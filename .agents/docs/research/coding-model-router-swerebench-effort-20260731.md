@@ -205,6 +205,15 @@ separately from inference calls and assigned zero usage cost because the
 provider returned no inference usage. All live workers received the same
 validator repair before their next validation.
 
+One `boardgameio__boardgame.io-894` `xhigh` rollout exhausted the frozen
+900-second agent budget after 16 fully metered provider turns. The pinned
+harness recorded `HarnessError`, no patch, no official scoring invocation, and
+no reward. Per the frozen outcome rule above, this is a gradeable
+post-execution agent-failure zero, not retryable infrastructure. The validator
+accepts only that explicit agent-timeout shape, records reward provenance and
+that the official verifier was not reached, and continues to reject every
+other unrecognized unscored trace.
+
 ## Target-compatible candidate families
 
 Development may compare the following lightweight families. All use only the

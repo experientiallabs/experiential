@@ -75,20 +75,45 @@ for index, outer in enumerate(records):
         raise SystemExit(f"row {index} has a different task")
     if trace.get("verifiers", {}).get("commit") != "f6e420b9908ae14d625f079881f13c15011ee1c9":
         raise SystemExit(f"row {index} has a different verifier commit")
+    calls = trace.get("calls")
+    if not isinstance(calls, list) or not calls or len(calls) > 40:
+        raise SystemExit(f"row {index} has invalid provider calls")
     reward = trace.get("rewards", {}).get("solved", {}).get("score")
-    if (
+    trace_errors = trace.get("errors", [])
+    post_execution_timeout = (
+        reward is None
+        and trace.get("ok") is False
+        and outer.get("ok") is False
+        and trace.get("stop_condition") == "error"
+        and trace.get("info", {}).get("patch") is None
+        and isinstance(trace_errors, list)
+        and any(
+            isinstance(error, dict)
+            and error.get("type") == "HarnessError"
+            and isinstance(error.get("message"), str)
+            and error["message"].startswith("agent timeout:")
+            for error in trace_errors
+        )
+    )
+    if post_execution_timeout:
+        reward = 0.0
+        reward_provenance = "gradeable post-execution agent timeout"
+    elif (
         isinstance(reward, bool)
         or not isinstance(reward, (int, float))
         or float(reward) not in {0.0, 1.0}
     ):
         raise SystemExit(f"row {index} lacks an official binary reward")
+    else:
+        reward_provenance = "official verifier"
     scoring = trace.get("timing", {}).get("scoring", {})
     start, end = scoring.get("start"), scoring.get("end")
-    if not isinstance(start, (int, float)) or not isinstance(end, (int, float)) or end <= start:
+    if post_execution_timeout:
+        scoring_seconds = None
+    elif not isinstance(start, (int, float)) or not isinstance(end, (int, float)) or end <= start:
         raise SystemExit(f"row {index} lacks official scoring timing")
-    calls = trace.get("calls")
-    if not isinstance(calls, list) or not calls or len(calls) > 40:
-        raise SystemExit(f"row {index} has invalid provider calls")
+    else:
+        scoring_seconds = end - start
     usage = {field: 0 for field in totals}
     provider_errors = []
     for call_index, call in enumerate(calls):
@@ -128,22 +153,30 @@ for index, outer in enumerate(records):
     if not 1 <= inference_calls <= 20:
         raise SystemExit(f"row {index} has invalid provider inference calls")
     patch = trace.get("info", {}).get("patch")
-    if not isinstance(patch, str):
+    if post_execution_timeout:
+        patch_bytes = 0
+        patch_sha256 = None
+    elif not isinstance(patch, str):
         raise SystemExit(f"row {index} lacks a patch string")
+    else:
+        patch_bytes = len(patch.encode())
+        patch_sha256 = hashlib.sha256(patch.encode()).hexdigest()
     cells.append({
         "attempt_number": args.attempt_offset + index,
         "reward": float(reward),
+        "reward_provenance": reward_provenance,
+        "official_verifier_reached": not post_execution_timeout,
         "provider_calls": len(calls),
         "provider_inference_calls": inference_calls,
         "provider_errors": provider_errors,
         "stop_condition": trace.get("stop_condition"),
         "trace_ok": trace.get("ok"),
         "outer_ok": outer.get("ok"),
-        "trace_errors": trace.get("errors", []),
+        "trace_errors": trace_errors,
         "outer_errors": outer.get("errors", []),
-        "patch_bytes": len(patch.encode()),
-        "patch_sha256": hashlib.sha256(patch.encode()).hexdigest(),
-        "scoring_seconds": end - start,
+        "patch_bytes": patch_bytes,
+        "patch_sha256": patch_sha256,
+        "scoring_seconds": scoring_seconds,
         "usage": usage,
     })
 report = {

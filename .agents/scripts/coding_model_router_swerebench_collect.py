@@ -107,7 +107,7 @@ def _outcome(
         or isinstance(reward, bool)
         or float(reward) not in {0.0, 1.0}
     ):
-        raise ValueError("cell has invalid official reward")
+        raise ValueError("cell has invalid gradeable reward")
     usage = _usage(cell.get("usage"), "cell usage")
     return {
         "task_id": str(task["task_id"]),
@@ -120,6 +120,8 @@ def _outcome(
         "reasoning_effort": effort,
         "attempt_number": attempt,
         "reward": float(reward),
+        "reward_provenance": cell.get("reward_provenance", "official verifier"),
+        "official_verifier_reached": cell.get("official_verifier_reached", True),
         "cost_usd": _cost(usage),
         "cost_provenance": "trace-derived frozen list-price estimate",
         "usage": usage,
