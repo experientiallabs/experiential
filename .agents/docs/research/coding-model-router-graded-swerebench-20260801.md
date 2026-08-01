@@ -160,6 +160,12 @@ terminated and its provider usage was not recoverable. The task is permanently e
 six arms with zero reruns. The maximum retained development cohort is now 660 of 673, or 98.1
 percent, still above the frozen requirement.
 
+The first `luna-max` command for `vmware__govmomi-3628` also completed successfully, but its
+official trace contained no graded reward. The worker had terminated before the audit, so the trace
+and provider usage were irrecoverable. The task is permanently excluded across all six arms with
+zero reruns. The maximum retained development cohort is now 659 of 673, or 97.9 percent, still
+above the frozen requirement.
+
 A pre-fit code audit found that the implementation required positive matched task-blind advantage
 only after averaging the five split seeds. The frozen rule requires a positive advantage in every
 seed. The fitter now applies all four development gates independently to each seed and fails on an
