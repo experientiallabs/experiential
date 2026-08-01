@@ -915,7 +915,7 @@ def _update_summary(
             {
                 "protocol": protocol,
                 "total_tasks": total_tasks,
-                "expected_cells": total_tasks * 10,
+                "expected_cells": total_tasks * len(EFFORTS) * 2,
                 "complete_tasks": complete_tasks,
                 "excluded_tasks": excluded_tasks,
                 "retained_task_coverage": (total_tasks - excluded_tasks) / total_tasks,
@@ -1233,7 +1233,7 @@ def execute(
         "efforts": list(EFFORTS),
         "attempts_per_effort": 2,
         "tasks": len(selected),
-        "expected_cells": len(selected) * 10,
+        "expected_cells": len(selected) * len(EFFORTS) * 2,
         "reused_smoke_cells": (4 if len(selected) >= 2 else 2)
         if phase.reuse_smoke
         else 0,
