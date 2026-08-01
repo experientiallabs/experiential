@@ -188,6 +188,14 @@ before recording a Docker image, scientific command, or provider call. Together 
 earlier transport failures, these fifteen tasks remain eligible for exactly one fresh-sandbox
 infrastructure retry after the initial controller finishes.
 
+The installed E2B SDK creates a thread-local HTTP/2 transport with a 300-second keepalive cache.
+That reuse matches the observed stale closed-connection error. The single frozen retry pass will
+therefore run with `E2B_MAX_KEEPALIVE_CONNECTIONS=0` and operational concurrency 20. This changes
+only control-plane connection reuse and scheduling, not task inputs, arms, attempts, harness,
+verifier, or scientific selection. A read-only list stress probe was stopped immediately after it
+reached the E2B API rate limit; subsequent monitoring uses only the local persisted tracker until
+the limit window clears.
+
 A pre-fit code audit found that the implementation required positive matched task-blind advantage
 only after averaging the five split seeds. The frozen rule requires a positive advantage in every
 seed. The fitter now applies all four development gates independently to each seed and fails on an
