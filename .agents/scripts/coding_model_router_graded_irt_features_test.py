@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from coding_model_router_graded_irt_features import (
+    frozen_feature_view,
     frozen_feature_views,
     prompt_shape_features,
     signed_hash_features,
@@ -29,6 +30,10 @@ def test_frozen_views_are_deterministic_and_aligned() -> None:
     assert np.array_equal(first["combined"][:, 2_048:], first["prompt-shape"])
     assert np.allclose(np.linalg.norm(first["signed-hash-512"], axis=1), 1.0)
     assert np.allclose(np.linalg.norm(first["signed-hash-2048"], axis=1), 1.0)
+    assert all(
+        np.array_equal(frozen_feature_view(prompts, name=name), values)
+        for name, values in first.items()
+    )
 
 
 def test_prompt_shape_uses_only_text_observables() -> None:

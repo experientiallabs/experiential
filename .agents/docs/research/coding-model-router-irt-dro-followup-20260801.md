@@ -145,6 +145,16 @@ single-core audit records at least 10,000 decisions, zero network calls, p50 bel
 below 20 ms. Missing latency evidence is a failed promotion gate, not an implicit infinity used
 only for tie breaking.
 
+The remote runner in `.agents/scripts/coding_model_router_graded_irt_run.py` emits one complete
+2,000-row scalar metric report per outer seed. It rejects incomplete grids, duplicate policies,
+source drift, or mismatched audited inputs. A separate remote command refits only structures that
+pass every non-latency gate, times the exact prompt feature, probability, and guarded-choice path
+on one CPU, and emits aggregate latency rows only. Final selection requires exact latency coverage
+of every scientifically eligible policy. The E2B orchestrator runs five seed workers concurrently,
+then runs latency and selection in a no-internet sandbox. Every sandbox is terminated after its
+bounded command, and only source hashes, input hashes, scalar metrics, latency aggregates, and the
+selection decision return to the Mac.
+
 Synthetic E2B performance preflight used 524 fit tasks, six arms, exact count likelihood, no
 provider calls, no target outcomes, and no persisted fitted state. The original 512-feature,
 two-latent joint fit failed after about 77 seconds at 1,000 iterations. Ridge initialization made

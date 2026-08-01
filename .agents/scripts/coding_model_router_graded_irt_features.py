@@ -78,3 +78,23 @@ def frozen_feature_views(texts: Sequence[str]) -> dict[str, np.ndarray]:
         "prompt-shape": shape,
         "combined": combined,
     }
+
+
+def frozen_feature_view(texts: Sequence[str], *, name: str) -> np.ndarray:
+    """Build exactly one frozen view for an online route decision."""
+    prompts = tuple(texts)
+    if name == "signed-hash-512":
+        return signed_hash_features(prompts, dimension=512)
+    if name == "signed-hash-2048":
+        return signed_hash_features(prompts, dimension=2_048)
+    if name == "prompt-shape":
+        return prompt_shape_features(prompts)
+    if name == "combined":
+        return np.concatenate(
+            [
+                signed_hash_features(prompts, dimension=2_048),
+                prompt_shape_features(prompts),
+            ],
+            axis=1,
+        )
+    raise ValueError(f"unsupported frozen IRT feature view: {name}")
