@@ -73,14 +73,14 @@ def _fixture() -> tuple[
 def test_frozen_grid_is_complete_unique_and_ordered() -> None:
     structures = frozen_structures()
     points = frozen_operating_points()
-    assert len(structures) == 240
-    assert len({value.key for value in structures}) == 240
-    assert [value.order for value in structures] == list(range(240))
+    assert len(structures) == 80
+    assert len({value.key for value in structures}) == 80
+    assert [value.order for value in structures] == list(range(80))
     assert len(points) == 25
     assert len({value.key for value in points}) == 25
     assert [value.order for value in points] == list(range(25))
-    assert sum(value.monotone_luna for value in structures) == 48
-    assert sum(value.graph_l2 > 0.0 for value in structures) == 144
+    assert sum(value.monotone_luna for value in structures) == 16
+    assert sum(value.graph_l2 > 0.0 for value in structures) == 48
 
 
 def test_policy_gate_rewards_task_signal_over_identical_traffic() -> None:
@@ -139,9 +139,7 @@ def test_crossfit_predicts_every_task_from_repository_disjoint_training(
         total_values: np.ndarray,
         latent_dimension: int,
         *,
-        ability_l2: float,
-        feature_l2: float,
-        discrimination_l2: float,
+        projection_l2: float,
         monotone_luna: bool,
         graph_laplacian: np.ndarray | None,
         graph_l2: float,
@@ -150,9 +148,7 @@ def test_crossfit_predicts_every_task_from_repository_disjoint_training(
             passed_values,
             total_values,
             latent_dimension,
-            ability_l2,
-            feature_l2,
-            discrimination_l2,
+            projection_l2,
             monotone_luna,
             graph_laplacian,
             graph_l2,
@@ -169,8 +165,8 @@ def test_crossfit_predicts_every_task_from_repository_disjoint_training(
             axis=0,
         )
 
-    monkeypatch.setattr(nested, "fit_feature_binomial_irt", fake_fit)
-    monkeypatch.setattr(nested, "predict_feature_probabilities", fake_predict)
+    monkeypatch.setattr(nested, "fit_projected_binomial_irt", fake_fit)
+    monkeypatch.setattr(nested, "predict_projected_probabilities", fake_predict)
     task_count = 20
     features = np.arange(task_count, dtype=np.float64)[:, None]
     total = np.full((task_count, 6), 10.0, dtype=np.float64)

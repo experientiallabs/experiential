@@ -45,17 +45,23 @@ or an unweighted reward fraction. For task `i` and arm `a`, fit
 
 `f2p_passed[i,a] ~ Binomial(f2p_total[i], sigmoid(q[i] dot theta[a] - b[i]))`.
 
-The pre-call task representation produces:
+An exact task-level fit first estimates:
 
 - scalar difficulty `b[i]`;
 - nonnegative discrimination vector `q[i]`;
 - one ability vector `theta[a]` per model by reasoning-effort arm.
 
-Candidate representation dimensions are 2, 4, and 8. The task encoder candidates are signed
-hashing at 512 and 2,048 dimensions, the frozen prompt-shape vector, and their concatenation.
-Regularization strengths are 0.1, 1, 10, and 100. Compare unconstrained arm abilities with one
-variant whose Luna capacity coordinate is monotone from low through max. The Sol guard remains a
-separate arm and receives no ordinal constraint.
+Closed-form ridge then projects task difficulty and log discrimination onto pre-call features
+inside each fit fold. Unseen tasks use only those projected feature heads and the ephemeral arm
+abilities. The latent dimension is fixed at 2. Synthetic E2B preflight showed that dimensions 4
+and 8 reached the nonconvex optimizer's iteration limit even before real outcomes, while dimension
+2 completed. With six arms, eight independent ability dimensions are also unidentifiable.
+
+The task encoder candidates are signed hashing at 512 and 2,048 dimensions, the frozen
+prompt-shape vector, and their concatenation. Projection regularization strengths are 0.1, 1, 10,
+and 100. Compare unconstrained arm abilities with one variant whose Luna capacity coordinate is
+monotone from low through max. The Sol guard remains a separate arm and receives no ordinal
+constraint.
 
 The graph ablation constructs a fit-only task similarity graph from the same pre-call features.
 Feature rows are L2 normalized, each task selects its eight nearest tasks by descending cosine
@@ -66,9 +72,9 @@ online feature contract. Repository identity, model output, patch, tests, verifi
 future trajectory content remain forbidden features.
 
 The graph and monotone variants are separate ablations, not a factorial cross. For each feature
-view, latent dimension, and regularization strength, the structural grid contains exactly five
+view and regularization strength, the structural grid contains exactly five
 variants: unconstrained without a graph, monotone Luna capacity without a graph, and unconstrained
-with each of the three graph penalties. This produces 240 structural candidates before the 25
+with each of the three graph penalties. This produces 80 structural candidates before the 25
 cost-penalty and KL-radius operating points.
 
 ## Implementation starting point
@@ -79,7 +85,7 @@ unchanged. The graded SWE-rebench adaptation must:
 
 1. replace its equally weighted fractional cross-entropy with the exact binomial likelihood so a
    1-of-1 score does not carry the same information as a 100-of-100 score;
-2. generalize the scalar difficulty and discrimination to the frozen latent dimensions above;
+2. generalize the scalar difficulty and discrimination to the frozen two-dimensional latent;
 3. replace direct linear or Chebyshev scalarization with the repository KL-robust selection rule;
 4. remove fitted arm abilities and all other coefficients from persisted reports;
 5. freeze only task identity, selected arm, input hashes, route provenance, and aggregate fit
@@ -94,7 +100,11 @@ The prepared numeric core lives in
 `.agents/scripts/coding_model_router_graded_irt_core.py`. It implements the exact count-weighted
 binomial likelihood, analytic gradients, multidimensional nonnegative discrimination, a pre-call
 feature-conditioned variant that can score unseen tasks, and the forward-KL repository robust
-lower bound. It also implements the frozen monotone-capacity variant with a differentiable
+lower bound. Its promoted path fits exact task latents once and projects difficulty and log
+discrimination onto pre-call features by exact dual ridge, including the graph penalty on
+predicted difficulty. The earlier joint feature-conditioned optimizer remains tested numeric
+infrastructure but is not in the promoted grid after its synthetic performance failure. The core
+also implements the frozen monotone-capacity variant with a differentiable
 cumulative-softplus parameterization on the first latent coordinate for Luna low through max; the
 sixth Sol arm remains unconstrained. Its inline tests cover finite-difference gradients for both
 ability variants, exact denominator weighting, unseen-task prediction, monotone Luna ordering, and
@@ -117,10 +127,30 @@ repository reward and cost aggregation, forward-KL worst-case metrics, and paire
 They use only in-memory arrays and have no fitting, network, filesystem, or serialization surface.
 
 The in-memory nested orchestrator in
-`.agents/scripts/coding_model_router_graded_irt_nested.py` crosses the 240 structures with the 25
+`.agents/scripts/coding_model_router_graded_irt_nested.py` crosses the 80 structures with the 25
 operating points inside every seeded repository fold. It fits both the real and within-repository
 shuffled count rows, predicts each task out of fold exactly once, and retains only aggregate
 metrics. It has no filesystem or serialization surface and does not activate this lane.
+
+Synthetic E2B performance preflight used 524 fit tasks, six arms, exact count likelihood, no
+provider calls, no target outcomes, and no persisted fitted state. The original 512-feature,
+two-latent joint fit failed after about 77 seconds at 1,000 iterations. Ridge initialization made
+one joint case complete in 0.48 seconds, but representative joint graph and 2,048-feature fits took
+38 to 64 seconds, and both four- and eight-latent task fits still failed. The projected
+two-latent path completed task IRT in 0.24 seconds and every tested 512- and 2,048-feature
+projection, including graph regularization, in 0.02 to 0.17 seconds. Aggregate timing artifact
+hashes are `483b3eb8b146f466a7ba90bde5fb943fa1fc37ae058f5de245518dbdf7df733f`,
+`673f86b3c83dbb25afbd6f62f48e5c499c0178e77eb168313155ad946b0bc4ac`,
+`f5926272804df724ef0cd65865dcb83e4a83a8801a3c0599bebf9a168b04ecd4`, and
+`320959137aa3749ec907b245187b90dea36ad772acf8c2b9a23dcce02e359ec1`.
+
+The implemented projected core then received a second real-shape synthetic E2B preflight. Free,
+monotone, graph-regularized, and 2,048-feature fits all converged in 0.35 to 0.70 seconds. The
+complete 4,000-fit grid projects to 23 to 46 minutes serial and can be sharded independently by
+the five frozen seeds. The preflight again used zero provider calls and no outcomes, persisted no
+fitted state, and terminated the sandbox. Its aggregate artifact SHA-256 is
+`d03357b5c29304c737b063ae0cc53642659b6d2f4d0de1024b22a54b0373c830` and its core source
+SHA-256 is `0bdce68cfc85e872e7c424f41a37ffc87f6ed5411622217f5faac0263c231674`.
 
 All fitting, cross-validation, bootstrapping, and latency measurement run on E2B or Azure. The Mac
 only orchestrates and validates bounded artifacts. No foundation model, task embedding bank, or

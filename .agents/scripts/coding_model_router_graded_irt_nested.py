@@ -12,8 +12,8 @@ from dataclasses import dataclass
 
 import numpy as np
 from coding_model_router_graded_irt_core import (
-    fit_feature_binomial_irt,
-    predict_feature_probabilities,
+    fit_projected_binomial_irt,
+    predict_projected_probabilities,
 )
 from coding_model_router_graded_irt_protocol import (
     cosine_knn_laplacian,
@@ -34,7 +34,7 @@ FEATURE_NAMES = (
     "prompt-shape",
     "combined",
 )
-LATENT_DIMENSIONS = (2, 4, 8)
+LATENT_DIMENSIONS = (2,)
 REGULARIZATION_STRENGTHS = (0.1, 1.0, 10.0, 100.0)
 GRAPH_STRENGTHS = (0.01, 0.1, 1.0)
 COST_PENALTIES = (0.0, 0.005, 0.01, 0.02, 0.03)
@@ -173,7 +173,7 @@ def frozen_structures() -> tuple[IrtStructure, ...]:
                         )
                     )
     result = tuple(values)
-    if len(result) != 240 or len({value.key for value in result}) != len(result):
+    if len(result) != 80 or len({value.key for value in result}) != len(result):
         raise AssertionError("frozen IRT structure grid is incomplete or duplicated")
     return result
 
@@ -261,19 +261,20 @@ def crossfit_structure(
             if len(fold.train) <= 8:
                 raise ValueError("frozen eight-neighbor graph needs at least nine fit tasks")
             graph_laplacian = cosine_knn_laplacian(train_features, neighbors=8)
-        fit = fit_feature_binomial_irt(
+        fit = fit_projected_binomial_irt(
             train_features,
             passed[fold.train],
             total[fold.train],
             structure.latent_dimension,
-            ability_l2=structure.regularization,
-            feature_l2=structure.regularization,
-            discrimination_l2=structure.regularization,
+            projection_l2=structure.regularization,
             monotone_luna=structure.monotone_luna,
             graph_laplacian=graph_laplacian,
             graph_l2=structure.graph_l2,
         )
-        probabilities[fold.test] = predict_feature_probabilities(fit, features[fold.test])
+        probabilities[fold.test] = predict_projected_probabilities(
+            fit,
+            features[fold.test],
+        )
         fit_iterations += fit.iterations
 
         count_rows = np.concatenate(
@@ -285,19 +286,17 @@ def crossfit_structure(
             repositories[fold.train],
             seed=seed * 10_000 + fold_index,
         )
-        shuffled_fit = fit_feature_binomial_irt(
+        shuffled_fit = fit_projected_binomial_irt(
             train_features,
             shuffled_rows[:, :ARM_COUNT],
             shuffled_rows[:, ARM_COUNT:],
             structure.latent_dimension,
-            ability_l2=structure.regularization,
-            feature_l2=structure.regularization,
-            discrimination_l2=structure.regularization,
+            projection_l2=structure.regularization,
             monotone_luna=structure.monotone_luna,
             graph_laplacian=graph_laplacian,
             graph_l2=structure.graph_l2,
         )
-        shuffled_probabilities[fold.test] = predict_feature_probabilities(
+        shuffled_probabilities[fold.test] = predict_projected_probabilities(
             shuffled_fit,
             features[fold.test],
         )
@@ -563,19 +562,17 @@ def fit_full_routes(
     graph_laplacian = None
     if structure.graph_l2 > 0.0:
         graph_laplacian = cosine_knn_laplacian(development_features, neighbors=8)
-    fit = fit_feature_binomial_irt(
+    fit = fit_projected_binomial_irt(
         development_features,
         passed,
         total,
         structure.latent_dimension,
-        ability_l2=structure.regularization,
-        feature_l2=structure.regularization,
-        discrimination_l2=structure.regularization,
+        projection_l2=structure.regularization,
         monotone_luna=structure.monotone_luna,
         graph_laplacian=graph_laplacian,
         graph_l2=structure.graph_l2,
     )
-    probabilities = predict_feature_probabilities(fit, target_features)
+    probabilities = predict_projected_probabilities(fit, target_features)
     guard_arm = _best_static_arm(rewards, costs)
     mean_costs = np.mean(costs, axis=0)
     choices = quality_guarded_choices(

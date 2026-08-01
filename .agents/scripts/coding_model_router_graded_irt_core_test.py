@@ -7,13 +7,16 @@ import pytest
 from coding_model_router_graded_irt_core import (
     _initial_feature_parameters,
     _initial_parameters,
+    _ridge_projection,
     binomial_irt_loss_and_gradient,
     feature_binomial_irt_loss_and_gradient,
     fit_binomial_irt,
     fit_feature_binomial_irt,
+    fit_projected_binomial_irt,
     kl_robust_lower_bound,
     predict_feature_probabilities,
     predict_probabilities,
+    predict_projected_probabilities,
 )
 
 
@@ -83,6 +86,46 @@ def test_binomial_likelihood_weights_exact_denominators() -> None:
     )
     difficulty_gradient = gradient[2:4]
     assert difficulty_gradient[1] == pytest.approx(100.0 * difficulty_gradient[0])
+
+
+def test_monotone_task_irt_gradient_matches_finite_difference() -> None:
+    passed = np.asarray(
+        [[0, 1, 2, 3, 4, 2], [1, 2, 3, 4, 5, 3], [2, 3, 4, 5, 5, 4], [3, 4, 5, 5, 5, 5]],
+        dtype=np.float64,
+    )
+    total = np.full_like(passed, 5.0)
+    latent_dimension = 2
+    parameters = _initial_parameters(passed, total, latent_dimension)
+    _, gradient = binomial_irt_loss_and_gradient(
+        parameters,
+        passed,
+        total,
+        latent_dimension,
+        monotone_luna=True,
+    )
+    epsilon = 1e-6
+    numerical = np.zeros_like(parameters)
+    for index in range(len(parameters)):
+        upper = parameters.copy()
+        lower = parameters.copy()
+        upper[index] += epsilon
+        lower[index] -= epsilon
+        upper_loss = binomial_irt_loss_and_gradient(
+            upper,
+            passed,
+            total,
+            latent_dimension,
+            monotone_luna=True,
+        )[0]
+        lower_loss = binomial_irt_loss_and_gradient(
+            lower,
+            passed,
+            total,
+            latent_dimension,
+            monotone_luna=True,
+        )[0]
+        numerical[index] = (upper_loss - lower_loss) / (2.0 * epsilon)
+    np.testing.assert_allclose(gradient, numerical, atol=1e-6, rtol=1e-5)
 
 
 def test_feature_binomial_irt_gradient_matches_finite_difference() -> None:
@@ -354,6 +397,67 @@ def test_monotone_feature_fit_orders_luna_capacity_only() -> None:
     assert fit.abilities[5, 0] < fit.abilities[4, 0]
     predicted = predict_feature_probabilities(fit, np.asarray([[0.0]]))
     assert np.all(np.diff(predicted[0, :5]) > 0.0)
+
+
+def test_graph_ridge_projection_satisfies_its_normal_equation() -> None:
+    features = np.asarray(
+        [[-1.0, 0.2], [-0.4, 0.5], [0.3, -0.2], [1.1, 0.7]],
+        dtype=np.float64,
+    )
+    targets = np.asarray([-1.0, -0.2, 0.4, 1.2], dtype=np.float64)
+    laplacian = np.asarray(
+        [
+            [1.0, -1.0, 0.0, 0.0],
+            [-1.0, 2.0, -1.0, 0.0],
+            [0.0, -1.0, 2.0, -1.0],
+            [0.0, 0.0, -1.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    regularization = 0.3
+    graph_l2 = 0.2
+    weights = _ridge_projection(
+        features,
+        targets,
+        regularization=regularization,
+        graph_laplacian=laplacian,
+        graph_l2=graph_l2,
+    )
+    augmented = np.column_stack([features, np.ones(len(features))])
+    predictions = augmented @ weights
+    normal_gradient = (
+        augmented.T @ (predictions - targets)
+        + regularization * weights
+        + graph_l2 * augmented.T @ laplacian @ predictions
+    )
+    np.testing.assert_allclose(normal_gradient, 0.0, atol=1e-9)
+
+
+def test_projected_irt_predicts_unseen_tasks_without_task_state() -> None:
+    train_features = np.linspace(-1.5, 1.5, 40, dtype=np.float64)[:, None]
+    arm_abilities = np.asarray([-1.2, -0.7, -0.1, 0.5, 1.1, 0.2], dtype=np.float64)
+    probabilities = 1.0 / (
+        1.0 + np.exp(-(arm_abilities[None, :] - train_features))
+    )
+    total = np.full(probabilities.shape, 40.0)
+    passed = np.rint(total * probabilities)
+    fit = fit_projected_binomial_irt(
+        train_features,
+        passed,
+        total,
+        latent_dimension=2,
+        projection_l2=0.1,
+        monotone_luna=True,
+    )
+    predicted = predict_projected_probabilities(
+        fit,
+        np.asarray([[-1.0], [0.0], [1.0]], dtype=np.float64),
+    )
+    assert predicted.shape == (3, 6)
+    assert np.isfinite(predicted).all()
+    assert np.all(np.diff(fit.abilities[:5, 0]) > 0.0)
+    assert fit.difficulty_weights.shape == (2,)
+    assert fit.log_discrimination_weights.shape == (2, 2)
 
 
 def test_kl_robust_lower_bound_matches_two_repository_search() -> None:

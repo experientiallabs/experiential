@@ -43,6 +43,18 @@ class FeatureBinomialIrtFit:
     iterations: int
 
 
+@dataclass(frozen=True)
+class ProjectedBinomialIrtFit:
+    """One ephemeral task-IRT fit projected onto pre-call features."""
+
+    abilities: np.ndarray
+    difficulty_weights: np.ndarray
+    log_discrimination_weights: np.ndarray
+    loss: float
+    projection_loss: float
+    iterations: int
+
+
 def _validate_counts(passed: np.ndarray, total: np.ndarray) -> None:
     """Validate a dense task-by-arm matrix of exact binomial counts."""
     if passed.ndim != 2 or total.ndim != 2 or passed.shape != total.shape:
@@ -325,6 +337,7 @@ def binomial_irt_loss_and_gradient(
     ability_l2: float = DEFAULT_ABILITY_L2,
     difficulty_l2: float = DEFAULT_DIFFICULTY_L2,
     discrimination_l2: float = DEFAULT_DISCRIMINATION_L2,
+    monotone_luna: bool = False,
 ) -> tuple[float, np.ndarray]:
     """Return exact binomial negative log likelihood and its analytic gradient.
 
@@ -336,11 +349,16 @@ def binomial_irt_loss_and_gradient(
     if min(ability_l2, difficulty_l2, discrimination_l2) < 0.0:
         raise ValueError("IRT regularization strengths must be nonnegative")
     task_count, arm_count = passed.shape
-    abilities, difficulties, log_discriminations = _unpack(
+    raw_abilities, difficulties, log_discriminations = _unpack(
         parameters,
         task_count,
         arm_count,
         latent_dimension,
+    )
+    abilities = (
+        _monotone_luna_abilities(raw_abilities)
+        if monotone_luna
+        else raw_abilities
     )
     discriminations = np.exp(log_discriminations)
     logits = discriminations @ abilities.T - difficulties[:, None]
@@ -353,6 +371,11 @@ def binomial_irt_loss_and_gradient(
     error = (total * expit(logits) - passed) / assertion_count
     ability_gradient = error.T @ discriminations
     ability_gradient += 2.0 * ability_l2 * abilities / abilities.size
+    if monotone_luna:
+        ability_gradient = _monotone_luna_raw_gradient(
+            raw_abilities,
+            ability_gradient,
+        )
     difficulty_gradient = -np.sum(error, axis=1)
     difficulty_gradient += 2.0 * difficulty_l2 * difficulties / difficulties.size
     discrimination_gradient = (error @ abilities) * discriminations
@@ -535,6 +558,7 @@ def fit_binomial_irt(
     ability_l2: float = DEFAULT_ABILITY_L2,
     difficulty_l2: float = DEFAULT_DIFFICULTY_L2,
     discrimination_l2: float = DEFAULT_DISCRIMINATION_L2,
+    monotone_luna: bool = False,
 ) -> BinomialIrtFit:
     """Fit the ephemeral count-weighted model with bounded L-BFGS optimization."""
     _validate_counts(passed, total)
@@ -550,11 +574,26 @@ def fit_binomial_irt(
         + [(-8.0, 8.0)] * difficulty_size
         + [(-3.0, 3.0)] * discrimination_size
     )
+    if monotone_luna:
+        raw_abilities, difficulties, log_discriminations = _unpack(
+            initial,
+            task_count,
+            arm_count,
+            latent_dimension,
+        )
+        initial = np.concatenate(
+            [
+                _monotone_luna_initial(raw_abilities).ravel(),
+                difficulties,
+                log_discriminations.ravel(),
+            ]
+        )
     objective = partial(
         binomial_irt_loss_and_gradient,
         ability_l2=ability_l2,
         difficulty_l2=difficulty_l2,
         discrimination_l2=discrimination_l2,
+        monotone_luna=monotone_luna,
     )
     result = minimize(
         objective,
@@ -567,11 +606,16 @@ def fit_binomial_irt(
     )
     if not result.success or not np.isfinite(result.fun):
         raise RuntimeError(f"binomial IRT optimization failed: {result.message}")
-    abilities, difficulties, log_discriminations = _unpack(
+    raw_abilities, difficulties, log_discriminations = _unpack(
         np.asarray(result.x, dtype=np.float64),
         task_count,
         arm_count,
         latent_dimension,
+    )
+    abilities = (
+        _monotone_luna_abilities(raw_abilities)
+        if monotone_luna
+        else raw_abilities
     )
     return BinomialIrtFit(
         abilities=abilities.copy(),
@@ -678,6 +722,88 @@ def fit_feature_binomial_irt(
     )
 
 
+def _ridge_projection(
+    features: np.ndarray,
+    targets: np.ndarray,
+    *,
+    regularization: float,
+    graph_laplacian: np.ndarray | None = None,
+    graph_l2: float = 0.0,
+) -> np.ndarray:
+    """Project task latents onto pre-call features by exact dual ridge."""
+    _validate_features(features, len(features))
+    if targets.ndim not in (1, 2) or targets.shape[0] != len(features):
+        raise ValueError("ridge projection targets must align with feature rows")
+    if not np.isfinite(targets).all():
+        raise ValueError("ridge projection targets must be finite")
+    if not np.isfinite(regularization) or regularization <= 0.0:
+        raise ValueError("ridge projection regularization must be finite and positive")
+    _validate_graph_laplacian(graph_laplacian, len(features), graph_l2)
+    augmented = _augment_features(features)
+    gram = augmented @ augmented.T
+    graph_operator = np.eye(len(features), dtype=np.float64)
+    if graph_laplacian is not None and graph_l2 > 0.0:
+        graph_operator += graph_l2 * graph_laplacian
+    system = regularization * np.eye(len(features), dtype=np.float64)
+    system += graph_operator @ gram
+    dual = np.linalg.solve(system, targets)
+    weights = augmented.T @ dual
+    if not np.isfinite(weights).all():
+        raise RuntimeError("ridge projection produced non-finite weights")
+    return weights
+
+
+def fit_projected_binomial_irt(
+    features: np.ndarray,
+    passed: np.ndarray,
+    total: np.ndarray,
+    latent_dimension: int,
+    *,
+    projection_l2: float,
+    monotone_luna: bool = False,
+    graph_laplacian: np.ndarray | None = None,
+    graph_l2: float = 0.0,
+) -> ProjectedBinomialIrtFit:
+    """Fit exact task IRT once, then project its latents onto pre-call features."""
+    _validate_counts(passed, total)
+    _validate_features(features, len(passed))
+    _validate_graph_laplacian(graph_laplacian, len(passed), graph_l2)
+    task_fit = fit_binomial_irt(
+        passed,
+        total,
+        latent_dimension,
+        monotone_luna=monotone_luna,
+    )
+    difficulty_weights = _ridge_projection(
+        features,
+        task_fit.difficulties,
+        regularization=projection_l2,
+        graph_laplacian=graph_laplacian,
+        graph_l2=graph_l2,
+    )
+    log_discrimination_weights = _ridge_projection(
+        features,
+        task_fit.log_discriminations,
+        regularization=projection_l2,
+    )
+    augmented = _augment_features(features)
+    difficulty_residual = augmented @ difficulty_weights - task_fit.difficulties
+    discrimination_residual = (
+        augmented @ log_discrimination_weights - task_fit.log_discriminations
+    )
+    projection_loss = float(
+        np.mean(difficulty_residual**2) + np.mean(discrimination_residual**2)
+    )
+    return ProjectedBinomialIrtFit(
+        abilities=task_fit.abilities.copy(),
+        difficulty_weights=difficulty_weights.copy(),
+        log_discrimination_weights=log_discrimination_weights.copy(),
+        loss=task_fit.loss + projection_loss,
+        projection_loss=projection_loss,
+        iterations=task_fit.iterations,
+    )
+
+
 def predict_probabilities(fit: BinomialIrtFit) -> np.ndarray:
     """Predict fitted task-by-arm pass probabilities without serializing fit state."""
     if fit.abilities.ndim != 2 or fit.log_discriminations.ndim != 2:
@@ -711,4 +837,33 @@ def predict_feature_probabilities(
     augmented = _augment_features(features)
     difficulties = augmented @ fit.difficulty_weights
     discriminations = _softplus(augmented @ fit.discrimination_weights)
+    return expit(discriminations @ fit.abilities.T - difficulties[:, None])
+
+
+def predict_projected_probabilities(
+    fit: ProjectedBinomialIrtFit,
+    features: np.ndarray,
+) -> np.ndarray:
+    """Predict unseen-task arm probabilities from projected task IRT latents."""
+    if fit.abilities.ndim != 2 or fit.log_discrimination_weights.ndim != 2:
+        raise ValueError("projected IRT abilities and discrimination weights must be matrices")
+    if fit.difficulty_weights.ndim != 1:
+        raise ValueError("projected IRT difficulty weights must be a vector")
+    expected_feature_count = len(fit.difficulty_weights) - 1
+    _validate_features(features, len(features))
+    if features.shape[1] != expected_feature_count:
+        raise ValueError("prediction features do not match projected feature count")
+    if fit.log_discrimination_weights.shape != (
+        expected_feature_count + 1,
+        fit.abilities.shape[1],
+    ):
+        raise ValueError("projected IRT fitted dimensions do not match")
+    augmented = _augment_features(features)
+    difficulties = augmented @ fit.difficulty_weights
+    log_discriminations = np.clip(
+        augmented @ fit.log_discrimination_weights,
+        -3.0,
+        3.0,
+    )
+    discriminations = np.exp(log_discriminations)
     return expit(discriminations @ fit.abilities.T - difficulties[:, None])
