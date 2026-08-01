@@ -72,6 +72,7 @@ RESPONSES_ADAPTER_REPORT_SHA256 = (
     "476f4a5e0a67fc4880fc80ed27e52d333620461da63775689e8f5be38e66179c"
 )
 E2B_ACCOUNT_CAP = 1_000
+EXTERNAL_AUTHORIZATION: dict[str, object] | None = None
 TASK_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+$")
 IMAGE_PATTERN = re.compile(r"^docker\.io/swerebenchv2/[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$")
 STATE_LOCK = threading.Lock()
@@ -1245,12 +1246,16 @@ def execute(
         "deep_swe_outcomes_accessed": False,
         "model_persisted": False,
     }
-    if phase is DEVELOPMENT_PHASE:
+    if phase.reuse_smoke:
         launch["smoke_report_sha256"] = SMOKE_REPORT_SHA256
         launch["smoke_archive_sha256"] = SMOKE_ARCHIVE_SHA256
-    else:
+    elif authorization is not None:
         launch["phase"] = phase.name
         launch["authorization"] = authorization
+        launch["confirmation_outcomes_accessed_before_launch"] = False
+    elif EXTERNAL_AUTHORIZATION is not None:
+        launch["phase"] = "externally-authorized-confirmation"
+        launch["authorization"] = EXTERNAL_AUTHORIZATION
         launch["confirmation_outcomes_accessed_before_launch"] = False
     if launch_path.is_file():
         prior_launch = _read_object(launch_path)

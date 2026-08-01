@@ -16,6 +16,7 @@ def test_configure_binds_exact_single_arm(monkeypatch: pytest.MonkeyPatch) -> No
         "reused": runner.REUSED_TASKS,
         "archives": runner.SMOKE_ARCHIVE_SHA256,
         "spend": runner.DEFAULT_PRIOR_SPEND_USD,
+        "authorization": runner.EXTERNAL_AUTHORIZATION,
     }
     try:
         _, arm = confirm.configure("gpt-5.6-sol", "xhigh", 2_000.0)
@@ -33,3 +34,4 @@ def test_configure_binds_exact_single_arm(monkeypatch: pytest.MonkeyPatch) -> No
         monkeypatch.setattr(runner, "REUSED_TASKS", originals["reused"])
         monkeypatch.setattr(runner, "SMOKE_ARCHIVE_SHA256", originals["archives"])
         monkeypatch.setattr(runner, "DEFAULT_PRIOR_SPEND_USD", originals["spend"])
+        monkeypatch.setattr(runner, "EXTERNAL_AUTHORIZATION", originals["authorization"])

@@ -187,6 +187,7 @@ def main() -> None:
         args.corpus,
     )
     _, arm = configure(args.model, args.effort, prior_spend)
+    runner.EXTERNAL_AUTHORIZATION = authorization
     args.root.mkdir(parents=True, exist_ok=True)
     authorization_path = args.root / "authorization.json"
     if authorization_path.is_file():
