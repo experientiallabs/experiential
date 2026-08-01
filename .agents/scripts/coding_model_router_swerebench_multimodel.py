@@ -12,6 +12,7 @@ MODELS = {
     "gpt-5.6-sol": "sol",
     "gpt-5.6-terra": "terra",
 }
+FROZEN_PRIOR_SPEND_USD = 1_123.9297378
 
 
 def configure(model: str) -> None:
@@ -20,6 +21,7 @@ def configure(model: str) -> None:
         raise ValueError(f"unsupported frozen model: {model}")
     slug = MODELS[model]
     runner.MODEL = model
+    runner.DEFAULT_PRIOR_SPEND_USD = FROZEN_PRIOR_SPEND_USD
     runner.REMOTE_VALIDATOR = runner.REMOTE_VALIDATOR.replace(
         '"gpt-5.6-luna"', f'"{model}"'
     )

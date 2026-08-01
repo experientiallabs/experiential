@@ -58,4 +58,4 @@ The user authorized a USD 20,000 hard ceiling and monitors provider usage extern
 telemetry is preserved when available; otherwise reporting uses a clearly labeled trace-derived
 list-price estimate. All model execution and fitting run on E2B or Azure. The local Mac only
 orchestrates, validates small artifacts, and records results. No Modal app or persisted model is
-used.
+used. The frozen rough cumulative spend before this matrix is USD 1,123.9297378.

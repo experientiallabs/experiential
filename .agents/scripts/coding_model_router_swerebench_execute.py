@@ -55,6 +55,7 @@ POOLED_CONFIRMATION_FREEZE_LOCK_SHA256 = (
 )
 POOLED_SELECTED_CANDIDATE = "direct_ridge-hash8192-a10"
 POOLED_PRIOR_SPEND_USD = 887.541861
+DEFAULT_PRIOR_SPEND_USD = 405.7678502
 SMOKE_REPORT_SHA256 = "ee76a57040cbe7aaef692d2fc3f3df66d7a556cbf6dda74119e0802cb4230e13"
 SMOKE_ARCHIVE_SHA256 = {
     "xhigh": "bf1d576d25f1b56ae3a9484db5d5599576519a218aec3073db29272345f4015b",
@@ -858,7 +859,7 @@ def _update_summary(
     total_tasks: int,
     *,
     protocol: str = PROTOCOL,
-    prior_spend_usd: float = 405.7678502,
+    prior_spend_usd: float = DEFAULT_PRIOR_SPEND_USD,
 ) -> None:
     with STATE_LOCK:
         states = list((root / "tasks").glob("*/state.json"))
@@ -939,7 +940,7 @@ def _run_task(
     api_key: str,
     total_tasks: int,
     phase: ExecutionPhase = DEVELOPMENT_PHASE,
-    prior_spend_usd: float = 405.7678502,
+    prior_spend_usd: float = DEFAULT_PRIOR_SPEND_USD,
 ) -> None:
     task_id = str(row["task_id"])
     image = _docker_image(str(row["image_name"]))
@@ -1174,7 +1175,7 @@ def execute(
     if _sha256(corpus_path) != phase.corpus_sha256:
         raise ValueError(f"{phase.name} corpus hash mismatch")
     authorization: dict[str, object] | None = None
-    prior_spend_usd = 405.7678502
+    prior_spend_usd = DEFAULT_PRIOR_SPEND_USD
     if phase is CONFIRMATION_PHASE:
         if limit_tasks is not None:
             raise ValueError("confirmation does not allow a task limit")
