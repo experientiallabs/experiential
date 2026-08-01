@@ -131,6 +131,11 @@ The in-memory nested orchestrator in
 operating points inside every seeded repository fold. It fits both the real and within-repository
 shuffled count rows, predicts each task out of fold exactly once, and retains only aggregate
 metrics. It has no filesystem or serialization surface and does not activate this lane.
+The same module exposes one-seed aggregate evaluation and a separate final selector so the five
+frozen seeds can run in independent remote workers. The selector reconstructs the exact frozen
+structure by operating-point grid and rejects missing, duplicated, or unexpected seed metrics
+before it can promote a policy. No cross-fit probability, coefficient, or task embedding crosses
+the worker boundary.
 
 Synthetic E2B performance preflight used 524 fit tasks, six arms, exact count likelihood, no
 provider calls, no target outcomes, and no persisted fitted state. The original 512-feature,

@@ -474,44 +474,122 @@ def select_nested_policy(
     selected_seeds = tuple(int(seed) for seed in seeds)
     if not selected_structures or not selected_points or not selected_seeds:
         raise ValueError("nested selection requires structures, operating points, and seeds")
+    metrics = tuple(
+        metric
+        for seed in selected_seeds
+        for metric in evaluate_nested_seed(
+            feature_views,
+            passed,
+            total,
+            costs,
+            repositories,
+            structures=selected_structures,
+            operating_points=selected_points,
+            seed=seed,
+        )
+    )
+    return select_nested_metrics(
+        metrics,
+        structures=selected_structures,
+        operating_points=selected_points,
+        seeds=selected_seeds,
+        route_latency_ms=route_latency_ms,
+    )
+
+
+def evaluate_nested_seed(
+    feature_views: Mapping[str, np.ndarray],
+    passed: np.ndarray,
+    total: np.ndarray,
+    costs: np.ndarray,
+    repositories: np.ndarray,
+    *,
+    seed: int,
+    structures: Sequence[IrtStructure] | None = None,
+    operating_points: Sequence[OperatingPoint] | None = None,
+) -> tuple[PolicyMetric, ...]:
+    """Evaluate one independently shardable seed and return aggregate metrics only."""
+    selected_structures = (
+        frozen_structures() if structures is None else tuple(structures)
+    )
+    selected_points = (
+        frozen_operating_points()
+        if operating_points is None
+        else tuple(operating_points)
+    )
+    if not selected_structures or not selected_points:
+        raise ValueError("seed evaluation requires structures and operating points")
     metrics: list[PolicyMetric] = []
-    for seed in selected_seeds:
-        for structure in selected_structures:
-            if structure.feature_name not in feature_views:
-                raise ValueError(f"missing frozen feature view: {structure.feature_name}")
-            features = feature_views[structure.feature_name]
-            crossfit = crossfit_structure(
-                features,
+    for structure in selected_structures:
+        if structure.feature_name not in feature_views:
+            raise ValueError(f"missing frozen feature view: {structure.feature_name}")
+        features = feature_views[structure.feature_name]
+        crossfit = crossfit_structure(
+            features,
+            passed,
+            total,
+            costs,
+            repositories,
+            structure=structure,
+            seed=seed,
+        )
+        metrics.extend(
+            evaluate_policy(
+                crossfit,
                 passed,
                 total,
                 costs,
                 repositories,
                 structure=structure,
+                operating_point=operating_point,
                 seed=seed,
+                feature_count=features.shape[1],
             )
-            for operating_point in selected_points:
-                metrics.append(
-                    evaluate_policy(
-                        crossfit,
-                        passed,
-                        total,
-                        costs,
-                        repositories,
-                        structure=structure,
-                        operating_point=operating_point,
-                        seed=seed,
-                        feature_count=features.shape[1],
-                    )
-                )
+            for operating_point in selected_points
+        )
+    return tuple(metrics)
+
+
+def select_nested_metrics(
+    metrics: Sequence[PolicyMetric],
+    *,
+    structures: Sequence[IrtStructure] | None = None,
+    operating_points: Sequence[OperatingPoint] | None = None,
+    seeds: Sequence[int] = OUTER_SEEDS,
+    route_latency_ms: Mapping[str, float] | None = None,
+) -> NestedSelectionResult:
+    """Select from complete aggregate seed shards without any fitted numeric state."""
+    selected_structures = (
+        frozen_structures() if structures is None else tuple(structures)
+    )
+    selected_points = (
+        frozen_operating_points()
+        if operating_points is None
+        else tuple(operating_points)
+    )
+    selected_seeds = tuple(int(seed) for seed in seeds)
+    metric_values = tuple(metrics)
+    if not selected_structures or not selected_points or not selected_seeds:
+        raise ValueError("nested selection requires structures, operating points, and seeds")
+    expected_keys = {
+        f"{structure.key}__{operating_point.key}"
+        for structure in selected_structures
+        for operating_point in selected_points
+    }
     by_key: dict[str, list[PolicyMetric]] = {}
-    for metric in metrics:
+    for metric in metric_values:
         by_key.setdefault(metric.key, []).append(metric)
+    expected_seed_set = set(selected_seeds)
+    if set(by_key) != expected_keys or any(
+        len(values) != len(selected_seeds)
+        or {value.seed for value in values} != expected_seed_set
+        for values in by_key.values()
+    ):
+        raise ValueError("aggregate seed shards are incomplete, duplicated, or unexpected")
     eligible = [
         values
         for values in by_key.values()
-        if len(values) == len(selected_seeds)
-        and {value.seed for value in values} == set(selected_seeds)
-        and all(value.eligible for value in values)
+        if all(value.eligible for value in values)
     ]
     latency = route_latency_ms or {}
     winner = None
@@ -532,7 +610,7 @@ def select_nested_policy(
         )[0].key
     return NestedSelectionResult(
         selected_key=winner,
-        metrics=tuple(metrics),
+        metrics=metric_values,
         eligible_count=len(eligible),
     )
 

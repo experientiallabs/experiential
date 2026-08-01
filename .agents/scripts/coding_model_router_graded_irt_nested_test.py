@@ -9,9 +9,11 @@ from coding_model_router_graded_irt_nested import (
     CrossfitPredictions,
     IrtStructure,
     OperatingPoint,
+    evaluate_nested_seed,
     evaluate_policy,
     frozen_operating_points,
     frozen_structures,
+    select_nested_metrics,
     select_nested_policy,
 )
 
@@ -294,3 +296,69 @@ def test_one_failed_seed_prevents_selection(monkeypatch: pytest.MonkeyPatch) -> 
     assert result.selected_key is None
     assert result.eligible_count == 0
     assert len(result.metrics) == 5
+
+
+def test_complete_seed_shards_select_without_fitted_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crossfit, passed, total, costs, repositories = _fixture()
+
+    def fake_crossfit(*args: object, **kwargs: object) -> CrossfitPredictions:
+        del args, kwargs
+        return crossfit
+
+    monkeypatch.setattr(nested, "crossfit_structure", fake_crossfit)
+    feature_views = {"signed-hash-512": np.ones((10, 2), dtype=np.float64)}
+    seeds = (11, 23)
+    shards = tuple(
+        metric
+        for seed in seeds
+        for metric in evaluate_nested_seed(
+            feature_views,
+            passed,
+            total,
+            costs,
+            repositories,
+            structures=(_structure(),),
+            operating_points=(_operating_point(),),
+            seed=seed,
+        )
+    )
+    result = select_nested_metrics(
+        shards,
+        structures=(_structure(),),
+        operating_points=(_operating_point(),),
+        seeds=seeds,
+    )
+    assert result.selected_key == f"{_structure().key}__{_operating_point().key}"
+    assert result.eligible_count == 1
+    assert len(result.metrics) == 2
+
+
+def test_seed_shard_selection_rejects_missing_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crossfit, passed, total, costs, repositories = _fixture()
+
+    def fake_crossfit(*args: object, **kwargs: object) -> CrossfitPredictions:
+        del args, kwargs
+        return crossfit
+
+    monkeypatch.setattr(nested, "crossfit_structure", fake_crossfit)
+    shard = evaluate_nested_seed(
+        {"signed-hash-512": np.ones((10, 2), dtype=np.float64)},
+        passed,
+        total,
+        costs,
+        repositories,
+        structures=(_structure(),),
+        operating_points=(_operating_point(),),
+        seed=11,
+    )
+    with pytest.raises(ValueError, match="incomplete"):
+        select_nested_metrics(
+            shard,
+            structures=(_structure(),),
+            operating_points=(_operating_point(),),
+            seeds=(11, 23),
+        )
