@@ -668,6 +668,8 @@ def main() -> None:
                 "verifier_ok": grade.get("verifier_ok", False), "verifier_tail": grade.get("tail"),
                 "route_log": str(route_path), "spent_after": guard.spent_usd,
             })
+            result_path = args.artifact_root / f"{strategy}-{task['task_id']}-result.json"
+            result_path.write_text(json.dumps(run, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             print(
                 f"completed strategy={strategy} task={task['task_id']} graded={run['graded']} "
                 f"binary={run['reward_binary']} cost=${run['cost_usd']:.3f} switches={run['switches']}",
@@ -678,7 +680,11 @@ def main() -> None:
         with cf.ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = [executor.submit(run_one, task) for task in tasks]
             for future in cf.as_completed(futures):
-                run = future.result()
+                try:
+                    run = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"task failed without result: {type(exc).__name__}: {exc}", flush=True)
+                    continue
                 if run is not None:
                     results.append(run)
     summary = {"manifest": manifest, "results": results, "spent_usd": guard.spent_usd}
