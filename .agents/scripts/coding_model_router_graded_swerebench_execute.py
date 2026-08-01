@@ -19,6 +19,11 @@ from e2b import Sandbox, Template
 logger = logging.getLogger("coding-router-graded-swerebench-execute")
 
 PROTOCOL = "coding-router-graded-swerebench-development-execution-v1"
+PHASE_NAME = "development"
+EXPECTED_TASKS = 673
+REMOTE_SEGMENT = "development"
+METADATA_PHASE = "graded-swerebench-development"
+EXTERNAL_AUTHORIZATION: dict[str, Any] | None = None
 TEMPLATE_NAME = "deepswe-router-responses-v2"
 TEMPLATE_ID = "j1a2bxbpllu3rp84b4qj"
 TEMPLATE_BUILD_ID = "e971c040-95bd-45c1-89ee-fb597bf75671"
@@ -458,7 +463,7 @@ def _run_task(
         raise ValueError(f"unsafe frozen task: {task_id}")
     if (
         private.get("task_id") != task_id
-        or private.get("split") != "development"
+        or private.get("split") != PHASE_NAME
         or int(private.get("f2p_total", -1)) != int(public["f2p_total"])
     ):
         raise ValueError(f"public/private task drift: {task_id}")
@@ -520,7 +525,7 @@ def _run_task(
             envs={"OPENAI_API_KEY": api_key},
             metadata={
                 "owner": "coding-router-v47",
-                "phase": "graded-swerebench-development",
+                "phase": METADATA_PHASE,
                 "task_index": str(task_index),
                 "task_id": task_id,
                 "arm": arm.name,
@@ -535,7 +540,7 @@ def _run_task(
         state["stage"] = f"running-{arm.name}"
         _write_json(state_path, state)
         remote_root = (
-            f"/home/user/router-v47-development/{task_index:04d}/{arm.name}"
+            f"/home/user/router-v47-{REMOTE_SEGMENT}/{task_index:04d}/{arm.name}"
         )
         remote_task = f"{remote_root}/task.json"
         try:
@@ -707,12 +712,12 @@ def execute(
         )
     corpus = _read_object(corpus_path)
     public_rows = corpus.get("tasks")
-    if not isinstance(public_rows, list) or len(public_rows) != 673:
-        raise ValueError("development corpus must contain exactly 673 tasks")
+    if not isinstance(public_rows, list) or len(public_rows) != EXPECTED_TASKS:
+        raise ValueError(f"{PHASE_NAME} corpus must contain exactly {EXPECTED_TASKS} tasks")
     private_by_id = _read_verifier_rows(verifier_tasks_path)
     task_ids = [str(row.get("task_id")) for row in public_rows if isinstance(row, dict)]
-    if len(task_ids) != 673 or len(set(task_ids)) != 673:
-        raise ValueError("development corpus identities are invalid")
+    if len(task_ids) != EXPECTED_TASKS or len(set(task_ids)) != EXPECTED_TASKS:
+        raise ValueError(f"{PHASE_NAME} corpus identities are invalid")
     if any(task_id not in private_by_id for task_id in task_ids):
         raise ValueError("development corpus lacks a private verifier row")
 
@@ -739,10 +744,16 @@ def execute(
         "e2b_account_cap": E2B_ACCOUNT_CAP,
         "cost_ceiling_usd": COST_CEILING_USD,
         "prior_spend_usd": PRIOR_SPEND_USD,
+        "phase": PHASE_NAME,
         "deep_swe_outcomes_accessed": False,
         "confirmation_outcomes_accessed": False,
         "model_persisted": False,
     }
+    if PHASE_NAME == "confirmation":
+        if EXTERNAL_AUTHORIZATION is None:
+            raise ValueError("confirmation execution lacks frozen development authorization")
+        launch["authorization"] = EXTERNAL_AUTHORIZATION
+        launch["confirmation_outcomes_accessed_before_launch"] = False
     launch_path = root / "launch.json"
     if launch_path.is_file():
         prior = _read_object(launch_path)

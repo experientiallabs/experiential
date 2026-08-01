@@ -14,6 +14,7 @@ logger = logging.getLogger("coding-router-graded-swerebench-collect")
 
 PROTOCOL = "coding-router-graded-swerebench-development-collection-v1"
 EXECUTION_PROTOCOL = "coding-router-graded-swerebench-development-execution-v1"
+PHASE_NAME = "development"
 CORPUS_SHA256 = "48d88436a083b66972c25cd7d9439fd149c95bcf9caded2bab7f3b6453aea3d5"
 SOURCE_TASKS = 673
 MIN_RETAINED_TASKS = 640
@@ -96,7 +97,7 @@ def collect(root: Path, corpus_path: Path, output: Path) -> None:
     if output.exists():
         raise FileExistsError(output)
     if _sha256(corpus_path) != CORPUS_SHA256:
-        raise ValueError("development corpus changed")
+        raise ValueError(f"{PHASE_NAME} corpus changed")
     launch_path = root / "launch.json"
     launch = _read_object(launch_path)
     if (
@@ -108,11 +109,11 @@ def collect(root: Path, corpus_path: Path, output: Path) -> None:
         or launch.get("confirmation_outcomes_accessed") is not False
         or launch.get("model_persisted") is not False
     ):
-        raise ValueError("development launch manifest is invalid")
+        raise ValueError(f"{PHASE_NAME} launch manifest is invalid")
     corpus = _read_object(corpus_path)
     raw_tasks = corpus.get("tasks")
     if not isinstance(raw_tasks, list) or len(raw_tasks) != SOURCE_TASKS:
-        raise ValueError("development corpus must contain 673 tasks")
+        raise ValueError(f"{PHASE_NAME} corpus must contain {SOURCE_TASKS} tasks")
     tasks = [_object(task, f"task {index}") for index, task in enumerate(raw_tasks)]
 
     outcomes: list[dict[str, Any]] = []
@@ -205,6 +206,7 @@ def collect(root: Path, corpus_path: Path, output: Path) -> None:
                     "patch_sha256": report["patch_sha256"],
                     "patch_provenance": report["patch_provenance"],
                     "target_outcomes_used": False,
+                    "split": PHASE_NAME,
                 }
             )
             artifact_hashes[task_id][f"{arm}_report"] = _sha256(report_path)
@@ -244,7 +246,7 @@ def collect(root: Path, corpus_path: Path, output: Path) -> None:
         "unmetered_excluded_cost_provenance": "user monitors provider usage externally",
         "target_outcomes_used": False,
         "deep_swe_outcomes_accessed": False,
-        "confirmation_outcomes_accessed": False,
+        "confirmation_outcomes_accessed": PHASE_NAME == "confirmation",
         "fitted_numeric_router_state_persisted": False,
         "corpus_sha256": CORPUS_SHA256,
         "launch_sha256": _sha256(launch_path),

@@ -93,6 +93,12 @@ paired quality lower bound, avoid static dominance, and route in under 5 ms p95.
 frozen policy receives exactly one DeepSWE v1.1 transfer with graded fail-to-pass reward. No target
 repair, hyperparameter change, or rerun is allowed.
 
+The paired uncertainty gate uses 10,000 repository-cluster bootstrap draws with seed 20260801. Each
+draw resamples confirmation repositories with replacement and computes mean
+`router reward - 0.95 * fit-selected-static reward`, retaining original within-repository task
+clusters. Its 2.5th percentile must be nonnegative. This exact interval is frozen before any
+confirmation outcome is collected.
+
 ## Compute, persistence, and spend
 
 All cohort transformation, fitting, and analysis run on E2B or Azure. The Mac only orchestrates,
