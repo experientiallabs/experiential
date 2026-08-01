@@ -311,6 +311,22 @@ satisfies all of the following:
 7. the isolation audit still reports no target outcome access and no source to
    target repository or exact-prompt overlap.
 
+The matched task-blind mixture is the per-task expected reward and cost under
+the frozen route's empirical effort counts, so it has exactly the same effort
+traffic without using task identity. The 10,000-resample confidence bound uses
+seed `20260731`, samples repositories with replacement, retains every task in
+each sampled repository, and reports the 2.5th percentile of the resampled
+mean router-minus-mixture reward. These rules are fixed before confirmation
+outcomes exist.
+
+Confirmation execution, collection, and analysis use the phase-gated
+`coding_model_router_swerebench_execute.py`,
+`coding_model_router_swerebench_collect.py`, and
+`coding_model_router_swerebench_confirm.py` entry points. The executor refuses
+confirmation without the content-addressed development selection, label-free
+route files, passing sub-5-ms route audit, and failure-free development
+collection audit. Confirmation never reuses development smoke cells.
+
 A failed confirmation is final for the frozen route. Confirmation-dependent
 tuning or another confirmation cohort is prohibited.
 

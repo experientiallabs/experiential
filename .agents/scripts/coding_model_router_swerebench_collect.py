@@ -7,13 +7,20 @@ import hashlib
 import json
 import logging
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("coding-router-swerebench-collect")
 
 PROTOCOL = "coding-router-swerebench-development-collection-v2"
+CONFIRMATION_PROTOCOL = "coding-router-swerebench-confirmation-collection-v1"
+DEVELOPMENT_EXECUTION_PROTOCOL = "coding-router-swerebench-development-execution-v1"
+CONFIRMATION_EXECUTION_PROTOCOL = "coding-router-swerebench-confirmation-execution-v1"
 CORPUS_SHA256 = "7d846b5576d15e68fd18ac21bfe0610cc1614b3b35ec0ae0cb8cfae0b82962c1"
+CONFIRMATION_CORPUS_SHA256 = (
+    "9798dd1e58be0d13331d097307670dc3fc3760ad211da20e6367666523f080a7"
+)
 SMOKE_REPORT_SHA256 = "ee76a57040cbe7aaef692d2fc3f3df66d7a556cbf6dda74119e0802cb4230e13"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 SOURCE_TASKS = 200
@@ -23,6 +30,36 @@ USAGE_FIELDS = (
     "cached_input_tokens",
     "completion_tokens",
     "reasoning_tokens",
+)
+
+
+@dataclass(frozen=True)
+class CollectionPhase:
+    """Frozen collection differences between development and confirmation."""
+
+    name: str
+    protocol: str
+    execution_protocol: str
+    corpus_sha256: str
+    provenance: str
+    reuse_smoke: bool
+
+
+DEVELOPMENT_PHASE = CollectionPhase(
+    name="development",
+    protocol=PROTOCOL,
+    execution_protocol=DEVELOPMENT_EXECUTION_PROTOCOL,
+    corpus_sha256=CORPUS_SHA256,
+    provenance="development-matrix",
+    reuse_smoke=True,
+)
+CONFIRMATION_PHASE = CollectionPhase(
+    name="confirmation",
+    protocol=CONFIRMATION_PROTOCOL,
+    execution_protocol=CONFIRMATION_EXECUTION_PROTOCOL,
+    corpus_sha256=CONFIRMATION_CORPUS_SHA256,
+    provenance="confirmation-matrix",
+    reuse_smoke=False,
 )
 
 
@@ -42,6 +79,44 @@ def _object(value: object, label: str) -> dict[str, Any]:
 
 def _read_object(path: Path) -> dict[str, Any]:
     return _object(json.loads(path.read_text(encoding="utf-8")), str(path))
+
+
+def _collection_phase(name: str) -> CollectionPhase:
+    if name == DEVELOPMENT_PHASE.name:
+        return DEVELOPMENT_PHASE
+    if name == CONFIRMATION_PHASE.name:
+        return CONFIRMATION_PHASE
+    raise ValueError(f"unknown collection phase: {name!r}")
+
+
+def _launch_context(root: Path, phase: CollectionPhase) -> tuple[float, dict[str, object]]:
+    launch_path = root / "launch.json"
+    launch = _read_object(launch_path)
+    if (
+        launch.get("protocol") != phase.execution_protocol
+        or launch.get("corpus_sha256") != phase.corpus_sha256
+        or launch.get("deep_swe_outcomes_accessed") is not False
+        or launch.get("model_persisted") is not False
+    ):
+        raise ValueError(f"{phase.name} launch manifest is invalid")
+    prior_spend = launch.get("prior_spend_usd")
+    if (
+        isinstance(prior_spend, bool)
+        or not isinstance(prior_spend, (int, float))
+        or not 0.0 <= float(prior_spend) < 20_000.0
+    ):
+        raise ValueError(f"{phase.name} launch has invalid prior spend")
+    context: dict[str, object] = {"launch_sha256": _sha256(launch_path)}
+    if phase is CONFIRMATION_PHASE:
+        authorization = launch.get("authorization")
+        if (
+            launch.get("confirmation_outcomes_accessed_before_launch") is not False
+            or not isinstance(authorization, dict)
+            or authorization.get("confirmation_corpus_sha256") != phase.corpus_sha256
+        ):
+            raise ValueError("confirmation launch lacks frozen authorization")
+        context["authorization"] = authorization
+    return float(prior_spend), context
 
 
 def _usage(value: object, label: str) -> dict[str, int]:
@@ -135,15 +210,29 @@ def _outcome(
     }
 
 
-def collect(root: Path, corpus_path: Path, smoke_report_path: Path, output: Path) -> None:
+def collect(
+    root: Path,
+    corpus_path: Path,
+    smoke_report_path: Path | None,
+    output: Path,
+    *,
+    phase_name: str = "development",
+) -> None:
     """Validate retained task reports and drop whole infrastructure-missing tasks."""
-    if _sha256(corpus_path) != CORPUS_SHA256:
-        raise ValueError("development corpus hash mismatch")
+    phase = _collection_phase(phase_name)
+    if _sha256(corpus_path) != phase.corpus_sha256:
+        raise ValueError(f"{phase.name} corpus hash mismatch")
+    if phase.reuse_smoke and smoke_report_path is None:
+        raise ValueError("development collection requires the frozen smoke report")
+    if not phase.reuse_smoke and smoke_report_path is not None:
+        raise ValueError("confirmation collection must not reuse a smoke report")
+    prior_spend_usd, launch_context = _launch_context(root, phase)
     progress = _read_object(root / "progress.json")
     complete_tasks = progress.get("complete_tasks")
     excluded_count = progress.get("excluded_tasks", 0)
     if (
-        not isinstance(complete_tasks, int)
+        progress.get("protocol") != phase.execution_protocol
+        or not isinstance(complete_tasks, int)
         or not isinstance(excluded_count, int)
         or complete_tasks + excluded_count != SOURCE_TASKS
         or complete_tasks < MIN_RETAINED_TASKS
@@ -155,7 +244,7 @@ def collect(root: Path, corpus_path: Path, smoke_report_path: Path, output: Path
     if not isinstance(raw_tasks, list) or len(raw_tasks) != SOURCE_TASKS:
         raise ValueError("development corpus does not contain 200 tasks")
     tasks = [_object(task, f"corpus task {index}") for index, task in enumerate(raw_tasks)]
-    reused = _smoke_cells(smoke_report_path)
+    reused = _smoke_cells(smoke_report_path) if smoke_report_path is not None else {}
     outcomes: list[dict[str, object]] = []
     input_hashes: dict[str, dict[str, str]] = {}
     exclusions: list[dict[str, object]] = []
@@ -166,7 +255,7 @@ def collect(root: Path, corpus_path: Path, smoke_report_path: Path, output: Path
         task_dir = root / "tasks" / f"{index:04d}"
         state_path = task_dir / "state.json"
         state = _read_object(state_path)
-        if state.get("task_id") != task_id:
+        if state.get("protocol") != phase.execution_protocol or state.get("task_id") != task_id:
             raise ValueError(f"task {index} state identity changed")
         if state.get("stage") == "excluded-infrastructure":
             exclusion = _object(state.get("exclusion"), f"task {index} exclusion")
@@ -269,7 +358,7 @@ def collect(root: Path, corpus_path: Path, smoke_report_path: Path, output: Path
                 provenance = (
                     "reused-valid-smoke"
                     if smoke_cell is not None and attempt == 0
-                    else "development-matrix"
+                    else phase.provenance
                 )
                 outcomes.append(
                     _outcome(
@@ -309,7 +398,7 @@ def collect(root: Path, corpus_path: Path, smoke_report_path: Path, output: Path
         if row["provenance"] == "reused-valid-smoke"
     )
     audit = {
-        "protocol": PROTOCOL,
+        "protocol": phase.protocol,
         "valid": True,
         "source_tasks": SOURCE_TASKS,
         "tasks": retained_tasks,
@@ -327,17 +416,22 @@ def collect(root: Path, corpus_path: Path, smoke_report_path: Path, output: Path
         "excluded_infrastructure_cost_usd": excluded_infrastructure_cost,
         "spent_matrix_cost_usd": total_cost - reused_cost
         + excluded_infrastructure_cost,
-        "rough_cumulative_experiment_spend_usd": 405.7678502
+        "rough_cumulative_experiment_spend_usd": prior_spend_usd
         + total_cost
         - reused_cost
         + excluded_infrastructure_cost,
         "target_outcomes_used": False,
         "deep_swe_outcomes_accessed": False,
         "outcomes_sha256": _sha256(outcomes_path),
-        "corpus_sha256": CORPUS_SHA256,
-        "smoke_report_sha256": SMOKE_REPORT_SHA256,
+        "corpus_sha256": phase.corpus_sha256,
+        "launch": launch_context,
         "input_hashes": input_hashes,
     }
+    if phase.reuse_smoke:
+        audit["smoke_report_sha256"] = SMOKE_REPORT_SHA256
+    else:
+        audit["confirmation_outcomes_accessed"] = True
+        audit["confirmation_authorization_preserved"] = True
     (output / "completion-audit.json").write_text(
         json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -354,10 +448,21 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--corpus", type=Path, required=True)
-    parser.add_argument("--smoke-report", type=Path, required=True)
+    parser.add_argument("--smoke-report", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--phase",
+        choices=(DEVELOPMENT_PHASE.name, CONFIRMATION_PHASE.name),
+        default=DEVELOPMENT_PHASE.name,
+    )
     args = parser.parse_args()
-    collect(args.root, args.corpus, args.smoke_report, args.output)
+    collect(
+        args.root,
+        args.corpus,
+        args.smoke_report,
+        args.output,
+        phase_name=args.phase,
+    )
 
 
 if __name__ == "__main__":
