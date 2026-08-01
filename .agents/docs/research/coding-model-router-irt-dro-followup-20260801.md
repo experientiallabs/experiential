@@ -58,10 +58,15 @@ and 8 reached the nonconvex optimizer's iteration limit even before real outcome
 2 completed. With six arms, eight independent ability dimensions are also unidentifiable.
 
 The task encoder candidates are signed hashing at 512 and 2,048 dimensions, the frozen
-prompt-shape vector, and their concatenation. Projection regularization strengths are 0.1, 1, 10,
-and 100. Compare unconstrained arm abilities with one variant whose Luna capacity coordinate is
-monotone from low through max. The Sol guard remains a separate arm and receives no ordinal
-constraint.
+prompt-shape vector, and a concatenation of the 2,048-dimensional hash with prompt shape. Signed
+hashing uses stateless `HashingVectorizer` character-within-word n-grams of lengths 3 through 5,
+signed collisions, and row L2 normalization. Prompt shape is the fixed ten-value view covering
+log character, line, and word counts plus code-fence, exception, test, error, implementation,
+refactor, and performance indicators. It accepts prompt text only. Projection regularization
+strengths are 0.1, 1, 10, and 100. Compare unconstrained arm abilities with one variant whose Luna
+capacity coordinate is monotone from low through max. The Sol guard remains a separate arm and
+receives no ordinal constraint. The exact transform lives in
+`.agents/scripts/coding_model_router_graded_irt_features.py`.
 
 The graph ablation constructs a fit-only task similarity graph from the same pre-call features.
 Feature rows are L2 normalized, each task selects its eight nearest tasks by descending cosine
