@@ -90,6 +90,7 @@ for index, outer in enumerate(records):
     if not isinstance(calls, list) or not calls or len(calls) > 20:
         raise SystemExit(f"row {index} has invalid provider calls")
     usage = {field: 0 for field in totals}
+    provider_errors = []
     for call_index, call in enumerate(calls):
         if call.get("model") != "gpt-5.6-luna":
             raise SystemExit(f"row {index} call {call_index} has a different model")
@@ -98,7 +99,23 @@ for index, outer in enumerate(records):
         sampling = call.get("sampling", {})
         if sampling.get("reasoning_effort") != args.effort or sampling.get("max_tokens") != 32768:
             raise SystemExit(f"row {index} call {call_index} has different sampling")
-        call_usage = call.get("usage", {})
+        call_usage = call.get("usage")
+        if call_usage is None:
+            error = call.get("error")
+            if not isinstance(error, dict):
+                raise SystemExit(f"row {index} call {call_index} lacks usage and error")
+            status = error.get("status_code")
+            if not isinstance(status, int) or not 429 <= status <= 599:
+                raise SystemExit(f"row {index} call {call_index} has ungradeable missing usage")
+            provider_errors.append({
+                "call_index": call_index,
+                "type": error.get("type"),
+                "status_code": status,
+                "usage_charge": "zero; provider returned no inference usage",
+            })
+            continue
+        if not isinstance(call_usage, dict):
+            raise SystemExit(f"row {index} call {call_index} has invalid usage")
         for field in totals:
             value = call_usage.get(field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -114,6 +131,8 @@ for index, outer in enumerate(records):
         "attempt_number": args.attempt_offset + index,
         "reward": float(reward),
         "provider_calls": len(calls),
+        "provider_inference_calls": len(calls) - len(provider_errors),
+        "provider_errors": provider_errors,
         "stop_condition": trace.get("stop_condition"),
         "trace_ok": trace.get("ok"),
         "outer_ok": outer.get("ok"),

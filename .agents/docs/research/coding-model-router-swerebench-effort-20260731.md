@@ -192,6 +192,17 @@ gradeable outcomes. Each effort archive and compact audit report is synced and
 hashed before its task state advances. A worker failure leaves completed
 efforts immutable and resumes only missing scientific cells.
 
+The development validator initially required token usage on every provider
+attempt. Three otherwise gradeable cells included one recorded OpenAI 503
+attempt with null usage, followed by additional successful model turns and a
+completed official zero reward. The failure was accounting-only: the exact
+owned sandboxes and raw traces were preserved, a content-equivalent validator
+accepted null usage only for an explicit HTTP 429 through 599 provider error,
+and the three effort artifacts were recovered without rerunning a scientific
+cell. Such attempts are counted separately from inference calls and assigned
+zero usage cost because the provider returned no inference usage. All live
+workers received the same validator repair before their next validation.
+
 ## Target-compatible candidate families
 
 Development may compare the following lightweight families. All use only the
