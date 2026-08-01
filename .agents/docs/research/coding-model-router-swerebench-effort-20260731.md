@@ -363,3 +363,40 @@ Trace-derived experiment spend after the valid smoke is approximately USD
 telemetry where available, otherwise update a clearly labeled trace-derived
 estimate after each completed tranche. Stop before any launch whose estimate
 would take total experiment spend above USD 20,000.
+
+## Frozen confirmation result
+
+The untouched confirmation finished on 2026-08-01. It retained 198 of 200
+tasks and collected all 1,980 required cells for those tasks. Two tasks were
+excluded across every effort after completed inference reached an official
+scoring timeout. Neither exclusion was rerun. One separate task failed before
+inference while loading its source data, then completed all ten cells in one
+fresh sandbox after the main wave drained. The collection audit is valid,
+reports 99 percent task coverage, and records no DeepSWE outcome access.
+
+The selected route used `luna-high` for 88 tasks and `luna-max` for 110 tasks.
+It achieved 0.505051 reward at USD 0.169186 per task. The matched task-blind
+mixture achieved 0.465488 reward at USD 0.169729 per task. The route advantage
+was 0.039562, with a repository-bootstrap 95 percent lower bound of 0.010050.
+It retained 104.71 percent of the strongest static reward, was not statically
+dominated, and kept its measured routing p95 at 3.352 ms.
+
+The frozen route nevertheless failed confirmation because the required
+shuffled-label negative control also passed the primary gate. That control
+achieved 0.494949 reward, a 0.029933 matched-blind advantage, and a positive
+95 percent lower bound of 0.003559. The observed gain therefore cannot be
+attributed to task signal under the preregistered standard. This failure is
+final for the candidate. It does not authorize a DeepSWE transfer, and no
+target route or target outcome was opened.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Confirmation outcomes | `0c03bcbd935c0983c9e6355413222fb1545206d6ae5a91329b505f77f35300d6` |
+| Confirmation collection audit | `cced3491bfb5e4cb5eeaebde6473ad399c3ed4ebf8cbee916fb598625a0f4744` |
+| Confirmation report | `98012e4268d97db14264db317053a5e961524bf05148e59116e060a7a22d2fdf` |
+| Confirmation analysis manifest | `991c0cb65339e5c87826e930a736e8d4f71942c3a91be533637af8b80f3c2090` |
+
+The confirmation matrix cost USD 244.558267 including excluded infrastructure
+attempts. Rough cumulative spend for this experiment line is USD 887.541861.
+The next external study must select against multiple shuffled controls
+directly, rather than using a single shuffled control only as a final veto.
