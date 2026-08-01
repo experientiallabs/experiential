@@ -44,7 +44,8 @@ The six arms are:
 
 Each task-arm cell receives exactly one attempt with the pinned mini-swe-agent 2.4.5 harness,
 20-turn limit, OpenAI Responses adapter, Docker task image, and verifiers commit
-`f6e420b9908ae14d625f079881f13c15011ee1c9`. Tasks run with concurrency 100 under the 1,000
+`f6e420b9908ae14d625f079881f13c15011ee1c9`. Each sandbox runs exactly one task-arm cell within
+the workspace's one-hour lifetime, with up to 100 tasks advancing concurrently under the 1,000
 sandbox E2B cap. Every completed cell is persisted immediately and the run is resumable.
 
 The pinned SWE-rebench taskset source SHA-256 is

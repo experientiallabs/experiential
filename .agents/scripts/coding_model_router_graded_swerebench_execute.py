@@ -472,65 +472,81 @@ def _run_task(
         _write_json(state_path, state)
         return
     attempts = state.get("sandbox_attempts")
-    if not isinstance(attempts, list) or len(attempts) >= 2:
-        raise RuntimeError(f"frozen infrastructure retry exhausted: {task_id}")
+    if not isinstance(attempts, list):
+        raise ValueError(f"invalid sandbox attempt state: {task_id}")
 
-    sandbox = Sandbox.create(
-        TEMPLATE_NAME,
-        timeout=6 * 3_600,
-        secure=True,
-        allow_internet_access=True,
-        envs={"OPENAI_API_KEY": api_key},
-        metadata={
-            "owner": "coding-router-v47",
-            "phase": "graded-swerebench-development",
-            "task_index": str(task_index),
-            "task_id": task_id,
-        },
-    )
-    attempt: dict[str, Any] = {
-        "sandbox_id": sandbox.sandbox_id,
-        "missing_arms": [arm.name for arm in missing],
-        "terminated": False,
-    }
-    attempts.append(attempt)
-    state["stage"] = "running"
-    _write_json(state_path, state)
-    remote_root = f"/home/user/router-v47-development/{task_index:04d}"
-    remote_task = f"{remote_root}/task.json"
-    try:
-        runner._run(sandbox, f"mkdir -p {remote_root}/runtime", timeout=120)
-        sandbox.files.write(remote_task, json.dumps(private, sort_keys=True))
-        sandbox.files.write(f"{remote_root}/taskset.py", patched_taskset.read_bytes())
-        sandbox.files.write(f"{remote_root}/taskset-patch-report.json", patch_report.read_bytes())
-        sandbox.files.write(f"{remote_root}/validate.py", REMOTE_VALIDATOR)
-        runner._run(
-            sandbox,
-            (
-                f"test \"$(sudo sha256sum {TASKSET_REMOTE} | cut -d' ' -f1)\" = "
-                f"{TASKSET_SOURCE_SHA256} && "
-                f"sudo cp {remote_root}/taskset.py {TASKSET_REMOTE} && "
-                f"test \"$(sudo sha256sum {TASKSET_REMOTE} | cut -d' ' -f1)\" = "
-                f"{TASKSET_PATCHED_SHA256} && "
-                f"cp {remote_root}/taskset-patch-report.json {remote_root}/runtime/ && "
-                "test \"$(sha256sum /opt/coding-router/"
-                "swerebench-docker-adapter-report.json | cut -d' ' -f1)\" = "
-                f"{DOCKER_ADAPTER_REPORT_SHA256} && "
-                "test \"$(sha256sum /opt/coding-router/"
-                "verifiers-responses-adapter-report.json | cut -d' ' -f1)\" = "
-                f"{RESPONSES_ADAPTER_REPORT_SHA256} && "
-                f"cp /opt/coding-router/*-adapter-report.json {remote_root}/runtime/ && "
-                f"sha256sum {remote_root}/runtime/* > {remote_root}/runtime/sha256sums"
-            ),
-            timeout=120,
+    for arm in missing:
+        arm_attempts = [
+            value
+            for value in attempts
+            if isinstance(value, dict) and value.get("arm") == arm.name
+        ]
+        if len(arm_attempts) >= 2:
+            raise RuntimeError(f"frozen infrastructure retry exhausted: {task_id}/{arm.name}")
+        sandbox = Sandbox.create(
+            TEMPLATE_NAME,
+            timeout=3_600,
+            secure=True,
+            allow_internet_access=True,
+            envs={"OPENAI_API_KEY": api_key},
+            metadata={
+                "owner": "coding-router-v47",
+                "phase": "graded-swerebench-development",
+                "task_index": str(task_index),
+                "task_id": task_id,
+                "arm": arm.name,
+            },
         )
-        runner._run(sandbox, f"sudo docker pull {image}", timeout=1_800)
-        state["docker_image_id"] = runner._run(
-            sandbox,
-            f"sudo docker image inspect {image} --format '{{{{.Id}}}}'",
-            timeout=120,
-        ).stdout.strip()
-        for arm in missing:
+        attempt: dict[str, Any] = {
+            "sandbox_id": sandbox.sandbox_id,
+            "arm": arm.name,
+            "terminated": False,
+        }
+        attempts.append(attempt)
+        state["stage"] = f"running-{arm.name}"
+        _write_json(state_path, state)
+        remote_root = (
+            f"/home/user/router-v47-development/{task_index:04d}/{arm.name}"
+        )
+        remote_task = f"{remote_root}/task.json"
+        try:
+            runner._run(sandbox, f"mkdir -p {remote_root}/runtime", timeout=120)
+            sandbox.files.write(remote_task, json.dumps(private, sort_keys=True))
+            sandbox.files.write(f"{remote_root}/taskset.py", patched_taskset.read_bytes())
+            sandbox.files.write(
+                f"{remote_root}/taskset-patch-report.json",
+                patch_report.read_bytes(),
+            )
+            sandbox.files.write(f"{remote_root}/validate.py", REMOTE_VALIDATOR)
+            runner._run(
+                sandbox,
+                (
+                    f"test \"$(sudo sha256sum {TASKSET_REMOTE} | cut -d' ' -f1)\" = "
+                    f"{TASKSET_SOURCE_SHA256} && "
+                    f"sudo cp {remote_root}/taskset.py {TASKSET_REMOTE} && "
+                    f"test \"$(sudo sha256sum {TASKSET_REMOTE} | cut -d' ' -f1)\" = "
+                    f"{TASKSET_PATCHED_SHA256} && "
+                    f"cp {remote_root}/taskset-patch-report.json "
+                    f"{remote_root}/runtime/ && "
+                    "test \"$(sha256sum /opt/coding-router/"
+                    "swerebench-docker-adapter-report.json | cut -d' ' -f1)\" = "
+                    f"{DOCKER_ADAPTER_REPORT_SHA256} && "
+                    "test \"$(sha256sum /opt/coding-router/"
+                    "verifiers-responses-adapter-report.json | cut -d' ' -f1)\" = "
+                    f"{RESPONSES_ADAPTER_REPORT_SHA256} && "
+                    f"cp /opt/coding-router/*-adapter-report.json "
+                    f"{remote_root}/runtime/ && "
+                    f"sha256sum {remote_root}/runtime/* > "
+                    f"{remote_root}/runtime/sha256sums"
+                ),
+                timeout=120,
+            )
+            runner._run(sandbox, f"sudo docker pull {image}", timeout=1_800)
+            attempt["docker_image_id"] = runner._run(
+                sandbox,
+                f"sudo docker image inspect {image} --format '{{{{.Id}}}}'",
+                timeout=120,
+            ).stdout.strip()
             output_dir = f"{remote_root}/{arm.name}"
             config_path = f"{remote_root}/{arm.name}.toml"
             report_path = f"{remote_root}/{arm.name}.report.json"
@@ -546,7 +562,7 @@ def _run_task(
                 state=state,
                 state_path=state_path,
                 attempt=attempt,
-                timeout=3 * 3_600,
+                timeout=3_500,
             )
             runner._run(
                 sandbox,
@@ -601,19 +617,25 @@ def _run_task(
                 arm.name,
                 float(report["reward"]),
             )
-        state["stage"] = "complete"
-    except Exception as error:
-        state["stage"] = "failed"
-        state["error"] = repr(error)
-        attempt["error"] = repr(error)
-        logger.exception("task failed index=%d id=%s", task_index, task_id)
-        raise
-    finally:
-        sandbox.kill()
-        attempt["terminated"] = True
-        state["sandbox_terminated"] = True
-        _write_json(state_path, state)
-        _update_summary(root, total_tasks)
+        except Exception as error:
+            state["stage"] = "failed"
+            state["error"] = repr(error)
+            attempt["error"] = repr(error)
+            logger.exception(
+                "task failed index=%d id=%s arm=%s",
+                task_index,
+                task_id,
+                arm.name,
+            )
+            raise
+        finally:
+            sandbox.kill()
+            attempt["terminated"] = True
+            _write_json(state_path, state)
+            _update_summary(root, total_tasks)
+    state["stage"] = "complete"
+    state["all_sandboxes_terminated"] = True
+    _write_json(state_path, state)
 
 
 def execute(
