@@ -191,6 +191,12 @@ usage could not be recovered. The task is permanently excluded across all six ar
 reruns. The maximum retained development cohort is now 654 of 673, or 97.2 percent, still above
 the frozen requirement.
 
+After one valid `sol-max` cell, the `luna-low` command for
+`dependencytrack__dependency-track-2298` completed successfully but produced no official graded
+reward. The worker had terminated and its provider usage could not be recovered. The task is
+permanently excluded across all six arms with zero reruns. The maximum retained development cohort
+is now 653 of 673, or 97.0 percent, still above the frozen requirement.
+
 A second E2B HTTP/2 control-plane wave then affected ten workers for
 `joernio__joern-5591`, `shazow__whatsabi-174`, `pymodbus-dev__pymodbus-2593`,
 `moment__luxon-1685`, `icssc__antalmanac-912`, `tailwindlabs__tailwindcss-jit-69`,
