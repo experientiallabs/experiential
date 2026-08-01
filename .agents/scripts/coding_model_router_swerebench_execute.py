@@ -11,6 +11,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,12 +20,16 @@ from e2b import CommandResult, Sandbox, Template
 logger = logging.getLogger("coding-router-swerebench-execute")
 
 PROTOCOL = "coding-router-swerebench-development-execution-v1"
+CONFIRMATION_PROTOCOL = "coding-router-swerebench-confirmation-execution-v1"
 TEMPLATE_NAME = "deepswe-router-responses-v2"
 TEMPLATE_ID = "j1a2bxbpllu3rp84b4qj"
 TEMPLATE_BUILD_ID = "e971c040-95bd-45c1-89ee-fb597bf75671"
 MODEL = "gpt-5.6-luna"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CORPUS_SHA256 = "7d846b5576d15e68fd18ac21bfe0610cc1614b3b35ec0ae0cb8cfae0b82962c1"
+CONFIRMATION_CORPUS_SHA256 = (
+    "9798dd1e58be0d13331d097307670dc3fc3760ad211da20e6367666523f080a7"
+)
 SMOKE_REPORT_SHA256 = "ee76a57040cbe7aaef692d2fc3f3df66d7a556cbf6dda74119e0802cb4230e13"
 SMOKE_ARCHIVE_SHA256 = {
     "xhigh": "bf1d576d25f1b56ae3a9484db5d5599576519a218aec3073db29272345f4015b",
@@ -44,6 +49,36 @@ E2B_ACCOUNT_CAP = 1_000
 TASK_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+$")
 IMAGE_PATTERN = re.compile(r"^docker\.io/swerebenchv2/[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$")
 STATE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class ExecutionPhase:
+    """Frozen execution differences between development and confirmation."""
+
+    name: str
+    protocol: str
+    corpus_sha256: str
+    remote_segment: str
+    metadata_phase: str
+    reuse_smoke: bool
+
+
+DEVELOPMENT_PHASE = ExecutionPhase(
+    name="development",
+    protocol=PROTOCOL,
+    corpus_sha256=CORPUS_SHA256,
+    remote_segment="development",
+    metadata_phase="swerebench-development-matrix",
+    reuse_smoke=True,
+)
+CONFIRMATION_PHASE = ExecutionPhase(
+    name="confirmation",
+    protocol=CONFIRMATION_PROTOCOL,
+    corpus_sha256=CONFIRMATION_CORPUS_SHA256,
+    remote_segment="confirmation",
+    metadata_phase="swerebench-confirmation-matrix",
+    reuse_smoke=False,
+)
 
 REMOTE_VALIDATOR = r'''"""Audit new matrix traces and write a compact report."""
 import argparse
@@ -233,6 +268,128 @@ def _read_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def _read_rows(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise ValueError(f"{path}:{line_number} is not a JSON object")
+        rows.append(value)
+    return rows
+
+
+def _execution_phase(name: str) -> ExecutionPhase:
+    if name == DEVELOPMENT_PHASE.name:
+        return DEVELOPMENT_PHASE
+    if name == CONFIRMATION_PHASE.name:
+        return CONFIRMATION_PHASE
+    raise ValueError(f"unknown execution phase: {name!r}")
+
+
+def _confirmation_authorization(
+    fit_output: Path,
+    development_audit_path: Path,
+    confirmation_corpus_path: Path,
+) -> tuple[float, dict[str, object]]:
+    """Validate the frozen label-free route before any confirmation outcome exists."""
+    required = {
+        "development_report": fit_output / "development-report.json",
+        "selection_lock": fit_output / "selection-lock.json",
+        "route_audit": fit_output / "route-audit.json",
+        "routes": fit_output / "confirmation-routes.jsonl",
+        "shuffled_routes": fit_output / "confirmation-shuffled-routes.jsonl",
+    }
+    for label, path in required.items():
+        if not path.is_file():
+            raise FileNotFoundError(f"confirmation authorization lacks {label}: {path}")
+    report = _read_object(required["development_report"])
+    lock = _read_object(required["selection_lock"])
+    route_audit = _read_object(required["route_audit"])
+    development_audit = _read_object(development_audit_path)
+    confirmation_corpus = _read_object(confirmation_corpus_path)
+    raw_tasks = confirmation_corpus.get("tasks")
+    if not isinstance(raw_tasks, list) or len(raw_tasks) != 200:
+        raise ValueError("confirmation corpus does not contain exactly 200 tasks")
+    task_ids = []
+    for index, raw_task in enumerate(raw_tasks):
+        if not isinstance(raw_task, dict) or not isinstance(raw_task.get("task_id"), str):
+            raise ValueError(f"confirmation corpus task {index} is invalid")
+        task_ids.append(raw_task["task_id"])
+    if len(set(task_ids)) != 200:
+        raise ValueError("confirmation corpus task identities are not unique")
+
+    false_flags = (
+        "target_outcomes_used",
+        "deep_swe_outcomes_accessed",
+        "confirmation_outcomes_accessed",
+    )
+    for label, payload in {
+        "development report": report,
+        "selection lock": lock,
+        "route audit": route_audit,
+    }.items():
+        for flag in false_flags:
+            if flag in payload and payload.get(flag) is not False:
+                raise ValueError(f"{label} has unsafe {flag}")
+    if (
+        report.get("development_passed") is not True
+        or report.get("confirmation_authorized") is not True
+        or report.get("confirmation_routes_written") is not True
+    ):
+        raise ValueError("external development did not authorize confirmation")
+    if (
+        development_audit.get("valid") is not True
+        or development_audit.get("deep_swe_outcomes_accessed") is not False
+        or development_audit.get("target_outcomes_used") is not False
+        or float(development_audit.get("retained_task_coverage", 0.0)) < 0.95
+    ):
+        raise ValueError("development collection audit does not pass isolation gates")
+    if _sha256(confirmation_corpus_path) != CONFIRMATION_CORPUS_SHA256:
+        raise ValueError("confirmation corpus hash mismatch")
+    inputs = report.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError("development report lacks content-addressed inputs")
+    if (
+        inputs.get("collection_audit_sha256") != _sha256(development_audit_path)
+        or inputs.get("confirmation_corpus_sha256") != CONFIRMATION_CORPUS_SHA256
+        or lock.get("collection_audit_sha256") != _sha256(development_audit_path)
+        or lock.get("confirmation_corpus_sha256") != CONFIRMATION_CORPUS_SHA256
+    ):
+        raise ValueError("fit authorization inputs drifted")
+    if route_audit.get("selection_lock_sha256") != _sha256(required["selection_lock"]):
+        raise ValueError("selection lock hash mismatch")
+    if (
+        route_audit.get("confirmation_routes_sha256") != _sha256(required["routes"])
+        or route_audit.get("shuffled_routes_sha256")
+        != _sha256(required["shuffled_routes"])
+        or route_audit.get("fitted_numeric_state_persisted") is not False
+    ):
+        raise ValueError("sealed confirmation route audit is invalid")
+    latency = route_audit.get("latency")
+    if not isinstance(latency, dict) or latency.get("passed") is not True:
+        raise ValueError("frozen route failed the latency gate")
+    for label in ("routes", "shuffled_routes"):
+        rows = _read_rows(required[label])
+        if len(rows) != 200 or [row.get("task_id") for row in rows] != task_ids:
+            raise ValueError(f"{label} do not exactly cover the frozen confirmation corpus")
+        for row in rows:
+            if row.get("reasoning_effort") not in EFFORTS:
+                raise ValueError(f"{label} contain an invalid reasoning effort")
+    prior_spend = development_audit.get("rough_cumulative_experiment_spend_usd")
+    if (
+        isinstance(prior_spend, bool)
+        or not isinstance(prior_spend, (int, float))
+        or not 0.0 <= float(prior_spend) < 20_000.0
+    ):
+        raise ValueError("development audit has invalid cumulative spend")
+    hashes = {f"{label}_sha256": _sha256(path) for label, path in required.items()}
+    hashes["development_audit_sha256"] = _sha256(development_audit_path)
+    hashes["confirmation_corpus_sha256"] = CONFIRMATION_CORPUS_SHA256
+    return float(prior_spend), hashes
+
+
 def _capacity() -> int:
     paginator = Sandbox.list(limit=100)
     count = 0
@@ -257,8 +414,13 @@ def _effort_order(task_index: int) -> tuple[str, ...]:
     return EFFORTS[offset:] + EFFORTS[:offset]
 
 
-def _new_rollouts(task_id: str, effort: str) -> tuple[int, int]:
-    if task_id in REUSED_TASKS and effort in SMOKE_ARCHIVE_SHA256:
+def _new_rollouts(
+    task_id: str,
+    effort: str,
+    *,
+    reuse_smoke: bool = True,
+) -> tuple[int, int]:
+    if reuse_smoke and task_id in REUSED_TASKS and effort in SMOKE_ARCHIVE_SHA256:
         return 1, 1
     return 2, 0
 
@@ -518,7 +680,13 @@ def _task_excluded(state: dict[str, Any]) -> bool:
     )
 
 
-def _update_summary(root: Path, total_tasks: int) -> None:
+def _update_summary(
+    root: Path,
+    total_tasks: int,
+    *,
+    protocol: str = PROTOCOL,
+    prior_spend_usd: float = 405.7678502,
+) -> None:
     with STATE_LOCK:
         states = list((root / "tasks").glob("*/state.json"))
         completed_efforts = 0
@@ -570,7 +738,7 @@ def _update_summary(root: Path, total_tasks: int) -> None:
         _write_json(
             root / "progress.json",
             {
-                "protocol": PROTOCOL,
+                "protocol": protocol,
                 "total_tasks": total_tasks,
                 "expected_cells": total_tasks * 10,
                 "complete_tasks": complete_tasks,
@@ -584,7 +752,7 @@ def _update_summary(root: Path, total_tasks: int) -> None:
                 "provider_calls": provider_calls,
                 "usage": usage,
                 "matrix_cost_usd": cost,
-                "rough_cumulative_experiment_spend_usd": 405.7678502 + cost,
+                "rough_cumulative_experiment_spend_usd": prior_spend_usd + cost,
             },
         )
 
@@ -595,6 +763,8 @@ def _run_task(
     row: dict[str, Any],
     api_key: str,
     total_tasks: int,
+    phase: ExecutionPhase = DEVELOPMENT_PHASE,
+    prior_spend_usd: float = 405.7678502,
 ) -> None:
     task_id = str(row["task_id"])
     image = _docker_image(str(row["image_name"]))
@@ -603,7 +773,11 @@ def _run_task(
     state_path = task_dir / "state.json"
     if state_path.is_file():
         state = _read_object(state_path)
-        if state.get("task_id") != task_id or state.get("image") != image:
+        if (
+            state.get("protocol") != phase.protocol
+            or state.get("task_id") != task_id
+            or state.get("image") != image
+        ):
             raise ValueError(f"task state identity drift at {task_dir}")
         if _task_excluded(state):
             return
@@ -611,7 +785,7 @@ def _run_task(
             return
     else:
         state = {
-            "protocol": PROTOCOL,
+            "protocol": phase.protocol,
             "task_index": task_index,
             "task_id": task_id,
             "image": image,
@@ -643,7 +817,7 @@ def _run_task(
         envs={"OPENAI_API_KEY": api_key},
         metadata={
             "owner": "coding-router-v40",
-            "phase": "swerebench-development-matrix",
+            "phase": phase.metadata_phase,
             "task_index": str(task_index),
             "task_id": task_id,
         },
@@ -660,7 +834,7 @@ def _run_task(
     state["stage"] = "running"
     _write_json(state_path, state)
     verified = False
-    remote_root = f"/home/user/router-v40-development/{task_index:04d}"
+    remote_root = f"/home/user/router-v40-{phase.remote_segment}/{task_index:04d}"
     try:
         _run(sandbox, f"mkdir -p {remote_root}/runtime", timeout=120)
         _run(
@@ -699,7 +873,11 @@ def _run_task(
         sandbox.files.write(f"{remote_root}/validate.py", REMOTE_VALIDATOR)
 
         for effort in missing:
-            rollouts, attempt_offset = _new_rollouts(task_id, effort)
+            rollouts, attempt_offset = _new_rollouts(
+                task_id,
+                effort,
+                reuse_smoke=phase.reuse_smoke,
+            )
             output_dir = f"{remote_root}/{effort}"
             config_path = f"{remote_root}/{effort}.toml"
             report_path = f"{remote_root}/{effort}.report.json"
@@ -769,7 +947,12 @@ def _run_task(
             }
             state["stage"] = f"completed-{effort}"
             _write_json(state_path, state)
-            _update_summary(root, total_tasks)
+            _update_summary(
+                root,
+                total_tasks,
+                protocol=phase.protocol,
+                prior_spend_usd=prior_spend_usd,
+            )
             logger.info(
                 "task=%d/%d id=%s effort=%s new_cells=%d reused=%d",
                 task_index + 1,
@@ -793,7 +976,12 @@ def _run_task(
             attempt["terminated"] = True
             state["sandbox_terminated"] = True
         _write_json(state_path, state)
-        _update_summary(root, total_tasks)
+        _update_summary(
+            root,
+            total_tasks,
+            protocol=phase.protocol,
+            prior_spend_usd=prior_spend_usd,
+        )
 
 
 def execute(
@@ -802,10 +990,28 @@ def execute(
     *,
     concurrency: int,
     limit_tasks: int | None,
+    phase_name: str = "development",
+    fit_output: Path | None = None,
+    development_audit: Path | None = None,
 ) -> None:
     """Validate the frozen launch and execute or resume every missing task."""
-    if _sha256(corpus_path) != CORPUS_SHA256:
-        raise ValueError("development corpus hash mismatch")
+    phase = _execution_phase(phase_name)
+    if _sha256(corpus_path) != phase.corpus_sha256:
+        raise ValueError(f"{phase.name} corpus hash mismatch")
+    authorization: dict[str, object] | None = None
+    prior_spend_usd = 405.7678502
+    if phase is CONFIRMATION_PHASE:
+        if limit_tasks is not None:
+            raise ValueError("confirmation does not allow a task limit")
+        if fit_output is None or development_audit is None:
+            raise ValueError("confirmation requires fit output and development audit")
+        prior_spend_usd, authorization = _confirmation_authorization(
+            fit_output,
+            development_audit,
+            corpus_path,
+        )
+    elif fit_output is not None or development_audit is not None:
+        raise ValueError("development does not accept confirmation authorization inputs")
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is unavailable")
@@ -827,10 +1033,10 @@ def execute(
     root.mkdir(parents=True, exist_ok=True)
     (root / "tasks").mkdir(exist_ok=True)
     launch_path = root / "launch.json"
-    launch = {
-        "protocol": PROTOCOL,
+    launch: dict[str, object] = {
+        "protocol": phase.protocol,
         "corpus_path": str(corpus_path.resolve()),
-        "corpus_sha256": CORPUS_SHA256,
+        "corpus_sha256": phase.corpus_sha256,
         "template": TEMPLATE_NAME,
         "template_id": TEMPLATE_ID,
         "template_build_id": TEMPLATE_BUILD_ID,
@@ -839,17 +1045,24 @@ def execute(
         "attempts_per_effort": 2,
         "tasks": len(selected),
         "expected_cells": len(selected) * 10,
-        "reused_smoke_cells": 4 if len(selected) >= 2 else 2,
-        "smoke_report_sha256": SMOKE_REPORT_SHA256,
-        "smoke_archive_sha256": SMOKE_ARCHIVE_SHA256,
+        "reused_smoke_cells": (4 if len(selected) >= 2 else 2)
+        if phase.reuse_smoke
+        else 0,
         "concurrency": concurrency,
         "active_e2b_before": active,
         "e2b_account_cap": E2B_ACCOUNT_CAP,
         "cost_ceiling_usd": 20_000.0,
-        "prior_spend_usd": 405.7678502,
+        "prior_spend_usd": prior_spend_usd,
         "deep_swe_outcomes_accessed": False,
         "model_persisted": False,
     }
+    if phase is DEVELOPMENT_PHASE:
+        launch["smoke_report_sha256"] = SMOKE_REPORT_SHA256
+        launch["smoke_archive_sha256"] = SMOKE_ARCHIVE_SHA256
+    else:
+        launch["phase"] = phase.name
+        launch["authorization"] = authorization
+        launch["confirmation_outcomes_accessed_before_launch"] = False
     if launch_path.is_file():
         prior_launch = _read_object(launch_path)
         operational = {"active_e2b_before", "concurrency"}
@@ -863,7 +1076,12 @@ def execute(
             raise ValueError("resume launch manifest differs from the frozen experiment")
     else:
         _write_json(launch_path, launch)
-    _update_summary(root, len(selected))
+    _update_summary(
+        root,
+        len(selected),
+        protocol=phase.protocol,
+        prior_spend_usd=prior_spend_usd,
+    )
     errors: list[Exception] = []
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
@@ -874,6 +1092,8 @@ def execute(
                 row,
                 api_key,
                 len(selected),
+                phase,
+                prior_spend_usd,
             ): index
             for index, raw_row in enumerate(selected)
             for row in [_read_row(raw_row, index)]
@@ -883,7 +1103,12 @@ def execute(
                 future.result()
             except Exception as error:  # noqa: BLE001 - isolate task workers
                 errors.append(error)
-    _update_summary(root, len(selected))
+    _update_summary(
+        root,
+        len(selected),
+        protocol=phase.protocol,
+        prior_spend_usd=prior_spend_usd,
+    )
     if errors:
         raise RuntimeError(f"{len(errors)} task workers failed; inspect task states")
 
@@ -901,12 +1126,22 @@ def main() -> None:
     parser.add_argument("--corpus", type=Path, required=True)
     parser.add_argument("--concurrency", type=int, default=25)
     parser.add_argument("--limit-tasks", type=int)
+    parser.add_argument(
+        "--phase",
+        choices=(DEVELOPMENT_PHASE.name, CONFIRMATION_PHASE.name),
+        default=DEVELOPMENT_PHASE.name,
+    )
+    parser.add_argument("--fit-output", type=Path)
+    parser.add_argument("--development-audit", type=Path)
     args = parser.parse_args()
     execute(
         args.root,
         args.corpus,
         concurrency=args.concurrency,
         limit_tasks=args.limit_tasks,
+        phase_name=args.phase,
+        fit_output=args.fit_output,
+        development_audit=args.development_audit,
     )
 
 

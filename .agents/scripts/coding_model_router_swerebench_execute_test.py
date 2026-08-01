@@ -11,6 +11,10 @@ from types import SimpleNamespace
 import coding_model_router_swerebench_execute as execute
 
 
+def _write_json(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def _call() -> dict[str, object]:
     return {
         "model": "gpt-5.6-luna",
@@ -234,3 +238,105 @@ def test_durable_eval_starts_once_and_polls_atomic_exit_marker(tmp_path: Path) -
     assert process["pid"] == 314
     assert process["scientific_command_starts"] == 1
     assert process["completed"] is True
+
+
+def test_confirmation_never_reuses_development_smoke_cells() -> None:
+    task_id = next(iter(execute.REUSED_TASKS))
+    assert execute._new_rollouts(task_id, "xhigh") == (1, 1)
+    assert execute._new_rollouts(task_id, "xhigh", reuse_smoke=False) == (2, 0)
+
+
+def test_confirmation_authorization_is_content_addressed(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    corpus = tmp_path / "confirmation.json"
+    tasks = [
+        {
+            "task_id": f"owner__repo-{index}",
+            "repository": f"owner/repo-{index}",
+            "prompt_sha256": f"{index:064x}",
+        }
+        for index in range(200)
+    ]
+    _write_json(corpus, {"tasks": tasks})
+    corpus_hash = execute._sha256(corpus)
+    monkeypatch.setattr(execute, "CONFIRMATION_CORPUS_SHA256", corpus_hash)
+
+    development_audit = tmp_path / "completion-audit.json"
+    _write_json(
+        development_audit,
+        {
+            "valid": True,
+            "retained_task_coverage": 0.98,
+            "rough_cumulative_experiment_spend_usd": 638.5,
+            "target_outcomes_used": False,
+            "deep_swe_outcomes_accessed": False,
+        },
+    )
+    audit_hash = execute._sha256(development_audit)
+    fit_output = tmp_path / "fit"
+    fit_output.mkdir()
+    lock = fit_output / "selection-lock.json"
+    _write_json(
+        lock,
+        {
+            "collection_audit_sha256": audit_hash,
+            "confirmation_corpus_sha256": corpus_hash,
+            "target_outcomes_used": False,
+            "deep_swe_outcomes_accessed": False,
+            "confirmation_outcomes_accessed": False,
+        },
+    )
+    rows = [
+        {
+            "task_id": task["task_id"],
+            "reasoning_effort": "high",
+            "target_outcomes_used": False,
+            "deep_swe_outcomes_accessed": False,
+        }
+        for task in tasks
+    ]
+    routes = fit_output / "confirmation-routes.jsonl"
+    shuffled = fit_output / "confirmation-shuffled-routes.jsonl"
+    content = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+    routes.write_text(content, encoding="utf-8")
+    shuffled.write_text(content, encoding="utf-8")
+    _write_json(
+        fit_output / "route-audit.json",
+        {
+            "selection_lock_sha256": execute._sha256(lock),
+            "confirmation_routes_sha256": execute._sha256(routes),
+            "shuffled_routes_sha256": execute._sha256(shuffled),
+            "latency": {"passed": True, "p95_ms": 1.0},
+            "fitted_numeric_state_persisted": False,
+            "target_outcomes_used": False,
+            "deep_swe_outcomes_accessed": False,
+            "confirmation_outcomes_accessed": False,
+        },
+    )
+    _write_json(
+        fit_output / "development-report.json",
+        {
+            "development_passed": True,
+            "confirmation_authorized": True,
+            "confirmation_routes_written": True,
+            "target_outcomes_used": False,
+            "deep_swe_outcomes_accessed": False,
+            "confirmation_outcomes_accessed": False,
+            "inputs": {
+                "collection_audit_sha256": audit_hash,
+                "confirmation_corpus_sha256": corpus_hash,
+            },
+        },
+    )
+
+    spend, hashes = execute._confirmation_authorization(
+        fit_output,
+        development_audit,
+        corpus,
+    )
+
+    assert spend == 638.5
+    assert hashes["development_audit_sha256"] == audit_hash
+    assert hashes["confirmation_corpus_sha256"] == corpus_hash
