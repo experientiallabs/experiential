@@ -29,6 +29,7 @@ PROTOCOL = "coding-router-pooled-uplift-confirmation-analysis-v1"
 COLLECTION_PROTOCOL = "coding-router-pooled-uplift-confirmation-collection-v1"
 SELECTED_CANDIDATE = "direct_ridge-hash8192-a10"
 NULL_COUNT = 128
+BOOTSTRAP_SEED = 20_260_801
 ROUTES_SHA256 = "aac7523746ee9aac0f9789ba9ee4d4e260fad8d2447730102d7aaa44816224c8"
 NULL_ROUTES_SHA256 = "4e1570b285eac8da96c13069479f3f7ea9e49b7bedaae8c90d636777a3212a59"
 ROUTE_AUDIT_SHA256 = "4f31fe2245cbad1123beada405d18d12b6e323963bde14c3ac69a90993c4db6b"
@@ -89,21 +90,15 @@ def _best_null_comparison(
 ) -> dict[str, object]:
     """Compare real routing with the outcome-best frozen null route."""
     task_rows = np.arange(len(data.task_ids))
-    real_counts = np.bincount(real_choices, minlength=len(ARMS))
-    traffic = real_counts / len(real_choices)
-    blind = data.rewards @ traffic
     real_rewards = data.rewards[task_rows, real_choices]
+    null_rewards = np.empty(NULL_COUNT, dtype=np.float64)
     null_advantages = np.empty(NULL_COUNT, dtype=np.float64)
     for null_index, choices in enumerate(null_choices):
-        if not np.array_equal(
-            np.bincount(choices, minlength=len(ARMS)),
-            real_counts,
-        ):
-            raise ValueError(f"null route {null_index} does not preserve traffic")
-        null_advantages[null_index] = float(
-            np.mean(data.rewards[task_rows, choices] - blind)
-        )
-    best_index = int(np.argmax(null_advantages))
+        traffic = np.bincount(choices, minlength=len(ARMS)) / len(choices)
+        routed = data.rewards[task_rows, choices]
+        null_rewards[null_index] = float(np.mean(routed))
+        null_advantages[null_index] = float(np.mean(routed - data.rewards @ traffic))
+    best_index = int(np.argmax(null_rewards))
     best_rewards = data.rewards[task_rows, null_choices[best_index]]
     differences = real_rewards - best_rewards
     difference = float(np.mean(differences))
@@ -111,13 +106,22 @@ def _best_null_comparison(
         differences,
         data.repositories,
         resamples=bootstrap_resamples,
+        seed=BOOTSTRAP_SEED,
     )
     return {
         "best_null_index": best_index,
+        "best_null_reward": float(null_rewards[best_index]),
         "best_null_matched_blind_advantage": float(null_advantages[best_index]),
+        "best_null_arm_counts": {
+            ARMS[index]: int(value)
+            for index, value in enumerate(
+                np.bincount(null_choices[best_index], minlength=len(ARMS))
+            )
+        },
         "real_minus_best_null_reward": difference,
         "real_minus_best_null_ci95_lower": lower,
         "repository_bootstrap_resamples": bootstrap_resamples,
+        "repository_bootstrap_seed": BOOTSTRAP_SEED,
         "passed": difference > 0.0 and lower > 0.0,
     }
 
@@ -191,7 +195,11 @@ def analyze(
 
     real_choices = _real_choices(paths["routes"], data)
     null_choices = _null_choices(paths["null_routes"], data)
-    primary = _evaluate_route(data, real_choices)
+    primary = _evaluate_route(
+        data,
+        real_choices,
+        bootstrap_seed=BOOTSTRAP_SEED,
+    )
     null_comparison = _best_null_comparison(data, real_choices, null_choices)
     excluded = audit.get("excluded_tasks")
     coverage = (

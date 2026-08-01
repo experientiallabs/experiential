@@ -1,8 +1,8 @@
 # Pooled cross-attempt reasoning-effort uplift protocol
 
-Status: development passed, the fresh confirmation cohort and all real and null
-routes are frozen, and the external confirmation matrix is running. DeepSWE
-outcomes remain sealed.
+Status: terminal negative. Development passed, but the fresh external
+confirmation failed. DeepSWE outcomes remain sealed and this candidate cannot
+advance.
 
 ## Objective
 
@@ -238,3 +238,51 @@ The content-addressed execution phase uses 200 isolated E2B workers against the
 per task through the official verifier, persists every completed effort, and
 does not reuse any prior smoke cell. The one-shot confirmation analysis remains
 sealed until collection is complete.
+
+## External confirmation result
+
+The matrix retained 197 of 200 tasks across 108 repositories, or 98.5 percent
+coverage, with 1,970 dense gradeable cells. Three tasks from the same Sage
+Carbon repository were dropped under the frozen whole-task infrastructure
+policy. Two workers exited 137 before durable trace persistence. The third
+completed both max-effort inferences with 40 total provider calls, but both
+official verifier scoring runs timed out. No scientific cell was rerun. Each
+failure sandbox was terminated only after its exact boundary was audited.
+
+The collected outcomes SHA-256 is
+`f96a7262de2763a616d93294c54408f9279d33a97cd5d8b31eca6d5de0519be7`.
+The completion audit SHA-256 is
+`83a8388236d095585c750738b70ecae766260581037da8f6f85bb108301fd6ef`.
+The matrix used 30,664 recorded provider calls and cost USD 236.3878768 by the
+trace-derived frozen list-price estimate. Rough cumulative experiment spend is
+USD 1,123.9297378. Provider usage for the two zero-trace worker crashes is
+unavailable and is explicitly excluded from that estimate.
+
+On the retained cohort, the real route sent 182 tasks to `luna-high` and 15 to
+`luna-max`. It achieved 0.4543147208 reward at USD 0.1432880030 per task. Its
+traffic-matched blind reward was 0.4494060656, an apparent advantage of only
+0.0049086552 with repository-bootstrap lower bound -0.0104728827. Quality
+retention versus static max was 0.9421052632, below the frozen 0.95 gate.
+
+Frozen null route 113 was strongest after the same whole-task exclusions. It
+achieved 0.4746192893 reward at the same retained 182 high and 15 max traffic.
+The real route therefore trailed the best of 128 frozen nulls by 0.0203045685,
+with repository-bootstrap lower bound -0.0427135678. Coverage, isolation,
+latency, and static non-dominance passed. Matched-blind advantage, quality
+retention, and best-null comparison failed. The accepted confirmation report
+SHA-256 is
+`37e2a2915121204bff8782cb301696f3c79a033e5d17b1ba599c67254b7eb553`.
+
+The analysis implementation was audited before accepting the report. Its first
+run stopped before producing metrics because retained whole-task exclusions can
+change null-route traffic even when full-cohort traffic is preserved. The
+comparison was repaired to use the conservative frozen quantity, real reward
+minus the highest-reward null on the retained cohort. A subsequent report was
+rejected because a reused helper carried seed `20260731`; the protocol-frozen
+seed is `20260801`. That invalid report remains preserved separately. The
+accepted report above uses 10,000 repository bootstrap resamples with seed
+`20260801` for both confidence bounds.
+
+This result rejects the pooled cross-attempt text router. Its small development
+margin over the family null did not reproduce, and more of the same task-text
+signal is not justified. No DeepSWE transfer is authorized.

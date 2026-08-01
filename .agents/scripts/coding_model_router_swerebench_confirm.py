@@ -169,6 +169,7 @@ def _evaluate_route(
     choices: np.ndarray,
     *,
     bootstrap_resamples: int = BOOTSTRAP_RESAMPLES,
+    bootstrap_seed: int = BOOTSTRAP_SEED,
 ) -> dict[str, object]:
     if choices.shape != (len(data.task_ids),) or np.any(
         (choices < 0) | (choices >= len(EFFORTS))
@@ -204,6 +205,7 @@ def _evaluate_route(
         advantages,
         data.repositories,
         resamples=bootstrap_resamples,
+        seed=bootstrap_seed,
     )
     return {
         "reward": reward,
@@ -213,7 +215,7 @@ def _evaluate_route(
         "matched_blind_cost_usd_per_task": float(np.mean(blind_cost)),
         "matched_blind_advantage": advantage,
         "repository_bootstrap_resamples": bootstrap_resamples,
-        "repository_bootstrap_seed": BOOTSTRAP_SEED,
+        "repository_bootstrap_seed": bootstrap_seed,
         "matched_blind_advantage_ci95_lower": lower,
         "primary_matched_blind_passed": advantage > 0.0 and lower > 0.0,
         "static_efforts": static,
