@@ -92,6 +92,12 @@ ability variants, exact denominator weighting, unseen-task prediction, monotone 
 the KL solution. The module has no filesystem or serialization surface. It remains conditional
 infrastructure and does not activate this lane.
 
+The pure protocol helpers in `.agents/scripts/coding_model_router_graded_irt_protocol.py` implement
+seed-sensitive repository-disjoint folds with exact one-fold task coverage and a shuffled-label
+control that permutes complete outcome rows only within repositories. These replace the older
+Codeforces implementation's unseeded folds and corpus-wide shuffle. They load no outcomes, fit no
+model, and persist no state, so preparing them does not activate this lane.
+
 All fitting, cross-validation, bootstrapping, and latency measurement run on E2B or Azure. The Mac
 only orchestrates and validates bounded artifacts. No foundation model, task embedding bank, or
 fitted numeric router state is persisted. The remote worker may retain coefficients only for its

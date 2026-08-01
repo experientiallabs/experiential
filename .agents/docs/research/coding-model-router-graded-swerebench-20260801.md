@@ -172,6 +172,22 @@ no graded reward. The worker had terminated and the missing cell was irrecoverab
 permanently excluded across all six arms with zero reruns. The maximum retained development cohort
 is now 658 of 673, or 97.8 percent, still above the frozen requirement.
 
+The `sol-max` command for `kubermatic__kubermatic-14462` failed to produce an official graded
+reward after four valid arms, and the first `luna-low` command for `giampaolo__psutil-2379` failed
+the same way. Both commands completed successfully and both workers had terminated, so the missing
+cells and provider usage were irrecoverable. Both tasks are permanently excluded across all six
+arms with zero reruns. The maximum retained development cohort is now 656 of 673, or 97.5 percent,
+still above the frozen requirement.
+
+A second E2B HTTP/2 control-plane wave then affected nine workers for
+`joernio__joern-5591`, `shazow__whatsabi-174`, `pymodbus-dev__pymodbus-2593`,
+`moment__luxon-1685`, `tailwindlabs__tailwindcss-jit-69`,
+`open-telemetry__opentelemetry-go-contrib-3041`, `swc-project__swc-8703`,
+`solid__community-server-347`, and `pyca__cryptography-12342`. Every affected attempt terminated
+before recording a Docker image, scientific command, or provider call. Together with the five
+earlier transport failures, these fourteen tasks remain eligible for exactly one fresh-sandbox
+infrastructure retry after the initial controller finishes.
+
 A pre-fit code audit found that the implementation required positive matched task-blind advantage
 only after averaging the five split seeds. The frozen rule requires a positive advantage in every
 seed. The fitter now applies all four development gates independently to each seed and fails on an
