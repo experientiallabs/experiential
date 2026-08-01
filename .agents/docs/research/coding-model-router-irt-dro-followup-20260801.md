@@ -105,6 +105,11 @@ repositories. These replace the older Codeforces implementation's unseeded folds
 shuffle. They load no outcomes, fit no model, and persist no state, so preparing them does not
 activate this lane.
 
+The pure robust-selection helpers in
+`.agents/scripts/coding_model_router_graded_irt_selection.py` implement the frozen pointwise guard,
+repository reward and cost aggregation, forward-KL worst-case metrics, and paired robust margins.
+They use only in-memory arrays and have no fitting, network, filesystem, or serialization surface.
+
 All fitting, cross-validation, bootstrapping, and latency measurement run on E2B or Azure. The Mac
 only orchestrates and validates bounded artifacts. No foundation model, task embedding bank, or
 fitted numeric router state is persisted. The remote worker may retain coefficients only for its
@@ -117,11 +122,20 @@ Use five repository-grouped outer seeds and five repository-grouped inner folds.
 training repositories and predict every arm's graded pass probability on inner validation tasks.
 For each candidate, enumerate cost penalties on the frozen grid `0, 0.005, 0.01, 0.02, 0.03`.
 
-For every task, choose the least expensive arm whose repository-robust lower reward estimate is at
-least 95 percent of the fit-selected static guard estimate. The robust estimate minimizes expected
-reward over a KL-divergence ball around the inner-fold repository distribution. Radius candidates
-are `0, 0.01, 0.03, 0.05, 0.1`. Radius and cost penalty are selected only from inner out-of-fold
-predictions.
+Within each inner fold, repeat the inner-training mean cost of each arm across validation tasks and
+normalize those six costs to `[0, 1]`. For each task and cost penalty, choose the arm maximizing
+`predicted_reward - cost_penalty * normalized_cost`, breaking ties by lower mean cost and then
+frozen arm order. Revert that choice to the fit-selected static guard unless its predicted reward
+is at least 95 percent of the guard prediction. This creates deterministic candidate policies
+without weakening the pointwise predicted-quality guard.
+
+Apply distributional robustness to each complete candidate policy, matching RACER's policy-level
+formulation rather than claiming a per-task KL guarantee. Aggregate the paired task margins
+`routed_reward - 0.95 * guard_reward` and `0.60 * guard_cost - routed_cost` within each repository.
+The robust score is the minimum expected repository margin over the forward-KL set
+`KL(shifted || equal_repository_empirical) <= radius`. Both lower bounds must be nonnegative.
+Radius candidates are `0, 0.01, 0.03, 0.05, 0.1`. Radius and cost penalty are selected only from
+inner out-of-fold routes and outcomes.
 
 The mechanical winner minimizes cost subject to all of these fit-only conditions:
 
