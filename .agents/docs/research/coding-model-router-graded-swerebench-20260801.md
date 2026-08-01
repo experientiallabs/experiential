@@ -214,6 +214,12 @@ records each sandbox update and suppresses sandboxes proven terminated.
 The maximum retained development cohort is now 652 of 673, or 96.9 percent, still above the frozen
 requirement.
 
+The first `luna-max` command for `vazco__uniforms-1363` completed its scientific process but the
+official trace contained no graded reward. The sandbox had already terminated, so the artifact was
+irrecoverable and the frozen scientific cell cannot be rerun. The task is permanently excluded
+across all six arms with zero reruns. The maximum retained development cohort is now 651 of 673, or
+96.7 percent, still above the frozen requirement.
+
 A second E2B HTTP/2 control-plane wave then affected ten workers for
 `joernio__joern-5591`, `shazow__whatsabi-174`, `pymodbus-dev__pymodbus-2593`,
 `moment__luxon-1685`, `icssc__antalmanac-912`, `tailwindlabs__tailwindcss-jit-69`,
