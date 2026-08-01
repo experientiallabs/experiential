@@ -139,6 +139,28 @@ model, effort, token limit, and verifier remain frozen. The prior Chat
 Completions token adapter is retained only as evidence for the failed transport
 probe and is not required by the final Responses runtime.
 
+The same four scientific cells then completed through the Responses runtime in
+owned sandbox `izarp6idyx2t2r1m1zef6`, which was terminated after raw artifact
+sync. Both efforts solved
+`acloudguru__serverless-plugin-aws-alerts-13` and scored zero on
+`0xs34n__starknet.js-538`; this runtime smoke is not evidence of a routing
+effect. The `xhigh` and `max` archives have SHA-256 values
+`bf1d576d25f1b56ae3a9484db5d5599576519a218aec3073db29272345f4015b`
+and
+`c449dc999a4d604546c358affcf5e1cba1865aba8ca312789b92b5eb27bb4e6a`.
+The strict audit verified all four official rewards, every call's model,
+effort, Responses endpoint, output limit, and token usage, the official scoring
+timings, patch hashes, archive hashes, unchanged attempt identities, and
+sandbox termination. It counted 62 provider calls, 152,889 uncached input
+tokens, 1,343,252 cached input tokens, 25,106 output tokens, and 10,646
+reasoning tokens included within output. Frozen list prices give a trace-derived
+estimate of USD 0.437850. The canonical audit report is
+`/private/tmp/coding-router-swerebench-v40-smoke-resume-1/smoke-report.json`,
+SHA-256
+`ee76a57040cbe7aaef692d2fc3f3df66d7a556cbf6dda74119e0802cb4230e13`.
+It explicitly corrects the pre-audit state file's stale zero provider-call
+count to the audited value 62.
+
 ## Smoke and matrix launch
 
 Run exactly four cells first: the first two development tasks by frozen task
@@ -230,9 +252,9 @@ refit, threshold, representation, or arm change regardless of the result.
 
 ## Budget and stopping
 
-Prior trace-derived experiment spend is approximately USD 405.33. The user
-monitors provider billing externally and authorized a USD 20,000 hard ceiling.
-Exact metering is not a launch gate. Preserve exact telemetry where available,
-otherwise update a clearly labeled trace-derived estimate after the smoke and
-each completed tranche. Stop before any launch whose estimate would take total
-experiment spend above USD 20,000.
+Trace-derived experiment spend after the valid smoke is approximately USD
+405.767850. The user monitors provider billing externally and authorized a USD
+20,000 hard ceiling. Exact metering is not a launch gate. Preserve exact
+telemetry where available, otherwise update a clearly labeled trace-derived
+estimate after each completed tranche. Stop before any launch whose estimate
+would take total experiment spend above USD 20,000.
