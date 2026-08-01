@@ -31,14 +31,23 @@ Terra and Sol run as new isolated E2B matrices. Arm identity is always model plu
 
 ## Frozen search and promotion gates
 
-Development uses repository-grouped cross-fitting. It compares every static arm, task-blind
-mixtures, deterministic character-hash reward and uplift heads, and WMO guarded kNN. Candidate
-selection minimizes cost subject to at least 95 percent reward retention versus the strongest
-fit-selected static arm.
+Development uses five repeated repository-grouped five-fold evaluations with seeds 11, 23, 37,
+41, and 59. It compares every static arm and every unordered pair of arms. Dynamic pair policies
+route only between the cheaper and more expensive member, which bounds confirmation to two dense
+arms. The frozen families are paired reward-uplift Ridge on signed character 3-to-5-gram hashing
+at 512, 2,048, and 8,192 dimensions with alpha 1, 10, or 100, and paired-difference kNN at k 8,
+16, 32, or 64. Ridge sends to the expensive arm when predicted expensive-minus-cheap reward
+exceeds one of -0.10, 0, 0.02, 0.05, 0.10, or 0.20. kNN uses the same asymmetric paired guard as
+WMO with z 0, 0.5, 1, 1.645, or 2 and no absolute similarity floor. Candidate selection minimizes
+cost subject to at least 95 percent reward retention versus the strongest fit-selected static arm
+on every repeated evaluation. Ties break by frozen family, pair, and parameter order.
 
 Exactly one candidate may be frozen for the untouched external confirmation cohort. Before any
-confirmation provider call, freeze its routes, matched task-blind traffic control, and 128
-repository-grouped label-permutation null routes. Promotion requires all of:
+confirmation provider call, refit that configuration on all retained development tasks and freeze
+its routes, a task-blind route with exactly the same expensive-arm traffic, and 128 null routes
+formed by independently permuting the paired reward-difference labels at repository-group level
+before refitting the selected configuration. No null may change the selected pair, family, or
+hyperparameters. Promotion requires all of:
 
 1. at least 95 percent retained external reward and at least 40 percent cost savings;
 2. positive repository-bootstrap lower bound versus the matched task-blind control;
