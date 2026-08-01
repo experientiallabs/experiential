@@ -167,3 +167,12 @@ incomplete route vector. This correction happened before development collection 
 before any confirmation outcome was accessed. The remote fit manifest also records successful
 sandbox termination only after termination completes, so it cannot claim destruction of fitted
 state early. Neither correction changes the frozen candidate grid or selection order.
+
+The full frozen fitter received an E2B performance preflight using synthetic rewards only. It
+evaluated all 480 candidates across five seeds for 661 tasks, 489 repositories, and 768-dimensional
+features in 424.6 seconds. The 1,586,400 route decisions measured 0.230 ms p50 and 0.457 ms p95,
+below the 5 ms gate. The preflight made zero provider calls, accessed no target outcomes, persisted
+no fitted state, and terminated its sandbox successfully. Its fitter SHA-256 was
+`0485fa5b34d1af9ef751d5763bda9c881ba48a82707135292e21002e6675ea77`, matching the frozen
+development fitter. This establishes that fitting and route generation fit within the one-hour E2B
+sandbox limit without moving heavy computation onto the Mac.
