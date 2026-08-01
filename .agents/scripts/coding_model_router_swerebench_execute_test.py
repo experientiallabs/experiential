@@ -136,35 +136,27 @@ def test_whole_task_exclusion_requires_audited_zero_reruns() -> None:
 
 
 def test_durable_eval_starts_once_and_polls_atomic_exit_marker(tmp_path: Path) -> None:
-    class FakeHandle:
-        pid = 314
-
-        def __init__(self) -> None:
-            self.disconnected = False
-
-        def disconnect(self) -> None:
-            self.disconnected = True
-
     class FakeCommands:
-        def __init__(self, handle: FakeHandle) -> None:
-            self.handle = handle
+        def __init__(self) -> None:
             self.starts: list[str] = []
             self.polls = 0
 
-        def run(self, command: str, *, background: bool, timeout: int) -> FakeHandle:
-            assert background is True
-            assert timeout == 120
-            self.starts.append(command)
-            return self.handle
-
-        def list(self, *, request_timeout: int) -> list[SimpleNamespace]:
-            assert request_timeout == 60
+        def run(self, command: str, *, timeout: int) -> SimpleNamespace:
+            if "nohup bash" in command:
+                assert timeout == 120
+                self.starts.append(command)
+                return SimpleNamespace(stdout="314\n")
+            assert timeout == 60
             self.polls += 1
-            return [SimpleNamespace(pid=314)]
+            return SimpleNamespace(stdout="stopped")
 
     class FakeFiles:
         def __init__(self, commands: FakeCommands) -> None:
             self.commands = commands
+            self.writes: dict[str, str] = {}
+
+        def write(self, path: str, content: str) -> None:
+            self.writes[path] = content
 
         def exists(self, path: str, *, request_timeout: int) -> bool:
             assert path == "/remote/xhigh.eval-exit-status"
@@ -175,12 +167,12 @@ def test_durable_eval_starts_once_and_polls_atomic_exit_marker(tmp_path: Path) -
             assert path == "/remote/xhigh.eval-exit-status"
             return "0\n"
 
-    handle = FakeHandle()
-    commands = FakeCommands(handle)
+    commands = FakeCommands()
+    files = FakeFiles(commands)
     sandbox = SimpleNamespace(
         sandbox_id="sandbox-1",
         commands=commands,
-        files=FakeFiles(commands),
+        files=files,
     )
     state = {"stage": "running-xhigh"}
     attempt: dict[str, object] = {}
@@ -200,9 +192,10 @@ def test_durable_eval_starts_once_and_polls_atomic_exit_marker(tmp_path: Path) -
 
     assert active is sandbox
     assert result.exit_code == 0
-    assert handle.disconnected is True
     assert len(commands.starts) == 1
-    assert commands.starts[0].count("scientific-eval --frozen") == 1
+    assert commands.starts[0].count("nohup bash") == 1
+    wrapper = files.writes["/remote/xhigh.eval-exit-status.wrapper.sh"]
+    assert wrapper.count("scientific-eval --frozen") == 1
     process = attempt["effort_processes"]["xhigh"]
     assert process["pid"] == 314
     assert process["scientific_command_starts"] == 1

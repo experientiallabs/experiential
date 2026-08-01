@@ -336,12 +336,17 @@ def _run_durable_eval(
     """Run one scientific command once and poll its persisted exit status.
 
     Long-lived E2B output streams have intermittently failed at the HTTP/2
-    control plane while the remote command kept running. Starting the command
-    in the background gives it an exact PID, while an atomic remote exit marker
-    makes completion recoverable without ever issuing the scientific command a
+    control plane while the remote command kept running. A short launcher starts
+    a detached wrapper exactly once, while remote PID and atomic exit markers
+    make completion recoverable without ever issuing the scientific command a
     second time.
     """
     temporary_status_path = f"{exit_status_path}.tmp"
+    wrapper_path = f"{exit_status_path}.wrapper.sh"
+    pid_path = f"{exit_status_path}.pid"
+    temporary_pid_path = f"{pid_path}.tmp"
+    lock_path = f"{exit_status_path}.launch-lock"
+    log_path = f"{exit_status_path}.log"
     wrapped = (
         "set +e\n"
         f"{command}\n"
@@ -350,10 +355,28 @@ def _run_durable_eval(
         f"mv {temporary_status_path} {exit_status_path}\n"
         'exit "$router_eval_status"'
     )
-    handle = sandbox.commands.run(wrapped, background=True, timeout=120)
+    sandbox.files.write(wrapper_path, wrapped)
+    launcher = (
+        "set -eu\n"
+        f"if mkdir {lock_path} 2>/dev/null; then\n"
+        f"  nohup bash {wrapper_path} > {log_path} 2>&1 </dev/null &\n"
+        "  router_eval_pid=$!\n"
+        f"  printf '%s\\n' \"$router_eval_pid\" > {temporary_pid_path}\n"
+        f"  mv {temporary_pid_path} {pid_path}\n"
+        "else\n"
+        f"  test -s {pid_path}\n"
+        "fi\n"
+        f"cat {pid_path}"
+    )
+    launch_result = sandbox.commands.run(launcher, timeout=120)
+    pid = int(launch_result.stdout.strip())
+    if pid <= 1:
+        raise ValueError(f"invalid durable eval pid: {pid}")
     process = {
-        "pid": handle.pid,
+        "pid": pid,
         "exit_status_path": exit_status_path,
+        "pid_path": pid_path,
+        "wrapper_path": wrapper_path,
         "scientific_command_starts": 1,
     }
     processes = attempt.setdefault("effort_processes", {})
@@ -361,15 +384,15 @@ def _run_durable_eval(
         raise ValueError("invalid durable effort process state")
     processes[effort] = process
     _write_json(state_path, state)
-    handle.disconnect()
 
     deadline = time.monotonic() + timeout
     active = sandbox
+    missing_pid_polls = 0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(
-                f"durable eval timed out effort={effort} pid={handle.pid}; "
+                f"durable eval timed out effort={effort} pid={pid}; "
                 "the scientific command was not rerun"
             )
         try:
@@ -390,15 +413,19 @@ def _run_durable_eval(
                     ),
                     active,
                 )
-            running = any(
-                remote_process.pid == handle.pid
-                for remote_process in active.commands.list(request_timeout=60)
+            process_result = active.commands.run(
+                (
+                    f"if kill -0 {pid} 2>/dev/null; then "
+                    "printf running; else printf stopped; fi"
+                ),
+                timeout=60,
             )
+            running = process_result.stdout.strip() == "running"
         except Exception as error:  # noqa: BLE001 - reconnect exact remote PID state
             logger.warning(
                 "durable eval poll reconnect effort=%s pid=%d error=%r",
                 effort,
-                handle.pid,
+                pid,
                 error,
             )
             poll_errors = process.setdefault("poll_errors", [])
@@ -408,10 +435,19 @@ def _run_durable_eval(
             active = Sandbox.connect(sandbox.sandbox_id, request_timeout=60)
         else:
             if not running:
+                if active.files.exists(exit_status_path, request_timeout=60):
+                    continue
+                missing_pid_polls += 1
+                process["missing_pid_polls"] = missing_pid_polls
+                _write_json(state_path, state)
+                if missing_pid_polls <= 5:
+                    time.sleep(min(1.0, remaining))
+                    continue
                 raise RuntimeError(
-                    f"durable eval pid={handle.pid} ended without exit marker; "
+                    f"durable eval pid={pid} ended without exit marker; "
                     "the scientific command was not rerun"
                 )
+            missing_pid_polls = 0
         time.sleep(min(poll_interval, remaining))
 
 
