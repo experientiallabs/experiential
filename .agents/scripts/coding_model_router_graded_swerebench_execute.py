@@ -787,10 +787,7 @@ def execute(
     launch_path = root / "launch.json"
     if launch_path.is_file():
         prior = _read_object(launch_path)
-        operational = {"active_e2b_before", "concurrency"}
-        if {key: value for key, value in prior.items() if key not in operational} != {
-            key: value for key, value in launch.items() if key not in operational
-        }:
+        if _launch_identity(prior) != _launch_identity(launch):
             raise ValueError("resume launch manifest differs from the frozen experiment")
     else:
         _write_json(launch_path, launch)
@@ -821,6 +818,14 @@ def execute(
     _update_summary(root, len(public_rows))
     if errors:
         raise RuntimeError(f"{len(errors)} task workers failed; inspect task states")
+
+
+def _launch_identity(launch: dict[str, Any]) -> dict[str, Any]:
+    """Return the scientific launch identity for resume comparison."""
+    operational = {"active_e2b_before", "concurrency"}
+    identity = {key: value for key, value in launch.items() if key not in operational}
+    identity.setdefault("phase", PHASE_NAME)
+    return identity
 
 
 def main() -> None:

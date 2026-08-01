@@ -220,6 +220,14 @@ irrecoverable and the frozen scientific cell cannot be rerun. The task is perman
 across all six arms with zero reruns. The maximum retained development cohort is now 651 of 673, or
 96.7 percent, still above the frozen requirement.
 
+The final `luna-xhigh` command for `zcashfoundation__zebra-8788` completed with exit code zero
+after four valid arms, but the local controller then lost DNS while polling the still-live worker.
+The worker was reconnected by exact sandbox identity before expiry. Its official validator found
+that the preserved trace contained no graded reward, so no valid report could be produced. The
+worker was then terminated and the task was permanently excluded across all six arms with zero
+reruns. The maximum retained development cohort is now 650 of 673, or 96.6 percent, still above
+the frozen requirement.
+
 A second E2B HTTP/2 control-plane wave then affected ten workers for
 `joernio__joern-5591`, `shazow__whatsabi-174`, `pymodbus-dev__pymodbus-2593`,
 `moment__luxon-1685`, `icssc__antalmanac-912`, `tailwindlabs__tailwindcss-jit-69`,
@@ -262,6 +270,14 @@ only control-plane connection reuse and scheduling, not task inputs, arms, attem
 verifier, or scientific selection. A read-only list stress probe was stopped immediately after it
 reached the E2B API rate limit; subsequent monitoring uses only the local persisted tracker until
 the limit window clears.
+
+The first retry controller invocation made zero provider calls because a newer launch manifest
+added the fixed `phase` field while the original persisted development launch predated that field.
+The resume comparison already excluded operational concurrency and active-capacity values, but it
+incorrectly treated the absent legacy field as scientific drift. The comparison now normalizes a
+missing phase to the controller's frozen phase while still rejecting every scientific identity
+change. Focused regression tests cover the legacy resume and a changed corpus identity. The retry
+was then relaunched with the same frozen inputs, disabled HTTP keepalive reuse, and concurrency 20.
 
 A pre-fit code audit found that the implementation required positive matched task-blind advantage
 only after averaging the five split seeds. The frozen rule requires a positive advantage in every
