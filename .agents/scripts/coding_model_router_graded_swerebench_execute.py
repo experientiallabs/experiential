@@ -206,11 +206,17 @@ patch = trace.get("info", {}).get("patch")
 if post_execution_agent_failure:
     patch_bytes = 0
     patch_sha256 = None
+    patch_provenance = "post-execution agent failure"
+elif patch is None:
+    patch_bytes = 0
+    patch_sha256 = hashlib.sha256(b"").hexdigest()
+    patch_provenance = "official trace reported no source changes"
 elif not isinstance(patch, str):
     raise SystemExit("trace lacks a patch string")
 else:
     patch_bytes = len(patch.encode())
     patch_sha256 = hashlib.sha256(patch.encode()).hexdigest()
+    patch_provenance = "official captured patch"
 
 report = {
     "protocol": "coding-router-graded-swerebench-arm-artifact-v1",
@@ -234,6 +240,7 @@ report = {
     "outer_errors": outer.get("errors", []),
     "patch_bytes": patch_bytes,
     "patch_sha256": patch_sha256,
+    "patch_provenance": patch_provenance,
     "scoring_seconds": scoring_seconds,
     "usage": usage,
     "usage_provenance": "exact token counts from pinned verifier Responses trace",
@@ -353,10 +360,26 @@ def _completed(task_dir: Path, arm: Arm, value: object) -> bool:
     )
 
 
+def _excluded(state: dict[str, Any]) -> bool:
+    """Return whether a gradeable cell was lost only after scientific completion."""
+    exclusion = state.get("exclusion")
+    return (
+        state.get("stage") == "excluded-audit-artifact-loss"
+        and isinstance(exclusion, dict)
+        and exclusion.get("scope") == "whole-task"
+        and exclusion.get("reason") == "validator rejected official no-change trace"
+        and isinstance(exclusion.get("arm"), str)
+        and exclusion.get("observed_scientific_cells") == 1
+        and exclusion.get("scientific_cells_rerun") == 0
+        and exclusion.get("provider_usage_recoverable") is False
+    )
+
+
 def _update_summary(root: Path, total_tasks: int) -> None:
     with STATE_LOCK:
         completed_arms = 0
         complete_tasks = 0
+        excluded_tasks = 0
         failed_tasks = 0
         provider_calls = 0
         usage = {
@@ -383,6 +406,8 @@ def _update_summary(root: Path, total_tasks: int) -> None:
                             usage[name][field] += int(arm_usage.get(field, 0))
             if state.get("stage") == "complete":
                 complete_tasks += 1
+            if _excluded(state):
+                excluded_tasks += 1
             if state.get("stage") == "failed":
                 failed_tasks += 1
         costs: dict[str, float] = {}
@@ -402,6 +427,8 @@ def _update_summary(root: Path, total_tasks: int) -> None:
                 "total_tasks": total_tasks,
                 "expected_cells": total_tasks * len(ARMS),
                 "complete_tasks": complete_tasks,
+                "excluded_tasks": excluded_tasks,
+                "retained_task_coverage": (total_tasks - excluded_tasks) / total_tasks,
                 "failed_tasks": failed_tasks,
                 "completed_arms": completed_arms,
                 "completed_scientific_cells": completed_arms,
@@ -446,6 +473,8 @@ def _run_task(
             or state.get("image") != image
         ):
             raise ValueError(f"task state identity drift: {task_id}")
+        if _excluded(state):
+            return
     else:
         state = {
             "protocol": PROTOCOL,

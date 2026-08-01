@@ -104,3 +104,14 @@ cumulative spend before this campaign is USD 3,025.10805955. The prior measured 
 194 external tasks projects this one-attempt matrix near USD 1,563 per 1,000 tasks, but this is only
 a trace-derived planning estimate. The campaign stops before the total ceiling and preserves exact
 token telemetry when available.
+
+## Launch audit
+
+The first controller launch made zero provider calls because E2B rejected six-hour sandbox
+lifetimes before creating a worker. The corrected execution uses one cell per one-hour sandbox.
+After paid work began, the local artifact validator incorrectly rejected an officially scored
+no-change trace whose captured patch was null. The audit-only validator was updated in all 100
+active experiment-owned sandboxes without changing any scientific evaluation. Four cells completed
+before that update and their remote traces were lost on worker termination. Those four tasks are
+permanently excluded whole-task with zero reruns. The resulting 669 of 673 maximum development
+coverage is 99.4 percent, above the frozen 95 percent requirement.

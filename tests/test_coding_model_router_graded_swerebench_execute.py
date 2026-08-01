@@ -39,6 +39,7 @@ def _run_validator(
     *,
     reward: float,
     f2p_total: int = 4,
+    patch: str | None = "diff",
 ) -> subprocess.CompletedProcess[str]:
     validator = tmp_path / "validate.py"
     traces = tmp_path / "traces.jsonl"
@@ -55,7 +56,7 @@ def _run_validator(
         "rewards": {"solved": {"score": reward}},
         "timing": {"scoring": {"start": 1.0, "end": 2.0}},
         "calls": [_call()],
-        "info": {"patch": "diff"},
+        "info": {"patch": patch},
         "ok": True,
         "errors": [],
         "stop_condition": "agent_completed",
@@ -102,6 +103,14 @@ def test_validator_rejects_reward_inconsistent_with_denominator(tmp_path: Path) 
     assert "inconsistent with the F2P denominator" in result.stderr
 
 
+def test_validator_accepts_officially_scored_no_change_trace(tmp_path: Path) -> None:
+    result = _run_validator(tmp_path, reward=0.0, patch=None)
+    assert result.returncode == 0, result.stderr
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["patch_bytes"] == 0
+    assert report["patch_provenance"] == "official trace reported no source changes"
+
+
 def test_config_freezes_one_local_task_and_model_effort() -> None:
     config = module._config(
         module.Arm("sol-max", "gpt-5.6-sol", "max"),
@@ -119,3 +128,20 @@ def test_arm_order_rotates_without_changing_roster() -> None:
     assert module._arm_order(0) == module.ARMS
     assert module._arm_order(1)[0] == module.ARMS[1]
     assert set(module._arm_order(5)) == set(module.ARMS)
+
+
+def test_exclusion_requires_one_lost_cell_and_zero_reruns() -> None:
+    state = {
+        "stage": "excluded-audit-artifact-loss",
+        "exclusion": {
+            "scope": "whole-task",
+            "reason": "validator rejected official no-change trace",
+            "arm": "luna-medium",
+            "observed_scientific_cells": 1,
+            "scientific_cells_rerun": 0,
+            "provider_usage_recoverable": False,
+        },
+    }
+    assert module._excluded(state)
+    state["exclusion"]["scientific_cells_rerun"] = 1
+    assert not module._excluded(state)
