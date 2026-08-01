@@ -89,7 +89,10 @@ lower bound. It also implements the frozen monotone-capacity variant with a diff
 cumulative-softplus parameterization on the first latent coordinate for Luna low through max; the
 sixth Sol arm remains unconstrained. Its inline tests cover finite-difference gradients for both
 ability variants, exact denominator weighting, unseen-task prediction, monotone Luna ordering, and
-the KL solution. The module has no filesystem or serialization surface. It remains conditional
+the KL solution. The feature-conditioned loss also accepts a validated fit-only graph Laplacian
+and applies the frozen graph penalty directly to predicted task difficulty. Its tests cover the
+graph gradient by finite differences, reject malformed Laplacians, and exercise the optimizer
+wiring. The module has no filesystem or serialization surface. It remains conditional
 infrastructure and does not activate this lane.
 
 The pure protocol helpers in `.agents/scripts/coding_model_router_graded_irt_protocol.py` implement

@@ -74,6 +74,34 @@ def _validate_features(features: np.ndarray, task_count: int) -> None:
         raise ValueError("task features must be finite")
 
 
+def _validate_graph_laplacian(
+    graph_laplacian: np.ndarray | None,
+    task_count: int,
+    graph_l2: float,
+) -> None:
+    """Validate an optional fit-only task graph penalty."""
+    if not np.isfinite(graph_l2) or graph_l2 < 0.0:
+        raise ValueError("graph regularization strength must be finite and nonnegative")
+    if graph_laplacian is None:
+        if graph_l2 != 0.0:
+            raise ValueError("positive graph regularization requires a graph Laplacian")
+        return
+    if graph_laplacian.shape != (task_count, task_count):
+        raise ValueError("graph Laplacian must be a square task-by-task matrix")
+    if not np.isfinite(graph_laplacian).all():
+        raise ValueError("graph Laplacian must be finite")
+    if not np.allclose(graph_laplacian, graph_laplacian.T, atol=1e-10):
+        raise ValueError("graph Laplacian must be symmetric")
+    if np.any(np.diag(graph_laplacian) < -1e-10):
+        raise ValueError("graph Laplacian diagonal must be nonnegative")
+    off_diagonal = graph_laplacian.copy()
+    np.fill_diagonal(off_diagonal, 0.0)
+    if np.any(off_diagonal > 1e-10):
+        raise ValueError("graph Laplacian off-diagonal entries must be nonpositive")
+    if not np.allclose(np.sum(graph_laplacian, axis=1), 0.0, atol=1e-10):
+        raise ValueError("graph Laplacian rows must sum to zero")
+
+
 def _feature_parameter_shapes(
     arm_count: int,
     feature_count: int,
@@ -351,6 +379,9 @@ def feature_binomial_irt_loss_and_gradient(
     feature_l2: float = DEFAULT_DIFFICULTY_L2,
     discrimination_l2: float = DEFAULT_DISCRIMINATION_L2,
     monotone_luna: bool = False,
+    graph_laplacian: np.ndarray | None = None,
+    graph_l2: float = 0.0,
+    _graph_validated: bool = False,
 ) -> tuple[float, np.ndarray]:
     """Return exact binomial loss for a feature-conditioned IRT model.
 
@@ -360,6 +391,8 @@ def feature_binomial_irt_loss_and_gradient(
     """
     _validate_counts(passed, total)
     _validate_features(features, len(passed))
+    if not _graph_validated:
+        _validate_graph_laplacian(graph_laplacian, len(passed), graph_l2)
     if min(ability_l2, feature_l2, discrimination_l2) < 0.0:
         raise ValueError("feature IRT regularization strengths must be nonnegative")
     _, arm_count = passed.shape
@@ -384,6 +417,10 @@ def feature_binomial_irt_loss_and_gradient(
     loss += ability_l2 * float(np.mean(abilities**2))
     loss += feature_l2 * float(np.mean(difficulty_weights**2))
     loss += discrimination_l2 * float(np.mean(discrimination_weights**2))
+    if graph_laplacian is not None and graph_l2 > 0.0:
+        loss += graph_l2 * float(
+            difficulties @ graph_laplacian @ difficulties / len(difficulties)
+        )
 
     error = (total * expit(logits) - passed) / assertion_count
     ability_gradient = error.T @ discriminations
@@ -395,6 +432,15 @@ def feature_binomial_irt_loss_and_gradient(
         )
     difficulty_gradient = augmented.T @ (-np.sum(error, axis=1))
     difficulty_gradient += 2.0 * feature_l2 * difficulty_weights / difficulty_weights.size
+    if graph_laplacian is not None and graph_l2 > 0.0:
+        difficulty_gradient += (
+            2.0
+            * graph_l2
+            * augmented.T
+            @ graph_laplacian
+            @ difficulties
+            / len(difficulties)
+        )
     discrimination_linear_gradient = (error @ abilities) * expit(discrimination_linear)
     discrimination_gradient = augmented.T @ discrimination_linear_gradient
     discrimination_gradient += (
@@ -546,6 +592,8 @@ def fit_feature_binomial_irt(
     feature_l2: float = DEFAULT_DIFFICULTY_L2,
     discrimination_l2: float = DEFAULT_DISCRIMINATION_L2,
     monotone_luna: bool = False,
+    graph_laplacian: np.ndarray | None = None,
+    graph_l2: float = 0.0,
 ) -> FeatureBinomialIrtFit:
     """Fit a feature-conditioned model for ephemeral grouped evaluation.
 
@@ -554,6 +602,7 @@ def fit_feature_binomial_irt(
     """
     _validate_counts(passed, total)
     _validate_features(features, len(passed))
+    _validate_graph_laplacian(graph_laplacian, len(passed), graph_l2)
     _, arm_count = passed.shape
     feature_count = features.shape[1]
     initial = _initial_feature_parameters(
@@ -594,6 +643,9 @@ def fit_feature_binomial_irt(
         feature_l2=feature_l2,
         discrimination_l2=discrimination_l2,
         monotone_luna=monotone_luna,
+        graph_laplacian=graph_laplacian,
+        graph_l2=graph_l2,
+        _graph_validated=True,
     )
     result = minimize(
         objective,

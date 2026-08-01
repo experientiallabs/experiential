@@ -144,6 +144,115 @@ def test_feature_binomial_irt_gradient_matches_finite_difference() -> None:
     np.testing.assert_allclose(gradient, numerical, atol=1e-6, rtol=1e-5)
 
 
+def test_graph_regularized_feature_gradient_matches_finite_difference() -> None:
+    features = np.asarray(
+        [[-1.0, 0.2], [-0.4, 0.5], [0.3, -0.2], [1.1, 0.7]],
+        dtype=np.float64,
+    )
+    passed = np.asarray(
+        [[0, 1, 2], [1, 2, 3], [2, 3, 4], [3, 4, 5]],
+        dtype=np.float64,
+    )
+    total = np.full_like(passed, 5.0)
+    laplacian = np.asarray(
+        [
+            [1.0, -1.0, 0.0, 0.0],
+            [-1.0, 2.0, -1.0, 0.0],
+            [0.0, -1.0, 2.0, -1.0],
+            [0.0, 0.0, -1.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    latent_dimension = 2
+    parameters = _initial_feature_parameters(features, passed, total, latent_dimension)
+    _, gradient = feature_binomial_irt_loss_and_gradient(
+        parameters,
+        features,
+        passed,
+        total,
+        latent_dimension,
+        graph_laplacian=laplacian,
+        graph_l2=0.3,
+    )
+    epsilon = 1e-6
+    numerical = np.zeros_like(parameters)
+    for index in range(len(parameters)):
+        upper = parameters.copy()
+        lower = parameters.copy()
+        upper[index] += epsilon
+        lower[index] -= epsilon
+        upper_loss = feature_binomial_irt_loss_and_gradient(
+            upper,
+            features,
+            passed,
+            total,
+            latent_dimension,
+            graph_laplacian=laplacian,
+            graph_l2=0.3,
+        )[0]
+        lower_loss = feature_binomial_irt_loss_and_gradient(
+            lower,
+            features,
+            passed,
+            total,
+            latent_dimension,
+            graph_laplacian=laplacian,
+            graph_l2=0.3,
+        )[0]
+        numerical[index] = (upper_loss - lower_loss) / (2.0 * epsilon)
+    np.testing.assert_allclose(gradient, numerical, atol=1e-6, rtol=1e-5)
+
+
+def test_graph_regularization_requires_valid_laplacian() -> None:
+    features = np.asarray([[-1.0], [1.0]], dtype=np.float64)
+    passed = np.asarray([[0, 1], [1, 2]], dtype=np.float64)
+    total = np.full_like(passed, 2.0)
+    parameters = _initial_feature_parameters(features, passed, total, 1)
+    invalid = np.asarray([[1.0, 1.0], [-1.0, 1.0]], dtype=np.float64)
+    with pytest.raises(ValueError, match="symmetric"):
+        feature_binomial_irt_loss_and_gradient(
+            parameters,
+            features,
+            passed,
+            total,
+            1,
+            graph_laplacian=invalid,
+            graph_l2=0.1,
+        )
+    with pytest.raises(ValueError, match="requires"):
+        feature_binomial_irt_loss_and_gradient(
+            parameters,
+            features,
+            passed,
+            total,
+            1,
+            graph_l2=0.1,
+        )
+
+
+def test_graph_regularized_feature_fit_is_finite() -> None:
+    features = np.linspace(-1.5, 1.5, 12, dtype=np.float64)[:, None]
+    abilities = np.linspace(-1.0, 1.0, 6, dtype=np.float64)
+    probabilities = 1.0 / (1.0 + np.exp(-(abilities[None, :] - features)))
+    total = np.full(probabilities.shape, 20.0)
+    passed = np.rint(total * probabilities)
+    adjacency = np.zeros((len(features), len(features)), dtype=np.float64)
+    for index in range(len(features) - 1):
+        adjacency[index, index + 1] = 1.0
+        adjacency[index + 1, index] = 1.0
+    laplacian = np.diag(np.sum(adjacency, axis=1)) - adjacency
+    fit = fit_feature_binomial_irt(
+        features,
+        passed,
+        total,
+        latent_dimension=2,
+        graph_laplacian=laplacian,
+        graph_l2=0.1,
+    )
+    assert np.isfinite(fit.loss)
+    assert fit.difficulty_weights.shape == (2,)
+
+
 def test_monotone_feature_irt_gradient_matches_finite_difference() -> None:
     features = np.asarray(
         [[-1.0, 0.2], [-0.4, 0.5], [0.3, -0.2], [1.1, 0.7]],
