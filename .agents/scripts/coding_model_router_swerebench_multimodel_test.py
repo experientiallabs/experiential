@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import coding_model_router_swerebench_execute as runner
 import coding_model_router_swerebench_multimodel as multimodel
-import pytest
 
 
-def test_configure_binds_terra_without_smoke_reuse(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_configure_binds_terra_without_smoke_reuse() -> None:
     original_validator = runner.REMOTE_VALIDATOR
     original_phase = runner.DEVELOPMENT_PHASE
     original_model = runner.MODEL
@@ -28,12 +25,12 @@ def test_configure_binds_terra_without_smoke_reuse(
         assert '"gpt-5.6-terra"' in runner.REMOTE_VALIDATOR
         assert '"gpt-5.6-luna"' not in runner.REMOTE_VALIDATOR
     finally:
-        monkeypatch.setattr(runner, "REMOTE_VALIDATOR", original_validator)
-        monkeypatch.setattr(runner, "DEVELOPMENT_PHASE", original_phase)
-        monkeypatch.setattr(runner, "MODEL", original_model)
-        monkeypatch.setattr(runner, "DEFAULT_PRIOR_SPEND_USD", original_prior_spend)
-        monkeypatch.setattr(runner, "REUSED_TASKS", original_reused)
-        monkeypatch.setattr(runner, "SMOKE_ARCHIVE_SHA256", original_archives)
+        runner.REMOTE_VALIDATOR = original_validator
+        runner.DEVELOPMENT_PHASE = original_phase
+        runner.MODEL = original_model
+        runner.DEFAULT_PRIOR_SPEND_USD = original_prior_spend
+        runner.REUSED_TASKS = original_reused
+        runner.SMOKE_ARCHIVE_SHA256 = original_archives
 
 
 def test_model_prices_cover_every_supported_model() -> None:

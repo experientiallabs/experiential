@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import coding_model_router_model_effort_confirm as confirm
 import coding_model_router_swerebench_execute as runner
-import pytest
 
 
-def test_configure_binds_exact_single_arm(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_configure_binds_exact_single_arm() -> None:
     originals = {
         "model": runner.MODEL,
         "efforts": runner.EFFORTS,
@@ -27,11 +26,11 @@ def test_configure_binds_exact_single_arm(monkeypatch: pytest.MonkeyPatch) -> No
         assert runner.DEVELOPMENT_PHASE.reuse_smoke is False
         assert runner.DEFAULT_PRIOR_SPEND_USD == 2_000.0
     finally:
-        monkeypatch.setattr(runner, "MODEL", originals["model"])
-        monkeypatch.setattr(runner, "EFFORTS", originals["efforts"])
-        monkeypatch.setattr(runner, "DEVELOPMENT_PHASE", originals["phase"])
-        monkeypatch.setattr(runner, "REMOTE_VALIDATOR", originals["validator"])
-        monkeypatch.setattr(runner, "REUSED_TASKS", originals["reused"])
-        monkeypatch.setattr(runner, "SMOKE_ARCHIVE_SHA256", originals["archives"])
-        monkeypatch.setattr(runner, "DEFAULT_PRIOR_SPEND_USD", originals["spend"])
-        monkeypatch.setattr(runner, "EXTERNAL_AUTHORIZATION", originals["authorization"])
+        runner.MODEL = originals["model"]
+        runner.EFFORTS = originals["efforts"]
+        runner.DEVELOPMENT_PHASE = originals["phase"]
+        runner.REMOTE_VALIDATOR = originals["validator"]
+        runner.REUSED_TASKS = originals["reused"]
+        runner.SMOKE_ARCHIVE_SHA256 = originals["archives"]
+        runner.DEFAULT_PRIOR_SPEND_USD = originals["spend"]
+        runner.EXTERNAL_AUTHORIZATION = originals["authorization"]

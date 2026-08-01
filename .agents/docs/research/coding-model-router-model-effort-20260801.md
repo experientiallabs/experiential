@@ -70,3 +70,26 @@ telemetry is preserved when available; otherwise reporting uses a clearly labele
 list-price estimate. All model execution and fitting run on E2B or Azure. The local Mac only
 orchestrates, validates small artifacts, and records results. No Modal app or persisted model is
 used. The frozen rough cumulative spend before this matrix is USD 1,123.9297378.
+
+## Result
+
+The result is terminal negative on external development. DeepSWE remained sealed and no external
+confirmation provider call was launched.
+
+The merged matrix retained 194 of 200 tasks, or 97 percent, with 5,820 dense scientific cells.
+Sol completed 194 tasks and excluded 6 whole tasks. Terra completed 195 tasks and excluded 5 whole
+tasks. The six-task union was excluded across every model and effort. No scientific cell was
+rerun. New trace-derived spend was USD 1,901.17832175, for rough cumulative experiment spend of
+USD 3,025.10805955.
+
+The strongest static arm was `sol-max`, with mean reward 0.729381 and mean cost USD 0.959561 per
+task. The full 15-arm oracle reached reward 0.840206 at USD 0.257736 per task. Nine of the fourteen
+`sol-max` pair oracles could satisfy the frozen point gates. For example, the
+`sol-max` plus `luna-low` oracle reached reward 0.744845 at USD 0.505041 per task, 47.37 percent
+savings, 102.12 percent quality retention, and 0.208404 matched-blind advantage. The action space
+therefore has substantial complementarity.
+
+None of the 1,596 frozen task-text Ridge and kNN candidates passed development. The failure is not
+lack of oracle headroom. It is lack of generalizable task-text signal in the tested representation
+and estimators. The no-internet E2B fit exited successfully, persisted no fitted numeric state, and
+returned only the terminal-negative selection report.
