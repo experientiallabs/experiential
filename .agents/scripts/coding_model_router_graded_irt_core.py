@@ -17,6 +17,8 @@ from scipy.special import expit
 DEFAULT_ABILITY_L2 = 0.01
 DEFAULT_DIFFICULTY_L2 = 0.01
 DEFAULT_DISCRIMINATION_L2 = 0.05
+FROZEN_ARM_COUNT = 6
+LUNA_ARM_COUNT = 5
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,56 @@ def _augment_features(features: np.ndarray) -> np.ndarray:
 def _softplus(values: np.ndarray) -> np.ndarray:
     """Return a stable positive discrimination transform."""
     return np.logaddexp(0.0, values) + 1e-6
+
+
+def _monotone_luna_abilities(raw_abilities: np.ndarray) -> np.ndarray:
+    """Map raw abilities to a monotone first coordinate for the five Luna arms."""
+    if (
+        raw_abilities.ndim != 2
+        or raw_abilities.shape[0] != FROZEN_ARM_COUNT
+        or raw_abilities.shape[1] < 1
+    ):
+        raise ValueError("monotone Luna abilities require the frozen six-arm roster")
+    abilities = raw_abilities.copy()
+    increments = _softplus(raw_abilities[1:LUNA_ARM_COUNT, 0])
+    abilities[1:LUNA_ARM_COUNT, 0] = raw_abilities[0, 0] + np.cumsum(increments)
+    return abilities
+
+
+def _monotone_luna_raw_gradient(
+    raw_abilities: np.ndarray,
+    ability_gradient: np.ndarray,
+) -> np.ndarray:
+    """Apply the monotone Luna parameterization Jacobian to an ability gradient."""
+    if raw_abilities.shape != ability_gradient.shape:
+        raise ValueError("ability gradient must match raw abilities")
+    _monotone_luna_abilities(raw_abilities)
+    raw_gradient = ability_gradient.copy()
+    luna_gradient = ability_gradient[:LUNA_ARM_COUNT, 0]
+    suffix = np.cumsum(luna_gradient[::-1])[::-1]
+    raw_gradient[0, 0] = suffix[0]
+    raw_gradient[1:LUNA_ARM_COUNT, 0] = (
+        expit(raw_abilities[1:LUNA_ARM_COUNT, 0]) * suffix[1:]
+    )
+    return raw_gradient
+
+
+def _monotone_luna_initial(raw_abilities: np.ndarray) -> np.ndarray:
+    """Convert initial direct abilities to the monotone raw parameterization."""
+    if (
+        raw_abilities.ndim != 2
+        or raw_abilities.shape[0] != FROZEN_ARM_COUNT
+        or raw_abilities.shape[1] < 1
+    ):
+        raise ValueError("monotone Luna initialization requires the frozen six-arm roster")
+    raw = raw_abilities.copy()
+    target = raw_abilities[:LUNA_ARM_COUNT, 0].copy()
+    for index in range(1, LUNA_ARM_COUNT):
+        target[index] = max(target[index], target[index - 1] + 0.01)
+    raw[0, 0] = target[0]
+    positive = np.maximum(np.diff(target) - 1e-6, 1e-6)
+    raw[1:LUNA_ARM_COUNT, 0] = np.log(np.expm1(positive))
+    return raw
 
 
 def _tilted_distribution(
@@ -298,6 +350,7 @@ def feature_binomial_irt_loss_and_gradient(
     ability_l2: float = DEFAULT_ABILITY_L2,
     feature_l2: float = DEFAULT_DIFFICULTY_L2,
     discrimination_l2: float = DEFAULT_DISCRIMINATION_L2,
+    monotone_luna: bool = False,
 ) -> tuple[float, np.ndarray]:
     """Return exact binomial loss for a feature-conditioned IRT model.
 
@@ -310,11 +363,16 @@ def feature_binomial_irt_loss_and_gradient(
     if min(ability_l2, feature_l2, discrimination_l2) < 0.0:
         raise ValueError("feature IRT regularization strengths must be nonnegative")
     _, arm_count = passed.shape
-    abilities, difficulty_weights, discrimination_weights = _unpack_feature_parameters(
+    raw_abilities, difficulty_weights, discrimination_weights = _unpack_feature_parameters(
         parameters,
         arm_count,
         features.shape[1],
         latent_dimension,
+    )
+    abilities = (
+        _monotone_luna_abilities(raw_abilities)
+        if monotone_luna
+        else raw_abilities
     )
     augmented = _augment_features(features)
     difficulties = augmented @ difficulty_weights
@@ -330,6 +388,11 @@ def feature_binomial_irt_loss_and_gradient(
     error = (total * expit(logits) - passed) / assertion_count
     ability_gradient = error.T @ discriminations
     ability_gradient += 2.0 * ability_l2 * abilities / abilities.size
+    if monotone_luna:
+        ability_gradient = _monotone_luna_raw_gradient(
+            raw_abilities,
+            ability_gradient,
+        )
     difficulty_gradient = augmented.T @ (-np.sum(error, axis=1))
     difficulty_gradient += 2.0 * feature_l2 * difficulty_weights / difficulty_weights.size
     discrimination_linear_gradient = (error @ abilities) * expit(discrimination_linear)
@@ -482,8 +545,13 @@ def fit_feature_binomial_irt(
     ability_l2: float = DEFAULT_ABILITY_L2,
     feature_l2: float = DEFAULT_DIFFICULTY_L2,
     discrimination_l2: float = DEFAULT_DISCRIMINATION_L2,
+    monotone_luna: bool = False,
 ) -> FeatureBinomialIrtFit:
-    """Fit a feature-conditioned model for ephemeral grouped evaluation."""
+    """Fit a feature-conditioned model for ephemeral grouped evaluation.
+
+    When ``monotone_luna`` is enabled, the first latent ability coordinate is constrained to
+    increase from Luna low through Luna max. The sixth Sol arm remains unconstrained.
+    """
     _validate_counts(passed, total)
     _validate_features(features, len(passed))
     _, arm_count = passed.shape
@@ -499,6 +567,22 @@ def fit_feature_binomial_irt(
         feature_count,
         latent_dimension,
     )
+    if monotone_luna:
+        raw_abilities, difficulty_weights, discrimination_weights = (
+            _unpack_feature_parameters(
+                initial,
+                arm_count,
+                feature_count,
+                latent_dimension,
+            )
+        )
+        initial = np.concatenate(
+            [
+                _monotone_luna_initial(raw_abilities).ravel(),
+                difficulty_weights,
+                discrimination_weights.ravel(),
+            ]
+        )
     bounds = (
         [(-8.0, 8.0)] * ability_size
         + [(-8.0, 8.0)] * difficulty_size
@@ -509,6 +593,7 @@ def fit_feature_binomial_irt(
         ability_l2=ability_l2,
         feature_l2=feature_l2,
         discrimination_l2=discrimination_l2,
+        monotone_luna=monotone_luna,
     )
     result = minimize(
         objective,
@@ -521,11 +606,16 @@ def fit_feature_binomial_irt(
     )
     if not result.success or not np.isfinite(result.fun):
         raise RuntimeError(f"feature binomial IRT optimization failed: {result.message}")
-    abilities, difficulty_weights, discrimination_weights = _unpack_feature_parameters(
+    raw_abilities, difficulty_weights, discrimination_weights = _unpack_feature_parameters(
         np.asarray(result.x, dtype=np.float64),
         arm_count,
         feature_count,
         latent_dimension,
+    )
+    abilities = (
+        _monotone_luna_abilities(raw_abilities)
+        if monotone_luna
+        else raw_abilities
     )
     return FeatureBinomialIrtFit(
         abilities=abilities.copy(),

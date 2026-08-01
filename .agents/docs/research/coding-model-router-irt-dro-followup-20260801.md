@@ -85,9 +85,12 @@ The prepared numeric core lives in
 `.agents/scripts/coding_model_router_graded_irt_core.py`. It implements the exact count-weighted
 binomial likelihood, analytic gradients, multidimensional nonnegative discrimination, a pre-call
 feature-conditioned variant that can score unseen tasks, and the forward-KL repository robust
-lower bound. Its inline tests cover finite-difference gradients, exact denominator weighting,
-unseen-task prediction, and the KL solution. The module has no filesystem or serialization
-surface. It remains conditional infrastructure and does not activate this lane.
+lower bound. It also implements the frozen monotone-capacity variant with a differentiable
+cumulative-softplus parameterization on the first latent coordinate for Luna low through max; the
+sixth Sol arm remains unconstrained. Its inline tests cover finite-difference gradients for both
+ability variants, exact denominator weighting, unseen-task prediction, monotone Luna ordering, and
+the KL solution. The module has no filesystem or serialization surface. It remains conditional
+infrastructure and does not activate this lane.
 
 All fitting, cross-validation, bootstrapping, and latency measurement run on E2B or Azure. The Mac
 only orchestrates and validates bounded artifacts. No foundation model, task embedding bank, or

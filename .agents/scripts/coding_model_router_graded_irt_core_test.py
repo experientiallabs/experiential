@@ -144,6 +144,53 @@ def test_feature_binomial_irt_gradient_matches_finite_difference() -> None:
     np.testing.assert_allclose(gradient, numerical, atol=1e-6, rtol=1e-5)
 
 
+def test_monotone_feature_irt_gradient_matches_finite_difference() -> None:
+    features = np.asarray(
+        [[-1.0, 0.2], [-0.4, 0.5], [0.3, -0.2], [1.1, 0.7]],
+        dtype=np.float64,
+    )
+    passed = np.asarray(
+        [[0, 1, 2, 3, 4, 2], [1, 2, 3, 4, 5, 3], [2, 3, 4, 5, 5, 4], [3, 4, 5, 5, 5, 5]],
+        dtype=np.float64,
+    )
+    total = np.full_like(passed, 5.0)
+    latent_dimension = 2
+    parameters = _initial_feature_parameters(features, passed, total, latent_dimension)
+    _, gradient = feature_binomial_irt_loss_and_gradient(
+        parameters,
+        features,
+        passed,
+        total,
+        latent_dimension,
+        monotone_luna=True,
+    )
+    epsilon = 1e-6
+    numerical = np.zeros_like(parameters)
+    for index in range(len(parameters)):
+        upper = parameters.copy()
+        lower = parameters.copy()
+        upper[index] += epsilon
+        lower[index] -= epsilon
+        upper_loss = feature_binomial_irt_loss_and_gradient(
+            upper,
+            features,
+            passed,
+            total,
+            latent_dimension,
+            monotone_luna=True,
+        )[0]
+        lower_loss = feature_binomial_irt_loss_and_gradient(
+            lower,
+            features,
+            passed,
+            total,
+            latent_dimension,
+            monotone_luna=True,
+        )[0]
+        numerical[index] = (upper_loss - lower_loss) / (2.0 * epsilon)
+    np.testing.assert_allclose(gradient, numerical, atol=1e-6, rtol=1e-5)
+
+
 def test_multidimensional_fit_recovers_arm_order() -> None:
     task_count = 36
     arm_count = 6
@@ -178,6 +225,26 @@ def test_feature_fit_predicts_unseen_task_probabilities() -> None:
     assert predicted.shape == (3, 6)
     assert np.all(np.diff(np.mean(predicted, axis=0)) > 0.0)
     assert np.all(np.diff(predicted[:, -1]) < 0.0)
+
+
+def test_monotone_feature_fit_orders_luna_capacity_only() -> None:
+    train_features = np.linspace(-1.5, 1.5, 40, dtype=np.float64)[:, None]
+    arm_abilities = np.asarray([-1.2, -0.7, -0.1, 0.5, 1.1, 0.2], dtype=np.float64)
+    logits = arm_abilities[None, :] - train_features
+    probabilities = 1.0 / (1.0 + np.exp(-logits))
+    total = np.full(probabilities.shape, 40.0)
+    passed = np.rint(total * probabilities)
+    fit = fit_feature_binomial_irt(
+        train_features,
+        passed,
+        total,
+        latent_dimension=2,
+        monotone_luna=True,
+    )
+    assert np.all(np.diff(fit.abilities[:5, 0]) > 0.0)
+    assert fit.abilities[5, 0] < fit.abilities[4, 0]
+    predicted = predict_feature_probabilities(fit, np.asarray([[0.0]]))
+    assert np.all(np.diff(predicted[0, :5]) > 0.0)
 
 
 def test_kl_robust_lower_bound_matches_two_repository_search() -> None:
