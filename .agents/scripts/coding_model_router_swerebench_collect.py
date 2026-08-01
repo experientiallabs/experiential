@@ -50,6 +50,10 @@ class CollectionPhase:
     corpus_sha256: str
     provenance: str
     reuse_smoke: bool
+    requires_authorization: bool
+    model: str
+    arm_prefix: str
+    prices_per_mtok: tuple[float, float, float]
 
 
 DEVELOPMENT_PHASE = CollectionPhase(
@@ -59,6 +63,10 @@ DEVELOPMENT_PHASE = CollectionPhase(
     corpus_sha256=CORPUS_SHA256,
     provenance="development-matrix",
     reuse_smoke=True,
+    requires_authorization=False,
+    model="gpt-5.6-luna",
+    arm_prefix="luna",
+    prices_per_mtok=(1.0, 0.1, 6.0),
 )
 CONFIRMATION_PHASE = CollectionPhase(
     name="confirmation",
@@ -67,6 +75,10 @@ CONFIRMATION_PHASE = CollectionPhase(
     corpus_sha256=CONFIRMATION_CORPUS_SHA256,
     provenance="confirmation-matrix",
     reuse_smoke=False,
+    requires_authorization=True,
+    model="gpt-5.6-luna",
+    arm_prefix="luna",
+    prices_per_mtok=(1.0, 0.1, 6.0),
 )
 POOLED_CONFIRMATION_PHASE = CollectionPhase(
     name="pooled-confirmation",
@@ -75,6 +87,10 @@ POOLED_CONFIRMATION_PHASE = CollectionPhase(
     corpus_sha256=POOLED_CONFIRMATION_CORPUS_SHA256,
     provenance="pooled-confirmation-matrix",
     reuse_smoke=False,
+    requires_authorization=True,
+    model="gpt-5.6-luna",
+    arm_prefix="luna",
+    prices_per_mtok=(1.0, 0.1, 6.0),
 )
 
 
@@ -112,6 +128,7 @@ def _launch_context(root: Path, phase: CollectionPhase) -> tuple[float, dict[str
     if (
         launch.get("protocol") != phase.execution_protocol
         or launch.get("corpus_sha256") != phase.corpus_sha256
+        or launch.get("model") != phase.model
         or launch.get("deep_swe_outcomes_accessed") is not False
         or launch.get("model_persisted") is not False
     ):
@@ -124,7 +141,7 @@ def _launch_context(root: Path, phase: CollectionPhase) -> tuple[float, dict[str
     ):
         raise ValueError(f"{phase.name} launch has invalid prior spend")
     context: dict[str, object] = {"launch_sha256": _sha256(launch_path)}
-    if not phase.reuse_smoke:
+    if phase.requires_authorization:
         authorization = launch.get("authorization")
         if (
             launch.get("confirmation_outcomes_accessed_before_launch") is not False
@@ -149,11 +166,12 @@ def _usage(value: object, label: str) -> dict[str, int]:
     return result
 
 
-def _cost(usage: dict[str, int]) -> float:
+def _cost(usage: dict[str, int], phase: CollectionPhase = DEVELOPMENT_PHASE) -> float:
+    input_rate, cached_input_rate, output_rate = phase.prices_per_mtok
     return (
-        usage["prompt_tokens"] / 1_000_000
-        + usage["cached_input_tokens"] * 0.1 / 1_000_000
-        + usage["completion_tokens"] * 6.0 / 1_000_000
+        usage["prompt_tokens"] * input_rate / 1_000_000
+        + usage["cached_input_tokens"] * cached_input_rate / 1_000_000
+        + usage["completion_tokens"] * output_rate / 1_000_000
     )
 
 
@@ -194,6 +212,7 @@ def _outcome(
     cell: dict[str, Any],
     *,
     provenance: str,
+    phase: CollectionPhase = DEVELOPMENT_PHASE,
 ) -> dict[str, object]:
     reward = cell.get("reward")
     if (
@@ -209,14 +228,14 @@ def _outcome(
         "language": str(task["language"]),
         "prompt": str(task["prompt"]),
         "prompt_sha256": str(task["prompt_sha256"]),
-        "arm": f"luna-{effort}",
-        "model": "gpt-5.6-luna",
+        "arm": f"{phase.arm_prefix}-{effort}",
+        "model": phase.model,
         "reasoning_effort": effort,
         "attempt_number": attempt,
         "reward": float(reward),
         "reward_provenance": cell.get("reward_provenance", "official verifier"),
         "official_verifier_reached": cell.get("official_verifier_reached", True),
-        "cost_usd": _cost(usage),
+        "cost_usd": _cost(usage, phase),
         "cost_provenance": "trace-derived frozen list-price estimate",
         "usage": usage,
         "provider_calls": int(cell.get("provider_calls", 0)),
@@ -299,7 +318,7 @@ def collect(
             exclusion_usage = _usage(
                 exclusion.get("usage"), f"task {index} exclusion usage"
             )
-            excluded_infrastructure_cost += _cost(exclusion_usage)
+            excluded_infrastructure_cost += _cost(exclusion_usage, phase)
             excluded_efforts = _object(
                 state.get("efforts"), f"task {index} completed excluded efforts"
             )
@@ -312,7 +331,8 @@ def collect(
                     _usage(
                         payload.get("usage"),
                         f"task {index} completed excluded effort usage",
-                    )
+                    ),
+                    phase,
                 )
             exclusions.append(
                 {
@@ -384,6 +404,7 @@ def collect(
                         attempt,
                         attempt_cells[attempt],
                         provenance=provenance,
+                        phase=phase,
                     )
                 )
                 if smoke_cell is not None and attempt == 0:
@@ -422,6 +443,8 @@ def collect(
         "retained_task_coverage": retained_tasks / SOURCE_TASKS,
         "excluded_tasks": exclusions,
         "efforts": list(EFFORTS),
+        "model": phase.model,
+        "arm_prefix": phase.arm_prefix,
         "attempts_per_effort": 2,
         "cells": expected_cells,
         "unique_cell_identities": len(identities),
@@ -446,7 +469,7 @@ def collect(
     }
     if phase.reuse_smoke:
         audit["smoke_report_sha256"] = SMOKE_REPORT_SHA256
-    else:
+    elif phase.requires_authorization:
         audit["confirmation_outcomes_accessed"] = True
         audit["confirmation_authorization_preserved"] = True
     (output / "completion-audit.json").write_text(

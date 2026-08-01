@@ -21,6 +21,7 @@ def test_development_launch_context_preserves_prior_spend(tmp_path: Path) -> Non
         {
             "protocol": collect.DEVELOPMENT_EXECUTION_PROTOCOL,
             "corpus_sha256": collect.CORPUS_SHA256,
+            "model": "gpt-5.6-luna",
             "prior_spend_usd": 405.7678502,
             "deep_swe_outcomes_accessed": False,
             "model_persisted": False,
@@ -48,6 +49,7 @@ def test_confirmation_launch_context_requires_frozen_authorization(
         {
             "protocol": collect.CONFIRMATION_EXECUTION_PROTOCOL,
             "corpus_sha256": collect.CONFIRMATION_CORPUS_SHA256,
+            "model": "gpt-5.6-luna",
             "prior_spend_usd": 640.0,
             "deep_swe_outcomes_accessed": False,
             "model_persisted": False,
@@ -73,6 +75,7 @@ def test_confirmation_launch_context_rejects_preaccessed_outcomes(
         {
             "protocol": collect.CONFIRMATION_EXECUTION_PROTOCOL,
             "corpus_sha256": collect.CONFIRMATION_CORPUS_SHA256,
+            "model": "gpt-5.6-luna",
             "prior_spend_usd": 640.0,
             "deep_swe_outcomes_accessed": False,
             "model_persisted": False,
