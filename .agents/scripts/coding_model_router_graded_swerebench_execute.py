@@ -366,13 +366,22 @@ def _completed(task_dir: Path, arm: Arm, value: object) -> bool:
 
 
 def _excluded(state: dict[str, Any]) -> bool:
-    """Return whether a gradeable cell was lost only after scientific completion."""
+    """Return whether one frozen cell made the whole task unusable without a rerun."""
     exclusion = state.get("exclusion")
     return (
-        state.get("stage") == "excluded-audit-artifact-loss"
-        and isinstance(exclusion, dict)
+        isinstance(exclusion, dict)
+        and (state.get("stage"), exclusion.get("reason"))
+        in {
+            (
+                "excluded-audit-artifact-loss",
+                "validator rejected official no-change trace",
+            ),
+            (
+                "excluded-ungradeable-scientific-cell",
+                "official trace lacked a graded reward after one frozen attempt",
+            ),
+        }
         and exclusion.get("scope") == "whole-task"
-        and exclusion.get("reason") == "validator rejected official no-change trace"
         and isinstance(exclusion.get("arm"), str)
         and exclusion.get("observed_scientific_cells") == 1
         and exclusion.get("scientific_cells_rerun") == 0

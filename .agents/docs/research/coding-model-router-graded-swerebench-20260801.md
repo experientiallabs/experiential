@@ -131,3 +131,9 @@ permanently excluded whole-task with zero scientific reruns. The watcher now wai
 controller persists the pulled Docker image identity, which occurs after the controller validator
 write, before installing the corrected audit-only validator. The resulting 664 of 673 maximum
 development coverage is 98.7 percent, above the frozen 95 percent requirement.
+
+One later `luna-high` cell for `open-telemetry__opentelemetry-swift-763` completed its single
+frozen agent attempt but produced no official graded reward. Its worker had already terminated, so
+the trace and provider usage were irrecoverable. The task is permanently excluded across all six
+arms with zero reruns under the frozen missing-cell rule. The resulting 663 of 673 maximum
+development coverage is 98.5 percent, above the frozen requirement.
