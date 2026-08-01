@@ -24,8 +24,13 @@ POOLED_CONFIRMATION_PROTOCOL = "coding-router-pooled-uplift-confirmation-executi
 TEMPLATE_NAME = "deepswe-router-responses-v2"
 TEMPLATE_ID = "j1a2bxbpllu3rp84b4qj"
 TEMPLATE_BUILD_ID = "e971c040-95bd-45c1-89ee-fb597bf75671"
-MODEL = "gpt-5.6-luna"
+MODEL: str = "gpt-5.6-luna"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+MODEL_PRICES_PER_MTOK = {
+    "gpt-5.6-luna": (1.0, 0.1, 6.0),
+    "gpt-5.6-terra": (2.5, 0.25, 15.0),
+    "gpt-5.6-sol": (5.0, 0.5, 30.0),
+}
 CORPUS_SHA256 = "7d846b5576d15e68fd18ac21bfe0610cc1614b3b35ec0ae0cb8cfae0b82962c1"
 CONFIRMATION_CORPUS_SHA256 = (
     "9798dd1e58be0d13331d097307670dc3fc3760ad211da20e6367666523f080a7"
@@ -111,7 +116,7 @@ POOLED_CONFIRMATION_PHASE = ExecutionPhase(
     metadata_owner="coding-router-v42",
 )
 
-REMOTE_VALIDATOR = r'''"""Audit new matrix traces and write a compact report."""
+REMOTE_VALIDATOR: str = r'''"""Audit new matrix traces and write a compact report."""
 import argparse
 import hashlib
 import json
@@ -898,10 +903,11 @@ def _update_summary(
                 excluded_tasks += 1
             if state.get("stage") == "failed":
                 failed_tasks += 1
+        input_rate, cached_input_rate, output_rate = MODEL_PRICES_PER_MTOK[MODEL]
         cost = (
-            usage["prompt_tokens"] / 1_000_000
-            + usage["cached_input_tokens"] * 0.1 / 1_000_000
-            + usage["completion_tokens"] * 6.0 / 1_000_000
+            usage["prompt_tokens"] * input_rate / 1_000_000
+            + usage["cached_input_tokens"] * cached_input_rate / 1_000_000
+            + usage["completion_tokens"] * output_rate / 1_000_000
         )
         _write_json(
             root / "progress.json",
@@ -920,6 +926,7 @@ def _update_summary(
                 "provider_calls": provider_calls,
                 "usage": usage,
                 "matrix_cost_usd": cost,
+                "cost_provenance": "trace-derived frozen list-price estimate",
                 "rough_cumulative_experiment_spend_usd": prior_spend_usd + cost,
             },
         )
