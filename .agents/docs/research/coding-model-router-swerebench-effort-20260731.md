@@ -64,6 +64,18 @@ development candidate and every confirmation gate are content-addressed.
   `95fa38ac-01fa-45b5-841d-72e17fce0819`
 - E2B account cap: 1,000 sandboxes
 
+The filtered dataset rewrites each upstream
+`docker.io/swerebenchv2/<name>:<tag>` image to the Prime-only alias
+`prime/primeintellect/<name>:<tag>`. E2B's Docker runtime cannot resolve that
+alias. Before loading tasks, the runtime verifies the pinned official taskset
+source hash
+`b7dab7d2b263d6d296cc9e2e4b9b4597cc3fbba040d3036a139cf0fb4432e730`
+and applies
+`.agents/scripts/coding_model_router_swerebench_docker_adapter.py`. The adapter
+reverses exactly the documented registry rewrite and changes no prompt, task,
+test, verifier, resource, or reward field. Its preimage hash, postimage hash,
+and mapping report must persist with every run.
+
 The official `swerebench_v2_v1` taskset restores test files, applies the hidden
 test patch only at scoring time, runs the pinned test command, and returns one
 only when every fail-to-pass and pass-to-pass test passes. Empty patches,
@@ -77,6 +89,28 @@ provider turn. Exact usage telemetry is retained when available. Otherwise the
 ledger uses the existing trace-derived estimator and labels that provenance.
 Frozen list prices are USD 1.00 per million input tokens, USD 0.10 per million
 cached input tokens, and USD 6.00 per million output tokens.
+
+## Infrastructure repair record
+
+The first smoke invocation reached zero provider turns in all four cells and
+stopped with `SandboxError` because Docker treated the Prime aliases as Docker
+Hub names. These are infrastructure failures, not model outcomes. The raw
+failed artifacts remain under
+`/private/tmp/coding-router-swerebench-v40-smoke`; no cell was replaced and no
+scientific attempt number was consumed.
+
+A zero-provider E2B probe on 2026-07-31 verified the adapter against the pinned
+taskset source. It pulled both exact frozen images from Docker Hub:
+
+- `0xs34n-starknet.js:538-72d73f6`, image ID
+  `sha256:bab8a1ea7e8dd5755faed8f0775f94f94f1cea0f8812d3f88d425526f61461cc`
+- `acloudguru-serverless-plugin-aws-alerts:13-3d02390`, image ID
+  `sha256:324c193d3ffd988872c40b5a39866b28f028ae04059b285f71e792af516d7d9d`
+
+The adapter output hash was
+`a2790c3f296a28f40eb8732d68c091cc7b9899e08916aedec6b2b53a644f7b3e`.
+The exact probe sandbox `ia52cg7dc80uxregp3qr6` was terminated after artifact
+sync. Resume must use the same four task, effort, and attempt identities.
 
 ## Smoke and matrix launch
 
