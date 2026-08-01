@@ -570,6 +570,7 @@ def _grade(task: dict[str, Any], patch: str, root: Path) -> dict[str, Any]:
                 _docker("cp", str(patch_path), f"{box.cid}:/logs/artifacts/model.patch", timeout=120.0)
             box.bash("chmod +x /tests/test.sh")
             output = box.bash(
+                "export PATH=/opt/venv/bin:$PATH; "
                 "bash /tests/test.sh 2>&1 | tail -c 4000; "
                 "echo '---REWARD---'; cat /logs/verifier/reward.json 2>/dev/null",
                 timeout=VERIFY_TIMEOUT_S,
