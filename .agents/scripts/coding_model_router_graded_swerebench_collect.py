@@ -93,6 +93,10 @@ def _excluded(state: dict[str, Any]) -> bool:
                 "excluded-ungradeable-scientific-cell",
                 "official trace lacked a graded reward after one frozen attempt",
             ),
+            (
+                "excluded-ungradeable-scientific-cell",
+                "scientific artifact became irrecoverable after E2B transport loss",
+            ),
         }
         and exclusion.get("scope") == "whole-task"
         and exclusion.get("observed_scientific_cells") == 1

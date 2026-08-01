@@ -137,3 +137,11 @@ frozen agent attempt but produced no official graded reward. Its worker had alre
 the trace and provider usage were irrecoverable. The task is permanently excluded across all six
 arms with zero reruns under the frozen missing-cell rule. The resulting 663 of 673 maximum
 development coverage is 98.5 percent, above the frozen requirement.
+
+A later E2B HTTP/2 control-plane failure affected seven task workers. Five failed before their
+scientific command started and remain eligible for the single frozen infrastructure retry.
+`switchbacktech__compass-519` completed its `luna-max` command without a graded reward, and
+`azuread__microsoft-authentication-library-for-python-315` started its `luna-xhigh` command before
+the transport failed and its sandbox was terminated. Neither scientific cell can be recovered or
+rerun. Both tasks are permanently excluded whole-task. The resulting 661 of 673 maximum
+development coverage is 98.2 percent, above the frozen requirement.
