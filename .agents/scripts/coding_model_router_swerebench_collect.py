@@ -15,11 +15,18 @@ logger = logging.getLogger("coding-router-swerebench-collect")
 
 PROTOCOL = "coding-router-swerebench-development-collection-v2"
 CONFIRMATION_PROTOCOL = "coding-router-swerebench-confirmation-collection-v1"
+POOLED_CONFIRMATION_PROTOCOL = "coding-router-pooled-uplift-confirmation-collection-v1"
 DEVELOPMENT_EXECUTION_PROTOCOL = "coding-router-swerebench-development-execution-v1"
 CONFIRMATION_EXECUTION_PROTOCOL = "coding-router-swerebench-confirmation-execution-v1"
+POOLED_CONFIRMATION_EXECUTION_PROTOCOL = (
+    "coding-router-pooled-uplift-confirmation-execution-v1"
+)
 CORPUS_SHA256 = "7d846b5576d15e68fd18ac21bfe0610cc1614b3b35ec0ae0cb8cfae0b82962c1"
 CONFIRMATION_CORPUS_SHA256 = (
     "9798dd1e58be0d13331d097307670dc3fc3760ad211da20e6367666523f080a7"
+)
+POOLED_CONFIRMATION_CORPUS_SHA256 = (
+    "6edd8ed4777d6bc48cf29f76a9fb4b9d60e3324908aa79d4d03df8617f6be825"
 )
 SMOKE_REPORT_SHA256 = "ee76a57040cbe7aaef692d2fc3f3df66d7a556cbf6dda74119e0802cb4230e13"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -61,6 +68,14 @@ CONFIRMATION_PHASE = CollectionPhase(
     provenance="confirmation-matrix",
     reuse_smoke=False,
 )
+POOLED_CONFIRMATION_PHASE = CollectionPhase(
+    name="pooled-confirmation",
+    protocol=POOLED_CONFIRMATION_PROTOCOL,
+    execution_protocol=POOLED_CONFIRMATION_EXECUTION_PROTOCOL,
+    corpus_sha256=POOLED_CONFIRMATION_CORPUS_SHA256,
+    provenance="pooled-confirmation-matrix",
+    reuse_smoke=False,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -86,6 +101,8 @@ def _collection_phase(name: str) -> CollectionPhase:
         return DEVELOPMENT_PHASE
     if name == CONFIRMATION_PHASE.name:
         return CONFIRMATION_PHASE
+    if name == POOLED_CONFIRMATION_PHASE.name:
+        return POOLED_CONFIRMATION_PHASE
     raise ValueError(f"unknown collection phase: {name!r}")
 
 
@@ -107,7 +124,7 @@ def _launch_context(root: Path, phase: CollectionPhase) -> tuple[float, dict[str
     ):
         raise ValueError(f"{phase.name} launch has invalid prior spend")
     context: dict[str, object] = {"launch_sha256": _sha256(launch_path)}
-    if phase is CONFIRMATION_PHASE:
+    if not phase.reuse_smoke:
         authorization = launch.get("authorization")
         if (
             launch.get("confirmation_outcomes_accessed_before_launch") is not False
@@ -452,7 +469,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--phase",
-        choices=(DEVELOPMENT_PHASE.name, CONFIRMATION_PHASE.name),
+        choices=(
+            DEVELOPMENT_PHASE.name,
+            CONFIRMATION_PHASE.name,
+            POOLED_CONFIRMATION_PHASE.name,
+        ),
         default=DEVELOPMENT_PHASE.name,
     )
     args = parser.parse_args()

@@ -247,6 +247,15 @@ def test_confirmation_never_reuses_development_smoke_cells() -> None:
     assert execute._new_rollouts(task_id, "xhigh", reuse_smoke=False) == (2, 0)
 
 
+def test_pooled_confirmation_has_frozen_phase_and_raised_concurrency() -> None:
+    phase = execute._execution_phase("pooled-confirmation")
+    assert phase is execute.POOLED_CONFIRMATION_PHASE
+    assert phase.metadata_owner == "coding-router-v42"
+    assert phase.reuse_smoke is False
+    assert execute._max_concurrency(phase) == 200
+    assert execute._max_concurrency(execute.CONFIRMATION_PHASE) == 100
+
+
 def test_recovery_helpers_can_load_executor_without_sys_modules_registration() -> None:
     path = Path(execute.__file__)
     spec = importlib.util.spec_from_file_location("detached_swerebench_execute", path)

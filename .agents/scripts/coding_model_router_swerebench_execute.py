@@ -20,6 +20,7 @@ logger = logging.getLogger("coding-router-swerebench-execute")
 
 PROTOCOL = "coding-router-swerebench-development-execution-v1"
 CONFIRMATION_PROTOCOL = "coding-router-swerebench-confirmation-execution-v1"
+POOLED_CONFIRMATION_PROTOCOL = "coding-router-pooled-uplift-confirmation-execution-v1"
 TEMPLATE_NAME = "deepswe-router-responses-v2"
 TEMPLATE_ID = "j1a2bxbpllu3rp84b4qj"
 TEMPLATE_BUILD_ID = "e971c040-95bd-45c1-89ee-fb597bf75671"
@@ -29,6 +30,26 @@ CORPUS_SHA256 = "7d846b5576d15e68fd18ac21bfe0610cc1614b3b35ec0ae0cb8cfae0b82962c
 CONFIRMATION_CORPUS_SHA256 = (
     "9798dd1e58be0d13331d097307670dc3fc3760ad211da20e6367666523f080a7"
 )
+POOLED_CONFIRMATION_CORPUS_SHA256 = (
+    "6edd8ed4777d6bc48cf29f76a9fb4b9d60e3324908aa79d4d03df8617f6be825"
+)
+POOLED_CONFIRMATION_MANIFEST_SHA256 = (
+    "7bd743a794c5054e053a9d163c088d0f9f72fbd911043c44f90b792801eade60"
+)
+POOLED_CONFIRMATION_ROUTES_SHA256 = (
+    "aac7523746ee9aac0f9789ba9ee4d4e260fad8d2447730102d7aaa44816224c8"
+)
+POOLED_CONFIRMATION_NULL_ROUTES_SHA256 = (
+    "4e1570b285eac8da96c13069479f3f7ea9e49b7bedaae8c90d636777a3212a59"
+)
+POOLED_CONFIRMATION_ROUTE_AUDIT_SHA256 = (
+    "4f31fe2245cbad1123beada405d18d12b6e323963bde14c3ac69a90993c4db6b"
+)
+POOLED_CONFIRMATION_FREEZE_LOCK_SHA256 = (
+    "c8deac37d91912e268108a94a227abae34ab858e3bbbd2c637623697da092751"
+)
+POOLED_SELECTED_CANDIDATE = "direct_ridge-hash8192-a10"
+POOLED_PRIOR_SPEND_USD = 887.541861
 SMOKE_REPORT_SHA256 = "ee76a57040cbe7aaef692d2fc3f3df66d7a556cbf6dda74119e0802cb4230e13"
 SMOKE_ARCHIVE_SHA256 = {
     "xhigh": "bf1d576d25f1b56ae3a9484db5d5599576519a218aec3073db29272345f4015b",
@@ -59,6 +80,7 @@ class ExecutionPhase(NamedTuple):
     remote_segment: str
     metadata_phase: str
     reuse_smoke: bool
+    metadata_owner: str
 
 
 DEVELOPMENT_PHASE = ExecutionPhase(
@@ -68,6 +90,7 @@ DEVELOPMENT_PHASE = ExecutionPhase(
     remote_segment="development",
     metadata_phase="swerebench-development-matrix",
     reuse_smoke=True,
+    metadata_owner="coding-router-v40",
 )
 CONFIRMATION_PHASE = ExecutionPhase(
     name="confirmation",
@@ -76,6 +99,16 @@ CONFIRMATION_PHASE = ExecutionPhase(
     remote_segment="confirmation",
     metadata_phase="swerebench-confirmation-matrix",
     reuse_smoke=False,
+    metadata_owner="coding-router-v40",
+)
+POOLED_CONFIRMATION_PHASE = ExecutionPhase(
+    name="pooled-confirmation",
+    protocol=POOLED_CONFIRMATION_PROTOCOL,
+    corpus_sha256=POOLED_CONFIRMATION_CORPUS_SHA256,
+    remote_segment="pooled-confirmation-v42",
+    metadata_phase="pooled-uplift-confirmation-matrix",
+    reuse_smoke=False,
+    metadata_owner="coding-router-v42",
 )
 
 REMOTE_VALIDATOR = r'''"""Audit new matrix traces and write a compact report."""
@@ -283,6 +316,8 @@ def _execution_phase(name: str) -> ExecutionPhase:
         return DEVELOPMENT_PHASE
     if name == CONFIRMATION_PHASE.name:
         return CONFIRMATION_PHASE
+    if name == POOLED_CONFIRMATION_PHASE.name:
+        return POOLED_CONFIRMATION_PHASE
     raise ValueError(f"unknown execution phase: {name!r}")
 
 
@@ -386,6 +421,141 @@ def _confirmation_authorization(
     hashes["development_audit_sha256"] = _sha256(development_audit_path)
     hashes["confirmation_corpus_sha256"] = CONFIRMATION_CORPUS_SHA256
     return float(prior_spend), hashes
+
+
+def _pooled_confirmation_authorization(
+    fit_output: Path,
+    confirmation_manifest_path: Path,
+    confirmation_corpus_path: Path,
+) -> tuple[float, dict[str, object]]:
+    """Validate the pooled route and all null routes before provider execution."""
+    required = {
+        "route_audit": fit_output / "route-audit.json",
+        "freeze_lock": fit_output / "freeze-lock.json",
+        "routes": fit_output / "confirmation-routes.jsonl",
+        "null_routes": fit_output / "confirmation-null-routes.jsonl",
+    }
+    for label, path in required.items():
+        if not path.is_file():
+            raise FileNotFoundError(f"pooled confirmation lacks {label}: {path}")
+    expected_hashes = {
+        "route_audit": POOLED_CONFIRMATION_ROUTE_AUDIT_SHA256,
+        "freeze_lock": POOLED_CONFIRMATION_FREEZE_LOCK_SHA256,
+        "routes": POOLED_CONFIRMATION_ROUTES_SHA256,
+        "null_routes": POOLED_CONFIRMATION_NULL_ROUTES_SHA256,
+    }
+    for label, expected in expected_hashes.items():
+        if _sha256(required[label]) != expected:
+            raise ValueError(f"frozen pooled {label} hash mismatch")
+    if _sha256(confirmation_corpus_path) != POOLED_CONFIRMATION_CORPUS_SHA256:
+        raise ValueError("pooled confirmation corpus hash mismatch")
+    if _sha256(confirmation_manifest_path) != POOLED_CONFIRMATION_MANIFEST_SHA256:
+        raise ValueError("pooled confirmation manifest hash mismatch")
+
+    corpus = _read_object(confirmation_corpus_path)
+    manifest = _read_object(confirmation_manifest_path)
+    audit = _read_object(required["route_audit"])
+    freeze = _read_object(required["freeze_lock"])
+    raw_tasks = corpus.get("tasks")
+    if not isinstance(raw_tasks, list) or len(raw_tasks) != 200:
+        raise ValueError("pooled confirmation corpus must contain exactly 200 tasks")
+    task_ids = [
+        task.get("task_id") if isinstance(task, dict) else None for task in raw_tasks
+    ]
+    if not all(isinstance(task_id, str) for task_id in task_ids):
+        raise ValueError("pooled confirmation corpus contains an invalid task identity")
+    if len(set(task_ids)) != 200:
+        raise ValueError("pooled confirmation task identities are not unique")
+
+    if (
+        manifest.get("valid") is not True
+        or manifest.get("confirmation_tasks") != 200
+        or manifest.get("confirmation_tasks_sha256")
+        != POOLED_CONFIRMATION_CORPUS_SHA256
+        or manifest.get("target_repository_overlap") != 0
+        or manifest.get("target_normalized_prompt_overlap") != 0
+        or manifest.get("development_repository_overlap") != 0
+        or manifest.get("development_task_id_overlap") != 0
+        or manifest.get("development_normalized_prompt_overlap") != 0
+        or manifest.get("target_reward_fields_accessed") is not False
+        or manifest.get("target_cost_fields_accessed") is not False
+    ):
+        raise ValueError("pooled confirmation cohort failed isolation gates")
+    if (
+        audit.get("valid") is not True
+        or audit.get("selected_candidate") != POOLED_SELECTED_CANDIDATE
+        or audit.get("confirmation_tasks") != 200
+        or audit.get("null_count") != 128
+        or audit.get("null_unique_route_hashes") != 128
+        or audit.get("route_latency_p95_ms", 5.0) >= 5.0
+        or audit.get("target_outcomes_used") is not False
+        or audit.get("deep_swe_outcomes_accessed") is not False
+        or audit.get("internet_access") is not False
+        or audit.get("fitted_numeric_router_state_persisted") is not False
+    ):
+        raise ValueError("pooled confirmation route audit is unsafe")
+    if (
+        audit.get("confirmation_tasks_sha256")
+        != POOLED_CONFIRMATION_CORPUS_SHA256
+        or audit.get("confirmation_manifest_sha256")
+        != POOLED_CONFIRMATION_MANIFEST_SHA256
+        or audit.get("confirmation_routes_sha256")
+        != POOLED_CONFIRMATION_ROUTES_SHA256
+        or audit.get("confirmation_null_routes_sha256")
+        != POOLED_CONFIRMATION_NULL_ROUTES_SHA256
+    ):
+        raise ValueError("pooled confirmation route audit inputs drifted")
+    if (
+        freeze.get("valid") is not True
+        or freeze.get("selected_candidate") != POOLED_SELECTED_CANDIDATE
+        or freeze.get("provider_calls_before_freeze") != 0
+        or freeze.get("target_outcomes_used") is not False
+        or freeze.get("fitted_numeric_router_state_persisted") is not False
+        or freeze.get("confirmation_tasks_sha256")
+        != POOLED_CONFIRMATION_CORPUS_SHA256
+        or freeze.get("confirmation_routes_sha256")
+        != POOLED_CONFIRMATION_ROUTES_SHA256
+        or freeze.get("confirmation_null_routes_sha256")
+        != POOLED_CONFIRMATION_NULL_ROUTES_SHA256
+        or freeze.get("route_audit_sha256")
+        != POOLED_CONFIRMATION_ROUTE_AUDIT_SHA256
+    ):
+        raise ValueError("pooled confirmation freeze lock is unsafe")
+
+    allowed_arms = {"luna-high", "luna-max"}
+    routes = _read_rows(required["routes"])
+    if len(routes) != 200 or [row.get("task_id") for row in routes] != task_ids:
+        raise ValueError("pooled real routes do not exactly cover the corpus")
+    if any(
+        row.get("arm") not in allowed_arms
+        or row.get("target_outcomes_used") is not False
+        for row in routes
+    ):
+        raise ValueError("pooled real routes contain an unsafe decision")
+    null_routes = _read_rows(required["null_routes"])
+    if len(null_routes) != 128 * 200:
+        raise ValueError("pooled null routes do not contain 128 complete routes")
+    for null_index in range(128):
+        rows = null_routes[null_index * 200 : (null_index + 1) * 200]
+        if [row.get("task_id") for row in rows] != task_ids:
+            raise ValueError(f"pooled null route {null_index} does not cover the corpus")
+        if any(
+            row.get("null_index") != null_index
+            or row.get("arm") not in allowed_arms
+            or row.get("target_outcomes_used") is not False
+            for row in rows
+        ):
+            raise ValueError(f"pooled null route {null_index} is unsafe")
+
+    hashes = {f"{label}_sha256": _sha256(path) for label, path in required.items()}
+    hashes["confirmation_manifest_sha256"] = POOLED_CONFIRMATION_MANIFEST_SHA256
+    hashes["confirmation_corpus_sha256"] = POOLED_CONFIRMATION_CORPUS_SHA256
+    hashes["null_route_count"] = 128
+    return POOLED_PRIOR_SPEND_USD, hashes
+
+
+def _max_concurrency(phase: ExecutionPhase) -> int:
+    return 200 if phase is POOLED_CONFIRMATION_PHASE else 100
 
 
 def _capacity() -> int:
@@ -814,7 +984,7 @@ def _run_task(
         allow_internet_access=True,
         envs={"OPENAI_API_KEY": api_key},
         metadata={
-            "owner": "coding-router-v40",
+            "owner": phase.metadata_owner,
             "phase": phase.metadata_phase,
             "task_index": str(task_index),
             "task_id": task_id,
@@ -1008,13 +1178,26 @@ def execute(
             development_audit,
             corpus_path,
         )
+    elif phase is POOLED_CONFIRMATION_PHASE:
+        if limit_tasks is not None:
+            raise ValueError("pooled confirmation does not allow a task limit")
+        if fit_output is None or development_audit is None:
+            raise ValueError(
+                "pooled confirmation requires frozen routes and cohort manifest"
+            )
+        prior_spend_usd, authorization = _pooled_confirmation_authorization(
+            fit_output,
+            development_audit,
+            corpus_path,
+        )
     elif fit_output is not None or development_audit is not None:
         raise ValueError("development does not accept confirmation authorization inputs")
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is unavailable")
-    if concurrency < 1 or concurrency > 100:
-        raise ValueError("concurrency must be between 1 and 100")
+    max_concurrency = _max_concurrency(phase)
+    if concurrency < 1 or concurrency > max_concurrency:
+        raise ValueError(f"concurrency must be between 1 and {max_concurrency}")
     if not Template.exists(TEMPLATE_NAME):
         raise RuntimeError(f"required E2B template is absent: {TEMPLATE_NAME}")
     active = _capacity()
@@ -1126,7 +1309,11 @@ def main() -> None:
     parser.add_argument("--limit-tasks", type=int)
     parser.add_argument(
         "--phase",
-        choices=(DEVELOPMENT_PHASE.name, CONFIRMATION_PHASE.name),
+        choices=(
+            DEVELOPMENT_PHASE.name,
+            CONFIRMATION_PHASE.name,
+            POOLED_CONFIRMATION_PHASE.name,
+        ),
         default=DEVELOPMENT_PHASE.name,
     )
     parser.add_argument("--fit-output", type=Path)

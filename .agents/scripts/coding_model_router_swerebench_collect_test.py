@@ -89,3 +89,11 @@ def test_confirmation_launch_context_rejects_preaccessed_outcomes(
         assert "frozen authorization" in str(error)
     else:
         raise AssertionError("pre-accessed confirmation outcomes were accepted")
+
+
+def test_pooled_confirmation_uses_its_frozen_collection_identity() -> None:
+    phase = collect._collection_phase("pooled-confirmation")
+    assert phase is collect.POOLED_CONFIRMATION_PHASE
+    assert phase.execution_protocol == collect.POOLED_CONFIRMATION_EXECUTION_PROTOCOL
+    assert phase.corpus_sha256 == collect.POOLED_CONFIRMATION_CORPUS_SHA256
+    assert phase.reuse_smoke is False
