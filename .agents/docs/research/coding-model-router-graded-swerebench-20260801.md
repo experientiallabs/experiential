@@ -179,6 +179,12 @@ cells and provider usage were irrecoverable. Both tasks are permanently excluded
 arms with zero reruns. The maximum retained development cohort is now 656 of 673, or 97.5 percent,
 still above the frozen requirement.
 
+After five valid arms, the `luna-low` command for `valkey-io__valkey-1579` completed successfully
+but its official trace contained no graded reward. The worker had terminated and the missing cell
+and provider usage were irrecoverable. The task is permanently excluded across all six arms with
+zero reruns. The maximum retained development cohort is now 655 of 673, or 97.3 percent, still
+above the frozen requirement.
+
 A second E2B HTTP/2 control-plane wave then affected ten workers for
 `joernio__joern-5591`, `shazow__whatsabi-174`, `pymodbus-dev__pymodbus-2593`,
 `moment__luxon-1685`, `icssc__antalmanac-912`, `tailwindlabs__tailwindcss-jit-69`,
