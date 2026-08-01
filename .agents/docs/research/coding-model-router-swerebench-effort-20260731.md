@@ -59,9 +59,13 @@ development candidate and every confirmation gate are content-addressed.
 - Harness: verifiers `mini_swe_agent` version 2.4.5
 - Verifiers commit: `f6e420b9908ae14d625f079881f13c15011ee1c9`
 - Official taskset commit: `a90fbd708de9ab18f85b5ffc3a0bdc60825dcc84`
-- Runtime: task-specific Docker image inside E2B template
+- Base runtime: task-specific Docker image inside model-free E2B template
   `deepswe-router-docker-v1`, template ID `3v4ie6miz6uhlhhfeyea`, build ID
   `95fa38ac-01fa-45b5-841d-72e17fce0819`
+- Final runtime: model-free E2B template `deepswe-router-responses-v2`,
+  template ID `j1a2bxbpllu3rp84b4qj`, build ID
+  `e971c040-95bd-45c1-89ee-fb597bf75671`; it derives from the base and bakes
+  in only the two content-checked source adapters described below
 - E2B account cap: 1,000 sandboxes
 
 The filtered dataset rewrites each upstream
@@ -177,6 +181,16 @@ If the smoke exposes an infrastructure defect, repair and resume only these
 four cells. Do not launch a replacement smoke. If the smoke is valid, run all
 2,000 development cells with bounded E2B concurrency. Reuse completed cells by
 content hash and never rerun a gradeable model outcome.
+
+The development execution uses 25 E2B workers. Each worker owns one task,
+pulls its single frozen image once, and executes two attempts per effort. A
+five-way cyclic rotation of the frozen effort tuple by task index balances
+effort order across the 200 tasks. The first two tasks' `xhigh` and `max`
+attempt-zero cells are reused from the valid smoke by archive hash, so the
+development launch creates 1,996 new cells and does not rerun those four
+gradeable outcomes. Each effort archive and compact audit report is synced and
+hashed before its task state advances. A worker failure leaves completed
+efforts immutable and resumes only missing scientific cells.
 
 ## Target-compatible candidate families
 
