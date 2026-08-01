@@ -224,6 +224,15 @@ timeout with both `error` and `max_turns` stop labels, so the explicit timeout
 error record, absent patch, failed trace status, and completed provider usage
 are the canonical classification fields rather than the stop label alone.
 
+One `openllb__hlb-160` `medium` rollout ended after six fully metered provider
+turns when the pinned mini-swe-agent process exited 137. The harness recorded an
+explicit `HarnessError`, no patch, no official scoring invocation, and no
+reward. The frozen outcome rule grades agent errors after model execution as
+zero, so the validator accepts only this exact mini-swe-agent exit-137 shape,
+records its provenance, and continues to reject other harness exit codes. The
+paired effort artifact was recovered from the exact owned sandbox without a
+scientific rerun.
+
 ## Target-compatible candidate families
 
 Development may compare the following lightweight families. All use only the

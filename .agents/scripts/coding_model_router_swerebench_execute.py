@@ -85,24 +85,36 @@ for index, outer in enumerate(records):
         raise SystemExit(f"row {index} has invalid provider calls")
     reward = trace.get("rewards", {}).get("solved", {}).get("score")
     trace_errors = trace.get("errors", [])
-    post_execution_timeout = (
+    timeout_error = isinstance(trace_errors, list) and any(
+        isinstance(error, dict)
+        and error.get("type") == "HarnessError"
+        and isinstance(error.get("message"), str)
+        and error["message"].startswith("agent timeout:")
+        for error in trace_errors
+    )
+    mini_swe_agent_exit_137 = isinstance(trace_errors, list) and any(
+        isinstance(error, dict)
+        and error.get("type") == "HarnessError"
+        and isinstance(error.get("message"), str)
+        and error["message"].startswith("harness 'mini_swe_agent' exited 137:")
+        for error in trace_errors
+    )
+    post_execution_agent_failure = (
         reward is None
         and trace.get("ok") is False
         and outer.get("ok") is False
         and trace.get("stop_condition") in {"error", "max_turns"}
         and trace.get("info", {}).get("patch") is None
         and isinstance(trace_errors, list)
-        and any(
-            isinstance(error, dict)
-            and error.get("type") == "HarnessError"
-            and isinstance(error.get("message"), str)
-            and error["message"].startswith("agent timeout:")
-            for error in trace_errors
-        )
+        and (timeout_error or mini_swe_agent_exit_137)
     )
-    if post_execution_timeout:
+    if post_execution_agent_failure:
         reward = 0.0
-        reward_provenance = "gradeable post-execution agent timeout"
+        reward_provenance = (
+            "gradeable post-execution agent timeout"
+            if timeout_error
+            else "gradeable post-execution mini-swe-agent exit 137"
+        )
     elif (
         isinstance(reward, bool)
         or not isinstance(reward, (int, float))
@@ -113,7 +125,7 @@ for index, outer in enumerate(records):
         reward_provenance = "official verifier"
     scoring = trace.get("timing", {}).get("scoring", {})
     start, end = scoring.get("start"), scoring.get("end")
-    if post_execution_timeout:
+    if post_execution_agent_failure:
         scoring_seconds = None
     elif not isinstance(start, (int, float)) or not isinstance(end, (int, float)) or end <= start:
         raise SystemExit(f"row {index} lacks official scoring timing")
@@ -158,7 +170,7 @@ for index, outer in enumerate(records):
     if not 1 <= inference_calls <= 20:
         raise SystemExit(f"row {index} has invalid provider inference calls")
     patch = trace.get("info", {}).get("patch")
-    if post_execution_timeout:
+    if post_execution_agent_failure:
         patch_bytes = 0
         patch_sha256 = None
     elif not isinstance(patch, str):
@@ -170,7 +182,7 @@ for index, outer in enumerate(records):
         "attempt_number": args.attempt_offset + index,
         "reward": float(reward),
         "reward_provenance": reward_provenance,
-        "official_verifier_reached": not post_execution_timeout,
+        "official_verifier_reached": not post_execution_agent_failure,
         "provider_calls": len(calls),
         "provider_inference_calls": inference_calls,
         "provider_errors": provider_errors,

@@ -100,6 +100,40 @@ def test_validator_rejects_unrecognized_unscored_error(tmp_path: Path) -> None:
     assert "lacks an official binary reward" in result.stderr
 
 
+def test_validator_accepts_post_execution_mini_swe_agent_exit_137_as_zero(
+    tmp_path: Path,
+) -> None:
+    trace = _timeout_trace()
+    trace["errors"] = [
+        {
+            "type": "HarnessError",
+            "message": (
+                "harness 'mini_swe_agent' exited 137: "
+                "Warning: Input is not a terminal (fd=0)."
+            ),
+        }
+    ]
+    result = _run_validator(tmp_path, trace)
+    assert result.returncode == 0, result.stderr
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    cell = report["cells"][0]
+    assert cell["reward"] == 0.0
+    assert cell["reward_provenance"] == (
+        "gradeable post-execution mini-swe-agent exit 137"
+    )
+    assert cell["official_verifier_reached"] is False
+
+
+def test_validator_rejects_other_harness_exit_codes(tmp_path: Path) -> None:
+    trace = _timeout_trace()
+    trace["errors"] = [
+        {"type": "HarnessError", "message": "harness 'mini_swe_agent' exited 1"}
+    ]
+    result = _run_validator(tmp_path, trace)
+    assert result.returncode != 0
+    assert "lacks an official binary reward" in result.stderr
+
+
 def test_validator_preserves_unicode_line_separator_inside_patch(tmp_path: Path) -> None:
     trace = {
         "task": {"data": {"name": "owner__repo-1"}},
