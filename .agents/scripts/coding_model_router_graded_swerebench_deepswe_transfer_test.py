@@ -200,6 +200,8 @@ def test_evaluate_opens_hash_pinned_six_arm_matrix_once(
 
     assert report["target_tasks"] == 2
     assert report["router"]["reward"] == 1.0
+    assert report["router"]["best_reward_hit_rate"] == 1.0
+    assert report["router"]["cost_efficiency_gain_vs_fit_static"] > 1.0
     assert report["target_evaluation_count"] == 1
     assert report["target_outcomes_used_for_fit"] is False
     assert report["input_sha256"]["target_matrix"] == _sha256(matrix)

@@ -330,6 +330,9 @@ def _route_metrics(
     static_costs = costs.mean(axis=0)
     if static_rewards[baseline] <= 0.0 or static_costs[baseline] <= 0.0:
         raise ValueError("DeepSWE fit-selected static baseline is degenerate")
+    routed_rewards = rewards[rows, choices]
+    cost_efficiency = reward / cost
+    baseline_efficiency = float(static_rewards[baseline] / static_costs[baseline])
     traffic = np.bincount(choices, minlength=len(ARMS)).astype(float) / len(choices)
     blind_reward = rewards @ traffic
     blind_cost = costs @ traffic
@@ -344,6 +347,10 @@ def _route_metrics(
         "reward": reward,
         "cost_usd_per_task": cost,
         "cost_usd_total": float(np.sum(costs[rows, choices])),
+        "cost_usd_per_reward": cost / reward if reward > 0.0 else None,
+        "reward_per_cost_usd": cost_efficiency,
+        "cost_efficiency_gain_vs_fit_static": cost_efficiency / baseline_efficiency,
+        "best_reward_hit_rate": float(np.mean(routed_rewards >= rewards.max(axis=1) - 1e-12)),
         "quality_retention": reward / float(static_rewards[baseline]),
         "cost_savings": 1.0 - cost / float(static_costs[baseline]),
         "matched_blind_reward": float(np.mean(blind_reward)),
