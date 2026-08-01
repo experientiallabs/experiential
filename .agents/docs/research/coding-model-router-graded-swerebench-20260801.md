@@ -146,6 +146,12 @@ the transport failed and its sandbox was terminated. Neither scientific cell can
 rerun. Both tasks are permanently excluded whole-task. The resulting 661 of 673 maximum
 development coverage is 98.2 percent, above the frozen requirement.
 
+The `sol-max` scientific command for `rustls__rustls-2022` later completed after three other arms
+had produced valid artifacts, but its trace contained no official graded reward. The worker had
+terminated and its provider usage was not recoverable. The task is permanently excluded across all
+six arms with zero reruns. The maximum retained development cohort is now 660 of 673, or 98.1
+percent, still above the frozen requirement.
+
 A pre-fit code audit found that the implementation required positive matched task-blind advantage
 only after averaging the five split seeds. The frozen rule requires a positive advantage in every
 seed. The fitter now applies all four development gates independently to each seed and fails on an
