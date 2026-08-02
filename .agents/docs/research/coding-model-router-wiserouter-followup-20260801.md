@@ -128,3 +128,25 @@ Development fitting makes zero provider calls. Rough cumulative experiment spend
 4,135.54607635. The user authorized a USD 20,000 hard ceiling and monitors provider billing
 externally. If development fails, confirmation and DeepSWE remain sealed. If it passes, the dense
 six-arm confirmation is the only next paid tranche.
+
+## Final development result
+
+The frozen development study ran once on a secure, no-internet, single-CPU E2B sandbox from
+commit `5a82903a`. It completed 90 preregistered candidates over the audited 649-task matrix with
+zero provider calls. Sixty candidates produced complete five-seed metrics. All 30 candidates with
+32 contexts failed closed because at least one fit context fell below the frozen support minimum.
+
+No candidate passed the primary development gates, so the null study, latency audit, confirmation
+route freeze, external confirmation, and DeepSWE target evaluation did not run. The closest point
+to the quality gate was `hash2048-j8-shrink0-save0.4`: its worst seed retained 84.42 percent of
+static quality and saved 38.16 percent, with a positive 0.00980 matched-blind advantage. The point
+with the greatest worst-seed savings was `hash2048-j8-shrink4-save0.6`: it saved 58.09 percent but
+retained only 76.32 percent quality. The workload-budget family therefore does not satisfy the
+frozen 95 percent quality and 40 percent savings objective on external development.
+
+The aggregate report SHA-256 is
+`bf4834ca16141dd940c3b5db192a01c3f7a1338287cfb7c3145bbc6246dbd0e4`. E2B sandbox
+`i1n9f3okwggj5lwwb79t6` was destroyed and an exact-ID active-sandbox check found it unavailable.
+The report confirms zero target or confirmation outcome access, zero persisted fitted numeric
+state, zero persisted task vectors or outcome matrix, and unchanged rough cumulative spend of USD
+4,135.54607635.
