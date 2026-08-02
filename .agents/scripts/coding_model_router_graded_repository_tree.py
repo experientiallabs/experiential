@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 import numpy as np
-from coding_model_router_graded_wiserouter import _structural as prompt_shape_row
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
 PROTOCOL = "coding-router-graded-repository-tree-v1"
@@ -283,6 +282,36 @@ def _tokens(text: str) -> tuple[str, ...]:
     expanded = _TOKEN_BOUNDARY.sub(" ", unicodedata.normalize("NFKC", text))
     terms = _ALPHANUMERIC.findall(expanded.replace("_", " ").replace("-", " ").casefold())
     return tuple(term for term in terms if len(term) >= 2 and term not in ENGLISH_STOP_WORDS)
+
+
+def _prompt_shape_row(text: str) -> list[float]:
+    """Return the existing frozen 15-value SWE-smith prompt-shape block."""
+    lower = text.casefold()
+    lines = text.splitlines()
+    path_tokens = sum(token.count("/") for token in text.split())
+    stack_markers = sum(
+        lower.count(marker)
+        for marker in ("traceback", "stack trace", " at ", "exception:")
+    )
+    return [
+        math.log1p(len(text)),
+        math.log1p(len(text.split())),
+        math.log1p(len(lines)),
+        math.log1p(text.count("```")),
+        math.log1p(stack_markers),
+        math.log1p(path_tokens),
+        math.log1p(text.count("`") + text.count('"') + text.count("'")),
+        math.log1p(sum(lower.count(word) for word in ("fix", "bug", "repair"))),
+        math.log1p(lower.count("test")),
+        math.log1p(
+            sum(lower.count(word) for word in ("dependency", "package", "build"))
+        ),
+        float("python" in lower or ".py" in lower),
+        float("javascript" in lower or ".js" in lower or "node" in lower),
+        float("typescript" in lower or ".ts" in lower),
+        float("rust" in lower or ".rs" in lower or "cargo" in lower),
+        float("golang" in lower or ".go" in lower),
+    ]
 
 
 def _category(file: TreeFile) -> str:
@@ -575,7 +604,7 @@ def feature_blocks(
     files: Sequence[TreeFile], *, issue: str, language: str
 ) -> RepositoryFeatureBlocks:
     """Construct all three unstandardized frozen feature blocks."""
-    prompt = np.asarray(prompt_shape_row(issue), dtype=np.float64)
+    prompt = np.asarray(_prompt_shape_row(issue), dtype=np.float64)
     result = RepositoryFeatureBlocks(
         structure=structure_features(files, language),
         localization=localization_features(files, issue),

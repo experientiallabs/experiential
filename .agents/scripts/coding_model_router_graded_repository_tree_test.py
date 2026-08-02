@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from coding_model_router_graded_wiserouter import _structural
 from coding_model_router_graded_repository_tree import (
     RawTreeEntry,
     TreeFile,
@@ -88,3 +89,9 @@ def test_empty_issue_and_missing_language_are_explicit_and_finite() -> None:
     assert np.isfinite(blocks.structure).all()
     assert np.isfinite(blocks.localization).all()
     assert np.isfinite(blocks.prompt_shape).all()
+
+
+def test_prompt_shape_exactly_matches_the_frozen_existing_block() -> None:
+    issue = "Fix `src/server.py` after traceback in a Rust package test"
+    blocks = feature_blocks(_tree(), issue=issue, language="Python")
+    assert np.array_equal(blocks.prompt_shape, np.asarray(_structural(issue)))
