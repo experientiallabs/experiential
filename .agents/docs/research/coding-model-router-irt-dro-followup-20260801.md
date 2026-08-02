@@ -183,6 +183,20 @@ grid, folds, outcomes, and selection rule are unchanged. Non-finite results and 
 other than the exact iteration-limit condition still fail closed. This is a numeric convergence
 repair for the frozen search, not a new candidate or target-informed retry.
 
+The repaired real development run completed all 4,000 frozen real and shuffled-label fits and
+emitted 2,000 policy metrics for each of the five seeds. No policy passed development. Zero policy
+in any seed reached 40 percent savings, and zero policy had a nonnegative robust cost margin. The
+best nominal savings by seed ranged from 10.1 to 21.1 percent, and the best savings among policies
+meeting the 95 percent quality floor ranged from 9.6 to 14.0 percent. Because there was no
+scientifically eligible policy, the one-CPU latency worker correctly audited zero routes and no
+confirmation manifest was produced. All six exact E2B sandbox identifiers returned
+`SandboxNotFoundException` after teardown. The run made zero provider calls, persisted no fitted
+state, and accessed neither confirmation nor DeepSWE outcomes. The selection, latency, and
+manifest SHA-256 digests are
+`4d1e29184c9b4db893a460cafc970382a782820b561faeb15102b111ca5e3067`,
+`5394b16125b9c86a2693af2f090919033ec01b6354c31ff2231523a6ab7913f5`, and
+`e3d77db37d4f271bbe59d43b85b1e12621347cfdec61dfbefbe75830fd4b6024`.
+
 All fitting, cross-validation, bootstrapping, and latency measurement run on E2B or Azure. The Mac
 only orchestrates and validates bounded artifacts. No foundation model, task embedding bank, or
 fitted numeric router state is persisted. The remote worker may retain coefficients only for its

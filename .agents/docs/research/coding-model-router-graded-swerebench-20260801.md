@@ -319,3 +319,10 @@ SHA-256 is `d0535ec56d2855c87ea2cff45e5eb34068088efc904b9c61a5cafb0af6e7c25f`.
 This development failure activates the frozen conditional graded IRT plus KL-DRO lane. The current
 320-task confirmation remains sealed and may be opened exactly once only if that lane selects an
 externally eligible policy.
+
+The conditional IRT plus KL-DRO lane then completed all 4,000 frozen real and shuffled-label fits
+on E2B. It also failed development. No policy reached 40 percent savings in any seed, and no policy
+had a nonnegative robust cost margin. Best nominal savings ranged from 10.1 to 21.1 percent across
+seeds, or 9.6 to 14.0 percent after enforcing the 95 percent quality floor. No latency candidate or
+confirmation route manifest was emitted. Confirmation and DeepSWE remain sealed. The selection
+report SHA-256 is `4d1e29184c9b4db893a460cafc970382a782820b561faeb15102b111ca5e3067`.
