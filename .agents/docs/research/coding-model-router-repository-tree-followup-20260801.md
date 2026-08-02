@@ -218,3 +218,22 @@ identities, source hash drift, schema drift, and any malformed projected field s
 complete command. This correction does not normalize a prompt, accept a mismatch, change a
 feature, inspect an outcome, or retry a scientific task. It was frozen before the first Git tree
 was acquired.
+
+The corrected whole-task rejection run found that only 281 of 649 tasks exactly matched all
+frozen source fields. Its then-current controller still acquired those 281 Git trees before
+applying the final coverage gate. Of them, 264 produced valid frozen feature rows and 17 failed
+tree validation or retrieval. The worker was terminated, no feature row left remote compute, and
+no fit began. Since source identity alone capped possible coverage at 43.3 percent, the tree
+results cannot change the scientific decision.
+
+The final audit command moved the source coverage gate before every Git request. It reproduced
+281 exact source rows, 368 whole-task source exclusions, and 43.297 percent maximum coverage over
+the 649-task denominator. It then stopped before tree retrieval or feature construction. Coverage
+report SHA-256 is `485579a89d5ce790b093adef4d10c4f74ad2b7601468af5f510f710a8dbc83bb`.
+Exact E2B sandbox `ij1uukngkzwx1imp0ptkj` was terminated and returned
+`SandboxNotFoundException` on an exact-ID check. All acquisition attempts made zero provider
+calls, joined no outcomes, and accessed neither confirmation nor DeepSWE.
+
+This family therefore fails the frozen development coverage gate before fitting. The 270 learner
+structures, 3,510 operating points, family null, latency audit, confirmation route freeze,
+external confirmation, and DeepSWE target evaluation did not run.
