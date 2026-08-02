@@ -457,16 +457,54 @@ def _tool_args(attrs: JsonObject) -> JsonObject:
 _OI_TOOL_NAME_SUFFIX = ".tool_call.function.name"
 _OI_TOOL_ARGS_SUFFIX = ".tool_call.function.arguments"
 
+# Arize's `export_model_to_df` flattens the SAME tool call differently: `llm.output_messages` stays
+# a nested list whose inner keys are dotted, so NO top-level key ends in the suffixes above, e.g.
+#   llm.output_messages = [{"message.role": "assistant",
+#                           "message.tool_calls": [{"tool_call.function.name": "read_file",
+#                                                   "tool_call.function.arguments": "{...}"}]}]
+# Every level is shape-checked rather than assumed: the dataframe path fills an absent column with
+# a float NaN, and a raw OTLP export carries the same field as a JSON string. Neither is a list, so
+# both fall through to the caller's existing behavior instead of being guessed at.
+_OI_MESSAGES_KEY = "llm.output_messages"
+_OI_TOOL_CALLS_KEY = "message.tool_calls"
+_OI_CALL_NAME_KEY = "tool_call.function.name"
+_OI_CALL_ARGS_KEY = "tool_call.function.arguments"
+
+
+def _nested_openinference_tool_call(attrs: JsonObject) -> tuple[str, JsonValue] | None:
+    """The first tool call inside a nested `llm.output_messages` list, if any."""
+    messages = attrs.get(_OI_MESSAGES_KEY)
+    if not isinstance(messages, list):
+        return None
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        calls = message.get(_OI_TOOL_CALLS_KEY)
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            name = call.get(_OI_CALL_NAME_KEY)
+            if isinstance(name, str) and name:
+                return name, call.get(_OI_CALL_ARGS_KEY)
+    return None
+
 
 def _openinference_tool_call(attrs: JsonObject) -> tuple[str, JsonValue] | None:
-    """The lowest-indexed OpenInference tool call `(name, raw_args)` on an LLM span, if any."""
+    """The first OpenInference tool call `(name, raw_args)` on an LLM span, if any.
+
+    Reads either flattening of the same span: Phoenix's indexed top-level keys first, then Arize's
+    nested `llm.output_messages` list. A turn with parallel calls yields only its first here, the
+    one paired with this span; the rest arrive as their own steps from their tool spans.
+    """
     name_keys = sorted(k for k in attrs if k.endswith(_OI_TOOL_NAME_SUFFIX))
     for name_key in name_keys:
         name = attrs.get(name_key)
         if isinstance(name, str) and name:
             args_key = name_key[: -len(_OI_TOOL_NAME_SUFFIX)] + _OI_TOOL_ARGS_SUFFIX
             return name, attrs.get(args_key)
-    return None
+    return _nested_openinference_tool_call(attrs)
 
 
 def action_from_llm_span(span: SpanRecord) -> Action:

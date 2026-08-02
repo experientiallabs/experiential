@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from wmo.core.types import ErrorClass, StepAttribution
+from wmo.core.types import ActionKind, ErrorClass, StepAttribution
 from wmo.ingest.normalize import (
     SpanEmitter,
     SpanRecord,
@@ -266,3 +266,67 @@ def test_span_emitter_keeps_a_span_own_value_and_needs_no_trace_attributes() -> 
     bare = SpanEmitter("t2")
     bare.emit({"gen_ai.completion": "hi"}, tool=False)
     assert bare.spans[0].attributes == {"gen_ai.operation.name": "chat", "gen_ai.completion": "hi"}
+
+
+def test_openinference_tool_call_is_read_from_a_nested_output_messages_list() -> None:
+    """Arize keeps `llm.output_messages` a nested list; the tool call must still be found.
+
+    Regression: the flat scan only matched top-level keys ending in `.tool_call.function.name`,
+    which an `export_model_to_df` export has none of, so a tool call fell through to the message
+    branch and `output.value` (the whole provider envelope: system instructions, usage, sampling
+    config) became the action content. On a real export that misread 739 of 876 LLM spans. The
+    envelope is in this fixture on purpose: it is what the span would have fallen back to.
+    """
+    spans = [
+        SpanRecord(
+            trace_id="t1",
+            span_id="a",
+            attributes={
+                "openinference.span.kind": "LLM",
+                "llm.output_messages": [
+                    {
+                        "message.role": "assistant",
+                        "message.tool_calls": [
+                            {
+                                "tool_call.function.name": "read_file",
+                                "tool_call.function.arguments": '{"path": "migrations/007.sql"}',
+                                "tool_call.id": "call_abc123",
+                            }
+                        ],
+                    }
+                ],
+                "output.value": (
+                    '{"id": "resp_1", "instructions": "You are a migration reviewer.",'
+                    ' "usage": {"total_tokens": 4158}, "temperature": 1.0}'
+                ),
+            },
+        ),
+    ]
+    (trace,) = spans_to_traces(spans, source="test")
+    action = trace.steps[0].action
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "read_file"
+    assert action.arguments == {"path": "migrations/007.sql"}
+    # The envelope must not survive anywhere on the action.
+    assert action.content is None
+
+
+def test_openinference_tool_call_still_reads_the_flat_indexed_keys() -> None:
+    """Phoenix's `get_spans_dataframe` flattening keeps working alongside Arize's nested one."""
+    prefix = "llm.output_messages.0.message.tool_calls.0.tool_call.function"
+    spans = [
+        SpanRecord(
+            trace_id="t1",
+            span_id="a",
+            attributes={
+                "openinference.span.kind": "LLM",
+                f"{prefix}.name": "get_user",
+                f"{prefix}.arguments": '{"id": "u1"}',
+            },
+        ),
+    ]
+    (trace,) = spans_to_traces(spans, source="test")
+    action = trace.steps[0].action
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "get_user"
+    assert action.arguments == {"id": "u1"}
