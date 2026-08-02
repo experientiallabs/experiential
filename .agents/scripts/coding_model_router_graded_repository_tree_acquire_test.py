@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 from coding_model_router_graded_repository_tree_acquire import (
     DatasetTask,
-    FeatureRow,
     _coverage_report,
     validate_projection,
 )
@@ -82,11 +81,7 @@ def test_coverage_is_label_free_and_stratified() -> None:
         DatasetTask("two", "repo/a", "Python", "p", "b", "i"),
         DatasetTask("three", "repo/b", "Go", "p", "c", "i"),
     ]
-    rows = [
-        FeatureRow("one", "repo/a", "Python", "a", (1.0,), (2.0,), (3.0,)),
-        FeatureRow("three", "repo/b", "Go", "c", (1.0,), (2.0,), (3.0,)),
-    ]
-    report = _coverage_report(tasks, rows, [{"task_id": "two"}])
+    report = _coverage_report(tasks, {"one", "three"}, [{"task_id": "two"}])
     assert report["coverage"] == pytest.approx(2 / 3)
     assert report["outcomes_joined"] is False
     assert report["provider_calls"] == 0

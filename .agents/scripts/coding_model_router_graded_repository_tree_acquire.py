@@ -312,9 +312,11 @@ def acquire_feature_rows(
 
 
 def _coverage_report(
-    tasks: Sequence[DatasetTask], rows: Sequence[FeatureRow], failures: Sequence[dict[str, str]]
+    tasks: Sequence[DatasetTask],
+    eligible_task_ids: set[str],
+    failures: Sequence[dict[str, str]],
 ) -> dict[str, Any]:
-    retained = {row.task_id for row in rows}
+    retained = eligible_task_ids
     by_language_total = Counter(task.language.casefold() for task in tasks)
     by_language_valid = Counter(
         task.language.casefold() for task in tasks if task.task_id in retained
@@ -332,13 +334,13 @@ def _coverage_report(
     by_size_valid = Counter(
         bucket(repository_sizes[task.repository]) for task in tasks if task.task_id in retained
     )
-    coverage = len(rows) / len(tasks)
+    coverage = len(retained) / len(tasks)
     return {
         "protocol": f"{PROTOCOL}-acquisition-v1",
         "dataset_revision": DATASET_REVISION,
         "dataset_parquet_sha256": DATASET_PARQUET_SHA256,
         "tasks": len(tasks),
-        "eligible_tasks": len(rows),
+        "eligible_tasks": len(retained),
         "coverage": coverage,
         "coverage_gate": MIN_DEVELOPMENT_COVERAGE,
         "coverage_passed": coverage >= MIN_DEVELOPMENT_COVERAGE,
@@ -377,10 +379,6 @@ def main() -> None:
     args = parser.parse_args()
     manifest = _manifest_tasks(args.development_corpus, args.completion_audit)
     projection = validate_projection(manifest, load_projected_dataset(args.dataset_parquet))
-    rows, tree_failures = acquire_feature_rows(
-        projection.tasks, os.environ.get("GITHUB_TOKEN")
-    )
-    failures = [*projection.failures, *tree_failures]
     projected_by_id = {task.task_id: task for task in projection.tasks}
     coverage_tasks = tuple(
         DatasetTask(
@@ -397,7 +395,24 @@ def main() -> None:
         )
         for task in manifest
     )
-    coverage = _coverage_report(coverage_tasks, rows, failures)
+    source_ids = set(projected_by_id)
+    if len(source_ids) / len(coverage_tasks) < MIN_DEVELOPMENT_COVERAGE:
+        coverage = _coverage_report(
+            coverage_tasks, source_ids, list(projection.failures)
+        )
+        coverage["source_projection_only"] = True
+        args.coverage_out.write_text(
+            json.dumps(coverage, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        raise RuntimeError("pinned source projection missed the frozen coverage gate")
+    rows, tree_failures = acquire_feature_rows(
+        projection.tasks, os.environ.get("GITHUB_TOKEN")
+    )
+    failures = [*projection.failures, *tree_failures]
+    coverage = _coverage_report(
+        coverage_tasks, {row.task_id for row in rows}, failures
+    )
+    coverage["source_projection_only"] = False
     args.coverage_out.write_text(
         json.dumps(coverage, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
