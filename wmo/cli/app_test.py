@@ -3243,7 +3243,9 @@ def test_worker_role_provider_config_provider_flag_uses_that_backends_flagship(
     config = cli_app_module._worker_role_provider_config("openai", None, None)
 
     assert config.kind is ProviderKind.OPENAI
-    assert config.model == "gpt-5.5"
+    # The flagship is the catalog's first OpenAI row: gpt-5.6-sol, the top tier of the 5.6
+    # family (sol > terra > luna).
+    assert config.model == "gpt-5.6-sol"
 
 
 def test_worker_role_provider_config_demands_a_model_for_a_catalog_less_provider(
