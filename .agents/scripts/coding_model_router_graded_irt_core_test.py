@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
+import coding_model_router_graded_irt_core as core
 from coding_model_router_graded_irt_core import (
     _initial_feature_parameters,
     _initial_parameters,
@@ -357,6 +360,41 @@ def test_multidimensional_fit_recovers_arm_order() -> None:
     assert np.isfinite(fit.loss)
     assert fit.abilities.shape == (arm_count, 2)
     assert fit.log_discriminations.shape == (task_count, 2)
+
+
+def test_binomial_fit_continues_from_finite_iteration_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    passed = np.asarray([[0, 1], [1, 2]], dtype=np.float64)
+    total = np.asarray([[2, 2], [2, 2]], dtype=np.float64)
+    calls = 0
+
+    def fake_minimize(
+        objective: object,
+        initial: np.ndarray,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        del objective, kwargs
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            success=calls == 2,
+            fun=1.0,
+            x=np.asarray(initial, dtype=np.float64),
+            nit=1_000 if calls == 1 else 7,
+            message=(
+                "STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT"
+                if calls == 1
+                else "CONVERGENCE"
+            ),
+        )
+
+    monkeypatch.setattr(core, "minimize", fake_minimize)
+
+    fit = core.fit_binomial_irt(passed, total, latent_dimension=2)
+
+    assert calls == 2
+    assert fit.iterations == 1_007
 
 
 def test_feature_fit_predicts_unseen_task_probabilities() -> None:

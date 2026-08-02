@@ -305,3 +305,17 @@ no fitted state, and terminated its sandbox successfully. Its fitter SHA-256 was
 `0485fa5b34d1af9ef751d5763bda9c881ba48a82707135292e21002e6675ea77`, matching the frozen
 development fitter. This establishes that fitting and route generation fit within the one-hour E2B
 sandbox limit without moving heavy computation onto the Mac.
+
+The real 649-task development fit completed on E2B with all 480 frozen candidates and five seeds.
+No kNN candidate passed development. The closest point,
+`guard-luna-high-k32-z1.645-lam0.02`, retained 95.8 to 97.7 percent quality and had positive
+matched task-blind advantage in every seed, but saved only 11.5 to 13.4 percent instead of the
+required 40 percent. Route latency passed at 0.306 ms p50 and 0.370 ms p95. In contrast, every
+pair oracle containing `sol-max` saved 56.9 to 61.4 percent while improving mean reward, so the
+matrix contains material conditional headroom that the frozen kNN policy did not learn. The fit
+accessed no confirmation or DeepSWE outcomes, persisted no embeddings, kNN bank, or fitted numeric
+state, and its exact E2B worker was proven unavailable after teardown. The selection report
+SHA-256 is `d0535ec56d2855c87ea2cff45e5eb34068088efc904b9c61a5cafb0af6e7c25f`.
+This development failure activates the frozen conditional graded IRT plus KL-DRO lane. The current
+320-task confirmation remains sealed and may be opened exactly once only if that lane selects an
+externally eligible policy.

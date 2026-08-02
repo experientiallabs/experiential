@@ -175,6 +175,14 @@ fitted state, and terminated the sandbox. Its aggregate artifact SHA-256 is
 `d03357b5c29304c737b063ae0cc53642659b6d2f4d0de1024b22a54b0373c830` and its core source
 SHA-256 is `0bdce68cfc85e872e7c424f41a37ffc87f6ed5411622217f5faac0263c231674`.
 
+The first real development launch produced no seed artifact because one seed-23 fold reached the
+L-BFGS-B 1,000-iteration limit. All five no-internet workers terminated and confirmation and
+DeepSWE remained sealed. The optimizer now performs up to three deterministic continuation passes
+from the previous finite iterate. The objective, initialization, bounds, tolerances, candidate
+grid, folds, outcomes, and selection rule are unchanged. Non-finite results and every failure
+other than the exact iteration-limit condition still fail closed. This is a numeric convergence
+repair for the frozen search, not a new candidate or target-informed retry.
+
 All fitting, cross-validation, bootstrapping, and latency measurement run on E2B or Azure. The Mac
 only orchestrates and validates bounded artifacts. No foundation model, task embedding bank, or
 fitted numeric router state is persisted. The remote worker may retain coefficients only for its

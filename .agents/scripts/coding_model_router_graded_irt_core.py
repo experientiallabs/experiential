@@ -17,6 +17,8 @@ from scipy.special import expit
 DEFAULT_ABILITY_L2 = 0.01
 DEFAULT_DIFFICULTY_L2 = 0.01
 DEFAULT_DISCRIMINATION_L2 = 0.05
+BINOMIAL_IRT_MAX_ITERATIONS_PER_PASS = 1_000
+BINOMIAL_IRT_CONTINUATION_PASSES = 3
 FROZEN_ARM_COUNT = 6
 LUNA_ARM_COUNT = 5
 
@@ -595,16 +597,32 @@ def fit_binomial_irt(
         discrimination_l2=discrimination_l2,
         monotone_luna=monotone_luna,
     )
-    result = minimize(
-        objective,
-        initial,
-        args=(passed, total, latent_dimension),
-        method="L-BFGS-B",
-        jac=True,
-        bounds=bounds,
-        options={"maxiter": 1_000, "ftol": 1e-10, "gtol": 1e-7},
-    )
-    if not result.success or not np.isfinite(result.fun):
+    total_iterations = 0
+    for _ in range(BINOMIAL_IRT_CONTINUATION_PASSES):
+        result = minimize(
+            objective,
+            initial,
+            args=(passed, total, latent_dimension),
+            method="L-BFGS-B",
+            jac=True,
+            bounds=bounds,
+            options={
+                "maxiter": BINOMIAL_IRT_MAX_ITERATIONS_PER_PASS,
+                "ftol": 1e-10,
+                "gtol": 1e-7,
+            },
+        )
+        total_iterations += int(result.nit)
+        if result.success and np.isfinite(result.fun):
+            break
+        if (
+            "ITERATIONS REACHED LIMIT" not in str(result.message)
+            or not np.isfinite(result.fun)
+            or not np.isfinite(result.x).all()
+        ):
+            raise RuntimeError(f"binomial IRT optimization failed: {result.message}")
+        initial = np.asarray(result.x, dtype=np.float64)
+    else:
         raise RuntimeError(f"binomial IRT optimization failed: {result.message}")
     raw_abilities, difficulties, log_discriminations = _unpack(
         np.asarray(result.x, dtype=np.float64),
@@ -622,7 +640,7 @@ def fit_binomial_irt(
         difficulties=difficulties.copy(),
         log_discriminations=log_discriminations.copy(),
         loss=float(result.fun),
-        iterations=int(result.nit),
+        iterations=total_iterations,
     )
 
 
