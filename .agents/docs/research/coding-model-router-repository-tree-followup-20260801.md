@@ -201,3 +201,20 @@ Development tree acquisition and fitting make zero provider-model calls. Rough c
 experiment spend begins at USD 4,135.54607635. The user authorized a USD 20,000 hard ceiling and
 monitors provider billing externally. If source-tree coverage is below 95 percent, no development
 point passes, or latency fails, confirmation and DeepSWE remain sealed and this family stops.
+
+## Source acquisition launch audit
+
+The first remote source-acquisition command downloaded and hash-verified the pinned native
+Parquet, then stopped before any Git tree request because task `keras-team__keras-19955` had a
+problem statement that did not byte-match the frozen development manifest. The exact E2B worker
+was terminated. It made zero provider calls, joined no outcomes, persisted no feature row, and
+accessed neither confirmation nor DeepSWE.
+
+The source validator now applies the already frozen rejection rule at whole-task scope. A missing
+row or repository, language, prompt, or image mismatch is recorded as a label-free source
+exclusion before tree retrieval instead of aborting the complete acquisition command. The 95
+percent coverage denominator remains all 649 retained development tasks. Duplicate dataset
+identities, source hash drift, schema drift, and any malformed projected field still abort the
+complete command. This correction does not normalize a prompt, accept a mismatch, change a
+feature, inspect an outcome, or retry a scientific task. It was frozen before the first Git tree
+was acquired.

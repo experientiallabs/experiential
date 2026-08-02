@@ -81,6 +81,14 @@ class FeatureRow:
     prompt_shape: tuple[float, ...]
 
 
+@dataclass(frozen=True)
+class ProjectionResult:
+    """Exact source rows plus label-free whole-task rejections."""
+
+    tasks: tuple[DatasetTask, ...]
+    failures: tuple[dict[str, str], ...]
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -141,16 +149,19 @@ def _dataset_task(row: dict[str, Any]) -> DatasetTask:
 def validate_projection(
     manifest_tasks: Sequence[dict[str, Any]],
     dataset_rows: Iterable[dict[str, Any]],
-) -> tuple[DatasetTask, ...]:
+) -> ProjectionResult:
     """Validate an allowed-column-only dataset projection against the frozen manifest."""
     wanted = {str(task["task_id"]): task for task in manifest_tasks}
     selected: dict[str, DatasetTask] = {}
+    failures: dict[str, dict[str, str]] = {}
+    seen: set[str] = set()
     for row in dataset_rows:
         task_id = row.get("instance_id")
         if not isinstance(task_id, str) or task_id not in wanted:
             continue
-        if task_id in selected:
+        if task_id in seen:
             raise ValueError("pinned dataset repeats a retained task identity")
+        seen.add(task_id)
         projected = _dataset_task(row)
         frozen = wanted[task_id]
         comparisons = {
@@ -161,12 +172,30 @@ def validate_projection(
         }
         mismatches = [name for name, pair in comparisons.items() if pair[0] != pair[1]]
         if mismatches:
-            raise ValueError(f"dataset task {task_id} mismatched: {','.join(mismatches)}")
-        selected[task_id] = projected
-    if set(selected) != set(wanted):
-        missing = sorted(set(wanted) - set(selected))
-        raise ValueError(f"pinned dataset projection missed {len(missing)} retained tasks")
-    return tuple(selected[str(task["task_id"])] for task in manifest_tasks)
+            failures[task_id] = {
+                "task_id": task_id,
+                "repository": str(frozen.get("repository", "")),
+                "reason_type": f"source-identity-mismatch:{','.join(mismatches)}",
+            }
+        else:
+            selected[task_id] = projected
+    for task_id in sorted(set(wanted) - set(selected) - set(failures)):
+        failures[task_id] = {
+            "task_id": task_id,
+            "repository": str(wanted[task_id].get("repository", "")),
+            "reason_type": "source-row-missing",
+        }
+    ordered_tasks = tuple(
+        selected[str(task["task_id"])]
+        for task in manifest_tasks
+        if str(task["task_id"]) in selected
+    )
+    ordered_failures = tuple(
+        failures[str(task["task_id"])]
+        for task in manifest_tasks
+        if str(task["task_id"]) in failures
+    )
+    return ProjectionResult(ordered_tasks, ordered_failures)
 
 
 def load_projected_dataset(parquet_path: Path) -> Iterable[dict[str, Any]]:
@@ -347,9 +376,28 @@ def main() -> None:
     parser.add_argument("--coverage-out", type=Path, required=True)
     args = parser.parse_args()
     manifest = _manifest_tasks(args.development_corpus, args.completion_audit)
-    tasks = validate_projection(manifest, load_projected_dataset(args.dataset_parquet))
-    rows, failures = acquire_feature_rows(tasks, os.environ.get("GITHUB_TOKEN"))
-    coverage = _coverage_report(tasks, rows, failures)
+    projection = validate_projection(manifest, load_projected_dataset(args.dataset_parquet))
+    rows, tree_failures = acquire_feature_rows(
+        projection.tasks, os.environ.get("GITHUB_TOKEN")
+    )
+    failures = [*projection.failures, *tree_failures]
+    projected_by_id = {task.task_id: task for task in projection.tasks}
+    coverage_tasks = tuple(
+        DatasetTask(
+            task_id=str(task["task_id"]),
+            repository=str(task["repository"]),
+            language=str(task["language"]),
+            prompt=str(task["prompt"]),
+            base_commit=(
+                projected_by_id[str(task["task_id"])].base_commit
+                if str(task["task_id"]) in projected_by_id
+                else "source-rejected"
+            ),
+            image_name=str(task["image_name"]),
+        )
+        for task in manifest
+    )
+    coverage = _coverage_report(coverage_tasks, rows, failures)
     args.coverage_out.write_text(
         json.dumps(coverage, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

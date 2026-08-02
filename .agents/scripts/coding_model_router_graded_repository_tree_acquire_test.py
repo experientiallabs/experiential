@@ -45,8 +45,8 @@ def _dataset() -> list[dict[str, object]]:
 
 
 def test_projection_uses_only_exact_retained_identities() -> None:
-    tasks = validate_projection(_manifest(), _dataset())
-    assert tasks == (
+    result = validate_projection(_manifest(), _dataset())
+    assert result.tasks == (
         DatasetTask(
             task_id="owner__repo-1",
             repository="owner/repo",
@@ -56,19 +56,22 @@ def test_projection_uses_only_exact_retained_identities() -> None:
             image_name="docker.io/example:1",
         ),
     )
+    assert result.failures == ()
 
 
 @pytest.mark.parametrize("field", ["repo", "language", "problem_statement", "image_name"])
 def test_projection_rejects_manifest_mismatch(field: str) -> None:
     rows = _dataset()
     rows[0][field] = "changed"
-    with pytest.raises(ValueError, match="mismatched"):
-        validate_projection(_manifest(), rows)
+    result = validate_projection(_manifest(), rows)
+    assert result.tasks == ()
+    assert result.failures[0]["reason_type"].startswith("source-identity-mismatch:")
 
 
 def test_projection_rejects_missing_and_duplicate_tasks() -> None:
-    with pytest.raises(ValueError, match="missed"):
-        validate_projection(_manifest(), [])
+    missing = validate_projection(_manifest(), [])
+    assert missing.tasks == ()
+    assert missing.failures[0]["reason_type"] == "source-row-missing"
     with pytest.raises(ValueError, match="repeats"):
         validate_projection(_manifest(), [_dataset()[0], _dataset()[0]])
 
