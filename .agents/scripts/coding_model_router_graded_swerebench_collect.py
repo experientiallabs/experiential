@@ -37,6 +37,16 @@ USAGE_FIELDS = (
     "completion_tokens",
     "reasoning_tokens",
 )
+EMPTY_PATCH_SHA256 = hashlib.sha256(b"").hexdigest()
+PATCH_PROVENANCE_VALUES = {
+    "post-execution agent failure",
+    "official trace reported no source changes",
+    "official captured patch",
+}
+USAGE_PROVENANCE_VALUES = {
+    "exact token counts from pinned verifier Responses trace",
+    "mixed exact and conservative trace-derived token estimate",
+}
 
 
 def _sha256(path: Path) -> str:
@@ -77,6 +87,46 @@ def _cost(model: str, usage: dict[str, int]) -> float:
         + usage["cached_input_tokens"] * cached_rate
         + usage["completion_tokens"] * output_rate
     ) / 1_000_000
+
+
+def _patch_provenance(
+    report: dict[str, Any], label: str
+) -> tuple[str, str]:
+    """Validate patch evidence and support the frozen legacy report schema."""
+    patch_bytes = report.get("patch_bytes")
+    patch_sha256 = report.get("patch_sha256")
+    official = report.get("official_verifier_reached")
+    if isinstance(patch_bytes, bool) or not isinstance(patch_bytes, int) or patch_bytes < 0:
+        raise ValueError(f"{label} has invalid patch bytes")
+
+    declared = report.get("patch_provenance")
+    valid_sha = (
+        isinstance(patch_sha256, str)
+        and len(patch_sha256) == 64
+        and all(character in "0123456789abcdef" for character in patch_sha256)
+    )
+    if declared == "post-execution agent failure":
+        consistent = patch_bytes == 0 and patch_sha256 is None and official is False
+    elif declared == "official trace reported no source changes":
+        consistent = (
+            patch_bytes == 0
+            and patch_sha256 == EMPTY_PATCH_SHA256
+            and official is True
+        )
+    elif declared == "official captured patch":
+        consistent = valid_sha and official is True
+    elif declared is None:
+        if patch_bytes > 0 and valid_sha and official is True:
+            return (
+                "official captured patch",
+                "inferred from validated legacy report fields",
+            )
+        raise ValueError(f"{label} has ambiguous legacy patch evidence")
+    else:
+        raise ValueError(f"{label} has inconsistent patch provenance")
+    if not consistent:
+        raise ValueError(f"{label} has inconsistent patch evidence")
+    return str(declared), "declared by arm validator report"
 
 
 def _excluded(state: dict[str, Any]) -> bool:
@@ -127,6 +177,21 @@ def collect(root: Path, corpus_path: Path, output: Path) -> None:
         or launch.get("model_persisted") is not False
     ):
         raise ValueError(f"{PHASE_NAME} launch manifest is invalid")
+    progress_path = root / "progress.json"
+    progress = _read_object(progress_path)
+    if (
+        progress.get("protocol") != EXECUTION_PROTOCOL
+        or progress.get("total_tasks") != SOURCE_TASKS
+        or progress.get("complete_tasks") != 649
+        or progress.get("excluded_tasks") != 24
+        or progress.get("failed_tasks") != 0
+        or progress.get("completed_scientific_cells") != 3941
+        or not isinstance(progress.get("matrix_cost_usd"), (int, float))
+        or not isinstance(
+            progress.get("rough_cumulative_experiment_spend_usd"), (int, float)
+        )
+    ):
+        raise ValueError(f"{PHASE_NAME} progress summary is invalid")
     corpus = _read_object(corpus_path)
     raw_tasks = corpus.get("tasks")
     if not isinstance(raw_tasks, list) or len(raw_tasks) != SOURCE_TASKS:
@@ -136,6 +201,7 @@ def collect(root: Path, corpus_path: Path, output: Path) -> None:
     outcomes: list[dict[str, Any]] = []
     exclusions: list[dict[str, Any]] = []
     artifact_hashes: dict[str, dict[str, str]] = {}
+    usage_provenance_counts = {value: 0 for value in USAGE_PROVENANCE_VALUES}
     total_cost = 0.0
     for index, task in enumerate(tasks):
         task_id = str(task["task_id"])
@@ -197,6 +263,13 @@ def collect(root: Path, corpus_path: Path, output: Path) -> None:
             ):
                 raise ValueError(f"invalid graded report: {task_id}/{arm}")
             usage = _usage(report.get("usage"), f"task {index} {arm} usage")
+            usage_provenance = report.get("usage_provenance")
+            if usage_provenance not in USAGE_PROVENANCE_VALUES:
+                raise ValueError(f"task {index} {arm} has invalid usage provenance")
+            usage_provenance_counts[str(usage_provenance)] += 1
+            patch_provenance, patch_provenance_source = _patch_provenance(
+                report, f"task {index} {arm}"
+            )
             cost = _cost(model, usage)
             total_cost += cost
             outcomes.append(
@@ -218,10 +291,12 @@ def collect(root: Path, corpus_path: Path, output: Path) -> None:
                     "cost_usd": cost,
                     "cost_provenance": "trace-derived frozen list-price estimate",
                     "usage": usage,
+                    "usage_provenance": usage_provenance,
                     "provider_calls": report["provider_calls"],
                     "stop_condition": report["stop_condition"],
                     "patch_sha256": report["patch_sha256"],
-                    "patch_provenance": report["patch_provenance"],
+                    "patch_provenance": patch_provenance,
+                    "patch_provenance_source": patch_provenance_source,
                     "target_outcomes_used": False,
                     "split": PHASE_NAME,
                 }
@@ -256,17 +331,21 @@ def collect(root: Path, corpus_path: Path, output: Path) -> None:
         "attempts_per_arm": 1,
         "cells": expected_cells,
         "unique_cell_identities": len(identities),
-        "spent_matrix_cost_usd": total_cost,
-        "rough_cumulative_experiment_spend_usd": float(launch["prior_spend_usd"])
-        + total_cost,
+        "retained_matrix_cost_usd": total_cost,
+        "spent_matrix_cost_usd": float(progress["matrix_cost_usd"]),
+        "rough_cumulative_experiment_spend_usd": float(
+            progress["rough_cumulative_experiment_spend_usd"]
+        ),
         "unmetered_excluded_scientific_cells": len(exclusions),
         "unmetered_excluded_cost_provenance": "user monitors provider usage externally",
+        "usage_provenance_counts": usage_provenance_counts,
         "target_outcomes_used": False,
         "deep_swe_outcomes_accessed": False,
         "confirmation_outcomes_accessed": PHASE_NAME == "confirmation",
         "fitted_numeric_router_state_persisted": False,
         "corpus_sha256": CORPUS_SHA256,
         "launch_sha256": _sha256(launch_path),
+        "progress_sha256": _sha256(progress_path),
         "outcomes_sha256": _sha256(outcomes_path),
         "artifact_hashes": artifact_hashes,
     }

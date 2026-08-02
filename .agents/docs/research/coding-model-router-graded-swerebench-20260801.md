@@ -279,6 +279,16 @@ missing phase to the controller's frozen phase while still rejecting every scien
 change. Focused regression tests cover the legacy resume and a changed corpus identity. The retry
 was then relaunched with the same frozen inputs, disabled HTTP keepalive reuse, and concurrency 20.
 
+The single retry pass recovered all thirty-four originally eligible transport failures. Its final
+`sol-max` command for `swc-project__swc-8703` started exactly once, then the local controller
+lost DNS while polling the exact worker. The one-hour worker expired before the next recovery
+window, and an exact-ID reconnect returned `SandboxNotFoundException`. No fresh sandbox or second
+scientific command was launched. The missing result and provider usage are irrecoverable, so the
+task is permanently excluded whole-task with zero reruns. Development therefore ends with 649
+dense six-arm tasks and 24 permanent exclusions, retaining 96.4 percent of the frozen 673-task
+cohort. All task states are terminal, every completed task has six valid arm artifacts, and no
+scientific command start count exceeds one.
+
 A pre-fit code audit found that the implementation required positive matched task-blind advantage
 only after averaging the five split seeds. The frozen rule requires a positive advantage in every
 seed. The fitter now applies all four development gates independently to each seed and fails on an
