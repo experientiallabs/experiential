@@ -16,8 +16,9 @@ to what `wmo` consumes: the write side, its argparse CLI, and the canonical-repo
 push path needs all stayed behind upstream. The flagship wheel must install with no runtime
 dependency on `environment-capture` (AGENTS.md section One package). A `Requires-Dist` on it
 would make every `wmo` release wait on an upstream release, and it strands upstream's
-unreleased fixes: the ``wmh-``/``wmo-`` dataset-name fallback below landed in 0.1.1, which was
-never published, so no pip user has ever had it from PyPI.
+unreleased fixes: the ``wmh-``/``wmo-`` dataset-name fallback landed in upstream's 0.1.1, which
+was never published; this module carried it until the Hub repos were renamed on 2026-08-03, at
+which point the Hub's own redirects took over the legacy ids.
 
 Upstream is now a PyPI distribution rather than an in-repo directory, so the two diverge by
 release instead of by hand-mirrored edit. This copy is the one `wmo` runs and the one its tests
@@ -46,11 +47,11 @@ _CORPUS_FILE = "traces.otel.jsonl"
 _HUB = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 _CHUNK_BYTES = 1 << 20
 
-# Dataset-repo name prefixes, most-preferred first. LEGACY FALLBACK: the project renamed
-# `wmh` -> `wmo`, but the org's dataset repos on the Hub are still published under the old
-# `wmh-<benchmark>-traces` name, so every read must try both. Once the Hub repos are renamed,
-# drop "wmh" from this tuple and the fallback disappears with it.
-_REPO_PREFIXES = ("wmo", "wmh")
+# Dataset-repo name prefix. The org's Hub repos were renamed `wmh-*` -> `wmo-*` on
+# 2026-08-03; the Hub redirects the old ids, so clients pinned to the legacy names
+# (the published environment-capture 0.1.0 among them) keep resolving without a
+# fallback here.
+_REPO_PREFIXES = ("wmo",)
 _REPO_SUFFIX = "-traces"
 # What the Hub answers for a repo id that does not resolve: 404 anonymously, 401 when a token
 # is attached (it will not admit a repo is missing to a caller that might lack access), 403

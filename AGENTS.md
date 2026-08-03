@@ -168,6 +168,11 @@ uv run pytest -q
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
    `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.
 
+   `.agents/` is the one sanctioned scratchpad: a local, gitignored working directory for agent
+   sessions (notes, probe scripts, run outputs). It is never tracked, never part of a PR, and
+   nothing under `wmo/` or `docs/` may reference a path inside it. Anything in a scratchpad worth
+   keeping gets promoted into a real surface or an external repo before the work merges.
+
    **Agents must never create a new top-level directory.** Not for scratch work, not for a
    one-off script, not for output, not "temporarily". If work does not fit an existing surface,
    put it under the closest one and say so — do not invent a sibling. The only way a new

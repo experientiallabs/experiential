@@ -38,3 +38,6 @@ wandb/
 # External clones and downloaded data bundles land in the working directory, never in git.
 .tau2-bench/
 environment-capture-data/
+
+# Local agent scratchpads: never tracked, never in PRs (AGENTS.md, Repository layout).
+.agents/

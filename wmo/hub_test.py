@@ -270,39 +270,32 @@ def test_fetch_with_dest_writes_only_the_corpus_file(
     assert not (data_root / "gaia2" / "evals").exists()
 
 
-def test_fetch_falls_back_to_the_legacy_repo_name(
+def test_fetch_fails_plainly_when_the_repo_does_not_resolve(
     data_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The org's datasets are still published under the pre-rename ``wmh-`` name (the code
-    renamed wmh -> wmo, the Hub repos did not), so the canonical id 404s and the whole bundle
-    must come from the legacy repo instead of failing the download.
+    """One canonical name per benchmark: an unresolvable repo is an error, not a hunt.
 
-    This is the fix vendoring exists to ship: it landed in the member's 0.1.1, which was never
-    published, so until `wmo` owned this code no pip user's `wmo download` could resolve a
-    single one of the org's datasets.
+    The wmh-/wmo- fallback this test used to pin was dropped when the Hub repos were
+    renamed (2026-08-03); the Hub redirects the legacy ids, so the fallback's job moved
+    to the Hub itself and a miss here means the dataset genuinely is not published.
     """
-    canonical, legacy = candidate_repo_ids("gaia2")
+    (canonical,) = candidate_repo_ids("gaia2")
     calls = _fake_hub(
         monkeypatch,
-        {"traces.otel.jsonl": b"spans\n", "data/train.jsonl": b"tasks\n"},
-        live_repos={legacy},
+        {"traces.otel.jsonl": b"spans\n"},
+        live_repos=set(),
     )
 
-    path = fetch_corpus("gaia2")
+    with pytest.raises(CorpusRepoUnavailable):
+        fetch_corpus("gaia2")
 
-    assert path.read_bytes() == b"spans\n"
-    assert (data_root / "gaia2" / "data" / "train.jsonl").read_bytes() == b"tasks\n"
-    assert calls.trees == [canonical, legacy]
-    # every file streams from the repo that actually resolved, not the preferred name
-    assert set(calls.resolves) == {legacy}
-
+    assert calls.trees == [canonical]
 
 def test_fetch_asks_once_when_the_canonical_repo_resolves(
     data_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Catch-and-retry, not probe-then-fetch: once the Hub repos are renamed the fallback
-    costs nothing, because a resolving canonical id is never followed by a legacy lookup."""
-    canonical, _legacy = candidate_repo_ids("gaia2")
+    """A resolving canonical id is the only lookup: one name, one tree call."""
+    (canonical,) = candidate_repo_ids("gaia2")
     calls = _fake_hub(monkeypatch, {"traces.otel.jsonl": b"spans\n"}, live_repos={canonical})
 
     fetch_corpus("gaia2")
@@ -470,26 +463,25 @@ def test_published_corpora_maps_repos_to_benchmarks(monkeypatch: pytest.MonkeyPa
     assert published[0].repo_id == candidate_repo_ids("gaia2")[0]
 
 
-def test_published_corpora_accepts_the_legacy_repo_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`wmo download` with no arguments lists what the org publishes; everything it publishes
-    today still carries the pre-rename ``wmh-`` prefix, and dropping those empties the picker."""
+def test_published_corpora_ignores_legacy_prefixed_listings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-rename, a wmh-prefixed row in the org listing is stale and never offered.
+
+    Offering it would make the picker advertise a name fetch no longer tries; the Hub
+    redirect covers old CLIENTS, not old listings.
+    """
     listing = [
-        {"id": "experiential-labs/wmh-gaia2-traces", "lastModified": "2026-07-07T06:00:00.000Z"},
-        {
-            "id": "experiential-labs/wmh-bird-sql-traces",
-            "lastModified": "2026-07-05T00:00:00.000Z",
-        },
+        {"id": "experiential-labs/wmo-gaia2-traces", "lastModified": "2026-08-03T00:00:00.000Z"},
+        {"id": "experiential-labs/wmh-bird-sql-traces", "lastModified": "2026-07-05T00:00:00.000Z"},
         {"id": "experiential-labs/unrelated-dataset", "lastModified": "2026-07-06T00:00:00.000Z"},
-        {"id": "experiential-labs/wmh-not-a-benchmark-traces", "lastModified": ""},
     ]
     monkeypatch.setattr(hub, "_http_json_page", lambda url, *, token: (listing, None))
 
     published = published_corpora()
     assert [(c.benchmark, c.repo_id) for c in published] == [
-        ("gaia2", "experiential-labs/wmh-gaia2-traces"),
-        ("bird-sql", "experiential-labs/wmh-bird-sql-traces"),
+        ("gaia2", "experiential-labs/wmo-gaia2-traces"),
     ]
-
 
 def test_published_corpora_lists_a_double_published_benchmark_once(
     monkeypatch: pytest.MonkeyPatch,
