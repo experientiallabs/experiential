@@ -336,9 +336,12 @@ def test_cli_exposes_the_small_command_set() -> None:
         "download",
         "knowledge",
     }
-    platform = {"login", "logout", "status", "push", "pull", "run"}
+    # `run` (the hosted agent-session runner) moved to the agent-optimization repo
+    # with the rest of the agent surfaces; the platform commands that remain are
+    # the model registry round-trip and the login lifecycle.
+    platform = {"login", "logout", "status", "push", "pull"}
     assert names == core | platform
-    # `optimize` is a GROUP now (harness today; route and training-type optimizers join it).
+    # `optimize` is a GROUP (route, model, and distill; harness search moved out).
     groups = {group.name for group in app.registered_groups}
     assert "optimize" in groups
 
