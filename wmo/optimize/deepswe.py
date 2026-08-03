@@ -310,8 +310,9 @@ def convert_deepswe(source: Path, *, embedding_cache: Path, out: Path) -> Deepsw
                     cached_input_tokens=trial.n_cache_tokens or 0,
                 ),
                 cost_usd=trial.cost_usd or 0.0,
-                error=None if priced else "published trial carries no cost_usd; unscored so "
-                "cost means stay honest",
+                error=None
+                if priced
+                else "published trial carries no cost_usd; unscored so cost means stay honest",
             )
         )
     matrix = OutcomeMatrix(pool=pool, outcomes=outcomes)

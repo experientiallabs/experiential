@@ -193,9 +193,7 @@ def _run_matrix(manifest: Manifest, snapshot: Path, out_dir: Path) -> dict[str, 
             # The grouped protocol: the manifest ships a scenario -> group map (a coding task's
             # repository), and no group straddles fit and report. Same determinism discipline
             # as the scenario split, so the reproduction is still one exact partition.
-            groups = json.loads(
-                (snapshot / protocol.split_groups_file).read_text(encoding="utf-8")
-            )
+            groups = json.loads((snapshot / protocol.split_groups_file).read_text(encoding="utf-8"))
             split = split_router_scenarios_grouped(matrix.scenario_ids(), groups)
         else:
             # The same deterministic 70/30 scenario split the CLI fit computes, so the manifest

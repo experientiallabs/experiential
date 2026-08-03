@@ -87,9 +87,7 @@ def _write_source(tmp_path: Path, trials: list[dict[str, object]]) -> Path:
         if trial["included_in_score"]:
             by_config.setdefault(str(trial["config"]), []).append(float(bool(trial["passed"])))
     (source / "leaderboard-live.json").write_text(
-        json.dumps(
-            {"rows": [{"config": c, "pass_at_1": fmean(v)} for c, v in by_config.items()]}
-        ),
+        json.dumps({"rows": [{"config": c, "pass_at_1": fmean(v)} for c, v in by_config.items()]}),
         encoding="utf-8",
     )
     return source
