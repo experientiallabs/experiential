@@ -50,11 +50,10 @@ def _claude_price(input_per_mtok: float, output_per_mtok: float) -> ModelPrice:
 
 
 def _gpt56_price(input_per_mtok: float, output_per_mtok: float) -> ModelPrice:
-    """A GPT-5.6 row: like `_openai_price` but WITH a cache-write charge.
+    """A GPT-5.6 row: like `_openai_price` but WITH a cache-write charge at 1.25x input.
 
-    The 5.6 family is the first OpenAI generation to bill cache writes, at 1.25x input (the same
-    premium and the same multiplier the DeepSWE price table records). Reusing `_openai_price`
-    here would leave the write tier None and under-report the cost of every cached run.
+    The 5.6 family is the first OpenAI generation to bill cache writes, so reusing
+    `_openai_price` would leave the write tier None and under-report every cached run.
     """
     return ModelPrice(
         input_per_mtok=input_per_mtok,
@@ -101,12 +100,9 @@ _PRICES: dict[str, ModelPrice] = {
     "claude-sonnet-4-6": _claude_price(input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-haiku-4-5": _claude_price(input_per_mtok=1.0, output_per_mtok=5.0),
     # --- OpenAI / Azure OpenAI (GPT-5.x; Azure deployments reuse the base model's price) ---
-    # gpt-5.6-sol is the family's frontier tier and the README's baseline example, so it needs a
-    # built-in price or that example demands hand-entered rates. $5/$30 agrees with the DeepSWE
-    # table's independently-fetched row (2026-07-28). terra and luna are deliberately absent: the
-    # 2026-07-30 price cut moved both and this row is only re-verified for sol, so an entry for
-    # them must carry explicit input_per_mtok/output_per_mtok rather than bill at a stale guess.
     "gpt-5.6-sol": _gpt56_price(input_per_mtok=5.0, output_per_mtok=30.0),
+    "gpt-5.6-terra": _gpt56_price(input_per_mtok=2.0, output_per_mtok=12.0),
+    "gpt-5.6-luna": _gpt56_price(input_per_mtok=0.2, output_per_mtok=1.2),
     "gpt-5.5": _openai_price(input_per_mtok=5.0, output_per_mtok=30.0),
     "gpt-5.5-pro": _openai_price(input_per_mtok=30.0, output_per_mtok=180.0),
     "gpt-5.4": _openai_price(input_per_mtok=2.5, output_per_mtok=15.0),

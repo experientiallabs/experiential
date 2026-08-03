@@ -27,7 +27,10 @@ from wmo.providers.base import (
     ProviderConfig,
     StreamChunk,
     VerifyResult,
+    chat_request_output_budget,
+    guard_starved_chat_response,
     guard_starved_completion,
+    guard_starved_output,
     normalize_chat_temperature,
     verify_via_ping,
 )
@@ -192,7 +195,18 @@ class OpenAIProvider:
             return self._responses_delegate().stream(
                 system, messages, temperature=temperature, max_tokens=max_tokens
             )
-        return _openai_common.stream(
+        return self._guarded_chat_stream(system, messages, temperature, max_tokens)
+
+    def _guarded_chat_stream(
+        self,
+        system: str,
+        messages: list[Message],
+        temperature: float,
+        max_tokens: int,
+    ) -> Iterator[StreamChunk]:
+        """The chat-route stream, checked for starvation once the terminal usage is known."""
+        emitted = False
+        for chunk in _openai_common.stream(
             self._get_client().chat.completions,
             self.config.model,
             system,
@@ -201,7 +215,20 @@ class OpenAIProvider:
             temperature=temperature if self.config.endpoint else None,
             max_tokens_field=self._max_tokens_field,
             **self._chat_effort_kwargs(),
-        )
+        ):
+            if chunk.delta:
+                emitted = True
+            if chunk.done:
+                # A terminal chunk with no usage reports nothing to compare against the cap, so
+                # there is no evidence of starvation either way; 0 leaves the guard inert.
+                guard_starved_output(
+                    produced_output=emitted,
+                    output_tokens=chunk.usage.output_tokens if chunk.usage else 0,
+                    max_tokens=max_tokens,
+                    model=self.config.model,
+                    reasoning_effort=self.config.reasoning_effort,
+                )
+            yield chunk
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured request on the configured OpenAI-compatible backend."""
@@ -211,12 +238,19 @@ class OpenAIProvider:
             request,
             forward_temperature=self._forward_temperature,
         )
-        return _openai_common.complete_chat(
+        response = _openai_common.complete_chat(
             self._get_client().chat.completions,
             self.config.model,
             request,
             max_tokens_field=self._max_tokens_field,
         )
+        guard_starved_chat_response(
+            response,
+            chat_request_output_budget(request),
+            model=self.config.model,
+            reasoning_effort=self.config.reasoning_effort,
+        )
+        return response
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if self.config.embed_model is None:

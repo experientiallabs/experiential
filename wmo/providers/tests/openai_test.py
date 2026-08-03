@@ -522,3 +522,54 @@ def test_prepare_prepares_the_route_the_request_will_take(
     provider.prepare()
 
     assert prepared == ["responses"]
+
+
+def test_effort_dialed_stream_raises_when_it_yields_nothing_at_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that emits no text but burns the whole budget is the same starvation complete()
+    guards; unguarded, the consumer records an empty assistant turn as a success."""
+    provider = OpenAIProvider(
+        ProviderConfig(
+            kind=ProviderKind.OPENAI,
+            model="my-model",
+            endpoint="http://localhost:8000/v1",
+            reasoning_effort="max",
+        )
+    )
+    chat = _FakeStreamingCompletions([_FakeStreamChunk(None, _FakeUsage(10, 64))])
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
+    )
+
+    with pytest.raises(ValueError, match="reasoning consumed"):
+        list(provider.stream("sys", [Message(role="user", content="hi")], max_tokens=64))
+
+
+def test_effort_dialed_stream_that_emits_text_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deltas mean the call produced output; the guard must not touch a working stream."""
+    provider = OpenAIProvider(
+        ProviderConfig(
+            kind=ProviderKind.OPENAI,
+            model="my-model",
+            endpoint="http://localhost:8000/v1",
+            reasoning_effort="max",
+        )
+    )
+    chat = _FakeStreamingCompletions(
+        [_FakeStreamChunk("hi"), _FakeStreamChunk(None, _FakeUsage(10, 64))]
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
+    )
+
+    chunks = list(provider.stream("sys", [Message(role="user", content="hi")], max_tokens=64))
+
+    assert [c.delta for c in chunks if c.delta] == ["hi"]
+    assert chunks[-1].done is True

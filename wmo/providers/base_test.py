@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import pytest
+from llm_waterfall import ChatRequest, ChatResponse
+from pydantic import JsonValue
 
 from wmo.providers.base import (
     PING_MAX_TOKENS,
@@ -12,6 +14,8 @@ from wmo.providers.base import (
     ProviderKind,
     TokenUsage,
     VerifyResult,
+    chat_request_output_budget,
+    guard_starved_chat_response,
     guard_starved_completion,
     verify_via_ping,
 )
@@ -120,3 +124,54 @@ def test_configs_with_no_effort_dial_are_untouched() -> None:
     starved = Completion(text="", usage=TokenUsage(input_tokens=10, output_tokens=8192))
 
     guard_starved_completion(starved, 8192, model="gpt-5.5", reasoning_effort=None)
+
+
+def _chat_response(
+    content: str | None,
+    completion_tokens: int,
+    *,
+    tool_calls: list[dict[str, JsonValue]] | None = None,
+) -> ChatResponse:
+    message: dict[str, object] = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        message["tool_calls"] = tool_calls
+    return ChatResponse.model_validate(
+        {
+            "choices": [{"index": 0, "message": message}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": completion_tokens},
+        }
+    )
+
+
+def test_starved_structured_reply_raises() -> None:
+    """complete_chat can be starved exactly like complete; it used to return the empty reply."""
+    starved = _chat_response(None, 8192)
+
+    with pytest.raises(ValueError, match="reasoning consumed"):
+        guard_starved_chat_response(starved, 8192, model="gpt-5.6-sol", reasoning_effort="max")
+
+
+def test_a_tool_call_with_empty_content_is_not_starvation() -> None:
+    """An assistant turn that called a tool has empty content by design: the normal agent
+    success shape, and the one thing a content-only check would wrongly kill."""
+    tool_call: list[dict[str, JsonValue]] = [
+        {"id": "c1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}
+    ]
+    called = _chat_response(None, 8192, tool_calls=tool_call)
+
+    guard_starved_chat_response(called, 8192, model="gpt-5.6-sol", reasoning_effort="max")
+
+
+def test_chat_request_output_budget_reads_either_field_spelling() -> None:
+    """The budget arrives under whichever name the caller used, or the guard reads None."""
+    assert (
+        chat_request_output_budget(
+            ChatRequest.model_validate({"messages": [], "max_completion_tokens": 4096})
+        )
+        == 4096
+    )
+    assert (
+        chat_request_output_budget(ChatRequest.model_validate({"messages": [], "max_tokens": 512}))
+        == 512
+    )
+    assert chat_request_output_budget(ChatRequest.model_validate({"messages": []})) is None
