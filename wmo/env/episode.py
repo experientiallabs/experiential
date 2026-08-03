@@ -32,6 +32,8 @@ class Agent(Protocol):
 
 
 class StopReason(StrEnum):
+    """Why a rollout ended."""
+
     AGENT_DONE = "agent_done"  # the agent returned DONE_SIGNAL
     MAX_STEPS = "max_steps"  # the step budget ran out
     ENV_ERROR = "env_error"  # env.step raised; episode recorded up to the failure

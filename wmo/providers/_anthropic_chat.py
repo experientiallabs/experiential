@@ -28,6 +28,18 @@ CACHE_CONTROL_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
 """The 5-minute-TTL breakpoint. The only TTL the Messages API bills at the documented rates."""
 
 
+def effort_fields(reasoning_effort: str) -> dict[str, object]:
+    """The cross-vendor effort dial as Messages-API fields; the ONE owner of this wire shape.
+
+    Claude 5 refuses budget-token thinking ("use thinking.type.adaptive and
+    output_config.effort"), so the dial is adaptive thinking plus an effort level
+    (low|medium|high|max, probed live 2026-07-29). Every Anthropic call path - the
+    structured chat contract, plain completion, and streaming - sends exactly these
+    fields, so two pool arms differing only in effort stay two arms on every path.
+    """
+    return {"thinking": {"type": "adaptive"}, "output_config": {"effort": reasoning_effort}}
+
+
 def messages_request(
     request: ChatRequest,
     model: str,
@@ -115,8 +127,7 @@ def messages_request(
         "max_tokens": request.max_tokens or request.max_completion_tokens or default_max_tokens,
     }
     if reasoning_effort is not None:
-        payload["thinking"] = {"type": "adaptive"}
-        payload["output_config"] = {"effort": reasoning_effort}
+        payload.update(effort_fields(reasoning_effort))
 
     tools = _tools(request)
     if tools is not None:

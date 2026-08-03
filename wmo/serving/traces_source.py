@@ -9,6 +9,7 @@ Hub. Recorded traces are grouped by task into replayable scenarios for the Explo
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Callable
 from enum import StrEnum
@@ -50,6 +51,8 @@ def _action_label(action: Action) -> str:
 
 
 class ScenarioStep(BaseModel):
+    """One replayable step of a scenario, with its action pre-rendered for display."""
+
     action: Action
     action_label: str
     observation: str
@@ -57,6 +60,8 @@ class ScenarioStep(BaseModel):
 
 
 class TraceScenario(BaseModel):
+    """One trace turned into a bounded, replayable scenario."""
+
     id: str
     label: str
     task: str | None
@@ -103,8 +108,6 @@ def scenarios_from_traces(
 def _scenario_label(task: str | None, index: int) -> str:
     if not task:
         return f"Scenario {index + 1}"
-    import json
-
     try:
         parsed = json.loads(task)
         text = parsed.get("reason_for_call") or parsed.get("task_instructions") or task
@@ -114,12 +117,16 @@ def _scenario_label(task: str | None, index: int) -> str:
 
 
 class DownloadStatus(StrEnum):
+    """Lifecycle of one background trace download."""
+
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
 
 
 class DownloadProgress(BaseModel):
+    """How far a trace download has got, and why it stopped when it failed."""
+
     status: DownloadStatus
     downloaded: int = 0
     total: int | None = None  # bytes, when the server reports Content-Length

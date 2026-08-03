@@ -9,6 +9,7 @@ number of policy variants offline on identical data. Produced by `wmo.env.closed
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from pathlib import Path
 
 from pydantic import BaseModel, model_validator
@@ -27,6 +28,7 @@ MATRIX_DIGEST_CHARS = 16
 # Hash ordering makes the partition stable across machines and independent of matrix row order.
 ROUTER_FIT_FRACTION = 0.7
 ROUTER_SPLIT_VERSION = "scenario-hash-70-30-v1"
+ROUTER_GROUPED_SPLIT_VERSION = "group-hash-70-30-v1"
 
 
 class RouterScenarioSplit(BaseModel):
@@ -62,6 +64,70 @@ def split_router_scenarios(scenario_ids: list[str]) -> RouterScenarioSplit:
     return RouterScenarioSplit(
         fit_ids=tuple(sid for sid in scenario_ids if sid in fit_set),
         report_ids=tuple(sid for sid in scenario_ids if sid not in fit_set),
+    )
+
+
+def split_router_scenarios_grouped(
+    scenario_ids: list[str],
+    groups: Mapping[str, str],
+    *,
+    salt: str = "",
+) -> RouterScenarioSplit:
+    """The grouped variant of `split_router_scenarios`: no group straddles fit and report.
+
+    Coding tasks from one repository share code, conventions, and often the very functions under
+    test, so a scenario-level split lets a report scenario's near-duplicate sit in the fit bank
+    and the held-out number quietly inherits the leak. Assigning whole GROUPS (for coding
+    matrices: the task's repository) to one side is the honest protocol; it is the difference
+    between claiming generalization to new tasks and to new repositories.
+
+    Determinism matches the scenario split: groups are ranked by the SHA-256 of their name and
+    consumed in that order until the fit side holds at least `ROUTER_FIT_FRACTION` of the
+    SCENARIOS (fractions are of scenarios, not groups, so one giant repository cannot starve the
+    report side by count). Returned ids retain the caller's order. `salt` perturbs the ranking
+    only, deterministically: research protocols that want several independent grouped splits of
+    one matrix (a median over splits, not one lucky partition) salt it with a small integer.
+
+    Raises:
+        ValueError: Duplicate scenario ids, a scenario without a group, or fewer than two
+            groups (one group cannot yield a held-out claim about unseen groups).
+    """
+    if len(scenario_ids) != len(set(scenario_ids)):
+        raise ValueError("router split requires unique scenario ids")
+    missing = [sid for sid in scenario_ids if sid not in groups]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} scenario(s) have no group (first: {missing[:3]}); a grouped split "
+            "needs a group for every scenario"
+        )
+    members: dict[str, list[str]] = {}
+    for sid in scenario_ids:
+        members.setdefault(groups[sid], []).append(sid)
+    if len(members) < 2:
+        raise ValueError(
+            "a grouped router split needs at least 2 groups so one can remain held out; "
+            "with a single group, use split_router_scenarios (and know the split is ungrouped)"
+        )
+    ranked = sorted(
+        members,
+        key=lambda group: (hashlib.sha256(f"{salt}\0{group}".encode()).digest(), group),
+    )
+    target = round(len(scenario_ids) * ROUTER_FIT_FRACTION)
+    target = min(len(scenario_ids) - 1, max(1, target))
+    fit_groups: set[str] = set()
+    fit_size = 0
+    for group in ranked:
+        if fit_size >= target:
+            break
+        fit_groups.add(group)
+        fit_size += len(members[group])
+    if len(fit_groups) == len(ranked):
+        # Every group landed in fit (the last one overshot the target): hold the last-ranked
+        # group out so the report side exists. Deterministic, since `ranked` is.
+        fit_groups.discard(ranked[-1])
+    return RouterScenarioSplit(
+        fit_ids=tuple(sid for sid in scenario_ids if groups[sid] in fit_groups),
+        report_ids=tuple(sid for sid in scenario_ids if groups[sid] not in fit_groups),
     )
 
 

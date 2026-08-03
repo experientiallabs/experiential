@@ -34,8 +34,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pydantic import JsonValue
 
 from wmo.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
-from wmo.harness.environment import AgentEnvironment, is_env_action
-from wmo.harness.runner_link import params_schema, provider_context_window, stop_reason_for_done
+from wmo.harness.environment import AgentEnvironment
+from wmo.harness.runner_link import (
+    HostEpisode,
+    params_schema,
+    provider_context_window,
+    stop_reason_for_done,
+)
 from wmo.harness.runtime import (
     DEFAULT_EVAL_EPISODE_TIMEOUT_S,
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -69,8 +74,13 @@ class _MaterializeError(RuntimeError):
     """Remote source materialization failed; the episode must not run stale files."""
 
 
-class _Episode:
-    """Mutable per-run state the shim handlers share."""
+class _Episode(HostEpisode):
+    """Mutable per-run state the shim handlers share.
+
+    Inherits the host-side episode contract (environment tool routing under a budget, transcript
+    recording) from `HostEpisode` and adds what only the HTTP shim needs: the worker prompts and
+    sampling policy, plus the completion signal entry.ts reads back.
+    """
 
     def __init__(
         self,
@@ -87,19 +97,19 @@ class _Episode:
         max_output_tokens: int,
         context_window: int | None = None,
     ) -> None:
-        self.instruction = instruction
+        super().__init__(
+            instruction=instruction,
+            tools=tools,
+            environment=environment,
+            skills=skills,
+            max_env_actions=max_env_actions,
+        )
         self.system_prompt = system_prompt
-        self.tools = tools
         self.provider = provider
-        self.environment = environment
         self.temperature = temperature
-        self.skills = skills
-        self.max_env_actions = max_env_actions
         self.max_turns = max_turns
         self.max_output_tokens = max_output_tokens
         self.context_window = context_window
-        self.steps: list[Step] = []
-        self.answer: str = ""
         self.proxy_error: str = ""
         self.done_reason: str = ""
         # The host's view of the most recent worker completion, which entry.ts reads back through
@@ -108,7 +118,6 @@ class _Episode:
         self.unparsed_tool_calls: list[str] = []
         self.tool_call_turns: int = 0
         self.done = threading.Event()
-        self._env_calls = 0
 
     def task_json(self) -> JsonObject:
         return {
@@ -117,10 +126,7 @@ class _Episode:
             "max_turns": self.max_turns,
             "max_output_tokens": self.max_output_tokens,
             "context_window": self.context_window,
-            "tools": [
-                {"name": t.name, "description": t.description, "parameters": _params_schema(t)}
-                for t in self.tools
-            ],
+            "tools": self.tool_specs(),
         }
 
     def signal_json(self) -> JsonObject:
@@ -131,30 +137,6 @@ class _Episode:
             "provider_error": self.proxy_error,
             "tool_call_turns": self.tool_call_turns,
         }
-
-    def run_tool(self, name: str, arguments: JsonObject) -> JsonObject:
-        action = Action(kind=ActionKind.TOOL_CALL, name=name, arguments=arguments)
-        if name not in {t.name for t in self.tools}:
-            obs = Observation(content=f"tool {name!r} not available", is_error=True)
-        elif name == READ_SKILL.name:
-            raw_name = arguments.get("name")
-            skill_name = raw_name if isinstance(raw_name, str) else ""
-            skill = self.skills.get(skill_name)
-            if skill is None:
-                obs = Observation(content=f"no skill named {skill_name!r}", is_error=True)
-            else:
-                obs = Observation(content=skill.body)
-        elif self._env_calls >= self.max_env_actions:
-            obs = Observation(content="environment action budget exhausted", is_error=True)
-        elif not is_env_action(action):
-            obs = Observation(content=f"tool {name!r} not available", is_error=True)
-        else:
-            self._env_calls += 1
-            obs = self.environment.execute(action)
-        self.steps.append(
-            Step(action=action, observation=obs, state_before=EnvState(), task=self.instruction)
-        )
-        return {"content": obs.content, "is_error": obs.is_error}
 
     def worker_request(self, body: JsonObject) -> ChatRequest:
         """Apply the document sampling policy to one runner-authored structured request."""

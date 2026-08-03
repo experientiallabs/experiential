@@ -31,6 +31,8 @@ _EMPTY_OBS = Observation(content="")
 
 @runtime_checkable
 class Retriever(Protocol):
+    """The demo-retrieval seam: index a corpus, then serve the nearest prior steps per query."""
+
     def index(self, traces: list[Trace]) -> None:
         """Build phase: embed every step's (state, action) and store it in the buffer."""
         ...

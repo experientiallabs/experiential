@@ -68,6 +68,15 @@ postgres = ["psycopg[binary]>=3.1"]
 # the 0.23.x exception surface llm-waterfall's classification trusts by name (classify.py).
 # wandb is optional run tracking (lazy import, activated only via [wandb] enabled in the run config).
 distill = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5", "wandb>=0.17"]
+# The in-process local embedder (`wmo.providers.local_embed`, EmbedderKind.LOCAL): Qwen3
+# embeddings with no embedding API in the loop. mlx-lm exists only on Apple silicon, hence the
+# marker; it is imported via importlib there (a static import would break the type gate
+# everywhere else), while torch/transformers install on every platform and stay static-lazy.
+local = [
+    "mlx-lm>=0.24; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "torch>=2.4",
+    "transformers>=4.51",
+]
 # dev pulls in every backend SDK so `ty check` and the full test suite resolve over the whole
 # project (the providers import anthropic/openai/boto3 lazily, but type-checking needs them present).
 dev = [
@@ -78,7 +87,7 @@ dev = [
     # certificate-pinning checks (the box's own cert is an operational secret). It arrives
     # transitively via httpx, but a direct import gets a direct declaration.
     "certifi",
-    "world-model-optimizer[otel,viz,e2b,connectors,harbor,postgres,distill]",
+    "world-model-optimizer[otel,viz,e2b,connectors,harbor,postgres,distill,local]",
 ]
 
 [dependency-groups]

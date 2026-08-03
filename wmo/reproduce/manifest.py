@@ -44,10 +44,15 @@ class MatrixProtocol(BaseModel):
     embedding_cache_file: str | None = None  # .npy aligned to the matrix (bit-exact, offline)
     # The embedding identity the vectors have (recorded on the policy so serving rebuilds
     # the same geometry). With a cache file present, no credential for it is needed.
-    embedder_kind: Literal["hashing", "azure"] = "azure"
+    embedder_kind: Literal["hashing", "azure", "local"] = "azure"
     embedder_dim: int = 3072
     embedder_deployment: str | None = None
     embedder_endpoint: str | None = None
+    embedder_model: str | None = None  # local kind: the HF model id the vectors belong to
+    # Snapshot-relative JSON mapping scenario id -> group (e.g. a coding task's repository).
+    # Present = the fit/report split is GROUPED (`split_router_scenarios_grouped`): no group
+    # straddles the split, so the held-out claim is about unseen repositories, not unseen rows.
+    split_groups_file: str | None = None
     fallback: str | None = None
     # Pool entry every request goes to; replaces the kNN fit with a static pin.
     pin_model: str | None = None

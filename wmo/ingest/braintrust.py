@@ -50,6 +50,7 @@ from wmo.core.types import JsonObject
 from wmo.ingest.adapter import VendorPull, register_adapter
 from wmo.ingest.base import BaseTraceAdapter
 from wmo.ingest.normalize import (
+    SpanEmitter,
     SpanRecord,
     as_text,
     iso_to_ordinal,
@@ -269,30 +270,12 @@ class BraintrustAdapter(BaseTraceAdapter):
                 meta_obj = meta
                 break
 
-        spans: list[SpanRecord] = []
-        ordinal = 0
-
-        def emit(attrs: JsonObject, *, tool: bool, error: bool = False) -> None:
-            nonlocal ordinal
-            if ordinal == 0:
-                if task is not None:
-                    attrs.setdefault("gen_ai.prompt", task)
-                if meta_obj:
-                    attrs.setdefault("wmo.trace.metadata", json.dumps(meta_obj))
-            spans.append(
-                SpanRecord(
-                    trace_id=trace_id,
-                    span_id=f"{trace_id[:12]}{ordinal:06x}{'t' if tool else 'a'}",
-                    name="execute_tool" if tool else "chat",
-                    start_nano=ordinal,
-                    attributes={
-                        "gen_ai.operation.name": "execute_tool" if tool else "chat",
-                        **attrs,
-                    },
-                    status_error=error,
-                )
-            )
-            ordinal += 1
+        first_attributes: JsonObject = {}
+        if task is not None:
+            first_attributes["gen_ai.prompt"] = task
+        if meta_obj:
+            first_attributes["wmo.trace.metadata"] = json.dumps(meta_obj)
+        emitter = SpanEmitter(trace_id, first_attributes)
 
         for _, row in indexed:
             rtype = _row_type(row)
@@ -305,7 +288,7 @@ class BraintrustAdapter(BaseTraceAdapter):
                 # nearest following execute_tool span), so we do NOT synthesize a result here.
                 for tool_call in calls:
                     name, args = openai_call_name_args(tool_call)
-                    emit(
+                    emitter.emit(
                         {"gen_ai.tool.name": name, "gen_ai.tool.call.arguments": args},
                         tool=False,
                         error=error,
@@ -314,7 +297,7 @@ class BraintrustAdapter(BaseTraceAdapter):
                 # A `tool` row (or an unknown-typed tool-like row) = a tool execution: an
                 # `execute_tool` result span. We carry name/args too so a standalone tool row (no
                 # preceding llm action) still pairs; the normalizer backfills the action otherwise.
-                emit(
+                emitter.emit(
                     {
                         "gen_ai.tool.name": _row_name(row),
                         "gen_ai.tool.call.arguments": as_text(row.get("input")),
@@ -325,9 +308,11 @@ class BraintrustAdapter(BaseTraceAdapter):
                 )
             elif rtype in _LLM_TYPES or output is not None:
                 # A plain llm/task turn (no tool call): a message action, no observation.
-                emit({"gen_ai.completion": _completion_text(output)}, tool=False, error=error)
+                emitter.emit(
+                    {"gen_ai.completion": _completion_text(output)}, tool=False, error=error
+                )
             # Rows with no usable output and no tool semantics (e.g. score/eval) are ignored.
-        return spans
+        return emitter.spans
 
     def _is_tool_like(self, row: JsonObject) -> bool:
         """An unknown-typed row is a tool execution when it has a name and I/O (input/output)."""

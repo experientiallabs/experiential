@@ -42,6 +42,8 @@ COST_ASSUMPTIONS_V1 = (
 
 
 class ModelRef(BaseModel):
+    """A pool model as the report names it."""
+
     model_id: str  # pool entry name
     label: str
     tier: Tier
@@ -80,11 +82,15 @@ class CandidateResult(BaseModel):
 
 
 class MixShare(BaseModel):
+    """How much of the held-out traffic the routed policy sends to one model."""
+
     model_id: str
     share: float  # fraction of held-out scenarios the policy routes to this model
 
 
 class ImprovementReport(BaseModel):
+    """The endpoint's routing report: headline comparison, per-model evidence, and the mix."""
+
     endpoint_id: str
     generated_at: str
     scenario_count: int

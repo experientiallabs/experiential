@@ -12,6 +12,8 @@ from wmo.utils.waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 
 
 class ProviderKind(StrEnum):
+    """Which backend serves a provider's completions."""
+
     ANTHROPIC = "anthropic"  # Opus 4.8 direct
     BEDROCK = "bedrock"  # Claude 4.8 via AWS
     AZURE_OPENAI = "azure"  # GPT 5.5 via the Azure OpenAI service
@@ -24,20 +26,25 @@ class ProviderKind(StrEnum):
 class EmbedderKind(StrEnum):
     """Which embedder supplies phi for retrieval.
 
-    `HASHING` is the offline, zero-config default (no creds, no network). The other three map 1:1 to
-    the same-named `ProviderKind` and use that backend's embeddings API. Anthropic is intentionally
-    absent — it has no embeddings API; configure `BEDROCK`/`OPENAI`/`AZURE_OPENAI` (or `HASHING`).
+    `HASHING` is the offline, zero-config default (no creds, no network). `LOCAL` runs a small
+    embedding model in-process (Qwen3-Embedding-0.6B by default; MLX on Apple silicon, torch on
+    CUDA or CPU elsewhere): weights download from Hugging Face on first use, after which it is
+    as offline and credential-free as `HASHING` while being semantic (`wmo.providers.local_embed`).
+    The other three map 1:1 to the same-named `ProviderKind` and use that backend's embeddings
+    API. Anthropic is intentionally absent (it has no embeddings API); configure
+    `BEDROCK`/`OPENAI`/`AZURE_OPENAI`, or `HASHING`/`LOCAL` for the no-API paths.
     """
 
     HASHING = "hashing"  # offline HashingEmbedder (default)
+    LOCAL = "local"  # in-process Qwen3 embeddings via MLX or torch (no API)
     BEDROCK = "bedrock"  # Titan on AWS Bedrock
     OPENAI = "openai"  # OpenAI embeddings
     AZURE_OPENAI = "azure"  # Azure OpenAI embedding deployment
 
     def provider_kind(self) -> ProviderKind:
-        """The ProviderKind backing this embedder. Raises for `HASHING` (no provider)."""
-        if self is EmbedderKind.HASHING:
-            raise ValueError("HASHING is the offline embedder; it has no backing provider")
+        """The ProviderKind backing this embedder. Raises for `HASHING`/`LOCAL` (no provider)."""
+        if self in (EmbedderKind.HASHING, EmbedderKind.LOCAL):
+            raise ValueError(f"{self.value} embeds in-process; it has no backing provider")
         return ProviderKind(self.value)
 
 
@@ -45,11 +52,15 @@ Role = Literal["user", "assistant"]
 
 
 class Message(BaseModel):
+    """One turn of a completion request."""
+
     role: Role
     content: str
 
 
 class TokenUsage(BaseModel):
+    """Tokens one call billed, with the cache-read and cache-write subsets broken out."""
+
     input_tokens: int = 0
     output_tokens: int = 0
     # Prompt tokens served from the provider's cache (a SUBSET of input_tokens, never in
@@ -69,6 +80,8 @@ class TokenUsage(BaseModel):
 
 
 class Completion(BaseModel):
+    """One completion: its text, what it cost in tokens, and which model served it."""
+
     text: str
     usage: TokenUsage = Field(default_factory=TokenUsage)
     # The model that actually served, when the provider is a failover chain and a fallback took
@@ -81,6 +94,8 @@ DEFAULT_MAX_TOKENS = 8192
 
 
 class VerifyResult(BaseModel):
+    """Outcome of a provider credential/reachability check, per `wmo providers verify`."""
+
     ok: bool
     kind: ProviderKind
     model: str

@@ -30,6 +30,8 @@ Respond with ONLY a JSON object, no prose:
 
 
 class AssertionResult(BaseModel):
+    """One gold assertion's verdict, as the judge returned it."""
+
     assertion: str
     passed: bool
     why: str = ""

@@ -52,7 +52,7 @@ from pydantic import JsonValue
 from wmo.core.types import JsonObject
 from wmo.ingest.adapter import VendorPull, register_adapter
 from wmo.ingest.base import BaseTraceAdapter
-from wmo.ingest.normalize import SpanRecord, as_text, iso_to_ordinal
+from wmo.ingest.normalize import SpanEmitter, SpanRecord, as_text, iso_to_ordinal
 
 # Mastra self-hosts, so the "vendor" is a server base URL (dev default http://localhost:4111).
 _MASTRA_URL_ENV = "MASTRA_URL"
@@ -249,27 +249,7 @@ class MastraAdapter(BaseTraceAdapter):
             if task is not None:
                 break
 
-        spans: list[SpanRecord] = []
-        ordinal = 0
-
-        def emit(attrs: JsonObject, *, tool: bool, error: bool = False) -> None:
-            nonlocal ordinal
-            if ordinal == 0 and task is not None:
-                attrs.setdefault("gen_ai.prompt", task)
-            spans.append(
-                SpanRecord(
-                    trace_id=trace_id,
-                    span_id=f"{trace_id[:12]}{ordinal:06x}{'t' if tool else 'a'}",
-                    name="execute_tool" if tool else "chat",
-                    start_nano=ordinal,
-                    attributes={
-                        "gen_ai.operation.name": "execute_tool" if tool else "chat",
-                        **attrs,
-                    },
-                    status_error=error,
-                )
-            )
-            ordinal += 1
+        emitter = SpanEmitter(trace_id, {} if task is None else {"gen_ai.prompt": task})
 
         for _, span in indexed:
             stype = _span_type(span)
@@ -279,19 +259,19 @@ class MastraAdapter(BaseTraceAdapter):
                 if calls:
                     for tool_call in calls:
                         name, args = _call_name_args(tool_call)
-                        emit(
+                        emitter.emit(
                             {"gen_ai.tool.name": name, "gen_ai.tool.call.arguments": args},
                             tool=False,
                             error=error,
                         )
                 else:
-                    emit(
+                    emitter.emit(
                         {"gen_ai.completion": _completion_text(span.get("output"))},
                         tool=False,
                         error=error,
                     )
             elif stype in _TOOL_TYPES:
-                emit(
+                emitter.emit(
                     {
                         "gen_ai.tool.name": _tool_span_name(span),
                         "gen_ai.tool.call.arguments": as_text(span.get("input")),
@@ -301,7 +281,7 @@ class MastraAdapter(BaseTraceAdapter):
                     error=error,
                 )
             # agent_run / workflow_* / llm_chunk / generic -> no standalone step.
-        return spans
+        return emitter.spans
 
     def _pull_payloads(self, pull: VendorPull) -> list[JsonValue]:
         """Fetch AI-tracing spans from a running Mastra server's observability API.
