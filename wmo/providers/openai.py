@@ -27,6 +27,7 @@ from wmo.providers.base import (
     ProviderConfig,
     StreamChunk,
     VerifyResult,
+    guard_starved_completion,
     normalize_chat_temperature,
     verify_via_ping,
 )
@@ -156,7 +157,7 @@ class OpenAIProvider:
             return self._responses_delegate().complete(
                 system, messages, temperature=temperature, max_tokens=max_tokens
             )
-        return _openai_common.complete(
+        completion = _openai_common.complete(
             self._get_client().chat.completions,
             self.config.model,
             system,
@@ -168,6 +169,15 @@ class OpenAIProvider:
             max_tokens_field=self._max_tokens_field,
             **self._chat_effort_kwargs(),
         )
+        # The effort-dialed chat route (custom endpoint) never reaches the Responses delegate, so
+        # it needs the same starvation check a reasoning server can trigger here too.
+        guard_starved_completion(
+            completion,
+            max_tokens,
+            model=self.config.model,
+            reasoning_effort=self.config.reasoning_effort,
+        )
+        return completion
 
     def stream(
         self,

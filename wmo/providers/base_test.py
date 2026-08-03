@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import pytest
+
 from wmo.providers.base import (
     PING_MAX_TOKENS,
     Completion,
     Message,
     ProviderConfig,
     ProviderKind,
+    TokenUsage,
     VerifyResult,
+    guard_starved_completion,
     verify_via_ping,
 )
 
@@ -86,3 +90,33 @@ def test_verify_reports_real_failures() -> None:
     result = verify_via_ping(_RaisingProvider(exc))
     assert not result.ok
     assert "401" in (result.detail or "")
+
+
+def test_starved_completion_raises_instead_of_returning_empty_text() -> None:
+    """Reasoning ate the whole budget: 200 with no text would be scored as a failed task."""
+    starved = Completion(text="", usage=TokenUsage(input_tokens=10, output_tokens=8192))
+
+    with pytest.raises(ValueError, match="consumed the entire 8192-token output budget"):
+        guard_starved_completion(starved, 8192, model="gpt-5.6-sol", reasoning_effort="max")
+
+
+def test_a_short_answer_at_top_effort_is_not_starved() -> None:
+    """Starvation is prompt-dependent: effort=max on a trivial prompt emitted 6 tokens live, so a
+    fixed budget floor would have rejected a call that works. Only the outcome may trigger."""
+    fine = Completion(text="PONG", usage=TokenUsage(input_tokens=10, output_tokens=6))
+
+    guard_starved_completion(fine, 2048, model="gpt-5.6-sol", reasoning_effort="max")
+
+
+def test_empty_text_below_the_cap_is_not_relabelled_as_a_budget_problem() -> None:
+    """A refusal or content filter returns empty WITHOUT hitting the cap; don't misdiagnose it."""
+    refused = Completion(text="", usage=TokenUsage(input_tokens=10, output_tokens=12))
+
+    guard_starved_completion(refused, 8192, model="gpt-5.6-sol", reasoning_effort="max")
+
+
+def test_configs_with_no_effort_dial_are_untouched() -> None:
+    """The dial is the opt-in: an undialed call keeps whatever behaviour it had before."""
+    starved = Completion(text="", usage=TokenUsage(input_tokens=10, output_tokens=8192))
+
+    guard_starved_completion(starved, 8192, model="gpt-5.5", reasoning_effort=None)

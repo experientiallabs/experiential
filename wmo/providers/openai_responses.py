@@ -16,6 +16,7 @@ from wmo.providers.base import (
     StreamChunk,
     TokenUsage,
     VerifyResult,
+    guard_starved_completion,
 )
 
 if TYPE_CHECKING:
@@ -99,7 +100,16 @@ class OpenAIResponsesProvider:
                 max_output_tokens=max_tokens,
                 store=False,
             )
-        return Completion(text=_response_text(response), usage=_usage_from_response(response))
+        completion = Completion(text=_response_text(response), usage=_usage_from_response(response))
+        # Covers the direct openai_responses kind AND the openai kind's effort dispatch, which
+        # routes here rather than duplicating the check.
+        guard_starved_completion(
+            completion,
+            max_tokens,
+            model=self.config.model,
+            reasoning_effort=self.config.reasoning_effort,
+        )
+        return completion
 
     def stream(
         self,

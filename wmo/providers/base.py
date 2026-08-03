@@ -309,6 +309,52 @@ _PING_MESSAGES: list[Message] = [Message(role="user", content="ping")]
 # two regardless, so the headroom costs nothing there.
 PING_MAX_TOKENS = 2048
 
+
+def guard_starved_completion(
+    completion: Completion,
+    max_tokens: int | None,
+    *,
+    model: str,
+    reasoning_effort: str | None,
+) -> None:
+    """Raise when reasoning ate the whole output budget and left no visible text.
+
+    A reasoning model spends output tokens on thought before any text. When the budget cannot
+    cover both, the request still returns 200 with an EMPTY string — so a sweep records it as the
+    candidate failing the task rather than as an infrastructure fault, and the arm is quietly
+    scored as bad at the very effort it was meant to showcase. Raising converts that silent
+    mis-scoring into a loud, actionable failure.
+
+    The test is the observed outcome (no text AND output tokens pinned to the cap), not a budget
+    threshold, because starvation is PROMPT-dependent rather than effort-dependent. Measured live
+    on gpt-5.6-sol: `effort=max` on a trivial prompt emitted 6 output tokens and answered fine in
+    a 2000 budget, while `effort=high` and `effort=max` on one hard combinatorics prompt both
+    burned all 8192 and returned zero characters (`effort=medium` answered it in 6310). Any fixed
+    floor would therefore reject calls that would have succeeded — including `verify_via_ping`,
+    which deliberately pings with only PING_MAX_TOKENS.
+
+    Scoped to effort-dialed configs so calls that set no dial behave exactly as before. The same
+    trap exists at the provider's default effort; this does not attempt to police that.
+
+    Raises:
+        ValueError: The call was starved: it hit the cap without emitting any text.
+    """
+    if reasoning_effort is None or max_tokens is None:
+        return
+    if completion.text.strip():
+        return
+    if completion.usage.output_tokens < max_tokens:
+        # Empty for some other reason (a refusal, a content filter). Not this failure mode, and
+        # not something to relabel as a budget problem.
+        return
+    raise ValueError(
+        f"{model} at reasoning_effort={reasoning_effort!r} returned no text: reasoning consumed "
+        f"the entire {max_tokens}-token output budget ({completion.usage.output_tokens} output "
+        "tokens, 0 characters). An empty completion scores as a failed task rather than an error, "
+        "so this fails loudly instead. Raise the output budget or lower the effort."
+    )
+
+
 # Belt-and-suspenders for the above: if a reasoning model spends even the larger ping budget on
 # reasoning before emitting output, the resulting error still PROVES the model is reachable (auth
 # ok, model exists). Treat these markers as reachable so `verify` passes instead of reporting fail.
