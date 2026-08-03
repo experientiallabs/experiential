@@ -57,9 +57,14 @@ _REPO_SUFFIX = "-traces"
 # for a gated repo. Any of these means "try the next candidate name", not "the Hub is broken".
 _MISSING_REPO_CODES = frozenset({401, 403, 404})
 
-# on_progress(bytes_done, bytes_total): called after every streamed chunk, across ALL files in
-# the fetch (front-ends render one bar for the whole bundle).
-ProgressCallback = Callable[[int, int], None]
+# on_progress(files_done, files_total, bytes_total): called after every streamed chunk, across ALL
+# files in the fetch (front-ends render one bar for the whole bundle). Progress is weighted by
+# FILES, not bytes: a bundle is fetched one request per file, so per-request latency is what the
+# wait is made of, and a byte-weighted bar finishes while most of that wait remains (one 11MB file
+# of a 293-file bundle is 97% of the bytes and 2% of the time). A partly-streamed file counts as
+# its byte fraction, so a bundle that is one big file still animates. `bytes_total` is constant
+# for the fetch and is context for the caller to render, never the bar's unit.
+ProgressCallback = Callable[[float, float, int], None]
 
 
 @dataclass(frozen=True)
@@ -323,8 +328,8 @@ def fetch_corpus(
     is fetched; existing files are kept unless ``force=True`` — fetching must never silently
     clobber a corpus that local capture waves have grown past the published one, and an
     interrupted fetch picks up the files it hasn't finished. With an explicit ``dest`` only the
-    corpus file is written (no data dirs). ``on_progress(bytes_done, bytes_total)`` fires per
-    streamed chunk across the whole bundle.
+    corpus file is written (no data dirs). ``on_progress(files_done, files_total, bytes_total)``
+    fires per streamed chunk across the whole bundle, counted in FILES (see ``ProgressCallback``).
 
     Raises ``ValueError`` for unknown/unpublished corpora and ``urllib.error.URLError`` (incl.
     ``HTTPError``, and ``CorpusRepoUnavailable`` when no candidate repo id resolves) when the
@@ -367,18 +372,27 @@ def fetch_corpus(
                 continue
             work.append((remote_path, local, size))
 
-    total = sum(size for _, _, size in work)
-    done = 0
+    byte_total = sum(size for _, _, size in work)
+    file_total = len(work)
+    done = 0.0
+    file_base = 0.0  # units completed before the file in flight
+    current_size = 0  # its advertised size; 0 when the tree does not give one
+
+    def report() -> None:
+        if on_progress is not None:
+            on_progress(done, file_total, byte_total)
 
     def chunk_done(n: int) -> None:
         nonlocal done
-        done += n
-        if on_progress is not None:
-            on_progress(done, total)
+        # An unsized file cannot be tracked mid-stream; it advances a whole unit when it lands.
+        if current_size:
+            done = min(done + n / current_size, file_base + 1.0)
+            report()
 
     for remote_path, local, size in work:
         url = f"{_HUB}/datasets/{repo_id}/resolve/{revision}/{urllib.parse.quote(remote_path)}"
         file_base = done
+        current_size = size
         written = -1
         last: Exception | None = None
         for delay_s in (0, 1, 3):  # transient failures retry THIS file, not the whole bundle
@@ -410,6 +424,11 @@ def fetch_corpus(
         if written < 0:
             assert last is not None
             raise last
+        if done < file_base + 1.0:
+            # The file landed: snap to its boundary. Only reports when that actually moves, so a
+            # sized file (already at the boundary via `chunk_done`) does not emit a duplicate.
+            done = file_base + 1.0
+            report()
     return target
 
 

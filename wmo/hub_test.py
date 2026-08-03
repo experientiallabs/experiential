@@ -121,19 +121,52 @@ def test_fetch_downloads_corpus_and_data_dirs_with_one_progress_bar(
             "gold/t1.json": b"{}",
         },
     )
-    progress: list[tuple[int, int]] = []
+    progress: list[tuple[float, float, int]] = []
 
     path = fetch_corpus(
-        "continual-learning", on_progress=lambda done, total: progress.append((done, total))
+        "continual-learning",
+        on_progress=lambda done, total, size: progress.append((done, total, size)),
     )
 
     assert path == data_root / "continual-learning" / "traces.otel.jsonl"
     assert path.read_bytes() == b"spans\n"
     assert (data_root / "continual-learning" / "data" / "train.jsonl").read_bytes() == b"tasks\n"
     assert (data_root / "continual-learning" / "gold" / "t1.json").read_bytes() == b"{}"
-    # one monotone bar over the WHOLE bundle: total constant, done reaches it
-    total = 6 + 6 + 2
-    assert progress == [(6, total), (12, total), (14, total)]
+    # One monotone bar over the WHOLE bundle, counted in FILES, with the byte size along for
+    # the caller to render as context.
+    assert progress == [(1.0, 3, 14), (2.0, 3, 14), (3.0, 3, 14)]
+
+
+def test_progress_counts_files_so_one_big_file_does_not_finish_the_bar(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle's wait is per-request, so the bar has to count files rather than bytes.
+
+    Regression: the bar was byte-weighted, and these bundles are one big corpus file plus a long
+    tail of small task files. Measured on a real 293-file fetch, it read 97.3% after the first
+    file (0.9s) while the remaining 292 files took 48.8s to move it the last 2.7%, so the
+    download looked finished, or hung, for most of its life.
+    """
+    _fake_hub(
+        monkeypatch,
+        {
+            "traces.otel.jsonl": b"x" * 10_000,
+            "data/a.jsonl": b"a",
+            "data/b.jsonl": b"b",
+            "gold/c.json": b"c",
+        },
+    )
+    progress: list[tuple[float, float, int]] = []
+
+    fetch_corpus(
+        "continual-learning",
+        on_progress=lambda done, total, size: progress.append((done, total, size)),
+    )
+
+    # The corpus file is 99.97% of the bytes but only one of the four requests, so the bar has
+    # to stand at one quarter when it lands, not at "done".
+    assert progress[0] == (1.0, 4, 10_003)
+    assert progress[-1] == (4.0, 4, 10_003)
 
 
 def test_fetch_keeps_existing_local_files_unless_forced(

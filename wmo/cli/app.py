@@ -26,9 +26,10 @@ from uuid import uuid4
 import typer
 from pydantic import ValidationError
 from rich.console import Console
+from rich.filesize import decimal
 from rich.markup import escape
 from rich.panel import Panel
-from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn
+from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Table
 
 from wmo.cli.defer import add_deferred_typer
@@ -1317,20 +1318,31 @@ def _all_downloadable() -> list[str]:
 
 
 def _fetch_with_progress(name: str, *, force: bool) -> Path:
-    """fetch_corpus with a live byte progress bar (hidden when nothing needs downloading)."""
+    """fetch_corpus with a live per-file progress bar (hidden when nothing needs downloading).
+
+    The bar counts FILES because that is what the wait is made of: a bundle is one request per
+    file, so a byte-weighted bar sat at 97% for 98% of the download. The bundle's size stays on
+    screen as description text, which is where a constant belongs.
+    """
     from wmo.hub import fetch_corpus
 
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
-        DownloadColumn(),
+        TextColumn("{task.completed:.0f}/{task.total:.0f} files"),
         console=_console,
         transient=True,
     ) as progress:
         task_id = progress.add_task(f"downloading {name}", total=None, visible=False)
 
-        def on_progress(done: int, total: int) -> None:
-            progress.update(task_id, completed=done, total=total or None, visible=True)
+        def on_progress(done: float, total: float, byte_total: int) -> None:
+            progress.update(
+                task_id,
+                completed=done,
+                total=total or None,
+                description=f"downloading {name} ({decimal(byte_total)})",
+                visible=True,
+            )
 
         return fetch_corpus(name, force=force, on_progress=on_progress)
 
