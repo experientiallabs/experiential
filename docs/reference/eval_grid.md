@@ -67,8 +67,20 @@ are never committed.
 
 ## Reproducing a full grid
 
-The trace corpora are the ones under `environment-capture-data/<suite>/` (e.g.
-`kimi-gui-control`, `tau-bench`, `terminal-tasks`, `swe-bench`) - fetch a corpus with
-`wmo download <suite>`, evolve one prompt per (suite × model) with `wmo build`, collect them into a
-`--gepa-prompts` directory as `<label>.txt`, then run `wmo eval grid <suite>/default` per benchmark
-and `grid-heatmap` across the saved JSONs. All cells in a comparison must share one `JUDGE_VERSION`.
+Everything a grid reads arrives with the bundle, so start with the download; nothing here is in the
+repo:
+
+```bash
+wmo download tau-bench terminal-tasks swe-bench   # or `all`; run bare for a picker over the org's datasets
+```
+
+Each bundle lands at `environment-capture-data/<suite>/` with the corpus, the `evals/<suite>.toml`
+the grid names, and `models/` (the prebuilt world model, whose `prompts/optimized.txt` is that
+suite's already-evolved prompt). `wmo download` with no arguments lists what is actually published,
+which is the only reliable list: a benchmark can be registered in `wmo.hub.CORPORA` and have no
+dataset repo yet, and passing that name gets you a 401 rather than a bundle.
+
+From there: evolve one prompt per (suite × model) with `wmo build` (or start from the bundled
+`prompts/optimized.txt` for the models it already covers), collect them into a `--gepa-prompts`
+directory as `<label>.txt`, then run `wmo eval grid <suite>/default` per benchmark and
+`grid-heatmap` across the saved JSONs. All cells in a comparison must share one `JUDGE_VERSION`.

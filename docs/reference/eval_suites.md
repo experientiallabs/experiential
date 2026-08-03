@@ -8,14 +8,30 @@ This sits on top of the open-loop eval scorer (`wmo.engine.eval`): for each held
 
 ## The definition
 
-Each downloaded task directory bundles everything: corpus, prebuilt models, and its eval suites. `wmo download <benchmark>` writes them under the data root (`environment-capture-data/` in the working directory unless `$ENVCAP_DATA_ROOT` overrides it):
+Suites are not in this repo. They ship in the benchmark's published dataset on the Hub, alongside the corpus they score and the world model built from it, and `wmo download <benchmark>` is how you get all three. Nothing is discoverable before that download; there is no bundled copy to fall back on.
+
+`wmo download` writes under the data root (`environment-capture-data/` in the working directory unless `$ENVCAP_DATA_ROOT` overrides it):
+
+```bash
+wmo download tau-bench
+```
 
 ```
 environment-capture-data/
   tau-bench/
-    traces.otel.jsonl     # the corpus (1033 traces)
-    evals/default.toml    # the suite definition
-    models/               # prebuilt example world models (tau-bench, tau-telecom)
+    traces.otel.jsonl        # the corpus
+    evals/default.toml       # the suite definition
+    models/tau-bench/        # prebuilt world model (config.toml, card.json, metrics.json, prompts/, index/)
+    models/tau-telecom/      # ... a second one, for the telecom domain
+```
+
+That layout is the same one a local `wmo build` writes, which is the point: `wmo eval list` globs `<data root>/*/evals/*.toml` and model resolution walks `<data root>/<benchmark>/models/<name>/`, so a downloaded bundle and a locally captured one are found by identical code. Suite `files` entries are relative to the suite file (`../traces.otel.jsonl`), which resolves because the corpus and the suites land in one benchmark directory.
+
+The prebuilt models come down ready to run, so scoring a suite does not require building anything first:
+
+```bash
+wmo list --root environment-capture-data/tau-bench   # what the bundle shipped, with its metrics
+wmo play --name tau-bench                            # step it; resolution spans downloaded bundles
 ```
 
 `evals/default.toml`:
@@ -42,6 +58,7 @@ skips the suite with that same message as a warning on stderr — if a suite is 
 ## Running
 
 ```bash
+wmo download tau-bench           # required first: suites arrive with the bundle, not with the repo
 wmo eval list                    # every suite under environment-capture-data/*/evals/
 wmo eval run tau-bench           # run a suite, save a local JSON result
 wmo eval results                 # summarize local suite results (all suites)

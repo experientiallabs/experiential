@@ -1133,12 +1133,16 @@ def download(
     benchmarks: list[str] = _DOWNLOAD_BENCHMARKS,
     force: bool = typer.Option(False, "--force", help="Overwrite existing local files."),
 ) -> None:
-    """Download benchmark data bundles (trace corpus + task data) from the Hub.
+    """Download benchmark data bundles (traces, task data, prebuilt model, evals) from the Hub.
 
     With no arguments, lists the org's published datasets (live, via the Hub API) and offers a
     picker. Bundles land in `environment-capture-data/<benchmark>/` under the current directory;
     set `ENVCAP_DATA_ROOT` to put them somewhere else. Existing local files are kept unless
     `--force`.
+
+    A bundle arrives ready to use, not just ready to build from: its `models/` are prebuilt world
+    models `wmo play`/`demo`/`eval --mode closed-loop` resolve by name, and its `evals/` are the
+    named suites `wmo eval list` discovers.
     """
     from wmo.cli.ui import select_option
     from wmo.hub import corpus_path, published_corpora

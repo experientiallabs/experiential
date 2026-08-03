@@ -1,7 +1,8 @@
 """Fetch and list trace-corpus data bundles from the Hugging Face Hub (stdlib-only).
 
-Every publishable benchmark's bundle — the trace corpus plus its task data / gold / evidence
-dirs — lives in a dataset repo under the org. This is the READ core behind `wmo download`, plus
+Every publishable benchmark's bundle lives in a dataset repo under the org: the trace corpus, its
+task data / gold / evidence dirs, and the prebuilt world model and eval suites built from that
+corpus (see ``_ARTIFACT_DIRS``). This is the READ core behind `wmo download`, plus
 the "is it local, and where" resolver (`corpus_path`) that decides whether to fetch or serve
 from disk. Plain HTTP against the Hub's public REST API, so it needs no extra dependency and no
 token for public repos (pass ``token`` for private ones).
@@ -55,6 +56,19 @@ _REPO_SUFFIX = "-traces"
 # is attached (it will not admit a repo is missing to a caller that might lack access), 403
 # for a gated repo. Any of these means "try the next candidate name", not "the Hub is broken".
 _MISSING_REPO_CODES = frozenset({401, 403, 404})
+
+# Prebuilt artifact dirs published in the same dataset repo as the corpus, fetched for every
+# benchmark. Unlike `CorpusSpec.data_dirs` these are not upstream data but `wmo`'s own outputs (the
+# benchmark's prebuilt world model and its named eval suites), and the set is identical everywhere,
+# so it is a constant rather than a per-corpus field.
+#
+# The remote paths mirror the local layout EXACTLY: `models/<name>/` holding
+# `{card.json,config.toml,metrics.json,prompts/,index/}`, and `evals/*.toml`, landing under
+# `<data root>/<benchmark>/`. That is what `WorldModelStore` walks and what suite discovery globs
+# as `<root>/*/evals/*.toml`, so a downloaded bundle is found by the same code as a locally
+# captured one, with no special case for "came from the Hub". A suite names its corpus relatively
+# (`../traces.otel.jsonl`), which resolves because both land in one benchmark dir.
+_ARTIFACT_DIRS = ("models", "evals")
 
 # on_progress(bytes_done, bytes_total): called after every streamed chunk, across ALL files in
 # the fetch (front-ends render one bar for the whole bundle).
@@ -316,14 +330,18 @@ def fetch_corpus(
     revision: str = "main",
     on_progress: ProgressCallback | None = None,
 ) -> Path:
-    """Download the benchmark's corpus AND published data dirs into place; returns the corpus path.
+    """Download the benchmark's whole bundle into place; returns the corpus path.
+
+    The bundle is the corpus file, the spec's published data dirs, and the prebuilt artifact
+    dirs every benchmark ships (``_ARTIFACT_DIRS``: the world model and its eval suites), all
+    written under ``<data root>/<benchmark>/`` at the paths discovery already expects.
 
     Local-first and resumable at file granularity: every published file that is missing locally
     is fetched; existing files are kept unless ``force=True`` — fetching must never silently
     clobber a corpus that local capture waves have grown past the published one, and an
     interrupted fetch picks up the files it hasn't finished. With an explicit ``dest`` only the
-    corpus file is written (no data dirs). ``on_progress(bytes_done, bytes_total)`` fires per
-    streamed chunk across the whole bundle.
+    corpus file is written (no data or artifact dirs). ``on_progress(bytes_done, bytes_total)``
+    fires per streamed chunk across the whole bundle.
 
     Raises ``ValueError`` for unknown/unpublished corpora and ``urllib.error.URLError`` (incl.
     ``HTTPError``, and ``CorpusRepoUnavailable`` when no candidate repo id resolves) when the
@@ -355,9 +373,10 @@ def fetch_corpus(
             )
         work.append((_CORPUS_FILE, target, sizes[_CORPUS_FILE]))
     if dest is None:
+        bundle_dirs = frozenset(spec.data_dirs) | frozenset(_ARTIFACT_DIRS)
         for remote_path, size in sorted(sizes.items()):
             top = remote_path.split("/", 1)[0]
-            if top not in spec.data_dirs:
+            if top not in bundle_dirs:
                 continue
             local = root / benchmark / remote_path
             # File-level skip, not dir-level: an interrupted fetch that materialized only part

@@ -50,7 +50,7 @@ functions they do, so you can drop to any stage and the next run resumes around 
 | Command | Purpose | Artifact |
 |---|---|---|
 | `wmo ingest` | Normalize traces from a file, a vendor API, or a Postgres table into OTel JSONL. No model is built. | an OTel GenAI JSONL corpus, ready for `wmo build --file` |
-| `wmo download` | Fetch published benchmark data bundles (trace corpus plus task data) from the Hub. | `environment-capture-data/<benchmark>/` |
+| `wmo download` | Fetch published benchmark data bundles from the Hub: trace corpus, task data, the prebuilt world model(s) built from that corpus, and its named eval suites. | `environment-capture-data/<benchmark>/` (`traces.otel.jsonl`, `models/<name>/`, `evals/*.toml`) |
 | `wmo scenarios build` | Distill a trace corpus into a weighted, representative scenario set (facets, cluster, select). | a `ScenarioSet` |
 | `wmo scenarios verify` | Closed-loop verification of a scenario set: back-agreement on source traces plus solvability rollouts. | a verification report |
 

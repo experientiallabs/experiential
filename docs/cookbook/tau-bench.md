@@ -76,9 +76,12 @@ uv run wmo build \
   --name tau-bench --fidelity low --embed-provider hashing
 ```
 
-`wmo download` fetches the published data bundle (trace corpus plus task data) into
-`environment-capture-data/tau-bench/`; run it with no arguments for a picker over everything
-published. `--source` defaults to `otel-genai`, which is what that corpus is. Traces from an
+`wmo download` fetches the published data bundle into `environment-capture-data/tau-bench/`: the
+trace corpus, its task data, the `evals/` suites, and `models/` with the world models already built
+from that corpus (`wmo list --root environment-capture-data/tau-bench` shows them and their
+fidelity). Building your own below is the walk-through; the prebuilt one is there if you would
+rather skip to serving or scoring. Run `wmo download` with no arguments for a picker over
+everything published. `--source` defaults to `otel-genai`, which is what that corpus is. Traces from an
 observability stack (Phoenix, Langfuse, LangSmith, Braintrust, PostHog, Mastra) go through the
 same command with `--source <name>`, or through `wmo ingest` first.
 

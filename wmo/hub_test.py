@@ -138,6 +138,74 @@ def test_fetch_downloads_corpus_and_data_dirs_with_one_progress_bar(
     assert progress == [(6, total), (12, total), (14, total)]
 
 
+_PREBUILT = {
+    "traces.otel.jsonl": b"spans\n",
+    "models/tau-bench/config.toml": b'serve_provider = "bedrock"\n',
+    "models/tau-bench/card.json": b'{"name": "tau-bench"}',
+    "models/tau-bench/metrics.json": b"{}",
+    "models/tau-bench/prompts/base.txt": b"you are a backend\n",
+    "models/tau-bench/index/embeddings.npy": b"\x93NUMPY-ish",
+    "evals/default.toml": b'title = "Tau Bench default replay"\nfiles = ["../traces.otel.jsonl"]\n',
+}
+
+
+def test_fetch_downloads_the_prebuilt_model_and_eval_suites(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle is not just traces: the world model built from them and its suites ride along.
+
+    tau-bench declares no ``data_dirs``, which is the point: the artifact dirs are a property of
+    every bundle, not of a corpus spec, so a benchmark with no upstream payload still gets them.
+    """
+    _fake_hub(monkeypatch, _PREBUILT)
+
+    fetch_corpus("tau-bench")
+
+    bench = data_root / "tau-bench"
+    for remote_path, content in _PREBUILT.items():
+        assert (bench / remote_path).read_bytes() == content
+
+
+def test_fetch_places_artifacts_where_existing_discovery_looks(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The remote layout mirrors the local one, so nothing downstream needs a Hub special case.
+
+    This asserts against the REAL resolvers rather than restating paths: the store that every
+    read command walks (`<data root>/<benchmark>/models/<name>/`) and the suite glob
+    (`<root>/*/evals/*.toml`). Renaming either layout on the Hub breaks here instead of at a
+    user's first `wmo eval`.
+    """
+    from wmo.config.store import WorldModelStore
+    from wmo.engine.eval_suites import discover_eval_suites
+
+    _fake_hub(monkeypatch, _PREBUILT)
+
+    fetch_corpus("tau-bench")
+
+    assert WorldModelStore(data_root / "tau-bench").list_names() == ["tau-bench"]
+    suites = discover_eval_suites(data_root)
+    assert [suite.id for suite in suites] == ["tau-bench/default"]
+    # The suite's relative `files` resolve because corpus and suites land in one benchmark dir.
+    assert suites[0].resolve_files() == [data_root / "tau-bench" / "traces.otel.jsonl"]
+
+
+def test_fetch_keeps_a_local_artifact_unless_forced(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Local-first covers artifacts too: a model retuned in place is not published-over."""
+    _fake_hub(monkeypatch, _PREBUILT)
+    config = data_root / "tau-bench" / "models" / "tau-bench" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('serve_provider = "retuned-locally"\n')
+
+    fetch_corpus("tau-bench")
+    assert config.read_text() == 'serve_provider = "retuned-locally"\n'
+
+    fetch_corpus("tau-bench", force=True)
+    assert config.read_bytes() == _PREBUILT["models/tau-bench/config.toml"]
+
+
 def test_fetch_keeps_existing_local_files_unless_forced(
     data_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -183,11 +251,23 @@ def test_fetch_resumes_missing_files_inside_an_existing_dir(
 def test_fetch_with_dest_writes_only_the_corpus_file(
     data_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _fake_hub(monkeypatch, {"traces.otel.jsonl": b"spans\n", "data/train.jsonl": b"tasks\n"})
+    """An explicit `dest` asks for one file, so neither data nor artifact dirs are materialized
+    (they have nowhere sensible to go: their layout is relative to the benchmark dir)."""
+    _fake_hub(
+        monkeypatch,
+        {
+            "traces.otel.jsonl": b"spans\n",
+            "data/train.jsonl": b"tasks\n",
+            "models/gaia2/config.toml": b"top_k = 5\n",
+            "evals/default.toml": b"seed = 0\n",
+        },
+    )
     dest = tmp_path / "elsewhere" / "corpus.jsonl"
     assert fetch_corpus("gaia2", dest=dest) == dest
     assert dest.read_bytes() == b"spans\n"
     assert not (data_root / "gaia2" / "data").exists()
+    assert not (data_root / "gaia2" / "models").exists()
+    assert not (data_root / "gaia2" / "evals").exists()
 
 
 def test_fetch_falls_back_to_the_legacy_repo_name(
