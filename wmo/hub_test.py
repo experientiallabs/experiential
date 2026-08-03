@@ -291,6 +291,7 @@ def test_fetch_fails_plainly_when_the_repo_does_not_resolve(
 
     assert calls.trees == [canonical]
 
+
 def test_fetch_asks_once_when_the_canonical_repo_resolves(
     data_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -482,6 +483,7 @@ def test_published_corpora_ignores_legacy_prefixed_listings(
     assert [(c.benchmark, c.repo_id) for c in published] == [
         ("gaia2", "experiential-labs/wmo-gaia2-traces"),
     ]
+
 
 def test_published_corpora_lists_a_double_published_benchmark_once(
     monkeypatch: pytest.MonkeyPatch,
