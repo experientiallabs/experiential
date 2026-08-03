@@ -31,7 +31,6 @@ __all__ = [
     "StopReason",
     "Surface",
     "SurfaceKind",
-    "SurfaceOp",
     "ToolCall",
     "is_env_action",
     "parse_tool_call",
