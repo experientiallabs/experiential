@@ -218,6 +218,10 @@ class OpenAIProvider:
         ):
             if chunk.delta:
                 emitted = True
+            # Yield the terminal chunk BEFORE checking: those tokens were spent and billed either
+            # way, and usage rides the terminal chunk, so raising first would drop the call from
+            # the consumer's metering.
+            yield chunk
             if chunk.done:
                 # A terminal chunk with no usage reports nothing to compare against the cap, so
                 # there is no evidence of starvation either way; 0 leaves the guard inert.
@@ -228,7 +232,6 @@ class OpenAIProvider:
                     model=self.config.model,
                     reasoning_effort=self.config.reasoning_effort,
                 )
-            yield chunk
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured request on the configured OpenAI-compatible backend."""

@@ -154,6 +154,9 @@ class OpenAIResponsesProvider:
             close = getattr(events, "close", None)
             if callable(close):
                 close()
+        # Terminal chunk first: those tokens were billed either way and usage rides this chunk, so
+        # raising before it would drop the call from the consumer's metering.
+        yield StreamChunk(done=True, usage=usage)
         # A stream that yielded no text but burned the whole budget is the same starvation
         # complete() guards; without this the consumer records an empty assistant turn as success.
         guard_starved_output(
@@ -163,7 +166,6 @@ class OpenAIResponsesProvider:
             model=self.config.model,
             reasoning_effort=self.config.reasoning_effort,
         )
-        yield StreamChunk(done=True, usage=usage)
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured request through the native Responses API."""

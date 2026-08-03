@@ -544,8 +544,16 @@ def test_effort_dialed_stream_raises_when_it_yields_nothing_at_the_cap(
         lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
     )
 
+    seen = []
     with pytest.raises(ValueError, match="reasoning consumed"):
-        list(provider.stream("sys", [Message(role="user", content="hi")], max_tokens=64))
+        for chunk in provider.stream("sys", [Message(role="user", content="hi")], max_tokens=64):
+            seen.append(chunk)
+
+    # The terminal usage chunk must arrive BEFORE the raise: those tokens were billed either way,
+    # so raising first would drop a real, paid-for call from the consumer's metering.
+    assert [c.done for c in seen] == [True]
+    assert seen[0].usage is not None
+    assert seen[0].usage.output_tokens == 64
 
 
 def test_effort_dialed_stream_that_emits_text_is_left_alone(
