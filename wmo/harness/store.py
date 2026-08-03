@@ -24,8 +24,10 @@ not silently ignored. Dotfiles (.DS_Store and friends) are skipped.
 
 from __future__ import annotations
 
+import json
 import tomllib
 from pathlib import Path
+from uuid import uuid4
 
 import tomli_w
 
@@ -199,3 +201,19 @@ def _parse_rendered(name: str, directory: Path) -> HarnessDoc:
     if not files:
         raise ValueError(f"harness dir {directory} has neither {_DOC_FILE} nor {SYSTEM_FILE}")
     return HarnessSourceTree(files=tuple(files)).to_doc(name)
+
+
+def write_json_atomic(path: Path, payload: object) -> None:
+    """Write `payload` as JSON via a same-directory temp file and an atomic replace.
+
+    A torn artifact must never be loadable; the temp name is unique per call so two
+    concurrent writers cannot publish each other's half-written file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staging = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        staging.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        staging.replace(path)
+    except BaseException:
+        staging.unlink(missing_ok=True)
+        raise

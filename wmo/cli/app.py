@@ -86,23 +86,15 @@ app.add_typer(research_app, name="research")
 app.add_typer(scenarios_app, name="scenarios")
 add_deferred_typer(
     app,
-    name="harness",
-    module="wmo.cli.harness_app",
-    attr="harness_app",
-    help="Inspect and initialize named, versioned agent harnesses.",
-    known_names=("list", "show", "init"),
-)
-add_deferred_typer(
-    app,
     name="optimize",
-    module="wmo.cli.harness_app",
+    module="wmo.cli.optimize_app",
     attr="optimize_app",
     help=(
         "Optimizers behind one switch. `model` is the staged one-command path (preflight, "
-        "sweep, fit, tune, report); `route` is those steps individually; `harness` searches the "
-        "agent scaffold; `distill` trains an adapter."
+        "sweep, fit, tune, report); `route` is those steps individually; `distill` trains "
+        "an adapter."
     ),
-    known_names=("route", "distill", "model", "harness"),
+    known_names=("route", "distill", "model"),
 )
 add_deferred_typer(
     app,
@@ -129,13 +121,9 @@ def _register_ingest() -> None:
 
 
 def _register_side_commands() -> None:
-    from wmo.cli.agent_session import register as register_agent_session_commands
-    from wmo.cli.e2b_cmds import register as register_e2b_commands
     from wmo.cli.platform_cmds import register as register_platform_commands
 
     register_platform_commands(app)
-    register_agent_session_commands(app)
-    register_e2b_commands(app)
 
 
 _register_ingest()
@@ -1541,7 +1529,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     (bedrock/claude-opus-4-8 when no role is configured); `--provider`/`--model` override it.
     """
     from wmo.cli.eval_closed_loop import run_agreement, run_closed_loop
-    from wmo.cli.harness_app import _explicit
+    from wmo.cli.ui import explicit_param as _explicit
     from wmo.telemetry import capture_eval_completed
 
     args = tokens or []

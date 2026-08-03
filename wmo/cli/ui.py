@@ -1134,3 +1134,13 @@ def _action_text(action: Action) -> str:
     if action.kind == ActionKind.TOOL_CALL:
         return f"{action.name}({action.arguments})"
     return f'message: "{action.content}"'
+
+
+def explicit_param(ctx: typer.Context, param: str) -> bool:
+    """Whether `param` was explicitly passed on the command line.
+
+    Compared by enum NAME: typer vendors click, so its ParameterSource enum is not
+    click.core's class and an identity check would silently never match.
+    """
+    source = ctx.get_parameter_source(param)
+    return source is not None and source.name == "COMMANDLINE"

@@ -35,7 +35,6 @@ from wmo.harness.e2b_sandbox import (
     SandboxFactory,
     SandboxUsage,
 )
-from wmo.harness.live_session import LiveSession, SessionEvent, ToolOutcome
 from wmo.harness.pi_e2b import (
     LIVE_START_CMD,
     NODE_INSTALL_CMD,
@@ -1936,84 +1935,6 @@ def test_durable_channel_replays_a_large_context_with_a_compressed_frame_budget(
     assert channel.recv(timeout=0.5) == frame
     frame_calls = [call for call in files.read_calls if "/frames/" in call[0]]
     assert frame_calls == [(_frame_path(1), 5.0, True)]
-
-
-def test_live_session_completes_exactly_once_across_a_durable_stdout_drop() -> None:
-    """A dropped notification stream cannot duplicate model/tool work during one real turn."""
-    frames: list[JsonObject] = [
-        {"type": "hello"},
-        {"type": "state", "status": "idle"},
-        {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
-        {
-            "type": "tool_request",
-            "req_id": 2,
-            "name": "bash",
-            "arguments": {"command": "pwd"},
-        },
-        {
-            "type": "tool_request",
-            "req_id": 3,
-            "name": "submit",
-            "arguments": {"answer": "done"},
-        },
-        {"type": "state", "status": "idle", "reason": "completed", "turns": 1},
-    ]
-    # stdout carries the opening frames, repeats the LLM request, then disconnects. The tool,
-    # submit, and final state must continue from the exact filesystem frames.
-    handle = _DisconnectingHandle(
-        _stdout_events(
-            [
-                _envelope(1, frames[0]),
-                _envelope(2, frames[1]),
-                _envelope(3, frames[2]),
-                _envelope(3, frames[2]),
-            ]
-        )
-    )
-    fake = FakeSandbox(handle)
-    _store_outbox(fake, frames)
-    channel = _durable_channel(fake, handle)
-    assert channel.recv(timeout=0.5) == {"type": "hello"}
-
-    worker_calls: list[ChatRequest] = []
-    tool_calls: list[str] = []
-    events: list[SessionEvent] = []
-
-    def worker(request: ChatRequest) -> ChatResponse:
-        worker_calls.append(request)
-        return _completion("on it")
-
-    def execute(name: str, arguments: JsonObject, emit) -> ToolOutcome:  # noqa: ANN001
-        del arguments, emit
-        tool_calls.append(name)
-        return ToolOutcome(content="/home/user/project\n")
-
-    session = LiveSession(
-        channel,
-        tools=[TOOL_REGISTRY["bash"], SUBMIT],
-        execute_tool=execute,
-        on_event=events.append,
-        worker_fn=worker,
-    )
-    session.start()
-    events.clear()
-    session.send_user_message("finish once")
-    for _ in range(20):
-        session.pump(timeout=0.05)
-        if any(
-            event.kind == "state" and event.payload.get("reason") == "completed" for event in events
-        ):
-            break
-
-    assert session.status == "idle"
-    assert len(worker_calls) == 1
-    assert tool_calls == ["bash"]
-    dispatched_types = [frame["type"] for frame in fake.durable_dispatches]
-    assert dispatched_types.count("llm_response") == 1
-    assert dispatched_types.count("tool_response") == 2
-    assert [event.kind for event in events].count("assistant_message") == 1
-    assert [event.kind for event in events].count("tool_call") == 1
-    assert [event.kind for event in events].count("submit") == 1
 
 
 def test_durable_channel_fails_after_a_committed_frame_stays_corrupt() -> None:
