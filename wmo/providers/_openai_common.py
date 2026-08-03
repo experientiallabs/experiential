@@ -54,6 +54,7 @@ def complete(
     max_tokens: int,
     temperature: float | None = None,
     max_tokens_field: str = "max_completion_tokens",
+    reasoning_effort: str | None = None,
 ) -> Completion:
     """Run one chat completion and map it onto our `Completion`.
 
@@ -62,6 +63,8 @@ def complete(
     classic `max_tokens` (see `ProviderConfig.resolved_chat_max_tokens_field`). `temperature`
     is sent ONLY when given: GPT 5.5's reasoning models reject non-default sampling params
     (callers pass None), while OpenAI-compatible servers (vLLM policies) need it.
+    `reasoning_effort` is likewise sent only when given; callers on real OpenAI route the dial
+    through the Responses API instead, so this carries it only for OpenAI-compatible servers.
     """
     # The output-budget param name is dynamic, so this call crosses the SDK boundary through
     # the same one-line cast `stream` uses below.
@@ -71,6 +74,8 @@ def complete(
         "messages": to_messages(system, messages),
         max_tokens_field: max_tokens,
     }
+    if reasoning_effort is not None:
+        base_kwargs["reasoning_effort"] = reasoning_effort
     if temperature is None:
         response: ChatCompletion = resource.create(**base_kwargs)
     else:
@@ -101,12 +106,13 @@ def stream(
     max_tokens: int,
     temperature: float | None = None,
     max_tokens_field: str = "max_completion_tokens",
+    reasoning_effort: str | None = None,
 ) -> Iterator[StreamChunk]:
     """Stream one chat completion as `StreamChunk`s (deltas, then a terminal chunk with usage).
 
     `stream_options.include_usage` makes the wire stream end with a usage-bearing chunk, so the
-    terminal `StreamChunk` carries real token counts instead of estimates. `temperature` and
-    `max_tokens_field` follow the same rules as `complete`.
+    terminal `StreamChunk` carries real token counts instead of estimates. `temperature`,
+    `max_tokens_field`, and `reasoning_effort` follow the same rules as `complete`.
     """
     resource = cast("Any", chat_completions)
     kwargs: dict[str, Any] = {
@@ -118,6 +124,8 @@ def stream(
     }
     if temperature is not None:
         kwargs["temperature"] = temperature
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
     usage = TokenUsage()
     upstream = resource.create(**kwargs)
     try:
