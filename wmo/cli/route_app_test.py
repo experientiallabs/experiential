@@ -2936,14 +2936,14 @@ def test_route_fit_defaults_to_the_knn_champion(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("command", ["fit", "sweep"])
 def test_route_compressor_help_lists_every_shipped_id(command: str) -> None:
-    """Rendered from the registry: `llmlingua2-endpoint` shipped while the help said two ids.
+    """Rendered from the registry, so a shipped id cannot go unadvertised.
 
     Asserted against the ids registered at import rather than the live registry, because that is
     when typer builds a help string (this module itself registers fakes afterwards).
     """
     result = runner.invoke(app, ["optimize", "route", command, "--help"])
     assert result.exit_code == 0, result.output
-    for compressor_id in ("identity", "truncate", "llmlingua2-endpoint"):
+    for compressor_id in ("identity", "truncate"):
         assert compressor_id in registered_compressor_ids()
         assert _says(result.output, compressor_id)
 

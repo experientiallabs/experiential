@@ -461,8 +461,8 @@ def registered_compressor_ids() -> tuple[str, ...]:
 
     The one source of that list. `--compressor`'s help text renders it rather than spelling the
     ids out, because a hand-written enumeration goes stale the moment a compressor is registered:
-    `llmlingua2-endpoint` shipped as a lazy factory and the help kept advertising two ids for
-    several releases while the flag accepted three.
+    a lazily-registered endpoint compressor once shipped while the help kept advertising two ids
+    for several releases, so the flag accepted more than its own help admitted.
     """
     return tuple(sorted({*_COMPRESSORS, *_COMPRESSOR_FACTORIES}))
 

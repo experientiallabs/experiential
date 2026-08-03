@@ -452,6 +452,9 @@ class RoutingPolicy(BaseModel):
     # BEFORE routing (the router embeds what the model will see), so it cannot vary by cluster
     # at serve time; per-cluster overrides live on ClusterRanking for the joint fit and eval
     # grids. None (the default) = compression off, today's behavior exactly.
+    # LOAD-BEARING for stored artifacts: this model tolerates unknown keys (pydantic extra
+    # defaults to ignore), so deleting this field or fit_compression raises nothing and
+    # silently discards the stored value on the next load. Removing one is a data migration.
     compression: CompressionConfig | None = None
     # D-COMPRESS representation consistency: the compression config the ROUTING EVIDENCE was
     # fitted under (bank rows, cluster centroids, and the novelty floor quantile all live in the

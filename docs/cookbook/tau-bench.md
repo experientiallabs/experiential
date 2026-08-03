@@ -51,7 +51,7 @@ Copies `.env.example` to `.env` if you have no `.env` yet (an existing one is ne
 runs `uv sync --extra dev`. Then fill in the credentials you actually have: `.env.example`
 documents each block inline, including which ones are optional and which single feature needs
 them. Bedrock or Anthropic direct is enough to get through steps 1 through 3; `TINKER_API_KEY` is
-step 4 only, and the `WMO_COMPRESSOR_*` block is step 5 only.
+step 4 only.
 
 There is nothing to verify yet, and that is fine. Credentials are exercised at first use, and the
 two places that spend money check theirs before they spend it. Step 2 live-pings every candidate
@@ -477,52 +477,7 @@ cost-aware policy would route everything to it. The re-run then re-sweeps the en
 refits, and traffic shifts to the student only on the cells where it earned them. A student that
 earns nothing changes nothing, which is the point of measuring rather than assuming.
 
-## Step 5 (optional): compress the prompt
-
-Compression is a stage in front of routing: request, then compress, then route, then call. It is
-**default-off**, and it should stay off in production until its accuracy gate passes. What
-follows is how to measure it, not a recommendation to ship it.
-
-Measure a compressed arm, then fit in the same geometry:
-
-```bash
-uv run wmo optimize route sweep tau-bench \
-  --traces environment-capture-data/tau-bench/traces.otel.jsonl \
-  --compressor llmlingua2-endpoint --aggressiveness 0.4 --out matrix-c04.json
-
-uv run wmo optimize route fit matrix-c04.json --kind knn \
-  --compressor llmlingua2-endpoint --aggressiveness 0.4 \
-  --out .wmo/models/tau-bench/policy.json
-```
-
-`wmo optimize model tau-bench --compressor llmlingua2-endpoint --aggressiveness 0.4` runs that same
-pair end to end (the arm configures its sweep and its fit, and the compact row in the plan table
-names it), which is the one-command way to measure an arm once you know which one you want.
-
-One sweep per arm, one matrix per arm. `--aggressiveness` is a dial in `[0, 1]` where 0.0 is a
-no-op and higher never removes less, but it is not an exact removal fraction: the achieved ratio
-is recorded per episode. Available compressors are `identity`, `truncate`, and
-`llmlingua2-endpoint`; the last is a learned 177M-parameter classifier served from a GPU box and
-needs the `WMO_COMPRESSOR_*` variables from `.env.example`. It fails closed on an unreachable
-endpoint or a missing certificate rather than silently serving uncompressed text, because a
-compressor that degrades quietly makes every cost and accuracy result depend on the health of a
-box nobody was watching.
-
-**The arm must match the fit.** A fitted policy records the compression config its evidence was
-fitted under (`fit_compression`) alongside the config it would serve, and an endpoint whose two
-disagree does not mount at all. This is not pedantry: a bank, its centroids, and its novelty
-floor are geometry in the space of the text the fit embedded, and serving a different
-representation against them was measured to trip the novelty floor 10 to 13 times more often,
-collapse route-away, and raise cost 11 to 41 percent while accuracy sat flat to negative. That is
-a broken policy, not a degraded one. Refit under the serving config, or serve the config the
-artifact was fitted under. Static policies embed nothing and are exempt.
-
-Only user-message content is compressed. System prompts, the model's own prior replies, tool
-calls, and tool results pass through verbatim. And a compressor's own inference cost counts:
-effective cost per completed task includes it, so an arm that saves prompt tokens and pays more
-for the compressor than it saved has not saved anything.
-
-## Step 6: serve it
+## Step 5: serve it
 
 ```bash
 uv run wmo serve --name tau-bench

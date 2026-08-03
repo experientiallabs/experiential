@@ -83,10 +83,6 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    # The compressor-endpoint tests import certifi directly to borrow a real PEM for the
-    # certificate-pinning checks (the box's own cert is an operational secret). It arrives
-    # transitively via httpx, but a direct import gets a direct declaration.
-    "certifi",
     "world-model-optimizer[otel,viz,e2b,connectors,harbor,postgres,distill,local]",
 ]
 

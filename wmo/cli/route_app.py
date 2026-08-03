@@ -78,7 +78,7 @@ _WM_SIMULATED = "wm_simulated"
 _REAL_EPISODE = "real_episode"
 _DEFAULT_WM_JUDGE = "world-model verifier"
 
-COMPRESSOR_IDS_HELP = "identity | llmlingua2-endpoint | truncate"
+COMPRESSOR_IDS_HELP = "identity | truncate"
 """What `--compressor` accepts. Mirrors `wmo.optimize.compression.registered_compressor_ids()`."""
 
 _MATRIX_DIGEST_MARK = "sha256="
@@ -937,9 +937,7 @@ def convert_deepswe_cmd(
     from wmo.optimize.outcomes import OutcomeMatrix
 
     try:
-        result = convert_deepswe(
-            Path(source), embedding_cache=Path(embedding_cache), out=Path(out)
-        )
+        result = convert_deepswe(Path(source), embedding_cache=Path(embedding_cache), out=Path(out))
     except (FileNotFoundError, ValueError, KeyError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     top = top_arm(OutcomeMatrix.load(result.matrix_path))

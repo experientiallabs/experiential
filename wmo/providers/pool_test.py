@@ -1218,7 +1218,7 @@ def test_disabled_entry_still_validates_loudly(tmp_path: Path) -> None:
         ("http://host.docker.internal:11434/v1", True),
         ("http://silens-mac.local:11434/v1", True),
         ("https://api.openai.com/v1", False),
-        ("https://40.80.93.150:8443", False),
+        ("https://203.0.113.10:8443", False),
         (None, False),
         ("", False),
     ],

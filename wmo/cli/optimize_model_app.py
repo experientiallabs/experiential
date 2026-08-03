@@ -155,7 +155,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         None,
         "--compressor",
         help="Compress every request through this compressor before routing it (identity | "
-        "truncate | llmlingua2-endpoint). The sweep then measures that arm and the fit embeds "
+        "truncate). The sweep then measures that arm and the fit embeds "
         "its bank through the same compressor, so the endpoint serves what was measured. "
         "Default: no compression.",
     ),
@@ -253,7 +253,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     `--compressor` measures and fits a compressed arm end to end, which is the same thing a
     `route sweep --compressor` plus `route fit --compressor` pair does by hand:
 
-        wmo optimize model support --compressor llmlingua2-endpoint --aggressiveness 0.4
+        wmo optimize model support --compressor truncate --aggressiveness 0.4
 
     Artifacts land exactly where the manual commands put them, so you can drop to any of them
     mid-flow and this command resumes around it: `policy.json` (plus its evidence bank) in the

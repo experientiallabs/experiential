@@ -161,7 +161,10 @@ class ScenarioOutcome(BaseModel):
     # neighbours never faced, and a reader comparing two matrices deserves to see how much of one
     # of them is re-runs.
     remeasured: bool = False
-    # D-COMPRESS fields, additive with defaults so pre-compression matrices load unchanged;
+    # D-COMPRESS fields, additive with defaults so pre-compression matrices load unchanged.
+    # LOAD-BEARING for stored artifacts: this model tolerates unknown keys (pydantic extra
+    # defaults to ignore), so deleting a field here raises nothing and silently discards the
+    # stored values on the next load. Removing one is a data migration, not a cleanup;
     # 0/"" = the episode ran uncompressed. Token counts are the compressor's deterministic
     # proxy totals summed over the episode's calls (wmo.optimize.compression); billable truth
     # stays in `usage`/`cost_usd`. Latency and cost are the compressor's OWN, which sit inside
