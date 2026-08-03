@@ -53,7 +53,6 @@ functions they do, so you can drop to any stage and the next run resumes around 
 | `wmo download` | Fetch published benchmark data bundles (trace corpus plus task data) from the Hub. | `environment-capture-data/<benchmark>/` |
 | `wmo scenarios build` | Distill a trace corpus into a weighted, representative scenario set (facets, cluster, select). | a `ScenarioSet` |
 | `wmo scenarios verify` | Closed-loop verification of a scenario set: back-agreement on source traces plus solvability rollouts. | a verification report |
-| `wmo examples list` / `run` | List the self-contained task examples, or launch one's local helper (extra args after `--`). | whatever the example's launcher writes |
 
 `wmo scenarios build` produces a `ScenarioSet`; `wmo optimize harness --tasks` takes `TaskSpec`
 JSONL. The two formats are not interchangeable.

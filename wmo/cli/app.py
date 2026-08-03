@@ -11,9 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
-import os
 import random
-import subprocess
 import time
 import urllib.error
 import uuid
@@ -73,9 +71,6 @@ app = typer.Typer(
 
 
 providers_app = typer.Typer(help="Manage and verify LLM providers.", no_args_is_help=True)
-examples_app = typer.Typer(
-    help="List and launch self-contained task examples.", no_args_is_help=True
-)
 # "harness" here would collide with the `wmo harness` group, which manages a different object.
 config_app = typer.Typer(help="Manage project-local wmo settings.", no_args_is_help=True)
 research_app = typer.Typer(
@@ -86,7 +81,6 @@ scenarios_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(providers_app, name="providers")
-app.add_typer(examples_app, name="examples")
 app.add_typer(config_app, name="config")
 app.add_typer(research_app, name="research")
 app.add_typer(scenarios_app, name="scenarios")
@@ -550,59 +544,6 @@ def _print_verify_result(result: VerifyResult, sources: list[str], *, prefix: st
         _console.print(f"  [yellow]{hint}[/yellow]")
 
 
-@examples_app.command("list")
-def examples_list() -> None:
-    """List self-contained example tasks."""
-    examples = _discover_examples()
-    if not examples:
-        _console.print("[yellow]no examples found[/yellow]")
-        return
-    for example in examples:
-        # Data-only bundles (what `wmo download` fetches) have no launcher, so say so here
-        # rather than letting `wmo examples run` be the only way to find out.
-        note = "" if (example / "run.sh").exists() else "  [dim](data only — no run.sh)[/dim]"
-        _console.print(f"{example.name}{note}")
-
-
-@examples_app.command(
-    "run",
-    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
-)
-def examples_run(
-    ctx: typer.Context,
-    name: str = typer.Argument(..., help="Example task name."),
-) -> None:
-    """Run an example's local launcher, forwarding any extra args after `--`."""
-    example_dir = _resolve_example(name)
-    runner = example_dir / "run.sh"
-    if not runner.exists():
-        # A data-only bundle (`wmo download`) is listed but not runnable; name what it IS for.
-        traces = example_dir / "traces.otel.jsonl"
-        hint = (
-            "; it is a data-only bundle — build a world model from it with "
-            f"`wmo build --file {traces} --name {name}`"
-            if traces.exists()
-            else ""
-        )
-        raise typer.BadParameter(f"example {name!r} has no run.sh launcher{hint}")
-    if not os.access(runner, os.X_OK):
-        raise typer.BadParameter(
-            f"example {name!r} has a run.sh that is not executable; run `chmod +x {runner}`"
-        )
-    try:
-        result = subprocess.run([str(runner), *ctx.args], cwd=example_dir, check=False)
-    except OSError as exc:
-        # The exec itself failed, so there is no exit code to forward: the launcher has no
-        # shebang (ENOEXEC), or names an interpreter that is not installed (ENOENT, whose
-        # "No such file or directory" reads as a lie about a run.sh we just stat'd). Say which
-        # line to look at instead of letting the errno out as a traceback.
-        raise typer.BadParameter(
-            f"example {name!r} could not start {runner} ({exc.strerror or exc}); "
-            f"check its interpreter line with `head -1 {runner}`"
-        ) from exc
-    raise typer.Exit(result.returncode)
-
-
 # The serve provider `wmo build` falls back to when neither `--provider` nor a configured worker
 # role names one.
 _BUILD_PROVIDER = "bedrock"
@@ -918,10 +859,7 @@ def build(
         ) from None
     # A provider-backed embedder needs an embeddings model; fail fast, not deep inside embed().
     # The in-process kinds need none: hashing has no model, local carries its own default.
-    if (
-        embed_kind not in (EmbedderKind.HASHING, EmbedderKind.LOCAL)
-        and not params.embed_model
-    ):
+    if embed_kind not in (EmbedderKind.HASHING, EmbedderKind.LOCAL) and not params.embed_model:
         raise typer.BadParameter(
             f"--embed-provider {embed_kind.value} requires --embed-model "
             "(the embeddings model id / Azure embedding deployment)"
@@ -2754,8 +2692,6 @@ def demo(
 ) -> None:
     """Replay a randomly sampled recorded scenario against the world model, open loop."""
 
-    from wmo.utils.waterfall import is_capacity_error
-
     import wmo.providers as providers
     from wmo.cli.ui import select_provider_and_model
     from wmo.engine.build import ingest
@@ -2763,6 +2699,7 @@ def demo(
     from wmo.engine.world_model import WorldModel
     from wmo.providers import verify_all
     from wmo.providers.retry import wrap_provider_with_retries
+    from wmo.utils.waterfall import is_capacity_error
 
     wm, resolved_name, _provider, model_root = _load_model_any(
         name, root, max_fidelity=max_fidelity
@@ -3119,7 +3056,11 @@ def _discover_examples() -> list[Path]:
 
 
 def _is_safe_example_name(name: str) -> bool:
-    """Whether `name` would resolve via `wmo examples run` — keeps list/hint/run in agreement."""
+    """Whether `name` is resolvable at all — discovery must not surface what lookup would reject.
+
+    A downloaded dir whose name `validate_name` rejects can never be named on a command line, so
+    listing it as a model candidate or in an "available:" hint would only offer a dead end.
+    """
     try:
         validate_name(name)
     except ValueError:
@@ -3429,9 +3370,7 @@ def research_plot_concurrency_combined(
 # so a reader sees the decision-rule difference instead of hunting for it: its router picked the
 # CHEAPEST arm whose predicted solve odds cleared a threshold (cost first, quality as the
 # constraint), measured over 6 seeded 80/20 repo splits.
-_DEEPSWE_LAB_REFERENCE = (
-    "cost ratio median 3.18x (range 0.90-5.25), graded delta median -0.015"
-)
+_DEEPSWE_LAB_REFERENCE = "cost ratio median 3.18x (range 0.90-5.25), graded delta median -0.015"
 
 
 @research_app.command("deepswe-holdout")
@@ -3492,9 +3431,7 @@ def research_deepswe_holdout(
                 "`wmo optimize route convert-deepswe` (or the downloaded published bundle)"
             )
     matrix = OutcomeMatrix.load(root / "matrix.json")
-    groups: dict[str, str] = json.loads(
-        (root / "scenario_groups.json").read_text(encoding="utf-8")
-    )
+    groups: dict[str, str] = json.loads((root / "scenario_groups.json").read_text(encoding="utf-8"))
     built = CachedTaskEmbedder(matrix, root / "task_embeddings.npy")
     spec = EmbedderSpec(kind="local", dim=built.dim)
 

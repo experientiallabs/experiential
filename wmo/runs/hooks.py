@@ -13,8 +13,8 @@ command, so telemetry is allowed to be missing and is never allowed to raise. Co
   events back and the oldest are dropped once the bound is reached, so an hours-long outage costs
   telemetry (recoverable later with `wmo runs backfill`) and never memory.
 - Nothing blocks on a deadline of its own. There is no watchdog and no background thread: every
-  push happens inside a callback the run was making anyway, which is what keeps the tau runner's
-  no-hang property (`.agents/scripts/run_tau_grid.py`) true with emission on.
+  push happens inside a callback the run was making anyway, so turning emission on can never make
+  a long-running sweep block or hang where it would otherwise have made progress.
 
 Seq bands come from `wmo.runs.schema` and are the same ones `wmo runs backfill` uses, so what a run
 reports live and what a later backfill replays converge on one identity instead of double-counting.
