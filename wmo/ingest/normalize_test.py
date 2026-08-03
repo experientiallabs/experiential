@@ -236,6 +236,8 @@ def test_current_wmo_trace_metadata_key_wins_over_the_legacy_one() -> None:
     (trace,) = spans_to_traces(spans, source="test")
 
     assert trace.metadata["benchmark"] == "current"
+
+
 def test_span_emitter_orders_spans_and_seeds_only_the_first() -> None:
     """The shape the row adapters share: ordinal ids/sort keys, first-span-only trace attributes."""
     emitter = SpanEmitter("trace-abcdefghijkl", {"gen_ai.prompt": "do it"})

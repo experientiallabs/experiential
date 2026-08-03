@@ -84,6 +84,7 @@ def _local_model_uncached(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr("wmo.optimize.policy.default_model_cached", lambda backend=None: False)
 
+
 optimize_module = importlib.import_module("wmo.cli.optimize_model_app")
 route_module = importlib.import_module("wmo.cli.route_app")
 
