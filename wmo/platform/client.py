@@ -190,40 +190,6 @@ class RemoteWorldModel(BaseModel):
     updated_at: str | None = None
 
 
-class RemoteHarness(BaseModel):
-    """The slice of a registry harness row the CLI presents."""
-
-    id: str
-    name: str
-    latest_version: int
-    updated_at: str | None = None
-
-
-class RemoteHarnessVersion(BaseModel):
-    """One doc-less entry of a harness's version lineage."""
-
-    version: int
-    doc_hash: str
-    created_at: str | None = None
-
-
-class HarnessVersionDoc(BaseModel):
-    """One full harness version, doc included."""
-
-    version: int
-    doc: dict[str, JsonValue]
-    doc_hash: str
-
-
-class PushedHarnessVersion(BaseModel):
-    """Response of a harness push: the version the doc landed as."""
-
-    name: str
-    version: int
-    doc_hash: str
-    created: bool  # False when the push was an idempotent repeat of the tip
-
-
 class RunTarget(BaseModel):
     """A platform id resolved to one executable resource kind."""
 
@@ -241,53 +207,6 @@ class RemoteWorldModelSession(BaseModel):
     id: str
     world_model_id: str
     status: str
-
-
-class RemoteAgentSession(BaseModel):
-    """Hosted E2B agent session state needed by the CLI driver."""
-
-    id: str
-    agent_id: str
-    status: str
-    workspace_sync: bool
-    launched_from: str
-    starting_detail: str | None = None
-    ended_reason: str | None = None
-    error: str | None = None
-
-
-class RemoteAgentSessionEvent(BaseModel):
-    """One durable event from a hosted agent session transcript."""
-
-    seq: int
-    kind: Literal[
-        "user_message",
-        "assistant_message",
-        "tool_call",
-        "tool_output",
-        "tool_result",
-        "submit",
-        "state",
-        "status",
-        "error",
-        "workspace_patch",
-    ]
-    payload: dict[str, JsonValue]
-
-
-class RemoteAgentEventPage(BaseModel):
-    """One poll page of hosted transcript events and current session status."""
-
-    events: list[RemoteAgentSessionEvent]
-    last_seq: int
-    status: str
-
-
-class WorkspacePatchResult(BaseModel):
-    """Paths accepted or rejected while applying a live workspace patch."""
-
-    applied: list[str]
-    conflicts: list[str]
 
 
 class LocalPiRunInfo(BaseModel):
@@ -405,117 +324,6 @@ class PlatformClient:
         )
         self._raise_for_error(response)
         return Observation.model_validate(_decode_json(response)["observation"])
-
-    def create_agent_session(
-        self,
-        agent_id: str,
-        *,
-        workspace: bytes | None,
-        instruction: str | None = None,
-    ) -> RemoteAgentSession:
-        """Create a hosted agent session, optionally staging a local snapshot."""
-        payload: dict[str, JsonValue] = {"instruction": instruction}
-        if workspace is not None:
-            upload = self._client.post(
-                f"/api/agents/{agent_id}/workspace-uploads",
-                files={"workspace": ("workspace.tar.gz", workspace, "application/gzip")},
-                timeout=_WORKSPACE_TIMEOUT_SECONDS,
-            )
-            self._raise_for_error(upload)
-            payload["workspace_upload_id"] = str(_decode_json(upload)["id"])
-        response = self._client.post(
-            f"/api/agents/{agent_id}/sessions",
-            json=payload,
-        )
-        self._raise_for_error(response)
-        return RemoteAgentSession.model_validate(_decode_json(response))
-
-    def get_agent_session(self, agent_id: str, session_id: str) -> RemoteAgentSession:
-        """Read current hosted agent session state."""
-        response = self._client.get(f"/api/agents/{agent_id}/sessions/{session_id}")
-        self._raise_for_error(response)
-        return RemoteAgentSession.model_validate(_decode_json(response))
-
-    def resolve_agent_session(self, session_id: str) -> RemoteAgentSession:
-        """Resolve a bare session id to its owning agent and current state."""
-        response = self._client.get(f"/api/agent-sessions/{session_id}")
-        self._raise_for_error(response)
-        return RemoteAgentSession.model_validate(_decode_json(response))
-
-    def end_agent_session(self, agent_id: str, session_id: str) -> RemoteAgentSession:
-        """Request an end, reconciling directly when the hosted driver is gone."""
-        response = self._client.post(f"/api/agents/{agent_id}/sessions/{session_id}/end")
-        self._raise_for_error(response)
-        return RemoteAgentSession.model_validate(_decode_json(response))
-
-    def list_agent_session_events(
-        self, agent_id: str, session_id: str, *, after: int
-    ) -> RemoteAgentEventPage:
-        """Poll hosted transcript events after one durable sequence cursor."""
-        response = self._client.get(
-            f"/api/agents/{agent_id}/sessions/{session_id}/events",
-            params={"after": after},
-        )
-        self._raise_for_error(response)
-        return RemoteAgentEventPage.model_validate(_decode_json(response))
-
-    def post_agent_session_command(
-        self, agent_id: str, session_id: str, kind: str, *, text: str | None = None
-    ) -> None:
-        """Steer, interrupt, or end one hosted agent session."""
-        response = self._client.post(
-            f"/api/agents/{agent_id}/sessions/{session_id}/commands",
-            json={"kind": kind, "text": text},
-        )
-        self._raise_for_error(response)
-
-    def upload_agent_workspace_patch(
-        self, agent_id: str, session_id: str, content: bytes
-    ) -> WorkspacePatchResult:
-        """Apply local changes conditionally to a running hosted workspace."""
-        response = self._client.post(
-            f"/api/agents/{agent_id}/sessions/{session_id}/workspace/patches",
-            files={"patch": ("workspace-patch.tar.gz", content, "application/gzip")},
-            timeout=_WORKSPACE_TIMEOUT_SECONDS,
-        )
-        self._raise_for_error(response)
-        return WorkspacePatchResult.model_validate(_decode_json(response))
-
-    def download_agent_workspace_patch(
-        self, agent_id: str, session_id: str, revision: str
-    ) -> bytes:
-        """Download one remote-to-local live workspace patch."""
-        response = self._client.get(
-            f"/api/agents/{agent_id}/sessions/{session_id}/workspace/patches/{revision}",
-            timeout=_WORKSPACE_TIMEOUT_SECONDS,
-        )
-        self._raise_for_error(response)
-        return response.content
-
-    def acknowledge_agent_workspace_patch(
-        self, agent_id: str, session_id: str, revision: str
-    ) -> None:
-        """Remove a remote patch after it is safely reflected or reported locally."""
-        response = self._client.post(
-            f"/api/agents/{agent_id}/sessions/{session_id}/workspace/patches/{revision}/ack"
-        )
-        self._raise_for_error(response)
-
-    def download_agent_workspace(self, agent_id: str, session_id: str) -> bytes:
-        """Download a terminal hosted session's final E2B workspace snapshot."""
-        response = self._client.get(
-            f"/api/agents/{agent_id}/sessions/{session_id}/workspace",
-            timeout=_WORKSPACE_TIMEOUT_SECONDS,
-        )
-        self._raise_for_error(response)
-        return response.content
-
-    def acknowledge_agent_workspace(self, agent_id: str, session_id: str) -> None:
-        """Confirm the final archive is safe locally so platform objects can be removed."""
-        response = self._client.post(f"/api/agents/{agent_id}/sessions/{session_id}/workspace/ack")
-        self._raise_for_error(response)
-
-    # -- world models --------------------------------------------------------------------------
 
     def list_world_models(self, org_id: str) -> list[RemoteWorldModel]:
         response = self._client.get(f"/api/orgs/{org_id}/world-models")
@@ -782,44 +590,6 @@ class PlatformClient:
             raise PlatformError(msg)
         part_path.replace(dest)
         return actual
-
-    # -- harnesses -----------------------------------------------------------------------------
-
-    def list_harnesses(self, org_id: str) -> list[RemoteHarness]:
-        response = self._client.get(f"/api/orgs/{org_id}/harnesses")
-        self._raise_for_error(response)
-        rows = _rows(_decode_json(response), "harnesses")
-        return [RemoteHarness.model_validate(row) for row in rows]
-
-    def get_harness(
-        self, org_id: str, name: str
-    ) -> tuple[RemoteHarness, list[RemoteHarnessVersion]]:
-        response = self._client.get(f"/api/orgs/{org_id}/harnesses/{name}")
-        self._raise_for_error(response)
-        payload = _decode_json(response)
-        harness = RemoteHarness.model_validate(payload["harness"])
-        rows = _rows(payload, "versions")
-        versions = [RemoteHarnessVersion.model_validate(row) for row in rows]
-        return harness, versions
-
-    def get_harness_version(self, org_id: str, name: str, version: int) -> HarnessVersionDoc:
-        response = self._client.get(f"/api/orgs/{org_id}/harnesses/{name}/versions/{version}")
-        self._raise_for_error(response)
-        return HarnessVersionDoc.model_validate(_decode_json(response))
-
-    def push_harness_version(
-        self,
-        org_id: str,
-        name: str,
-        doc: dict[str, JsonValue],
-        doc_hash: str,
-    ) -> PushedHarnessVersion:
-        response = self._client.post(
-            f"/api/orgs/{org_id}/harnesses/{name}/versions",
-            json={"doc": doc, "doc_hash": doc_hash},
-        )
-        self._raise_for_error(response)
-        return PushedHarnessVersion.model_validate(_decode_json(response))
 
     # -- built-in local pi runs ---------------------------------------------------------------
 

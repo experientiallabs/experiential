@@ -27,7 +27,6 @@ Three optimizers, named for the artifact each produces.
 | `wmo optimize route pin` | Serve one pool model as an endpoint, with no matrix and no fit. | a `kind="static"` `policy.json` |
 | `wmo optimize route student` | Add a distilled student to the candidate pool as a priced entry. | a `[[model]]` entry in `pool.toml` |
 | `wmo optimize route convert-deepswe` | Convert DeepSWE v1.1's published trials into a fit-ready matrix bundle (the research-adapter producer; refuses unless every published pass@1 reproduces). | `matrix.json` + `task_embeddings.npy` + `scenario_groups.json` |
-| `wmo optimize harness` | Search the agent scaffold (prompts, skills, tool policy, loop params) against a world model or on harbor tasks. A non-interactive run needs `--yes` in either environment. | an immutable `vN` `HarnessDoc` in the store, `champion` alias moved, plus a delta archive |
 | `wmo optimize distill probe` | Ask a measured outcome matrix whether this workload has a teacher gap worth distilling at all, and which model is the cheapest sufficient teacher. Free. Exits 0 (distill), 3 (no gap), 4 (too thin to say). | nothing (prints) |
 | `wmo optimize distill run` | Train the agent model itself: on-policy distillation of a Tinker LoRA student from harbor rollouts, gated on held-out solve rates. A non-interactive run needs `--yes`. | a run dir (config snapshot, metrics, checkpoints, evals, `gate.json`) and, on an accepted gate, an adapter version |
 | `wmo optimize distill report` | Read a finished or aborted run back: gate verdict and held-out before/after table. Free. | nothing (prints) |
@@ -54,7 +53,7 @@ functions they do, so you can drop to any stage and the next run resumes around 
 | `wmo scenarios build` | Distill a trace corpus into a weighted, representative scenario set (facets, cluster, select). | a `ScenarioSet` |
 | `wmo scenarios verify` | Closed-loop verification of a scenario set: back-agreement on source traces plus solvability rollouts. | a verification report |
 
-`wmo scenarios build` produces a `ScenarioSet`; `wmo optimize harness --tasks` takes `TaskSpec`
+`wmo scenarios build` produces a `ScenarioSet`
 JSONL. The two formats are not interchangeable.
 
 ## Providers, harnesses, config
@@ -62,17 +61,14 @@ JSONL. The two formats are not interchangeable.
 | Command | Purpose | Artifact |
 |---|---|---|
 | `wmo providers verify` | Ping every configured provider on the completion and embedding paths (deduped by kind and model): the `[models.<role>]` roles in `.wmo/settings.toml` **and** the providers each built world model recorded. Run it before `wmo build` — with nothing built yet it still checks the roles, and just skips the embed half. | nothing (prints a row per provider) |
-| `wmo harness list` / `show` / `init` | Inspect stored harness versions and aliases, or write the baseline as `v1` with `champion` pointed at it. | a `HarnessDoc` version in the store |
 | `wmo config telemetry` | View or change project-local usage telemetry settings. | `.wmo/settings.toml` |
-| `wmo e2b` | Inspect and reclaim E2B sandbox capacity. | nothing (prints, or reclaims) |
 
 ## Running agents, and the platform
 
 | Command | Purpose | Artifact |
 |---|---|---|
-| `wmo run` | Run a platform world model or agent by id, or the built-in local pi harness with no target. | a run record under `.wmo/runs/`; uploaded workspaces sync back |
 | `wmo login` / `logout` / `status` | Connect this machine to a platform account, disconnect, or show the current account and organizations. | a saved credential |
-| `wmo push` / `pull` | Publish a local world model or harness to the platform registry, or fetch one from it. | a registry entry, or a local artifact dir |
+| `wmo push` / `pull` | Publish a local world model to the platform registry, or fetch a model or endpoint state from it. | a registry entry, or a local artifact dir |
 | `wmo reproduce list` / `run <benchmark>` | Reproduce a published benchmark result from its shipped manifest: download the pinned data, replay the pinned protocol, and compare every published number field by field. `matrix` manifests run offline and bit-exact; `commands` manifests replay live CLI steps, state their estimated spend, and refuse without `--yes`. Exit 0 is REPRODUCED, 4 is DIVERGED. | `verdict.json` plus the run's own artifacts |
 | `wmo runs list` / `show` / `tail` | See the runs this organization is feeding: progress, spend, stages, per-candidate cells, and the live event log. `--json` on the first two; `--org` (id or slug) to read another organization the credential can see, which otherwise comes from the login or `WMO_PLATFORM_ORG`. | nothing (prints) |
 | `wmo runs stop` / `retry` | Ask the process feeding a run to stop at its next safe boundary, or to re-measure its unscored cells. Pull-based: it takes effect when that process next reports in, and a runner that owns its own retry policy may refuse with a reason. | a queued command |
@@ -85,10 +81,6 @@ free, though. Pushes ride the run's own callbacks rather than a background threa
 platform costs at most a few bounded seconds at stage boundaries while its requests time out.
 Re-running a backfill is free: events are keyed by the emitter's sequence number, and the platform
 discards ones it already holds.
-
-`wmo run` is the primary execution surface. Bare runs execute harness code and bash on your
-machine behind an explicit consent boundary and a `--dir` file-tool jail; hosted ids run their
-champion harness in platform-managed sandboxes and need no local model or sandbox credentials.
 
 ## Research
 

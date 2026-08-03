@@ -15,10 +15,8 @@ from wmo.platform.client import (
     PlatformClient,
     PlatformError,
     PlatformUnreachable,
-    RemoteAgentSession,
     fetch_cli_config,
 )
-from wmo.utils.waterfall.types import ChatMessage, ChatRequest
 
 API_URL = "https://api.test"
 
@@ -112,228 +110,6 @@ def test_unified_run_target_and_world_model_session_payloads() -> None:
         "/api/run-targets/wm-1",
         "/api/world-models/wm-1/sessions",
         "/api/sessions/sess-1/step",
-    ]
-
-
-def test_hosted_agent_session_uses_regular_create_and_workspace_patch_routes() -> None:
-    """Agent runs use regular sessions plus the live workspace patch protocol."""
-    seen: list[str] = []
-    session = {
-        "id": "sess-1",
-        "agent_id": "agent-1",
-        "status": "starting",
-        "workspace_sync": True,
-        "launched_from": "cli",
-    }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(f"{request.method} {request.url.path}")
-        path = request.url.path
-        if path.endswith("/workspace-uploads"):
-            body = request.read()
-            assert b"archive-bytes" in body
-            return httpx.Response(201, json={"id": "upload-1"})
-        if path.endswith("/sessions") and request.method == "POST":
-            assert json.loads(request.read()) == {
-                "instruction": "fix the tests",
-                "workspace_upload_id": "upload-1",
-            }
-            return httpx.Response(202, json=session)
-        if path.endswith("/events"):
-            assert request.url.params["after"] == "0"
-            return httpx.Response(
-                200,
-                json={
-                    "events": [
-                        {"seq": 1, "kind": "assistant_message", "payload": {"text": "done"}}
-                    ],
-                    "last_seq": 1,
-                    "status": "running",
-                },
-            )
-        if path.endswith("/commands"):
-            assert json.loads(request.read()) == {"kind": "user_message", "text": "continue"}
-            return httpx.Response(202, json={"command_id": 1})
-        if path.endswith("/workspace/patches/patch-7/ack"):
-            return httpx.Response(204)
-        if path.endswith("/workspace/patches/patch-7"):
-            return httpx.Response(200, content=b"remote-patch")
-        if path.endswith("/workspace/patches"):
-            body = request.read()
-            assert b"local-patch" in body
-            return httpx.Response(200, json={"applied": ["local.txt"], "conflicts": []})
-        if path.endswith("/workspace/ack"):
-            return httpx.Response(204)
-        if path.endswith("/workspace"):
-            return httpx.Response(200, content=b"final-archive")
-        return httpx.Response(200, json={**session, "status": "ended"})
-
-    with _client(handler) as client:
-        created = client.create_agent_session(
-            "agent-1", workspace=b"archive-bytes", instruction="fix the tests"
-        )
-        page = client.list_agent_session_events("agent-1", created.id, after=0)
-        client.post_agent_session_command("agent-1", created.id, "user_message", text="continue")
-        current = client.get_agent_session("agent-1", created.id)
-        patch_result = client.upload_agent_workspace_patch("agent-1", created.id, b"local-patch")
-        patch = client.download_agent_workspace_patch("agent-1", created.id, "patch-7")
-        client.acknowledge_agent_workspace_patch("agent-1", created.id, "patch-7")
-        final = client.download_agent_workspace("agent-1", created.id)
-        client.acknowledge_agent_workspace("agent-1", created.id)
-
-    assert created.workspace_sync
-    assert page.events[0].payload["text"] == "done"
-    assert current.status == "ended"
-    assert patch_result.applied == ["local.txt"]
-    assert patch == b"remote-patch"
-    assert final == b"final-archive"
-    assert seen == [
-        "POST /api/agents/agent-1/workspace-uploads",
-        "POST /api/agents/agent-1/sessions",
-        "GET /api/agents/agent-1/sessions/sess-1/events",
-        "POST /api/agents/agent-1/sessions/sess-1/commands",
-        "GET /api/agents/agent-1/sessions/sess-1",
-        "POST /api/agents/agent-1/sessions/sess-1/workspace/patches",
-        "GET /api/agents/agent-1/sessions/sess-1/workspace/patches/patch-7",
-        "POST /api/agents/agent-1/sessions/sess-1/workspace/patches/patch-7/ack",
-        "GET /api/agents/agent-1/sessions/sess-1/workspace",
-        "POST /api/agents/agent-1/sessions/sess-1/workspace/ack",
-    ]
-
-
-def test_hosted_agent_session_without_workspace_posts_create_directly() -> None:
-    """The default agent run does not stage any local workspace upload."""
-    seen: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(f"{request.method} {request.url.path}")
-        assert request.url.path == "/api/agents/agent-1/sessions"
-        assert json.loads(request.read()) == {"instruction": "remote task"}
-        return httpx.Response(
-            202,
-            json={
-                "id": "sess-1",
-                "agent_id": "agent-1",
-                "status": "starting",
-                "workspace_sync": False,
-                "launched_from": "cli",
-            },
-        )
-
-    with _client(handler) as client:
-        created = client.create_agent_session("agent-1", workspace=None, instruction="remote task")
-
-    assert not created.workspace_sync
-    assert seen == ["POST /api/agents/agent-1/sessions"]
-
-
-def test_detached_session_resolution_and_end_routes() -> None:
-    """A bare session id resolves to its agent, and end uses the reconciling route."""
-    seen: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(f"{request.method} {request.url.path}")
-        if request.url.path == "/api/agent-sessions/sess-9":
-            return httpx.Response(
-                200,
-                json={
-                    "id": "sess-9",
-                    "agent_id": "agent-2",
-                    "status": "running",
-                    "workspace_sync": False,
-                    "launched_from": "cli",
-                },
-            )
-        assert request.url.path == "/api/agents/agent-2/sessions/sess-9/end"
-        return httpx.Response(
-            202,
-            json={
-                "id": "sess-9",
-                "agent_id": "agent-2",
-                "status": "failed",
-                "workspace_sync": False,
-                "launched_from": "cli",
-                "ended_reason": "stalled",
-                "error": "driver heartbeat went stale",
-            },
-        )
-
-    with _client(handler) as client:
-        resolved = client.resolve_agent_session("sess-9")
-        ended = client.end_agent_session(resolved.agent_id, resolved.id)
-
-    assert resolved.agent_id == "agent-2"
-    assert resolved.status == "running"
-    assert ended.status == "failed"
-    assert ended.ended_reason == "stalled"
-    assert seen == [
-        "GET /api/agent-sessions/sess-9",
-        "POST /api/agents/agent-2/sessions/sess-9/end",
-    ]
-
-
-def test_hosted_agent_session_accepts_future_launch_origins() -> None:
-    """A compatible platform origin extension does not break session decoding."""
-    session = RemoteAgentSession.model_validate(
-        {
-            "id": "sess-1",
-            "agent_id": "agent-1",
-            "status": "running",
-            "workspace_sync": False,
-            "launched_from": "automation",
-        }
-    )
-
-    assert session.launched_from == "automation"
-
-
-def test_builtin_local_pi_run_payloads() -> None:
-    """The built-in harness has an org-scoped, metered platform worker path."""
-    seen: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request.url.path)
-        if request.url.path == "/api/orgs/org-1/local-pi-runs":
-            return httpx.Response(
-                201,
-                json={
-                    "id": "run-1",
-                    "org_id": "org-1",
-                    "status": "running",
-                    "worker_provider": "bedrock",
-                    "worker_model": "claude-haiku-4-5",
-                },
-            )
-        if request.url.path.endswith("/worker-completion"):
-            return httpx.Response(
-                200,
-                json={
-                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-                },
-            )
-        assert request.url.path.endswith("/finish")
-        assert json.loads(request.read()) == {
-            "status": "ended",
-            "ended_reason": "user_ended",
-            "error": None,
-        }
-        return httpx.Response(202, json={})
-
-    with _client(handler) as client:
-        run = client.create_local_pi_run("org-1")
-        response = client.complete_local_pi_worker(
-            "org-1",
-            run.id,
-            ChatRequest(messages=[ChatMessage(role="user", content="hi")]),
-        )
-        client.finish_local_pi_run("org-1", run.id, status="ended", ended_reason="user_ended")
-
-    assert response.choices[0].message.content == "ok"
-    assert seen == [
-        "/api/orgs/org-1/local-pi-runs",
-        "/api/orgs/org-1/local-pi-runs/run-1/worker-completion",
-        "/api/orgs/org-1/local-pi-runs/run-1/finish",
     ]
 
 
@@ -444,42 +220,6 @@ def test_download_model_bundle_rejects_digest_mismatch(tmp_path: Path) -> None:
     assert not dest.exists()
 
 
-def test_harness_round_trip_payloads() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST":
-            assert request.url.path == "/api/orgs/org-1/harnesses/agent/versions"
-            payload = json.loads(request.read())
-            assert payload["doc_hash"] == "a" * 32
-            return httpx.Response(
-                201,
-                json={"name": "agent", "version": 3, "doc_hash": "a" * 32, "created": True},
-            )
-        if request.url.path == "/api/orgs/org-1/harnesses/agent/versions/3":
-            return httpx.Response(
-                200, json={"version": 3, "doc": {"name": "agent"}, "doc_hash": "a" * 32}
-            )
-        assert request.url.path == "/api/orgs/org-1/harnesses/agent"
-        return httpx.Response(
-            200,
-            json={
-                "harness": {"id": "h-1", "name": "agent", "latest_version": 3},
-                "versions": [{"version": 3, "doc_hash": "a" * 32}],
-            },
-        )
-
-    with _client(handler) as client:
-        pushed = client.push_harness_version("org-1", "agent", {"name": "agent"}, "a" * 32)
-        assert pushed.version == 3
-        assert pushed.created
-
-        harness, versions = client.get_harness("org-1", "agent")
-        assert harness.latest_version == 3
-        assert versions[0].doc_hash == "a" * 32
-
-        doc = client.get_harness_version("org-1", "agent", 3)
-        assert doc.doc == {"name": "agent"}
-
-
 def test_fetch_cli_config_reads_the_api_url() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == "https://platform.test/api/cli/config"
@@ -521,23 +261,6 @@ def test_fetch_cli_config_maps_a_non_json_200() -> None:
     assert "text/html" in str(info.value)
 
 
-def test_requests_map_an_unreachable_host() -> None:
-    """Every request goes through the guarded transport, whichever endpoint it hits."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectTimeout("", request=request)
-
-    with _client(handler) as client:
-        with pytest.raises(PlatformUnreachable, match="cannot reach") as info:
-            client.whoami()
-        # An empty-message timeout must still name what happened.
-        assert "ConnectTimeout" in str(info.value)
-        with pytest.raises(PlatformUnreachable):
-            client.resolve_run_target("wm_1")
-        with pytest.raises(PlatformUnreachable):
-            client.list_harnesses("org-1")
-
-
 def test_whoami_maps_a_non_json_200() -> None:
     """`login --api-url`/`status` reach whoami first: a captive portal is not a crash."""
 
@@ -546,24 +269,6 @@ def test_whoami_maps_a_non_json_200() -> None:
 
     with _client(handler) as client, pytest.raises(PlatformError, match="not JSON"):
         client.whoami()
-
-
-def test_every_endpoint_maps_a_non_json_200() -> None:
-    """A proxy that answers 200 HTML everywhere must not reach any caller as a decoder error."""
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, html="<html>Sign in</html>")
-
-    with _client(handler) as client:
-        for call in (
-            lambda: client.resolve_run_target("wm_1"),
-            lambda: client.list_world_models("org-1"),
-            lambda: client.list_harnesses("org-1"),
-            lambda: client.get_harness_version("org-1", "pi", 1),
-            lambda: client.create_agent_session("agent-1", workspace=None),
-        ):
-            with pytest.raises(PlatformError, match="not JSON"):
-                call()
 
 
 def test_a_json_array_body_is_a_platform_error() -> None:

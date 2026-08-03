@@ -63,26 +63,14 @@ uv run pytest -q
   meter sandbox lifetime, retry uncertain transport only in a fresh sandbox, and fail closed when
   cleanup cannot be proved.
 
-## Harness optimization
+## Optimization surfaces
 
-- `wmo optimize harness <agent> <world-model> --tasks <tasks.jsonl>` is the primary public
-  harness-creation workflow. Keep CLI wiring in `wmo/cli/harness_app.py` and search behavior in
-  `wmo/harness/create.py` (world-model delta search) or `wmo/harness/population.py` plus
-  `wmo/harness/project_proposer.py` (the `harbor` environment's complete-source population
-  search); another public workflow needs a distinct user case and equivalent validation, audit,
-  and versioning guarantees.
-- A harness is a validated `HarnessDoc`, not an editable directory. Its typed surfaces cover
-  prompts, skills, tool policy, loop parameters, and executable code; rendered files are exports.
-- Change harnesses only through `HarnessDelta`. Preserve parent and child hashes, per-surface
-  preconditions, operation rationales, expected effects, and atomic whole-document validation.
-- Score candidates with closed-loop evaluation against the world model. Worker location (`local`
-  or `e2b`) never changes which environment is under test.
-- Promotion must pass the trigger screen plus regression-suite, full-split, and optional holdout
-  gates. Binary success is primary, assertion credit breaks ties, and newly passing tasks join the
-  regression suite.
-- Persist every proposal and verdict in `DeltaArchive`, including screened, rejected, and invalid
-  deltas. `HarnessStore` writes immutable `vN` versions and moves the `champion` alias for
-  promotion or rollback.
+- Harness-search optimization (`wmo optimize harness`, world-model delta search, the harbor
+  population search, live agent sessions) moved to the private `agent-optimization` repo
+  (2026-08-03). What stays here is the execution seam it builds on: `wmo/harness/` holds the
+  episode runtime, `HarnessDoc`, scoring, the store, and the sandbox plumbing, because
+  closed-loop eval and distillation run and score agent episodes. Do not grow search or
+  mutation machinery back into this repo.
 - `wmo optimize model <world-model>` is the staged one-command path over the routing surface:
   preflight, sweep, fit, tune, report, each stage calling the same library function its manual
   `wmo optimize route` command calls, so consent, metering, and artifacts stay single-sourced. It
@@ -120,10 +108,8 @@ uv run pytest -q
   student's own sampled tokens for the collapse a KL curve hides; their thresholds are fractions
   of a baseline each run measures at its first training step and persists in its run manifest,
   never absolute nats or token counts. See `docs/reference/distill.md` for the user-facing how-to.
-- `wmo scenarios build` produces a weighted `ScenarioSet`; `wmo optimize harness --tasks` currently
-  requires `TaskSpec` JSONL. Do not treat those artifact formats as interchangeable.
-- Changes here require focused coverage in `create_test.py`, `delta_test.py`, `store_test.py`,
-  `proposer_test.py`, and the scenario builder or verification tests as applicable.
+- Changes to the execution seam require focused coverage in `store_test.py`, `scoring_test.py`,
+  and the closed-loop or distillation tests that consume it.
 
 ## Python
 

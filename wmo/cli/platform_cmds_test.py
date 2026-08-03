@@ -3,23 +3,18 @@
 from __future__ import annotations
 
 import json
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
-import typer
 from typer.testing import CliRunner, Result
 
 from wmo.cli.app import app
-from wmo.cli.platform_cmds import _pull_harness, _resolve_kind
 from wmo.harness.doc import HarnessDoc, Surface, SurfaceKind
 from wmo.harness.store import HarnessStore
 from wmo.platform.client import (
-    HarnessVersionDoc,
     PlatformError,
     PlatformUnreachable,
-    RemoteHarness,
     RemoteWorldModel,
     WhoAmI,
 )
@@ -28,7 +23,7 @@ from wmo.runs.client import PushAck
 from wmo.runs.schema import pipeline_external_id
 
 if TYPE_CHECKING:
-    from wmo.platform.client import PlatformClient
+    pass
 
 runner = CliRunner()
 
@@ -163,13 +158,6 @@ def test_status_falls_back_to_the_api_url(monkeypatch: pytest.MonkeyPatch) -> No
     assert connected.split("Connected to ", 1)[1].strip() == "https://api.test"
 
 
-def test_pull_rejects_unknown_kind() -> None:
-    """An invalid --kind fails fast instead of dispatching to harness routes."""
-    result = runner.invoke(app, ["pull", "anything", "--kind", "typo"])
-    assert result.exit_code != 0
-    assert "must be 'model' or 'harness'" in result.output
-
-
 def _pathful_doc() -> HarnessDoc:
     return HarnessDoc(
         name="pi",
@@ -189,41 +177,6 @@ class _HarnessVersionClient(_StubClient):
     """Serves one canned harness version payload with a configurable hash."""
 
     payload_doc_hash = ""
-
-    def get_harness_version(self, org_id: str, name: str, version: int) -> HarnessVersionDoc:
-        del org_id, name
-        return HarnessVersionDoc(
-            version=version,
-            doc=_pathful_doc().model_dump(mode="json"),
-            doc_hash=type(self).payload_doc_hash,
-        )
-
-
-def test_pull_harness_accepts_the_legacy_doc_hash(tmp_path: Path) -> None:
-    """Pathful versions the platform recorded pre-path-hash must stay pullable."""
-    doc = _pathful_doc()
-    root = str(tmp_path / ".wmo")
-
-    class _LegacyClient(_HarnessVersionClient):
-        payload_doc_hash = doc.legacy_doc_hash
-
-    _pull_harness(cast("PlatformClient", _LegacyClient()), "org-1", "pi", root, version=3)
-
-    assert HarnessStore(root).load("pi").doc_hash == doc.doc_hash
-
-
-def test_pull_harness_still_rejects_a_corrupt_doc_hash(tmp_path: Path) -> None:
-    class _CorruptClient(_HarnessVersionClient):
-        payload_doc_hash = "0" * 32
-
-    with pytest.raises(typer.Exit):
-        _pull_harness(
-            cast("PlatformClient", _CorruptClient()),
-            "org-1",
-            "pi",
-            str(tmp_path / ".wmo"),
-            version=3,
-        )
 
 
 def test_login_with_token_drops_stale_default_org(
@@ -346,12 +299,6 @@ def test_login_does_not_blame_the_key_for_an_unreachable_api(
     assert "rejected" not in result.output
 
 
-def test_push_requires_login_first(tmp_path: Path) -> None:
-    result = runner.invoke(app, ["push", "anything", "--root", str(tmp_path)])
-    assert result.exit_code != 0
-    assert "no local world model or harness" in result.output
-
-
 def _connected() -> None:
     save_credentials(
         PlatformCredentials(
@@ -368,45 +315,6 @@ def _write_harness(root: str, name: str = "demo") -> None:
         name=name, surfaces=[Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p")]
     )
     HarnessStore(root).save_version(doc)
-
-
-def test_push_reports_an_unreachable_platform(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = str(tmp_path / ".wmo")
-    _write_harness(root)
-    _connected()
-
-    class _UnreachableClient(_StubClient):
-        def push_harness_version(self, *_args: object, **_kwargs: object) -> object:
-            raise _unreachable()
-
-    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _UnreachableClient)
-
-    result = runner.invoke(app, ["push", "demo", "--root", root])
-
-    _assert_clean_failure(result)
-    assert "Push failed" in result.output
-    assert "cannot reach" in result.output
-
-
-def test_push_reports_a_platform_http_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = str(tmp_path / ".wmo")
-    _write_harness(root)
-    _connected()
-
-    class _MissingOrgClient(_StubClient):
-        def push_harness_version(self, *_args: object, **_kwargs: object) -> object:
-            raise PlatformError("not found", status_code=404)
-
-    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _MissingOrgClient)
-
-    result = runner.invoke(app, ["push", "demo", "--root", root])
-
-    _assert_clean_failure(result)
-    assert "Push failed: not found" in _flatten(result.output)
 
 
 def test_pull_surfaces_the_hint_inside_a_platform_error(
@@ -449,58 +357,10 @@ def test_pull_reports_an_unreachable_platform(
     assert "cannot reach" in result.output
 
 
-def test_push_rejects_an_unknown_ref(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A typo'd --ref is a usage error naming where the versions are listed."""
-    root = str(tmp_path / ".wmo")
-    _write_harness(root)
-    _connected()
-    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _StubClient)
-
-    result = runner.invoke(app, ["push", "demo", "--ref", "v99", "--root", root])
-
-    _assert_clean_failure(result)
-    normalized = _flatten(result.output)
-    assert "no version v99" in normalized
-    assert "wmo harness list" in normalized
-
-
-def test_push_unknown_name_names_the_root_and_the_next_step(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Run against the default relative --root so the message's root is readable
-    # in the wrapped error box, exactly as a user in the wrong directory sees it.
-    monkeypatch.chdir(tmp_path)
-    _write_harness(".wmo")
-
-    result = runner.invoke(app, ["push", "nosuchmodel"])
-
-    _assert_clean_failure(result)
-    normalized = _flatten(result.output)
-    assert "no local world model or harness named 'nosuchmodel' under .wmo" in normalized
-    assert "have: demo" in normalized
-    assert "wmo list" in normalized
-
-
 def test_logout_when_not_logged_in() -> None:
     result = runner.invoke(app, ["logout"])
     assert result.exit_code == 0
     assert "nothing to remove" in result.output.lower()
-
-
-def test_resolve_kind_disambiguates(tmp_path: Path) -> None:
-    root = str(tmp_path / ".wmo")
-    resolve = partial(_resolve_kind, name="x", root=root)
-    assert resolve(None, model=True, harness=False) == "model"
-    assert resolve(None, model=False, harness=True) == "harness"
-    assert resolve("model", model=True, harness=True) == "model"
-    with pytest.raises(typer.BadParameter, match="pass --kind"):
-        resolve(None, model=True, harness=True)
-    with pytest.raises(typer.BadParameter, match="no local world model or harness"):
-        resolve(None, model=False, harness=False)
-    with pytest.raises(typer.BadParameter, match="no local world model"):
-        resolve("model", model=False, harness=True)
-    with pytest.raises(typer.BadParameter, match="must be"):
-        resolve("bundle", model=True, harness=False)
 
 
 def test_bare_login_targets_the_hosted_platform(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -755,9 +615,6 @@ class _PullStateClient(_StubClient):
             for name in type(self).model_names
         ]
 
-    def list_harnesses(self, _org_id: str) -> list[RemoteHarness]:
-        return []
-
     def get_endpoint(self, _org_id: str, name: str) -> dict[str, object] | None:
         return {"name": name} if name in type(self).endpoint_names else None
 
@@ -865,43 +722,6 @@ def test_pull_removes_a_stale_bank_when_the_current_policy_has_none(
     assert "stale policy.json.bank.npz" in _flatten(result.output)
 
 
-def test_pull_names_endpoints_in_the_nothing_found_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The not-found message covers everything a pull can now reach."""
-    root = str(tmp_path / ".wmo")
-    _connected()
-    _PullStateClient.model_names = ()
-    _PullStateClient.endpoint_names = ()
-    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _PullStateClient)
-
-    result = runner.invoke(app, ["pull", "ghost", "--root", root])
-
-    _assert_clean_failure(result)
-    assert "no world model, endpoint, or harness" in _flatten(result.output)
-
-
-def test_pull_still_refuses_a_model_harness_ambiguity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A same-named endpoint must not swallow the deliberate ambiguity refusal."""
-    root = str(tmp_path / ".wmo")
-    _connected()
-
-    class _AmbiguousClient(_PullStateClient):
-        def list_harnesses(self, _org_id: str) -> list[RemoteHarness]:
-            return [RemoteHarness(id="h-1", name="demo-model", latest_version=1)]
-
-    _AmbiguousClient.model_names = ("demo-model",)
-    _AmbiguousClient.endpoint_names = ("demo-model",)
-    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _AmbiguousClient)
-
-    result = runner.invoke(app, ["pull", "demo-model", "--root", root])
-
-    _assert_clean_failure(result)
-    assert "pass --kind" in _flatten(result.output)
-
-
 def test_pull_removes_a_stale_report_when_the_endpoint_has_none(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -926,33 +746,3 @@ def test_pull_removes_a_stale_report_when_the_endpoint_has_none(
     assert result.exit_code == 0, result.output
     assert not stale.exists()
     assert "stale report.json" in _flatten(result.output)
-
-
-def test_pull_tolerates_a_platform_with_no_harness_registry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The hosted platform serves no harness routes; detection must not die there."""
-    root = str(tmp_path / ".wmo")
-    _connected()
-
-    class _NoHarnessRegistryClient(_PullStateClient):
-        def list_harnesses(self, _org_id: str) -> list[RemoteHarness]:
-            raise PlatformError("Unauthorized", status_code=401)
-
-    _NoHarnessRegistryClient.model_names = ()
-    _NoHarnessRegistryClient.endpoint_names = ("hosted-only",)
-    _NoHarnessRegistryClient.policy_payload = {
-        "policy": {"kind": "static", "default_model": "m1", "pool": []},
-        "report": None,
-        "bank": None,
-    }
-    _NoHarnessRegistryClient.bank_bytes = None
-    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _NoHarnessRegistryClient)
-
-    result = runner.invoke(app, ["pull", "hosted-only", "--root", root])
-
-    assert result.exit_code == 0, result.output
-    assert (Path(root) / "models" / "hosted-only" / "policy.json").is_file()
-    # An auth-denied registry (as opposed to one the platform does not serve)
-    # is worked around AUDIBLY: the collision assumption is stated.
-    assert "assuming the name is not also a harness" in _flatten(result.output)
