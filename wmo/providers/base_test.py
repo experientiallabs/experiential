@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import JsonValue
 
 from wmo.providers.base import (
@@ -19,6 +18,7 @@ from wmo.providers.base import (
     guard_starved_completion,
     verify_via_ping,
 )
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 
 class RecordingProvider:
