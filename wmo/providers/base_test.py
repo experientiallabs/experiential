@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import pytest
+from llm_waterfall import ChatRequest, ChatResponse
+from pydantic import JsonValue
+
 from wmo.providers.base import (
     PING_MAX_TOKENS,
     Completion,
     Message,
     ProviderConfig,
     ProviderKind,
+    TokenUsage,
     VerifyResult,
+    chat_request_output_budget,
+    guard_starved_chat_response,
+    guard_starved_completion,
     verify_via_ping,
 )
 
@@ -86,3 +94,84 @@ def test_verify_reports_real_failures() -> None:
     result = verify_via_ping(_RaisingProvider(exc))
     assert not result.ok
     assert "401" in (result.detail or "")
+
+
+def test_starved_completion_raises_instead_of_returning_empty_text() -> None:
+    """Reasoning ate the whole budget: 200 with no text would be scored as a failed task."""
+    starved = Completion(text="", usage=TokenUsage(input_tokens=10, output_tokens=8192))
+
+    with pytest.raises(ValueError, match="consumed the entire 8192-token output budget"):
+        guard_starved_completion(starved, 8192, model="gpt-5.6-sol", reasoning_effort="max")
+
+
+def test_a_short_answer_at_top_effort_is_not_starved() -> None:
+    """Starvation is prompt-dependent: effort=max on a trivial prompt emitted 6 tokens live, so a
+    fixed budget floor would have rejected a call that works. Only the outcome may trigger."""
+    fine = Completion(text="PONG", usage=TokenUsage(input_tokens=10, output_tokens=6))
+
+    guard_starved_completion(fine, 2048, model="gpt-5.6-sol", reasoning_effort="max")
+
+
+def test_empty_text_below_the_cap_is_not_relabelled_as_a_budget_problem() -> None:
+    """A refusal or content filter returns empty WITHOUT hitting the cap; don't misdiagnose it."""
+    refused = Completion(text="", usage=TokenUsage(input_tokens=10, output_tokens=12))
+
+    guard_starved_completion(refused, 8192, model="gpt-5.6-sol", reasoning_effort="max")
+
+
+def test_configs_with_no_effort_dial_are_untouched() -> None:
+    """The dial is the opt-in: an undialed call keeps whatever behaviour it had before."""
+    starved = Completion(text="", usage=TokenUsage(input_tokens=10, output_tokens=8192))
+
+    guard_starved_completion(starved, 8192, model="gpt-5.5", reasoning_effort=None)
+
+
+def _chat_response(
+    content: str | None,
+    completion_tokens: int,
+    *,
+    tool_calls: list[dict[str, JsonValue]] | None = None,
+) -> ChatResponse:
+    message: dict[str, object] = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        message["tool_calls"] = tool_calls
+    return ChatResponse.model_validate(
+        {
+            "choices": [{"index": 0, "message": message}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": completion_tokens},
+        }
+    )
+
+
+def test_starved_structured_reply_raises() -> None:
+    """complete_chat can be starved exactly like complete; it used to return the empty reply."""
+    starved = _chat_response(None, 8192)
+
+    with pytest.raises(ValueError, match="reasoning consumed"):
+        guard_starved_chat_response(starved, 8192, model="gpt-5.6-sol", reasoning_effort="max")
+
+
+def test_a_tool_call_with_empty_content_is_not_starvation() -> None:
+    """An assistant turn that called a tool has empty content by design: the normal agent
+    success shape, and the one thing a content-only check would wrongly kill."""
+    tool_call: list[dict[str, JsonValue]] = [
+        {"id": "c1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}
+    ]
+    called = _chat_response(None, 8192, tool_calls=tool_call)
+
+    guard_starved_chat_response(called, 8192, model="gpt-5.6-sol", reasoning_effort="max")
+
+
+def test_chat_request_output_budget_reads_either_field_spelling() -> None:
+    """The budget arrives under whichever name the caller used, or the guard reads None."""
+    assert (
+        chat_request_output_budget(
+            ChatRequest.model_validate({"messages": [], "max_completion_tokens": 4096})
+        )
+        == 4096
+    )
+    assert (
+        chat_request_output_budget(ChatRequest.model_validate({"messages": [], "max_tokens": 512}))
+        == 512
+    )
+    assert chat_request_output_budget(ChatRequest.model_validate({"messages": []})) is None

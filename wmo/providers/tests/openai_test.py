@@ -395,3 +395,189 @@ def test_built_in_models_still_send_max_completion_tokens(monkeypatch: pytest.Mo
 
     assert chat.last_kwargs["max_completion_tokens"] == 64
     assert "max_tokens" not in chat.last_kwargs
+
+
+class _FakeResponsesResource:
+    """Records the Responses-API payload an effort-dialed call sends."""
+
+    def __init__(self) -> None:
+        self.last_kwargs: dict[str, object] = {}
+
+    def create(self, **kwargs: object) -> object:
+        self.last_kwargs = kwargs
+        raise AssertionError("payload captured")
+
+
+class _FakeResponsesClient:
+    def __init__(self, responses: _FakeResponsesResource) -> None:
+        self.responses = responses
+
+
+def _recording_responses(
+    provider: OpenAIProvider, monkeypatch: pytest.MonkeyPatch
+) -> _FakeResponsesResource:
+    """Point the provider's Responses delegate at a recording client, as the chat tests do."""
+    resource = _FakeResponsesResource()
+    delegate = provider._responses_delegate()  # noqa: SLF001 - asserting the dispatch target
+    monkeypatch.setattr(delegate, "_get_client", lambda: _FakeResponsesClient(resource))
+    return resource
+
+
+def test_reasoning_effort_on_real_openai_goes_out_as_responses_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dial must reach the wire: chat/completions silently dropped it, billing a
+    default-effort run as an effort-dialed arm, and rejects the family's top `max` outright."""
+    provider = OpenAIProvider(
+        ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.6-sol", reasoning_effort="max")
+    )
+    resource = _recording_responses(provider, monkeypatch)
+
+    assert provider._dispatch_to_responses() is True  # noqa: SLF001
+    with pytest.raises(AssertionError, match="payload captured"):
+        provider.complete("sys", [Message(role="user", content="hi")], max_tokens=64)
+
+    assert resource.last_kwargs["reasoning"] == {"effort": "max"}
+
+
+def test_reasoning_effort_on_a_custom_endpoint_stays_on_the_chat_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenAIResponsesProvider builds its client with no base_url, so it cannot reach a
+    self-hosted server; the dial rides chat/completions there under vLLM's spelling."""
+    provider = OpenAIProvider(
+        ProviderConfig(
+            kind=ProviderKind.OPENAI,
+            model="my-model",
+            endpoint="http://localhost:8000/v1",
+            reasoning_effort="xhigh",
+        )
+    )
+    chat = _FakeChatCompletions(_FakeChatResponse("ok", _FakeUsage(1, 1)))
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
+    )
+
+    assert provider._dispatch_to_responses() is False  # noqa: SLF001
+    provider.complete("sys", [Message(role="user", content="hi")], max_tokens=64)
+
+    assert chat.last_kwargs["reasoning_effort"] == "xhigh"
+
+
+def test_no_reasoning_effort_leaves_the_chat_payload_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Configs with no dial must be byte-identical to before the dispatch existed."""
+    provider = OpenAIProvider(_config())
+    chat = _FakeChatCompletions(_FakeChatResponse("ok", _FakeUsage(1, 1)))
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
+    )
+
+    assert provider._dispatch_to_responses() is False  # noqa: SLF001
+    provider.complete("sys", [Message(role="user", content="hi")], max_tokens=64)
+
+    assert "reasoning_effort" not in chat.last_kwargs
+    assert "reasoning" not in chat.last_kwargs
+
+
+def test_complete_chat_routes_the_dial_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Structured requests take the same route as text ones, or the two disagree per call."""
+    provider = OpenAIProvider(
+        ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.6-sol", reasoning_effort="high")
+    )
+    resource = _recording_responses(provider, monkeypatch)
+
+    with pytest.raises(AssertionError, match="payload captured"):
+        provider.complete_chat(
+            ChatRequest.model_validate(
+                {"messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 32}
+            )
+        )
+
+    assert resource.last_kwargs["reasoning"] == {"effort": "high"}
+
+
+def test_prepare_prepares_the_route_the_request_will_take(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An effort-dialed config must never prepare (and so never key-check) the unused client."""
+    provider = OpenAIProvider(
+        ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.6-sol", reasoning_effort="max")
+    )
+    monkeypatch.setattr(
+        provider, "_get_client", lambda: pytest.fail("prepared the chat client instead")
+    )
+    prepared: list[str] = []
+    monkeypatch.setattr(
+        provider._responses_delegate(),  # noqa: SLF001
+        "prepare",
+        lambda: prepared.append("responses"),
+    )
+
+    provider.prepare()
+
+    assert prepared == ["responses"]
+
+
+def test_effort_dialed_stream_raises_when_it_yields_nothing_at_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that emits no text but burns the whole budget is the same starvation complete()
+    guards; unguarded, the consumer records an empty assistant turn as a success."""
+    provider = OpenAIProvider(
+        ProviderConfig(
+            kind=ProviderKind.OPENAI,
+            model="my-model",
+            endpoint="http://localhost:8000/v1",
+            reasoning_effort="max",
+        )
+    )
+    chat = _FakeStreamingCompletions([_FakeStreamChunk(None, _FakeUsage(10, 64))])
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
+    )
+
+    seen = []
+    with pytest.raises(ValueError, match="reasoning consumed"):
+        for chunk in provider.stream("sys", [Message(role="user", content="hi")], max_tokens=64):
+            seen.append(chunk)
+
+    # The terminal usage chunk must arrive BEFORE the raise: those tokens were billed either way,
+    # so raising first would drop a real, paid-for call from the consumer's metering.
+    assert [c.done for c in seen] == [True]
+    assert seen[0].usage is not None
+    assert seen[0].usage.output_tokens == 64
+
+
+def test_effort_dialed_stream_that_emits_text_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deltas mean the call produced output; the guard must not touch a working stream."""
+    provider = OpenAIProvider(
+        ProviderConfig(
+            kind=ProviderKind.OPENAI,
+            model="my-model",
+            endpoint="http://localhost:8000/v1",
+            reasoning_effort="max",
+        )
+    )
+    chat = _FakeStreamingCompletions(
+        [_FakeStreamChunk("hi"), _FakeStreamChunk(None, _FakeUsage(10, 64))]
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
+    )
+
+    chunks = list(provider.stream("sys", [Message(role="user", content="hi")], max_tokens=64))
+
+    assert [c.delta for c in chunks if c.delta] == ["hi"]
+    assert chunks[-1].done is True

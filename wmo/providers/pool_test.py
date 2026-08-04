@@ -1282,3 +1282,26 @@ def test_reasoning_effort_validates_at_load_not_first_request() -> None:
             model="us.anthropic.claude-opus-4-8",
             reasoning_effort="max",
         )
+
+
+def test_xhigh_is_accepted_for_openai_and_refused_for_anthropic() -> None:
+    """`xhigh` is the GPT-5.6 rung between high and max; Anthropic's dial has no such value,
+    so an Anthropic entry carrying it is a mis-mapped arm that must fail at load."""
+    assert (
+        PoolEntry(
+            name="sol@xhigh",
+            kind=ProviderKind.OPENAI,
+            model="gpt-5.6-sol",
+            reasoning_effort="xhigh",
+        )
+        .provider_config()
+        .reasoning_effort
+        == "xhigh"
+    )
+    with pytest.raises(ValidationError, match="xhigh"):
+        PoolEntry(
+            name="sonnet-5@xhigh",
+            kind=ProviderKind.ANTHROPIC,
+            model="claude-sonnet-5",
+            reasoning_effort="xhigh",
+        )

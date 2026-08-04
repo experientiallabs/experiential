@@ -48,7 +48,7 @@ the router-fit scenarios recorded in the policy:
 
 ```bash
 wmo optimize route report matrix.json .wmo/models/my-model/policy.json \
-  --baseline gpt-5.5
+  --baseline gpt-5.6-sol
 ```
 
 Distill your own small model into the pool with [`wmo optimize distill`](wmo/distill/README.md),
