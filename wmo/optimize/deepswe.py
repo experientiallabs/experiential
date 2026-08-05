@@ -35,8 +35,8 @@ What converts, and the honesty rules:
 
 Everything this module writes is a build output for the published artifact bundle
 (HF: matrix.json + task_embeddings.npy + scenario_groups.json); nothing here is committed to
-git. `wmo optimize route convert-deepswe` is the CLI face; `wmo reproduce run` consumes the
-published bundle through the `deepswe-coding` manifest.
+git. `wmo optimize route convert-deepswe` is the CLI face; the research repo's `reproduce run`
+consumes the published bundle through its `deepswe-coding113` manifest.
 """
 
 from __future__ import annotations

@@ -324,7 +324,7 @@ def fit_knn_artifact(
     # recorded vectors from a cache) while `embedder` stays the artifact's recorded identity:
     # the vectors are that spec's vectors wherever they were computed, and serving still
     # rebuilds from the spec. The substitute must be geometry-identical to the spec or the
-    # bank it fits is a lie; `wmo reproduce` is the only shipped caller.
+    # bank it fits is a lie; the research repo's `reproduce` command is the only shipped caller.
     if built is None:
         built = embedder.build()
     if compression is not None:

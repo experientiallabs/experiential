@@ -19,8 +19,8 @@ from wmo.optimize.deepswe import (
     price_table_span,
     top_arm,
 )
+from wmo.optimize.embedding_cache import CachedTaskEmbedder
 from wmo.optimize.outcomes import OutcomeMatrix
-from wmo.reproduce.embedding import CachedTaskEmbedder
 
 # The machine-local published-artifact cache (trials/tasks/leaderboard + instruction texts) and
 # the recorded Qwen3 embedding cache. Unset means the live reproduction tests skip; the numbers

@@ -12,7 +12,7 @@ routing supervision without spending a GPU-hour or an API dollar.
 | 1 | `wmo optimize route convert-deepswe <source> --embedding-cache <qwen3.json> --out bundle/` | `matrix.json` + `task_embeddings.npy` + `scenario_groups.json` |
 | 2 | `wmo optimize route fit bundle/matrix.json --kind knn --fallback claude-opus-5@high --embedder local` | `policy.json` + bank sidecar |
 | 3 | `wmo research deepswe-holdout bundle/` | the repo-grouped holdout table below |
-| 4 | `wmo reproduce run deepswe-coding113` | the bit-exact verdict on the published bundle |
+| 4 | `reproduce run deepswe-coding113` | the bit-exact verdict on the published bundle |
 
 ## The conversion and its gate
 
@@ -67,7 +67,8 @@ number on a different pool.
 ## Reproduce it
 
 ```bash
-uv run wmo reproduce run deepswe-coding113
+# in the research repo: github.com/experientiallabs/research
+uv run reproduce run deepswe-coding113
 ```
 
 Downloads the pinned bundle, replays the exact grouped-split fit and report offline, and

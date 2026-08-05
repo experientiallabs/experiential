@@ -104,14 +104,6 @@ add_deferred_typer(
     help="See and steer optimization runs: list, show, tail, stop, retry, backfill.",
     known_names=("list", "show", "tail", "stop", "retry", "backfill"),
 )
-add_deferred_typer(
-    app,
-    name="reproduce",
-    module="wmo.cli.reproduce_app",
-    attr="reproduce_app",
-    help="Replay published benchmark results and compare the measured verdict.",
-    known_names=("list", "run"),
-)
 
 
 def _register_ingest() -> None:
@@ -3409,11 +3401,11 @@ def research_deepswe_holdout(
 
     from rich.table import Table
 
+    from wmo.optimize.embedding_cache import CachedTaskEmbedder
     from wmo.optimize.knn import apply_cost_quality, fit_knn_artifact
     from wmo.optimize.outcomes import OutcomeMatrix, split_router_scenarios_grouped
     from wmo.optimize.policy import EmbedderSpec
     from wmo.optimize.report import build_report
-    from wmo.reproduce.embedding import CachedTaskEmbedder
 
     root = Path(bundle)
     for name in ("matrix.json", "task_embeddings.npy", "scenario_groups.json"):

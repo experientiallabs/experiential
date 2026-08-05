@@ -587,7 +587,8 @@ CI is wide; routed p95 latency is WORSE than the anchor's; the corpus mix is ~85
 ## Reproduce it with one command
 
 ```bash
-uv run wmo reproduce run tau-bench --yes
+# in the research repo: github.com/experientiallabs/research
+uv run reproduce run tau-bench --yes
 ```
 
 Downloads the public trace corpus, builds the world model, buys the 440-cell sweep against
@@ -595,7 +596,7 @@ live providers on a pinned public-route pool, fits, reports, and compares agains
 published row within stated tolerances. This is the PROTOCOL-exact reproduction: it spends
 real money (estimated ~$110; the command states it and refuses without `--yes`), providers
 are nondeterministic, and public prices drift - which is exactly what the tolerances in the
-shipped manifest encode. `wmo reproduce list` shows both reproduction classes.
+shipped manifest encode. `reproduce list` shows both reproduction classes.
 
 ## The real-episode leg, reproduced free
 
@@ -607,7 +608,8 @@ is glm-5.2 at −88%, unserveable until it has an authoritative price; the publi
 carries both, so the reproduction shows the gap. That leg is bit-exact and free to replay:
 
 ```bash
-uv run wmo reproduce run tau-bench-real
+# in the research repo: github.com/experientiallabs/research
+uv run reproduce run tau-bench-real
 ```
 
 Offline and credential-free (a static pin routes nothing, so the replay is arithmetic over

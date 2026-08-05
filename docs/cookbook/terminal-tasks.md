@@ -123,7 +123,8 @@ One command, offline, credential-free - the shipped default is a static pin, so 
 is arithmetic over the published outcome matrix:
 
 ```bash
-uv run wmo reproduce run terminal-bench-2
+# in the research repo: github.com/experientiallabs/research
+uv run reproduce run terminal-bench-2
 ```
 
 Downloads the pinned matrix from
