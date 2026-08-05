@@ -1,7 +1,8 @@
-"""Pluggable optimizers (GEPA prompt evolution today) + the LLM judges that score predictions.
+"""Shared optimizer contracts plus artifact-specific optimization packages.
 
-The switchable-optimizer interface lives in `wmo.optimize.base`; concrete optimizers implement
-its `Optimizer` protocol and return `OptimizeResult`s whose `ArtifactRef`s say what they built.
+Routing policy search lives in `wmo.optimize.routing`, model training lives in
+`wmo.optimize.model`, and the harness execution seam lives in `wmo.optimize.harness`.
+Shared protocols, prompt evolution, rewards, and judges stay at this package root.
 """
 
 from wmo.optimize.base import ArtifactRef, OptimizeMetrics, Optimizer, OptimizeResult

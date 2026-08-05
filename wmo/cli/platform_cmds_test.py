@@ -10,8 +10,8 @@ import pytest
 from typer.testing import CliRunner, Result
 
 from wmo.cli.app import app
-from wmo.harness.doc import HarnessDoc, Surface, SurfaceKind
-from wmo.harness.store import HarnessStore
+from wmo.optimize.harness.doc import HarnessDoc, Surface, SurfaceKind
+from wmo.optimize.harness.store import HarnessStore
 from wmo.platform.client import (
     PlatformError,
     PlatformUnreachable,

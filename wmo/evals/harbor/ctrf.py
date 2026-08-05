@@ -3,7 +3,7 @@
 Harbor's pytest verifiers run under `pytest-json-ctrf` and write a CTRF (Common Test Report
 Format) document to `<trial_dir>/verifier/ctrf.json` beside the binary `reward.txt`. That report
 is the only place a trial's per-test outcomes survive, so it is where the resolution a binary
-reward discards comes from (see `wmo.harness.scoring.GradedTests` for why that resolution
+reward discards comes from (see `wmo.optimize.harness.scoring.GradedTests` for why that resolution
 matters and how coarse it is).
 
 The shape this parses, confirmed against all 46 reports of the 48-episode TerminalBench-2 probe
@@ -34,7 +34,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from wmo.harness.scoring import GradedTests
+from wmo.optimize.harness.scoring import GradedTests
 
 logger = logging.getLogger(__name__)
 

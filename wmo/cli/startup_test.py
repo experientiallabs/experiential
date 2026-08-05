@@ -43,7 +43,7 @@ banned = (
     "scipy",
     "uvicorn",
     "wmo.serving.server",
-    "wmo.distill",
+    "wmo.optimize.model",
     "wmo.cli.route_app",
     "wmo.evals.open_loop",
 )
@@ -71,7 +71,7 @@ assert runner.invoke(app, ["list"]).exit_code == 0
 assert runner.invoke(app, ["config", "telemetry", "status"]).exit_code == 0
 banned = (
     "wmo.serving.server",
-    "wmo.distill",
+    "wmo.optimize.model",
     "wmo.cli.route_app",
     "fastapi",
     "sklearn",

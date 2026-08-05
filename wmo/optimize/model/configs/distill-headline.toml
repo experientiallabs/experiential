@@ -1,0 +1,89 @@
+# Headline run: Nemotron-3 Nano distilled from Ultra on the full TB2 split
+# (72 train / 17 holdout). Warmup collects 144 teacher episodes (~36 passing at
+# the observed 25% teacher solve rate) for the SFT bootstrap, then 40 OPD steps.
+# Cost projection from the product smoke: ~$50-100 total; the cap is a backstop.
+# Model names are the tinker-cookbook catalog names (pinned by
+# test_checked_in_run_configs_resolve_cookbook_renderers).
+[student]
+base_model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+lora_rank = 32
+
+[teacher]
+backend = "tinker"
+model = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
+
+[harbor]
+job_template = "wmo/optimize/model/configs/tb2-harbor-job-template.yaml"
+backend = "local"
+reward_key = "reward"
+
+[rollout]
+max_turns = 20
+context_budget_tokens = 65536
+compaction = false
+
+# Terminus-2 cannot use the stock reasoning renderers: they hand harbor's response
+# parser a LIST and kill the trial, and they strip thinking from history, which
+# fragments the episode into one datum per turn. The wmo verbatim wrappers keep the
+# reasoning in the token stream and the episode a single datum (wmo/optimize/model/renderers.py).
+[rollout.renderers]
+"nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16" = "wmo/nemotron3_verbatim"
+"nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16" = "wmo/nemotron3_ultra_verbatim"
+
+[train]
+steps = 40
+tasks_per_batch = 8
+group_size = 4
+learning_rate = 1e-4
+advantage_clip = 4.0
+center_advantages = true
+max_datum_tokens = 65536
+sampler_refresh_every = 1
+save_state_every = 4
+trial_concurrency = 32
+
+# temperature 1.0 keeps issued sampler logprobs comparable to the untempered
+# teacher logprobs (unbiased reverse-KL advantages).
+[sampling]
+temperature = 1.0
+max_tokens = 8192
+
+[warmup]
+steps = 2
+rollouts_per_task = 2
+keep = "passed"
+
+# Interim evals off (the default): the holdout gate is the measurement that
+# matters, and interim train-subsample evals only burn rollout budget.
+# teacher_baseline_from / student_baseline_from can reuse a prior run's
+# holdout baselines (same split, attempts >= gate.k, same teacher/base model).
+[eval]
+every = 0
+tasks = 12
+k = 1
+
+[gate]
+k = 3
+min_teacher_fraction = 0.7
+require_no_regression = true
+
+[pricing]
+# Ultra 64K (verified live 2026-07-23): prefill 2.49, sample 6.225, train
+# 5.478 USD/Mtok. Cached prefill 0.498 is exactly the 20%-of-prefill default,
+# so both cached rates are left implied.
+teacher_prefill = 2.49
+teacher_sample = 6.225
+# Nano prices are unlisted on the console; these are implied from reconciling
+# the console's billed totals (306M tokens / $78) against the run's metered
+# per-request volumes.
+student_prefill = 0.30
+student_sample = 0.70
+student_train = 0.60
+
+[budget]
+max_usd = 600.0
+
+[wandb]
+enabled = true
+project = "wmo-distill"
+run_name = "nano-from-ultra-tb2-headline"

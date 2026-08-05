@@ -3401,11 +3401,11 @@ def research_deepswe_holdout(
 
     from rich.table import Table
 
-    from wmo.optimize.embedding_cache import CachedTaskEmbedder
-    from wmo.optimize.knn import apply_cost_quality, fit_knn_artifact
-    from wmo.optimize.outcomes import OutcomeMatrix, split_router_scenarios_grouped
-    from wmo.optimize.policy import EmbedderSpec
-    from wmo.optimize.report import build_report
+    from wmo.optimize.routing.embedding_cache import CachedTaskEmbedder
+    from wmo.optimize.routing.knn import apply_cost_quality, fit_knn_artifact
+    from wmo.optimize.routing.outcomes import OutcomeMatrix, split_router_scenarios_grouped
+    from wmo.optimize.routing.policy import EmbedderSpec
+    from wmo.optimize.routing.report import build_report
 
     root = Path(bundle)
     for name in ("matrix.json", "task_embeddings.npy", "scenario_groups.json"):

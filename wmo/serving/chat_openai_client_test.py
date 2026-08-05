@@ -24,7 +24,7 @@ import uvicorn
 from fastapi import FastAPI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam
 
-from wmo.optimize.policy import RoutingPolicy
+from wmo.optimize.routing.policy import RoutingPolicy
 from wmo.providers.base import (
     Completion,
     Message,

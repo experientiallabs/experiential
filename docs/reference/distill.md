@@ -58,7 +58,7 @@ Where episodes come from is config-selected: exactly one of `[harbor]` or `[tau2
   `[rollout.renderers]` and `rollout.compaction` are terminus-2 knobs and are rejected under
   this source. `rollout.max_turns` maps to tau2's `--max-steps` and `rollout.episode_timeout_s`
   to its graceful per-simulation `--timeout`. The reference config is
-  `wmo/distill/configs/distill-tau2-smoke.toml`.
+  `wmo/optimize/model/configs/distill-tau2-smoke.toml`.
 
 Training phases are also composable per run: `train.steps = 0` makes the run **warmup-only**
 (the supervised phase - teacher rollouts, keep-filter, cross-entropy - is the whole run, then
@@ -91,7 +91,7 @@ the student-after eval and the gate run as usual); it is rejected unless `warmup
 
 One TOML file describes one run. `[student]`, `[teacher]`, and exactly ONE rollout source
 section (`[harbor]` below; `[tau2]` per the section above, with
-`wmo/distill/configs/distill-tau2-smoke.toml` as its reference shape) are required; every
+`wmo/optimize/model/configs/distill-tau2-smoke.toml` as its reference shape) are required; every
 other section has complete defaults. A minimal, realistic harbor-source config:
 
 ```toml

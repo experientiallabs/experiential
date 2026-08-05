@@ -22,11 +22,13 @@ from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
-from wmo.distill.store import DistillModelCard
 from wmo.engine.world_model import WorldModel
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.ingest.otel_writer import write_traces_jsonl
-from wmo.optimize.compression import (
+from wmo.optimize.model.store import DistillModelCard
+from wmo.optimize.reward import EpisodeScore
+from wmo.optimize.routing import evaluate_policy
+from wmo.optimize.routing.compression import (
     CompressionConfig,
     Compressor,
     TruncateCompressor,
@@ -34,11 +36,9 @@ from wmo.optimize.compression import (
     registered_compressor_ids,
     same_compression,
 )
-from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmo.optimize.policy import POLICY_FILENAME, RoutingPolicy, select_model
-from wmo.optimize.reward import EpisodeScore
-from wmo.optimize.routing import evaluate_policy
-from wmo.optimize.sweep_partial import PartialHeader, PlanIdentity
+from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
+from wmo.optimize.routing.policy import POLICY_FILENAME, RoutingPolicy, select_model
+from wmo.optimize.routing.sweep_partial import PartialHeader, PlanIdentity
 from wmo.providers import pool as pool_module
 from wmo.providers.base import (
     Completion,
@@ -66,7 +66,9 @@ def _local_model_uncached(monkeypatch: pytest.MonkeyPatch) -> None:
     Hugging Face cache; the fit tests here assert the hashing and azure legs, and must observe
     the same resolution on a machine with the cache warm as on CI without it.
     """
-    monkeypatch.setattr("wmo.optimize.policy.default_model_cached", lambda backend=None: False)
+    monkeypatch.setattr(
+        "wmo.optimize.routing.policy.default_model_cached", lambda backend=None: False
+    )
 
 
 def _arm(compression: CompressionConfig | None) -> tuple[str, str, float]:
@@ -3477,7 +3479,7 @@ def _deepswe_fixture(tmp_path: Path) -> tuple[Path, Path]:
     """A tiny publisher-shaped DeepSWE source directory plus its embedding cache."""
     import numpy as np
 
-    from wmo.optimize.deepswe import PROMPT_BOILERPLATE
+    from wmo.optimize.routing.deepswe import PROMPT_BOILERPLATE
 
     source = tmp_path / "deepswe-source"
     trials: list[dict[str, object]] = []
@@ -3590,7 +3592,7 @@ def test_route_convert_deepswe_refuses_contradicted_leaderboard(tmp_path: Path) 
 
 
 def test_research_deepswe_holdout_reports_grouped_medians(tmp_path: Path) -> None:
-    from wmo.optimize.deepswe import convert_deepswe
+    from wmo.optimize.routing.deepswe import convert_deepswe
 
     source, cache = _deepswe_fixture(tmp_path)
     bundle = tmp_path / "bundle"

@@ -33,8 +33,8 @@ from wmo.evals.harbor.scorer import (
     HarborScorer,
     MissingRewardMode,
 )
-from wmo.harness.doc import HarnessDoc
-from wmo.harness.scoring import GradedTests, RewardMode
+from wmo.optimize.harness.doc import HarnessDoc
+from wmo.optimize.harness.scoring import GradedTests, RewardMode
 from wmo.providers.base import ProviderConfig, ProviderKind
 
 _JOB_ID = UUID("00000000-0000-4000-8000-000000000001")
@@ -699,14 +699,14 @@ def test_custom_agent_import_path_and_extra_kwargs_thread_into_the_job(tmp_path:
         harness_backend="e2b",
         e2b_template="pi-template",
         agent_concurrency=1,
-        agent_import_path="wmo.distill.agents:WmoDistillHarborAgent",
+        agent_import_path="wmo.optimize.model.agents:WmoDistillHarborAgent",
         extra_agent_kwargs={"token_sink_dir": "/runs/tokens/step-0000"},
         runner=_Runner([]),
     )
     candidate = HarnessDoc.baseline()
     config = scorer._candidate_job(candidate)
     [agent] = config.agents
-    assert agent.import_path == "wmo.distill.agents:WmoDistillHarborAgent"
+    assert agent.import_path == "wmo.optimize.model.agents:WmoDistillHarborAgent"
     assert agent.kwargs["token_sink_dir"] == "/runs/tokens/step-0000"
     assert agent.kwargs["harness"] == candidate.model_dump(mode="json")
     assert agent.kwargs["harness_backend"] == "e2b"
@@ -799,13 +799,13 @@ def test_create_threads_agent_import_path_and_extra_kwargs(
             harness_backend="e2b",
             e2b_template="pi-template",
             agent_concurrency=1,
-            agent_import_path="wmo.distill.agents:WmoDistillHarborAgent",
+            agent_import_path="wmo.optimize.model.agents:WmoDistillHarborAgent",
             extra_agent_kwargs={"token_sink_dir": "/runs/tokens/step-0001"},
         )
     )
     config = scorer._candidate_job(HarnessDoc.baseline())
     [agent] = config.agents
-    assert agent.import_path == "wmo.distill.agents:WmoDistillHarborAgent"
+    assert agent.import_path == "wmo.optimize.model.agents:WmoDistillHarborAgent"
     assert agent.kwargs["token_sink_dir"] == "/runs/tokens/step-0001"
 
 

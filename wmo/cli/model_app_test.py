@@ -23,9 +23,12 @@ from wmo.agents.default import default_agent
 from wmo.cli import app
 from wmo.cli.model_app import PROBE_EXIT_INSUFFICIENT, PROBE_EXIT_NO_GAP
 from wmo.config.settings import load_settings
-from wmo.distill.config import DistillConfig
-from wmo.distill.gate import DistillGateRecord
-from wmo.distill.loop import (
+from wmo.optimize.harness.doc import HarnessDoc
+from wmo.optimize.harness.e2b_reap import CapacityCheck, ReapOutcome
+from wmo.optimize.harness.store import HarnessStore
+from wmo.optimize.model.config import DistillConfig
+from wmo.optimize.model.gate import DistillGateRecord
+from wmo.optimize.model.loop import (
     STUDENT_AFTER_EVAL,
     STUDENT_BEFORE_EVAL,
     TEACHER_BASELINE_EVAL,
@@ -38,19 +41,16 @@ from wmo.distill.loop import (
     StepMetrics,
     resume_command,
 )
-from wmo.distill.rollouts import E2B_SANDBOXES_PER_TRIAL
-from wmo.distill.store import DEFAULT_TINKER_OPENAI_ENDPOINT, AdapterStore, DistillRunStore
-from wmo.harness.doc import HarnessDoc
-from wmo.harness.e2b_reap import CapacityCheck, ReapOutcome
-from wmo.harness.store import HarnessStore
-from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
+from wmo.optimize.model.rollouts import E2B_SANDBOXES_PER_TRIAL
+from wmo.optimize.model.store import DEFAULT_TINKER_OPENAI_ENDPOINT, AdapterStore, DistillRunStore
+from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import PoolEntry
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from wmo.distill.loop import DistillServiceClient, LiveTrialPreflight
+    from wmo.optimize.model.loop import DistillServiceClient, LiveTrialPreflight
 
 model_app_module = importlib.import_module("wmo.cli.model_app")
 
@@ -574,7 +574,7 @@ def test_distill_names_the_install_command_when_the_distill_extra_is_missing(
     """
     _write_inputs(tmp_path, extra_toml='[rollout.renderers]\n"test/student" = "qwen3"\n')
     # A deterministic stand-in for a no-extras install, whether or not this venv has the extra.
-    monkeypatch.setitem(sys.modules, "wmo.distill.renderers", None)
+    monkeypatch.setitem(sys.modules, "wmo.optimize.model.renderers", None)
     _patch_run(monkeypatch, _RunRecorder())
 
     result = _invoke(tmp_path, "--yes")

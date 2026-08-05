@@ -24,7 +24,7 @@ from harbor.models.trial.paths import TrialPaths
 
 import wmo.evals.harbor.e2b_environment as e2b_environment_module
 from wmo.evals.harbor.e2b_environment import WmoE2BEnvironment
-from wmo.harness.e2b_ledger import SandboxLedger, read_ledger_files
+from wmo.optimize.harness.e2b_ledger import SandboxLedger, read_ledger_files
 
 _LEDGER_PID = 424_242
 

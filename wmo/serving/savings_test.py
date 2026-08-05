@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from wmo.optimize.policy import RoutingPolicy
+from wmo.optimize.routing.policy import RoutingPolicy
 from wmo.providers.base import ProviderKind
 from wmo.providers.pool import PoolEntry
 from wmo.serving.chat import RequestLogRecord

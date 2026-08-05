@@ -37,9 +37,9 @@ from harbor.models.agent.context import AgentContext
 from harbor.models.task.config import MCPServerConfig
 
 from wmo.core.types import Action, ActionKind, JsonObject, Observation
-from wmo.harness.doc import HarnessDoc
-from wmo.harness.environment import is_env_action
-from wmo.harness.runtime import (
+from wmo.optimize.harness.doc import HarnessDoc
+from wmo.optimize.harness.environment import is_env_action
+from wmo.optimize.harness.runtime import (
     DEFAULT_EVAL_EPISODE_TIMEOUT_S,
     RunResult,
     validate_episode_timeout_s,

@@ -31,9 +31,9 @@ from wmo.config.card import ModelCard, load_card
 from wmo.core.types import Action, EnvState, Observation, Session
 from wmo.engine.loader import load_world_model
 from wmo.engine.world_model import WorldModel
-from wmo.optimize.pareto import PARETO_FILENAME, ParetoCurve
-from wmo.optimize.policy import POLICY_FILENAME, RoutingPolicy
 from wmo.optimize.reward import EpisodeScore
+from wmo.optimize.routing.pareto import PARETO_FILENAME, ParetoCurve
+from wmo.optimize.routing.policy import POLICY_FILENAME, RoutingPolicy
 from wmo.serving.builds import BuildManager, BuildRouteRequest, BuildSnapshot
 from wmo.serving.chat import (
     EndpointRuntime,

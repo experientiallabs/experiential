@@ -27,7 +27,7 @@ last-token pooling reproduces its vectors at median cosine 1.0 across sampled ta
 EOS drops to ~0.82), so this module matches the artifact rather than the card. Quantized (MLX
 4-bit) and full-precision (torch) weights produce slightly different vectors of the same
 geometry; anything that must be bit-exact (a published reproduction) serves recorded vectors
-through `wmo.optimize.embedding_cache.CachedTaskEmbedder` instead of re-embedding.
+through `wmo.optimize.routing.embedding_cache.CachedTaskEmbedder` instead of re-embedding.
 """
 
 from __future__ import annotations

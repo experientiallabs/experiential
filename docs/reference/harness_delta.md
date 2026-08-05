@@ -6,9 +6,9 @@ Getting this right matters more than any implementation detail downstream: **the
 representation IS the search space**, and everything the meta-agent can learn about *how to
 improve harnesses* is bounded by what the update object can express.
 
-Implementation: `wmo/harness/doc.py` (the document), `wmo/harness/delta.py` (the delta),
-`wmo/harness/mutate.py` (delta parsing), `wmo/harness/proposer.py` (proposal runtimes), and
-`wmo/harness/create.py` (clustering, gate, archive).
+WMO owns the shared document and execution contracts in `wmo/optimize/harness/`, including
+`doc.py`, `code_runtime.py`, `runtime.py`, `scoring.py`, and `store.py`. Delta parsing, proposal
+runtimes, population search, and promotion live in the private `agent-optimization` repository.
 
 ---
 
@@ -123,7 +123,7 @@ class HarnessDelta(BaseModel):
   validated against the parent doc — and the child re-validates as a whole `HarnessDoc` — before a
   token of eval budget is spent. Path safety, unknown-target rejection, skill-name consistency,
   and code compilation are impossible-by-construction rather than checked piecemeal.
-- **The strongest lever is code** (`code:runtime`, `wmo/harness/code_runtime.py`): live search
+- **The strongest lever is code** (`code:runtime`, `wmo/optimize/harness/code_runtime.py`): live search
   campaigns showed correct failure diagnoses that prompt- and skill-level edits could not fix —
   loop structure, retries, verification passes, context compaction, and token budgets are
   programs, not wording. The code surface holds a module defining `run(kit)`; the `RuntimeKit` is

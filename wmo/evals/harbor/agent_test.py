@@ -21,8 +21,8 @@ from wmo.evals.harbor.agent import (
     WmoHarborAgent,
     _bounded_observation_text,
 )
-from wmo.harness.doc import HarnessDoc
-from wmo.harness.runtime import RunResult, RuntimeCancelled, StopReason, TokenUsage
+from wmo.optimize.harness.doc import HarnessDoc
+from wmo.optimize.harness.runtime import RunResult, RuntimeCancelled, StopReason, TokenUsage
 from wmo.providers.base import Provider, ProviderConfig, ProviderKind
 from wmo.providers.retry import RetryingProvider
 

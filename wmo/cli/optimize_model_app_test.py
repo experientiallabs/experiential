@@ -36,26 +36,26 @@ from wmo.core.types import (
 from wmo.engine.world_model import WorldModel
 from wmo.env.closed_loop import scenario_id
 from wmo.ingest.otel_writer import write_traces_jsonl
-from wmo.optimize.compression import CompressionConfig
-from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmo.optimize.pipeline import (
+from wmo.optimize.reward import EpisodeScore
+from wmo.optimize.routing.compression import CompressionConfig
+from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
+from wmo.optimize.routing.pipeline import (
     MANIFEST_FILENAME,
     MATRIX_FILENAME,
     REPORT_FILENAME,
     RunManifest,
     Stage,
 )
-from wmo.optimize.policy import (
+from wmo.optimize.routing.policy import (
     AZURE_EMBEDDER_DEPLOYMENT,
     AZURE_EMBEDDER_ENV,
     POLICY_FILENAME,
     EmbedderSpec,
     RoutingPolicy,
 )
-from wmo.optimize.report import ImprovementReport
-from wmo.optimize.reward import EpisodeScore
-from wmo.optimize.sweep import SweepPlan, plan_sweep, resolve_config
-from wmo.optimize.sweep_partial import PartialHeader
+from wmo.optimize.routing.report import ImprovementReport
+from wmo.optimize.routing.sweep import SweepPlan, plan_sweep, resolve_config
+from wmo.optimize.routing.sweep_partial import PartialHeader
 from wmo.providers.base import (
     Completion,
     Message,
@@ -82,7 +82,9 @@ def _local_model_uncached(monkeypatch: pytest.MonkeyPatch) -> None:
     Hugging Face cache; these tests assert the azure and hashing legs, and must observe the
     same resolution on a machine with the cache warm as on CI without it.
     """
-    monkeypatch.setattr("wmo.optimize.policy.default_model_cached", lambda backend=None: False)
+    monkeypatch.setattr(
+        "wmo.optimize.routing.policy.default_model_cached", lambda backend=None: False
+    )
 
 
 optimize_module = importlib.import_module("wmo.cli.optimize_model_app")
@@ -763,8 +765,8 @@ def test_the_sweep_stage_and_route_sweep_produce_identical_matrices(
 ) -> None:
     """The extraction's guarantee: two commands, one measurement, byte-identical evidence.
 
-    Both faces call `wmo.optimize.sweep`, so a divergence here would mean one of them grew its
-    own copy of the scenario cut, the tools hint, or the cell ordering.
+    Both faces call `wmo.optimize.routing.sweep`, so a divergence here would mean one of them
+    grew its own copy of the scenario cut, the tools hint, or the cell ordering.
     """
     _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9}, modules=(route_module,))
     root = _project(tmp_path)

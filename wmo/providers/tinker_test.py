@@ -1,6 +1,6 @@
 """Tests for the Tinker provider: span recording, response shape, lazy imports.
 
-Everything runs against the deterministic fakes in `wmo.distill.fake_tinker`
+Everything runs against the deterministic fakes in `wmo.optimize.model.fake_tinker`
 plus a minimal char-level `ChatRendering`; the real tinker SDK is never
 touched (several tests pin that by poisoning `sys.modules`).
 """
@@ -19,10 +19,10 @@ from typing import TYPE_CHECKING, NoReturn, cast
 import pytest
 from pydantic import JsonValue, ValidationError
 
-import wmo.distill.rendering as rendering_module
+import wmo.optimize.model.rendering as rendering_module
 import wmo.providers.tinker as tinker_module
 from wmo.config.config import PROVIDER_ENV_VARS
-from wmo.distill.config import (
+from wmo.optimize.model.config import (
     DistillConfig,
     HarborConfig,
     RolloutConfig,
@@ -30,11 +30,11 @@ from wmo.distill.config import (
     TeacherConfig,
     TrainConfig,
 )
-from wmo.distill.data import build_datums
-from wmo.distill.deadlines import TinkerDeadlineError
-from wmo.distill.fake_tinker import FakeSampledSequence, FakeSamplingClient, FakeTokenizer
-from wmo.distill.rendering import ParsedAssistantMessage
-from wmo.distill.tokens import TrialRecord
+from wmo.optimize.model.data import build_datums
+from wmo.optimize.model.deadlines import TinkerDeadlineError
+from wmo.optimize.model.fake_tinker import FakeSampledSequence, FakeSamplingClient, FakeTokenizer
+from wmo.optimize.model.rendering import ParsedAssistantMessage
+from wmo.optimize.model.tokens import TrialRecord
 from wmo.providers.base import (
     UNPARSED_TOOL_CALLS_KEY,
     ContextWindowProvider,

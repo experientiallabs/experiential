@@ -42,10 +42,10 @@ if TYPE_CHECKING:
     # Type-only: real imports are local to the commands and helpers that construct or inspect
     # these values, so importing this module never pulls the optimize/engine/env/distill/pool
     # bodies behind it.
-    from wmo.optimize.knn import DialResult, KnnFitOutcome
-    from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-    from wmo.optimize.policy import RoutingPolicy
-    from wmo.optimize.sweep import CandidateCoverage, DeferredRisk, SweepPlan, SweepRun
+    from wmo.optimize.routing.knn import DialResult, KnnFitOutcome
+    from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
+    from wmo.optimize.routing.policy import RoutingPolicy
+    from wmo.optimize.routing.sweep import CandidateCoverage, DeferredRisk, SweepPlan, SweepRun
     from wmo.providers.pool import PoolEntry
     from wmo.utils.waterfall import ChatMaxTokensField
 
@@ -63,7 +63,8 @@ DEFAULT_MATRIX_FILENAME = "matrix.json"
 """Default `sweep --out`: the outcome matrix `fit` takes as its argument."""
 
 # Literal mirrors of constants that otherwise live behind a heavy import
-# (`wmo.optimize.compression`, `wmo.optimize.policy`, `wmo.env.llm_agent`, `wmo.providers.pool`).
+# (`wmo.optimize.routing.compression`, `wmo.optimize.routing.policy`, `wmo.env.llm_agent`,
+# `wmo.providers.pool`).
 # Typer evaluates Option defaults and f-string help text at command-definition time, so these
 # have to be values, not names imported from those modules; the real constants are re-imported
 # inside the command bodies that need their behavior.
@@ -79,7 +80,7 @@ _REAL_EPISODE = "real_episode"
 _DEFAULT_WM_JUDGE = "world-model verifier"
 
 COMPRESSOR_IDS_HELP = "identity | truncate"
-"""What `--compressor` accepts. Mirrors `wmo.optimize.compression.registered_compressor_ids()`."""
+"""What `--compressor` accepts; mirrors the registered compressor ids."""
 
 _MATRIX_DIGEST_MARK = "sha256="
 """How `load_matrix_with_digest` spells the digest inside a policy's `fitted_from`."""
@@ -257,8 +258,8 @@ def sweep(
     """
     from wmo.engine import load_world_model
     from wmo.env import WorldModelEnv
-    from wmo.optimize.compression import resolve_compression
-    from wmo.optimize.sweep import (
+    from wmo.optimize.routing.compression import resolve_compression
+    from wmo.optimize.routing.sweep import (
         SweepError,
         coverage,
         execute_sweep,
@@ -481,7 +482,7 @@ def uneven_warning(rows: list[CandidateCoverage]) -> str | None:
     SETS, and candidates ranked on the same scenarios with different numbers of surviving EPISODES.
     Both bias a fit; naming which one happened is what makes the message actionable.
     """
-    from wmo.optimize.sweep import Unevenness, unevenness
+    from wmo.optimize.routing.sweep import Unevenness, unevenness
 
     counts = ", ".join(f"{escape(row.candidate)} {row.scored}" for row in rows)
     match unevenness(rows):
@@ -704,7 +705,7 @@ def student(
     student and the rest of the roster, run `wmo optimize route fit` on a matrix that covers both.
     """
     from wmo.core.locks import FileLockTimeout
-    from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
+    from wmo.optimize.model.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
     from wmo.providers.pool import upsert_pool_entry
 
     card_path = Path(card_dir) / MODEL_CARD_FILE
@@ -849,7 +850,7 @@ def _reads_as(model: type[OutcomeMatrix] | type[RoutingPolicy], path: Path) -> b
 
 def _load_matrix(matrix_file: str) -> tuple[OutcomeMatrix, str]:
     """The outcome matrix at `matrix_file`, with the digest provenance a fit stamps."""
-    from wmo.optimize.outcomes import load_matrix_with_digest
+    from wmo.optimize.routing.outcomes import load_matrix_with_digest
 
     path = Path(matrix_file)
     try:
@@ -862,7 +863,7 @@ def _load_matrix(matrix_file: str) -> tuple[OutcomeMatrix, str]:
     except OSError as exc:
         raise typer.BadParameter(f"cannot read the outcome matrix at {path}: {exc}") from exc
     except ValidationError as exc:
-        from wmo.optimize.policy import RoutingPolicy
+        from wmo.optimize.routing.policy import RoutingPolicy
 
         if _reads_as(RoutingPolicy, path):
             raise typer.BadParameter(
@@ -875,7 +876,7 @@ def _load_matrix(matrix_file: str) -> tuple[OutcomeMatrix, str]:
 
 def _load_policy(policy_file: str) -> RoutingPolicy:
     """The fitted policy at `policy_file`."""
-    from wmo.optimize.policy import RoutingPolicy
+    from wmo.optimize.routing.policy import RoutingPolicy
 
     path = Path(policy_file)
     try:
@@ -893,7 +894,7 @@ def _load_policy(policy_file: str) -> RoutingPolicy:
         # as a ValidationError.
         raise typer.BadParameter(f"cannot read the policy at {path}: {exc}") from exc
     except ValidationError as exc:
-        from wmo.optimize.outcomes import OutcomeMatrix
+        from wmo.optimize.routing.outcomes import OutcomeMatrix
 
         if _reads_as(OutcomeMatrix, path):
             raise typer.BadParameter(
@@ -933,8 +934,8 @@ def convert_deepswe_cmd(
     from the raw trials. `fit` and `report` consume the bundle unchanged;
     `wmo research deepswe-holdout` runs the grouped holdout protocol on it.
     """
-    from wmo.optimize.deepswe import convert_deepswe, top_arm
-    from wmo.optimize.outcomes import OutcomeMatrix
+    from wmo.optimize.routing.deepswe import convert_deepswe, top_arm
+    from wmo.optimize.routing.outcomes import OutcomeMatrix
 
     try:
         result = convert_deepswe(Path(source), embedding_cache=Path(embedding_cache), out=Path(out))
@@ -1068,16 +1069,16 @@ def fit(
     staged pipeline never fits it and no served endpoint carries one, so choose it only to
     measure against the champion.
     """
-    from wmo.optimize.compression import (
+    from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
+    from wmo.optimize.routing.compression import (
         CompressingEmbedder,
         compression_signature,
         resolve_compression,
         same_compression,
     )
-    from wmo.optimize.knn import fit_knn_artifact
-    from wmo.optimize.outcomes import ROUTER_SPLIT_VERSION, split_router_scenarios
-    from wmo.optimize.policy import embedder_provenance, probe_embedder, resolve_embedder
-    from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
+    from wmo.optimize.routing.knn import fit_knn_artifact
+    from wmo.optimize.routing.outcomes import ROUTER_SPLIT_VERSION, split_router_scenarios
+    from wmo.optimize.routing.policy import embedder_provenance, probe_embedder, resolve_embedder
 
     if kind not in ("rank", "knn"):
         raise typer.BadParameter(f"unknown kind '{kind}'; use knn or rank")
@@ -1266,7 +1267,7 @@ def pin(
     say so. Replace it with `wmo optimize route fit` on a real outcome matrix to let the router
     choose per request.
     """
-    from wmo.optimize.policy import RoutingPolicy
+    from wmo.optimize.routing.policy import RoutingPolicy
     from wmo.providers.pool import load_pool
 
     store = WorldModelStore(root)
@@ -1364,9 +1365,9 @@ def tune(
     """Set a fitted policy's cost/quality dial in place, without refitting anything.
 
     The dial maps to the policy's knobs along the measured frontier (see
-    `wmo.optimize.knn.apply_cost_quality`). The first successful run copies the un-tuned artifact
-    to `policy.base.json` and every later run re-reads THAT, so the dial is always applied to the
-    policy as fitted and sliding twice never compounds:
+    `wmo.optimize.routing.knn.apply_cost_quality`). The first successful run copies the un-tuned
+    artifact to `policy.base.json` and every later run re-reads THAT, so the dial is always applied
+    to the policy as fitted and sliding twice never compounds:
 
         wmo optimize route tune models/support/policy.json --cost-quality 0.6
 
@@ -1378,7 +1379,7 @@ def tune(
     The evidence bank is untouched, so this is instant. A served endpoint can be dialed without
     touching files at all: `PUT /v1/endpoints/{name}/config`.
     """
-    from wmo.optimize.knn import tune_policy_dial
+    from wmo.optimize.routing.knn import tune_policy_dial
 
     try:
         dialed = tune_policy_dial(Path(policy_file), cost_quality)
@@ -1389,7 +1390,7 @@ def tune(
 
 def print_dial(console: Console, dialed: DialResult) -> None:
     """Report an applied dial position against the frontier that was actually measured."""
-    from wmo.optimize.knn import COST_QUALITY_ANCHORS
+    from wmo.optimize.routing.knn import COST_QUALITY_ANCHORS
 
     knobs = dialed.knobs
     console.print(
@@ -1446,14 +1447,14 @@ def report(
     ),
 ) -> None:
     """Build the improvement report for a fitted policy over a matrix."""
-    from wmo.optimize.pareto import (
+    from wmo.optimize.routing.pareto import (
         PARETO_FILENAME,
         REAL_EPISODE,
         WM_SIMULATED,
         held_out_curve,
     )
-    from wmo.optimize.policy import write_artifact_atomically
-    from wmo.optimize.report import build_report
+    from wmo.optimize.routing.policy import write_artifact_atomically
+    from wmo.optimize.routing.report import build_report
 
     if provenance not in {WM_SIMULATED, REAL_EPISODE}:
         # A typo here would silently label real measurements as simulated, which is the one
@@ -1595,7 +1596,7 @@ def push(
     The endpoint keeps its id, name, and URL, so a customer's client is unaffected by
     the swap, and live pods pick the new policy up on their own.
     """
-    from wmo.optimize.policy import RoutingPolicy
+    from wmo.optimize.routing.policy import RoutingPolicy
 
     policy_path = Path(policy_file)
     if not policy_path.is_file():

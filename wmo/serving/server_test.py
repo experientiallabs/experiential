@@ -11,7 +11,7 @@ from wmo.config.card import CardCorpus, ModelCard, TracesSource
 from wmo.core.types import Action, ActionKind, Observation, Step, Trace
 from wmo.engine.knowledge import KnowledgeBase
 from wmo.engine.world_model import WorldModel
-from wmo.optimize.policy import RoutingPolicy
+from wmo.optimize.routing.policy import RoutingPolicy
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.providers.pool import PoolEntry
 from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
@@ -418,7 +418,12 @@ def _knn_policy_dir(tmp_path: Path) -> tuple[Path, RoutingPolicy]:
     """A model dir holding a knn policy.json plus its bank, the way a fit leaves it."""
     import numpy as np
 
-    from wmo.optimize.policy import KNN_BANK_FILENAME, POLICY_FILENAME, EmbedderSpec, KnnBank
+    from wmo.optimize.routing.policy import (
+        KNN_BANK_FILENAME,
+        POLICY_FILENAME,
+        EmbedderSpec,
+        KnnBank,
+    )
 
     model_dir = tmp_path / "models" / "support"
     model_dir.mkdir(parents=True)

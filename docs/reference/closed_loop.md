@@ -61,5 +61,5 @@ those.
 scoring + `WorldModelEnvironment`), `gold.py` (gold-assertion judge), `agreement.py`
 (report-vs-report comparison), `tasks.py` (task specs).
 
-`wmo/harness/`: `runtime.py` (the fixed agent loop), `environment.py` (the `AgentEnvironment`
-seam the loop drives), `tools.py` (the tool registry).
+`wmo/optimize/harness/`: `runtime.py` (the fixed agent loop), `environment.py` (the
+`AgentEnvironment` seam the loop drives), `tools.py` (the tool registry).

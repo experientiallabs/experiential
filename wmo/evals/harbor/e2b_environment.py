@@ -20,8 +20,8 @@ everything else (mounts, network policy, uploads, verification) harbor's:
   published account rate.
 
 It also owns this backend's sandbox lifecycle hygiene. Every created sandbox is appended to the
-`wmo.harness.e2b_ledger` record the moment E2B returns it and released when its kill is proved,
-so a run that dies without graceful shutdown leaves its sandboxes reapable by exact id
+`wmo.optimize.harness.e2b_ledger` record the moment E2B returns it and released when its kill is
+proved, so a run that dies without graceful shutdown leaves its sandboxes reapable by exact id
 (`wmo e2b reap`) instead of holding account concurrency slots for their full multi-hour timeout.
 Creates that hit the account's concurrent-sandbox cap (a 429) wait and retry on a bounded
 schedule, so a transient spike costs latency rather than the trial.
@@ -62,8 +62,8 @@ from wmo.evals.harbor.e2b_template_policy import (
     qualify_harbor_e2b_template_name,
     resolve_e2b_template_resources,
 )
-from wmo.harness.e2b_ledger import default_ledger, harbor_trial_name
-from wmo.harness.e2b_sandbox import acquire_e2b_create_slot_async
+from wmo.optimize.harness.e2b_ledger import default_ledger, harbor_trial_name
+from wmo.optimize.harness.e2b_sandbox import acquire_e2b_create_slot_async
 
 # Harbor's own _create_sandbox contract: two attempts with a short pause. Replicated here so
 # routing through the create gate does not change harbor's retry behavior.

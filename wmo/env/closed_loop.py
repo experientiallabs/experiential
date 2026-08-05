@@ -6,9 +6,9 @@ Each (candidate model, scenario, episode) cell runs one `run_episode` with the c
 
 The grid is addressable, not just iterable: `pool_cells` enumerates it in the canonical order,
 `run_cell` measures exactly one cell, and `run_cells` drives a list of them with bounded
-concurrency. That split is what lets `wmo.optimize.sweep` resume a partially measured grid (it
-runs the cells that are missing, not the whole product) while `evaluate_pool` stays the one-call
-API for measuring all of it.
+concurrency. That split is what lets `wmo.optimize.routing.sweep` resume a partially measured
+grid (it runs the cells that are missing, not the whole product) while `evaluate_pool` stays the
+one-call API for measuring all of it.
 
 Concurrency notes:
 - A cell is an independent episode against its OWN env and its OWN candidate provider, so cells
@@ -52,9 +52,9 @@ from wmo.env.base import Env
 from wmo.env.episode import run_episode
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS, LLMAgent
 from wmo.env.scenarios import Scenario
-from wmo.optimize.compression import CompressionConfig, estimate_tokens, get_compressor
-from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.reward import EpisodeScore
+from wmo.optimize.routing.compression import CompressionConfig, estimate_tokens, get_compressor
+from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.providers.base import (
     DEFAULT_MAX_TOKENS,
     Completion,

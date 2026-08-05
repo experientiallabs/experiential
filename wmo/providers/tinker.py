@@ -23,7 +23,7 @@ identity); `config.model` carries either a `tinker://` sampler-weights path or
 a base model name for an untrained student. The tinker SDK is an optional
 extra imported lazily (`uv sync --extra distill`), same contract as e2b.
 
-Every SDK call is deadline-bounded (`wmo.distill.deadlines`): a wedged
+Every SDK call is deadline-bounded (`wmo.optimize.model.deadlines`): a wedged
 session raises a retryable `TinkerDeadlineError` instead of hanging, and the
 provider drops its lazily built sampling client on expiry so the retry
 wrapper's next attempt heals through a fresh session.
@@ -52,8 +52,8 @@ from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel, Field, model_validator
 
-from wmo.distill.deadlines import TinkerDeadlineError, call_with_deadline, wait_with_deadline
-from wmo.distill.rendering import (
+from wmo.optimize.model.deadlines import TinkerDeadlineError, call_with_deadline, wait_with_deadline
+from wmo.optimize.model.rendering import (
     ChatRendering,
     ParsedAssistantMessage,
     RendererTokenizer,
@@ -314,7 +314,7 @@ class TokenSpan(BaseModel):
     re-render the same conversation with its own chat template instead of
     guessing at the student template's framing. They are optional for
     backward compatibility: sinks recorded before they existed still load, and
-    `wmo.distill.tokens.reconstruct_conversation` reports honestly (None) that
+    `wmo.optimize.model.tokens.reconstruct_conversation` reports honestly (None) that
     such a sink cannot be replayed.
     """
 
@@ -329,7 +329,7 @@ class TokenSpan(BaseModel):
     logprobs_are_placeholders: bool = False
     """True when `sampled_logprobs` are stand-ins, not sampler-issued values.
 
-    Set only by the text bridge (`wmo.distill.text_episodes`), which re-encodes
+    Set only by the text bridge (`wmo.optimize.model.text_episodes`), which re-encodes
     a teacher's recorded TEXT under the student's template: the token ids are
     real training targets but no sampler ever scored them, so there are no
     logprobs to record and the field carries zeros to satisfy alignment.
@@ -338,7 +338,7 @@ class TokenSpan(BaseModel):
     target_tokens and weights, never logprobs). The advantage losses
     (`importance_sampling`, `ppo`) compute a teacher-minus-student gap FROM
     these values, so training on placeholders would optimize a fabricated
-    objective; `wmo.distill.data.attach_advantages` refuses such spans rather
+    objective; `wmo.optimize.model.data.attach_advantages` refuses such spans rather
     than trusting callers to remember. Default False, so every recorded sink
     and every previously written manifest loads unchanged."""
 
@@ -455,7 +455,7 @@ class SampledSequenceLike(Protocol):
 class TinkerSampler(Protocol):
     """The sampling call the provider makes, in token-id terms.
 
-    `wmo.distill.fake_tinker.FakeSamplingClient` satisfies this directly;
+    `wmo.optimize.model.fake_tinker.FakeSamplingClient` satisfies this directly;
     real `tinker.SamplingClient`s are adapted via `SdkSampler`.
     """
 
@@ -606,7 +606,7 @@ class TinkerChatProvider:
             `model` is the `tinker://` sampler-weights path (or a base model
             name for an untrained student).
         sampling_client: Optional injected sampler (tests use the fakes in
-            `wmo.distill.fake_tinker`; wrap a real `tinker.SamplingClient` in
+            `wmo.optimize.model.fake_tinker`; wrap a real `tinker.SamplingClient` in
             `SdkSampler`). When None, a real client is fetched lazily from
             the process-wide shared cache (`shared_sampling_client`, keyed by
             `config.model`; one client per model string serves every

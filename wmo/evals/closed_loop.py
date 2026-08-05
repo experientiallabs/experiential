@@ -26,8 +26,8 @@ from wmo.core.types import Action, Observation
 from wmo.engine.world_model import WorldModel
 from wmo.evals.gold import GoldJudge, GoldVerdict
 from wmo.evals.tasks import TaskSpec
-from wmo.harness.environment import AgentEnvironment
-from wmo.harness.runtime import (
+from wmo.optimize.harness.environment import AgentEnvironment
+from wmo.optimize.harness.runtime import (
     AgentRuntime,
     RunResult,
     Runtime,

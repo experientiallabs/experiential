@@ -11,9 +11,9 @@ import pytest
 from wmo.core.types import Action, EnvState, Observation
 from wmo.env.closed_loop import evaluate_pool
 from wmo.env.scenarios import Scenario
-from wmo.optimize.compression import CompressionConfig
-from wmo.optimize.outcomes import ScenarioOutcome
 from wmo.optimize.reward import EpisodeScore
+from wmo.optimize.routing.compression import CompressionConfig
+from wmo.optimize.routing.outcomes import ScenarioOutcome
 from wmo.providers.base import (
     Completion,
     Message,

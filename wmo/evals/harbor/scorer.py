@@ -1,6 +1,6 @@
 """Score harness candidates on real benchmark tasks through harbor.
 
-`HarborScorer` implements the `wmo.harness.scoring.Scorer` protocol: one exact `HarnessDoc`
+`HarborScorer` implements the `wmo.optimize.harness.scoring.Scorer` protocol: one exact `HarnessDoc`
 candidate becomes one harbor job (the WMO agent bridge + a pinned task list), harbor owns the
 task environments and the verifier lifecycle, and the verifier rewards project into a
 `ScoreReport`. Harbor's own job directory is the artifact record, and each cell points at its
@@ -62,14 +62,20 @@ from wmo.evals.harbor.agent import (
 from wmo.evals.harbor.ctrf import read_trial_graded_tests
 from wmo.evals.harbor.e2b_template_policy import WMO_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH
 from wmo.evals.harbor.tasks import resolve_harbor_tasks
-from wmo.harness.doc import HarnessDoc
-from wmo.harness.e2b_sandbox import resolve_e2b_template
-from wmo.harness.runtime import (
+from wmo.optimize.harness.doc import HarnessDoc
+from wmo.optimize.harness.e2b_sandbox import resolve_e2b_template
+from wmo.optimize.harness.runtime import (
     DEFAULT_EVAL_EPISODE_TIMEOUT_S,
     HarnessSearchCancelled,
     validate_episode_timeout_s,
 )
-from wmo.harness.scoring import RewardMode, ScoreCell, ScoreReport, ScoreRequest, reward_passed
+from wmo.optimize.harness.scoring import (
+    RewardMode,
+    ScoreCell,
+    ScoreReport,
+    ScoreRequest,
+    reward_passed,
+)
 from wmo.providers.base import ProviderConfig
 
 logger = logging.getLogger(__name__)

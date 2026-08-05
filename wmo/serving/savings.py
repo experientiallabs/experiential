@@ -24,13 +24,13 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
-from wmo.optimize.knn import COST_QUALITY_ANCHORS, COST_QUALITY_BALANCED, cost_quality_knobs
+from wmo.optimize.routing.knn import COST_QUALITY_ANCHORS, COST_QUALITY_BALANCED, cost_quality_knobs
 from wmo.providers.base import TokenUsage
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from wmo.optimize.policy import RoutingPolicy
+    from wmo.optimize.routing.policy import RoutingPolicy
     from wmo.serving.chat import RequestLogRecord
 
 SavingsWindow = Literal["all_time", "7d"]

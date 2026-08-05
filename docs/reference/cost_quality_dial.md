@@ -73,8 +73,8 @@ Three ways, same mapping.
 ```python
 from pathlib import Path
 
-from wmo.optimize.knn import COST_QUALITY_ANCHORS, apply_cost_quality
-from wmo.optimize.policy import RoutingPolicy
+from wmo.optimize.routing.knn import COST_QUALITY_ANCHORS, apply_cost_quality
+from wmo.optimize.routing.policy import RoutingPolicy
 
 fitted = RoutingPolicy.load(Path("models/support/policy.json"))
 cheaper = apply_cost_quality(fitted, 0.6)   # a copy; `fitted` is untouched

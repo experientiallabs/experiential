@@ -12,8 +12,8 @@ Two credential paths:
 
 The mcp SDK is the optional ``connectors`` extra: this module imports and registers without it,
 and only the MCP code paths import it (lazily, mirroring the e2b guard in
-``wmo/harness/e2b_sandbox.py``). Asyncio stays contained here: the public connector surface is
-synchronous.
+``wmo/optimize/harness/e2b_sandbox.py``). Asyncio stays contained here: the public connector
+surface is synchronous.
 """
 
 from __future__ import annotations

@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from wmo.distill.rollouts import rollout_stats
-from wmo.distill.tokens import assemble_trial_records
 from wmo.evals.harbor.ctrf import read_trial_graded_tests
-from wmo.harness.scoring import GradedTests, ScoreCell
+from wmo.optimize.harness.scoring import GradedTests, ScoreCell
+from wmo.optimize.model.rollouts import rollout_stats
+from wmo.optimize.model.tokens import assemble_trial_records
 
 # -- realistic CTRF fixtures -----------------------------------------------------------------------
 

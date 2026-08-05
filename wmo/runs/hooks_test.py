@@ -10,8 +10,8 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from wmo.core.types import JsonObject, JsonValue
-from wmo.optimize.outcomes import ScenarioOutcome
-from wmo.optimize.pipeline import Stage, StageRecord
+from wmo.optimize.routing.outcomes import ScenarioOutcome
+from wmo.optimize.routing.pipeline import Stage, StageRecord
 from wmo.platform.client import PlatformUnreachable
 from wmo.runs.backfill import cell_payload
 from wmo.runs.client import PUSH_ATTEMPTS, PushRejected, RunsSink

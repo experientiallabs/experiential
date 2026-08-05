@@ -10,7 +10,7 @@ back.
 
 `probe` comes BEFORE either of those and costs nothing: it reads the routing
 sweep's outcome matrix and answers whether this workload has a teacher gap at
-all (`wmo.optimize.teacher`). Most workloads do not, and the cheapest run is
+all (`wmo.optimize.routing.teacher`). Most workloads do not, and the cheapest run is
 the one the evidence says to skip.
 
 `run` owns the run's CLI lifecycle: load and pin the inputs (config, task
@@ -51,19 +51,19 @@ if TYPE_CHECKING:
     # these values, so importing this module never pulls the distill/harness/optimize bodies
     # behind it.
     from wmo.core.types import JsonObject
-    from wmo.distill.config import DistillConfig
-    from wmo.distill.cost import CostEstimate
-    from wmo.distill.gate import DistillGateRecord
-    from wmo.distill.loop import DistillEvalReport, DistillProgress, DistillResult
-    from wmo.distill.store import AdapterStore, DistillRunStore
-    from wmo.harness.doc import HarnessDoc
-    from wmo.harness.e2b_reap import CapacityCheck
-    from wmo.optimize.teacher import TeacherSearchVerdict
+    from wmo.optimize.harness.doc import HarnessDoc
+    from wmo.optimize.harness.e2b_reap import CapacityCheck
+    from wmo.optimize.model.config import DistillConfig
+    from wmo.optimize.model.cost import CostEstimate
+    from wmo.optimize.model.gate import DistillGateRecord
+    from wmo.optimize.model.loop import DistillEvalReport, DistillProgress, DistillResult
+    from wmo.optimize.model.store import AdapterStore, DistillRunStore
+    from wmo.optimize.routing.teacher import TeacherSearchVerdict
 
-# Literal mirrors of constants that otherwise live behind a heavy import (`wmo.distill.loop`,
-# `wmo.optimize.teacher`). Typer evaluates Option defaults at command-definition time, so these
-# have to be values, not names imported from those modules; the real constants are re-imported
-# inside the command bodies that need their behavior.
+# Literal mirrors of constants that otherwise live behind a heavy import (`wmo.optimize.model.loop`,
+# `wmo.optimize.routing.teacher`). Typer evaluates Option defaults at command-definition time,
+# so these have to be values, not names imported from those modules; the real constants are
+# re-imported inside the command bodies that need their behavior.
 _DEFAULT_DISTILL_HARNESS = "pi"
 _DEFAULT_MIN_GAP = 0.10
 
@@ -95,7 +95,7 @@ _console = Console()
 @model_app.command("run")
 def _load_harbor_task_ids(path: Path) -> tuple[str, ...]:
     """Load the exact ordered task-id list, validated by the canonical score request rules."""
-    from wmo.harness.scoring import ScoreRequest
+    from wmo.optimize.harness.scoring import ScoreRequest
 
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -216,7 +216,7 @@ def report(
 
         wmo optimize distill report --run-dir runs/d1
     """
-    from wmo.distill.store import DistillRunStore
+    from wmo.optimize.model.store import DistillRunStore
 
     store = DistillRunStore(run_dir)
     gate = _load_gate(store)
@@ -264,8 +264,8 @@ def probe(
     insufficient evidence (this matrix is too thin to say either way; sweep more scenarios).
     Anything else is the usual usage or IO failure.
     """
-    from wmo.optimize.outcomes import OutcomeMatrix
-    from wmo.optimize.teacher import select_teacher
+    from wmo.optimize.routing.outcomes import OutcomeMatrix
+    from wmo.optimize.routing.teacher import select_teacher
 
     path = Path(matrix_file)
     if not path.is_file():
@@ -452,10 +452,14 @@ def run_distill(
     # Deferred import: harness_app registers this module's typer app at module
     # scope, so importing its helpers back at module scope would be a circular
     # import.
-    from wmo.distill.cost import estimate_run_cost
-    from wmo.distill.loop import DEFAULT_DISTILL_HARNESS, DistillBudgetError, run_distillation
-    from wmo.distill.store import AdapterStore, DistillRunStore
-    from wmo.harness.store import write_json_atomic
+    from wmo.optimize.harness.store import write_json_atomic
+    from wmo.optimize.model.cost import estimate_run_cost
+    from wmo.optimize.model.loop import (
+        DEFAULT_DISTILL_HARNESS,
+        DistillBudgetError,
+        run_distillation,
+    )
+    from wmo.optimize.model.store import AdapterStore, DistillRunStore
 
     backend_override: Literal["local", "e2b"] | None
     if backend is None:
@@ -654,7 +658,7 @@ def _preflight_tau2(cfg: DistillConfig, task_ids: Sequence[str]) -> None:
     Raises:
         typer.BadParameter: If any prerequisite is missing.
     """
-    from wmo.distill.tau2 import parse_tau2_task_id
+    from wmo.optimize.model.tau2 import parse_tau2_task_id
 
     assert cfg.tau2 is not None
     if cfg.tau2.backend == "e2b":
@@ -701,7 +705,7 @@ def _preflight_tau2(cfg: DistillConfig, task_ids: Sequence[str]) -> None:
 
 def _load_config(path: Path) -> DistillConfig:
     """Load the run TOML, turning load failures into usage errors."""
-    from wmo.distill.config import load_distill_config
+    from wmo.optimize.model.config import load_distill_config
 
     try:
         return load_distill_config(path)
@@ -780,8 +784,8 @@ def _resolve_seed_doc(root: str, harness_ref: str) -> tuple[str, HarnessDoc, int
     """
     from wmo.agents.default import default_agent
     from wmo.config.store import validate_name
-    from wmo.distill.loop import DEFAULT_DISTILL_HARNESS
-    from wmo.harness.store import HarnessStore
+    from wmo.optimize.harness.store import HarnessStore
+    from wmo.optimize.model.loop import DEFAULT_DISTILL_HARNESS
 
     base, _, ref = harness_ref.partition("@")
     try:
@@ -807,7 +811,7 @@ def _pinned_seed_doc(root: str, record: DistillCliRunRecord) -> tuple[str, Harne
     remaining trials run.
     """
     from wmo.agents.default import default_agent
-    from wmo.harness.store import HarnessStore
+    from wmo.optimize.harness.store import HarnessStore
 
     base = record.agent.partition("@")[0]
     if record.seed_version is None:
@@ -848,8 +852,8 @@ def _preflight_e2b_capacity(console: Console, *, trial_concurrency: int) -> None
         typer.BadParameter: If capacity cannot be measured (missing extra or credential) or
             too few slots are free after reaping the safe class.
     """
-    from wmo.distill.rollouts import E2B_SANDBOXES_PER_TRIAL
-    from wmo.harness.e2b_reap import E2B_API_KEY_ENV, check_capacity, is_credential_error
+    from wmo.optimize.harness.e2b_reap import E2B_API_KEY_ENV, check_capacity, is_credential_error
+    from wmo.optimize.model.rollouts import E2B_SANDBOXES_PER_TRIAL
 
     required = trial_concurrency * E2B_SANDBOXES_PER_TRIAL
     try:
@@ -888,8 +892,8 @@ def _preflight_e2b_capacity(console: Console, *, trial_concurrency: int) -> None
 
 def _capacity_failure_message(check: CapacityCheck, trial_concurrency: int) -> str:
     """The actionable message for a run that cannot get enough sandbox slots."""
-    from wmo.distill.rollouts import E2B_SANDBOXES_PER_TRIAL
-    from wmo.harness.e2b_reap import DEFAULT_E2B_SANDBOX_CAP, E2B_SANDBOX_CAP_ENV
+    from wmo.optimize.harness.e2b_reap import DEFAULT_E2B_SANDBOX_CAP, E2B_SANDBOX_CAP_ENV
+    from wmo.optimize.model.rollouts import E2B_SANDBOXES_PER_TRIAL
 
     reaped = (
         f" Reaping orphans of dead local runs freed {check.reaped} slot(s) and was not enough."
@@ -1014,7 +1018,7 @@ def _print_result(
     base_model: str,
 ) -> None:
     """Print the gate verdict, artifact paths, and the serving handoff snippet."""
-    from wmo.distill.store import build_handoff_toml
+    from wmo.optimize.model.store import build_handoff_toml
 
     gate = result.gate
     color = "green" if gate.accepted else "yellow"
@@ -1058,7 +1062,10 @@ def _maybe_promote(console: Console, result: DistillResult, cfg: DistillConfig, 
     """
     from wmo.cli.model_roles import load_settings_or_abort
     from wmo.config.settings import ModelRole, save_settings, settings_path
-    from wmo.distill.store import DEFAULT_TINKER_OPENAI_ENDPOINT, STUDENT_CHAT_MAX_TOKENS_FIELD
+    from wmo.optimize.model.store import (
+        DEFAULT_TINKER_OPENAI_ENDPOINT,
+        STUDENT_CHAT_MAX_TOKENS_FIELD,
+    )
 
     if result.adapter_version is None:
         console.print(
@@ -1099,7 +1106,7 @@ def _maybe_promote(console: Console, result: DistillResult, cfg: DistillConfig, 
 
 # -- report ------------------------------------------------------------------------------------
 
-# Literal mirrors of `wmo.distill.loop`'s eval keys, kept here so importing this module for
+# Literal mirrors of `wmo.optimize.model.loop`'s eval keys, kept here so importing this module for
 # `--help` does not pull the distill loop's own heavy dependencies.
 _REPORT_ROWS: tuple[tuple[str, str], ...] = (
     ("teacher", "baseline-teacher"),
@@ -1112,7 +1119,7 @@ with the `evals/<key>.json` each one was written to."""
 
 def _load_gate(store: DistillRunStore) -> DistillGateRecord:
     """Read the run's `gate.json`, turning a missing or corrupt file into a usage error."""
-    from wmo.distill.gate import DistillGateRecord
+    from wmo.optimize.model.gate import DistillGateRecord
 
     try:
         text = store.gate_path.read_text(encoding="utf-8")
@@ -1135,7 +1142,7 @@ def _load_eval_report(store: DistillRunStore, key: str) -> DistillEvalReport | N
     aborted run may have none), so the table degrades to the rates gate.json
     already carries rather than failing.
     """
-    from wmo.distill.loop import DistillEvalReport
+    from wmo.optimize.model.loop import DistillEvalReport
 
     try:
         text = (store.evals_dir / f"{key}.json").read_text(encoding="utf-8")

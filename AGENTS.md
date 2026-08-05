@@ -67,8 +67,9 @@ uv run pytest -q
 
 - Harness-search optimization (`wmo optimize harness`, world-model delta search, the harbor
   population search, live agent sessions) moved to the private `agent-optimization` repo
-  (2026-08-03). What stays here is the execution seam it builds on: `wmo/harness/` holds the
-  episode runtime, `HarnessDoc`, scoring, the store, and the sandbox plumbing, because
+  (2026-08-03). What stays here is the execution seam it builds on:
+  `wmo/optimize/harness/` holds the episode runtime, `HarnessDoc`, scoring, the store, and the
+  sandbox plumbing, because
   closed-loop eval and distillation run and score agent episodes. Do not grow search or
   mutation machinery back into this repo.
 - `wmo optimize model <world-model>` is the staged one-command path over the routing surface:
@@ -78,8 +79,8 @@ uv run pytest -q
   disposable: every artifact lands where the manual command and `wmo serve` already read it. A
   stage is skipped only when its recorded input fingerprints still match and its artifact is
   unchanged on disk, and the reason prints either way. CLI face in
-  `wmo/cli/optimize_model_app.py`, stage engine in `wmo/optimize/pipeline.py`, the shared sweep
-  core in `wmo/optimize/sweep.py`.
+  `wmo/cli/optimize_model_app.py`, stage engine in `wmo/optimize/routing/pipeline.py`, and shared
+  sweep core in `wmo/optimize/routing/sweep.py`.
 - `wmo optimize distill run` is the third optimization surface, named for the artifact it produces
   (`adapter`, beside harness's `prompt` and route's `routing_policy`): instead of editing the
   harness it trains the agent MODEL, a distillation of a Tinker LoRA student from real
@@ -104,10 +105,11 @@ uv run pytest -q
   wandb sections),
   snapshotted into the run dir; `wmo optimize distill report --run-dir <dir>` reads a finished run
   back. The CLI face lives in `wmo/cli/model_app.py` and the loop
-  in `wmo/distill/`. Degeneration tripwires (`[tripwire]`, `wmo/distill/tripwire.py`) watch the
-  student's own sampled tokens for the collapse a KL curve hides; their thresholds are fractions
-  of a baseline each run measures at its first training step and persists in its run manifest,
-  never absolute nats or token counts. See `docs/reference/distill.md` for the user-facing how-to.
+  in `wmo/optimize/model/`. Degeneration tripwires (`[tripwire]`,
+  `wmo/optimize/model/tripwire.py`) watch the student's own sampled tokens for the collapse a KL
+  curve hides; their thresholds are fractions of a baseline each run measures at its first
+  training step and persists in its run manifest, never absolute nats or token counts. See
+  `docs/reference/distill.md` for the user-facing how-to.
 - Changes to the execution seam require focused coverage in `store_test.py`, `scoring_test.py`,
   and the closed-loop or distillation tests that consume it.
 
@@ -150,6 +152,9 @@ uv run pytest -q
    domain subpackages under `wmo/` (`core`, `config`, `providers`, `ingest`, `retrieval`,
    `optimize`, `engine`, `serving`, `cli`). Add a CLI command when it represents a clear user
    workflow; avoid both unrelated command sprawl and hiding useful behavior behind internal APIs.
+   Optimization domains are nested one level deeper: routing in `wmo/optimize/routing/`, model
+   training in `wmo/optimize/model/`, and harness artifacts and execution in
+   `wmo/optimize/harness/`. Do not add optimization domains back to the flat `wmo/` namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
    `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.

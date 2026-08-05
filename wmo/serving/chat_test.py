@@ -15,14 +15,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from wmo.core.types import JsonObject
-from wmo.optimize.compression import (
+from wmo.optimize.routing.compression import (
     CompressionConfig,
     CompressionResult,
     Compressor,
     get_compressor,
     register_compressor,
 )
-from wmo.optimize.policy import (
+from wmo.optimize.routing.policy import (
     KNN_BANK_FILENAME,
     POLICY_FILENAME,
     ClusterRanking,
@@ -496,7 +496,7 @@ def test_runtime_builds_the_policy_embedder_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # An azure embedder spec would otherwise construct a fresh SDK client per request.
-    from wmo.optimize.policy import EmbedderSpec
+    from wmo.optimize.routing.policy import EmbedderSpec
 
     builds = {"n": 0}
     original = EmbedderSpec.build
@@ -519,7 +519,7 @@ def test_static_policy_never_builds_its_embedder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A static route must keep serving even when the embedder spec cannot initialize here.
-    from wmo.optimize.policy import EmbedderSpec
+    from wmo.optimize.routing.policy import EmbedderSpec
 
     def exploding_build(self: EmbedderSpec) -> object:
         raise RuntimeError("no credentials in this environment")
@@ -2943,7 +2943,7 @@ def test_a_compressor_that_returns_the_wrong_segment_count_is_named(tmp_path: Pa
 
 
 def test_config_carries_the_pareto_curve_when_the_runtime_has_one(tmp_path: Path) -> None:
-    from wmo.optimize.pareto import ParetoCurve, ParetoPoint
+    from wmo.optimize.routing.pareto import ParetoCurve, ParetoPoint
 
     curve = ParetoCurve(
         points=[

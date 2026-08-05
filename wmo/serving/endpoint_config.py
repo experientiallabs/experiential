@@ -32,8 +32,8 @@ class EndpointConfig(BaseModel):
     """What an operator can set per endpoint without refitting anything.
 
     `cost_quality` is the one dial (0.0 = max quality, 1.0 = max savings; see
-    `wmo.optimize.knn.apply_cost_quality`). None means "serve the policy as fitted", which is
-    also what an absent file means.
+    `wmo.optimize.routing.knn.apply_cost_quality`). None means "serve the policy as fitted",
+    which is also what an absent file means.
 
     `extra="forbid"` for the same reason `PoolEntry` forbids it: a typo like `cost_qualty` must
     fail at load with the key named, not be silently ignored and leave an operator staring at an

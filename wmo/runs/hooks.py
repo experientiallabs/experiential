@@ -51,8 +51,8 @@ from threading import Lock
 from pydantic import BaseModel, ConfigDict
 
 from wmo.core.types import JsonObject
-from wmo.optimize.outcomes import ScenarioOutcome
-from wmo.optimize.pipeline import Stage, StageRecord
+from wmo.optimize.routing.outcomes import ScenarioOutcome
+from wmo.optimize.routing.pipeline import Stage, StageRecord
 from wmo.runs.backfill import cell_payload
 from wmo.runs.client import ControlCommand, PushAck, PushRejected, RunsSink, runs_sink
 from wmo.runs.reader import EventRow, RunsReader

@@ -1,14 +1,14 @@
 """The default pi agent definition shipped by wmo."""
 
-from wmo.harness.doc import (
+from wmo.optimize.harness.doc import (
     MAX_OUTPUT_TOKENS_ID,
     RUNTIME_KIND_ID,
     HarnessDoc,
     Surface,
     SurfaceKind,
 )
-from wmo.harness.pi_vendor import pi_agent_code_surfaces
-from wmo.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS
+from wmo.optimize.harness.pi_vendor import pi_agent_code_surfaces
+from wmo.optimize.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def default_agent(name: str = "default") -> HarnessDoc:

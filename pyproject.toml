@@ -44,7 +44,8 @@ viz = ["seaborn>=0.13", "matplotlib>=3.8", "pandas>=2.0"]
 # The e2b harness backend (`--harness-backend e2b`): the pi-node harness PROCESS executes in
 # pooled E2B microVMs while the environment stays the world model. Only those runs need it —
 # local runs stay sandbox-free — so it is an optional extra imported lazily
-# (wmo.harness.e2b_sandbox / wmo.harness.pi_e2b). Exact pin: the harbor E2B environment
+# (wmo.optimize.harness.e2b_sandbox / wmo.optimize.harness.pi_e2b). Exact pin: the harbor E2B
+# environment
 # (wmo.evals.harbor.e2b_environment) depends on version-sensitive template-build API behavior
 # and embeds the e2b version in template alias derivation.
 e2b = ["e2b==2.31.0"]
@@ -61,7 +62,7 @@ connectors = ["mcp>=1.27"]
 # The Postgres trace source (`wmo ingest --source postgres`): the driver is imported lazily
 # inside the adapter's pull path, same contract as the vendor-SDK extras.
 postgres = ["psycopg[binary]>=3.1"]
-# On-policy distillation (`wmo.distill` + the tinker provider): trains a LoRA student on
+# On-policy distillation (`wmo.optimize.model` + the tinker provider): trains a LoRA student on
 # Tinker from harbor rollouts. Imported lazily, same contract as the e2b extra. The cookbook
 # pin tracks the 0.4.x renderer surface this integration was verified against; Tinker's model
 # lineup churns, so base-model names live in run configs, never in code. The tinker pin tracks
@@ -111,7 +112,7 @@ packages = ["wmo"]
 # tests run the whole loop against, and `wmo/conftest.py` is a pytest fixture module. Both are
 # imported only by tests, so neither belongs in the published wheel. `fake_tinker` stays where
 # it is rather than moving under a test path: five test modules import it by that name.
-exclude = ["**/*_test.py", "wmo/distill/fake_tinker.py", "wmo/conftest.py"]
+exclude = ["**/*_test.py", "wmo/optimize/model/fake_tinker.py", "wmo/conftest.py"]
 # The vendored waterfall utility's MIT notice at wmo/utils/waterfall/LICENSE needs no
 # force-include: `packages = ["wmo"]` already ships every non-Python file under wmo/.
 

@@ -20,9 +20,9 @@ from wmo.evals.closed_loop import (
 )
 from wmo.evals.gold import AssertionResult, GoldJudge, GoldVerdict
 from wmo.evals.tasks import TaskSpec
-from wmo.harness.e2b_sandbox import SandboxCleanupError
-from wmo.harness.environment import AgentEnvironment, is_env_action
-from wmo.harness.runtime import RunResult, RuntimeCancelled, StopReason, TokenUsage
+from wmo.optimize.harness.e2b_sandbox import SandboxCleanupError
+from wmo.optimize.harness.environment import AgentEnvironment, is_env_action
+from wmo.optimize.harness.runtime import RunResult, RuntimeCancelled, StopReason, TokenUsage
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
 
@@ -669,7 +669,7 @@ def test_evaluate_closed_loop_passes_concurrency_through() -> None:
 
 def test_report_aggregates_worker_usage_from_self_metering_runtimes() -> None:
     """Cells that report worker usage sum into the report; none reported -> None."""
-    from wmo.harness.runtime import TokenUsage
+    from wmo.optimize.harness.runtime import TokenUsage
 
     class MeteredRuntime:
         def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:

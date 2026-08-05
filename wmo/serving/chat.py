@@ -50,9 +50,9 @@ cache-aware routing model.
 
 The endpoint's operator surface lives here too, deliberately outside the OpenAI routes so a
 customer's OpenAI client sees exactly what it saw before: `GET`/`PUT /v1/endpoints/{name}/config`
-reads and moves the cost/quality dial (`wmo.optimize.knn.apply_cost_quality`) on the live runtime
-with no restart and no refit, and `GET /v1/endpoints/{name}/savings` totals what the endpoint has
-saved so far out of the request log (`wmo.serving.savings`).
+reads and moves the cost/quality dial (`wmo.optimize.routing.knn.apply_cost_quality`) on the live
+runtime with no restart and no refit. `GET /v1/endpoints/{name}/savings` totals what the endpoint
+has saved so far out of the request log (`wmo.serving.savings`).
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 from starlette.background import BackgroundTask
 
-from wmo.optimize.compression import (
+from wmo.optimize.routing.compression import (
     CompressionConfig,
     CompressionStats,
     Compressor,
@@ -82,14 +82,14 @@ from wmo.optimize.compression import (
     estimate_tokens,
     same_compression,
 )
-from wmo.optimize.knn import (
+from wmo.optimize.routing.knn import (
     COST_QUALITY_ANCHORS,
     CostQualityAnchor,
     apply_cost_quality,
     cost_quality_named_point,
 )
-from wmo.optimize.pareto import ParetoCurve
-from wmo.optimize.policy import (
+from wmo.optimize.routing.pareto import ParetoCurve
+from wmo.optimize.routing.policy import (
     Embedder,
     GateOutcome,
     Propensity,
@@ -526,7 +526,7 @@ class RequestLogRecord(BaseModel):
     router_cost_usd: float = 0.0  # the routing decision's own inference cost, passed through
     # D-COMPRESS fields: stored and OPAQUE like the routing fields above (log only, never in
     # response bodies or headers). 0/"" defaults = the request served uncompressed. Token
-    # counts are the compressor's deterministic proxy totals (see wmo.optimize.compression);
+    # counts are the compressor's deterministic proxy totals (see wmo.optimize.routing.compression);
     # billable truth stays in input_tokens/cost_usd from the provider-reported usage.
     tokens_in_raw: int = 0
     tokens_in_compressed: int = 0
@@ -547,7 +547,8 @@ class RequestLogRecord(BaseModel):
     ttfb_ms: float | None = None
     status: Literal["ok", "error"] = "ok"
     error_message: str | None = None
-    # The routing decision's evidence, flattened (see `wmo.optimize.policy.RoutingEvidence`).
+    # The routing decision's evidence, flattened (see
+    # `wmo.optimize.routing.policy.RoutingEvidence`).
     # Flat rather than nested because this row is a JSONL contract the platform reads column-wise:
     # counting fallback-forced requests or histogramming n_pairs should not need a JSON path. All
     # nullable, and all null for the kinds that compute no paired evidence (static, rank) and for
@@ -621,7 +622,7 @@ class EndpointRuntime:
     """One served endpoint: its policy, its providers, its affinity memory, its log.
 
     `cost_quality` sets the endpoint's cost/quality dial at mount time (see
-    `wmo.optimize.knn.apply_cost_quality`); None serves the policy exactly as fitted, so
+    `wmo.optimize.routing.knn.apply_cost_quality`); None serves the policy exactly as fitted, so
     mounting never silently re-tunes an artifact. `config_path` is the `endpoint.toml` a live
     dial change is persisted to, so the setting survives a restart; None keeps changes in memory
     (injected-policy tests, and any caller that owns persistence itself).
@@ -1316,7 +1317,7 @@ class EndpointConfigResponse(BaseModel):
     dial fields are null and PUT returns 409.
 
     `pareto` is the MEASURED cost/quality curve for THIS endpoint's workload
-    (`wmo.optimize.pareto`, written as `pareto.json` beside the report at optimize time):
+    (`wmo.optimize.routing.pareto`, written as `pareto.json` beside the report at optimize time):
     every candidate and the routed dial detents on (effective cost per completed task,
     reward), frontier-flagged, with a recommended point. None for endpoints optimized before
     the artifact existed; a renderer shows nothing then, never an empty chart. Unlike
