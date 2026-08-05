@@ -25,6 +25,9 @@ from wmo.providers.base import (
     StreamChunk,
     TokenUsage,
     VerifyResult,
+    chat_request_output_budget,
+    guard_starved_chat_response,
+    guard_starved_completion,
     normalize_chat_temperature,
     verify_via_ping,
 )
@@ -201,12 +204,21 @@ class AzureOpenAIProvider:
                 message.content if message is not None and isinstance(message.content, str) else ""
             )
             usage = response.token_usage()
-            return Completion(
+            completion = Completion(
                 text=text,
                 usage=TokenUsage(
                     input_tokens=usage.input_tokens, output_tokens=usage.output_tokens
                 ),
             )
+            # Azure dispatches effort to Responses for the same reason the openai kind does, so it
+            # inherits the same starvation trap: reasoning can eat the budget and return no text.
+            guard_starved_completion(
+                completion,
+                max_tokens,
+                model=self._deployment(),
+                reasoning_effort=self.config.reasoning_effort,
+            )
+            return completion
         return _openai_common.complete(
             self._get_client().chat.completions,
             self._deployment(),
@@ -258,13 +270,20 @@ class AzureOpenAIProvider:
         if self.config.reasoning_effort is not None:
             # Structured reasoning needs Azure's native v1 Responses route: encrypted-reasoning
             # replay and reasoning.effort are not part of the api-versioned chat-completions API.
-            return _responses_common.complete_chat(
+            response = _responses_common.complete_chat(
                 self._get_responses_client().responses,
                 self._deployment(),
                 request,
                 reasoning_effort=self.config.reasoning_effort,
                 allow_sampling=False,
             )
+            guard_starved_chat_response(
+                response,
+                chat_request_output_budget(request),
+                model=self._deployment(),
+                reasoning_effort=self.config.reasoning_effort,
+            )
+            return response
         return _openai_common.complete_chat(
             self._get_client().chat.completions,
             self._deployment(),

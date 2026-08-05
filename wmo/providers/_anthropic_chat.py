@@ -20,8 +20,9 @@ from __future__ import annotations
 import json
 from typing import cast
 
-from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import JsonValue
+
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 CACHE_CONTROL_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
 """The 5-minute-TTL breakpoint. The only TTL the Messages API bills at the documented rates."""

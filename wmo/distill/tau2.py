@@ -54,7 +54,6 @@ from collections.abc import Callable, Sequence
 from hashlib import blake2s
 from pathlib import Path
 
-from llm_waterfall.types import ChatFunctionCall, ChatMessage, ChatToolCall
 from pydantic import JsonValue
 
 from wmo.core.types import JsonObject
@@ -69,6 +68,7 @@ from wmo.harness.runtime import StopReason
 from wmo.providers.base import ProviderConfig, ProviderKind
 from wmo.providers.retry import RetryingToolCallingProvider
 from wmo.providers.tinker import TinkerChatProvider, TokenRecorder
+from wmo.utils.waterfall.types import ChatFunctionCall, ChatMessage, ChatToolCall
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ TASK_SPLIT_OVERRIDES = {"telecom": "full"}
 A property of the corpus, not a knob: the pinned telecom scenarios were
 captured from telecom's 2285-task "full" split, and tau2's default "base"
 split raises on the missing ids (see
-`packages/environment-capture/tau-bench/README.md`)."""
+the tau-bench data bundle's README)."""
 
 RESULTS_FILENAME = "results.json"
 SPANS_SINK_DIR = "spans"

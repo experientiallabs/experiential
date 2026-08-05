@@ -1,8 +1,8 @@
 # Agent guide — world-model-optimizer
 
 WMO couples three first-class capabilities: a worker-agent runtime, world models learned from
-agent traces, and an optimizer that improves the worker's harness against those models. Reusable
-code lives under `wmo/`; task-specific examples live under `examples/`.
+agent traces, and an optimizer that improves the worker's harness against those models. All
+importable code lives under `wmo/`; benchmark data arrives as a dependency (see rule 6).
 
 ## Toolchain
 
@@ -63,26 +63,14 @@ uv run pytest -q
   meter sandbox lifetime, retry uncertain transport only in a fresh sandbox, and fail closed when
   cleanup cannot be proved.
 
-## Harness optimization
+## Optimization surfaces
 
-- `wmo optimize harness <agent> <world-model> --tasks <tasks.jsonl>` is the primary public
-  harness-creation workflow. Keep CLI wiring in `wmo/cli/harness_app.py` and search behavior in
-  `wmo/harness/create.py` (world-model delta search) or `wmo/harness/population.py` plus
-  `wmo/harness/project_proposer.py` (the `harbor` environment's complete-source population
-  search); another public workflow needs a distinct user case and equivalent validation, audit,
-  and versioning guarantees.
-- A harness is a validated `HarnessDoc`, not an editable directory. Its typed surfaces cover
-  prompts, skills, tool policy, loop parameters, and executable code; rendered files are exports.
-- Change harnesses only through `HarnessDelta`. Preserve parent and child hashes, per-surface
-  preconditions, operation rationales, expected effects, and atomic whole-document validation.
-- Score candidates with closed-loop evaluation against the world model. Worker location (`local`
-  or `e2b`) never changes which environment is under test.
-- Promotion must pass the trigger screen plus regression-suite, full-split, and optional holdout
-  gates. Binary success is primary, assertion credit breaks ties, and newly passing tasks join the
-  regression suite.
-- Persist every proposal and verdict in `DeltaArchive`, including screened, rejected, and invalid
-  deltas. `HarnessStore` writes immutable `vN` versions and moves the `champion` alias for
-  promotion or rollback.
+- Harness-search optimization (`wmo optimize harness`, world-model delta search, the harbor
+  population search, live agent sessions) moved to the private `agent-optimization` repo
+  (2026-08-03). What stays here is the execution seam it builds on: `wmo/harness/` holds the
+  episode runtime, `HarnessDoc`, scoring, the store, and the sandbox plumbing, because
+  closed-loop eval and distillation run and score agent episodes. Do not grow search or
+  mutation machinery back into this repo.
 - `wmo optimize model <world-model>` is the staged one-command path over the routing surface:
   preflight, sweep, fit, tune, report, each stage calling the same library function its manual
   `wmo optimize route` command calls, so consent, metering, and artifacts stay single-sourced. It
@@ -120,10 +108,8 @@ uv run pytest -q
   student's own sampled tokens for the collapse a KL curve hides; their thresholds are fractions
   of a baseline each run measures at its first training step and persists in its run manifest,
   never absolute nats or token counts. See `docs/reference/distill.md` for the user-facing how-to.
-- `wmo scenarios build` produces a weighted `ScenarioSet`; `wmo optimize harness --tasks` currently
-  requires `TaskSpec` JSONL. Do not treat those artifact formats as interchangeable.
-- Changes here require focused coverage in `create_test.py`, `delta_test.py`, `store_test.py`,
-  `proposer_test.py`, and the scenario builder or verification tests as applicable.
+- Changes to the execution seam require focused coverage in `store_test.py`, `scoring_test.py`,
+  and the closed-loop or distillation tests that consume it.
 
 ## Python
 
@@ -165,80 +151,61 @@ uv run pytest -q
    `optimize`, `engine`, `serving`, `cli`). Add a CLI command when it represents a clear user
    workflow; avoid both unrelated command sprawl and hiding useful behavior behind internal APIs.
 
-5. **Keep the top-level layout intentional.** The default tracked top-level directories are: `wmo/`,
-   `examples/`, `docs/`, `assets/`, `web/`, `deploy/`, `.agents/`, `.claude/`, `.github/`, plus
-   `packages/`: the monorepo workspace members (see § Monorepo). A new top-level concept requires
-   an explicit architecture rationale plus updates to this guide and `wmo/repo_layout_test.py`;
-   do not force it into an unrelated directory merely to preserve the current list. What each
-   surface is for:
+5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
+   `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.
+
+   `.agents/` is the one sanctioned scratchpad: a local, gitignored working directory for agent
+   sessions (notes, probe scripts, run outputs). It is never tracked, never part of a PR, and
+   nothing under `wmo/` or `docs/` may reference a path inside it. Anything in a scratchpad worth
+   keeping gets promoted into a real surface or an external repo before the work merges.
+
+   **Agents must never create a new top-level directory.** Not for scratch work, not for a
+   one-off script, not for output, not "temporarily". If work does not fit an existing surface,
+   put it under the closest one and say so — do not invent a sibling. The only way a new
+   top-level directory is ever added is that a human names the exact directory and grants
+   permission for that name; then, in the same change, it is added to `ALLOWED_TOP_DIRS` in
+   `wmo/repo_layout_test.py` and documented here. Blanket approval to "restructure" or
+   "add whatever you need" is not permission for a directory name. Absent that, an agent that
+   wants a new surface asks and waits. The same rule binds top-level FILES, against
+   `ALLOWED_TOP_FILES` in the same test. Both lists are enforced by the gate, so an unapproved
+   directory fails CI rather than landing quietly. What each surface is for:
    - `docs/`: **reviewed public documentation** in `docs/research/` (completed research writeups
      and their rendered figures under `docs/research/figures/`), `docs/reference/` (how-to
      references verified against main), and `docs/cookbook/` (end-to-end walks through the whole
      pipeline on one benchmark, each step one real CLI command plus the artifact it creates),
      plus the single root page `docs/usage.md` (the terse map of the CLI surface: one line of
      purpose and one artifact per command). Nothing else: raw result JSONs, vector sources, design
-     notes, drafts, and proposals all live in `.agents/docs/`. `docs/README.md` indexes every
+     notes, and drafts do not belong in the repo at all. `docs/README.md` indexes every
      doc and records its purpose. Update or remove superseded material only after checking
-     references and retaining durable evidence. `docs/`
-     never mentions `.agents/` at all, not even as a disclaimed pointer (enforced by
-     `wmo/repo_layout_test.py`): a reader of docs/ should never learn the workspace exists.
+     references and retaining durable evidence.
      Reproduction lives in the report itself, quoted as public `wmo` API/CLI plus the exact
      parameter pins.
-     Everything else that is "generated" stays out of git: eval results under the local
-     `.wmo/evals/` artifact root, built models under `.wmo/models/` (intentional prebuilt
-     example artifacts under `examples/<task>/models/`), eval suite definitions under
-     `examples/<task>/evals/`. Never commit local settings files (`settings.toml` anywhere).
-   - `.agents/` — **the agents' workspace**: one-off scripts, experiment runners, plans,
-     scratchpads, and drafts. It is committed so work transfers across worktrees and chats, but it
-     is not a public API. Apply proportionate review: executable helpers must be safe and correct,
-     and anything reused should gain tests or documentation appropriate to its risk. Nothing may
-     import from it or link to it as if it were permanent. `.agents/docs/` is organized as
-     `reference/`, `design-decisions/`, `research/` (analysis prose plus small, stable result JSONs
-     that finished writeups cite, e.g. `trace_scaling_results/`; bulky or churning experiment
-     data — the distill/ablation program's pools, episodes, and eval JSONs — is never
-     committed and goes to the Notion experiments area under Research with a SHA-256
-     manifest, enforced by .gitignore on `research/distill/`), `proposals/`. When work matures,
-     promote its durable output (writeup → `docs/research/`, verified how-to → `docs/reference/`,
-     reusable code → `wmo/`, dataset tooling → `examples/<task>/`). Retire obsolete working
-     material only after checking active references and preserving unique evidence or decisions.
-   - `web/` — the project website (Next.js/TypeScript). Excluded from the Python gate; carries
-     its own gate instead: `npm run lint` and `npx tsc --noEmit` from `web/` must be clean
-     before every commit that touches it.
-   - `deploy/` — **services we run ourselves**, one directory per service, each holding its
-     server code, unit file, deploy script, and operator README. These are neither library code
-     (nothing in `wmo/` imports them; they run on other machines) nor workspace scratch (they
-     are long-lived infrastructure the team depends on and rotates credentials for), which is
-     why they are not folded into `wmo/` or `.agents/`. A service here must be reproducible from
-     its own directory alone: someone with ssh access and no other context can redeploy it.
-     Secrets never live here, only the public half of pinned certificates.
+     Everything "generated" stays out of git: eval results under the local `.wmo/evals/`
+     artifact root, built models under `.wmo/models/`, and the benchmark data bundles
+     `wmo download` fetches. Never commit local settings files (`settings.toml` anywhere).
+   - `wmo/` — the flagship package and the only importable code. Domain subpackages own their
+     own area (rule 4); `wmo/utils/` holds self-contained building blocks with no WMO domain
+     concepts and no import back into the rest of `wmo` (today: `wmo/utils/waterfall/`, the
+     LLM failover chain, vendored with its own MIT `LICENSE`).
    - `assets/` — media referenced by README/docs (demo GIFs, logos).
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
-   - `packages/`: every workspace member lives here, one directory per package:
-     `packages/llm-waterfall/` (stateless LLM failover, bundled into the flagship WMO wheel) and
-     `packages/environment-capture/` (benchmark adapters + real-run trace capture emitting OTel
-     GenAI JSONL, consumed from PyPI). Per-benchmark data dirs
-     (`packages/environment-capture/<benchmark>/`) follow
-     the examples/ discipline: Hub-hosted data bundles (trace corpus + task data/gold dirs as
-     public datasets under the experiential-labs org; gitignored here, fetched via
-     `environment_capture.hub`) + provenance/license README + thin
-     scripts; heavy dependencies and cloned upstreams in local gitignored venvs. Out-of-process
-     `backend/` scripts are currently excluded from ty; tau-bench, terminal-tasks, and swe-bench
-     retain documented legacy ruff/ty exemptions until they are migrated. Do not broaden these
-     exclusions; changes should add targeted checks and narrow them where practical.
+   - `.github/` — CI workflows.
 
-6. **Keep dataset-specific logic inside its benchmark dir.** Benchmark launch/capture/conversion
-   logic belongs under `packages/environment-capture/<benchmark>/` (all ten benchmark integrations live
-   there — tau-bench, terminal-tasks, swe-bench included); non-benchmark task examples belong
-   under `examples/<task>/`. Either way a dir is self-contained: `traces.otel.jsonl`, optional
-   `evals/*.toml`, task-local helpers. Launch helpers through `wmo examples run <task> -- <args>`
-   (discovery spans both roots).
+   Scratch work has no home in this repo. One-off scripts, experiment runners, scratchpads, and
+   drafts go outside the checkout (`/tmp`, a personal directory, or the Notion experiments area
+   under Research). When such work matures, promote its durable output into a real surface:
+   writeup → `docs/research/`, verified how-to → `docs/reference/`, reusable code → `wmo/`.
+
+6. **Benchmark data is a dependency, not a directory.** Benchmark launch/capture/conversion logic
+   lives in the separately published `environment-capture` distribution, and its trace corpora and
+   task data are Hub-hosted bundles fetched with `wmo download` (`wmo/hub.py`). Do not
+   vendor a benchmark's data, gold dirs, or capture scripts back into this repo.
 
 7. **Give reusable workflows a clear owner.** Avoid parallel top-level scripts for harness actions.
-   If a workflow is generally useful outside one example dataset, implement it in `wmo/` and expose
-   it through the CLI. When a workspace member already owns the right contract, prefer its public
-   API; use a separate implementation when requirements differ materially and document the boundary
-   (see Monorepo).
+   If a workflow is generally useful, implement it in `wmo/` and expose it through the CLI. When a
+   published dependency already owns the right contract, prefer its public API; use a separate
+   implementation when requirements differ materially and document the boundary.
 
 8. **Keep imports explicit and fail-fast.** Put imports at module scope unless moving them is
    required to break a real circular dependency. Do not use lazy imports for optional convenience,
@@ -286,58 +253,36 @@ uv run pytest -q
     - Accents, in order of use: `#0070f3` (primary blue), `#7928ca` purple, `#f5a623` amber,
       `#ee0000` red, `#50e3c2` teal
     The published figures under `docs/` (e.g. `docs/research/figures/trace_scaling_law.png`) are the visual
-    reference. (`.agents/scripts/plot_trace_scaling.py` shows one way to produce them, but
-    `.agents/` contents are disposable — the palette above is the contract, not that script.)
+    reference. The palette above is the contract; the script that renders any given figure is
+    not, and does not belong in the repo (rule 5).
 
-## Monorepo
+## One package
 
-This repo is a **uv workspace** monorepo. The root `pyproject.toml` is the `wmo` flagship
-package (its quickstart is unchanged: clone → `uv sync` → `uv run wmo ...`), and each member lives
-under `packages/<name>/` with its own `pyproject.toml` and version. The release policy is explicit
-per member rather than inferred from workspace membership.
-Rules of the road:
+This repo publishes **one distribution**: `world-model-optimizer`, whose importable code is all of
+`wmo/` and nothing else. It was a uv workspace until the `packages/` members were retired —
+`environment-capture` to PyPI, `llm-waterfall` into `wmo/utils/waterfall/`. Rules of the road:
 
-- **Membership**: `[tool.uv.workspace].members = ["packages/*"]` in the root pyproject — a new dir under `packages/` with a pyproject IS a member; anything inside the
-  workspace that depends on a member resolves it from source via `[tool.uv.sources]`
-  (`{ workspace = true }`), never from PyPI.
-- **Dependency arrows**: the arrow between the trees is empty in BOTH directions. Members never
-  import `wmo`, and members remain installable and usable standalone. Shipped `wmo/` modules
-  import no workspace member either: a member import has to be paid for with a `Requires-Dist`
-  line, and that line makes every `wmo` release wait on a member release and strands the
-  member's unreleased fixes from pip users entirely (that is what happened to the dataset-name
-  fallback now vendored in `wmo/hub.py`). What the flagship needs from a member gets vendored,
-  with the origin named in the module docstring; `wmo/repo_layout_test.py` enforces the rule.
-  The intentional `llm-waterfall` exception is bundled into the flagship wheel, so importing it
-  is importing our own shipped code: it stays a workspace development dependency and is not a
-  `Requires-Dist` dependency of WMO. Do not add a second runtime copy or a separate release
-  requirement without revisiting the one-distribution decision. The no-member-import rule binds
-  the whole of `wmo/`, tests included — the boundary is the directory, not the wheel manifest,
-  so `wmo/` stays readable and extractable with `packages/` off the path entirely. A check that
-  needs both sides reads the other file off disk and skips when it is absent (that is how
-  `wmo/hub_test.py` pins the vendored hub copy against its origin), or it does not exist. One
-  carve-out, in the other direction: the no-wmo-import rule binds the member's PUBLISHED source
-  tree (what `[tool.hatch.build]`/`include` ships in the wheel), so local research and capture
-  scripts inside per-benchmark data dirs (e.g. `packages/environment-capture/tau-bench/rl/`)
-  may import `wmo` — they are workspace tooling that happens to live next to the data it
-  operates on, they never ship, and the member must stay installable without them.
-- **Gate scoping**: the root gate (`uv run ruff check .`, `uv run ty check`,
-  `uv run pytest -q`) covers the flagship and every Python member (member tests are inline
-  `*_test.py`, discovered via root `testpaths`). A member may carry stricter/looser settings in
-  its own `[tool.ruff]`/`[tool.ty]` tables (ruff resolves the closest config). `web/` keeps its
-  own separate JS gate (rule 5).
-- **Publishing**: `.github/workflows/python-package.yml` builds and publishes only the flagship
-  `world-model-optimizer` distribution. Its wheel includes `wmo` plus `llm_waterfall`; the publish
-  job runs only for a GitHub release and uses the `pypi` trusted-publisher environment. Do not add
-  member publishing workflows unless the release policy changes explicitly.
-- **Shared capabilities**: when a member already owns the needed contract, prefer consuming its
-  public API. A separate implementation is appropriate when requirements differ materially;
-  document the ownership boundary and why reuse would be incorrect.
+- **No workspace, no members**: there is no `[tool.uv.workspace]` and no `[tool.uv.sources]`. A
+  dependency is either a normal PyPI requirement in `[project.dependencies]` or it is code under
+  `wmo/`. Do not reintroduce a member directory (rule 5 forbids the top-level dir anyway).
+- **Vendor or depend, decide once**: a shared building block goes to PyPI and is depended on
+  (`environment-capture`), or it is vendored under `wmo/utils/` with its upstream `LICENSE`
+  (`wmo/utils/waterfall/`). Vendoring is for code we alone consume and do not publish; keep it
+  free of imports back into `wmo` so it stays independently testable. The data-bundle read core
+  behind `wmo download` is vendored the same way at `wmo/hub.py`, which names its origin in the
+  module docstring: a `wmo` release must never wait on an `environment-capture` release.
+- **Gate scoping**: the root gate is `uv run ruff check .`, `uv run ty check`, `uv run pytest -q`,
+  all over the single `testpaths = ["wmo"]`. Tests are inline `*_test.py` beside the module they
+  cover. There is exactly one ruff config and one ty config, at the root.
+- **Publishing**: `.github/workflows/python-package.yml` builds and publishes the flagship
+  `world-model-optimizer` distribution; the publish job runs only for a GitHub release and uses
+  the `pypi` trusted-publisher environment.
 
 ## Docs
 
 The repo is the single source of truth for project docs: finished, production-ready reports in
-`docs/` (rule 5); working docs, plans, and drafts in `.agents/docs/`. The former Notion docs
-database (Eng Docs → world-model-optimizer, page `38e0f8b3-f591-8087-b6b7-fc883178dc5e`) was
-migrated into `.agents/docs/` on 2026-07-02 and is deprecated — do not add new project docs to
-Notion. Review working docs in `.agents/docs/` periodically. Promote durable decisions and evidence
-to `docs/`; remove obsolete material only after checking references and preserving anything unique.
+`docs/` (rule 5). There is no in-repo home for working docs, plans, or drafts — keep them outside
+the checkout (see rule 5) until they are worth promoting. The former Notion docs database (Eng
+Docs → world-model-optimizer, page `38e0f8b3-f591-8087-b6b7-fc883178dc5e`) is deprecated — do not
+add new project docs to Notion. Promote durable decisions and evidence to `docs/`; remove obsolete
+material only after checking references and preserving anything unique.

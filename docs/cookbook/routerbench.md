@@ -99,7 +99,8 @@ moves cost/latency about 1% through embedding-API nondeterminism on near-tie nei
 ## Reproduce it with one command
 
 ```bash
-uv run wmo reproduce run routerbench
+# in the research repo: github.com/experientiallabs/research
+uv run reproduce run routerbench
 ```
 
 Downloads the published matrix and recorded embedding vectors

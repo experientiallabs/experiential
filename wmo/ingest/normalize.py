@@ -86,6 +86,10 @@ _LLM_PRESENCE_KEYS = (
 _STATE_STRUCTURED_KEY = "wmo.state.structured"
 _STATE_SCRATCHPAD_KEY = "wmo.state.scratchpad"
 _TRACE_METADATA_KEY = "wmo.trace.metadata"
+# The pre-rename spelling of the key above. Corpora emitted before the wmh -> wmo rename still
+# carry it — including anything produced by the published `environment-capture` until its own
+# rename ships — and dropping their metadata silently would lose benchmark/task_id/reward.
+_LEGACY_TRACE_METADATA_KEY = "wmh.trace.metadata"
 _ATTRIBUTION_KEY = "wmo.attribution"
 
 # Per-step attribution vocabularies (GenAI semconv first, OpenInference fallback). The response
@@ -519,9 +523,11 @@ def _state_before(span: SpanRecord) -> EnvState:
 
 
 def _trace_metadata(spans: list[SpanRecord]) -> JsonObject:
-    """First `wmo.trace.metadata` object across a trace's spans."""
+    """First `wmo.trace.metadata` object across a trace's spans (legacy `wmh.` key accepted)."""
     for span in spans:
         raw = span.attributes.get(_TRACE_METADATA_KEY)
+        if raw is None:
+            raw = span.attributes.get(_LEGACY_TRACE_METADATA_KEY)
         if isinstance(raw, dict):
             return raw
         if isinstance(raw, str):

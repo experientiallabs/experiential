@@ -7,7 +7,6 @@ import importlib.util
 import inspect
 import json
 import os
-import subprocess
 import sys
 import time
 from importlib.machinery import ModuleSpec
@@ -337,9 +336,12 @@ def test_cli_exposes_the_small_command_set() -> None:
         "download",
         "knowledge",
     }
-    platform = {"login", "logout", "status", "push", "pull", "run"}
+    # `run` (the hosted agent-session runner) moved to the agent-optimization repo
+    # with the rest of the agent surfaces; the platform commands that remain are
+    # the model registry round-trip and the login lifecycle.
+    platform = {"login", "logout", "status", "push", "pull"}
     assert names == core | platform
-    # `optimize` is a GROUP now (harness today; route and training-type optimizers join it).
+    # `optimize` is a GROUP (route, model, and distill; harness search moved out).
     groups = {group.name for group in app.registered_groups}
     assert "optimize" in groups
 
@@ -486,7 +488,7 @@ def test_help_keeps_the_bracketed_pointer_it_exists_to_teach(
     assert expected in rendered
 
 
-@pytest.mark.parametrize("args", [[], ["providers"], ["examples"], ["config"]])
+@pytest.mark.parametrize("args", [[], ["providers"], ["config"]])
 def test_bare_invocation_shows_help(args: list[str]) -> None:
     result = runner.invoke(app, args)
     assert "Missing command" not in result.output
@@ -516,12 +518,6 @@ def test_build_rejects_the_reserved_harbor_name(tmp_path) -> None:  # noqa: ANN0
     assert "reserved" in result.output
 
 
-def test_examples_run_rejects_invalid_name_with_friendly_error() -> None:
-    result = runner.invoke(app, ["examples", "run", "tau bench"])
-    assert result.exit_code == 2  # usage error, not a ValueError traceback
-    assert "unknown example" in result.output
-
-
 def test_serve_rejects_invalid_name_with_friendly_error(tmp_path) -> None:  # noqa: ANN001
     result = runner.invoke(app, ["serve", "--name", "tau bench", "--root", str(tmp_path / ".wmo")])
     assert result.exit_code == 2  # usage error, not a ValueError traceback
@@ -529,95 +525,22 @@ def test_serve_rejects_invalid_name_with_friendly_error(tmp_path) -> None:  # no
 
 
 def test_examples_discovery_skips_unresolvable_names(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    # A dir whose name validate_name rejects can never be run, so list (and the "available:"
-    # hint in the unknown-example error) must not advertise it.
+    # A downloaded dir whose name validate_name rejects can never be named on a command line, so
+    # discovery must drop it rather than offer it as a model candidate or an "available:" hint.
     for dirname in ("good-example", "tau bench"):
         example = tmp_path / dirname
         example.mkdir()
-        (example / "run.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        (example / "traces.otel.jsonl").write_text("", encoding="utf-8")
     monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
 
-    listed = runner.invoke(app, ["examples", "list"])
-    assert listed.exit_code == 0, listed.output
-    assert "good-example" in listed.output
-    assert "tau bench" not in listed.output
+    found = [path.name for path in cli_app_module._discover_examples()]
 
-    unknown = runner.invoke(app, ["examples", "run", "nope"])
-    assert unknown.exit_code == 2
-    assert "available: good-example" in unknown.output
+    assert found == ["good-example"]
 
 
 def _flat(output: str) -> str:
     """Rich wraps error panels; flatten box drawing and newlines before matching a message."""
     return " ".join(output.replace("│", " ").split())
-
-
-def test_examples_data_only_bundle_is_marked_and_points_at_wmo_build(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    # What `wmo download` fetches: a corpus with no launcher. `list` must say so, and `run` must
-    # name what the bundle IS for instead of dead-ending on "no run.sh launcher".
-    bundle = tmp_path / "demo-corpus"
-    bundle.mkdir()
-    (bundle / "traces.otel.jsonl").write_text("", encoding="utf-8")
-    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
-
-    listed = runner.invoke(app, ["examples", "list"])
-    assert listed.exit_code == 0, listed.output
-    assert "demo-corpus" in listed.output
-    assert "data only" in listed.output
-
-    result = runner.invoke(app, ["examples", "run", "demo-corpus"])
-    assert result.exit_code == 2, result.output
-    output = _flat(result.output)
-    assert "data-only bundle" in output
-    assert "wmo build --file" in output
-    assert "--name demo-corpus" in output
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="Windows ignores the Unix exec bit")
-def test_examples_run_rejects_a_non_executable_launcher(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    # A run.sh that lost its exec bit (archive, checkout) must be a usage error naming chmod,
-    # not a PermissionError traceback out of subprocess.
-    example = tmp_path / "noexec"
-    example.mkdir()
-    launcher = example / "run.sh"
-    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
-    launcher.chmod(0o644)
-    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
-
-    result = runner.invoke(app, ["examples", "run", "noexec"])
-
-    assert result.exit_code == 2, result.output  # usage error, not a traceback
-    assert "chmod +x" in _flat(result.output)
-
-
-@pytest.mark.parametrize(
-    "script",
-    [
-        pytest.param("echo hi\n", id="no-shebang"),  # execve -> ENOEXEC
-        pytest.param("#!/nonexistent/interp\n", id="missing-interpreter"),  # execve -> ENOENT
-    ],
-)
-def test_examples_run_reports_a_launcher_that_cannot_be_started(
-    tmp_path,  # noqa: ANN001
-    monkeypatch,  # noqa: ANN001
-    script: str,
-) -> None:
-    # X_OK passes but the kernel still refuses to exec, so `subprocess.run` raises before there
-    # is any exit code to forward. That must not surface as an OSError traceback either.
-    example = tmp_path / "unstartable"
-    example.mkdir()
-    launcher = example / "run.sh"
-    launcher.write_text(script, encoding="utf-8")
-    launcher.chmod(0o755)
-    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
-
-    result = runner.invoke(app, ["examples", "run", "unstartable"])
-
-    assert result.exit_code == 2, result.output  # usage error, not a traceback
-    assert not isinstance(result.exception, OSError), result.exception
-    output = _flat(result.output)
-    assert "could not start" in output
-    assert "head -1" in output
 
 
 def test_config_help_does_not_reuse_the_harness_group_name() -> None:
@@ -631,14 +554,14 @@ def test_config_help_does_not_reuse_the_harness_group_name() -> None:
 
 
 def test_serve_help_names_the_openai_endpoint_and_a_real_example_root() -> None:
-    # The OpenAI-compatible surface is what README step 3 exists for, and examples/tau-bench
-    # moved to packages/environment-capture/ — the help must name both correctly.
+    # The OpenAI-compatible surface is what README step 3 exists for, and benchmark data now
+    # arrives via `wmo download` — the help must name the endpoint and the real data root.
     result = runner.invoke(app, ["serve", "--help"])
     assert result.exit_code == 0, result.output
     output = _flat(result.output)
     assert "/v1/chat/completions" in output
     assert "examples/tau-bench" not in output
-    assert "packages/environment-capture/tau-bench" in output
+    assert "environment-capture-data/tau-bench" in output
 
 
 def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -998,7 +921,6 @@ def test_retry_narrator_dedupes_identical_failures_and_counts_down(monkeypatch) 
 def test_providers_subcommand_is_registered() -> None:
     group_names = {group.name for group in app.registered_groups}
     assert "providers" in group_names
-    assert "examples" in group_names
     assert "config" in group_names
 
 
@@ -1442,35 +1364,6 @@ def test_providers_set_does_not_save_a_failed_provider(monkeypatch, tmp_path) ->
     assert load_settings(root).models.worker is None
 
 
-def test_examples_list_shows_task_folders() -> None:
-    result = runner.invoke(app, ["examples", "list"])
-    assert result.exit_code == 0, result.output
-    assert "tau-bench" in result.output
-    assert "swe-bench" in result.output
-    assert "terminal-tasks" in result.output
-
-
-def test_examples_run_invokes_task_launcher(monkeypatch) -> None:  # noqa: ANN001
-    seen: dict[str, object] = {}
-
-    def fake_run(command: list[str], *, cwd: object, check: bool) -> subprocess.CompletedProcess:
-        seen["command"] = command
-        seen["cwd"] = cwd
-        seen["check"] = check
-        return subprocess.CompletedProcess(command, 0)
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    result = runner.invoke(app, ["examples", "run", "tau-bench", "--", "--trace", "0"])
-
-    assert result.exit_code == 0, result.output
-    command = cast(list[str], seen["command"])
-    assert Path(command[0]).as_posix().endswith("environment-capture/tau-bench/run.sh")
-    assert command[1:] == ["--trace", "0"]
-    assert Path(str(seen["cwd"])).as_posix().endswith("environment-capture/tau-bench")
-    assert seen["check"] is False
-
-
 def test_eval_trace_file_command_still_scores(patched_provider, tmp_path) -> None:  # noqa: ANN001
     result = runner.invoke(
         app,
@@ -1869,8 +1762,8 @@ def test_eval_help_lists_every_dispatched_flow() -> None:
     # The grid family owns six of this command's options, so its tokens must be discoverable.
     for token in ("grid <suite>", "grid-plot", "grid-heatmap", "agreement"):
         assert token in flat
-    # Suites moved out of examples/ long ago; the help must not send readers to the wrong dir.
-    assert "packages/environment-capture" in flat
+    # Suites live beside the downloaded corpus; the help must not send readers to a repo dir.
+    assert "environment-capture-data" in flat
 
 
 def test_build_then_list_shows_named_model(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -3243,7 +3136,9 @@ def test_worker_role_provider_config_provider_flag_uses_that_backends_flagship(
     config = cli_app_module._worker_role_provider_config("openai", None, None)
 
     assert config.kind is ProviderKind.OPENAI
-    assert config.model == "gpt-5.5"
+    # The flagship is the catalog's first OpenAI row: gpt-5.6-sol, the top tier of the 5.6
+    # family (sol > terra > luna).
+    assert config.model == "gpt-5.6-sol"
 
 
 def test_worker_role_provider_config_demands_a_model_for_a_catalog_less_provider(

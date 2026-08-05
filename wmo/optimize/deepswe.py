@@ -35,8 +35,8 @@ What converts, and the honesty rules:
 
 Everything this module writes is a build output for the published artifact bundle
 (HF: matrix.json + task_embeddings.npy + scenario_groups.json); nothing here is committed to
-git. `wmo optimize route convert-deepswe` is the CLI face; `wmo reproduce run` consumes the
-published bundle through the `deepswe-coding` manifest.
+git. `wmo optimize route convert-deepswe` is the CLI face; the research repo's `reproduce run`
+consumes the published bundle through its `deepswe-coding113` manifest.
 """
 
 from __future__ import annotations
@@ -310,8 +310,9 @@ def convert_deepswe(source: Path, *, embedding_cache: Path, out: Path) -> Deepsw
                     cached_input_tokens=trial.n_cache_tokens or 0,
                 ),
                 cost_usd=trial.cost_usd or 0.0,
-                error=None if priced else "published trial carries no cost_usd; unscored so "
-                "cost means stay honest",
+                error=None
+                if priced
+                else "published trial carries no cost_usd; unscored so cost means stay honest",
             )
         )
     matrix = OutcomeMatrix(pool=pool, outcomes=outcomes)

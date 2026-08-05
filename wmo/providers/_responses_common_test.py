@@ -3,12 +3,12 @@
 import json
 
 import pytest
-from llm_waterfall import ChatRequest
 
 from wmo.providers._responses_common import (
     responses_request,
     responses_response,
 )
+from wmo.utils.waterfall import ChatRequest
 
 
 def test_responses_request_translates_exact_pi_first_turn() -> None:

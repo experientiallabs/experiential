@@ -1,6 +1,6 @@
 """The vendored pi agent, and the seam that turns it into a searchable harness.
 
-`wmo/harness/vendor/pi-agent/` is a byte-exact copy of `packages/agent` from
+`wmo/harness/vendor/pi-agent/` is a byte-exact copy of the upstream `packages/agent` dir from
 earendil-works/pi at v0.80.3 (commit a23abe4a695df8b69b613f73e9fdda2a8af894d4). The pin, the
 license attribution, and the integrity ledger live beside it: `vendor/pi-agent/VENDOR.md`,
 `vendor/pi-agent/LICENSE`, and `vendor/manifest.sha256` (regenerate/verify with

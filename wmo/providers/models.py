@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict
 
 from wmo.providers.base import ProviderKind
+from wmo.utils.waterfall import ChatMaxTokensField
 
 
 class ProviderModel(BaseModel):
@@ -30,6 +30,28 @@ class ProviderModel(BaseModel):
 
 
 _MODELS: tuple[ProviderModel, ...] = (
+    # The GPT-5.6 family is named by tier rather than by size: sol is the frontier row,
+    # terra sits mid, luna is the cheap one (see MODEL_PRICES_USD_PER_MTOK). All three
+    # reject a forwarded temperature and take max_completion_tokens; verified live against
+    # the OpenAI chat/completions API 2026-08-02.
+    ProviderModel(
+        provider=ProviderKind.OPENAI,
+        model_type="gpt-5.6-sol",
+        model_id="gpt-5.6-sol",
+        forward_temperature=False,
+    ),
+    ProviderModel(
+        provider=ProviderKind.OPENAI,
+        model_type="gpt-5.6-terra",
+        model_id="gpt-5.6-terra",
+        forward_temperature=False,
+    ),
+    ProviderModel(
+        provider=ProviderKind.OPENAI,
+        model_type="gpt-5.6-luna",
+        model_id="gpt-5.6-luna",
+        forward_temperature=False,
+    ),
     ProviderModel(
         provider=ProviderKind.OPENAI,
         model_type="gpt-5.5",
@@ -52,6 +74,27 @@ _MODELS: tuple[ProviderModel, ...] = (
         provider=ProviderKind.OPENAI,
         model_type="gpt-5.4-mini",
         model_id="gpt-5.4-mini",
+        forward_temperature=False,
+    ),
+    # Only the Responses API accepts the 5.6 family's top `max` reasoning effort; the same
+    # value on chat/completions is rejected as unsupported (verified live 2026-08-02), so
+    # route quality-first sol work through OPENAI_RESPONSES.
+    ProviderModel(
+        provider=ProviderKind.OPENAI_RESPONSES,
+        model_type="gpt-5.6-sol",
+        model_id="gpt-5.6-sol",
+        forward_temperature=False,
+    ),
+    ProviderModel(
+        provider=ProviderKind.OPENAI_RESPONSES,
+        model_type="gpt-5.6-terra",
+        model_id="gpt-5.6-terra",
+        forward_temperature=False,
+    ),
+    ProviderModel(
+        provider=ProviderKind.OPENAI_RESPONSES,
+        model_type="gpt-5.6-luna",
+        model_id="gpt-5.6-luna",
         forward_temperature=False,
     ),
     ProviderModel(

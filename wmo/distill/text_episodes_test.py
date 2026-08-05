@@ -5,8 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from llm_waterfall.types import ChatFunctionCall, ChatMessage, ChatTool, ChatToolCall
-from llm_waterfall.types import ChatFunctionDefinition as FunctionDef
 
 from wmo.distill.config import DistillConfig
 from wmo.distill.data import attach_advantages, build_datums
@@ -17,6 +15,8 @@ from wmo.distill.text_episodes import (
     episodes_to_trial_records,
     text_warmup_manifest,
 )
+from wmo.utils.waterfall.types import ChatFunctionCall, ChatMessage, ChatTool, ChatToolCall
+from wmo.utils.waterfall.types import ChatFunctionDefinition as FunctionDef
 
 
 class _StubRendering:

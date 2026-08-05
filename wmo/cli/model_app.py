@@ -30,6 +30,7 @@ a bare `--resume` (no `--config`) loads.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -92,6 +93,23 @@ _console = Console()
 
 
 @model_app.command("run")
+def _load_harbor_task_ids(path: Path) -> tuple[str, ...]:
+    """Load the exact ordered task-id list, validated by the canonical score request rules."""
+    from wmo.harness.scoring import ScoreRequest
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(f"cannot load task ids from {path}: {error}") from error
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise typer.BadParameter(f"{path} must contain one JSON array of task-id strings")
+    try:
+        request = ScoreRequest(task_ids=tuple(raw), attempts=1)
+    except ValidationError as error:
+        raise typer.BadParameter(f"invalid task ids in {path}: {error}") from error
+    return request.task_ids
+
+
 def run(
     ctx: typer.Context,
     config: str = typer.Option(
@@ -434,11 +452,10 @@ def run_distill(
     # Deferred import: harness_app registers this module's typer app at module
     # scope, so importing its helpers back at module scope would be a circular
     # import.
-    from wmo.cli.harness_app import _load_harbor_task_ids
     from wmo.distill.cost import estimate_run_cost
     from wmo.distill.loop import DEFAULT_DISTILL_HARNESS, DistillBudgetError, run_distillation
     from wmo.distill.store import AdapterStore, DistillRunStore
-    from wmo.harness.population import write_json_atomic
+    from wmo.harness.store import write_json_atomic
 
     backend_override: Literal["local", "e2b"] | None
     if backend is None:

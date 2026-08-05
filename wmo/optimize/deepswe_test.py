@@ -19,8 +19,8 @@ from wmo.optimize.deepswe import (
     price_table_span,
     top_arm,
 )
+from wmo.optimize.embedding_cache import CachedTaskEmbedder
 from wmo.optimize.outcomes import OutcomeMatrix
-from wmo.reproduce.embedding import CachedTaskEmbedder
 
 # The machine-local published-artifact cache (trials/tasks/leaderboard + instruction texts) and
 # the recorded Qwen3 embedding cache. Unset means the live reproduction tests skip; the numbers
@@ -87,9 +87,7 @@ def _write_source(tmp_path: Path, trials: list[dict[str, object]]) -> Path:
         if trial["included_in_score"]:
             by_config.setdefault(str(trial["config"]), []).append(float(bool(trial["passed"])))
     (source / "leaderboard-live.json").write_text(
-        json.dumps(
-            {"rows": [{"config": c, "pass_at_1": fmean(v)} for c, v in by_config.items()]}
-        ),
+        json.dumps({"rows": [{"config": c, "pass_at_1": fmean(v)} for c, v in by_config.items()]}),
         encoding="utf-8",
     )
     return source

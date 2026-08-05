@@ -87,8 +87,9 @@ Where do traces come from? Two answers:
   LangSmith, Braintrust, PostHog, Mastra); `wmo ingest` normalizes them standalone.
 - **An existing benchmark**: `uv run wmo download tau-bench` fetches a published
   trace corpus captured from real benchmark runs, and `wmo build --file
-  packages/environment-capture/tau-bench/traces.otel.jsonl --name tau-bench` builds
-  from it. Run `wmo download` with no arguments to list everything published.
+  environment-capture-data/tau-bench/traces.otel.jsonl --name tau-bench` builds
+  from it (download writes under `environment-capture-data/` in the working
+  directory, or `$ENVCAP_DATA_ROOT` when set). Run `wmo download` with no arguments to list everything published.
 
 (`--train-split 0.5` only matters for a corpus this tiny: the router is measured on
 the TEST band of the build's three-way split, and 12 traces at the default split leave

@@ -16,6 +16,10 @@ from wmo.providers.base import (
     StreamChunk,
     TokenUsage,
     VerifyResult,
+    chat_request_output_budget,
+    guard_starved_chat_response,
+    guard_starved_completion,
+    guard_starved_output,
 )
 
 if TYPE_CHECKING:
@@ -99,7 +103,16 @@ class OpenAIResponsesProvider:
                 max_output_tokens=max_tokens,
                 store=False,
             )
-        return Completion(text=_response_text(response), usage=_usage_from_response(response))
+        completion = Completion(text=_response_text(response), usage=_usage_from_response(response))
+        # Covers the direct openai_responses kind AND the openai kind's effort dispatch, which
+        # routes here rather than duplicating the check.
+        guard_starved_completion(
+            completion,
+            max_tokens,
+            model=self.config.model,
+            reasoning_effort=self.config.reasoning_effort,
+        )
+        return completion
 
     def stream(
         self,
@@ -122,6 +135,7 @@ class OpenAIResponsesProvider:
         if self.config.reasoning_effort:
             kwargs["reasoning"] = cast("Reasoning", {"effort": self.config.reasoning_effort})
         usage = TokenUsage()
+        emitted = False
         # The evolving Responses stream-event union stays behind this one SDK-boundary cast
         # (same pattern as _openai_common.complete_chat).
         events = cast("Any", self._get_client().responses).create(**kwargs)
@@ -130,6 +144,7 @@ class OpenAIResponsesProvider:
                 kind = getattr(event, "type", "")
                 if kind == "response.output_text.delta":
                     if event.delta:
+                        emitted = True
                         yield StreamChunk(delta=event.delta)
                 elif kind == "response.completed":
                     # Same extractor as complete(): keeps the cached-token split, which OpenAI
@@ -139,17 +154,35 @@ class OpenAIResponsesProvider:
             close = getattr(events, "close", None)
             if callable(close):
                 close()
+        # Terminal chunk first: those tokens were billed either way and usage rides this chunk, so
+        # raising before it would drop the call from the consumer's metering.
         yield StreamChunk(done=True, usage=usage)
+        # A stream that yielded no text but burned the whole budget is the same starvation
+        # complete() guards; without this the consumer records an empty assistant turn as success.
+        guard_starved_output(
+            produced_output=emitted,
+            output_tokens=usage.output_tokens,
+            max_tokens=max_tokens,
+            model=self.config.model,
+            reasoning_effort=self.config.reasoning_effort,
+        )
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured request through the native Responses API."""
-        return _responses_common.complete_chat(
+        response = _responses_common.complete_chat(
             self._get_client().responses,
             self.config.model,
             request,
             reasoning_effort=self.config.reasoning_effort,
             allow_sampling=False,
         )
+        guard_starved_chat_response(
+            response,
+            chat_request_output_budget(request),
+            model=self.config.model,
+            reasoning_effort=self.config.reasoning_effort,
+        )
+        return response
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed text through OpenAI's embeddings API.

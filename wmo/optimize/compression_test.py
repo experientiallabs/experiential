@@ -90,14 +90,10 @@ def test_registry_rejects_unknown_id_with_guidance() -> None:
     assert "truncate" in str(caught.value)
 
 
-def test_registered_ids_include_the_lazily_registered_endpoint_compressor() -> None:
-    """The list `--compressor`'s help renders, so a registered id cannot go undocumented.
-
-    `llmlingua2-endpoint` is registered as a FACTORY at import of `wmo.optimize`, which is why
-    the two hand-written help strings kept advertising only identity and truncate.
-    """
+def test_registered_ids_are_the_shipped_pair_sorted() -> None:
+    """The list `--compressor`'s help renders, so a registered id cannot go undocumented."""
     ids = registered_compressor_ids()
-    assert {"identity", "truncate", "llmlingua2-endpoint"} <= set(ids)
+    assert {"identity", "truncate"} <= set(ids)
     assert list(ids) == sorted(ids)
 
 

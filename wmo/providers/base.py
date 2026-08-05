@@ -6,8 +6,9 @@ from collections.abc import Callable, Iterator
 from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
-from llm_waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 from pydantic import BaseModel, Field
+
+from wmo.utils.waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 
 
 class ProviderKind(StrEnum):
@@ -308,6 +309,113 @@ _PING_MESSAGES: list[Message] = [Message(role="user", content="ping")]
 # can't cover it — which reads like bad credentials. Non-reasoning models stop after a token or
 # two regardless, so the headroom costs nothing there.
 PING_MAX_TOKENS = 2048
+
+
+def guard_starved_output(
+    *,
+    produced_output: bool,
+    output_tokens: int,
+    max_tokens: int | None,
+    model: str,
+    reasoning_effort: str | None,
+) -> None:
+    """Shared core of the starvation check, for every call shape.
+
+    `produced_output` is whatever counts as a usable result for the shape being checked: visible
+    text for `complete`/`stream`, and text OR tool calls for `complete_chat` — a structured reply
+    whose content is empty because it returned tool calls is a normal, successful response and
+    must never be read as starvation.
+
+    See `guard_starved_completion` for the measurements behind this and why the test is the
+    observed outcome rather than a budget floor.
+
+    Raises:
+        ValueError: The call was starved: it hit the cap without producing usable output.
+    """
+    if reasoning_effort is None or max_tokens is None:
+        return
+    if produced_output:
+        return
+    if output_tokens < max_tokens:
+        # Empty for some other reason (a refusal, a content filter). Not this failure mode, and
+        # not something to relabel as a budget problem.
+        return
+    raise ValueError(
+        f"{model} at reasoning_effort={reasoning_effort!r} returned no output: reasoning consumed "
+        f"the entire {max_tokens}-token output budget ({output_tokens} output tokens). An empty "
+        "result scores as a failed task rather than an error, so this fails loudly instead. "
+        "Raise the output budget or lower the effort."
+    )
+
+
+def guard_starved_completion(
+    completion: Completion,
+    max_tokens: int | None,
+    *,
+    model: str,
+    reasoning_effort: str | None,
+) -> None:
+    """Raise when reasoning ate the whole output budget and left no visible text.
+
+    A reasoning model spends output tokens on thought before any text. When the budget cannot
+    cover both, the request still returns 200 with an EMPTY string — so a sweep records it as the
+    candidate failing the task rather than as an infrastructure fault, and the arm is quietly
+    scored as bad at the very effort it was meant to showcase. Raising converts that silent
+    mis-scoring into a loud, actionable failure.
+
+    The test is the observed outcome (no text AND output tokens pinned to the cap), not a budget
+    threshold, because starvation is PROMPT-dependent rather than effort-dependent. Measured live
+    on gpt-5.6-sol: `effort=max` on a trivial prompt emitted 6 output tokens and answered fine in
+    a 2000 budget, while `effort=high` and `effort=max` on one hard combinatorics prompt both
+    burned all 8192 and returned zero characters (`effort=medium` answered it in 6310). Any fixed
+    floor would therefore reject calls that would have succeeded — including `verify_via_ping`,
+    which deliberately pings with only PING_MAX_TOKENS.
+
+    Scoped to effort-dialed configs so calls that set no dial behave exactly as before. The same
+    trap exists at the provider's default effort; this does not attempt to police that.
+
+    Raises:
+        ValueError: The call was starved: it hit the cap without emitting any text.
+    """
+    guard_starved_output(
+        produced_output=bool(completion.text.strip()),
+        output_tokens=completion.usage.output_tokens,
+        max_tokens=max_tokens,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
+
+
+def chat_request_output_budget(request: ChatRequest) -> int | None:
+    """The output budget a structured request asked for, under either field spelling."""
+    return request.max_completion_tokens or request.max_tokens
+
+
+def guard_starved_chat_response(
+    response: ChatResponse,
+    max_tokens: int | None,
+    *,
+    model: str,
+    reasoning_effort: str | None,
+) -> None:
+    """`guard_starved_completion` for a structured reply.
+
+    Tool calls count as output: an assistant turn with empty `content` because it called a tool is
+    the normal success shape for an agent runtime, not starvation.
+    """
+    message = response.choices[0].message if response.choices else None
+    text = message.content if message is not None else None
+    produced = bool(str(text).strip() if text is not None else "") or bool(
+        message is not None and message.tool_calls
+    )
+    guard_starved_output(
+        produced_output=produced,
+        output_tokens=response.token_usage().output_tokens,
+        max_tokens=max_tokens,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
+
 
 # Belt-and-suspenders for the above: if a reasoning model spends even the larger ping budget on
 # reasoning before emitting output, the resulting error still PROVES the model is reachable (auth

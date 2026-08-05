@@ -1,7 +1,8 @@
 """Fetch and list trace-corpus data bundles from the Hugging Face Hub (stdlib-only).
 
-Every publishable benchmark's bundle — the trace corpus plus its task data / gold / evidence
-dirs — lives in a dataset repo under the org. This is the READ core behind `wmo download`, plus
+Every publishable benchmark's bundle lives in a dataset repo under the org: the trace corpus, its
+task data / gold / evidence dirs, and the prebuilt world model and eval suites built from that
+corpus (see ``_ARTIFACT_DIRS``). This is the READ core behind `wmo download`, plus
 the "is it local, and where" resolver (`corpus_path`) that decides whether to fetch or serve
 from disk. Plain HTTP against the Hub's public REST API, so it needs no extra dependency and no
 token for public repos (pass ``token`` for private ones).
@@ -12,16 +13,16 @@ files, and fetching never overwrites an existing file unless forced. Downloads s
 
 VENDORED, deliberately. This is a copy of the read half of `environment_capture.hub`, narrowed
 to what `wmo` consumes: the write side, its argparse CLI, and the canonical-repo-id helper the
-push path needs all stayed behind in the member. The flagship wheel must install with no
-dependency on anything under `packages/` (AGENTS.md § Monorepo) — a `Requires-Dist` on a member
-makes every `wmo` release wait on a member release, and it strands the member's unreleased
-fixes: the ``wmh-``/``wmo-`` dataset-name fallback below landed in the member's 0.1.1, which was
-never published, so no pip user has ever had it. `wmo/repo_layout_test.py` keeps the import from
-coming back.
+push path needs all stayed behind upstream. The flagship wheel must install with no runtime
+dependency on `environment-capture` (AGENTS.md section One package). A `Requires-Dist` on it
+would make every `wmo` release wait on an upstream release, and it strands upstream's
+unreleased fixes: the ``wmh-``/``wmo-`` dataset-name fallback landed in upstream's 0.1.1, which
+was never published; this module carried it until the Hub repos were renamed on 2026-08-03, at
+which point the Hub's own redirects took over the legacy ids.
 
-The two copies still share a registry and a data root, so a benchmark added on one side must be
-added on the other by hand. `test_the_two_copies_agree_on_the_registry_and_the_data_root` fails
-the build when that is forgotten; the rest of the body is not pinned, so keep edits mirrored.
+Upstream is now a PyPI distribution rather than an in-repo directory, so the two diverge by
+release instead of by hand-mirrored edit. This copy is the one `wmo` runs and the one its tests
+cover; a benchmark added upstream has to be added here deliberately.
 """
 
 from __future__ import annotations
@@ -46,16 +47,29 @@ _CORPUS_FILE = "traces.otel.jsonl"
 _HUB = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 _CHUNK_BYTES = 1 << 20
 
-# Dataset-repo name prefixes, most-preferred first. LEGACY FALLBACK: the project renamed
-# `wmh` -> `wmo`, but the org's dataset repos on the Hub are still published under the old
-# `wmh-<benchmark>-traces` name, so every read must try both. Once the Hub repos are renamed,
-# drop "wmh" from this tuple and the fallback disappears with it.
-_REPO_PREFIXES = ("wmo", "wmh")
+# Dataset-repo name prefix. The org's Hub repos were renamed `wmh-*` -> `wmo-*` on
+# 2026-08-03; the Hub redirects the old ids, so clients pinned to the legacy names
+# (the published environment-capture 0.1.0 among them) keep resolving without a
+# fallback here.
+_REPO_PREFIXES = ("wmo",)
 _REPO_SUFFIX = "-traces"
 # What the Hub answers for a repo id that does not resolve: 404 anonymously, 401 when a token
 # is attached (it will not admit a repo is missing to a caller that might lack access), 403
 # for a gated repo. Any of these means "try the next candidate name", not "the Hub is broken".
 _MISSING_REPO_CODES = frozenset({401, 403, 404})
+
+# Prebuilt artifact dirs published in the same dataset repo as the corpus, fetched for every
+# benchmark. Unlike `CorpusSpec.data_dirs` these are not upstream data but `wmo`'s own outputs (the
+# benchmark's prebuilt world model and its named eval suites), and the set is identical everywhere,
+# so it is a constant rather than a per-corpus field.
+#
+# The remote paths mirror the local layout EXACTLY: `models/<name>/` holding
+# `{card.json,config.toml,metrics.json,prompts/,index/}`, and `evals/*.toml`, landing under
+# `<data root>/<benchmark>/`. That is what `WorldModelStore` walks and what suite discovery globs
+# as `<root>/*/evals/*.toml`, so a downloaded bundle is found by the same code as a locally
+# captured one, with no special case for "came from the Hub". A suite names its corpus relatively
+# (`../traces.otel.jsonl`), which resolves because both land in one benchmark dir.
+_ARTIFACT_DIRS = ("models", "evals")
 
 # on_progress(files_done, files_total, bytes_total): called after every streamed chunk, across ALL
 # files in the fetch (front-ends render one bar for the whole bundle). Progress is weighted by
@@ -322,14 +336,19 @@ def fetch_corpus(
     revision: str = "main",
     on_progress: ProgressCallback | None = None,
 ) -> Path:
-    """Download the benchmark's corpus AND published data dirs into place; returns the corpus path.
+    """Download the benchmark's whole bundle into place; returns the corpus path.
+
+    The bundle is the corpus file, the spec's published data dirs, and the prebuilt artifact
+    dirs every benchmark ships (``_ARTIFACT_DIRS``: the world model and its eval suites), all
+    written under ``<data root>/<benchmark>/`` at the paths discovery already expects.
 
     Local-first and resumable at file granularity: every published file that is missing locally
     is fetched; existing files are kept unless ``force=True`` — fetching must never silently
     clobber a corpus that local capture waves have grown past the published one, and an
     interrupted fetch picks up the files it hasn't finished. With an explicit ``dest`` only the
-    corpus file is written (no data dirs). ``on_progress(files_done, files_total, bytes_total)``
-    fires per streamed chunk across the whole bundle, counted in FILES (see ``ProgressCallback``).
+    corpus file is written (no data or artifact dirs).
+    ``on_progress(files_done, files_total, bytes_total)`` fires per streamed chunk across the
+    whole bundle, counted in FILES (see ``ProgressCallback``).
 
     Raises ``ValueError`` for unknown/unpublished corpora and ``urllib.error.URLError`` (incl.
     ``HTTPError``, and ``CorpusRepoUnavailable`` when no candidate repo id resolves) when the
@@ -361,9 +380,10 @@ def fetch_corpus(
             )
         work.append((_CORPUS_FILE, target, sizes[_CORPUS_FILE]))
     if dest is None:
+        bundle_dirs = frozenset(spec.data_dirs) | frozenset(_ARTIFACT_DIRS)
         for remote_path, size in sorted(sizes.items()):
             top = remote_path.split("/", 1)[0]
-            if top not in spec.data_dirs:
+            if top not in bundle_dirs:
                 continue
             local = root / benchmark / remote_path
             # File-level skip, not dir-level: an interrupted fetch that materialized only part
@@ -460,22 +480,20 @@ def _resolve_repo(
 def _data_root() -> Path:
     """Where benchmark data dirs live (``<root>/<benchmark>/traces.otel.jsonl``).
 
-    Resolution order: the ``ENVCAP_DATA_ROOT`` env var; the capture member's directory in a git
-    checkout (``packages/environment-capture/``, which holds the benchmark dirs local capture
-    writes into); else, for an installed wheel, ``environment-capture-data/`` under the current
-    directory — a pip user's bundles land in their project, never inside site-packages.
+    Resolution order: the ``ENVCAP_DATA_ROOT`` env var, else ``environment-capture-data/`` under
+    the current directory, so a pip user's bundles land in their project and never inside
+    site-packages. A checkout resolves the same way: the capture member directory this used to
+    prefer (``packages/environment-capture/``) no longer exists, and ``.gitignore`` keeps the
+    downloaded bundles out of git.
 
-    The env var keeps environment-capture's name on purpose: this is the SHARED data root, and
-    in a checkout this module and the member must resolve the same directory or a bundle written
-    by one is invisible to the other. The checkout branch is the one line that could not be
-    copied verbatim — the member finds that directory as its own parent, `wmo` has to name it.
+    The env var keeps environment-capture's name on purpose. This is the SHARED data root, so a
+    bundle written by the published capture tooling and one written by ``wmo download`` land in
+    the same place; point the var at a fixed path when you need the root to be independent of
+    the directory a command happens to run from.
     """
     override = os.environ.get("ENVCAP_DATA_ROOT")
     if override:
         return Path(override)
-    checkout = Path(__file__).resolve().parents[1] / "packages" / "environment-capture"
-    if (checkout / "pyproject.toml").exists():  # repo checkout: the capture member dir
-        return checkout
     return Path.cwd() / "environment-capture-data"
 
 

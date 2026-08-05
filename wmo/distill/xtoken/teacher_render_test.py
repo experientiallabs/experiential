@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import json
 
-from llm_waterfall.types import ChatFunctionCall, ChatMessage, ChatTool, ChatToolCall
-
 from wmo.distill.xtoken.byte_offsets import BYTE_DECODER
 from wmo.distill.xtoken.teacher_render import render_for_teacher
+from wmo.utils.waterfall.types import ChatFunctionCall, ChatMessage, ChatTool, ChatToolCall
 
 
 class FakeTemplateTokenizer:

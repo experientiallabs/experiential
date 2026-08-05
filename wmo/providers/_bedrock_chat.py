@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 from typing import cast
 
-from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import JsonValue
+
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 
 def converse_request(request: ChatRequest, model: str) -> dict[str, object]:

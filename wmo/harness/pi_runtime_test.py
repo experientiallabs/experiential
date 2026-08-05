@@ -9,7 +9,6 @@ from socket import socket
 from typing import cast
 
 import pytest
-from llm_waterfall import ChatRequest, ChatResponse
 
 from wmo.core.types import Action, Observation
 from wmo.harness import pi_runtime as pi_runtime_module
@@ -34,6 +33,7 @@ from wmo.harness.runtime import StopReason
 from wmo.harness.skills import Skill, SkillLibrary
 from wmo.harness.tools import SUBMIT, TOOL_REGISTRY
 from wmo.providers.base import Provider
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 
 class _Env:

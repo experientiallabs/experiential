@@ -179,8 +179,8 @@ OUTPUT_CONTRACT = (
 # putting the deliberation before `output` is what makes it an actual deliberation rather than a
 # post-hoc rationalization. `kb_note` is the cross-session counterpart of `state_note` (persisted
 # to the knowledge base by the engine); `ground_query` is offered only when a grounder is active.
-# Deliberation instruction, tuned on observed live failures (.agents/docs/research/
-# agentic_results inspection):
+# Deliberation instruction, tuned by inspecting observed live failures (the raw inspection
+# artifacts stay outside the repo, per AGENTS.md rule 5):
 # unbounded deliberations blew the token budget and truncated the output (hence "1-4 short
 # sentences"); agent-side policy was mistaken for an env gate (a cancel the policy forbids still
 # EXECUTES — tools are mechanical); unobserved state was assumed ("already installed");

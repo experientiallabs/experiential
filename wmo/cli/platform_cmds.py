@@ -1,7 +1,7 @@
 """Platform commands: `wmo login`, `wmo logout`, `wmo status`, `wmo push`, `wmo pull`.
 
 `login` connects this machine to a platform account (browser flow by default,
-`--token` for headless); `push`/`pull` round-trip world models and harnesses
+`--token` for headless); `push`/`pull` round-trip world models and endpoint artifacts
 against the platform registry, auto-detecting the artifact kind from what
 exists locally (or remotely, for pulls).
 """
@@ -57,16 +57,9 @@ _LOGIN_NO_BROWSER = typer.Option(
     "--no-browser", help="Print the authorization URL instead of opening a browser."
 )
 _ORG = typer.Option("--org", help="Organization id (defaults to the login's default organization).")
-_KIND = typer.Option(
-    "--kind", help="Artifact kind: model or harness (auto-detected when unambiguous)."
-)
 _PUSH_AS = typer.Option(
     "--as", help="Remote name to publish under (local names may not be slug-safe)."
 )
-_PUSH_REF = typer.Option(
-    "--ref", help="Harness version or alias to push (default: champion, else latest)."
-)
-_PULL_VERSION = typer.Option("--version", help="Harness version to pull (default: latest).")
 _PULL_FORCE = typer.Option("--force", help="Replace an existing local artifact.")
 _PUSH_SERVE_MODEL = typer.Option(
     "--serve-model",
@@ -187,15 +180,13 @@ def status() -> None:
 
 
 def push(
-    name: Annotated[str, typer.Argument(help="Local world model or harness name.")],
+    name: Annotated[str, typer.Argument(help="Local world model name.")],
     org: Annotated[str | None, _ORG] = None,
-    kind: Annotated[str | None, _KIND] = None,
     push_as: Annotated[str | None, _PUSH_AS] = None,
-    ref: Annotated[str | None, _PUSH_REF] = None,
     serve_model: Annotated[str | None, _PUSH_SERVE_MODEL] = None,
     root: Annotated[str, _ROOT] = ".wmo",
 ) -> None:
-    """Publish a local world model or harness to the platform registry.
+    """Publish a local world model to the platform registry.
 
     A model push carries everything the model directory holds: the simulation
     (the built bundle), the model (a measured policy.json + report.json become
@@ -204,41 +195,32 @@ def push(
     absent are skipped with a note, so a bundle-only directory pushes exactly
     as before.
     """
-    from wmo.harness.store import HarnessStore
-
     model_dir = WorldModelStore(root).dir_for(name)
-    harness_exists = HarnessStore(root).exists(name)
-    resolved_kind = _resolve_kind(
-        kind, name=name, root=root, model=model_dir is not None, harness=harness_exists
-    )
+    if model_dir is None:
+        raise typer.BadParameter(_nothing_local(name, root))
     remote_name = push_as or name
 
     credentials, org_id = _require_connection(org)
     with _connected(credentials, "Push failed") as client:
-        if resolved_kind == "model" and model_dir is not None:
-            pushed_id = _push_model(client, org_id, remote_name, model_dir)
-            _push_endpoint_artifacts(
-                client,
-                org_id,
-                remote_name,
-                model_dir,
-                world_model_id=pushed_id,
-                serve_model=serve_model,
-            )
-            _push_pipeline(client, org_id, remote_name, model_dir)
-        else:
-            _push_harness(client, org_id, remote_name, name, ref, root)
+        pushed_id = _push_model(client, org_id, remote_name, model_dir)
+        _push_endpoint_artifacts(
+            client,
+            org_id,
+            remote_name,
+            model_dir,
+            world_model_id=pushed_id,
+            serve_model=serve_model,
+        )
+        _push_pipeline(client, org_id, remote_name, model_dir)
 
 
 def pull(
-    name: Annotated[str, typer.Argument(help="Remote world model, endpoint, or harness name.")],
+    name: Annotated[str, typer.Argument(help="Remote world model or endpoint name.")],
     org: Annotated[str | None, _ORG] = None,
-    kind: Annotated[str | None, _KIND] = None,
-    version: Annotated[int | None, _PULL_VERSION] = None,
     force: Annotated[bool, _PULL_FORCE] = False,
     root: Annotated[str, _ROOT] = ".wmo",
 ) -> None:
-    """Fetch the CURRENT platform state of a model, endpoint, or harness.
+    """Fetch the CURRENT platform state of a model or endpoint.
 
     A model pull restores the bundle as pushed, then overwrites policy.json,
     report.json, and the knn bank with what the same-named endpoint serves NOW,
@@ -248,11 +230,9 @@ def pull(
     command and does not need --force; --force still governs replacing an
     existing local bundle.
     """
-    if kind is not None and kind not in ("model", "harness"):
-        raise typer.BadParameter("--kind must be 'model' or 'harness'")
     credentials, org_id = _require_connection(org)
     with _connected(credentials, "Pull failed") as client:
-        resolved_kind = kind or _detect_pullable_kind(client, org_id, name)
+        resolved_kind = _detect_pullable_kind(client, org_id, name)
         if resolved_kind == "model":
             _pull_model(client, org_id, name, root, force=force)
             _pull_endpoint_artifacts(client, org_id, name, WorldModelStore(root).model_dir(name))
@@ -260,14 +240,12 @@ def pull(
             dest_dir = WorldModelStore(root).model_dir(name)
             if not _pull_endpoint_artifacts(client, org_id, name, dest_dir):
                 raise typer.BadParameter(
-                    f"the organization has no world model, endpoint, or harness named {name!r}"
+                    f"the organization has no world model or endpoint named {name!r}"
                 )
             _console.print(
                 "no simulation to pull: the endpoint's evidence came from a real benchmark "
                 "or a hosted fit, so only its measured artifacts live locally"
             )
-        else:
-            _pull_harness(client, org_id, name, root, version=version)
 
 
 # -- helpers -------------------------------------------------------------------------------------
@@ -336,86 +314,30 @@ def _require_connection(org: str | None) -> tuple[PlatformCredentials, str]:
     return credentials, org_id
 
 
-def _resolve_kind(kind: str | None, *, name: str, root: str, model: bool, harness: bool) -> str:
-    if kind is not None:
-        if kind not in ("model", "harness"):
-            raise typer.BadParameter("--kind must be 'model' or 'harness'")
-        if kind == "model" and not model:
-            raise typer.BadParameter(_nothing_local(name, root, kind="model"))
-        if kind == "harness" and not harness:
-            raise typer.BadParameter(_nothing_local(name, root, kind="harness"))
-        return kind
-    if model and harness:
-        raise typer.BadParameter("both a model and a harness have this name locally; pass --kind")
-    if model:
-        return "model"
-    if harness:
-        return "harness"
-    raise typer.BadParameter(_nothing_local(name, root, kind=None))
-
-
-def _nothing_local(name: str, root: str, *, kind: str | None) -> str:
+def _nothing_local(name: str, root: str) -> str:
     """Say what was looked for, where, what is actually there, and what to run next."""
-    from wmo.harness.store import HarnessStore
-
-    if kind == "model":
-        label, have = "world model", WorldModelStore(root).list_names()
-        hint = f"`wmo build --name {name}` builds one"
-    elif kind == "harness":
-        label, have = "harness", HarnessStore(root).list_names()
-        hint = f"`wmo harness init {name}` creates one"
-    else:
-        label = "world model or harness"
-        have = [*WorldModelStore(root).list_names(), *HarnessStore(root).list_names()]
-        hint = "`wmo list` and `wmo harness list` show what is here"
+    have = WorldModelStore(root).list_names()
     found = f"have: {', '.join(have)}" if have else "nothing is built there"
-    return f"no local {label} named {name!r} under {root} ({found}); {hint}, or pass --root <dir>"
+    return (
+        f"no local world model named {name!r} under {root} ({found}); "
+        f"`wmo build --name {name}` builds one, or pass --root <dir>"
+    )
 
 
 def _detect_pullable_kind(client: PlatformClient, org_id: str, name: str) -> str:
-    """What a pull by this name reaches: model, harness, or endpoint-only.
+    """What a pull by this name reaches: a model, or an endpoint with no simulation.
 
-    The endpoint probe runs only after the model and harness reads both come
-    up empty, so a genuine model/harness ambiguity still refuses with the
-    pass-`--kind` message instead of silently selecting a same-named endpoint.
-    An endpoint with no same-named simulation (platform-created, or its
-    evidence is a real benchmark) is still pullable: its measured artifacts
-    are the whole point of fetching current state.
+    The endpoint probe runs only after the model read comes up empty. An endpoint
+    with no same-named simulation (platform-created, or its evidence is a real
+    benchmark) is still pullable: its measured artifacts are the whole point of
+    fetching current state.
     """
-    # The model list goes first ON PURPOSE: a dead credential fails here with
-    # the platform's own sentence, so the tolerant harness probe below never
-    # masks a real auth problem.
-    from wmo.platform.client import PlatformError
-
     model_names = {model.name for model in client.list_world_models(org_id)}
-    try:
-        harness_names = {harness.name for harness in client.list_harnesses(org_id)}
-    except PlatformError as error:
-        if error.status_code in (401, 403, 404):
-            # This platform exposes no harness registry to this credential
-            # (the hosted platform serves none at all, and the customer-key
-            # allowlist ends before it). The credential could not pull a
-            # harness either way, so the model proceeds - but never silently,
-            # in case a registry this credential cannot see does hold the name.
-            harness_names = set()
-            if error.status_code != 404:
-                _console.print(
-                    "harness registry not readable with this credential; "
-                    "assuming the name is not also a harness"
-                )
-        else:
-            raise
-    if name in model_names and name in harness_names:
-        raise typer.BadParameter("both a model and a harness have this name remotely; pass --kind")
     if name in model_names:
         return "model"
-    if name in harness_names:
-        return "harness"
     if client.get_endpoint(org_id, name) is not None:
         return "endpoint"
-    raise typer.BadParameter(
-        f"the organization has no world model, endpoint, or harness named {name!r}"
-    )
+    raise typer.BadParameter(f"the organization has no world model or endpoint named {name!r}")
 
 
 def _push_model(client: PlatformClient, org_id: str, remote_name: str, model_dir: Path) -> str:
@@ -558,40 +480,6 @@ def _push_pipeline(client: PlatformClient, org_id: str, remote_name: str, model_
     )
 
 
-def _push_harness(
-    client: PlatformClient,
-    org_id: str,
-    remote_name: str,
-    local_name: str,
-    ref: str | None,
-    root: str,
-) -> None:
-    from wmo.harness.store import HarnessStore
-
-    try:
-        doc = HarnessStore(root).load(local_name, ref)
-    except (FileNotFoundError, ValueError) as error:
-        # A typo'd --ref is user input, not a bug: same treatment as
-        # `wmo harness show <name>@<ref>`.
-        raise typer.BadParameter(
-            f"{error}; `wmo harness list --root {root}` shows the versions and aliases"
-        ) from error
-    if remote_name != local_name:
-        doc = doc.model_copy(update={"name": remote_name})
-    pushed = client.push_harness_version(
-        org_id, remote_name, doc.model_dump(mode="json"), doc.doc_hash
-    )
-    if pushed.created:
-        _console.print(
-            f"{_CHECK} Pushed harness [bold]{pushed.name}[/bold] as remote v{pushed.version}"
-        )
-    else:
-        _console.print(
-            f"Remote [bold]{pushed.name}[/bold] v{pushed.version} already has this exact doc; "
-            "nothing to push."
-        )
-
-
 def _pull_model(client: PlatformClient, org_id: str, name: str, root: str, *, force: bool) -> None:
     from wmo.platform.transfer import unpack_model_bundle
 
@@ -652,33 +540,6 @@ def _pull_endpoint_artifacts(
         f"into {dest_dir}"
     )
     return True
-
-
-def _pull_harness(
-    client: PlatformClient, org_id: str, name: str, root: str, *, version: int | None
-) -> None:
-    from wmo.harness.doc import HarnessDoc
-    from wmo.harness.store import CHAMPION_ALIAS, HarnessStore
-
-    if version is None:
-        harness, _versions = client.get_harness(org_id, name)
-        if harness.latest_version < 1:
-            raise typer.BadParameter(f"remote harness {name!r} has no versions yet")
-        version = harness.latest_version
-    payload = client.get_harness_version(org_id, name, version)
-    doc = HarnessDoc.model_validate(payload.doc)
-    # Versions the platform recorded before doc_hash covered materialized paths carry the legacy
-    # hash; accept either so pre-change pathful (pi-node) records stay pullable.
-    if payload.doc_hash not in (doc.doc_hash, doc.legacy_doc_hash):
-        _console.print("[red]Pulled doc failed its integrity check; not saving.[/red]")
-        raise typer.Exit(code=1)
-    saved = HarnessStore(root).save_version(
-        doc.model_copy(update={"name": name}), alias=CHAMPION_ALIAS
-    )
-    _console.print(
-        f"{_CHECK} Pulled harness [bold]{name}[/bold] remote v{version} → local v{saved.version} "
-        f"(champion)"
-    )
 
 
 def _print_orgs(identity: WhoAmI, default_org: str | None) -> None:

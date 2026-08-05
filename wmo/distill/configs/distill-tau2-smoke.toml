@@ -4,12 +4,13 @@
 # gate) for a few dollars. The real tau study trains Qwen3.5-9B from Qwen3.6-27B;
 # this pair exists to shake the machinery, not to measure.
 #
-# One-time setup (see packages/environment-capture/tau-bench/README.md): clone
-# tau2-bench and build its own 3.13 venv under packages/environment-capture/tau-bench,
-# then run from the repo root so the relative paths below resolve. The pinned azure/
+# One-time setup: tau2-bench is an external clone no wheel can ship, so clone it and
+# build its own 3.13 venv somewhere outside this repo, then point the two paths below
+# at it (`wmo optimize distill run` names the exact commands if they are missing). The
+# values here assume a `.tau2-bench/` clone in the working directory. The pinned azure/
 # user simulator needs AZURE_API_KEY, AZURE_API_BASE, AZURE_API_VERSION in the env.
-# Task splits: .agents/distill/tau2-{train,holdout}-task-ids.json (composite
-# "domain/task_id" strings, pinned from the BENCH-B scenario files).
+# Task splits are pinned per run as composite "domain/task_id" strings taken from the
+# BENCH-B scenario files.
 [student]
 base_model = "Qwen/Qwen3.5-4B"
 lora_rank = 16
@@ -19,8 +20,8 @@ backend = "tinker"
 model = "Qwen/Qwen3.5-9B"
 
 [tau2]
-tau2_bin = "packages/environment-capture/tau-bench/.venv/bin/tau2"
-data_dir = "packages/environment-capture/tau-bench/tau2-bench/data"
+tau2_bin = ".tau2-bench/.venv/bin/tau2"
+data_dir = ".tau2-bench/tau2-bench/data"
 # user_llm stays at the pinned default (azure/gpt-5.4-mini): the user simulator is
 # part of the environment, and every arm of the tau study faces the same customers.
 

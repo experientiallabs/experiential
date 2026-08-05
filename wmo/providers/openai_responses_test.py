@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import pytest
-from llm_waterfall import ChatRequest
 
 from wmo.providers.base import DEFAULT_MAX_TOKENS, Message, ProviderConfig, ProviderKind
 from wmo.providers.openai_responses import OpenAIResponsesProvider
+from wmo.utils.waterfall import ChatRequest
 
 
 class _FakeUsage:

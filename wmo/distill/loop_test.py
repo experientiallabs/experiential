@@ -19,10 +19,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, cast, get_args
 
 import pytest
-from llm_waterfall.types import ChatMessage, ChatTool
 
 import wmo.distill.loop as loop_module
 import wmo.providers.tinker as providers_tinker
+from wmo.utils.waterfall.types import ChatMessage, ChatTool
 
 if TYPE_CHECKING:
     import tinker
@@ -2634,7 +2634,7 @@ def test_tinker_provider_config_is_the_one_shape_every_rollout_samples_through()
     """The student sampler's provider config IS the shared helper's output.
 
     The helper is also the seam a rollout-only caller (the scaffold probe in
-    `.agents/distill/probe_scaffold.py`) uses to sample the BASE student
+    the operator's probe scaffold) uses to sample the BASE student
     without opening a training client, so `model == base_model` must be legal
     and must carry the same renderer identity.
     """

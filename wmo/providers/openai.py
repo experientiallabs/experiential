@@ -27,6 +27,10 @@ from wmo.providers.base import (
     ProviderConfig,
     StreamChunk,
     VerifyResult,
+    chat_request_output_budget,
+    guard_starved_chat_response,
+    guard_starved_completion,
+    guard_starved_output,
     normalize_chat_temperature,
     verify_via_ping,
 )
@@ -35,6 +39,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from openai import OpenAI
+
+    from wmo.providers.openai_responses import OpenAIResponsesProvider
 
 
 class OpenAIProvider:
@@ -47,8 +53,40 @@ class OpenAIProvider:
         # config, so its endpoint+key pairing is trusted, unlike a model bundle's config.toml.
         self._api_key = api_key
         self._client: OpenAI | None = None
+        self._responses: OpenAIResponsesProvider | None = None
         self._forward_temperature = config.resolved_chat_forward_temperature()
         self._max_tokens_field = config.resolved_chat_max_tokens_field()
+
+    def _responses_delegate(self) -> OpenAIResponsesProvider:
+        """The Responses-API provider that owns effort-dialed calls on real OpenAI.
+
+        Built lazily and cached, from the same config and credential, so the delegate resolves
+        its key exactly as this provider would.
+        """
+        if self._responses is None:
+            from wmo.providers.openai_responses import OpenAIResponsesProvider
+
+            self._responses = OpenAIResponsesProvider(self.config, api_key=self._api_key)
+        return self._responses
+
+    def _dispatch_to_responses(self) -> bool:
+        """Whether an effort-dialed call must go through the Responses API.
+
+        chat/completions accepts SOME effort values for the GPT-5.6 family but rejects the top
+        `max` outright (verified live 2026-08-02), so effort is only fully expressible on
+        Responses. `OpenAIResponsesProvider` builds its client with no `base_url`, so it can
+        only speak to real OpenAI; a custom OpenAI-compatible endpoint keeps the chat route and
+        forwards the dial as `reasoning_effort` there instead (vLLM's spelling). Forwarding to a
+        server that has never heard of it earns a loud 400, which is the point: this used to
+        drop the operator's dial silently and bill a default-effort run as an effort-dialed arm.
+        """
+        return self.config.reasoning_effort is not None and not self.config.endpoint
+
+    def _chat_effort_kwargs(self) -> dict[str, str]:
+        """The effort dial as chat/completions spells it, for custom endpoints only."""
+        if self.config.reasoning_effort is None or not self.config.endpoint:
+            return {}
+        return {"reasoning_effort": self.config.reasoning_effort}
 
     def _get_client(self) -> OpenAI:
         # Lazy: don't import the SDK or read the key env vars until first use.
@@ -60,7 +98,7 @@ class OpenAIProvider:
             # timeouts). `timeout=240` turns a stall into a bounded failure instead of a silent
             # multi-hour hang. Retry ownership is split by CONCERN, not stacked: the SDK's
             # `max_retries=1` owns a single same-endpoint transient retry (one blip on THIS server),
-            # while the llm-waterfall chain owns cross-endpoint failover on capacity errors (move to
+            # while the waterfall chain owns cross-endpoint failover on capacity errors (move to
             # the NEXT backend). They don't compound the way Bedrock's botocore retries did (3 same
             # -model attempts before failover) because one is bounded at 1; and unlike a Bedrock
             # target, a grid's OpenAI/self-hosted target is a SINGLE provider with no chain behind
@@ -100,6 +138,11 @@ class OpenAIProvider:
         Raises:
             openai.OpenAIError: No key resolved for this configuration.
         """
+        # Branch exactly like the call paths, so the thing prepared is the thing that requests:
+        # an effort-dialed config on real OpenAI never touches the chat client.
+        if self._dispatch_to_responses():
+            self._responses_delegate().prepare()
+            return
         self._get_client()
 
     def complete(
@@ -110,7 +153,14 @@ class OpenAIProvider:
         temperature: float = 0.7,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Completion:
-        return _openai_common.complete(
+        if self._dispatch_to_responses():
+            # Same reasoning as AzureOpenAIProvider.complete: text consumers must take the route
+            # that actually carries the dial, or the chat client drops it. Reasoning models reject
+            # non-default sampling, so `temperature` is not forwarded.
+            return self._responses_delegate().complete(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
+        completion = _openai_common.complete(
             self._get_client().chat.completions,
             self.config.model,
             system,
@@ -120,7 +170,17 @@ class OpenAIProvider:
             # trained NEEDS temperature diversity); real OpenAI GPT-5.5 rejects them.
             temperature=temperature if self.config.endpoint else None,
             max_tokens_field=self._max_tokens_field,
+            **self._chat_effort_kwargs(),
         )
+        # The effort-dialed chat route (custom endpoint) never reaches the Responses delegate, so
+        # it needs the same starvation check a reasoning server can trigger here too.
+        guard_starved_completion(
+            completion,
+            max_tokens,
+            model=self.config.model,
+            reasoning_effort=self.config.reasoning_effort,
+        )
+        return completion
 
     def stream(
         self,
@@ -131,7 +191,22 @@ class OpenAIProvider:
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Iterator[StreamChunk]:
         """Stream a completion natively (same temperature rule as complete)."""
-        return _openai_common.stream(
+        if self._dispatch_to_responses():
+            return self._responses_delegate().stream(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
+        return self._guarded_chat_stream(system, messages, temperature, max_tokens)
+
+    def _guarded_chat_stream(
+        self,
+        system: str,
+        messages: list[Message],
+        temperature: float,
+        max_tokens: int,
+    ) -> Iterator[StreamChunk]:
+        """The chat-route stream, checked for starvation once the terminal usage is known."""
+        emitted = False
+        for chunk in _openai_common.stream(
             self._get_client().chat.completions,
             self.config.model,
             system,
@@ -139,20 +214,46 @@ class OpenAIProvider:
             max_tokens,
             temperature=temperature if self.config.endpoint else None,
             max_tokens_field=self._max_tokens_field,
-        )
+            **self._chat_effort_kwargs(),
+        ):
+            if chunk.delta:
+                emitted = True
+            # Yield the terminal chunk BEFORE checking: those tokens were spent and billed either
+            # way, and usage rides the terminal chunk, so raising first would drop the call from
+            # the consumer's metering.
+            yield chunk
+            if chunk.done:
+                # A terminal chunk with no usage reports nothing to compare against the cap, so
+                # there is no evidence of starvation either way; 0 leaves the guard inert.
+                guard_starved_output(
+                    produced_output=emitted,
+                    output_tokens=chunk.usage.output_tokens if chunk.usage else 0,
+                    max_tokens=max_tokens,
+                    model=self.config.model,
+                    reasoning_effort=self.config.reasoning_effort,
+                )
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured request on the configured OpenAI-compatible backend."""
+        if self._dispatch_to_responses():
+            return self._responses_delegate().complete_chat(request)
         request = normalize_chat_temperature(
             request,
             forward_temperature=self._forward_temperature,
         )
-        return _openai_common.complete_chat(
+        response = _openai_common.complete_chat(
             self._get_client().chat.completions,
             self.config.model,
             request,
             max_tokens_field=self._max_tokens_field,
         )
+        guard_starved_chat_response(
+            response,
+            chat_request_output_budget(request),
+            model=self.config.model,
+            reasoning_effort=self.config.reasoning_effort,
+        )
+        return response
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if self.config.embed_model is None:

@@ -21,8 +21,9 @@ import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, cast
 
-from llm_waterfall.types import ChatFunctionCall, ChatMessage, ChatTool, ChatToolCall
 from pydantic import BaseModel, Field, JsonValue
+
+from wmo.utils.waterfall.types import ChatFunctionCall, ChatMessage, ChatTool, ChatToolCall
 
 if TYPE_CHECKING:
     from tinker_cookbook.renderers import Renderer
@@ -171,7 +172,7 @@ def salvage_truncated_tool_call(text: str) -> str | None:
 
 
 def _text_content(content: JsonValue) -> str:
-    """Flatten llm_waterfall message content (None, string, or part list) to text.
+    """Flatten wmo.utils.waterfall message content (None, string, or part list) to text.
 
     OpenAI-format content parts (`{"type": "text", "text": ...}`) are joined in
     order; non-text parts are rejected loudly rather than dropped silently.
@@ -197,7 +198,7 @@ def _text_content(content: JsonValue) -> str:
 
 
 def renderer_messages_from_chat(messages: list[ChatMessage]) -> list[RendererMessage]:
-    """Convert llm_waterfall chat messages into cookbook renderer messages.
+    """Convert wmo.utils.waterfall chat messages into cookbook renderer messages.
 
     Mirrors the cookbook's `openai_messages_to_tinker`: roles pass through,
     content flattens to text, and tool-result linkage (`tool_call_id`, `name`)
@@ -238,7 +239,7 @@ def renderer_messages_from_chat(messages: list[ChatMessage]) -> list[RendererMes
 
 
 def _chat_tool_calls(calls: Sequence[RendererToolCall]) -> list[ChatToolCall]:
-    """Cookbook renderer tool calls as llm_waterfall chat tool calls."""
+    """Cookbook renderer tool calls as wmo.utils.waterfall chat tool calls."""
     return [
         ChatToolCall(
             id=tc.id or f"call_{index}",
@@ -249,7 +250,7 @@ def _chat_tool_calls(calls: Sequence[RendererToolCall]) -> list[ChatToolCall]:
 
 
 def tool_specs_from_chat(tools: list[ChatTool]) -> list[ToolSpec]:
-    """Convert llm_waterfall tool definitions into cookbook ToolSpec dicts."""
+    """Convert wmo.utils.waterfall tool definitions into cookbook ToolSpec dicts."""
     return [
         {
             "name": tool.function.name,

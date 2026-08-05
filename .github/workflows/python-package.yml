@@ -8,8 +8,6 @@ on:
       - "uv.lock"
       - "README.md"
       - "wmo/**"
-      - "packages/llm-waterfall/llm_waterfall/**"
-      - "packages/llm-waterfall/LICENSE"
   push:
     branches: [main]
     paths:
@@ -18,8 +16,6 @@ on:
       - "uv.lock"
       - "README.md"
       - "wmo/**"
-      - "packages/llm-waterfall/llm_waterfall/**"
-      - "packages/llm-waterfall/LICENSE"
   release:
     types: [published]
 
@@ -38,7 +34,7 @@ jobs:
         run: |
           uv venv /tmp/wmo-wheel-smoke
           uv pip install --python /tmp/wmo-wheel-smoke/bin/python dist/*.whl
-          /tmp/wmo-wheel-smoke/bin/python -c "import llm_waterfall, wmo"
+          /tmp/wmo-wheel-smoke/bin/python -c "import wmo, wmo.utils.waterfall"
           /tmp/wmo-wheel-smoke/bin/wmo --help
       - uses: actions/upload-artifact@v4
         with:

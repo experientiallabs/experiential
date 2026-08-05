@@ -8,7 +8,7 @@ behind the shipped default and one command that reproduces it exactly.
 
 | Step | Command | Artifact |
 |---|---|---|
-| 1 | `uv run wmo reproduce run swe-bench` | `verdict.json` + `policy.json` + `report_vs_fable-5.json` under the run's out dir |
+| 1 | `uv run reproduce run swe-bench` (research repo) | `verdict.json` + `policy.json` + `report_vs_fable-5.json` under the run's out dir |
 
 The evidence behind the product's `swe-bench` default: 640 real mini-swe-agent episodes - 
 20 pinned SWE-bench Verified instances x 16 candidate models x 2 episodes - each run inside
@@ -40,7 +40,8 @@ One command, offline, credential-free - the shipped default is a static pin, so 
 is arithmetic over the published outcome matrix:
 
 ```bash
-uv run wmo reproduce run swe-bench
+# in the research repo: github.com/experientiallabs/research
+uv run reproduce run swe-bench
 ```
 
 Downloads the pinned matrix from

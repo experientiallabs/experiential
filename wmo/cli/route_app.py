@@ -42,13 +42,12 @@ if TYPE_CHECKING:
     # Type-only: real imports are local to the commands and helpers that construct or inspect
     # these values, so importing this module never pulls the optimize/engine/env/distill/pool
     # bodies behind it.
-    from llm_waterfall import ChatMaxTokensField
-
     from wmo.optimize.knn import DialResult, KnnFitOutcome
     from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
     from wmo.optimize.policy import RoutingPolicy
     from wmo.optimize.sweep import CandidateCoverage, DeferredRisk, SweepPlan, SweepRun
     from wmo.providers.pool import PoolEntry
+    from wmo.utils.waterfall import ChatMaxTokensField
 
 # The two output-budget parameter names any OpenAI-compatible backend accepts.
 _MAX_TOKENS_FIELDS: tuple[ChatMaxTokensField, ...] = ("max_tokens", "max_completion_tokens")
@@ -79,7 +78,7 @@ _WM_SIMULATED = "wm_simulated"
 _REAL_EPISODE = "real_episode"
 _DEFAULT_WM_JUDGE = "world-model verifier"
 
-COMPRESSOR_IDS_HELP = "identity | llmlingua2-endpoint | truncate"
+COMPRESSOR_IDS_HELP = "identity | truncate"
 """What `--compressor` accepts. Mirrors `wmo.optimize.compression.registered_compressor_ids()`."""
 
 _MATRIX_DIGEST_MARK = "sha256="
@@ -938,9 +937,7 @@ def convert_deepswe_cmd(
     from wmo.optimize.outcomes import OutcomeMatrix
 
     try:
-        result = convert_deepswe(
-            Path(source), embedding_cache=Path(embedding_cache), out=Path(out)
-        )
+        result = convert_deepswe(Path(source), embedding_cache=Path(embedding_cache), out=Path(out))
     except (FileNotFoundError, ValueError, KeyError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     top = top_arm(OutcomeMatrix.load(result.matrix_path))

@@ -1,10 +1,12 @@
-"""Tests for the vendored Hub read core: listing, fetching, atomicity, drift (no network).
+"""Tests for the vendored Hub read core: listing, fetching, atomicity (no network).
 
 This is the copy `pip install world-model-optimizer` actually runs, so it carries its own
-coverage rather than leaning on the member's. Two of these tests exist only because it IS a
-copy: `test_the_vendored_copy_has_not_drifted_from_its_origin` diffs the shared source regions
-against the member's file, and the data-root case pins the one line that could NOT be copied
-verbatim. Neither imports the member — nothing under `wmo/` does.
+coverage rather than leaning on the upstream distribution's. Nothing here imports
+`environment_capture`, and nothing under `wmo/` does either.
+
+There used to be a drift test diffing this file's shared regions against the in-repo
+`packages/environment-capture/` copy. That directory is gone, so the check could only ever
+skip; upstream now diverges by release, not by hand-mirrored edit.
 """
 
 from __future__ import annotations
@@ -169,6 +171,74 @@ def test_progress_counts_files_so_one_big_file_does_not_finish_the_bar(
     assert progress[-1] == (4.0, 4, 10_003)
 
 
+_PREBUILT = {
+    "traces.otel.jsonl": b"spans\n",
+    "models/tau-bench/config.toml": b'serve_provider = "bedrock"\n',
+    "models/tau-bench/card.json": b'{"name": "tau-bench"}',
+    "models/tau-bench/metrics.json": b"{}",
+    "models/tau-bench/prompts/base.txt": b"you are a backend\n",
+    "models/tau-bench/index/embeddings.npy": b"\x93NUMPY-ish",
+    "evals/default.toml": b'title = "Tau Bench default replay"\nfiles = ["../traces.otel.jsonl"]\n',
+}
+
+
+def test_fetch_downloads_the_prebuilt_model_and_eval_suites(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle is not just traces: the world model built from them and its suites ride along.
+
+    tau-bench declares no ``data_dirs``, which is the point: the artifact dirs are a property of
+    every bundle, not of a corpus spec, so a benchmark with no upstream payload still gets them.
+    """
+    _fake_hub(monkeypatch, _PREBUILT)
+
+    fetch_corpus("tau-bench")
+
+    bench = data_root / "tau-bench"
+    for remote_path, content in _PREBUILT.items():
+        assert (bench / remote_path).read_bytes() == content
+
+
+def test_fetch_places_artifacts_where_existing_discovery_looks(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The remote layout mirrors the local one, so nothing downstream needs a Hub special case.
+
+    This asserts against the REAL resolvers rather than restating paths: the store that every
+    read command walks (`<data root>/<benchmark>/models/<name>/`) and the suite glob
+    (`<root>/*/evals/*.toml`). Renaming either layout on the Hub breaks here instead of at a
+    user's first `wmo eval`.
+    """
+    from wmo.config.store import WorldModelStore
+    from wmo.engine.eval_suites import discover_eval_suites
+
+    _fake_hub(monkeypatch, _PREBUILT)
+
+    fetch_corpus("tau-bench")
+
+    assert WorldModelStore(data_root / "tau-bench").list_names() == ["tau-bench"]
+    suites = discover_eval_suites(data_root)
+    assert [suite.id for suite in suites] == ["tau-bench/default"]
+    # The suite's relative `files` resolve because corpus and suites land in one benchmark dir.
+    assert suites[0].resolve_files() == [data_root / "tau-bench" / "traces.otel.jsonl"]
+
+
+def test_fetch_keeps_a_local_artifact_unless_forced(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Local-first covers artifacts too: a model retuned in place is not published-over."""
+    _fake_hub(monkeypatch, _PREBUILT)
+    config = data_root / "tau-bench" / "models" / "tau-bench" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('serve_provider = "retuned-locally"\n')
+
+    fetch_corpus("tau-bench")
+    assert config.read_text() == 'serve_provider = "retuned-locally"\n'
+
+    fetch_corpus("tau-bench", force=True)
+    assert config.read_bytes() == _PREBUILT["models/tau-bench/config.toml"]
+
+
 def test_fetch_keeps_existing_local_files_unless_forced(
     data_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -214,46 +284,52 @@ def test_fetch_resumes_missing_files_inside_an_existing_dir(
 def test_fetch_with_dest_writes_only_the_corpus_file(
     data_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _fake_hub(monkeypatch, {"traces.otel.jsonl": b"spans\n", "data/train.jsonl": b"tasks\n"})
+    """An explicit `dest` asks for one file, so neither data nor artifact dirs are materialized
+    (they have nowhere sensible to go: their layout is relative to the benchmark dir)."""
+    _fake_hub(
+        monkeypatch,
+        {
+            "traces.otel.jsonl": b"spans\n",
+            "data/train.jsonl": b"tasks\n",
+            "models/gaia2/config.toml": b"top_k = 5\n",
+            "evals/default.toml": b"seed = 0\n",
+        },
+    )
     dest = tmp_path / "elsewhere" / "corpus.jsonl"
     assert fetch_corpus("gaia2", dest=dest) == dest
     assert dest.read_bytes() == b"spans\n"
     assert not (data_root / "gaia2" / "data").exists()
+    assert not (data_root / "gaia2" / "models").exists()
+    assert not (data_root / "gaia2" / "evals").exists()
 
 
-def test_fetch_falls_back_to_the_legacy_repo_name(
+def test_fetch_fails_plainly_when_the_repo_does_not_resolve(
     data_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The org's datasets are still published under the pre-rename ``wmh-`` name (the code
-    renamed wmh -> wmo, the Hub repos did not), so the canonical id 404s and the whole bundle
-    must come from the legacy repo instead of failing the download.
+    """One canonical name per benchmark: an unresolvable repo is an error, not a hunt.
 
-    This is the fix vendoring exists to ship: it landed in the member's 0.1.1, which was never
-    published, so until `wmo` owned this code no pip user's `wmo download` could resolve a
-    single one of the org's datasets.
+    The wmh-/wmo- fallback this test used to pin was dropped when the Hub repos were
+    renamed (2026-08-03); the Hub redirects the legacy ids, so the fallback's job moved
+    to the Hub itself and a miss here means the dataset genuinely is not published.
     """
-    canonical, legacy = candidate_repo_ids("gaia2")
+    (canonical,) = candidate_repo_ids("gaia2")
     calls = _fake_hub(
         monkeypatch,
-        {"traces.otel.jsonl": b"spans\n", "data/train.jsonl": b"tasks\n"},
-        live_repos={legacy},
+        {"traces.otel.jsonl": b"spans\n"},
+        live_repos=set(),
     )
 
-    path = fetch_corpus("gaia2")
+    with pytest.raises(CorpusRepoUnavailable):
+        fetch_corpus("gaia2")
 
-    assert path.read_bytes() == b"spans\n"
-    assert (data_root / "gaia2" / "data" / "train.jsonl").read_bytes() == b"tasks\n"
-    assert calls.trees == [canonical, legacy]
-    # every file streams from the repo that actually resolved, not the preferred name
-    assert set(calls.resolves) == {legacy}
+    assert calls.trees == [canonical]
 
 
 def test_fetch_asks_once_when_the_canonical_repo_resolves(
     data_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Catch-and-retry, not probe-then-fetch: once the Hub repos are renamed the fallback
-    costs nothing, because a resolving canonical id is never followed by a legacy lookup."""
-    canonical, _legacy = candidate_repo_ids("gaia2")
+    """A resolving canonical id is the only lookup: one name, one tree call."""
+    (canonical,) = candidate_repo_ids("gaia2")
     calls = _fake_hub(monkeypatch, {"traces.otel.jsonl": b"spans\n"}, live_repos={canonical})
 
     fetch_corpus("gaia2")
@@ -421,24 +497,24 @@ def test_published_corpora_maps_repos_to_benchmarks(monkeypatch: pytest.MonkeyPa
     assert published[0].repo_id == candidate_repo_ids("gaia2")[0]
 
 
-def test_published_corpora_accepts_the_legacy_repo_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`wmo download` with no arguments lists what the org publishes; everything it publishes
-    today still carries the pre-rename ``wmh-`` prefix, and dropping those empties the picker."""
+def test_published_corpora_ignores_legacy_prefixed_listings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-rename, a wmh-prefixed row in the org listing is stale and never offered.
+
+    Offering it would make the picker advertise a name fetch no longer tries; the Hub
+    redirect covers old CLIENTS, not old listings.
+    """
     listing = [
-        {"id": "experiential-labs/wmh-gaia2-traces", "lastModified": "2026-07-07T06:00:00.000Z"},
-        {
-            "id": "experiential-labs/wmh-bird-sql-traces",
-            "lastModified": "2026-07-05T00:00:00.000Z",
-        },
+        {"id": "experiential-labs/wmo-gaia2-traces", "lastModified": "2026-08-03T00:00:00.000Z"},
+        {"id": "experiential-labs/wmh-bird-sql-traces", "lastModified": "2026-07-05T00:00:00.000Z"},
         {"id": "experiential-labs/unrelated-dataset", "lastModified": "2026-07-06T00:00:00.000Z"},
-        {"id": "experiential-labs/wmh-not-a-benchmark-traces", "lastModified": ""},
     ]
     monkeypatch.setattr(hub, "_http_json_page", lambda url, *, token: (listing, None))
 
     published = published_corpora()
     assert [(c.benchmark, c.repo_id) for c in published] == [
-        ("gaia2", "experiential-labs/wmh-gaia2-traces"),
-        ("bird-sql", "experiential-labs/wmh-bird-sql-traces"),
+        ("gaia2", "experiential-labs/wmo-gaia2-traces"),
     ]
 
 
@@ -485,70 +561,29 @@ def test_published_corpora_follows_pagination(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_data_root_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Env override wins; a checkout resolves the CAPTURE MEMBER's dir; an installed wheel lands
-    bundles under the CWD, never inside site-packages.
+    """Env override wins; otherwise bundles land under the CWD, never inside site-packages.
 
-    The checkout branch is the line vendoring could not copy: the member finds that directory as
-    its own parent, `wmo/hub.py` is one level shallower and has to name it. Getting it wrong
-    would silently point the flagship at the repo root, where no benchmark dir exists.
+    There is no checkout special case any more: `packages/environment-capture/` is gone, so a
+    checkout and an installed wheel resolve identically. That makes the root CWD-relative, which
+    is the property worth pinning: `wmo download` and every later command that reads the bundle
+    have to run from the same directory, or `ENVCAP_DATA_ROOT` has to name a fixed path.
     """
     monkeypatch.setenv("ENVCAP_DATA_ROOT", str(tmp_path / "override"))
     assert hub._data_root() == tmp_path / "override"
 
     monkeypatch.delenv("ENVCAP_DATA_ROOT")
-    checkout = hub._data_root()
-    assert checkout == Path(hub.__file__).resolve().parents[1] / "packages" / "environment-capture"
-    assert (checkout / "pyproject.toml").exists()
-
-    site = tmp_path / "venv" / "site-packages" / "wmo"
-    site.mkdir(parents=True)
-    monkeypatch.setattr(hub, "__file__", str(site / "hub.py"))
     monkeypatch.chdir(tmp_path)
     assert hub._data_root() == tmp_path / "environment-capture-data"
 
+    # Where the module itself lives is irrelevant, so a pip user's bundles land in their project
+    # rather than inside site-packages.
+    site = tmp_path / "venv" / "site-packages" / "wmo"
+    site.mkdir(parents=True)
+    monkeypatch.setattr(hub, "__file__", str(site / "hub.py"))
+    assert hub._data_root() == tmp_path / "environment-capture-data"
 
-#: Source regions `wmo/hub.py` copied verbatim from the member and must keep copying verbatim,
-#: as (start marker, end marker) slices. Everything the two copies genuinely share lives here:
-#: the spec dataclass and the registry, the repo-name convention, and the prefix constants
-#: behind it. The rest of each file is allowed to differ — that is what "narrowed to what `wmo`
-#: consumes" means, and `_data_root` is deliberately not the same line in both.
-_SHARED_SOURCE_REGIONS = (
-    ("class CorpusSpec:", "class PublishedCorpus:"),
-    ("def candidate_repo_ids", "def _benchmark_from_repo_name"),
-    ("_REPO_PREFIXES", "_MISSING_REPO_CODES"),
-)
-
-
-def test_the_vendored_copy_has_not_drifted_from_its_origin() -> None:
-    """A vendored copy that drifts from its origin is worse than the import it replaced.
-
-    A benchmark registered on one side only makes `wmo download` and the member's capture
-    disagree about what exists; a repo-id rule that differs makes them look for the same bundle
-    under different dataset names. Both are silent until someone cannot find their data.
-
-    Compared as SOURCE TEXT, read off disk, rather than by importing the member: `wmo/` imports
-    nothing from `packages/`, tests included, and this test is not entitled to an exemption from
-    the rule the rest of the PR exists to establish. Text is also the stricter comparison — it
-    catches a comment or a docstring going stale, which a value check waves through.
-    """
-    copy_path = Path(hub.__file__).resolve()
-    member = (
-        copy_path.parents[1] / "packages" / "environment-capture" / "environment_capture/hub.py"
-    )
-    if not member.is_file():  # installed sdist, or the member is gone: nothing to compare
-        pytest.skip("the environment-capture member is not present in this tree")
-    origin = member.read_text(encoding="utf-8")
-    copy = copy_path.read_text(encoding="utf-8")
-    for start, end in _SHARED_SOURCE_REGIONS:
-        assert _region(copy, start, end) == _region(origin, start, end), (
-            f"wmo/hub.py drifted from the member's hub.py in the region {start!r}..{end!r}; "
-            "the two are hand-mirrored copies, so make the same edit in both (see the VENDORED "
-            "note at the top of wmo/hub.py)"
-        )
-
-
-def _region(source: str, start: str, end: str) -> str:
-    """The text of `source` from the line introducing `start` up to the one introducing `end`."""
-    assert start in source, f"marker {start!r} is gone; update _SHARED_SOURCE_REGIONS"
-    assert end in source, f"marker {end!r} is gone; update _SHARED_SOURCE_REGIONS"
-    return source[source.index(start) : source.index(end)]
+    # It tracks the CWD, not the repo: run from elsewhere and the root moves with you.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert hub._data_root() == elsewhere / "environment-capture-data"

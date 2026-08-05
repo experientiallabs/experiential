@@ -13,15 +13,6 @@ import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from llm_waterfall.types import (
-    ChatChoice,
-    ChatFunctionCall,
-    ChatMessage,
-    ChatRequest,
-    ChatResponse,
-    ChatToolCall,
-    ChatUsage,
-)
 
 from wmo.core.types import JsonObject
 from wmo.optimize.compression import (
@@ -63,6 +54,15 @@ from wmo.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
 from wmo.serving.query_embeddings import QUERY_EMBEDDING_FILENAME, QueryEmbeddingStore
 from wmo.serving.savings import EndpointSavings, SavingsWindow
 from wmo.tracking.pricing import ModelPrice
+from wmo.utils.waterfall.types import (
+    ChatChoice,
+    ChatFunctionCall,
+    ChatMessage,
+    ChatRequest,
+    ChatResponse,
+    ChatToolCall,
+    ChatUsage,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

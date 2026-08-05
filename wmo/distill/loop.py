@@ -82,7 +82,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, cast, runtime_checkable
 from uuid import uuid4
 
-from llm_waterfall.types import ChatMessage
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.config.store import validate_name
@@ -155,6 +154,7 @@ from wmo.providers.tinker import (
     shared_sampling_client,
     shared_service_client,
 )
+from wmo.utils.waterfall.types import ChatMessage
 
 if TYPE_CHECKING:
     import tinker

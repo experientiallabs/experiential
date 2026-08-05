@@ -134,7 +134,7 @@ def run_judge_quality(
 
 
 # --- The labeled suite ----------------------------------------------------------------------
-# Content is modeled on real steps from examples/ corpora (tau-bench flight tools, terminal-task
+# Content is modeled on real steps from the benchmark corpora (tau-bench flight tools, terminal-task
 # bash) so bands reflect the judge's actual input distribution, not toy strings.
 
 _RESERVATION_JSON = (

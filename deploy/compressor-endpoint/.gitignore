@@ -1,6 +1,0 @@
-# Only the PUBLIC half of the pinned certificate belongs in git. The private key is generated
-# on the box and never leaves it; this guard means a stray copy cannot be committed by accident.
-key.pem
-*key*.pem
-*.key
-env

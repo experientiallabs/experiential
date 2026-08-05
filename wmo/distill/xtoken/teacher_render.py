@@ -34,10 +34,10 @@ import json
 import logging
 from typing import Literal, Protocol
 
-from llm_waterfall.types import ChatMessage, ChatTool
 from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.distill.xtoken.byte_offsets import span_byte_ends
+from wmo.utils.waterfall.types import ChatMessage, ChatTool
 
 logger = logging.getLogger(__name__)
 

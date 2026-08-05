@@ -29,7 +29,6 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
-from llm_waterfall import ChatMaxTokensField
 from openai import OpenAI
 
 from wmo.providers import _openai_common
@@ -45,6 +44,7 @@ from wmo.providers.base import (
     normalize_chat_temperature,
     verify_via_ping,
 )
+from wmo.utils.waterfall import ChatMaxTokensField
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -72,7 +72,7 @@ _MAX_TOKENS_FIELD: ChatMaxTokensField = "max_tokens"
 # Bound every request the way the other OpenAI-shaped backends do: an upstream provider behind
 # OpenRouter can hold a connection open with no output, and an unbounded stall turns an eval
 # into a silent multi-hour hang. One same-endpoint retry, since cross-model failover is the
-# llm-waterfall chain's job (and OpenRouter's own `models` fallback list), not this client's.
+# waterfall chain's job (and OpenRouter's own `models` fallback list), not this client's.
 _TIMEOUT_SECONDS = 240.0
 _MAX_RETRIES = 1
 

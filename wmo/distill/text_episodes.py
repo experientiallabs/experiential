@@ -84,13 +84,13 @@ import logging
 from collections.abc import Iterable, Sequence
 from typing import Protocol
 
-from llm_waterfall.types import ChatMessage, ChatTool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wmo.distill.store import WarmupTrialsManifest
 from wmo.distill.tokens import TrialRecord
 from wmo.harness.runtime import StopReason
 from wmo.providers.tinker import TokenSpan
+from wmo.utils.waterfall.types import ChatMessage, ChatTool
 
 logger = logging.getLogger(__name__)
 

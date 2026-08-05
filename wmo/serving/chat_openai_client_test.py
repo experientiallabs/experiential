@@ -22,15 +22,6 @@ import openai
 import pytest
 import uvicorn
 from fastapi import FastAPI
-from llm_waterfall.types import (
-    ChatChoice,
-    ChatFunctionCall,
-    ChatMessage,
-    ChatRequest,
-    ChatResponse,
-    ChatToolCall,
-    ChatUsage,
-)
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam
 
 from wmo.optimize.policy import RoutingPolicy
@@ -48,6 +39,15 @@ from wmo.serving.chat import (
     RequestLog,
     create_chat_router,
     install_openai_error_shapes,
+)
+from wmo.utils.waterfall.types import (
+    ChatChoice,
+    ChatFunctionCall,
+    ChatMessage,
+    ChatRequest,
+    ChatResponse,
+    ChatToolCall,
+    ChatUsage,
 )
 
 

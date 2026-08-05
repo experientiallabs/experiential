@@ -51,7 +51,7 @@ Copies `.env.example` to `.env` if you have no `.env` yet (an existing one is ne
 runs `uv sync --extra dev`. Then fill in the credentials you actually have: `.env.example`
 documents each block inline, including which ones are optional and which single feature needs
 them. Bedrock or Anthropic direct is enough to get through steps 1 through 3; `TINKER_API_KEY` is
-step 4 only, and the `WMO_COMPRESSOR_*` block is step 5 only.
+step 4 only.
 
 There is nothing to verify yet, and that is fine. Credentials are exercised at first use, and the
 two places that spend money check theirs before they spend it. Step 2 live-pings every candidate
@@ -72,13 +72,16 @@ Get the corpus, then build:
 ```bash
 uv run wmo download tau-bench
 uv run wmo build \
-  --file packages/environment-capture/tau-bench/traces.otel.jsonl \
+  --file environment-capture-data/tau-bench/traces.otel.jsonl \
   --name tau-bench --fidelity low --embed-provider hashing
 ```
 
-`wmo download` fetches the published data bundle (trace corpus plus task data) into
-`packages/environment-capture/tau-bench/`; run it with no arguments for a picker over everything
-published. `--source` defaults to `otel-genai`, which is what that corpus is. Traces from an
+`wmo download` fetches the published data bundle into `environment-capture-data/tau-bench/`: the
+trace corpus, its task data, the `evals/` suites, and `models/` with the world models already built
+from that corpus (`wmo list --root environment-capture-data/tau-bench` shows them and their
+fidelity). Building your own below is the walk-through; the prebuilt one is there if you would
+rather skip to serving or scoring. Run `wmo download` with no arguments for a picker over
+everything published. `--source` defaults to `otel-genai`, which is what that corpus is. Traces from an
 observability stack (Phoenix, Langfuse, LangSmith, Braintrust, PostHog, Mastra) go through the
 same command with `--source <name>`, or through `wmo ingest` first.
 
@@ -145,7 +148,7 @@ Look at the thing before optimizing it:
 ```bash
 uv run wmo play --name tau-bench      # step in yourself
 uv run wmo demo --name tau-bench \
-  --traces packages/environment-capture/tau-bench/traces.otel.jsonl   # replay one, open loop
+  --traces environment-capture-data/tau-bench/traces.otel.jsonl   # replay one, open loop
 ```
 
 `wmo demo` needs the corpus because a build keeps no copy of the traces it read, only the prompts,
@@ -211,7 +214,7 @@ This is the whole routing workflow, and it has one question in it.
 
 ```bash
 uv run wmo optimize model tau-bench \
-  --traces packages/environment-capture/tau-bench/traces.otel.jsonl \
+  --traces environment-capture-data/tau-bench/traces.otel.jsonl \
   --scenarios 8
 ```
 
@@ -393,7 +396,7 @@ to any of them and the next `optimize model` run notices and resumes around it.
 ```bash
 # 1. buy the evidence (the only paid step)
 uv run wmo optimize route sweep tau-bench \
-  --traces packages/environment-capture/tau-bench/traces.otel.jsonl \
+  --traces environment-capture-data/tau-bench/traces.otel.jsonl \
   --pool .wmo/pool.toml --scenarios 8 --out matrix.json
 
 # 2. fit the policy
@@ -477,52 +480,7 @@ cost-aware policy would route everything to it. The re-run then re-sweeps the en
 refits, and traffic shifts to the student only on the cells where it earned them. A student that
 earns nothing changes nothing, which is the point of measuring rather than assuming.
 
-## Step 5 (optional): compress the prompt
-
-Compression is a stage in front of routing: request, then compress, then route, then call. It is
-**default-off**, and it should stay off in production until its accuracy gate passes. What
-follows is how to measure it, not a recommendation to ship it.
-
-Measure a compressed arm, then fit in the same geometry:
-
-```bash
-uv run wmo optimize route sweep tau-bench \
-  --traces packages/environment-capture/tau-bench/traces.otel.jsonl \
-  --compressor llmlingua2-endpoint --aggressiveness 0.4 --out matrix-c04.json
-
-uv run wmo optimize route fit matrix-c04.json --kind knn \
-  --compressor llmlingua2-endpoint --aggressiveness 0.4 \
-  --out .wmo/models/tau-bench/policy.json
-```
-
-`wmo optimize model tau-bench --compressor llmlingua2-endpoint --aggressiveness 0.4` runs that same
-pair end to end (the arm configures its sweep and its fit, and the compact row in the plan table
-names it), which is the one-command way to measure an arm once you know which one you want.
-
-One sweep per arm, one matrix per arm. `--aggressiveness` is a dial in `[0, 1]` where 0.0 is a
-no-op and higher never removes less, but it is not an exact removal fraction: the achieved ratio
-is recorded per episode. Available compressors are `identity`, `truncate`, and
-`llmlingua2-endpoint`; the last is a learned 177M-parameter classifier served from a GPU box and
-needs the `WMO_COMPRESSOR_*` variables from `.env.example`. It fails closed on an unreachable
-endpoint or a missing certificate rather than silently serving uncompressed text, because a
-compressor that degrades quietly makes every cost and accuracy result depend on the health of a
-box nobody was watching.
-
-**The arm must match the fit.** A fitted policy records the compression config its evidence was
-fitted under (`fit_compression`) alongside the config it would serve, and an endpoint whose two
-disagree does not mount at all. This is not pedantry: a bank, its centroids, and its novelty
-floor are geometry in the space of the text the fit embedded, and serving a different
-representation against them was measured to trip the novelty floor 10 to 13 times more often,
-collapse route-away, and raise cost 11 to 41 percent while accuracy sat flat to negative. That is
-a broken policy, not a degraded one. Refit under the serving config, or serve the config the
-artifact was fitted under. Static policies embed nothing and are exempt.
-
-Only user-message content is compressed. System prompts, the model's own prior replies, tool
-calls, and tool results pass through verbatim. And a compressor's own inference cost counts:
-effective cost per completed task includes it, so an arm that saves prompt tokens and pays more
-for the compressor than it saved has not saved anything.
-
-## Step 6: serve it
+## Step 5: serve it
 
 ```bash
 uv run wmo serve --name tau-bench
@@ -629,7 +587,8 @@ CI is wide; routed p95 latency is WORSE than the anchor's; the corpus mix is ~85
 ## Reproduce it with one command
 
 ```bash
-uv run wmo reproduce run tau-bench --yes
+# in the research repo: github.com/experientiallabs/research
+uv run reproduce run tau-bench --yes
 ```
 
 Downloads the public trace corpus, builds the world model, buys the 440-cell sweep against
@@ -637,7 +596,7 @@ live providers on a pinned public-route pool, fits, reports, and compares agains
 published row within stated tolerances. This is the PROTOCOL-exact reproduction: it spends
 real money (estimated ~$110; the command states it and refuses without `--yes`), providers
 are nondeterministic, and public prices drift - which is exactly what the tolerances in the
-shipped manifest encode. `wmo reproduce list` shows both reproduction classes.
+shipped manifest encode. `reproduce list` shows both reproduction classes.
 
 ## The real-episode leg, reproduced free
 
@@ -649,7 +608,8 @@ is glm-5.2 at −88%, unserveable until it has an authoritative price; the publi
 carries both, so the reproduction shows the gap. That leg is bit-exact and free to replay:
 
 ```bash
-uv run wmo reproduce run tau-bench-real
+# in the research repo: github.com/experientiallabs/research
+uv run reproduce run tau-bench-real
 ```
 
 Offline and credential-free (a static pin routes nothing, so the replay is arithmetic over

@@ -286,8 +286,8 @@ class SourceResolver:
     """Ground read-verb actions in the REAL file content at a pinned commit.
 
     `pins` maps a trace's instance id -> {repo, base_commit} (for swe-bench this is the
-    committed `examples/swe-bench/instance_commits.json`, built once from the public dataset —
-    any corpus whose traces can be pinned the same way gets the same machinery). Files are
+    `instance_commits.json` shipped in the swe-bench data bundle, built once from the public
+    dataset — any corpus whose traces can be pinned the same way gets the same machinery). Files are
     fetched keylessly from raw.githubusercontent.com, memoized per file, and sliced to the
     requested line range. Callers own the STALENESS GATE: never resolve a path the session has
     already touched — the pinned content is wrong the moment the agent edits the file (verified

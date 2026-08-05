@@ -12,7 +12,7 @@ never-silently-switch-models invariant while surviving capacity pressure over an
 This is deliberately NOT in `wmo.providers`: main removed the programmatic `FallbackProvider` in
 favour of `.wmo/fallback.toml`, and this seam exists only because the grid composes pre-built
 providers (metered/capped wrappers, injected fakes in tests) into same-model chains. Capacity
-classification is reused from the shared llm-waterfall package (`is_capacity_error`), not
+classification is reused from the shared waterfall module (`is_capacity_error`), not
 re-implemented here.
 """
 
@@ -20,9 +20,8 @@ from __future__ import annotations
 
 import re
 
-from llm_waterfall import is_capacity_error
-
 from wmo.providers.base import Completion, Message, Provider, ProviderConfig
+from wmo.utils.waterfall import is_capacity_error
 
 
 def anthropic_direct_id(bedrock_model: str) -> str | None:
@@ -48,7 +47,7 @@ class SameModelFailover:
 
     Every rung MUST serve the same underlying model (a Bedrock model, its direct-Anthropic twin, or
     the same model in another region) - the chain spreads throttling load without changing what is
-    measured. Capacity errors (throttling, transient 5xx, timeouts - see llm-waterfall's
+    measured. Capacity errors (throttling, transient 5xx, timeouts - see waterfall's
     `is_capacity_error`) spill to the next rung; a real error (bad request, auth) propagates
     immediately, and the last rung's error surfaces when the whole chain is capacity-constrained.
     """

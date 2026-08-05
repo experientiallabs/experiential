@@ -1218,7 +1218,7 @@ def test_disabled_entry_still_validates_loudly(tmp_path: Path) -> None:
         ("http://host.docker.internal:11434/v1", True),
         ("http://silens-mac.local:11434/v1", True),
         ("https://api.openai.com/v1", False),
-        ("https://40.80.93.150:8443", False),
+        ("https://203.0.113.10:8443", False),
         (None, False),
         ("", False),
     ],
@@ -1281,4 +1281,27 @@ def test_reasoning_effort_validates_at_load_not_first_request() -> None:
             kind=ProviderKind.BEDROCK,
             model="us.anthropic.claude-opus-4-8",
             reasoning_effort="max",
+        )
+
+
+def test_xhigh_is_accepted_for_openai_and_refused_for_anthropic() -> None:
+    """`xhigh` is the GPT-5.6 rung between high and max; Anthropic's dial has no such value,
+    so an Anthropic entry carrying it is a mis-mapped arm that must fail at load."""
+    assert (
+        PoolEntry(
+            name="sol@xhigh",
+            kind=ProviderKind.OPENAI,
+            model="gpt-5.6-sol",
+            reasoning_effort="xhigh",
+        )
+        .provider_config()
+        .reasoning_effort
+        == "xhigh"
+    )
+    with pytest.raises(ValidationError, match="xhigh"):
+        PoolEntry(
+            name="sonnet-5@xhigh",
+            kind=ProviderKind.ANTHROPIC,
+            model="claude-sonnet-5",
+            reasoning_effort="xhigh",
         )

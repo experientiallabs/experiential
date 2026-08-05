@@ -7,11 +7,11 @@ import uuid
 from pathlib import Path
 
 import tomli_w
-from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, Field, ValidationError
 
 from wmo.config.config import ARTIFACT_DIR
 from wmo.core.files import write_text_atomic
+from wmo.utils.waterfall import ChatMaxTokensField
 
 SETTINGS_FILENAME = "settings.toml"
 

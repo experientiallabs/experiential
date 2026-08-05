@@ -32,7 +32,6 @@ from typing import Literal, NamedTuple
 from urllib.parse import urlsplit
 
 import tomli_w
-from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_core import ErrorDetails
 
@@ -49,6 +48,7 @@ from wmo.providers.base import (
 from wmo.providers.openrouter_pricing import resolve_price as resolve_openrouter_price
 from wmo.providers.registry import get_provider
 from wmo.tracking.pricing import ModelPrice, price_for
+from wmo.utils.waterfall import ChatMaxTokensField
 
 DEFAULT_POOL_PATH = Path(".wmo/pool.toml")
 
@@ -98,7 +98,9 @@ class PoolEntry(BaseModel):
     # adaptive thinking's `output_config.effort` (low|medium|high|max, probed live
     # 2026-07-29). Two entries differing only in effort are two ARMS with one runtime
     # model id - the router-vs-router comparison's whole premise.
-    reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = None
+    # `xhigh` is the GPT-5.6 family's rung between high and max and is OPENAI-ONLY:
+    # Anthropic's dial has no such value, hence the per-kind check below.
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] | None = None
     input_per_mtok: float | None = None
     output_per_mtok: float | None = None
     cached_input_per_mtok: float | None = None  # provider cache-read price, USD per 1M tokens
@@ -114,6 +116,13 @@ class PoolEntry(BaseModel):
                 f"pool entry {self.name!r}: reasoning_effort is not supported on bedrock "
                 "(Converse has no effort dial); route effort-dialed Claude through the "
                 "direct anthropic kind instead"
+            )
+        # Same fail-at-LOAD reason: `xhigh` exists only on the GPT-5.6 family, so an Anthropic
+        # entry carrying it is a mis-mapped arm that would 400 on every cell of a sweep.
+        if self.reasoning_effort == "xhigh" and self.kind == ProviderKind.ANTHROPIC:
+            raise ValueError(
+                f"pool entry {self.name!r}: reasoning_effort='xhigh' is OpenAI-only "
+                "(Anthropic's effort dial is low|medium|high|max); use 'high' or 'max'"
             )
         return self
 

@@ -1,7 +1,10 @@
-"""Agent definitions and project-backed session execution."""
+"""Built-in agent definitions.
+
+The optimizer, meta, and project agents moved to the agent-optimization repo with
+the harness-search program; what ships here is the default agent the playground
+and distillation seed from.
+"""
 
 from wmo.agents.default import default_agent
-from wmo.agents.meta import meta_agent
-from wmo.agents.project import AgentProject, AgentProjectRun
 
-__all__ = ["AgentProject", "AgentProjectRun", "default_agent", "meta_agent"]
+__all__ = ["default_agent"]
