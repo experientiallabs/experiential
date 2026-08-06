@@ -774,6 +774,30 @@ class _FakeReader:
         pass
 
 
+def test_stdin_reader_marks_a_piped_turn_before_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        closed = False
+
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def send_user_message(self, text: str) -> str:
+            self.messages.append(text)
+            return "msg-1"
+
+    session = _Session()
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO("fix the tests\n"))
+    reader = mod.StdinCommandReader(cast("mod.live_session.LiveSession", session))
+
+    reader.run()
+
+    assert session.messages == ["fix the tests"]
+    assert reader.submitted.is_set()
+    assert reader.eof.is_set()
+
+
 def _patch_driver_boundaries(
     monkeypatch: pytest.MonkeyPatch,
     channel: _FakeChannel,
@@ -842,6 +866,52 @@ def test_local_driver_treats_an_empty_task_as_no_opening_turn_at_eof() -> None:
     driver._loop(cast("mod.live_session.LiveSession", session), stdin_eof)
 
     assert driver._instruction is None
+    assert session.ends == 1
+
+
+def test_local_driver_waits_for_a_piped_turn_to_return_idle_at_eof() -> None:
+    class _PipedTurnSession:
+        def __init__(self) -> None:
+            self.closed = False
+            self.status = "idle"
+            self.pumps = 0
+            self.ends = 0
+
+        def pump(self, timeout: float = 0.2) -> bool:
+            _ = timeout
+            self.pumps += 1
+            assert self.pumps <= 3, "the piped turn must end after returning to idle"
+            if self.pumps == 2:
+                self.status = "running"
+            elif self.pumps == 3:
+                self.status = "idle"
+            return True
+
+        def end(self) -> None:
+            self.ends += 1
+            self.closed = True
+
+    driver = mod.LocalLiveDriver(
+        jail_root=Path.cwd(),
+        doc=HarnessDoc.baseline("test"),
+        provider=_FakeProvider(),
+        worker_fn=None,
+        recorder=None,
+        instruction=None,
+    )
+    session = _PipedTurnSession()
+    stdin_eof = threading.Event()
+    stdin_eof.set()
+    stdin_submitted = threading.Event()
+    stdin_submitted.set()
+
+    driver._loop(
+        cast("mod.live_session.LiveSession", session),
+        stdin_eof,
+        stdin_submitted,
+    )
+
+    assert session.pumps == 3
     assert session.ends == 1
 
 

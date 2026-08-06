@@ -476,6 +476,7 @@ class StdinCommandReader(threading.Thread):
         """Read stdin on a daemon thread; the session's intents are thread-safe."""
         super().__init__(daemon=True)
         self._session = session
+        self.submitted = threading.Event()
         self.eof = threading.Event()
 
     def run(self) -> None:
@@ -491,8 +492,9 @@ class StdinCommandReader(threading.Thread):
                 self._session.interrupt()
             elif line:
                 self._session.send_user_message(line)
-        # The driver owns EOF handling. For a one-shot ``--task`` it must wait
-        # until the opening turn returns to idle before ending the session.
+                self.submitted.set()
+        # The driver owns EOF handling. It must wait until any submitted turn
+        # returns to idle before ending the session.
         self.eof.set()
 
 
@@ -558,7 +560,8 @@ class LocalLiveDriver:
             reader = StdinCommandReader(session)
             reader.start()
             stdin_eof = getattr(reader, "eof", threading.Event())
-            self._loop(session, stdin_eof)
+            stdin_submitted = getattr(reader, "submitted", threading.Event())
+            self._loop(session, stdin_eof, stdin_submitted)
             if session.status == "failed":
                 error = "local live session runner failed"
                 reason = "error"
@@ -578,8 +581,14 @@ class LocalLiveDriver:
         """Run one tool locally (each tool blocks the session pump)."""
         return self._executor(name, args, emit)
 
-    def _loop(self, session: live_session.LiveSession, stdin_eof: threading.Event) -> None:
-        """Pump until closed, treating closed stdin as one-shot after ``--task``."""
+    def _loop(
+        self,
+        session: live_session.LiveSession,
+        stdin_eof: threading.Event,
+        stdin_submitted: threading.Event | None = None,
+    ) -> None:
+        """Pump until closed, treating closed stdin as one-shot after the final turn."""
+        stdin_submitted = stdin_submitted or threading.Event()
         last_tick = 0.0
         saw_running = False
         end_sent = False
@@ -592,7 +601,10 @@ class LocalLiveDriver:
             if (
                 stdin_eof.is_set()
                 and not end_sent
-                and (self._instruction is None or (saw_running and session.status == "idle"))
+                and (
+                    (self._instruction is None and not stdin_submitted.is_set())
+                    or (saw_running and session.status == "idle")
+                )
             ):
                 session.end()
                 end_sent = True
