@@ -217,6 +217,9 @@ class LocalPiRunInfo(BaseModel):
     status: str
     worker_provider: str
     worker_model: str
+    # Newer platforms resolve deployment-owned limits next to the worker credentials. Older
+    # deployments omit this field, so the CLI retains an identity-based best-effort fallback.
+    context_window: int | None = None
 
 
 def fetch_cli_config(web_url: str, *, transport: httpx.BaseTransport | None = None) -> str | None:

@@ -197,6 +197,9 @@ class _FakeClient:
         self.closed = False
         self.local_pi_created: list[str] = []
         self.local_pi_finished: list[str] = []
+        self.local_pi_worker_provider = "bedrock"
+        self.local_pi_worker_model = "claude-haiku-4-5"
+        self.local_pi_context_window: int | None = None
 
     def resolve_run_target(self, target_id: str) -> object:
         return type(
@@ -207,7 +210,14 @@ class _FakeClient:
 
     def create_local_pi_run(self, org_id: str) -> object:
         self.local_pi_created.append(org_id)
-        return type("Run", (), {"id": "run-1"})()
+        return mod.platform_client.LocalPiRunInfo(
+            id="run-1",
+            org_id=org_id,
+            status="running",
+            worker_provider=self.local_pi_worker_provider,
+            worker_model=self.local_pi_worker_model,
+            context_window=self.local_pi_context_window,
+        )
 
     def complete_local_pi_worker(
         self,
@@ -483,6 +493,8 @@ def test_build_driver_logged_in_bare_run_uses_platform_proxy(
         lambda: credentials,
     )
     client = _FakeClient()
+    client.local_pi_worker_provider = "tinker"
+    client.local_pi_worker_model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16:peft:65536"
     monkeypatch.setattr(
         "wmo.runtime.platform.client.PlatformClient",
         lambda *_args, **_kwargs: client,
@@ -499,6 +511,7 @@ def test_build_driver_logged_in_bare_run_uses_platform_proxy(
     assert isinstance(driver, mod.LocalLiveDriver)
     assert driver._provider is None
     assert driver._worker_fn is not None
+    assert driver._context_window == 65_536
     assert isinstance(driver._recorder, mod.LocalPiRunRecorder)
     assert client.local_pi_created == ["org-1"]
 
@@ -794,6 +807,42 @@ def test_local_driver_boots_sends_task_and_closes_process(
 
     assert _FakeLiveSession.sent == ["inspect the repo"]
     assert channel.closed
+
+
+def test_local_driver_treats_an_empty_task_as_no_opening_turn_at_eof() -> None:
+    class _IdleSession:
+        def __init__(self) -> None:
+            self.closed = False
+            self.status = "idle"
+            self.pumps = 0
+            self.ends = 0
+
+        def pump(self, timeout: float = 0.2) -> bool:
+            _ = timeout
+            self.pumps += 1
+            assert self.pumps == 1, "an empty one-shot task must end on its first idle pump"
+            return True
+
+        def end(self) -> None:
+            self.ends += 1
+            self.closed = True
+
+    driver = mod.LocalLiveDriver(
+        jail_root=Path.cwd(),
+        doc=HarnessDoc.baseline("test"),
+        provider=_FakeProvider(),
+        worker_fn=None,
+        recorder=None,
+        instruction="",
+    )
+    session = _IdleSession()
+    stdin_eof = threading.Event()
+    stdin_eof.set()
+
+    driver._loop(cast("mod.live_session.LiveSession", session), stdin_eof)
+
+    assert driver._instruction is None
+    assert session.ends == 1
 
 
 def test_ctrl_c_escalation_resets_after_the_turn_returns_idle() -> None:

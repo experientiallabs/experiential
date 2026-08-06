@@ -45,6 +45,7 @@ import queue
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal, cast
@@ -222,6 +223,7 @@ class LiveSession:
         self._reset_cancel = reset_cancel
 
         self._inbox: queue.Queue[_Intent] = queue.Queue()
+        self._deferred_messages: deque[_UserMessage] = deque()
         self._interrupt_requested = threading.Event()
         self._session_id = uuid.uuid4().hex
         self._status: str = "starting"
@@ -350,22 +352,13 @@ class LiveSession:
             except queue.Empty:
                 return
             if isinstance(intent, _UserMessage):
-                with self._turn_lock:
-                    # An idle boundary may race ahead of an already queued message. Preserve the
-                    # input as a fresh prompt rather than dropping it; its generation still lets
-                    # a stale interrupt queued before it be distinguished from one queued after.
-                    if not self._turn_active:
-                        self._turn_active = True
-                        self._turn_generation = max(self._turn_generation, intent.generation)
-                self._actions_this_turn = 0
-                # NB: do not clear `_aborting` here - a new message can be drained before
-                # the cancelled turn's in-flight submit frame is read, and clearing now
-                # would let that stale submit emit. The runner's next `state` frame (the
-                # real turn boundary) clears it in `_on_state`.
-                self._emit("user_message", {"msg_id": intent.msg_id, "text": intent.text})
-                self._safe_send(
-                    {"type": "user_message", "msg_id": intent.msg_id, "text": intent.text}
-                )
+                if self._aborting:
+                    # The peer still reports running until the aborted prompt reaches its idle
+                    # boundary. Sending now would turn this next instruction into a steer that
+                    # clearAllQueues discards, so hold it and start it from `_on_state` instead.
+                    self._deferred_messages.append(intent)
+                    continue
+                self._send_user_message(intent)
             elif isinstance(intent, _Interrupt):
                 with self._turn_lock:
                     targets_active_turn = (
@@ -531,6 +524,22 @@ class LiveSession:
         if isinstance(cleared, list) and cleared:
             payload["cleared_steers"] = cleared
         self._emit("state", payload)
+        if self._status == "idle":
+            while self._deferred_messages:
+                self._send_user_message(self._deferred_messages.popleft())
+
+    def _send_user_message(self, intent: _UserMessage) -> None:
+        """Send one queued message once it is safe for the peer to start or steer a turn."""
+        with self._turn_lock:
+            # An idle boundary may race ahead of an already queued message. Preserve the input as
+            # a fresh prompt rather than dropping it; its generation still distinguishes stale
+            # interrupts queued before it from a stop queued afterward.
+            if not self._turn_active:
+                self._turn_active = True
+                self._turn_generation = max(self._turn_generation, intent.generation)
+        self._actions_this_turn = 0
+        self._emit("user_message", {"msg_id": intent.msg_id, "text": intent.text})
+        self._safe_send({"type": "user_message", "msg_id": intent.msg_id, "text": intent.text})
 
     def _emit_assistant(self, completion: ChatResponse) -> None:
         if not completion.choices:

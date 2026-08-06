@@ -51,6 +51,7 @@ from wmo.common.vendor.waterfall import ChatRequest, ChatResponse
 from wmo.runtime.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
 from wmo.runtime.harness.live_session import SessionEvent, ToolOutcome
 from wmo.runtime.harness.pi_vendor import pi_agent_code_surfaces
+from wmo.runtime.harness.runner_link import provider_context_window
 from wmo.runtime.harness.tools import READ_SKILL, resolve_tools
 from wmo.simulation.model.play import parse_action
 
@@ -507,6 +508,7 @@ class LocalLiveDriver:
         worker_fn: Callable[[ChatRequest], ChatResponse] | None,
         recorder: RunRecorder | None,
         instruction: str | None,
+        context_window: int | None = None,
     ) -> None:
         """Configure the driver; ``run`` performs boot, loop, and teardown."""
         self._jail = jail_root
@@ -514,7 +516,8 @@ class LocalLiveDriver:
         self._provider = provider
         self._worker_fn = worker_fn
         self._recorder = recorder
-        self._instruction = instruction
+        self._instruction = instruction or None
+        self._context_window = context_window
         self._executor = LocalToolExecutor(jail_root)
         self._channel: pi_local.LocalStdioChannel | None = None
         self._interrupts = 0
@@ -541,6 +544,7 @@ class LocalLiveDriver:
                 worker_fn=self._worker_fn,
                 max_output_tokens=self._doc.max_output_tokens(),
                 temperature=self._doc.temperature(),
+                context_window=self._context_window,
                 cancel_active=self._executor.cancel,
                 reset_cancel=self._executor.reset_cancel,
             )
@@ -845,6 +849,40 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
     return built
 
 
+def _platform_worker_context_window(run: platform_client.LocalPiRunInfo) -> int | None:
+    """Resolve the context guard for the platform-selected worker without using its credentials.
+
+    A current platform may return the deployment-owned value directly. For older deployments,
+    Tinker catalog identities can carry their served tier as the final numeric suffix; otherwise
+    use the same provider capability probe as local pi execution. That probe is best-effort and
+    degrades to the runner fallback when the local machine cannot inspect a platform-owned backend.
+    """
+    if run.context_window is not None:
+        return run.context_window if run.context_window >= 1024 else None
+    try:
+        kind = ProviderKind(run.worker_provider)
+    except ValueError:
+        return None
+    if kind is ProviderKind.TINKER:
+        raw_tier = run.worker_model.rsplit(":", 1)[-1]
+        with contextlib.suppress(ValueError):
+            declared = int(raw_tier)
+            if declared >= 1024:
+                return declared
+    spec = resolve_provider_model(kind, run.worker_model)
+    try:
+        worker = provider_registry.get_provider(
+            ProviderConfig(
+                kind=kind,
+                model_type=spec.model_type,
+                model=spec.model_id,
+            )
+        )
+    except Exception:  # noqa: BLE001 - capability discovery must not block a proxied run
+        return None
+    return provider_context_window(worker)
+
+
 _TARGET_ARG = typer.Argument(
     help="Platform run-target id. Omit it to run the built-in pi harness locally."
 )
@@ -983,6 +1021,7 @@ def _build_driver(
             worker_fn=built_in_worker,
             recorder=recorder,
             instruction=task,
+            context_window=_platform_worker_context_window(run),
         )
 
     if not logged_in:

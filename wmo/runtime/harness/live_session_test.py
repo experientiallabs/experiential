@@ -544,13 +544,13 @@ def test_submit_after_state_boundary_is_not_suppressed() -> None:
 
 
 def test_stale_submit_after_a_quick_next_message_is_still_suppressed() -> None:
-    """A cancelled turn's in-flight submit is suppressed even if the user already sent a new
-    message: only the runner's next state frame (the turn boundary) clears the abort gate."""
+    """Hold the next message until idle while suppressing the cancelled turn's stale submit."""
     channel = ScriptedChannel(
         [
             {"type": "state", "status": "idle"},
-            # The cancelled turn's submit arrives AFTER the user's next message was drained.
             {"type": "tool_request", "req_id": 1, "name": "submit", "arguments": {"answer": "x"}},
+            {"type": "state", "status": "idle", "reason": "aborted"},
+            {"type": "state", "status": "running"},
         ]
     )
     events: list[SessionEvent] = []
@@ -560,6 +560,19 @@ def test_stale_submit_after_a_quick_next_message_is_still_suppressed() -> None:
     session.interrupt()
     session.send_user_message("do the next thing")  # queued before the stale submit is read
     events.clear()
+
+    session.pump(timeout=0)  # suppress the stale submit; the next instruction remains held
+    sent_messages = [
+        str(frame["text"]) for frame in channel.sent if frame["type"] == "user_message"
+    ]
+    assert sent_messages == ["first"]
+
+    session.pump(timeout=0)  # idle is the boundary that releases the next instruction
+    sent_messages = [
+        str(frame["text"]) for frame in channel.sent if frame["type"] == "user_message"
+    ]
+    assert sent_messages == ["first", "do the next thing"]
+
     _drain(session)
     assert not any(e.kind == "submit" for e in events)  # stale submit stays suppressed
 
