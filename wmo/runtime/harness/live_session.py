@@ -260,6 +260,12 @@ class LiveSession:
         return self._failure_message
 
     @property
+    def turn_active(self) -> bool:
+        """Return whether a user turn is queued or running, independent of peer state lag."""
+        with self._turn_lock:
+            return self._turn_active
+
+    @property
     def last_completed_message_id(self) -> str | None:
         """Return the last user message acknowledged by a terminal idle frame."""
         return self._last_completed_message_id

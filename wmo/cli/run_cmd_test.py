@@ -740,6 +740,22 @@ def test_run_command_dispatches_bare_path_after_consent(
     assert "THIS machine" in result.output
 
 
+def test_local_consent_renders_the_jail_path_literally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jail = tmp_path / "[" / "items]"
+    jail.mkdir(parents=True)
+    console = Console(file=io.StringIO(), width=200, color_system=None)
+    monkeypatch.setattr(mod, "_console", console)
+
+    mod._confirm_local_execution(jail, yes=True)
+
+    output = cast("io.StringIO", console.file).getvalue()
+    assert str(jail) in output
+    assert "THIS machine" in output
+
+
 def test_run_command_rejects_a_directory_for_platform_target(tmp_path: Path) -> None:
     result = CliRunner().invoke(app, ["run", "wm-1", "--dir", str(tmp_path)])
 
@@ -1008,7 +1024,8 @@ def test_local_driver_drains_a_delayed_piped_turn_before_eof_shutdown() -> None:
 
 def test_ctrl_c_escalation_resets_after_the_turn_returns_idle() -> None:
     class _Session:
-        status = "running"
+        status = "idle"  # the peer's running acknowledgement can lag the queued turn
+        turn_active = True
 
         def __init__(self) -> None:
             self.interrupts = 0
@@ -1032,10 +1049,42 @@ def test_ctrl_c_escalation_resets_after_the_turn_returns_idle() -> None:
 
     driver._handle_sigint(cast("mod.live_session.LiveSession", session))
     driver._on_running(False)
-    session.status = "running"
+    session.turn_active = True
     driver._handle_sigint(cast("mod.live_session.LiveSession", session))
 
     assert session.interrupts == 2
+    assert session.ends == 0
+
+
+def test_ctrl_c_while_truly_idle_does_not_arm_the_next_press() -> None:
+    class _Session:
+        turn_active = False
+
+        def __init__(self) -> None:
+            self.interrupts = 0
+            self.ends = 0
+
+        def interrupt(self) -> None:
+            self.interrupts += 1
+
+        def end(self) -> None:
+            self.ends += 1
+
+    driver = mod.LocalLiveDriver(
+        jail_root=Path.cwd(),
+        doc=HarnessDoc.baseline("test"),
+        provider=_FakeProvider(),
+        worker_fn=None,
+        recorder=None,
+        instruction=None,
+    )
+    session = _Session()
+
+    driver._handle_sigint(cast("mod.live_session.LiveSession", session))
+    session.turn_active = True
+    driver._handle_sigint(cast("mod.live_session.LiveSession", session))
+
+    assert session.interrupts == 1
     assert session.ends == 0
 
 

@@ -643,7 +643,7 @@ class LocalLiveDriver:
 
     def _handle_sigint(self, session: live_session.LiveSession) -> None:
         """First Ctrl-C interrupts the current turn; a second ends the session."""
-        if session.status != "running":
+        if not session.turn_active:
             self._interrupts = 0
             _console.print("\n[yellow]no active turn (:quit to end)[/yellow]")
             return
@@ -991,10 +991,16 @@ def register(app: typer.Typer) -> None:
 def _confirm_local_execution(jail_root: Path, *, yes: bool) -> None:
     """Warn that harness code and bash run with local user permissions."""
     _console.print(
-        "[bold yellow]The built-in pi harness and its shell commands run on THIS machine"
-        "[/bold yellow].\n"
-        f"File tools stay under {jail_root}, and bash starts there, but bash is not "
-        "OS-sandboxed and can access anything your user can."
+        Text.assemble(
+            (
+                "The built-in pi harness and its shell commands run on THIS machine",
+                "bold yellow",
+            ),
+            ".\nFile tools stay under ",
+            str(jail_root),
+            ", and bash starts there, but bash is not OS-sandboxed and can access anything your "
+            "user can.",
+        )
     )
     if not yes and not typer.confirm("continue?"):
         raise typer.Exit(code=1)
