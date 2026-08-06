@@ -42,6 +42,10 @@ uv run pytest -q
 
 ## Worker-agent execution
 
+- Agent execution code lives under `wmo/runtime/`: built-in agents, the generic episode contract,
+  harness documents and execution, hosted platform transport, run transport, and real-agent
+  evaluation adapters. Optimization may depend on this package; runtime code must not depend on
+  optimization algorithms.
 - Keep `wmo run` as the primary supported execution surface. Bare runs use the built-in local pi
   harness; platform ids resolve to hosted world-model or agent sessions. Add another public entry
   point only for a distinct user need, with consistent lifecycle and safety behavior.
@@ -67,11 +71,9 @@ uv run pytest -q
 
 - Harness-search optimization (`wmo optimize harness`, world-model delta search, the harbor
   population search, live agent sessions) moved to the private `agent-optimization` repo
-  (2026-08-03). What stays here is the execution seam it builds on:
-  `wmo/optimize/harness/` holds the episode runtime, `HarnessDoc`, scoring, the store, and the
-  sandbox plumbing, because
-  closed-loop eval and distillation run and score agent episodes. Do not grow search or
-  mutation machinery back into this repo.
+  (2026-08-03). `wmo/runtime/harness/` holds the episode runtime, `HarnessDoc`, scoring, the store,
+  and sandbox plumbing used by closed-loop evaluation and distillation. Do not grow search or
+  mutation machinery back into this repository or place runtime code under `wmo/optimize/`.
 - `wmo optimize model <world-model>` is the staged one-command path over the routing surface:
   preflight, sweep, fit, tune, report, each stage calling the same library function its manual
   `wmo optimize route` command calls, so consent, metering, and artifacts stay single-sourced. It
@@ -148,13 +150,12 @@ uv run pytest -q
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
    JSON use pydantic's `JsonValue` (see `wmo/core/types.py:JsonObject`), not `Any`.
 
-4. **Keep the structure coherent and the command surface intentional.** Code is organized into
-   domain subpackages under `wmo/` (`core`, `config`, `providers`, `ingest`, `retrieval`,
-   `optimize`, `engine`, `serving`, `cli`). Add a CLI command when it represents a clear user
+4. **Keep the structure coherent and the command surface intentional.** Agent execution is nested
+   under `wmo/runtime/`; routing and model optimization are nested under `wmo/optimize/`. The
+   remaining world-model and shared packages are being consolidated separately and retain their
+   current roots until those moves land. Add a CLI command when it represents a clear user
    workflow; avoid both unrelated command sprawl and hiding useful behavior behind internal APIs.
-   Optimization domains are nested one level deeper: routing in `wmo/optimize/routing/`, model
-   training in `wmo/optimize/model/`, and harness artifacts and execution in
-   `wmo/optimize/harness/`. Do not add optimization domains back to the flat `wmo/` namespace.
+   Do not return runtime or optimization domains to the flat `wmo/` namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
    `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.

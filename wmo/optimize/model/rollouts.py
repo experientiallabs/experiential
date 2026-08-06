@@ -60,11 +60,11 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.core.types import JsonObject
-from wmo.optimize.harness.doc import HarnessDoc
-from wmo.optimize.harness.runtime import StopReason
 from wmo.optimize.model.config import DistillConfig
 from wmo.optimize.model.tokens import TrialRecord, assemble_harbor_trial_records
 from wmo.providers.base import ProviderConfig, ProviderKind
+from wmo.runtime.harness.doc import HarnessDoc
+from wmo.runtime.harness.runtime import StopReason
 
 if TYPE_CHECKING:
     from harbor.models.job.config import JobConfig
@@ -330,7 +330,7 @@ class RolloutStats(BaseModel):
     `solve_rate`.
 
     Same trials, read at test resolution instead of the benchmark's one bit (see
-    `wmo.optimize.harness.scoring.GradedTests`). `solve_rate` stays the headline because binary IS
+    `wmo.runtime.harness.scoring.GradedTests`). `solve_rate` stays the headline because binary IS
     the benchmark's definition of success; this exists because a small binary holdout cannot
     resolve a real effect. On the 48-episode TerminalBench-2 probe it reads 0.319 against a 0.217
     binary solve
@@ -643,7 +643,7 @@ def collect_harbor_rollouts(
         import yaml
         from harbor.models.job.config import JobConfig
 
-        from wmo.evals.harbor.scorer import HarborScorer
+        from wmo.runtime.evaluation.harbor.scorer import HarborScorer
     except ImportError as error:
         raise ImportError(MISSING_HARBOR_EXTRA) from error
 

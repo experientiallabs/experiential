@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from wmo.engine.world_model import WorldModel
 from wmo.env.base import WorldModelEnv
-from wmo.env.episode import Agent, run_episode
+from wmo.runtime.episode import Agent, run_episode
 from wmo.scenarios.synthesis import EvalScenario
 from wmo.scenarios.verification import ChecklistJudge
 

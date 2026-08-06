@@ -86,10 +86,10 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from wmo.optimize.harness.runtime import StopReason
 from wmo.optimize.model.store import WarmupTrialsManifest
 from wmo.optimize.model.tokens import TrialRecord
 from wmo.providers.tinker import TokenSpan
+from wmo.runtime.harness.runtime import StopReason
 from wmo.utils.waterfall.types import ChatMessage, ChatTool
 
 logger = logging.getLogger(__name__)

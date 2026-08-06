@@ -23,7 +23,6 @@ from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
 from wmo.engine.world_model import WorldModel
-from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.model.store import DistillModelCard
 from wmo.optimize.reward import EpisodeScore
@@ -52,6 +51,7 @@ from wmo.providers.base import (
 from wmo.providers.openrouter import OPENROUTER_API_KEY_ENV
 from wmo.providers.pool import PoolEntry, load_pool
 from wmo.providers.registry import get_provider as registry_get_provider
+from wmo.runtime.agents.llm import DEFAULT_HISTORY_CHARS
 from wmo.serving.traces_source import TRACES_FILENAME
 from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 

@@ -26,8 +26,9 @@ from wmo.core.types import Action, Observation
 from wmo.engine.world_model import WorldModel
 from wmo.evals.gold import GoldJudge, GoldVerdict
 from wmo.evals.tasks import TaskSpec
-from wmo.optimize.harness.environment import AgentEnvironment
-from wmo.optimize.harness.runtime import (
+from wmo.providers.base import Provider
+from wmo.runtime.harness.environment import AgentEnvironment
+from wmo.runtime.harness.runtime import (
     AgentRuntime,
     RunResult,
     Runtime,
@@ -36,7 +37,6 @@ from wmo.optimize.harness.runtime import (
     TokenUsage,
     combine_usage,
 )
-from wmo.providers.base import Provider
 
 DEFAULT_K = 3  # eval-reporting convention: every metric is the mean of k passes, never single-pass
 _ROLLOUT_EVIDENCE_CHARS = 12_000

@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from wmo.core.types import Trace
 from wmo.engine.world_model import WorldModel
 from wmo.env.base import WorldModelEnv
-from wmo.env.episode import Agent, run_episode
+from wmo.runtime.episode import Agent, run_episode
 from wmo.scenarios.mining.facets import Outcome
 from wmo.scenarios.synthesis import EvalScenario, ScenarioSet
 from wmo.scenarios.verification.judge import ChecklistJudge, ChecklistResult

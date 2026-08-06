@@ -15,9 +15,6 @@ import pytest
 from harbor.models.job.config import JobConfig
 
 import wmo.optimize.model.rollouts as rollouts_module
-from wmo.evals.harbor.scorer import HarborScorer
-from wmo.optimize.harness.doc import HarnessDoc
-from wmo.optimize.harness.scoring import GradedTests, ScoreCell, ScoreReport, ScoreRequest
 from wmo.optimize.model.config import (
     DistillConfig,
     HarborConfig,
@@ -34,6 +31,9 @@ from wmo.optimize.model.rollouts import (
 from wmo.optimize.model.tokens import TrialRecord
 from wmo.providers.base import ProviderConfig, ProviderKind
 from wmo.providers.tinker import TokenSpan
+from wmo.runtime.evaluation.harbor.scorer import HarborScorer
+from wmo.runtime.harness.doc import HarnessDoc
+from wmo.runtime.harness.scoring import GradedTests, ScoreCell, ScoreReport, ScoreRequest
 
 _TASK_IDS = ("task-a", "task-b")
 _GROUP_SIZE = 2
@@ -596,7 +596,7 @@ def test_module_scope_never_imports_the_harbor_extra() -> None:
         elif isinstance(node, ast.ImportFrom) and node.module is not None:
             roots.add(node.module.split(".")[0])
     assert not roots & {"harbor", "yaml"}
-    # wmo.optimize.model.agents and wmo.evals.harbor import harbor at module scope, and
+    # wmo.optimize.model.agents and wmo.runtime.evaluation.harbor import harbor at module scope, and
     # wmo.optimize.model.renderers subclasses tinker-cookbook classes at module scope; the
     # collector may only pull them inside a guarded lazy block.
     banned_wmo = {"wmo.optimize.model.agents", "wmo.optimize.model.renderers", "wmo.evals"}

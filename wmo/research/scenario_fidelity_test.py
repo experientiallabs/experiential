@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 
 from wmo.engine.world_model import WorldModel
-from wmo.env.episode import Agent
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.research.scenario_fidelity import (
     ScoreMatrix,
@@ -16,6 +15,7 @@ from wmo.research.scenario_fidelity import (
     score_matrix,
     spearman,
 )
+from wmo.runtime.episode import Agent
 from wmo.scenarios.synthesis import EvalScenario
 from wmo.scenarios.verification import CHECKLIST_SYSTEM, ChecklistJudge
 from wmo.scenarios.verification.verify_test import EmptyRetriever, OneShotAgent

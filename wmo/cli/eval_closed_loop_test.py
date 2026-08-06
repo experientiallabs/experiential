@@ -19,17 +19,17 @@ from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings, save
 from wmo.evals.closed_loop import ClosedLoopReport, TaskOutcome
 from wmo.evals.gold import GoldJudge, GoldVerdict
 from wmo.evals.tasks import TaskSpec
-from wmo.optimize.harness.doc import (
+from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.runtime.harness.doc import (
     RUNTIME_KIND_ID,
     TOOL_POLICY_ID,
     HarnessDoc,
     Surface,
     SurfaceKind,
 )
-from wmo.optimize.harness.environment import AgentEnvironment
-from wmo.optimize.harness.pi_e2b import E2BPiRuntime
-from wmo.optimize.harness.runtime import AgentRuntime, RunResult, Runtime
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.runtime.harness.environment import AgentEnvironment
+from wmo.runtime.harness.pi_e2b import E2BPiRuntime
+from wmo.runtime.harness.runtime import AgentRuntime, RunResult, Runtime
 
 eval_cl_module = importlib.import_module("wmo.cli.eval_closed_loop")
 model_roles_module = importlib.import_module("wmo.cli.model_roles")

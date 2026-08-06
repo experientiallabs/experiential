@@ -63,7 +63,7 @@ DEFAULT_MATRIX_FILENAME = "matrix.json"
 """Default `sweep --out`: the outcome matrix `fit` takes as its argument."""
 
 # Literal mirrors of constants that otherwise live behind a heavy import
-# (`wmo.optimize.routing.compression`, `wmo.optimize.routing.policy`, `wmo.env.llm_agent`,
+# (`wmo.optimize.routing.compression`, `wmo.optimize.routing.policy`, `wmo.runtime.agents.llm`,
 # `wmo.providers.pool`).
 # Typer evaluates Option defaults and f-string help text at command-definition time, so these
 # have to be values, not names imported from those modules; the real constants are re-imported

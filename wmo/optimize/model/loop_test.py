@@ -27,9 +27,6 @@ from wmo.utils.waterfall.types import ChatMessage, ChatTool
 if TYPE_CHECKING:
     import tinker
 from wmo.core.types import JsonObject
-from wmo.optimize.harness.doc import HarnessDoc
-from wmo.optimize.harness.runtime import StopReason
-from wmo.optimize.harness.scoring import GradedTests
 from wmo.optimize.model.config import (
     BudgetConfig,
     DistillConfig,
@@ -98,6 +95,9 @@ from wmo.optimize.model.tokens import TrialRecord
 from wmo.optimize.model.tracking import DistillTracker
 from wmo.providers.base import ProviderConfig, ProviderKind
 from wmo.providers.tinker import SampledSequenceLike, TokenSpan
+from wmo.runtime.harness.doc import HarnessDoc
+from wmo.runtime.harness.runtime import StopReason
+from wmo.runtime.harness.scoring import GradedTests
 
 _NAME = "distill-loop-test"
 _TRAIN_IDS = ("task-a", "task-b", "task-c", "task-d")

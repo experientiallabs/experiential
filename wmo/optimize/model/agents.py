@@ -12,7 +12,7 @@ entry prune deletes invalid trial dirs wholesale before re-running them, and
 a sink inside the trial dir would vanish with it. The rollout collector keys
 the sink dir per training step and joins sinks back to trials by name.
 
-Like every module in `wmo.evals.harbor`, this module imports the harbor SDK
+Like every module in `wmo.runtime.evaluation.harbor`, this module imports the harbor SDK
 at module scope and is therefore imported lazily by its consumers; `import
 wmo.optimize.model` must succeed without the harbor extra.
 """
@@ -26,15 +26,15 @@ from typing import Literal
 from harbor.models.task.config import MCPServerConfig
 
 from wmo.core.types import JsonObject
-from wmo.evals.harbor.agent import (
+from wmo.providers.base import Provider, ProviderConfig, ProviderKind
+from wmo.providers.retry import wrap_provider_with_retries
+from wmo.providers.tinker import TinkerChatProvider, TokenRecorder
+from wmo.runtime.evaluation.harbor.agent import (
     DEFAULT_EPISODE_WORKERS,
     MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
     WmoHarborAgent,
 )
-from wmo.optimize.harness.runtime import DEFAULT_EVAL_EPISODE_TIMEOUT_S
-from wmo.providers.base import Provider, ProviderConfig, ProviderKind
-from wmo.providers.retry import wrap_provider_with_retries
-from wmo.providers.tinker import TinkerChatProvider, TokenRecorder
+from wmo.runtime.harness.runtime import DEFAULT_EVAL_EPISODE_TIMEOUT_S
 
 WMO_DISTILL_HARBOR_AGENT_IMPORT_PATH = "wmo.optimize.model.agents:WmoDistillHarborAgent"
 

@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from wmo.optimize.harness.doc import HarnessDoc
 from wmo.optimize.model.config import DistillConfig
 from wmo.optimize.model.rollouts import collect_rollouts
 from wmo.optimize.model.tau2 import (
@@ -20,6 +19,7 @@ from wmo.optimize.model.tau2 import (
     parse_tau2_task_id,
 )
 from wmo.providers.base import ProviderConfig, ProviderKind
+from wmo.runtime.harness.doc import HarnessDoc
 
 
 def _cfg(**tau2_overrides: object) -> DistillConfig:

@@ -56,6 +56,7 @@ from wmo.optimize.routing.policy import (
 from wmo.optimize.routing.report import ImprovementReport
 from wmo.optimize.routing.sweep import SweepPlan, plan_sweep, resolve_config
 from wmo.optimize.routing.sweep_partial import PartialHeader
+from wmo.optimize.telemetry import hooks as hooks_module
 from wmo.providers.base import (
     Completion,
     Message,
@@ -66,8 +67,7 @@ from wmo.providers.base import (
     VerifyResult,
 )
 from wmo.providers.pool import load_pool
-from wmo.runs import hooks as hooks_module
-from wmo.runs.client import RunsSink
+from wmo.runtime.runs.client import RunsSink
 from wmo.serving.traces_source import TRACES_FILENAME
 from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 

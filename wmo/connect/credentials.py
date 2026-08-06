@@ -1,6 +1,7 @@
 """Connector credentials, stored once per user.
 
-Like the platform credential (`wmo/platform/credentials.py`), connector tokens are user-global:
+Like the platform credential (`wmo/runtime/platform/credentials.py`), connector tokens are
+user-global:
 `~/.wmo/connectors.toml` (directory overridable via `$WMO_HOME`, exact file overridable via
 `$WMO_CONNECTORS_PATH`), one TOML table per connector name. A `WMO_<NAME>_TOKEN` environment
 variable injects a token-kind credential without a file, so CI and headless runs never write one
@@ -20,7 +21,7 @@ from pydantic import ValidationError
 
 from wmo.connect.types import ConnectError, ConnectorAuth
 from wmo.core.types import JsonObject
-from wmo.platform.credentials import wmo_home
+from wmo.runtime.platform.credentials import wmo_home
 
 ENV_CONNECTORS_PATH = "WMO_CONNECTORS_PATH"
 

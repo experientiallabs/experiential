@@ -57,8 +57,6 @@ from pathlib import Path
 from pydantic import JsonValue
 
 from wmo.core.types import JsonObject
-from wmo.optimize.harness.doc import HarnessDoc
-from wmo.optimize.harness.runtime import StopReason
 from wmo.optimize.model.config import DistillConfig
 from wmo.optimize.model.data import CONTEXT_OVERFLOW_STOP_REASON
 from wmo.optimize.model.rollouts import RolloutStats, rollout_stats
@@ -68,6 +66,8 @@ from wmo.optimize.model.tokens import TrialRecord, load_trial_spans
 from wmo.providers.base import ProviderConfig, ProviderKind
 from wmo.providers.retry import RetryingToolCallingProvider
 from wmo.providers.tinker import TinkerChatProvider, TokenRecorder
+from wmo.runtime.harness.doc import HarnessDoc
+from wmo.runtime.harness.runtime import StopReason
 from wmo.utils.waterfall.types import ChatFunctionCall, ChatMessage, ChatToolCall
 
 logger = logging.getLogger(__name__)

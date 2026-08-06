@@ -2320,8 +2320,8 @@ def scenarios_verify(
     """
     import wmo.providers as providers
     from wmo.engine.world_model import WorldModel
-    from wmo.env.llm_agent import LLMAgent
     from wmo.providers.retry import wrap_provider_with_retries
+    from wmo.runtime.agents.llm import LLMAgent
     from wmo.scenarios import ChecklistJudge, verify_scenarios
 
     scenario_set = _load_scenario_set(scenarios_file)

@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from wmo.optimize.harness.scoring import GradedTests, ScoreCell
 from wmo.optimize.model.tokens import (
     TrialRecord,
     assemble_harbor_trial_records,
@@ -19,6 +18,7 @@ from wmo.optimize.model.tokens import (
     read_trial_stop_reason,
 )
 from wmo.providers.tinker import TokenRecorder, TokenSpan
+from wmo.runtime.harness.scoring import GradedTests, ScoreCell
 
 
 def _span(call_index: int) -> TokenSpan:

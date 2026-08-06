@@ -51,14 +51,14 @@ if TYPE_CHECKING:
     # these values, so importing this module never pulls the distill/harness/optimize bodies
     # behind it.
     from wmo.core.types import JsonObject
-    from wmo.optimize.harness.doc import HarnessDoc
-    from wmo.optimize.harness.e2b_reap import CapacityCheck
     from wmo.optimize.model.config import DistillConfig
     from wmo.optimize.model.cost import CostEstimate
     from wmo.optimize.model.gate import DistillGateRecord
     from wmo.optimize.model.loop import DistillEvalReport, DistillProgress, DistillResult
     from wmo.optimize.model.store import AdapterStore, DistillRunStore
     from wmo.optimize.routing.teacher import TeacherSearchVerdict
+    from wmo.runtime.harness.doc import HarnessDoc
+    from wmo.runtime.harness.e2b_reap import CapacityCheck
 
 # Literal mirrors of constants that otherwise live behind a heavy import (`wmo.optimize.model.loop`,
 # `wmo.optimize.routing.teacher`). Typer evaluates Option defaults at command-definition time,
@@ -95,7 +95,7 @@ _console = Console()
 @model_app.command("run")
 def _load_harbor_task_ids(path: Path) -> tuple[str, ...]:
     """Load the exact ordered task-id list, validated by the canonical score request rules."""
-    from wmo.optimize.harness.scoring import ScoreRequest
+    from wmo.runtime.harness.scoring import ScoreRequest
 
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -452,7 +452,6 @@ def run_distill(
     # Deferred import: harness_app registers this module's typer app at module
     # scope, so importing its helpers back at module scope would be a circular
     # import.
-    from wmo.optimize.harness.store import write_json_atomic
     from wmo.optimize.model.cost import estimate_run_cost
     from wmo.optimize.model.loop import (
         DEFAULT_DISTILL_HARNESS,
@@ -460,6 +459,7 @@ def run_distill(
         run_distillation,
     )
     from wmo.optimize.model.store import AdapterStore, DistillRunStore
+    from wmo.runtime.harness.store import write_json_atomic
 
     backend_override: Literal["local", "e2b"] | None
     if backend is None:
@@ -782,10 +782,10 @@ def _resolve_seed_doc(root: str, harness_ref: str) -> tuple[str, HarnessDoc, int
     base name, the document, and the resolved store version (None for the
     built-in seed) so a resume can pin exactly what the run started from.
     """
-    from wmo.agents.default import default_agent
     from wmo.config.store import validate_name
-    from wmo.optimize.harness.store import HarnessStore
     from wmo.optimize.model.loop import DEFAULT_DISTILL_HARNESS
+    from wmo.runtime.agents.default import default_agent
+    from wmo.runtime.harness.store import HarnessStore
 
     base, _, ref = harness_ref.partition("@")
     try:
@@ -810,8 +810,8 @@ def _pinned_seed_doc(root: str, record: DistillCliRunRecord) -> tuple[str, Harne
     any store edit) between sessions cannot silently change which harness the
     remaining trials run.
     """
-    from wmo.agents.default import default_agent
-    from wmo.optimize.harness.store import HarnessStore
+    from wmo.runtime.agents.default import default_agent
+    from wmo.runtime.harness.store import HarnessStore
 
     base = record.agent.partition("@")[0]
     if record.seed_version is None:
@@ -852,8 +852,8 @@ def _preflight_e2b_capacity(console: Console, *, trial_concurrency: int) -> None
         typer.BadParameter: If capacity cannot be measured (missing extra or credential) or
             too few slots are free after reaping the safe class.
     """
-    from wmo.optimize.harness.e2b_reap import E2B_API_KEY_ENV, check_capacity, is_credential_error
     from wmo.optimize.model.rollouts import E2B_SANDBOXES_PER_TRIAL
+    from wmo.runtime.harness.e2b_reap import E2B_API_KEY_ENV, check_capacity, is_credential_error
 
     required = trial_concurrency * E2B_SANDBOXES_PER_TRIAL
     try:
@@ -892,8 +892,8 @@ def _preflight_e2b_capacity(console: Console, *, trial_concurrency: int) -> None
 
 def _capacity_failure_message(check: CapacityCheck, trial_concurrency: int) -> str:
     """The actionable message for a run that cannot get enough sandbox slots."""
-    from wmo.optimize.harness.e2b_reap import DEFAULT_E2B_SANDBOX_CAP, E2B_SANDBOX_CAP_ENV
     from wmo.optimize.model.rollouts import E2B_SANDBOXES_PER_TRIAL
+    from wmo.runtime.harness.e2b_reap import DEFAULT_E2B_SANDBOX_CAP, E2B_SANDBOX_CAP_ENV
 
     reaped = (
         f" Reaping orphans of dead local runs freed {check.reaped} slot(s) and was not enough."

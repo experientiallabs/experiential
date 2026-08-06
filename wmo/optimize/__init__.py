@@ -1,7 +1,7 @@
 """Shared optimizer contracts plus artifact-specific optimization packages.
 
 Routing policy search lives in `wmo.optimize.routing`, model training lives in
-`wmo.optimize.model`, and the harness execution seam lives in `wmo.optimize.harness`.
+`wmo.optimize.model`, and the harness execution seam lives in `wmo.runtime.harness`.
 Shared protocols, prompt evolution, rewards, and judges stay at this package root.
 """
 

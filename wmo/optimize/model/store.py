@@ -22,7 +22,7 @@ or needs to resume lives under it:
                           # copies plus the spans/ sink dir of recorded token spans)
       warmup-rollouts/    # the warmup phase's isolated rollout root (teacher trials)
 
-`AdapterStore` mirrors `wmo/optimize/harness/store.py`'s `HarnessStore` idiom for the
+`AdapterStore` mirrors `wmo/runtime/harness/store.py`'s `HarnessStore` idiom for the
 trained adapters themselves: `.wmo/adapters/<name>/` accumulates immutable
 `vN/model_card.json` versions, and movable aliases in `aliases.toml` mark
 deployment state (promotion and rollback are re-pointing, never rewriting).

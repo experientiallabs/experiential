@@ -19,13 +19,9 @@ import pytest
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
-from wmo.agents.default import default_agent
 from wmo.cli import app
 from wmo.cli.model_app import PROBE_EXIT_INSUFFICIENT, PROBE_EXIT_NO_GAP
 from wmo.config.settings import load_settings
-from wmo.optimize.harness.doc import HarnessDoc
-from wmo.optimize.harness.e2b_reap import CapacityCheck, ReapOutcome
-from wmo.optimize.harness.store import HarnessStore
 from wmo.optimize.model.config import DistillConfig
 from wmo.optimize.model.gate import DistillGateRecord
 from wmo.optimize.model.loop import (
@@ -46,6 +42,10 @@ from wmo.optimize.model.store import DEFAULT_TINKER_OPENAI_ENDPOINT, AdapterStor
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import PoolEntry
+from wmo.runtime.agents.default import default_agent
+from wmo.runtime.harness.doc import HarnessDoc
+from wmo.runtime.harness.e2b_reap import CapacityCheck, ReapOutcome
+from wmo.runtime.harness.store import HarnessStore
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

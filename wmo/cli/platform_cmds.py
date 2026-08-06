@@ -22,7 +22,7 @@ from rich.console import Console
 from rich.table import Table
 
 from wmo.config.store import WorldModelStore
-from wmo.platform.credentials import (
+from wmo.runtime.platform.credentials import (
     DEFAULT_WEB_URL,
     PlatformCredentials,
     clear_credentials,
@@ -32,7 +32,7 @@ from wmo.platform.credentials import (
 )
 
 if TYPE_CHECKING:
-    from wmo.platform.client import PlatformClient, PlatformError, WhoAmI
+    from wmo.runtime.platform.client import PlatformClient, PlatformError, WhoAmI
 
 # Kept here rather than importing wmo.cli.runs_app: platform commands are registered by the
 # root CLI, and loading their run-history implementation would defeat the light-command boundary.
@@ -77,7 +77,7 @@ def login(
     no_browser: Annotated[bool, _LOGIN_NO_BROWSER] = False,
 ) -> None:
     """Connect this machine to a platform account."""
-    from wmo.platform.client import (
+    from wmo.runtime.platform.client import (
         PlatformClient,
         PlatformError,
         PlatformUnreachable,
@@ -158,7 +158,7 @@ def logout() -> None:
 
 def status() -> None:
     """Show the platform connection: account and organizations."""
-    from wmo.platform.client import PlatformError
+    from wmo.runtime.platform.client import PlatformError
 
     credentials = load_credentials()
     if not credentials.is_complete():
@@ -253,7 +253,7 @@ def pull(
 
 def _browser_login(web_url: str, *, open_browser: bool) -> str | None:
     """Run the loopback browser flow; fall back to a hidden paste prompt."""
-    from wmo.platform.auth import BrowserLogin
+    from wmo.runtime.platform.auth import BrowserLogin
 
     login_attempt = BrowserLogin(web_url)
     try:
@@ -273,7 +273,7 @@ def _browser_login(web_url: str, *, open_browser: bool) -> str | None:
 
 
 def _client(credentials: PlatformCredentials) -> PlatformClient:
-    from wmo.platform.client import PlatformClient
+    from wmo.runtime.platform.client import PlatformClient
 
     if credentials.api_url is None or credentials.token is None:
         raise typer.BadParameter("not connected to a platform; run `wmo login` first")
@@ -287,7 +287,7 @@ def _connected(credentials: PlatformCredentials, headline: str) -> Iterator[Plat
     `PlatformClient` reports every failure as a `PlatformError` (unreachable
     hosts included), so this one handler covers every request the body makes.
     """
-    from wmo.platform.client import PlatformError
+    from wmo.runtime.platform.client import PlatformError
 
     with _client(credentials) as client:
         try:
@@ -341,8 +341,8 @@ def _detect_pullable_kind(client: PlatformClient, org_id: str, name: str) -> str
 
 
 def _push_model(client: PlatformClient, org_id: str, remote_name: str, model_dir: Path) -> str:
-    from wmo.platform.client import PlatformError
-    from wmo.platform.transfer import extract_push_meta, pack_model_dir
+    from wmo.runtime.platform.client import PlatformError
+    from wmo.runtime.platform.transfer import extract_push_meta, pack_model_dir
 
     meta = extract_push_meta(model_dir)
     with tempfile.TemporaryDirectory(prefix="wmo-push-") as staging:
@@ -445,10 +445,14 @@ def _push_pipeline(client: PlatformClient, org_id: str, remote_name: str, model_
     free. A run that already reported itself live is left alone rather than
     double-counted.
     """
-    from wmo.runs.backfill import BackfillRefused, ensure_backfillable, optimize_events
-    from wmo.runs.client import PushRejected, PushUnavailable, RunsSink, default_emitter_id
-    from wmo.runs.reader import RunsReader
-    from wmo.runs.schema import pipeline_external_id
+    from wmo.optimize.telemetry.backfill import (
+        BackfillRefused,
+        ensure_backfillable,
+        optimize_events,
+    )
+    from wmo.runtime.runs.client import PushRejected, PushUnavailable, RunsSink, default_emitter_id
+    from wmo.runtime.runs.reader import RunsReader
+    from wmo.runtime.runs.schema import pipeline_external_id
 
     manifest = model_dir / MANIFEST_RELPATH
     if not manifest.is_file():
@@ -481,7 +485,7 @@ def _push_pipeline(client: PlatformClient, org_id: str, remote_name: str, model_
 
 
 def _pull_model(client: PlatformClient, org_id: str, name: str, root: str, *, force: bool) -> None:
-    from wmo.platform.transfer import unpack_model_bundle
+    from wmo.runtime.platform.transfer import unpack_model_bundle
 
     dest_dir = WorldModelStore(root).model_dir(name)
     with tempfile.TemporaryDirectory(prefix="wmo-pull-") as staging:

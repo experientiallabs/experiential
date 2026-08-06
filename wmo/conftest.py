@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from wmo.platform.credentials import ENV_API_URL, ENV_HOME, ENV_ORG, ENV_TOKEN, ENV_WEB_URL
 from wmo.providers import openrouter_pricing
+from wmo.runtime.platform.credentials import ENV_API_URL, ENV_HOME, ENV_ORG, ENV_TOKEN, ENV_WEB_URL
 
 
 @pytest.fixture(autouse=True)

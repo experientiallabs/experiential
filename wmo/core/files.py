@@ -15,7 +15,7 @@ because it needs Unix-only `fcntl` and this does not: keeping them together woul
 the import path of `wmo.config`, which is the import path of almost everything.
 
 Not covered here: the credential and session writers (`wmo.config.dotenv`,
-`wmo.platform.credentials`, `wmo.connect.credentials`, `wmo.cli.session_state`,
+`wmo.runtime.platform.credentials`, `wmo.connect.credentials`, `wmo.cli.session_state`,
 `wmo.cli.workspace_sync`). Those need 0600 from the moment of creation and refuse to follow a
 symlink, which is a different contract, not a stricter setting of this one.
 """

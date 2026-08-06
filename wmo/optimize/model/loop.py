@@ -85,14 +85,6 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.config.store import validate_name
-from wmo.optimize.harness.doc import (
-    MAX_OUTPUT_TOKENS_ID,
-    MAX_TURNS_ID,
-    TEMPERATURE_ID,
-    HarnessDoc,
-    Surface,
-    SurfaceKind,
-)
 from wmo.optimize.model.config import DistillConfig, PricingConfig, TeacherConfig
 from wmo.optimize.model.cost import (
     METER_NAMES,
@@ -153,6 +145,14 @@ from wmo.providers.tinker import (
     evict_shared_sampling_client,
     shared_sampling_client,
     shared_service_client,
+)
+from wmo.runtime.harness.doc import (
+    MAX_OUTPUT_TOKENS_ID,
+    MAX_TURNS_ID,
+    TEMPERATURE_ID,
+    HarnessDoc,
+    Surface,
+    SurfaceKind,
 )
 from wmo.utils.waterfall.types import ChatMessage
 

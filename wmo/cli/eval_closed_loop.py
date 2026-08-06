@@ -19,7 +19,7 @@ from rich.console import Console
 if TYPE_CHECKING:
     from wmo.evals.closed_loop import ClosedLoopReport
     from wmo.evals.gold import GoldVerdict
-    from wmo.optimize.harness.doc import HarnessDoc
+    from wmo.runtime.harness.doc import HarnessDoc
 
 
 def run_closed_loop(
@@ -54,7 +54,7 @@ def run_closed_loop(
     from wmo.evals.closed_loop import ClosedLoopEval
     from wmo.evals.gold import GoldJudge
     from wmo.evals.tasks import load_tasks
-    from wmo.optimize.harness.runtime import DEFAULT_MAX_TURNS, AgentRuntime
+    from wmo.runtime.harness.runtime import DEFAULT_MAX_TURNS, AgentRuntime
 
     if harness_backend not in ("local", "e2b"):
         raise typer.BadParameter(
@@ -156,7 +156,7 @@ def run_closed_loop(
     finally:
         if harness_backend == "e2b":
             # An eval-owned e2b runtime owns a private sandbox pool; tear it down with the eval.
-            from wmo.optimize.harness.pi_e2b import E2BPiRuntime
+            from wmo.runtime.harness.pi_e2b import E2BPiRuntime
 
             if isinstance(runtime, E2BPiRuntime):
                 runtime.close()
@@ -199,7 +199,7 @@ def _load_report(path: str) -> ClosedLoopReport:
 
 def _with_max_turns(doc: HarnessDoc, max_turns: int) -> HarnessDoc:
     """A copy of `doc` with its max-turns surface replaced (re-validated via the constructor)."""
-    from wmo.optimize.harness.doc import MAX_TURNS_ID, HarnessDoc, Surface, SurfaceKind
+    from wmo.runtime.harness.doc import MAX_TURNS_ID, HarnessDoc, Surface, SurfaceKind
 
     surfaces = [s for s in doc.surfaces if s.id != MAX_TURNS_ID]
     surfaces.append(Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content=str(max_turns)))
@@ -207,7 +207,7 @@ def _with_max_turns(doc: HarnessDoc, max_turns: int) -> HarnessDoc:
 
 
 def _load_harness(name: str | None, root: str) -> HarnessDoc | None:
-    from wmo.optimize.harness.store import HarnessStore
+    from wmo.runtime.harness.store import HarnessStore
 
     if name is None:
         return None

@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from wmo.engine.world_model import WorldModel
-    from wmo.env.base import Env
+    from wmo.runtime.environment import Env
 
 
 def _traces(count: int = 30) -> list[Trace]:

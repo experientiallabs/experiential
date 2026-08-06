@@ -25,13 +25,17 @@ ROUTING_MODULES = {
 
 
 def test_optimization_domains_are_nested() -> None:
-    """Routing, model, and harness ownership stays visible in the package tree."""
-    expected = {"routing", "model", "harness"}
+    """Routing and model optimization ownership stays visible in the package tree."""
+    expected = {"routing", "model"}
     missing = sorted(name for name in expected if not (OPTIMIZE_DIR / name).is_dir())
     assert not missing, f"optimization domain packages missing under wmo/optimize: {missing}"
 
     legacy = sorted(name for name in ("distill", "harness") if (WMO_DIR / name).exists())
     assert not legacy, f"optimization packages returned to the flat wmo namespace: {legacy}"
+
+    assert not (OPTIMIZE_DIR / "harness").exists(), (
+        "agent execution belongs under wmo/runtime/harness, not wmo/optimize/harness"
+    )
 
     flat_routing = sorted(name for name in ROUTING_MODULES if (OPTIMIZE_DIR / name).exists())
     assert not flat_routing, (

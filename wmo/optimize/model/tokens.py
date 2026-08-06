@@ -32,9 +32,9 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.core.types import JsonObject
-from wmo.optimize.harness.runtime import StopReason
-from wmo.optimize.harness.scoring import GradedTests, ScoreCell
 from wmo.providers.tinker import TokenSpan
+from wmo.runtime.harness.runtime import StopReason
+from wmo.runtime.harness.scoring import GradedTests, ScoreCell
 
 logger = logging.getLogger(__name__)
 

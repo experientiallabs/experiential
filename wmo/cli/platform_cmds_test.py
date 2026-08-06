@@ -10,17 +10,17 @@ import pytest
 from typer.testing import CliRunner, Result
 
 from wmo.cli.app import app
-from wmo.optimize.harness.doc import HarnessDoc, Surface, SurfaceKind
-from wmo.optimize.harness.store import HarnessStore
-from wmo.platform.client import (
+from wmo.runtime.harness.doc import HarnessDoc, Surface, SurfaceKind
+from wmo.runtime.harness.store import HarnessStore
+from wmo.runtime.platform.client import (
     PlatformError,
     PlatformUnreachable,
     RemoteWorldModel,
     WhoAmI,
 )
-from wmo.platform.credentials import ENV_HOME, PlatformCredentials, save_credentials
-from wmo.runs.client import PushAck
-from wmo.runs.schema import pipeline_external_id
+from wmo.runtime.platform.credentials import ENV_HOME, PlatformCredentials, save_credentials
+from wmo.runtime.runs.client import PushAck
+from wmo.runtime.runs.schema import pipeline_external_id
 
 if TYPE_CHECKING:
     pass
@@ -197,7 +197,7 @@ def test_login_with_token_drops_stale_default_org(
     result = runner.invoke(app, ["login", "--token", "xpl_new"])
 
     assert result.exit_code == 0, result.output
-    from wmo.platform.credentials import load_credentials
+    from wmo.runtime.platform.credentials import load_credentials
 
     saved = load_credentials()
     assert saved.token == "xpl_new"
@@ -231,7 +231,7 @@ def test_login_with_explicit_api_url_skips_web_discovery(
     )
 
     assert result.exit_code == 0, result.output
-    from wmo.platform.credentials import load_credentials
+    from wmo.runtime.platform.credentials import load_credentials
 
     saved = load_credentials()
     assert saved.web_url == "https://preview.test"
@@ -248,7 +248,7 @@ def test_login_with_api_url_only_records_no_web_url(monkeypatch: pytest.MonkeyPa
     )
 
     assert result.exit_code == 0, result.output
-    from wmo.platform.credentials import load_credentials
+    from wmo.runtime.platform.credentials import load_credentials
 
     saved = load_credentials()
     assert saved.api_url == "https://api-preview.test"

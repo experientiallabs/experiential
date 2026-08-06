@@ -37,8 +37,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.core.files import write_text_atomic
 from wmo.core.types import JsonValue
-from wmo.platform.credentials import wmo_home
 from wmo.providers.openrouter import OPENROUTER_MODELS_URL
+from wmo.runtime.platform.credentials import wmo_home
 from wmo.tracking.pricing import ModelPrice
 
 logger = logging.getLogger(__name__)

@@ -44,12 +44,12 @@ viz = ["seaborn>=0.13", "matplotlib>=3.8", "pandas>=2.0"]
 # The e2b harness backend (`--harness-backend e2b`): the pi-node harness PROCESS executes in
 # pooled E2B microVMs while the environment stays the world model. Only those runs need it —
 # local runs stay sandbox-free — so it is an optional extra imported lazily
-# (wmo.optimize.harness.e2b_sandbox / wmo.optimize.harness.pi_e2b). Exact pin: the harbor E2B
+# (wmo.runtime.harness.e2b_sandbox / wmo.runtime.harness.pi_e2b). Exact pin: the harbor E2B
 # environment
-# (wmo.evals.harbor.e2b_environment) depends on version-sensitive template-build API behavior
+# (wmo.runtime.evaluation.harbor.e2b_environment) depends on version-sensitive template-build API behavior
 # and embeds the e2b version in template alias derivation.
 e2b = ["e2b==2.31.0"]
-# The harbor evaluator (`wmo.evals.harbor`): scores harness candidates on real
+# The harbor evaluator (`wmo.runtime.evaluation.harbor`): scores harness candidates on real
 # Terminal-Bench-2-style tasks through the harbor runner. Imported lazily, same contract as
 # the e2b extra. Exact pin: our E2B template alias derivation embeds harbor's version and
 # tracks its build behavior. Running harbor task environments ON E2B additionally needs

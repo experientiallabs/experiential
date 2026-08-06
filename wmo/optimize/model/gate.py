@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from wmo.optimize.model.config import GateConfig
 
 # Tie tolerance for solve-rate comparisons. Mirrors the private _TIE_EPS in
-# wmo/optimize/harness/create.py: rates computed from identical verdicts must compare
+# wmo/runtime/harness/create.py: rates computed from identical verdicts must compare
 # equal, so a gate must never fail on float noise. Defined locally because
 # create.py's constant is module-private.
 _TIE_EPS = 1e-9

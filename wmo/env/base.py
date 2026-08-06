@@ -1,41 +1,11 @@
-"""The `Env` protocol and its world-model backend.
-
-An `Env` is one episode's worth of environment: `reset` starts it, `step` advances it. Real
-environments (a benchmark harness, a coded oracle app, a simulator) implement the same protocol in
-their example folders, which is what makes "iterate in the world model, validate in the real env"
-a one-line swap instead of two agent loops.
-"""
+"""The world-model implementation of the runtime environment contract."""
 
 from __future__ import annotations
-
-from typing import Protocol, runtime_checkable
 
 from wmo.core.types import Action, EnvState, Observation
 from wmo.engine.world_model import WorldModel
 from wmo.optimize.reward import EpisodeScore
 from wmo.tracking import RunRecord
-
-
-@runtime_checkable
-class Env(Protocol):
-    """One episode of an environment an agent steps against."""
-
-    def reset(self, task: str | None = None, seed_state: EnvState | None = None) -> EnvState:
-        """Start a fresh episode; returns the environment's LIVE state view.
-
-        Contract: the returned `EnvState` is the env's current state object, updated in place as
-        the episode advances — callers that need a point-in-time snapshot must copy it
-        (`state.model_copy(deep=True)`), which is what `run_episode` does per recorded step.
-        """
-        ...
-
-    def step(self, action: Action) -> Observation:
-        """Apply `action` to the current episode and return the environment's response."""
-        ...
-
-    def close(self) -> None:
-        """Release episode resources (sessions, containers, sim handles). Idempotent."""
-        ...
 
 
 class WorldModelEnv:

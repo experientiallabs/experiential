@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from wmo.optimize.routing.report import ImprovementReport
     from wmo.optimize.routing.sweep import SweepPlan
     from wmo.optimize.routing.teacher import TeacherSearchVerdict
-    from wmo.runs.hooks import PipelineEmitter
+    from wmo.optimize.telemetry.hooks import PipelineEmitter
 
 _console = Console()
 
@@ -280,8 +280,8 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     from wmo.optimize.routing.policy import POLICY_FILENAME, probe_embedder
     from wmo.optimize.routing.sweep import SweepError, plan_sweep, resolve_config, resumable_cells
     from wmo.optimize.routing.sweep import preflight_pool as run_preflight
-    from wmo.runs.hooks import PipelineEmitter
-    from wmo.runs.schema import RunStatus
+    from wmo.optimize.telemetry.hooks import PipelineEmitter
+    from wmo.runtime.runs.schema import RunStatus
 
     if distill is not None:
         raise typer.BadParameter(_distill_reserved_message(world_model=world_model, root=root))

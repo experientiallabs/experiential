@@ -43,7 +43,6 @@ from wmo.env.closed_loop import (
     run_cells,
     scenario_id,
 )
-from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.env.scenarios import Scenario, scenarios_from_traces, tools_hint_from_traces
 from wmo.ingest import get_adapter
 from wmo.optimize.reward import EpisodeScore
@@ -58,13 +57,14 @@ from wmo.optimize.routing.sweep_partial import (
 )
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import ModelPool, load_pool, prepare_pool_provider
+from wmo.runtime.agents.llm import DEFAULT_HISTORY_CHARS
 from wmo.serving.traces_source import TRACES_FILENAME, local_traces_path
 from wmo.tracking import RunRecord, merge_run_records, save_run
 
 if TYPE_CHECKING:
     from wmo.core.types import Trace
     from wmo.engine.world_model import WorldModel
-    from wmo.env.base import Env
+    from wmo.runtime.environment import Env
 
 logger = logging.getLogger(__name__)
 
