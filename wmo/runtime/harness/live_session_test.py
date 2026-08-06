@@ -31,7 +31,9 @@ class ScriptedChannel:
 
 
 def _completion(
-    text: str = "", tool_calls: list | None = None, usage: dict | None = None
+    text: str = "",
+    tool_calls: list[JsonObject] | None = None,
+    usage: JsonObject | None = None,
 ) -> ChatResponse:
     msg: JsonObject = {"role": "assistant", "content": text}
     if tool_calls is not None:

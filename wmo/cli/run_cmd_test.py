@@ -61,6 +61,42 @@ def test_executor_reads_writes_and_jails(tmp_path: Path) -> None:
     assert absolute.is_error
 
 
+def test_executor_cancel_wins_the_race_before_a_file_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = mod.LocalToolExecutor(tmp_path)
+    resolved = threading.Event()
+    release = threading.Event()
+    outcomes: list[mod.ToolOutcome] = []
+    original_resolve = executor._resolve
+
+    def pause_after_initial_cancel_check(path: str) -> Path:
+        target = original_resolve(path)
+        resolved.set()
+        release.wait(timeout=2)
+        return target
+
+    monkeypatch.setattr(executor, "_resolve", pause_after_initial_cancel_check)
+    thread = threading.Thread(
+        target=lambda: outcomes.append(
+            executor("write_file", {"path": "sub/race.txt", "content": "stale"}, _noop_emit)
+        )
+    )
+    thread.start()
+    assert resolved.wait(1)
+
+    executor.cancel()
+    release.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    [result] = outcomes
+    assert result.is_error
+    assert result.content == "interrupted"
+    assert not (tmp_path / "sub").exists()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="LocalToolExecutor bash needs a Unix shell")
 def test_executor_bash_runs_in_jail_and_reports_exit(tmp_path: Path) -> None:
     executor = mod.LocalToolExecutor(tmp_path)

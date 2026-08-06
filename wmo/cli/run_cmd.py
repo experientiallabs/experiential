@@ -120,20 +120,21 @@ class LocalToolExecutor:
         """Confine every tool path under ``jail_root`` (its resolved real path)."""
         self._jail = jail_root.resolve()
         self._cancelled = threading.Event()
-        self._process_lock = threading.Lock()
+        self._operation_lock = threading.Lock()
         self._active_process: subprocess.Popen[bytes] | None = None
 
     def cancel(self) -> None:
         """Cancel the current command and reject racing tools until the turn reaches idle."""
-        self._cancelled.set()
-        with self._process_lock:
+        with self._operation_lock:
+            self._cancelled.set()
             process = self._active_process
         if process is not None and process.poll() is None:
             _kill_process_group(process)
 
     def reset_cancel(self) -> None:
         """Allow tools for the next turn after the runner reports the idle boundary."""
-        self._cancelled.clear()
+        with self._operation_lock:
+            self._cancelled.clear()
 
     def _resolve(self, path: str) -> Path:
         """Resolve a tool path under the jail, rejecting any escape."""
@@ -159,8 +160,13 @@ class LocalToolExecutor:
             if name == "write_file":
                 path = str(args.get("path", ""))
                 target = self._resolve(path)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(str(args.get("content", "")), encoding="utf-8")
+                # Cancellation and filesystem mutation share one linearization point. If cancel
+                # acquires the lock first, no directory or file from the stale turn is created.
+                with self._operation_lock:
+                    if self._cancelled.is_set():
+                        return ToolOutcome(content="interrupted", is_error=True)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(str(args.get("content", "")), encoding="utf-8")
                 return ToolOutcome(content=f"wrote {path}")
         except _JailEscape as error:
             return ToolOutcome(content=f"path {error} escapes the session directory", is_error=True)
@@ -184,7 +190,7 @@ class LocalToolExecutor:
         if process.stdout is None or process.stderr is None:  # pragma: no cover
             process.kill()
             raise RuntimeError("bash process did not expose stdout and stderr")
-        with self._process_lock:
+        with self._operation_lock:
             self._active_process = process
         if self._cancelled.is_set():
             _kill_process_group(process)
@@ -243,7 +249,7 @@ class LocalToolExecutor:
             if readers_stopped:
                 process.stdout.close()
                 process.stderr.close()
-            with self._process_lock:
+            with self._operation_lock:
                 if self._active_process is process:
                     self._active_process = None
 
