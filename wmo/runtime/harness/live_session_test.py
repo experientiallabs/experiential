@@ -155,6 +155,12 @@ def test_channel_type_error_is_not_retried_as_a_second_receive() -> None:
 
 def test_full_turn_emits_ordered_events_and_answers_frames() -> None:
     events: list[SessionEvent] = []
+    completed_state: JsonObject = {
+        "type": "state",
+        "status": "idle",
+        "reason": "completed",
+        "turns": 1,
+    }
     channel = ScriptedChannel(
         [
             {"type": "state", "status": "idle"},  # consumed by start()
@@ -166,13 +172,7 @@ def test_full_turn_emits_ordered_events_and_answers_frames() -> None:
                 "name": "submit",
                 "arguments": {"answer": "done"},
             },
-            {
-                "type": "state",
-                "status": "idle",
-                "reason": "completed",
-                "turns": 1,
-                "msg_id": "completed-1",
-            },
+            completed_state,
         ]
     )
 
@@ -191,7 +191,8 @@ def test_full_turn_emits_ordered_events_and_answers_frames() -> None:
     )
     session.start()
     events.clear()  # drop the initial "ready" state event; assert only the turn's events
-    session.send_user_message("list the files")
+    message_id = session.send_user_message("list the files")
+    completed_state["msg_id"] = message_id
     _drain(session)
 
     kinds = [e.kind for e in events]
@@ -216,7 +217,7 @@ def test_full_turn_emits_ordered_events_and_answers_frames() -> None:
     assert session.worker_usage.calls == 1
     assert session.worker_usage.input_tokens == 5
     assert session.worker_usage.output_tokens == 7
-    assert session.last_completed_message_id == "completed-1"
+    assert session.last_completed_message_id == message_id
 
 
 def test_submit_tool_response_is_answered_without_executor() -> None:
@@ -325,13 +326,68 @@ def test_stale_idle_does_not_reset_a_newer_interrupted_message() -> None:
     assert resets == [True]
 
 
-def test_interrupt_while_idle_is_ignored_and_does_not_poison_the_next_turn() -> None:
+def test_stale_idle_does_not_make_the_newer_message_uninterruptible() -> None:
+    """A stale pre-Stop idle state cannot make the current prompt appear inactive."""
+    first_running: JsonObject = {"type": "state", "status": "running"}
+    stale_idle: JsonObject = {"type": "state", "status": "idle", "reason": "completed"}
+    interrupted_idle: JsonObject = {"type": "state", "status": "idle", "reason": "aborted"}
     channel = ScriptedChannel(
         [
             {"type": "state", "status": "idle"},
-            {"type": "state", "status": "running"},
+            first_running,
+            stale_idle,
             {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
-            {"type": "state", "status": "idle", "reason": "completed"},
+            interrupted_idle,
+        ]
+    )
+    cancelled: list[bool] = []
+    ran: list[str] = []
+
+    def execute(name: str, args: JsonObject, emit) -> ToolOutcome:  # noqa: ANN001
+        ran.append(name)
+        return ToolOutcome(content="must not run")
+
+    session = LiveSession(
+        channel,
+        tools=[BASH],
+        execute_tool=execute,
+        on_event=lambda event: None,
+        cancel_active=lambda: cancelled.append(True),
+    )
+    session.start()
+    first_message_id = session.send_user_message("first")
+    first_running["msg_id"] = first_message_id
+    stale_idle["msg_id"] = first_message_id
+    session.pump(timeout=0)
+
+    second_message_id = session.send_user_message("second")
+    interrupted_idle["msg_id"] = second_message_id
+    session.pump(timeout=0)
+    assert session.status == "running"
+
+    session.interrupt()
+    session.pump(timeout=0)
+
+    assert cancelled == [True]
+    assert any(frame["type"] == "abort" for frame in channel.sent)
+    assert ran == []
+    response = next(frame for frame in channel.sent if frame["type"] == "tool_response")
+    assert response["content"] == "interrupted"
+    assert response["is_error"] is True
+
+    session.pump(timeout=0)
+    assert session.status == "idle"
+
+
+def test_interrupt_while_idle_is_ignored_and_does_not_poison_the_next_turn() -> None:
+    running_state: JsonObject = {"type": "state", "status": "running"}
+    completed_state: JsonObject = {"type": "state", "status": "idle", "reason": "completed"}
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            running_state,
+            {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
+            completed_state,
         ]
     )
     cancelled: list[bool] = []
@@ -350,7 +406,9 @@ def test_interrupt_while_idle_is_ignored_and_does_not_poison_the_next_turn() -> 
     )
     session.start()
     session.interrupt()
-    session.send_user_message("go")
+    message_id = session.send_user_message("go")
+    running_state["msg_id"] = message_id
+    completed_state["msg_id"] = message_id
     _drain(session)
 
     assert cancelled == []

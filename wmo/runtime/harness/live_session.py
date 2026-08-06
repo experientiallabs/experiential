@@ -533,12 +533,12 @@ class LiveSession:
             elif incoming_status == "idle":
                 cancel_pending = self._interrupt_requested.is_set() or self._aborting
                 expected_message_id = (
-                    self._interrupted_message_id if cancel_pending else self._active_message_id
+                    self._interrupted_message_id
+                    if cancel_pending
+                    else self._last_enqueued_message_id or self._active_message_id
                 )
                 accept_state = (
-                    not cancel_pending
-                    or expected_message_id is None
-                    or completed_message_id == expected_message_id
+                    expected_message_id is None or completed_message_id == expected_message_id
                 )
                 if accept_state:
                     self._status = incoming_status
