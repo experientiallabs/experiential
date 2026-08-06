@@ -22,9 +22,9 @@ from wmo.cli.ui import (
 )
 from wmo.config import PROVIDER_ENV_VARS, ModelInfo
 from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.engine.world_model import WorldModel
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind, VerifyResult
-from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
+from wmo.simulation.model.world_model import WorldModel
+from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
 
 ui_module = importlib.import_module("wmo.cli.ui")
 

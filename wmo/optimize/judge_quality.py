@@ -64,7 +64,7 @@ class CaseVerdict(BaseModel):
 
 
 class JudgeQualityReport(BaseModel):
-    """Aggregate meta-eval result over a case suite (satisfies `wmo.evals.base.EvalResult`)."""
+    """Aggregate meta-eval result satisfying the shared evaluation result protocol."""
 
     verdicts: list[CaseVerdict] = Field(default_factory=list)
 

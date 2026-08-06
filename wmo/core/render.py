@@ -115,13 +115,14 @@ def build_env_prompt(
     Mirrors DreamGym Eq. 4 ``M_exp(R_t | {(s_i,a_i)}, {d_j}, tau)``: the base/optimized prompt is
     the system message; the task, current state, recent history, retrieved demos, and the incoming
     action form the user message. This is the *single* assembly used by both the serving engine
-    (`wmo.engine.prompts`) and the GEPA optimizer, so prompts are evolved against exactly what the
-    world model serves.
+    (`wmo.simulation.model.prompts`) and the GEPA optimizer, so prompts are evolved against
+    exactly what the world model serves.
 
     `knowledge`/`reasoning`/`grounding`/`confidence` are the opt-in agentic-mode extensions; at
     their defaults the rendering is byte-identical to the pre-knowledge shape (pinned in
     render_test), so prebuilt models keep serving unchanged. `knowledge` (the cross-session
-    knowledge base, rendered by `wmo.engine.knowledge`) becomes an authoritative facts section;
+    knowledge base, rendered by `wmo.simulation.model.knowledge`) becomes an authoritative facts
+    section;
     `reasoning` switches the output contract to deliberate-then-answer; `grounding` offers the
     `ground_query` escape hatch (pass it only when a live grounder will actually serve it).
     """

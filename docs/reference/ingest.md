@@ -9,7 +9,7 @@ which normalizes a source into an OTel-GenAI JSONL corpus (with live progress) t
 command reads.
 
 Everything plugs into **one interface** (`TraceAdapter`) and **one normalizer**
-(`wmo.ingest.normalize`), so adding a source is a thin adapter, never a rewrite.
+(`wmo.simulation.ingest.normalize`), so adding a source is a thin adapter, never a rewrite.
 
 ## Quickstart
 
@@ -29,7 +29,7 @@ wmo build                                                   # or pick the source
 `--source` is a registered adapter (`otel-genai`, `chat-json`, `braintrust`, `phoenix`, `langfuse`,
 `langsmith`, `posthog`, `mastra`, `postgres`); `--file` reads an export, `--pull` fetches live
 (with `--project`/`--api-key`) for sources that support it. `wmo ingest` auto-detects a file's
-format when `--source` is omitted (`wmo.ingest.detect`); an unrecognized or mixed corpus errors
+format when `--source` is omitted (`wmo.simulation.ingest.detect`); an unrecognized or mixed corpus errors
 with guidance instead of guessing. On an interactive terminal, `wmo build` with no source launches
 a wizard that lists the sources and prompts for file-or-pull.
 
@@ -40,7 +40,7 @@ other corpus the harness reads: `wmo ingest`'s output feeds
 
 ### Progress events (the streaming contract)
 
-`wmo ingest --json` (and the library generator `wmo.ingest.stream.ingest_events`) emit one JSON
+`wmo ingest --json` (and the library generator `wmo.simulation.ingest.stream.ingest_events`) emit one JSON
 event per line: `{"type": "detected", "format", "traces"}`, then repeated
 `{"type": "progress", "normalized", "total", "note"?}`, then a terminal
 `{"type": "done", "traces", "steps", "otel_object"}` or `{"type": "error", "message", "code"?}`.
@@ -158,7 +158,7 @@ wmo build --name my-model --source chat-json --file conversation.json
 
 Each assistant tool call becomes an Action paired with its `role:"tool"` result (the Observation);
 a trailing assistant message becomes a final message step. Accepts one conversation object, a JSON
-array of them, JSONL (one per line), or a bare message list. See `wmo/ingest/messages.py`.
+array of them, JSONL (one per line), or a bare message list. See `wmo/simulation/ingest/messages.py`.
 
 ## The trace contract (what an adapter produces)
 
@@ -188,18 +188,18 @@ replay.
 ```
                                   ┌─ from_file(path)  ─┐
   raw export / vendor API ──▶ adapter                  ├─▶ list[SpanRecord] ──▶ spans_to_traces ──▶ list[Trace]
-                                  └─ from_vendor(pull) ─┘        (wmo.ingest.normalize: the ONE normalizer)
+                                  └─ from_vendor(pull) ─┘        (wmo.simulation.ingest.normalize: the ONE normalizer)
 ```
 
-- `wmo/ingest/adapter.py` - the `TraceAdapter` protocol + the registry (`register_adapter`,
+- `wmo/simulation/ingest/adapter.py` - the `TraceAdapter` protocol + the registry (`register_adapter`,
   `get_adapter`, `list_adapters`).
-- `wmo/ingest/base.py` - `BaseTraceAdapter`: file/JSONL loading + vendor plumbing, so a concrete
+- `wmo/simulation/ingest/base.py` - `BaseTraceAdapter`: file/JSONL loading + vendor plumbing, so a concrete
   adapter only implements `spans_from_payload` (and optionally `_pull_payloads`).
-- `wmo/ingest/normalize.py` - the shared span→Trace core. Understands **both** the OTel GenAI
+- `wmo/simulation/ingest/normalize.py` - the shared span→Trace core. Understands **both** the OTel GenAI
   (`gen_ai.*`) and **OpenInference** (`openinference.span.kind`, `tool.name`, `input.value` /
   `output.value`, `llm.*`) vocabularies, pairs each action span with its following tool span, and
   honors optional `wmo.*` enrichments.
-- `wmo/ingest/otel_writer.py` - the inverse: `Trace` → OTel-GenAI span JSONL (used to persist a
+- `wmo/simulation/ingest/otel_writer.py` - the inverse: `Trace` → OTel-GenAI span JSONL (used to persist a
   corpus; round-trips losslessly through `otel-genai`).
 
 ## Add a new source in ~30 lines
@@ -207,12 +207,12 @@ replay.
 Most providers export spans that are already OTLP or OpenInference, so a new adapter is small:
 
 ```python
-# wmo/ingest/myprovider.py
+# wmo/simulation/ingest/myprovider.py
 from __future__ import annotations
 
-from wmo.ingest.adapter import register_adapter
-from wmo.ingest.base import BaseTraceAdapter
-from wmo.ingest.normalize import SpanRecord
+from wmo.simulation.ingest.adapter import register_adapter
+from wmo.simulation.ingest.base import BaseTraceAdapter
+from wmo.simulation.ingest.normalize import SpanRecord
 
 
 class MyProviderAdapter(BaseTraceAdapter):
@@ -243,7 +243,7 @@ class MyProviderAdapter(BaseTraceAdapter):
 register_adapter(MyProviderAdapter())
 ```
 
-Then import it in `wmo/ingest/__init__.py` (for registration on package import), add an inline
+Then import it in `wmo/simulation/ingest/__init__.py` (for registration on package import), add an inline
 `myprovider_test.py` with a recorded fixture payload (no network), and `wmo build --source myprovider`
 picks it up. To support `--pull`, implement `_pull_payloads(pull)` returning raw payloads from the
 vendor API (use `httpx`; lazy-import the vendor SDK only if needed). To surface it in the build
@@ -252,7 +252,7 @@ adapters for reference.
 
 ## Conventions
 
-Adapters live in `wmo/ingest/`, are typed (no `Any`/bare `dict`; use `wmo.core.types`
+Adapters live in `wmo/simulation/ingest/`, are typed (no `Any`/bare `dict`; use `wmo.core.types`
 `JsonValue`/`JsonObject`), and are tested inline with fixtures - never the network. Vendor SDKs are
 optional extras, imported lazily; file ingestion works with none installed.
 
@@ -325,7 +325,7 @@ The `langfuse` adapter turns a [Langfuse](https://langfuse.com) trace export int
 `Trace` shape the harness builds world models from. Langfuse does **not** emit OTLP spans - it models
 a *trace* with a flat list of nested *observations* - so this adapter overrides `spans_from_payload`
 and re-emits the observations in OTel-GenAI vocabulary for the shared normalizer
-(`wmo/ingest/normalize.py`).
+(`wmo/simulation/ingest/normalize.py`).
 
 ### The shape
 
@@ -407,7 +407,7 @@ See [End-to-end scripts](#langfuse) for a runnable script.
 The `langsmith` adapter turns a [LangSmith](https://smith.langchain.com) (LangChain) run export into
 the normalized `Trace` shape the harness builds world models from. LangSmith does **not** emit OTLP
 spans - it models a trace as a tree of *runs* - so this adapter overrides `spans_from_payload` and
-re-emits the runs in OTel-GenAI vocabulary for the shared normalizer (`wmo/ingest/normalize.py`).
+re-emits the runs in OTel-GenAI vocabulary for the shared normalizer (`wmo/simulation/ingest/normalize.py`).
 
 ### The shape
 
@@ -496,7 +496,7 @@ The `braintrust` adapter turns a [Braintrust](https://www.braintrust.dev) span-r
 normalized `Trace` shape the harness builds world models from. Braintrust does **not** emit OTLP
 spans - it logs **spans as rows** in an experiment or project log, where a *trace* is the set of rows
 that share a `root_span_id` - so this adapter overrides `spans_from_payload` and re-emits each row in
-OTel-GenAI vocabulary for the shared normalizer (`wmo/ingest/normalize.py`).
+OTel-GenAI vocabulary for the shared normalizer (`wmo/simulation/ingest/normalize.py`).
 
 ### The shape
 
@@ -578,7 +578,7 @@ See [End-to-end scripts](#braintrust) for a runnable script.
 The `posthog` adapter turns [PostHog LLM observability](https://posthog.com/docs/ai-engineering) data
 into the normalized `Trace` shape the harness builds world models from. PostHog captures LLM traces
 as analytics **events** (not OTLP spans), so this adapter maps the `$ai_*` events into the OTel-GenAI
-vocabulary for the shared normalizer (`wmo/ingest/normalize.py`).
+vocabulary for the shared normalizer (`wmo/simulation/ingest/normalize.py`).
 
 ### The shape
 
@@ -626,7 +626,7 @@ See [End-to-end scripts](#posthog) for a runnable script.
 The `mastra` adapter turns a [Mastra](https://mastra.ai) AI-tracing export into the normalized
 `Trace` shape the harness builds world models from. Mastra (a TypeScript agent framework) records
 agent runs as **AI-tracing spans** (`ExportedSpan`) typed by `type`, which this adapter maps into the
-OTel-GenAI vocabulary for the shared normalizer (`wmo/ingest/normalize.py`). The span id field is
+OTel-GenAI vocabulary for the shared normalizer (`wmo/simulation/ingest/normalize.py`). The span id field is
 `id`, and spans order by `startTime`. (Mastra renamed its LLM spans to "model" spans in the 2025-11
 release; the adapter still accepts the pre-rename aliases - `spanType`, `llm_generation`, `spanId`,
 `startedAt` - so older exports keep working.)

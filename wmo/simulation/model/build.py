@@ -1,0 +1,432 @@
+"""The build pipeline behind `wmo build`.
+
+ingest -> normalize -> split(train/test) -> embed/index -> GEPA optimize -> write `.wmo/` artifact.
+Ingestion is part of the build: there is no separate ingest step.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+
+from wmo.config import ArtifactPaths, HarnessConfig, save_config
+from wmo.core.types import Trace
+from wmo.optimize import GEPAOptimizer, OptimizeResult, RubricJudge
+from wmo.providers import get_provider
+from wmo.providers.base import Embedder, Provider
+from wmo.simulation.ingest import VendorPull, drop_degenerate_traces, get_adapter
+from wmo.simulation.model.autoconfig import (
+    DEFAULT_VAL_CAP,
+    AutoFidelityReport,
+    CorpusSignature,
+    WinnerSpec,
+    search_max_fidelity,
+    select_candidates,
+    signature_estimate,
+)
+from wmo.simulation.model.knowledge import KnowledgeBase, seed_knowledge
+from wmo.simulation.model.prompts import BASE_ENV_PROMPT
+from wmo.simulation.model.reporting import BuildReporter, NullReporter
+from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
+
+# The single cut point on the `_trace_fraction` hash line that every train/held-out default reads.
+# `wmo build` trains GEPA on `[0, DEFAULT_TRAIN_SPLIT)` and `wmo eval` scores from
+# `DEFAULT_TRAIN_SPLIT` up, over the SAME corpus and the SAME deterministic line, so the two must
+# be one number. They were not: build defaulted to 0.8 and eval to 0.7, which handed eval the
+# `[0.7, 0.8)` band (about 10% of any corpus) as "held-out" when GEPA had trained on it, inflating
+# every reconstruction-fidelity number produced on the documented happy path by an unknown amount.
+# `wmo/cli/app_test.py` pins both CLI paths here so they cannot drift apart again.
+DEFAULT_TRAIN_SPLIT = 0.8
+
+
+class EmptyCorpusError(ValueError):
+    """Ingest produced no traces, so there is nothing to build.
+
+    A `ValueError` subclass so existing library callers keep working, but a distinct type so the
+    CLI can turn the most common cause (an export the pinned `--source` adapter cannot read) into
+    a usage error naming `--source` instead of letting a traceback escape.
+    """
+
+
+def _count_steps(traces: list[Trace]) -> int:
+    return sum(len(trace.steps) for trace in traces)
+
+
+def ingest(
+    config: HarnessConfig, *, file: str | None = None, vendor: VendorPull | None = None
+) -> list[Trace]:
+    """Load + normalize traces from a file upload or a vendor SDK pull into `Trace` objects."""
+    adapter = get_adapter(config.trace_adapter)
+    if file is not None:
+        return adapter.from_file(file)
+    if vendor is not None:
+        return adapter.from_vendor(vendor)
+    raise ValueError("ingest needs either a file path or a vendor pull")
+
+
+def _trace_fraction(trace: Trace) -> float:
+    """Stable hash of `trace_id` mapped to [0, 1). Order-independent, reproducible across runs."""
+    digest = hashlib.blake2b(trace.trace_id.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") / 2**64
+
+
+def split_traces(traces: list[Trace], train_split: float) -> tuple[list[Trace], list[Trace]]:
+    """Deterministic train/held-out split for GEPA (held-out is never seen during evolution).
+
+    Assignment is by a stable hash of `trace_id`, so the same corpus always splits the same way
+    regardless of order and rebuilds are reproducible. `train_split` is the target train fraction,
+    and callers that have no reason to pick their own should pass `DEFAULT_TRAIN_SPLIT`: a build
+    and an eval that cut this line at different points overlap, and the overlap is a leak.
+    """
+    train: list[Trace] = []
+    test: list[Trace] = []
+    for trace in traces:
+        (train if _trace_fraction(trace) < train_split else test).append(trace)
+    return train, test
+
+
+def split_traces_3way(
+    traces: list[Trace], train_frac: float, val_frac: float
+) -> tuple[list[Trace], list[Trace], list[Trace]]:
+    """Deterministic train / validation / test split by the same stable `trace_id` hash.
+
+    GEPA needs THREE disjoint sets, not two: `train` seeds reflection minibatches, `val` selects
+    among candidate prompts, and `test` is the truly-held-out set we report on — never seen by GEPA.
+    Using the val set as the reported held-out number (the old 2-way behaviour) lets GEPA select a
+    candidate on the very examples we then grade it on, so any "lift" can be selection overfitting.
+
+    Cut points are on the SAME [0,1) hash line as `split_traces`, so `train` is prefix-compatible:
+    `[0, train_frac)` = train, `[train_frac, train_frac+val_frac)` = val, rest = test.
+    Requires `train_frac + val_frac < 1` so test is non-empty.
+    """
+    valid = train_frac > 0 and val_frac > 0 and train_frac + val_frac < 1
+    if not valid:
+        raise ValueError(
+            f"need train_frac>0, val_frac>0, train_frac+val_frac<1; "
+            f"got train_frac={train_frac}, val_frac={val_frac}"
+        )
+    train: list[Trace] = []
+    val: list[Trace] = []
+    test: list[Trace] = []
+    val_cut = train_frac + val_frac
+    for trace in traces:
+        f = _trace_fraction(trace)
+        if f < train_frac:
+            train.append(trace)
+        elif f < val_cut:
+            val.append(trace)
+        else:
+            test.append(trace)
+    return train, val, test
+
+
+def split_holdout(
+    traces: list[Trace], train_frac: float, val_frac: float | None = None
+) -> tuple[list[Trace], list[Trace], bool]:
+    """Split into (train, the band a measurement may score, tiny-corpus fallback flag).
+
+    One owner for the "cut the corpus, then fall back to everything when it is too small" idiom
+    every measurement path needs (`wmo eval`, the eval grid, `wmo optimize route sweep`).
+
+    A positive `val_frac` cuts 3-way on the build's hash line and returns the reserved TEST band,
+    the one prompt selection never saw; `None` or `0` keeps the plain 2-way split. A corpus too
+    small to leave a held-out band falls back to the WHOLE corpus on both sides and the third
+    element is True, because those scores are NOT leak-free and a caller may need to say so.
+    """
+    if val_frac:
+        train, _val, holdout = split_traces_3way(traces, train_frac, val_frac)
+    else:
+        train, holdout = split_traces(traces, train_frac)
+    if not holdout:
+        return traces, traces, True
+    return train, holdout, False
+
+
+def build(
+    config: HarnessConfig,
+    *,
+    file: str | None = None,
+    vendor: VendorPull | None = None,
+    root: str = ".wmo",
+    serve_provider: Provider | None = None,
+    judge_provider: Provider | None = None,
+    embedder: Embedder | None = None,
+    reporter: BuildReporter | None = None,
+    max_fidelity: bool = False,
+    fidelity_budget: int = DEFAULT_VAL_CAP,
+    full_search: bool = False,
+    cheap_search: bool = False,
+    estimate_only: bool = False,
+    drop_degenerate: bool = False,
+    gepa_val_cap: int | None = None,
+    limit: int | None = None,
+) -> OptimizeResult:
+    """Ingest traces and run the full build, creating + persisting the artifact under `root`.
+
+    `serve_provider` / `embedder` are injectable for testing; in production they are constructed
+    from `config` (serve provider via the registry, embedder = offline HashingEmbedder sized to
+    `config.embed_dim`). `judge_provider`, when given, runs the judge separately from the serve
+    provider: pass a pinned single backend when `serve_provider` is a failover chain, so GEPA's
+    fitness metric is scored by one model throughout even while rollouts fail over. `reporter`
+    receives progress events (defaults to a no-op). Returns the GEPA OptimizeResult (also
+    persisted).
+
+    `config.gepa_budget <= 0` skips prompt optimization entirely (the low fidelity tier: RAG
+    over the base prompt). `max_fidelity` runs the auto-configuration search after the build
+    (see `wmo.simulation.model.autoconfig`): candidates — pruned by corpus signature unless
+    `full_search` — are replay-scored on `fidelity_budget` held-out traces with the prompt the
+    artifact will serve, and the result lands in `auto_fidelity.json`. The search never changes
+    the serve DEFAULTS (plain RAG unless flags were set explicitly): the winner activates at
+    runtime via `--max-fidelity`.
+
+    `limit` caps the corpus at the first N normalized traces, so a first cheap build over a large
+    file export does not have to read the whole thing into GEPA. It is applied AFTER the
+    degenerate-trace filter, so `limit=N` with `drop_degenerate` yields N *usable* traces, which
+    is why it is not the same knob as `VendorPull.limit`. A pull is bounded vendor-side at fetch
+    time (`wmo.simulation.ingest.base.from_vendor` slices to `pull.limit`), before this function
+    can see which traces are degenerate; combining the two yields *at most* N. Callers that want
+    exactly N usable traces from a pull must over-fetch: pass a larger `VendorPull.limit`
+    than `limit`.
+    """
+    report = reporter or NullReporter()
+    paths = ArtifactPaths(root)
+    traces = ingest(config, file=file, vendor=vendor)
+    if drop_degenerate:
+        # Some captures are polluted with all-empty-observation traces (swe-bench is 66% such
+        # junk, D24); building on them trains and measures the model on capture damage. Reuses
+        # `wmo.simulation.ingest.drop_degenerate_traces` — the same filter the research runners
+        # (run_trace_scaling / run_fidelity_tiers, via their own --drop-degenerate) apply.
+        traces, dropped = drop_degenerate_traces(traces)
+        report.activity(f"dropped {dropped} degenerate (all-empty-observation) traces")
+    if limit is not None:
+        traces = traces[:limit]
+    if not traces:
+        raise EmptyCorpusError("no traces ingested; nothing to build")
+    report.ingest_done(len(traces), _count_steps(traces))
+
+    # Three disjoint sets: train seeds GEPA's reflection minibatches, val (capped) selects
+    # among candidate prompts, and test is never seen by GEPA — `wmo eval` grades on it without
+    # selection overfitting. The remainder after train splits evenly into val/test.
+    train, val, test = split_traces_3way(traces, config.train_split, (1.0 - config.train_split) / 2)
+    report.split_done(len(train), len(val), len(test))
+
+    provider = serve_provider or get_provider(config.serve_provider_config())
+    # The GEPA judge can run on a cheaper model (config.judge_model) of the same provider kind;
+    # with no judge_model it shares the serve provider.
+    if judge_provider is None:
+        serve_cfg = config.serve_provider_config()
+        if config.judge_model and config.judge_model != serve_cfg.model:
+            judge_provider = get_provider(
+                serve_cfg.model_copy(update={"model": config.judge_model})
+            )
+        else:
+            judge_provider = provider
+    embed = embedder or HashingEmbedder(dim=config.embed_dim)
+
+    # Optional knowledge base: extract canonical env facts (rules/gates, entities, schemas) from
+    # the TRAIN split only — the same leak-free discipline as retrieval — into human-editable
+    # markdown under knowledge/. Falls back to the full corpus only when the corpus is too small
+    # to split (mirrors the `test or train` GEPA fallback below).
+    # Known simplification: GEPA below still evolves the prompt under the BASE output contract,
+    # even when this artifact will serve with knowledge/reasoning. That composes — the evolved
+    # SYSTEM prompt never encodes the output contract (it is appended per-completion by
+    # build_env_prompt) — but the optimizer is not yet selecting under agentic-mode conditions.
+    if config.knowledge:
+        seed_knowledge(KnowledgeBase(paths.knowledge), train or traces, provider)
+
+    # Serving index over the full corpus: at serve time we retrieve from everything we have seen.
+    retriever = EmbeddingRetriever(embed)
+    retriever.index(traces)
+    report.index_done(_count_steps(traces))
+
+    # GEPA evolves the env prompt under serving conditions: it retrieves demos the same way the
+    # world model will, but from a SEPARATE retriever it re-indexes over train-only (so held-out
+    # steps never retrieve themselves). The embedder is stateless, so it's safe to share.
+    # The progress total is GEPA's REAL translated metric-call budget (reported via on_budget),
+    # not the iteration count — sizing the bar with iterations made it hit 100% while thousands
+    # of valset calls were still running.
+    metric_total = {"calls": config.gepa_budget}
+
+    def _on_budget(total: int) -> None:
+        metric_total["calls"] = total
+        report.optimize_start(total)
+
+    def _on_rollout(done: int, score: float | None) -> None:
+        report.rollout(done, metric_total["calls"], score)
+
+    if config.gepa_budget <= 0:
+        # Low fidelity tier: no prompt optimization — the artifact serves the base prompt with
+        # RAG. OptimizeResult's zeroed metrics honestly say "nothing was optimized".
+        result = OptimizeResult(prompt=BASE_ENV_PROMPT)
+    else:
+        # Optimize against the SAME rubric we evaluate with (RubricJudge). NOTE: the judge MODEL
+        # may differ — config.judge_model defaults to a cheap per-provider model for GEPA cost,
+        # while `wmo eval` pins the judge to the requested serve-grade model — so
+        # held_out_accuracy is only directly comparable to eval fidelity when --judge-model
+        # matches the eval judge.
+        optimizer = GEPAOptimizer(
+            provider,
+            RubricJudge(judge_provider),
+            retriever=EmbeddingRetriever(embed),
+            on_rollout=_on_rollout,
+            on_budget=_on_budget,
+            on_activity=report.activity,
+        )
+        # Candidate selection only needs a stable, SMALL sample: every GEPA iteration re-scores
+        # the whole valset, and steps (not traces) are what bound cost — a long-trace corpus once
+        # turned a 4-iteration tier into $131. The default ceiling applies always; a fidelity
+        # tier may widen it (`gepa_val_cap`, in steps).
+        gepa_val_size = gepa_val_cap or _GEPA_VAL_STEP_CAP
+        gepa_val = _cap_gepa_valset(val or train, gepa_val_size)
+        # The acceptance re-check (inside `optimizer.optimize`) must not grade base-vs-winner on
+        # the very steps GEPA selected candidates against: that would test selection, not
+        # generalization, and is exactly what made `metrics.held_out_accuracy` unable to answer
+        # whether GEPA helps. `val` is the SAME validation split `gepa_val` was capped from
+        # (never test: the build's data boundary keeps test untouched for `wmo eval`), so its
+        # leftover traces past the cap are a genuinely disjoint, still leak-free sample. Capping
+        # that remainder at the same `gepa_val_size` keeps the re-check's cost the same order of
+        # magnitude as before in the common case: the two fresh eval passes already happened
+        # every GEPA build (`recheck_rollouts = 2 * len(recheck_steps)`), just against the
+        # selection data; this only repoints them. `allow_oversized_first=False`: unlike
+        # `gepa_val` (which must never come back empty - GEPA needs SOME valset), an empty
+        # `recheck` has a graceful, already-tested fallback inside `optimize()` (re-scores the
+        # selection valset itself), so a single oversized trace landing first in the leftover
+        # must not be let through alone - that would blow the re-check's cost past the selection
+        # pass it is supposed to match, for no benefit over falling back. `metrics.json` records
+        # which of the two happened via `fresh_recheck_disjoint` - never silently indistinguishable.
+        recheck = _cap_gepa_valset(val[len(gepa_val) :], gepa_val_size, allow_oversized_first=False)
+        result = optimizer.optimize(
+            train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget, recheck=recheck
+        )
+        # A GEPA candidate can be empty - a weak reflection LM (e.g. a self-reflecting open model)
+        # sometimes proposes a blank env prompt that still scores acceptably on easy steps and
+        # gets selected. An empty env prompt is never a valid artifact, so fall back to base.
+        if not result.prompt.strip():
+            result = OptimizeResult(
+                prompt=BASE_ENV_PROMPT,
+                frontier=result.frontier or [BASE_ENV_PROMPT],
+                metrics=result.metrics,
+            )
+    report.optimize_done(
+        result.metrics.held_out_accuracy, len(result.frontier), result.metrics.rollouts_used
+    )
+
+    if estimate_only:
+        # Low tier: ship the signature's strongest ESTIMATED config with no LLM search — the
+        # ladder's floor. Persisted as the winner so `--max-fidelity` serves it and so the
+        # higher tiers (rebuilt separately) seed the identical incumbent from the same signature.
+        signature = CorpusSignature.from_traces(train or traces)
+        estimate = signature_estimate(signature, has_pins=False)
+        if estimate.knowledge and not paths.knowledge.is_dir():
+            seed_knowledge(KnowledgeBase(paths.knowledge), train or traces, provider)
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.auto_fidelity.write_text(
+            AutoFidelityReport(
+                winner_label=estimate.label,
+                considered=[estimate.label],
+                winner_spec=WinnerSpec.from_candidate(estimate),
+            ).model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+    elif max_fidelity:
+        # Score the candidate configs on the held-out split with the prompt the artifact will
+        # serve (leak-free: demos + candidate KB from train only; `test or train` mirrors GEPA's
+        # tiny-corpus fallback). The result is a RUNTIME menu, not a serve default: the report is
+        # persisted (plus the KB when the winner needs it) and `--max-fidelity` activates the
+        # winner when the model is run — plain runs stay pure RAG.
+        # The build's search considers only candidates the RUNTIME can activate — no
+        # source_pins here: the workspace candidate is research-measurable (the tiers runner
+        # passes pins), but serve-side activation doesn't exist yet, and a persisted winner
+        # the runtime can't serve would make auto_fidelity.json a lie.
+        # Seed the KB into the ARTIFACT before the search and hand its rendered text in, so a
+        # knowledge winner's score was measured on the exact KB that serves (and the extraction
+        # runs once, not once ephemeral + once to persist). If no knowledge candidate wins, the
+        # seeded dir is removed again — a plain artifact stays knowledge-free.
+        kb_seeded_for_search = False
+        signature = CorpusSignature.from_traces(train or traces)
+        # The floor: the same estimate the `low` tier ships. Every searching tier carries it as
+        # its incumbent, so medium/high/max improve-or-hold on low, never regress (monotonic).
+        incumbent = signature_estimate(signature, has_pins=False)
+        menu = select_candidates(signature, full_ladder=full_search, cheap_only=cheap_search)
+        if (any(c.knowledge for c in menu) or incumbent.knowledge) and not paths.knowledge.is_dir():
+            seed_knowledge(KnowledgeBase(paths.knowledge), train or traces, provider)
+            kb_seeded_for_search = True
+        kb = KnowledgeBase(paths.knowledge)
+        auto = search_max_fidelity(
+            result.prompt,
+            train or traces,
+            test or train,
+            provider,
+            RubricJudge(judge_provider),
+            embed,
+            val_cap=fidelity_budget,
+            # Pass the already-computed menu so the search doesn't recompute the identical
+            # signature+select_candidates (and so the KB-seed decision above and the scored set
+            # can't drift from separate calls).
+            candidates=menu,
+            incumbent=incumbent,
+            # Whatever the artifact's KB renders (even empty) is what candidates measure —
+            # passing None here would let the search re-extract a DIFFERENT ephemeral KB
+            # and crown a winner the shipped artifact cannot reproduce.
+            knowledge_text=kb.render() if paths.knowledge.is_dir() else None,
+        )
+        if kb_seeded_for_search and not auto.winner.knowledge and not config.knowledge:
+            # The search created the KB only to measure the kb candidate; a non-knowledge
+            # winner means the artifact should stay knowledge-free (a knowledge/ dir is a
+            # user-visible surface).
+            shutil.rmtree(paths.knowledge, ignore_errors=True)
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.auto_fidelity.write_text(auto.model_dump_json(indent=2), encoding="utf-8")
+
+    _persist(paths, config, retriever, result)
+    return result
+
+
+# Ceiling on GEPA's candidate-selection valset, in steps (~one full-val pass per iteration).
+# Small on purpose: selection only needs a stable ranking signal, and fidelity saturates fast.
+_GEPA_VAL_STEP_CAP = 16
+
+
+def _cap_gepa_valset(
+    traces: list[Trace], max_steps: int = _GEPA_VAL_STEP_CAP, *, allow_oversized_first: bool = True
+) -> list[Trace]:
+    """A prefix of `traces` totalling at most `max_steps` steps.
+
+    `split_traces` already shuffles deterministically, so the prefix is an unbiased, stable
+    sample of the held-out split.
+
+    `allow_oversized_first` (default True, GEPA's own selection valset): a single trace bigger
+    than `max_steps` still passes through alone when it is the very first candidate, so GEPA is
+    never starved of a valset entirely. Pass False for a caller where an EMPTY result has an
+    acceptable fallback and the cost ceiling matters more than always returning something (e.g.
+    the acceptance re-check's disjoint sample in `wmo.simulation.model.build.build`: if the leftover
+    validation traces happen to start with one unusually long trace, letting it through alone
+    would blow the re-check's cost past what the selection valset itself pays - `optimize()`
+    already falls back gracefully to the selection valset on an empty `recheck`, so returning
+    `[]` here is strictly safer than an oversized pass).
+    """
+    capped: list[Trace] = []
+    steps = 0
+    for trace in traces:
+        if (capped or not allow_oversized_first) and steps + len(trace.steps) > max_steps:
+            break
+        capped.append(trace)
+        steps += len(trace.steps)
+    return capped
+
+
+def _persist(
+    paths: ArtifactPaths,
+    config: HarnessConfig,
+    retriever: EmbeddingRetriever,
+    result: OptimizeResult,
+) -> None:
+    """Write config, prompts, frontier, metrics, and the retrieval index under `.wmo/`."""
+    save_config(config, paths.root)
+    paths.base_prompt.parent.mkdir(parents=True, exist_ok=True)
+    paths.base_prompt.write_text(BASE_ENV_PROMPT, encoding="utf-8")
+    paths.optimized_prompt.write_text(result.prompt, encoding="utf-8")
+    paths.frontier.write_text(json.dumps(result.frontier, indent=2), encoding="utf-8")
+    paths.metrics.write_text(result.metrics.model_dump_json(indent=2), encoding="utf-8")
+    retriever.save(paths.index)

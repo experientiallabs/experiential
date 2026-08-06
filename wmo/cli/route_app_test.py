@@ -17,13 +17,11 @@ from filelock import FileLock
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
-import wmo.env as env_module
+import wmo.simulation as env_module
 from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
-from wmo.engine.world_model import WorldModel
-from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.model.store import DistillModelCard
 from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing import evaluate_policy
@@ -52,7 +50,9 @@ from wmo.providers.openrouter import OPENROUTER_API_KEY_ENV
 from wmo.providers.pool import PoolEntry, load_pool
 from wmo.providers.registry import get_provider as registry_get_provider
 from wmo.runtime.agents.llm import DEFAULT_HISTORY_CHARS
-from wmo.serving.traces_source import TRACES_FILENAME
+from wmo.simulation.ingest.otel_writer import write_traces_jsonl
+from wmo.simulation.model.world_model import WorldModel
+from wmo.simulation.serving.traces_source import TRACES_FILENAME
 from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 
 runner = CliRunner()
@@ -1437,7 +1437,7 @@ def _patch_seams(
             _ScriptedCandidate(config, seams.systems, throttled=throttled),
         )
 
-    monkeypatch.setattr("wmo.engine.load_world_model", _load)
+    monkeypatch.setattr("wmo.simulation.model.load_world_model", _load)
     monkeypatch.setattr("wmo.providers.pool.get_provider", _get_provider)
     if no_scoring:
         real = env_module.WorldModelEnv

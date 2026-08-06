@@ -4,7 +4,7 @@ A **grid** scores one eval suite across many **(model × condition)** cells on t
 split, by the *same* judge - answering the project's core question: does `base → +RAG → +GEPA →
 +GEPA+RAG` actually lift world-model reconstruction fidelity, for which serving models, at what
 cost? It's the multi-model sibling of `wmo eval` (one trace) and `wmo eval run` (one suite), built
-on the same open-loop scorer (`wmo.evals.open_loop.evaluate_files`).
+on the same open-loop scorer (`wmo.simulation.evaluation.open_loop.evaluate_files`).
 
 ## Conditions
 
@@ -27,7 +27,7 @@ A model with no evolved prompt in the `--gepa-prompts` dir is scored on `base`/`
   not comparable, so never mix them in one chart.
 - **Same-model capacity fallover.** A Bedrock target fails over on capacity errors across regions
   and then to the *same model on the direct Anthropic API* (Bedrock Opus is heavily throttled; the
-  direct API is the identical model, so what's measured is unchanged - see `wmo.evals.failover`).
+  direct API is the identical model, so what's measured is unchanged - see `wmo.simulation.evaluation.failover`).
   The pinned judge fails over *only* to that same-model direct API, never to a different model - a
   judge that swapped models mid-grid would score cells on different scales (cf.
   `docs/reference/failover.md`).
@@ -77,7 +77,7 @@ wmo download tau-bench terminal-tasks swe-bench   # or `all`; run bare for a pic
 Each bundle lands at `environment-capture-data/<suite>/` with the corpus, the `evals/<suite>.toml`
 the grid names, and `models/` (the prebuilt world model, whose `prompts/optimized.txt` is that
 suite's already-evolved prompt). `wmo download` with no arguments lists what is actually published,
-which is the only reliable list: a benchmark can be registered in `wmo.hub.CORPORA` and have no
+which is the only reliable list: a benchmark can be registered in `wmo.simulation.hub.CORPORA` and have no
 dataset repo yet, and passing that name gets you a 401 rather than a bundle.
 
 From there: evolve one prompt per (suite × model) with `wmo build` (or start from the bundled

@@ -10,8 +10,8 @@ replays a candidate prompt over held-out steps, scores each with our `Judge`, an
 critiques into the reflective dataset the engine feeds back to the reflection LM.
 
 The optimizer stays decoupled from the serving engine: replaying a candidate only needs a
-`Provider` (see `predict_observation`), so we do NOT import `wmo.engine` (that would create the
-cycle engine -> optimize -> engine). Prompt assembly is the shared
+`Provider` (see `predict_observation`), so we do NOT import `wmo.simulation.model`; that would
+create the cycle simulation -> optimize -> simulation. Prompt assembly is the shared
 `wmo.core.render.build_env_prompt` — the exact assembly the world model serves — so GEPA evolves
 against what is actually deployed.
 """
@@ -31,8 +31,8 @@ from wmo.core.types import Action, EnvState, JsonValue, Observation, Step, Trace
 from wmo.optimize.base import OptimizeMetrics, OptimizeResult
 from wmo.optimize.judge import Judge
 from wmo.providers.base import DEFAULT_MAX_TOKENS, Message, Provider
-from wmo.retrieval import Retriever
-from wmo.retrieval.leakfree import DemoRetriever
+from wmo.simulation.retrieval import Retriever
+from wmo.simulation.retrieval.leakfree import DemoRetriever
 
 # The single named component GEPA evolves: the specialized env (system) prompt.
 ENV_PROMPT_COMPONENT = "env_prompt"

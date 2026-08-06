@@ -13,7 +13,7 @@ from posthog import Posthog
 
 from wmo.config import ARTIFACT_DIR
 from wmo.config.settings import ensure_telemetry_anonymous_id, load_settings
-from wmo.engine.reporting import BuildReporter
+from wmo.simulation.model.reporting import BuildReporter
 from wmo.tracking import RunRecord
 
 POSTHOG_PROJECT_API_KEY = "phc_rPFfCufWpxyctR7duEZTTXovP4k5kbHqSqzd4Z4MQJdL"

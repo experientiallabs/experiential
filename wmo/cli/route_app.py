@@ -256,8 +256,6 @@ def sweep(
     without `--allow-uneven-coverage`. `sweep && fit` in a script then stops instead of fitting on
     it, and the matrix is written either way.
     """
-    from wmo.engine import load_world_model
-    from wmo.env import WorldModelEnv
     from wmo.optimize.routing.compression import resolve_compression
     from wmo.optimize.routing.sweep import (
         SweepError,
@@ -268,6 +266,8 @@ def sweep(
         resolve_config,
         resumable_cells,
     )
+    from wmo.simulation import WorldModelEnv
+    from wmo.simulation.model import load_world_model
 
     out_path = Path(out)
     if compressor is None and aggressiveness > 0.0:

@@ -33,14 +33,14 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 
 from wmo.core.types import Step, Trace
-from wmo.engine.replay import replay
 from wmo.optimize.judge import Judge
 from wmo.providers.base import Embedder, Provider
 from wmo.research.ablation import Condition, as_int
 from wmo.research.pipeline import optimize_prompt, score_prompt
 from wmo.research.scaling_split import CorpusSplit, partition_corpus, subsample_train
 from wmo.research.seed_stability import BackendFactory
-from wmo.retrieval import EmbeddingRetriever
+from wmo.simulation.model.replay import replay
+from wmo.simulation.retrieval import EmbeddingRetriever
 
 # A point on the sweep grid: (number of train traces, GEPA iteration budget).
 GridPoint = tuple[int, int]

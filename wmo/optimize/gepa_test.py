@@ -199,7 +199,7 @@ def test_optimize_reports_real_metric_call_budget_via_on_budget() -> None:
 
 
 def test_optimize_can_retrieve_from_separate_rag_corpus() -> None:
-    from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
+    from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
 
     class PromptRecordingProvider(FakeProvider):
         def __init__(self) -> None:
@@ -568,7 +568,7 @@ def test_reflection_lm_brackets_the_call_in_activity() -> None:
 def test_adapter_evaluate_streams_per_step_activity() -> None:
     lines: list[str] = []
     adapter = WorldModelGEPAAdapter(FakeProvider(), FakeJudge(score=0.5), on_activity=lines.append)
-    from wmo.retrieval.leakfree import DemoRetriever
+    from wmo.simulation.retrieval.leakfree import DemoRetriever
 
     steps = _eval_steps([_trace("t1")], DemoRetriever(None, []))
     adapter.evaluate(steps, {ENV_PROMPT_COMPONENT: "BASE"})
@@ -669,8 +669,8 @@ def test_adapter_judge_exception_is_invalid_not_a_world_model_zero() -> None:
 
 
 def test_eval_steps_retrieves_demos_without_same_trace_leakage() -> None:
-    from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
-    from wmo.retrieval.leakfree import DemoRetriever
+    from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
+    from wmo.simulation.retrieval.leakfree import DemoRetriever
 
     # Two train traces. Each step's nearest neighbor is its own sibling (same trace) — which must be
     # excluded — so the demo it actually gets must come from the OTHER trace.
@@ -692,7 +692,7 @@ def test_eval_steps_retrieves_demos_without_same_trace_leakage() -> None:
 
 
 def test_eval_steps_zero_shot_without_retriever() -> None:
-    from wmo.retrieval.leakfree import DemoRetriever
+    from wmo.simulation.retrieval.leakfree import DemoRetriever
 
     traces = [_trace("t", n=2)]
     eval_steps = _eval_steps(traces, DemoRetriever(None, traces))  # no retriever -> zero-shot

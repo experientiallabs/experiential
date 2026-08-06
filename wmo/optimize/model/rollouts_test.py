@@ -599,7 +599,11 @@ def test_module_scope_never_imports_the_harbor_extra() -> None:
     # wmo.optimize.model.agents and wmo.runtime.evaluation.harbor import harbor at module scope, and
     # wmo.optimize.model.renderers subclasses tinker-cookbook classes at module scope; the
     # collector may only pull them inside a guarded lazy block.
-    banned_wmo = {"wmo.optimize.model.agents", "wmo.optimize.model.renderers", "wmo.evals"}
+    banned_wmo = {
+        "wmo.optimize.model.agents",
+        "wmo.optimize.model.renderers",
+        "wmo.simulation.evaluation",
+    }
     for node in tree.body:
         if isinstance(node, ast.ImportFrom) and node.module is not None:
             assert not any(

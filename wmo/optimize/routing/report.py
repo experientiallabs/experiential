@@ -132,11 +132,11 @@ def _aggregate(outcomes: list[ScenarioOutcome]) -> tuple[float, float, float, fl
 def _productive_call_seconds(scored: list[ScenarioOutcome]) -> list[float]:
     """Per-call seconds, skipping calls the provider answered with blank text.
 
-    `wmo.env.closed_loop._TimedProvider` appends `call_seconds` and `replies` in lockstep per
-    provider call, so there a blank reply is identifiable by index. Those calls return fast and
-    carry no action, and `LLMAgent` buys another completion to replace them, so counting them
-    would report a latency at which the endpoint never delivered work: a model that blanks often
-    would look FASTER than one that answers first time. Cost is deliberately left alone, because
+    `wmo.optimize.routing.evaluation._TimedProvider` appends `call_seconds` and `replies` in
+    lockstep per provider call, so there a blank reply is identifiable by index. Those calls
+    return fast and carry no action. `LLMAgent` buys another completion to replace them, so
+    counting them would report latency at which the endpoint never delivered work. A model that
+    blanks often would look faster than one that answers first time. Cost is left alone because
     the blank attempts were really paid for.
 
     Other producers do not promise that pairing (the real-episode runner records one reply per

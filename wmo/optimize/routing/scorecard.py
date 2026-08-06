@@ -32,15 +32,16 @@ Discipline inherited from the surrounding code, and where this module deliberate
   episode-level (each episode is a task attempt that cost money), but a mean reward over
   episodes silently reweights the comparison when two arms ran different episode counts on the
   same scenario, which is the scenario-level version of the bug the common set exists to stop.
-- Comparability invariants fail loudly rather than merge, as in `wmo.evals.grid.merge_results`.
+- Comparability invariants fail loudly rather than merge, as in
+  `wmo.simulation.evaluation.grid.merge_results`.
   A `wm_simulated` arm never silently scores against a `real_episode` anchor, and two arms whose
   condition labels collide are rejected: the GEPA program lost runs to colliding labels, so a
   `ConditionLabel` here is structured and must name every experimental axis.
 - Costs are consumed, never re-derived. `ScenarioOutcome.cost_usd` was priced at record time by
   `PoolEntry.cost_usd`, which bills cache reads and cache writes at their own tiers; that is
   where "cache-adjusted" comes from and re-pricing here would drop negotiated rates.
-- Every estimate names its basis, as in `wmo.serving.savings`: `cost_assumptions` is composed
-  from what the rows actually contained and is mandatory non-empty.
+- Every estimate names its basis, as in `wmo.simulation.serving.savings`: `cost_assumptions` is
+  composed from what the rows actually contained and is mandatory non-empty.
 - Latency is per TASK, not per call as in `report.py`, and it is MODEL time: `call_seconds`
   excludes environment and tool time by contract (`outcomes.py`), so these numbers understate
   an operator's wall clock and flatter any optimizer that only shortens prompts. Cost per
@@ -979,9 +980,9 @@ def _anchor_dominates(card: Scorecard, latency: LatencyObjective) -> bool:
 def _require_comparable(arm: Arm, anchor: Arm) -> None:
     """Fail loudly on any axis that must match for the two sides to be one comparison.
 
-    Follows `wmo.evals.grid.merge_results`: an invariant that would produce a plausible but
-    meaningless number is checked, not documented. `base_model`, `optimizer`, and `seed` are
-    free to differ, because differing on them is what an ablation IS.
+    Follows `wmo.simulation.evaluation.grid.merge_results`: an invariant that would produce a
+    plausible but meaningless number is checked, not documented. `base_model`, `optimizer`, and
+    `seed` may differ because differing on them is what an ablation is.
     """
     if arm.name == anchor.name:
         raise ValueError(

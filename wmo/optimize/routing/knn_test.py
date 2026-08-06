@@ -29,7 +29,7 @@ from wmo.optimize.routing.policy import (
 )
 from wmo.providers.base import ProviderKind
 from wmo.providers.pool import PoolEntry
-from wmo.retrieval.embedders import HashingEmbedder
+from wmo.simulation.retrieval.embedders import HashingEmbedder
 
 _SQL_TASKS = [
     "SELECT count(*) FROM superheroes WHERE height > 190",

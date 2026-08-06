@@ -262,8 +262,8 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     manifest under `<model>/optimize/`. Deleting that directory resets resume and breaks nothing.
     """
     from wmo.cli.route_app import print_deferred_risks, print_tiny_corpus_note
-    from wmo.env.closed_loop import scenario_id
     from wmo.optimize.routing.compression import resolve_compression
+    from wmo.optimize.routing.evaluation import scenario_id
     from wmo.optimize.routing.outcomes import split_router_scenarios
     from wmo.optimize.routing.pipeline import (
         MANIFEST_DIRNAME,
@@ -917,7 +917,7 @@ def _report_anchor(policy_path: Path, *, baseline: str | None, fallback: str | N
 
 def _scenario_identity(plan: SweepPlan) -> str:
     """The scenario SET the sweep will measure, as an id list a change is visible in."""
-    from wmo.env.closed_loop import scenario_id
+    from wmo.optimize.routing.evaluation import scenario_id
 
     return ",".join(scenario_id(scenario) for scenario in plan.scenarios)
 
@@ -955,8 +955,8 @@ def _stage_plan_text(
     already_measured: int = 0,
 ) -> str:
     """One line saying what this stage will actually do, in the operator's terms."""
-    from wmo.env.closed_loop import scenario_id
     from wmo.optimize.routing.compression import compression_signature
+    from wmo.optimize.routing.evaluation import scenario_id
     from wmo.optimize.routing.knn import cost_quality_named_point
     from wmo.optimize.routing.outcomes import split_router_scenarios
     from wmo.optimize.routing.pipeline import Stage
@@ -1330,11 +1330,11 @@ def _stage_sweep(
     must not buy them a second time.
     """
     from wmo.cli.route_app import _compressor_note, cell_progress, print_world_model_spend
-    from wmo.engine import load_world_model
-    from wmo.env import WorldModelEnv
     from wmo.optimize.routing.compression import compression_signature
     from wmo.optimize.routing.pipeline import Stage, StageRecord, file_sha256
     from wmo.optimize.routing.sweep import execute_sweep
+    from wmo.simulation import WorldModelEnv
+    from wmo.simulation.model import load_world_model
 
     world_model, _serve_provider = load_world_model(model_dir)
     run = execute_sweep(

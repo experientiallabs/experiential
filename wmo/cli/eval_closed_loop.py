@@ -17,9 +17,9 @@ import typer
 from rich.console import Console
 
 if TYPE_CHECKING:
-    from wmo.evals.closed_loop import ClosedLoopReport
-    from wmo.evals.gold import GoldVerdict
     from wmo.runtime.harness.doc import HarnessDoc
+    from wmo.simulation.evaluation.closed_loop import ClosedLoopReport
+    from wmo.simulation.evaluation.gold import GoldVerdict
 
 
 def run_closed_loop(
@@ -50,11 +50,11 @@ def run_closed_loop(
     """
     from wmo.cli.model_roles import resolve_opt_in_model_provider
     from wmo.config import WorldModelStore
-    from wmo.engine import load_world_model
-    from wmo.evals.closed_loop import ClosedLoopEval
-    from wmo.evals.gold import GoldJudge
-    from wmo.evals.tasks import load_tasks
     from wmo.runtime.harness.runtime import DEFAULT_MAX_TURNS, AgentRuntime
+    from wmo.simulation.evaluation.closed_loop import ClosedLoopEval
+    from wmo.simulation.evaluation.gold import GoldJudge
+    from wmo.simulation.evaluation.tasks import load_tasks
+    from wmo.simulation.model import load_world_model
 
     if harness_backend not in ("local", "e2b"):
         raise typer.BadParameter(
@@ -173,7 +173,7 @@ def run_closed_loop(
 
 def run_agreement(console: Console, *, report_a: str, report_b: str, threshold: float) -> None:
     """Compare two saved closed-loop reports task-by-task and print the agreement verdict."""
-    from wmo.evals.agreement import compute_agreement
+    from wmo.simulation.evaluation.agreement import compute_agreement
 
     a = _load_report(report_a)
     b = _load_report(report_b)
@@ -189,7 +189,7 @@ def run_agreement(console: Console, *, report_a: str, report_b: str, threshold: 
 
 
 def _load_report(path: str) -> ClosedLoopReport:
-    from wmo.evals.closed_loop import ClosedLoopReport
+    from wmo.simulation.evaluation.closed_loop import ClosedLoopReport
 
     try:
         return ClosedLoopReport.model_validate_json(Path(path).read_text(encoding="utf-8"))

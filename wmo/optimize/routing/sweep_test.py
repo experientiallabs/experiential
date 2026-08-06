@@ -19,10 +19,9 @@ import pytest
 
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
-from wmo.env.closed_loop import CellKey
-from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing.compression import CompressionConfig
+from wmo.optimize.routing.evaluation import CellKey
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.sweep import (
     SweepError,
@@ -47,14 +46,15 @@ from wmo.providers.base import (
     VerifyResult,
 )
 from wmo.providers.pool import PoolEntry, load_pool
-from wmo.serving.traces_source import TRACES_FILENAME
+from wmo.simulation.ingest.otel_writer import write_traces_jsonl
+from wmo.simulation.serving.traces_source import TRACES_FILENAME
 from wmo.tracking import Phase, RunRecord, UsageTotals
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from wmo.engine.world_model import WorldModel
     from wmo.runtime.environment import Env
+    from wmo.simulation.model.world_model import WorldModel
 
 
 def _traces(count: int = 30) -> list[Trace]:

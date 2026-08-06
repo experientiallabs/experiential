@@ -5,7 +5,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from wmo.engine.world_model import WorldModel
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.research.scenario_fidelity import (
     ScoreMatrix,
@@ -16,9 +15,10 @@ from wmo.research.scenario_fidelity import (
     spearman,
 )
 from wmo.runtime.episode import Agent
-from wmo.scenarios.synthesis import EvalScenario
-from wmo.scenarios.verification import CHECKLIST_SYSTEM, ChecklistJudge
-from wmo.scenarios.verification.verify_test import EmptyRetriever, OneShotAgent
+from wmo.simulation.model.world_model import WorldModel
+from wmo.simulation.scenarios.synthesis import EvalScenario
+from wmo.simulation.scenarios.verification import CHECKLIST_SYSTEM, ChecklistJudge
+from wmo.simulation.scenarios.verification.verify_test import EmptyRetriever, OneShotAgent
 
 
 class RoutedProvider:

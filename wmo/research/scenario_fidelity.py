@@ -16,11 +16,11 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from pydantic import BaseModel, Field
 
-from wmo.engine.world_model import WorldModel
-from wmo.env.base import WorldModelEnv
 from wmo.runtime.episode import Agent, run_episode
-from wmo.scenarios.synthesis import EvalScenario
-from wmo.scenarios.verification import ChecklistJudge
+from wmo.simulation.environment import WorldModelEnv
+from wmo.simulation.model.world_model import WorldModel
+from wmo.simulation.scenarios.synthesis import EvalScenario
+from wmo.simulation.scenarios.verification import ChecklistJudge
 
 # Every reported metric is a mean over this many independent rollouts per (agent, scenario) cell.
 DEFAULT_PASSES = 3

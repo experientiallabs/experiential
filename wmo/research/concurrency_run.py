@@ -36,7 +36,7 @@ from wmo.core.types import Trace
 from wmo.optimize.gepa import predict_observation
 from wmo.providers.base import Provider
 from wmo.research.concurrency_scaling import RealBatch, RealRunner, WorldBatch, WorldRunner
-from wmo.retrieval.leakfree import DemoRetriever
+from wmo.simulation.retrieval.leakfree import DemoRetriever
 from wmo.tracking.metered import MeteredProvider
 from wmo.tracking.tracker import Phase, RunTracker
 

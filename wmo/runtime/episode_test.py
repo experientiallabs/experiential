@@ -5,8 +5,7 @@ from __future__ import annotations
 import pytest
 
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Step
-from wmo.env import EpisodeResult, StopReason, run_episode
-from wmo.runtime.episode import DONE_SIGNAL
+from wmo.runtime import DONE_SIGNAL, EpisodeResult, StopReason, run_episode
 
 
 class ScriptedEnv:

@@ -34,8 +34,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.config import ArtifactPaths, HarnessConfig, load_config
 from wmo.core.types import Action, EnvState, Observation
-from wmo.engine import split_holdout
-from wmo.env.closed_loop import (
+from wmo.optimize.reward import EpisodeScore
+from wmo.optimize.routing.compression import CompressionConfig, compression_signature
+from wmo.optimize.routing.evaluation import (
     CellKey,
     PoolCell,
     ScoringEnv,
@@ -43,10 +44,6 @@ from wmo.env.closed_loop import (
     run_cells,
     scenario_id,
 )
-from wmo.env.scenarios import Scenario, scenarios_from_traces, tools_hint_from_traces
-from wmo.ingest import get_adapter
-from wmo.optimize.reward import EpisodeScore
-from wmo.optimize.routing.compression import CompressionConfig, compression_signature
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.sweep_partial import (
     PartialSweepError,
@@ -58,13 +55,16 @@ from wmo.optimize.routing.sweep_partial import (
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import ModelPool, load_pool, prepare_pool_provider
 from wmo.runtime.agents.llm import DEFAULT_HISTORY_CHARS
-from wmo.serving.traces_source import TRACES_FILENAME, local_traces_path
+from wmo.simulation.ingest import get_adapter
+from wmo.simulation.model import split_holdout
+from wmo.simulation.scenarios.spec import Scenario, scenarios_from_traces, tools_hint_from_traces
+from wmo.simulation.serving.traces_source import TRACES_FILENAME, local_traces_path
 from wmo.tracking import RunRecord, merge_run_records, save_run
 
 if TYPE_CHECKING:
     from wmo.core.types import Trace
-    from wmo.engine.world_model import WorldModel
     from wmo.runtime.environment import Env
+    from wmo.simulation.model.world_model import WorldModel
 
 logger = logging.getLogger(__name__)
 
@@ -365,8 +365,8 @@ class SweepRun(BaseModel):
     matrix: OutcomeMatrix
     # Candidate-side spend with the compressor's bill IN it. The D-COMPRESS accounting rule is
     # that every savings number is effective cost per completed task, compressor inference cost
-    # and latency included, and `wmo.serving.savings` already sums both; a sweep reporting only
-    # the model half would be a second, quieter answer to the same question.
+    # and latency included. `wmo.simulation.serving.savings` already sums both; a sweep reporting
+    # only the model half would be a second, quieter answer to the same question.
     candidate_usd: float
     # The compressor's share of that total. Kept separately because it is the part the plan
     # table cannot project, so the spend forecast has to divide it back out to stay like-for-like
@@ -433,9 +433,9 @@ def execute_sweep(
 ) -> SweepRun:
     """Run every cell of `plan` against a FROZEN world model, write the matrix, meter both sides.
 
-    Frozen for the whole sweep (the `wmo.evals.closed_loop` precedent): without it a candidate's
-    PREDICTED steps enter the shared retrieval buffer and become demos for the next candidate, so
-    the comparison this matrix exists to make would depend on sweep order. Freezing is also what
+    Frozen for the whole sweep, following `wmo.simulation.evaluation.closed_loop`. Without it, a
+    candidate's predicted steps enter the shared retrieval buffer and become demos for the next
+    candidate, so the comparison would depend on sweep order. Freezing is also what
     makes concurrent cells safe: the shared retrieval index is read-only for the whole run, so
     parallel episodes cannot race to write it (see `plan.max_concurrency`).
 

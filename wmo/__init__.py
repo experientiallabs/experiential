@@ -16,9 +16,9 @@ from wmo.core.types import (
     Step,
     Trace,
 )
-from wmo.engine.world_model import WorldModel
-from wmo.env.base import WorldModelEnv
 from wmo.runtime import DONE_SIGNAL, Agent, Env, EpisodeResult, StopReason, run_episode
+from wmo.simulation.environment import WorldModelEnv
+from wmo.simulation.model.world_model import WorldModel
 
 __all__ = [
     "WorldModel",

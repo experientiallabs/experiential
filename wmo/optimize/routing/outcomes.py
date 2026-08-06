@@ -2,8 +2,9 @@
 
 This is the routing optimizer's training data and the improvement report's evidence base, the
 RouterBench-style precomputed matrix: run the pool over the scenario set once, then compare any
-number of policy variants offline on identical data. Produced by `wmo.env.closed_loop`
-(kept import-free of `wmo.env`/`wmo.engine` here so optimizers can consume it without cycles).
+number of policy variants offline on identical data. Produced by
+`wmo.optimize.routing.evaluation` and kept free of simulation imports so optimizers can consume
+it without cycles.
 """
 
 from __future__ import annotations

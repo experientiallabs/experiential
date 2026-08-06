@@ -56,7 +56,7 @@ those.
 
 ## Where the pieces live
 
-`wmo/evals/`: `base.py` (the general `Evaluation`/`EvalResult` interface), `open_loop.py`
+`wmo/simulation/evaluation/`: `base.py` (the general `Evaluation`/`EvalResult` interface), `open_loop.py`
 (teacher-forced replay fidelity — the default `wmo eval` mode), `closed_loop.py` (k-pass live
 scoring + `WorldModelEnvironment`), `gold.py` (gold-assertion judge), `agreement.py`
 (report-vs-report comparison), `tasks.py` (task specs).

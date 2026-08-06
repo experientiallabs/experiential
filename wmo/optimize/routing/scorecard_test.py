@@ -24,7 +24,7 @@ from wmo.optimize.routing.scorecard import (
 )
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import PoolEntry
-from wmo.retrieval.embedders import HashingEmbedder
+from wmo.simulation.retrieval.embedders import HashingEmbedder
 
 _BASE = ConditionLabel(
     base_model="qwen3-8b",

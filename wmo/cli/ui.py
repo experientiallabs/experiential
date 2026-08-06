@@ -7,8 +7,9 @@ Everything that talks to `rich` lives here so the engine stays headless. Respons
   region, budget), so a bare `wmo build` becomes a guided creation flow.
 - `select_model` shows a numbered picker so a user can choose which built world model to run when
   `--name` is omitted and several exist.
-- `RichBuildReporter` implements `wmo.engine.reporting.BuildReporter`, turning build events into a
-  guided, animated pipeline (stage lines + a live GEPA rollout progress bar) on a TTY, and into
+- `RichBuildReporter` implements `wmo.simulation.model.reporting.BuildReporter`, turning build
+  events into a guided, animated pipeline (stage lines + a live GEPA rollout progress bar) on a
+  TTY, and into
   plain one-line-per-event output when piped (non-TTY), so logs stay legible.
 - `run_play_repl` drives the human-in-the-loop demo: the user types actions, the world model
   answers, and the evolving session state (scratchpad + history) is rendered each turn.
@@ -54,8 +55,8 @@ from wmo.providers.base import ProviderConfig, ProviderKind, VerifyResult
 
 if TYPE_CHECKING:
     from wmo.core.types import Action, Session
-    from wmo.engine.play import PlayTurn
-    from wmo.engine.world_model import WorldModel
+    from wmo.simulation.model.play import PlayTurn
+    from wmo.simulation.model.world_model import WorldModel
 
 # A reader takes a fully-rendered prompt string and returns the user's typed line.
 PromptReader = Callable[[str], str]
@@ -150,8 +151,8 @@ class BuildParams(BaseModel):
     judge_model: str | None = None
     region: str | None = None
     fidelity: str = "medium"
-    # Mirrors wmo.engine.build.DEFAULT_TRAIN_SPLIT (0.8): kept as a literal here so this light,
-    # importable-without-the-engine module never has to pull in wmo.engine.build.
+    # Mirrors wmo.simulation.model.build.DEFAULT_TRAIN_SPLIT (0.8). It stays literal so this light
+    # module never has to import wmo.simulation.model.build.
     train_split: float = 0.8
     embed_provider: str = "hashing"
     embed_model: str | None = None
@@ -160,7 +161,7 @@ class BuildParams(BaseModel):
 
 # Trace sources offered in the build wizard: name -> (label, can-pull-live). File-only sources
 # (otel-genai/chat-json) read an export; the rest can also pull live from a vendor API. Any adapter
-# registered in `wmo.ingest` is usable via `--source` even if it isn't surfaced here.
+# registered in `wmo.simulation.ingest` is usable via `--source` even if it isn't surfaced here.
 _SOURCES: dict[str, tuple[str, bool]] = {
     "otel-genai": ("OpenTelemetry GenAI spans (file)", False),
     "chat-json": ("Chat / tool-call log, OpenAI-style (file)", False),
@@ -1091,7 +1092,7 @@ def _handle_action(console: Console, world_model: WorldModel, session_id: str, l
     A failed step (e.g. a provider/network error) is reported and swallowed so the REPL keeps the
     session alive instead of crashing the whole interactive run.
     """
-    from wmo.engine.play import parse_action, play_turn
+    from wmo.simulation.model.play import parse_action, play_turn
 
     try:
         action = parse_action(line)

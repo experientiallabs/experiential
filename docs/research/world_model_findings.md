@@ -465,7 +465,7 @@ machine; treat any number without that pinning as unfalsifiable.
 ## Reproduce
 
 All six layers are driven by the public `wmo` API; any thin driver reproduces them. Corpora:
-`environment-capture-data/<suite>/traces.otel.jsonl` via `wmo.ingest` (adapter
+`environment-capture-data/<suite>/traces.otel.jsonl` via `wmo.simulation.ingest` (adapter
 `otel-genai`, degenerate traces dropped for swe-healthy). Splits via
 `wmo.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`. Figures: matplotlib over the
 result JSONs, brand palette per AGENTS.md rule 15.

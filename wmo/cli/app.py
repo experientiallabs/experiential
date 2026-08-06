@@ -54,15 +54,15 @@ from wmo.config import (
 if TYPE_CHECKING:
     import wmo.cli.pool_registry as pool_registry
     from wmo.core.types import JsonObject, Trace
-    from wmo.engine.eval_suites import EvalSuite
-    from wmo.engine.world_model import WorldModel
-    from wmo.evals.grid import ModelSpec
-    from wmo.evals.open_loop import EvalReport
     from wmo.providers import ProviderConfig, ProviderKind, VerifyResult
     from wmo.providers.base import Embedder, Provider
     from wmo.providers.models import ProviderModel
     from wmo.providers.pool import Tier
-    from wmo.scenarios import ScenarioSet
+    from wmo.simulation.evaluation.grid import ModelSpec
+    from wmo.simulation.evaluation.open_loop import EvalReport
+    from wmo.simulation.model.eval_suites import EvalSuite
+    from wmo.simulation.model.world_model import WorldModel
+    from wmo.simulation.scenarios import ScenarioSet
 
 
 app = typer.Typer(
@@ -536,7 +536,7 @@ _DB_SOURCES = ("postgres",)
 
 def _check_build_source(source: str) -> None:
     """Reject a `--source` that `wmo build` cannot drive, naming the `wmo ingest` two-step."""
-    from wmo.ingest import list_adapters
+    from wmo.simulation.ingest import list_adapters
 
     if source not in list_adapters():
         raise typer.BadParameter(
@@ -564,8 +564,8 @@ def _check_build_file(file: str) -> None:
 
 def _empty_corpus_error(file: str | None, source: str) -> typer.BadParameter:
     """Explain an empty ingest: usually `--source` does not match the export's real format."""
-    from wmo.ingest.base import load_payloads
-    from wmo.ingest.detect import detect_format
+    from wmo.simulation.ingest.base import load_payloads
+    from wmo.simulation.ingest.detect import detect_format
 
     if file is None:
         return typer.BadParameter(
@@ -719,13 +719,13 @@ def build(
         serve_model_default,
     )
     from wmo.config.card import make_build_card, save_card
-    from wmo.engine.build import EmptyCorpusError
-    from wmo.engine.build import build as run_build
-    from wmo.engine.grounding import GROUNDER_KINDS
-    from wmo.ingest import VendorPull
     from wmo.providers import ProviderKind
     from wmo.providers.base import EmbedderKind
-    from wmo.retrieval import get_embedder
+    from wmo.simulation.ingest import VendorPull
+    from wmo.simulation.model.build import EmptyCorpusError
+    from wmo.simulation.model.build import build as run_build
+    from wmo.simulation.model.grounding import GROUNDER_KINDS
+    from wmo.simulation.retrieval import get_embedder
     from wmo.telemetry import BuildTelemetryStats, TelemetryBuildReporter, capture_build_completed
     from wmo.tracking import MeteredProvider, Phase, RunTracker, classify_build_call, save_run
 
@@ -1126,7 +1126,7 @@ def download(
     named suites `wmo eval list` discovers.
     """
     from wmo.cli.ui import select_option
-    from wmo.hub import corpus_path, published_corpora
+    from wmo.simulation.hub import corpus_path, published_corpora
 
     selected = list(benchmarks or [])
     if selected == ["all"]:
@@ -1219,7 +1219,7 @@ def _all_downloadable() -> list[str]:
     Both narrowings are announced. A quiet substitution of a stale local list for the live one,
     or a quiet drop of a registered benchmark, reads afterwards as "everything was fetched".
     """
-    from wmo.hub import CORPORA, downloadable_benchmarks, published_corpora
+    from wmo.simulation.hub import CORPORA, downloadable_benchmarks, published_corpora
 
     try:
         return sorted(corpus.benchmark for corpus in published_corpora())
@@ -1245,7 +1245,7 @@ def _fetch_with_progress(name: str, *, force: bool) -> Path:
     file, so a byte-weighted bar sat at 97% for 98% of the download. The bundle's size stays on
     screen as description text, which is where a constant belongs.
     """
-    from wmo.hub import fetch_corpus
+    from wmo.simulation.hub import fetch_corpus
 
     with Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -1298,7 +1298,7 @@ def serve(
 
     import uvicorn
 
-    from wmo.serving.server import create_app
+    from wmo.simulation.serving.server import create_app
 
     names = list(name) if name else None
     # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
@@ -1310,7 +1310,7 @@ def serve(
     uvicorn.run(server_app, host="127.0.0.1", port=port)
 
 
-# Charting deps ship in the optional `viz` extra, so `wmo.evals.grid_plot` /
+# Charting deps ship in the optional `viz` extra, so `wmo.simulation.evaluation.grid_plot` /
 # `wmo.research.concurrency_plot` import them lazily. Every chart-writing flow probes for them
 # UP FRONT instead: `wmo eval grid` otherwise spent the whole (paid) grid and only then died on
 # `import matplotlib` with a raw traceback that never named the extra.
@@ -1354,7 +1354,7 @@ def _resolve_eval_suite_or_usage(selector: str, examples_roots: list[str]) -> Ev
     Same contract as `_resolve_example`: a typo prints a clean box listing the available suites,
     never a traceback.
     """
-    from wmo.engine.eval_suites import resolve_eval_suite
+    from wmo.simulation.model.eval_suites import resolve_eval_suite
 
     try:
         return resolve_eval_suite(selector, examples_roots)
@@ -1690,7 +1690,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
 
 
 def _eval_list(examples_roots: list[str]) -> None:
-    from wmo.engine.eval_suites import discover_eval_suites
+    from wmo.simulation.model.eval_suites import discover_eval_suites
 
     suites = discover_eval_suites(examples_roots)
     if not suites:
@@ -1718,7 +1718,7 @@ def _eval_results(
     *,
     limit: int,
 ) -> None:
-    from wmo.engine.eval_suites import list_eval_results, resolve_eval_suite
+    from wmo.simulation.model.eval_suites import list_eval_results, resolve_eval_suite
 
     resolved_suite = suite_filter
     if suite_filter is not None:
@@ -1772,9 +1772,9 @@ def _parse_model_specs(models: str | None) -> list[ModelSpec]:
     (`resolve_provider_model`), so a friendly model type resolves to its canonical wire id while an
     unknown (self-hosted) id passes through unchanged, and a bad provider fails at parse time.
     """
-    from wmo.evals.grid import ModelSpec
     from wmo.providers import ProviderKind
     from wmo.providers.models import resolve_provider_model
+    from wmo.simulation.evaluation.grid import ModelSpec
 
     raw = models.split(",") if models else list(_DEFAULT_GRID_MODELS)
     specs: list[ModelSpec] = []
@@ -1828,9 +1828,9 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
     out: str | None,
 ) -> None:
     """Run the model x condition grid for a suite, write result JSON + a fidelity bar chart PNG."""
-    from wmo.engine.prompts import BASE_ENV_PROMPT
-    from wmo.evals.grid import run_grid
-    from wmo.evals.grid_plot import plot_grid
+    from wmo.simulation.evaluation.grid import run_grid
+    from wmo.simulation.evaluation.grid_plot import plot_grid
+    from wmo.simulation.model.prompts import BASE_ENV_PROMPT
 
     suite = _resolve_eval_suite_or_usage(selector, examples_roots)
     # The chart is the last thing written, so probe its deps before the grid spends anything.
@@ -1892,8 +1892,8 @@ def _eval_grid_plot(paths: list[str], *, out: str | None, dataset_label: str | N
     process-global) be combined with the API-model grid into one chart - and re-plots any saved
     result without re-running the eval.
     """
-    from wmo.evals.grid import GridResult, merge_results
-    from wmo.evals.grid_plot import plot_grid
+    from wmo.simulation.evaluation.grid import GridResult, merge_results
+    from wmo.simulation.evaluation.grid_plot import plot_grid
 
     _require_viz_extra()
     results = [GridResult.model_validate_json(Path(p).read_text(encoding="utf-8")) for p in paths]
@@ -1922,8 +1922,8 @@ def _eval_grid_heatmap(paths: list[str], *, out: str | None) -> None:
     Accepts any mix of API/Qwen result JSONs; same-suite results are merged into one 5-model row
     set, then all suites become the heatmap's columns (rows = model x condition).
     """
-    from wmo.evals.grid import GridResult, merge_results
-    from wmo.evals.grid_plot import plot_grid_heatmap
+    from wmo.simulation.evaluation.grid import GridResult, merge_results
+    from wmo.simulation.evaluation.grid_plot import plot_grid_heatmap
 
     _require_viz_extra()
     by_suite: dict[str, list[GridResult]] = {}
@@ -1953,7 +1953,7 @@ def _eval_run_suite(
     reasoning: bool | None,
     out: str | None,
 ) -> None:
-    from wmo.engine.eval_suites import result_path
+    from wmo.simulation.model.eval_suites import result_path
     from wmo.telemetry import capture_eval_completed, settings_root_from_results_root
 
     suite = _resolve_eval_suite_or_usage(selector, examples_roots)
@@ -2040,7 +2040,7 @@ def _eval_options(
     knowledge: bool | None = None,
     reasoning: bool | None = None,
 ) -> _EvalOptions:
-    from wmo.engine.build import DEFAULT_TRAIN_SPLIT
+    from wmo.simulation.model.build import DEFAULT_TRAIN_SPLIT
 
     split = DEFAULT_TRAIN_SPLIT if train_split is None else train_split
     dim = 512 if embed_dim is None else embed_dim
@@ -2077,10 +2077,10 @@ def _run_eval_files(
     chain: str | None = None,
 ) -> EvalReport:
     import wmo.providers as providers
-    from wmo.engine.prompts import BASE_ENV_PROMPT
-    from wmo.evals.open_loop import OpenLoopEval
     from wmo.optimize.judge import RubricJudge
-    from wmo.retrieval import HashingEmbedder
+    from wmo.simulation.evaluation.open_loop import OpenLoopEval
+    from wmo.simulation.model.prompts import BASE_ENV_PROMPT
+    from wmo.simulation.retrieval import HashingEmbedder
 
     for path in files:
         if not path.exists():
@@ -2200,7 +2200,7 @@ def knowledge_(
     the env's own cross-session notes; `grounded.md` caches web-search groundings. Models are
     resolved exactly as `wmo demo`/`wmo play` resolve them, so a shipped example needs no `--root`.
     """
-    from wmo.engine.knowledge import KnowledgeBase
+    from wmo.simulation.model.knowledge import KnowledgeBase
 
     store_root, resolved = _resolve_model_any(name, root)
     model_dir = WorldModelStore(str(store_root)).resolve(resolved)
@@ -2267,7 +2267,7 @@ def scenarios_build(
     Writes a `ScenarioSet` JSON: scenarios (task, seed state, checklist, weight, provenance),
     the named clusters they came from, and the corpus-coverage number that justifies them.
     """
-    from wmo.scenarios import FacetExtractor, ScenarioBuildConfig, build_scenario_set
+    from wmo.simulation.scenarios import FacetExtractor, ScenarioBuildConfig, build_scenario_set
 
     traces = _ingest_scenario_corpus(file)
     if limit is not None:
@@ -2319,10 +2319,10 @@ def scenarios_verify(
     With `--drop`, unverified scenarios are removed from the set in place.
     """
     import wmo.providers as providers
-    from wmo.engine.world_model import WorldModel
     from wmo.providers.retry import wrap_provider_with_retries
     from wmo.runtime.agents.llm import LLMAgent
-    from wmo.scenarios import ChecklistJudge, verify_scenarios
+    from wmo.simulation.model.world_model import WorldModel
+    from wmo.simulation.scenarios import ChecklistJudge, verify_scenarios
 
     scenario_set = _load_scenario_set(scenarios_file)
     traces = _ingest_scenario_corpus(file)
@@ -2388,7 +2388,7 @@ def _ingest_scenario_corpus(file: str) -> list[Trace]:
     likeliest first-run mistake. Guard it here rather than letting `Path.read_text` raise, which
     reaches the user as a stdlib FileNotFoundError/IsADirectoryError traceback.
     """
-    from wmo.ingest import get_adapter
+    from wmo.simulation.ingest import get_adapter
 
     path = Path(file)
     if path.is_dir():
@@ -2414,7 +2414,7 @@ def _load_scenario_set(scenarios_file: str) -> ScenarioSet:
     ValidationError that sends the user to pydantic's docs; neither says the file is supposed to
     be the output of `wmo scenarios build`.
     """
-    from wmo.scenarios import ScenarioSet
+    from wmo.simulation.scenarios import ScenarioSet
 
     path = Path(scenarios_file)
     build_hint = (
@@ -2629,7 +2629,7 @@ def _resolve_scenario_embedder(
     import wmo.providers as providers
     from wmo.providers import ProviderConfig
     from wmo.providers.base import EmbedderKind
-    from wmo.retrieval import HashingEmbedder
+    from wmo.simulation.retrieval import HashingEmbedder
 
     try:
         kind = EmbedderKind(embed_provider)
@@ -2690,11 +2690,11 @@ def demo(
 
     import wmo.providers as providers
     from wmo.cli.ui import select_provider_and_model
-    from wmo.engine.build import ingest
-    from wmo.engine.demo import run_demo
-    from wmo.engine.world_model import WorldModel
     from wmo.providers import verify_all
     from wmo.providers.retry import wrap_provider_with_retries
+    from wmo.simulation.model.build import ingest
+    from wmo.simulation.model.demo import run_demo
+    from wmo.simulation.model.world_model import WorldModel
     from wmo.utils.waterfall import is_capacity_error
 
     wm, resolved_name, _provider, model_root = _load_model_any(
@@ -2850,7 +2850,7 @@ def _demo_traces(model_dir: Path, resolved_name: str, explicit: str | None) -> P
     example layout. A build keeps NO copy of the corpus it read, so a plain `wmo build` leaves
     neither, and the failure has to name the file to pass rather than the directory it searched.
     """
-    from wmo.serving.traces_source import TRACES_FILENAME, local_traces_path
+    from wmo.simulation.serving.traces_source import TRACES_FILENAME, local_traces_path
 
     if explicit is not None:
         path = Path(explicit)
@@ -3023,14 +3023,14 @@ def _benchmark_roots() -> tuple[Path, ...]:
     """Every root holding self-contained task dirs.
 
     Benchmark data is not vendored in this repo: `wmo download` writes bundles through
-    `wmo.hub`, which owns where they land (`$ENVCAP_DATA_ROOT` if set, else
+    `wmo.simulation.hub`, which owns where they land (`$ENVCAP_DATA_ROOT` if set, else
     `environment-capture-data/` under the working directory). Deriving the root from
     `corpus_path` instead of hardcoding one keeps discovery pointed wherever download wrote,
     including when the override moves it.
     """
     # Imported here per this module's deferred-import rule (#373): the CLI's startup
     # latency budget forbids eager imports, and this function runs only on discovery.
-    from wmo.hub import CORPORA, corpus_path
+    from wmo.simulation.hub import CORPORA, corpus_path
 
     # corpus_path is `<root>/<benchmark>/traces.otel.jsonl`, so its grandparent is the root.
     return (corpus_path(next(iter(CORPORA))).parent.parent,)
@@ -3136,15 +3136,15 @@ def research_concurrency(
     (train_split, top_k, prompt) and the example's `run.sh`. See `wmo.research.concurrency_run`.
     """
     import wmo.providers as providers
-    from wmo.engine.build import split_traces
-    from wmo.engine.eval_suites import resolve_eval_suite
-    from wmo.engine.prompts import BASE_ENV_PROMPT
-    from wmo.ingest import get_adapter
     from wmo.research import Side, run_concurrency_scaling
     from wmo.research.concurrency_run import build_real_runner, build_world_runner
     from wmo.research.concurrency_scaling import ConcurrencyPoint
-    from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
-    from wmo.retrieval.leakfree import DemoRetriever
+    from wmo.simulation.ingest import get_adapter
+    from wmo.simulation.model.build import split_traces
+    from wmo.simulation.model.eval_suites import resolve_eval_suite
+    from wmo.simulation.model.prompts import BASE_ENV_PROMPT
+    from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
+    from wmo.simulation.retrieval.leakfree import DemoRetriever
 
     if scenarios < 1:
         raise typer.BadParameter("--scenarios must be at least 1")
@@ -3572,8 +3572,8 @@ def _load_model(name: str | None, root: str, *, max_fidelity: bool = False):  # 
     Returns `(world_model, resolved_name, provider)`.
     """
     import wmo.providers as providers
-    from wmo.engine.world_model import WorldModel
     from wmo.providers.retry import wrap_provider_with_retries
+    from wmo.simulation.model.world_model import WorldModel
 
     store = WorldModelStore(root)
     resolved_name = _resolve_name(store, name)

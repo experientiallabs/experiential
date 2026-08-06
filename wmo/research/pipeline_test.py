@@ -5,10 +5,10 @@ from __future__ import annotations
 import pytest
 
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
-from wmo.engine.replay import ReplayReport
 from wmo.optimize.judge import JudgeResult
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.research.pipeline import optimize_prompt, score_prompt
+from wmo.simulation.model.replay import ReplayReport
 
 
 class FakeProvider:

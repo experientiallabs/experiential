@@ -3,8 +3,8 @@
 The standalone half of what `wmo build` does first: pick a source (auto-detected for files),
 normalize to the harness's OTel span JSONL, and report progress. The output feeds any downstream
 command (`wmo build --source otel-genai --file <out>`), and the same event stream drives the
-platform's SSE trace-ingest endpoint (`wmo.ingest.stream.ingest_events`), so the CLI and the
-hosted flow can't drift.
+platform's SSE trace-ingest endpoint (`wmo.simulation.ingest.stream.ingest_events`), so the CLI
+and hosted flow cannot drift.
 
 Output modes: a rich progress bar on a TTY, and `--json` for one D-INGEST event object per line
 (machine-readable; what a wrapping process pipes to a wire).
@@ -23,7 +23,7 @@ from rich.markup import escape
 from rich.progress import BarColumn, Progress, TextColumn
 
 if TYPE_CHECKING:
-    from wmo.ingest.stream import IngestEvent
+    from wmo.simulation.ingest.stream import IngestEvent
 
 _console = Console()
 
@@ -36,7 +36,7 @@ def _default_out(file: str | None, source: str | None) -> Path:
 
 def _render_rich(stream: Iterator[IngestEvent]) -> bool:
     """Consume the event stream behind a progress bar; returns True on success."""
-    from wmo.ingest.stream import DetectedEvent, DoneEvent, ErrorEvent, ProgressEvent
+    from wmo.simulation.ingest.stream import DetectedEvent, DoneEvent, ErrorEvent, ProgressEvent
 
     ok = False
     with Progress(
@@ -120,8 +120,8 @@ def ingest(
     any other command that reads a trace file). Progress events follow the D-INGEST vocabulary:
     detected -> progress... -> done | error.
     """
-    from wmo.ingest import VendorPull, list_adapters
-    from wmo.ingest.stream import DoneEvent, ErrorEvent, event_json, ingest_events
+    from wmo.simulation.ingest import VendorPull, list_adapters
+    from wmo.simulation.ingest.stream import DoneEvent, ErrorEvent, event_json, ingest_events
 
     if (dsn is not None or table is not None) and source is None:
         source = "postgres"

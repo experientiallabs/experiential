@@ -8,7 +8,8 @@ evaluation reports.
 
 Judge failures are not world-model failures: a reply that cannot be parsed into the five
 dimensions is retried once and, if still bad, flagged with `JudgeResult.valid=False` so callers
-(`wmo.engine.replay`) can exclude it from fidelity aggregates instead of recording a spurious 0.
+(`wmo.simulation.model.replay`) can exclude it from fidelity aggregates instead of recording a
+spurious 0.
 """
 
 from __future__ import annotations

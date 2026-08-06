@@ -17,11 +17,15 @@ uv run pytest -q
 
 ## World models and trace lifecycle
 
+- World-model code lives under `wmo/simulation/`: context collection, trace ingestion, the model
+  implementation, retrieval, scenario construction, evaluation, serving, and artifact download.
+  Keep these responsibilities nested here instead of returning domain packages to `wmo/`.
 - `wmo build --file <traces> --name <model>` is the canonical trace-to-model path. Route every
   corpus through the registered `TraceAdapter` seam rather than adding parallel ingest or build
   flows.
-- New trace sources belong in `wmo/ingest/`, normalize into the `Trace` and `Step` contracts in
-  `wmo/core/types.py`, support file ingestion, and register from `wmo/ingest/__init__.py`.
+- New trace sources belong in `wmo/simulation/ingest/`, normalize into the `Trace` and `Step`
+  contracts in `wmo/core/types.py`, support file ingestion, and register from
+  `wmo/simulation/ingest/__init__.py`.
 - Preserve the build's data boundary: deterministic train, validation, and test splits; a
   full-corpus serving index; train-only prompt optimization and knowledge extraction; untouched
   test data for final evaluation.
@@ -142,7 +146,7 @@ uv run pytest -q
    in scope or prevent meaningful validation.
 
 2. **Tests live inline next to the code.** A module `foo.py` is tested by `foo_test.py` in the same
-   directory (e.g. `wmo/engine/world_model.py` → `wmo/engine/world_model_test.py`). There is no
+   directory (e.g. `wmo/simulation/model/world_model.py` → `wmo/simulation/model/world_model_test.py`). There is no
    top-level `tests/` directory. Pytest is configured (`python_files = ["*_test.py"]`) to discover
    these.
 
@@ -151,11 +155,12 @@ uv run pytest -q
    JSON use pydantic's `JsonValue` (see `wmo/core/types.py:JsonObject`), not `Any`.
 
 4. **Keep the structure coherent and the command surface intentional.** Agent execution is nested
-   under `wmo/runtime/`; routing and model optimization are nested under `wmo/optimize/`. The
-   remaining world-model and shared packages are being consolidated separately and retain their
-   current roots until those moves land. Add a CLI command when it represents a clear user
-   workflow; avoid both unrelated command sprawl and hiding useful behavior behind internal APIs.
-   Do not return runtime or optimization domains to the flat `wmo/` namespace.
+   under `wmo/runtime/`; world-model construction and execution are nested under
+   `wmo/simulation/`; routing and model optimization are nested under `wmo/optimize/`. Shared
+   infrastructure retains its current roots until its separate consolidation lands. Add a CLI
+   command when it represents a clear user workflow; avoid unrelated command sprawl and hiding
+   useful behavior behind internal APIs. Do not return domain packages to the flat `wmo/`
+   namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
    `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.
@@ -205,7 +210,7 @@ uv run pytest -q
 
 6. **Benchmark data is a dependency, not a directory.** Benchmark launch/capture/conversion logic
    lives in the separately published `environment-capture` distribution, and its trace corpora and
-   task data are Hub-hosted bundles fetched with `wmo download` (`wmo/hub.py`). Do not
+   task data are Hub-hosted bundles fetched with `wmo download` (`wmo/simulation/hub.py`). Do not
    vendor a benchmark's data, gold dirs, or capture scripts back into this repo.
 
 7. **Give reusable workflows a clear owner.** Avoid parallel top-level scripts for harness actions.
@@ -275,7 +280,7 @@ This repo publishes **one distribution**: `world-model-optimizer`, whose importa
   (`environment-capture`), or it is vendored under `wmo/utils/` with its upstream `LICENSE`
   (`wmo/utils/waterfall/`). Vendoring is for code we alone consume and do not publish; keep it
   free of imports back into `wmo` so it stays independently testable. The data-bundle read core
-  behind `wmo download` is vendored the same way at `wmo/hub.py`, which names its origin in the
+  behind `wmo download` is vendored the same way at `wmo/simulation/hub.py`, which names its origin in the
   module docstring: a `wmo` release must never wait on an `environment-capture` release.
 - **Gate scoping**: the root gate is `uv run ruff check .`, `uv run ty check`, `uv run pytest -q`,
   all over the single `testpaths = ["wmo"]`. Tests are inline `*_test.py` beside the module they

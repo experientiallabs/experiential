@@ -5,9 +5,9 @@ These wrap the real pipeline so an ablation measures the deployed behavior, not 
 - `optimize_prompt` runs `GEPAOptimizer` at a chosen GEPA `seed` (the knob added to
   `wmo.optimize.gepa`) and returns the winning prompt + its metrics.
 - `score_prompt` replay-scores a prompt's held-out reconstruction fidelity by delegating to the
-  canonical `wmo.engine.replay.replay` — the SAME scorer `wmo eval` uses — so an experiment's metric
-  is directly comparable to the rest of the harness (and any rubric/judge upgrade lands here for
-  free).
+  canonical `wmo.simulation.model.replay.replay`, the same scorer `wmo eval` uses. An experiment's
+  metric is directly comparable to the rest of the harness, and any rubric or judge upgrade lands
+  here for free.
 
 Both take an explicit `Provider`, `Judge`, and `Embedder` so callers control whether they hit a live
 backend or fakes in tests — no network is assumed here.
@@ -23,14 +23,14 @@ import logging
 from collections.abc import Callable
 
 from wmo.core.types import Step, Trace
-from wmo.engine.grounding import Grounder, SourceResolver
-from wmo.engine.replay import ReplayReport, replay
-from wmo.engine.workspace import RepoTreeResolver
 from wmo.optimize.base import OptimizeResult
 from wmo.optimize.gepa import GEPAOptimizer
 from wmo.optimize.judge import RUBRIC_DIMENSIONS, Judge, RubricDimension
 from wmo.providers.base import Embedder, Provider
-from wmo.retrieval import EmbeddingRetriever, RetrievalKey
+from wmo.simulation.model.grounding import Grounder, SourceResolver
+from wmo.simulation.model.replay import ReplayReport, replay
+from wmo.simulation.model.workspace import RepoTreeResolver
+from wmo.simulation.retrieval import EmbeddingRetriever, RetrievalKey
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +52,8 @@ def optimize_prompt(
 ) -> OptimizeResult:
     """Evolve `base_prompt` with GEPA at `seed` (RAG-aware when `embedder` is set).
 
-    Mirrors `wmo.engine.build`: a fresh train-only retriever makes optimization leak-free. Returns
-    the GEPA `OptimizeResult` (winning prompt + held-out accuracy + rollouts used).
+    Mirrors `wmo.simulation.model.build`: a fresh train-only retriever makes optimization
+    leak-free. Returns the GEPA `OptimizeResult` with its winner, accuracy, and rollout count.
     `hard_step_filter`/`select_on_hard` forward to `GEPAOptimizer.optimize` so experiments can
     concentrate reflection (and optionally candidate selection) on the steps with headroom - see
     that method for the semantics and caveats.
@@ -103,9 +103,9 @@ def score_prompt(
 ) -> float:
     """Replay-score `prompt`'s held-out fidelity, leak-free. Returns the mean judge score (0..1).
 
-    Thin adapter over `wmo.engine.replay.replay`: builds the serving retriever from `embedder` and
-    forwards the leak-free `train` corpus, then returns the aggregate `mean_score`. Using `replay`
-    (not a private loop) means the rubric/judge the rest of the harness uses scores ablations too.
+    Thin adapter over `wmo.simulation.model.replay.replay`: builds the serving retriever from
+    `embedder` and forwards the leak-free `train` corpus, then returns aggregate `mean_score`.
+    Using `replay`, not a private loop, means the shared rubric and judge score ablations too.
     `sample_turns="sampled"` scores Qwen-AgentWorld's 5 turns per trace (cheaper on big test sets);
     `seed` makes that turn selection reproducible. `retrieval_key` selects what phi embeds:
     "state_action" (full summary) or "action" (command-only). `knowledge`/`reasoning` are the

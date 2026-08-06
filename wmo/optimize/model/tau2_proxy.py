@@ -20,7 +20,7 @@ chat-completion JSON, `ChatRequest`/`ChatResponse` (`wmo.utils.waterfall.types`)
 ARE that wire shape, and `ToolCallingProvider.complete_chat` consumes and
 produces them directly. Tool schemas render into the prompt and sampled tool
 calls parse back through the provider's own renderer, the same path every
-other structured consumer uses (see `wmo.serving.chat` for the full serving
+other structured consumer uses (see `wmo.simulation.serving.chat` for the full serving
 surface; this proxy serves exactly one caller on loopback and meters nothing,
 which is why it does not mount that router).
 """
@@ -281,7 +281,7 @@ class EpisodeProxy:
                 realign_tool_argument_types(response, chat_request.tools)
             except Exception as exc:  # noqa: BLE001 - reported as an OpenAI-shaped 502
                 logger.error("proxy completion for %s failed: %s", alias, exc)
-                # Same split as wmo.serving.chat: full detail to the log above,
+                # Same split as wmo.simulation.serving.chat: full detail to the log above,
                 # exception class name to the wire (CodeQL: stack-trace exposure).
                 return JSONResponse(
                     status_code=502,

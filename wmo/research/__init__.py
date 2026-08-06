@@ -13,7 +13,7 @@ Two layers:
   experiment = writing one `Ablation`.
 - `pipeline` — the reusable build/eval primitives every ablation leans on: `optimize_prompt` (run
   GEPA at a chosen seed) and `score_prompt` (replay-score held-out fidelity via the canonical
-  `wmo.engine.replay`, leak-free).
+  `wmo.simulation.model.replay`, leak-free).
 
 Concrete experiments:
 

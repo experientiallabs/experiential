@@ -42,10 +42,10 @@ banned = (
     "sklearn",
     "scipy",
     "uvicorn",
-    "wmo.serving.server",
+    "wmo.simulation.serving.server",
     "wmo.optimize.model",
     "wmo.cli.route_app",
-    "wmo.evals.open_loop",
+    "wmo.simulation.evaluation.open_loop",
 )
 roots = {k.split(".")[0] for k in sys.modules}
 bad = []
@@ -70,7 +70,7 @@ runner = CliRunner()
 assert runner.invoke(app, ["list"]).exit_code == 0
 assert runner.invoke(app, ["config", "telemetry", "status"]).exit_code == 0
 banned = (
-    "wmo.serving.server",
+    "wmo.simulation.serving.server",
     "wmo.optimize.model",
     "wmo.cli.route_app",
     "fastapi",
@@ -98,7 +98,7 @@ def test_serve_help_loads_uvicorn_path_when_handler_imports() -> None:
     _run(
         """
 import sys
-from wmo.serving.server import create_app
+from wmo.simulation.serving.server import create_app
 assert callable(create_app)
 assert "fastapi" in {m.split(".")[0] for m in sys.modules}
 """

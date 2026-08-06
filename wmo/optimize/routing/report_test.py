@@ -15,7 +15,7 @@ from wmo.optimize.routing.policy import ClusterRanking, EmbedderSpec, RoutingPol
 from wmo.optimize.routing.report import build_report
 from wmo.providers.base import Embedder, ProviderKind, TokenUsage
 from wmo.providers.pool import PoolEntry
-from wmo.retrieval.embedders import HashingEmbedder
+from wmo.simulation.retrieval.embedders import HashingEmbedder
 
 
 def _entries() -> list[PoolEntry]:

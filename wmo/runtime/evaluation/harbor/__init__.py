@@ -1,9 +1,9 @@
 """Ground-truth harness evaluation through Harbor (optional `harbor` extra).
 
 This subpackage imports the `harbor` PyPI package at module scope and is therefore imported
-lazily by its consumers, exactly like the e2b extra: `import wmo` (and `wmo.evals`) must succeed
-without it. The E2B task-environment path additionally needs the e2b extra and is itself only
-imported through harbor's environment factory (`wmo.runtime.evaluation.harbor.e2b_environment`).
+lazily by its consumers, exactly like the e2b extra. Importing `wmo` and
+`wmo.simulation.evaluation` must succeed without it. The E2B task-environment path also needs e2b
+and is imported only through Harbor's environment factory.
 """
 
 from wmo.runtime.evaluation.harbor.agent import WmoHarborAgent

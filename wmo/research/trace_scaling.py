@@ -29,16 +29,16 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from wmo.core.types import JsonValue, Trace
-from wmo.engine.grounding import FetchGrounder, SourceResolver
-from wmo.engine.knowledge import seeded_knowledge_text
-from wmo.engine.replay import ReplayReport
-from wmo.engine.workspace import RepoTreeResolver
 from wmo.optimize.judge import RubricDimension
 from wmo.research.ablation import Condition, as_int
 from wmo.research.pipeline import optimize_prompt, score_prompt
 from wmo.research.scaling_split import CorpusSplit, partition_corpus, subsample_train
 from wmo.research.seed_stability import BackendFactory
-from wmo.retrieval import RetrievalKey
+from wmo.simulation.model.grounding import FetchGrounder, SourceResolver
+from wmo.simulation.model.knowledge import seeded_knowledge_text
+from wmo.simulation.model.replay import ReplayReport
+from wmo.simulation.model.workspace import RepoTreeResolver
+from wmo.simulation.retrieval import RetrievalKey
 
 # The prompt/agentic configurations the sweep compares. `base` = the shipped prompt + RAG only
 # (cheap); `gepa` = GEPA-optimized on the train sample (expensive); `reason` = base + the

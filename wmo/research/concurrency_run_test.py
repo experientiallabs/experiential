@@ -17,7 +17,7 @@ from wmo.providers.base import (
     VerifyResult,
 )
 from wmo.research.concurrency_run import build_real_runner, build_world_runner
-from wmo.retrieval.leakfree import DemoRetriever
+from wmo.simulation.retrieval.leakfree import DemoRetriever
 
 
 class _FakeProvider:

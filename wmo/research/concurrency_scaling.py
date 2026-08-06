@@ -3,9 +3,9 @@
 The world model and the real sandbox both reconstruct the SAME held-out scenarios; the question
 this experiment answers is **how the wall-clock of each side changes as we raise concurrency W**,
 and therefore the *time differential* T_real(W) / T_world(W) at each level. The world-model side
-parallelizes near-perfectly: open-loop replay is teacher-forced, so each scenario is independent and
-gets its own provider client + metering (see `wmo.engine.replay.replay`, the same scorer `wmo eval`
-uses). The real side is bounded by container/process standup. The crossover and saturation points
+parallelizes near-perfectly: open-loop replay is teacher-forced, so each scenario is independent
+and gets its own provider client and metering. See `wmo.simulation.model.replay.replay`, the same
+scorer `wmo eval` uses. The real side is bounded by container/process standup. The saturation points
 are the headline.
 
 This reuses the deployed prediction primitive rather than reimplementing it: the caller passes a

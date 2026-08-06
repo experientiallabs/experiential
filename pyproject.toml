@@ -55,9 +55,9 @@ e2b = ["e2b==2.31.0"]
 # tracks its build behavior. Running harbor task environments ON E2B additionally needs
 # `wmo[harbor,e2b]` plus harbor's own e2b extra (`harbor[e2b]`, for dockerfile-parse).
 harbor = ["harbor==0.20.0"]
-# Context connectors (`wmo.connect`): the MCP client SDK backs the Notion connector's
+# Context connectors (`wmo.simulation.context`): the MCP client SDK backs the Notion connector's
 # remote-MCP OAuth/pull path. Only that path needs it, so it is an optional extra imported
-# lazily (wmo.connect.notion), same contract as the e2b extra above.
+# lazily (wmo.simulation.context.notion), same contract as the e2b extra above.
 connectors = ["mcp>=1.27"]
 # The Postgres trace source (`wmo ingest --source postgres`): the driver is imported lazily
 # inside the adapter's pull path, same contract as the vendor-SDK extras.
@@ -93,7 +93,7 @@ dev = [
 #
 # A dependency GROUP is not published metadata, so nothing here reaches a `pip install
 # world-model-optimizer`. That is the whole point for environment-capture: it is a development
-# dependency only, and shipped `wmo/` imports nothing from it (`wmo/hub.py` vendors the
+# dependency only, and shipped `wmo/` imports nothing from it (`wmo/simulation/hub.py` vendors the
 # bundle-fetch read core `wmo download` needs). llm-waterfall is no longer a dependency in any
 # form: its source is vendored under `wmo/utils/waterfall/` and ships inside the flagship wheel.
 dev = ["environment-capture[bedrock,fetch]"]

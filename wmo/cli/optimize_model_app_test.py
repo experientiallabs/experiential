@@ -19,7 +19,7 @@ import pytest
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
-import wmo.env as env_module
+import wmo.simulation as env_module
 from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
@@ -33,11 +33,9 @@ from wmo.core.types import (
     Step,
     Trace,
 )
-from wmo.engine.world_model import WorldModel
-from wmo.env.closed_loop import scenario_id
-from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing.compression import CompressionConfig
+from wmo.optimize.routing.evaluation import scenario_id
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.pipeline import (
     MANIFEST_FILENAME,
@@ -68,7 +66,9 @@ from wmo.providers.base import (
 )
 from wmo.providers.pool import load_pool
 from wmo.runtime.runs.client import RunsSink
-from wmo.serving.traces_source import TRACES_FILENAME
+from wmo.simulation.ingest.otel_writer import write_traces_jsonl
+from wmo.simulation.model.world_model import WorldModel
+from wmo.simulation.serving.traces_source import TRACES_FILENAME
 from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 
 runner = CliRunner()
@@ -315,7 +315,8 @@ def _patch_seams(
     """Stub the world model and every pool provider; return the fake for post-run assertions.
 
     `modules` is retained for call-site compatibility; both `optimize model` and `route`
-    resolve the world model through `wmo.engine.load_world_model`, so that is the only seam.
+    resolve the world model through `wmo.simulation.model.load_world_model`, so that is the only
+    seam.
     """
     _ = modules
     world_model = _FakeWorldModel(rewards=rewards, session_usd=session_usd)
@@ -332,7 +333,7 @@ def _patch_seams(
             _ScriptedCandidate(config, world_model, throttled=config.model in throttled_models),
         )
 
-    monkeypatch.setattr("wmo.engine.load_world_model", _load)
+    monkeypatch.setattr("wmo.simulation.model.load_world_model", _load)
     monkeypatch.setattr("wmo.providers.pool.get_provider", _get_provider)
     return world_model
 

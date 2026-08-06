@@ -6,9 +6,9 @@ from collections.abc import Callable
 
 import wmo.research.gepa_scaling as gs
 from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.engine.replay import ReplayReport, StepResult
 from wmo.research.ablation import run_ablation
 from wmo.research.gepa_scaling import GepaScalingAblation
+from wmo.simulation.model.replay import ReplayReport, StepResult
 
 
 def _trace(i: int, n_steps: int = 1) -> Trace:

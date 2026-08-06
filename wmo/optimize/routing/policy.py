@@ -80,7 +80,7 @@ from wmo.providers.local_embed import (
 )
 from wmo.providers.pool import PoolEntry
 from wmo.providers.registry import get_provider
-from wmo.retrieval.embedders import BatchedEmbedder, HashingEmbedder
+from wmo.simulation.retrieval.embedders import BatchedEmbedder, HashingEmbedder
 
 POLICY_VERSION = 2
 POLICY_FILENAME = "policy.json"
@@ -384,9 +384,9 @@ class RoutingDecision(BaseModel):
     evidence: RoutingEvidence | None = None
 
     # The L2-normalized vector this request was routed on, attached by `select_model` so serving
-    # can persist it (`wmo.serving.query_embeddings`) without re-embedding the text. Private
-    # because it is per-request state, not part of the decision's shape: it must not appear in a
-    # log row, a report, or a comparison between two decisions.
+    # can persist it (`wmo.simulation.serving.query_embeddings`) without re-embedding the text.
+    # Private because it is per-request state, not part of the decision's shape. It must not appear
+    # in a log row, a report, or a comparison between two decisions.
     _query_embedding: np.ndarray | None = PrivateAttr(default=None)
 
     def attach_query_embedding(self, vector: np.ndarray) -> None:
@@ -613,9 +613,9 @@ class RoutingPolicy(BaseModel):
 
         Runs both mount gates again rather than trusting validation, for two reasons: the
         cost/quality dial installs a NEW policy object on a live runtime
-        (`wmo.serving.chat.EndpointRuntime._install_policy`), so the compressor has to follow the
-        object requests actually read; and a policy assembled in memory through `model_copy`
-        never went through a validator at all, so this is the only place a hand-built mismatch
+        (`wmo.simulation.serving.chat.EndpointRuntime._install_policy`), so the compressor has to
+        follow the object requests actually read; and a policy assembled in memory through
+        `model_copy` never went through a validator, so this is the only place a hand-built mismatch
         is caught before it serves traffic.
         """
         self._check_compression()

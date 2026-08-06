@@ -166,8 +166,9 @@ def normalize_chat_temperature(
 class Embedder(Protocol):
     """The embedding half of a provider (phi in DreamGym).
 
-    Retrieval depends only on this narrower capability, so it accepts either a full `Provider` or a
-    standalone local embedder (`wmo.retrieval.embedders.HashingEmbedder`) without requiring creds.
+    Retrieval depends only on this narrower capability, so it accepts either a full `Provider` or
+    a standalone local embedder (`wmo.simulation.retrieval.embedders.HashingEmbedder`) without
+    requiring credentials.
     """
 
     def embed(self, texts: list[str]) -> list[list[float]]: ...

@@ -34,9 +34,6 @@ from wmo.config import (
     save_settings,
 )
 from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.engine.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
-from wmo.engine.eval_suites import EvalSuiteConfig
-from wmo.ingest import VendorPull
 from wmo.providers.base import (
     Completion,
     EmbedderKind,
@@ -51,6 +48,9 @@ from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 # The exact text the tinker provider raises: the CLI hint has to recognise THAT
 # message, not a paraphrase of it.
 from wmo.providers.tinker import _MISSING_TINKER_EXTRA
+from wmo.simulation.ingest import VendorPull
+from wmo.simulation.model.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
+from wmo.simulation.model.eval_suites import EvalSuiteConfig
 from wmo.tracking.pricing import ModelPrice
 
 # `wmo.cli`'s `app` attribute (the Typer object) shadows the `wmo.cli.app` submodule on
@@ -154,12 +154,14 @@ def patched_provider(monkeypatch) -> None:  # noqa: ANN001 - pytest fixture
     import wmo.providers.waterfall as waterfall_mod
 
     fake = FakeProvider()
-    # `wmo.engine.__init__` rebinds the name `build` to the function, shadowing the submodule
+    # `wmo.simulation.model.__init__` rebinds `build` to the function, shadowing the submodule
     # attribute, so reach module objects through sys.modules rather than attribute access.
-    monkeypatch.setattr(sys.modules["wmo.engine.build"], "get_provider", lambda config: fake)
+    monkeypatch.setattr(
+        sys.modules["wmo.simulation.model.build"], "get_provider", lambda config: fake
+    )
     # loader.py (serve/demo/play) and the CLI construct through the chain-aware seam.
     monkeypatch.setattr(
-        sys.modules["wmo.engine.loader"], "provider_or_chain", lambda config, **kw: fake
+        sys.modules["wmo.simulation.model.loader"], "provider_or_chain", lambda config, **kw: fake
     )
     monkeypatch.setattr(providers_pkg, "get_provider", lambda config: fake)
     monkeypatch.setattr(providers_pkg, "provider_or_chain", lambda config, **kw: fake)
@@ -349,7 +351,7 @@ def test_cli_exposes_the_small_command_set() -> None:
 def test_knowledge_command_prints_path_and_files(tmp_path) -> None:  # noqa: ANN001 - fixture
     from wmo.config import save_config
     from wmo.config.config import HarnessConfig
-    from wmo.engine.knowledge import KnowledgeBase
+    from wmo.simulation.model.knowledge import KnowledgeBase
 
     root = tmp_path / ".wmo"
     model_dir = root / "models" / "airline"
@@ -371,7 +373,7 @@ def test_knowledge_command_prints_bracketed_markdown_verbatim(tmp_path) -> None:
     """
     from wmo.config import save_config
     from wmo.config.config import HarnessConfig
-    from wmo.engine.knowledge import KnowledgeBase
+    from wmo.simulation.model.knowledge import KnowledgeBase
 
     root = tmp_path / ".wmo"
     model_dir = root / "models" / "airline"
@@ -409,7 +411,7 @@ def test_knowledge_command_flags_a_kb_the_model_ignores(tmp_path) -> None:  # no
     """Files under `knowledge/` are inert unless the model was built with `--knowledge`."""
     from wmo.config import save_config
     from wmo.config.config import HarnessConfig
-    from wmo.engine.knowledge import KnowledgeBase
+    from wmo.simulation.model.knowledge import KnowledgeBase
 
     root = tmp_path / ".wmo"
     model_dir = root / "models" / "airline"
@@ -428,7 +430,7 @@ def test_knowledge_command_flags_a_kb_the_model_ignores(tmp_path) -> None:  # no
 def test_knowledge_command_stays_quiet_when_the_kb_is_live(tmp_path) -> None:  # noqa: ANN001
     from wmo.config import save_config
     from wmo.config.config import HarnessConfig
-    from wmo.engine.knowledge import KnowledgeBase
+    from wmo.simulation.model.knowledge import KnowledgeBase
 
     root = tmp_path / ".wmo"
     model_dir = root / "models" / "airline"
@@ -445,7 +447,7 @@ def test_knowledge_resolves_a_shipped_example_like_demo_and_play(tmp_path, monke
     """`wmo knowledge` must see the same models `wmo demo`/`wmo play` resolve, examples included."""
     from wmo.config import save_config
     from wmo.config.config import HarnessConfig
-    from wmo.engine.knowledge import KnowledgeBase
+    from wmo.simulation.model.knowledge import KnowledgeBase
 
     example = tmp_path / "airline-bench"
     model_dir = example / "models" / "airline"
@@ -765,7 +767,7 @@ def test_demo_keeps_the_traceback_for_a_wmo_bug(patched_provider, tmp_path, monk
     root = tmp_path / ".wmo"
     _build(root, "demo-model", tmp_path)
     monkeypatch.setattr(
-        "wmo.engine.demo.run_demo",
+        "wmo.simulation.model.demo.run_demo",
         lambda *a, **kw: (_ for _ in ()).throw(KeyError("internal")),
     )
 
@@ -2121,8 +2123,8 @@ def test_build_pull_limit_is_a_fetch_cap_applied_once(
 ) -> None:
     """A pull spends `--limit` vendor-side, so `--drop-degenerate` can leave fewer than N.
 
-    `wmo.ingest.base.from_vendor` slices to `pull.limit` before `build` ever sees the corpus,
-    so re-applying the same cap after the degenerate filter cannot restore the dropped traces —
+    `wmo.simulation.ingest.base.from_vendor` slices to `pull.limit` before `build` sees the
+    corpus, so re-applying the same cap after the degenerate filter cannot restore dropped traces;
     it would only read as a promise of N usable traces that this transport cannot keep. Pinning
     both halves: the adapter receives the cap, and `build` is not handed it a second time.
     """
@@ -2141,12 +2143,13 @@ def test_build_pull_limit_is_a_fetch_cap_applied_once(
             traces = [_pull_trace(f"{i:032d}", usable=bool(i % 2)) for i in range(6)]
             return traces if pull.limit is None else traces[: pull.limit]
 
-    # `wmo.engine.build` is shadowed by the `build` function re-exported from
-    # `wmo.engine.__init__`, so attribute / `import wmo.engine.build` resolve the function.
+    # `wmo.simulation.model.build` is shadowed by the `build` function re-exported from
+    # `wmo.simulation.model.__init__`, so attribute access and import statements resolve the
+    # function.
     # Reach the submodule only through importlib / sys.modules.
     import importlib
 
-    engine_build = importlib.import_module("wmo.engine.build")
+    engine_build = importlib.import_module("wmo.simulation.model.build")
     real_run_build = engine_build.build
 
     def _spy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202 - passthrough spy
@@ -3164,8 +3167,8 @@ def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:
         fetched.append((name, force))
         return tmp_path / name / "traces.otel.jsonl"
 
-    monkeypatch.setattr("wmo.hub.fetch_corpus", fake_fetch)
-    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.simulation.hub.fetch_corpus", fake_fetch)
+    monkeypatch.setattr("wmo.simulation.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "bird-sql", "dabstep", "--force"])
     assert result.exit_code == 0, result.output
     assert fetched == [("bird-sql", True), ("dabstep", True)]
@@ -3177,12 +3180,12 @@ def test_download_all_expands_to_the_published_list(monkeypatch, tmp_path: Path)
     # registry entry that isn't published yet would 404.
     fetched: list[str] = []
     published = [SimpleNamespace(benchmark=n, last_modified=None) for n in ("a-bench", "b-bench")]
-    monkeypatch.setattr("wmo.hub.published_corpora", lambda: published)
+    monkeypatch.setattr("wmo.simulation.hub.published_corpora", lambda: published)
     monkeypatch.setattr(
-        "wmo.hub.fetch_corpus",
+        "wmo.simulation.hub.fetch_corpus",
         lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
     )
-    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.simulation.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "all"])
     assert result.exit_code == 0, result.output
     assert fetched == ["a-bench", "b-bench"]
@@ -3201,8 +3204,8 @@ def test_download_multi_skips_a_404_and_fetches_the_rest(monkeypatch, tmp_path: 
         fetched.append(name)
         return tmp_path
 
-    monkeypatch.setattr("wmo.hub.fetch_corpus", fetch)
-    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.simulation.hub.fetch_corpus", fetch)
+    monkeypatch.setattr("wmo.simulation.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "a-bench", "broken", "z-bench"])
     assert fetched == ["a-bench", "z-bench"]  # kept going past the 404
     assert result.exit_code != 0  # ...but the failure is still reported at the end
@@ -3220,7 +3223,7 @@ def test_download_all_offline_skips_the_unpublished_and_still_succeeds(  # noqa:
     # subset, and it says what it dropped.
     import urllib.error
 
-    from wmo.hub import CORPORA, downloadable_benchmarks
+    from wmo.simulation.hub import CORPORA, downloadable_benchmarks
 
     unpublished = sorted(n for n, spec in CORPORA.items() if not spec.published)
     assert unpublished, "this test is meaningless once every registered corpus is published"
@@ -3229,12 +3232,12 @@ def test_download_all_offline_skips_the_unpublished_and_still_succeeds(  # noqa:
     def no_catalogue(*_args: object, **_kwargs: object) -> None:
         raise urllib.error.URLError("offline")
 
-    monkeypatch.setattr("wmo.hub.published_corpora", no_catalogue)
+    monkeypatch.setattr("wmo.simulation.hub.published_corpora", no_catalogue)
     monkeypatch.setattr(
-        "wmo.hub.fetch_corpus",
+        "wmo.simulation.hub.fetch_corpus",
         lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
     )
-    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.simulation.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "all"])
     assert result.exit_code == 0, result.output  # no failure over an unpushed registry entry
     assert fetched == downloadable_benchmarks()
@@ -3255,8 +3258,8 @@ def test_download_multi_keeps_going_past_a_truncated_transfer(monkeypatch, tmp_p
         fetched.append(name)
         return tmp_path
 
-    monkeypatch.setattr("wmo.hub.fetch_corpus", fetch)
-    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.simulation.hub.fetch_corpus", fetch)
+    monkeypatch.setattr("wmo.simulation.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "a-bench", "short", "z-bench"])
     assert fetched == ["a-bench", "z-bench"]  # kept going past the short transfer
     assert result.exit_code != 0  # ...but the failure is still reported at the end
@@ -3271,8 +3274,8 @@ def test_download_of_one_bundle_reports_a_truncated_transfer_as_a_failure(  # no
     def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
         raise OSError("traces.otel.jsonl: 6 bytes, tree lists 4096 — truncated transfer")
 
-    monkeypatch.setattr("wmo.hub.fetch_corpus", fetch)
-    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.simulation.hub.fetch_corpus", fetch)
+    monkeypatch.setattr("wmo.simulation.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "dabstep"])
     assert result.exit_code == 1
     assert "truncated transfer" in result.output
@@ -3287,7 +3290,7 @@ def test_download_multi_reports_an_unknown_name_without_stranding_the_rest(  # n
     # hand-typed list used to abort the command before the good ones were attempted.
     fetched: list[str] = []
 
-    from wmo.hub import CORPORA
+    from wmo.simulation.hub import CORPORA
 
     def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
         if name not in CORPORA:
@@ -3295,8 +3298,8 @@ def test_download_multi_reports_an_unknown_name_without_stranding_the_rest(  # n
         fetched.append(name)
         return tmp_path
 
-    monkeypatch.setattr("wmo.hub.fetch_corpus", fetch)
-    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.simulation.hub.fetch_corpus", fetch)
+    monkeypatch.setattr("wmo.simulation.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "nope", "dabstep"])
     assert fetched == ["dabstep"]
     assert result.exit_code != 0
@@ -3311,7 +3314,7 @@ def test_download_failure_names_every_repo_id_it_tried(monkeypatch, tmp_path: Pa
     import urllib.error
     from http.client import HTTPMessage
 
-    from wmo.hub import CorpusRepoUnavailable, candidate_repo_ids
+    from wmo.simulation.hub import CorpusRepoUnavailable, candidate_repo_ids
 
     attempts = [
         (repo_id, urllib.error.HTTPError(f"https://hub/{repo_id}", 404, "nf", HTTPMessage(), None))
@@ -3321,8 +3324,8 @@ def test_download_failure_names_every_repo_id_it_tried(monkeypatch, tmp_path: Pa
     def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
         raise CorpusRepoUnavailable(name, "main", attempts)
 
-    monkeypatch.setattr("wmo.hub.fetch_corpus", fetch)
-    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.simulation.hub.fetch_corpus", fetch)
+    monkeypatch.setattr("wmo.simulation.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "dabstep"])
     assert result.exit_code != 0
     for repo_id in candidate_repo_ids("dabstep"):
@@ -3330,7 +3333,7 @@ def test_download_failure_names_every_repo_id_it_tried(monkeypatch, tmp_path: Pa
 
 
 def test_download_unknown_benchmark_is_a_usage_error(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
-    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.simulation.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "nope"])
     assert result.exit_code != 0
     assert "no published corpus" in result.output
@@ -3340,7 +3343,7 @@ def test_download_picker_lists_published_and_fetches_choice(
     monkeypatch,  # noqa: ANN001
     tmp_path: Path,
 ) -> None:
-    from wmo.hub import PublishedCorpus
+    from wmo.simulation.hub import PublishedCorpus
 
     published = [
         PublishedCorpus(
@@ -3350,12 +3353,12 @@ def test_download_picker_lists_published_and_fetches_choice(
         )
     ]
     fetched: list[str] = []
-    monkeypatch.setattr("wmo.hub.published_corpora", lambda: published)
+    monkeypatch.setattr("wmo.simulation.hub.published_corpora", lambda: published)
     monkeypatch.setattr(
-        "wmo.hub.fetch_corpus",
+        "wmo.simulation.hub.fetch_corpus",
         lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
     )
-    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.simulation.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download"], input="1\n")
     assert result.exit_code == 0, result.output
     assert fetched == ["gaia2"]
@@ -3439,9 +3442,10 @@ def test_default_eval_holdout_contains_no_build_training_trace() -> None:
     # real split functions: nothing GEPA trained on may be scored as held-out.
     traces = [Trace(trace_id=f"trace-{i}") for i in range(400)]
     build_split = _build_cli_train_split_default()
-    # Mirrors `wmo.engine.build.build`: train / val / test on one hash line.
+    # Mirrors `wmo.simulation.model.build.build`: train / val / test on one hash line.
     gepa_train, _val, _test = split_traces_3way(traces, build_split, (1.0 - build_split) / 2)
-    # Mirrors `wmo.evals.open_loop.evaluate_files` on the ad hoc `wmo eval <file>` path.
+    # Mirrors `wmo.simulation.evaluation.open_loop.evaluate_files` on the ad hoc
+    # `wmo eval <file>` path.
     _eval_train, holdout = split_traces(traces, _eval_cli_train_split_default())
     assert gepa_train, "sanity: the corpus must actually produce a training split"
     assert holdout, "sanity: the corpus must actually produce a holdout"

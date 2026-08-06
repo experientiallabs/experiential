@@ -7,10 +7,10 @@ set (and a fixed valid set GEPA selects on) and vary only how many TRAIN traces 
 Two deterministic carves, both stable as the corpus grows so a checked-in run reproduces:
 
 1. `partition_corpus` hashes each `trace_id` into [0, 1) (the same blake2b trick as
-   `wmo.engine.build.split_traces`) and slices fixed `test` / `valid` bands off the top; everything
-   else is the train *pool*. A trace's band depends only on its id, so adding more traces never
-   moves an existing trace between test / valid / pool — the test set a run reports on is identical
-   at every trace count.
+   `wmo.simulation.model.build.split_traces`) and slices fixed `test` and `valid` bands off the
+   top; everything else is the train *pool*. A trace's band depends only on its id, so adding more
+   traces never moves an existing trace between test, valid, and pool; the test set is identical at
+   every trace count.
 2. `subsample_train` takes `n` traces from that pool in a seed-shuffled order. The order is fixed
    for a given seed, so the n=10 sample is a prefix of the n=20 sample (nested): each step up the
    curve *adds* traces rather than resampling, isolating the effect of corpus size.

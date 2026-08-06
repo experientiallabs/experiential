@@ -4,7 +4,7 @@
 
 An **eval suite** is a versioned, reproducible eval config that ships in the benchmark's data bundle, living next to the corpus it scores: `environment-capture-data/<task>/evals/<suite>.toml`. It names the trace files (relative to the suite file) and pins the scoring config. `wmo eval run <suite>` scores a prompt against it and persists the result locally.
 
-This sits on top of the open-loop eval scorer (`wmo.engine.eval`): for each held-out step it feeds the recorded `(state, action)` teacher-forced, has the world model predict the observation, and scores it against the *real* recorded observation with the reference-grounded 5-dimension `RubricJudge`.
+This sits on top of the open-loop eval scorer (`wmo.simulation.model.eval`): for each held-out step it feeds the recorded `(state, action)` teacher-forced, has the world model predict the observation, and scores it against the *real* recorded observation with the reference-grounded 5-dimension `RubricJudge`.
 
 ## The definition
 
@@ -72,4 +72,4 @@ Both flows score on the `[models.worker]` role that `wmo providers set` writes t
 
 ## How it layers
 
-`wmo/engine/eval_suites.py` discovers suites (`examples_root/*/evals/*.toml`), resolves one by name, and lists persisted results. The `wmo eval` CLI command is a thin wrapper; scoring delegates to the same `wmo.engine.replay` path as ad hoc `wmo eval` and the research harness, so all fidelity numbers stay comparable.
+`wmo/simulation/model/eval_suites.py` discovers suites (`examples_root/*/evals/*.toml`), resolves one by name, and lists persisted results. The `wmo eval` CLI command is a thin wrapper; scoring delegates to the same `wmo.simulation.model.replay` path as ad hoc `wmo eval` and the research harness, so all fidelity numbers stay comparable.

@@ -42,7 +42,7 @@ from wmo.providers.base import ProviderKind
 from wmo.providers.local_embed import DEFAULT_LOCAL_EMBED_MODEL, LOCAL_EMBED_DIM
 from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 from wmo.providers.pool import PoolEntry
-from wmo.retrieval.embedders import HashingEmbedder
+from wmo.simulation.retrieval.embedders import HashingEmbedder
 from wmo.tracking.pricing import ModelPrice
 
 
@@ -514,7 +514,7 @@ def test_azure_embedder_spec_builds_a_batched_provider_embedder(
         batch=128,
     )
     embedder = spec.build()  # constructs lazily; no network until embed()
-    from wmo.retrieval.embedders import BatchedEmbedder
+    from wmo.simulation.retrieval.embedders import BatchedEmbedder
 
     assert isinstance(embedder, BatchedEmbedder)
 

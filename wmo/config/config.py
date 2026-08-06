@@ -20,8 +20,9 @@ from wmo.providers.models import resolve_provider_model
 
 ARTIFACT_DIR = ".wmo"
 
-# Mirror of `wmo.engine.build.DEFAULT_TRAIN_SPLIT`, the one cut point on the trace-id hash line
-# that `wmo build` and `wmo eval` share. The canonical constant lives next to the split functions
+# Mirror of `wmo.simulation.model.build.DEFAULT_TRAIN_SPLIT`, the one cut point on the trace-id
+# hash line shared by `wmo build` and `wmo eval`. The canonical constant lives by the split
+# functions
 # and cannot be imported here (build.py imports this module, so the arrow would be a cycle), so
 # `config_test.py` asserts the two stay equal instead.
 _DEFAULT_TRAIN_SPLIT = 0.8
@@ -178,7 +179,7 @@ class HarnessConfig(BaseModel):
     # `knowledge`: seed a knowledge base from train traces at build and render it into the env
     # prompt at serve. `reasoning`: deliberate-then-answer output contract. `grounder`: web-search
     # backend for grounding unknown entities ("none" keeps everything hermetic; see
-    # `wmo.engine.grounding` for backends).
+    # `wmo.simulation.model.grounding` for backends).
     knowledge: bool = False
     reasoning: bool = False
     grounder: str = "none"

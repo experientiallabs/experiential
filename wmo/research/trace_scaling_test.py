@@ -352,7 +352,7 @@ def test_conf_suffixes_thread_confidence_flags(monkeypatch) -> None:  # noqa: AN
 
 
 def test_results_dir_persists_per_cell_replay_reports(monkeypatch, tmp_path) -> None:  # noqa: ANN001
-    from wmo.engine.replay import ReplayReport, StepResult
+    from wmo.simulation.model.replay import ReplayReport, StepResult
 
     def fake_score(prompt, held_out, *, on_report=None, **_):  # noqa: ANN001, ANN003, ANN202
         assert on_report is not None
