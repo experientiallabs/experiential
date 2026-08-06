@@ -18,6 +18,13 @@ on:
       - "wmo/**"
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the built distribution to PyPI"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -26,7 +33,22 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve the latest published release
+        id: release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          published_tag="$(
+            gh release view --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,publishedAt,tagName \
+              --jq 'select(.isDraft == false and .publishedAt != null) | .tagName'
+          )"
+          test -n "$published_tag"
+          echo "tag=$published_tag" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', steps.release.outputs.tag) || github.ref }}
       - uses: astral-sh/setup-uv@v6
       - name: Build the WMO distribution
         run: uv build --package world-model-optimizer --no-sources
@@ -42,7 +64,10 @@ jobs:
           path: dist/
 
   publish:
-    if: github.event_name == 'release'
+    if: >-
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' && inputs.publish)
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
