@@ -338,10 +338,9 @@ def test_cli_exposes_the_small_command_set() -> None:
         "download",
         "knowledge",
     }
-    # `run` (the hosted agent-session runner) moved to the agent-optimization repo
-    # with the rest of the agent surfaces; the platform commands that remain are
-    # the model registry round-trip and the login lifecycle.
-    platform = {"login", "logout", "status", "push", "pull"}
+    # `run` owns local pi execution and hosted world-model sessions. Platform
+    # commands also cover the model registry round-trip and login lifecycle.
+    platform = {"login", "logout", "status", "push", "pull", "run"}
     assert names == core | platform
     # `optimize` is a GROUP (route, model, and distill; harness search moved out).
     groups = {group.name for group in app.registered_groups}

@@ -115,8 +115,10 @@ def _register_ingest() -> None:
 
 def _register_side_commands() -> None:
     from wmo.cli.platform_cmds import register as register_platform_commands
+    from wmo.cli.run_cmd import register as register_run_command
 
     register_platform_commands(app)
+    register_run_command(app)
 
 
 _register_ingest()

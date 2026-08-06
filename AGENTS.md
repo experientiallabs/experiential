@@ -51,21 +51,17 @@ uv run pytest -q
   evaluation adapters. Optimization may depend on this package; runtime code must not depend on
   optimization algorithms.
 - Keep `wmo run` as the primary supported execution surface. Bare runs use the built-in local pi
-  harness; platform ids resolve to hosted world-model or agent sessions. Add another public entry
-  point only for a distinct user need, with consistent lifecycle and safety behavior.
+  harness; platform world-model ids resolve to hosted sessions. Agent ids must fail clearly until
+  the platform exposes a hosted agent-session API again. Add another public entry point only for a
+  distinct user need, with consistent lifecycle and safety behavior.
 - `wmo providers set` owns the project-local worker model in `.wmo/settings.toml`. Local runs and
   builds use that role unless explicit flags override it; credentials remain in the environment
   or gitignored `.env`, never in settings.
 - Only bare runs execute harness code and bash on the user's machine. Preserve the explicit local
   execution consent boundary and the `--dir` file-tool jail.
-- Hosted agent ids run their champion harness in platform-managed E2B. Do not require local model
-  or E2B credentials for this path, and keep worker LLM calls, provider secrets, and world-model
-  state host-side.
-- Workspace upload is explicit through `-u` or `--upload-dir`. Preserve bounded regular-file
-  snapshots, incremental bidirectional patches, final three-way reconciliation, concurrent local
-  edits, and the complete remote recovery archive on conflict.
-- Detached sessions must survive without a local process. Persist the transcript cursor and sync
-  checkpoint under WMO user state, then catch up before send, attach, or end.
+- Do not reintroduce hosted-agent CLI flags against endpoints that do not exist. If hosted agent
+  sessions return, keep worker LLM calls, provider secrets, and world-model state host-side, and
+  require no local model or E2B credentials for that path.
 - For optimizer and eval E2B runs, sandbox the real pi process while the environment remains the
   world-model simulation. Reuse warm sandboxes within score waves, isolate concurrent cells,
   meter sandbox lifetime, retry uncertain transport only in a fresh sandbox, and fail closed when

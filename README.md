@@ -55,6 +55,18 @@ Distill your own small model into the pool with [`wmo optimize distill`](wmo/opt
 serve a single model with no routing via `wmo optimize route pin`, or build an optimized harness
 for your agent with `wmo optimize harness`.
 
+### Run the built-in agent
+
+A bare `wmo run` launches the built-in pi harness on this machine. File tools stay under the
+selected directory, but bash is not OS-sandboxed, so the CLI asks for explicit consent. Logged-out
+runs use the configured local worker provider; logged-in runs proxy worker calls through the
+platform.
+
+```bash
+wmo providers set
+wmo run --dir . --task "fix the failing tests"
+```
+
 ### Hosted platform
 
 Create an account at [platform.experientiallabs.ai](https://platform.experientiallabs.ai), then
@@ -64,10 +76,10 @@ authenticate the CLI:
 wmo login
 ```
 
-Copy an agent ID from the platform and run its current champion harness:
+Copy a world-model ID from the platform and open an interactive session:
 
 ```bash
-wmo run <agent-id>
+wmo run <world-model-id>
 ```
 
 ### E2B backend
@@ -103,27 +115,20 @@ print(obs.content)
 Or over HTTP (same code path), namespaced by model name: `GET /world_models`, then `POST
 /world_models/{name}/sessions` and `POST /world_models/{name}/sessions/{id}/step`.
 
-## Run after platform login
+## Run a world model from the platform
 
-After `wmo login`, the same `wmo run` command can open a hosted world model or run an agent's
-current champion harness in E2B. The platform manages model and sandbox credentials, so hosted
-runs do not need local API keys.
+After `wmo login`, `wmo run` resolves a platform target ID and opens a hosted world-model session.
+The platform manages model credentials, so this path needs no local API key.
 
 ```bash
 wmo login
-wmo run <world-model-or-agent-id>
-wmo run <agent-id> -u . --task "fix the failing tests"
+wmo run <world-model-id> --task "check out the cart"
 ```
 
-Workspace upload is opt-in with `-u`: WMO live-syncs changes and preserves concurrent local edits.
-Long-running agents can detach, continue in the platform, and be messaged or reattached later.
-
-```bash
-wmo run <agent-id> -u . --detach
-wmo run --send "Now run the full test suite"
-wmo run --attach
-wmo run --end
-```
+The target resolver still distinguishes agent IDs from world-model IDs. Hosted agent sessions are
+currently unavailable because the platform no longer exposes their session API; an agent ID fails
+with an actionable message instead of falling through to the world-model endpoint. Omit the ID to
+run the built-in pi harness locally.
 
 ## Runtime agents and optimizers in E2B sandboxes
 
