@@ -54,7 +54,13 @@ from pydantic import JsonValue
 from wmo.common.core.types import JsonObject
 from wmo.common.providers.base import ToolCallingProvider
 from wmo.common.vendor.waterfall import ChatRequest, ChatResponse
-from wmo.runtime.harness.runner_link import Channel, TokenUsage, WorkerFn, params_schema
+from wmo.runtime.harness.runner_link import (
+    Channel,
+    TokenUsage,
+    WorkerFn,
+    params_schema,
+    provider_context_window,
+)
 from wmo.runtime.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS
 from wmo.runtime.harness.tools import READ_SKILL, SUBMIT, ToolSpec
 
@@ -166,6 +172,7 @@ class LiveSession:
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         temperature: float = 0.7,
         conversation_scope: ConversationScope = "session",
+        context_window: int | None = None,
         cancel_active: CancelHook | None = None,
         reset_cancel: CancelHook | None = None,
     ) -> None:
@@ -196,9 +203,21 @@ class LiveSession:
             raise ValueError("temperature must be in [0, 2]")
         if conversation_scope not in ("session", "turn"):
             raise ValueError("conversation_scope must be 'session' or 'turn'")
+        if context_window is not None and (
+            isinstance(context_window, bool) or not isinstance(context_window, int)
+        ):
+            raise ValueError("context_window must be an integer number of tokens when set")
+        if context_window is not None and context_window < 1024:
+            raise ValueError("context_window must be at least 1024 tokens when set")
         self._max_output_tokens = max_output_tokens
         self._temperature = temperature
         self._conversation_scope = conversation_scope
+        # A wrong assumed window is worse than no value: the live runner uses it to trim before
+        # provider requests. Prefer an explicit transport value, then the provider's served-model
+        # capability, and otherwise let the runner keep its documented fallback.
+        self._context_window = (
+            context_window if context_window is not None else provider_context_window(provider)
+        )
         self._cancel_active = cancel_active
         self._reset_cancel = reset_cancel
 
@@ -245,6 +264,7 @@ class LiveSession:
                 "max_output_tokens": self._max_output_tokens,
                 "temperature": self._temperature,
                 "conversation_scope": self._conversation_scope,
+                "context_window": self._context_window,
             }
         )
         # The runner sends `state:idle` once the agent is constructed and ready for the first

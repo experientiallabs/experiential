@@ -83,6 +83,29 @@ def test_start_can_scope_conversation_to_each_outer_turn() -> None:
     assert channel.sent[0]["conversation_scope"] == "turn"
 
 
+def test_start_carries_the_providers_served_context_window() -> None:
+    class ContextProvider:
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            _ = request
+            return _completion()
+
+        def context_window(self) -> int | None:
+            return 65_536
+
+    channel = ScriptedChannel([{"type": "state", "status": "idle"}])
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=lambda event: None,
+        provider=ContextProvider(),
+    )
+
+    session.start()
+
+    assert channel.sent[0]["context_window"] == 65_536
+
+
 def test_rejects_unknown_conversation_scope() -> None:
     channel = ScriptedChannel([])
 

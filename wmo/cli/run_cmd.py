@@ -763,12 +763,26 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
         model_name = catalog[0]
     spec = resolve_provider_model(kind, model_name)
     use_configured_knobs = configured is not None and configured.provider == kind.value
+    configured_spec = (
+        resolve_provider_model(kind, configured.model) if use_configured_knobs else None
+    )
+    same_configured_model = (
+        configured_spec is not None and configured_spec.model_id == spec.model_id
+    )
+    model_type = spec.model_type
+    if (
+        use_configured_knobs
+        and configured is not None
+        and configured.model_type is not None
+        and (model is None or same_configured_model)
+    ):
+        # A tinker:// runtime ID does not encode the base model that selects its renderer,
+        # tokenizer, and served context tier. Preserve that explicit identity unless this call
+        # actually swapped to a different model.
+        model_type = configured.model_type
     deployment = configured.deployment if use_configured_knobs else None
     api_version = configured.api_version if use_configured_knobs else None
     if kind is ProviderKind.AZURE_OPENAI:
-        configured_spec = (
-            resolve_provider_model(kind, configured.model) if use_configured_knobs else None
-        )
         model_changed = (
             model is not None
             and configured_spec is not None
@@ -789,17 +803,25 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
             )
         deployment = deployment or spec.model_type
         api_version = api_version or DEFAULT_AZURE_API_VERSION
-    built = provider_registry.get_provider(
-        ProviderConfig(
-            kind=kind,
-            model_type=spec.model_type,
-            model=spec.model_id,
-            region=configured.region if use_configured_knobs else None,
-            endpoint=configured.endpoint if use_configured_knobs else None,
-            deployment=deployment,
-            api_version=api_version,
-        )
+    config = ProviderConfig(
+        kind=kind,
+        model_type=model_type,
+        model=spec.model_id,
+        region=configured.region if use_configured_knobs else None,
+        endpoint=configured.endpoint if use_configured_knobs else None,
+        deployment=deployment,
+        api_version=api_version,
+        reasoning_effort=configured.reasoning_effort if use_configured_knobs else None,
     )
+    if (
+        use_configured_knobs
+        and configured is not None
+        and configured.chat_max_tokens_field is not None
+    ):
+        config = config.model_copy(
+            update={"chat_max_tokens_field": configured.chat_max_tokens_field}
+        )
+    built = provider_registry.get_provider(config)
     if not isinstance(built, ToolCallingProvider):
         msg = (
             f"provider {kind.value}/{spec.model_id} does not support structured tool calling; "

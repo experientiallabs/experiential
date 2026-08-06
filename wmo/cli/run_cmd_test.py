@@ -426,6 +426,50 @@ def test_build_driver_azure_model_override_rejects_a_stale_configured_deployment
     assert configs == []
 
 
+def test_build_driver_preserves_a_configured_tinker_models_base_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(
+                worker=ModelRole(
+                    provider="tinker",
+                    model="tinker://run/weights/42",
+                    model_type="Qwen/Qwen3-8B",
+                    chat_max_tokens_field="max_tokens",
+                )
+            )
+        ),
+        tmp_path / ".wmo",
+    )
+    monkeypatch.setattr(
+        "wmo.runtime.platform.credentials.load_credentials",
+        PlatformCredentials,
+    )
+    configs: list[ProviderConfig] = []
+    monkeypatch.setattr(
+        "wmo.common.providers.registry.get_provider",
+        lambda config: configs.append(config) or _FakeProvider(),
+    )
+
+    driver = mod._build_driver(
+        target=None,
+        jail_root=tmp_path,
+        provider=None,
+        model=None,
+        task=None,
+    )
+
+    assert isinstance(driver, mod.LocalLiveDriver)
+    [config] = configs
+    assert config.kind is ProviderKind.TINKER
+    assert config.model == "tinker://run/weights/42"
+    assert config.model_type == "Qwen/Qwen3-8B"
+    assert config.chat_max_tokens_field == "max_tokens"
+
+
 def test_build_driver_logged_in_bare_run_uses_platform_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
