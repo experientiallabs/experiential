@@ -253,6 +253,12 @@ class LiveSession:
         """Return the runner or channel error that closed this session, when one exists."""
         return self._failure_message
 
+    @property
+    def turn_active(self) -> bool:
+        """Whether a submitted user turn is queued, running, or awaiting its idle boundary."""
+        with self._turn_lock:
+            return self._turn_active
+
     def start(self, hello_timeout: float = 60.0) -> None:
         """Send `session_start` and block until the runner reports its first idle state."""
         self._channel.send(

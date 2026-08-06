@@ -184,6 +184,7 @@ def test_full_turn_emits_ordered_events_and_answers_frames() -> None:
     session.start()
     events.clear()  # drop the initial "ready" state event; assert only the turn's events
     session.send_user_message("list the files")
+    assert session.turn_active
     _drain(session)
 
     kinds = [e.kind for e in events]
@@ -208,6 +209,7 @@ def test_full_turn_emits_ordered_events_and_answers_frames() -> None:
     assert session.worker_usage.calls == 1
     assert session.worker_usage.input_tokens == 5
     assert session.worker_usage.output_tokens == 7
+    assert not session.turn_active
 
 
 def test_submit_tool_response_is_answered_without_executor() -> None:

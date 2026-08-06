@@ -774,7 +774,7 @@ class _FakeReader:
         pass
 
 
-def test_stdin_reader_marks_a_piped_turn_before_eof(
+def test_stdin_reader_queues_a_piped_turn_before_eof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Session:
@@ -794,7 +794,6 @@ def test_stdin_reader_marks_a_piped_turn_before_eof(
     reader.run()
 
     assert session.messages == ["fix the tests"]
-    assert reader.submitted.is_set()
     assert reader.eof.is_set()
 
 
@@ -838,6 +837,7 @@ def test_local_driver_treats_an_empty_task_as_no_opening_turn_at_eof() -> None:
         def __init__(self) -> None:
             self.closed = False
             self.status = "idle"
+            self.turn_active = False
             self.pumps = 0
             self.ends = 0
 
@@ -846,6 +846,9 @@ def test_local_driver_treats_an_empty_task_as_no_opening_turn_at_eof() -> None:
             self.pumps += 1
             assert self.pumps == 1, "an empty one-shot task must end on its first idle pump"
             return True
+
+        def flush_pending_intents(self) -> None:
+            pass
 
         def end(self) -> None:
             self.ends += 1
@@ -869,23 +872,42 @@ def test_local_driver_treats_an_empty_task_as_no_opening_turn_at_eof() -> None:
     assert session.ends == 1
 
 
-def test_local_driver_waits_for_a_piped_turn_to_return_idle_at_eof() -> None:
-    class _PipedTurnSession:
+def test_local_driver_drains_a_delayed_piped_turn_before_eof_shutdown() -> None:
+    stdin_eof = threading.Event()
+
+    class _DelayedPipedTurnSession:
         def __init__(self) -> None:
             self.closed = False
-            self.status = "idle"
+            self.status = "running"
+            self.turn_active = True
+            self.pending_messages = 0
             self.pumps = 0
+            self.flushes = 0
             self.ends = 0
 
         def pump(self, timeout: float = 0.2) -> bool:
             _ = timeout
             self.pumps += 1
             assert self.pumps <= 3, "the piped turn must end after returning to idle"
-            if self.pumps == 2:
+            if self.pumps == 1:
+                # The reader queues a second line after this pump drained intents but before it
+                # receives the first turn's idle frame, then publishes EOF.
+                self.pending_messages = 1
+                stdin_eof.set()
+                self.status = "idle"
+                self.turn_active = False
+            elif self.pumps == 2:
                 self.status = "running"
             elif self.pumps == 3:
                 self.status = "idle"
+                self.turn_active = False
             return True
+
+        def flush_pending_intents(self) -> None:
+            self.flushes += 1
+            if self.pending_messages:
+                self.pending_messages = 0
+                self.turn_active = True
 
         def end(self) -> None:
             self.ends += 1
@@ -899,19 +921,12 @@ def test_local_driver_waits_for_a_piped_turn_to_return_idle_at_eof() -> None:
         recorder=None,
         instruction=None,
     )
-    session = _PipedTurnSession()
-    stdin_eof = threading.Event()
-    stdin_eof.set()
-    stdin_submitted = threading.Event()
-    stdin_submitted.set()
+    session = _DelayedPipedTurnSession()
 
-    driver._loop(
-        cast("mod.live_session.LiveSession", session),
-        stdin_eof,
-        stdin_submitted,
-    )
+    driver._loop(cast("mod.live_session.LiveSession", session), stdin_eof)
 
     assert session.pumps == 3
+    assert session.flushes == 3
     assert session.ends == 1
 
 
