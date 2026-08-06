@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.evaluation.failover import (
     SameModelFailover,
     anthropic_direct_id,

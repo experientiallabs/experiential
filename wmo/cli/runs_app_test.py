@@ -13,7 +13,7 @@ from typer.testing import CliRunner, Result
 
 from wmo.cli import runs_app as runs_module
 from wmo.cli.app import app
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.runtime.platform.client import PlatformClient
 from wmo.runtime.runs.reader import EventPage, EventRow, RunDetail, RunsReader
 from wmo.runtime.runs.schema import RUN_SEQ_BAND

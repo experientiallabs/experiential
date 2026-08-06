@@ -26,8 +26,9 @@ from typing import cast
 
 import pytest
 
-from wmo.core.types import Action, JsonObject, Observation
-from wmo.providers.base import UNPARSED_TOOL_CALLS_KEY
+from wmo.common.core.types import Action, JsonObject, Observation
+from wmo.common.providers.base import UNPARSED_TOOL_CALLS_KEY
+from wmo.common.vendor.waterfall import ChatRequest, ChatResponse
 from wmo.runtime.harness import e2b_sandbox as e2b_sandbox_module
 from wmo.runtime.harness import pi_e2b as pi_e2b_module
 from wmo.runtime.harness.e2b_sandbox import (
@@ -58,7 +59,6 @@ from wmo.runtime.harness.runtime import (
 )
 from wmo.runtime.harness.skills import Skill, SkillLibrary
 from wmo.runtime.harness.tools import SUBMIT, TOOL_REGISTRY, ToolSpec
-from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 _Event = tuple[str | None, str | None, str | None]
 _PID = 4242

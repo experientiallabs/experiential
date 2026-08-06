@@ -13,7 +13,7 @@ and report what was dropped.
 
 from __future__ import annotations
 
-from wmo.core.types import Trace
+from wmo.common.core.types import Trace
 
 
 def drop_degenerate_traces(traces: list[Trace]) -> tuple[list[Trace], int]:

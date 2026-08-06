@@ -14,9 +14,9 @@ import pytest
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 
-from wmo.core.types import Action, ActionKind
-from wmo.providers.base import Provider, ProviderConfig, ProviderKind
-from wmo.providers.retry import RetryingProvider
+from wmo.common.core.types import Action, ActionKind
+from wmo.common.providers.base import Provider, ProviderConfig, ProviderKind
+from wmo.common.providers.retry import RetryingProvider
 from wmo.runtime.evaluation.harbor.agent import (
     MAX_OBSERVATION_CHARS,
     HarborAgentEnvironment,

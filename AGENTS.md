@@ -24,7 +24,7 @@ uv run pytest -q
   corpus through the registered `TraceAdapter` seam rather than adding parallel ingest or build
   flows.
 - New trace sources belong in `wmo/simulation/ingest/`, normalize into the `Trace` and `Step`
-  contracts in `wmo/core/types.py`, support file ingestion, and register from
+  contracts in `wmo/common/core/types.py`, support file ingestion, and register from
   `wmo/simulation/ingest/__init__.py`.
 - Preserve the build's data boundary: deterministic train, validation, and test splits; a
   full-corpus serving index; train-only prompt optimization and knowledge extraction; untouched
@@ -146,21 +146,22 @@ uv run pytest -q
    in scope or prevent meaningful validation.
 
 2. **Tests live inline next to the code.** A module `foo.py` is tested by `foo_test.py` in the same
-   directory (e.g. `wmo/simulation/model/world_model.py` → `wmo/simulation/model/world_model_test.py`). There is no
-   top-level `tests/` directory. Pytest is configured (`python_files = ["*_test.py"]`) to discover
-   these.
+   directory (e.g. `wmo/simulation/model/world_model.py` maps to
+   `wmo/simulation/model/world_model_test.py`). There is no top-level `tests/` directory. Pytest is
+   configured (`python_files = ["*_test.py"]`) to discover these.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
-   JSON use pydantic's `JsonValue` (see `wmo/core/types.py:JsonObject`), not `Any`.
+   JSON use pydantic's `JsonValue` (see `wmo/common/core/types.py:JsonObject`), not `Any`.
 
 4. **Keep the structure coherent and the command surface intentional.** Agent execution is nested
    under `wmo/runtime/`; world-model construction and execution are nested under
-   `wmo/simulation/`; routing and model optimization are nested under `wmo/optimize/`. Shared
-   infrastructure retains its current roots until its separate consolidation lands. Add a CLI
-   command when it represents a clear user workflow; avoid unrelated command sprawl and hiding
-   useful behavior behind internal APIs. Do not return domain packages to the flat `wmo/`
-   namespace.
+   `wmo/simulation/`; routing, model optimization, and research harnesses are nested under
+   `wmo/optimize/`; shared contracts, config, providers, observability, and vendored utilities are
+   nested under `wmo/common/`. Common code must not import a product domain, and runtime code must
+   not import simulation or optimization. Add a CLI command when it represents a clear user
+   workflow; avoid unrelated command sprawl and hiding useful behavior behind internal APIs. Do
+   not return domain packages or production modules to the flat `wmo/` namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
    `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.
@@ -194,10 +195,10 @@ uv run pytest -q
      Everything "generated" stays out of git: eval results under the local `.wmo/evals/`
      artifact root, built models under `.wmo/models/`, and the benchmark data bundles
      `wmo download` fetches. Never commit local settings files (`settings.toml` anywhere).
-   - `wmo/` — the flagship package and the only importable code. Domain subpackages own their
-     own area (rule 4); `wmo/utils/` holds self-contained building blocks with no WMO domain
-     concepts and no import back into the rest of `wmo` (today: `wmo/utils/waterfall/`, the
-     LLM failover chain, vendored with its own MIT `LICENSE`).
+   - `wmo/` is the flagship package and the only importable code. Domain subpackages own their
+     area under the rule 4 hierarchy. `wmo/common/vendor/` holds self-contained building blocks
+     with no import back into WMO product domains, including the waterfall chain and its MIT
+     `LICENSE`.
    - `assets/` — media referenced by README/docs (demo GIFs, logos).
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
@@ -271,14 +272,14 @@ uv run pytest -q
 
 This repo publishes **one distribution**: `world-model-optimizer`, whose importable code is all of
 `wmo/` and nothing else. It was a uv workspace until the `packages/` members were retired —
-`environment-capture` to PyPI, `llm-waterfall` into `wmo/utils/waterfall/`. Rules of the road:
+`environment-capture` to PyPI, `llm-waterfall` into `wmo/common/vendor/waterfall/`. Rules of the road:
 
 - **No workspace, no members**: there is no `[tool.uv.workspace]` and no `[tool.uv.sources]`. A
   dependency is either a normal PyPI requirement in `[project.dependencies]` or it is code under
   `wmo/`. Do not reintroduce a member directory (rule 5 forbids the top-level dir anyway).
 - **Vendor or depend, decide once**: a shared building block goes to PyPI and is depended on
-  (`environment-capture`), or it is vendored under `wmo/utils/` with its upstream `LICENSE`
-  (`wmo/utils/waterfall/`). Vendoring is for code we alone consume and do not publish; keep it
+  (`environment-capture`), or it is vendored under `wmo/common/vendor/` with its upstream
+  `LICENSE` (`wmo/common/vendor/waterfall/`). Vendoring is for code we alone consume; keep it
   free of imports back into `wmo` so it stays independently testable. The data-bundle read core
   behind `wmo download` is vendored the same way at `wmo/simulation/hub.py`, which names its origin in the
   module docstring: a `wmo` release must never wait on an `environment-capture` release.

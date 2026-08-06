@@ -21,7 +21,9 @@ from typer.testing import CliRunner, Result
 
 from wmo.cli import app
 from wmo.cli.model_app import PROBE_EXIT_INSUFFICIENT, PROBE_EXIT_NO_GAP
-from wmo.config.settings import load_settings
+from wmo.common.config.settings import load_settings
+from wmo.common.providers.base import ProviderKind, TokenUsage
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.model.config import DistillConfig
 from wmo.optimize.model.gate import DistillGateRecord
 from wmo.optimize.model.loop import (
@@ -40,8 +42,6 @@ from wmo.optimize.model.loop import (
 from wmo.optimize.model.rollouts import E2B_SANDBOXES_PER_TRIAL
 from wmo.optimize.model.store import DEFAULT_TINKER_OPENAI_ENDPOINT, AdapterStore, DistillRunStore
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmo.providers.base import ProviderKind, TokenUsage
-from wmo.providers.pool import PoolEntry
 from wmo.runtime.agents.default import default_agent
 from wmo.runtime.harness.doc import HarnessDoc
 from wmo.runtime.harness.e2b_reap import CapacityCheck, ReapOutcome

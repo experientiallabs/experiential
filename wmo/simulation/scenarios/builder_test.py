@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.retrieval import HashingEmbedder
 from wmo.simulation.scenarios.builder import ScenarioBuildConfig, build_scenario_set
 from wmo.simulation.scenarios.mining.facets import Outcome, TraceFacet

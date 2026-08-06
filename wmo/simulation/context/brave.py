@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 
 import httpx
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.simulation.context.connector import ConnectUI, register_connector
 from wmo.simulation.context.credentials import resolve_env_token
 from wmo.simulation.context.types import (

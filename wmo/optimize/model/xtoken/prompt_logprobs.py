@@ -13,7 +13,7 @@ Five wire facts are load-bearing (each was a real bug or a live probe finding):
    is no error: the response looks perfectly well formed and every span sum is wrong.
 2. `/v1/chat/completions` supports neither `echo` nor `prompt_logprobs`, so it cannot
    score a prompt at all. The chat template is applied client-side (see
-   `wmo.optimize.model.rendering`) and the rendered ids come here.
+   `wmo.common.providers.tinker_rendering`) and the rendered ids come here.
 3. Position convention: `prompt_logprobs[p]` is the distribution FOR token p (entry 0
    is null because token 0 has no context). That is exactly the Tinker
    `compute_logprobs` convention `wmo.optimize.model.teacher` already uses, so `score`
@@ -25,10 +25,10 @@ Five wire facts are load-bearing (each was a real bug or a live probe finding):
    id (a JSON string) whose value carries a `logprob`, and the REALIZED token's entry
    is the one we want, never the argmax.
 5. Auth is a Bearer token when `api_key` is set. The repo convention for self-hosted
-   endpoints is the `WMO_ENDPOINT_API_KEY` env var (see `wmo.providers.openai`), but
+   endpoints is the `WMO_ENDPOINT_API_KEY` env var (see `wmo.common.providers.openai`), but
    this module never reads the environment: the caller passes the key in.
 
-Deadlines are owned here rather than through `wmo.optimize.model.deadlines`. That module
+Deadlines are owned here rather than through `wmo.common.providers.tinker_deadlines`. That module
 bounds Tinker SDK calls (futures and blocking calls with no timeout parameter) and its
 knobs are Tinker-named env vars; httpx already bounds an HTTP request natively, so
 wrapping it in a watchdog thread would add a second, weaker timer and a misleading
@@ -51,7 +51,7 @@ from collections.abc import Callable
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from wmo.providers.base import ProviderKind, VerifyResult
+from wmo.common.providers.base import ProviderKind, VerifyResult
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ class PromptLogprobTimeoutError(PromptLogprobError, TimeoutError):
 
     Subclasses `TimeoutError` and keeps "timed out" in the message so retry
     layers classify it as transient capacity, matching
-    `wmo.optimize.model.deadlines.TinkerDeadlineError`'s contract.
+    `wmo.common.providers.tinker_deadlines.TinkerDeadlineError`'s contract.
     """
 
 
@@ -276,7 +276,7 @@ class PromptLogprobClient:
     def verify(self) -> VerifyResult:
         """One tiny scoring probe, reporting failure as `ok=False` instead of raising.
 
-        Mirrors `wmo.providers.base.verify_via_ping` and `TinkerTeacher.verify`, so
+        Mirrors `wmo.common.providers.base.verify_via_ping` and `TinkerTeacher.verify`, so
         preflight can report every misconfigured backend at once. The probe's tokens
         are excluded from `usage()`.
 

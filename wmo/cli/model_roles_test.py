@@ -16,8 +16,8 @@ from wmo.cli.model_roles import (
     load_settings_or_abort,
     resolve_opt_in_model_provider,
 )
-from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
-from wmo.providers.base import (
+from wmo.common.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
+from wmo.common.providers.base import (
     DEFAULT_MAX_TOKENS,
     Completion,
     Message,

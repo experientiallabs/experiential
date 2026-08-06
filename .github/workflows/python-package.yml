@@ -34,7 +34,7 @@ jobs:
         run: |
           uv venv /tmp/wmo-wheel-smoke
           uv pip install --python /tmp/wmo-wheel-smoke/bin/python dist/*.whl
-          /tmp/wmo-wheel-smoke/bin/python -c "import wmo, wmo.utils.waterfall"
+          /tmp/wmo-wheel-smoke/bin/python -c "import wmo, wmo.common.vendor.waterfall"
           /tmp/wmo-wheel-smoke/bin/wmo --help
       - uses: actions/upload-artifact@v4
         with:

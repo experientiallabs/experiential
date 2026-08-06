@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.simulation.context.brave import MAX_RESULTS, BraveConnector
 from wmo.simulation.context.connector import ConnectUI, get_connector
 from wmo.simulation.context.types import ConnectError, ConnectorAuth, ItemKind, PullQuery

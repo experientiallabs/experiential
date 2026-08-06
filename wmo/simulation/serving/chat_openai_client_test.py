@@ -24,8 +24,7 @@ import uvicorn
 from fastapi import FastAPI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam
 
-from wmo.optimize.routing.policy import RoutingPolicy
-from wmo.providers.base import (
+from wmo.common.providers.base import (
     Completion,
     Message,
     ProviderKind,
@@ -33,14 +32,8 @@ from wmo.providers.base import (
     TokenUsage,
     VerifyResult,
 )
-from wmo.providers.pool import PoolEntry
-from wmo.simulation.serving.chat import (
-    EndpointRuntime,
-    RequestLog,
-    create_chat_router,
-    install_openai_error_shapes,
-)
-from wmo.utils.waterfall.types import (
+from wmo.common.providers.pool import PoolEntry
+from wmo.common.vendor.waterfall.types import (
     ChatChoice,
     ChatFunctionCall,
     ChatMessage,
@@ -48,6 +41,13 @@ from wmo.utils.waterfall.types import (
     ChatResponse,
     ChatToolCall,
     ChatUsage,
+)
+from wmo.optimize.routing.policy import RoutingPolicy
+from wmo.simulation.serving.chat import (
+    EndpointRuntime,
+    RequestLog,
+    create_chat_router,
+    install_openai_error_shapes,
 )
 
 

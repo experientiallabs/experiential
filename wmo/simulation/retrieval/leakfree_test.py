@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
 from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
 from wmo.simulation.retrieval.leakfree import DemoRetriever
 

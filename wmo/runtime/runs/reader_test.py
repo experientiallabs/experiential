@@ -16,7 +16,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from wmo.core.types import JsonObject, JsonValue
+from wmo.common.core.types import JsonObject, JsonValue
 from wmo.runtime.platform.client import PlatformClient, PlatformError, PlatformUnreachable
 from wmo.runtime.runs.reader import RunsReader, _resolve_org
 

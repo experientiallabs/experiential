@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from wmo.core.types import ActionKind
+from wmo.common.core.types import ActionKind
 from wmo.simulation.ingest import get_adapter
 from wmo.simulation.ingest.adapter import VendorPull
 from wmo.simulation.ingest.langfuse import LangfuseAdapter

@@ -29,7 +29,7 @@ from pathlib import Path
 
 from pydantic import JsonValue
 
-from wmo.core.types import Trace
+from wmo.common.core.types import Trace
 from wmo.simulation.ingest.adapter import VendorPull
 from wmo.simulation.ingest.normalize import SpanRecord, collect_spans, spans_to_traces
 

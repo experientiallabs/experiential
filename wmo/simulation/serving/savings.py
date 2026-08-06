@@ -24,8 +24,8 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
+from wmo.common.providers.base import TokenUsage
 from wmo.optimize.routing.knn import COST_QUALITY_ANCHORS, COST_QUALITY_BALANCED, cost_quality_knobs
-from wmo.providers.base import TokenUsage
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.core.types import ActionKind
+from wmo.common.core.types import ActionKind
 from wmo.runtime.harness.tools import (
     DEFAULT_TOOLS,
     parse_tool_call,

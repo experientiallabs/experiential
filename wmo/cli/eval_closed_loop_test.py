@@ -15,8 +15,8 @@ import pytest
 from typer.testing import CliRunner, Result
 
 from wmo.cli import app
-from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.runtime.harness.doc import (
     RUNTIME_KIND_ID,
     TOOL_POLICY_ID,

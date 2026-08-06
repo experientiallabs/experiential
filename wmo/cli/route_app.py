@@ -36,18 +36,18 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from wmo.cli.consent import require_spend_consent
-from wmo.config import ARTIFACT_DIR, WorldModelStore
+from wmo.common.config import ARTIFACT_DIR, WorldModelStore
 
 if TYPE_CHECKING:
     # Type-only: real imports are local to the commands and helpers that construct or inspect
     # these values, so importing this module never pulls the optimize/engine/env/distill/pool
     # bodies behind it.
+    from wmo.common.providers.pool import PoolEntry
+    from wmo.common.vendor.waterfall import ChatMaxTokensField
     from wmo.optimize.routing.knn import DialResult, KnnFitOutcome
     from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
     from wmo.optimize.routing.policy import RoutingPolicy
     from wmo.optimize.routing.sweep import CandidateCoverage, DeferredRisk, SweepPlan, SweepRun
-    from wmo.providers.pool import PoolEntry
-    from wmo.utils.waterfall import ChatMaxTokensField
 
 # The two output-budget parameter names any OpenAI-compatible backend accepts.
 _MAX_TOKENS_FIELDS: tuple[ChatMaxTokensField, ...] = ("max_tokens", "max_completion_tokens")
@@ -64,7 +64,7 @@ DEFAULT_MATRIX_FILENAME = "matrix.json"
 
 # Literal mirrors of constants that otherwise live behind a heavy import
 # (`wmo.optimize.routing.compression`, `wmo.optimize.routing.policy`, `wmo.runtime.agents.llm`,
-# `wmo.providers.pool`).
+# `wmo.common.providers.pool`).
 # Typer evaluates Option defaults and f-string help text at command-definition time, so these
 # have to be values, not names imported from those modules; the real constants are re-imported
 # inside the command bodies that need their behavior.
@@ -704,9 +704,9 @@ def student(
     `wmo optimize route pin <world-model> --model student`; to have the router CHOOSE between the
     student and the rest of the roster, run `wmo optimize route fit` on a matrix that covers both.
     """
-    from wmo.core.locks import FileLockTimeout
+    from wmo.common.core.locks import FileLockTimeout
+    from wmo.common.providers.pool import upsert_pool_entry
     from wmo.optimize.model.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
-    from wmo.providers.pool import upsert_pool_entry
 
     card_path = Path(card_dir) / MODEL_CARD_FILE
     if not card_path.is_file():
@@ -800,7 +800,7 @@ def _credential_note(entry: PoolEntry) -> str:
 
 def _pool_has(path: Path, name: str) -> bool:
     """Whether `path` already carries an entry called `name` (False when there is no pool yet)."""
-    from wmo.providers.pool import load_pool
+    from wmo.common.providers.pool import load_pool
 
     if not path.is_file():
         return False
@@ -814,7 +814,7 @@ def _pool_has(path: Path, name: str) -> bool:
 
 def _pool_disabled(path: Path, name: str) -> bool:
     """Whether `path` carries an entry called `name` with `enabled = false` (else False)."""
-    from wmo.providers.pool import load_pool
+    from wmo.common.providers.pool import load_pool
 
     if not path.is_file():
         return False
@@ -1267,8 +1267,8 @@ def pin(
     say so. Replace it with `wmo optimize route fit` on a real outcome matrix to let the router
     choose per request.
     """
+    from wmo.common.providers.pool import load_pool
     from wmo.optimize.routing.policy import RoutingPolicy
-    from wmo.providers.pool import load_pool
 
     store = WorldModelStore(root)
     try:

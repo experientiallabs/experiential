@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.scenarios.verification import ChecklistJudge
 
 

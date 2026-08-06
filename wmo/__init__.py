@@ -7,7 +7,7 @@ Public API:
     obs = wm.step(session.id, action)
 """
 
-from wmo.core.types import (
+from wmo.common.core.types import (
     Action,
     ActionKind,
     EnvState,

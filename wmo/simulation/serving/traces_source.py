@@ -18,8 +18,8 @@ from pathlib import Path
 import httpx
 from pydantic import BaseModel, Field
 
-from wmo.config.card import TracesSource
-from wmo.core.types import Action
+from wmo.common.config.card import TracesSource
+from wmo.common.core.types import Action
 from wmo.simulation.ingest import get_adapter
 
 TRACES_FILENAME = "traces.otel.jsonl"

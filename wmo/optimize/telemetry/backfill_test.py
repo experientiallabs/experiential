@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from pydantic import JsonValue
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.optimize.telemetry.backfill import (
     ArtifactError,
     _total,

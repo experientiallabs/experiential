@@ -19,7 +19,7 @@ from typing import Literal
 
 import pytest
 
-from wmo.core.types import JsonObject, JsonValue
+from wmo.common.core.types import JsonObject, JsonValue
 from wmo.optimize.model.config import (
     DistillConfig,
     HarborConfig,
@@ -350,7 +350,7 @@ def test_a_torn_run_record_write_leaves_the_previous_record_intact(
 
     A crash mid-write is modelled by failing the payload's `fsync`, which is
     reached with the bytes already written to the temp file and the rename not
-    yet done. The record goes through `wmo.core.files.write_text_atomic`, so
+    yet done. The record goes through `wmo.common.core.files.write_text_atomic`, so
     what a resume reads back is still the complete previous record; an in-place
     write would have truncated it and cost the dashboard run.
     """

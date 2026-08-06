@@ -13,13 +13,13 @@ from typing import Any, cast
 
 import pytest
 
-from wmo.core.types import Action, JsonObject, Observation
+from wmo.common.core.types import Action, JsonObject, Observation
+from wmo.common.vendor.waterfall import ChatRequest, ChatResponse
 from wmo.runtime.harness import runner_link as runner_link_module
 from wmo.runtime.harness.runner_link import RunnerLink, SocketChannel, read_frame, write_frame
 from wmo.runtime.harness.runtime import SCAFFOLD_LOSS_STOP_REASONS, RuntimeCancelled, StopReason
 from wmo.runtime.harness.skills import Skill, SkillLibrary
 from wmo.runtime.harness.tools import SUBMIT, TOOL_REGISTRY
-from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 
 class _Env:
@@ -560,7 +560,7 @@ def test_multiple_episodes_over_one_channel() -> None:
 def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
     import os as _os
 
-    from wmo.providers.base import Provider, ProviderConfig, ProviderKind
+    from wmo.common.providers.base import Provider, ProviderConfig, ProviderKind
     from wmo.runtime.harness.doc import (
         MAX_OUTPUT_TOKENS_ID,
         MAX_TURNS_ID,

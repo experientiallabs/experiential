@@ -18,7 +18,7 @@ from typing import cast
 
 import httpx
 
-from wmo.core.types import JsonObject, JsonValue
+from wmo.common.core.types import JsonObject, JsonValue
 from wmo.simulation.context.apps import get_app
 from wmo.simulation.context.connector import ConnectUI, register_connector
 from wmo.simulation.context.oauth import run_device_flow

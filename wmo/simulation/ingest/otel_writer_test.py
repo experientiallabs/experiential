@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wmo.core.types import (
+from wmo.common.core.types import (
     Action,
     ActionKind,
     EnvState,

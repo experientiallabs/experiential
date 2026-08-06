@@ -52,7 +52,7 @@ from threading import Lock
 
 from pydantic import BaseModel, ConfigDict
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.optimize.routing.outcomes import ScenarioOutcome
 from wmo.optimize.routing.pipeline import Stage, StageRecord
 from wmo.optimize.telemetry.backfill import cell_payload

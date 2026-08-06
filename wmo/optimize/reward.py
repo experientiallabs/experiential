@@ -18,10 +18,10 @@ import json
 
 from pydantic import BaseModel, Field, ValidationError
 
-from wmo.core.parsing import extract_json_object
-from wmo.core.render import render_action
-from wmo.core.types import Step
-from wmo.providers.base import Message, Provider
+from wmo.common.core.parsing import extract_json_object
+from wmo.common.core.render import render_action
+from wmo.common.core.types import Step
+from wmo.common.providers.base import Message, Provider
 
 REWARD_JUDGE_SYSTEM = """You are a strict evaluator of agent rollouts in a simulated environment.
 You are given a TASK and the sequence of steps an agent took (each step: the agent's action and

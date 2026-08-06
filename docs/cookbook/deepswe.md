@@ -27,7 +27,7 @@ bundle is a build output published to Hugging Face
 ## The local embedder
 
 Queries and tasks embed with `EmbedderSpec(kind="local")`: Qwen3-Embedding-0.6B in-process,
-via MLX on Apple silicon or torch on CUDA/CPU (`wmo.providers.local_embed`, the `local`
+via MLX on Apple silicon or torch on CUDA/CPU (`wmo.common.providers.local_embed`, the `local`
 extra). Weights download from Hugging Face once; after that the whole routing path (embed,
 retrieve, decide) is offline and credential-free. Fits and reproductions replay the bundle's
 RECORDED vectors (`task_embeddings.npy`) instead of re-embedding, which is what makes the

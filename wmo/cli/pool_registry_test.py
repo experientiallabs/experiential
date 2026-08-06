@@ -28,17 +28,17 @@ from wmo.cli.pool_registry import (
     register_model_ids,
     run_pool_registry,
 )
-from wmo.config import PROVIDER_ENV_VARS
-from wmo.providers.base import ProviderKind, VerifyResult
-from wmo.providers.catalog import (
+from wmo.common.config import PROVIDER_ENV_VARS
+from wmo.common.observability.pricing import ModelPrice
+from wmo.common.providers.base import ProviderKind, VerifyResult
+from wmo.common.providers.catalog import (
     CatalogModel,
     CatalogSource,
     ProviderCatalog,
     list_provider_models,
 )
-from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
-from wmo.providers.pool import PoolEntry, load_pool
-from wmo.tracking.pricing import ModelPrice
+from wmo.common.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
+from wmo.common.providers.pool import PoolEntry, load_pool
 
 _SONNET = "anthropic/claude-sonnet-4.5"
 _DEEPSEEK = "deepseek/deepseek-v3.2"
@@ -302,8 +302,8 @@ def test_a_price_is_re_asked_until_it_is_a_non_negative_number(tmp_path: Path) -
 
 
 def test_a_built_in_priced_model_is_not_asked_for_a_price(tmp_path: Path) -> None:
-    # gpt-5.4 is in `wmo.tracking.pricing`, so the entry is honest without any declared price
-    # and stays as small as a hand-written one.
+    # gpt-5.4 is in `wmo.common.observability.pricing`, so the entry is honest without a declared
+    # price and stays as small as a hand-written one.
     pool = tmp_path / "pool.toml"
     written, _, _ = _drive(
         pool,

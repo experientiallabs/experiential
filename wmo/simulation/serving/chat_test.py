@@ -14,7 +14,27 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
+from wmo.common.observability.pricing import ModelPrice
+from wmo.common.providers.base import (
+    Completion,
+    Message,
+    ProviderKind,
+    StreamChunk,
+    TokenUsage,
+    VerifyResult,
+)
+from wmo.common.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
+from wmo.common.providers.pool import PoolEntry, load_pool
+from wmo.common.vendor.waterfall.types import (
+    ChatChoice,
+    ChatFunctionCall,
+    ChatMessage,
+    ChatRequest,
+    ChatResponse,
+    ChatToolCall,
+    ChatUsage,
+)
 from wmo.optimize.routing.compression import (
     CompressionConfig,
     CompressionResult,
@@ -30,16 +50,6 @@ from wmo.optimize.routing.policy import (
     KnnBank,
     RoutingPolicy,
 )
-from wmo.providers.base import (
-    Completion,
-    Message,
-    ProviderKind,
-    StreamChunk,
-    TokenUsage,
-    VerifyResult,
-)
-from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
-from wmo.providers.pool import PoolEntry, load_pool
 from wmo.simulation.retrieval.embedders import HashingEmbedder
 from wmo.simulation.serving import chat as chat_module
 from wmo.simulation.serving.chat import ChatMessage as EndpointMessage
@@ -53,22 +63,12 @@ from wmo.simulation.serving.chat import (
 from wmo.simulation.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
 from wmo.simulation.serving.query_embeddings import QUERY_EMBEDDING_FILENAME, QueryEmbeddingStore
 from wmo.simulation.serving.savings import EndpointSavings, SavingsWindow
-from wmo.tracking.pricing import ModelPrice
-from wmo.utils.waterfall.types import (
-    ChatChoice,
-    ChatFunctionCall,
-    ChatMessage,
-    ChatRequest,
-    ChatResponse,
-    ChatToolCall,
-    ChatUsage,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from typing import Any
 
-    from wmo.providers.base import ProviderConfig
+    from wmo.common.providers.base import ProviderConfig
 
 
 class _EchoProvider:

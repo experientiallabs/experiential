@@ -20,7 +20,7 @@ from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from wmo.core.types import JsonObject, Trace
+from wmo.common.core.types import JsonObject, Trace
 
 # The artifact families the optimizer switch must carry. Adding a family here (and nowhere
 # else) is the extension point for a new optimizer type.

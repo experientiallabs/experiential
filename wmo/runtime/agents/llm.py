@@ -14,9 +14,9 @@ from typing import NamedTuple
 
 from pydantic import BaseModel, ValidationError
 
-from wmo.core.parsing import extract_json_object
-from wmo.core.types import Action, ActionKind, EnvState, JsonObject, Step
-from wmo.providers.base import Completion, Message, Provider
+from wmo.common.core.parsing import extract_json_object
+from wmo.common.core.types import Action, ActionKind, EnvState, JsonObject, Step
+from wmo.common.providers.base import Completion, Message, Provider
 from wmo.runtime.episode import DONE_SIGNAL
 
 AGENT_SYSTEM = """You are an agent operating in a tool environment to complete a task.

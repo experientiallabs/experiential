@@ -13,13 +13,13 @@ import pytest
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 
+from wmo.common.providers.base import ProviderConfig, ProviderKind
+from wmo.common.providers.retry import RetryingToolCallingProvider
+from wmo.common.providers.tinker import TinkerChatProvider, TokenSpan
 from wmo.optimize.model.agents import (
     WMO_DISTILL_HARBOR_AGENT_IMPORT_PATH,
     WmoDistillHarborAgent,
 )
-from wmo.providers.base import ProviderConfig, ProviderKind
-from wmo.providers.retry import RetryingToolCallingProvider
-from wmo.providers.tinker import TinkerChatProvider, TokenSpan
 from wmo.runtime.harness.doc import HarnessDoc
 from wmo.runtime.harness.runtime import RunResult, StopReason
 

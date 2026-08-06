@@ -54,8 +54,8 @@ from harbor.models.trial.config import AgentConfig, TaskConfig
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
 
-from wmo.core.types import JsonObject
-from wmo.providers.base import ProviderConfig
+from wmo.common.core.types import JsonObject
+from wmo.common.providers.base import ProviderConfig
 from wmo.runtime.evaluation.harbor.agent import (
     DEFAULT_EPISODE_WORKERS,
     MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,

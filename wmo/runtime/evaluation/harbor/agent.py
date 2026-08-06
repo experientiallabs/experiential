@@ -36,10 +36,10 @@ from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 from harbor.models.task.config import MCPServerConfig
 
-from wmo.core.types import Action, ActionKind, JsonObject, Observation
-from wmo.providers.base import Provider, ProviderConfig
-from wmo.providers.registry import get_provider
-from wmo.providers.retry import wrap_provider_with_retries
+from wmo.common.core.types import Action, ActionKind, JsonObject, Observation
+from wmo.common.providers.base import Provider, ProviderConfig
+from wmo.common.providers.registry import get_provider
+from wmo.common.providers.retry import wrap_provider_with_retries
 from wmo.runtime.harness.doc import HarnessDoc
 from wmo.runtime.harness.environment import is_env_action
 from wmo.runtime.harness.runtime import (

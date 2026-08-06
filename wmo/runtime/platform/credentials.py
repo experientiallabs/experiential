@@ -15,7 +15,9 @@ from pathlib import Path
 import tomli_w
 from pydantic import BaseModel
 
-ENV_HOME = "WMO_HOME"
+from wmo.common.config.paths import ENV_HOME as ENV_HOME
+from wmo.common.config.paths import wmo_home
+
 ENV_WEB_URL = "WMO_PLATFORM_URL"
 ENV_API_URL = "WMO_PLATFORM_API_URL"
 ENV_TOKEN = "WMO_PLATFORM_TOKEN"
@@ -39,12 +41,6 @@ class PlatformCredentials(BaseModel):
     def is_complete(self) -> bool:
         """Whether requests can be made without further configuration."""
         return bool(self.api_url and self.token)
-
-
-def wmo_home() -> Path:
-    """The user-global wmo directory (`$WMO_HOME` or `~/.wmo`)."""
-    override = os.environ.get(ENV_HOME)
-    return Path(override) if override else Path.home() / ".wmo"
 
 
 def credentials_path() -> Path:

@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
-from wmo.config.card import TracesSource
+from wmo.common.config.card import TracesSource
 from wmo.simulation.serving.traces_source import (
     TRACES_FILENAME,
     DownloadStatus,

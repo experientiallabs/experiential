@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from wmo.core.types import ActionKind, Trace
+from wmo.common.core.types import ActionKind, Trace
 
 
 class Scenario(BaseModel):

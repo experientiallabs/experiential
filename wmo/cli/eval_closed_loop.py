@@ -49,7 +49,7 @@ def run_closed_loop(
     at once unless `--eval-concurrency` caps them.
     """
     from wmo.cli.model_roles import resolve_opt_in_model_provider
-    from wmo.config import WorldModelStore
+    from wmo.common.config import WorldModelStore
     from wmo.runtime.harness.runtime import DEFAULT_MAX_TURNS, AgentRuntime
     from wmo.simulation.evaluation.closed_loop import ClosedLoopEval
     from wmo.simulation.evaluation.gold import GoldJudge

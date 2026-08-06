@@ -26,9 +26,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from wmo.config import ARTIFACT_DIR, WorldModelStore, validate_name
-from wmo.config.card import ModelCard, load_card
-from wmo.core.types import Action, EnvState, Observation, Session
+from wmo.common.config import ARTIFACT_DIR, WorldModelStore, validate_name
+from wmo.common.config.card import ModelCard, load_card
+from wmo.common.core.types import Action, EnvState, Observation, Session
+from wmo.common.observability import RunRecord
 from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing.pareto import PARETO_FILENAME, ParetoCurve
 from wmo.optimize.routing.policy import POLICY_FILENAME, RoutingPolicy
@@ -51,7 +52,6 @@ from wmo.simulation.serving.traces_source import (
     resolve_url,
     scenarios_from_traces,
 )
-from wmo.tracking import RunRecord
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +180,7 @@ def resolve_model_dirs(artifact_dirs: Sequence[str], names: list[str] | None) ->
 def _load_card_or_none(model_dir: Path) -> ModelCard | None:
     """Read a model's card, degrading a malformed one to None instead of aborting the server.
 
-    A card is additive metadata (see `wmo.config.card`); one corrupt `card.json` - e.g. a
+    A card is additive metadata (see `wmo.common.config.card`); one corrupt `card.json` - e.g. a
     build killed mid-write - must not stop the healthy models from being served.
     """
     try:

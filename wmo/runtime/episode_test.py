@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Step
+from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step
 from wmo.runtime import DONE_SIGNAL, EpisodeResult, StopReason, run_episode
 
 

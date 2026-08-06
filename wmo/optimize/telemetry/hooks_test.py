@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from wmo.core.types import JsonObject, JsonValue
+from wmo.common.core.types import JsonObject, JsonValue
 from wmo.optimize.routing.outcomes import ScenarioOutcome
 from wmo.optimize.routing.pipeline import Stage, StageRecord
 from wmo.optimize.telemetry.backfill import cell_payload

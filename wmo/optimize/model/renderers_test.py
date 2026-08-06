@@ -37,6 +37,7 @@ from harbor.llms.tinker import TinkerLLM
 from tinker_cookbook.renderers import get_registered_renderer_names, get_renderer
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
+from wmo.common.providers.tinker import TokenSpan
 from wmo.optimize.model.config import (
     DistillConfig,
     HarborConfig,
@@ -66,7 +67,6 @@ from wmo.optimize.model.renderers import (
     register_wmo_renderers,
 )
 from wmo.optimize.model.tokens import TrialRecord
-from wmo.providers.tinker import TokenSpan
 
 if TYPE_CHECKING:
     from wmo.optimize.model.data import TrainDatum

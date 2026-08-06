@@ -33,8 +33,8 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from wmo.core.text import validate_durable_text
-from wmo.providers.base import Provider, ToolCallingProvider
+from wmo.common.core.text import validate_durable_text
+from wmo.common.providers.base import Provider, ToolCallingProvider
 from wmo.runtime.harness.code_runtime import (
     DEFAULT_RUNTIME_CODE,
     CodeRuntime,

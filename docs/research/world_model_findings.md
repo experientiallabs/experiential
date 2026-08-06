@@ -26,7 +26,7 @@ as one six-PR train (#41, #72, #97, #55, #120, #98); the six layers map to five 
   degenerate-dropped corpus where noted).
 - **Split discipline**: deterministic by hash of `trace_id` into a fixed test band (the y-axis
   never changes as the corpus grows), a fixed valid band, and a train pool
-  (`wmo.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`). Selection (GEPA, config
+  (`wmo.optimize.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`). Selection (GEPA, config
   search) uses valid; the reported number is always the untouched test slice.
 - **Metric**: open-loop reconstruction fidelity. The world model replays recorded steps
   teacher-forced (`predict_observation`); a pinned `RubricJudge` scores each predicted
@@ -467,11 +467,11 @@ machine; treat any number without that pinning as unfalsifiable.
 All six layers are driven by the public `wmo` API; any thin driver reproduces them. Corpora:
 `environment-capture-data/<suite>/traces.otel.jsonl` via `wmo.simulation.ingest` (adapter
 `otel-genai`, degenerate traces dropped for swe-healthy). Splits via
-`wmo.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`. Figures: matplotlib over the
+`wmo.optimize.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`. Figures: matplotlib over the
 result JSONs, brand palette per AGENTS.md rule 15.
 
 ```text
-Layer 1  wmo.research.TraceScalingAblation + run_ablation
+Layer 1  wmo.optimize.research.TraceScalingAblation + run_ablation
          counts=1,4,16,64,256,648 (auto-caps at each pool), modes=base, seeds=0,1,
          sample_turns=sampled, test_cap=40, concurrency=8, top_k=5
          serve + judge us.anthropic.claude-opus-4-8 (Bedrock, AWS_PROFILE=default us-east-1),
@@ -484,7 +484,7 @@ Layer 2  same ablation, counts=1,16,<pool>, test_cap=15,
          retrieval_key="state_action"; unoptimized: top_k=5, no cap
          semantic arm: Azure ada-002 embedder; command-only key arm: retrieval_key="action"
 
-Layer 3  wmo.research.GepaScalingAblation + run_ablation
+Layer 3  wmo.optimize.research.GepaScalingAblation + run_ablation
          common: sample_turns=sampled, test_cap=40, concurrency=8, gepa_val_steps=30
          budget axis: budgets {0,1,2,4,8,16} at counts=64, seeds 0,1
          trace axis: counts {1,4,16,pool} at budgets=8, seed 0

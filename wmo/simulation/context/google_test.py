@@ -16,7 +16,7 @@ import httpx
 import pytest
 
 import wmo.simulation.context.google as google_mod
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.simulation.context.connector import ConnectUI, get_connector
 from wmo.simulation.context.credentials import (
     ENV_CONNECTORS_PATH,

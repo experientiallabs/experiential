@@ -27,11 +27,11 @@ from statistics import median, quantiles
 
 from pydantic import BaseModel, Field
 
+from wmo.common.providers.base import Embedder
+from wmo.common.providers.pool import Tier
 from wmo.optimize.routing.compression import CompressingEmbedder
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.policy import RoutingPolicy, select_model
-from wmo.providers.base import Embedder
-from wmo.providers.pool import Tier
 
 # What the v1 cost numbers assume; shipped verbatim in every report until the cache-aware cost
 # model replaces it (2026-07-23 caching entry in the coordination log).

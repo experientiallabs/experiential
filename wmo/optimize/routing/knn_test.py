@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from wmo.common.providers.base import ProviderKind
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.routing import evaluate_policy
 from wmo.optimize.routing.knn import (
     COST_QUALITY_ANCHORS,
@@ -27,8 +29,6 @@ from wmo.optimize.routing.policy import (
     RoutingPolicy,
     knn_decision,
 )
-from wmo.providers.base import ProviderKind
-from wmo.providers.pool import PoolEntry
 from wmo.simulation.retrieval.embedders import HashingEmbedder
 
 _SQL_TASKS = [

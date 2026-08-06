@@ -15,6 +15,8 @@ import pytest
 from harbor.models.job.config import JobConfig
 
 import wmo.optimize.model.rollouts as rollouts_module
+from wmo.common.providers.base import ProviderConfig, ProviderKind
+from wmo.common.providers.tinker import TokenSpan
 from wmo.optimize.model.config import (
     DistillConfig,
     HarborConfig,
@@ -29,8 +31,6 @@ from wmo.optimize.model.rollouts import (
     terminus_2_agent_kwargs,
 )
 from wmo.optimize.model.tokens import TrialRecord
-from wmo.providers.base import ProviderConfig, ProviderKind
-from wmo.providers.tinker import TokenSpan
 from wmo.runtime.evaluation.harbor.scorer import HarborScorer
 from wmo.runtime.harness.doc import HarnessDoc
 from wmo.runtime.harness.scoring import GradedTests, ScoreCell, ScoreReport, ScoreRequest
@@ -992,7 +992,7 @@ def test_harbor_tinker_llm_shares_one_service_client() -> None:
             return object()
 
     service = _FakeService()
-    with mock.patch("wmo.providers.tinker.shared_service_client", return_value=service):
+    with mock.patch("wmo.common.providers.tinker.shared_service_client", return_value=service):
 
         class _Stub:
             """The TinkerLLM attribute surface the patched method touches."""

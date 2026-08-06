@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import wmo
-from wmo.core.types import ActionKind
+from wmo.common.core.types import ActionKind
 
 
 def test_public_api_matches_quickstart() -> None:

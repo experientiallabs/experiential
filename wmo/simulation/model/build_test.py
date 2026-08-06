@@ -6,9 +6,9 @@ import json
 
 import pytest
 
-from wmo.config import ArtifactPaths, HarnessConfig
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.config import ArtifactPaths, HarnessConfig
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.model.build import (
     EmptyCorpusError,
     build,
@@ -471,7 +471,7 @@ def test_build_max_fidelity_finds_the_winner_but_leaves_defaults_plain(tmp_path)
         fidelity_budget=2,
         full_search=True,
     )
-    from wmo.config import load_config
+    from wmo.common.config import load_config
 
     # The search NEVER changes the serve defaults — a plain run stays pure RAG...
     persisted = load_config(str(root))

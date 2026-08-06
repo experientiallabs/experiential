@@ -20,14 +20,10 @@ from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError
 
-from wmo.core.parsing import extract_json_object
-from wmo.core.types import JsonObject, Observation, Step
-from wmo.providers.base import Message, Provider
-
-# A stable substring of JUDGE_SYSTEM used to recognize judge calls when attributing run cost
-# (wmo.tracking.metered). Kept as a named constant so the prompt and the classifier never drift:
-# JUDGE_SYSTEM must always contain JUDGE_MARKER (pinned by judge_test.py).
-JUDGE_MARKER = "grade a world model"
+from wmo.common.core.parsing import extract_json_object
+from wmo.common.core.types import JsonObject, Observation, Step
+from wmo.common.observability.metered import JUDGE_MARKER as JUDGE_MARKER
+from wmo.common.providers.base import Message, Provider
 
 # Bumped whenever scoring semantics change (prompt rules, weights, validity, truncation), so
 # persisted eval results record which judge produced them and cross-version rows are never

@@ -11,10 +11,10 @@ from collections.abc import Mapping
 
 import pytest
 
+from wmo.common.providers.base import ProviderKind, TokenUsage
+from wmo.common.providers.pool import PoolEntry, Tier
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.teacher import select_teacher
-from wmo.providers.base import ProviderKind, TokenUsage
-from wmo.providers.pool import PoolEntry, Tier
 
 
 def _entry(name: str, *, per_mtok: float, tier: Tier = "open") -> PoolEntry:

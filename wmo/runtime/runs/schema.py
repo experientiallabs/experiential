@@ -63,8 +63,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from wmo.config import ARTIFACT_DIR
-from wmo.core.types import JsonObject
+from wmo.common.config import ARTIFACT_DIR
+from wmo.common.core.types import JsonObject
 
 # Width of one writer's seq band. Defined ONCE, here: the backfill command and
 # every live hook import it, because two writers disagreeing about the width

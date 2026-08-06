@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.optimize.judge import RubricJudge
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.evaluation.failover import SameModelFailover
 from wmo.simulation.evaluation.grid import (
     CONDITIONS,

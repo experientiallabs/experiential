@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field, JsonValue
 
-from wmo.core.types import (
+from wmo.common.core.types import (
     Action,
     ActionKind,
     EnvState,

@@ -19,7 +19,7 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, Field
 
-from wmo.core.types import JsonObject, JsonValue
+from wmo.common.core.types import JsonObject, JsonValue
 
 # Fetched content is capped so one huge document or page cannot blow up a bundle.
 CONTENT_CAP_CHARS = 200_000

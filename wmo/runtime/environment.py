@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from wmo.core.types import Action, EnvState, Observation
+from wmo.common.core.types import Action, EnvState, Observation
 
 
 @runtime_checkable

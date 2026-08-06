@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from wmo.core.types import Action, EnvState, Observation
+from wmo.common.core.types import Action, EnvState, Observation
+from wmo.common.observability import RunRecord
 from wmo.optimize.reward import EpisodeScore
 from wmo.simulation.model.world_model import WorldModel
-from wmo.tracking import RunRecord
 
 
 class WorldModelEnv:

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.model.knowledge import (
     GROUNDED_FILE,
     LEARNED_FILE,

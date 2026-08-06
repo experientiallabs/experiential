@@ -24,7 +24,7 @@ uv run python - <<'PY'
 import json
 from wmo.optimize.judge import RubricJudge
 from wmo.optimize.judge_quality import run_judge_quality
-from wmo.providers import ProviderConfig, ProviderKind, get_provider
+from wmo.common.providers import ProviderConfig, ProviderKind, get_provider
 
 judge = RubricJudge(get_provider(ProviderConfig(
     kind=ProviderKind.BEDROCK, model="us.anthropic.claude-opus-4-8")))

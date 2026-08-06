@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 
-from wmo.core.types import Action, ActionKind, Observation, Step
+from wmo.common.core.types import Action, ActionKind, Observation, Step
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.optimize.reward import EpisodeRewardJudge, EpisodeScore, _build_reward_prompt
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 
 def _step(content: str = "ok", is_error: bool = False) -> Step:

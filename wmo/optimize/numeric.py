@@ -15,8 +15,8 @@ import math
 
 from pydantic import JsonValue
 
-from wmo.core.parsing import extract_json_object
-from wmo.core.types import Observation, Step
+from wmo.common.core.parsing import extract_json_object
+from wmo.common.core.types import Observation, Step
 from wmo.optimize.judge import JudgeResult
 
 # A flattened JSON leaf: numbers score by relative error, everything else by exact match.

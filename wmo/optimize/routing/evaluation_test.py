@@ -8,12 +8,8 @@ from typing import cast
 
 import pytest
 
-from wmo.core.types import Action, EnvState, Observation
-from wmo.optimize.reward import EpisodeScore
-from wmo.optimize.routing.compression import CompressionConfig
-from wmo.optimize.routing.evaluation import evaluate_pool
-from wmo.optimize.routing.outcomes import ScenarioOutcome
-from wmo.providers.base import (
+from wmo.common.core.types import Action, EnvState, Observation
+from wmo.common.providers.base import (
     Completion,
     Message,
     ProviderConfig,
@@ -21,7 +17,11 @@ from wmo.providers.base import (
     TokenUsage,
     VerifyResult,
 )
-from wmo.providers.pool import ModelPool, PoolEntry
+from wmo.common.providers.pool import ModelPool, PoolEntry
+from wmo.optimize.reward import EpisodeScore
+from wmo.optimize.routing.compression import CompressionConfig
+from wmo.optimize.routing.evaluation import evaluate_pool
+from wmo.optimize.routing.outcomes import ScenarioOutcome
 from wmo.simulation.scenarios.spec import Scenario
 
 

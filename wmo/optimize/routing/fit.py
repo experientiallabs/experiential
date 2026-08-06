@@ -50,8 +50,8 @@ from wmo.optimize.routing.policy import (
 )
 
 if TYPE_CHECKING:
+    from wmo.common.providers.base import Embedder
     from wmo.optimize.routing.outcomes import OutcomeMatrix
-    from wmo.providers.base import Embedder
 
 logger = logging.getLogger(__name__)
 

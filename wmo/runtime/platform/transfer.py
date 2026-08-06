@@ -28,8 +28,8 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from wmo.config.config import HarnessConfig
-from wmo.core.types import JsonValue
+from wmo.common.config.config import HarnessConfig
+from wmo.common.core.types import JsonValue
 
 # auto_fidelity.json rides along because it names the model's measured-best
 # runtime configuration; knowledge/ because that configuration may BE

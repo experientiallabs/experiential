@@ -17,8 +17,18 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from wmo.config import HarnessConfig, save_config
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.config import HarnessConfig, save_config
+from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.observability import Phase, RunRecord, UsageTotals
+from wmo.common.providers.base import (
+    Completion,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+    TokenUsage,
+    VerifyResult,
+)
+from wmo.common.providers.pool import PoolEntry, load_pool
 from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing.compression import CompressionConfig
 from wmo.optimize.routing.evaluation import CellKey
@@ -37,18 +47,8 @@ from wmo.optimize.routing.sweep import (
     unevenness,
 )
 from wmo.optimize.routing.sweep_partial import partial_path
-from wmo.providers.base import (
-    Completion,
-    Message,
-    ProviderConfig,
-    ProviderKind,
-    TokenUsage,
-    VerifyResult,
-)
-from wmo.providers.pool import PoolEntry, load_pool
 from wmo.simulation.ingest.otel_writer import write_traces_jsonl
 from wmo.simulation.serving.traces_source import TRACES_FILENAME
-from wmo.tracking import Phase, RunRecord, UsageTotals
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -496,7 +496,7 @@ def candidates(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         built.append(config.model)
         return _DoneProvider(config)
 
-    monkeypatch.setattr("wmo.providers.pool.get_provider", _get_provider)
+    monkeypatch.setattr("wmo.common.providers.pool.get_provider", _get_provider)
     return built
 
 
@@ -729,8 +729,8 @@ def test_pool_digest_ignores_the_enabled_field() -> None:
     information there, and an unchanged roster must keep its recorded digest across the
     upgrade that added the field.
     """
+    from wmo.common.providers.pool import ModelPool, PoolEntry
     from wmo.optimize.routing.sweep import _pool_digest
-    from wmo.providers.pool import ModelPool, PoolEntry
 
     entry = PoolEntry(name="on", kind=ProviderKind.OPENAI, model="gpt-5.4")
     explicit = entry.model_copy(update={"enabled": True})

@@ -6,10 +6,11 @@ from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
 
-import wmo.providers.tinker as providers_tinker
+import wmo.common.providers.tinker as providers_tinker
+from wmo.common.providers.base import ProviderKind
+from wmo.common.providers.tinker_deadlines import TinkerDeadlineError
 from wmo.optimize.model.config import TeacherConfig
 from wmo.optimize.model.data import TrainDatum
-from wmo.optimize.model.deadlines import TinkerDeadlineError
 from wmo.optimize.model.fake_tinker import FakeSamplingClient, FakeTokenizer
 from wmo.optimize.model.teacher import (
     TOKENIZER_PROBE_TEXTS,
@@ -19,7 +20,6 @@ from wmo.optimize.model.teacher import (
     TinkerTeacher,
     tokenizer_fingerprint_check,
 )
-from wmo.providers.base import ProviderKind
 
 if TYPE_CHECKING:
     import tinker

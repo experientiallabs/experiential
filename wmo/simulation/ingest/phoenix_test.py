@@ -11,7 +11,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from wmo.core.types import ActionKind
+from wmo.common.core.types import ActionKind
 from wmo.simulation.ingest.adapter import VendorPull, get_adapter
 from wmo.simulation.ingest.normalize import spans_to_traces
 from wmo.simulation.ingest.phoenix import PhoenixAdapter

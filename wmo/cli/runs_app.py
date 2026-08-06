@@ -29,7 +29,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from wmo.config import ARTIFACT_DIR
+from wmo.common.config import ARTIFACT_DIR
 from wmo.runtime.platform.credentials import credentials_path
 from wmo.runtime.runs.schema import (
     LEDGER_LINE,
@@ -45,7 +45,7 @@ from wmo.runtime.runs.schema import (
 )
 
 if TYPE_CHECKING:
-    from wmo.core.types import JsonObject
+    from wmo.common.core.types import JsonObject
     from wmo.runtime.platform.client import PlatformError
     from wmo.runtime.runs.reader import CellStats, EventRow, RunDetail, RunsReader, RunSummary
     from wmo.runtime.runs.schema import RunEvent

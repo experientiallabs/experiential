@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from wmo.core.types import Action, ActionKind, Observation, Step
+from wmo.common.core.types import Action, ActionKind, Observation, Step
 from wmo.optimize.judge import JudgeResult
 from wmo.optimize.judge_quality import (
     JUDGE_QUALITY_CASES,

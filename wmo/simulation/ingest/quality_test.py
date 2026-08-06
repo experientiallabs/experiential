@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
 from wmo.simulation.ingest.quality import drop_degenerate_traces
 
 

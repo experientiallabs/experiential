@@ -86,11 +86,11 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from wmo.common.providers.tinker import TokenSpan
+from wmo.common.vendor.waterfall.types import ChatMessage, ChatTool
 from wmo.optimize.model.store import WarmupTrialsManifest
 from wmo.optimize.model.tokens import TrialRecord
-from wmo.providers.tinker import TokenSpan
 from wmo.runtime.harness.runtime import StopReason
-from wmo.utils.waterfall.types import ChatMessage, ChatTool
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,7 @@ PLACEHOLDER_LOGPROB = 0.0
 class TurnRendering(Protocol):
     """The two rendering operations turning teacher text into training targets.
 
-    Deliberately narrower than `wmo.optimize.model.rendering.ChatRendering`: this
+    Deliberately narrower than `wmo.common.providers.tinker_rendering.ChatRendering`: this
     bridge never samples, decodes, or parses, so it asks for nothing it does
     not use. `CookbookChatRendering` satisfies it structurally, which is how
     `build_offline_rendering` (no Tinker client) plugs straight in.

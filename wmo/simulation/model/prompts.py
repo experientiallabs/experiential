@@ -8,15 +8,16 @@ The env prompt is the heart of the system. It composes:
   - the incoming action
 into the single completion that predicts the next observation (DreamGym Eq. 4).
 
-The actual rendering lives in `wmo.core.render` (which depends on nothing), so the serving engine
-and the GEPA optimizer share one assembly — prompts are evolved against exactly what the world model
-serves. This module is the engine-facing entry point: it adapts a live `Session` to that renderer.
+The actual rendering lives in `wmo.common.core.render` (which depends on nothing), so the serving
+engine and the GEPA optimizer share one assembly. Prompts are evolved against exactly what the
+world model serves. This module is the engine-facing entry point: it adapts a live `Session` to that
+renderer.
 """
 
 from __future__ import annotations
 
-from wmo.core.render import build_env_prompt as _build_env_prompt
-from wmo.core.types import Action, Session, Step
+from wmo.common.core.render import build_env_prompt as _build_env_prompt
+from wmo.common.core.types import Action, Session, Step
 
 # Layer (a): the env-agnostic base prompt. GEPA (layer b) evolves a specialized version of this.
 # Tuned via replay-fidelity measurement across example traces:

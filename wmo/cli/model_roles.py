@@ -7,11 +7,11 @@ from typing import Literal
 
 import typer
 
-from wmo.config.config import ARTIFACT_DIR
-from wmo.config.settings import ModelRole, ProjectSettings, load_settings
-from wmo.providers.base import Provider, ProviderConfig, ProviderKind
-from wmo.providers.models import resolve_provider_model
-from wmo.providers.registry import get_provider
+from wmo.common.config.config import ARTIFACT_DIR
+from wmo.common.config.settings import ModelRole, ProjectSettings, load_settings
+from wmo.common.providers.base import Provider, ProviderConfig, ProviderKind
+from wmo.common.providers.models import resolve_provider_model
+from wmo.common.providers.registry import get_provider
 
 OptInModelRole = Literal["agent", "meta"]
 ModelRoleName = Literal["worker", "judge", "summary", "meta", "agent"]

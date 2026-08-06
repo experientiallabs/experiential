@@ -12,7 +12,7 @@ the per-file report into a `GridCell`. Two invariants make cells comparable:
   from different judge generations are never silently compared.
 - Target token **cost is metered separately** from the judge (a `MeteredProvider` wraps only the
   target), so a cell reports target-side cost, not judge cost. Cost is `None` when the model has no
-  pricing row (see `wmo.tracking.pricing.price_for`) rather than a misleading 0.
+  pricing row (see `wmo.common.observability.pricing.price_for`) rather than a misleading 0.
 
 `run_grid` is provider-agnostic: each `ModelSpec` names a provider/model the registry can build, so
 a self-hosted OpenAI-compatible model (e.g. Qwen-AgentWorld on vLLM) is just `provider="openai"`
@@ -26,14 +26,14 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
+from wmo.common.observability import MeteredProvider, RunTracker
+from wmo.common.observability.pricing import price_for
+from wmo.common.providers import ProviderConfig, ProviderKind, get_provider
+from wmo.common.providers.base import Completion, Message, Provider
 from wmo.optimize.judge import JUDGE_VERSION, Judge, RubricJudge
-from wmo.providers import ProviderConfig, ProviderKind, get_provider
-from wmo.providers.base import Completion, Message, Provider
 from wmo.simulation.evaluation.failover import anthropic_direct_id, same_model_chain
 from wmo.simulation.evaluation.open_loop import EvalReport, evaluate_files
 from wmo.simulation.retrieval import HashingEmbedder
-from wmo.tracking import MeteredProvider, RunTracker
-from wmo.tracking.pricing import price_for
 
 # Regions a Bedrock TARGET fails over across (same model, so what's measured is unchanged - this
 # only spreads throttling load, it does not switch models).

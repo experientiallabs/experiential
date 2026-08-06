@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from pydantic import JsonValue, ValidationError
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.runtime.runs.ledger import Calibration, LedgerLine
 
 

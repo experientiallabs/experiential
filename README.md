@@ -88,7 +88,7 @@ for testing and optimization.
 
 ```python
 from wmo import Action, ActionKind
-from wmo.config.store import WorldModelStore
+from wmo.common.config.store import WorldModelStore
 from wmo.simulation.model.loader import load_world_model
 
 model_dir = WorldModelStore(".wmo").resolve("airline")

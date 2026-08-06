@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from wmo.core.types import ActionKind, ErrorClass, StepAttribution
+from wmo.common.core.types import ActionKind, ErrorClass, StepAttribution
 from wmo.simulation.ingest.normalize import (
     SpanEmitter,
     SpanRecord,

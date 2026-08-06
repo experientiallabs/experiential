@@ -12,7 +12,7 @@ from pathlib import Path
 
 from pydantic import JsonValue
 
-from wmo.core.types import ActionKind, JsonObject
+from wmo.common.core.types import ActionKind, JsonObject
 from wmo.simulation.ingest.adapter import VendorPull
 from wmo.simulation.ingest.base import BaseTraceAdapter
 

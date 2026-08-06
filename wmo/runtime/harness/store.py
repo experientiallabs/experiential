@@ -31,9 +31,9 @@ from uuid import uuid4
 
 import tomli_w
 
-from wmo.config.store import validate_name
-from wmo.core.files import write_text_atomic
-from wmo.core.locks import file_write_lock
+from wmo.common.config.store import validate_name
+from wmo.common.core.files import write_text_atomic
+from wmo.common.core.locks import file_write_lock
 from wmo.runtime.harness.doc import HarnessDoc
 from wmo.runtime.harness.source_tree import SYSTEM_FILE, HarnessSourceFile, HarnessSourceTree
 

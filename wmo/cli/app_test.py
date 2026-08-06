@@ -22,7 +22,7 @@ from typer.testing import CliRunner
 from wmo.cli import app, pool_registry
 from wmo.cli.app import _CONCURRENCY_ISOLATION_FLAGS
 from wmo.cli.pool_registry import read_pool_entries
-from wmo.config import (
+from wmo.common.config import (
     FIDELITY_TIERS,
     FidelityTier,
     HarnessConfig,
@@ -33,8 +33,9 @@ from wmo.config import (
     load_settings,
     save_settings,
 )
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.providers.base import (
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.observability.pricing import ModelPrice
+from wmo.common.providers.base import (
     Completion,
     EmbedderKind,
     Message,
@@ -43,15 +44,14 @@ from wmo.providers.base import (
     VerifyResult,
     verify_via_ping,
 )
-from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
+from wmo.common.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 
 # The exact text the tinker provider raises: the CLI hint has to recognise THAT
 # message, not a paraphrase of it.
-from wmo.providers.tinker import _MISSING_TINKER_EXTRA
+from wmo.common.providers.tinker import _MISSING_TINKER_EXTRA
 from wmo.simulation.ingest import VendorPull
 from wmo.simulation.model.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
 from wmo.simulation.model.eval_suites import EvalSuiteConfig
-from wmo.tracking.pricing import ModelPrice
 
 # `wmo.cli`'s `app` attribute (the Typer object) shadows the `wmo.cli.app` submodule on
 # plain `import wmo.cli.app as ...`; go through importlib to monkeypatch module globals.
@@ -149,9 +149,9 @@ def patched_provider(monkeypatch) -> None:  # noqa: ANN001 - pytest fixture
     """
     import sys
 
-    import wmo.providers as providers_pkg
-    import wmo.providers.registry as registry
-    import wmo.providers.waterfall as waterfall_mod
+    import wmo.common.providers as providers_pkg
+    import wmo.common.providers.registry as registry
+    import wmo.common.providers.waterfall as waterfall_mod
 
     fake = FakeProvider()
     # `wmo.simulation.model.__init__` rebinds `build` to the function, shadowing the submodule
@@ -301,7 +301,7 @@ def test_build_wizard_does_not_reuse_connection_for_changed_provider(
 
 
 def test_build_writes_model_card(patched_provider, tmp_path) -> None:  # noqa: ANN001
-    from wmo.config.card import load_card
+    from wmo.common.config.card import load_card
 
     root = tmp_path / ".wmo"
     _build(root, "tau2-airline", tmp_path)
@@ -319,7 +319,7 @@ def test_build_survives_card_write_failure(patched_provider, monkeypatch, tmp_pa
     def _boom(card, model_dir) -> None:  # noqa: ANN001
         raise OSError("disk full")
 
-    monkeypatch.setattr("wmo.config.card.save_card", _boom)
+    monkeypatch.setattr("wmo.common.config.card.save_card", _boom)
     root = tmp_path / ".wmo"
     _build(root, "tau2-airline", tmp_path)  # asserts exit_code == 0 internally
     assert (root / "models" / "tau2-airline" / "config.toml").exists()
@@ -349,8 +349,8 @@ def test_cli_exposes_the_small_command_set() -> None:
 
 
 def test_knowledge_command_prints_path_and_files(tmp_path) -> None:  # noqa: ANN001 - fixture
-    from wmo.config import save_config
-    from wmo.config.config import HarnessConfig
+    from wmo.common.config import save_config
+    from wmo.common.config.config import HarnessConfig
     from wmo.simulation.model.knowledge import KnowledgeBase
 
     root = tmp_path / ".wmo"
@@ -371,8 +371,8 @@ def test_knowledge_command_prints_bracketed_markdown_verbatim(tmp_path) -> None:
     Unescaped, `[/items]` raised MarkupError (the command died on ordinary content) and both
     `list[str]` and the link text were silently deleted from the rendered output.
     """
-    from wmo.config import save_config
-    from wmo.config.config import HarnessConfig
+    from wmo.common.config import save_config
+    from wmo.common.config.config import HarnessConfig
     from wmo.simulation.model.knowledge import KnowledgeBase
 
     root = tmp_path / ".wmo"
@@ -395,8 +395,8 @@ def test_knowledge_command_prints_bracketed_markdown_verbatim(tmp_path) -> None:
 def test_knowledge_command_without_kb_says_how_to_enable(tmp_path) -> None:  # noqa: ANN001
     # The empty state used to print a directory that does not exist and say "drop *.md files in
     # this folder" without naming the flag that seeds one, so this now pins both halves.
-    from wmo.config import save_config
-    from wmo.config.config import HarnessConfig
+    from wmo.common.config import save_config
+    from wmo.common.config.config import HarnessConfig
 
     root = tmp_path / ".wmo"
     save_config(HarnessConfig(), root=root / "models" / "airline")
@@ -409,8 +409,8 @@ def test_knowledge_command_without_kb_says_how_to_enable(tmp_path) -> None:  # n
 
 def test_knowledge_command_flags_a_kb_the_model_ignores(tmp_path) -> None:  # noqa: ANN001
     """Files under `knowledge/` are inert unless the model was built with `--knowledge`."""
-    from wmo.config import save_config
-    from wmo.config.config import HarnessConfig
+    from wmo.common.config import save_config
+    from wmo.common.config.config import HarnessConfig
     from wmo.simulation.model.knowledge import KnowledgeBase
 
     root = tmp_path / ".wmo"
@@ -428,8 +428,8 @@ def test_knowledge_command_flags_a_kb_the_model_ignores(tmp_path) -> None:  # no
 
 
 def test_knowledge_command_stays_quiet_when_the_kb_is_live(tmp_path) -> None:  # noqa: ANN001
-    from wmo.config import save_config
-    from wmo.config.config import HarnessConfig
+    from wmo.common.config import save_config
+    from wmo.common.config.config import HarnessConfig
     from wmo.simulation.model.knowledge import KnowledgeBase
 
     root = tmp_path / ".wmo"
@@ -445,8 +445,8 @@ def test_knowledge_command_stays_quiet_when_the_kb_is_live(tmp_path) -> None:  #
 
 def test_knowledge_resolves_a_shipped_example_like_demo_and_play(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     """`wmo knowledge` must see the same models `wmo demo`/`wmo play` resolve, examples included."""
-    from wmo.config import save_config
-    from wmo.config.config import HarnessConfig
+    from wmo.common.config import save_config
+    from wmo.common.config.config import HarnessConfig
     from wmo.simulation.model.knowledge import KnowledgeBase
 
     example = tmp_path / "airline-bench"
@@ -674,7 +674,7 @@ def test_demo_provider_failure_is_a_clean_error_not_a_traceback(
     """The likeliest first-run failure: the serve provider has no credentials."""
     import openai
 
-    import wmo.providers as providers_pkg
+    import wmo.common.providers as providers_pkg
 
     root = tmp_path / ".wmo"
     _build(root, "demo-model", tmp_path)
@@ -720,7 +720,7 @@ def test_demo_off_a_terminal_calls_an_outage_an_outage(
     import httpx
     import openai
 
-    import wmo.providers as providers_pkg
+    import wmo.common.providers as providers_pkg
 
     root = tmp_path / ".wmo"
     _build(root, "demo-model", tmp_path)
@@ -794,7 +794,7 @@ def test_play_refuses_a_serve_provider_it_cannot_prepare(
     patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`prepare()` is free and offline, so a missing credential fails before the first step."""
-    import wmo.providers as providers_pkg
+    import wmo.common.providers as providers_pkg
 
     root = tmp_path / ".wmo"
     _build(root, "demo-model", tmp_path)
@@ -815,8 +815,8 @@ def test_play_refuses_a_serve_provider_it_cannot_prepare(
 
 def _example_model(root: Path, example: str, name: str) -> Path:
     """A shipped-example artifact: <root>/<example>/models/<name>/ plus the example's corpus."""
-    from wmo.config import save_config
-    from wmo.config.config import HarnessConfig
+    from wmo.common.config import save_config
+    from wmo.common.config.config import HarnessConfig
 
     example_dir = root / example
     (example_dir / "traces.otel.jsonl").parent.mkdir(parents=True, exist_ok=True)
@@ -846,8 +846,8 @@ def test_demo_root_spelling_does_not_change_what_is_discovered(tmp_path, monkeyp
 def test_demo_lists_a_shadowed_example_distinguishably(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     # A local build of the same name used to appear twice in the list, and --name could not say
     # which one was meant.
-    from wmo.config import save_config
-    from wmo.config.config import HarnessConfig
+    from wmo.common.config import save_config
+    from wmo.common.config.config import HarnessConfig
 
     _example_model(tmp_path, "airline-bench", "airline")
     project = tmp_path / "project"
@@ -951,7 +951,7 @@ def test_providers_set_verifies_and_saves_local_worker(monkeypatch, tmp_path) ->
         checked.extend(configs)
         return [VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs]
 
-    monkeypatch.setattr("wmo.providers.verify_all", verify)
+    monkeypatch.setattr("wmo.common.providers.verify_all", verify)
     result = runner.invoke(
         app,
         [
@@ -984,7 +984,7 @@ def _accept_every_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     provider, and `verify_pool_entry` proves each routing candidate over its own route.
     """
     monkeypatch.setattr(
-        "wmo.providers.verify_all",
+        "wmo.common.providers.verify_all",
         lambda configs: [
             VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs
         ],
@@ -1336,7 +1336,7 @@ def test_providers_set_without_pool_flags_leaves_scripted_runs_untouched(
 def test_providers_set_does_not_save_a_failed_provider(monkeypatch, tmp_path) -> None:  # noqa: ANN001
     root = tmp_path / ".wmo"
     monkeypatch.setattr(
-        "wmo.providers.verify_all",
+        "wmo.common.providers.verify_all",
         lambda configs: [
             VerifyResult(
                 ok=False,
@@ -1381,7 +1381,7 @@ def test_eval_pins_the_judge_off_the_failover_chain(monkeypatch, tmp_path) -> No
     # World-model calls may fail over (provider_or_chain); the judge is the metric and must stay
     # pinned to the single requested backend — a judge that silently switches models mid-run
     # makes fidelity numbers incomparable.
-    import wmo.providers as providers_pkg
+    import wmo.common.providers as providers_pkg
 
     chain = FakeProvider()
     pinned = FakeProvider()
@@ -1426,8 +1426,8 @@ def _record_eval_providers(monkeypatch: pytest.MonkeyPatch) -> list[ProviderConf
         seen.append(config)
         return fake
 
-    monkeypatch.setattr("wmo.providers.provider_or_chain", record)
-    monkeypatch.setattr("wmo.providers.get_provider", record)
+    monkeypatch.setattr("wmo.common.providers.provider_or_chain", record)
+    monkeypatch.setattr("wmo.common.providers.get_provider", record)
     return seen
 
 
@@ -2089,7 +2089,7 @@ def test_build_empty_trace_file_names_source_and_ingest(patched_provider, tmp_pa
 def test_build_limit_caps_a_file_corpus(patched_provider, tmp_path) -> None:  # noqa: ANN001
     # --limit was wired only into the VendorPull branch, so it was silently ignored for --file
     # builds while `wmo ingest --limit` capped both transports.
-    from wmo.config.card import load_card
+    from wmo.common.config.card import load_card
 
     root = tmp_path / ".wmo"
     result = runner.invoke(
@@ -2128,7 +2128,7 @@ def test_build_pull_limit_is_a_fetch_cap_applied_once(
     it would only read as a promise of N usable traces that this transport cannot keep. Pinning
     both halves: the adapter receives the cap, and `build` is not handed it a second time.
     """
-    from wmo.config.card import load_card
+    from wmo.common.config.card import load_card
 
     seen: list[VendorPull] = []
     passed_to_build: dict[str, object] = {}
@@ -2293,10 +2293,10 @@ def test_build_aborts_when_provider_sdk_missing(monkeypatch, tmp_path) -> None: 
     Regression: previously the ModuleNotFoundError was swallowed inside GEPA and the build
     "succeeded" with a useless held-out-0.0 model.
     """
-    from wmo.providers.base import VerifyResult
+    from wmo.common.providers.base import VerifyResult
 
     monkeypatch.setattr(
-        "wmo.providers.verify_all",
+        "wmo.common.providers.verify_all",
         lambda configs: [
             VerifyResult(
                 ok=False,
@@ -2429,7 +2429,7 @@ def _record_verify_all(monkeypatch: pytest.MonkeyPatch, pinged: list[ProviderCon
         pinged.extend(configs)
         return [VerifyResult(ok=True, kind=c.kind, model=c.model) for c in configs]
 
-    monkeypatch.setattr("wmo.providers.verify_all", fake_verify_all)
+    monkeypatch.setattr("wmo.common.providers.verify_all", fake_verify_all)
 
 
 def test_providers_verify_nothing_configured_is_actionable(tmp_path: Path) -> None:
@@ -2478,7 +2478,7 @@ def test_providers_verify_reports_a_role_failure_with_its_credentials(
     settings.models.worker = ModelRole(provider="bedrock", model="claude-opus-4-8")
     save_settings(settings, root)
     monkeypatch.setattr(
-        "wmo.providers.verify_all",
+        "wmo.common.providers.verify_all",
         lambda configs: [
             VerifyResult(
                 ok=False,
@@ -2510,7 +2510,7 @@ def test_providers_verify_missing_optional_sdk_points_at_the_install(
     settings.models.worker = ModelRole(provider="tinker", model="Qwen/Qwen3-8B")
     save_settings(settings, root)
     monkeypatch.setattr(
-        "wmo.providers.verify_all",
+        "wmo.common.providers.verify_all",
         lambda configs: [
             VerifyResult(ok=False, kind=c.kind, model=c.model, detail=_MISSING_TINKER_EXTRA)
             for c in configs
@@ -2719,13 +2719,13 @@ def test_research_concurrency_uses_the_configured_worker_provider(
     monkeypatch.chdir(tmp_path)
     # get_provider is the identity here, so calling the runner's factory yields its config.
     built: list[ProviderConfig] = []
-    monkeypatch.setattr("wmo.providers.get_provider", lambda config: config)
+    monkeypatch.setattr("wmo.common.providers.get_provider", lambda config: config)
     monkeypatch.setattr(
-        "wmo.research.concurrency_run.build_world_runner",
+        "wmo.optimize.research.concurrency_run.build_world_runner",
         lambda factory, prompt, demos, selected: built.append(factory()),
     )
     monkeypatch.setattr(
-        "wmo.research.run_concurrency_scaling",
+        "wmo.optimize.research.run_concurrency_scaling",
         lambda *a, **kw: SimpleNamespace(benchmark="", best_speedup=lambda: None),
     )
 
@@ -2953,7 +2953,7 @@ def test_research_concurrency_malformed_suite_file_omits_the_listing_hint(tmp_pa
 
 
 def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa: ANN001
-    from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
+    from wmo.common.config.settings import ModelRole, ModelsSettings, ProjectSettings
 
     made: list[ProviderConfig] = []
 
@@ -2961,7 +2961,7 @@ def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa:
         made.append(config)
         return config  # identity provider: assertions read the config directly
 
-    monkeypatch.setattr("wmo.providers.get_provider", fake_get_provider)
+    monkeypatch.setattr("wmo.common.providers.get_provider", fake_get_provider)
     monkeypatch.setattr(
         cli_app_module,
         "load_settings_or_abort",
@@ -2984,9 +2984,9 @@ def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa:
 
 
 def test_scenario_role_llms_cli_flags_pin_every_role(monkeypatch) -> None:  # noqa: ANN001
-    from wmo.config.settings import ProjectSettings
+    from wmo.common.config.settings import ProjectSettings
 
-    monkeypatch.setattr("wmo.providers.get_provider", lambda config: config)
+    monkeypatch.setattr("wmo.common.providers.get_provider", lambda config: config)
     monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
     summary, worker, judge = cli_app_module._scenario_role_llms("bedrock", "some-model", None)
     assert summary is worker
@@ -2997,9 +2997,9 @@ def test_scenario_role_llms_cli_flags_pin_every_role(monkeypatch) -> None:  # no
 def test_scenario_role_llms_model_flag_keeps_the_configured_provider(monkeypatch) -> None:  # noqa: ANN001
     # Half a flag pair used to complete from bedrock, so `--model gpt-5.5` on an OpenAI project
     # asked bedrock for an OpenAI model id.
-    from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
+    from wmo.common.config.settings import ModelRole, ModelsSettings, ProjectSettings
 
-    monkeypatch.setattr("wmo.providers.get_provider", lambda config: config)
+    monkeypatch.setattr("wmo.common.providers.get_provider", lambda config: config)
     monkeypatch.setattr(
         cli_app_module,
         "load_settings_or_abort",
@@ -3013,9 +3013,9 @@ def test_scenario_role_llms_model_flag_keeps_the_configured_provider(monkeypatch
 
 
 def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None:  # noqa: ANN001
-    from wmo.config.settings import ProjectSettings
+    from wmo.common.config.settings import ProjectSettings
 
-    monkeypatch.setattr("wmo.providers.get_provider", lambda config: config)
+    monkeypatch.setattr("wmo.common.providers.get_provider", lambda config: config)
     monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
     summary, worker, judge = cli_app_module._scenario_role_llms(None, None, None)
     assert summary is worker
@@ -3024,7 +3024,7 @@ def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None
 
 
 def test_worker_role_provider_config_falls_back_to_bedrock(monkeypatch) -> None:  # noqa: ANN001
-    from wmo.config.settings import ProjectSettings
+    from wmo.common.config.settings import ProjectSettings
 
     monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
     config = cli_app_module._worker_role_provider_config(None, None, None)
@@ -3033,7 +3033,7 @@ def test_worker_role_provider_config_falls_back_to_bedrock(monkeypatch) -> None:
 
 
 def _azure_worker_settings(monkeypatch: pytest.MonkeyPatch, deployment: str | None) -> None:
-    from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
+    from wmo.common.config.settings import ModelRole, ModelsSettings, ProjectSettings
 
     monkeypatch.setattr(
         cli_app_module,
@@ -3126,7 +3126,7 @@ def test_worker_role_provider_config_provider_flag_uses_that_backends_flagship(
     # A --provider naming another backend must take its model from THAT backend's catalog:
     # pairing --provider openai with bedrock's claude-opus-4-8 sends OpenAI a model it has never
     # heard of, so the command fails instead of running on the backend the user selected.
-    from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
+    from wmo.common.config.settings import ModelRole, ModelsSettings, ProjectSettings
 
     monkeypatch.setattr(
         cli_app_module,
@@ -3149,7 +3149,7 @@ def test_worker_role_provider_config_demands_a_model_for_a_catalog_less_provider
 ) -> None:
     # openrouter/tinker publish no built-in rows — nothing can derive an operator's route or
     # weights path — so the fix is to say which model, not to guess one.
-    from wmo.config.settings import ProjectSettings
+    from wmo.common.config.settings import ProjectSettings
 
     monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
 

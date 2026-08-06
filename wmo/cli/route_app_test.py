@@ -20,8 +20,22 @@ from typer.testing import CliRunner, Result
 import wmo.simulation as env_module
 from wmo.cli import consent as consent_module
 from wmo.cli.app import app
-from wmo.config import HarnessConfig, save_config
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
+from wmo.common.config import HarnessConfig, save_config
+from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
+from wmo.common.observability import Phase, RunRecord, UsageTotals, load_runs
+from wmo.common.providers import pool as pool_module
+from wmo.common.providers.base import (
+    Completion,
+    Message,
+    Provider,
+    ProviderConfig,
+    ProviderKind,
+    TokenUsage,
+    VerifyResult,
+)
+from wmo.common.providers.openrouter import OPENROUTER_API_KEY_ENV
+from wmo.common.providers.pool import PoolEntry, load_pool
+from wmo.common.providers.registry import get_provider as registry_get_provider
 from wmo.optimize.model.store import DistillModelCard
 from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing import evaluate_policy
@@ -36,24 +50,10 @@ from wmo.optimize.routing.compression import (
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.policy import POLICY_FILENAME, RoutingPolicy, select_model
 from wmo.optimize.routing.sweep_partial import PartialHeader, PlanIdentity
-from wmo.providers import pool as pool_module
-from wmo.providers.base import (
-    Completion,
-    Message,
-    Provider,
-    ProviderConfig,
-    ProviderKind,
-    TokenUsage,
-    VerifyResult,
-)
-from wmo.providers.openrouter import OPENROUTER_API_KEY_ENV
-from wmo.providers.pool import PoolEntry, load_pool
-from wmo.providers.registry import get_provider as registry_get_provider
 from wmo.runtime.agents.llm import DEFAULT_HISTORY_CHARS
 from wmo.simulation.ingest.otel_writer import write_traces_jsonl
 from wmo.simulation.model.world_model import WorldModel
 from wmo.simulation.serving.traces_source import TRACES_FILENAME
-from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 
 runner = CliRunner()
 
@@ -1438,7 +1438,7 @@ def _patch_seams(
         )
 
     monkeypatch.setattr("wmo.simulation.model.load_world_model", _load)
-    monkeypatch.setattr("wmo.providers.pool.get_provider", _get_provider)
+    monkeypatch.setattr("wmo.common.providers.pool.get_provider", _get_provider)
     if no_scoring:
         real = env_module.WorldModelEnv
         monkeypatch.setattr(

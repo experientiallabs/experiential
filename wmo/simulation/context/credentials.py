@@ -19,8 +19,8 @@ from pathlib import Path
 import tomli_w
 from pydantic import ValidationError
 
-from wmo.core.types import JsonObject
-from wmo.runtime.platform.credentials import wmo_home
+from wmo.common.config.paths import wmo_home
+from wmo.common.core.types import JsonObject
 from wmo.simulation.context.types import ConnectError, ConnectorAuth
 
 ENV_CONNECTORS_PATH = "WMO_CONNECTORS_PATH"

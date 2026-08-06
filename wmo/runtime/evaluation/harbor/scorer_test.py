@@ -24,7 +24,7 @@ from harbor.trial import errors as harbor_trial_errors
 from harbor.verifier import verifier as harbor_verifier
 
 import wmo.runtime.evaluation.harbor.scorer as scorer_module
-from wmo.providers.base import ProviderConfig, ProviderKind
+from wmo.common.providers.base import ProviderConfig, ProviderKind
 from wmo.runtime.evaluation.harbor.agent import WMO_HARBOR_AGENT_IMPORT_PATH
 from wmo.runtime.evaluation.harbor.e2b_template_policy import WMO_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH
 from wmo.runtime.evaluation.harbor.scorer import (

@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.runtime.platform.client import PlatformError, PlatformUnreachable
 from wmo.runtime.runs.client import (
     MAX_DOCUMENT_BYTES,

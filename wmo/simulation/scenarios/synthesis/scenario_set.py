@@ -6,7 +6,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from wmo.core.types import EnvState
+from wmo.common.core.types import EnvState
 from wmo.simulation.scenarios.mining.clustering import TraceCluster
 from wmo.simulation.scenarios.mining.facets import Outcome
 from wmo.simulation.scenarios.spec import Scenario

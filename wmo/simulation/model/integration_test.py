@@ -13,9 +13,9 @@ import os
 
 import pytest
 
-from wmo.config import ArtifactPaths, HarnessConfig
-from wmo.core.types import Action, ActionKind
-from wmo.providers import ProviderConfig, ProviderKind, get_provider
+from wmo.common.config import ArtifactPaths, HarnessConfig
+from wmo.common.core.types import Action, ActionKind
+from wmo.common.providers import ProviderConfig, ProviderKind, get_provider
 from wmo.simulation.model.build import build
 from wmo.simulation.model.world_model import WorldModel
 

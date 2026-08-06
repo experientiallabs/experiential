@@ -9,7 +9,7 @@ requires-python = ">=3.12"
 dependencies = [
     # Cross-platform advisory file locking for the durable registries wmo edits in place (the
     # candidate pool, the harness and adapter alias tables). Declared directly because
-    # `wmo.core.locks` imports it; it was already in the resolved graph via torch/datasets/
+    # `wmo.common.core.locks` imports it; it was already in the resolved graph via torch/datasets/
     # huggingface-hub/harbor. It is what keeps a Unix-only `fcntl` off wmo's import path.
     "filelock>=3.12",
     # typer/rich/fastapi/uvicorn floors match harbor 0.20.0's requirements so the harbor
@@ -69,7 +69,7 @@ postgres = ["psycopg[binary]>=3.1"]
 # the 0.23.x exception surface llm-waterfall's classification trusts by name (classify.py).
 # wandb is optional run tracking (lazy import, activated only via [wandb] enabled in the run config).
 distill = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5", "wandb>=0.17"]
-# The in-process local embedder (`wmo.providers.local_embed`, EmbedderKind.LOCAL): Qwen3
+# The in-process local embedder (`wmo.common.providers.local_embed`, EmbedderKind.LOCAL): Qwen3
 # embeddings with no embedding API in the loop. mlx-lm exists only on Apple silicon, hence the
 # marker; it is imported via importlib there (a static import would break the type gate
 # everywhere else), while torch/transformers install on every platform and stay static-lazy.
@@ -95,7 +95,7 @@ dev = [
 # world-model-optimizer`. That is the whole point for environment-capture: it is a development
 # dependency only, and shipped `wmo/` imports nothing from it (`wmo/simulation/hub.py` vendors the
 # bundle-fetch read core `wmo download` needs). llm-waterfall is no longer a dependency in any
-# form: its source is vendored under `wmo/utils/waterfall/` and ships inside the flagship wheel.
+# form: its source is vendored under `wmo/common/vendor/waterfall/` and ships inside the flagship wheel.
 dev = ["environment-capture[bedrock,fetch]"]
 
 [project.scripts]
@@ -113,7 +113,7 @@ packages = ["wmo"]
 # imported only by tests, so neither belongs in the published wheel. `fake_tinker` stays where
 # it is rather than moving under a test path: five test modules import it by that name.
 exclude = ["**/*_test.py", "wmo/optimize/model/fake_tinker.py", "wmo/conftest.py"]
-# The vendored waterfall utility's MIT notice at wmo/utils/waterfall/LICENSE needs no
+# The vendored waterfall utility's MIT notice at wmo/common/vendor/waterfall/LICENSE needs no
 # force-include: `packages = ["wmo"]` already ships every non-Python file under wmo/.
 
 [tool.hatch.build.targets.sdist]
@@ -143,7 +143,7 @@ select = ["E", "F", "I", "UP", "B", "ANN", "BLE", "T20"]
 # The waterfall utility's adapter tests stub provider SDK clients, whose kwargs are genuinely
 # arbitrary — the fakes have to accept whatever the SDK signature accepts. Scoped to that one
 # module tree so the rest of `wmo/` keeps ANN401 in full force.
-"wmo/utils/waterfall/**/*_test.py" = ["ANN401"]
+"wmo/common/vendor/waterfall/**/*_test.py" = ["ANN401"]
 
 [tool.ty.environment]
 python-version = "3.12"

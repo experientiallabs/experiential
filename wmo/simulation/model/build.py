@@ -10,11 +10,12 @@ import hashlib
 import json
 import shutil
 
-from wmo.config import ArtifactPaths, HarnessConfig, save_config
-from wmo.core.types import Trace
+from wmo.common.config import ArtifactPaths, HarnessConfig, save_config
+from wmo.common.core.types import Trace
+from wmo.common.observability.reporting import BuildReporter, NullReporter
+from wmo.common.providers import get_provider
+from wmo.common.providers.base import Embedder, Provider
 from wmo.optimize import GEPAOptimizer, OptimizeResult, RubricJudge
-from wmo.providers import get_provider
-from wmo.providers.base import Embedder, Provider
 from wmo.simulation.ingest import VendorPull, drop_degenerate_traces, get_adapter
 from wmo.simulation.model.autoconfig import (
     DEFAULT_VAL_CAP,
@@ -27,7 +28,6 @@ from wmo.simulation.model.autoconfig import (
 )
 from wmo.simulation.model.knowledge import KnowledgeBase, seed_knowledge
 from wmo.simulation.model.prompts import BASE_ENV_PROMPT
-from wmo.simulation.model.reporting import BuildReporter, NullReporter
 from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
 
 # The single cut point on the `_trace_fraction` hash line that every train/held-out default reads.

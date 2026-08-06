@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from wmo.core.parsing import extract_json_object
-from wmo.core.text import normalize_durable_text
-from wmo.providers.base import Message, Provider
+from wmo.common.core.parsing import extract_json_object
+from wmo.common.core.text import normalize_durable_text
+from wmo.common.providers.base import Message, Provider
 
 GOLD_JUDGE_MARKER = "grade whether an agent completed a task"
 

@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pytest
 
+from wmo.common.providers.base import ProviderKind, TokenUsage
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.routing.outcomes import (
     OutcomeMatrix,
     ScenarioOutcome,
     split_router_scenarios,
     split_router_scenarios_grouped,
 )
-from wmo.providers.base import ProviderKind, TokenUsage
-from wmo.providers.pool import PoolEntry
 
 
 def _outcome(

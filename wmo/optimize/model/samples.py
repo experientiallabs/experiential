@@ -26,8 +26,8 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from wmo.common.providers.tinker import TokenSpan
 from wmo.optimize.model.tokens import TrialRecord
-from wmo.providers.tinker import TokenSpan
 
 MAX_EPISODE_CHARS = 40_000
 """Rendered episode bodies longer than this keep head and tail; the middle is elided."""

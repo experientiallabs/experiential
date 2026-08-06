@@ -12,6 +12,11 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
+from wmo.common.observability.pricing import ModelPrice
+from wmo.common.providers.base import ProviderKind
+from wmo.common.providers.local_embed import DEFAULT_LOCAL_EMBED_MODEL, LOCAL_EMBED_DIM
+from wmo.common.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.routing.compression import (
     CompressionConfig,
     CompressionResult,
@@ -38,12 +43,7 @@ from wmo.optimize.routing.policy import (
     select_model,
     write_artifact_atomically,
 )
-from wmo.providers.base import ProviderKind
-from wmo.providers.local_embed import DEFAULT_LOCAL_EMBED_MODEL, LOCAL_EMBED_DIM
-from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
-from wmo.providers.pool import PoolEntry
 from wmo.simulation.retrieval.embedders import HashingEmbedder
-from wmo.tracking.pricing import ModelPrice
 
 
 class _ChurnyCompressor:
@@ -265,7 +265,7 @@ def test_a_failed_policy_save_leaves_the_previous_artifact_intact(
 ) -> None:
     """Serving reads the artifact dir while the optimizer writes it: no torn policy.json.
 
-    The failure is injected at the payload's fsync, which `wmo.core.files.write_bytes_atomic`
+    The failure is injected at the payload's fsync, which `wmo.common.core.files.write_bytes_atomic`
     reaches with the bytes on the staging file and the rename not yet done. That is the moment an
     in-place write would already have destroyed the served artifact.
     """

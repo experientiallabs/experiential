@@ -7,7 +7,7 @@ Everything that talks to `rich` lives here so the engine stays headless. Respons
   region, budget), so a bare `wmo build` becomes a guided creation flow.
 - `select_model` shows a numbered picker so a user can choose which built world model to run when
   `--name` is omitted and several exist.
-- `RichBuildReporter` implements `wmo.simulation.model.reporting.BuildReporter`, turning build
+- `RichBuildReporter` implements `wmo.common.observability.reporting.BuildReporter`, turning build
   events into a guided, animated pipeline (stage lines + a live GEPA rollout progress bar) on a
   TTY, and into
   plain one-line-per-event output when piped (non-TTY), so logs stay legible.
@@ -44,17 +44,17 @@ from rich.segment import ControlType
 from rich.table import Table
 from rich.text import Text
 
-from wmo.config import (
+from wmo.common.config import (
     PROVIDER_ENV_VARS,
     ModelInfo,
     normalize_name,
     upsert_env_var,
     validate_name,
 )
-from wmo.providers.base import ProviderConfig, ProviderKind, VerifyResult
+from wmo.common.providers.base import ProviderConfig, ProviderKind, VerifyResult
 
 if TYPE_CHECKING:
-    from wmo.core.types import Action, Session
+    from wmo.common.core.types import Action, Session
     from wmo.simulation.model.play import PlayTurn
     from wmo.simulation.model.world_model import WorldModel
 
@@ -256,7 +256,7 @@ def select_provider_and_model(
     retry default. Also reused by `wmo demo`'s switch-provider flow. Returns
     (provider, model, region).
     """
-    from wmo.providers.models import resolve_provider_model
+    from wmo.common.providers.models import resolve_provider_model
 
     providers = list(_PROVIDER_MODELS)
     with_creds = [p for p in providers if has_credentials(p)]
@@ -325,8 +325,8 @@ def run_build_wizard(
     to the picker instead of surfacing after the wizard. `verify`/`verify_embed` exist so tests
     can stub the pings. Raises `ValueError` if no trace source (file or vendor) is provided.
     """
-    from wmo.providers import verify_all, verify_embedder
-    from wmo.providers.models import resolve_provider_model
+    from wmo.common.providers import verify_all, verify_embedder
+    from wmo.common.providers.models import resolve_provider_model
 
     interactive = reader is None
     check = verify if verify is not None else (lambda cfg: verify_all([cfg])[0])
@@ -1130,7 +1130,7 @@ def _render_state(console: Console, session: Session) -> None:
 
 
 def _action_text(action: Action) -> str:
-    from wmo.core.types import ActionKind
+    from wmo.common.core.types import ActionKind
 
     if action.kind == ActionKind.TOOL_CALL:
         return f"{action.name}({action.arguments})"

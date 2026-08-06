@@ -6,9 +6,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from wmo.common.providers.base import ProviderKind
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.routing.policy import RoutingPolicy
-from wmo.providers.base import ProviderKind
-from wmo.providers.pool import PoolEntry
 from wmo.simulation.serving.chat import RequestLogRecord
 from wmo.simulation.serving.savings import (
     BASIS_BILLING,

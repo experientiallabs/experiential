@@ -23,7 +23,7 @@ from pathlib import Path
 import tomli_w
 from pydantic import BaseModel, ConfigDict, Field
 
-from wmo.core.files import write_text_atomic
+from wmo.common.core.files import write_text_atomic
 
 ENDPOINT_CONFIG_FILENAME = "endpoint.toml"
 

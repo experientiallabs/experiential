@@ -16,8 +16,8 @@ import json
 
 from pydantic import BaseModel, JsonValue
 
-from wmo.core.parsing import extract_json_object
-from wmo.core.types import Action, ActionKind, JsonObject, Observation
+from wmo.common.core.parsing import extract_json_object
+from wmo.common.core.types import Action, ActionKind, JsonObject, Observation
 from wmo.simulation.model.world_model import WorldModel
 
 

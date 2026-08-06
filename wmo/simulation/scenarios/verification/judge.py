@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, ValidationError
 
-from wmo.core.parsing import extract_json_object
-from wmo.core.types import ActionKind, Step
-from wmo.providers.base import Message, Provider
+from wmo.common.core.parsing import extract_json_object
+from wmo.common.core.types import ActionKind, Step
+from wmo.common.providers.base import Message, Provider
 
 CHECKLIST_SYSTEM = """You grade one AI-agent episode against a checklist of success criteria.
 You see the task, the checklist, and a digest of the episode (tool calls, observations, messages).

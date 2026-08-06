@@ -21,14 +21,14 @@ sampled positions, so the returned rows align index for index with the datum
 logprobs to guard any off-by-one).
 
 The tinker SDK is an optional extra imported lazily (`uv sync --extra
-distill`), mirroring `wmo.providers.tinker`; injecting a sampling client
+distill`), mirroring `wmo.common.providers.tinker`; injecting a sampling client
 (tests use `wmo.optimize.model.fake_tinker.FakeSamplingClient`) avoids the SDK
-entirely. The lazily built real client comes from `wmo.providers.tinker`'s
+entirely. The lazily built real client comes from `wmo.common.providers.tinker`'s
 process-wide shared cache (one `tinker.ServiceClient` and one
 `SamplingClient` per model string for the whole process), so teacher
 construction never adds server-side sessions of its own.
 
-Every SDK call is deadline-bounded (`wmo.optimize.model.deadlines`): a wedged
+Every SDK call is deadline-bounded (`wmo.common.providers.tinker_deadlines`): a wedged
 session raises a retryable `TinkerDeadlineError` instead of hanging, and the
 teacher drops its lazily built client on expiry, evicting the shared cache
 entry, so the next score() call rebuilds a fresh session (an injected client
@@ -44,11 +44,11 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
+from wmo.common.providers.base import ProviderKind, VerifyResult
+from wmo.common.providers.tinker import evict_shared_sampling_client, shared_sampling_client
+from wmo.common.providers.tinker_deadlines import TinkerDeadlineError, wait_with_deadline
 from wmo.optimize.model.config import TeacherConfig
 from wmo.optimize.model.data import TopkCandidates, TrainDatum
-from wmo.optimize.model.deadlines import TinkerDeadlineError, wait_with_deadline
-from wmo.providers.base import ProviderKind, VerifyResult
-from wmo.providers.tinker import evict_shared_sampling_client, shared_sampling_client
 
 if TYPE_CHECKING:
     import tinker
@@ -344,7 +344,7 @@ class TinkerTeacher:
         sampling_client: Optional injected scorer (tests use the fakes in
             `wmo.optimize.model.fake_tinker`; wrap a real `tinker.SamplingClient` in
             `SdkLogprobScorer`). When None, a real client is fetched lazily
-            on first use from `wmo.providers.tinker`'s process-wide shared
+            on first use from `wmo.common.providers.tinker`'s process-wide shared
             cache, keyed by the teacher's model identity (checkpoint or base
             model name); an injected client bypasses the cache entirely.
     """
@@ -369,7 +369,7 @@ class TinkerTeacher:
 
     def _build_sdk_scorer(self) -> LogprobScorer:
         # Lazy: the SDK import and the API-key check happen inside the shared
-        # cache path (`wmo.providers.tinker.shared_sampling_client`). One
+        # cache path (`wmo.common.providers.tinker.shared_sampling_client`). One
         # process-wide ServiceClient and one SamplingClient per model string
         # are shared with the rollout providers, so building the teacher
         # never adds server-side sessions of its own.
@@ -619,7 +619,7 @@ class TinkerTeacher:
     def verify(self) -> VerifyResult:
         """One tiny compute_logprobs probe, reporting failure as ok=False.
 
-        Mirrors `wmo.providers.base.verify_via_ping`: never raises, so
+        Mirrors `wmo.common.providers.base.verify_via_ping`: never raises, so
         preflight can report every misconfigured client at once.
         """
         model = self._model_identity()

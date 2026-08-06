@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from wmo.common.vendor.waterfall.types import ChatFunctionCall, ChatMessage, ChatTool, ChatToolCall
+from wmo.common.vendor.waterfall.types import ChatFunctionDefinition as FunctionDef
 from wmo.optimize.model.config import DistillConfig
 from wmo.optimize.model.data import attach_advantages, build_datums
 from wmo.optimize.model.store import DistillRunStore
@@ -15,8 +17,6 @@ from wmo.optimize.model.text_episodes import (
     episodes_to_trial_records,
     text_warmup_manifest,
 )
-from wmo.utils.waterfall.types import ChatFunctionCall, ChatMessage, ChatTool, ChatToolCall
-from wmo.utils.waterfall.types import ChatFunctionDefinition as FunctionDef
 
 
 class _StubRendering:
@@ -192,7 +192,7 @@ class TestRealRenderer:
 
     def test_real_qwen_rendering_produces_loss_bearing_turns(self) -> None:
         pytest.importorskip("tinker_cookbook")
-        from wmo.optimize.model.rendering import build_offline_rendering
+        from wmo.common.providers.tinker_rendering import build_offline_rendering
 
         try:
             rendering = build_offline_rendering("Qwen/Qwen3.5-9B")

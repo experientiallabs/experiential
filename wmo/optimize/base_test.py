@@ -19,8 +19,8 @@ from wmo.optimize.base import (
 from wmo.optimize.gepa import GEPAOptimizer
 
 if TYPE_CHECKING:
+    from wmo.common.providers.base import Provider
     from wmo.optimize.judge import Judge
-    from wmo.providers.base import Provider
 
 
 def test_optimize_result_defaults_are_prompt_only() -> None:

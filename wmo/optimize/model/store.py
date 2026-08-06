@@ -40,17 +40,17 @@ from urllib.parse import urlsplit
 import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from wmo.config.store import validate_name
-from wmo.core.files import write_text_atomic
-from wmo.core.locks import file_write_lock
-from wmo.core.types import JsonObject
+from wmo.common.config.store import validate_name
+from wmo.common.core.files import write_text_atomic
+from wmo.common.core.locks import file_write_lock
+from wmo.common.core.types import JsonObject
+from wmo.common.providers.base import ProviderKind
+from wmo.common.providers.pool import PoolEntry
+from wmo.common.vendor.waterfall import ChatMaxTokensField
 from wmo.optimize.model.config import DistillConfig, load_distill_config, snapshot_toml
 from wmo.optimize.model.gate import DistillGateRecord
 from wmo.optimize.model.tokens import TrialRecord
 from wmo.optimize.model.tripwire import TripwireBaseline
-from wmo.providers.base import ProviderKind
-from wmo.providers.pool import PoolEntry
-from wmo.utils.waterfall import ChatMaxTokensField
 
 logger = logging.getLogger(__name__)
 
@@ -966,8 +966,8 @@ def student_pool_entry(
     The Tinker-specific defaults apply ONLY when the entry actually points at Tinker. Reading
     `TINKER_API_KEY` for a host the caller named would send a Tinker bearer token to that host,
     and the pool's whole credential rule is that an operator pairs a key with an endpoint
-    deliberately (see the module docstring of `wmo.providers.pool`), never that a helper picks
-    the pairing. A custom endpoint therefore gets `api_key_env=None`, which is the documented
+    deliberately (see the module docstring of `wmo.common.providers.pool`), never that a helper
+    picks the pairing. A custom endpoint therefore gets `api_key_env=None`, which is the documented
     custom-endpoint convention: the openai provider falls back to `WMO_ENDPOINT_API_KEY` and
     never sends a key the caller did not put there. Its output-budget field likewise falls back
     to the repo-wide default rather than inheriting Tinker's `max_tokens`. Pass `api_key_env` or

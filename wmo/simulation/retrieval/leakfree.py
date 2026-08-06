@@ -17,7 +17,7 @@ won't match the corpus and the exclusion would silently no-op.
 
 from __future__ import annotations
 
-from wmo.core.types import Step, Trace
+from wmo.common.core.types import Step, Trace
 from wmo.simulation.retrieval.retriever import Retriever
 
 # Over-fetch margin so that, after dropping same-trace demos, we can still fill top_k.

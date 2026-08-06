@@ -19,7 +19,8 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 import pytest
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
+from wmo.common.providers.base import ProviderKind
 from wmo.optimize.model.xtoken.prompt_logprobs import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_TIMEOUT_S,
@@ -27,7 +28,6 @@ from wmo.optimize.model.xtoken.prompt_logprobs import (
     PromptLogprobError,
     PromptLogprobTimeoutError,
 )
-from wmo.providers.base import ProviderKind
 
 _MODEL = "zai-org/GLM-5.2"
 _ENDPOINT = "https://vllm-host"

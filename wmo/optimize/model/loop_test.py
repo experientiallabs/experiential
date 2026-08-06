@@ -20,13 +20,16 @@ from typing import TYPE_CHECKING, Literal, NoReturn, cast, get_args
 
 import pytest
 
+import wmo.common.providers.tinker as providers_tinker
 import wmo.optimize.model.loop as loop_module
-import wmo.providers.tinker as providers_tinker
-from wmo.utils.waterfall.types import ChatMessage, ChatTool
+from wmo.common.vendor.waterfall.types import ChatMessage, ChatTool
 
 if TYPE_CHECKING:
     import tinker
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
+from wmo.common.providers.base import ProviderConfig, ProviderKind
+from wmo.common.providers.tinker import SampledSequenceLike, TokenSpan
+from wmo.common.providers.tinker_deadlines import TinkerDeadlineError
 from wmo.optimize.model.config import (
     BudgetConfig,
     DistillConfig,
@@ -43,7 +46,6 @@ from wmo.optimize.model.config import (
     WarmupConfig,
 )
 from wmo.optimize.model.data import AdvantageStats, TrainDatum, attach_advantages
-from wmo.optimize.model.deadlines import TinkerDeadlineError
 from wmo.optimize.model.fake_tinker import (
     FakeDatum,
     FakeSamplingClient,
@@ -93,8 +95,6 @@ from wmo.optimize.model.store import AdapterStore, DistillRunStore
 from wmo.optimize.model.teacher import EncodingTokenizer
 from wmo.optimize.model.tokens import TrialRecord
 from wmo.optimize.model.tracking import DistillTracker
-from wmo.providers.base import ProviderConfig, ProviderKind
-from wmo.providers.tinker import SampledSequenceLike, TokenSpan
 from wmo.runtime.harness.doc import HarnessDoc
 from wmo.runtime.harness.runtime import StopReason
 from wmo.runtime.harness.scoring import GradedTests
@@ -2994,7 +2994,7 @@ def test_sdk_training_client_surfaces_none_when_the_service_reports_nothing() ->
 
 def test_client_construction_is_deadline_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     # Sampling-client construction now goes through the process-wide shared
-    # cache (bounded there; see wmo/providers/tinker_test.py), so the loop's
+    # cache (bounded there; see wmo/common/providers/tinker_test.py), so the loop's
     # remaining direct construction is the training client.
     _short_deadlines(monkeypatch)
     never = threading.Event()

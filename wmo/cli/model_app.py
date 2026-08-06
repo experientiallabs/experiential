@@ -44,13 +44,13 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from wmo.cli.consent import can_prompt, require_spend_consent
-from wmo.config import ARTIFACT_DIR
+from wmo.common.config import ARTIFACT_DIR
 
 if TYPE_CHECKING:
     # Type-only: real imports are local to the commands and helpers that construct or inspect
     # these values, so importing this module never pulls the distill/harness/optimize bodies
     # behind it.
-    from wmo.core.types import JsonObject
+    from wmo.common.core.types import JsonObject
     from wmo.optimize.model.config import DistillConfig
     from wmo.optimize.model.cost import CostEstimate
     from wmo.optimize.model.gate import DistillGateRecord
@@ -782,7 +782,7 @@ def _resolve_seed_doc(root: str, harness_ref: str) -> tuple[str, HarnessDoc, int
     base name, the document, and the resolved store version (None for the
     built-in seed) so a resume can pin exactly what the run started from.
     """
-    from wmo.config.store import validate_name
+    from wmo.common.config.store import validate_name
     from wmo.optimize.model.loop import DEFAULT_DISTILL_HARNESS
     from wmo.runtime.agents.default import default_agent
     from wmo.runtime.harness.store import HarnessStore
@@ -1061,7 +1061,7 @@ def _maybe_promote(console: Console, result: DistillResult, cfg: DistillConfig, 
     skips the write with a warning.
     """
     from wmo.cli.model_roles import load_settings_or_abort
-    from wmo.config.settings import ModelRole, save_settings, settings_path
+    from wmo.common.config.settings import ModelRole, save_settings, settings_path
     from wmo.optimize.model.store import (
         DEFAULT_TINKER_OPENAI_ENDPOINT,
         STUDENT_CHAT_MAX_TOKENS_FIELD,

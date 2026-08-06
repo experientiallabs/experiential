@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.core.types import Action, Observation
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.core.types import Action, Observation
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.runtime.harness.code_runtime import (
     DEFAULT_RUNTIME_CODE,
     CodeRuntime,

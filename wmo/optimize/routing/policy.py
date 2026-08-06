@@ -62,7 +62,17 @@ from uuid import uuid4
 import numpy as np
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
-from wmo.core.files import write_bytes_atomic
+from wmo.common.core.files import write_bytes_atomic
+from wmo.common.providers.base import Embedder, ProviderConfig, ProviderKind
+from wmo.common.providers.local_embed import (
+    DEFAULT_LOCAL_EMBED_MODEL,
+    LOCAL_EMBED_DIM,
+    LocalEmbedder,
+    default_model_cached,
+    pick_backend,
+)
+from wmo.common.providers.pool import PoolEntry
+from wmo.common.providers.registry import get_provider
 from wmo.optimize.routing.compression import (
     CompressionConfig,
     Compressor,
@@ -70,16 +80,6 @@ from wmo.optimize.routing.compression import (
     same_compression,
     servable_compressor,
 )
-from wmo.providers.base import Embedder, ProviderConfig, ProviderKind
-from wmo.providers.local_embed import (
-    DEFAULT_LOCAL_EMBED_MODEL,
-    LOCAL_EMBED_DIM,
-    LocalEmbedder,
-    default_model_cached,
-    pick_backend,
-)
-from wmo.providers.pool import PoolEntry
-from wmo.providers.registry import get_provider
 from wmo.simulation.retrieval.embedders import BatchedEmbedder, HashingEmbedder
 
 POLICY_VERSION = 2
@@ -128,8 +128,8 @@ def write_artifact_atomically(path: Path, payload: bytes) -> None:
     `KnnBank.save` stages the same way for the sidecar it streams through numpy.
 
     The per-call staging name, the cleanup on failure, and the durability are
-    `wmo.core.files.write_bytes_atomic`'s; this wrapper is the artifact layer's name for it, kept
-    because the reason above is the artifact directory's, not a property of writing files.
+    `wmo.common.core.files.write_bytes_atomic`'s; this wrapper is the artifact layer's name for it,
+    kept because the reason above is the artifact directory's, not a property of writing files.
     """
     write_bytes_atomic(path, payload)
 
@@ -150,7 +150,7 @@ class EmbedderSpec(BaseModel):
 
     `hashing` is deterministic, offline, and credential-free, so a policy file is fully
     self-contained. `local` runs a small embedding model in-process (Qwen3-Embedding-0.6B by
-    default, via MLX or torch: `wmo.providers.local_embed`): credential-free like hashing but
+    default, via MLX or torch: `wmo.common.providers.local_embed`): credential-free like hashing but
     semantic, at the price of a one-time weights download. `azure` uses an Azure embedding
     deployment (per-entry credential conventions matching the model pool: `api_key_env` names
     the env var); the fitter records whichever the fit actually used, and serving reconstructs
@@ -1109,8 +1109,8 @@ def knn_decision(
 # the library stays free of the CLI framework; `route_app` translates that to
 # `typer.BadParameter` at the boundary.
 # What `--embedder auto` looks for. The project's standard Azure OpenAI convention, the same pair
-# `wmo.config` requires of an AZURE_OPENAI provider and that `.env.example` documents; auto does
-# not invent a new variable, it notices the one an operator has already set up.
+# `wmo.common.config` requires of an AZURE_OPENAI provider and that `.env.example` documents;
+# auto does not invent a new variable, it notices the one an operator has already set up.
 AZURE_EMBEDDER_ENV = ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT")
 AZURE_EMBEDDER_DEPLOYMENT = "text-embedding-3-large"
 AZURE_EMBEDDER_DIM = 3072  # the deployment's native width, and what the champion was measured at

@@ -56,9 +56,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from wmo.common.providers.pool import PoolEntry, Tier
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.scorecard import effective_cost_per_completed_task, rows_for_model
-from wmo.providers.pool import PoolEntry, Tier
 
 DEFAULT_MIN_GAP = 0.10
 """Reward points (as a fraction of 1.0) a teacher must beat the student by. 0.10 = 10 points.

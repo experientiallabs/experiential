@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import pytest
 
+from wmo.common.providers.base import ProviderKind, TokenUsage
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
 from wmo.optimize.routing.scorecard import (
@@ -22,8 +24,6 @@ from wmo.optimize.routing.scorecard import (
     rows_for_model,
     rows_for_policy,
 )
-from wmo.providers.base import ProviderKind, TokenUsage
-from wmo.providers.pool import PoolEntry
 from wmo.simulation.retrieval.embedders import HashingEmbedder
 
 _BASE = ConditionLabel(

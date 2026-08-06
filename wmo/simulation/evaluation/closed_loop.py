@@ -21,9 +21,9 @@ from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
 
-from wmo.core.text import normalize_durable_text
-from wmo.core.types import Action, Observation
-from wmo.providers.base import Provider
+from wmo.common.core.text import normalize_durable_text
+from wmo.common.core.types import Action, Observation
+from wmo.common.providers.base import Provider
 from wmo.runtime.harness.environment import AgentEnvironment
 from wmo.runtime.harness.runtime import (
     AgentRuntime,

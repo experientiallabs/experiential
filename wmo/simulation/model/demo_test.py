@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.model.demo import run_demo
 from wmo.simulation.model.world_model import WorldModel
 from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder

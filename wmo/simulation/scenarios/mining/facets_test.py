@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.scenarios.mining.facets import (
     FacetExtractor,
     Outcome,

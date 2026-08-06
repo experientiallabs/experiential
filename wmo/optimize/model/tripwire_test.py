@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import pytest
 
+from wmo.common.providers.tinker import TokenSpan
 from wmo.optimize.model.config import (
     PROBE_BASELINE_ENTROPY_NATS,
     PROBE_BASELINE_EPISODE_TOKENS,
@@ -28,7 +29,6 @@ from wmo.optimize.model.tripwire import (
     metric_ratio,
     policy_health,
 )
-from wmo.providers.tinker import TokenSpan
 
 # The sibling lane's pre-registered absolute rule, kept here only to prove it
 # would fire on our own healthy baseline.

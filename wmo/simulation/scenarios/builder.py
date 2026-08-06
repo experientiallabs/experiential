@@ -12,8 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from pydantic import BaseModel
 
-from wmo.core.types import Trace
-from wmo.providers.base import Embedder, Provider
+from wmo.common.core.types import Trace
+from wmo.common.providers.base import Embedder, Provider
 from wmo.simulation.scenarios.mining.clustering import cluster_facets, name_clusters, normalize_rows
 from wmo.simulation.scenarios.mining.facets import TraceFacet
 from wmo.simulation.scenarios.mining.selection import (

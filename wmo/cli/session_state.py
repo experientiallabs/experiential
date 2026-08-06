@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ValidationError
 
-from wmo.runtime.platform.credentials import wmo_home
+from wmo.common.config.paths import wmo_home
 
 if TYPE_CHECKING:
     from pathlib import Path

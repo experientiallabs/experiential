@@ -2,6 +2,7 @@
 
 import pytest
 
+from wmo.common.providers.tinker import TokenSpan
 from wmo.optimize.model.config import (
     DistillConfig,
     EvalConfig,
@@ -26,7 +27,6 @@ from wmo.optimize.model.cost import (
     estimate_run_cost,
 )
 from wmo.optimize.model.tokens import TrialRecord
-from wmo.providers.tinker import TokenSpan
 
 FULL_PRICING = PricingConfig(
     student_prefill=1.0,

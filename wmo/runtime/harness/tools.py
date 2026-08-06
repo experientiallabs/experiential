@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, ValidationError
 
-from wmo.core.parsing import extract_json_object
-from wmo.core.types import Action, ActionKind, JsonObject
+from wmo.common.core.parsing import extract_json_object
+from wmo.common.core.types import Action, ActionKind, JsonObject
 
 
 class ToolSpec(BaseModel):

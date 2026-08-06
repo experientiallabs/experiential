@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
 from wmo.simulation.scenarios.mining.facets import Outcome, TraceFacet
 from wmo.simulation.scenarios.mining.facets_test import FakeProvider
 from wmo.simulation.scenarios.synthesis import ScenarioSynthesizer

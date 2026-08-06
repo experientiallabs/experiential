@@ -95,8 +95,8 @@ from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from wmo.common.providers.base import Embedder
     from wmo.optimize.routing.policy import RoutingPolicy
-    from wmo.providers.base import Embedder
 
 # Whether an arm's numbers came from episodes against a world-model simulation or against the
 # real environment. Mixing the two in one comparison is the single easiest way to publish a

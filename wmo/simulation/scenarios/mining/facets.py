@@ -17,9 +17,9 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ValidationError
 
-from wmo.core.parsing import extract_json_object
-from wmo.core.types import ActionKind, Trace
-from wmo.providers.base import Message, Provider
+from wmo.common.core.parsing import extract_json_object
+from wmo.common.core.types import ActionKind, Trace
+from wmo.common.providers.base import Message, Provider
 
 
 class Outcome(StrEnum):

@@ -23,7 +23,7 @@ from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TextIO, cast
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.runtime.harness.pi_e2b import (
     HELLO_TIMEOUT_S,
     PI_NPM_PACKAGES,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from wmo.common.providers.base import Embedder, ProviderKind, TokenUsage
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.routing.compression import (
     CompressionConfig,
     CompressionResult,
@@ -13,8 +15,6 @@ from wmo.optimize.routing.compression import (
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
 from wmo.optimize.routing.report import build_report
-from wmo.providers.base import Embedder, ProviderKind, TokenUsage
-from wmo.providers.pool import PoolEntry
 from wmo.simulation.retrieval.embedders import HashingEmbedder
 
 

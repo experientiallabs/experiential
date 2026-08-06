@@ -20,9 +20,15 @@ from wmo.cli.ui import (
     run_play_repl,
     select_model,
 )
-from wmo.config import PROVIDER_ENV_VARS, ModelInfo
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind, VerifyResult
+from wmo.common.config import PROVIDER_ENV_VARS, ModelInfo
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.providers.base import (
+    Completion,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+    VerifyResult,
+)
 from wmo.simulation.model.world_model import WorldModel
 from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
 

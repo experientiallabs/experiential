@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
 from wmo.simulation.scenarios.spec import Scenario, scenarios_from_traces
 
 
@@ -39,7 +39,7 @@ def test_empty_input_gives_empty_output() -> None:
 
 
 def test_tools_hint_from_traces_summarizes_tool_surface() -> None:
-    from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+    from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
     from wmo.simulation.scenarios.spec import tools_hint_from_traces
 
     steps = [
@@ -69,7 +69,7 @@ def test_tools_hint_from_traces_summarizes_tool_surface() -> None:
 
 
 def test_tools_hint_empty_for_toolless_traces() -> None:
-    from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+    from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
     from wmo.simulation.scenarios.spec import tools_hint_from_traces
 
     steps = [

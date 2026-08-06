@@ -55,7 +55,7 @@ def test_top_level_directories_are_allowlisted() -> None:
     assert not unexpected, (
         f"top-level directories {sorted(unexpected)} are not in the AGENTS.md rule 5 allowlist "
         f"{sorted(ALLOWED_TOP_DIRS)}. The allowlist is closed and agents may not extend it: put "
-        "reusable code in wmo/ (self-contained building blocks in wmo/utils/), finished reports "
+        "reusable code in wmo/ (self-contained building blocks in wmo/common/), finished reports "
         "in docs/, and one-off or scratch work OUTSIDE the repo. Adding a new top-level "
         "directory requires a human to grant permission for that exact name."
     )
@@ -180,15 +180,16 @@ def test_there_is_no_uv_workspace() -> None:
     """One distribution, no members (AGENTS.md § One package).
 
     The workspace was retired when `packages/` was deleted: `environment-capture` resolves from
-    PyPI and `llm-waterfall` was vendored into `wmo/utils/waterfall/`. Reintroducing a member
-    means reintroducing a top-level `packages/` directory, which rule 5 forbids outright.
+    PyPI and `llm-waterfall` was vendored into `wmo/common/vendor/waterfall/`. Reintroducing a
+    member means reintroducing a top-level `packages/` directory, which rule 5 forbids outright.
     """
     with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
         root = tomllib.load(fh)
     uv_config = root.get("tool", {}).get("uv", {})
     assert "workspace" not in uv_config, (
         "[tool.uv.workspace] is back; this repo publishes one distribution whose importable code "
-        "is all of wmo/. Depend on PyPI or vendor under wmo/utils/ (AGENTS.md § One package)"
+        "is all of wmo/. Depend on PyPI or vendor under wmo/common/vendor/ "
+        "(AGENTS.md § One package)"
     )
     assert "sources" not in uv_config, (
         "[tool.uv.sources] is back; with no workspace every dependency resolves from PyPI "

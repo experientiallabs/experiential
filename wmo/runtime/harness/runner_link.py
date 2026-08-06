@@ -28,8 +28,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
-from wmo.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
-from wmo.providers.base import ContextWindowProvider, ToolCallingProvider
+from wmo.common.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
+from wmo.common.providers.base import ContextWindowProvider, ToolCallingProvider
+from wmo.common.vendor.waterfall import ChatRequest, ChatResponse
 from wmo.runtime.harness.environment import AgentEnvironment, is_env_action
 from wmo.runtime.harness.runtime import (
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -41,7 +42,6 @@ from wmo.runtime.harness.runtime import (
 )
 from wmo.runtime.harness.skills import SkillLibrary
 from wmo.runtime.harness.tools import READ_SKILL, ToolSpec
-from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 logger = logging.getLogger(__name__)
 

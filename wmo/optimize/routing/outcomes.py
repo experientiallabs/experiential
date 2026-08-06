@@ -15,10 +15,10 @@ from pathlib import Path
 
 from pydantic import BaseModel, model_validator
 
-from wmo.core.files import write_text_atomic
+from wmo.common.core.files import write_text_atomic
+from wmo.common.providers.base import TokenUsage
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.routing.compression import CompressionConfig
-from wmo.providers.base import TokenUsage
-from wmo.providers.pool import PoolEntry
 
 # Provenance carries a digest of the matrix, not just its path: a corpus is routinely rebuilt in
 # place under the same filename, and a fit is identified by the data it saw. 16 hex characters

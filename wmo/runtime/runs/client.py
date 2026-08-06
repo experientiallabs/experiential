@@ -31,7 +31,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.runtime.platform.client import PlatformClient, PlatformError, PlatformUnreachable
 from wmo.runtime.platform.credentials import load_credentials
 from wmo.runtime.runs.schema import (

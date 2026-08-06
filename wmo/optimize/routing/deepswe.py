@@ -50,9 +50,9 @@ from statistics import fmean
 import numpy as np
 from pydantic import BaseModel, ConfigDict
 
+from wmo.common.providers.base import ProviderKind, TokenUsage
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmo.providers.base import ProviderKind, TokenUsage
-from wmo.providers.pool import PoolEntry
 
 logger = logging.getLogger(__name__)
 

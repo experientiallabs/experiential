@@ -31,8 +31,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from wmo.core.types import JsonObject
-from wmo.providers.tinker import TokenSpan
+from wmo.common.core.types import JsonObject
+from wmo.common.providers.tinker import TokenSpan
 from wmo.runtime.harness.runtime import StopReason
 from wmo.runtime.harness.scoring import GradedTests, ScoreCell
 

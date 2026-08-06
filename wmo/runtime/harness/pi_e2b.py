@@ -40,8 +40,8 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, cast, overload
 
-from wmo.core.types import JsonObject
-from wmo.providers.base import ToolCallingProvider
+from wmo.common.core.types import JsonObject
+from wmo.common.providers.base import ToolCallingProvider
 from wmo.runtime.harness.e2b_sandbox import (
     DEFAULT_SANDBOX_TIMEOUT_S,
     E2B_TEMPLATE_ENV,

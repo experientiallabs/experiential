@@ -33,7 +33,7 @@ import re
 
 from pydantic import JsonValue
 
-from wmo.core.types import Trace
+from wmo.common.core.types import Trace
 from wmo.simulation.ingest.adapter import (
     SourceCredentialError,
     VendorPull,

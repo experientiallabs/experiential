@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from wmo.core.types import Action, ActionKind
+from wmo.common.core.types import Action, ActionKind
 from wmo.simulation.model.grounding import SourceResolver
 from wmo.simulation.model.workspace import (
     RepoTreeResolver,

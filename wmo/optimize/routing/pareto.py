@@ -41,8 +41,8 @@ from wmo.optimize.routing.scorecard import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from wmo.common.providers.base import Embedder
     from wmo.optimize.routing.policy import RoutingPolicy
-    from wmo.providers.base import Embedder
 
 PointKind = Literal["model", "routed"]
 

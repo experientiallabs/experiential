@@ -2,7 +2,7 @@
 
 The harness builds a world model from **recorded agent traces**. You pick a **source** and the
 harness turns traces from whatever you already have - an observability provider, an OTLP export, a
-Postgres table, or a plain chat/tool-call log - into the normalized `wmo.core.types.Trace` shape.
+Postgres table, or a plain chat/tool-call log - into the normalized `wmo.common.core.types.Trace` shape.
 
 Ingestion runs two ways: as the first stage of `wmo build`, or standalone via **`wmo ingest`**,
 which normalizes a source into an OTel-GenAI JSONL corpus (with live progress) that any later
@@ -175,7 +175,7 @@ A `Trace` is `{trace_id, steps, source, metadata}`. Each `Step` is one
 a predicted observation for `(state_before, action)` against the recorded one, so faithful `action`
 and `observation` are what matter most.
 
-Each step also carries optional **`attribution`** (`wmo.core.types.StepAttribution`): the model
+Each step also carries optional **`attribution`** (`wmo.common.core.types.StepAttribution`): the model
 and provider that produced the action, token counts, cost, latency, and an `error_class`
 (`controllable` = the LLM call failed, `environmental` = the tool failed). The normalizer fills it
 best-effort from the GenAI/OpenInference vocabularies (`gen_ai.response.model`, `gen_ai.usage.*`,
@@ -252,7 +252,7 @@ adapters for reference.
 
 ## Conventions
 
-Adapters live in `wmo/simulation/ingest/`, are typed (no `Any`/bare `dict`; use `wmo.core.types`
+Adapters live in `wmo/simulation/ingest/`, are typed (no `Any`/bare `dict`; use `wmo.common.core.types`
 `JsonValue`/`JsonObject`), and are tested inline with fixtures - never the network. Vendor SDKs are
 optional extras, imported lazily; file ingestion works with none installed.
 

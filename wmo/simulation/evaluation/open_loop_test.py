@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 
-from wmo.core.types import Observation, Step
+from wmo.common.core.types import Observation, Step
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.optimize.judge import JudgeResult
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.evaluation.open_loop import evaluate_files
 from wmo.simulation.retrieval import HashingEmbedder
 

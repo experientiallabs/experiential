@@ -14,8 +14,8 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from wmo.config.config import ARTIFACT_DIR
-from wmo.config.store import validate_name
+from wmo.common.config.config import ARTIFACT_DIR
+from wmo.common.config.store import validate_name
 from wmo.simulation.context.types import ContextItem, PullQuery
 
 _MANIFEST_FILENAME = "manifest.json"

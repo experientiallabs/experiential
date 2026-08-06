@@ -15,8 +15,8 @@ from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
 
+from wmo.common.providers.base import Embedder, Provider
 from wmo.optimize.judge import Judge
-from wmo.providers.base import Embedder, Provider
 from wmo.simulation.ingest import get_adapter
 from wmo.simulation.model.build import DEFAULT_TRAIN_SPLIT, split_holdout
 from wmo.simulation.model.knowledge import seeded_knowledge_text

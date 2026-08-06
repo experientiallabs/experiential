@@ -2,9 +2,9 @@
 
 When the env encounters a real-world entity outside its traces and knowledge base (an API's error
 format, a package name, a flight code), it may emit a `ground_query` (see
-`wmo.core.render.output_contract`) instead of hallucinating. A `Grounder` serves that query; the
-engine caches results into the knowledge base (`grounded.md`) so an entity is searched at most
-once per model, and re-completes the step with the results in context.
+`wmo.common.core.render.output_contract`) instead of hallucinating. A `Grounder` serves that
+query; the engine caches results into the knowledge base (`grounded.md`) so an entity is searched at
+most once per model, and re-completes the step with the results in context.
 
 The default is `NullGrounder` — no network, tests and evals stay hermetic. Real backends:
 
@@ -34,7 +34,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, Field, ValidationError
 
-from wmo.core.types import Action
+from wmo.common.core.types import Action
 
 GROUNDER_KINDS = ("none", "brave", "fetch")
 _BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"

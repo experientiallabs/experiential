@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wmo.config import load_config
-from wmo.providers import provider_or_chain
-from wmo.providers.base import Provider
+from wmo.common.config import load_config
+from wmo.common.providers import provider_or_chain
+from wmo.common.providers.base import Provider
 from wmo.simulation.model.world_model import WorldModel
 
 

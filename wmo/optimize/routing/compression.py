@@ -28,7 +28,7 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
-from wmo.providers.base import Embedder
+from wmo.common.providers.base import Embedder
 
 # The proxy tokenizer: ~4 chars per token, the industry rule of thumb. Deterministic and
 # provider-agnostic; used only for the compressor's own raw-vs-compressed accounting.

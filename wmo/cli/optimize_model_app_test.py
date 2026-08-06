@@ -22,8 +22,8 @@ from typer.testing import CliRunner, Result
 import wmo.simulation as env_module
 from wmo.cli import consent as consent_module
 from wmo.cli.app import app
-from wmo.config import HarnessConfig, save_config
-from wmo.core.types import (
+from wmo.common.config import HarnessConfig, save_config
+from wmo.common.core.types import (
     Action,
     ActionKind,
     EnvState,
@@ -33,6 +33,17 @@ from wmo.core.types import (
     Step,
     Trace,
 )
+from wmo.common.observability import Phase, RunRecord, UsageTotals, load_runs
+from wmo.common.providers.base import (
+    Completion,
+    Message,
+    Provider,
+    ProviderConfig,
+    ProviderKind,
+    TokenUsage,
+    VerifyResult,
+)
+from wmo.common.providers.pool import load_pool
 from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing.compression import CompressionConfig
 from wmo.optimize.routing.evaluation import scenario_id
@@ -55,21 +66,10 @@ from wmo.optimize.routing.report import ImprovementReport
 from wmo.optimize.routing.sweep import SweepPlan, plan_sweep, resolve_config
 from wmo.optimize.routing.sweep_partial import PartialHeader
 from wmo.optimize.telemetry import hooks as hooks_module
-from wmo.providers.base import (
-    Completion,
-    Message,
-    Provider,
-    ProviderConfig,
-    ProviderKind,
-    TokenUsage,
-    VerifyResult,
-)
-from wmo.providers.pool import load_pool
 from wmo.runtime.runs.client import RunsSink
 from wmo.simulation.ingest.otel_writer import write_traces_jsonl
 from wmo.simulation.model.world_model import WorldModel
 from wmo.simulation.serving.traces_source import TRACES_FILENAME
-from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 
 runner = CliRunner()
 
@@ -334,7 +334,7 @@ def _patch_seams(
         )
 
     monkeypatch.setattr("wmo.simulation.model.load_world_model", _load)
-    monkeypatch.setattr("wmo.providers.pool.get_provider", _get_provider)
+    monkeypatch.setattr("wmo.common.providers.pool.get_provider", _get_provider)
     return world_model
 
 

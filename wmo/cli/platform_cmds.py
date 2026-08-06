@@ -21,7 +21,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from wmo.config.store import WorldModelStore
+from wmo.common.config.store import WorldModelStore
 from wmo.runtime.platform.credentials import (
     DEFAULT_WEB_URL,
     PlatformCredentials,

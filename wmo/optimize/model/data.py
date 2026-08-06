@@ -39,9 +39,9 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from wmo.common.providers.tinker import TokenSpan
 from wmo.optimize.model.config import DistillConfig
 from wmo.optimize.model.tokens import TrialRecord
-from wmo.providers.tinker import TokenSpan
 
 if TYPE_CHECKING:
     import tinker

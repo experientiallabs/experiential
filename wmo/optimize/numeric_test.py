@@ -8,7 +8,7 @@ from collections.abc import Mapping
 import pytest
 from pydantic import JsonValue
 
-from wmo.core.types import Action, ActionKind, Observation, Step
+from wmo.common.core.types import Action, ActionKind, Observation, Step
 from wmo.optimize.judge import Judge
 from wmo.optimize.numeric import NumericJudge
 

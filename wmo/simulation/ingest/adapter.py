@@ -10,7 +10,7 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
-from wmo.core.types import Trace
+from wmo.common.core.types import Trace
 
 
 class SourceCredentialError(PermissionError):

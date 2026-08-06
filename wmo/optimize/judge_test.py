@@ -6,7 +6,8 @@ import re
 
 import pytest
 
-from wmo.core.types import Action, ActionKind, Observation, Step
+from wmo.common.core.types import Action, ActionKind, Observation, Step
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.optimize.judge import (
     JUDGE_MARKER,
     JUDGE_SYSTEM,
@@ -18,13 +19,12 @@ from wmo.optimize.judge import (
     RubricJudge,
     _build_judge_prompt,
 )
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 
 def test_judge_system_contains_marker() -> None:
-    # Run-cost attribution (wmo.tracking.metered.classify_build_call) recognizes judge calls by
-    # JUDGE_MARKER. If the prompt is edited to no longer contain it, judge cost is silently
-    # misattributed to GEPA — pin the coupling here.
+    # Run-cost attribution recognizes judge calls by JUDGE_MARKER in
+    # wmo.common.observability.metered.classify_build_call. If the prompt is edited to no longer
+    # contain it, judge cost is silently misattributed to GEPA. Pin the coupling here.
     assert JUDGE_MARKER in JUDGE_SYSTEM
 
 

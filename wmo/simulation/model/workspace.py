@@ -20,7 +20,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from wmo.core.types import Action
+from wmo.common.core.types import Action
 from wmo.simulation.model.grounding import FetchFn, FileRead, SourceResolver, http_get
 
 # Files fetched per grep before degrading to the filename-list partial. Keeps a dir-wide grep

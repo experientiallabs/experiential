@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from wmo.core.types import Action, ActionKind
+from wmo.common.core.types import Action, ActionKind
 from wmo.runtime.platform.client import (
     PlatformClient,
     PlatformError,

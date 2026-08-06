@@ -8,8 +8,9 @@ Two flavors of phi:
 * A real provider's embeddings API (Bedrock Titan / OpenAI / Azure OpenAI) — semantic phi. Selected
   by setting `embed_provider` (an `EmbedderKind`) + the backend's credentials.
 
-Both satisfy the `wmo.providers.base.Embedder` protocol, so `EmbeddingRetriever` and the world model
-consume either interchangeably. `get_embedder` is the single place this choice is resolved.
+Both satisfy the `wmo.common.providers.base.Embedder` protocol, so `EmbeddingRetriever` and the
+world model consume either interchangeably. `get_embedder` is the single place this choice is
+resolved.
 """
 
 from __future__ import annotations
@@ -19,11 +20,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from wmo.providers.base import EmbedderKind
+from wmo.common.providers.base import EmbedderKind
 
 if TYPE_CHECKING:
-    from wmo.config import HarnessConfig
-    from wmo.providers.base import Embedder
+    from wmo.common.config import HarnessConfig
+    from wmo.common.providers.base import Embedder
 
 DEFAULT_DIM = 512
 _NGRAM = 3
@@ -68,7 +69,7 @@ def get_embedder(config: HarnessConfig) -> Embedder:
 
     `embed_provider == HASHING` (the default) returns the offline `HashingEmbedder` sized to
     `config.embed_dim` (no credentials, no network). `LOCAL` runs the in-process Qwen3 model
-    (`wmo.providers.local_embed`), also credential-free; its `embed_dim` must be the model's
+    (`wmo.common.providers.local_embed`), also credential-free; its `embed_dim` must be the model's
     native width (1024 for the default), which the embedder checks on first use. Any other kind
     constructs the matching backend provider (via the registry) with `embed_dim` threaded
     through, so the provider requests vectors of exactly the persisted dimension and the
@@ -80,11 +81,11 @@ def get_embedder(config: HarnessConfig) -> Embedder:
     if config.embed_provider is EmbedderKind.HASHING:
         return HashingEmbedder(dim=config.embed_dim)
     if config.embed_provider is EmbedderKind.LOCAL:
-        from wmo.providers.local_embed import LocalEmbedder
+        from wmo.common.providers.local_embed import LocalEmbedder
 
         return LocalEmbedder(dim=config.embed_dim)
 
-    from wmo.providers import get_provider
+    from wmo.common.providers import get_provider
 
     # `embed_provider_config` resolves the backing provider and stamps `embed_dim` on it.
     return get_provider(config.embed_provider_config())

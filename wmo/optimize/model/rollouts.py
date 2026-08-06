@@ -59,10 +59,10 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
+from wmo.common.providers.base import ProviderConfig, ProviderKind
 from wmo.optimize.model.config import DistillConfig
 from wmo.optimize.model.tokens import TrialRecord, assemble_harbor_trial_records
-from wmo.providers.base import ProviderConfig, ProviderKind
 from wmo.runtime.harness.doc import HarnessDoc
 from wmo.runtime.harness.runtime import StopReason
 
@@ -252,7 +252,7 @@ def _share_harbor_tinker_service_client() -> None:
     instance and never closes it, and terminus-2 builds one `TinkerLLM` per
     TRIAL. The SDK's service client starts a heartbeat task that strongly
     references its holder, so each one pins a live server-side session for the
-    rest of the process -- the exact leak `wmo.providers.tinker.
+    rest of the process -- the exact leak `wmo.common.providers.tinker.
     shared_service_client` exists to prevent for wmo's own call paths. Harbor's
     class was the one path that still bypassed it.
 
@@ -273,7 +273,7 @@ def _share_harbor_tinker_service_client() -> None:
         return
     from harbor.llms.tinker import TinkerLLM
 
-    from wmo.providers import tinker as tinker_provider
+    import wmo.common.providers.tinker as tinker_provider
 
     if not hasattr(TinkerLLM, "_ensure_client"):  # pragma: no cover - upstream moved
         logger.warning(

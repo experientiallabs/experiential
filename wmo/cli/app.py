@@ -32,7 +32,7 @@ from rich.table import Table
 
 from wmo.cli.defer import add_deferred_typer
 from wmo.cli.model_roles import configured_role_configs, load_settings_or_abort
-from wmo.config import (
+from wmo.common.config import (
     ARTIFACT_DIR,
     DEFAULT_MODEL_NAME,
     FIDELITY_TIERS,
@@ -53,11 +53,11 @@ from wmo.config import (
 
 if TYPE_CHECKING:
     import wmo.cli.pool_registry as pool_registry
-    from wmo.core.types import JsonObject, Trace
-    from wmo.providers import ProviderConfig, ProviderKind, VerifyResult
-    from wmo.providers.base import Embedder, Provider
-    from wmo.providers.models import ProviderModel
-    from wmo.providers.pool import Tier
+    from wmo.common.core.types import JsonObject, Trace
+    from wmo.common.providers import ProviderConfig, ProviderKind, VerifyResult
+    from wmo.common.providers.base import Embedder, Provider
+    from wmo.common.providers.models import ProviderModel
+    from wmo.common.providers.pool import Tier
     from wmo.simulation.evaluation.grid import ModelSpec
     from wmo.simulation.evaluation.open_loop import EvalReport
     from wmo.simulation.model.eval_suites import EvalSuite
@@ -211,7 +211,7 @@ def _worker_provider_config(
     api_version: str | None = None,
 ) -> ProviderConfig:
     """Resolve the provider settings used by the built-in worker agent."""
-    from wmo.providers import ProviderKind
+    from wmo.common.providers import ProviderKind
 
     config = _provider_config(provider, model, region)
     if endpoint is not None:
@@ -280,7 +280,7 @@ def providers_set(
     """
     import wmo.cli.pool_registry as pool_registry
     from wmo.cli.ui import select_provider_and_model
-    from wmo.providers import verify_all
+    from wmo.common.providers import verify_all
 
     if tier is not None and tier not in pool_registry.TIERS:
         raise typer.BadParameter(f"--tier must be one of: {', '.join(pool_registry.TIERS)}")
@@ -425,8 +425,8 @@ def providers_verify(
     checked (the offline hashing embedder needs no credentials and is skipped). `--name` scopes
     the whole report to that one world model.
     """
-    from wmo.providers import verify_all, verify_embedder
-    from wmo.providers.base import EmbedderKind
+    from wmo.common.providers import verify_all, verify_embedder
+    from wmo.common.providers.base import EmbedderKind
 
     store = WorldModelStore(root)
     names = [name] if name is not None else store.list_names()
@@ -593,7 +593,7 @@ def _empty_corpus_error(file: str | None, source: str) -> typer.BadParameter:
 
 def _chain_bad_parameter(err: ValueError) -> typer.BadParameter:
     """Render a failover-chain resolution failure as a usage error naming the file to write."""
-    from wmo.providers.waterfall import FALLBACK_CONFIG_PATH
+    from wmo.common.providers.waterfall import FALLBACK_CONFIG_PATH
 
     return typer.BadParameter(
         f"{err}. Write {FALLBACK_CONFIG_PATH} as [[chain.<name>]] rung tables (one table per "
@@ -604,7 +604,7 @@ def _chain_bad_parameter(err: ValueError) -> typer.BadParameter:
 
 def _provider_or_chain_or_abort(config: ProviderConfig, chain: str | None) -> Provider:
     """`providers.provider_or_chain`, with chain-resolution errors as clean usage errors."""
-    import wmo.providers as providers
+    import wmo.common.providers as providers
 
     try:
         return providers.provider_or_chain(config, chain=chain)
@@ -709,7 +709,7 @@ def build(
     """
     # `--vendor <name>` is the deprecated alias for `--source <name> --pull`: it names the source
     # adapter and implies a live pull.
-    import wmo.providers as providers
+    import wmo.common.providers as providers
     from wmo.cli.ui import (
         BuildParams,
         RichBuildReporter,
@@ -718,16 +718,26 @@ def build(
         run_build_wizard,
         serve_model_default,
     )
-    from wmo.config.card import make_build_card, save_card
-    from wmo.providers import ProviderKind
-    from wmo.providers.base import EmbedderKind
+    from wmo.common.config.card import make_build_card, save_card
+    from wmo.common.observability import (
+        MeteredProvider,
+        Phase,
+        RunTracker,
+        classify_build_call,
+        save_run,
+    )
+    from wmo.common.observability.telemetry import (
+        BuildTelemetryStats,
+        TelemetryBuildReporter,
+        capture_build_completed,
+    )
+    from wmo.common.providers import ProviderKind
+    from wmo.common.providers.base import EmbedderKind
     from wmo.simulation.ingest import VendorPull
     from wmo.simulation.model.build import EmptyCorpusError
     from wmo.simulation.model.build import build as run_build
     from wmo.simulation.model.grounding import GROUNDER_KINDS
     from wmo.simulation.retrieval import get_embedder
-    from wmo.telemetry import BuildTelemetryStats, TelemetryBuildReporter, capture_build_completed
-    from wmo.tracking import MeteredProvider, Phase, RunTracker, classify_build_call, save_run
 
     if vendor:
         source = vendor
@@ -1005,9 +1015,9 @@ def _verify_or_abort(config: HarnessConfig, chain: str | None = None) -> None:
     being swallowed inside GEPA and yielding a useless model. Raises `typer.Exit(1)` with an
     actionable hint (`uv sync` for a missing SDK; "check creds / model id" otherwise).
     """
-    import wmo.providers as providers
-    from wmo.providers import verify_all, verify_embedder
-    from wmo.providers.base import EmbedderKind
+    import wmo.common.providers as providers
+    from wmo.common.providers import verify_all, verify_embedder
+    from wmo.common.providers.base import EmbedderKind
 
     checks = [(config.serve_provider_config(), False)]
     if config.embed_provider not in (EmbedderKind.HASHING, EmbedderKind.LOCAL):
@@ -1054,7 +1064,8 @@ def _missing_sdk(detail: str) -> bool:
 
     Two shapes reach here: the raw ImportError text of a core SDK ("No module named 'boto3'"), and
     an optional extra's own message, which replaces that text with its install hint (see
-    `wmo.providers.tinker.check_tinker_prerequisites`) and so never contains the module wording.
+    `wmo.common.providers.tinker.check_tinker_prerequisites`) and therefore never contains the
+    module wording.
     """
     return "No module named" in detail or "SDK is not installed" in detail
 
@@ -1311,8 +1322,8 @@ def serve(
 
 
 # Charting deps ship in the optional `viz` extra, so `wmo.simulation.evaluation.grid_plot` /
-# `wmo.research.concurrency_plot` import them lazily. Every chart-writing flow probes for them
-# UP FRONT instead: `wmo eval grid` otherwise spent the whole (paid) grid and only then died on
+# `wmo.optimize.research.concurrency_plot` import them lazily. Every chart-writing flow probes for
+# them up front: `wmo eval grid` otherwise spent the whole paid grid and only then died on
 # `import matplotlib` with a raw traceback that never named the extra.
 _VIZ_MODULES = ("matplotlib", "seaborn")
 
@@ -1534,7 +1545,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     """
     from wmo.cli.eval_closed_loop import run_agreement, run_closed_loop
     from wmo.cli.ui import explicit_param as _explicit
-    from wmo.telemetry import capture_eval_completed
+    from wmo.common.observability.telemetry import capture_eval_completed
 
     args = tokens or []
     suite_roots = (
@@ -1772,8 +1783,8 @@ def _parse_model_specs(models: str | None) -> list[ModelSpec]:
     (`resolve_provider_model`), so a friendly model type resolves to its canonical wire id while an
     unknown (self-hosted) id passes through unchanged, and a bad provider fails at parse time.
     """
-    from wmo.providers import ProviderKind
-    from wmo.providers.models import resolve_provider_model
+    from wmo.common.providers import ProviderKind
+    from wmo.common.providers.models import resolve_provider_model
     from wmo.simulation.evaluation.grid import ModelSpec
 
     raw = models.split(",") if models else list(_DEFAULT_GRID_MODELS)
@@ -1953,8 +1964,11 @@ def _eval_run_suite(
     reasoning: bool | None,
     out: str | None,
 ) -> None:
+    from wmo.common.observability.telemetry import (
+        capture_eval_completed,
+        settings_root_from_results_root,
+    )
     from wmo.simulation.model.eval_suites import result_path
-    from wmo.telemetry import capture_eval_completed, settings_root_from_results_root
 
     suite = _resolve_eval_suite_or_usage(selector, examples_roots)
     suite_prompt = suite.resolve_prompt()
@@ -2076,7 +2090,7 @@ def _run_eval_files(
     provider_config: ProviderConfig,
     chain: str | None = None,
 ) -> EvalReport:
-    import wmo.providers as providers
+    import wmo.common.providers as providers
     from wmo.optimize.judge import RubricJudge
     from wmo.simulation.evaluation.open_loop import OpenLoopEval
     from wmo.simulation.model.prompts import BASE_ENV_PROMPT
@@ -2318,8 +2332,8 @@ def scenarios_verify(
     baseline LLM agent on every scenario, and grades episodes against each scenario's checklist.
     With `--drop`, unverified scenarios are removed from the set in place.
     """
-    import wmo.providers as providers
-    from wmo.providers.retry import wrap_provider_with_retries
+    import wmo.common.providers as providers
+    from wmo.common.providers.retry import wrap_provider_with_retries
     from wmo.runtime.agents.llm import LLMAgent
     from wmo.simulation.model.world_model import WorldModel
     from wmo.simulation.scenarios import ChecklistJudge, verify_scenarios
@@ -2461,7 +2475,7 @@ def _unreadable_input(
 
 def _provider_kind(provider: str) -> ProviderKind:
     """The `ProviderKind` a `--provider` flag names, as a usage error when it names none."""
-    from wmo.providers import ProviderKind
+    from wmo.common.providers import ProviderKind
 
     try:
         return ProviderKind(provider)
@@ -2471,8 +2485,8 @@ def _provider_kind(provider: str) -> ProviderKind:
 
 
 def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
-    from wmo.providers import ProviderConfig
-    from wmo.providers.models import resolve_provider_model
+    from wmo.common.providers import ProviderConfig
+    from wmo.common.providers.models import resolve_provider_model
 
     kind = _provider_kind(provider)
     spec = resolve_provider_model(kind, model)
@@ -2498,7 +2512,7 @@ def _default_model_for_provider(kind: ProviderKind) -> str:
     no built-in rows (nothing can derive an operator's route or weights path), so they must be
     told which model to run.
     """
-    from wmo.providers.models import model_types_for_provider
+    from wmo.common.providers.models import model_types_for_provider
 
     catalog = model_types_for_provider(kind)
     if not catalog:
@@ -2571,8 +2585,8 @@ def _worker_role_provider_config(
     configured role drops that role's model and connection fields, which belong to the backend it
     replaced — the model then comes from the NEW backend's catalog, never from bedrock's.
     """
-    from wmo.providers import ProviderKind
-    from wmo.providers.models import resolve_provider_model
+    from wmo.common.providers import ProviderKind
+    from wmo.common.providers.models import resolve_provider_model
 
     configured = _role_provider_config("worker", region)
     if configured is None or (provider is not None and provider != configured.kind.value):
@@ -2606,7 +2620,7 @@ def _scenario_role_llms(
     built-in default. Judging benefits from a different family than the worker: a same-family
     judge carries self-preference bias toward the generator's outputs.
     """
-    import wmo.providers as providers
+    import wmo.common.providers as providers
 
     if provider is not None or model is not None:
         llm = providers.get_provider(_worker_role_provider_config(provider, model, region))
@@ -2626,9 +2640,9 @@ def _scenario_role_llms(
 def _resolve_scenario_embedder(
     embed_provider: str, embed_model: str | None, embed_dim: int, region: str | None
 ) -> Embedder:
-    import wmo.providers as providers
-    from wmo.providers import ProviderConfig
-    from wmo.providers.base import EmbedderKind
+    import wmo.common.providers as providers
+    from wmo.common.providers import ProviderConfig
+    from wmo.common.providers.base import EmbedderKind
     from wmo.simulation.retrieval import HashingEmbedder
 
     try:
@@ -2641,7 +2655,7 @@ def _resolve_scenario_embedder(
     if kind is EmbedderKind.HASHING:
         return HashingEmbedder(dim=embed_dim)
     if kind is EmbedderKind.LOCAL:
-        from wmo.providers.local_embed import LocalEmbedder
+        from wmo.common.providers.local_embed import LocalEmbedder
 
         return LocalEmbedder(embed_model, dim=embed_dim)
     if not embed_model:
@@ -2688,14 +2702,14 @@ def demo(
 ) -> None:
     """Replay a randomly sampled recorded scenario against the world model, open loop."""
 
-    import wmo.providers as providers
+    import wmo.common.providers as providers
     from wmo.cli.ui import select_provider_and_model
-    from wmo.providers import verify_all
-    from wmo.providers.retry import wrap_provider_with_retries
+    from wmo.common.providers import verify_all
+    from wmo.common.providers.retry import wrap_provider_with_retries
+    from wmo.common.vendor.waterfall import is_capacity_error
     from wmo.simulation.model.build import ingest
     from wmo.simulation.model.demo import run_demo
     from wmo.simulation.model.world_model import WorldModel
-    from wmo.utils.waterfall import is_capacity_error
 
     wm, resolved_name, _provider, model_root = _load_model_any(
         name, root, max_fidelity=max_fidelity
@@ -3133,12 +3147,13 @@ def research_concurrency(
     Reconstructs a fixed batch of N held-out scenarios from `suite`'s corpus at each concurrency
     level, timing the world-model batch and (with `--side both`) the matching real-sandbox batch,
     to give the time differential T_real(W)/T_world(W). Reuses the suite's corpus + config
-    (train_split, top_k, prompt) and the example's `run.sh`. See `wmo.research.concurrency_run`.
+    (train_split, top_k, prompt) and the example's `run.sh`. See
+    `wmo.optimize.research.concurrency_run`.
     """
-    import wmo.providers as providers
-    from wmo.research import Side, run_concurrency_scaling
-    from wmo.research.concurrency_run import build_real_runner, build_world_runner
-    from wmo.research.concurrency_scaling import ConcurrencyPoint
+    import wmo.common.providers as providers
+    from wmo.optimize.research import Side, run_concurrency_scaling
+    from wmo.optimize.research.concurrency_run import build_real_runner, build_world_runner
+    from wmo.optimize.research.concurrency_scaling import ConcurrencyPoint
     from wmo.simulation.ingest import get_adapter
     from wmo.simulation.model.build import split_traces
     from wmo.simulation.model.eval_suites import resolve_eval_suite
@@ -3321,7 +3336,7 @@ def research_plot_concurrency(
     never surfaces a raw ModuleNotFoundError traceback.
     """
     _require_viz_extra()
-    from wmo.research.concurrency_plot import render_report
+    from wmo.optimize.research.concurrency_plot import render_report
 
     try:
         written = render_report(report, out, title=title)
@@ -3352,7 +3367,7 @@ def research_plot_concurrency_combined(
     and guarded by the same `_require_viz_extra` pre-flight.
     """
     _require_viz_extra()
-    from wmo.research.concurrency_plot import render_cost, render_speedup
+    from wmo.optimize.research.concurrency_plot import render_cost, render_speedup
 
     try:
         speedup_path = render_speedup(reports, out_speedup)
@@ -3571,8 +3586,8 @@ def _load_model(name: str | None, root: str, *, max_fidelity: bool = False):  # 
     dying. `max_fidelity` = the online extras (see `WorldModel.load`); default is pure RAG.
     Returns `(world_model, resolved_name, provider)`.
     """
-    import wmo.providers as providers
-    from wmo.providers.retry import wrap_provider_with_retries
+    import wmo.common.providers as providers
+    from wmo.common.providers.retry import wrap_provider_with_retries
     from wmo.simulation.model.world_model import WorldModel
 
     store = WorldModelStore(root)
@@ -3603,7 +3618,7 @@ def _prepare_serve_provider_or_exit(provider: Provider, config: ProviderConfig) 
     fail here with the same hint `wmo providers verify` prints. Bedrock and tinker document a
     residual gap they cannot close locally; those still fail on the first call.
     """
-    from wmo.providers.base import PreparableProvider
+    from wmo.common.providers.base import PreparableProvider
 
     if not isinstance(provider, PreparableProvider):
         return

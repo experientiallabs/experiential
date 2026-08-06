@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.optimize.judge import JudgeResult
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.model.grounding import GroundingResult, SourceResolver
 from wmo.simulation.model.replay import replay
 from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder

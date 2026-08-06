@@ -9,8 +9,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from wmo.optimize.model.tau2_proxy import EpisodeProxy, realign_tool_argument_types
-from wmo.utils.waterfall.types import (
+from wmo.common.vendor.waterfall.types import (
     ChatChoice,
     ChatFunctionCall,
     ChatFunctionDefinition,
@@ -21,6 +20,7 @@ from wmo.utils.waterfall.types import (
     ChatToolCall,
     ChatUsage,
 )
+from wmo.optimize.model.tau2_proxy import EpisodeProxy, realign_tool_argument_types
 
 
 class _FakeProvider:

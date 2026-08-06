@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from wmo.common.providers.tinker import TokenSpan
 from wmo.optimize.model.samples import (
     FRAGMENT_BREAK,
     MAX_EPISODE_CHARS,
@@ -15,7 +16,6 @@ from wmo.optimize.model.samples import (
     truncate_middle,
 )
 from wmo.optimize.model.tokens import TrialRecord
-from wmo.providers.tinker import TokenSpan
 
 _SPECIAL_BASE = 1000
 """Fake special-token ids start here; the decoder renders them as `<|sp|>`."""

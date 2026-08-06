@@ -7,11 +7,11 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from wmo.config.card import CardCorpus, ModelCard, TracesSource
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.config.card import CardCorpus, ModelCard, TracesSource
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.routing.policy import RoutingPolicy
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
-from wmo.providers.pool import PoolEntry
 from wmo.simulation.model.knowledge import KnowledgeBase
 from wmo.simulation.model.world_model import WorldModel
 from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder

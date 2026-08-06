@@ -38,7 +38,7 @@ from pathlib import Path
 
 from pydantic import JsonValue, ValidationError
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.runtime.runs.ledger import LedgerLine
 from wmo.runtime.runs.schema import (
     CELL_BATCH_CAP,

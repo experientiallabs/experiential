@@ -209,7 +209,7 @@ def test_fetch_places_artifacts_where_existing_discovery_looks(
     (`<root>/*/evals/*.toml`). Renaming either layout on the Hub breaks here instead of at a
     user's first `wmo eval`.
     """
-    from wmo.config.store import WorldModelStore
+    from wmo.common.config.store import WorldModelStore
     from wmo.simulation.model.eval_suites import discover_eval_suites
 
     _fake_hub(monkeypatch, _PREBUILT)

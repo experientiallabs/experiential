@@ -18,9 +18,9 @@ from typing import Literal, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-from wmo.core.render import encode_action, encode_state_action
-from wmo.core.types import Action, EnvState, Observation, Step, Trace
-from wmo.providers.base import Embedder
+from wmo.common.core.render import encode_action, encode_state_action
+from wmo.common.core.types import Action, EnvState, Observation, Step, Trace
+from wmo.common.providers.base import Embedder
 
 # What text phi embeds per step: the full (state, action) summary, or the command-only action.
 RetrievalKey = Literal["state_action", "action"]
@@ -77,8 +77,9 @@ class EmbeddingRetriever:
         return encode_state_action(step.state_before, step.action)
 
     def _embed_steps(self, steps: list[Step]) -> NDArray[np.float64]:
-        # phi embeds the canonical step text from wmo.core.render — the same text the engine and
-        # GEPA render, so an embedded step and a shown demo match. `key_mode` selects which text.
+        # phi embeds the canonical step text from wmo.common.core.render, the same text the engine
+        # and GEPA render, so an embedded step and a shown demo match. `key_mode` selects which
+        # text.
         texts = [self._key_text(s) for s in steps]
         vectors = self._provider.embed(texts)
         return np.asarray(vectors, dtype=np.float64)

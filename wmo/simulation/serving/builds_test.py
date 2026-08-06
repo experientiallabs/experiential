@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from wmo.config import HarnessConfig
-from wmo.config.card import load_card
-from wmo.simulation.model.reporting import BuildReporter
+from wmo.common.config import HarnessConfig
+from wmo.common.config.card import load_card
+from wmo.common.observability.reporting import BuildReporter
 from wmo.simulation.serving.builds import (
     BuildFn,
     BuildManager,

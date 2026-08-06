@@ -231,7 +231,7 @@ def test_runtime_backend_selector() -> None:
     """Default backend is local (in-process); unknown backends are rejected."""
     import pytest
 
-    from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+    from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
     from wmo.runtime.harness.code_runtime import CodeRuntime
     from wmo.runtime.harness.doc import CODE_RUNTIME_ID, code_baseline
 
@@ -249,7 +249,7 @@ def test_runtime_backend_selector() -> None:
 
     from typing import cast
 
-    from wmo.providers.base import Provider
+    from wmo.common.providers.base import Provider
 
     provider = cast("Provider", _P())
 
@@ -284,8 +284,14 @@ def _pi_doc() -> HarnessDoc:
 def _stub_provider():  # noqa: ANN202 - returns the casted Provider protocol below
     from typing import cast
 
-    from wmo.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
-    from wmo.utils.waterfall import ChatRequest, ChatResponse
+    from wmo.common.providers.base import (
+        Completion,
+        Message,
+        Provider,
+        ProviderConfig,
+        ProviderKind,
+    )
+    from wmo.common.vendor.waterfall import ChatRequest, ChatResponse
 
     class _P:
         config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")

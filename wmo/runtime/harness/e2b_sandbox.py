@@ -4,9 +4,9 @@ An E2B microVM is where a `pi-node` harness *process* executes under `backend="e
 environment its tool calls hit stays whatever `AgentEnvironment` the eval binds (normally the
 world-model simulation). This module owns only the sandbox mechanics: the exact protocol slice of
 `e2b.Sandbox` the harness uses (so tests substitute fakes), the lazy-SDK default factory, and
-capacity-shaped creation retries with fixed (1, 3, 9) s delays — the
-`wmo.providers.retry.RetryingProvider` precedent, no RNG in scoring paths. The e2b SDK stays an
-optional extra (`uv sync --extra e2b`).
+capacity-shaped creation retries with fixed (1, 3, 9) s delays, following the
+`wmo.common.providers.retry.RetryingProvider` precedent with no RNG in scoring paths. The e2b SDK
+stays an optional extra (`uv sync --extra e2b`).
 """
 
 from __future__ import annotations

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.model.play import parse_action, play_turn
 from wmo.simulation.model.world_model import WorldModel
 from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder

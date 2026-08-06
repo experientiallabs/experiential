@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from wmo.core.types import Action, Observation
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.core.types import Action, Observation
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.runtime.harness.runtime import (
     DEFAULT_SYSTEM_PROMPT,
     JSON_PROTOCOL_CLAUSE,

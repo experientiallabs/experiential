@@ -24,7 +24,7 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel
 
-from wmo.core.types import JsonObject, Trace
+from wmo.common.core.types import JsonObject, Trace
 from wmo.simulation.ingest.adapter import SourceCredentialError, VendorPull, get_adapter
 from wmo.simulation.ingest.base import BaseTraceAdapter, load_payloads
 from wmo.simulation.ingest.detect import detect_format

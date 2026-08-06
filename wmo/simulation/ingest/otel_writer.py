@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from wmo.core.types import ActionKind, JsonObject, JsonValue, Step, Trace
+from wmo.common.core.types import ActionKind, JsonObject, JsonValue, Step, Trace
 
 
 def _attr(key: str, value: str) -> JsonObject:

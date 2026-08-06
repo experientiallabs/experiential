@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from wmo.providers import openrouter_pricing
+from wmo.common.providers import openrouter_pricing
 from wmo.runtime.platform.credentials import ENV_API_URL, ENV_HOME, ENV_ORG, ENV_TOKEN, ENV_WEB_URL
 
 
@@ -23,7 +23,7 @@ def _no_local_fallback_chain(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     The real one is developer-local and gitignored; chain tests pass an explicit `path=`.
     """
     monkeypatch.setattr(
-        "wmo.providers.waterfall.FALLBACK_CONFIG_PATH", tmp_path / "no-fallback.toml"
+        "wmo.common.providers.waterfall.FALLBACK_CONFIG_PATH", tmp_path / "no-fallback.toml"
     )
 
 

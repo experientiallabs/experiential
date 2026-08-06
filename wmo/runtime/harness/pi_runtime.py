@@ -33,8 +33,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pydantic import JsonValue
 
-from wmo.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
-from wmo.providers.base import UNPARSED_TOOL_CALLS_KEY, Provider, ToolCallingProvider
+from wmo.common.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
+from wmo.common.providers.base import UNPARSED_TOOL_CALLS_KEY, Provider, ToolCallingProvider
+from wmo.common.vendor.waterfall import ChatRequest
 from wmo.runtime.harness.environment import AgentEnvironment
 from wmo.runtime.harness.runner_link import (
     HostEpisode,
@@ -52,7 +53,6 @@ from wmo.runtime.harness.runtime import (
 )
 from wmo.runtime.harness.skills import SkillLibrary
 from wmo.runtime.harness.tools import READ_SKILL, ToolSpec
-from wmo.utils.waterfall import ChatRequest
 
 # The runner: node runs here, reached over SSH. The checkout keeps pi's node_modules; per-episode
 # source is overwritten from the harness surfaces.

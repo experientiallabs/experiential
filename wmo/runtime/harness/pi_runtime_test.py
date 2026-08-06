@@ -10,8 +10,9 @@ from typing import cast
 
 import pytest
 
-from wmo.core.types import Action, Observation
-from wmo.providers.base import Provider
+from wmo.common.core.types import Action, Observation
+from wmo.common.providers.base import Provider
+from wmo.common.vendor.waterfall import ChatRequest, ChatResponse
 from wmo.runtime.harness import pi_runtime as pi_runtime_module
 from wmo.runtime.harness.doc import (
     MAX_OUTPUT_TOKENS_ID,
@@ -33,7 +34,6 @@ from wmo.runtime.harness.pi_runtime import (
 from wmo.runtime.harness.runtime import StopReason
 from wmo.runtime.harness.skills import Skill, SkillLibrary
 from wmo.runtime.harness.tools import SUBMIT, TOOL_REGISTRY
-from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 
 class _Env:
@@ -172,7 +172,7 @@ def test_local_shim_close_waits_for_active_environment_handler(
 
 
 def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
-    from wmo.providers.base import ProviderConfig, ProviderKind
+    from wmo.common.providers.base import ProviderConfig, ProviderKind
 
     class _P:
         config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")

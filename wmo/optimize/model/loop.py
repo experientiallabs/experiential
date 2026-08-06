@@ -32,7 +32,7 @@ The Tinker SDK stays an optional extra: the real service client is built
 lazily only when no `service_client` is injected, and the thin `Sdk*`
 adapters here (mirroring `SdkSampler` and `SdkLogprobScorer`) are the only
 code that touches it. Every SDK call is deadline-bounded
-(`wmo.optimize.model.deadlines`), so a wedged session raises a typed
+(`wmo.common.providers.tinker_deadlines`), so a wedged session raises a typed
 `TinkerDeadlineError` instead of hanging; see `SdkTrainingClient` for the
 per-call idempotency reasoning that decides what expiry does. Tests drive
 the whole loop with the deterministic fakes in `wmo.optimize.model.fake_tinker`,
@@ -84,7 +84,23 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from wmo.config.store import validate_name
+from wmo.common.config.store import validate_name
+from wmo.common.providers.base import ProviderConfig, ProviderKind
+from wmo.common.providers.tinker import (
+    TINKER_API_KEY_ENV,
+    SampledSequenceLike,
+    SdkSampler,
+    evict_shared_sampling_client,
+    shared_sampling_client,
+    shared_service_client,
+)
+from wmo.common.providers.tinker_deadlines import (
+    TinkerDeadlineError,
+    call_with_deadline,
+    wait_with_deadline,
+)
+from wmo.common.providers.tinker_rendering import ChatRendering, RendererTokenizer, build_renderer
+from wmo.common.vendor.waterfall.types import ChatMessage
 from wmo.optimize.model.config import DistillConfig, PricingConfig, TeacherConfig
 from wmo.optimize.model.cost import (
     METER_NAMES,
@@ -104,9 +120,7 @@ from wmo.optimize.model.data import (
     to_tinker_datums,
     to_tinker_sft_datums,
 )
-from wmo.optimize.model.deadlines import TinkerDeadlineError, call_with_deadline, wait_with_deadline
 from wmo.optimize.model.gate import DistillGateRecord, gate_distillation
-from wmo.optimize.model.rendering import ChatRendering, RendererTokenizer, build_renderer
 from wmo.optimize.model.rollouts import RolloutStats, collect_rollouts, rollout_stats
 from wmo.optimize.model.samples import sample_rollouts, samples_markdown
 from wmo.optimize.model.store import (
@@ -137,15 +151,6 @@ from wmo.optimize.model.tripwire import (
     metric_ratio,
     policy_health,
 )
-from wmo.providers.base import ProviderConfig, ProviderKind
-from wmo.providers.tinker import (
-    TINKER_API_KEY_ENV,
-    SampledSequenceLike,
-    SdkSampler,
-    evict_shared_sampling_client,
-    shared_sampling_client,
-    shared_service_client,
-)
 from wmo.runtime.harness.doc import (
     MAX_OUTPUT_TOKENS_ID,
     MAX_TURNS_ID,
@@ -154,7 +159,6 @@ from wmo.runtime.harness.doc import (
     Surface,
     SurfaceKind,
 )
-from wmo.utils.waterfall.types import ChatMessage
 
 if TYPE_CHECKING:
     import tinker
@@ -893,7 +897,7 @@ class SdkSamplingClient:
 
     Args:
         client: The SDK sampling client, normally fetched from the
-            process-wide shared cache in `wmo.providers.tinker`.
+            process-wide shared cache in `wmo.common.providers.tinker`.
         model: The shared-cache key the client was fetched under. When set, a
             `TinkerDeadlineError` from any call evicts that cache entry so
             every future user of the model string (including the harbor trial
@@ -970,7 +974,7 @@ class SdkTrainingClient:
     Save names carry a per-session nonce so a resumed run re-saving the same
     step never collides with an earlier session's artifact names.
 
-    Every SDK call is deadline-bounded (`wmo.optimize.model.deadlines`), and what a
+    Every SDK call is deadline-bounded (`wmo.common.providers.tinker_deadlines`), and what a
     deadline expiry does depends on the call's idempotency:
 
     - `forward_backward` and `optim_step` are NOT idempotent mid-batch: the
@@ -1134,7 +1138,7 @@ class SdkServiceClient:
     """Adapts a real `tinker.ServiceClient` to `DistillServiceClient`.
 
     The wrapped service builds training clients; sampling clients come from
-    the process-wide shared cache in `wmo.providers.tinker` (one
+    the process-wide shared cache in `wmo.common.providers.tinker` (one
     `SamplingClient` per model string, shared with the rollout providers and
     the teacher), so per-refresh construction never adds server-side sessions
     beyond one per distinct sampler path.
@@ -1165,7 +1169,7 @@ def _build_sdk_service_client() -> SdkServiceClient:
     """Build the real service adapter (the `service_client=None` path).
 
     The SDK's service client pins one live server-side session for the life
-    of the process, so the loop adapts `wmo.providers.tinker`'s process-wide
+    of the process, so the loop adapts `wmo.common.providers.tinker`'s process-wide
     shared instance instead of constructing a second one.
 
     Raises:

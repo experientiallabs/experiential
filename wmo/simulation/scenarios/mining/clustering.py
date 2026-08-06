@@ -11,8 +11,8 @@ from __future__ import annotations
 import numpy as np
 from pydantic import BaseModel, ValidationError
 
-from wmo.core.parsing import extract_json_object
-from wmo.providers.base import Message, Provider
+from wmo.common.core.parsing import extract_json_object
+from wmo.common.providers.base import Message, Provider
 from wmo.simulation.scenarios.mining.facets import TraceFacet
 
 _KMEANS_ITERS = 50

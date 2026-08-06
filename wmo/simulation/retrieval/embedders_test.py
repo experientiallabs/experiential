@@ -6,8 +6,8 @@ import math
 
 import pytest
 
-from wmo.config import HarnessConfig
-from wmo.providers.base import EmbedderKind, ProviderConfig, ProviderKind
+from wmo.common.config import HarnessConfig
+from wmo.common.providers.base import EmbedderKind, ProviderConfig, ProviderKind
 from wmo.simulation.retrieval.embedders import HashingEmbedder, get_embedder
 
 
@@ -65,8 +65,8 @@ def test_get_embedder_builds_provider_with_embed_dim_threaded(
         captured["config"] = config
         return object()  # the factory returns whatever the registry builds
 
-    # The factory imports get_provider from wmo.providers lazily; patch it there.
-    import wmo.providers as providers_pkg
+    # The factory imports get_provider from wmo.common.providers lazily; patch it there.
+    import wmo.common.providers as providers_pkg
 
     monkeypatch.setattr(providers_pkg, "get_provider", fake_get_provider)
 

@@ -1,17 +1,19 @@
 """Same-model failover for the eval grid (never silently switches models).
 
-Main's failover architecture (`wmo.providers.provider_or_chain` + `.wmo/fallback.toml`) rides a
-config-driven chain for *world-model* calls and keeps the *judge* pinned. The grid needs one thing
-that config can't express: a **programmatic, per-cell, same-model** chain. Its judge is a single
-pinned model and each cell's target is a distinct model, so there is no static named chain to point
-at - yet Bedrock Anthropic models throttle hard, and the direct Anthropic API is the *identical*
-model on an un-throttled endpoint. Failing over Bedrock -> direct-Anthropic (same model), or across
-Bedrock regions (same model), keeps what's measured unchanged, so it honours main's
-never-silently-switch-models invariant while surviving capacity pressure over an 80-cell grid.
+Main's failover architecture (`wmo.common.providers.provider_or_chain` plus `.wmo/fallback.toml`)
+rides a config-driven chain for *world-model* calls and keeps the *judge* pinned. The grid needs one
+thing that config can't express: a **programmatic, per-cell, same-model** chain. Its judge is a
+single pinned model and each cell's target is a distinct model, so there is no static named chain
+to point at. Yet Bedrock Anthropic models throttle hard, and the direct Anthropic API is the
+*identical* model on an un-throttled endpoint. Failing over Bedrock to direct-Anthropic (same
+model), or across Bedrock regions (same model), keeps what's measured unchanged, so it honours
+main's never-silently-switch-models invariant while surviving capacity pressure over an 80-cell
+grid.
 
-This is deliberately NOT in `wmo.providers`: main removed the programmatic `FallbackProvider` in
-favour of `.wmo/fallback.toml`, and this seam exists only because the grid composes pre-built
-providers (metered/capped wrappers, injected fakes in tests) into same-model chains. Capacity
+This is deliberately NOT in `wmo.common.providers`: main removed the programmatic
+`FallbackProvider` in favour of `.wmo/fallback.toml`, and this seam exists only because the grid
+composes pre-built providers (metered/capped wrappers, injected fakes in tests) into same-model
+chains. Capacity
 classification is reused from the shared waterfall module (`is_capacity_error`), not
 re-implemented here.
 """
@@ -20,8 +22,8 @@ from __future__ import annotations
 
 import re
 
-from wmo.providers.base import Completion, Message, Provider, ProviderConfig
-from wmo.utils.waterfall import is_capacity_error
+from wmo.common.providers.base import Completion, Message, Provider, ProviderConfig
+from wmo.common.vendor.waterfall import is_capacity_error
 
 
 def anthropic_direct_id(bedrock_model: str) -> str | None:

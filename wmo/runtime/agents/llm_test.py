@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Step
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind, VerifyResult
+from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step
+from wmo.common.providers.base import (
+    Completion,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+    VerifyResult,
+)
 from wmo.runtime.agents.llm import LLMAgent
 from wmo.runtime.episode import DONE_SIGNAL
 

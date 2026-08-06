@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.optimize.judge import JudgeResult
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.model.autoconfig import (
     DEFAULT_CANDIDATES,
     FETCH_CANDIDATE,

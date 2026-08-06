@@ -34,9 +34,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from wmo.common.providers.tinker import TokenSpan
 from wmo.optimize.model.config import DistillConfig, PricingConfig
 from wmo.optimize.model.tokens import TrialRecord
-from wmo.providers.tinker import TokenSpan
 
 logger = logging.getLogger(__name__)
 

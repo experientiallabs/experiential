@@ -74,6 +74,23 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 from starlette.background import BackgroundTask
 
+from wmo.common.providers.base import (
+    DEFAULT_MAX_TOKENS,
+    Message,
+    Provider,
+    StreamingProvider,
+    TokenUsage,
+    ToolCallingProvider,
+)
+from wmo.common.providers.pool import PoolEntry, pool_provider
+from wmo.common.vendor.waterfall.types import (
+    ChatChoice,
+    ChatRequest,
+    ChatResponse,
+    ChatTool,
+    ChatToolCall,
+)
+from wmo.common.vendor.waterfall.types import ChatMessage as ProviderChatMessage
 from wmo.optimize.routing.compression import (
     CompressionConfig,
     CompressionStats,
@@ -97,20 +114,9 @@ from wmo.optimize.routing.policy import (
     RoutingPolicy,
     select_model,
 )
-from wmo.providers.base import (
-    DEFAULT_MAX_TOKENS,
-    Message,
-    Provider,
-    StreamingProvider,
-    TokenUsage,
-    ToolCallingProvider,
-)
-from wmo.providers.pool import PoolEntry, pool_provider
 from wmo.simulation.serving.endpoint_config import EndpointConfig
 from wmo.simulation.serving.query_embeddings import QueryEmbeddingStore
 from wmo.simulation.serving.savings import EndpointSavings, SavingsWindow, compute_savings
-from wmo.utils.waterfall.types import ChatChoice, ChatRequest, ChatResponse, ChatTool, ChatToolCall
-from wmo.utils.waterfall.types import ChatMessage as ProviderChatMessage
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -1106,7 +1112,7 @@ def _provider_request(request: ChatCompletionRequest, messages: list[ChatMessage
     contradict.
 
     `parallel_tool_calls` rides through as one of `ChatRequest`'s extras, which is where the
-    providers already read it from (`wmo.providers._responses_common`) and where
+    providers already read it from (`wmo.common.providers._responses_common`) and where
     `ChatRequest.provider_payload` puts it on a chat-completions wire. Set only when the client
     sent it, so a pool entry whose backend rejects the field never sees it unasked.
     """

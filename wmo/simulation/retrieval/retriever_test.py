@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.retrieval.retriever import EmbeddingRetriever, Retriever
 
 
@@ -111,7 +111,7 @@ def test_add_into_empty_buffer_then_retrieves() -> None:
     assert retriever.topk(EnvState(), step.action, k=1)[0].observation.content == "first"
 
 
-# phi text rendering (encode_state_action) is owned and tested by wmo/core/render_test.py.
+# phi text rendering (encode_state_action) is owned and tested by wmo/common/core/render_test.py.
 
 
 def test_save_load_roundtrip_preserves_topk(tmp_path) -> None:  # noqa: ANN001 - pytest fixture

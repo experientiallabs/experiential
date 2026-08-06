@@ -25,10 +25,10 @@ from typing import Literal
 
 from harbor.models.task.config import MCPServerConfig
 
-from wmo.core.types import JsonObject
-from wmo.providers.base import Provider, ProviderConfig, ProviderKind
-from wmo.providers.retry import wrap_provider_with_retries
-from wmo.providers.tinker import TinkerChatProvider, TokenRecorder
+from wmo.common.core.types import JsonObject
+from wmo.common.providers.base import Provider, ProviderConfig, ProviderKind
+from wmo.common.providers.retry import wrap_provider_with_retries
+from wmo.common.providers.tinker import TinkerChatProvider, TokenRecorder
 from wmo.runtime.evaluation.harbor.agent import (
     DEFAULT_EPISODE_WORKERS,
     MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,

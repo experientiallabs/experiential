@@ -35,7 +35,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from wmo.cli.consent import require_spend_consent
-from wmo.config import ARTIFACT_DIR, WorldModelStore
+from wmo.common.config import ARTIFACT_DIR, WorldModelStore
 
 if TYPE_CHECKING:
     # Type-only: real imports are local to the functions that construct or inspect these values,
@@ -70,7 +70,7 @@ ASSUMED_OUTPUT_TOKENS = 250
 
 # Literal mirrors of constants that otherwise live behind heavy imports:
 # `wmo.optimize.routing.knn`, `wmo.optimize.routing.outcomes`,
-# `wmo.optimize.routing.policy`, and `wmo.providers.pool`. Typer evaluates Option defaults at
+# `wmo.optimize.routing.policy`, and `wmo.common.providers.pool`. Typer evaluates Option defaults at
 # command-definition time and `_KNN_KNOBS` is built at module import time, so these have to be
 # values, not names imported from those modules; the real constants are re-imported inside the
 # function bodies that need their behavior.
@@ -524,7 +524,7 @@ def _is_disabled_in(pool_file: Path, name: str) -> bool:
     Best-effort for an error message: the pool already loaded once through preflight, so a
     second read here cannot fail in a new way, and any surprise reads as plain "not a model".
     """
-    from wmo.providers.pool import load_pool
+    from wmo.common.providers.pool import load_pool
 
     try:
         return any(

@@ -7,7 +7,7 @@ env otherwise guesses wrong. It is:
 
 - **seeded at build time** from TRAIN traces only (`seed_knowledge`, an LLM extraction pass),
 - **read at serve time** — rendered whole (size-budgeted) into the env prompt's KNOWLEDGE BASE
-  section (`wmo.core.render.build_env_prompt`),
+  section (`wmo.common.core.render.build_env_prompt`),
 - **written at serve time** — the env's `kb_note` contract field appends to `learned.md` and the
   grounder caches web results in `grounded.md`; the seeded files are never auto-modified,
 - **edited by humans** — it's just markdown; open the folder in any editor.
@@ -24,10 +24,10 @@ from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 
-from wmo.core.parsing import extract_json_object
-from wmo.core.render import render_demo
-from wmo.core.types import Trace
-from wmo.providers.base import Message, Provider
+from wmo.common.core.parsing import extract_json_object
+from wmo.common.core.render import render_demo
+from wmo.common.core.types import Trace
+from wmo.common.providers.base import Message, Provider
 
 # Build-time seeded files (never auto-modified after seeding; humans edit freely).
 SEEDED_FILES = ("rules.md", "entities.md", "schemas.md")

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from wmo.common.providers.base import ProviderKind
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.routing import (
     evaluate_policy,
     fit_rank_policy,
@@ -12,8 +14,6 @@ from wmo.optimize.routing import (
 )
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
-from wmo.providers.base import ProviderKind
-from wmo.providers.pool import PoolEntry
 from wmo.simulation.retrieval.embedders import HashingEmbedder
 
 _SQL_TASKS = [

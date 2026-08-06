@@ -32,7 +32,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-from wmo.runtime.platform.credentials import wmo_home
+from wmo.common.config.paths import wmo_home
 
 logger = logging.getLogger(__name__)
 

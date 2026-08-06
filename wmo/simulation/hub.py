@@ -39,7 +39,7 @@ from http.client import HTTPMessage
 from pathlib import Path
 from typing import IO
 
-from wmo.core.types import JsonValue
+from wmo.common.core.types import JsonValue
 
 _ORG = "experiential-labs"
 _CORPUS_FILE = "traces.otel.jsonl"

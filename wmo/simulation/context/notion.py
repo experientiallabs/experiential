@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, cast
 import httpx
 from pydantic import ValidationError
 
-from wmo.core.types import JsonObject, JsonValue
+from wmo.common.core.types import JsonObject, JsonValue
 from wmo.simulation.context.connector import ConnectUI, register_connector
 from wmo.simulation.context.credentials import list_connected, save_connector_auth, token_env_var
 from wmo.simulation.context.oauth import LoopbackServer, serve_until

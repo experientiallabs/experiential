@@ -24,7 +24,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from wmo.core.text import validate_durable_text
+from wmo.common.core.text import validate_durable_text
 from wmo.runtime.harness.doc import HarnessDoc
 
 RewardMode = Literal["raw", "positive-binary"]

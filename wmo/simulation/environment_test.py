@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.runtime import Env
 from wmo.simulation import WorldModelEnv
 from wmo.simulation.model.world_model import WorldModel

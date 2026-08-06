@@ -9,7 +9,7 @@ from pathlib import PurePosixPath
 import tomli_w
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from wmo.core.text import validate_durable_text
+from wmo.common.core.text import validate_durable_text
 
 # _SAFE_PATH_RE and _SLUG_RE are doc's path and surface-id grammars; sharing them keeps this
 # module's file checks and Surface validation from ever drifting apart.

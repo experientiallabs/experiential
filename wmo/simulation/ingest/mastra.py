@@ -49,7 +49,7 @@ import os
 import httpx
 from pydantic import JsonValue
 
-from wmo.core.types import JsonObject
+from wmo.common.core.types import JsonObject
 from wmo.simulation.ingest.adapter import VendorPull, register_adapter
 from wmo.simulation.ingest.base import BaseTraceAdapter
 from wmo.simulation.ingest.normalize import SpanEmitter, SpanRecord, as_text, iso_to_ordinal

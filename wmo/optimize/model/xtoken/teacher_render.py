@@ -36,8 +36,8 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from wmo.common.vendor.waterfall.types import ChatMessage, ChatTool
 from wmo.optimize.model.xtoken.byte_offsets import span_byte_ends
-from wmo.utils.waterfall.types import ChatMessage, ChatTool
 
 logger = logging.getLogger(__name__)
 

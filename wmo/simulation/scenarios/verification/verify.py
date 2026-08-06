@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from wmo.core.types import Trace
+from wmo.common.core.types import Trace
 from wmo.runtime.episode import Agent, run_episode
 from wmo.simulation.environment import WorldModelEnv
 from wmo.simulation.model.world_model import WorldModel

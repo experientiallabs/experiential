@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from pydantic import BaseModel, Field
 
-from wmo.core.types import Action, ActionKind, Observation, Step
+from wmo.common.core.types import Action, ActionKind, Observation, Step
 from wmo.optimize.judge import Judge
 
 

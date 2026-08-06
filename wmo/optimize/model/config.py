@@ -24,7 +24,7 @@ from pydantic import (
     model_validator,
 )
 
-from wmo.optimize.model.rendering import MISSING_DISTILL_EXTRA
+from wmo.common.providers.tinker_rendering import MISSING_DISTILL_EXTRA
 
 
 class StudentConfig(BaseModel):

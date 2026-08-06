@@ -23,7 +23,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 import httpx
 from pydantic import BaseModel, Field
 
-from wmo.core.types import JsonObject, JsonValue
+from wmo.common.core.types import JsonObject, JsonValue
 from wmo.simulation.context.credentials import save_connector_auth
 from wmo.simulation.context.types import ConnectError, ConnectorAuth, transport_errors
 

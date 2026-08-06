@@ -10,8 +10,8 @@ import threading
 
 import pytest
 
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Step
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.runtime.harness.e2b_sandbox import SandboxCleanupError
 from wmo.runtime.harness.environment import AgentEnvironment, is_env_action
 from wmo.runtime.harness.runtime import RunResult, RuntimeCancelled, StopReason, TokenUsage

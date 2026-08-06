@@ -12,7 +12,7 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
-from wmo.core.types import Action, ActionKind, EnvState, Step
+from wmo.common.core.types import Action, ActionKind, EnvState, Step
 from wmo.runtime.environment import Env
 
 # An agent signals it is finished by returning a MESSAGE action whose content equals this.

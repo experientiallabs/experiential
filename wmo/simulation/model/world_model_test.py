@@ -8,11 +8,11 @@ from pathlib import Path
 
 import pytest
 
-import wmo.telemetry as telemetry
-from wmo.config import ArtifactPaths, HarnessConfig, save_config
-from wmo.config.settings import set_telemetry_enabled
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
-from wmo.providers.base import (
+import wmo.common.observability.telemetry as telemetry
+from wmo.common.config import ArtifactPaths, HarnessConfig, save_config
+from wmo.common.config.settings import set_telemetry_enabled
+from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.providers.base import (
     Completion,
     Message,
     ProviderConfig,
@@ -572,8 +572,8 @@ def test_load_named_model_uses_project_root_for_telemetry_opt_out(
 
 def test_score_session_meters_judge_separately_from_serve() -> None:
     """Reward-judge tokens land under Phase.JUDGE on the session tracker, not SERVE (D12 split)."""
+    from wmo.common.observability import Phase
     from wmo.optimize.reward import EpisodeScore
-    from wmo.tracking import Phase
 
     class JudgeReply:
         def __init__(self) -> None:
@@ -623,8 +623,8 @@ def test_max_fidelity_rag_deep_winner_applies_topk_and_demo_cap(tmp_path) -> Non
     """A persisted rag-deep winner must change what the runtime actually serves."""
     import json as _json
 
-    from wmo.config import ArtifactPaths, HarnessConfig, save_config
-    from wmo.providers.base import ProviderConfig, ProviderKind
+    from wmo.common.config import ArtifactPaths, HarnessConfig, save_config
+    from wmo.common.providers.base import ProviderConfig, ProviderKind
 
     root = tmp_path / ".wmo"
     root.mkdir()

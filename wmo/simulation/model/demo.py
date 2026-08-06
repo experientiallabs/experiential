@@ -12,7 +12,7 @@ from collections.abc import Callable
 
 from pydantic import BaseModel
 
-from wmo.core.types import Action, Observation, Trace
+from wmo.common.core.types import Action, Observation, Trace
 from wmo.simulation.model.world_model import WorldModel
 
 

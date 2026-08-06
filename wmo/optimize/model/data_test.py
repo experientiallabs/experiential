@@ -8,6 +8,7 @@ import sys
 
 import pytest
 
+from wmo.common.providers.tinker import TokenSpan
 from wmo.optimize.model.config import (
     DistillConfig,
     HarborConfig,
@@ -29,7 +30,6 @@ from wmo.optimize.model.data import (
 )
 from wmo.optimize.model.fake_tinker import FakeDatum, FakeServiceClient, FakeTrainingClient
 from wmo.optimize.model.tokens import TrialRecord
-from wmo.providers.tinker import TokenSpan
 
 
 def _cfg(

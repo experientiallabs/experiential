@@ -12,7 +12,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
 
-from wmo.core.text import normalize_durable_text
+from wmo.common.core.text import normalize_durable_text
 
 
 class TaskSpec(BaseModel):

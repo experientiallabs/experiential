@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from wmo.core.types import Action, ActionKind, Observation
+from wmo.common.core.types import Action, ActionKind, Observation
 
 # The tool names the environment answers (everything except the runtime-handled `submit`).
 ENV_TOOLS = frozenset({"bash", "read_file", "write_file"})

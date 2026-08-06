@@ -5,7 +5,7 @@
 default), or a `WandbTracker` streaming step metrics, eval solve rates,
 sample rollout tables, and the final gate summary to a wandb run. The wandb
 SDK stays an optional extra
-(lazy import, mirroring the tinker SDK in `wmo.providers.tinker`), and
+(lazy import, mirroring the tinker SDK in `wmo.common.providers.tinker`), and
 credentials are checked at init so a misconfigured run fails fast BEFORE any
 paid rollout. After a successful init the contract inverts: a wandb failure
 mid-run (network blip, service outage) logs one warning and every later
@@ -26,8 +26,8 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from wmo.core.files import write_text_atomic
-from wmo.core.types import JsonObject, JsonValue
+from wmo.common.core.files import write_text_atomic
+from wmo.common.core.types import JsonObject, JsonValue
 from wmo.optimize.model.config import DistillConfig
 from wmo.optimize.model.samples import SampleRollout
 

@@ -12,8 +12,8 @@ critiques into the reflective dataset the engine feeds back to the reflection LM
 The optimizer stays decoupled from the serving engine: replaying a candidate only needs a
 `Provider` (see `predict_observation`), so we do NOT import `wmo.simulation.model`; that would
 create the cycle simulation -> optimize -> simulation. Prompt assembly is the shared
-`wmo.core.render.build_env_prompt` — the exact assembly the world model serves — so GEPA evolves
-against what is actually deployed.
+`wmo.common.core.render.build_env_prompt`, the exact assembly the world model serves, so GEPA
+evolves against what is actually deployed.
 """
 
 from __future__ import annotations
@@ -25,12 +25,12 @@ from dataclasses import dataclass
 import gepa
 from gepa.core.adapter import EvaluationBatch, GEPAAdapter
 
-from wmo.core.parsing import dumps_observation_contract, parse_observation
-from wmo.core.render import build_env_prompt, encode_state_action
-from wmo.core.types import Action, EnvState, JsonValue, Observation, Step, Trace
+from wmo.common.core.parsing import dumps_observation_contract, parse_observation
+from wmo.common.core.render import build_env_prompt, encode_state_action
+from wmo.common.core.types import Action, EnvState, JsonValue, Observation, Step, Trace
+from wmo.common.providers.base import DEFAULT_MAX_TOKENS, Message, Provider
 from wmo.optimize.base import OptimizeMetrics, OptimizeResult
 from wmo.optimize.judge import Judge
-from wmo.providers.base import DEFAULT_MAX_TOKENS, Message, Provider
 from wmo.simulation.retrieval import Retriever
 from wmo.simulation.retrieval.leakfree import DemoRetriever
 
@@ -65,7 +65,7 @@ def predict_observation(
     """Predict the observation for (state, action) under `prompt`, using only a Provider.
 
     This is the single rollout primitive GEPA and replay use. It assembles the prompt with the
-    shared `wmo.core.render.build_env_prompt` and parses the completion with the shared
+    shared `wmo.common.core.render.build_env_prompt` and parses the completion with the shared
     `parse_observation` — the exact assembly AND output contract the serving engine uses — so the
     predicted observation (content + is_error + state_note) matches what the world model produces.
     `knowledge`/`reasoning` mirror the serving engine's agentic mode (grounding stays serve-only:
@@ -754,7 +754,7 @@ def _mean_valset_score(
     Raises on a total judge outage rather than returning 0.0: the acceptance re-check compares
     two of these means, and an all-invalid pass (raw zeros, nothing to impute) would silently
     revert a good winner or wave through a bad one on a number that says nothing about fidelity.
-    Same contract as `wmo.research.pipeline.score_prompt`.
+    Same contract as `wmo.optimize.research.pipeline.score_prompt`.
 
     Raises:
         RuntimeError: if steps were scored but every judgement was invalid (judge outage).

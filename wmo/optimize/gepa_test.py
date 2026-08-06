@@ -7,7 +7,14 @@ critique. We assert the optimizer runs a bounded loop and returns a valid fronti
 
 from __future__ import annotations
 
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.providers.base import (
+    DEFAULT_MAX_TOKENS,
+    Completion,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+)
 from wmo.optimize.base import Optimizer, OptimizeResult
 from wmo.optimize.gepa import (
     ENV_PROMPT_COMPONENT,
@@ -19,7 +26,6 @@ from wmo.optimize.gepa import (
     predict_observation,
 )
 from wmo.optimize.judge import JudgeResult
-from wmo.providers.base import DEFAULT_MAX_TOKENS, Completion, Message, ProviderConfig, ProviderKind
 
 
 def test_metric_call_budget_funds_exploration_not_just_seed_eval() -> None:
