@@ -290,6 +290,20 @@ def test_pi_node_source_tree_renders_and_round_trips(tmp_path: Path) -> None:
     assert reloaded_code == original_code
 
 
+def test_local_live_harness_round_trips_without_changing_session_inputs(tmp_path: Path) -> None:
+    """Persistence preserves every input the restored local LiveSession consumes."""
+    from wmo.cli.run_cmd import _assemble, _pi_node_baseline
+
+    store = HarnessStore(tmp_path)
+    saved = store.save_version(_pi_node_baseline())
+    loaded = store.load(saved.name, f"v{saved.version}")
+
+    assert loaded.doc_hash == saved.doc_hash
+    assert loaded.runtime_kind() == "pi-node"
+    assert _assemble(loaded) == _assemble(saved)
+    assert "src/agent.ts" in _assemble(loaded)[2]
+
+
 def test_code_surface_path_colliding_with_a_reserved_file_is_rejected(tmp_path: Path) -> None:
     """A pathful code surface may not shadow SYSTEM.md/config.toml/etc. in the export."""
     doc = HarnessDoc(

@@ -699,3 +699,76 @@ def test_report_aggregates_worker_usage_from_self_metering_runtimes() -> None:
         tasks, lambda task: _StaticEnv(), _ScriptedRuntime(), _AnswerJudge(), k=1
     )
     assert silent.worker_usage is None
+
+
+def test_closed_loop_consumes_a_live_session_backed_result() -> None:
+    """The simulation consumer scores the answer and usage emitted by LiveSession."""
+    from wmo.common.core.types import JsonObject
+    from wmo.runtime.harness.live_session import LiveSession, SessionEvent, ToolOutcome
+    from wmo.runtime.harness.tools import SUBMIT
+
+    class _Channel:
+        def __init__(self, inbound: list[JsonObject]) -> None:
+            self._inbound = inbound
+            self.sent: list[JsonObject] = []
+
+        def send(self, frame: JsonObject) -> None:
+            self.sent.append(frame)
+
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            _ = timeout
+            return self._inbound.pop(0) if self._inbound else None
+
+    class _LiveRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            _ = environment
+            completed: JsonObject = {
+                "type": "state",
+                "status": "idle",
+                "reason": "completed",
+            }
+            channel = _Channel(
+                [
+                    {"type": "state", "status": "idle"},
+                    {
+                        "type": "tool_request",
+                        "req_id": 1,
+                        "name": "submit",
+                        "arguments": {"answer": "pass"},
+                    },
+                    completed,
+                ]
+            )
+            events: list[SessionEvent] = []
+            session = LiveSession(
+                channel,
+                tools=[SUBMIT],
+                execute_tool=lambda name, args, emit: ToolOutcome(content="unused"),
+                on_event=events.append,
+            )
+            session.start()
+            message_id = session.send_user_message(instruction)
+            completed["msg_id"] = message_id
+            session.pump(timeout=0)
+            session.pump(timeout=0)
+            answer_event = next(event for event in events if event.kind == "submit")
+            answer = answer_event.payload["answer"]
+            assert isinstance(answer, str)
+            return RunResult(
+                task_id=task_id,
+                stop_reason=StopReason.SUBMITTED,
+                answer=answer,
+                worker_usage=session.worker_usage,
+            )
+
+    report = evaluate_with_env(
+        [TaskSpec(task_id="live-pass", instruction="finish", gold=["g"])],
+        lambda task: _StaticEnv(),
+        _LiveRuntime(),
+        _AnswerJudge(),
+        k=1,
+    )
+
+    assert report.success_rate == 1.0
+    assert report.per_task["live-pass"].attempts[0].answer == "pass"
+    assert report.worker_usage == TokenUsage()

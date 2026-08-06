@@ -270,6 +270,111 @@ def test_interrupt_sends_abort_frame() -> None:
     assert resets == [True, True]  # initial ready state, then the aborted turn boundary
 
 
+def test_matching_idle_cannot_reset_before_the_cancel_hook_finishes() -> None:
+    """A delayed cancel hook must land before its matching terminal reset."""
+    idle_delivered = threading.Event()
+
+    class _SignallingChannel(ScriptedChannel):
+        def __init__(self, inbound: list[JsonObject]) -> None:
+            super().__init__(inbound)
+            self._receives = 0
+
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            self._receives += 1
+            frame = super().recv(timeout)
+            if self._receives == 2:
+                idle_delivered.set()
+            return frame
+
+    aborted_state: JsonObject = {"type": "state", "status": "idle", "reason": "aborted"}
+    channel = _SignallingChannel([{"type": "state", "status": "idle"}, aborted_state])
+    cancel_entered = threading.Event()
+    release_cancel = threading.Event()
+    reset_called = threading.Event()
+    hook_order: list[str] = []
+    executor_cancelled = False
+
+    def cancel() -> None:
+        nonlocal executor_cancelled
+        cancel_entered.set()
+        release_cancel.wait(timeout=2)
+        executor_cancelled = True
+        hook_order.append("cancel")
+
+    def reset() -> None:
+        nonlocal executor_cancelled
+        executor_cancelled = False
+        hook_order.append("reset")
+        reset_called.set()
+
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=lambda event: None,
+        cancel_active=cancel,
+        reset_cancel=reset,
+    )
+    session.start()
+    hook_order.clear()
+    reset_called.clear()
+    message_id = session.send_user_message("go")
+    aborted_state["msg_id"] = message_id
+
+    interrupt_thread = threading.Thread(target=session.interrupt)
+    interrupt_thread.start()
+    assert cancel_entered.wait(timeout=1)
+    pump_thread = threading.Thread(target=session.pump, kwargs={"timeout": 0})
+    pump_thread.start()
+    assert idle_delivered.wait(timeout=1)
+    reset_raced_ahead = reset_called.wait(timeout=0.1)
+    release_cancel.set()
+    interrupt_thread.join(timeout=1)
+    pump_thread.join(timeout=1)
+
+    assert not interrupt_thread.is_alive()
+    assert not pump_thread.is_alive()
+    assert not reset_raced_ahead
+    assert hook_order == ["cancel", "reset"]
+    assert executor_cancelled is False
+
+
+def test_idle_callback_can_interrupt_the_deferred_turn() -> None:
+    """The next prompt stays active while an aborted prompt crosses its idle boundary."""
+    aborted_state: JsonObject = {"type": "state", "status": "idle", "reason": "aborted"}
+    channel = ScriptedChannel([{"type": "state", "status": "idle"}, aborted_state])
+    holder: dict[str, LiveSession] = {}
+    cancellations: list[bool] = []
+
+    def on_event(event: SessionEvent) -> None:
+        if event.kind == "state" and event.payload.get("reason") == "aborted":
+            holder["session"].interrupt()
+
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=on_event,
+        cancel_active=lambda: cancellations.append(True),
+    )
+    holder["session"] = session
+    session.start()
+    first_message_id = session.send_user_message("first")
+    aborted_state["msg_id"] = first_message_id
+    session.interrupt()
+    session.send_user_message("second")
+
+    session.pump(timeout=0)
+    session.flush_pending_intents()
+
+    sent_messages = [frame for frame in channel.sent if frame["type"] == "user_message"]
+    aborts = [frame for frame in channel.sent if frame["type"] == "abort"]
+    assert [frame["text"] for frame in sent_messages] == ["first", "second"]
+    assert len(aborts) == 2
+    assert cancellations == [True, True]
+    assert session.turn_active
+
+
 def test_stale_idle_does_not_reset_a_newer_interrupted_message() -> None:
     """An old idle acknowledgement cannot re-enable work for a newer cancelled prompt."""
     running_state: JsonObject = {"type": "state", "status": "running"}
