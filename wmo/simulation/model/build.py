@@ -174,8 +174,8 @@ def build(
 
     `config.gepa_budget <= 0` skips prompt optimization entirely (the low fidelity tier: RAG
     over the base prompt). `max_fidelity` runs the auto-configuration search after the build
-    (see `wmo.simulation.model.autoconfig`): candidates — pruned by corpus signature unless
-    `full_search` — are replay-scored on `fidelity_budget` held-out traces with the prompt the
+    (see `wmo.simulation.model.autoconfig`): candidates, pruned by corpus signature unless
+    `full_search`, are replay-scored on `fidelity_budget` held-out traces with the prompt the
     artifact will serve, and the result lands in `auto_fidelity.json`. The search never changes
     the serve DEFAULTS (plain RAG unless flags were set explicitly): the winner activates at
     runtime via `--max-fidelity`.
@@ -195,7 +195,7 @@ def build(
     if drop_degenerate:
         # Some captures are polluted with all-empty-observation traces (swe-bench is 66% such
         # junk, D24); building on them trains and measures the model on capture damage. Reuses
-        # `wmo.simulation.ingest.drop_degenerate_traces` — the same filter the research runners
+        # `wmo.simulation.ingest.drop_degenerate_traces`, the same filter the research runners
         # (run_trace_scaling / run_fidelity_tiers, via their own --drop-degenerate) apply.
         traces, dropped = drop_degenerate_traces(traces)
         report.activity(f"dropped {dropped} degenerate (all-empty-observation) traces")

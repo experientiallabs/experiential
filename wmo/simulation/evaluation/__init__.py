@@ -1,14 +1,14 @@
 """World-model evaluation: one interface, an open-loop and a closed-loop implementation.
 
-- `base` — the general `Evaluation`/`EvalResult` interface: mode-specific inputs are bound at
+- `base`: the general `Evaluation`/`EvalResult` interface. Mode-specific inputs are bound at
   construction; `run()` returns a report with a one-line `summary()` and a `headline` score.
-- `open_loop` — teacher-forced replay of held-out trace steps, scored for per-step reconstruction
+- `open_loop`: teacher-forced replay of held-out trace steps, scored for per-step reconstruction
   fidelity (the default `wmo eval` mode).
-- `closed_loop` — a live agent runs tasks with the world model as its environment, gold-judged for
+- `closed_loop`: a live agent runs tasks with the world model as its environment, gold-judged for
   end-to-end task success over k=3 passes (`wmo eval --mode closed-loop`).
-- `agreement` — compare two closed-loop reports task-by-task (e.g. simulated vs real): the
+- `agreement`: compare two closed-loop reports task-by-task (e.g. simulated vs real), the
   outcome-agreement validity check.
-- `gold` / `tasks` — the gold-assertion judge and the task specs closed-loop eval scores against.
+- `gold` / `tasks`: the gold-assertion judge and the task specs closed-loop eval scores against.
 """
 
 from wmo.simulation.evaluation.agreement import AgreementReport, compute_agreement

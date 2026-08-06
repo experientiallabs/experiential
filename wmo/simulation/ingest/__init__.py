@@ -15,7 +15,7 @@ imported; their heavy SDKs are optional extras, imported lazily inside the adapt
 
 # Import for the registration side effect so `get_adapter(...)` works on package import. The
 # provider adapters are SDK-free (they parse exports as JSON and pull over httpx), so importing them
-# here is cheap and brings no heavy dependency — their optional extras only matter if a user drives
+# here is cheap and brings no heavy dependency. Their optional extras only matter if a user drives
 # the provider's own SDK alongside `wmo ingest`.
 from wmo.simulation.ingest import braintrust as braintrust  # noqa: F401
 from wmo.simulation.ingest import langfuse as langfuse  # noqa: F401

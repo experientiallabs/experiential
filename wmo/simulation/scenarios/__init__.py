@@ -1,7 +1,7 @@
 """Scenario-set construction: distill a trace corpus into a representative eval scenario set.
 
 The pipeline (Clio-style facets -> embed -> cluster -> select -> synthesize -> verify), organized
-as one subpackage per stage — `mining/`, `synthesis/`, `verification/` — with `builder` on top:
+as one subpackage per stage: `mining/`, `synthesis/`, and `verification/`, with `builder` on top:
 
     facets = FacetExtractor(provider).extract_all(traces)
     scenario_set = build_scenario_set(traces, facets, provider, embedder, config)

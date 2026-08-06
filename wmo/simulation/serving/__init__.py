@@ -1,4 +1,4 @@
-"""Local FastAPI backend — the live environment agents call over HTTP."""
+"""Local FastAPI backend that live environment agents call over HTTP."""
 
 from wmo.simulation.serving.server import create_app
 
