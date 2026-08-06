@@ -55,18 +55,6 @@ Distill your own small model into the pool with [`wmo optimize distill`](wmo/opt
 serve a single model with no routing via `wmo optimize route pin`, or build an optimized harness
 for your agent with `wmo optimize harness`.
 
-### Run the built-in agent
-
-A bare `wmo run` launches the built-in pi harness on this machine. File tools stay under the
-selected directory, but bash is not OS-sandboxed, so the CLI asks for explicit consent. Logged-out
-runs use the configured local worker provider; logged-in runs proxy worker calls through the
-platform.
-
-```bash
-wmo providers set
-wmo run --dir . --task "fix the failing tests"
-```
-
 ### Hosted platform
 
 Create an account at [platform.experientiallabs.ai](https://platform.experientiallabs.ai), then
@@ -124,11 +112,6 @@ The platform manages model credentials, so this path needs no local API key.
 wmo login
 wmo run <world-model-id> --task "check out the cart"
 ```
-
-The target resolver still distinguishes agent IDs from world-model IDs. Hosted agent sessions are
-currently unavailable because the platform no longer exposes their session API; an agent ID fails
-with an actionable message instead of falling through to the world-model endpoint. Omit the ID to
-run the built-in pi harness locally.
 
 ## Runtime agents and optimizers in E2B sandboxes
 
