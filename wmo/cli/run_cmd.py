@@ -19,6 +19,7 @@ import codecs
 import contextlib
 import os
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -156,7 +157,7 @@ class LocalToolExecutor:
                 return self._bash(str(args.get("command", "")), emit)
             if name == "read_file":
                 target = self._resolve(str(args.get("path", "")))
-                return _capped(target.read_text(encoding="utf-8", errors="replace"))
+                return self._read_file(target)
             if name == "write_file":
                 path = str(args.get("path", ""))
                 target = self._resolve(path)
@@ -173,6 +174,28 @@ class LocalToolExecutor:
         except OSError as error:
             return ToolOutcome(content=f"{name} failed: {error}", is_error=True)
         return ToolOutcome(content=f"tool {name!r} not available", is_error=True)
+
+    def _read_file(self, target: Path) -> ToolOutcome:
+        """Read one regular file incrementally without retaining its full contents."""
+        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                return ToolOutcome(
+                    content="read_file failed: path is not a regular file", is_error=True
+                )
+            output = _BoundedTextBuffer(_TOOL_OUTPUT_CAP)
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            while not self._cancelled.is_set():
+                chunk = os.read(descriptor, 4096)
+                if not chunk:
+                    break
+                output.append(decoder.decode(chunk))
+            if self._cancelled.is_set():
+                return ToolOutcome(content="interrupted", is_error=True)
+            output.append(decoder.decode(b"", final=True))
+            return ToolOutcome(content=output.render(), truncated=output.truncated)
+        finally:
+            os.close(descriptor)
 
     def _bash(self, command: str, emit: Callable[[str, str], None]) -> ToolOutcome:
         """Run a fresh ``bash -lc`` in the jail root, streaming output to ``emit``."""

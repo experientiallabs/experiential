@@ -190,16 +190,48 @@ def test_executor_cancel_stops_an_active_bash_command(tmp_path: Path) -> None:
     assert result.content == "interrupted"
 
 
-def test_executor_caps_large_output(tmp_path: Path) -> None:
+def test_executor_streams_and_caps_large_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     (tmp_path / "big.txt").write_text(
-        "x" * (mod._TOOL_OUTPUT_CAP + 500),
+        "head" + "x" * (mod._TOOL_OUTPUT_CAP + 500) + "tail",
         encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda *_args, **_kwargs: pytest.fail("read_file must not materialize the whole file"),
     )
 
     result = mod.LocalToolExecutor(tmp_path)("read_file", {"path": "big.txt"}, _noop_emit)
 
     assert result.truncated
     assert "chars truncated" in result.content
+    assert result.content.startswith("head")
+    assert result.content.endswith("tail")
+    assert len(result.content) <= mod._TOOL_OUTPUT_CAP
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are not available on this platform")
+def test_executor_rejects_a_fifo_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "blocked"
+    os.mkfifo(fifo)
+    outcomes: list[mod.ToolOutcome] = []
+    thread = threading.Thread(
+        target=lambda: outcomes.append(
+            mod.LocalToolExecutor(tmp_path)("read_file", {"path": "blocked"}, _noop_emit)
+        ),
+        daemon=True,
+    )
+
+    thread.start()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    [result] = outcomes
+    assert result.is_error
+    assert "not a regular file" in result.content
 
 
 def test_terminal_sink_renders_agent_text_without_rich_markup(
