@@ -15,28 +15,43 @@ command used.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
+import os
+import signal
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Protocol
+from typing import Annotated, BinaryIO, Protocol
 
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.text import Text
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from wmo.common.core.types import JsonObject
-    from wmo.common.providers.base import ToolCallingProvider
-    from wmo.common.vendor.waterfall import ChatRequest, ChatResponse
-    from wmo.runtime.harness.doc import HarnessDoc
-    from wmo.runtime.harness.live_session import LiveSession, SessionEvent, ToolOutcome
-    from wmo.runtime.harness.pi_local import LocalStdioChannel
-    from wmo.runtime.platform.client import PlatformClient
+import wmo.common.providers.registry as provider_registry
+import wmo.runtime.harness.live_session as live_session
+import wmo.runtime.harness.pi_local as pi_local
+import wmo.runtime.platform.client as platform_client
+import wmo.runtime.platform.credentials as platform_credentials
+from wmo.common.config import load_settings
+from wmo.common.core.types import JsonObject
+from wmo.common.providers.base import (
+    PreparableProvider,
+    ProviderConfig,
+    ProviderKind,
+    ToolCallingProvider,
+)
+from wmo.common.providers.models import model_types_for_provider, resolve_provider_model
+from wmo.common.vendor.waterfall import ChatRequest, ChatResponse
+from wmo.runtime.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
+from wmo.runtime.harness.live_session import SessionEvent, ToolOutcome
+from wmo.runtime.harness.pi_vendor import pi_agent_code_surfaces
+from wmo.runtime.harness.tools import READ_SKILL, resolve_tools
+from wmo.simulation.model.play import parse_action
 
 _console = Console()
 
@@ -51,12 +66,10 @@ class _JailEscape(RuntimeError):
     """A tool path resolved outside the session's working directory."""
 
 
-def _capped(content: str, *, is_error: bool = False) -> ToolOutcome:
+def _capped(content: str, *, is_error: bool = False, truncated: bool = False) -> ToolOutcome:
     """Cap tool output to the head+tail budget with a truncation marker."""
-    from wmo.runtime.harness.live_session import ToolOutcome
-
     if len(content) <= _TOOL_OUTPUT_CAP:
-        return ToolOutcome(content=content, is_error=is_error)
+        return ToolOutcome(content=content, is_error=is_error, truncated=truncated)
     half = _TOOL_OUTPUT_CAP // 2
     dropped = len(content) - _TOOL_OUTPUT_CAP
     capped = f"{content[:half]}\n... [{dropped} chars truncated] ...\n{content[-half:]}"
@@ -70,8 +83,6 @@ def _assemble(doc: HarnessDoc) -> tuple[str, list, dict[str, str], dict[str, str
     the resolved tool specs, the code surfaces as {path: content} (the agent's own
     code, materialized into the local runner), and skill bodies answered host-side.
     """
-    from wmo.runtime.harness.tools import READ_SKILL, resolve_tools
-
     tool_names = doc.tools()
     if doc.skills() and READ_SKILL.name not in tool_names:
         tool_names.append(READ_SKILL.name)
@@ -90,9 +101,6 @@ def _pi_node_baseline() -> HarnessDoc:
     pi code surfaces on and pins ``param:runtime-kind = pi-node`` so a not-logged-in
     session has a runnable agent without fetching a champion.
     """
-    from wmo.runtime.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
-    from wmo.runtime.harness.pi_vendor import pi_agent_code_surfaces
-
     base = HarnessDoc.baseline("local-session")
     surfaces = [
         *base.surfaces,
@@ -122,8 +130,6 @@ class LocalToolExecutor:
         self, name: str, args: JsonObject, emit: Callable[[str, str], None]
     ) -> ToolOutcome:
         """Execute one tool call locally; a failure is an observation, not a crash."""
-        from wmo.runtime.harness.live_session import ToolOutcome
-
         try:
             if name == "bash":
                 return self._bash(str(args.get("command", "")), emit)
@@ -144,35 +150,147 @@ class LocalToolExecutor:
 
     def _bash(self, command: str, emit: Callable[[str, str], None]) -> ToolOutcome:
         """Run a fresh ``bash -lc`` in the jail root, streaming output to ``emit``."""
+        stdout_buffer = _BoundedTextBuffer(_TOOL_OUTPUT_CAP)
+        stderr_buffer = _BoundedTextBuffer(_TOOL_OUTPUT_CAP)
+        emit_lock = threading.Lock()
+        process = subprocess.Popen(  # noqa: S603 - the agent's tool intentionally runs commands
+            ["bash", "-lc", command],  # noqa: S607 - bash on PATH is the documented contract
+            cwd=self._jail,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        # PIPE guarantees both handles. Keep the guard for type narrowing and defensive failure.
+        if process.stdout is None or process.stderr is None:  # pragma: no cover
+            process.kill()
+            raise RuntimeError("bash process did not expose stdout and stderr")
+        readers = (
+            threading.Thread(
+                target=_drain_process_stream,
+                args=(process.stdout, "stdout", stdout_buffer, emit, emit_lock),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_drain_process_stream,
+                args=(process.stderr, "stderr", stderr_buffer, emit, emit_lock),
+                daemon=True,
+            ),
+        )
+        for reader in readers:
+            reader.start()
+        timed_out = False
         try:
-            result = subprocess.run(  # noqa: S603 - the agent's tool is meant to run shell commands
-                ["bash", "-lc", command],  # noqa: S607 - bash on PATH is the documented contract
-                cwd=self._jail,
-                capture_output=True,
-                text=True,
-                timeout=_BASH_TIMEOUT_S,
-                check=False,
-            )
-            stdout, stderr, exit_code = result.stdout, result.stderr, result.returncode
-        except subprocess.TimeoutExpired as error:
-            stdout = _as_text(error.stdout)
-            stderr = _as_text(error.stderr) + f"\n[timed out after {int(_BASH_TIMEOUT_S)}s]"
+            exit_code = process.wait(timeout=_BASH_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_process_group(process)
             exit_code = 124
-        if stdout:
-            emit("stdout", stdout)
-        if stderr:
-            emit("stderr", stderr)
+        finally:
+            if process.poll() is None:
+                _kill_process_group(process)
+            process.wait()
+            for reader in readers:
+                reader.join()
+            process.stdout.close()
+            process.stderr.close()
+
+        if timed_out:
+            note = f"\n[timed out after {_BASH_TIMEOUT_S:g}s]"
+            stderr_buffer.append(note)
+            _emit_safely(emit, emit_lock, "stderr", note)
+        stdout = stdout_buffer.render()
+        stderr = stderr_buffer.render()
         body = stdout + stderr
         if exit_code != 0:
             body = f"{body}\n[exit {exit_code}]"
-        return _capped(body, is_error=exit_code != 0)
+        return _capped(
+            body,
+            is_error=exit_code != 0,
+            truncated=stdout_buffer.truncated or stderr_buffer.truncated,
+        )
 
 
-def _as_text(value: object) -> str:
-    """Coerce subprocess stdout/stderr (str | bytes | None) to text."""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value if isinstance(value, str) else ""
+class _BoundedTextBuffer:
+    """Keep only the head and tail of one process stream in bounded memory."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._head_limit = limit // 2
+        self._tail_limit = limit - self._head_limit
+        self._head = ""
+        self._tail = ""
+        self._total = 0
+
+    @property
+    def truncated(self) -> bool:
+        return self._total > self._limit
+
+    def append(self, chunk: str) -> None:
+        """Record a chunk without retaining more than ``limit`` characters."""
+        if not chunk:
+            return
+        self._total += len(chunk)
+        head_room = self._head_limit - len(self._head)
+        if head_room > 0:
+            self._head += chunk[:head_room]
+            chunk = chunk[head_room:]
+        if chunk and self._tail_limit:
+            self._tail = (self._tail + chunk)[-self._tail_limit :]
+
+    def render(self) -> str:
+        """Return the complete stream or a fixed-size head/tail rendering."""
+        if not self.truncated:
+            return self._head + self._tail
+        dropped = self._total - self._limit
+        marker = f"\n... [{dropped} chars truncated] ...\n"
+        payload = max(0, self._limit - len(marker))
+        head_size = payload // 2
+        tail_size = payload - head_size
+        return self._head[:head_size] + marker + self._tail[-tail_size:]
+
+
+def _drain_process_stream(
+    stream: BinaryIO,
+    stream_name: str,
+    output: _BoundedTextBuffer,
+    emit: Callable[[str, str], None],
+    emit_lock: threading.Lock,
+) -> None:
+    """Drain a byte pipe in small chunks while retaining only bounded decoded text."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while chunk := stream.read(4096):
+        text = decoder.decode(chunk)
+        output.append(text)
+        _emit_safely(emit, emit_lock, stream_name, text)
+    tail = decoder.decode(b"", final=True)
+    output.append(tail)
+    _emit_safely(emit, emit_lock, stream_name, tail)
+
+
+def _emit_safely(
+    emit: Callable[[str, str], None],
+    lock: threading.Lock,
+    stream: str,
+    chunk: str,
+) -> None:
+    """Serialize the two pipe-reader callbacks and keep draining if a sink fails."""
+    if not chunk:
+        return
+    with lock, contextlib.suppress(Exception):
+        emit(stream, chunk)
+
+
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Kill bash and its descendants so a timed-out pipeline cannot retain the pipes."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # Some app sandboxes allow setsid but deny killpg. Killing the group leader still
+        # terminates the ordinary single-command path and keeps timeout handling functional.
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
 
 
 class RunRecorder(Protocol):
@@ -188,7 +306,7 @@ class RunRecorder(Protocol):
 class LocalPiRunRecorder:
     """Finish and close an org-scoped built-in pi run; it has no transcript."""
 
-    def __init__(self, client: PlatformClient, org_id: str, run_id: str) -> None:
+    def __init__(self, client: platform_client.PlatformClient, org_id: str, run_id: str) -> None:
         self._client = client
         self._org_id = org_id
         self._run_id = run_id
@@ -202,10 +320,8 @@ class LocalPiRunRecorder:
 
     def finish(self, *, ended_reason: str, error: str | None) -> None:
         """Report the terminal state and release the HTTP client."""
-        from wmo.runtime.platform.client import PlatformError
-
         status = "failed" if error is not None else "ended"
-        with contextlib.suppress(PlatformError):
+        with contextlib.suppress(platform_client.PlatformError):
             self._client.finish_local_pi_run(
                 self._org_id,
                 self._run_id,
@@ -241,28 +357,31 @@ class TerminalEventSink:
         if event.kind == "assistant_message":
             text = str(payload.get("text", ""))
             if text:
-                _console.print(f"\n[bold cyan]agent[/bold cyan] {text}")
+                _console.print(Text.assemble("\n", ("agent", "bold cyan"), " ", text))
         elif event.kind == "tool_call":
-            _console.print(f"[dim]$ {payload.get('name', '')} {payload.get('arguments', '')}[/dim]")
+            call = f"$ {payload.get('name', '')} {payload.get('arguments', '')}"
+            _console.print(Text(call, style="dim"))
         elif event.kind == "tool_output":
             _console.print(str(payload.get("text", "")), end="", markup=False, highlight=False)
         elif event.kind == "tool_result":
             if payload.get("is_error"):
-                _console.print(f"[red]{payload.get('content', '')}[/red]")
+                _console.print(Text(str(payload.get("content", "")), style="red"))
         elif event.kind == "submit":
-            _console.print(f"\n[bold green]submitted[/bold green] {payload.get('answer', '')}")
+            answer = str(payload.get("answer", ""))
+            _console.print(Text.assemble("\n", ("submitted", "bold green"), " ", answer))
         elif event.kind == "state":
             status = str(payload.get("status", ""))
             self._on_running(status == "running")
-            _console.print(f"[dim]({status})[/dim]")
+            _console.print(Text(f"({status})", style="dim"))
         elif event.kind == "error":
-            _console.print(f"[red]error: {payload.get('message', '')}[/red]")
+            message = str(payload.get("message", ""))
+            _console.print(Text(f"error: {message}", style="red"))
 
 
 class StdinCommandReader(threading.Thread):
     """Feed typed stdin lines as steer/interrupt/end intents to the session."""
 
-    def __init__(self, session: LiveSession) -> None:
+    def __init__(self, session: live_session.LiveSession) -> None:
         """Read stdin on a daemon thread; the session's intents are thread-safe."""
         super().__init__(daemon=True)
         self._session = session
@@ -307,23 +426,20 @@ class LocalLiveDriver:
         self._recorder = recorder
         self._instruction = instruction
         self._executor = LocalToolExecutor(jail_root)
-        self._channel: LocalStdioChannel | None = None
+        self._channel: pi_local.LocalStdioChannel | None = None
         self._interrupts = 0
 
     def run(self) -> None:
         """Boot the local runner, drive the session, and always tear down."""
-        from wmo.runtime.harness.live_session import LiveSession
-        from wmo.runtime.harness.pi_local import start_local_live_runner
-
         system, tool_specs, files, skill_bodies = _assemble(self._doc)
         _console.print("[dim]starting the built-in pi harness locally...[/dim]")
-        session: LiveSession | None = None
+        session: live_session.LiveSession | None = None
         reason = "user_ended"
         error: str | None = None
         try:
-            channel = start_local_live_runner()
+            channel = pi_local.start_local_live_runner()
             self._channel = channel
-            session = LiveSession(
+            session = live_session.LiveSession(
                 channel,
                 tools=tool_specs,
                 execute_tool=self._execute,
@@ -356,7 +472,7 @@ class LocalLiveDriver:
         except Exception as exc:  # noqa: BLE001 - report any driver failure, then tear down
             error = str(exc)
             reason = "error"
-            _console.print(f"[red]session failed: {exc}[/red]")
+            _console.print(Text(f"session failed: {exc}", style="red"))
         finally:
             self._teardown(session, reason=reason, error=error)
         if error is not None:
@@ -368,7 +484,7 @@ class LocalLiveDriver:
         """Run one tool locally (each tool blocks the session pump)."""
         return self._executor(name, args, emit)
 
-    def _loop(self, session: LiveSession, stdin_eof: threading.Event) -> None:
+    def _loop(self, session: live_session.LiveSession, stdin_eof: threading.Event) -> None:
         """Pump until closed, treating closed stdin as one-shot after ``--task``."""
         last_tick = 0.0
         saw_running = False
@@ -392,7 +508,7 @@ class LocalLiveDriver:
                 if self._recorder is not None:
                     self._recorder.flush()
 
-    def _handle_sigint(self, session: LiveSession) -> None:
+    def _handle_sigint(self, session: live_session.LiveSession) -> None:
         """First Ctrl-C interrupts the current turn; a second ends the session."""
         self._interrupts += 1
         if self._interrupts == 1:
@@ -402,7 +518,13 @@ class LocalLiveDriver:
             _console.print("\n[yellow]ending session[/yellow]")
             session.end()
 
-    def _teardown(self, session: LiveSession | None, *, reason: str, error: str | None) -> None:
+    def _teardown(
+        self,
+        session: live_session.LiveSession | None,
+        *,
+        reason: str,
+        error: str | None,
+    ) -> None:
         if session is not None and not session.closed:
             with contextlib.suppress(Exception):
                 session.end()
@@ -417,7 +539,13 @@ class LocalLiveDriver:
 class RemoteWorldModelDriver:
     """Interactive terminal loop over the platform's world-model session API."""
 
-    def __init__(self, client: PlatformClient, target_id: str, name: str, task: str | None) -> None:
+    def __init__(
+        self,
+        client: platform_client.PlatformClient,
+        target_id: str,
+        name: str,
+        task: str | None,
+    ) -> None:
         """Store the resolved target and opening task."""
         self._client = client
         self._target_id = target_id
@@ -426,30 +554,25 @@ class RemoteWorldModelDriver:
 
     def run(self) -> None:
         """Create one hosted session and step it until the user exits."""
-        from wmo.runtime.platform.client import PlatformError
-
         try:
             session = self._client.create_world_model_session(self._target_id, task=self._task)
             _console.print(
                 Panel(
                     'Type an action such as [cyan]search {"q": "SFO"}[/cyan], '
                     "or a free-text message. Commands: [cyan]:help[/cyan], [cyan]:quit[/cyan].",
-                    title=f"[bold]running world model[/bold] {self._name}",
-                    subtitle=f"task: {self._task}" if self._task else "no task set",
+                    title=Text.assemble(("running world model", "bold"), " ", self._name),
+                    subtitle=Text(f"task: {self._task}" if self._task else "no task set"),
                     border_style="cyan",
                 )
             )
             self._loop(session.id)
-        except PlatformError as error:
+        except platform_client.PlatformError as error:
             raise typer.BadParameter(str(error)) from error
         finally:
             self._client.close()
 
     def _loop(self, session_id: str) -> None:
         """Read actions and render hosted observations."""
-        from wmo.runtime.platform.client import PlatformError
-        from wmo.simulation.model.play import parse_action
-
         while True:
             try:
                 line = _console.input("[bold]agent>[/bold] ").strip()
@@ -476,19 +599,21 @@ class RemoteWorldModelDriver:
             try:
                 action = parse_action(line)
             except ValueError as error:
-                _console.print(f"[red]parse error[/red]: {error}")
+                _console.print(Text(f"parse error: {error}", style="red"))
                 continue
             try:
                 with _console.status("[dim]world model thinking...[/dim]", spinner="dots"):
                     observation = self._client.step_world_model_session(session_id, action)
-            except PlatformError as error:
-                _console.print(f"[red]step failed[/red]: {error}")
+            except platform_client.PlatformError as error:
+                _console.print(Text(f"step failed: {error}", style="red"))
                 continue
             style = "red" if observation.is_error else "green"
             title = "error" if observation.is_error else "observation"
             _console.print(
                 Panel(
-                    observation.content or "[dim](empty)[/dim]",
+                    Text(observation.content)
+                    if observation.content
+                    else Text("(empty)", style="dim"),
                     title=title,
                     border_style=style,
                 )
@@ -512,16 +637,6 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
         typer.BadParameter: The provider name is unknown, the model cannot do tool calling, or
             the backend cannot be prepared. Every message names `wmo providers set`.
     """
-    from wmo.common.config import load_settings
-    from wmo.common.providers.base import (
-        PreparableProvider,
-        ProviderConfig,
-        ProviderKind,
-        ToolCallingProvider,
-    )
-    from wmo.common.providers.models import model_types_for_provider, resolve_provider_model
-    from wmo.common.providers.registry import get_provider
-
     configured = load_settings().models.resolve("worker")
     provider_name = provider or (
         configured.provider if configured is not None else _DEFAULT_PROVIDER
@@ -549,7 +664,7 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
         model_name = catalog[0]
     spec = resolve_provider_model(kind, model_name)
     use_configured_knobs = configured is not None and configured.provider == kind.value
-    built = get_provider(
+    built = provider_registry.get_provider(
         ProviderConfig(
             kind=kind,
             model_type=spec.model_type,
@@ -570,7 +685,7 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
     source = "settings models.worker" if configured is not None else "built-in default"
     if provider is not None or model is not None:
         source = "--provider/--model"
-    _console.print(f"[dim]worker: {kind.value}/{spec.model_id} ({source})[/dim]")
+    _console.print(Text(f"worker: {kind.value}/{spec.model_id} ({source})", style="dim"))
     if isinstance(built, PreparableProvider):
         try:
             built.prepare()
@@ -671,10 +786,7 @@ def _build_driver(
     confirm_local: Callable[[], None] | None = None,
 ) -> LocalLiveDriver | RemoteWorldModelDriver:
     """Resolve the execution kind once and assemble its driver."""
-    from wmo.runtime.platform.client import PlatformClient, PlatformError
-    from wmo.runtime.platform.credentials import load_credentials
-
-    credentials = load_credentials()
+    credentials = platform_credentials.load_credentials()
     logged_in = credentials.is_complete()
 
     if target is None:
@@ -702,14 +814,14 @@ def _build_driver(
             )
         if confirm_local is not None:
             confirm_local()
-        client = PlatformClient(str(credentials.api_url), str(credentials.token))
+        client = platform_client.PlatformClient(str(credentials.api_url), str(credentials.token))
         try:
             org_id = _default_org(client, credentials.default_org)
             run = client.create_local_pi_run(org_id)
         except typer.BadParameter:
             client.close()
             raise
-        except PlatformError as error:
+        except platform_client.PlatformError as error:
             client.close()
             raise typer.BadParameter(str(error)) from error
         recorder = LocalPiRunRecorder(client, org_id, run.id)
@@ -735,7 +847,7 @@ def _build_driver(
             "platform target runs use platform credentials; --provider/--model are not accepted"
         )
 
-    client = PlatformClient(str(credentials.api_url), str(credentials.token))
+    client = platform_client.PlatformClient(str(credentials.api_url), str(credentials.token))
     try:
         resolved = client.resolve_run_target(target)
         if resolved.kind == "world_model":
@@ -745,12 +857,12 @@ def _build_driver(
             "hosted agent sessions are unavailable because the platform no longer exposes "
             "their session API; omit the id to run the built-in pi harness locally"
         )
-    except PlatformError as error:
+    except platform_client.PlatformError as error:
         client.close()
         raise typer.BadParameter(str(error)) from error
 
 
-def _default_org(client: PlatformClient, configured: str | None) -> str:
+def _default_org(client: platform_client.PlatformClient, configured: str | None) -> str:
     """Resolve the login's organization, auto-picking only an unambiguous sole org."""
     if configured is not None:
         return configured

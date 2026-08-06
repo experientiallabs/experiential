@@ -8,6 +8,7 @@ import io
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -76,6 +77,40 @@ def test_executor_bash_runs_in_jail_and_reports_exit(tmp_path: Path) -> None:
     assert "[exit 3]" in failed.content
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="LocalToolExecutor bash needs a Unix shell")
+def test_executor_bash_streams_chunks_and_retains_bounded_output(tmp_path: Path) -> None:
+    chunks: list[tuple[str, str]] = []
+
+    result = mod.LocalToolExecutor(tmp_path)(
+        "bash",
+        {"command": "printf '%050000d' 0"},
+        lambda stream, chunk: chunks.append((stream, chunk)),
+    )
+
+    assert not result.is_error
+    assert result.truncated
+    assert len(result.content) <= mod._TOOL_OUTPUT_CAP
+    assert len(chunks) > 1
+    assert max(len(chunk) for _stream, chunk in chunks) <= 4096
+    assert sum(len(chunk) for _stream, chunk in chunks) == 50_000
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="LocalToolExecutor bash needs a Unix shell")
+def test_executor_bash_kills_the_process_group_on_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "_BASH_TIMEOUT_S", 0.05)
+
+    started = time.monotonic()
+    result = mod.LocalToolExecutor(tmp_path)("bash", {"command": "sleep 5"}, _noop_emit)
+
+    assert time.monotonic() - started < 2
+    assert result.is_error
+    assert "timed out after 0.05s" in result.content
+    assert "[exit 124]" in result.content
+
+
 def test_executor_caps_large_output(tmp_path: Path) -> None:
     (tmp_path / "big.txt").write_text(
         "x" * (mod._TOOL_OUTPUT_CAP + 500),
@@ -86,6 +121,20 @@ def test_executor_caps_large_output(tmp_path: Path) -> None:
 
     assert result.truncated
     assert "chars truncated" in result.content
+
+
+def test_terminal_sink_renders_agent_text_without_rich_markup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    console = Console(file=io.StringIO(), width=200, color_system=None)
+    monkeypatch.setattr(mod, "_console", console)
+    text = "Keep list[str], [a link](https://example.test), and [/items] literal."
+
+    mod.TerminalEventSink(recorder=None, on_running=lambda _running: None)(
+        SessionEvent(kind="assistant_message", payload={"text": text})
+    )
+
+    assert text in cast("io.StringIO", console.file).getvalue()
 
 
 class _FakeProvider:
