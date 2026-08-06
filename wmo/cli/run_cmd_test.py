@@ -350,6 +350,29 @@ def test_platform_target_rejects_local_provider_before_resolution(
         )
 
 
+def test_logged_in_bare_run_rejects_local_provider_before_consent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credentials = PlatformCredentials(api_url="https://api.test", token="xpl_test")
+    monkeypatch.setattr(
+        "wmo.runtime.platform.credentials.load_credentials",
+        lambda: credentials,
+    )
+    prompted: list[bool] = []
+
+    with pytest.raises(typer.BadParameter, match="logged-in runs use platform credentials"):
+        mod._build_driver(
+            target=None,
+            jail_root=Path.cwd(),
+            provider="openai",
+            model=None,
+            task=None,
+            confirm_local=lambda: prompted.append(True),
+        )
+
+    assert prompted == []
+
+
 def test_run_command_dispatches_bare_path_after_consent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

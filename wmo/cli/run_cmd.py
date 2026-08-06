@@ -666,9 +666,9 @@ def _build_driver(
     if target is None:
         if jail_root is None:
             raise typer.BadParameter("a working directory is required for the built-in pi harness")
-        if confirm_local is not None:
-            confirm_local()
         if not logged_in:
+            if confirm_local is not None:
+                confirm_local()
             _console.print(
                 "[dim]not logged in: running the built-in baseline agent with local "
                 "credentials[/dim]"
@@ -686,6 +686,8 @@ def _build_driver(
                 "logged-in runs use platform credentials; omit --provider/--model, "
                 "or run wmo logout to use local credentials"
             )
+        if confirm_local is not None:
+            confirm_local()
         client = PlatformClient(str(credentials.api_url), str(credentials.token))
         try:
             org_id = _default_org(client, credentials.default_org)
