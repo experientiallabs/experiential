@@ -106,6 +106,28 @@ def test_start_surfaces_the_runner_construction_error() -> None:
         session.start()
 
 
+def test_channel_type_error_is_not_retried_as_a_second_receive() -> None:
+    class BrokenChannel:
+        def __init__(self) -> None:
+            self.receives = 0
+
+        def send(self, frame: JsonObject) -> None:
+            _ = frame
+
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            _ = timeout
+            self.receives += 1
+            raise TypeError("decoder bug")
+
+    channel = BrokenChannel()
+    session = LiveSession(channel, tools=[], execute_tool=_no_tool, on_event=lambda event: None)
+
+    with pytest.raises(RuntimeError, match="decoder bug"):
+        session.start()
+
+    assert channel.receives == 1
+
+
 def test_full_turn_emits_ordered_events_and_answers_frames() -> None:
     events: list[SessionEvent] = []
     channel = ScriptedChannel(
@@ -205,11 +227,48 @@ def test_interrupt_sends_abort_frame() -> None:
         reset_cancel=lambda: resets.append(True),
     )
     session.start()
+    session.send_user_message("go")
     session.interrupt()
     session.pump(timeout=0)
     assert any(f["type"] == "abort" and f["reason"] == "user_interrupt" for f in channel.sent)
     assert cancelled == [True]
     assert resets == [True, True]  # initial ready state, then the aborted turn boundary
+
+
+def test_interrupt_while_idle_is_ignored_and_does_not_poison_the_next_turn() -> None:
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "state", "status": "running"},
+            {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
+            {"type": "state", "status": "idle", "reason": "completed"},
+        ]
+    )
+    cancelled: list[bool] = []
+    ran: list[str] = []
+
+    def execute(name: str, args: JsonObject, emit) -> ToolOutcome:  # noqa: ANN001
+        ran.append(name)
+        return ToolOutcome(content="ok")
+
+    session = LiveSession(
+        channel,
+        tools=[BASH],
+        execute_tool=execute,
+        on_event=lambda event: None,
+        cancel_active=lambda: cancelled.append(True),
+    )
+    session.start()
+    session.interrupt()
+    session.send_user_message("go")
+    _drain(session)
+
+    assert cancelled == []
+    assert not any(frame["type"] == "abort" for frame in channel.sent)
+    assert ran == ["bash"]
+    response = next(frame for frame in channel.sent if frame["type"] == "tool_response")
+    assert response["content"] == "ok"
+    assert response["is_error"] is False
 
 
 def test_end_sends_abort_then_shutdown_and_closes() -> None:
@@ -369,6 +428,7 @@ def test_interrupt_releases_a_blocking_worker_request() -> None:
         worker_fn=worker,
     )
     session.start()
+    session.send_user_message("go")
     pump = threading.Thread(target=session.pump)
     pump.start()
     assert started.wait(1)
@@ -428,6 +488,7 @@ def test_interrupt_suppresses_a_racing_submit_event() -> None:
     events: list[SessionEvent] = []
     session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
     session.start()
+    session.send_user_message("go")
     events.clear()
     session.interrupt()  # user hits Stop while the submit is racing
     _drain(session)
@@ -450,8 +511,11 @@ def test_submit_after_state_boundary_is_not_suppressed() -> None:
     events: list[SessionEvent] = []
     session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
     session.start()
+    session.send_user_message("first")
     session.interrupt()
     events.clear()
+    session.pump(timeout=0)  # consume the aborted turn's idle boundary
+    session.send_user_message("second")
     _drain(session)
     assert any(e.kind == "submit" for e in events)
 
@@ -469,6 +533,7 @@ def test_stale_submit_after_a_quick_next_message_is_still_suppressed() -> None:
     events: list[SessionEvent] = []
     session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
     session.start()
+    session.send_user_message("first")
     session.interrupt()
     session.send_user_message("do the next thing")  # queued before the stale submit is read
     events.clear()
@@ -489,6 +554,7 @@ def test_running_state_does_not_clear_the_abort_gate() -> None:
     events: list[SessionEvent] = []
     session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
     session.start()
+    session.send_user_message("go")
     session.interrupt()
     events.clear()
     _drain(session)
@@ -511,6 +577,7 @@ def test_aborting_skips_real_tool_execution() -> None:
 
     session = LiveSession(channel, tools=[BASH], execute_tool=execute, on_event=lambda e: None)
     session.start()
+    session.send_user_message("go")
     session.interrupt()  # user hits Stop while a bash request is already queued
     _drain(session)
     assert ran == []  # the tool never executed against the live sandbox

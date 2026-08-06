@@ -58,6 +58,7 @@ _console = Console()
 
 _TOOL_OUTPUT_CAP = 16_000
 _BASH_TIMEOUT_S = 300.0
+_PIPE_DRAIN_TIMEOUT_S = 0.25
 _TICK_S = 5.0
 _DEFAULT_PROVIDER = "bedrock"
 _DEFAULT_MODEL = "claude-opus-4-8"
@@ -186,15 +187,30 @@ class LocalToolExecutor:
             self._active_process = process
         if self._cancelled.is_set():
             _kill_process_group(process)
+        reader_stop = threading.Event()
         readers = (
             threading.Thread(
                 target=_drain_process_stream,
-                args=(process.stdout, "stdout", stdout_buffer, emit, emit_lock),
+                args=(
+                    process.stdout,
+                    "stdout",
+                    stdout_buffer,
+                    emit,
+                    emit_lock,
+                    reader_stop,
+                ),
                 daemon=True,
             ),
             threading.Thread(
                 target=_drain_process_stream,
-                args=(process.stderr, "stderr", stderr_buffer, emit, emit_lock),
+                args=(
+                    process.stderr,
+                    "stderr",
+                    stderr_buffer,
+                    emit,
+                    emit_lock,
+                    reader_stop,
+                ),
                 daemon=True,
             ),
         )
@@ -215,10 +231,17 @@ class LocalToolExecutor:
             # Re-signal after the leader exits so no just-forked descendant retains the pipes.
             if timed_out or self._cancelled.is_set():
                 _kill_process_group(process)
-            for reader in readers:
-                reader.join()
-            process.stdout.close()
-            process.stderr.close()
+            readers_stopped = _join_process_readers(readers, _PIPE_DRAIN_TIMEOUT_S)
+            if not readers_stopped:
+                # A background child can outlive bash while inheriting its stdout/stderr. Do not
+                # let that keep the tool call open: kill the exact process group, then ask the
+                # nonblocking readers to stop even if a detached descendant still owns a pipe.
+                _kill_process_group(process)
+                reader_stop.set()
+                readers_stopped = _join_process_readers(readers, _PIPE_DRAIN_TIMEOUT_S)
+            if readers_stopped:
+                process.stdout.close()
+                process.stderr.close()
             with self._process_lock:
                 if self._active_process is process:
                     self._active_process = None
@@ -286,17 +309,35 @@ def _drain_process_stream(
     output: _BoundedTextBuffer,
     emit: Callable[[str, str], None],
     emit_lock: threading.Lock,
+    stop: threading.Event,
 ) -> None:
-    """Drain a byte pipe in small chunks while retaining only bounded decoded text."""
+    """Drain a byte pipe without blocking forever on a descendant that inherited it."""
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    read: Callable[[int], bytes] = getattr(stream, "read1", stream.read)
-    while chunk := read(4096):
-        text = decoder.decode(chunk)
-        output.append(text)
-        _emit_safely(emit, emit_lock, stream_name, text)
+    os.set_blocking(stream.fileno(), False)
+    while not stop.is_set():
+        try:
+            chunk = os.read(stream.fileno(), 4096)
+        except BlockingIOError:
+            stop.wait(0.01)
+            continue
+        except OSError:
+            break
+        if not chunk:
+            break
+        decoded = decoder.decode(chunk)
+        output.append(decoded)
+        _emit_safely(emit, emit_lock, stream_name, decoded)
     tail = decoder.decode(b"", final=True)
     output.append(tail)
     _emit_safely(emit, emit_lock, stream_name, tail)
+
+
+def _join_process_readers(readers: tuple[threading.Thread, ...], timeout: float) -> bool:
+    """Give all pipe readers one shared bounded interval to finish."""
+    deadline = time.monotonic() + timeout
+    for reader in readers:
+        reader.join(timeout=max(0.0, deadline - time.monotonic()))
+    return not any(reader.is_alive() for reader in readers)
 
 
 def _emit_safely(
@@ -725,6 +766,27 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
     deployment = configured.deployment if use_configured_knobs else None
     api_version = configured.api_version if use_configured_knobs else None
     if kind is ProviderKind.AZURE_OPENAI:
+        configured_spec = (
+            resolve_provider_model(kind, configured.model) if use_configured_knobs else None
+        )
+        model_changed = (
+            model is not None
+            and configured_spec is not None
+            and configured_spec.model_id != spec.model_id
+        )
+        if (
+            model_changed
+            and configured is not None
+            and deployment is not None
+            and deployment not in (spec.model_type, spec.model_id)
+        ):
+            raise typer.BadParameter(
+                f"the configured azure worker serves {configured.model} from deployment "
+                f"{deployment!r}, and on Azure the deployment name is what is actually invoked, "
+                f"so --model {spec.model_type} needs the deployment that serves it. Run "
+                f"`wmo providers set --provider azure --model {spec.model_type} "
+                f"--deployment <deployment>` to point the worker role at it."
+            )
         deployment = deployment or spec.model_type
         api_version = api_version or DEFAULT_AZURE_API_VERSION
     built = provider_registry.get_provider(

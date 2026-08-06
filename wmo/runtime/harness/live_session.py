@@ -47,7 +47,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast
+from typing import Literal, cast
 
 from pydantic import JsonValue
 
@@ -121,10 +121,12 @@ class _OperationInterrupted(RuntimeError):
 class _UserMessage:
     text: str
     msg_id: str
+    generation: int
 
 
 @dataclass
 class _Interrupt:
+    generation: int
     reason: str = "user_interrupt"
 
 
@@ -208,6 +210,9 @@ class LiveSession:
         self._failure_message: str | None = None
         self._actions_this_turn = 0
         self._aborting = False
+        self._turn_lock = threading.Lock()
+        self._turn_generation = 0
+        self._turn_active = False
         self._pending_ping: str | None = None
         self.worker_usage = TokenUsage()
 
@@ -263,13 +268,22 @@ class LiveSession:
     def send_user_message(self, text: str) -> str:
         """Queue a user message; returns the msg_id echoed on its `user_message` event."""
         msg_id = uuid.uuid4().hex
-        self._inbox.put(_UserMessage(text=text, msg_id=msg_id))
+        with self._turn_lock:
+            if not self._turn_active:
+                self._turn_generation += 1
+            self._turn_active = True
+            generation = self._turn_generation
+        self._inbox.put(_UserMessage(text=text, msg_id=msg_id, generation=generation))
         return msg_id
 
     def interrupt(self, reason: str = "user_interrupt") -> None:
         """Queue an interrupt: abort the current run (does not end the session)."""
+        with self._turn_lock:
+            if not self._turn_active:
+                return
+            generation = self._turn_generation
         self._request_cancel()
-        self._inbox.put(_Interrupt(reason=reason))
+        self._inbox.put(_Interrupt(generation=generation, reason=reason))
 
     def flush_pending_intents(self) -> None:
         """Send queued controls without consuming another runner frame.
@@ -316,6 +330,13 @@ class LiveSession:
             except queue.Empty:
                 return
             if isinstance(intent, _UserMessage):
+                with self._turn_lock:
+                    # An idle boundary may race ahead of an already queued message. Preserve the
+                    # input as a fresh prompt rather than dropping it; its generation still lets
+                    # a stale interrupt queued before it be distinguished from one queued after.
+                    if not self._turn_active:
+                        self._turn_active = True
+                        self._turn_generation = max(self._turn_generation, intent.generation)
                 self._actions_this_turn = 0
                 # NB: do not clear `_aborting` here - a new message can be drained before
                 # the cancelled turn's in-flight submit frame is read, and clearing now
@@ -326,6 +347,12 @@ class LiveSession:
                     {"type": "user_message", "msg_id": intent.msg_id, "text": intent.text}
                 )
             elif isinstance(intent, _Interrupt):
+                with self._turn_lock:
+                    targets_active_turn = (
+                        self._turn_active and intent.generation == self._turn_generation
+                    )
+                if not targets_active_turn:
+                    continue
                 # Mark the current turn as aborting so a `submit` tool_request that was
                 # already in flight when the interrupt fired does not emit a final submit
                 # event: the host, not the runner, owns event emission, so this gate is
@@ -459,6 +486,13 @@ class LiveSession:
         status = frame.get("status")
         if isinstance(status, str):
             self._status = status
+        with self._turn_lock:
+            if self._status == "running":
+                if not self._turn_active:
+                    self._turn_generation += 1
+                self._turn_active = True
+            elif self._status == "idle":
+                self._turn_active = False
         # Only the terminal `idle` frame is the cancelled turn's true boundary. The
         # runner emits `state:running` at each prompt start; clearing on that (or any
         # non-idle frame) could re-enable submit emission while the turn is still
@@ -576,17 +610,8 @@ class LiveSession:
 
 
 def _recv_with_timeout(channel: Channel, timeout: float | None) -> JsonObject | None:
-    """Call `channel.recv`, passing `timeout` when the channel supports it (E2BStdioChannel does).
-
-    The bare `Channel` protocol has a no-arg `recv`; the E2B channel accepts an optional timeout so
-    the pump can wake to flush the inbox even while the runner is thinking. A channel without the
-    parameter blocks - acceptable for in-process test doubles that always have a frame ready.
-    """
-    recv: Any = channel.recv
-    try:
-        return cast("JsonObject | None", recv(timeout))
-    except TypeError:
-        return cast("JsonObject | None", recv())
+    """Receive one frame through the typed timeout-aware `Channel` protocol."""
+    return channel.recv(timeout)
 
 
 @dataclass

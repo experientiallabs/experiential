@@ -67,6 +67,7 @@ JSONL. The two formats are not interchangeable.
 
 | Command | Purpose | Artifact |
 |---|---|---|
+| `wmo run [world-model-id]` | With no target, run the built-in pi agent against a selected local directory. With a hosted world-model ID, open its interactive simulation session. Hosted agent IDs are currently unsupported. | nothing locally; logged-in local runs leave a platform usage record |
 | `wmo login` / `logout` / `status` | Connect this machine to a platform account, disconnect, or show the current account and organizations. | a saved credential |
 | `wmo push` / `pull` | Publish a local world model to the platform registry, or fetch a model or endpoint state from it. | a registry entry, or a local artifact dir |
 | `reproduce list` / `run <benchmark>` (moved to the [research repo](https://github.com/experientiallabs/research)) | Reproduce a published benchmark result from its shipped manifest: download the pinned data, replay the pinned protocol, and compare every published number field by field. `matrix` manifests run offline and bit-exact; `commands` manifests replay live CLI steps, state their estimated spend, and refuse without `--yes`. Exit 0 is REPRODUCED, 4 is DIVERGED. | `verdict.json` plus the run's own artifacts |

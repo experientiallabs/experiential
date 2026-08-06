@@ -112,6 +112,21 @@ def test_executor_bash_kills_the_process_group_on_timeout(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="LocalToolExecutor bash needs a Unix shell")
+def test_executor_bash_does_not_wait_for_a_background_child_holding_its_pipes(
+    tmp_path: Path,
+) -> None:
+    started = time.monotonic()
+
+    result = mod.LocalToolExecutor(tmp_path)(
+        "bash", {"command": "sleep 5 & printf done"}, _noop_emit
+    )
+
+    assert time.monotonic() - started < 2
+    assert not result.is_error
+    assert result.content == "done"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="LocalToolExecutor bash needs a Unix shell")
 def test_executor_cancel_stops_an_active_bash_command(tmp_path: Path) -> None:
     executor = mod.LocalToolExecutor(tmp_path)
     started = threading.Event()
@@ -365,6 +380,50 @@ def test_build_driver_azure_override_supplies_required_azure_defaults(
     assert config.model == "gpt-5.5"
     assert config.deployment == "gpt-5.5"
     assert config.api_version == mod.DEFAULT_AZURE_API_VERSION
+
+
+def test_build_driver_azure_model_override_rejects_a_stale_configured_deployment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(
+                worker=ModelRole(
+                    provider="azure",
+                    model="gpt-5.4",
+                    endpoint="https://azure.example/v1",
+                    deployment="prod-54-canary",
+                )
+            )
+        ),
+        tmp_path / ".wmo",
+    )
+    monkeypatch.setattr(
+        "wmo.runtime.platform.credentials.load_credentials",
+        PlatformCredentials,
+    )
+    configs: list[ProviderConfig] = []
+    monkeypatch.setattr(
+        "wmo.common.providers.registry.get_provider",
+        lambda config: configs.append(config) or _FakeProvider(),
+    )
+
+    with pytest.raises(typer.BadParameter) as excinfo:
+        mod._build_driver(
+            target=None,
+            jail_root=tmp_path,
+            provider=None,
+            model="gpt-5.5",
+            task=None,
+        )
+
+    assert "prod-54-canary" in str(excinfo.value)
+    assert "wmo providers set --provider azure --model gpt-5.5 --deployment <deployment>" in str(
+        excinfo.value
+    )
+    assert configs == []
 
 
 def test_build_driver_logged_in_bare_run_uses_platform_proxy(
