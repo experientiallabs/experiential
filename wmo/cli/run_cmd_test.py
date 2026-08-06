@@ -768,6 +768,7 @@ class _FakeReader:
     """A stdin reader that never touches stdin."""
 
     def __init__(self, _session: object) -> None:
+        self.last_message_id: str | None = None
         self.eof = threading.Event()
 
     def start(self) -> None:
@@ -794,6 +795,7 @@ def test_stdin_reader_queues_a_piped_turn_before_eof(
     reader.run()
 
     assert session.messages == ["fix the tests"]
+    assert reader.last_message_id == "msg-1"
     assert reader.eof.is_set()
 
 
@@ -837,7 +839,7 @@ def test_local_driver_treats_an_empty_task_as_no_opening_turn_at_eof() -> None:
         def __init__(self) -> None:
             self.closed = False
             self.status = "idle"
-            self.turn_active = False
+            self.last_completed_message_id: str | None = None
             self.pumps = 0
             self.ends = 0
 
@@ -863,24 +865,30 @@ def test_local_driver_treats_an_empty_task_as_no_opening_turn_at_eof() -> None:
         instruction="",
     )
     session = _IdleSession()
-    stdin_eof = threading.Event()
-    stdin_eof.set()
+    reader = _FakeReader(None)
+    reader.eof.set()
 
-    driver._loop(cast("mod.live_session.LiveSession", session), stdin_eof)
+    driver._loop(
+        cast("mod.live_session.LiveSession", session),
+        cast("mod.StdinCommandReader", reader),
+        None,
+    )
 
     assert driver._instruction is None
     assert session.ends == 1
 
 
 def test_local_driver_drains_a_delayed_piped_turn_before_eof_shutdown() -> None:
-    stdin_eof = threading.Event()
+    reader = _FakeReader(None)
+    reader.last_message_id = "second"
+    reader.eof.set()
 
     class _DelayedPipedTurnSession:
         def __init__(self) -> None:
             self.closed = False
             self.status = "running"
-            self.turn_active = True
-            self.pending_messages = 0
+            self.last_completed_message_id: str | None = None
+            self.pending_messages = 1
             self.pumps = 0
             self.flushes = 0
             self.ends = 0
@@ -890,24 +898,20 @@ def test_local_driver_drains_a_delayed_piped_turn_before_eof_shutdown() -> None:
             self.pumps += 1
             assert self.pumps <= 3, "the piped turn must end after returning to idle"
             if self.pumps == 1:
-                # The reader queues a second line after this pump drained intents but before it
-                # receives the first turn's idle frame, then publishes EOF.
-                self.pending_messages = 1
-                stdin_eof.set()
+                # This pump drains and sends the second line, then consumes the already-buffered
+                # idle frame for the first line. Only the message id distinguishes that stale idle.
+                self.pending_messages = 0
                 self.status = "idle"
-                self.turn_active = False
+                self.last_completed_message_id = "first"
             elif self.pumps == 2:
                 self.status = "running"
             elif self.pumps == 3:
                 self.status = "idle"
-                self.turn_active = False
+                self.last_completed_message_id = "second"
             return True
 
         def flush_pending_intents(self) -> None:
             self.flushes += 1
-            if self.pending_messages:
-                self.pending_messages = 0
-                self.turn_active = True
 
         def end(self) -> None:
             self.ends += 1
@@ -923,7 +927,11 @@ def test_local_driver_drains_a_delayed_piped_turn_before_eof_shutdown() -> None:
     )
     session = _DelayedPipedTurnSession()
 
-    driver._loop(cast("mod.live_session.LiveSession", session), stdin_eof)
+    driver._loop(
+        cast("mod.live_session.LiveSession", session),
+        cast("mod.StdinCommandReader", reader),
+        None,
+    )
 
     assert session.pumps == 3
     assert session.flushes == 3

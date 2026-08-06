@@ -401,6 +401,7 @@ class Session {
 	private conversationScope: "session" | "turn" = "session";
 	private interrupted = false;
 	private hitTurnCap = false;
+	private lastMessageId: string | undefined;
 
 	constructor(conn: StdioConn) {
 		this.conn = conn;
@@ -504,6 +505,8 @@ class Session {
 	handleUserMessage(frame: Frame): void {
 		const text = String(frame.text ?? "");
 		if (!this.agent) return;
+		const messageId = frame.msg_id;
+		if (typeof messageId === "string") this.lastMessageId = messageId;
 		if (this.running) {
 			this.agent.steer(userMessage(text));
 			return;
@@ -554,6 +557,7 @@ class Session {
 	private sendState(status: "idle" | "running", reason?: string): void {
 		const frame: Frame = { type: "state", status, turns: this.turns };
 		if (reason) frame.reason = reason;
+		if (this.lastMessageId) frame.msg_id = this.lastMessageId;
 		this.conn.send(frame);
 	}
 }

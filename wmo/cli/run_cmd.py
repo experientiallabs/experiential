@@ -52,7 +52,7 @@ from wmo.runtime.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, Surfac
 from wmo.runtime.harness.live_session import SessionEvent, ToolOutcome
 from wmo.runtime.harness.pi_vendor import pi_agent_code_surfaces
 from wmo.runtime.harness.runner_link import provider_context_window
-from wmo.runtime.harness.tools import READ_SKILL, resolve_tools
+from wmo.runtime.harness.tools import READ_SKILL, ToolSpec, resolve_tools
 from wmo.simulation.model.play import parse_action
 
 _console = Console()
@@ -79,7 +79,7 @@ def _capped(content: str, *, is_error: bool = False, truncated: bool = False) ->
     return ToolOutcome(content=capped, is_error=is_error, truncated=True)
 
 
-def _assemble(doc: HarnessDoc) -> tuple[str, list, dict[str, str], dict[str, str]]:
+def _assemble(doc: HarnessDoc) -> tuple[str, list[ToolSpec], dict[str, str], dict[str, str]]:
     """Derive the LiveSession inputs from a HarnessDoc (mirrors the hosted driver).
 
     Returns the assembled system prompt (prompt + rendered tools + skills index),
@@ -476,6 +476,7 @@ class StdinCommandReader(threading.Thread):
         """Read stdin on a daemon thread; the session's intents are thread-safe."""
         super().__init__(daemon=True)
         self._session = session
+        self.last_message_id: str | None = None
         self.eof = threading.Event()
 
     def run(self) -> None:
@@ -490,7 +491,7 @@ class StdinCommandReader(threading.Thread):
             if line == ":stop":
                 self._session.interrupt()
             elif line:
-                self._session.send_user_message(line)
+                self.last_message_id = self._session.send_user_message(line)
         # The driver owns EOF handling. It must wait until any submitted turn
         # returns to idle before ending the session.
         self.eof.set()
@@ -553,12 +554,12 @@ class LocalLiveDriver:
                 "[green]session ready[/green] - type to steer, [bold]:stop[/bold] to interrupt, "
                 "[bold]:quit[/bold] to end."
             )
+            opening_message_id = None
             if self._instruction:
-                session.send_user_message(self._instruction)
+                opening_message_id = session.send_user_message(self._instruction)
             reader = StdinCommandReader(session)
             reader.start()
-            stdin_eof = getattr(reader, "eof", threading.Event())
-            self._loop(session, stdin_eof)
+            self._loop(session, reader, opening_message_id)
             if session.status == "failed":
                 error = "local live session runner failed"
                 reason = "error"
@@ -578,7 +579,12 @@ class LocalLiveDriver:
         """Run one tool locally (each tool blocks the session pump)."""
         return self._executor(name, args, emit)
 
-    def _loop(self, session: live_session.LiveSession, stdin_eof: threading.Event) -> None:
+    def _loop(
+        self,
+        session: live_session.LiveSession,
+        reader: StdinCommandReader,
+        opening_message_id: str | None,
+    ) -> None:
         """Pump until closed, treating closed stdin as one-shot after the final turn."""
         last_tick = 0.0
         end_sent = False
@@ -587,11 +593,17 @@ class LocalLiveDriver:
                 session.pump(timeout=0.5)
             except KeyboardInterrupt:
                 self._handle_sigint(session)
-            if stdin_eof.is_set() and not end_sent:
+            if reader.eof.is_set() and not end_sent:
                 # EOF is published only after the reader queues its final message. Drain any
-                # message that raced with the frame just received, then wait for its idle boundary.
+                # message that raced with the frame just received, then require the peer's idle
+                # acknowledgement for the final message rather than accepting a stale idle frame.
                 session.flush_pending_intents()
-                if session.status == "idle" and not session.turn_active:
+                final_message_id = reader.last_message_id or opening_message_id
+                final_turn_completed = (
+                    final_message_id is None
+                    or session.last_completed_message_id == final_message_id
+                )
+                if session.status == "idle" and final_turn_completed:
                     session.end()
                     end_sent = True
             now = time.monotonic()

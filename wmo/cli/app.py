@@ -32,6 +32,7 @@ from rich.table import Table
 
 from wmo.cli.defer import add_deferred_typer
 from wmo.cli.model_roles import configured_role_configs, load_settings_or_abort
+from wmo.cli.run_cmd import register as register_run_command
 from wmo.common.config import (
     ARTIFACT_DIR,
     DEFAULT_MODEL_NAME,
@@ -115,7 +116,6 @@ def _register_ingest() -> None:
 
 def _register_side_commands() -> None:
     from wmo.cli.platform_cmds import register as register_platform_commands
-    from wmo.cli.run_cmd import register as register_run_command
 
     register_platform_commands(app)
     register_run_command(app)

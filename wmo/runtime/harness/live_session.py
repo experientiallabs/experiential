@@ -229,6 +229,7 @@ class LiveSession:
         self._status: str = "starting"
         self._closed = False
         self._failure_message: str | None = None
+        self._last_completed_message_id: str | None = None
         self._actions_this_turn = 0
         self._aborting = False
         self._turn_lock = threading.Lock()
@@ -254,10 +255,9 @@ class LiveSession:
         return self._failure_message
 
     @property
-    def turn_active(self) -> bool:
-        """Whether a submitted user turn is queued, running, or awaiting its idle boundary."""
-        with self._turn_lock:
-            return self._turn_active
+    def last_completed_message_id(self) -> str | None:
+        """Return the last user message acknowledged by a terminal idle frame."""
+        return self._last_completed_message_id
 
     def start(self, hello_timeout: float = 60.0) -> None:
         """Send `session_start` and block until the runner reports its first idle state."""
@@ -512,6 +512,9 @@ class LiveSession:
                 self._turn_active = True
             elif self._status == "idle":
                 self._turn_active = False
+        completed_message_id = frame.get("msg_id")
+        if self._status == "idle" and isinstance(completed_message_id, str):
+            self._last_completed_message_id = completed_message_id
         # Only the terminal `idle` frame is the cancelled turn's true boundary. The
         # runner emits `state:running` at each prompt start; clearing on that (or any
         # non-idle frame) could re-enable submit emission while the turn is still

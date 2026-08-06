@@ -247,10 +247,66 @@ def test_live_runner_turn_scope_clears_only_the_prior_outer_turn(tmp_path: Path)
                 process,
                 {"type": "user_message", "msg_id": f"m{index}", "text": f"round {index}"},
             )
-            assert _read_live_frame(process)["status"] == "running"
+            running = _read_live_frame(process)
+            assert running["status"] == "running"
+            assert running["msg_id"] == f"m{index}"
             terminal = _read_live_frame(process)
             assert terminal["status"] == "idle"
             assert terminal["reason"] == "completed"
+            assert terminal["msg_id"] == f"m{index}"
+    finally:
+        _stop_live_runner(process)
+
+
+def test_live_runner_idle_acknowledges_the_last_steered_message(tmp_path: Path) -> None:
+    """A terminal idle frame identifies every user message absorbed by that turn."""
+    node = _node_22()
+    env = os.environ.copy()
+    env.pop("WMO_LIVE_OUTBOX", None)
+    env["NODE_NO_WARNINGS"] = "1"
+    process = _start_live_runner(node, env, cwd=tmp_path)
+    agent_source = """export class Agent {
+  state = { messages: [] };
+  listeners = [];
+  pendingResolve = null;
+  constructor(_options) {}
+  subscribe(listener) { this.listeners.push(listener); return () => {}; }
+  steer(_message) { this.pendingResolve?.(); this.pendingResolve = null; }
+  abort() { this.pendingResolve?.(); this.pendingResolve = null; }
+  async prompt(_text) {
+    await new Promise((resolve) => { this.pendingResolve = resolve; });
+    for (const listener of this.listeners) await listener({ type: "turn_end" });
+  }
+}
+"""
+    try:
+        assert _read_live_frame(process)["type"] == "hello"
+        _send_live_frame(
+            process,
+            {
+                "type": "session_start",
+                "files": {"src/agent.ts": agent_source},
+                "tools": [],
+            },
+        )
+        assert _read_live_frame(process) == {"type": "state", "status": "idle", "turns": 0}
+
+        _send_live_frame(
+            process,
+            {"type": "user_message", "msg_id": "first", "text": "first instruction"},
+        )
+        running = _read_live_frame(process)
+        assert running["status"] == "running"
+        assert running["msg_id"] == "first"
+
+        _send_live_frame(
+            process,
+            {"type": "user_message", "msg_id": "second", "text": "second instruction"},
+        )
+        terminal = _read_live_frame(process)
+        assert terminal["status"] == "idle"
+        assert terminal["reason"] == "completed"
+        assert terminal["msg_id"] == "second"
     finally:
         _stop_live_runner(process)
 
