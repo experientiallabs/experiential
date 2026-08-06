@@ -15,7 +15,7 @@ into this repo so the harness search runs the real agent's source rather than a 
 
 The tag is a convenience label; **the commit SHA is the pin**. `wmo/optimize/harness/vendor/vendor_pi.sh` fetches upstream
 at that SHA, re-materializes this tree, and regenerates `wmo/optimize/harness/vendor/manifest.sha256`
-(the per-file integrity ledger). Re-running it must produce zero diff against the committed copy —
+(the per-file integrity ledger). Re-running it must produce zero diff against the committed copy;
 that is how anyone re-verifies this vendoring from scratch.
 
 ## License
