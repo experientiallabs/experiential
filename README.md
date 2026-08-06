@@ -7,7 +7,7 @@
 <p align="center">
   🌐 <a href="https://platform.experientiallabs.ai">Platform</a> |
   📚 <a href="https://github.com/experientiallabs/world-model-optimizer/tree/main/docs">Docs</a> |
-  <a href="https://discord.gg/QwjJpEyHd"><img src="https://cdn.simpleicons.org/discord/5865F2" alt="" width="16" height="16"> Discord</a>
+  <a href="https://discord.gg/B6sM8xTVwU"><img src="https://cdn.simpleicons.org/discord/5865F2" alt="" width="16" height="16"> Discord</a>
 </p>
 
 ## Getting started
