@@ -519,20 +519,34 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
         ProviderKind,
         ToolCallingProvider,
     )
-    from wmo.common.providers.models import resolve_provider_model
+    from wmo.common.providers.models import model_types_for_provider, resolve_provider_model
     from wmo.common.providers.registry import get_provider
 
     configured = load_settings().models.resolve("worker")
     provider_name = provider or (
         configured.provider if configured is not None else _DEFAULT_PROVIDER
     )
-    model_name = model or (configured.model if configured is not None else _DEFAULT_MODEL)
     try:
         kind = ProviderKind(provider_name)
     except ValueError:
         kinds = ", ".join(k.value for k in ProviderKind)
         msg = f"unknown provider {provider_name!r}; choose one of: {kinds}"
         raise typer.BadParameter(msg) from None
+    if model is not None:
+        model_name = model
+    elif configured is not None and configured.provider == kind.value:
+        model_name = configured.model
+    elif provider is None:
+        model_name = _DEFAULT_MODEL
+    else:
+        catalog = model_types_for_provider(kind)
+        if not catalog:
+            raise typer.BadParameter(
+                f"provider {kind.value!r} has no default model; pass --model <model>, or run "
+                f"`wmo providers set --provider {kind.value} --model <model>` to configure the "
+                "worker role"
+            )
+        model_name = catalog[0]
     spec = resolve_provider_model(kind, model_name)
     use_configured_knobs = configured is not None and configured.provider == kind.value
     built = get_provider(

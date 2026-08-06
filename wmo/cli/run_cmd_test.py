@@ -214,6 +214,43 @@ def test_build_driver_uses_configured_local_worker(
     assert config.model == "gpt-5.4-mini"
 
 
+def test_build_driver_provider_override_uses_the_new_providers_default_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(worker=ModelRole(provider="bedrock", model="claude-sonnet-4-6"))
+        ),
+        tmp_path / ".wmo",
+    )
+    monkeypatch.setattr(
+        "wmo.runtime.platform.credentials.load_credentials",
+        PlatformCredentials,
+    )
+    configs: list[ProviderConfig] = []
+
+    def get_provider(config: ProviderConfig) -> _FakeProvider:
+        configs.append(config)
+        return _FakeProvider()
+
+    monkeypatch.setattr("wmo.common.providers.registry.get_provider", get_provider)
+
+    driver = mod._build_driver(
+        target=None,
+        jail_root=tmp_path,
+        provider="openai",
+        model=None,
+        task=None,
+    )
+
+    assert isinstance(driver, mod.LocalLiveDriver)
+    [config] = configs
+    assert config.kind is ProviderKind.OPENAI
+    assert config.model == "gpt-5.6-sol"
+
+
 def test_build_driver_logged_in_bare_run_uses_platform_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
