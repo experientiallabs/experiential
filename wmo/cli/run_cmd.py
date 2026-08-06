@@ -37,6 +37,7 @@ import wmo.runtime.harness.live_session as live_session
 import wmo.runtime.harness.pi_local as pi_local
 import wmo.runtime.platform.client as platform_client
 import wmo.runtime.platform.credentials as platform_credentials
+from wmo.cli.model_roles import DEFAULT_AZURE_API_VERSION
 from wmo.common.config import load_settings
 from wmo.common.core.types import JsonObject
 from wmo.common.providers.base import (
@@ -116,6 +117,21 @@ class LocalToolExecutor:
     def __init__(self, jail_root: Path) -> None:
         """Confine every tool path under ``jail_root`` (its resolved real path)."""
         self._jail = jail_root.resolve()
+        self._cancelled = threading.Event()
+        self._process_lock = threading.Lock()
+        self._active_process: subprocess.Popen[bytes] | None = None
+
+    def cancel(self) -> None:
+        """Cancel the current command and reject racing tools until the turn reaches idle."""
+        self._cancelled.set()
+        with self._process_lock:
+            process = self._active_process
+        if process is not None and process.poll() is None:
+            _kill_process_group(process)
+
+    def reset_cancel(self) -> None:
+        """Allow tools for the next turn after the runner reports the idle boundary."""
+        self._cancelled.clear()
 
     def _resolve(self, path: str) -> Path:
         """Resolve a tool path under the jail, rejecting any escape."""
@@ -130,6 +146,8 @@ class LocalToolExecutor:
         self, name: str, args: JsonObject, emit: Callable[[str, str], None]
     ) -> ToolOutcome:
         """Execute one tool call locally; a failure is an observation, not a crash."""
+        if self._cancelled.is_set():
+            return ToolOutcome(content="interrupted", is_error=True)
         try:
             if name == "bash":
                 return self._bash(str(args.get("command", "")), emit)
@@ -164,6 +182,10 @@ class LocalToolExecutor:
         if process.stdout is None or process.stderr is None:  # pragma: no cover
             process.kill()
             raise RuntimeError("bash process did not expose stdout and stderr")
+        with self._process_lock:
+            self._active_process = process
+        if self._cancelled.is_set():
+            _kill_process_group(process)
         readers = (
             threading.Thread(
                 target=_drain_process_stream,
@@ -189,11 +211,20 @@ class LocalToolExecutor:
             if process.poll() is None:
                 _kill_process_group(process)
             process.wait()
+            # A child can fork into the new group while the first signal is being delivered.
+            # Re-signal after the leader exits so no just-forked descendant retains the pipes.
+            if timed_out or self._cancelled.is_set():
+                _kill_process_group(process)
             for reader in readers:
                 reader.join()
             process.stdout.close()
             process.stderr.close()
+            with self._process_lock:
+                if self._active_process is process:
+                    self._active_process = None
 
+        if self._cancelled.is_set():
+            return ToolOutcome(content="interrupted", is_error=True)
         if timed_out:
             note = f"\n[timed out after {_BASH_TIMEOUT_S:g}s]"
             stderr_buffer.append(note)
@@ -258,7 +289,8 @@ def _drain_process_stream(
 ) -> None:
     """Drain a byte pipe in small chunks while retaining only bounded decoded text."""
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    while chunk := stream.read(4096):
+    read: Callable[[int], bytes] = getattr(stream, "read1", stream.read)
+    while chunk := read(4096):
         text = decoder.decode(chunk)
         output.append(text)
         _emit_safely(emit, emit_lock, stream_name, text)
@@ -287,10 +319,27 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
     except ProcessLookupError:
         pass
     except PermissionError:
-        # Some app sandboxes allow setsid but deny killpg. Killing the group leader still
-        # terminates the ordinary single-command path and keeps timeout handling functional.
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
+        # Some app sandboxes allow setsid but deny killpg. Enumerate this exact process group so
+        # foreground children are still terminated even after their leader exits.
+        _kill_process_group_members(process.pid)
+
+
+def _kill_process_group_members(group_id: int) -> None:
+    """Kill one owned process group member-by-member when killpg is unavailable."""
+    try:
+        members = subprocess.run(  # noqa: S603, S607 - fixed pgrep with a numeric group ID
+            ["pgrep", "-g", str(group_id)],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        ).stdout.splitlines() or [str(group_id)]
+    except (OSError, subprocess.SubprocessError):
+        members = [str(group_id)]
+    for raw_pid in members:
+        with contextlib.suppress(ValueError):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(int(raw_pid), signal.SIGKILL)
 
 
 class RunRecorder(Protocol):
@@ -443,9 +492,7 @@ class LocalLiveDriver:
                 channel,
                 tools=tool_specs,
                 execute_tool=self._execute,
-                on_event=TerminalEventSink(
-                    recorder=self._recorder, on_running=lambda _running: None
-                ),
+                on_event=TerminalEventSink(recorder=self._recorder, on_running=self._on_running),
                 files=files,
                 system_prompt=system,
                 skill_bodies=skill_bodies,
@@ -453,6 +500,8 @@ class LocalLiveDriver:
                 worker_fn=self._worker_fn,
                 max_output_tokens=self._doc.max_output_tokens(),
                 temperature=self._doc.temperature(),
+                cancel_active=self._executor.cancel,
+                reset_cancel=self._executor.reset_cancel,
             )
             session.start()
             _console.print(
@@ -510,6 +559,10 @@ class LocalLiveDriver:
 
     def _handle_sigint(self, session: live_session.LiveSession) -> None:
         """First Ctrl-C interrupts the current turn; a second ends the session."""
+        if session.status != "running":
+            self._interrupts = 0
+            _console.print("\n[yellow]no active turn (:quit to end)[/yellow]")
+            return
         self._interrupts += 1
         if self._interrupts == 1:
             _console.print("\n[yellow]interrupting (press Ctrl-C again to quit)[/yellow]")
@@ -517,6 +570,11 @@ class LocalLiveDriver:
         else:
             _console.print("\n[yellow]ending session[/yellow]")
             session.end()
+
+    def _on_running(self, running: bool) -> None:
+        """Reset Ctrl-C escalation once the interrupted turn reaches a non-running state."""
+        if not running:
+            self._interrupts = 0
 
     def _teardown(
         self,
@@ -664,6 +722,11 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
         model_name = catalog[0]
     spec = resolve_provider_model(kind, model_name)
     use_configured_knobs = configured is not None and configured.provider == kind.value
+    deployment = configured.deployment if use_configured_knobs else None
+    api_version = configured.api_version if use_configured_knobs else None
+    if kind is ProviderKind.AZURE_OPENAI:
+        deployment = deployment or spec.model_type
+        api_version = api_version or DEFAULT_AZURE_API_VERSION
     built = provider_registry.get_provider(
         ProviderConfig(
             kind=kind,
@@ -671,8 +734,8 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
             model=spec.model_id,
             region=configured.region if use_configured_knobs else None,
             endpoint=configured.endpoint if use_configured_knobs else None,
-            deployment=configured.deployment if use_configured_knobs else None,
-            api_version=configured.api_version if use_configured_knobs else None,
+            deployment=deployment,
+            api_version=api_version,
         )
     )
     if not isinstance(built, ToolCallingProvider):

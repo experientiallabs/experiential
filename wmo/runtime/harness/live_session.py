@@ -40,7 +40,10 @@ sides, so eval episodes are unaffected):
 
 from __future__ import annotations
 
+import contextlib
 import queue
+import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -95,6 +98,7 @@ EventSink = Callable[[SessionEvent], None]
 # the final (already length-capped by the executor) observation the agent sees.
 OutputEmitter = Callable[[str, str], None]
 ToolExecutor = Callable[[str, JsonObject, OutputEmitter], "ToolOutcome"]
+CancelHook = Callable[[], None]
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,10 @@ class ToolOutcome:
     content: str
     is_error: bool = False
     truncated: bool = False
+
+
+class _OperationInterrupted(RuntimeError):
+    """The user interrupted a host-side provider or tool operation."""
 
 
 # --------------------------------------------------------------------------------------------------
@@ -156,6 +164,8 @@ class LiveSession:
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         temperature: float = 0.7,
         conversation_scope: ConversationScope = "session",
+        cancel_active: CancelHook | None = None,
+        reset_cancel: CancelHook | None = None,
     ) -> None:
         self._channel = channel
         self._tools = list(tools)
@@ -187,8 +197,11 @@ class LiveSession:
         self._max_output_tokens = max_output_tokens
         self._temperature = temperature
         self._conversation_scope = conversation_scope
+        self._cancel_active = cancel_active
+        self._reset_cancel = reset_cancel
 
         self._inbox: queue.Queue[_Intent] = queue.Queue()
+        self._interrupt_requested = threading.Event()
         self._session_id = uuid.uuid4().hex
         self._status: str = "starting"
         self._closed = False
@@ -255,6 +268,7 @@ class LiveSession:
 
     def interrupt(self, reason: str = "user_interrupt") -> None:
         """Queue an interrupt: abort the current run (does not end the session)."""
+        self._request_cancel()
         self._inbox.put(_Interrupt(reason=reason))
 
     def flush_pending_intents(self) -> None:
@@ -269,6 +283,7 @@ class LiveSession:
 
     def end(self) -> None:
         """Queue a graceful end: abort any run, then shut the runner down."""
+        self._request_cancel()
         self._inbox.put(_End())
 
     def ping(self) -> None:
@@ -356,12 +371,14 @@ class LiveSession:
             request_body = dict(body) if isinstance(body, dict) else {}
             request_body["temperature"] = self._temperature
             request = ChatRequest.model_validate(request_body)
-            completion = self._worker_fn(request)
+            completion = self._call_worker(request)
             self._meter(completion)
             self._emit_assistant(completion)
             self._safe_send(
                 {"type": "llm_response", "req_id": req_id, "completion": completion.wire_payload()}
             )
+        except _OperationInterrupted:
+            self._safe_send({"type": "llm_response", "req_id": req_id, "error": "interrupted"})
         except Exception as exc:  # noqa: BLE001 - report to the runner, never crash the host
             self._emit("error", {"message": f"worker LLM error: {exc}"})
             self._safe_send({"type": "llm_response", "req_id": req_id, "error": str(exc)})
@@ -378,13 +395,13 @@ class LiveSession:
             # If the turn is being interrupted, do NOT emit a final submit for it -
             # the answer belongs to a cancelled run. Still respond so the runner's
             # submit tool does not hang; the aborted run ends via `state:idle`.
-            if not self._aborting:
+            if not self._aborting and not self._interrupt_requested.is_set():
                 answer = args.get("answer")
                 self._emit("submit", {"answer": answer if isinstance(answer, str) else ""})
             self._respond_tool(req_id, "submitted", is_error=False)
             return
 
-        if self._aborting:
+        if self._aborting or self._interrupt_requested.is_set():
             # The turn is being interrupted; do NOT run a real side-effecting tool
             # (bash / write_file) for a cancelled run. Respond so the runner's tool
             # call does not hang; the aborted run ends via `state:idle`.
@@ -412,6 +429,8 @@ class LiveSession:
                 # A transient sandbox/FS error becomes an error result, so the runner
                 # always gets a tool_response and pump() keeps running.
                 outcome = ToolOutcome(content=f"tool {name!r} failed: {exc}", is_error=True)
+            if self._interrupt_requested.is_set():
+                outcome = ToolOutcome(content="interrupted", is_error=True)
         self._emit(
             "tool_result",
             {
@@ -446,6 +465,10 @@ class LiveSession:
         # aborting, letting a stale in-flight `submit` surface as a final answer.
         if self._status == "idle":
             self._aborting = False
+            self._interrupt_requested.clear()
+            if self._reset_cancel is not None:
+                with contextlib.suppress(Exception):
+                    self._reset_cancel()
         payload: JsonObject = {"status": self._status}
         for key in ("turns", "reason", "msg_id"):
             if key in frame:
@@ -467,6 +490,48 @@ class LiveSession:
         reported = completion.token_usage()
         self.worker_usage.input_tokens += reported.input_tokens
         self.worker_usage.output_tokens += reported.output_tokens
+
+    def _call_worker(self, request: ChatRequest) -> ChatResponse:
+        """Run one blocking provider request without preventing an immediate session interrupt.
+
+        Provider SDKs expose no shared cancellation API. The request therefore runs on a daemon
+        thread while the pump waits in short bounded intervals. An interrupt releases the session
+        immediately and ignores a later completion; provider-side timeout/retry policy still owns
+        the underlying request lifetime.
+        """
+        if self._worker_fn is None:  # narrowed by _answer_llm; defensive for direct calls
+            raise RuntimeError("live session has no worker configured")
+        if self._interrupt_requested.is_set():
+            raise _OperationInterrupted
+        results: queue.Queue[ChatResponse | Exception] = queue.Queue(maxsize=1)
+        worker_fn = self._worker_fn
+
+        def invoke() -> None:
+            try:
+                results.put(worker_fn(request))
+            except Exception as exc:  # noqa: BLE001 - re-raised on the pump thread below
+                results.put(exc)
+
+        threading.Thread(target=invoke, name="wmo-live-worker", daemon=True).start()
+        while True:
+            if self._interrupt_requested.is_set():
+                raise _OperationInterrupted
+            try:
+                result = results.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if self._interrupt_requested.is_set():
+                raise _OperationInterrupted
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    def _request_cancel(self) -> None:
+        """Signal in-flight host work immediately, before the pump can drain the intent queue."""
+        self._interrupt_requested.set()
+        if self._cancel_active is not None:
+            with contextlib.suppress(Exception):
+                self._cancel_active()
 
     def _tool_specs(self) -> list[JsonObject]:
         return [
@@ -530,13 +595,9 @@ class _Deadline:
     _remaining: float = field(init=False)
 
     def __post_init__(self) -> None:
-        import time
-
         self._end = time.monotonic() + self.seconds
 
     def remaining(self) -> float:
-        import time
-
         return max(0.0, self._end - time.monotonic())
 
     def expired(self) -> bool:

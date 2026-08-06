@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from wmo.common.core.types import JsonObject
@@ -186,12 +188,28 @@ def test_submit_tool_response_is_answered_without_executor() -> None:
 
 
 def test_interrupt_sends_abort_frame() -> None:
-    channel = ScriptedChannel([{"type": "state", "status": "idle"}])
-    session = LiveSession(channel, tools=[], execute_tool=_no_tool, on_event=lambda e: None)
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "state", "status": "idle", "reason": "aborted"},
+        ]
+    )
+    cancelled: list[bool] = []
+    resets: list[bool] = []
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=lambda e: None,
+        cancel_active=lambda: cancelled.append(True),
+        reset_cancel=lambda: resets.append(True),
+    )
     session.start()
     session.interrupt()
     session.pump(timeout=0)
     assert any(f["type"] == "abort" and f["reason"] == "user_interrupt" for f in channel.sent)
+    assert cancelled == [True]
+    assert resets == [True, True]  # initial ready state, then the aborted turn boundary
 
 
 def test_end_sends_abort_then_shutdown_and_closes() -> None:
@@ -323,6 +341,50 @@ def test_worker_error_is_reported_not_raised() -> None:
     assert any(e.kind == "error" for e in events)
     resp = next(f for f in channel.sent if f["type"] == "llm_response")
     assert "provider down" in str(resp["error"])
+
+
+def test_interrupt_releases_a_blocking_worker_request() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    events: list[SessionEvent] = []
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+        ]
+    )
+
+    def worker(_request: ChatRequest) -> ChatResponse:
+        started.set()
+        release.wait(timeout=2)
+        finished.set()
+        return _completion(text="too late")
+
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=events.append,
+        worker_fn=worker,
+    )
+    session.start()
+    pump = threading.Thread(target=session.pump)
+    pump.start()
+    assert started.wait(1)
+
+    session.interrupt()
+    pump.join(timeout=1)
+    session.flush_pending_intents()
+
+    assert not pump.is_alive()
+    response = next(frame for frame in channel.sent if frame["type"] == "llm_response")
+    assert response["error"] == "interrupted"
+    assert any(frame["type"] == "abort" for frame in channel.sent)
+    assert not any(event.kind == "assistant_message" for event in events)
+
+    release.set()
+    assert finished.wait(1)
 
 
 def test_channel_close_marks_session_ended() -> None:

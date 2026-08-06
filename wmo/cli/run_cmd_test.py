@@ -111,6 +111,34 @@ def test_executor_bash_kills_the_process_group_on_timeout(
     assert "[exit 124]" in result.content
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="LocalToolExecutor bash needs a Unix shell")
+def test_executor_cancel_stops_an_active_bash_command(tmp_path: Path) -> None:
+    executor = mod.LocalToolExecutor(tmp_path)
+    started = threading.Event()
+    outcomes: list[object] = []
+
+    def emit(_stream: str, chunk: str) -> None:
+        if "started" in chunk:
+            started.set()
+
+    thread = threading.Thread(
+        target=lambda: outcomes.append(
+            executor("bash", {"command": "printf started; sleep 5"}, emit)
+        )
+    )
+    thread.start()
+    assert started.wait(1)
+
+    executor.cancel()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    [result] = outcomes
+    assert isinstance(result, mod.ToolOutcome)
+    assert result.is_error
+    assert result.content == "interrupted"
+
+
 def test_executor_caps_large_output(tmp_path: Path) -> None:
     (tmp_path / "big.txt").write_text(
         "x" * (mod._TOOL_OUTPUT_CAP + 500),
@@ -298,6 +326,45 @@ def test_build_driver_provider_override_uses_the_new_providers_default_model(
     [config] = configs
     assert config.kind is ProviderKind.OPENAI
     assert config.model == "gpt-5.6-sol"
+
+
+def test_build_driver_azure_override_supplies_required_azure_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(worker=ModelRole(provider="bedrock", model="claude-sonnet-4-6"))
+        ),
+        tmp_path / ".wmo",
+    )
+    monkeypatch.setattr(
+        "wmo.runtime.platform.credentials.load_credentials",
+        PlatformCredentials,
+    )
+    configs: list[ProviderConfig] = []
+
+    def get_provider(config: ProviderConfig) -> _FakeProvider:
+        configs.append(config)
+        return _FakeProvider()
+
+    monkeypatch.setattr("wmo.common.providers.registry.get_provider", get_provider)
+
+    driver = mod._build_driver(
+        target=None,
+        jail_root=tmp_path,
+        provider="azure",
+        model=None,
+        task=None,
+    )
+
+    assert isinstance(driver, mod.LocalLiveDriver)
+    [config] = configs
+    assert config.kind is ProviderKind.AZURE_OPENAI
+    assert config.model == "gpt-5.5"
+    assert config.deployment == "gpt-5.5"
+    assert config.api_version == mod.DEFAULT_AZURE_API_VERSION
 
 
 def test_build_driver_logged_in_bare_run_uses_platform_proxy(
@@ -626,6 +693,39 @@ def test_local_driver_boots_sends_task_and_closes_process(
     assert channel.closed
 
 
+def test_ctrl_c_escalation_resets_after_the_turn_returns_idle() -> None:
+    class _Session:
+        status = "running"
+
+        def __init__(self) -> None:
+            self.interrupts = 0
+            self.ends = 0
+
+        def interrupt(self) -> None:
+            self.interrupts += 1
+
+        def end(self) -> None:
+            self.ends += 1
+
+    driver = mod.LocalLiveDriver(
+        jail_root=Path.cwd(),
+        doc=HarnessDoc.baseline("test"),
+        provider=_FakeProvider(),
+        worker_fn=None,
+        recorder=None,
+        instruction=None,
+    )
+    session = _Session()
+
+    driver._handle_sigint(cast("mod.live_session.LiveSession", session))
+    driver._on_running(False)
+    session.status = "running"
+    driver._handle_sigint(cast("mod.live_session.LiveSession", session))
+
+    assert session.interrupts == 2
+    assert session.ends == 0
+
+
 def test_remote_world_model_driver_creates_and_steps_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -641,7 +741,11 @@ def test_remote_world_model_driver_creates_and_steps_session(
 
         def step_world_model_session(self, _session: str, action: Action) -> object:
             self.actions.append(action)
-            return type("Observation", (), {"content": "found it", "is_error": False})()
+            return type(
+                "Observation",
+                (),
+                {"content": "found list[str] and [/items] literally", "is_error": False},
+            )()
 
         def close(self) -> None:
             self.closed = True
@@ -663,6 +767,7 @@ def test_remote_world_model_driver_creates_and_steps_session(
     assert len(client.actions) == 1
     assert client.actions[0].name == "search"
     assert client.closed
+    assert "found list[str] and [/items] literally" in cast("io.StringIO", console.file).getvalue()
 
 
 def test_world_model_loop_rejects_detach(monkeypatch: pytest.MonkeyPatch) -> None:
