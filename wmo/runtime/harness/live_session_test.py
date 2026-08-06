@@ -242,10 +242,11 @@ def test_submit_tool_response_is_answered_without_executor() -> None:
 
 
 def test_interrupt_sends_abort_frame() -> None:
+    aborted_state: JsonObject = {"type": "state", "status": "idle", "reason": "aborted"}
     channel = ScriptedChannel(
         [
             {"type": "state", "status": "idle"},
-            {"type": "state", "status": "idle", "reason": "aborted"},
+            aborted_state,
         ]
     )
     cancelled: list[bool] = []
@@ -259,12 +260,69 @@ def test_interrupt_sends_abort_frame() -> None:
         reset_cancel=lambda: resets.append(True),
     )
     session.start()
-    session.send_user_message("go")
+    message_id = session.send_user_message("go")
+    aborted_state["msg_id"] = message_id
     session.interrupt()
     session.pump(timeout=0)
     assert any(f["type"] == "abort" and f["reason"] == "user_interrupt" for f in channel.sent)
     assert cancelled == [True]
     assert resets == [True, True]  # initial ready state, then the aborted turn boundary
+
+
+def test_stale_idle_does_not_reset_a_newer_interrupted_message() -> None:
+    """An old idle acknowledgement cannot re-enable work for a newer cancelled prompt."""
+    running_state: JsonObject = {"type": "state", "status": "running"}
+    stale_idle: JsonObject = {"type": "state", "status": "idle", "reason": "completed"}
+    interrupted_idle: JsonObject = {"type": "state", "status": "idle", "reason": "aborted"}
+    channel = ScriptedChannel(
+        [
+            {"type": "state", "status": "idle"},
+            running_state,
+            stale_idle,
+            {"type": "llm_request", "req_id": 1, "openai_body": {"messages": []}},
+            interrupted_idle,
+        ]
+    )
+    resets: list[bool] = []
+    worker_calls: list[ChatRequest] = []
+
+    def worker(request: ChatRequest) -> ChatResponse:
+        worker_calls.append(request)
+        return _completion(text="must not run")
+
+    session = LiveSession(
+        channel,
+        tools=[],
+        execute_tool=_no_tool,
+        on_event=lambda event: None,
+        worker_fn=worker,
+        reset_cancel=lambda: resets.append(True),
+    )
+    session.start()
+    resets.clear()
+    first_message_id = session.send_user_message("first")
+    running_state["msg_id"] = first_message_id
+    stale_idle["msg_id"] = first_message_id
+    session.pump(timeout=0)
+
+    second_message_id = session.send_user_message("second")
+    interrupted_idle["msg_id"] = second_message_id
+    session.interrupt()
+    session.pump(timeout=0)
+
+    assert session.status == "running"
+    assert session.last_completed_message_id == first_message_id
+    assert resets == []
+
+    session.pump(timeout=0)
+    response = next(frame for frame in channel.sent if frame["type"] == "llm_response")
+    assert response["error"] == "interrupted"
+    assert worker_calls == []
+
+    session.pump(timeout=0)
+    assert session.status == "idle"
+    assert session.last_completed_message_id == second_message_id
+    assert resets == [True]
 
 
 def test_interrupt_while_idle_is_ignored_and_does_not_poison_the_next_turn() -> None:
@@ -533,17 +591,19 @@ def test_interrupt_suppresses_a_racing_submit_event() -> None:
 
 def test_submit_after_state_boundary_is_not_suppressed() -> None:
     """A fresh turn's submit is emitted normally after the aborted turn ended (state boundary)."""
+    aborted_state: JsonObject = {"type": "state", "status": "idle", "reason": "aborted"}
     channel = ScriptedChannel(
         [
             {"type": "state", "status": "idle"},
-            {"type": "state", "status": "idle", "reason": "aborted"},  # aborted turn ended
+            aborted_state,
             {"type": "tool_request", "req_id": 1, "name": "submit", "arguments": {"answer": "y"}},
         ]
     )
     events: list[SessionEvent] = []
     session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
     session.start()
-    session.send_user_message("first")
+    first_message_id = session.send_user_message("first")
+    aborted_state["msg_id"] = first_message_id
     session.interrupt()
     events.clear()
     session.pump(timeout=0)  # consume the aborted turn's idle boundary
@@ -554,18 +614,20 @@ def test_submit_after_state_boundary_is_not_suppressed() -> None:
 
 def test_stale_submit_after_a_quick_next_message_is_still_suppressed() -> None:
     """Hold the next message until idle while suppressing the cancelled turn's stale submit."""
+    aborted_state: JsonObject = {"type": "state", "status": "idle", "reason": "aborted"}
     channel = ScriptedChannel(
         [
             {"type": "state", "status": "idle"},
             {"type": "tool_request", "req_id": 1, "name": "submit", "arguments": {"answer": "x"}},
-            {"type": "state", "status": "idle", "reason": "aborted"},
+            aborted_state,
             {"type": "state", "status": "running"},
         ]
     )
     events: list[SessionEvent] = []
     session = LiveSession(channel, tools=[SUBMIT], execute_tool=_no_tool, on_event=events.append)
     session.start()
-    session.send_user_message("first")
+    first_message_id = session.send_user_message("first")
+    aborted_state["msg_id"] = first_message_id
     session.interrupt()
     session.send_user_message("do the next thing")  # queued before the stale submit is read
     events.clear()

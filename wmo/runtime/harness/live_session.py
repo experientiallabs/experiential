@@ -34,6 +34,7 @@ sides, so eval episodes are unaffected):
     llm_request   {req_id, openai_body}   (reused)
     tool_request  {req_id, name, arguments}  (reused)
     state         {status: "idle"|"running", turns, reason?, cleared_steers?, msg_id?}
+                  (`msg_id` is absent only from the initial ready `idle` state)
     pong          {nonce}
     episode_error {note}           (reused; a fatal runner error ends the session)
 """
@@ -134,6 +135,7 @@ class _UserMessage:
 @dataclass
 class _Interrupt:
     generation: int
+    msg_id: str | None
     reason: str = "user_interrupt"
 
 
@@ -235,6 +237,9 @@ class LiveSession:
         self._turn_lock = threading.Lock()
         self._turn_generation = 0
         self._turn_active = False
+        self._last_enqueued_message_id: str | None = None
+        self._active_message_id: str | None = None
+        self._interrupted_message_id: str | None = None
         self._pending_ping: str | None = None
         self.worker_usage = TokenUsage()
 
@@ -301,17 +306,25 @@ class LiveSession:
                 self._turn_generation += 1
             self._turn_active = True
             generation = self._turn_generation
-        self._inbox.put(_UserMessage(text=text, msg_id=msg_id, generation=generation))
+            self._last_enqueued_message_id = msg_id
+            # Keep the queue order linearizable with interrupt(): once the latest message id is
+            # visible to Stop, its intent is already ahead of that Stop in the inbox.
+            self._inbox.put(_UserMessage(text=text, msg_id=msg_id, generation=generation))
         return msg_id
 
     def interrupt(self, reason: str = "user_interrupt") -> None:
         """Queue an interrupt: abort the current run (does not end the session)."""
         with self._turn_lock:
-            if not self._turn_active:
+            if not self._turn_active or self._interrupt_requested.is_set():
                 return
             generation = self._turn_generation
-        self._request_cancel()
-        self._inbox.put(_Interrupt(generation=generation, reason=reason))
+            # Messages queued before Stop drain before this interrupt. Bind cancellation to the
+            # newest one so an already-buffered idle frame for an older prompt cannot clear it.
+            message_id = self._last_enqueued_message_id or self._active_message_id
+            self._interrupted_message_id = message_id
+            self._interrupt_requested.set()
+            self._inbox.put(_Interrupt(generation=generation, msg_id=message_id, reason=reason))
+        self._invoke_cancel_hook()
 
     def flush_pending_intents(self) -> None:
         """Send queued controls without consuming another runner frame.
@@ -368,7 +381,9 @@ class LiveSession:
             elif isinstance(intent, _Interrupt):
                 with self._turn_lock:
                     targets_active_turn = (
-                        self._turn_active and intent.generation == self._turn_generation
+                        self._turn_active
+                        and intent.generation == self._turn_generation
+                        and intent.msg_id == self._active_message_id
                     )
                 if not targets_active_turn:
                     continue
@@ -502,26 +517,54 @@ class LiveSession:
         )
 
     def _on_state(self, frame: JsonObject) -> None:
-        status = frame.get("status")
-        if isinstance(status, str):
-            self._status = status
+        raw_status = frame.get("status")
+        incoming_status = raw_status if isinstance(raw_status, str) else None
+        completed_message_id = frame.get("msg_id")
+        completed_message_id = (
+            completed_message_id if isinstance(completed_message_id, str) else None
+        )
+        accept_state = True
         with self._turn_lock:
-            if self._status == "running":
+            if incoming_status == "running":
+                self._status = incoming_status
                 if not self._turn_active:
                     self._turn_generation += 1
                 self._turn_active = True
-            elif self._status == "idle":
-                self._turn_active = False
-        completed_message_id = frame.get("msg_id")
-        if self._status == "idle" and isinstance(completed_message_id, str):
+            elif incoming_status == "idle":
+                cancel_pending = self._interrupt_requested.is_set() or self._aborting
+                expected_message_id = (
+                    self._interrupted_message_id if cancel_pending else self._active_message_id
+                )
+                accept_state = (
+                    not cancel_pending
+                    or expected_message_id is None
+                    or completed_message_id == expected_message_id
+                )
+                if accept_state:
+                    self._status = incoming_status
+                    self._turn_active = False
+                    if completed_message_id == self._active_message_id:
+                        self._active_message_id = None
+                    if completed_message_id == self._last_enqueued_message_id:
+                        self._last_enqueued_message_id = None
+            elif incoming_status is not None:
+                self._status = incoming_status
+        if incoming_status == "idle" and completed_message_id is not None:
             self._last_completed_message_id = completed_message_id
+        if not accept_state:
+            # This is a real acknowledgement for an older prompt, but it is not the current
+            # session state. In particular, it must not reset cancellation or release messages
+            # deferred behind the interrupted prompt.
+            return
+        idle_boundary = incoming_status == "idle"
         # Only the terminal `idle` frame is the cancelled turn's true boundary. The
         # runner emits `state:running` at each prompt start; clearing on that (or any
         # non-idle frame) could re-enable submit emission while the turn is still
         # aborting, letting a stale in-flight `submit` surface as a final answer.
-        if self._status == "idle":
+        if idle_boundary:
             self._aborting = False
             self._interrupt_requested.clear()
+            self._interrupted_message_id = None
             if self._reset_cancel is not None:
                 with contextlib.suppress(Exception):
                     self._reset_cancel()
@@ -533,7 +576,7 @@ class LiveSession:
         if isinstance(cleared, list) and cleared:
             payload["cleared_steers"] = cleared
         self._emit("state", payload)
-        if self._status == "idle":
+        if idle_boundary:
             while self._deferred_messages:
                 self._send_user_message(self._deferred_messages.popleft())
 
@@ -546,6 +589,7 @@ class LiveSession:
             if not self._turn_active:
                 self._turn_active = True
                 self._turn_generation = max(self._turn_generation, intent.generation)
+            self._active_message_id = intent.msg_id
         self._actions_this_turn = 0
         self._emit("user_message", {"msg_id": intent.msg_id, "text": intent.text})
         self._safe_send({"type": "user_message", "msg_id": intent.msg_id, "text": intent.text})
@@ -601,6 +645,10 @@ class LiveSession:
     def _request_cancel(self) -> None:
         """Signal in-flight host work immediately, before the pump can drain the intent queue."""
         self._interrupt_requested.set()
+        self._invoke_cancel_hook()
+
+    def _invoke_cancel_hook(self) -> None:
+        """Cancel host-side tool work after the cancellation flag is already observable."""
         if self._cancel_active is not None:
             with contextlib.suppress(Exception):
                 self._cancel_active()
