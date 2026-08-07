@@ -37,12 +37,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.common.config.store import validate_name
+from wmo.common.config.versioned_store import CHAMPION_ALIAS, VersionedArtifactStore
 from wmo.common.core.files import write_text_atomic
-from wmo.common.core.locks import file_write_lock
 from wmo.common.core.types import JsonObject
 from wmo.common.providers.base import ProviderKind
 from wmo.common.providers.pool import PoolEntry
@@ -56,7 +55,6 @@ logger = logging.getLogger(__name__)
 
 
 ADAPTERS_DIR = "adapters"
-CHAMPION_ALIAS = "champion"
 
 # Tinker's OpenAI-compatible serving endpoint: the production service base URL
 # plus the /oai/api/v1 OpenAI-compat prefix (a bare /v1 returns 404; verified
@@ -66,7 +64,6 @@ DEFAULT_TINKER_OPENAI_ENDPOINT = (
     "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
 )
 
-_ALIASES_FILE = "aliases.toml"
 MODEL_CARD_FILE = "model_card.json"
 """The per-run and per-adapter-version model card filename."""
 
@@ -649,7 +646,7 @@ class DistillRunStore:
         return self.handoff_path
 
 
-class AdapterStore:
+class AdapterStore(VersionedArtifactStore):
     """Named, versioned distilled adapters under `<root>/adapters/<name>/`.
 
     Mirrors `HarnessStore`: versions are append-only `vN/` directories (each
@@ -657,99 +654,16 @@ class AdapterStore:
     aliases, so promotion and rollback never rewrite an artifact.
     """
 
-    def __init__(self, root: str | Path = ".wmo") -> None:
-        self.root = Path(root)
+    subdirectory = ADAPTERS_DIR
+    kind = "adapter"
+    promotion_command = "`wmo optimize distill run`"
 
     @property
     def adapters_dir(self) -> Path:
-        return self.root / ADAPTERS_DIR
-
-    def dir_for(self, name: str) -> Path:
-        return self.adapters_dir / validate_name(name)
-
-    # -- enumeration -----------------------------------------------------------------------------
-
-    def list_names(self) -> list[str]:
-        if not self.adapters_dir.exists():
-            return []
-        return sorted(
-            d.name for d in self.adapters_dir.iterdir() if d.is_dir() and self.versions(d.name)
-        )
-
-    def versions(self, name: str) -> list[int]:
-        directory = self.dir_for(name)
-        if not directory.exists():
-            return []
-        found: list[int] = []
-        for child in directory.iterdir():
-            if child.is_dir() and child.name.startswith("v") and child.name[1:].isdigit():
-                found.append(int(child.name[1:]))
-        return sorted(found)
-
-    def exists(self, name: str) -> bool:
-        return bool(self.versions(name))
-
-    # -- aliases ---------------------------------------------------------------------------------
-
-    def aliases(self, name: str) -> dict[str, int]:
-        """The alias table for `name`, empty when it has none.
-
-        Names the file on a decode error: `resolve_version(None)` reads this to find the champion,
-        so a bare `tomllib` message would reach an operator as a parse error with no path, for a
-        file they never edited.
-        """
-        path = self.dir_for(name) / _ALIASES_FILE
-        if not path.exists():
-            return {}
-        try:
-            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
-        except tomllib.TOMLDecodeError as exc:
-            raise ValueError(
-                f"adapter alias file {path} is not valid TOML ({exc}); it maps alias names to "
-                f"version numbers under [aliases]. Repair it, or delete it to fall back to the "
-                f"latest version until the next `wmo optimize distill run` promotion re-points "
-                f"{CHAMPION_ALIAS}"
-            ) from exc
-        data = parsed.get("aliases", {})
-        return {k: v for k, v in data.items() if isinstance(v, int)}
-
-    def set_alias(self, name: str, alias: str, version: int) -> None:
-        """Point `alias` at `version` (moving it if it exists). Rollback is re-pointing.
-
-        The write was already atomic; the lock covers the rest of the read-modify-write. Two
-        promotions of DIFFERENT aliases each read the same table and the later write drops the
-        earlier one, with both reporting success.
-        """
-        if version not in self.versions(name):
-            raise ValueError(f"adapter {name!r} has no version v{version}")
-        path = self.dir_for(name) / _ALIASES_FILE
-        with file_write_lock(path, what="the adapter alias table"):
-            current = self.aliases(name)
-            current[alias] = version
-            write_text_atomic(path, tomli_w.dumps({"aliases": current}))
+        """The directory holding every named adapter."""
+        return self.artifacts_dir
 
     # -- load / save -----------------------------------------------------------------------------
-
-    def resolve_version(self, name: str, ref: str | None = None) -> int:
-        """Resolve a version ref: `None` -> champion alias, else latest; `"vN"`/`"N"`; an alias."""
-        available = self.versions(name)
-        if not available:
-            raise FileNotFoundError(
-                f"no adapter named {name!r} under {self.adapters_dir} "
-                f"(have: {', '.join(self.list_names()) or 'none'})"
-            )
-        aliases = self.aliases(name)
-        if ref is None:
-            return aliases.get(CHAMPION_ALIAS, available[-1])
-        normalized = ref.removeprefix("v")
-        if normalized.isdigit():
-            version = int(normalized)
-            if version not in available:
-                raise ValueError(f"adapter {name!r} has no version v{version}")
-            return version
-        if ref in aliases:
-            return aliases[ref]
-        raise ValueError(f"adapter {name!r} has no version or alias {ref!r}")
 
     def resolve(self, name: str, ref: str | None = None) -> DistillModelCard:
         """Load the model card a ref resolves to (see `resolve_version` for refs).
@@ -792,7 +706,7 @@ class AdapterStore:
         Returns:
             The new version number.
         """
-        validate_name(name)
+        validate_name(name, kind=self.kind)
         version = (self.versions(name)[-1] + 1) if self.exists(name) else 1
         stamped = card.model_copy(update={"name": name, "version": version})
         directory = self.dir_for(name) / f"v{version}"
