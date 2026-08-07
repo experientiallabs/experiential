@@ -1,0 +1,45 @@
+{
+  "schema": "xtoken-tblite-disjoint-canary-manifest-v1",
+  "dataset": "openthoughts-tblite@2.0",
+  "dataset_git_commit": "f075e463472c7790b85793b392dff1fff20cc0e3",
+  "selection": {
+    "method": "exclude run1 names, then sort remaining names by sha256('20260807:' + task_name)",
+    "seed": 20260807
+  },
+  "run1": [
+    "bash-log-processor-fix",
+    "basic-message-queue",
+    "book-portfolio-analysis",
+    "cpp-daemon-sighup-segfault",
+    "maven-slf4j-conflict",
+    "mlflow-register",
+    "protein-sequence",
+    "reproducibility-and-envsetup",
+    "systemd-log-monitoring",
+    "todos-api"
+  ],
+  "run2": [
+    "hydra-debug-slurm-mode",
+    "reverse-engineer-stack-vm",
+    "vimscript-vim-quine",
+    "anomaly-detection-ranking",
+    "api-endpoint-permission-canonicalizer",
+    "raft-log-repair-concurrent-access",
+    "ekf-localization",
+    "competitive-programming-solver",
+    "sign-vector-game",
+    "malicious-package-forensics"
+  ],
+  "run3": [
+    "prediction-model-evaluation",
+    "etl_checkpoint_resume_bug",
+    "multi-labeller",
+    "mtls-cert-rotation",
+    "bloom-filter-cache-penetration-prevention",
+    "industrial-kiln-controller",
+    "pandas-etl",
+    "scan-linux-persistence-artifacts",
+    "security-breach-incident-response",
+    "battery-charging-optimization"
+  ]
+}

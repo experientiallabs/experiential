@@ -1,0 +1,90 @@
+base_model: Qwen/Qwen3.5-4B
+model_revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+processor_type: AutoProcessor
+
+# Qwen3.5 is exposed as a multimodal processor even for text-only examples.
+skip_prepare_dataset: true
+remove_unused_columns: false
+sample_packing: false
+
+# Preserve the pinned model's own template. Explicit role boundaries make the
+# multimodal collator train only assistant spans without changing rendering.
+chat_template: tokenizer_default
+role_boundaries:
+  - role: system
+    start: "<|im_start|>system\n"
+    end: "<|im_end|>"
+    include_start: false
+    include_end: true
+  - role: user
+    start: "<|im_start|>user\n"
+    end: "<|im_end|>"
+    include_start: false
+    include_end: true
+  - role: assistant
+    start: "<|im_start|>assistant\n"
+    end: "<|im_end|>"
+    include_start: false
+    include_end: true
+
+datasets:
+  - path: /mnt/datasets/scratch/xtoken/tb2-qwen35-4b-glm52-step200/axolotl-sft/sft-data/real-verifier-perfect14.qwen-materialized.jsonl
+    type: chat_template
+    field_messages: messages
+    roles_to_train:
+      - assistant
+    train_on_eos: turn
+
+dataset_prepared_path: /mnt/datasets/scratch/xtoken/tb2-qwen35-4b-glm52-step200/axolotl-sft/cache/realverified14
+val_set_size: 0.0
+output_dir: /mnt/datasets/scratch/xtoken/tb2-qwen35-4b-glm52-step200/axolotl-sft/checkpoints/qwen35-4b-glm52-realverified14-sft-lr1e5-r64
+
+adapter: lora
+lora_r: 64
+lora_alpha: 128
+lora_dropout: 0.0
+lora_qkv_kernel: false
+lora_o_kernel: false
+lora_mlp_kernel: false
+lora_embedding_kernel: false
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+  - linear_attn.in_proj_qkv
+  - linear_attn.in_proj_z
+  - linear_attn.out_proj
+
+sequence_len: 32768
+pad_to_sequence_len: false
+
+micro_batch_size: 1
+gradient_accumulation_steps: 1
+seed: 20260807
+max_steps: 100
+optimizer: adamw_torch_fused
+lr_scheduler: constant
+learning_rate: 0.00001
+warmup_steps: 0
+weight_decay: 0.0
+max_grad_norm: 1.0
+
+bf16: true
+tf32: true
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+attn_implementation: flash_attention_2
+
+logging_steps: 1
+save_steps: 25
+save_total_limit: 5
+
+wandb_project: x_token
+wandb_entity:
+wandb_name: qwen35-4b-glm52-realverified14-sft-lr1e5-r64
+wandb_log_model:
