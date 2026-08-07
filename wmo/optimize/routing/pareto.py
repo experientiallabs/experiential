@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from wmo.optimize.routing.compression import CompressingEmbedder
+from wmo.optimize.routing.knn import apply_cost_quality
 from wmo.optimize.routing.outcomes import OutcomeMatrix
 from wmo.optimize.routing.scorecard import (
     DEFAULT_COMPLETION,
@@ -147,8 +149,6 @@ def pareto_curve(
         ValueError: when no scenario has a scored row, or `scenario_ids` names scenarios
             the matrix never measured.
     """
-    from wmo.optimize.routing.knn import apply_cost_quality
-
     ids = list(scenario_ids) if scenario_ids is not None else matrix.scenario_ids()
     known = set(matrix.scenario_ids())
     ghosts = [sid for sid in ids if sid not in known]
@@ -261,8 +261,6 @@ def _replay_embedder(policy: RoutingPolicy) -> Embedder:
     exactly as `build_report` replays); querying its bank with raw vectors trips the
     novelty floor and mismeasures the routed points.
     """
-    from wmo.optimize.routing.compression import CompressingEmbedder
-
     built = policy.embedder.build()
     if policy.fit_compression is not None:
         return CompressingEmbedder(built, policy.fit_compression)
