@@ -115,6 +115,7 @@ def capture_build_completed(
     record: RunRecord,
     root: str | Path,
 ) -> None:
+    """Record one successful `wmo build`: corpus shape, search effort, and what the build spent."""
     capture(
         "wmo build completed",
         {
@@ -149,6 +150,7 @@ def capture_eval_completed(
     top_k: int,
     root: str | Path,
 ) -> None:
+    """Record one successful `wmo eval`: which protocol ran, over how much, with which retrieval."""
     capture(
         "wmo eval completed",
         {
@@ -166,6 +168,12 @@ def capture_eval_completed(
 
 
 def settings_root_from_results_root(results_root: str) -> Path:
+    """The project root whose `settings.toml` governs telemetry for a run writing to `results_root`.
+
+    Eval results land in `<root>/evals/`, so the enclosing directory is the project root; any other
+    results root (an ad-hoc directory) falls back to the default artifact root rather than reading
+    an unrelated directory's settings.
+    """
     path = Path(results_root)
     return path.parent if path.name == "evals" else Path(ARTIFACT_DIR)
 

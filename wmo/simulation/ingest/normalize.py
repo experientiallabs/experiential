@@ -440,6 +440,13 @@ def _oi_kind(span: SpanRecord) -> str:
 
 
 def is_tool_span(span: SpanRecord) -> bool:
+    """True when the span records a tool execution (the observation half of a step).
+
+    Classification is by declared vocabulary first (GenAI `gen_ai.operation.name`, then
+    OpenInference `openinference.span.kind`), and only falls back to the span name when a span
+    declares neither. An explicit LLM marker is a negative answer, never a fall-through: a span
+    that says it is a model call must not be re-read as a tool call by its name.
+    """
     op = _operation(span)
     if op in _TOOL_OPS:
         return True
@@ -454,6 +461,12 @@ def is_tool_span(span: SpanRecord) -> bool:
 
 
 def is_llm_span(span: SpanRecord) -> bool:
+    """True when the span records a model call (the action half of a step).
+
+    The mirror of `is_tool_span`: declared vocabulary first, and for an undeclared span the
+    presence of any prompt/completion attribute rather than the span's name, since exporters agree
+    far more on where they put the text than on what they call the span.
+    """
     op = _operation(span)
     if op in _LLM_OPS:
         return True
@@ -546,6 +559,13 @@ def _openinference_tool_call(attrs: JsonObject) -> tuple[str, JsonValue] | None:
 
 
 def action_from_llm_span(span: SpanRecord) -> Action:
+    """The `Action` an LLM span records: its tool call when it made one, else its message.
+
+    Tool calls are read in decreasing directness: an explicit `gen_ai.tool.*` attribute, then an
+    OpenInference tool call flattened onto the span. With no tool call the span is a message turn,
+    whose content is the completion, falling back to the prompt when the exporter recorded only
+    the input side.
+    """
     attrs = span.attributes
     tool_name = _first(attrs, _TOOL_NAME_KEYS)
     if isinstance(tool_name, str) and tool_name:
@@ -560,6 +580,11 @@ def action_from_llm_span(span: SpanRecord) -> Action:
 
 
 def tool_call_action_from_tool_span(span: SpanRecord) -> Action:
+    """The tool-call `Action` a tool span implies, for a corpus that exports no matching LLM span.
+
+    An unnamed tool span still yields an action (`name=None`) rather than being dropped: the call
+    happened, and its observation is the part the world model has to learn to predict.
+    """
     name = _first(span.attributes, _TOOL_NAME_KEYS)
     return Action(
         kind=ActionKind.TOOL_CALL,
@@ -569,6 +594,7 @@ def tool_call_action_from_tool_span(span: SpanRecord) -> Action:
 
 
 def observation_from_tool_span(span: SpanRecord) -> Observation:
+    """The `Observation` a tool span records: its output text, flagged by the span's own status."""
     content = as_text(_first(span.attributes, _TOOL_OUTPUT_KEYS))
     return Observation(content=content, is_error=span.status_error)
 

@@ -141,12 +141,18 @@ class RunTracker:
         return list(self._events)
 
     def totals(self) -> UsageTotals:
+        """Calls, tokens, and cost across every recorded phase (what a spend cap reads)."""
         total = UsageTotals()
         for event in self._events:
             total._add(event)
         return total
 
     def by_phase(self) -> dict[Phase, UsageTotals]:
+        """The same totals split per phase, for the breakdown a run report prints.
+
+        Only phases that actually recorded a call appear, so an absent phase reads as "never ran"
+        rather than as a row of zeros.
+        """
         buckets: dict[Phase, UsageTotals] = defaultdict(UsageTotals)
         for event in self._events:
             buckets[event.phase]._add(event)

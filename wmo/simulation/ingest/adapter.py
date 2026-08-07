@@ -58,10 +58,22 @@ _ADAPTERS: dict[str, TraceAdapter] = {}
 
 
 def register_adapter(adapter: TraceAdapter) -> None:
+    """Publish `adapter` under its own `name`, replacing any adapter already registered there.
+
+    The seam a new trace source joins the build through: a module under `wmo/simulation/ingest/`
+    calls this at import time, and `wmo/simulation/ingest/__init__.py` importing that module is
+    what makes `--source <name>` and auto-detection see it.
+    """
     _ADAPTERS[adapter.name] = adapter
 
 
 def get_adapter(name: str) -> TraceAdapter:
+    """The registered adapter named `name`.
+
+    Raises:
+        ValueError: No adapter is registered under that name; the message lists the ones that are,
+            because this is what a mistyped `--source` reaches the user as.
+    """
     if name not in _ADAPTERS:
         raise ValueError(f"no trace adapter registered for {name!r}; have {list(_ADAPTERS)}")
     return _ADAPTERS[name]

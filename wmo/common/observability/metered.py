@@ -76,6 +76,7 @@ class MeteredProvider:
         temperature: float = 0.7,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Completion:
+        """Forward the call unchanged, recording its exact reported usage against a phase."""
         completion = self._provider.complete(
             system, messages, temperature=temperature, max_tokens=max_tokens
         )
@@ -140,6 +141,7 @@ class MeteredProvider:
             raise
 
     def embed(self, texts: list[str]) -> list[list[float]]:
+        """Forward the embedding call, recording it so EMBED appears in the phase breakdown."""
         # Embeddings carry no token usage from our providers; record a zero-usage event for the
         # call count so EMBED shows up in the breakdown. Attribute it to the embeddings model
         # (`embed_model`), not the completion model, so any future embed pricing is keyed right.

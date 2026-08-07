@@ -92,6 +92,7 @@ class ProjectSettings(BaseModel):
 
 
 def settings_path(root: str | Path = ARTIFACT_DIR) -> Path:
+    """The settings file for a project root (the file itself need not exist)."""
     return Path(root) / SETTINGS_FILENAME
 
 
@@ -132,12 +133,18 @@ def load_settings(root: str | Path = ARTIFACT_DIR) -> ProjectSettings:
 
 
 def save_settings(settings: ProjectSettings, root: str | Path = ARTIFACT_DIR) -> None:
+    """Write `settings` to `<root>/settings.toml` atomically, replacing whatever is there.
+
+    Unset fields are omitted rather than written as nulls, so a hand-edited file stays as terse as
+    the one `wmo providers set` writes.
+    """
     path = settings_path(root)
     data = settings.model_dump(mode="json", exclude_none=True)
     write_text_atomic(path, tomli_w.dumps(data))
 
 
 def set_telemetry_enabled(enabled: bool, root: str | Path = ARTIFACT_DIR) -> ProjectSettings:
+    """Persist the telemetry opt-in for one project, returning the settings as written."""
     settings = load_settings(root)
     settings.telemetry.enabled = enabled
     save_settings(settings, root)
@@ -145,6 +152,11 @@ def set_telemetry_enabled(enabled: bool, root: str | Path = ARTIFACT_DIR) -> Pro
 
 
 def ensure_telemetry_anonymous_id(root: str | Path = ARTIFACT_DIR) -> str:
+    """The project's anonymous telemetry id, minting and persisting one on first use.
+
+    Stable per project so events from the same project correlate without identifying anyone; it is
+    written only when telemetry actually needs it, never at project creation.
+    """
     settings = load_settings(root)
     if settings.telemetry.anonymous_id is None:
         settings.telemetry.anonymous_id = uuid.uuid4().hex

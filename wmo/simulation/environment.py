@@ -65,15 +65,22 @@ class WorldModelEnv:
         return self._last_score
 
     def reset(self, task: str | None = None, seed_state: EnvState | None = None) -> EnvState:
+        """Start a fresh episode and return its opening state, ending any episode still open."""
         self.close()  # a leftover session would otherwise leak in the world model
         session = self._world_model.new_session(task=task, seed_state=seed_state)
         self._session_id = session.id
         return session.state
 
     def step(self, action: Action) -> Observation:
+        """Apply one action to the open episode and return the world model's observation."""
         return self._world_model.step(self.session_id, action)
 
     def close(self) -> None:
+        """End the episode (scoring it first when configured to), idempotently.
+
+        Teardown never raises: a judge failure is captured for `last_score` to re-raise, so a
+        batch caller that only closes environments cannot be derailed by one bad score.
+        """
         if self._session_id is None:
             return
         try:

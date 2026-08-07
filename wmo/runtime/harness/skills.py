@@ -54,6 +54,12 @@ class Skill(BaseModel):
 
     @classmethod
     def from_markdown(cls, text: str) -> Skill:
+        """Parse a SKILL.md-style file (the inverse of `to_markdown`).
+
+        Raises:
+            ValueError: The file has no frontmatter, or its `name` is not kebab-case. Both are
+                refused rather than defaulted, because the name is the skill's addressable id.
+        """
         match = _FRONTMATTER_RE.match(text)
         if match is None:
             raise ValueError("skill file has no frontmatter")

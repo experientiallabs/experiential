@@ -288,12 +288,14 @@ class PlatformClient:
         self.close()
 
     def close(self) -> None:
+        """Release both underlying HTTP connections (short-request and bulk-transfer)."""
         self._client.close()
         self._transfer.close()
 
     # -- identity ------------------------------------------------------------------------------
 
     def whoami(self) -> WhoAmI:
+        """The identity this client's credentials resolve to on the configured platform."""
         response = self._client.get("/api/whoami")
         self._raise_for_error(response)
         # The identity call doubles as "is this host a platform?": `login
@@ -329,6 +331,7 @@ class PlatformClient:
         return Observation.model_validate(_decode_json(response)["observation"])
 
     def list_world_models(self, org_id: str) -> list[RemoteWorldModel]:
+        """Every world model an org has on the platform (what `wmo platform list` shows)."""
         response = self._client.get(f"/api/orgs/{org_id}/world-models")
         self._raise_for_error(response)
         rows = _rows(_decode_json(response), "world_models")

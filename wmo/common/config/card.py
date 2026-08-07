@@ -105,6 +105,7 @@ def make_build_card(
 
 
 def card_path(model_dir: str | Path) -> Path:
+    """The card file inside a model directory (the file itself need not exist)."""
     return Path(model_dir) / CARD_FILENAME
 
 
