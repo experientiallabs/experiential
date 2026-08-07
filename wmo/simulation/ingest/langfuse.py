@@ -61,15 +61,14 @@ from wmo.simulation.ingest.base import BaseTraceAdapter
 from wmo.simulation.ingest.normalize import (
     SpanEmitter,
     SpanRecord,
+    as_str,
     as_text,
+    first_str,
     iso_to_ordinal,
     openai_call_name_args,
     openai_tool_calls,
+    payload_digest_id,
 )
-
-
-def _as_str(value: JsonValue) -> str:
-    return value if isinstance(value, str) else ""
 
 
 def _start_ordinal(observation: JsonObject, fallback: int) -> int:
@@ -84,7 +83,7 @@ def _is_error(observation: JsonObject) -> bool:
     error signal — it is generic context Langfuse sets on any level — so we must not treat its
     presence as an error (that misclassified successful observations).
     """
-    return _as_str(observation.get("level")).upper() == "ERROR"
+    return as_str(observation.get("level")).upper() == "ERROR"
 
 
 def _observation_tool_name(observation: JsonObject) -> str:
@@ -218,7 +217,7 @@ class LangfuseAdapter(BaseTraceAdapter):
         emitter = SpanEmitter(trace_id, first_attributes)
 
         for _, obs in indexed:
-            otype = _as_str(obs.get("type")).upper()
+            otype = as_str(obs.get("type")).upper()
             error = _is_error(obs)
             calls = openai_tool_calls(obs.get("output")) if otype == "GENERATION" else []
             if calls:
@@ -265,12 +264,7 @@ class LangfuseAdapter(BaseTraceAdapter):
 
     def _trace_id(self, trace: JsonObject) -> str:
         """A stable grouping key. Langfuse ids are not 32-hex; that's fine (it's just a key)."""
-        tid = trace.get("id")
-        if isinstance(tid, str) and tid:
-            return tid
-        import hashlib
-
-        return hashlib.sha256(as_text(trace).encode()).hexdigest()[:32]
+        return first_str(trace, "id") or payload_digest_id(trace)
 
 
 register_adapter(LangfuseAdapter())

@@ -52,11 +52,13 @@ from pydantic import JsonValue
 from wmo.common.core.types import JsonObject
 from wmo.simulation.ingest.adapter import register_adapter
 from wmo.simulation.ingest.base import BaseTraceAdapter
-from wmo.simulation.ingest.normalize import SpanRecord, attrs_to_dict, collect_spans, iso_to_ordinal
-
-
-def _as_str(value: JsonValue) -> str:
-    return value if isinstance(value, str) else ""
+from wmo.simulation.ingest.normalize import (
+    SpanRecord,
+    as_str,
+    attrs_to_dict,
+    collect_spans,
+    iso_to_ordinal,
+)
 
 
 def _ctx_field(span: JsonObject, field: str) -> str:
@@ -91,12 +93,12 @@ def _phoenix_span(raw: JsonValue, ordinal: int) -> SpanRecord | None:
     trace_id = _ctx_field(raw, "trace_id")
     if not trace_id:
         return None
-    status = _as_str(raw.get("status_code")).upper()
+    status = as_str(raw.get("status_code")).upper()
     return SpanRecord(
         trace_id=trace_id,
         span_id=_ctx_field(raw, "span_id"),
-        parent_span_id=_as_str(raw.get("parent_id")),
-        name=_as_str(raw.get("name")),
+        parent_span_id=as_str(raw.get("parent_id")),
+        name=as_str(raw.get("name")),
         # `start_time`/`end_time` may be ISO strings (UI export) or datetimes (dataframe records).
         start_nano=iso_to_ordinal(raw.get("start_time"), ordinal),
         end_nano=iso_to_ordinal(raw.get("end_time"), ordinal),

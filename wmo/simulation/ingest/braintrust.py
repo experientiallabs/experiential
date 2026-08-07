@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 
 import httpx
 from pydantic import JsonValue
@@ -53,9 +54,11 @@ from wmo.simulation.ingest.normalize import (
     SpanEmitter,
     SpanRecord,
     as_text,
+    first_str,
     iso_to_ordinal,
     openai_call_name_args,
     openai_tool_calls,
+    payload_digest_id,
 )
 
 # Braintrust REST API. The fetch endpoint returns `{"events": [span rows]}`; the project list
@@ -71,14 +74,8 @@ _LLM_TYPES = frozenset({"llm", "task", "function", "chain", "agent"})
 _TOOL_TYPES = frozenset({"tool"})
 
 
-def _as_str(value: JsonValue) -> str:
-    return value if isinstance(value, str) else ""
-
-
 def _looks_like_uuid(value: str) -> bool:
     """True if `value` is a canonical UUID (Braintrust project ids), so we skip the name lookup."""
-    import uuid
-
     try:
         uuid.UUID(value)
     except ValueError:
@@ -243,13 +240,7 @@ class BraintrustAdapter(BaseTraceAdapter):
 
     def _trace_id(self, row: JsonObject) -> str:
         """The trace grouping key: `root_span_id`, then `span_id`, else a hash (stable fallback)."""
-        for key in ("root_span_id", "span_id"):
-            value = row.get(key)
-            if isinstance(value, str) and value:
-                return value
-        import hashlib
-
-        return hashlib.sha256(as_text(row).encode()).hexdigest()[:32]
+        return first_str(row, "root_span_id", "span_id") or payload_digest_id(row)
 
     def _spans_for_trace(self, trace_id: str, rows: list[JsonObject]) -> list[SpanRecord]:
         # Order by `created`; ties (or absent timestamps) keep input order via the index fallback.

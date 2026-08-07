@@ -48,19 +48,18 @@ from wmo.simulation.ingest.base import BaseTraceAdapter
 from wmo.simulation.ingest.normalize import (
     SpanEmitter,
     SpanRecord,
+    as_str,
     as_text,
+    first_str,
     iso_to_ordinal,
     openai_call_name_args,
+    payload_digest_id,
 )
 
 # PostHog API. `$AI_*` events are queried via HogQL over the `events` table. Host is region-specific
 # (US: us.posthog.com, EU: eu.posthog.com), so it is configurable.
 _API_HOST = os.environ.get("POSTHOG_HOST", "https://us.posthog.com").rstrip("/")
 _API_KEY_ENV = "POSTHOG_API_KEY"
-
-
-def _as_str(value: JsonValue) -> str:
-    return value if isinstance(value, str) else ""
 
 
 def _props(event: JsonObject) -> JsonObject:
@@ -149,7 +148,7 @@ def _first_user_text(messages: JsonValue) -> str | None:
     if not isinstance(messages, list):
         return None
     for message in messages:
-        if isinstance(message, dict) and _as_str(message.get("role")).lower() in {"user", "human"}:
+        if isinstance(message, dict) and as_str(message.get("role")).lower() in {"user", "human"}:
             content = message.get("content")
             if content is not None:
                 return as_text(content)
@@ -195,17 +194,11 @@ class PostHogAdapter(BaseTraceAdapter):
         return []
 
     def _trace_id(self, event: JsonObject) -> str:
-        props = _props(event)
-        for key in ("$ai_trace_id", "$ai_span_id"):
-            value = props.get(key)
-            if isinstance(value, str) and value:
-                return value
-        eid = event.get("id") or event.get("uuid")
-        if isinstance(eid, str) and eid:
-            return eid
-        import hashlib
-
-        return hashlib.sha256(as_text(event).encode()).hexdigest()[:32]
+        return (
+            first_str(_props(event), "$ai_trace_id", "$ai_span_id")
+            or first_str(event, "id", "uuid")
+            or payload_digest_id(event)
+        )
 
     def _spans_for_trace(self, trace_id: str, events: list[JsonObject]) -> list[SpanRecord]:
         indexed = list(enumerate(events))
@@ -242,7 +235,7 @@ class PostHogAdapter(BaseTraceAdapter):
             elif name == "$ai_span" and self._span_is_tool(props):
                 emitter.emit(
                     {
-                        "gen_ai.tool.name": _as_str(props.get("$ai_span_name")),
+                        "gen_ai.tool.name": as_str(props.get("$ai_span_name")),
                         "gen_ai.tool.call.arguments": as_text(props.get("$ai_input_state")),
                         "gen_ai.tool.message": as_text(props.get("$ai_output_state")),
                     },
@@ -257,7 +250,7 @@ class PostHogAdapter(BaseTraceAdapter):
         return (
             props.get("$ai_output_state") is not None
             or props.get("$ai_input_state") is not None
-            or bool(_as_str(props.get("$ai_span_name")))
+            or bool(as_str(props.get("$ai_span_name")))
         )
 
     def _pull_payloads(self, pull: VendorPull) -> list[JsonValue]:

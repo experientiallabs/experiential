@@ -64,11 +64,15 @@ from pydantic import JsonValue
 from wmo.common.core.types import JsonObject
 from wmo.simulation.ingest.adapter import VendorPull, register_adapter
 from wmo.simulation.ingest.base import BaseTraceAdapter
-from wmo.simulation.ingest.normalize import SpanEmitter, SpanRecord, as_text, iso_to_ordinal
-
-
-def _as_str(value: JsonValue) -> str:
-    return value if isinstance(value, str) else ""
+from wmo.simulation.ingest.normalize import (
+    SpanEmitter,
+    SpanRecord,
+    as_str,
+    as_text,
+    first_str,
+    iso_to_ordinal,
+    payload_digest_id,
+)
 
 
 def _is_error(run: JsonObject) -> bool:
@@ -373,7 +377,7 @@ class LangSmithAdapter(BaseTraceAdapter):
         emitter = SpanEmitter(trace_id, {} if task is None else {"gen_ai.prompt": task})
 
         for _, run in indexed:
-            run_type = _as_str(run.get("run_type")).lower()
+            run_type = as_str(run.get("run_type")).lower()
             error = _is_error(run)
             outputs = run.get("outputs")
             out_obj: JsonObject = outputs if isinstance(outputs, dict) else {}
@@ -414,13 +418,7 @@ class LangSmithAdapter(BaseTraceAdapter):
 
     def _trace_id(self, run: JsonObject) -> str:
         """Grouping key: `trace_id`, else the run's own `id` (a root run may omit trace_id)."""
-        for key in ("trace_id", "id"):
-            value = run.get(key)
-            if isinstance(value, str) and value:
-                return value
-        import hashlib
-
-        return hashlib.sha256(as_text(run).encode()).hexdigest()[:32]
+        return first_str(run, "trace_id", "id") or payload_digest_id(run)
 
 
 register_adapter(LangSmithAdapter())

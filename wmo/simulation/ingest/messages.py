@@ -30,6 +30,7 @@ Accepted file shapes (`from_file`):
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 from pydantic import JsonValue
@@ -41,8 +42,6 @@ from wmo.simulation.ingest.normalize import SpanRecord, as_text, openai_call_nam
 
 
 def _hash_id(*parts: str) -> str:
-    import hashlib
-
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:32]
 
 

@@ -21,6 +21,7 @@ span, so a faithfully captured trace round-trips for open-loop replay.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 
@@ -225,11 +226,48 @@ def as_text(value: JsonValue) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def _as_str(value: JsonValue) -> str:
+def as_str(value: JsonValue) -> str:
+    """A string field read off a vendor payload; anything non-string reads as empty.
+
+    The shared spelling for "this key should hold a string": every vendor adapter reads ids,
+    names, roles, and status codes out of loosely typed JSON, and a missing or wrongly typed key
+    has to degrade to `""` rather than raise.
+    """
     return value if isinstance(value, str) else ""
 
 
+def first_str(payload: JsonObject, *keys: str) -> str | None:
+    """The first key in `keys` whose value is a non-empty string, or `None` when none is.
+
+    Vendors spell the same field several ways across export versions (`traceId` vs `trace_id`),
+    so a reader states its preference order once instead of a chain of isinstance checks.
+    """
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def payload_digest_id(payload: JsonValue) -> str:
+    """A 32-hex id derived from a payload's own content, for an export that carries no id.
+
+    Deterministic (`as_text` sorts keys), so re-ingesting the same export groups its spans the
+    same way. It is a grouping key, not a vendor id: nothing round-trips it back to the vendor.
+    """
+    return hashlib.sha256(as_text(payload).encode()).hexdigest()[:32]
+
+
 # --- OpenAI chat-completion tool-call shape ---------------------------------------------------
+
+
+def is_chat_message(value: JsonValue) -> bool:
+    """True when `value` has the shape of one OpenAI-style chat message (a dict with a `role`).
+
+    The structural marker the `chat-json` format is detected by, shared so a file payload and a
+    Postgres payload column cannot disagree about what counts as a conversation.
+    """
+    return isinstance(value, dict) and isinstance(value.get("role"), str)
 
 
 def openai_tool_calls(output: JsonValue) -> list[JsonObject]:
@@ -329,9 +367,9 @@ def parse_span(raw: JsonValue) -> SpanRecord | None:
         status_error = code in (2, "STATUS_CODE_ERROR")
     return SpanRecord(
         trace_id=trace_id,
-        span_id=_as_str(raw.get("spanId")),
-        parent_span_id=_as_str(raw.get("parentSpanId")),
-        name=_as_str(raw.get("name")),
+        span_id=as_str(raw.get("spanId")),
+        parent_span_id=as_str(raw.get("parentSpanId")),
+        name=as_str(raw.get("name")),
         start_nano=to_int(raw.get("startTimeUnixNano")),
         end_nano=to_int(raw.get("endTimeUnixNano")),
         attributes=attrs_to_dict(raw.get("attributes")),

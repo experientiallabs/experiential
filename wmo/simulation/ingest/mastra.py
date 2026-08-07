@@ -52,7 +52,15 @@ from pydantic import JsonValue
 from wmo.common.core.types import JsonObject
 from wmo.simulation.ingest.adapter import VendorPull, register_adapter
 from wmo.simulation.ingest.base import BaseTraceAdapter
-from wmo.simulation.ingest.normalize import SpanEmitter, SpanRecord, as_text, iso_to_ordinal
+from wmo.simulation.ingest.normalize import (
+    SpanEmitter,
+    SpanRecord,
+    as_str,
+    as_text,
+    first_str,
+    iso_to_ordinal,
+    payload_digest_id,
+)
 
 # Mastra self-hosts, so the "vendor" is a server base URL (dev default http://localhost:4111).
 _MASTRA_URL_ENV = "MASTRA_URL"
@@ -63,10 +71,6 @@ _MASTRA_URL_ENV = "MASTRA_URL"
 # still accept. `model_chunk`/`model_step`/`agent_run`/`workflow_*`/`generic` are not steps.
 _LLM_TYPES = frozenset({"model_generation", "llm_generation"})
 _TOOL_TYPES = frozenset({"tool_call", "mcp_tool_call"})
-
-
-def _as_str(value: JsonValue) -> str:
-    return value if isinstance(value, str) else ""
 
 
 def _span_type(span: JsonObject) -> str:
@@ -158,7 +162,7 @@ def _first_user_text(value: JsonValue) -> str | None:
     """First user message text from a span `input` (a messages list), else the input as text."""
     if isinstance(value, list):
         for message in value:
-            if isinstance(message, dict) and _as_str(message.get("role")).lower() in {
+            if isinstance(message, dict) and as_str(message.get("role")).lower() in {
                 "user",
                 "human",
             }:
@@ -228,16 +232,8 @@ class MastraAdapter(BaseTraceAdapter):
         return []
 
     def _trace_id(self, span: JsonObject) -> str:
-        for key in ("traceId", "trace_id"):
-            value = span.get(key)
-            if isinstance(value, str) and value:
-                return value
-        sid = span.get("id") or span.get("spanId") or span.get("span_id")
-        if isinstance(sid, str) and sid:
-            return sid
-        import hashlib
-
-        return hashlib.sha256(as_text(span).encode()).hexdigest()[:32]
+        keys = ("traceId", "trace_id", "id", "spanId", "span_id")
+        return first_str(span, *keys) or payload_digest_id(span)
 
     def _spans_for_trace(self, trace_id: str, raw_spans: list[JsonObject]) -> list[SpanRecord]:
         indexed = list(enumerate(raw_spans))

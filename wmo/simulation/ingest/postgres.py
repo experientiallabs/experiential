@@ -42,7 +42,7 @@ from wmo.simulation.ingest.adapter import (
 )
 from wmo.simulation.ingest.base import BaseTraceAdapter
 from wmo.simulation.ingest.detect import detect_format
-from wmo.simulation.ingest.normalize import SpanRecord
+from wmo.simulation.ingest.normalize import SpanRecord, is_chat_message
 
 DSN_ENV = "WMO_POSTGRES_DSN"
 
@@ -72,10 +72,6 @@ def _validate_column(column: str, *, flag: str) -> str:
     return column
 
 
-def _is_message(payload: JsonValue) -> bool:
-    return isinstance(payload, dict) and isinstance(payload.get("role"), str)
-
-
 class PostgresAdapter(BaseTraceAdapter):
     """Read trace rows from a Postgres table; payload format shared with the file adapters."""
 
@@ -92,7 +88,7 @@ class PostgresAdapter(BaseTraceAdapter):
         payloads = [payload for _, payload in rows]
         if not payloads:
             return []
-        if all(_is_message(p) for p in payloads):
+        if all(is_chat_message(p) for p in payloads):
             rows = self._assemble_conversations(rows)
             inner: BaseTraceAdapter = self._inner_adapter("chat-json")
         else:

@@ -24,6 +24,7 @@ from __future__ import annotations
 from pydantic import JsonValue
 
 from wmo.simulation.ingest.adapter import list_adapters
+from wmo.simulation.ingest.normalize import is_chat_message
 
 # Mastra `ExportedSpan.type` values around the 2025-11 rename. See
 # `wmo/simulation/ingest/mastra.py`.
@@ -45,15 +46,11 @@ _WRAPPER_KEYS = ("data", "events", "results", "runs", "spans", "traces")
 _SAMPLE = 8
 
 
-def _is_message(value: JsonValue) -> bool:
-    return isinstance(value, dict) and isinstance(value.get("role"), str)
-
-
 def _detect_dict(payload: dict[str, JsonValue]) -> str | None:
     if isinstance(payload.get("resourceSpans"), list):
         return "otel-genai"
     messages = payload.get("messages")
-    if isinstance(messages, list) and messages and all(_is_message(m) for m in messages):
+    if isinstance(messages, list) and messages and all(is_chat_message(m) for m in messages):
         return "chat-json"
     if isinstance(payload.get("observations"), list):
         return "langfuse"
@@ -90,7 +87,7 @@ def _detect_one(payload: JsonValue) -> str | None:
     if isinstance(payload, dict):
         return _detect_dict(payload)
     if isinstance(payload, list):
-        if payload and all(_is_message(m) for m in payload):
+        if payload and all(is_chat_message(m) for m in payload):
             return "chat-json"
         for item in payload:
             verdict = _detect_one(item)

@@ -69,21 +69,6 @@ def resolve_opt_in_model_provider(
     return get_provider(config), configured.model
 
 
-def resolve_required_model_config(root: str, role: OptInModelRole) -> ProviderConfig:
-    """Resolve one opt-in role a workflow requires (no fallback provider exists for it).
-
-    The harbor optimize flow has no world model whose provider could stand in, so its
-    ``agent`` (worker) and ``meta`` (proposer) roles must be configured explicitly.
-    """
-    configured = load_settings_or_abort(root).models.resolve(role)
-    if configured is None:
-        raise typer.BadParameter(
-            f"settings [models.{role}] must be configured in <root>/settings.toml for this "
-            f"workflow; add a [models.{role}] table with provider and model"
-        )
-    return _model_config(configured, role=role)
-
-
 def configured_role_configs(root: str) -> list[tuple[ModelRoleName, ProviderConfig]]:
     """Resolve every model role a project has actually written down, in `MODEL_ROLE_NAMES` order.
 
