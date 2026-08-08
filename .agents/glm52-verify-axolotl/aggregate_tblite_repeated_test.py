@@ -122,3 +122,23 @@ def test_aggregate_rejects_checksum_mismatch(tmp_path: Path) -> None:
             bootstrap_samples=10,
             bootstrap_seed=1,
         )
+
+
+def test_aggregate_authorizes_official_only_when_all_checks_pass(
+    tmp_path: Path,
+) -> None:
+    """The serialized official gate must agree with the credible-win gate."""
+    paths = [tmp_path / f"run-{index}.json" for index in range(3)]
+    rows = [(f"task-{index}", f"sha-{index}", 0.0, 1.0) for index in range(6)]
+    for path in paths:
+        write_report(path, rows)
+
+    result = aggregate(
+        input_paths=paths,
+        expected_task_count=6,
+        bootstrap_samples=100,
+        bootstrap_seed=1,
+    )
+
+    assert result["promotion_gate"]["credible_tbilite_win"] is True
+    assert result["promotion_gate"]["official_tb2_authorized"] is True

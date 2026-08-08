@@ -178,6 +178,7 @@ def aggregate(
         "task_mean_sign_test_p_below_0_05": sign_p < 0.05,
         "graded_task_cluster_bootstrap_lower_above_zero": graded_ci[0] > 0,
     }
+    credible = all(gate_checks.values())
     return {
         "schema": "xtoken-tblite-repeated-task-clustered-v1",
         "evidence_scope": "repeated_held_out_tblite_screen_not_official_tb2",
@@ -202,8 +203,8 @@ def aggregate(
         },
         "promotion_gate": {
             "checks": gate_checks,
-            "credible_tbilite_win": all(gate_checks.values()),
-            "official_tb2_authorized": False,
+            "credible_tbilite_win": credible,
+            "official_tb2_authorized": credible,
         },
         "per_task": per_task,
     }
