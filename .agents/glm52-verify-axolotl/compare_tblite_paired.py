@@ -30,10 +30,22 @@ def load_arm(root: Path) -> dict[str, dict[str, Any]]:
 
 
 def reward(row: dict[str, Any]) -> float:
-    """Return the official environment verifier reward from a Harbor row."""
-    value = row.get("verifier_result", {}).get("rewards", {}).get("reward")
+    """Return verifier reward, counting a failed trial without one as zero."""
+    verifier_result = row.get("verifier_result")
+    rewards = (
+        verifier_result.get("rewards", {})
+        if isinstance(verifier_result, dict)
+        else {}
+    )
+    value = rewards.get("reward")
     if not isinstance(value, (int, float)):
-        raise ValueError(f"task {row.get('task_name')!r} has no numeric verifier reward")
+        failure = exception_type(row)
+        if failure is not None:
+            return 0.0
+        raise ValueError(
+            f"task {row.get('task_name')!r} has neither a numeric verifier "
+            "reward nor a recorded trial exception"
+        )
     return float(value)
 
 
@@ -62,7 +74,7 @@ def validate_provenance(
 
 
 def arm_summary(rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """Summarize observed trials only, never a hypothetical 100-task denominator."""
+    """Summarize every completed trial, including failed trials as zero."""
     rewards = [reward(row) for row in rows.values()]
     exceptions = Counter(
         value for row in rows.values() if (value := exception_type(row)) is not None

@@ -13,7 +13,7 @@ from compare_tblite_paired import compare
 def write_result(
     root: Path,
     task_name: str,
-    reward: float,
+    reward: float | None,
     *,
     checksum: str | None = None,
     exception: str | None = None,
@@ -32,7 +32,9 @@ def write_result(
                     "git_commit_id": "deadbeef",
                     "path": task_name,
                 },
-                "verifier_result": {"rewards": {"reward": reward}},
+                "verifier_result": (
+                    {"rewards": {"reward": reward}} if reward is not None else None
+                ),
                 "exception_info": (
                     {"exception_type": exception} if exception else None
                 ),
@@ -94,6 +96,45 @@ def test_compare_rejects_unmatched_task_sets(tmp_path: Path) -> None:
     write_result(adapter, "a", 1.0)
 
     with pytest.raises(ValueError, match="task sets differ"):
+        compare(
+            base_root=base,
+            adapter_root=adapter,
+            bootstrap_samples=10,
+            bootstrap_seed=1,
+        )
+
+
+def test_compare_counts_failed_trial_without_verifier_as_zero(
+    tmp_path: Path,
+) -> None:
+    """Agent failures remain in the paired denominator with zero reward."""
+    base = tmp_path / "base"
+    adapter = tmp_path / "adapter"
+    write_result(base, "a", None, exception="AgentTimeoutError")
+    write_result(adapter, "a", 1.0)
+
+    result = compare(
+        base_root=base,
+        adapter_root=adapter,
+        bootstrap_samples=10,
+        bootstrap_seed=1,
+    )
+
+    assert result["task_count"] == 1
+    assert result["base"]["graded_mean"] == 0.0
+    assert result["base"]["zero_reward_count"] == 1
+    assert result["adapter"]["graded_mean"] == 1.0
+    assert result["paired"]["graded_mean_delta"] == 1.0
+
+
+def test_compare_rejects_missing_verifier_without_failure(tmp_path: Path) -> None:
+    """A missing verifier result is not silently converted unless the trial failed."""
+    base = tmp_path / "base"
+    adapter = tmp_path / "adapter"
+    write_result(base, "a", None)
+    write_result(adapter, "a", 1.0)
+
+    with pytest.raises(ValueError, match="neither a numeric verifier reward"):
         compare(
             base_root=base,
             adapter_root=adapter,
