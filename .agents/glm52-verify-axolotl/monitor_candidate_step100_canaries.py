@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import shutil
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+CONTEXT_ERROR = "maximum context length is 65536"
+logger = logging.getLogger(__name__)
 
 
 def run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -55,7 +59,9 @@ def trial_rows(job: Path) -> list[dict[str, Any]]:
 
 def reward(row: dict[str, Any]) -> float | None:
     value = ((row.get("verifier_result") or {}).get("rewards") or {}).get("reward")
-    return float(value) if value is not None else None
+    if value is not None:
+        return float(value)
+    return 0.0 if exception_type(row) is not None else None
 
 
 def exception_type(row: dict[str, Any]) -> str | None:
@@ -65,7 +71,23 @@ def exception_type(row: dict[str, Any]) -> str | None:
     return None
 
 
+def context_overflow_trial(trial: Path) -> bool:
+    for relative in (
+        Path("agent/mini-swe-agent.txt"),
+        Path("agent/mini-swe-agent.trajectory.json"),
+        Path("trial.log"),
+    ):
+        path = trial / relative
+        try:
+            if CONTEXT_ERROR in path.read_text(errors="replace"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def arm_health(job: Path) -> dict[str, Any]:
+    result_paths = list(job.glob("*/result.json"))
     rows = trial_rows(job)
     rewards = [value for row in rows if (value := reward(row)) is not None]
     exceptions: dict[str, int] = {}
@@ -78,6 +100,9 @@ def arm_health(job: Path) -> dict[str, Any]:
         "strict": sum(value == 1.0 for value in rewards),
         "graded_mean": sum(rewards) / len(rewards) if rewards else None,
         "exceptions": dict(sorted(exceptions.items())),
+        "context_overflow_trials": sum(
+            context_overflow_trial(path.parent) for path in result_paths
+        ),
     }
 
 
@@ -108,7 +133,7 @@ def main() -> int:
     args = parser.parse_args()
     disk = shutil.disk_usage(args.root)
     snapshot = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "checkpoint_step": args.step,
         "orchestrator_alive": session_alive(f"candidate-step{args.step}-two-seed-canaries"),
         "server_alive": session_alive(f"qwen35-4b-candidate-step{args.step}-seeds-serve"),
@@ -122,7 +147,8 @@ def main() -> int:
     args.health_log.parent.mkdir(parents=True, exist_ok=True)
     with args.health_log.open("a") as handle:
         handle.write(json.dumps(snapshot, sort_keys=True) + "\n")
-    print(json.dumps(snapshot, sort_keys=True))
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logger.info(json.dumps(snapshot, sort_keys=True))
     return 0
 
 

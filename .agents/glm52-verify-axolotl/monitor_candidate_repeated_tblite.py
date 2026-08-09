@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 TRAIN_SEED = 20260809
+CONTEXT_ERROR = "maximum context length is 65536"
 
 
 def run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -63,9 +64,25 @@ def exception_type(row: dict[str, Any]) -> str | None:
     return str(value) if value else None
 
 
+def context_overflow_trial(trial: Path) -> bool:
+    for relative in (
+        Path("agent/mini-swe-agent.txt"),
+        Path("agent/mini-swe-agent.trajectory.json"),
+        Path("trial.log"),
+    ):
+        path = trial / relative
+        try:
+            if CONTEXT_ERROR in path.read_text(errors="replace"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def arm_health(job: Path) -> dict[str, Any]:
     rows = []
-    for path in job.glob("*/result.json"):
+    result_paths = list(job.glob("*/result.json"))
+    for path in result_paths:
         try:
             rows.append(json.loads(path.read_text()))
         except (json.JSONDecodeError, OSError):
@@ -85,6 +102,9 @@ def arm_health(job: Path) -> dict[str, Any]:
         "strict": sum(value == 1.0 for value in rewards),
         "graded_mean": sum(rewards) / len(rewards) if rewards else None,
         "exceptions": dict(sorted(exceptions.items())),
+        "context_overflow_trials": sum(
+            context_overflow_trial(path.parent) for path in result_paths
+        ),
         "harbor": {
             key: stats.get(key)
             for key in (

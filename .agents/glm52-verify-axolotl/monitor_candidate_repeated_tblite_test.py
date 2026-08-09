@@ -32,12 +32,16 @@ def test_arm_health_retains_exception_as_zero(tmp_path: Path) -> None:
         job / "two" / "result.json",
         {"exception_info": {"exception_type": "AgentTimeoutError"}},
     )
+    trajectory = job / "two" / "agent" / "mini-swe-agent.trajectory.json"
+    trajectory.parent.mkdir(parents=True, exist_ok=True)
+    trajectory.write_text("maximum context length is 65536 tokens")
     result = arm_health(job)
     assert result["result_files"] == 2
     assert result["scored"] == 2
     assert result["strict"] == 1
     assert result["graded_mean"] == 0.5
     assert result["exceptions"] == {"AgentTimeoutError": 1}
+    assert result["context_overflow_trials"] == 1
     assert result["harbor"]["n_running_trials"] == 1
     assert result["harbor"]["n_retries"] == 1
 
