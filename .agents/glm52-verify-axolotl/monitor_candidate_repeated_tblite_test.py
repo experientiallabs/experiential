@@ -5,6 +5,7 @@ from monitor_candidate_repeated_tblite import (
     arm_health,
     numerical_nan_signal,
     repeat_health,
+    token_summary,
 )
 
 
@@ -30,7 +31,10 @@ def test_arm_health_retains_exception_as_zero(tmp_path: Path) -> None:
     )
     write_json(
         job / "one" / "result.json",
-        {"verifier_result": {"rewards": {"reward": 1.0}}},
+        {
+            "verifier_result": {"rewards": {"reward": 1.0}},
+            "agent_result": {"n_input_tokens": 100, "n_output_tokens": 20},
+        },
     )
     write_json(
         job / "two" / "result.json",
@@ -46,6 +50,8 @@ def test_arm_health_retains_exception_as_zero(tmp_path: Path) -> None:
     assert result["graded_mean"] == 0.5
     assert result["exceptions"] == {"AgentTimeoutError": 1}
     assert result["context_overflow_trials"] == 1
+    assert result["tokens"]["output_tokens_total"] == 20
+    assert result["tokens"]["token_accounted_trials"] == 1
     assert result["harbor"]["n_running_trials"] == 1
     assert result["harbor"]["n_retries"] == 1
 
@@ -80,3 +86,18 @@ def test_numerical_nan_signal_ignores_single_run_summary() -> None:
     assert not numerical_nan_signal("run-to-run sd nan; stderr +/- nan")
     assert numerical_nan_signal("loss=NaN")
     assert numerical_nan_signal("tensor contains a NaN")
+
+
+def test_token_summary_uses_only_numeric_agent_accounting() -> None:
+    result = token_summary(
+        [
+            {"agent_result": {"n_input_tokens": 50.0, "n_output_tokens": 25.0}},
+            {"agent_result": {"n_input_tokens": None, "n_output_tokens": "12"}},
+        ]
+    )
+    assert result == {
+        "input_tokens_total": 50,
+        "output_tokens_total": 25,
+        "output_tokens_mean": 25.0,
+        "token_accounted_trials": 1,
+    }

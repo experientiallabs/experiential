@@ -90,6 +90,26 @@ def numerical_nan_signal(text: str) -> bool:
     return any(re.search(pattern, text, re.I) for pattern in NAN_SIGNAL_PATTERNS)
 
 
+def token_summary(rows: list[dict[str, Any]]) -> dict[str, int | float | None]:
+    """Summarize Harbor's cumulative agent token accounting."""
+    inputs: list[int] = []
+    outputs: list[int] = []
+    for row in rows:
+        agent_result = row.get("agent_result") or {}
+        input_tokens = agent_result.get("n_input_tokens")
+        output_tokens = agent_result.get("n_output_tokens")
+        if isinstance(input_tokens, (int, float)) and not isinstance(input_tokens, bool):
+            inputs.append(int(input_tokens))
+        if isinstance(output_tokens, (int, float)) and not isinstance(output_tokens, bool):
+            outputs.append(int(output_tokens))
+    return {
+        "input_tokens_total": sum(inputs),
+        "output_tokens_total": sum(outputs),
+        "output_tokens_mean": sum(outputs) / len(outputs) if outputs else None,
+        "token_accounted_trials": len(outputs),
+    }
+
+
 def arm_health(job: Path) -> dict[str, Any]:
     rows = []
     result_paths = list(job.glob("*/result.json"))
@@ -116,6 +136,7 @@ def arm_health(job: Path) -> dict[str, Any]:
         "context_overflow_trials": sum(
             context_overflow_trial(path.parent) for path in result_paths
         ),
+        "tokens": token_summary(rows),
         "harbor": {
             key: stats.get(key)
             for key in (
