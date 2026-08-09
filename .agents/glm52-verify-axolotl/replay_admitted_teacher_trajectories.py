@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Replay admitted teacher bash actions and run the real task verifier."""
 
+# ruff: noqa: ANN401
+
 from __future__ import annotations
 
 import argparse
@@ -13,7 +15,6 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -104,9 +105,7 @@ def extract_bash_actions(messages: list[dict[str, Any]]) -> tuple[BashAction, ..
             if not isinstance(function, dict) or function.get("name") != "bash":
                 raise ValueError(f"{context}: only the bash tool can be replayed")
             arguments = parse_arguments(function.get("arguments"), context=context)
-            if set(arguments) != {"command"} or not isinstance(
-                arguments["command"], str
-            ):
+            if set(arguments) != {"command"} or not isinstance(arguments["command"], str):
                 raise ValueError(f"{context}: expected exactly one string command")
             if tool_call_id not in tool_outputs:
                 raise ValueError(f"{context}: recorded tool output is missing")
@@ -151,9 +150,7 @@ def load_admitted_traces(path: Path) -> list[AdmittedTrace]:
             if not isinstance(messages, list):
                 raise ValueError(f"line {line_number}: message log is not a list")
             user_messages = [
-                message.get("content")
-                for message in messages
-                if message.get("role") == "user"
+                message.get("content") for message in messages if message.get("role") == "user"
             ]
             if not user_messages or not isinstance(user_messages[0], str):
                 raise ValueError(f"line {line_number}: first user message is missing")
@@ -171,6 +168,26 @@ def load_admitted_traces(path: Path) -> list[AdmittedTrace]:
     if not traces:
         raise ValueError("audit dataset is empty")
     return traces
+
+
+def load_completed_results(
+    out_root: Path, traces: list[AdmittedTrace]
+) -> dict[str, dict[str, Any]]:
+    """Load terminal episode results that can be skipped during an exact resume."""
+    completed: dict[str, dict[str, Any]] = {}
+    for trace in traces:
+        result_path = out_root / "episodes" / trace.task_id / "replay_result.json"
+        if not result_path.exists():
+            continue
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        if result.get("task_id") != trace.task_id:
+            raise ValueError(f"resume task mismatch in {result_path}")
+        if result.get("source_row_sha256") != trace.source_row_sha256:
+            raise ValueError(f"resume source hash mismatch in {result_path}")
+        if result.get("finished_at") is None:
+            continue
+        completed[trace.task_id] = result
+    return completed
 
 
 async def replay_trace(
@@ -203,9 +220,7 @@ async def replay_trace(
             result["status"] = "source_task_instruction_mismatch"
             return result
         result["task_instruction_sha256"] = sha256_text(task.instruction)
-        result["source_user_message_sha256"] = sha256_text(
-            trace.first_user_content
-        )
+        result["source_user_message_sha256"] = sha256_text(trace.first_user_content)
         result["task_instruction_embedded_in_source_prompt"] = True
         async with pool.session(task) as sandbox:
             result["setup"] = asdict(sandbox.report)
@@ -236,8 +251,7 @@ async def replay_trace(
                     "recorded_output_characters": len(action.recorded_output),
                     "replay_output_sha256": sha256_text(replay_output),
                     "replay_output_characters": len(replay_output),
-                    "recorded_output_exact_match": replay_output
-                    == action.recorded_output,
+                    "recorded_output_exact_match": replay_output == action.recorded_output,
                     "exit_code": shell_result.exit_code,
                     "timed_out": shell_result.timed_out,
                     "wall_s": round(time.time() - action_started, 3),
@@ -278,7 +292,6 @@ async def async_main(args: argparse.Namespace) -> int:
             raise FileNotFoundError(f"missing task directory: {task_dir}")
         tasks[trace.task_id] = load_task(task_dir)
 
-    args.out.mkdir(parents=True, exist_ok=False)
     audit_sha256 = hashlib.sha256(args.audit_dataset.read_bytes()).hexdigest()
     run_spec = {
         "schema": "xtoken-glm52-teacher-real-verifier-replay-run-v1",
@@ -295,7 +308,26 @@ async def async_main(args: argparse.Namespace) -> int:
         "final_environment_verifier_used": True,
         "model_judgment_is_official_task_verification": False,
     }
-    write_json_atomic(args.out / "run_spec.json", run_spec)
+    run_spec_path = args.out / "run_spec.json"
+    if args.out.exists():
+        if not args.resume:
+            raise FileExistsError(f"output exists; pass --resume: {args.out}")
+        if not run_spec_path.exists():
+            raise FileNotFoundError(f"resume run_spec is missing: {run_spec_path}")
+        existing_spec = json.loads(run_spec_path.read_text(encoding="utf-8"))
+        if existing_spec != run_spec:
+            raise ValueError("resume run_spec differs from requested protocol")
+    else:
+        args.out.mkdir(parents=True)
+        write_json_atomic(run_spec_path, run_spec)
+    completed_results = load_completed_results(args.out, traces)
+    pending_traces = [trace for trace in traces if trace.task_id not in completed_results]
+    LOGGER.info(
+        "resume gate completed=%d pending=%d total=%d",
+        len(completed_results),
+        len(pending_traces),
+        len(traces),
+    )
     pool = TMaxSandboxPool(
         SandboxConfig(
             template_alias=args.template_alias,
@@ -306,7 +338,7 @@ async def async_main(args: argparse.Namespace) -> int:
         ),
         max_concurrent=args.concurrency,
     )
-    completed = 0
+    completed = len(completed_results)
     lock = asyncio.Lock()
 
     async def one(trace: AdmittedTrace) -> dict[str, Any]:
@@ -330,7 +362,12 @@ async def async_main(args: argparse.Namespace) -> int:
             )
         return result
 
-    results = await asyncio.gather(*(one(trace) for trace in traces))
+    new_results = await asyncio.gather(*(one(trace) for trace in pending_traces))
+    result_by_task = {
+        **completed_results,
+        **{str(result["task_id"]): result for result in new_results},
+    }
+    results = [result_by_task[trace.task_id] for trace in traces]
     scored = [result for result in results if result.get("reward") is not None]
     positive = [result for result in scored if float(result["reward"]) > 0]
     perfect = [result for result in scored if float(result["reward"]) == 1]
@@ -343,9 +380,7 @@ async def async_main(args: argparse.Namespace) -> int:
         "perfect": len(perfect),
         "reward_sum": sum(float(result["reward"]) for result in scored),
         "mean_reward": (
-            sum(float(result["reward"]) for result in scored) / len(scored)
-            if scored
-            else None
+            sum(float(result["reward"]) for result in scored) / len(scored) if scored else None
         ),
         "status_counts": {
             status: sum(result["status"] == status for result in results)
@@ -371,6 +406,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--sandbox-timeout-s", type=int, default=3600)
     parser.add_argument("--bash-timeout-s", type=int, default=120)
+    parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
 
