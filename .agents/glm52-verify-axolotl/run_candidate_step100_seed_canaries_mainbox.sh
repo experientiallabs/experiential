@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+XROOT=/scratch/tb2-qwen35-4b-glm52-step200
+AXO_ROOT="$XROOT/axolotl-sft"
+SCRIPTS="$AXO_ROOT/scripts"
+EVAL_CODE="$XROOT/eval-code-b0d0568-run6"
+HERE="$EVAL_CODE/xtoken-ops/tblite-eval-9b"
+HARBOR_VENV=/scratch/rebench10/uvtools/datacurve-pier
+VALIDATION="$XROOT/next-sft-candidates-v1/checkpoint-validation-steps100-200.json"
+SERVER_SESSION=qwen35-4b-candidate-step100-seeds-serve
+PORT=8122
+BASE_MODEL=qwen35-4b-base
+SEEDS=(20260809 20260810)
+
+test "$(git -C "$EVAL_CODE" rev-parse HEAD)" = b0d05686f19646771d00ce5d76d1b42edfb8aced
+test -z "$(git -C "$EVAL_CODE" status --porcelain)"
+test -x "$HARBOR_VENV/bin/python"
+
+"$AXO_ROOT/venv/bin/python" "$SCRIPTS/validate_candidate_sft_checkpoints.py" \
+  --root "$AXO_ROOT/checkpoints" \
+  --seeds "${SEEDS[@]}" --steps 100 200 --out "$VALIDATION"
+
+adapter_specs=""
+for seed in "${SEEDS[@]}"; do
+  name="qwen35-4b-glm52-candidate-seed${seed}-step100"
+  directory="$AXO_ROOT/checkpoints/qwen35-4b-glm52-candidate-realverified-sft-lr1e5-r64-seed${seed}/checkpoint-100"
+  adapter_specs+="${adapter_specs:+ }${name}=${directory}"
+done
+
+export XROOT
+export ADAPTER_SPECS="$adapter_specs"
+export SESSION="$SERVER_SESSION"
+export PORT
+export HOST=0.0.0.0
+export CUDA_DEVICES=0,1
+export DP_SIZE=2
+export MAXLEN=65536
+export MAX_NUM_SEQS=32
+export GPU_UTIL=0.85
+export LOG_DIR="$AXO_ROOT/eval-logs/candidate-step100-seeds"
+export RUNTIME_DIR="$AXO_ROOT/eval-runtime/candidate-step100-seeds"
+bash "$SCRIPTS/serve_named_lora_set_4b.sh" start
+
+run_pair() {
+  local seed="$1"
+  local arm="candidate-seed${seed}-step100"
+  local served="qwen35-4b-glm52-candidate-seed${seed}-step100"
+  local root="$XROOT/candidate-step100-seed${seed}-tblite-canary10-seed0-run1"
+  local prefix="qwen35-4b-candidate-seed${seed}-step100-canary10-seed0"
+  local log="$XROOT/logs/${prefix}.log"
+
+  test ! -e "$root/jobs"
+  mkdir -p "$root/runtime" "$XROOT/logs"
+  export HERE
+  export EVAL_ROOT="$root"
+  export STORAGE_ROOT="$XROOT"
+  export HARBOR_VENV
+  export DOCKER_CONFIG=/home/azureuser/.docker
+  export BASE_SNAP=/scratch/xtoken-offline-9b-20260727/cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+  export HOST_ADDR=172.16.0.4
+  export API_BASE_LOCAL="http://127.0.0.1:${PORT}/v1"
+  export API_BASE_AGENT="http://172.16.0.4:${PORT}/v1"
+  export CUDA_DEVICES=0,1
+  export TP=1
+  export DP_SIZE=2
+  export MAXLEN=65536
+  export N_RUNS=1
+  export N_TASKS=10
+  export TASK_NAMES=
+  export CONCURRENCY=2
+  export SEED_BASE=0
+  export EXPECTED_DOCKER_ROOT_PREFIX=/scratch/
+  export BASE_MODEL
+  export JOB_PREFIX="$prefix"
+  export ADAPTER_ARM="$arm"
+  export ADAPTER_MODEL="$served"
+  sg docker -c "bash '$SCRIPTS/run_tblite_canary_pair.sh' 2>&1 | tee '$log'"
+
+  "$HARBOR_VENV/bin/python" "$SCRIPTS/compare_tblite_paired.py" \
+    --base "$root/jobs/${prefix}-base-run1" \
+    --adapter "$root/jobs/${prefix}-${arm}-run1" \
+    --out "$root/paired-vs-base-canary10.json"
+  "$HARBOR_VENV/bin/python" -c \
+    'import json,sys; row=json.load(open(sys.argv[1])); assert row["task_count"] == 10' \
+    "$root/paired-vs-base-canary10.json"
+}
+
+run_pair 20260809
+run_pair 20260810
+
+"$HARBOR_VENV/bin/python" "$SCRIPTS/select_candidate_canary.py" \
+  --input "20260809=$XROOT/candidate-step100-seed20260809-tblite-canary10-seed0-run1/paired-vs-base-canary10.json" \
+  --input "20260810=$XROOT/candidate-step100-seed20260810-tblite-canary10-seed0-run1/paired-vs-base-canary10.json" \
+  --out "$XROOT/candidate-step100-two-seed-canary-gate.json"
+
+touch "$XROOT/candidate-step100-two-seed-canaries.complete"
