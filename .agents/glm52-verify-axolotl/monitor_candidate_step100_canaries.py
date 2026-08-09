@@ -31,6 +31,14 @@ def session_alive(name: str) -> bool:
     return run("tmux", "has-session", "-t", name).returncode == 0
 
 
+def orchestrator_alive(step: int) -> bool:
+    """Accept the original two-seed runner or a resumable single-seed runner."""
+    return session_alive(f"candidate-step{step}-two-seed-canaries") or any(
+        session_alive(f"candidate-step{step}-seed{seed}-resume")
+        for seed in (20260809, 20260810)
+    )
+
+
 def gpu_health() -> list[dict[str, int]]:
     proc = run(
         "nvidia-smi",
@@ -142,8 +150,13 @@ def seed_health(root: Path, seed: int, step: int) -> dict[str, Any]:
     eval_root = root / f"candidate-step{step}-seed{seed}-tblite-canary10-seed0-run1"
     prefix = f"qwen35-4b-candidate-seed{seed}-step{step}-canary10-seed0"
     arm = f"candidate-seed{seed}-step{step}"
-    log = root / "logs" / f"{prefix}.log"
-    text = log.read_text(errors="replace") if log.exists() else ""
+    logs = [
+        root / "logs" / f"{prefix}.log",
+        root / "logs" / f"{prefix}.resume.log",
+    ]
+    text = "\n".join(
+        log.read_text(errors="replace") for log in logs if log.exists()
+    )
     return {
         "seed": seed,
         "base": arm_health(eval_root / "jobs" / f"{prefix}-base-run1"),
@@ -167,7 +180,7 @@ def main() -> int:
     snapshot = {
         "timestamp": datetime.now(UTC).isoformat(),
         "checkpoint_step": args.step,
-        "orchestrator_alive": session_alive(f"candidate-step{args.step}-two-seed-canaries"),
+        "orchestrator_alive": orchestrator_alive(args.step),
         "server_alive": session_alive(f"qwen35-4b-candidate-step{args.step}-seeds-serve"),
         "selection_gate_written": (
             args.root / f"candidate-step{args.step}-two-seed-canary-gate.json"

@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from monitor_candidate_step100_canaries import (
     arm_health,
     numerical_nan_signal,
+    orchestrator_alive,
+    seed_health,
     token_summary,
 )
 
@@ -62,3 +65,22 @@ def test_token_summary_rejects_boolean_token_values() -> None:
         "output_tokens_mean": 10.0,
         "token_accounted_trials": 1,
     }
+
+
+def test_orchestrator_alive_accepts_resume_session() -> None:
+    with patch(
+        "monitor_candidate_step100_canaries.session_alive",
+        side_effect=lambda name: name == "candidate-step100-seed20260810-resume",
+    ):
+        assert orchestrator_alive(100)
+
+
+def test_seed_health_reads_resume_log_signals(tmp_path: Path) -> None:
+    log = (
+        tmp_path
+        / "logs"
+        / "qwen35-4b-candidate-seed20260810-step100-canary10-seed0.resume.log"
+    )
+    log.parent.mkdir(parents=True)
+    log.write_text("CUDA OOM")
+    assert seed_health(tmp_path, 20260810, 100)["signals"]["oom"]
