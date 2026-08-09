@@ -18,6 +18,13 @@ if test -z "${N_TASKS:-}" && test -z "${TASK_NAMES:-}"; then
   echo "this canary wrapper requires N_TASKS or explicit TASK_NAMES" >&2
   exit 1
 fi
+if test -n "${N_TASKS:-}"; then
+  SCORE_TOTAL_TASKS="${N_TASKS}"
+else
+  IFS=, read -r -a selected_task_names <<<"${TASK_NAMES}"
+  SCORE_TOTAL_TASKS="${#selected_task_names[@]}"
+fi
+test "${SCORE_TOTAL_TASKS}" -gt 0
 
 run_arm() {
   local arm="$1"
@@ -31,6 +38,7 @@ run_arm() {
     --runs 1
   bash "${HERE}/run_tblite.sh" "${cfg}"
   "${HPY}" "${HERE}/score_tblite.py" "${job_dir}" \
+    --total-tasks "${SCORE_TOTAL_TASKS}" \
     --out "${RUNTIME_DIR}/tblite-9b-${arm}-score.json"
 }
 
