@@ -1,7 +1,11 @@
 import json
 from pathlib import Path
 
-from monitor_candidate_repeated_tblite import arm_health, repeat_health
+from monitor_candidate_repeated_tblite import (
+    arm_health,
+    numerical_nan_signal,
+    repeat_health,
+)
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -70,3 +74,9 @@ def test_repeat_health_uses_expected_paths(tmp_path: Path) -> None:
     assert result["base"]["graded_mean"] == 0.25
     assert result["adapter"]["strict"] == 1
     assert result["paired_report"] is True
+
+
+def test_numerical_nan_signal_ignores_single_run_summary() -> None:
+    assert not numerical_nan_signal("run-to-run sd nan; stderr +/- nan")
+    assert numerical_nan_signal("loss=NaN")
+    assert numerical_nan_signal("tensor contains a NaN")

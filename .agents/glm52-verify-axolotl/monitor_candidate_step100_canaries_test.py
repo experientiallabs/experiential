@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from monitor_candidate_step100_canaries import arm_health
+from monitor_candidate_step100_canaries import arm_health, numerical_nan_signal
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -32,3 +32,9 @@ def test_arm_health_counts_exception_as_zero_and_exposes_context_overflow(
     assert result["graded_mean"] == 0.5
     assert result["exceptions"] == {"NonZeroAgentExitCodeError": 1}
     assert result["context_overflow_trials"] == 1
+
+
+def test_numerical_nan_signal_ignores_single_run_summary() -> None:
+    assert not numerical_nan_signal("run-to-run sd nan; stderr +/- nan")
+    assert numerical_nan_signal("grad_norm: nan")
+    assert numerical_nan_signal("detected NaN in logits")

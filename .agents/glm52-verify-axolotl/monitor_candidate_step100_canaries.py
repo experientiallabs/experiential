@@ -16,6 +16,12 @@ from typing import Any
 CONTEXT_ERROR = "maximum context length is 65536"
 logger = logging.getLogger(__name__)
 
+NAN_SIGNAL_PATTERNS = (
+    r"\b(?:loss|gradient|grad_norm|logits?|probabilities|tensor)\s*(?:=|:|is)\s*nan\b",
+    r"\bnan\s+(?:loss|gradient|grad_norm|logits?|probabilities|tensor)\b",
+    r"\b(?:detected|found|contains?|produced|became)\s+(?:a\s+)?nan\b",
+)
+
 
 def run(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, check=False, capture_output=True, text=True)
@@ -86,6 +92,11 @@ def context_overflow_trial(trial: Path) -> bool:
     return False
 
 
+def numerical_nan_signal(text: str) -> bool:
+    """Detect numerical NaNs without flagging single-run summary statistics."""
+    return any(re.search(pattern, text, re.I) for pattern in NAN_SIGNAL_PATTERNS)
+
+
 def arm_health(job: Path) -> dict[str, Any]:
     result_paths = list(job.glob("*/result.json"))
     rows = trial_rows(job)
@@ -119,7 +130,7 @@ def seed_health(root: Path, seed: int, step: int) -> dict[str, Any]:
         "paired_report": (eval_root / "paired-vs-base-canary10.json").is_file(),
         "signals": {
             "oom": bool(re.search(r"out of memory|cuda oom", text, re.I)),
-            "nan": bool(re.search(r"(?<![a-z])nan(?![a-z])", text, re.I)),
+            "nan": numerical_nan_signal(text),
             "traceback": "traceback" in text.lower(),
         },
     }
