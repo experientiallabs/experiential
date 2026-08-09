@@ -8,7 +8,7 @@ SCRIPTS="$AXO_ROOT/scripts"
 EVAL_CODE="$XROOT/eval-code-b0d0568-run6"
 HERE="$EVAL_CODE/xtoken-ops/tblite-eval-9b"
 HARBOR_VENV=/scratch/rebench10/uvtools/datacurve-pier
-VALIDATION="$XROOT/next-sft-candidates-v1/checkpoint-validation-steps100-200.json"
+VALIDATION="$XROOT/next-sft-candidates-v1/checkpoint-validation-step${STEP}.json"
 SERVER_SESSION="qwen35-4b-candidate-step${STEP}-seeds-serve"
 PORT=8122
 BASE_MODEL=qwen35-4b-base
@@ -20,7 +20,7 @@ test -x "$HARBOR_VENV/bin/python"
 
 "$AXO_ROOT/venv/bin/python" "$SCRIPTS/validate_candidate_sft_checkpoints.py" \
   --root "$AXO_ROOT/checkpoints" \
-  --seeds "${SEEDS[@]}" --steps 100 200 --out "$VALIDATION"
+  --seeds "${SEEDS[@]}" --steps "$STEP" --out "$VALIDATION"
 
 adapter_specs=""
 for seed in "${SEEDS[@]}"; do
