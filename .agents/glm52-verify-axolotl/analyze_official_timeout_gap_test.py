@@ -33,7 +33,7 @@ def write_trial(
             "rollout_details": [
                 {
                     "prompt_token_ids": [[1, 2, 3]],
-                    "completion_token_ids": [4, 5],
+                    "completion_token_ids": [[4, 5]],
                 }
                 for _ in range(calls)
             ],
@@ -71,6 +71,9 @@ def test_compare_preserves_timeout_and_context_diagnostics(tmp_path: Path) -> No
     assert report["base"]["timeout_count"] == 1
     assert report["adapter"]["timeout_count"] == 2
     assert report["adapter"]["context_rejection_count"] == 2
+    assert report["base"]["llm_calls_mean"] == pytest.approx(2.0)
+    assert report["adapter"]["llm_calls_mean"] == pytest.approx(3.0)
+    assert report["adapter"]["max_completion_tokens"] == 2
     assert report["paired"]["common_timeout_tasks"] == ["a"]
     assert report["paired"]["adapter_only_timeout_tasks"] == ["b"]
     assert report["paired"]["output_token_ratio"] == pytest.approx(3.0)

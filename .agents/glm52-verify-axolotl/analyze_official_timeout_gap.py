@@ -39,13 +39,13 @@ def load_job(job_dir: Path) -> dict[str, dict[str, Any]]:
             raise ValueError(f"duplicate task {task_name!r} in {job_dir}")
         agent = result.get("agent_result") or {}
         rollouts = agent.get("rollout_details") or []
-        completion_lengths = [len(item.get("completion_token_ids") or []) for item in rollouts]
-        prompt_lengths = [
-            max(
-                (len(prompt) for prompt in item.get("prompt_token_ids") or []),
-                default=0,
-            )
+        completion_lengths = [
+            len(completion)
             for item in rollouts
+            for completion in item.get("completion_token_ids") or []
+        ]
+        prompt_lengths = [
+            len(prompt) for item in rollouts for prompt in item.get("prompt_token_ids") or []
         ]
         log_path = result_path.with_name("trial.log")
         log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
@@ -60,7 +60,7 @@ def load_job(job_dir: Path) -> dict[str, dict[str, Any]]:
             "elapsed_seconds": (finished_at - started_at).total_seconds(),
             "input_tokens": int(agent.get("n_input_tokens") or 0),
             "output_tokens": int(agent.get("n_output_tokens") or 0),
-            "llm_calls": len(rollouts),
+            "llm_calls": len(completion_lengths),
             "max_prompt_tokens_recorded": max(prompt_lengths, default=0),
             "max_completion_tokens": max(completion_lengths, default=0),
             "context_rejections": log_text.count(CONTEXT_ERROR),
