@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 
-def evaluate(inputs: dict[str, Path]) -> dict[str, object]:
+def evaluate(inputs: dict[str, Path], *, step: int = 100) -> dict[str, object]:
     reports = {seed: json.loads(path.read_text()) for seed, path in inputs.items()}
     if set(reports) != {"20260809", "20260810"}:
         raise ValueError("exactly training seeds 20260809 and 20260810 are required")
@@ -28,8 +28,9 @@ def evaluate(inputs: dict[str, Path]) -> dict[str, object]:
         for seed, report in reports.items()
     }
     return {
-        "schema": "candidate-step100-two-training-seed-canary-gate-v1",
+        "schema": "candidate-two-training-seed-canary-gate-v1",
         "evidence_scope": "held_out_tblite_canary_only_not_official_tb2",
+        "checkpoint_step": step,
         "selection_rule": (
             "both training seeds must pass every directional check; primary is "
             "predeclared seed 20260809, never best-of-two"
@@ -37,13 +38,14 @@ def evaluate(inputs: dict[str, Path]) -> dict[str, object]:
         "reports": reports,
         "checks": checks,
         "credible_direction": all(all(values.values()) for values in checks.values()),
-        "predeclared_primary_if_credible": "seed20260809-step100",
+        "predeclared_primary_if_credible": f"seed20260809-step{step}",
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", action="append", required=True)
+    parser.add_argument("--step", type=int, required=True)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
     inputs = {}
@@ -52,7 +54,7 @@ def main() -> int:
         if not separator or seed in inputs:
             raise ValueError(f"invalid or duplicate input: {raw}")
         inputs[seed] = Path(path)
-    payload = evaluate(inputs)
+    payload = evaluate(inputs, step=args.step)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(json.dumps(payload, indent=2, sort_keys=True))

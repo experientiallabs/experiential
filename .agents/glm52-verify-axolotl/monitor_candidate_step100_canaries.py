@@ -81,10 +81,10 @@ def arm_health(job: Path) -> dict[str, Any]:
     }
 
 
-def seed_health(root: Path, seed: int) -> dict[str, Any]:
-    eval_root = root / f"candidate-step100-seed{seed}-tblite-canary10-seed0-run1"
-    prefix = f"qwen35-4b-candidate-seed{seed}-step100-canary10-seed0"
-    arm = f"candidate-seed{seed}-step100"
+def seed_health(root: Path, seed: int, step: int) -> dict[str, Any]:
+    eval_root = root / f"candidate-step{step}-seed{seed}-tblite-canary10-seed0-run1"
+    prefix = f"qwen35-4b-candidate-seed{seed}-step{step}-canary10-seed0"
+    arm = f"candidate-seed{seed}-step{step}"
     log = root / "logs" / f"{prefix}.log"
     text = log.read_text(errors="replace") if log.exists() else ""
     return {
@@ -104,16 +104,18 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--health-log", required=True, type=Path)
+    parser.add_argument("--step", type=int, default=100)
     args = parser.parse_args()
     disk = shutil.disk_usage(args.root)
     snapshot = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "orchestrator_alive": session_alive("candidate-step100-two-seed-canaries"),
-        "server_alive": session_alive("qwen35-4b-candidate-step100-seeds-serve"),
+        "checkpoint_step": args.step,
+        "orchestrator_alive": session_alive(f"candidate-step{args.step}-two-seed-canaries"),
+        "server_alive": session_alive(f"qwen35-4b-candidate-step{args.step}-seeds-serve"),
         "selection_gate_written": (
-            args.root / "candidate-step100-two-seed-canary-gate.json"
+            args.root / f"candidate-step{args.step}-two-seed-canary-gate.json"
         ).is_file(),
-        "seeds": [seed_health(args.root, seed) for seed in (20260809, 20260810)],
+        "seeds": [seed_health(args.root, seed, args.step) for seed in (20260809, 20260810)],
         "disk": {"free": disk.free, "used": disk.used, "total": disk.total},
         "gpus": gpu_health(),
     }

@@ -53,12 +53,12 @@ tmux has-session -t "$SERVER_SESSION" 2>/dev/null && {
   touch "$FAILED"
   exit 1
 }
-tmux new-session -d -s "$SESSION" "bash '$LAUNCHER' 2>&1 | tee '$LOG'"
+tmux new-session -d -s "$SESSION" "STEP=100 bash '$LAUNCHER' 2>&1 | tee '$LOG'"
 
 tmp="$(mktemp)"
 crontab -l 2>/dev/null | grep -Fv 'codex-candidate192-training-monitor' | \
   grep -Fv 'codex-candidate-step100-canary-monitor' >"$tmp" || true
-printf '*/2 * * * * %s --root %s --health-log %s # codex-candidate-step100-canary-monitor\n' \
+printf '*/2 * * * * %s --root %s --health-log %s --step 100 # codex-candidate-step100-canary-monitor\n' \
   "$MONITOR" "$XROOT" "$HEALTH_LOG" >>"$tmp"
 crontab "$tmp"
 rm -f "$tmp"

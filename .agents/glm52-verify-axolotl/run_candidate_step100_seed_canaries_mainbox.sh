@@ -2,13 +2,14 @@
 set -euo pipefail
 
 XROOT=/scratch/tb2-qwen35-4b-glm52-step200
+STEP="${STEP:-100}"
 AXO_ROOT="$XROOT/axolotl-sft"
 SCRIPTS="$AXO_ROOT/scripts"
 EVAL_CODE="$XROOT/eval-code-b0d0568-run6"
 HERE="$EVAL_CODE/xtoken-ops/tblite-eval-9b"
 HARBOR_VENV=/scratch/rebench10/uvtools/datacurve-pier
 VALIDATION="$XROOT/next-sft-candidates-v1/checkpoint-validation-steps100-200.json"
-SERVER_SESSION=qwen35-4b-candidate-step100-seeds-serve
+SERVER_SESSION="qwen35-4b-candidate-step${STEP}-seeds-serve"
 PORT=8122
 BASE_MODEL=qwen35-4b-base
 SEEDS=(20260809 20260810)
@@ -23,8 +24,8 @@ test -x "$HARBOR_VENV/bin/python"
 
 adapter_specs=""
 for seed in "${SEEDS[@]}"; do
-  name="qwen35-4b-glm52-candidate-seed${seed}-step100"
-  directory="$AXO_ROOT/checkpoints/qwen35-4b-glm52-candidate-realverified-sft-lr1e5-r64-seed${seed}/checkpoint-100"
+  name="qwen35-4b-glm52-candidate-seed${seed}-step${STEP}"
+  directory="$AXO_ROOT/checkpoints/qwen35-4b-glm52-candidate-realverified-sft-lr1e5-r64-seed${seed}/checkpoint-${STEP}"
   adapter_specs+="${adapter_specs:+ }${name}=${directory}"
 done
 
@@ -38,16 +39,16 @@ export DP_SIZE=2
 export MAXLEN=65536
 export MAX_NUM_SEQS=32
 export GPU_UTIL=0.85
-export LOG_DIR="$AXO_ROOT/eval-logs/candidate-step100-seeds"
-export RUNTIME_DIR="$AXO_ROOT/eval-runtime/candidate-step100-seeds"
+export LOG_DIR="$AXO_ROOT/eval-logs/candidate-step${STEP}-seeds"
+export RUNTIME_DIR="$AXO_ROOT/eval-runtime/candidate-step${STEP}-seeds"
 bash "$SCRIPTS/serve_named_lora_set_4b.sh" start
 
 run_pair() {
   local seed="$1"
-  local arm="candidate-seed${seed}-step100"
-  local served="qwen35-4b-glm52-candidate-seed${seed}-step100"
-  local root="$XROOT/candidate-step100-seed${seed}-tblite-canary10-seed0-run1"
-  local prefix="qwen35-4b-candidate-seed${seed}-step100-canary10-seed0"
+  local arm="candidate-seed${seed}-step${STEP}"
+  local served="qwen35-4b-glm52-candidate-seed${seed}-step${STEP}"
+  local root="$XROOT/candidate-step${STEP}-seed${seed}-tblite-canary10-seed0-run1"
+  local prefix="qwen35-4b-candidate-seed${seed}-step${STEP}-canary10-seed0"
   local log="$XROOT/logs/${prefix}.log"
 
   test ! -e "$root/jobs"
@@ -90,8 +91,9 @@ run_pair 20260809
 run_pair 20260810
 
 "$HARBOR_VENV/bin/python" "$SCRIPTS/select_candidate_canary.py" \
-  --input "20260809=$XROOT/candidate-step100-seed20260809-tblite-canary10-seed0-run1/paired-vs-base-canary10.json" \
-  --input "20260810=$XROOT/candidate-step100-seed20260810-tblite-canary10-seed0-run1/paired-vs-base-canary10.json" \
-  --out "$XROOT/candidate-step100-two-seed-canary-gate.json"
+  --step "$STEP" \
+  --input "20260809=$XROOT/candidate-step${STEP}-seed20260809-tblite-canary10-seed0-run1/paired-vs-base-canary10.json" \
+  --input "20260810=$XROOT/candidate-step${STEP}-seed20260810-tblite-canary10-seed0-run1/paired-vs-base-canary10.json" \
+  --out "$XROOT/candidate-step${STEP}-two-seed-canary-gate.json"
 
-touch "$XROOT/candidate-step100-two-seed-canaries.complete"
+touch "$XROOT/candidate-step${STEP}-two-seed-canaries.complete"
