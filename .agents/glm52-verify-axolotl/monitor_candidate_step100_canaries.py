@@ -85,6 +85,21 @@ def exception_type(row: dict[str, Any]) -> str | None:
     return None
 
 
+def normalized_exception_type(row: dict[str, Any]) -> str | None:
+    """Prefer the observed root cause over Harbor's command-text classifier.
+
+    Harbor can label a mini-swe-agent context overflow as ``ApiRateLimitError``
+    when the benchmark task prompt itself contains rate-limit requirements.  The
+    exception message still contains vLLM's unambiguous context-window error.
+    """
+    raw = exception_type(row)
+    exception = row.get("exception_info") or row.get("exception")
+    text = json.dumps(exception, sort_keys=True) if exception is not None else ""
+    if "ContextWindowExceededError" in text or CONTEXT_ERROR in text:
+        return "ContextWindowExceededError"
+    return raw
+
+
 def context_overflow_trial(trial: Path) -> bool:
     for relative in (
         Path("agent/mini-swe-agent.txt"),
@@ -130,15 +145,19 @@ def arm_health(job: Path) -> dict[str, Any]:
     rows = trial_rows(job)
     rewards = [value for row in rows if (value := reward(row)) is not None]
     exceptions: dict[str, int] = {}
+    raw_exceptions: dict[str, int] = {}
     for row in rows:
-        if kind := exception_type(row):
+        if kind := normalized_exception_type(row):
             exceptions[kind] = exceptions.get(kind, 0) + 1
+        if raw_kind := exception_type(row):
+            raw_exceptions[raw_kind] = raw_exceptions.get(raw_kind, 0) + 1
     return {
         "result_files": len(rows),
         "scored": len(rewards),
         "strict": sum(value == 1.0 for value in rewards),
         "graded_mean": sum(rewards) / len(rewards) if rewards else None,
         "exceptions": dict(sorted(exceptions.items())),
+        "raw_exceptions": dict(sorted(raw_exceptions.items())),
         "context_overflow_trials": sum(
             context_overflow_trial(path.parent) for path in result_paths
         ),

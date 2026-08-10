@@ -49,11 +49,33 @@ def test_arm_health_retains_exception_as_zero(tmp_path: Path) -> None:
     assert result["strict"] == 1
     assert result["graded_mean"] == 0.5
     assert result["exceptions"] == {"AgentTimeoutError": 1}
+    assert result["raw_exceptions"] == {"AgentTimeoutError": 1}
     assert result["context_overflow_trials"] == 1
     assert result["tokens"]["output_tokens_total"] == 20
     assert result["tokens"]["token_accounted_trials"] == 1
     assert result["harbor"]["n_running_trials"] == 1
     assert result["harbor"]["n_retries"] == 1
+
+
+def test_arm_health_normalizes_context_overflow_misclassified_as_rate_limit(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "job"
+    write_json(
+        job / "overflow" / "result.json",
+        {
+            "exception_info": {
+                "exception_type": "ApiRateLimitError",
+                "exception_message": (
+                    "ContextWindowExceededError: maximum context length is 65536 tokens"
+                ),
+            }
+        },
+    )
+
+    result = arm_health(job)
+    assert result["exceptions"] == {"ContextWindowExceededError": 1}
+    assert result["raw_exceptions"] == {"ApiRateLimitError": 1}
 
 
 def test_repeat_health_uses_expected_paths(tmp_path: Path) -> None:

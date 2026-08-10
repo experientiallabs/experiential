@@ -41,9 +41,32 @@ def test_arm_health_counts_exception_as_zero_and_exposes_context_overflow(
     assert result["strict"] == 1
     assert result["graded_mean"] == 0.5
     assert result["exceptions"] == {"NonZeroAgentExitCodeError": 1}
+    assert result["raw_exceptions"] == {"NonZeroAgentExitCodeError": 1}
     assert result["context_overflow_trials"] == 1
     assert result["tokens"]["output_tokens_total"] == 20
     assert result["tokens"]["token_accounted_trials"] == 1
+
+
+def test_arm_health_normalizes_prompt_induced_rate_limit_misclassification(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "job"
+    write_json(
+        job / "overflow" / "result.json",
+        {
+            "exception_info": {
+                "exception_type": "ApiRateLimitError",
+                "exception_message": (
+                    "Task discusses rate limiting. ContextWindowExceededError: "
+                    "maximum context length is 65536 tokens"
+                ),
+            }
+        },
+    )
+
+    result = arm_health(job)
+    assert result["exceptions"] == {"ContextWindowExceededError": 1}
+    assert result["raw_exceptions"] == {"ApiRateLimitError": 1}
 
 
 def test_numerical_nan_signal_ignores_single_run_summary() -> None:

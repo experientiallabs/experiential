@@ -70,6 +70,16 @@ def exception_type(row: dict[str, Any]) -> str | None:
     return str(value) if value else None
 
 
+def normalized_exception_type(row: dict[str, Any]) -> str | None:
+    """Normalize Harbor classifier artifacts to the observed root cause."""
+    raw = exception_type(row)
+    exception = row.get("exception_info") or row.get("exception")
+    text = json.dumps(exception, sort_keys=True) if exception is not None else ""
+    if "ContextWindowExceededError" in text or CONTEXT_ERROR in text:
+        return "ContextWindowExceededError"
+    return raw
+
+
 def context_overflow_trial(trial: Path) -> bool:
     for relative in (
         Path("agent/mini-swe-agent.txt"),
@@ -120,6 +130,9 @@ def arm_health(job: Path) -> dict[str, Any]:
             continue
     rewards = [value for row in rows if (value := reward(row)) is not None]
     exceptions = Counter(
+        value for row in rows if (value := normalized_exception_type(row)) is not None
+    )
+    raw_exceptions = Counter(
         value for row in rows if (value := exception_type(row)) is not None
     )
     summary_path = job / "result.json"
@@ -133,6 +146,7 @@ def arm_health(job: Path) -> dict[str, Any]:
         "strict": sum(value == 1.0 for value in rewards),
         "graded_mean": sum(rewards) / len(rewards) if rewards else None,
         "exceptions": dict(sorted(exceptions.items())),
+        "raw_exceptions": dict(sorted(raw_exceptions.items())),
         "context_overflow_trials": sum(
             context_overflow_trial(path.parent) for path in result_paths
         ),
@@ -180,7 +194,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--health-log", required=True, type=Path)
-    parser.add_argument("--step", type=int, required=True, choices=(100, 200))
+    parser.add_argument("--step", type=int, required=True, choices=(25, 50, 100, 200))
     args = parser.parse_args()
     disk = shutil.disk_usage(args.root)
     snapshot = {
