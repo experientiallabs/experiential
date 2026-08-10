@@ -18,6 +18,7 @@ from replay_admitted_teacher_trajectories import (
     parse_recorded_exit_code,
     replay_trace,
     validate_code_commit,
+    validate_positive_integer,
 )
 
 
@@ -285,3 +286,14 @@ def test_code_commit_validation_is_exact_and_backward_compatible() -> None:
         validate_code_commit("A" * 40)
     with pytest.raises(ValueError, match="full lowercase Git SHA"):
         validate_code_commit("a" * 39)
+
+
+@pytest.mark.parametrize("value", [1, 120, 1200])
+def test_positive_runtime_values_are_accepted(value: int) -> None:
+    validate_positive_integer(value, name="verify timeout")
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_nonpositive_runtime_values_fail_closed(value: int) -> None:
+    with pytest.raises(ValueError, match="verify timeout must be positive"):
+        validate_positive_integer(value, name="verify timeout")

@@ -57,6 +57,12 @@ def validate_code_commit(value: str | None) -> None:
         raise ValueError("code commit must be a full lowercase Git SHA")
 
 
+def validate_positive_integer(value: int, *, name: str) -> None:
+    """Fail closed when a runtime budget or concurrency is non-positive."""
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+
+
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     """Write JSON without exposing a partially written result."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -345,6 +351,7 @@ async def async_main(args: argparse.Namespace) -> int:
         "concurrency": args.concurrency,
         "sandbox_timeout_s": args.sandbox_timeout_s,
         "bash_timeout_s": args.bash_timeout_s,
+        "verify_timeout_s": args.verify_timeout_s,
         "exact_teacher_bash_actions_replayed": True,
         "final_environment_verifier_used": True,
         "model_judgment_is_official_task_verification": False,
@@ -378,6 +385,7 @@ async def async_main(args: argparse.Namespace) -> int:
             lane="glm52-teacher-replay",
             sandbox_timeout_s=args.sandbox_timeout_s,
             bash_timeout_s=args.bash_timeout_s,
+            verify_timeout_s=args.verify_timeout_s,
         ),
         max_concurrent=args.concurrency,
     )
@@ -449,6 +457,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--sandbox-timeout-s", type=int, default=3600)
     parser.add_argument("--bash-timeout-s", type=int, default=120)
+    parser.add_argument("--verify-timeout-s", type=int, default=300)
     parser.add_argument("--code-commit")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -459,8 +468,10 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
     validate_code_commit(args.code_commit)
-    if args.concurrency <= 0:
-        raise ValueError("concurrency must be positive")
+    validate_positive_integer(args.concurrency, name="concurrency")
+    validate_positive_integer(args.sandbox_timeout_s, name="sandbox timeout")
+    validate_positive_integer(args.bash_timeout_s, name="bash timeout")
+    validate_positive_integer(args.verify_timeout_s, name="verify timeout")
     return asyncio.run(async_main(args))
 
 
