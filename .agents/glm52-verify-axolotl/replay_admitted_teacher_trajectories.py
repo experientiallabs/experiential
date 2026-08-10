@@ -105,8 +105,16 @@ def extract_bash_actions(messages: list[dict[str, Any]]) -> tuple[BashAction, ..
             if not isinstance(function, dict) or function.get("name") != "bash":
                 raise ValueError(f"{context}: only the bash tool can be replayed")
             arguments = parse_arguments(function.get("arguments"), context=context)
-            if set(arguments) != {"command"} or not isinstance(arguments["command"], str):
-                raise ValueError(f"{context}: expected exactly one string command")
+            if not {"command"} <= set(arguments) <= {"command", "description"}:
+                raise ValueError(
+                    f"{context}: expected command and optional description only"
+                )
+            if not isinstance(arguments["command"], str):
+                raise ValueError(f"{context}: command is not a string")
+            if "description" in arguments and not isinstance(
+                arguments["description"], str
+            ):
+                raise ValueError(f"{context}: description is not a string")
             if tool_call_id not in tool_outputs:
                 raise ValueError(f"{context}: recorded tool output is missing")
             actions.append(

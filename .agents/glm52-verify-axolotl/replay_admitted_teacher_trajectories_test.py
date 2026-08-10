@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from replay_admitted_teacher_trajectories import (
     AdmittedTrace,
+    extract_bash_actions,
     load_admitted_traces,
     load_completed_results,
 )
@@ -127,3 +128,28 @@ def test_loader_rejects_rows_selected_for_neither_stage(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="not selected for replay"):
         load_admitted_traces(path)
+
+
+def test_optional_bash_description_does_not_change_replayed_command() -> None:
+    """Accept the observed auxiliary description while replaying only command."""
+    record = replay_record(selected_for_replay=True, selected_for_sft=False)
+    messages = json.loads(record["source"]["message_log_json"])
+    messages[1]["tool_calls"][0]["function"]["arguments"] = {
+        "command": "pwd",
+        "description": "Show the current directory",
+    }
+    actions = extract_bash_actions(messages)
+    assert len(actions) == 1
+    assert actions[0].command == "pwd"
+
+
+@pytest.mark.parametrize("description", [None, 3, {"text": "bad"}])
+def test_nonstring_optional_bash_description_fails_closed(description: object) -> None:
+    record = replay_record(selected_for_replay=True, selected_for_sft=False)
+    messages = json.loads(record["source"]["message_log_json"])
+    messages[1]["tool_calls"][0]["function"]["arguments"] = {
+        "command": "pwd",
+        "description": description,
+    }
+    with pytest.raises(ValueError, match="description is not a string"):
+        extract_bash_actions(messages)
