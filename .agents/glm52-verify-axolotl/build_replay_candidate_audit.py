@@ -114,9 +114,15 @@ def main() -> int:
     parser.add_argument("--source-sha256", required=True)
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--candidate-manifest", type=Path, required=True)
+    parser.add_argument("--code-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     args = parser.parse_args()
+
+    if len(args.code_commit) != 40 or any(
+        character not in "0123456789abcdef" for character in args.code_commit
+    ):
+        raise ValueError("code commit must be a full lowercase Git SHA")
 
     for output in (args.output, args.manifest):
         if output.exists():
@@ -144,6 +150,7 @@ def main() -> int:
             handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
     manifest = {
         "schema": "glm52-real-verifier-replay-candidate-manifest-v1",
+        "code_commit": args.code_commit,
         "replay_rule": REPLAY_RULE,
         "source_corpus": str(args.corpus),
         "source_corpus_sha256": actual_source_sha256,

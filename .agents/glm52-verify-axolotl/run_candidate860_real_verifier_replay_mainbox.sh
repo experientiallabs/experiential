@@ -2,6 +2,7 @@
 set -euo pipefail
 
 XROOT=/scratch/tb2-qwen35-4b-glm52-step200
+CODE_COMMIT="${CODE_COMMIT:?set CODE_COMMIT to the exact deployed 40-character Git SHA}"
 AXO_ROOT="$XROOT/axolotl-sft"
 DATA_ROOT="$XROOT/next-sft-candidates-v2"
 PYTHON="$XROOT/runtime/venv-harbor-tb2/bin/python"
@@ -33,6 +34,7 @@ if test ! -e "$AUDIT" && test ! -e "$AUDIT_MANIFEST"; then
     --source-sha256 "$SOURCE_SHA256" \
     --candidates "$CANDIDATES" \
     --candidate-manifest "$CANDIDATE_MANIFEST" \
+    --code-commit "$CODE_COMMIT" \
     --output "$AUDIT" \
     --manifest "$AUDIT_MANIFEST"
 fi
