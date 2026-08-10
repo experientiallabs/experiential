@@ -26,7 +26,8 @@ for seed in 20260809 20260810; do
   run="${RUN_PREFIX}${seed}"
   train_log="$AXO_ROOT/logs/${run}.log"
   checkpoint="$AXO_ROOT/checkpoints/${run}/checkpoint-100/adapter_model.safetensors"
-  if ! grep -qi 'training completed!' "$train_log" || \
+  if ! test -s "$train_log" || \
+     ! grep -qi 'training completed!' "$train_log" || \
      ! grep -qi 'model successfully saved' "$train_log" || \
      ! test -s "$checkpoint"; then
     printf '%s incomplete seed=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$seed" >>"$LOG"
