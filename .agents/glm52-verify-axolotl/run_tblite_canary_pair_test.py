@@ -63,7 +63,7 @@ def test_scorer_uses_selected_task_denominator(
     assert all(line.startswith("OUT_TOK=16384 ") for line in make_calls)
 
     server_gate_calls = [
-        line for line in log.read_text().splitlines() if "65537" in line
+        line for line in log.read_text().splitlines() if "65538" in line
     ]
     assert len(server_gate_calls) == 1
 

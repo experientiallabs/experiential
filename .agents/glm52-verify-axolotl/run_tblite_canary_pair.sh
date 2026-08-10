@@ -8,13 +8,13 @@ ADAPTER_ARM="${ADAPTER_ARM:?ADAPTER_ARM is required}"
 ADAPTER_MODEL="${ADAPTER_MODEL:?ADAPTER_MODEL is required}"
 
 # mini-swe-agent budgets history as 65,536 - max_tokens before the chat template
-# is rendered. Reducing max_tokens by one only raises the history ceiling by one,
-# so the renderer still produces a deterministic 65,537-token request. Keep the
-# matched 16,384-token output budget and require one serving-only guard token.
-# The agent envelope remains 65,536; genuine requests above 65,537 still fail and
-# are reported as context overflows.
+# is rendered. The Qwen template can add two tokens after that budget is applied,
+# producing a deterministic 49,154 + 16,384 = 65,538-token request at the
+# boundary. Keep the matched 16,384-token output budget and require two
+# serving-only guard tokens. The logical agent envelope remains 65,536; requests
+# above the observed rendered boundary still fail and are reported as overflows.
 SAFE_OUT_TOK=16384
-MIN_SERVER_MAXLEN=65537
+MIN_SERVER_MAXLEN=65538
 if test "${OUT_TOK:-${SAFE_OUT_TOK}}" -gt "${SAFE_OUT_TOK}"; then
   echo "OUT_TOK must be <= ${SAFE_OUT_TOK} for the matched TBLite protocol" >&2
   exit 1
