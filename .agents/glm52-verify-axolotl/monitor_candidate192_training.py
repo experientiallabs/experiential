@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Append one health snapshot for both candidate-192 Axolotl training seeds."""
+"""Append one health snapshot for two Axolotl training seeds."""
 
 from __future__ import annotations
 
@@ -48,11 +48,18 @@ def gpu_health() -> list[dict[str, int]]:
     ]
 
 
-def seed_health(root: Path, seed: int) -> dict[str, Any]:
-    name = f"qwen35-4b-glm52-candidate-realverified-sft-lr1e5-r64-seed{seed}"
+def seed_health(
+    root: Path,
+    seed: int,
+    *,
+    run_prefix: str,
+    session_prefix: str,
+) -> dict[str, Any]:
+    """Return log, checkpoint, process, tracker, and failure health for one seed."""
+    name = f"{run_prefix}{seed}"
     log = root / "logs" / f"{name}.log"
     output = root / "checkpoints" / name
-    session = f"glm52-candidate192-sft-seed{seed}"
+    session = f"{session_prefix}{seed}"
     text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
     metrics = list(METRIC_RE.finditer(text))
     latest = metrics[-1].groupdict() if metrics else None
@@ -83,11 +90,24 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--health-log", type=Path, required=True)
+    parser.add_argument(
+        "--run-prefix",
+        default="qwen35-4b-glm52-candidate-realverified-sft-lr1e5-r64-seed",
+    )
+    parser.add_argument("--session-prefix", default="glm52-candidate192-sft-seed")
     args = parser.parse_args()
     disk = shutil.disk_usage(args.root)
     snapshot = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "runs": [seed_health(args.root, seed) for seed in (20260809, 20260810)],
+        "runs": [
+            seed_health(
+                args.root,
+                seed,
+                run_prefix=args.run_prefix,
+                session_prefix=args.session_prefix,
+            )
+            for seed in (20260809, 20260810)
+        ],
         "disk": {"free": disk.free, "used": disk.used, "total": disk.total},
         "gpus": gpu_health(),
     }
