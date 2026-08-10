@@ -47,6 +47,14 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def validate_code_commit(value: str | None) -> None:
+    """Fail closed when an optional deployed commit is not a full Git SHA."""
+    if value is None:
+        return
+    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError("code commit must be a full lowercase Git SHA")
+
+
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     """Write JSON without exposing a partially written result."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -320,6 +328,8 @@ async def async_main(args: argparse.Namespace) -> int:
         "final_environment_verifier_used": True,
         "model_judgment_is_official_task_verification": False,
     }
+    if args.code_commit is not None:
+        run_spec["code_commit"] = args.code_commit
     run_spec_path = args.out / "run_spec.json"
     if args.out.exists():
         if not args.resume:
@@ -418,6 +428,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--sandbox-timeout-s", type=int, default=3600)
     parser.add_argument("--bash-timeout-s", type=int, default=120)
+    parser.add_argument("--code-commit")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -426,6 +437,7 @@ def main() -> int:
     """Run the replay and return a fail-closed process status."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
+    validate_code_commit(args.code_commit)
     if args.concurrency <= 0:
         raise ValueError("concurrency must be positive")
     return asyncio.run(async_main(args))

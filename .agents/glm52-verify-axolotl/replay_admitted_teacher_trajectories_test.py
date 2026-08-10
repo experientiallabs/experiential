@@ -11,6 +11,7 @@ from replay_admitted_teacher_trajectories import (
     extract_bash_actions,
     load_admitted_traces,
     load_completed_results,
+    validate_code_commit,
 )
 
 
@@ -153,3 +154,12 @@ def test_nonstring_optional_bash_description_fails_closed(description: object) -
     }
     with pytest.raises(ValueError, match="description is not a string"):
         extract_bash_actions(messages)
+
+
+def test_code_commit_validation_is_exact_and_backward_compatible() -> None:
+    validate_code_commit(None)
+    validate_code_commit("a" * 40)
+    with pytest.raises(ValueError, match="full lowercase Git SHA"):
+        validate_code_commit("A" * 40)
+    with pytest.raises(ValueError, match="full lowercase Git SHA"):
+        validate_code_commit("a" * 39)

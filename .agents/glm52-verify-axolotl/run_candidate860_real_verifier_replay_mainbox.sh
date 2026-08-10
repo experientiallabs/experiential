@@ -60,5 +60,6 @@ mkdir -p "$(dirname "$LOG")"
   --concurrency 8 \
   --sandbox-timeout-s 3600 \
   --bash-timeout-s 120 \
+  --code-commit "$CODE_COMMIT" \
   --resume \
   2>&1 | tee -a "$LOG"
