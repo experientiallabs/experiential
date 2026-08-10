@@ -129,7 +129,7 @@ def extract_bash_actions(messages: list[dict[str, Any]]) -> tuple[BashAction, ..
 
 
 def load_admitted_traces(path: Path) -> list[AdmittedTrace]:
-    """Load a fail-closed set of model-admitted traces for real replay."""
+    """Load a fail-closed set of replay-selected or legacy SFT-admitted traces."""
     traces: list[AdmittedTrace] = []
     task_ids: set[str] = set()
     with path.open(encoding="utf-8") as handle:
@@ -137,8 +137,12 @@ def load_admitted_traces(path: Path) -> list[AdmittedTrace]:
             record = json.loads(line)
             admission = record.get("admission")
             source = record.get("source")
-            if not isinstance(admission, dict) or not admission.get("selected_for_sft"):
-                raise ValueError(f"line {line_number}: trace is not admitted")
+            selected_for_replay = isinstance(admission, dict) and bool(
+                admission.get("selected_for_replay")
+                or admission.get("selected_for_sft")
+            )
+            if not selected_for_replay:
+                raise ValueError(f"line {line_number}: trace is not selected for replay")
             if not isinstance(source, dict):
                 raise ValueError(f"line {line_number}: source record is missing")
             task_id = source.get("task_id")
