@@ -66,7 +66,9 @@ for eval_seed in 0 1 2; do
   export CUDA_DEVICES=0,1
   export TP=1
   export DP_SIZE=2
-  export MAXLEN=65536
+  # The logical agent envelope remains 65,536; Qwen rendering needs two
+  # serving-only guard tokens at the boundary.
+  export MAXLEN=65538
   export N_RUNS=1
   export N_TASKS=100
   export TASK_NAMES=

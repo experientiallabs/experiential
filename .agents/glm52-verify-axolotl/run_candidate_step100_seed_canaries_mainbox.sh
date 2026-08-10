@@ -36,7 +36,9 @@ export PORT
 export HOST=0.0.0.0
 export CUDA_DEVICES=0,1
 export DP_SIZE=2
-export MAXLEN=65536
+# The logical agent envelope remains 65,536; Qwen rendering needs two
+# serving-only guard tokens at the boundary.
+export MAXLEN=65538
 export MAX_NUM_SEQS=32
 export GPU_UTIL=0.85
 export LOG_DIR="$AXO_ROOT/eval-logs/candidate-step${STEP}-seeds"
@@ -65,7 +67,7 @@ run_pair() {
   export CUDA_DEVICES=0,1
   export TP=1
   export DP_SIZE=2
-  export MAXLEN=65536
+  export MAXLEN=65538
   export N_RUNS=1
   export N_TASKS=10
   export TASK_NAMES=
