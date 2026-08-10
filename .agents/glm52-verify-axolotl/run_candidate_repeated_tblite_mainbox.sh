@@ -2,10 +2,10 @@
 set -euo pipefail
 
 XROOT=/scratch/tb2-qwen35-4b-glm52-step200
-STEP="${STEP:?STEP must be 100 or 200}"
+STEP="${STEP:?STEP must be 25, 50, 100, or 200}"
 case "$STEP" in
-  100|200) ;;
-  *) echo "STEP must be 100 or 200" >&2; exit 2 ;;
+  25|50|100|200) ;;
+  *) echo "STEP must be 25, 50, 100, or 200" >&2; exit 2 ;;
 esac
 
 TRAIN_SEED=20260809

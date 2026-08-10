@@ -68,31 +68,57 @@ launch_repeated() {
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$step" >>"$LOG"
 }
 
-launch_step200_canary() {
-  local marker="$XROOT/candidate-step200-two-seed-canaries.launched"
+launch_canary() {
+  local step="$1"
+  local prior_step="$2"
+  local marker="$XROOT/candidate-step${step}-two-seed-canaries.launched"
   test ! -e "$marker" || return 0
-  test ! -e "$XROOT/candidate-step200-two-seed-canaries.preflight-failed"
-  ! tmux has-session -t candidate-step100-two-seed-canaries 2>/dev/null
+  test ! -e "$XROOT/candidate-step${step}-two-seed-canaries.preflight-failed"
+  ! tmux has-session -t "candidate-step${prior_step}-two-seed-canaries" 2>/dev/null
 
-  if tmux has-session -t qwen35-4b-candidate-step100-seeds-serve 2>/dev/null; then
-    tmux send-keys -t qwen35-4b-candidate-step100-seeds-serve C-c
+  if tmux has-session -t "qwen35-4b-candidate-step${prior_step}-seeds-serve" 2>/dev/null; then
+    tmux send-keys -t "qwen35-4b-candidate-step${prior_step}-seeds-serve" C-c
     sleep 20
-    tmux kill-session -t qwen35-4b-candidate-step100-seeds-serve 2>/dev/null || true
+    tmux kill-session -t "qwen35-4b-candidate-step${prior_step}-seeds-serve" 2>/dev/null || true
   fi
   for gpu in 0 1; do
     used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gpu")"
     test "$used" -le 8192
   done
 
-  tmux new-session -d -s candidate-step200-two-seed-canaries \
-    "STEP=200 bash '$SCRIPTS/run_candidate_step100_seed_canaries_mainbox.sh' 2>&1 | tee '$XROOT/logs/candidate-step200-two-seed-canaries.launch.log'"
-  install_canary_monitor 200
+  tmux new-session -d -s "candidate-step${step}-two-seed-canaries" \
+    "STEP='$step' bash '$SCRIPTS/run_candidate_step100_seed_canaries_mainbox.sh' 2>&1 | tee '$XROOT/logs/candidate-step${step}-two-seed-canaries.launch.log'"
+  install_canary_monitor "$step"
   sleep 35
-  tmux has-session -t candidate-step200-two-seed-canaries
+  tmux has-session -t "candidate-step${step}-two-seed-canaries"
   touch "$marker"
-  printf '%s launched two-seed step200 held-out canaries\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$LOG"
+  printf '%s launched two-seed step%s held-out canaries after step%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$step" "$prior_step" >>"$LOG"
 }
+
+if test -e "$XROOT/candidate-step25-two-seed-canaries.complete"; then
+  gate="$XROOT/candidate-step25-two-seed-canary-gate.json"
+  test -s "$gate"
+  if test "$(credible "$gate")" = 1; then
+    launch_repeated 25
+  else
+    touch "$XROOT/candidate-checkpoint-sweep-no-credible-canary.marker"
+    printf '%s steps 25, 50, 100, and 200 all failed the two-seed canary gate\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$LOG"
+  fi
+  exit 0
+fi
+
+if test -e "$XROOT/candidate-step50-two-seed-canaries.complete"; then
+  gate="$XROOT/candidate-step50-two-seed-canary-gate.json"
+  test -s "$gate"
+  if test "$(credible "$gate")" = 1; then
+    launch_repeated 50
+  else
+    launch_canary 25 50
+  fi
+  exit 0
+fi
 
 if test -e "$XROOT/candidate-step200-two-seed-canaries.complete"; then
   gate="$XROOT/candidate-step200-two-seed-canary-gate.json"
@@ -101,8 +127,7 @@ if test -e "$XROOT/candidate-step200-two-seed-canaries.complete"; then
     launch_repeated 200
   else
     touch "$XROOT/candidate-step200-no-credible-canary.marker"
-    printf '%s neither step100 nor step200 passed the two-seed canary gate\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$LOG"
+    launch_canary 50 200
   fi
   exit 0
 fi
@@ -113,7 +138,7 @@ if test -e "$XROOT/candidate-step100-two-seed-canaries.complete"; then
   if test "$(credible "$gate")" = 1; then
     launch_repeated 100
   else
-    launch_step200_canary
+    launch_canary 200 100
   fi
   exit 0
 fi
