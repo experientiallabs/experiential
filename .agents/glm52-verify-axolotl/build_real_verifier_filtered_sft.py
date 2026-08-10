@@ -10,7 +10,6 @@ import logging
 from pathlib import Path
 from typing import Any
 
-
 LOGGER = logging.getLogger(__name__)
 
 
@@ -60,6 +59,65 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(
                 json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
             )
+
+
+def merge_replay_recoveries(
+    primary_rows: list[dict[str, Any]],
+    recovery_sets: list[tuple[str, list[dict[str, Any]]]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Replace only unscored primary results with complete scored recoveries."""
+    primary_by_task = index_unique(primary_rows, "task_id", context="primary replay")
+    primary_order = [str(row["task_id"]) for row in primary_rows]
+    recovery_tasks: set[str] = set()
+    decisions: list[dict[str, Any]] = []
+    for source, rows in recovery_sets:
+        recovery_by_task = index_unique(rows, "task_id", context=source)
+        for task_id, recovery in recovery_by_task.items():
+            if task_id in recovery_tasks:
+                raise ValueError(f"duplicate recovery task across inputs: {task_id}")
+            recovery_tasks.add(task_id)
+            primary = primary_by_task.get(task_id)
+            if primary is None:
+                raise ValueError(f"recovery task is absent from primary replay: {task_id}")
+            if recovery.get("source_row_sha256") != primary.get("source_row_sha256"):
+                raise ValueError(f"{task_id}: recovery source row hash mismatch")
+            if recovery.get("finished_at") is None:
+                raise ValueError(f"{task_id}: recovery is unfinished")
+
+            recovery_reward = recovery.get("reward")
+            recovery_scored = recovery.get("status") == "scored" and isinstance(
+                recovery_reward, (int, float)
+            )
+            selected = False
+            if recovery_scored:
+                primary_reward = primary.get("reward")
+                primary_scored = primary.get("status") == "scored" and isinstance(
+                    primary_reward, (int, float)
+                )
+                if primary_scored:
+                    raise ValueError(f"{task_id}: refusing to replace scored primary result")
+                verifier = recovery.get("final_verifier")
+                if not isinstance(verifier, dict) or verifier.get("reward") != recovery_reward:
+                    raise ValueError(f"{task_id}: recovery verifier reward mismatch")
+                if recovery.get("model_judgment_is_official_task_verification") is not False:
+                    raise ValueError(f"{task_id}: invalid model-judgment boundary")
+                primary_by_task[task_id] = recovery
+                selected = True
+
+            decisions.append(
+                {
+                    "source": source,
+                    "task_id": task_id,
+                    "source_row_sha256": recovery.get("source_row_sha256"),
+                    "primary_status": primary.get("status"),
+                    "primary_reward": primary.get("reward"),
+                    "recovery_status": recovery.get("status"),
+                    "recovery_reward": recovery_reward,
+                    "selected_as_authoritative": selected,
+                    "recovery_result_sha256": canonical_sha256(recovery),
+                }
+            )
+    return [primary_by_task[task_id] for task_id in primary_order], decisions
 
 
 def build_bundle(
@@ -195,6 +253,7 @@ def main() -> int:
     parser.add_argument("--qwen-dataset", type=Path, required=True)
     parser.add_argument("--replay-root", type=Path, required=True)
     parser.add_argument("--replay-summary", type=Path, required=True)
+    parser.add_argument("--recovery-root", type=Path, action="append", default=[])
     parser.add_argument("--minimum-reward", type=float, default=1.0)
     parser.add_argument("--output-audit", type=Path, required=True)
     parser.add_argument("--output-qwen", type=Path, required=True)
@@ -216,6 +275,31 @@ def main() -> int:
     if len(replay_paths) != replay_summary.get("attempted"):
         raise ValueError("replay episode count differs from summary attempted count")
     replay_rows = [json.loads(path.read_text(encoding="utf-8")) for path in replay_paths]
+    recovery_sets: list[tuple[str, list[dict[str, Any]]]] = []
+    recovery_inputs: list[dict[str, Any]] = []
+    for recovery_root in args.recovery_root:
+        recovery_paths = sorted(recovery_root.glob("*/replay_result.json"))
+        if not recovery_paths:
+            raise ValueError(f"recovery root has no episode results: {recovery_root}")
+        recovery_rows = [
+            json.loads(path.read_text(encoding="utf-8")) for path in recovery_paths
+        ]
+        recovery_sets.append((str(recovery_root), recovery_rows))
+        recovery_inputs.append(
+            {
+                "root": str(recovery_root),
+                "results": [
+                    {
+                        "path": str(path),
+                        "sha256": sha256_bytes(path.read_bytes()),
+                    }
+                    for path in recovery_paths
+                ],
+            }
+        )
+    replay_rows, recovery_decisions = merge_replay_recoveries(
+        replay_rows, recovery_sets
+    )
     selected_audit, selected_qwen, ledger = build_bundle(
         audit_rows=audit_rows,
         qwen_rows=qwen_rows,
@@ -243,6 +327,12 @@ def main() -> int:
         "qwen_dataset_sha256": sha256_bytes(args.qwen_dataset.read_bytes()),
         "replay_summary": str(args.replay_summary),
         "replay_summary_sha256": sha256_bytes(args.replay_summary.read_bytes()),
+        "recovery_inputs": recovery_inputs,
+        "recovery_decisions": recovery_decisions,
+        "authoritative_recovery_count": sum(
+            bool(decision["selected_as_authoritative"])
+            for decision in recovery_decisions
+        ),
         "output_audit": str(args.output_audit),
         "output_audit_sha256": sha256_bytes(args.output_audit.read_bytes()),
         "output_qwen": str(args.output_qwen),
