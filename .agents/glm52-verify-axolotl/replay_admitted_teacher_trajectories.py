@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 LOGGER = logging.getLogger(__name__)
+EXIT_CODE_MARKER = re.compile(r"(?:^|\n)\(exit_code=(-?\d+)\)\s*$")
 
 
 @dataclass(frozen=True)
@@ -88,8 +89,25 @@ def parse_arguments(arguments: Any, *, context: str) -> dict[str, Any]:
 
 def parse_recorded_exit_code(output: str) -> int | None:
     """Read the terminal harness exit marker from a recorded tool response."""
-    match = re.search(r"(?:^|\n)\(exit_code=(-?\d+)\)\s*$", output)
+    match = EXIT_CODE_MARKER.search(output)
     return int(match.group(1)) if match else None
+
+
+def recorded_output_body(output: str) -> str:
+    """Remove only a terminal harness exit marker and trailing whitespace."""
+    return EXIT_CODE_MARKER.sub("", output).rstrip()
+
+
+def matches_recorded_exit_timeout(
+    action: BashAction, *, replay_output: str, exit_code: int, timed_out: bool
+) -> bool:
+    """Match a transport timeout to an exact teacher-recorded non-timeout exit."""
+    return (
+        timed_out
+        and action.recorded_exit_code not in (None, -1)
+        and exit_code == action.recorded_exit_code
+        and replay_output.rstrip() == recorded_output_body(action.recorded_output)
+    )
 
 
 def extract_bash_actions(messages: list[dict[str, Any]]) -> tuple[BashAction, ...]:
@@ -279,6 +297,12 @@ async def replay_trace(
                     timeout_s=bash_timeout_s,
                 )
                 replay_output = shell_result.output
+                recorded_exit_timeout_match = matches_recorded_exit_timeout(
+                    action,
+                    replay_output=replay_output,
+                    exit_code=shell_result.exit_code,
+                    timed_out=shell_result.timed_out,
+                )
                 action_record = {
                     "action_index": action_index,
                     "assistant_message_index": action.assistant_message_index,
@@ -295,19 +319,26 @@ async def replay_trace(
                     "recorded_output_exact_match": replay_output == action.recorded_output,
                     "exit_code": shell_result.exit_code,
                     "timed_out": shell_result.timed_out,
+                    "recorded_exit_timeout_match": recorded_exit_timeout_match,
                     "timeout_behavior_match": shell_result.timed_out
-                    == (action.recorded_exit_code == -1),
+                    == (action.recorded_exit_code == -1)
+                    or recorded_exit_timeout_match,
                     "wall_s": round(time.time() - action_started, 3),
                 }
                 result["actions"].append(action_record)
                 write_json_atomic(result_path, result)
-                if shell_result.timed_out and action.recorded_exit_code != -1:
-                    result["status"] = "replay_action_timeout"
-                    return result
                 if shell_result.timed_out:
-                    result.setdefault("matched_recorded_timeout_actions", []).append(
-                        action_index
-                    )
+                    if action.recorded_exit_code == -1:
+                        result.setdefault("matched_recorded_timeout_actions", []).append(
+                            action_index
+                        )
+                    elif recorded_exit_timeout_match:
+                        result.setdefault(
+                            "matched_recorded_exit_timeout_actions", []
+                        ).append(action_index)
+                    else:
+                        result["status"] = "replay_action_timeout"
+                        return result
 
             verifier = await sandbox.verify()
             result["final_verifier"] = asdict(verifier)

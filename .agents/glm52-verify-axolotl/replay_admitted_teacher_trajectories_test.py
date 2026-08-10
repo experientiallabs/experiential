@@ -15,7 +15,9 @@ from replay_admitted_teacher_trajectories import (
     extract_bash_actions,
     load_admitted_traces,
     load_completed_results,
+    matches_recorded_exit_timeout,
     parse_recorded_exit_code,
+    recorded_output_body,
     replay_trace,
     validate_code_commit,
     validate_positive_integer,
@@ -190,6 +192,36 @@ def test_recorded_timeout_metadata_is_extracted() -> None:
     assert actions[0].recorded_exit_code == -1
 
 
+def test_recorded_output_body_removes_only_terminal_exit_marker() -> None:
+    assert recorded_output_body("Terminated\n\n(exit_code=143)") == "Terminated"
+    assert recorded_output_body("prefix (exit_code=143) suffix") == (
+        "prefix (exit_code=143) suffix"
+    )
+
+
+def test_recorded_exit_timeout_match_requires_exit_and_output() -> None:
+    action = BashAction(
+        2,
+        0,
+        "call-1",
+        "start services",
+        "Terminated\n\n(exit_code=143)",
+        143,
+    )
+    assert matches_recorded_exit_timeout(
+        action, replay_output="Terminated\n", exit_code=143, timed_out=True
+    )
+    assert not matches_recorded_exit_timeout(
+        action, replay_output="different\n", exit_code=143, timed_out=True
+    )
+    assert not matches_recorded_exit_timeout(
+        action, replay_output="Terminated\n", exit_code=137, timed_out=True
+    )
+    assert not matches_recorded_exit_timeout(
+        action, replay_output="Terminated\n", exit_code=143, timed_out=False
+    )
+
+
 @dataclass
 class FakeReport:
     ok: bool = True
@@ -215,6 +247,12 @@ class FakeSandbox:
         self.commands.append(command)
         if command == "expected timeout":
             return SimpleNamespace(output="", exit_code=-1, timed_out=True)
+        if command == "expected exit timeout":
+            return SimpleNamespace(output="Terminated\n", exit_code=143, timed_out=True)
+        if command == "wrong output exit timeout":
+            return SimpleNamespace(output="different\n", exit_code=143, timed_out=True)
+        if command == "wrong code exit timeout":
+            return SimpleNamespace(output="Terminated\n", exit_code=137, timed_out=True)
         return SimpleNamespace(output="ok", exit_code=0, timed_out=False)
 
     async def verify(self) -> FakeCheck:
@@ -265,6 +303,80 @@ def test_replay_continues_after_timeout_recorded_by_teacher(tmp_path: Path) -> N
     assert result["status"] == "scored"
     assert result["reward"] == 1.0
     assert result["matched_recorded_timeout_actions"] == [0]
+
+
+def test_replay_continues_after_exact_recorded_exit_transport_timeout(
+    tmp_path: Path,
+) -> None:
+    sandbox = FakeSandbox()
+    result = asyncio.run(
+        replay_trace(
+            trace=AdmittedTrace(
+                source_row_index=3,
+                source_row_sha256="source-hash",
+                task_id="task-3",
+                rollout_id="rollout-3",
+                first_user_content="task instruction",
+                actions=(
+                    BashAction(
+                        2,
+                        0,
+                        "call-1",
+                        "expected exit timeout",
+                        "Terminated\n\n(exit_code=143)",
+                        143,
+                    ),
+                    BashAction(4, 0, "call-2", "continue", "ok", 0),
+                ),
+            ),
+            task=SimpleNamespace(instruction="task instruction"),
+            pool=FakePool(sandbox),
+            out_root=tmp_path,
+            bash_timeout_s=120,
+        )
+    )
+    assert sandbox.commands == ["expected exit timeout", "continue"]
+    assert result["status"] == "scored"
+    assert result["reward"] == 1.0
+    assert result["matched_recorded_exit_timeout_actions"] == [0]
+
+
+@pytest.mark.parametrize(
+    "command", ["wrong output exit timeout", "wrong code exit timeout"]
+)
+def test_replay_fails_closed_on_recorded_exit_timeout_mismatch(
+    tmp_path: Path, command: str
+) -> None:
+    sandbox = FakeSandbox()
+    result = asyncio.run(
+        replay_trace(
+            trace=AdmittedTrace(
+                source_row_index=3,
+                source_row_sha256="source-hash",
+                task_id="task-3",
+                rollout_id="rollout-3",
+                first_user_content="task instruction",
+                actions=(
+                    BashAction(
+                        2,
+                        0,
+                        "call-1",
+                        command,
+                        "Terminated\n\n(exit_code=143)",
+                        143,
+                    ),
+                    BashAction(4, 0, "call-2", "continue", "ok", 0),
+                ),
+            ),
+            task=SimpleNamespace(instruction="task instruction"),
+            pool=FakePool(sandbox),
+            out_root=tmp_path,
+            bash_timeout_s=120,
+        )
+    )
+    assert sandbox.commands == [command]
+    assert result["status"] == "replay_action_timeout"
+    assert result.get("reward") is None
 
 
 @pytest.mark.parametrize("description", [None, 3, {"text": "bad"}])
