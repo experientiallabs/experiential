@@ -11,7 +11,6 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-
 RUN_PREFIX = "qwen35-4b-glm52-candidate-realverified-sft-lr1e5-r64-seed"
 
 
@@ -23,8 +22,14 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_checkpoint(root: Path, seed: int, step: int) -> dict[str, object]:
-    checkpoint = root / f"{RUN_PREFIX}{seed}" / f"checkpoint-{step}"
+def validate_checkpoint(
+    root: Path,
+    seed: int,
+    step: int,
+    *,
+    run_prefix: str = RUN_PREFIX,
+) -> dict[str, object]:
+    checkpoint = root / f"{run_prefix}{seed}" / f"checkpoint-{step}"
     model_path = checkpoint / "adapter_model.safetensors"
     state_path = checkpoint / "trainer_state.json"
     config_path = checkpoint / "adapter_config.json"
@@ -83,11 +88,12 @@ def main() -> int:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--seeds", nargs="+", type=int, default=[20260809, 20260810])
     parser.add_argument("--steps", nargs="+", type=int, default=[100, 200])
+    parser.add_argument("--run-prefix", default=RUN_PREFIX)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
 
     records = [
-        validate_checkpoint(args.root, seed, step)
+        validate_checkpoint(args.root, seed, step, run_prefix=args.run_prefix)
         for seed in args.seeds
         for step in args.steps
     ]
@@ -97,7 +103,7 @@ def main() -> int:
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    print(json.dumps(payload, indent=2, sort_keys=True))  # noqa: T201
     return 0
 
 

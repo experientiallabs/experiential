@@ -31,10 +31,10 @@ def session_alive(name: str) -> bool:
     return run("tmux", "has-session", "-t", name).returncode == 0
 
 
-def orchestrator_alive(step: int) -> bool:
+def orchestrator_alive(step: int, family: str = "candidate") -> bool:
     """Accept the original two-seed runner or a resumable single-seed runner."""
-    return session_alive(f"candidate-step{step}-two-seed-canaries") or any(
-        session_alive(f"candidate-step{step}-seed{seed}-resume")
+    return session_alive(f"{family}-step{step}-two-seed-canaries") or any(
+        session_alive(f"{family}-step{step}-seed{seed}-resume")
         for seed in (20260809, 20260810)
     )
 
@@ -165,10 +165,15 @@ def arm_health(job: Path) -> dict[str, Any]:
     }
 
 
-def seed_health(root: Path, seed: int, step: int) -> dict[str, Any]:
-    eval_root = root / f"candidate-step{step}-seed{seed}-tblite-canary10-seed0-run1"
-    prefix = f"qwen35-4b-candidate-seed{seed}-step{step}-canary10-seed0"
-    arm = f"candidate-seed{seed}-step{step}"
+def seed_health(
+    root: Path,
+    seed: int,
+    step: int,
+    family: str = "candidate",
+) -> dict[str, Any]:
+    eval_root = root / f"{family}-step{step}-seed{seed}-tblite-canary10-seed0-run1"
+    prefix = f"qwen35-4b-{family}-seed{seed}-step{step}-canary10-seed0"
+    arm = f"{family}-seed{seed}-step{step}"
     logs = [
         root / "logs" / f"{prefix}.log",
         root / "logs" / f"{prefix}.resume.log",
@@ -194,17 +199,24 @@ def main() -> int:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--health-log", required=True, type=Path)
     parser.add_argument("--step", type=int, default=100)
+    parser.add_argument("--family", default="candidate")
     args = parser.parse_args()
     disk = shutil.disk_usage(args.root)
     snapshot = {
         "timestamp": datetime.now(UTC).isoformat(),
         "checkpoint_step": args.step,
-        "orchestrator_alive": orchestrator_alive(args.step),
-        "server_alive": session_alive(f"qwen35-4b-candidate-step{args.step}-seeds-serve"),
+        "family": args.family,
+        "orchestrator_alive": orchestrator_alive(args.step, args.family),
+        "server_alive": session_alive(
+            f"qwen35-4b-{args.family}-step{args.step}-seeds-serve"
+        ),
         "selection_gate_written": (
-            args.root / f"candidate-step{args.step}-two-seed-canary-gate.json"
+            args.root / f"{args.family}-step{args.step}-two-seed-canary-gate.json"
         ).is_file(),
-        "seeds": [seed_health(args.root, seed, args.step) for seed in (20260809, 20260810)],
+        "seeds": [
+            seed_health(args.root, seed, args.step, args.family)
+            for seed in (20260809, 20260810)
+        ],
         "disk": {"free": disk.free, "used": disk.used, "total": disk.total},
         "gpus": gpu_health(),
     }

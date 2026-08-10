@@ -107,3 +107,14 @@ def test_seed_health_reads_resume_log_signals(tmp_path: Path) -> None:
     log.parent.mkdir(parents=True)
     log.write_text("CUDA OOM")
     assert seed_health(tmp_path, 20260810, 100)["signals"]["oom"]
+
+
+def test_seed_health_supports_explicit_family(tmp_path: Path) -> None:
+    log = (
+        tmp_path
+        / "logs"
+        / "qwen35-4b-merged-seed20260810-step100-canary10-seed0.log"
+    )
+    log.parent.mkdir(parents=True)
+    log.write_text("detected NaN in logits")
+    assert seed_health(tmp_path, 20260810, 100, "merged")["signals"]["nan"]

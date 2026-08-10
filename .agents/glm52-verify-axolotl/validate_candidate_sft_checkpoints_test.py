@@ -8,12 +8,17 @@ from pathlib import Path
 import pytest
 import torch
 from safetensors.torch import save_file
-
 from validate_candidate_sft_checkpoints import RUN_PREFIX, validate_checkpoint
 
 
-def write_checkpoint(root: Path, *, seed: int = 1, step: int = 25) -> Path:
-    checkpoint = root / f"{RUN_PREFIX}{seed}" / f"checkpoint-{step}"
+def write_checkpoint(
+    root: Path,
+    *,
+    seed: int = 1,
+    step: int = 25,
+    run_prefix: str = RUN_PREFIX,
+) -> Path:
+    checkpoint = root / f"{run_prefix}{seed}" / f"checkpoint-{step}"
     checkpoint.mkdir(parents=True)
     tensors = {}
     for index in range(200):
@@ -33,6 +38,13 @@ def test_validate_checkpoint_accepts_expected_adapter(tmp_path: Path) -> None:
     assert result["tensor_count"] == 400
     assert result["all_finite"] is True
     assert result["all_nonzero"] is True
+
+
+def test_validate_checkpoint_accepts_explicit_run_prefix(tmp_path: Path) -> None:
+    run_prefix = "qwen35-4b-merged-seed"
+    write_checkpoint(tmp_path, run_prefix=run_prefix)
+    result = validate_checkpoint(tmp_path, 1, 25, run_prefix=run_prefix)
+    assert result["checkpoint"].endswith("qwen35-4b-merged-seed1/checkpoint-25")
 
 
 def test_validate_checkpoint_rejects_zero_tensor(tmp_path: Path) -> None:
