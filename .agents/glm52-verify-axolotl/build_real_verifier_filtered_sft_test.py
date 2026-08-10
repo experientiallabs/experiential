@@ -25,7 +25,12 @@ def qwen(task_id: str, source_hash: str) -> dict[str, object]:
     """Return one compact materialized training row."""
     return {
         "messages": [{"role": "assistant", "content": "gold"}],
-        "provenance": {"task_id": task_id, "source_row_sha256": source_hash},
+        "provenance": {
+            "task_id": task_id,
+            "source_row_sha256": source_hash,
+            "selected_for_sft": False,
+            "real_verifier_admission_pending": True,
+        },
     }
 
 
@@ -76,6 +81,13 @@ class BuildBundleTest(unittest.TestCase):
             audits[0]["adjudicator_judgment"],
         )
         self.assertEqual(selected_qwen[0]["messages"], qwens[0]["messages"])
+        self.assertTrue(selected_qwen[0]["provenance"]["selected_for_sft"])
+        self.assertFalse(
+            selected_qwen[0]["provenance"]["real_verifier_admission_pending"]
+        )
+        self.assertFalse(
+            selected_qwen[0]["provenance"]["pre_verifier_selected_for_sft"]
+        )
         self.assertTrue(ledger[0]["selected_for_real_verifier_sft"])
         self.assertFalse(ledger[1]["selected_for_real_verifier_sft"])
         self.assertEqual(

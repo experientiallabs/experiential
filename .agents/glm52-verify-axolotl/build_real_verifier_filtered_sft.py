@@ -230,8 +230,14 @@ def build_bundle(
 
         augmented_qwen = dict(qwen)
         augmented_provenance = dict(provenance)
+        if "selected_for_sft" in augmented_provenance:
+            augmented_provenance["pre_verifier_selected_for_sft"] = (
+                augmented_provenance["selected_for_sft"]
+            )
         augmented_provenance.update(
             {
+                "selected_for_sft": True,
+                "real_verifier_admission_pending": False,
                 "real_verifier_reward": float(reward),
                 "real_verifier_replay_status": status,
                 "real_verifier_replay_result_sha256": replay_sha256,
