@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from replay_admitted_teacher_trajectories import (
     AdmittedTrace,
+    BashAction,
     extract_bash_actions,
     load_admitted_traces,
     load_completed_results,
+    parse_recorded_exit_code,
+    replay_trace,
     validate_code_commit,
 )
 
@@ -39,6 +45,8 @@ def test_only_finished_matching_results_are_resumed(tmp_path: Path) -> None:
         "task_id": "task-3",
         "source_row_sha256": "source-hash",
         "finished_at": 123.0,
+        "status": "scored",
+        "reward": 0.0,
     }
     write_result(tmp_path, value)
     assert load_completed_results(tmp_path, [trace()]) == {"task-3": value}
@@ -51,6 +59,23 @@ def test_partial_result_is_retried(tmp_path: Path) -> None:
             "task_id": "task-3",
             "source_row_sha256": "source-hash",
             "finished_at": None,
+        },
+    )
+    assert load_completed_results(tmp_path, [trace()]) == {}
+
+
+@pytest.mark.parametrize(
+    "status", ["replay_action_timeout", "episode_error", "infrastructure_setup_failed"]
+)
+def test_finished_unscored_result_is_retried(tmp_path: Path, status: str) -> None:
+    write_result(
+        tmp_path,
+        {
+            "task_id": "task-3",
+            "source_row_sha256": "source-hash",
+            "finished_at": 123.0,
+            "status": status,
+            "reward": None,
         },
     )
     assert load_completed_results(tmp_path, [trace()]) == {}
@@ -142,6 +167,103 @@ def test_optional_bash_description_does_not_change_replayed_command() -> None:
     actions = extract_bash_actions(messages)
     assert len(actions) == 1
     assert actions[0].command == "pwd"
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("ok\n\n(exit_code=0)", 0),
+        ("(no output)\n\n(exit_code=-1)\n", -1),
+        ("plain output without marker", None),
+    ],
+)
+def test_recorded_exit_code_parser(output: str, expected: int | None) -> None:
+    assert parse_recorded_exit_code(output) == expected
+
+
+def test_recorded_timeout_metadata_is_extracted() -> None:
+    record = replay_record(selected_for_replay=True, selected_for_sft=False)
+    messages = json.loads(record["source"]["message_log_json"])
+    messages[2]["content"] = "(no output)\n\n(exit_code=-1)"
+    actions = extract_bash_actions(messages)
+    assert actions[0].recorded_exit_code == -1
+
+
+@dataclass
+class FakeReport:
+    ok: bool = True
+    shell_restarts: int = 1
+
+
+@dataclass
+class FakeCheck:
+    passed: bool = True
+    reward: float = 1.0
+
+
+class FakeSandbox:
+    def __init__(self) -> None:
+        self.report = FakeReport()
+        self.commands: list[str] = []
+
+    async def check_initial_state(self) -> FakeCheck:
+        return FakeCheck()
+
+    async def shell(self, command: str, *, timeout_s: int) -> SimpleNamespace:
+        assert timeout_s == 120
+        self.commands.append(command)
+        if command == "expected timeout":
+            return SimpleNamespace(output="", exit_code=-1, timed_out=True)
+        return SimpleNamespace(output="ok", exit_code=0, timed_out=False)
+
+    async def verify(self) -> FakeCheck:
+        return FakeCheck()
+
+
+class FakeSession:
+    def __init__(self, sandbox: FakeSandbox) -> None:
+        self.sandbox = sandbox
+
+    async def __aenter__(self) -> FakeSandbox:
+        return self.sandbox
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+class FakePool:
+    def __init__(self, sandbox: FakeSandbox) -> None:
+        self.sandbox = sandbox
+
+    def session(self, _task: object) -> FakeSession:
+        return FakeSession(self.sandbox)
+
+
+def test_replay_continues_after_timeout_recorded_by_teacher(tmp_path: Path) -> None:
+    sandbox = FakeSandbox()
+    result = asyncio.run(
+        replay_trace(
+            trace=AdmittedTrace(
+                source_row_index=3,
+                source_row_sha256="source-hash",
+                task_id="task-3",
+                rollout_id="rollout-3",
+                first_user_content="task instruction",
+                actions=(
+                    BashAction(2, 0, "call-1", "expected timeout", "", -1),
+                    BashAction(4, 0, "call-2", "continue", "ok", 0),
+                ),
+            ),
+            task=SimpleNamespace(instruction="task instruction"),
+            pool=FakePool(sandbox),
+            out_root=tmp_path,
+            bash_timeout_s=120,
+        )
+    )
+    assert sandbox.commands == ["expected timeout", "continue"]
+    assert result["status"] == "scored"
+    assert result["reward"] == 1.0
+    assert result["matched_recorded_timeout_actions"] == [0]
 
 
 @pytest.mark.parametrize("description", [None, 3, {"text": "bad"}])

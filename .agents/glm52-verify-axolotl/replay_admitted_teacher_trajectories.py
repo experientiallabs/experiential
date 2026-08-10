@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -28,6 +29,7 @@ class BashAction:
     tool_call_id: str
     command: str
     recorded_output: str
+    recorded_exit_code: int | None
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,12 @@ def parse_arguments(arguments: Any, *, context: str) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise ValueError(f"{context}: tool arguments are not an object")
     return arguments
+
+
+def parse_recorded_exit_code(output: str) -> int | None:
+    """Read the terminal harness exit marker from a recorded tool response."""
+    match = re.search(r"(?:^|\n)\(exit_code=(-?\d+)\)\s*$", output)
+    return int(match.group(1)) if match else None
 
 
 def extract_bash_actions(messages: list[dict[str, Any]]) -> tuple[BashAction, ...]:
@@ -132,6 +140,9 @@ def extract_bash_actions(messages: list[dict[str, Any]]) -> tuple[BashAction, ..
                     tool_call_id=tool_call_id,
                     command=arguments["command"],
                     recorded_output=tool_outputs[tool_call_id],
+                    recorded_exit_code=parse_recorded_exit_code(
+                        tool_outputs[tool_call_id]
+                    ),
                 )
             )
             consumed_outputs.add(tool_call_id)
@@ -206,6 +217,8 @@ def load_completed_results(
             raise ValueError(f"resume source hash mismatch in {result_path}")
         if result.get("finished_at") is None:
             continue
+        if result.get("status") != "scored" or result.get("reward") is None:
+            continue
         completed[trace.task_id] = result
     return completed
 
@@ -269,18 +282,26 @@ async def replay_trace(
                     "command_characters": len(action.command),
                     "recorded_output_sha256": sha256_text(action.recorded_output),
                     "recorded_output_characters": len(action.recorded_output),
+                    "recorded_exit_code": action.recorded_exit_code,
+                    "recorded_timed_out": action.recorded_exit_code == -1,
                     "replay_output_sha256": sha256_text(replay_output),
                     "replay_output_characters": len(replay_output),
                     "recorded_output_exact_match": replay_output == action.recorded_output,
                     "exit_code": shell_result.exit_code,
                     "timed_out": shell_result.timed_out,
+                    "timeout_behavior_match": shell_result.timed_out
+                    == (action.recorded_exit_code == -1),
                     "wall_s": round(time.time() - action_started, 3),
                 }
                 result["actions"].append(action_record)
                 write_json_atomic(result_path, result)
-                if shell_result.timed_out:
+                if shell_result.timed_out and action.recorded_exit_code != -1:
                     result["status"] = "replay_action_timeout"
                     return result
+                if shell_result.timed_out:
+                    result.setdefault("matched_recorded_timeout_actions", []).append(
+                        action_index
+                    )
 
             verifier = await sandbox.verify()
             result["final_verifier"] = asdict(verifier)
