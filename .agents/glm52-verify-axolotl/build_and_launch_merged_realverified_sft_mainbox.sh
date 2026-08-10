@@ -184,6 +184,7 @@ tmp="$(mktemp)"
 crontab -l 2>/dev/null | \
   grep -Fv 'codex-candidate192-training-monitor' | \
   grep -Fv 'codex-merged-realverified-training-monitor' | \
+  grep -Fv 'codex-candidate1052-build-launch-monitor' | \
   grep -Fv 'codex-candidate-step100-canary-monitor' | \
   grep -Fv 'codex-candidate-checkpoint-eval-advance' | \
   grep -Fv 'codex-candidate860-recovery-recorded-timeout4-monitor' | \
