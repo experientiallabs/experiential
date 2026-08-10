@@ -7,13 +7,16 @@ BASE_MODEL="${BASE_MODEL:-qwen35-4b-base}"
 ADAPTER_ARM="${ADAPTER_ARM:?ADAPTER_ARM is required}"
 ADAPTER_MODEL="${ADAPTER_MODEL:?ADAPTER_MODEL is required}"
 
-# A 16,384-token completion cap leaves exactly 49,152 tokens for the rendered
-# prompt. The chat template can add one token after the agent truncates history,
-# which produces a deterministic 65,537-token request. Reserve that token for
-# both arms so a matched task is not converted into a context-window failure.
-SAFE_OUT_TOK=16383
+# mini-swe-agent budgets history as 65,536 - max_tokens before the chat template
+# is rendered. Reducing max_tokens by one only raises the history ceiling by one,
+# so the renderer still produces a deterministic 65,537-token request. Keep the
+# matched 16,384-token output budget and require one serving-only guard token.
+# The agent envelope remains 65,536; genuine requests above 65,537 still fail and
+# are reported as context overflows.
+SAFE_OUT_TOK=16384
+MIN_SERVER_MAXLEN=65537
 if test "${OUT_TOK:-${SAFE_OUT_TOK}}" -gt "${SAFE_OUT_TOK}"; then
-  echo "OUT_TOK must be <= ${SAFE_OUT_TOK} for the 65,536-token server window" >&2
+  echo "OUT_TOK must be <= ${SAFE_OUT_TOK} for the matched TBLite protocol" >&2
   exit 1
 fi
 OUT_TOK="${OUT_TOK:-${SAFE_OUT_TOK}}"
@@ -21,6 +24,24 @@ export OUT_TOK
 
 # shellcheck source=/dev/null
 . "${HERE}/tblite_env.sh"
+"${HPY}" - "${API_BASE_LOCAL}" "${MIN_SERVER_MAXLEN}" "${BASE_MODEL}" <<'PY'
+import json
+import sys
+from urllib.request import urlopen
+
+api_base, minimum, base_model = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+with urlopen(f"{api_base.rstrip('/')}/models", timeout=10) as response:
+    models = json.load(response)["data"]
+record = next((row for row in models if row["id"] == base_model), None)
+if record is None:
+    raise SystemExit(f"base model is not served: {base_model}")
+actual = record.get("max_model_len")
+if actual is None or int(actual) < minimum:
+    raise SystemExit(
+        f"server max_model_len must be >= {minimum} for the rendered 65,536-token "
+        f"agent envelope; got {actual}"
+    )
+PY
 test "${N_RUNS}" -eq 1 || { echo "this canary wrapper requires N_RUNS=1" >&2; exit 1; }
 if test -n "${N_TASKS:-}" && test -n "${TASK_NAMES:-}"; then
   echo "set exactly one of N_TASKS or TASK_NAMES for a matched canary" >&2

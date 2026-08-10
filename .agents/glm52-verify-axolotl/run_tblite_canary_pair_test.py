@@ -29,6 +29,7 @@ def test_scorer_uses_selected_task_denominator(
     hpy.chmod(0o755)
     (here / "tblite_env.sh").write_text(
         'HPY="$STUB_HPY"\n'
+        'API_BASE_LOCAL="http://127.0.0.1:1/v1"\n'
         'CFG_DIR="$STUB_ROOT/cfg"\n'
         'JOBS_DIR="$STUB_ROOT/jobs"\n'
         'RUNTIME_DIR="$STUB_ROOT/runtime"\n'
@@ -59,7 +60,12 @@ def test_scorer_uses_selected_task_denominator(
         line for line in log.read_text().splitlines() if "make_tblite_cfgs.py" in line
     ]
     assert len(make_calls) == 2
-    assert all(line.startswith("OUT_TOK=16383 ") for line in make_calls)
+    assert all(line.startswith("OUT_TOK=16384 ") for line in make_calls)
+
+    server_gate_calls = [
+        line for line in log.read_text().splitlines() if "65537" in line
+    ]
+    assert len(server_gate_calls) == 1
 
     score_calls = [
         line for line in log.read_text().splitlines() if "score_tblite.py" in line
@@ -68,8 +74,8 @@ def test_scorer_uses_selected_task_denominator(
     assert all(f"--total-tasks {expected}" in line for line in score_calls)
 
 
-def test_rejects_unsafe_output_token_override(tmp_path: Path) -> None:
-    """Reject the original cap that causes a one-token overflow."""
+def test_rejects_output_token_override_above_matched_budget(tmp_path: Path) -> None:
+    """Reject an output cap above the matched 16,384-token budget."""
     here = tmp_path / "eval"
     here.mkdir()
     (here / "tblite_env.sh").write_text("exit 99\n")
@@ -83,11 +89,11 @@ def test_rejects_unsafe_output_token_override(tmp_path: Path) -> None:
         "TASK_NAMES": "",
         "ADAPTER_ARM": "adapter",
         "ADAPTER_MODEL": "adapter-model",
-        "OUT_TOK": "16384",
+        "OUT_TOK": "16385",
     }
     completed = subprocess.run(
         ["bash", str(script)], check=False, capture_output=True, text=True, env=env
     )
 
     assert completed.returncode == 1
-    assert "OUT_TOK must be <= 16383" in completed.stderr
+    assert "OUT_TOK must be <= 16384" in completed.stderr
