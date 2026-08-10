@@ -54,6 +54,46 @@ def index_candidates(rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     return indexed
 
 
+def validate_candidate_delta(
+    *,
+    candidates: list[dict[str, Any]],
+    prior_candidates: list[dict[str, Any]],
+    expanded_candidates: list[dict[str, Any]],
+    delta_manifest: dict[str, Any],
+    expanded_manifest: dict[str, Any],
+) -> None:
+    """Recompute the expanded-minus-prior delta and its evaluation boundary."""
+    if delta_manifest.get("schema") != "glm52-candidate-delta-v1":
+        raise ValueError("candidate delta manifest has an unexpected schema")
+    if (
+        expanded_manifest.get("schema")
+        != "glm52-diverse-concise-candidate-selection-v1"
+    ):
+        raise ValueError("expanded candidate manifest has an unexpected schema")
+    if expanded_manifest.get("evaluation_prompts_are_excluded_not_used_for_training") is not True:
+        raise ValueError("expanded manifest does not attest evaluation-prompt exclusion")
+    selection = expanded_manifest.get("selection")
+    if not isinstance(selection, dict):
+        raise ValueError("expanded manifest selection metadata is missing")
+    threshold = selection.get("near_duplicate_jaccard_threshold")
+    maximum_similarity = expanded_manifest.get("maximum_selected_evaluation_similarity")
+    if not isinstance(threshold, (int, float)) or not isinstance(
+        maximum_similarity, (int, float)
+    ):
+        raise ValueError("expanded manifest evaluation similarity metadata is invalid")
+    if float(maximum_similarity) >= float(threshold):
+        raise ValueError("expanded candidates cross the evaluation similarity threshold")
+
+    index_candidates(prior_candidates)
+    index_candidates(expanded_candidates)
+    prior_tasks = {str(row["task_id"]) for row in prior_candidates}
+    expected = [
+        row for row in expanded_candidates if str(row["task_id"]) not in prior_tasks
+    ]
+    if candidates != expected:
+        raise ValueError("candidate delta is not exactly expanded candidates minus prior tasks")
+
+
 def load_sources(
     corpus: Path, row_indices: set[int]
 ) -> dict[int, tuple[str, dict[str, Any]]]:
@@ -114,6 +154,9 @@ def main() -> int:
     parser.add_argument("--source-sha256", required=True)
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--candidate-manifest", type=Path, required=True)
+    parser.add_argument("--prior-candidates", type=Path, required=True)
+    parser.add_argument("--expanded-candidates", type=Path, required=True)
+    parser.add_argument("--expanded-manifest", type=Path, required=True)
     parser.add_argument("--code-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
@@ -131,6 +174,7 @@ def main() -> int:
     if actual_source_sha256 != args.source_sha256:
         raise ValueError("source corpus SHA-256 differs from the pinned digest")
     candidate_manifest = json.loads(args.candidate_manifest.read_text(encoding="utf-8"))
+    expanded_manifest = json.loads(args.expanded_manifest.read_text(encoding="utf-8"))
     candidate_sha256 = sha256_file(args.candidates)
     if candidate_manifest.get("output_sha256") != candidate_sha256:
         raise ValueError("candidate JSONL SHA-256 differs from its manifest")
@@ -138,8 +182,25 @@ def main() -> int:
         raise ValueError("candidate manifest has an invalid real-verifier boundary")
     if candidate_manifest.get("training_eligible") is not False:
         raise ValueError("candidate manifest unexpectedly marks rows training-eligible")
+    prior_sha256 = sha256_file(args.prior_candidates)
+    expanded_sha256 = sha256_file(args.expanded_candidates)
+    if candidate_manifest.get("prior_candidate_set_sha256") != prior_sha256:
+        raise ValueError("prior candidate SHA-256 differs from the delta manifest")
+    if candidate_manifest.get("expanded_candidate_set_sha256") != expanded_sha256:
+        raise ValueError("expanded candidate SHA-256 differs from the delta manifest")
+    if expanded_manifest.get("output_sha256") != expanded_sha256:
+        raise ValueError("expanded candidate SHA-256 differs from its manifest")
 
     candidates = load_jsonl(args.candidates)
+    prior_candidates = load_jsonl(args.prior_candidates)
+    expanded_candidates = load_jsonl(args.expanded_candidates)
+    validate_candidate_delta(
+        candidates=candidates,
+        prior_candidates=prior_candidates,
+        expanded_candidates=expanded_candidates,
+        delta_manifest=candidate_manifest,
+        expanded_manifest=expanded_manifest,
+    )
     indexed = index_candidates(candidates)
     sources = load_sources(args.corpus, set(indexed))
     records = build_records(candidates, sources)
@@ -158,6 +219,18 @@ def main() -> int:
         "candidates_sha256": candidate_sha256,
         "candidate_manifest": str(args.candidate_manifest),
         "candidate_manifest_sha256": sha256_file(args.candidate_manifest),
+        "prior_candidates": str(args.prior_candidates),
+        "prior_candidates_sha256": prior_sha256,
+        "expanded_candidates": str(args.expanded_candidates),
+        "expanded_candidates_sha256": expanded_sha256,
+        "expanded_manifest": str(args.expanded_manifest),
+        "expanded_manifest_sha256": sha256_file(args.expanded_manifest),
+        "evaluation_instruction_set_sha256": expanded_manifest[
+            "evaluation_instruction_set_sha256"
+        ],
+        "maximum_selected_evaluation_similarity": expanded_manifest[
+            "maximum_selected_evaluation_similarity"
+        ],
         "rows": len(records),
         "unique_tasks": len({record["source"]["task_id"] for record in records}),
         "output": str(args.output),

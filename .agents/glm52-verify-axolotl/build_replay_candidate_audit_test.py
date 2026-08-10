@@ -7,7 +7,12 @@ import json
 from pathlib import Path
 
 import pytest
-from build_replay_candidate_audit import build_records, index_candidates, load_sources
+from build_replay_candidate_audit import (
+    build_records,
+    index_candidates,
+    load_sources,
+    validate_candidate_delta,
+)
 
 
 def source(task_id: str, rollout_id: str, order: int) -> dict[str, object]:
@@ -57,3 +62,51 @@ def test_duplicate_candidate_task_fails_closed() -> None:
     rows = [candidate("task", "r0", 0, 0), candidate("task", "r1", 1, 1)]
     with pytest.raises(ValueError, match="duplicate candidate task_id"):
         index_candidates(rows)
+
+
+def expanded_manifest() -> dict[str, object]:
+    """Return a minimal valid evaluation-exclusion manifest."""
+    return {
+        "schema": "glm52-diverse-concise-candidate-selection-v1",
+        "evaluation_prompts_are_excluded_not_used_for_training": True,
+        "maximum_selected_evaluation_similarity": 0.1,
+        "selection": {"near_duplicate_jaccard_threshold": 0.75},
+    }
+
+
+def test_candidate_delta_is_recomputed_in_expanded_order() -> None:
+    prior = [candidate("old", "r0", 0, 0)]
+    new = candidate("new", "r1", 1, 1)
+    validate_candidate_delta(
+        candidates=[new],
+        prior_candidates=prior,
+        expanded_candidates=[prior[0], new],
+        delta_manifest={"schema": "glm52-candidate-delta-v1"},
+        expanded_manifest=expanded_manifest(),
+    )
+
+
+def test_candidate_delta_mismatch_fails_closed() -> None:
+    prior = [candidate("old", "r0", 0, 0)]
+    new = candidate("new", "r1", 1, 1)
+    with pytest.raises(ValueError, match="not exactly expanded"):
+        validate_candidate_delta(
+            candidates=[],
+            prior_candidates=prior,
+            expanded_candidates=[prior[0], new],
+            delta_manifest={"schema": "glm52-candidate-delta-v1"},
+            expanded_manifest=expanded_manifest(),
+        )
+
+
+def test_evaluation_similarity_boundary_fails_closed() -> None:
+    manifest = expanded_manifest()
+    manifest["maximum_selected_evaluation_similarity"] = 0.75
+    with pytest.raises(ValueError, match="similarity threshold"):
+        validate_candidate_delta(
+            candidates=[],
+            prior_candidates=[],
+            expanded_candidates=[],
+            delta_manifest={"schema": "glm52-candidate-delta-v1"},
+            expanded_manifest=manifest,
+        )

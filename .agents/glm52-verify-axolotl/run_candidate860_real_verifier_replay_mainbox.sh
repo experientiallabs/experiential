@@ -14,15 +14,19 @@ CORPUS=/scratch/xtoken-offline-9b-20260727/tmax/offline-c43abfc-20260802/corpus-
 SOURCE_SHA256=7220f5d58e41933e38c46a29eee37ff4da4a21e8901ea27f9ead624cc6df911a
 CANDIDATES="$DATA_ROOT/candidate860-new.jsonl"
 CANDIDATE_MANIFEST="$DATA_ROOT/candidate860-new.manifest.json"
-AUDIT="$DATA_ROOT/replay/candidate860.replay-audit.jsonl"
-AUDIT_MANIFEST="$DATA_ROOT/replay/candidate860.replay-audit.manifest.json"
+PRIOR_CANDIDATES="$XROOT/next-sft-candidates-v1/candidate192.jsonl"
+EXPANDED_CANDIDATES="$DATA_ROOT/candidate1052.jsonl"
+EXPANDED_MANIFEST="$DATA_ROOT/candidate1052.manifest.json"
+AUDIT="$DATA_ROOT/replay/candidate860.replay-audit-v2.jsonl"
+AUDIT_MANIFEST="$DATA_ROOT/replay/candidate860.replay-audit-v2.manifest.json"
 BUILD_SCRIPT="$AXO_ROOT/scripts/build_replay_candidate_audit.py"
 REPLAY_SCRIPT="$AXO_ROOT/scripts/replay_admitted_teacher_trajectories.py"
 OUT="$DATA_ROOT/teacher-replay/run1"
 LOG="$DATA_ROOT/logs/teacher-replay-run1.log"
 
 for required in "$PYTHON" "$E2B_ENV" "$CORPUS" "$CANDIDATES" \
-  "$CANDIDATE_MANIFEST" "$BUILD_SCRIPT" "$REPLAY_SCRIPT"; do
+  "$CANDIDATE_MANIFEST" "$PRIOR_CANDIDATES" "$EXPANDED_CANDIDATES" \
+  "$EXPANDED_MANIFEST" "$BUILD_SCRIPT" "$REPLAY_SCRIPT"; do
   test -r "$required" || { echo "missing required file: $required" >&2; exit 1; }
 done
 test -d "$TMAX_SOURCE"
@@ -34,6 +38,9 @@ if test ! -e "$AUDIT" && test ! -e "$AUDIT_MANIFEST"; then
     --source-sha256 "$SOURCE_SHA256" \
     --candidates "$CANDIDATES" \
     --candidate-manifest "$CANDIDATE_MANIFEST" \
+    --prior-candidates "$PRIOR_CANDIDATES" \
+    --expanded-candidates "$EXPANDED_CANDIDATES" \
+    --expanded-manifest "$EXPANDED_MANIFEST" \
     --code-commit "$CODE_COMMIT" \
     --output "$AUDIT" \
     --manifest "$AUDIT_MANIFEST"
