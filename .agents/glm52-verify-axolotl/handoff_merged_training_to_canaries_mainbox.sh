@@ -8,6 +8,7 @@ SESSION=merged-step100-two-seed-canaries
 SERVER_SESSION=qwen35-4b-merged-step100-seeds-serve
 LAUNCHER="$SCRIPTS/run_merged_step_seed_canaries_mainbox.sh"
 MONITOR="$SCRIPTS/monitor_candidate_step100_canaries.py"
+ADVANCE="$SCRIPTS/advance_merged_checkpoint_eval_mainbox.sh"
 HEALTH_LOG="$XROOT/next-sft-candidates-v2/monitor/merged-step100-canaries-health.jsonl"
 MARKER="$XROOT/merged-step100-two-seed-canaries.launched"
 FAILED="$XROOT/merged-step100-two-seed-canaries.preflight-failed"
@@ -50,6 +51,7 @@ done
 
 test -x "$LAUNCHER"
 test -x "$MONITOR"
+test -x "$ADVANCE"
 tmux has-session -t "$SERVER_SESSION" 2>/dev/null && {
   printf '%s unexpected server session already exists\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$LOG"
   touch "$FAILED"
@@ -60,9 +62,12 @@ tmux new-session -d -s "$SESSION" "STEP=100 bash '$LAUNCHER' 2>&1 | tee '$LOG'"
 tmp="$(mktemp)"
 crontab -l 2>/dev/null | grep -Fv 'codex-merged-realverified-training-monitor' | \
   grep -Fv 'codex-merged-training-to-canaries-handoff' | \
-  grep -Fv 'codex-merged-step-canary-monitor' >"$tmp" || true
+  grep -Fv 'codex-merged-step-canary-monitor' | \
+  grep -Fv 'codex-merged-checkpoint-eval-advance' >"$tmp" || true
 printf '*/2 * * * * %s --root %s --health-log %s --step 100 --family merged # codex-merged-step-canary-monitor\n' \
   "$MONITOR" "$XROOT" "$HEALTH_LOG" >>"$tmp"
+printf '*/2 * * * * %s >/dev/null 2>&1 # codex-merged-checkpoint-eval-advance\n' \
+  "$ADVANCE" >>"$tmp"
 crontab "$tmp"
 rm -f "$tmp"
 touch "$MARKER"

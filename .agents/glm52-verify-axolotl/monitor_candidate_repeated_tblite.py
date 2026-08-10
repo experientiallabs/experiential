@@ -165,16 +165,21 @@ def arm_health(job: Path) -> dict[str, Any]:
     }
 
 
-def repeat_health(root: Path, step: int, eval_seed: int) -> dict[str, Any]:
+def repeat_health(
+    root: Path,
+    step: int,
+    eval_seed: int,
+    family: str = "candidate",
+) -> dict[str, Any]:
     prefix = (
-        f"qwen35-4b-candidate-seed{TRAIN_SEED}-step{step}"
+        f"qwen35-4b-{family}-seed{TRAIN_SEED}-step{step}"
         f"-full100-eval-seed{eval_seed}"
     )
     eval_root = root / (
-        f"candidate-step{step}-seed{TRAIN_SEED}"
+        f"{family}-step{step}-seed{TRAIN_SEED}"
         f"-tblite-full100-eval-seed{eval_seed}-run1"
     )
-    arm = f"candidate-seed{TRAIN_SEED}-step{step}"
+    arm = f"{family}-seed{TRAIN_SEED}-step{step}"
     log = root / "logs" / f"{prefix}.log"
     text = log.read_text(errors="replace") if log.exists() else ""
     return {
@@ -195,23 +200,28 @@ def main() -> int:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--health-log", required=True, type=Path)
     parser.add_argument("--step", type=int, required=True, choices=(25, 50, 100, 200))
+    parser.add_argument("--family", default="candidate")
     args = parser.parse_args()
     disk = shutil.disk_usage(args.root)
     snapshot = {
         "timestamp": datetime.now(UTC).isoformat(),
         "checkpoint_step": args.step,
+        "family": args.family,
         "orchestrator_alive": session_alive(
-            f"candidate-step{args.step}-repeated-tblite"
+            f"{args.family}-step{args.step}-repeated-tblite"
         ),
         "server_alive": session_alive(
-            f"qwen35-4b-candidate-step{args.step}-seeds-serve"
+            f"qwen35-4b-{args.family}-step{args.step}-seeds-serve"
         ),
         "aggregate_written": (
             args.root
-            / f"candidate-step{args.step}-seed{TRAIN_SEED}"
+            / f"{args.family}-step{args.step}-seed{TRAIN_SEED}"
             "-tblite-repeated-eval-seeds0-2.json"
         ).is_file(),
-        "repeats": [repeat_health(args.root, args.step, seed) for seed in range(3)],
+        "repeats": [
+            repeat_health(args.root, args.step, seed, args.family)
+            for seed in range(3)
+        ],
         "disk": {"free": disk.free, "used": disk.used, "total": disk.total},
         "gpus": gpu_health(),
     }

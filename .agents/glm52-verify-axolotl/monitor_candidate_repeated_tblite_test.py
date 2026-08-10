@@ -104,6 +104,28 @@ def test_repeat_health_uses_expected_paths(tmp_path: Path) -> None:
     assert result["paired_report"] is True
 
 
+def test_repeat_health_supports_explicit_family(tmp_path: Path) -> None:
+    prefix = "qwen35-4b-merged-seed20260809-step100-full100-eval-seed0"
+    eval_root = (
+        tmp_path
+        / "merged-step100-seed20260809-tblite-full100-eval-seed0-run1"
+    )
+    write_json(
+        eval_root / "jobs" / f"{prefix}-base-run1" / "a" / "result.json",
+        {"verifier_result": {"rewards": {"reward": 0.0}}},
+    )
+    write_json(
+        eval_root
+        / "jobs"
+        / f"{prefix}-merged-seed20260809-step100-run1"
+        / "a"
+        / "result.json",
+        {"verifier_result": {"rewards": {"reward": 1.0}}},
+    )
+    result = repeat_health(tmp_path, 100, 0, "merged")
+    assert result["adapter"]["strict"] == 1
+
+
 def test_numerical_nan_signal_ignores_single_run_summary() -> None:
     assert not numerical_nan_signal("run-to-run sd nan; stderr +/- nan")
     assert numerical_nan_signal("loss=NaN")
