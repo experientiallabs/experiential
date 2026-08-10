@@ -42,10 +42,11 @@ export PORT
 export HOST=0.0.0.0
 export CUDA_DEVICES=0,1
 export DP_SIZE=2
-# mini-swe-agent keeps its logical benchmark envelope at 65,536 tokens, while
-# the Qwen chat template can add two renderer tokens at the boundary.
-export MAXLEN=65538
-export MAX_NUM_SEQS=32
+# mini-swe-agent 2.4.6 sends full tool history. Use the pinned model's native
+# context window; measured per-GPU KV capacity is 563,376 tokens, which safely
+# supports the matched two-trial evaluator at this window.
+export MAXLEN=262144
+export MAX_NUM_SEQS=2
 export GPU_UTIL=0.85
 export LOG_DIR="$AXO_ROOT/eval-logs/merged-step${STEP}-seeds"
 export RUNTIME_DIR="$AXO_ROOT/eval-runtime/merged-step${STEP}-seeds"
@@ -73,8 +74,8 @@ run_pair() {
   export CUDA_DEVICES=0,1
   export TP=1
   export DP_SIZE=2
-  # Endpoint assertion reflects the serving-only renderer guard above.
-  export MAXLEN=65538
+  # Endpoint assertion reflects the pinned model's native window above.
+  export MAXLEN=262144
   export N_RUNS=1
   export N_TASKS=10
   export TASK_NAMES=

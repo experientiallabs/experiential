@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 TRAIN_SEED = 20260809
-CONTEXT_ERROR = "maximum context length is 65536"
+CONTEXT_ERROR = "maximum context length is"
 
 NAN_SIGNAL_PATTERNS = (
     r"\b(?:loss|gradient|grad_norm|logits?|probabilities|tensor)\s*(?:=|:|is)\s*nan\b",

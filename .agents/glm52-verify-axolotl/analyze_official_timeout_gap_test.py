@@ -40,7 +40,9 @@ def write_trial(
         },
     }
     (trial / "result.json").write_text(json.dumps(result))
-    (trial / "trial.log").write_text("maximum context length is 65536\n" * context_rejections)
+    (trial / "trial.log").write_text(
+        "maximum context length is 262144\n" * context_rejections
+    )
 
 
 def test_compare_preserves_timeout_and_context_diagnostics(tmp_path: Path) -> None:

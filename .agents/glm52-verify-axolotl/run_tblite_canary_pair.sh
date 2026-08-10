@@ -7,14 +7,14 @@ BASE_MODEL="${BASE_MODEL:-qwen35-4b-base}"
 ADAPTER_ARM="${ADAPTER_ARM:?ADAPTER_ARM is required}"
 ADAPTER_MODEL="${ADAPTER_MODEL:?ADAPTER_MODEL is required}"
 
-# mini-swe-agent budgets history as 65,536 - max_tokens before the chat template
-# is rendered. The Qwen template can add two tokens after that budget is applied,
-# producing a deterministic 49,154 + 16,384 = 65,538-token request at the
-# boundary. Keep the matched 16,384-token output budget and require two
-# serving-only guard tokens. The logical agent envelope remains 65,536; requests
-# above the observed rendered boundary still fail and are reported as overflows.
+# mini-swe-agent 2.4.6 sends its full tool history and does not enforce a
+# 65,536-token input envelope. vLLM's overflow message reports only the first
+# threshold token, so the apparent 49,154/49,155 values are not the rendered
+# prompt length. Preserved failures re-tokenize to 49,779-51,725 prompt tokens.
+# Serve the pinned Qwen revision at its declared native context window while
+# retaining the matched 16,384-token per-turn output allowance.
 SAFE_OUT_TOK=16384
-MIN_SERVER_MAXLEN=65538
+MIN_SERVER_MAXLEN=262144
 if test "${OUT_TOK:-${SAFE_OUT_TOK}}" -gt "${SAFE_OUT_TOK}"; then
   echo "OUT_TOK must be <= ${SAFE_OUT_TOK} for the matched TBLite protocol" >&2
   exit 1
@@ -38,8 +38,8 @@ if record is None:
 actual = record.get("max_model_len")
 if actual is None or int(actual) < minimum:
     raise SystemExit(
-        f"server max_model_len must be >= {minimum} for the rendered 65,536-token "
-        f"agent envelope; got {actual}"
+        f"server max_model_len must be >= the pinned model's native context "
+        f"window ({minimum}); got {actual}"
     )
 PY
 test "${N_RUNS}" -eq 1 || { echo "this canary wrapper requires N_RUNS=1" >&2; exit 1; }

@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-CONTEXT_ERROR = "maximum context length is 65536"
+CONTEXT_ERROR = "maximum context length is"
 logger = logging.getLogger(__name__)
 
 NAN_SIGNAL_PATTERNS = (

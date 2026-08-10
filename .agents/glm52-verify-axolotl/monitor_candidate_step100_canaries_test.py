@@ -33,7 +33,7 @@ def test_arm_health_counts_exception_as_zero_and_exposes_context_overflow(
     )
     trajectory = job / "overflow" / "agent" / "mini-swe-agent.trajectory.json"
     trajectory.parent.mkdir(parents=True, exist_ok=True)
-    trajectory.write_text("maximum context length is 65536 tokens")
+    trajectory.write_text("maximum context length is 65538 tokens")
 
     result = arm_health(job)
     assert result["result_files"] == 2
@@ -58,7 +58,7 @@ def test_arm_health_normalizes_prompt_induced_rate_limit_misclassification(
                 "exception_type": "ApiRateLimitError",
                 "exception_message": (
                     "Task discusses rate limiting. ContextWindowExceededError: "
-                    "maximum context length is 65536 tokens"
+                    "maximum context length is 262144 tokens"
                 ),
             }
         },

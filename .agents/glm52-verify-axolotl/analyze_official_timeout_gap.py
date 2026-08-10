@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-CONTEXT_ERROR = "maximum context length is 65536"
+CONTEXT_ERROR = "maximum context length is"
 
 
 def _timestamp(value: str) -> datetime:
