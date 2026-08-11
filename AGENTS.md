@@ -141,10 +141,37 @@ uv run pytest -q
    has unrelated failures, record them and keep them out of the patch; fix them only when they are
    in scope or prevent meaningful validation.
 
-2. **Tests live inline next to the code.** A module `foo.py` is tested by `foo_test.py` in the same
-   directory (e.g. `wmo/simulation/model/world_model.py` maps to
-   `wmo/simulation/model/world_model_test.py`). There is no top-level `tests/` directory. Pytest is
-   configured (`python_files = ["*_test.py"]`) to discover these.
+2. **Tests live inline next to the code, one suite per module, both ways.** A module `foo.py` is
+   covered by `foo_test.py` in the same directory (e.g. `wmo/simulation/model/world_model.py` maps
+   to `wmo/simulation/model/world_model_test.py`). There is no `tests/` directory anywhere, at the
+   top level or nested inside a package. Pytest is configured (`python_files = ["*_test.py"]`) to
+   discover the inline suites. The pairing is exact in BOTH directions, and
+   `wmo/repo_layout_test.py` enforces it, so a violation fails CI rather than landing quietly:
+
+   - **Every module has a sibling suite.** The only exempt filenames are `__init__.py` (a
+     re-export surface, covered by its package's `api_test.py`), `__main__.py` (the `python -m`
+     shim over an already-tested entry point), and `conftest.py` (pytest wiring that every run
+     exercises). Coverage that lives in some other file does not satisfy the rule: the point of
+     the pairing is that a reader of `foo.py` can find its tests without searching, and that
+     nobody has to guess which suite would break if they changed it.
+   - **Every suite has the module it names.** A `foo_test.py` whose `foo.py` was renamed away
+     keeps passing while covering nothing, which is worse than no test at all: the gate reports
+     green over code that is gone. Tests for a module go in that module's suite, never in a
+     neighbour's.
+
+   A handful of suites genuinely cover something other than one sibling module: a package's
+   `__init__.py` re-export surface (`api_test.py`), a package's own import boundary
+   (`package_layout_test.py`), the CLI's import graph (`wmo/cli/startup_test.py`), a contract held
+   identically across every backend (`wmo/common/providers/streaming_test.py`), the vendored
+   waterfall importing with no SDKs installed
+   (`wmo/common/vendor/waterfall/import_hygiene_test.py`), a live end-to-end path
+   (`wmo/simulation/model/integration_test.py`), and wire compatibility proven with a real
+   third-party SDK (`wmo/simulation/serving/chat_openai_client_test.py`). They exist because their
+   subject is a seam between modules, so splitting them per module would destroy what they check.
+   That set is CLOSED, listed as `CROSS_CUTTING_TESTS` in `wmo/repo_layout_test.py`, and **agents
+   may never extend it.** A new test file either sits beside the module it covers or merges into
+   the cross-cutting suite that already owns its concern. A new entry requires a human to grant
+   that exact path, and then it lands in the same change that documents it here.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary

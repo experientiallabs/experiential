@@ -1,4 +1,4 @@
-"""Executable form of AGENTS.md rule 5: the repo's top level is an allowlist.
+"""Executable form of AGENTS.md rules 2 and 5: test pairing, and the top level as an allowlist.
 
 Runs against `git ls-files` so it checks what is TRACKED, not what happens to be on disk.
 Skipped outside a git checkout (e.g. an installed sdist).
@@ -58,6 +58,114 @@ def test_top_level_directories_are_allowlisted() -> None:
         "reusable code in wmo/ (self-contained building blocks in wmo/common/), finished reports "
         "in docs/, and one-off or scratch work OUTSIDE the repo. Adding a new top-level "
         "directory requires a human to grant permission for that exact name."
+    )
+
+
+# AGENTS.md rule 2: a module needs no sibling suite when it has no behavior of its own to cover.
+# `__init__.py` is a re-export surface (its package tests it through `api_test.py`), `__main__.py`
+# is the `python -m` shim over an already-tested entry point, and `conftest.py` is pytest wiring
+# that every suite exercises by running at all.
+UNTESTED_MODULE_NAMES = {"__init__.py", "__main__.py", "conftest.py"}
+
+# AGENTS.md rule 2: the CLOSED set of suites that cover something other than one sibling module,
+# each mapped to what it does cover. Two are patterned (a package's `api_test.py` covers its
+# `__init__.py` re-export surface, and `package_layout_test.py` covers a package's own boundary);
+# the rest are named outright. An agent may never extend this list: a new test file either sits
+# beside the module it covers, or it merges into the cross-cutting suite that already owns its
+# concern. Adding an entry requires a human to grant it for that exact path.
+CROSS_CUTTING_TESTS = {
+    "wmo/repo_layout_test.py": "the repo layout itself: this file",
+    "wmo/cli/startup_test.py": "the CLI's import graph: `wmo --help` must stay off heavy modules",
+    "wmo/common/providers/streaming_test.py": (
+        "one streaming contract held across every backend at once"
+    ),
+    "wmo/common/vendor/waterfall/import_hygiene_test.py": (
+        "the vendored package importing and constructing with zero provider SDKs installed"
+    ),
+    "wmo/simulation/model/integration_test.py": (
+        "convert -> build -> load -> step against a real Bedrock model (live, env-gated)"
+    ),
+    "wmo/simulation/serving/chat_openai_client_test.py": (
+        "wire compatibility proven with the real `openai` SDK against a booted server"
+    ),
+}
+
+#: Suite names that pair with a package rather than a module, keyed by the file they cover.
+_PACKAGE_SUITES = {"api_test.py": "__init__.py", "package_layout_test.py": "__init__.py"}
+
+
+def _tracked_python_files() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Every tracked `.py` path, split into (production modules, test suites)."""
+    paths = [p for p in _tracked_files() if p.endswith(".py")]
+    return (
+        tuple(p for p in paths if not p.endswith("_test.py")),
+        tuple(p for p in paths if p.endswith("_test.py")),
+    )
+
+
+def test_every_module_has_a_sibling_test() -> None:
+    """AGENTS.md rule 2: `foo.py` is covered by `foo_test.py` in the same directory."""
+    modules, tests = _tracked_python_files()
+    suites = set(tests)
+    missing = sorted(
+        p
+        for p in modules
+        if Path(p).name not in UNTESTED_MODULE_NAMES
+        and p.removesuffix(".py") + "_test.py" not in suites
+    )
+    assert not missing, (
+        f"modules with no sibling test: {missing}; add `<module>_test.py` beside each one "
+        f"(AGENTS.md rule 2). Only {sorted(UNTESTED_MODULE_NAMES)} are exempt, and coverage "
+        "living in some other file does not count: the pairing is what makes it findable"
+    )
+
+
+def test_every_test_covers_the_module_beside_it() -> None:
+    """AGENTS.md rule 2, the other direction: no test file without the module it names.
+
+    A `foo_test.py` whose `foo.py` was renamed or deleted keeps passing while covering nothing,
+    which is worse than no test at all: the suite reports green over code that is gone.
+    """
+    modules, tests = _tracked_python_files()
+    known = set(modules)
+    orphans = sorted(
+        p
+        for p in tests
+        if p not in CROSS_CUTTING_TESTS
+        and str(Path(p).parent / _PACKAGE_SUITES.get(Path(p).name, "")) not in known
+        and p.removesuffix("_test.py") + ".py" not in known
+    )
+    assert not orphans, (
+        f"test files with no module beside them: {orphans}; rename them to match the module they "
+        "cover, fold them into the sibling suite for that module, or (for a genuinely "
+        "cross-cutting suite) have a human add the exact path to CROSS_CUTTING_TESTS in "
+        "wmo/repo_layout_test.py in the same change that documents it in AGENTS.md rule 2"
+    )
+
+
+def test_the_cross_cutting_allowlist_has_no_stale_entries() -> None:
+    """An allowlisted path that no longer exists would silently license a future file's name."""
+    _modules, tests = _tracked_python_files()
+    stale = sorted(set(CROSS_CUTTING_TESTS) - set(tests))
+    assert not stale, (
+        f"CROSS_CUTTING_TESTS names paths that are not tracked test files: {stale}; drop the "
+        "entries so the exception list keeps describing what actually exists"
+    )
+
+
+def test_there_is_no_tests_directory() -> None:
+    """AGENTS.md rule 2: Python tests are inline, so no directory anywhere collects them.
+
+    Scoped to `.py` files outside `wmo/common/vendor/` and the vendored pi tree: those are
+    verbatim upstream copies whose own `test/` directories are theirs to lay out, not ours.
+    """
+    modules, tests = _tracked_python_files()
+    offenders = sorted(
+        p for p in (*modules, *tests) if re.search(r"(^|/)tests?/", p) and "/vendor/" not in p
+    )
+    assert not offenders, (
+        f"tracked files under a tests/ directory: {offenders}; every suite lives beside the "
+        "module it covers (AGENTS.md rule 2)"
     )
 
 
