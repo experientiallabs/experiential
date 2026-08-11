@@ -154,14 +154,15 @@ def test_the_cross_cutting_allowlist_has_no_stale_entries() -> None:
 
 
 def test_there_is_no_tests_directory() -> None:
-    """AGENTS.md rule 2: Python tests are inline, so no directory anywhere collects them.
+    """AGENTS.md rule 2: tests are inline, so no directory anywhere collects them.
 
-    Scoped to `.py` files outside `wmo/common/vendor/` and the vendored pi tree: those are
-    verbatim upstream copies whose own `test/` directories are theirs to lay out, not ours.
+    Every tracked path counts, not just `.py` files: a fixture, snapshot, or README under
+    `tests/` is the beginning of the directory this rule forbids, and the suite that reads it
+    follows. Vendored trees are exempt: they are verbatim upstream copies whose own `test/`
+    layout is theirs, not ours.
     """
-    modules, tests = _tracked_python_files()
     offenders = sorted(
-        p for p in (*modules, *tests) if re.search(r"(^|/)tests?/", p) and "/vendor/" not in p
+        p for p in _tracked_files() if re.search(r"(^|/)tests?/", p) and "/vendor/" not in p
     )
     assert not offenders, (
         f"tracked files under a tests/ directory: {offenders}; every suite lives beside the "
