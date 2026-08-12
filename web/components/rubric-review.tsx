@@ -27,6 +27,9 @@ export function RubricReview({ busy, onMutation, snapshot }: RubricReviewProps) 
   const activeDimensions = review.finalized_rubric?.dimensions ?? review.dimensions;
   const [editingScale, setEditingScale] = useState<EditingScale | null>(null);
   const [confirmingFinalization, setConfirmingFinalization] = useState(false);
+  const [replacingAll, setReplacingAll] = useState(false);
+  const [authoringReplacement, setAuthoringReplacement] = useState(false);
+  const [replacementDimensions, setReplacementDimensions] = useState<RubricDimension[]>([]);
   const [swipeStart, setSwipeStart] = useState<number | null>(null);
 
   const mutate = (action: RubricAction, payload: Record<string, unknown>) => {
@@ -59,12 +62,15 @@ export function RubricReview({ busy, onMutation, snapshot }: RubricReviewProps) 
             Add scale
           </Button>
           <Button
-            disabled={busy || finalized || activeDimensions.length === 0}
-            onClick={() => mutate("replace_all", { dimensions: activeDimensions })}
+            disabled={busy || finalized}
+            onClick={() => {
+              setReplacementDimensions([]);
+              setReplacingAll(true);
+            }}
             type="button"
           >
             <Replace aria-hidden="true" className="size-4" />
-            Replace all with active scales
+            Design replacement set
           </Button>
           <Button
             disabled={busy || finalized || activeDimensions.length === 0}
@@ -200,7 +206,115 @@ export function RubricReview({ busy, onMutation, snapshot }: RubricReviewProps) 
           </div>
         </Dialog>
       ) : null}
+      {replacingAll && !authoringReplacement ? (
+        <ReplaceAllDialog
+          activeDimensions={activeDimensions}
+          onAuthor={() => setAuthoringReplacement(true)}
+          onClose={() => setReplacingAll(false)}
+          onSubmit={() => {
+            mutate("replace_all", { dimensions: replacementDimensions });
+            setReplacingAll(false);
+          }}
+          proposals={review.proposals.flatMap((proposal) =>
+            proposal.dimensions.map((item) => item.dimension)
+          )}
+          selected={replacementDimensions}
+          setSelected={setReplacementDimensions}
+        />
+      ) : null}
+      {authoringReplacement ? (
+        <ScaleEditorDialog
+          onClose={() => setAuthoringReplacement(false)}
+          onSave={(dimension) => {
+            setReplacementDimensions((current) => [
+              ...current.filter((item) => item.dimension_id !== dimension.dimension_id),
+              dimension
+            ]);
+            setAuthoringReplacement(false);
+          }}
+        />
+      ) : null}
     </div>
+  );
+}
+
+function ReplaceAllDialog({
+  activeDimensions,
+  onAuthor,
+  onClose,
+  onSubmit,
+  proposals,
+  selected,
+  setSelected
+}: {
+  activeDimensions: RubricDimension[];
+  onAuthor: () => void;
+  onClose: () => void;
+  onSubmit: () => void;
+  proposals: RubricDimension[];
+  selected: RubricDimension[];
+  setSelected: (dimensions: RubricDimension[]) => void;
+}) {
+  const candidates = [...activeDimensions, ...proposals].filter(
+    (dimension, index, all) =>
+      all.findIndex((item) => item.dimension_id === dimension.dimension_id) === index
+  );
+  const selectedIds = new Set(selected.map((item) => item.dimension_id));
+  return (
+    <Dialog onClose={onClose} title="Design the complete replacement set">
+      <p className="mt-0 text-sm leading-relaxed text-muted">
+        Select existing or proposed scales, or author a new scale. Submission replaces every
+        active scale with this exact ordered set.
+      </p>
+      <div className="mt-4 space-y-2">
+        {candidates.map((dimension) => (
+          <label
+            className="flex items-start gap-3 rounded-[var(--radius-md)] border border-line p-3"
+            key={dimension.dimension_id}
+          >
+            <input
+              checked={selectedIds.has(dimension.dimension_id)}
+              className="mt-1"
+              onChange={(event) =>
+                setSelected(
+                  event.target.checked
+                    ? [...selected, dimension]
+                    : selected.filter((item) => item.dimension_id !== dimension.dimension_id)
+                )
+              }
+              type="checkbox"
+            />
+            <span>
+              <span className="block text-sm font-semibold text-ink">{dimension.name}</span>
+              <span className="mt-1 block text-xs leading-relaxed text-muted">
+                {dimension.description}
+              </span>
+            </span>
+          </label>
+        ))}
+      </div>
+      {selected.length > 0 ? (
+        <ol className="mt-4 rounded-[var(--radius-md)] bg-surface-subtle p-3 text-sm text-muted">
+          {selected.map((dimension, index) => (
+            <li key={dimension.dimension_id}>
+              {index + 1}. {dimension.name}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      <div className="mt-5 flex flex-wrap justify-end gap-2 border-t border-line pt-4">
+        <Button onClick={onClose} type="button">
+          Cancel
+        </Button>
+        <Button onClick={onAuthor} type="button">
+          <Plus aria-hidden="true" className="size-4" />
+          Author replacement scale
+        </Button>
+        <Button disabled={selected.length === 0} onClick={onSubmit} type="button" variant="primary">
+          Replace all scales
+        </Button>
+      </div>
+    </Dialog>
   );
 }
 

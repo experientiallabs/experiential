@@ -5,9 +5,10 @@
   "type": "module",
   "packageManager": "npm@10.9.8",
   "scripts": {
-    "dev": "next dev",
+    "dev": "node scripts/next-local.mjs dev",
     "review": "node scripts/review.mjs",
     "build": "next build",
+    "start": "node scripts/next-local.mjs start",
     "lint": "tsc --noEmit --project tsconfig.json",
     "test": "vitest run --config vitest.config.ts"
   },

@@ -1,18 +1,39 @@
 import { AlertTriangle, BarChart3, CheckCircle2, History } from "lucide-react";
+import { useState } from "react";
 
-import { Card, Chip, EmptyState } from "@/components/ui";
-import type { CalibrationReport, HumanScore, RubricDimension } from "@/lib/review-types";
+import { Button, Card, Chip, Dialog, EmptyState } from "@/components/ui";
+import type {
+  CalibrationApproval,
+  CalibrationReport,
+  HumanScore,
+  JudgeCalibration,
+  RubricDimension
+} from "@/lib/review-types";
 
 export function CalibrationReview({
+  busy,
+  calibrations,
   dimensions,
+  onApprove,
   reports,
   scores
 }: {
+  busy: boolean;
+  calibrations: JudgeCalibration[];
   dimensions: RubricDimension[];
+  onApprove: (reportId: string, approval: CalibrationApproval) => void;
   reports: CalibrationReport[];
   scores: HumanScore[];
 }) {
   const latest = reports.at(-1);
+  const approved = latest
+    ? calibrations.find(
+        (item) =>
+          item.out_of_fold_report_id === latest.report_id && item.status === "human_calibrated"
+      )
+    : undefined;
+  const [confirming, setConfirming] = useState(false);
+  const [acceptingRisk, setAcceptingRisk] = useState(false);
   return (
     <div className="space-y-4">
       <Card>
@@ -33,6 +54,12 @@ export function CalibrationReview({
         <>
           <Metrics report={latest} dimensions={dimensions} />
           <Disagreements report={latest} dimensions={dimensions} />
+          <ApprovalCard
+            approved={approved}
+            busy={busy}
+            onReview={() => setConfirming(true)}
+            report={latest}
+          />
         </>
       ) : (
         <EmptyState
@@ -41,7 +68,96 @@ export function CalibrationReview({
         />
       )}
       <ScoreHistory scores={scores} />
+      {latest && confirming ? (
+        <Dialog onClose={() => setConfirming(false)} title="Approve this judge calibration?">
+          <p className="mt-0 text-sm leading-relaxed text-muted">
+            This writes a human-calibrated judge artifact bound to report {latest.report_id}.
+            Approval cannot be inferred from viewing the report.
+          </p>
+          {latest.status === "insufficient" ? (
+            <label className="mt-4 flex items-start gap-3 rounded-[var(--radius-md)] bg-warning-soft p-3 text-sm text-warning">
+              <input
+                checked={acceptingRisk}
+                className="mt-0.5"
+                onChange={(event) => setAcceptingRisk(event.target.checked)}
+                type="checkbox"
+              />
+              I explicitly accept the calibration risk from fewer than ten eligible rollouts.
+            </label>
+          ) : null}
+          <div className="mt-5 flex justify-end gap-2">
+            <Button onClick={() => setConfirming(false)} type="button">
+              Cancel
+            </Button>
+            <Button
+              disabled={busy || (latest.status === "insufficient" && !acceptingRisk)}
+              onClick={() => {
+                onApprove(latest.report_id, {
+                  confirmed: true,
+                  accept_insufficient_risk: latest.status === "insufficient" && acceptingRisk
+                });
+                setConfirming(false);
+              }}
+              type="button"
+              variant="primary"
+            >
+              Confirm calibration approval
+            </Button>
+          </div>
+        </Dialog>
+      ) : null}
     </div>
+  );
+}
+
+function ApprovalCard({
+  approved,
+  busy,
+  onReview,
+  report
+}: {
+  approved?: JudgeCalibration;
+  busy: boolean;
+  onReview: () => void;
+  report: CalibrationReport;
+}) {
+  if (approved) {
+    return (
+      <Card>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="m-0 text-sm font-semibold text-ink">Human-calibrated artifact</h3>
+            <p className="mb-0 mt-2 break-all font-mono text-xs text-muted">
+              {approved.calibration_id}
+            </p>
+          </div>
+          <Chip label="human calibrated" tone="success" />
+        </div>
+        {approved.risk_acceptance ? (
+          <p className="mb-0 mt-3 text-sm text-warning">
+            Low-sample risk acceptance: {approved.risk_acceptance.artifact_id}
+          </p>
+        ) : null}
+      </Card>
+    );
+  }
+  const approvable = report.status === "ready_for_approval" || report.status === "insufficient";
+  return (
+    <Card>
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h3 className="m-0 text-sm font-semibold text-ink">Calibration approval</h3>
+          <p className="mb-0 mt-1 text-sm text-muted">
+            {approvable
+              ? "Review the exact persisted report before writing a human-calibrated artifact."
+              : "A provisional zero-label report cannot be human approved."}
+          </p>
+        </div>
+        <Button disabled={busy || !approvable} onClick={onReview} type="button" variant="primary">
+          {report.status === "insufficient" ? "Review low-sample approval" : "Approve calibration"}
+        </Button>
+      </div>
+    </Card>
   );
 }
 

@@ -1,4 +1,5 @@
 import type {
+  CalibrationApproval,
   ReviewMutationResponse,
   ReviewSnapshot,
   RubricAction,
@@ -9,6 +10,10 @@ export type ReviewApi = {
   getSnapshot: () => Promise<ReviewSnapshot>;
   mutateRubric: (action: RubricAction, payload: Record<string, unknown>) => Promise<ReviewSnapshot>;
   overrideScore: (payload: ScoreOverride) => Promise<ReviewMutationResponse>;
+  approveCalibration: (
+    reportId: string,
+    payload: CalibrationApproval
+  ) => Promise<ReviewMutationResponse>;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -39,6 +44,11 @@ export const localReviewApi: ReviewApi = {
     }),
   overrideScore: (payload) =>
     request<ReviewMutationResponse>("/api/review/score", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  approveCalibration: (reportId, payload) =>
+    request<ReviewMutationResponse>(`/api/review/calibration/${reportId}/approve`, {
       method: "POST",
       body: JSON.stringify(payload)
     })

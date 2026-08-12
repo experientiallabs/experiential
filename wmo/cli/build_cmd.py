@@ -149,8 +149,7 @@ def _ensure_review_draft(store: ProjectStore) -> None:
     Creating an empty root here lets a later browser session resume the build's project without a
     second store or artifact path.
     """
-    if store.read_review() is None:
-        store.write_review({})
+    store.update_review(lambda current: {} if current is None else current)
 
 
 def _current_revision() -> str:

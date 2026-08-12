@@ -7,27 +7,31 @@ const repositoryDir = path.resolve(webDir, "..");
 const options = parseOptions(process.argv.slice(2));
 const adapterUrl = `http://127.0.0.1:${options.apiPort}`;
 
-const adapter = spawn(
-  "uv",
-  [
-    "run",
-    "python",
-    "-m",
-    "wmo.review_server",
-    "--root",
-    options.root,
-    "--project",
-    options.project,
-    "--host",
-    "127.0.0.1",
-    "--port",
-    String(options.apiPort)
-  ],
-  { cwd: repositoryDir, stdio: "inherit" }
-);
+const adapterArguments = [
+  "run",
+  "python",
+  "-m",
+  "wmo.review_server",
+  "--root",
+  options.root,
+  "--project",
+  options.project,
+  "--host",
+  "127.0.0.1",
+  "--port",
+  String(options.apiPort)
+];
+if (options.taskSet) {
+  adapterArguments.push("--task-set", options.taskSet);
+}
+const adapter = spawn("uv", adapterArguments, { cwd: repositoryDir, stdio: "inherit" });
 const web = spawn("npm", ["run", "dev", "--", "--port", String(options.port)], {
   cwd: webDir,
-  env: { ...process.env, WMO_REVIEW_API_URL: adapterUrl },
+  env: {
+    ...process.env,
+    WMO_REVIEW_API_URL: adapterUrl,
+    WMO_REVIEW_WEB_PORT: String(options.port)
+  },
   stdio: "inherit"
 });
 
@@ -62,6 +66,7 @@ function parseOptions(args) {
   const options = {
     root: path.join(repositoryDir, ".wmo"),
     project: "default",
+    taskSet: null,
     apiPort: 8017,
     port: 3000
   };
@@ -71,6 +76,8 @@ function parseOptions(args) {
       options.root = requiredValue(args, ++index, value);
     } else if (value === "--project") {
       options.project = requiredValue(args, ++index, value);
+    } else if (value === "--task-set") {
+      options.taskSet = requiredValue(args, ++index, value);
     } else if (value === "--api-port") {
       options.apiPort = portValue(requiredValue(args, ++index, value), value);
     } else if (value === "--port") {

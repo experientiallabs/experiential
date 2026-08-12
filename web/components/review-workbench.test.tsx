@@ -6,6 +6,13 @@ import { draftReviewSnapshot, finalizedReviewSnapshot, taskSuccessDimension } fr
 import type { ReviewApi } from "@/lib/review-api";
 import type { ReviewMutationResponse, ReviewSnapshot } from "@/lib/review-types";
 
+const clarityDimension = {
+  ...taskSuccessDimension,
+  dimension_id: "customer-clarity",
+  name: "Customer clarity",
+  description: "Whether the response gives the customer a clear next step."
+};
+
 describe("ReviewWorkbench", () => {
   afterEach(() => cleanup());
 
@@ -26,7 +33,8 @@ describe("ReviewWorkbench", () => {
     const api: ReviewApi = {
       getSnapshot: vi.fn(async () => state),
       mutateRubric,
-      overrideScore: vi.fn()
+      overrideScore: vi.fn(),
+      approveCalibration: vi.fn()
     };
 
     render(<ReviewWorkbench api={api} />);
@@ -51,7 +59,8 @@ describe("ReviewWorkbench", () => {
     const api: ReviewApi = {
       getSnapshot: vi.fn(async () => finalizedReviewSnapshot),
       mutateRubric: vi.fn(),
-      overrideScore
+      overrideScore,
+      approveCalibration: vi.fn()
     };
 
     render(<ReviewWorkbench api={api} />);
@@ -74,7 +83,8 @@ describe("ReviewWorkbench", () => {
     const api: ReviewApi = {
       getSnapshot: vi.fn(async () => draftReviewSnapshot),
       mutateRubric: vi.fn(),
-      overrideScore: vi.fn()
+      overrideScore: vi.fn(),
+      approveCalibration: vi.fn()
     };
 
     render(<ReviewWorkbench api={api} />);
@@ -85,6 +95,97 @@ describe("ReviewWorkbench", () => {
     expect(screen.getByRole("option", { selected: true })).toHaveTextContent(
       "Explain a delayed shipment and give the customer a verified next step."
     );
+  });
+
+  it("submits the exact selected complete replacement set", async () => {
+    const snapshot: ReviewSnapshot = {
+      ...draftReviewSnapshot,
+      rubric_review: {
+        ...draftReviewSnapshot.rubric_review,
+        dimensions: [taskSuccessDimension],
+        proposals: [
+          {
+            ...draftReviewSnapshot.rubric_review.proposals[0],
+            dimensions: [
+              {
+                ...draftReviewSnapshot.rubric_review.proposals[0].dimensions[0],
+                dimension: clarityDimension
+              }
+            ]
+          }
+        ]
+      }
+    };
+    const mutateRubric = vi.fn(async () => snapshot);
+    const api: ReviewApi = {
+      getSnapshot: vi.fn(async () => snapshot),
+      mutateRubric,
+      overrideScore: vi.fn(),
+      approveCalibration: vi.fn()
+    };
+
+    render(<ReviewWorkbench api={api} />);
+    await screen.findByText("Rollout evidence");
+    fireEvent.click(screen.getByRole("button", { name: "Rubric scales" }));
+    fireEvent.click(screen.getByRole("button", { name: "Design replacement set" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Customer clarity/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Replace all scales" }));
+
+    await waitFor(() =>
+      expect(mutateRubric).toHaveBeenCalledWith("replace_all", {
+        dimensions: [clarityDimension]
+      })
+    );
+  });
+
+  it("requires low-sample risk confirmation and renders the written calibration", async () => {
+    const insufficientSnapshot: ReviewSnapshot = {
+      ...finalizedReviewSnapshot,
+      calibration_reports: finalizedReviewSnapshot.calibration_reports.map((report) => ({
+        ...report,
+        status: "insufficient"
+      }))
+    };
+    const approvedSnapshot: ReviewSnapshot = {
+      ...insufficientSnapshot,
+      calibrations: [
+        {
+          calibration_id: "human-calibration-fixture",
+          rubric_id: "rubric-fixture",
+          out_of_fold_report_id: "calibration-fixture",
+          label_count: 2,
+          recommended_label_count: 8,
+          status: "human_calibrated",
+          approved_at: "2026-08-12T00:00:00Z",
+          risk_acceptance: { artifact_id: "risk-fixture", sha256: "a".repeat(64) }
+        }
+      ]
+    };
+    const approveCalibration = vi.fn(async () => scoreResponse(approvedSnapshot));
+    const api: ReviewApi = {
+      getSnapshot: vi.fn(async () => insufficientSnapshot),
+      mutateRubric: vi.fn(),
+      overrideScore: vi.fn(),
+      approveCalibration
+    };
+
+    render(<ReviewWorkbench api={api} />);
+    await screen.findByText("Rollout evidence");
+    fireEvent.click(screen.getByRole("button", { name: "Calibration" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review low-sample approval" }));
+    const confirm = screen.getByRole("button", { name: "Confirm calibration approval" });
+    expect(confirm).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox", { name: /explicitly accept/ }));
+    fireEvent.click(confirm);
+
+    await waitFor(() =>
+      expect(approveCalibration).toHaveBeenCalledWith("calibration-fixture", {
+        confirmed: true,
+        accept_insufficient_risk: true
+      })
+    );
+    expect(await screen.findByText("Human-calibrated artifact")).toBeInTheDocument();
+    expect(screen.getByText(/risk-fixture/)).toBeInTheDocument();
   });
 });
 

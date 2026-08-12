@@ -152,6 +152,17 @@ export type CalibrationReport = {
   worst_disagreements: WorstDisagreement[];
 };
 
+export type JudgeCalibration = {
+  calibration_id: string;
+  rubric_id: string;
+  out_of_fold_report_id: string;
+  label_count: number;
+  recommended_label_count: number;
+  status: "provisional" | "insufficient" | "human_calibrated";
+  approved_at: string | null;
+  risk_acceptance: { artifact_id: string; sha256: string } | null;
+};
+
 export type HumanScore = {
   label_id: string;
   rubric_id: string;
@@ -174,6 +185,7 @@ export type ReviewSnapshot = {
   human_score_history: { scores: HumanScore[] };
   rollouts: ReviewRollout[];
   calibration_reports: CalibrationReport[];
+  calibrations: JudgeCalibration[];
 };
 
 export type ReviewMutationResponse = {
@@ -186,4 +198,9 @@ export type ScoreOverride = {
   lineage_id: string;
   dimension_id: string;
   score: Score;
+};
+
+export type CalibrationApproval = {
+  confirmed: boolean;
+  accept_insufficient_risk: boolean;
 };

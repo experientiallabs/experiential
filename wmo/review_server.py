@@ -7,23 +7,26 @@ directly. It calls this local adapter, which delegates every mutation to the W5 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Sequence
+import subprocess
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
+from urllib.parse import SplitResult, urlsplit
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
+from starlette.responses import JSONResponse
 
-from wmo.common.core.artifacts import ArtifactId, stable_id
+from wmo.common.core.artifacts import ArtifactId
 from wmo.common.judging import (
     CalibrationError,
     CalibrationReport,
-    HumanScore,
     HumanScoreHistory,
     HumanScoreReview,
+    JudgeCalibration,
     JudgeCalibrationService,
     JudgeScoreObservation,
     Judgment,
@@ -70,6 +73,7 @@ class ReviewSnapshot(BaseModel):
     human_score_history: HumanScoreHistory
     rollouts: tuple[ReviewRolloutView, ...]
     calibration_reports: tuple[CalibrationReport, ...]
+    calibrations: tuple[JudgeCalibration, ...]
 
 
 class RubricMutation(BaseModel):
@@ -92,6 +96,13 @@ class ScoreOverride(BaseModel):
     lineage_id: ArtifactId
     dimension_id: ArtifactId
     score: ScoreValue
+
+
+class CalibrationApproval(BaseModel):
+    """Explicit confirmation fields for one persisted calibration-report approval."""
+
+    confirmed: bool = False
+    accept_insufficient_risk: bool = False
 
 
 class ReviewMutationResponse(BaseModel):
@@ -124,15 +135,23 @@ class ReviewApplication:
         self,
         store: ProjectStore,
         *,
+        code_revision: str,
+        task_set_id: ArtifactId | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         """Create one local adapter without reading credentials or starting a provider client.
 
         Args:
             store: One initialized project-local WMO store.
+            code_revision: Exact current repository revision for newly produced artifacts.
+            task_set_id: Optional explicit task-set selection when no saved draft exists.
             clock: Optional deterministic clock used by review and label persistence.
         """
+        if not code_revision.strip():
+            raise ReviewServerError("review producer revision must be nonempty")
         self._store = store
+        self._code_revision = code_revision
+        self._task_set_id = task_set_id
         self._clock = _utc_now if clock is None else clock
 
     def snapshot(self) -> ReviewSnapshot:
@@ -170,6 +189,11 @@ class ReviewApplication:
             for report in _load_calibration_reports(self._store)
             if finalized is not None and report.rubric_id == finalized.rubric_id
         )
+        calibrations = tuple(
+            calibration
+            for calibration in _load_calibrations(self._store)
+            if finalized is not None and calibration.rubric_id == finalized.rubric_id
+        )
         return ReviewSnapshot(
             project_id=self._store.paths.project_id,
             local_data_notice=(
@@ -184,6 +208,7 @@ class ReviewApplication:
             human_score_history=score_review.history,
             rollouts=rollouts,
             calibration_reports=reports,
+            calibrations=calibrations,
         )
 
     def rubric_action(
@@ -264,45 +289,73 @@ class ReviewApplication:
             raise ReviewServerError("the stored judgment does not score the requested dimension")
 
         score_review = HumanScoreReview.open(self._store)
-        existing = _active_score(
-            score_review.history,
-            rubric_id=rubric.rubric_id,
-            rollout_id=override.rollout_id,
-            lineage_id=override.lineage_id,
-            dimension_id=override.dimension_id,
-        )
-        created_at = self._now()
-        label = HumanScore(
-            label_id=stable_id(
-                "human-score",
-                {
-                    "rubric_id": rubric.rubric_id,
-                    "rollout_id": override.rollout_id,
-                    "lineage_id": override.lineage_id,
-                    "dimension_id": override.dimension_id,
-                    "score": override.score,
-                    "sequence": len(score_review.history.scores),
-                },
-            ),
+        score_review.upsert(
             rubric_id=rubric.rubric_id,
             rollout_id=override.rollout_id,
             lineage_id=override.lineage_id,
             dimension_id=override.dimension_id,
             score=override.score,
-            created_at=created_at,
-            supersedes_label_id=None if existing is None else existing.label_id,
+            created_at=self._now(),
         )
-        if existing is None:
-            score_review.append(label)
-        else:
-            score_review.correct(label)
         notice = self._refresh_calibration(rubric_id=rubric.rubric_id, score_review=score_review)
         return ReviewMutationResponse(snapshot=self.snapshot(), notice=notice)
 
+    def approve_calibration(
+        self,
+        report_id: ArtifactId,
+        approval: CalibrationApproval,
+    ) -> ReviewMutationResponse:
+        """Approve one exact visible W6 report only after explicit human confirmation."""
+        if not approval.confirmed:
+            raise ReviewServerError("calibration approval requires explicit confirmation")
+        review = self._rubric_review(self._loaded_task_set())
+        rubric = review.draft.finalized_rubric
+        if rubric is None:
+            raise ReviewServerError("finalize the rubric before approving judge calibration")
+        report = next(
+            (
+                item
+                for item in _load_calibration_reports(self._store)
+                if item.report_id == report_id and item.rubric_id == rubric.rubric_id
+            ),
+            None,
+        )
+        if report is None:
+            raise ReviewServerError("the selected calibration report is missing for this rubric")
+        if report.status == "insufficient" and not approval.accept_insufficient_risk:
+            raise ReviewServerError(
+                "fewer than ten eligible rollouts require explicit insufficient-risk acceptance"
+            )
+        if report.status != "insufficient" and approval.accept_insufficient_risk:
+            raise ReviewServerError(
+                "insufficient-risk acceptance applies only to an insufficient report"
+            )
+        service = JudgeCalibrationService()
+        calibration = service.approve(
+            self._store,
+            report,
+            approved_at=self._now(),
+            accept_insufficient_labels=approval.accept_insufficient_risk,
+        )
+        stored = service.write_calibration(
+            self._store,
+            report=report,
+            calibration=calibration,
+        )
+        return ReviewMutationResponse(
+            snapshot=self.snapshot(),
+            notice=f"Human-calibrated judge artifact {stored.calibration_id} approved locally.",
+        )
+
     def _loaded_task_set(self) -> LoadedTaskSet:
-        """Resolve the sole selected task set used by this local review session."""
+        """Resolve the saved or explicitly selected task set for this local review session."""
         try:
-            return resolve_task_set(self._store.artifacts)
+            persisted = _persisted_task_set_id(self._store)
+            if persisted is not None and self._task_set_id not in {None, persisted}:
+                raise ReviewServerError(
+                    "--task-set conflicts with the task set already persisted in review.json"
+                )
+            return resolve_task_set(self._store.artifacts, persisted or self._task_set_id)
         except ArtifactCorruptionError as exc:
             raise ReviewServerError(str(exc)) from exc
 
@@ -312,7 +365,7 @@ class ReviewApplication:
             return RubricReview.open(
                 self._store,
                 source_task_set_id=task_set.task_set.task_set_id,
-                code_revision=task_set.task_set.code_revision,
+                code_revision=self._code_revision,
                 clock=self._clock,
             )
         except RubricReviewError as exc:
@@ -344,7 +397,7 @@ class ReviewApplication:
         try:
             label_set = score_review.finalize(
                 rubric_id=rubric_id,
-                code_revision=source_report.code_revision,
+                code_revision=self._code_revision,
                 created_at=created_at,
             )
             observations = _observations_for_active_scores(
@@ -360,7 +413,7 @@ class ReviewApplication:
                 router_lineage_split_id=source_report.router_lineage_split_id,
                 observations=observations,
                 created_at=created_at,
-                code_revision=source_report.code_revision,
+                code_revision=self._code_revision,
             )
             stored = service.write_report(self._store, report)
         except (CalibrationError, ProjectStoreError, ValueError) as exc:
@@ -382,6 +435,9 @@ def create_review_app(
     root: Path,
     project_id: str,
     *,
+    code_revision: str,
+    task_set_id: ArtifactId | None = None,
+    port: int = 8017,
     clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     """Create the loopback API over one project-local WMO review store.
@@ -389,18 +445,40 @@ def create_review_app(
     Args:
         root: Local `.wmo` root containing the project directory.
         project_id: One validated project identifier below the local root.
+        code_revision: Exact current producer revision for newly approved artifacts.
+        task_set_id: Optional task-set selection before a draft has persisted one.
+        port: Exact loopback port accepted in the HTTP Host boundary.
         clock: Optional deterministic clock for tests and local review writes.
 
     Returns:
         A FastAPI application with no auth, tenant, provider, or deployment integration.
     """
-    application = ReviewApplication(ProjectStore(root, project_id), clock=clock)
+    if not 1 <= port <= 65535:
+        raise ReviewServerError("review port must be between 1 and 65535")
+    application = ReviewApplication(
+        ProjectStore(root, project_id),
+        code_revision=code_revision,
+        task_set_id=task_set_id,
+        clock=clock,
+    )
     app = FastAPI(
         title="WMO local review",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
     )
+
+    @app.middleware("http")
+    async def enforce_loopback_request(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        """Reject DNS rebinding and cross-origin requests before any local evidence read."""
+        try:
+            _validate_loopback_request(request, port=port)
+        except ReviewServerError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        return await call_next(request)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -434,6 +512,20 @@ def create_review_app(
         except _LOCAL_REVIEW_ERRORS as exc:
             raise _http_error(exc) from exc
 
+    @app.post(
+        "/api/review/calibration/{report_id}/approve",
+        response_model=ReviewMutationResponse,
+    )
+    def approve_calibration(
+        report_id: ArtifactId,
+        approval: CalibrationApproval,
+    ) -> ReviewMutationResponse:
+        """Persist an explicitly confirmed human-calibrated W6 judge artifact."""
+        try:
+            return application.approve_calibration(report_id, approval)
+        except _LOCAL_REVIEW_ERRORS as exc:
+            raise _http_error(exc) from exc
+
     return app
 
 
@@ -452,6 +544,79 @@ def _http_error(error: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(error))
 
 
+def _validate_loopback_request(request: Request, *, port: int) -> None:
+    """Require one exact loopback Host and same-origin Origin or Referer when supplied."""
+    host_values = _raw_header_values(request, b"host")
+    if len(host_values) != 1:
+        raise ReviewServerError("local review requests require exactly one Host header")
+    allowed_hosts = {
+        f"127.0.0.1:{port}",
+        f"localhost:{port}",
+        f"[::1]:{port}",
+    }
+    host = host_values[0].casefold()
+    if host not in allowed_hosts:
+        raise ReviewServerError("local review Host must be loopback with the expected port")
+    expected = _origin_tuple(urlsplit(f"http://{host}"), label="Host")
+    for header_name in (b"origin", b"referer"):
+        values = _raw_header_values(request, header_name)
+        if len(values) > 1:
+            raise ReviewServerError(
+                f"local review requests may include at most one {header_name.decode()} header"
+            )
+        if values:
+            supplied = _origin_tuple(
+                urlsplit(values[0]),
+                label=header_name.decode().title(),
+            )
+            if supplied != expected:
+                raise ReviewServerError(
+                    f"local review {header_name.decode()} must match the loopback Host origin"
+                )
+
+
+def _raw_header_values(request: Request, name: bytes) -> tuple[str, ...]:
+    """Return every decoded raw request-header value for duplicate rejection."""
+    return tuple(
+        value.decode("latin-1").strip()
+        for key, value in request.scope.get("headers", ())
+        if key.lower() == name
+    )
+
+
+def _origin_tuple(value: SplitResult, *, label: str) -> tuple[str, str, int]:
+    """Parse one strict local HTTP origin for Host, Origin, and Referer comparison."""
+    try:
+        port = value.port
+    except ValueError as exc:
+        raise ReviewServerError(f"local review {label} has an invalid port") from exc
+    if (
+        value.scheme.casefold() != "http"
+        or value.hostname is None
+        or port is None
+        or value.username is not None
+        or value.password is not None
+    ):
+        raise ReviewServerError(f"local review {label} must be an explicit HTTP origin")
+    return value.scheme.casefold(), value.hostname.casefold(), port
+
+
+def _persisted_task_set_id(store: ProjectStore) -> ArtifactId | None:
+    """Return the task-set identity already selected by a valid resumable review draft."""
+    review = store.read_review()
+    if review is None:
+        return None
+    if not isinstance(review, dict):
+        raise ReviewServerError("review.json must be a JSON object")
+    saved = review.get("rubric_review")
+    if saved is None:
+        return None
+    try:
+        return RubricReviewDraft.model_validate(saved).source_task_set_id
+    except ValueError as exc:
+        raise ReviewServerError("review.json contains an invalid rubric review draft") from exc
+
+
 def _load_coverage(store: ProjectStore, task_set: LoadedTaskSet) -> CoverageReport | None:
     """Load coverage only from the selected immutable W5 task-set artifact."""
     envelope = task_set.task_set
@@ -462,7 +627,7 @@ def _load_coverage(store: ProjectStore, task_set: LoadedTaskSet) -> CoverageRepo
             store.artifacts.read_bytes(envelope.task_set_id, envelope.coverage_path)
         )
     except (ArtifactCorruptionError, ValueError) as exc:
-        raise ReviewServerError("the selected task-set coverage report is invalid") from exc
+        raise ReviewServerError("the selected task-set coverage report is corrupt") from exc
 
 
 def _load_rollout_records(store: ProjectStore) -> dict[ArtifactId, _RolloutRecord]:
@@ -470,18 +635,24 @@ def _load_rollout_records(store: ProjectStore) -> dict[ArtifactId, _RolloutRecor
     records: dict[ArtifactId, _RolloutRecord] = {}
     for artifact_id in store.artifacts.list_ids():
         stored = store.artifacts.read(artifact_id)
-        if stored.manifest.artifact_type not in {"rollout", "simulation-artifact-set"}:
+        if stored.manifest.artifact_type != "rollout":
             continue
-        for path in (item.path for item in stored.manifest.files):
-            for payload in _json_records(store.artifacts.read_bytes(artifact_id, path), path):
-                try:
-                    rollout = RolloutArtifact.model_validate_json(payload)
-                except ValueError:
-                    continue
-                records.setdefault(
-                    rollout.rollout_id,
-                    _RolloutRecord(artifact_id=artifact_id, rollout=rollout),
-                )
+        try:
+            rollout = RolloutArtifact.model_validate_json(
+                store.artifacts.read_bytes(artifact_id, "rollout.json")
+            )
+        except (ArtifactCorruptionError, ValueError) as exc:
+            raise ReviewServerError(f"rollout artifact {artifact_id} is corrupt") from exc
+        if rollout.artifact_id != artifact_id:
+            raise ReviewServerError(
+                f"rollout artifact {artifact_id} does not match its record identity"
+            )
+        if rollout.rollout_id in records:
+            raise ReviewServerError(f"rollout ID {rollout.rollout_id} is stored more than once")
+        records[rollout.rollout_id] = _RolloutRecord(
+            artifact_id=artifact_id,
+            rollout=rollout,
+        )
     return records
 
 
@@ -492,16 +663,20 @@ def _load_judgment_records(store: ProjectStore) -> dict[ArtifactId, _JudgmentRec
         stored = store.artifacts.read(artifact_id)
         if stored.manifest.artifact_type != "judgment":
             continue
-        for path in (item.path for item in stored.manifest.files):
-            for payload in _json_records(store.artifacts.read_bytes(artifact_id, path), path):
-                try:
-                    judgment = Judgment.model_validate_json(payload)
-                except ValueError:
-                    continue
-                records.setdefault(
-                    judgment.judgment_id,
-                    _JudgmentRecord(artifact_id=artifact_id, judgment=judgment),
-                )
+        try:
+            judgment = Judgment.model_validate_json(
+                store.artifacts.read_bytes(artifact_id, "judgment.json")
+            )
+        except (ArtifactCorruptionError, ValueError) as exc:
+            raise ReviewServerError(f"judgment artifact {artifact_id} is corrupt") from exc
+        if judgment.judgment_id != artifact_id:
+            raise ReviewServerError(
+                f"judgment artifact {artifact_id} does not match its record identity"
+            )
+        records[judgment.judgment_id] = _JudgmentRecord(
+            artifact_id=artifact_id,
+            judgment=judgment,
+        )
     return records
 
 
@@ -512,22 +687,41 @@ def _load_calibration_reports(store: ProjectStore) -> tuple[CalibrationReport, .
         stored = store.artifacts.read(artifact_id)
         if stored.manifest.artifact_type != "judge-calibration-report":
             continue
-        for path in (item.path for item in stored.manifest.files):
-            for payload in _json_records(store.artifacts.read_bytes(artifact_id, path), path):
-                try:
-                    reports.append(CalibrationReport.model_validate_json(payload))
-                except ValueError:
-                    continue
+        try:
+            report = CalibrationReport.model_validate_json(
+                store.artifacts.read_bytes(artifact_id, "report.json")
+            )
+        except (ArtifactCorruptionError, ValueError) as exc:
+            raise ReviewServerError(
+                f"judge-calibration report artifact {artifact_id} is corrupt"
+            ) from exc
+        if report.report_id != artifact_id:
+            raise ReviewServerError(
+                f"judge-calibration report {artifact_id} does not match its record identity"
+            )
+        reports.append(report)
     return tuple(sorted(reports, key=lambda item: (item.created_at, item.report_id)))
 
 
-def _json_records(payload: bytes, path: str) -> tuple[bytes, ...]:
-    """Return JSON object payloads from one known immutable artifact data file."""
-    if path.endswith(".json"):
-        return (payload,)
-    if path.endswith(".jsonl"):
-        return tuple(line for line in payload.splitlines() if line)
-    return ()
+def _load_calibrations(store: ProjectStore) -> tuple[JudgeCalibration, ...]:
+    """Read immutable W6 judge calibrations and fail closed on semantic corruption."""
+    calibrations: list[JudgeCalibration] = []
+    for artifact_id in store.artifacts.list_ids():
+        stored = store.artifacts.read(artifact_id)
+        if stored.manifest.artifact_type != "judge-calibration":
+            continue
+        try:
+            calibration = JudgeCalibration.model_validate_json(
+                store.artifacts.read_bytes(artifact_id, "calibration.json")
+            )
+        except (ArtifactCorruptionError, ValueError) as exc:
+            raise ReviewServerError(f"judge-calibration artifact {artifact_id} is corrupt") from exc
+        if calibration.calibration_id != artifact_id:
+            raise ReviewServerError(
+                f"judge-calibration {artifact_id} does not match its record identity"
+            )
+        calibrations.append(calibration)
+    return tuple(sorted(calibrations, key=lambda item: (item.created_at, item.calibration_id)))
 
 
 def _judgment_by_rollout(
@@ -629,26 +823,6 @@ def _task_for_rollout(rollout: RolloutArtifact, tasks: tuple[TaskCase, ...]) -> 
     raise ReviewServerError("the score target rollout does not belong to the selected task set")
 
 
-def _active_score(
-    history: HumanScoreHistory,
-    *,
-    rubric_id: ArtifactId,
-    rollout_id: ArtifactId,
-    lineage_id: ArtifactId,
-    dimension_id: ArtifactId,
-) -> HumanScore | None:
-    """Find the active prior label that a new score must correct, if one exists."""
-    for score in history.active_scores():
-        if (
-            score.rubric_id == rubric_id
-            and score.rollout_id == rollout_id
-            and score.lineage_id == lineage_id
-            and score.dimension_id == dimension_id
-        ):
-            return score
-    return None
-
-
 def _required_id(value: ArtifactId | None, field_name: str) -> ArtifactId:
     """Require one named artifact identity from a rubric mutation."""
     if value is None:
@@ -689,6 +863,19 @@ def _loopback_host(value: str) -> str:
     return value
 
 
+def _current_revision() -> str:
+    """Return the repository revision that will produce new local review artifacts."""
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    revision = result.stdout.strip()
+    return revision if result.returncode == 0 and revision else "local-unversioned"
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Run the local review adapter on loopback for the top-level TypeScript app.
 
@@ -698,6 +885,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Serve the WMO local review adapter on loopback.")
     parser.add_argument("--root", type=Path, default=Path(".wmo"))
     parser.add_argument("--project", default="default")
+    parser.add_argument("--task-set", default=None)
     parser.add_argument("--host", type=_loopback_host, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8017)
     arguments = parser.parse_args(argv)
@@ -708,7 +896,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     except ProjectStoreError as exc:
         parser.error(str(exc))
     uvicorn.run(
-        create_review_app(arguments.root, arguments.project),
+        create_review_app(
+            arguments.root,
+            arguments.project,
+            code_revision=_current_revision(),
+            task_set_id=arguments.task_set,
+            port=arguments.port,
+        ),
         host=arguments.host,
         port=arguments.port,
         log_level="warning",

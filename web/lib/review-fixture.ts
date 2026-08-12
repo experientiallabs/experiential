@@ -200,7 +200,8 @@ const baseSnapshot: ReviewSnapshot = {
       }
     }
   ],
-  calibration_reports: []
+  calibration_reports: [],
+  calibrations: []
 };
 
 export const draftReviewSnapshot: ReviewSnapshot = baseSnapshot;
@@ -246,5 +247,6 @@ export const finalizedReviewSnapshot: ReviewSnapshot = {
         }
       ]
     }
-  ]
+  ],
+  calibrations: []
 };

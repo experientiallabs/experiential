@@ -7,7 +7,7 @@ import logging
 import os
 import shutil
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
@@ -383,7 +383,7 @@ class ProjectStore:
             raise ProjectStoreError(str(exc)) from exc
 
     def write_review(self, review: BaseModel | JsonValue) -> None:
-        """Atomically replace the sole mutable local review draft.
+        """Lock and atomically replace the sole mutable local review draft.
 
         Args:
             review: Structured draft task, rubric, or calibration review state.
@@ -391,11 +391,35 @@ class ProjectStore:
         Raises:
             ProjectStoreError: The draft crosses the local no-secret boundary.
         """
-        try:
-            assert_secret_free(review)
-        except SecretBoundaryError as exc:
-            raise ProjectStoreError(str(exc)) from exc
-        write_bytes_atomic(self.paths.review_json, canonical_json_bytes(review))
+        with file_write_lock(self.paths.review_json, what="project review"):
+            self._write_review_unlocked(review)
+
+    def update_review(
+        self,
+        update: Callable[[JsonValue | None], BaseModel | JsonValue],
+    ) -> JsonValue:
+        """Lock the complete review read-modify-write cycle and return the stored value.
+
+        Args:
+            update: Transition that receives the latest draft while the project lock is held.
+
+        Returns:
+            The validated JSON value written atomically by this transaction.
+
+        Raises:
+            ProjectStoreError: The current draft is corrupt or the replacement crosses the
+                no-secret boundary.
+        """
+        with file_write_lock(self.paths.review_json, what="project review"):
+            current = self._read_review_unlocked()
+            replacement = update(current)
+            payload = canonical_json_bytes(replacement)
+            try:
+                stored = _JSON_VALUE_ADAPTER.validate_json(payload)
+            except ValidationError as exc:
+                raise ProjectStoreError("review update did not produce valid JSON") from exc
+            self._write_review_unlocked(stored)
+            return stored
 
     def read_review(self) -> JsonValue | None:
         """Load the mutable review draft, returning ``None`` before any draft exists.
@@ -406,6 +430,18 @@ class ProjectStore:
         Raises:
             ProjectStoreError: If the draft cannot be read or is not valid JSON.
         """
+        return self._read_review_unlocked()
+
+    def _write_review_unlocked(self, review: BaseModel | JsonValue) -> None:
+        """Atomically write a review value while the caller owns the project review lock."""
+        try:
+            assert_secret_free(review)
+        except SecretBoundaryError as exc:
+            raise ProjectStoreError(str(exc)) from exc
+        write_bytes_atomic(self.paths.review_json, canonical_json_bytes(review))
+
+    def _read_review_unlocked(self) -> JsonValue | None:
+        """Read the review value without taking a lock for callers that already hold it."""
         if not self.paths.review_json.exists():
             return None
         try:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -196,3 +197,76 @@ def test_review_finalize_recovers_after_artifact_write_before_draft_lock(tmp_pat
     )
 
     assert resumed.finalize() == rubric
+
+
+def test_concurrent_review_transitions_reload_under_lock_and_retain_both_events(
+    tmp_path: Path,
+) -> None:
+    """Two stale service instances cannot erase one another's accepted scale or event."""
+    store = _store(tmp_path)
+    proposal = _proposal()
+    first = RubricReview.open(
+        store,
+        source_task_set_id="task-set-1",
+        code_revision="producer-current",
+        proposals=(proposal,),
+        clock=lambda: _TIME,
+    )
+    second = RubricReview.open(
+        store,
+        source_task_set_id="task-set-1",
+        code_revision="producer-current",
+        proposals=(proposal,),
+        clock=lambda: _TIME,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (
+            executor.submit(first.accept, "task-success"),
+            executor.submit(second.accept, "policy-compliance"),
+        )
+        for future in futures:
+            future.result()
+
+    resumed = RubricReview.open(
+        store,
+        source_task_set_id="task-set-1",
+        code_revision="producer-current",
+        proposals=(proposal,),
+        clock=lambda: _TIME,
+    )
+    assert {item.dimension_id for item in resumed.draft.dimensions} == {
+        "task-success",
+        "policy-compliance",
+    }
+    assert tuple(event.kind for event in resumed.draft.events) == ("accept", "accept")
+
+
+def test_resumed_review_uses_current_producer_revision_for_new_rubric(tmp_path: Path) -> None:
+    """A new rubric records the current producer rather than its task or draft revision."""
+    store = _store(tmp_path)
+    _write_task_set(store)
+    proposal = _proposal()
+    original = RubricReview.open(
+        store,
+        source_task_set_id="task-set-1",
+        code_revision="old-review-producer",
+        proposals=(proposal,),
+        clock=lambda: _TIME,
+    )
+    original.accept("task-success")
+
+    resumed = RubricReview.open(
+        store,
+        source_task_set_id="task-set-1",
+        code_revision="current-review-producer",
+        proposals=(proposal,),
+        clock=lambda: _TIME,
+    )
+    rubric = resumed.finalize()
+
+    assert rubric.code_revision == "current-review-producer"
+    assert all(
+        store.artifacts.read(artifact_id).manifest.code_revision == "current-review-producer"
+        for artifact_id in rubric.accepted_proposal_evidence_ids
+    )

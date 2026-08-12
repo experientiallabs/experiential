@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, JsonValue, field_validator, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, JsonObject, stable_id
 from wmo.common.judging.proposal import (
@@ -111,13 +111,15 @@ class RubricReview:
         self,
         store: ProjectStore,
         draft: RubricReviewDraft,
-        root_review: JsonObject,
+        proposals: tuple[RubricProposal, ...],
+        producer_revision: str,
         clock: Callable[[], datetime],
     ) -> None:
         """Construct a review service from validated persisted draft state."""
         self._store = store
         self._draft = draft
-        self._root_review = root_review
+        self._proposals = proposals
+        self._producer_revision = producer_revision
         self._clock = clock
 
     @classmethod
@@ -135,7 +137,7 @@ class RubricReview:
         Args:
             store: Project-local storage containing the sole mutable review file.
             source_task_set_id: Task set whose representative evidence seeded this review.
-            code_revision: Exact code revision recorded in the finalized rubric artifact.
+            code_revision: Exact current producer revision for any new artifact.
             proposals: Optional model-proposed cards used when creating a new draft.
             clock: Injectable wall clock for deterministic callers and tests.
 
@@ -146,29 +148,30 @@ class RubricReview:
             RubricReviewError: Existing draft state belongs to another task set or proposal set.
         """
         now = _utc_now if clock is None else clock
-        root_review = _read_root_review(store)
-        saved = root_review.get("rubric_review")
-        if saved is None:
-            draft = RubricReviewDraft(
-                source_task_set_id=source_task_set_id,
-                code_revision=code_revision,
-                proposals=tuple(proposals),
-            )
-            review = cls(store, draft, root_review, now)
-            review._save()
-            return review
-        try:
-            draft = RubricReviewDraft.model_validate(saved)
-        except ValueError as exc:
-            raise RubricReviewError("review.json contains an invalid rubric review draft") from exc
-        if draft.source_task_set_id != source_task_set_id:
-            raise RubricReviewError("existing rubric review belongs to another task set")
-        if draft.code_revision != code_revision:
-            raise RubricReviewError("existing rubric review belongs to another code revision")
         supplied_proposals = tuple(proposals)
-        if supplied_proposals and supplied_proposals != draft.proposals:
-            raise RubricReviewError("existing rubric review has a different proposal set")
-        return cls(store, draft, root_review, now)
+        selected: list[RubricReviewDraft] = []
+
+        def initialize(current: JsonValue | None) -> JsonObject:
+            root = _root_review_from_value(current)
+            saved = root.get("rubric_review")
+            if saved is None:
+                draft = RubricReviewDraft(
+                    source_task_set_id=source_task_set_id,
+                    code_revision=code_revision,
+                    proposals=supplied_proposals,
+                )
+            else:
+                draft = _validated_draft(
+                    saved,
+                    source_task_set_id=source_task_set_id,
+                    proposals=supplied_proposals,
+                )
+            root["rubric_review"] = draft.model_dump(mode="json")
+            selected.append(draft)
+            return root
+
+        store.update_review(initialize)
+        return cls(store, selected[0], supplied_proposals, code_revision, now)
 
     @property
     def draft(self) -> RubricReviewDraft:
@@ -176,6 +179,10 @@ class RubricReview:
         return self._draft
 
     def accept(self, dimension_id: ArtifactId) -> None:
+        """Accept one proposed rubric card in a locked review transaction."""
+        self._mutate(lambda review: review._accept(dimension_id))
+
+    def _accept(self, dimension_id: ArtifactId) -> None:
         """Accept one proposed rubric card into the editable review order.
 
         Args:
@@ -198,6 +205,10 @@ class RubricReview:
         )
 
     def reject(self, dimension_id: ArtifactId) -> None:
+        """Reject one proposed rubric card in a locked review transaction."""
+        self._mutate(lambda review: review._reject(dimension_id))
+
+    def _reject(self, dimension_id: ArtifactId) -> None:
         """Reject one proposed card and remove it from the editable rubric if needed.
 
         Args:
@@ -223,6 +234,24 @@ class RubricReview:
         )
 
     def edit(
+        self,
+        dimension_id: ArtifactId,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        anchors: tuple[ScoreAnchor, ...] | None = None,
+    ) -> None:
+        """Edit one rubric card in a locked review transaction."""
+        self._mutate(
+            lambda review: review._edit(
+                dimension_id,
+                name=name,
+                description=description,
+                anchors=anchors,
+            )
+        )
+
+    def _edit(
         self,
         dimension_id: ArtifactId,
         *,
@@ -272,6 +301,10 @@ class RubricReview:
         )
 
     def add(self, dimension: RubricDimension) -> None:
+        """Add one human-authored scale in a locked review transaction."""
+        self._mutate(lambda review: review._add(dimension))
+
+    def _add(self, dimension: RubricDimension) -> None:
         """Add one human-authored zero-to-five rubric dimension.
 
         Args:
@@ -290,6 +323,11 @@ class RubricReview:
         )
 
     def replace_all(self, dimensions: Sequence[RubricDimension]) -> None:
+        """Replace every active scale in a locked review transaction."""
+        replacement = tuple(dimensions)
+        self._mutate(lambda review: review._replace_all(replacement))
+
+    def _replace_all(self, dimensions: Sequence[RubricDimension]) -> None:
         """Replace the editable scale set with a complete human-owned ordering.
 
         Args:
@@ -311,6 +349,11 @@ class RubricReview:
         )
 
     def order(self, dimension_ids: Sequence[ArtifactId]) -> None:
+        """Reorder every active scale in a locked review transaction."""
+        requested = tuple(dimension_ids)
+        self._mutate(lambda review: review._order(requested))
+
+    def _order(self, dimension_ids: Sequence[ArtifactId]) -> None:
         """Set the complete visible order of already accepted rubric dimensions.
 
         Args:
@@ -331,6 +374,16 @@ class RubricReview:
         )
 
     def finalize(self) -> Rubric:
+        """Finalize the current draft inside one locked review transaction."""
+        finalized: list[Rubric] = []
+
+        def transition(review: RubricReview) -> None:
+            finalized.append(review._finalize())
+
+        self._mutate(transition)
+        return finalized[0]
+
+    def _finalize(self) -> Rubric:
         """Write one immutable approved rubric artifact and lock the review draft.
 
         Returns:
@@ -371,7 +424,7 @@ class RubricReview:
                         self._store,
                         proposal=proposal,
                         source_task_set_input=task_set_input,
-                        code_revision=self._draft.code_revision,
+                        code_revision=self._producer_revision,
                         created_at=created_at,
                     ).proposal_evidence_id
                     for proposal in accepted_proposals
@@ -401,7 +454,7 @@ class RubricReview:
             schema_version=1,
             created_at=created_at,
             inputs=inputs,
-            code_revision=self._draft.code_revision,
+            code_revision=self._producer_revision,
             rubric_id=rubric_id,
             dimensions=self._draft.dimensions,
             source_task_set_id=self._draft.source_task_set_id,
@@ -433,7 +486,7 @@ class RubricReview:
         event = self._event("finalize", tuple(item.dimension_id for item in rubric.dimensions))
         self._draft = RubricReviewDraft(
             source_task_set_id=self._draft.source_task_set_id,
-            code_revision=self._draft.code_revision,
+            code_revision=self._producer_revision,
             proposals=self._draft.proposals,
             dimensions=rubric.dimensions,
             rejected_dimension_ids=self._draft.rejected_dimension_ids,
@@ -441,7 +494,6 @@ class RubricReview:
             status="finalized",
             finalized_rubric=rubric,
         )
-        self._save()
         return rubric
 
     def _candidate(self, dimension_id: ArtifactId) -> RubricDimension:
@@ -475,7 +527,7 @@ class RubricReview:
         event = self._event(event_kind, event_dimension_ids)
         self._draft = RubricReviewDraft(
             source_task_set_id=self._draft.source_task_set_id,
-            code_revision=self._draft.code_revision,
+            code_revision=self._producer_revision,
             proposals=self._draft.proposals,
             dimensions=dimensions,
             rejected_dimension_ids=(
@@ -485,7 +537,35 @@ class RubricReview:
             ),
             events=(*self._draft.events, event),
         )
-        self._save()
+
+    def _mutate(self, transition: Callable[[RubricReview], None]) -> None:
+        """Reload and apply one namespace transition while the review lock is held."""
+        selected: list[RubricReviewDraft] = []
+
+        def update(current: JsonValue | None) -> JsonObject:
+            root = _root_review_from_value(current)
+            saved = root.get("rubric_review")
+            if saved is None:
+                raise RubricReviewError("rubric review draft disappeared before mutation")
+            draft = _validated_draft(
+                saved,
+                source_task_set_id=self._draft.source_task_set_id,
+                proposals=self._proposals,
+            )
+            working = RubricReview(
+                self._store,
+                draft,
+                self._proposals,
+                self._producer_revision,
+                self._clock,
+            )
+            transition(working)
+            root["rubric_review"] = working._draft.model_dump(mode="json")
+            selected.append(working._draft)
+            return root
+
+        self._store.update_review(update)
+        self._draft = selected[0]
 
     def _event(
         self,
@@ -517,15 +597,9 @@ class RubricReview:
             raise RubricReviewError("rubric review clock must return a timezone-aware time")
         return value
 
-    def _save(self) -> None:
-        """Save only this service's namespace while preserving other review-draft fields."""
-        self._root_review["rubric_review"] = self._draft.model_dump(mode="json")
-        self._store.write_review(self._root_review)
 
-
-def _read_root_review(store: ProjectStore) -> JsonObject:
-    """Return the mutable review root as an object suitable for namespace-preserving writes."""
-    review = store.read_review()
+def _root_review_from_value(review: JsonValue | None) -> JsonObject:
+    """Validate one locked review value as an object suitable for namespace updates."""
     if review is None:
         return {}
     if not isinstance(review, dict):
@@ -536,6 +610,24 @@ def _read_root_review(store: ProjectStore) -> JsonObject:
             raise RubricReviewError("review.json must use string field names")
         root[key] = value
     return root
+
+
+def _validated_draft(
+    saved: JsonValue,
+    *,
+    source_task_set_id: ArtifactId,
+    proposals: tuple[RubricProposal, ...],
+) -> RubricReviewDraft:
+    """Validate a persisted rubric namespace against its selected task set and proposals."""
+    try:
+        draft = RubricReviewDraft.model_validate(saved)
+    except ValueError as exc:
+        raise RubricReviewError("review.json contains an invalid rubric review draft") from exc
+    if draft.source_task_set_id != source_task_set_id:
+        raise RubricReviewError("existing rubric review belongs to another task set")
+    if proposals and proposals != draft.proposals:
+        raise RubricReviewError("existing rubric review has a different proposal set")
+    return draft
 
 
 def _same_rubric_identity(left: Rubric, right: Rubric) -> bool:

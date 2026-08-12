@@ -8,7 +8,12 @@ import { RubricReview } from "@/components/rubric-review";
 import { TaskReview } from "@/components/task-review";
 import { Button, Card, Chip, EmptyState } from "@/components/ui";
 import { localReviewApi, type ReviewApi } from "@/lib/review-api";
-import type { ReviewSnapshot, RubricAction, ScoreOverride } from "@/lib/review-types";
+import type {
+  CalibrationApproval,
+  ReviewSnapshot,
+  RubricAction,
+  ScoreOverride
+} from "@/lib/review-types";
 
 type ReviewTab = "tasks" | "rubric" | "calibration";
 
@@ -91,6 +96,14 @@ export function ReviewWorkbench({ api = localReviewApi }: { api?: ReviewApi }) {
     });
   };
 
+  const approveCalibration = (reportId: string, input: CalibrationApproval) => {
+    void perform(async () => {
+      const response = await api.approveCalibration(reportId, input);
+      setSnapshot(response.snapshot);
+      setNotice(response.notice);
+    });
+  };
+
   async function perform(operation: () => Promise<void>) {
     setBusy(true);
     setError("");
@@ -165,7 +178,10 @@ export function ReviewWorkbench({ api = localReviewApi }: { api?: ReviewApi }) {
         ) : null}
         {snapshot && tab === "calibration" ? (
           <CalibrationReview
+            busy={busy}
+            calibrations={snapshot.calibrations}
             dimensions={activeDimensions}
+            onApprove={approveCalibration}
             reports={snapshot.calibration_reports}
             scores={snapshot.human_score_history.scores}
           />
