@@ -20,11 +20,9 @@ from wmo.common.providers.models import resolve_provider_model
 
 ARTIFACT_DIR = ".wmo"
 
-# Mirror of `wmo.simulation.model.build.DEFAULT_TRAIN_SPLIT`, the one cut point on the trace-id
-# hash line shared by `wmo build` and `wmo eval`. The canonical constant lives by the split
-# functions
-# and cannot be imported here (build.py imports this module, so the arrow would be a cycle), so
-# `config_test.py` asserts the two stay equal instead.
+# Mirror of `wmo.simulation.model.splits.DEFAULT_TRAIN_SPLIT`, the legacy trace-id split used by
+# open-loop evaluation. The canonical task miner owns the W5 50/20 task partition. Config cannot
+# import the simulation split module without a dependency cycle, so `config_test.py` pins equality.
 _DEFAULT_TRAIN_SPLIT = 0.8
 
 
@@ -174,6 +172,8 @@ class HarnessConfig(BaseModel):
     gepa_budget: int = 10  # GEPA iterations; ~valset_cap calls each (see _cap_gepa_valset)
     # Model id the GEPA judge runs on (same provider kind as serve). None = the serve model.
     judge_model: str | None = None
+    # Retained only to read existing world-model config artifacts. Canonical W5 builds select an
+    # explicit OTLP or PostHog loader and never consult this legacy setting.
     trace_adapter: str = "otel-genai"
     # Agentic-mode flags (all default OFF: artifacts built before these fields serve unchanged).
     # `knowledge`: seed a knowledge base from train traces at build and render it into the env

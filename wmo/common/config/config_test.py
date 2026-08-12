@@ -16,7 +16,7 @@ from wmo.common.config.config import (
     save_config,
 )
 from wmo.common.providers.base import EmbedderKind, ProviderConfig, ProviderKind
-from wmo.simulation.model.build import DEFAULT_TRAIN_SPLIT
+from wmo.simulation.model import DEFAULT_TRAIN_SPLIT
 
 
 def test_gepa_budget_default_is_modest() -> None:
@@ -240,8 +240,8 @@ def test_for_build_hashing_embedder_needs_no_embed_provider_config() -> None:
 
 
 def test_config_train_split_default_mirrors_the_canonical_constant() -> None:
-    # `_DEFAULT_TRAIN_SPLIT` is a mirror: the canonical value lives next to the split functions in
-    # `wmo.simulation.model.build`, which this module cannot import because build.py imports it.
+    # `_DEFAULT_TRAIN_SPLIT` is a mirror: the canonical value lives with the split functions in
+    # `wmo.simulation.model.splits`, which config cannot import without a dependency cycle.
     # A build config that cuts the hash line somewhere other than where `wmo eval` cuts it
     # hands GEPA's training traces back as scored "held-out" steps, so pin the mirror here.
     assert _DEFAULT_TRAIN_SPLIT == DEFAULT_TRAIN_SPLIT

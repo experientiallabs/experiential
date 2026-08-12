@@ -50,11 +50,20 @@ def _write_corpus(path, n_traces: int) -> None:  # noqa: ANN001 - tmp_path fixtu
             json.dumps(
                 {
                     "traceId": tid,
-                    "spanId": f"{tid[:8]}0000",
+                    "spanId": f"{t + 1:016x}",
                     "name": "chat",
-                    "startTimeUnixNano": 1,
+                    "startTimeUnixNano": "1760000000000000000",
+                    "endTimeUnixNano": "1760000001000000000",
                     "attributes": [
                         {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                        {
+                            "key": "gen_ai.provider.name",
+                            "value": {"stringValue": "openai"},
+                        },
+                        {
+                            "key": "gen_ai.request.model",
+                            "value": {"stringValue": "gpt-test"},
+                        },
                         {"key": "gen_ai.tool.name", "value": {"stringValue": "get_user"}},
                         {
                             "key": "gen_ai.tool.call.arguments",
@@ -69,9 +78,11 @@ def _write_corpus(path, n_traces: int) -> None:  # noqa: ANN001 - tmp_path fixtu
             json.dumps(
                 {
                     "traceId": tid,
-                    "spanId": f"{tid[:8]}0001",
+                    "spanId": f"{t + 1:015x}1",
+                    "parentSpanId": f"{t + 1:016x}",
                     "name": "execute_tool",
-                    "startTimeUnixNano": 2,
+                    "startTimeUnixNano": "1760000001000000000",
+                    "endTimeUnixNano": "1760000002000000000",
                     "attributes": [
                         {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
                         {"key": "gen_ai.tool.message", "value": {"stringValue": f"found u{t}"}},

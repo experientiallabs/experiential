@@ -1,47 +1,34 @@
-"""Trace ingestion: file uploads and vendor pulls -> normalized `Trace` objects.
+"""Canonical OTLP and focused PostHog trace ingestion."""
 
-A `TraceAdapter` turns one source's telemetry into the generic `Trace` schema. Adapters register
-themselves on import and are looked up by name (`get_adapter`) or listed (`list_adapters`). The
-span-based adapters share one normalizer (`wmo.simulation.ingest.normalize`) and the
-`BaseTraceAdapter` scaffolding, so adding a source is transport plus attribute mapping. See
-`docs/reference/ingest.md`.
-
-Bundled adapters:
-  - `otel-genai`  : OTLP-JSON spans following the OTel GenAI semantic conventions (file or pull).
-  - `chat-json`   : recorded OpenAI-style chat/tool-call conversations (file).
-Provider adapters (Braintrust, Phoenix/Arize, Langfuse, LangSmith) register when their module is
-imported; their heavy SDKs are optional extras, imported lazily inside the adapter.
-"""
-
-# Import for the registration side effect so `get_adapter(...)` works on package import. The
-# provider adapters are SDK-free (they parse exports as JSON and pull over httpx), so importing them
-# here is cheap and brings no heavy dependency. Their optional extras only matter if a user drives
-# the provider's own SDK alongside `wmo ingest`.
-from wmo.simulation.ingest import braintrust as braintrust  # noqa: F401
-from wmo.simulation.ingest import langfuse as langfuse  # noqa: F401
-from wmo.simulation.ingest import langsmith as langsmith  # noqa: F401
-from wmo.simulation.ingest import mastra as mastra  # noqa: F401
-from wmo.simulation.ingest import messages as messages  # noqa: F401
-from wmo.simulation.ingest import otel_genai as otel_genai  # noqa: F401
-from wmo.simulation.ingest import phoenix as phoenix  # noqa: F401
-from wmo.simulation.ingest import postgres as postgres  # noqa: F401
-from wmo.simulation.ingest import posthog as posthog  # noqa: F401
-from wmo.simulation.ingest.adapter import (
-    TraceAdapter,
-    VendorPull,
-    get_adapter,
-    list_adapters,
-    register_adapter,
+from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
+from wmo.simulation.ingest.otlp import (
+    GENAI_SEMANTIC_CONVENTION_VERSION,
+    OtlpTraceFormatError,
+    TraceNormalizationIssue,
+    TraceNormalizationResult,
+    load_otlp_file,
+    normalize_otlp_payload,
 )
-from wmo.simulation.ingest.base import BaseTraceAdapter
-from wmo.simulation.ingest.quality import drop_degenerate_traces
+from wmo.simulation.ingest.posthog import (
+    PostHogPullError,
+    PostHogPullRequest,
+    load_posthog_file,
+    normalize_posthog_payload,
+    pull_posthog_traces,
+)
 
 __all__ = [
-    "BaseTraceAdapter",
-    "TraceAdapter",
-    "VendorPull",
-    "drop_degenerate_traces",
-    "get_adapter",
-    "list_adapters",
-    "register_adapter",
+    "GENAI_SEMANTIC_CONVENTION_VERSION",
+    "OtlpTraceFormatError",
+    "PersistedTraceDataset",
+    "PostHogPullError",
+    "PostHogPullRequest",
+    "TraceNormalizationIssue",
+    "TraceNormalizationResult",
+    "load_otlp_file",
+    "load_posthog_file",
+    "normalize_otlp_payload",
+    "normalize_posthog_payload",
+    "persist_trace_dataset",
+    "pull_posthog_traces",
 ]

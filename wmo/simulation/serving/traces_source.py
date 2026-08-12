@@ -19,8 +19,8 @@ import httpx
 from pydantic import BaseModel, Field
 
 from wmo.common.config.card import TracesSource
-from wmo.common.core.types import Action
-from wmo.simulation.ingest import get_adapter
+from wmo.common.core.artifacts import JsonObject
+from wmo.simulation.ingest.otlp import OtlpTraceFormatError, load_otlp_file
 
 TRACES_FILENAME = "traces.otel.jsonl"
 
@@ -43,29 +43,21 @@ def local_traces_path(model_dir: Path) -> Path | None:
     return None
 
 
-def _action_label(action: Action) -> str:
-    """Format an action in the wmo-play grammar (matches the web index generator)."""
-    if action.kind.value == "tool_call":
-        return f"{action.name} {action.arguments}" if action.arguments else (action.name or "")
-    return f"say {action.content or ''}"
+class TraceSummaryStep(BaseModel):
+    """One canonical normalized span rendered for local trace inspection."""
 
-
-class ScenarioStep(BaseModel):
-    """One replayable step of a scenario, with its action pre-rendered for display."""
-
-    action: Action
-    action_label: str
-    observation: str
+    name: str
+    detail: str
     is_error: bool
 
 
-class TraceScenario(BaseModel):
-    """One trace turned into a bounded, replayable scenario."""
+class TraceSummary(BaseModel):
+    """One canonical trace rendered for bounded local inspection."""
 
     id: str
     label: str
     task: str | None
-    steps: list[ScenarioStep]
+    steps: list[TraceSummaryStep]
 
 
 def _clip(text: str, limit: int) -> str:
@@ -73,41 +65,76 @@ def _clip(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
-def scenarios_from_traces(
-    path: Path, *, max_scenarios: int = 6, max_steps: int = 10
-) -> list[TraceScenario]:
-    """Normalize a traces.otel.jsonl into a bounded list of replayable scenarios (one per trace)."""
-    traces = get_adapter("otel-genai").from_file(str(path))
-    out: list[TraceScenario] = []
-    for i, trace in enumerate(traces):
-        steps: list[ScenarioStep] = []
-        for step in trace.steps:
-            if step.observation.content is None:
-                continue
+def trace_summaries_from_otlp(
+    path: Path, *, max_traces: int = 6, max_steps: int = 10
+) -> list[TraceSummary]:
+    """Read a local OTLP export once and render bounded canonical trace summaries.
+
+    This inspect-only surface is intentionally separate from ``wmo build``. It invokes the same
+    strict OTLP normalizer directly and never reconstructs the removed scenario contracts.
+
+    Args:
+        path: Local OTLP JSON or JSONL export to inspect.
+        max_traces: Maximum trace summaries to return.
+        max_steps: Maximum canonical spans included per trace summary.
+
+    Returns:
+        Bounded canonical trace summaries in deterministic source-normalized order.
+
+    Raises:
+        ValueError: The selected local evidence cannot be normalized as OTLP.
+    """
+    try:
+        traces = load_otlp_file(path).traces
+    except OtlpTraceFormatError as exc:
+        raise ValueError(f"cannot normalize local OTLP trace evidence {path}: {exc}") from exc
+    out: list[TraceSummary] = []
+    for index, trace in enumerate(traces):
+        steps: list[TraceSummaryStep] = []
+        for span in trace.spans:
             steps.append(
-                ScenarioStep(
-                    action=step.action,
-                    action_label=_clip(_action_label(step.action), 100),
-                    observation=step.observation.content,
-                    is_error=step.observation.is_error,
+                TraceSummaryStep(
+                    name=span.name,
+                    detail=_span_detail(span.attributes),
+                    is_error=span.failure is not None,
                 )
             )
             if len(steps) >= max_steps:
                 break
         if not steps:
             continue
-        task = trace.steps[0].task if trace.steps else None
         out.append(
-            TraceScenario(id=f"t{i}", label=_scenario_label(task, i), task=task, steps=steps)
+            TraceSummary(
+                id=trace.trace_id,
+                label=_trace_label(trace.task, index),
+                task=trace.task,
+                steps=steps,
+            )
         )
-        if len(out) >= max_scenarios:
+        if len(out) >= max_traces:
             break
     return out
 
 
-def _scenario_label(task: str | None, index: int) -> str:
+def _span_detail(attributes: JsonObject) -> str:
+    """Extract a short inspectable detail from a canonical span's public attributes."""
+    for key in (
+        "gen_ai.tool.message",
+        "gen_ai.tool.result",
+        "gen_ai.completion",
+        "gen_ai.response.text",
+        "error.message",
+    ):
+        value = attributes.get(key)
+        if isinstance(value, str) and value:
+            return _clip(value, 160)
+    return _clip(json.dumps(attributes, sort_keys=True), 160) if attributes else ""
+
+
+def _trace_label(task: str, index: int) -> str:
+    """Render a compact canonical trace task label for the local inspection response."""
     if not task:
-        return f"Scenario {index + 1}"
+        return f"Trace {index + 1}"
     try:
         parsed = json.loads(task)
         text = parsed.get("reason_for_call") or parsed.get("task_instructions") or task
@@ -209,5 +236,5 @@ class TracesResponse(BaseModel):
 
     source: str  # "local" | "hub" | "none"
     downloadable: bool
-    scenarios: list[TraceScenario] = Field(default_factory=list)
+    scenarios: list[TraceSummary] = Field(default_factory=list)
     download: DownloadProgress | None = None

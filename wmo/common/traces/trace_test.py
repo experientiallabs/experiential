@@ -50,8 +50,12 @@ def test_trace_and_dataset_round_trip() -> None:
         created_at=datetime(2026, 8, 11, tzinfo=UTC),
         code_revision="e7aad17",
         dataset_id="traces-20260811",
+        semantic_convention_version="1.37.0",
         traces_path="traces.jsonl",
         traces_sha256=_DIGEST,
+        issues_path="normalization-issues.json",
+        issues_sha256=_DIGEST,
+        invalid_trace_count=1,
         trace_ids=(trace.trace_id,),
     )
 
@@ -93,7 +97,20 @@ def test_trace_requires_ordered_unique_spans_and_structured_failure() -> None:
             created_at=datetime(2026, 8, 11, tzinfo=UTC),
             code_revision="e7aad17",
             dataset_id="traces-20260811",
+            semantic_convention_version="1.37.0",
             traces_path="../traces.jsonl",
             traces_sha256=_DIGEST,
+            trace_ids=(trace.trace_id,),
+        )
+    with pytest.raises(ValidationError, match="requires an immutable issues report"):
+        TraceDataset(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            code_revision="e7aad17",
+            dataset_id="traces-20260811",
+            semantic_convention_version="1.37.0",
+            traces_path="traces.jsonl",
+            traces_sha256=_DIGEST,
+            invalid_trace_count=1,
             trace_ids=(trace.trace_id,),
         )

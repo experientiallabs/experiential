@@ -15,7 +15,6 @@ from wmo.optimize.routing.policy import RoutingPolicy
 from wmo.simulation.model.knowledge import KnowledgeBase
 from wmo.simulation.model.world_model import WorldModel
 from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
-from wmo.simulation.serving.builds import BuildManager
 from wmo.simulation.serving.chat import ChatMessage as EndpointMessage
 from wmo.simulation.serving.chat import RequestLog
 from wmo.simulation.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
@@ -153,92 +152,6 @@ def test_resolve_model_dirs_ignores_collision_outside_requested_names(tmp_path: 
 def test_load_card_or_none_degrades_malformed_card(tmp_path: Path) -> None:
     (tmp_path / "card.json").write_text("{ broken", encoding="utf-8")
     assert _load_card_or_none(tmp_path) is None
-
-
-def _ok_build_fn(config, *, file: str, root: str, reporter) -> None:  # noqa: ANN001 - test stub
-    reporter.ingest_done(1, 1)
-    Path(root).mkdir(parents=True, exist_ok=True)
-    (Path(root) / "config.toml").write_text("", encoding="utf-8")
-
-
-def _build_client(tmp_path: Path) -> TestClient:
-    manager = BuildManager(
-        store_root=tmp_path / ".wmo",
-        build_fn=_ok_build_fn,
-        verify_fn=lambda config: None,
-        register=lambda name, model_dir: None,
-    )
-    return TestClient(create_app(world_models={"airline": _world_model()}, build_manager=manager))
-
-
-def test_build_routes_run_a_build_and_stream_events(tmp_path: Path) -> None:
-    client = _build_client(tmp_path)
-    upload = client.post(
-        "/world_models/builds/uploads",
-        files={"file": ("t.jsonl", b"{}\n", "application/jsonl")},
-    )
-    started = client.post(
-        "/world_models/builds", json={"name": "fresh", "file": upload.json()["file"]}
-    )
-    assert started.status_code == 202
-    build_id = started.json()["build_id"]
-    # Poll until the background build reaches a terminal state.
-    import time
-
-    for _ in range(50):
-        if client.get(f"/world_models/builds/{build_id}").json()["status"] != "running":
-            break
-        time.sleep(0.05)
-    assert client.get(f"/world_models/builds/{build_id}").json()["status"] == "succeeded"
-    with client.stream("GET", f"/world_models/builds/{build_id}/events") as stream:
-        assert stream.headers["content-type"].startswith("text/event-stream")
-        text = "".join(stream.iter_text())
-    assert '"type": "done"' in text
-
-
-def test_build_routes_unavailable_without_manager() -> None:
-    client = _client()
-    resp = client.post("/world_models/builds", json={"name": "x", "file": "/nope"})
-    assert resp.status_code == 503
-
-
-def test_build_route_rejects_server_local_path(tmp_path: Path) -> None:
-    client = _build_client(tmp_path)
-    secret = tmp_path / "secret.jsonl"
-    secret.write_text("{}\n", encoding="utf-8")
-
-    response = client.post("/world_models/builds", json={"name": "fresh", "file": str(secret)})
-
-    assert response.status_code == 422
-    assert "upload" in response.json()["detail"]
-
-
-def test_upload_rejects_foreign_origin(tmp_path: Path) -> None:
-    client = _build_client(tmp_path)
-    resp = client.post(
-        "/world_models/builds/uploads",
-        files={"file": ("t.jsonl", b"{}\n", "application/jsonl")},
-        headers={"Origin": "https://evil.example.com"},
-    )
-    assert resp.status_code == 403
-    ok = client.post(
-        "/world_models/builds/uploads",
-        files={"file": ("t.jsonl", b"{}\n", "application/jsonl")},
-        headers={"Origin": "http://localhost:6001"},
-    )
-    assert ok.status_code == 200
-
-
-def test_upload_returns_opaque_filename(tmp_path: Path) -> None:
-    client = _build_client(tmp_path)
-    response = client.post(
-        "/world_models/builds/uploads",
-        files={"file": ("traces.jsonl", b"{}\n", "application/jsonl")},
-    )
-
-    assert response.status_code == 200
-    upload = response.json()["file"]
-    assert Path(upload).name == upload
 
 
 def test_session_lifecycle_and_step_are_namespaced() -> None:

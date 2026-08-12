@@ -1,147 +1,15 @@
 """Build, knowledge, and root CLI command tests."""
 
+import importlib
+
 # ruff: noqa: F403, F405
 from wmo.cli.cli_fixtures_test import *
-
-
-def test_build_uses_configured_worker_provider(patched_provider, tmp_path) -> None:  # noqa: ANN001
-    root = tmp_path / ".wmo"
-    settings = load_settings(root)
-    settings.models.worker = ModelRole(provider="openai", model="gpt-5.4-mini")
-    save_settings(settings, root)
-
-    result = runner.invoke(
-        app,
-        [
-            "build",
-            "--name",
-            "configured",
-            "--file",
-            _traces_file(tmp_path),
-            "--fidelity",
-            "low",
-            "--root",
-            str(root),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    config = load_config(root / "models" / "configured")
-    assert config.serve_provider is ProviderKind.OPENAI
-    assert config.serve_provider_config().model_type == "gpt-5.4-mini"
-
-
-def test_build_explicit_model_keeps_configured_azure_connection(
-    patched_provider: None, tmp_path: Path
-) -> None:
-    root = tmp_path / ".wmo"
-    settings = load_settings(root)
-    settings.models.worker = ModelRole(
-        provider="azure",
-        model="gpt-5.5",
-        endpoint="https://azure.example/v1",
-        deployment="configured-deployment",
-        api_version="2026-01-01",
-    )
-    save_settings(settings, root)
-
-    result = runner.invoke(
-        app,
-        [
-            "build",
-            "--name",
-            "explicit-model",
-            "--file",
-            _traces_file(tmp_path),
-            "--provider",
-            "azure",
-            "--model",
-            "gpt-5.5",
-            "--fidelity",
-            "low",
-            "--root",
-            str(root),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    config = load_config(root / "models" / "explicit-model")
-    provider = config.serve_provider_config()
-    assert provider.kind is ProviderKind.AZURE_OPENAI
-    assert provider.model_type == "gpt-5.5"
-    assert provider.endpoint == "https://azure.example/v1"
-    assert provider.deployment == "configured-deployment"
-    assert provider.api_version == "2026-01-01"
-
-
-def test_build_wizard_does_not_reuse_connection_for_changed_provider(
-    patched_provider: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    root = tmp_path / ".wmo"
-    settings = load_settings(root)
-    settings.models.worker = ModelRole(
-        provider="azure",
-        model="gpt-5.4",
-        endpoint="https://azure.example/v1",
-        deployment="configured-deployment",
-        api_version="2026-01-01",
-    )
-    save_settings(settings, root)
-
-    def switch_provider(_console, params):  # noqa: ANN001, ANN202
-        return params.model_copy(
-            update={
-                "name": "wizard-switch",
-                "file": _traces_file(tmp_path),
-                "provider": "openai",
-                "model": "gpt-5.4-mini",
-                "region": None,
-            }
-        )
-
-    monkeypatch.setattr("wmo.cli.ui.run_build_wizard", switch_provider)
-
-    result = runner.invoke(app, ["build", "--interactive", "--root", str(root)])
-
-    assert result.exit_code == 0, result.output
-    config = load_config(root / "models" / "wizard-switch")
-    provider = config.serve_provider_config()
-    assert provider.kind is ProviderKind.OPENAI
-    assert provider.endpoint is None
-    assert provider.deployment is None
-    assert provider.api_version is None
-
-
-def test_build_writes_model_card(patched_provider, tmp_path) -> None:  # noqa: ANN001
-    from wmo.common.config.card import load_card
-
-    root = tmp_path / ".wmo"
-    _build(root, "tau2-airline", tmp_path)
-    card = load_card(root / "models" / "tau2-airline")
-    assert card is not None
-    assert card.name == "tau2-airline"
-    assert card.corpus.traces is not None and card.corpus.traces > 0
-    assert card.corpus.steps > 0
-    assert card.provider == "bedrock"
-    assert card.built_at is not None
-
-
-def test_build_survives_card_write_failure(patched_provider, monkeypatch, tmp_path) -> None:  # noqa: ANN001
-    # The card is additive metadata: a write failure must not fail an otherwise-complete build.
-    def _boom(card, model_dir) -> None:  # noqa: ANN001
-        raise OSError("disk full")
-
-    monkeypatch.setattr("wmo.common.config.card.save_card", _boom)
-    root = tmp_path / ".wmo"
-    _build(root, "tau2-airline", tmp_path)  # asserts exit_code == 0 internally
-    assert (root / "models" / "tau2-airline" / "config.toml").exists()
 
 
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
     core = {
         "build",
-        "ingest",
         "list",
         "serve",
         "eval",
@@ -153,6 +21,19 @@ def test_cli_exposes_the_small_command_set() -> None:
     # `optimize` is a GROUP (route, model, and distill; harness search moved out).
     groups = {group.name for group in app.registered_groups}
     assert "optimize" in groups
+
+
+def test_main_keeps_environment_loading_before_cli_dispatch(monkeypatch) -> None:  # noqa: ANN001
+    """Preserve the explicit environment-loading boundary without reading a real env file."""
+    app_module = importlib.import_module("wmo.cli.app")
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "load_env_file", lambda: calls.append("load_env_file"))
+    monkeypatch.setattr(app_module, "_quiet_http_logs", lambda: calls.append("quiet_logs"))
+    monkeypatch.setattr(app_module, "app", lambda: calls.append("dispatch"))
+
+    app_module.main()
+
+    assert calls == ["load_env_file", "quiet_logs", "dispatch"]
 
 
 def test_knowledge_command_prints_path_and_files(tmp_path) -> None:  # noqa: ANN001 - fixture
@@ -275,11 +156,10 @@ def test_knowledge_resolves_a_shipped_example(tmp_path, monkeypatch) -> None:  #
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        (["build", "--help"], "[deprecated] alias for --source"),
+        (["build", "--help"], "Canonical source format: otlp"),
         (["eval", "--help"], "`[models.agent]` selects a distinct agent provider"),
         (["providers", "set", "--help"], "settings.toml` as `[models.worker]`"),
         (["providers", "verify", "--help"], "the `[models.<role>]` roles in"),
-        (["scenarios", "build", "--help"], "settings.toml [models.worker|judge|summary]."),
     ],
 )
 def test_help_keeps_the_bracketed_pointer_it_exists_to_teach(
@@ -287,9 +167,8 @@ def test_help_keeps_the_bracketed_pointer_it_exists_to_teach(
 ) -> None:
     """Typer renders help through rich markup, which swallows an unescaped `[...]` whole.
 
-    Each of these is the only pointer in that help text to where the setting lives (or, for
-    `--vendor`, the only sign that the option is deprecated), so a swallowed pair is silent
-    misinformation.
+    Each is the only pointer in that help text to a concrete user-facing setting, so a swallowed
+    pair is silent misinformation.
     """
     result = runner.invoke(app, argv)
     assert result.exit_code == 0, result.output
@@ -306,25 +185,6 @@ def test_bare_invocation_shows_help(args: list[str]) -> None:
     # Bare invocation keeps the usage-error exit code (click >=8.2), unlike explicit --help
     # which exits 0 - scripts can still tell "asked for help" from "forgot the command".
     assert result.exit_code == 2
-
-
-def test_build_rejects_invalid_name_flag_with_friendly_error(tmp_path) -> None:  # noqa: ANN001
-    result = runner.invoke(
-        app,
-        ["build", "--name", "tau/bench", "--file", _traces_file(tmp_path), "--no-interactive"],
-    )
-    assert result.exit_code == 2  # usage error, not a ValueError traceback
-    assert "invalid world model name" in result.output
-
-
-def test_build_rejects_the_reserved_harbor_name(tmp_path) -> None:  # noqa: ANN001
-    """`harbor` is the optimize environment literal, so no world model may claim it."""
-    result = runner.invoke(
-        app,
-        ["build", "--name", "harbor", "--file", _traces_file(tmp_path), "--no-interactive"],
-    )
-    assert result.exit_code == 2
-    assert "reserved" in result.output
 
 
 def test_serve_rejects_invalid_name_with_friendly_error(tmp_path) -> None:  # noqa: ANN001

@@ -1,7 +1,6 @@
-"""World-model construction, execution, and evaluation."""
+"""World-model execution surfaces retained outside canonical trace mining."""
 
 from wmo.simulation.environment import WorldModelEnv
 from wmo.simulation.model import WorldModel
-from wmo.simulation.scenarios.spec import Scenario, scenarios_from_traces
 
-__all__ = ["Scenario", "WorldModel", "WorldModelEnv", "scenarios_from_traces"]
+__all__ = ["WorldModel", "WorldModelEnv"]

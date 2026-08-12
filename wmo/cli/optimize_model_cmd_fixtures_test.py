@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -18,6 +20,7 @@ import wmo.simulation as env_module
 from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.common.config import HarnessConfig, save_config
+from wmo.common.core.artifacts import canonical_json_bytes
 from wmo.common.core.types import (
     Action,
     ActionKind,
@@ -29,6 +32,7 @@ from wmo.common.core.types import (
 )
 from wmo.common.judging.episode import EpisodeScore
 from wmo.common.observability import Phase, RunRecord, UsageTotals, load_runs
+from wmo.common.project import ProjectConfig, ProjectStore
 from wmo.common.providers.base import (
     Completion,
     Message,
@@ -39,8 +43,9 @@ from wmo.common.providers.base import (
     VerifyResult,
 )
 from wmo.common.providers.pool import load_pool
+from wmo.common.tasks import TaskCase, TaskSet, ToolSchema, resolve_task_set
 from wmo.optimize.routing.compression import CompressionConfig
-from wmo.optimize.routing.evaluation import scenario_id
+from wmo.optimize.routing.evaluation import task_id
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.pipeline import (
     MANIFEST_FILENAME,
@@ -57,11 +62,9 @@ from wmo.optimize.routing.policy import (
     RoutingPolicy,
 )
 from wmo.optimize.routing.report import ImprovementReport
-from wmo.optimize.routing.sweep import SweepPlan, plan_sweep, resolve_config
+from wmo.optimize.routing.sweep import SweepPlan, plan_sweep
 from wmo.optimize.routing.sweep_partial import PartialHeader
-from wmo.simulation.ingest.otel_writer import write_traces_jsonl
 from wmo.simulation.model.world_model import WorldModel
-from wmo.simulation.serving.traces_source import TRACES_FILENAME
 
 runner = CliRunner()
 
@@ -156,8 +159,53 @@ def _corpus(count: int = 30) -> list[Trace]:
     ]
 
 
+def _write_task_set(root: Path, traces: list[Trace]) -> None:
+    """Persist a verified immutable task set for direct optimizer command fixtures."""
+    project = ProjectStore(root, "default")
+    project.initialize(ProjectConfig(project_id="default"))
+    ordered = tuple(sorted(traces, key=lambda trace: trace.trace_id))
+    held_out_ids = set(_HELD_OUT_IDS).intersection(trace.trace_id for trace in ordered)
+    tasks = tuple(
+        TaskCase(
+            task_id=trace.trace_id,
+            lineage_group_id=f"lineage-{trace.trace_id}",
+            partition="held_out" if trace.trace_id in held_out_ids else "fit",
+            instruction=trace.steps[0].task or f"task {trace.trace_id}",
+            tools=(
+                ToolSchema(
+                    name=trace.steps[0].action.name or "message",
+                    description="Fixture task tool.",
+                    input_schema={"type": "object"},
+                ),
+            ),
+            workload_weight=1.0,
+            source_trace_ids=(trace.trace_id,),
+        )
+        for trace in ordered
+    )
+    payload = b"\n".join(canonical_json_bytes(task) for task in tasks) + b"\n"
+    task_set = TaskSet(
+        schema_version=1,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="test",
+        task_set_id="task-set-optimize",
+        task_ids=tuple(task.task_id for task in tasks),
+        tasks_path="tasks.jsonl",
+        tasks_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    project.artifacts.write(
+        artifact_id=task_set.task_set_id,
+        artifact_type="task-set",
+        envelope=task_set,
+        files={
+            "tasks.jsonl": payload,
+            "task-set.json": canonical_json_bytes(task_set),
+        },
+    )
+
+
 def _project(tmp_path: Path) -> Path:
-    """A built-model artifact dir (config + its own corpus); returns the project root."""
+    """A legacy model config plus the immutable task set routing now consumes."""
     root = tmp_path / ".wmo"
     model_dir = root / "models" / "support"
     save_config(
@@ -168,7 +216,7 @@ def _project(tmp_path: Path) -> Path:
         ),
         model_dir,
     )
-    write_traces_jsonl(_corpus(), model_dir / TRACES_FILENAME)
+    _write_task_set(root, _corpus())
     return root
 
 
@@ -375,10 +423,9 @@ def _sweep_plan(tmp_path: Path, root: Path) -> SweepPlan:
     model_dir = root / "models" / "support"
     return plan_sweep(
         model_dir=model_dir,
-        config=resolve_config(model_dir),
         pool=load_pool(_pool_file(tmp_path)),
         out_path=_paths(root)[0],
-        traces_file=None,
+        task_set=resolve_task_set(ProjectStore(root, "default").artifacts),
         scenarios=3,
         episodes=1,
         max_steps=4,
@@ -442,7 +489,7 @@ __all__ = (
     "load_pool",
     "EpisodeScore",
     "CompressionConfig",
-    "scenario_id",
+    "task_id",
     "OutcomeMatrix",
     "ScenarioOutcome",
     "MANIFEST_FILENAME",
@@ -458,11 +505,8 @@ __all__ = (
     "ImprovementReport",
     "SweepPlan",
     "plan_sweep",
-    "resolve_config",
     "PartialHeader",
-    "write_traces_jsonl",
     "WorldModel",
-    "TRACES_FILENAME",
     "runner",
     "_local_model_uncached",
     "optimize_module",
@@ -475,6 +519,7 @@ __all__ = (
     "_wide_console",
     "_no_azure_embedder_env",
     "_corpus",
+    "_write_task_set",
     "_project",
     "_pool_file",
     "_FakeWorldModel",

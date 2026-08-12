@@ -19,10 +19,10 @@ from wmo.common.providers.base import (
     VerifyResult,
 )
 from wmo.common.providers.pool import ModelPool, PoolEntry
+from wmo.common.tasks import TaskCase
 from wmo.optimize.routing.compression import CompressionConfig
 from wmo.optimize.routing.evaluation import evaluate_pool
 from wmo.optimize.routing.outcomes import ScenarioOutcome
-from wmo.simulation.scenarios.spec import Scenario
 
 
 class _FakeEnv:
@@ -142,9 +142,21 @@ def _pool() -> ModelPool:
     )
 
 
-_SCENARIOS = [
-    Scenario(task="list the files", provenance=["trace-1"]),
-    Scenario(task="delete the files", provenance=["trace-2"]),
+def _task(task_id: str, instruction: str) -> TaskCase:
+    """Build a minimal immutable task fixture for closed-loop evaluation."""
+    return TaskCase(
+        task_id=task_id,
+        lineage_group_id=f"lineage-{task_id}",
+        partition="held_out",
+        instruction=instruction,
+        workload_weight=1.0,
+        source_trace_ids=(task_id,),
+    )
+
+
+_TASKS = [
+    _task("trace-1", "list the files"),
+    _task("trace-2", "delete the files"),
 ]
 
 
@@ -152,7 +164,7 @@ def test_evaluate_pool_builds_full_matrix() -> None:
     matrix = evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
         _pool(),
-        _SCENARIOS,
+        _TASKS,
         provider_factory=_ScriptedProvider,
         max_steps=5,
     )
@@ -180,7 +192,7 @@ def test_evaluate_pool_repeats_episodes() -> None:
     matrix = evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.5, success=True, critique="")),
         _pool(),
-        _SCENARIOS[:1],
+        _TASKS[:1],
         provider_factory=_ScriptedProvider,
         episodes_per_scenario=3,
     )
@@ -193,7 +205,7 @@ def test_evaluate_pool_requires_a_scoring_env() -> None:
         evaluate_pool(
             lambda: _FakeEnv(None),
             _pool(),
-            _SCENARIOS[:1],
+            _TASKS[:1],
             provider_factory=_ScriptedProvider,
         )
 
@@ -202,7 +214,7 @@ def test_scenario_ids_fall_back_to_task_hash() -> None:
     matrix = evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.1, success=False, critique="")),
         _pool(),
-        [Scenario(task="no provenance here")],
+        [_task("task-no-provenance", "no provenance here")],
         provider_factory=_ScriptedProvider,
     )
     (scenario_id,) = matrix.scenario_ids()
@@ -210,7 +222,7 @@ def test_scenario_ids_fall_back_to_task_hash() -> None:
     rerun = evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.1, success=False, critique="")),
         _pool(),
-        [Scenario(task="no provenance here")],
+        [_task("task-no-provenance", "no provenance here")],
         provider_factory=_ScriptedProvider,
     )
     assert rerun.scenario_ids() == [scenario_id]
@@ -222,7 +234,7 @@ def test_scoring_failure_costs_one_cell_not_the_sweep() -> None:
     matrix = evaluate_pool(
         _ThrottledScoringEnv,
         _pool(),
-        _SCENARIOS,
+        _TASKS,
         provider_factory=_ScriptedProvider,
     )
     assert len(matrix.outcomes) == 4  # 2 models x 2 scenarios: nothing aborted
@@ -240,7 +252,7 @@ def test_errored_episode_is_unscored_even_when_the_env_scored_it() -> None:
     matrix = evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.05, success=False, critique="did nothing")),
         _pool(),
-        _SCENARIOS[:1],
+        _TASKS[:1],
         provider_factory=_FailFirstProvider,
     )
     outcome = matrix.outcomes[0]
@@ -261,7 +273,7 @@ def test_broken_progress_callback_does_not_abort_the_sweep() -> None:
     matrix = evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
         _pool(),
-        _SCENARIOS,
+        _TASKS,
         provider_factory=_ScriptedProvider,
         on_outcome=explode,
     )
@@ -276,7 +288,7 @@ def test_wrong_typed_score_yields_unscored_row_with_reason() -> None:
     matrix = evaluate_pool(
         lambda: _FakeEnv(cast("EpisodeScore", {"reward": 1.0})),
         _pool(),
-        _SCENARIOS[:1],
+        _TASKS[:1],
         provider_factory=_ScriptedProvider,
     )
     outcome = matrix.outcomes[0]
@@ -330,7 +342,7 @@ def test_history_chars_reaches_the_agent_from_evaluate_pool() -> None:
                 )
             ]
         ),
-        [Scenario(task="fetch the thing")],
+        [_task("fetch-the-thing", "fetch the thing")],
         max_steps=2,
         history_chars=77,
         provider_factory=_Recorder,
@@ -371,7 +383,7 @@ def test_evaluate_pool_threads_compression_through_the_measured_path() -> None:
     matrix = evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
         _pool(),
-        _SCENARIOS[:1],
+        _TASKS[:1],
         provider_factory=factory,
         max_steps=5,
         compression=CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
@@ -398,7 +410,7 @@ def test_evaluate_pool_threads_compression_through_the_measured_path() -> None:
     evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
         _pool(),
-        _SCENARIOS[:1],
+        _TASKS[:1],
         provider_factory=control_factory,
         max_steps=5,
     )
@@ -412,7 +424,7 @@ def test_uncompressed_rows_keep_default_compression_fields() -> None:
     matrix = evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
         _pool(),
-        _SCENARIOS[:1],
+        _TASKS[:1],
         provider_factory=_ScriptedProvider,
         max_steps=5,
     )
@@ -446,7 +458,7 @@ def _timed_evaluation(max_concurrency: int) -> tuple[float, list[ScenarioOutcome
     matrix = evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
         _pool(),
-        _SCENARIOS,
+        _TASKS,
         provider_factory=_SleepingProvider,
         max_steps=2,
         max_concurrency=max_concurrency,
@@ -498,7 +510,7 @@ def test_the_matrix_is_in_cell_order_even_when_the_cells_finish_backwards() -> N
     matrix = evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
         _pool(),
-        _SCENARIOS,
+        _TASKS,
         provider_factory=_PacedProvider,
         max_steps=2,
         max_concurrency=4,
@@ -530,7 +542,7 @@ def test_the_progress_callback_never_runs_two_cells_at_once() -> None:
     evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
         _pool(),
-        _SCENARIOS,
+        _TASKS,
         provider_factory=_ScriptedProvider,
         max_concurrency=4,
         on_outcome=watch,
@@ -563,7 +575,7 @@ def test_a_cell_that_raises_under_concurrency_still_reports_the_cells_that_finis
         evaluate_pool(
             next_env,
             ModelPool(models=[_pool().models[0]]),
-            _SCENARIOS,
+            _TASKS,
             provider_factory=_ScriptedProvider,
             max_concurrency=2,
             on_outcome=lambda outcome: seen.append(outcome.scenario_id),
@@ -576,7 +588,7 @@ def test_a_concurrency_below_one_is_a_usage_error() -> None:
         evaluate_pool(
             lambda: _FakeEnv(EpisodeScore(reward=0.1, success=False, critique="")),
             _pool(),
-            _SCENARIOS[:1],
+            _TASKS[:1],
             provider_factory=_ScriptedProvider,
             max_concurrency=0,
         )

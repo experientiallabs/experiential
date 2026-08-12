@@ -459,16 +459,16 @@ def test_route_sweep_rejects_a_missing_pool_file(
     assert not out.exists()
 
 
-def test_route_sweep_rejects_a_missing_trace_corpus(
+def test_route_sweep_rejects_a_missing_immutable_task_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_seams(monkeypatch)
-    root = _project(tmp_path, traces=None)  # a built model whose corpus was never kept
+    root = _project(tmp_path, traces=None)
     out, result = _sweep(tmp_path, root, "support", "--yes")
     assert result.exit_code != 0
     flat = _flat(result.output)
-    assert "notracecorpus" in flat
-    assert flat.count(TRACES_FILENAME) >= 2  # both places it looked, so the fix is obvious
+    assert "noimmutabletaskset" in flat
+    assert "wmobuild" in flat
     assert not out.exists()
 
 
@@ -484,50 +484,18 @@ def test_route_sweep_rejects_an_unbuilt_world_model(
     assert not out.exists()
 
 
-def test_route_sweep_says_when_a_tiny_corpus_is_not_leak_free(
+def test_route_sweep_keeps_the_immutable_held_out_partition_for_small_task_sets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Three train-band traces: the split leaves no held-out band, so the sweep falls back to the
-    # whole corpus the way `wmo eval` does and must say the scenarios are not leak-free.
+    # Even a small task set has an explicit held-out partition. The sweep must not recreate a
+    # split from its source traces or fall back to fit tasks.
     _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus(3))
     out, result = _sweep(tmp_path, root, "--scenarios", "2", "--yes")  # default model resolution
     assert result.exit_code == 0, result.output
-    assert "notleak-free" in _flat(result.output)
-    # Deterministic even here: the corpus is written newest-id-first, and `--scenarios` still cuts
-    # the same by-trace-id prefix.
+    assert "notleak-free" not in _flat(result.output)
+    # The direct fixture marks this stable task-ID prefix held out.
     assert OutcomeMatrix.load(out).scenario_ids() == ["tr-000", "tr-001"]
-
-
-def test_route_sweep_takes_the_corpus_from_traces_for_a_locally_built_model(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # `wmo build` keeps prompts, metrics and the index but NOT the corpus it read, so a model
-    # built the canonical way has no sibling traces file. `--traces` is the only thing that makes
-    # the documented call site work on such a project.
-    _patch_seams(monkeypatch)
-    root = _project(tmp_path, traces=None)  # built the canonical way: no corpus kept
-    corpus_file = tmp_path / "elsewhere" / "traces.otel.jsonl"
-    write_traces_jsonl(_corpus(), corpus_file)
-    out, result = _sweep(
-        tmp_path, root, "support", "--traces", str(corpus_file), "--scenarios", "2", "--yes"
-    )
-    assert result.exit_code == 0, result.output
-    assert OutcomeMatrix.load(out).scenario_ids() == list(_HELD_OUT_IDS[:2])
-
-
-def test_route_sweep_rejects_a_traces_file_that_is_not_there(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _patch_seams(monkeypatch)
-    root = _project(tmp_path, traces=None)
-    out, result = _sweep(
-        tmp_path, root, "support", "--traces", str(tmp_path / "gone.jsonl"), "--yes"
-    )
-    assert result.exit_code != 0
-    flat = _flat(result.output)
-    assert "gone.jsonl" in flat and "--traces" in flat
-    assert not out.exists()
 
 
 def test_route_sweep_names_the_positional_when_the_model_is_ambiguous(
@@ -538,7 +506,6 @@ def test_route_sweep_names_the_positional_when_the_model_is_ambiguous(
     # to name what a user of THIS command types.
     _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())
-    _project(tmp_path, traces=_corpus())  # same root
     save_config(
         HarnessConfig(
             providers=[ProviderConfig(kind=ProviderKind.ANTHROPIC, model="fake-serve")],

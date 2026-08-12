@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import importlib
-import inspect
 import json
 import os
-import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 
 import pytest
 import typer
@@ -43,8 +40,6 @@ from wmo.common.providers.base import (
 )
 from wmo.common.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 from wmo.common.providers.tinker import _MISSING_TINKER_EXTRA
-from wmo.simulation.ingest import VendorPull
-from wmo.simulation.model.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
 
 cli_app_module = importlib.import_module("wmo.cli.app")
 
@@ -110,13 +105,17 @@ def _squashed(text: str) -> str:
 
 
 def _traces_file(tmp_path) -> str:  # noqa: ANN001 - pytest fixture path
+    """Write one strict canonical OTLP trace for local command fixtures."""
     span_llm = {
         "traceId": "a" * 32,
-        "spanId": "s1",
+        "spanId": "1" * 16,
         "name": "chat",
-        "startTimeUnixNano": 1,
+        "startTimeUnixNano": "1760000000000000000",
+        "endTimeUnixNano": "1760000001000000000",
         "attributes": [
             {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+            {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
+            {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-test"}},
             {"key": "gen_ai.tool.name", "value": {"stringValue": "get_user"}},
             {"key": "gen_ai.tool.call.arguments", "value": {"stringValue": '{"id": "u1"}'}},
             {"key": "gen_ai.prompt", "value": {"stringValue": "look up u1"}},
@@ -124,9 +123,11 @@ def _traces_file(tmp_path) -> str:  # noqa: ANN001 - pytest fixture path
     }
     span_tool = {
         "traceId": "a" * 32,
-        "spanId": "s2",
+        "spanId": "2" * 16,
+        "parentSpanId": "1" * 16,
         "name": "execute_tool",
-        "startTimeUnixNano": 2,
+        "startTimeUnixNano": "1760000001000000000",
+        "endTimeUnixNano": "1760000002000000000",
         "attributes": [
             {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
             {"key": "gen_ai.tool.message", "value": {"stringValue": "found u1"}},
@@ -141,26 +142,14 @@ def _traces_file(tmp_path) -> str:  # noqa: ANN001 - pytest fixture path
 def patched_provider(monkeypatch) -> None:  # noqa: ANN001 - pytest fixture
     """Swap the real provider registry for the fake everywhere the CLI constructs one.
 
-    Each module binds `get_provider` at its own import time (build.py for the build pipeline,
-    loader.py for serve/demo/play), so patch every module-level name plus the registry the lazy
-    imports read.
+    Each production surface binds provider factories at module import time, so patch the
+    package-level seams and registry used by deterministic local evaluation fixtures.
     """
-    import sys
-
     import wmo.common.providers as providers_pkg
     import wmo.common.providers.registry as registry
     import wmo.common.providers.waterfall as waterfall_mod
 
     fake = FakeProvider()
-    # `wmo.simulation.model.__init__` rebinds `build` to the function, shadowing the submodule
-    # attribute, so reach module objects through sys.modules rather than attribute access.
-    monkeypatch.setattr(
-        sys.modules["wmo.simulation.model.build"], "get_provider", lambda config: fake
-    )
-    # loader.py (serve/demo/play) and the CLI construct through the chain-aware seam.
-    monkeypatch.setattr(
-        sys.modules["wmo.simulation.model.loader"], "provider_or_chain", lambda config, **kw: fake
-    )
     monkeypatch.setattr(providers_pkg, "get_provider", lambda config: fake)
     monkeypatch.setattr(providers_pkg, "provider_or_chain", lambda config, **kw: fake)
     # The pre-build verify guard pings via verify_all/verify_embedder, which construct providers
@@ -168,26 +157,6 @@ def patched_provider(monkeypatch) -> None:  # noqa: ANN001 - pytest fixture
     # patch the name waterfall.py bound at import for its no-chain-file passthrough.
     monkeypatch.setattr(registry, "get_provider", lambda config: fake)
     monkeypatch.setattr(waterfall_mod, "get_provider", lambda config: fake)
-
-
-def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture paths
-    result = runner.invoke(
-        app,
-        [
-            "build",
-            "--name",
-            name,
-            "--file",
-            _traces_file(tmp_path),
-            "--root",
-            str(root),
-            "--provider",
-            "bedrock",
-            "--fidelity",
-            "low",
-        ],
-    )
-    assert result.exit_code == 0, result.output
 
 
 def _flat(output: str) -> str:
@@ -330,45 +299,19 @@ def _azure_worker_settings(monkeypatch: pytest.MonkeyPatch, deployment: str | No
     )
 
 
-def _build_cli_train_split_default() -> float:
-    """The `--train-split` default `wmo build` registers, read off the Typer option itself."""
-    option = inspect.signature(build_module.build).parameters["train_split"].default
-    return cast(float, option.default)
-
-
-def _eval_cli_train_split_default() -> float:
-    """The train split `wmo eval` resolves when the user passes no `--train-split`."""
-    # `_eval_options` is the resolver under test: it is where `wmo eval` turns "no flag given"
-    # into a concrete split, so asserting on its output is asserting on the real default.
-    options = eval_module._eval_options(
-        prompt_file=None,
-        train_split=None,
-        embed_dim=None,
-        rag=None,
-        sample_turns=None,
-        seed=None,
-        top_k=None,
-    )
-    return options.train_split
-
-
 # The lean root app composes these commands; tests target their owning modules rather than
 # retaining aliases in the composition layer.
 catalog_module = importlib.import_module("wmo.cli.catalog_cmd")
-build_module = importlib.import_module("wmo.cli.build_cmd")
 eval_module = importlib.import_module("wmo.cli.eval_cmd")
 command_common_module = importlib.import_module("wmo.cli.command_common")
 
 __all__ = (
     "importlib",
-    "inspect",
     "json",
     "os",
-    "sys",
     "time",
     "Path",
     "SimpleNamespace",
-    "cast",
     "pytest",
     "typer",
     "ValidationError",
@@ -401,10 +344,6 @@ __all__ = (
     "CATALOG_PATH_ENV",
     "PriceCatalog",
     "_MISSING_TINKER_EXTRA",
-    "VendorPull",
-    "DEFAULT_TRAIN_SPLIT",
-    "split_traces",
-    "split_traces_3way",
     "cli_app_module",
     "runner",
     "_flat",
@@ -413,7 +352,6 @@ __all__ = (
     "_squashed",
     "_traces_file",
     "patched_provider",
-    "_build",
     "_accept_every_provider",
     "_seed_openrouter_catalog",
     "_record_eval_providers",
@@ -425,10 +363,7 @@ __all__ = (
     "_write_settings",
     "_record_verify_all",
     "_azure_worker_settings",
-    "_build_cli_train_split_default",
-    "_eval_cli_train_split_default",
     "catalog_module",
-    "build_module",
     "eval_module",
     "command_common_module",
 )

@@ -3,9 +3,8 @@
 Routes are namespaced by world model name (`/world_models/{name}/...`) so one backend can serve
 several named models at once - from one or more store roots (`.wmo`, a downloaded task dir, ...).
 Each route is a thin transport over an in-process `WorldModel`; the CLI and the API share the
-same code path. `GET /world_models` also returns each model's `card.json` (when present), and
-the `/world_models/builds` routes run new builds server-side so the website's build-your-own
-flow can watch progress over SSE.
+same code path. `GET /world_models` also returns each model's `card.json` when present. Canonical
+trace normalization and task mining belong exclusively to the local `wmo build` command.
 
 The backend is also the *reward* server for RL training: `POST .../sessions/{id}/score` judges the
 session's rollout (task + history) with `EpisodeRewardJudge`, returning the scalar episode reward
@@ -16,14 +15,11 @@ training scaffold gets environment and reward behind one API.
 from __future__ import annotations
 
 import logging
-import re
-import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from wmo.common.config import ARTIFACT_DIR, WorldModelStore, validate_name
@@ -35,7 +31,6 @@ from wmo.optimize.routing.pareto import PARETO_FILENAME, ParetoCurve
 from wmo.optimize.routing.policy import POLICY_FILENAME, RoutingPolicy
 from wmo.simulation.model.loader import load_world_model
 from wmo.simulation.model.world_model import WorldModel
-from wmo.simulation.serving.builds import BuildManager, BuildRouteRequest, BuildSnapshot
 from wmo.simulation.serving.chat import (
     EndpointRuntime,
     RequestLog,
@@ -50,19 +45,14 @@ from wmo.simulation.serving.traces_source import (
     TracesResponse,
     local_traces_path,
     resolve_url,
-    scenarios_from_traces,
+    trace_summaries_from_otlp,
 )
 
 logger = logging.getLogger(__name__)
 
-# Only browser origins matching this may reach the API (see the CORS note in create_app). Kept as
-# a module constant so the multipart-upload route can re-check it: multipart POSTs are CORS
-# "simple requests" that skip preflight, so CORSMiddleware alone does not stop a foreign page from
-# writing to disk - the route validates the Origin header itself.
+# Only browser origins matching this may reach the API. The API keeps CORS restricted because
+# served sessions and OpenAI-compatible endpoints may invoke configured local providers.
 ALLOWED_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
-
-# Reject an upload whose body exceeds this; keeps a stray/malicious POST from filling the disk.
-_MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 
 
 class NewSessionRequest(BaseModel):
@@ -108,12 +98,6 @@ class ModelsResponse(BaseModel):
     models: list[ModelCardEntry]
 
 
-class NewBuildResponse(BaseModel):
-    """Build-start reply: the id to poll for build events."""
-
-    build_id: str
-
-
 class KnowledgeResponse(BaseModel):
     """The model's knowledge base: enabled + every markdown file's content."""
 
@@ -125,12 +109,6 @@ class KnowledgeFileRequest(BaseModel):
     """Knowledge-file write body: the markdown to store."""
 
     content: str
-
-
-class UploadResponse(BaseModel):
-    """Trace-upload reply: the stored path of the uploaded file."""
-
-    file: str
 
 
 def resolve_model_dirs(artifact_dirs: Sequence[str], names: list[str] | None) -> dict[str, Path]:
@@ -280,7 +258,6 @@ def create_app(
     names: list[str] | None = None,
     world_models: dict[str, WorldModel] | None = None,
     cards: dict[str, ModelCard | None] | None = None,
-    build_manager: BuildManager | None = None,
     max_fidelity: bool = False,
     policies: dict[str, RoutingPolicy] | None = None,
 ) -> FastAPI:
@@ -288,10 +265,7 @@ def create_app(
 
     Models are either injected directly via `world_models` (name -> model, for tests), or loaded
     from every root in `artifact_dirs` with `names` selecting which to serve (default: all built
-    ones). When loading from disk, server-side builds are enabled and land in the first root
-    (the writable one, `.wmo` by convention); with injected models pass `build_manager`
-    explicitly or the build routes return 503. `max_fidelity` serves every disk-loaded model
-    with its online extras (the build-measured winner — see `WorldModel.load`).
+    ones). `max_fidelity` serves every disk-loaded model with its online extras.
 
     A model whose artifact dir carries a `policy.json` also serves as an OpenAI-compatible
     ENDPOINT: `/v1/chat/completions` (streaming included) routes each call through that policy
@@ -348,36 +322,6 @@ def create_app(
     )
     install_openai_error_shapes(app)
 
-    def _register(name: str, model_dir: Path) -> None:
-        """A finished serve-side build joins the live serving set immediately.
-
-        The card is published BEFORE the model so a concurrent `GET /world_models` can never list
-        the new model with a null card (readers key off `models`); any name they see already has
-        its card entry.
-        """
-        world_model, _provider = load_world_model(
-            model_dir, telemetry_root=artifact_dirs[0], max_fidelity=max_fidelity
-        )
-        model_cards[name] = _load_card_or_none(model_dir)
-        model_dirs[name] = model_dir
-        models[name] = world_model
-
-    def _name_taken(name: str) -> bool:
-        # Taken if it's in the live served set OR built on disk under any root - the latter
-        # catches a model built earlier but not currently served (via `--name`), which a build
-        # would otherwise silently overwrite.
-        if name in models:
-            return True
-        return any(WorldModelStore(root).exists(name) for root in artifact_dirs)
-
-    builds = build_manager
-    if builds is None and world_models is None:
-        builds = BuildManager(
-            store_root=artifact_dirs[0],
-            name_taken=_name_taken,
-            register=_register,
-        )
-
     def _model_or_404(name: str) -> WorldModel:
         try:
             return models[name]
@@ -393,15 +337,6 @@ def create_app(
         except KeyError:
             raise HTTPException(status_code=404, detail=f"no session {session_id}") from None
 
-    def _builds_or_503() -> BuildManager:
-        if builds is None:
-            raise HTTPException(
-                status_code=503,
-                detail="server-side builds are not enabled on this backend; "
-                "run `wmo build` locally instead",
-            )
-        return builds
-
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
@@ -413,74 +348,6 @@ def create_app(
             models=[
                 ModelCardEntry(name=name, card=model_cards.get(name)) for name in sorted(models)
             ],
-        )
-
-    @app.post("/world_models/builds", response_model=NewBuildResponse, status_code=202)
-    def new_build(req: BuildRouteRequest) -> NewBuildResponse:
-        manager = _builds_or_503()
-        try:
-            return NewBuildResponse(build_id=manager.start(req))
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from None
-        except FileExistsError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from None
-        except ValueError as exc:  # bad provider kind / model name / split
-            raise HTTPException(status_code=422, detail=str(exc)) from None
-
-    @app.post("/world_models/builds/uploads", response_model=UploadResponse)
-    def upload_traces(request: Request, file: UploadFile) -> UploadResponse:
-        manager = _builds_or_503()
-        # A multipart POST is a CORS "simple request" that skips preflight, so CORSMiddleware
-        # can't stop a foreign page from reaching this disk-writing route. Re-check the Origin
-        # here: browsers always send it on cross-origin requests, and we require it to be one of
-        # our own (or absent, i.e. a same-origin/non-browser caller like curl).
-        origin = request.headers.get("origin")
-        if origin is not None and not re.match(ALLOWED_ORIGIN_REGEX, origin):
-            raise HTTPException(status_code=403, detail=f"origin {origin!r} not allowed")
-        manager.uploads_dir.mkdir(parents=True, exist_ok=True)
-        suffix = Path(file.filename or "traces.jsonl").suffix.lower()
-        if suffix not in {".json", ".jsonl"}:
-            suffix = ".jsonl"
-        target = manager.uploads_dir / f"{uuid.uuid4().hex}{suffix}"
-        # Stream to disk in chunks (Starlette already spooled it to a temp file) with a size cap,
-        # so a huge/malicious upload can't be slurped whole into memory or fill the disk.
-        written = 0
-        with target.open("wb") as fh:
-            while chunk := file.file.read(1024 * 1024):
-                written += len(chunk)
-                if written > _MAX_UPLOAD_BYTES:
-                    fh.close()
-                    target.unlink(missing_ok=True)
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"upload exceeds {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit",
-                    )
-                fh.write(chunk)
-        return UploadResponse(file=target.name)
-
-    def _snapshot_or_404(manager: BuildManager, build_id: str) -> BuildSnapshot:
-        try:
-            return manager.snapshot(build_id)
-        except KeyError:
-            raise HTTPException(status_code=404, detail=f"no build {build_id}") from None
-
-    @app.get("/world_models/builds/{build_id}", response_model=BuildSnapshot)
-    def build_snapshot(build_id: str) -> BuildSnapshot:
-        return _snapshot_or_404(_builds_or_503(), build_id)
-
-    @app.get("/world_models/builds/{build_id}/events")
-    def build_events(build_id: str, request: Request) -> StreamingResponse:
-        manager = _builds_or_503()
-        _snapshot_or_404(manager, build_id)  # 404 before we hand back a stream
-        # Resume from the client's Last-Event-ID on reconnect so events aren't replayed/duplicated.
-        last = request.headers.get("last-event-id")
-        start = int(last) + 1 if last is not None and last.isdigit() else 0
-        return StreamingResponse(
-            manager.sse_events(build_id, start),
-            media_type="text/event-stream",
-            # Keep proxies/compression from buffering the stream (which would freeze progress
-            # until the build finishes and flushes everything at once).
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     @app.post("/world_models/{world_model_name}/sessions", response_model=NewSessionResponse)
@@ -571,7 +438,7 @@ def create_app(
             return TracesResponse(
                 source="local",
                 downloadable=False,
-                scenarios=scenarios_from_traces(local),
+                scenarios=trace_summaries_from_otlp(local),
                 download=progress,
             )
         has_hub = card is not None and card.traces_hf is not None

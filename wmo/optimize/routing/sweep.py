@@ -1,8 +1,8 @@
 """The routing sweep's library core: plan a closed-loop measurement, then run it.
 
 `wmo optimize route sweep` and the sweep stage of `wmo optimize model` are two faces of THIS
-module, so the two cannot drift. What lives here once: the scenario cut (the corpus's held-out
-band, sorted by trace id, capped by `scenarios`), the backend pre-flight that resolves every
+module, so the two cannot drift. What lives here once: the immutable held-out task cut, sorted by
+task ID and capped by `scenarios`, the backend pre-flight that resolves every
 candidate before anything is spent, the projected cost table's arithmetic, and the coverage
 contract that decides whether the resulting matrix is fit-ready.
 
@@ -32,12 +32,13 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from wmo.common.config import ArtifactPaths, HarnessConfig, load_config
+from wmo.common.config import ArtifactPaths
 from wmo.common.core.types import Action, EnvState, Observation
 from wmo.common.judging.episode import EpisodeScore
 from wmo.common.observability import RunRecord, merge_run_records, save_run
 from wmo.common.providers.base import ProviderKind, TokenUsage
 from wmo.common.providers.pool import ModelPool, load_pool, prepare_pool_provider
+from wmo.common.tasks import LoadedTaskSet, TaskCase
 from wmo.optimize.routing.compression import CompressionConfig, compression_signature
 from wmo.optimize.routing.evaluation import (
     CellKey,
@@ -45,7 +46,7 @@ from wmo.optimize.routing.evaluation import (
     ScoringEnv,
     pool_cells,
     run_cells,
-    scenario_id,
+    task_id,
 )
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.sweep_partial import (
@@ -56,13 +57,8 @@ from wmo.optimize.routing.sweep_partial import (
     read_partial,
 )
 from wmo.runtime.agents.llm import DEFAULT_HISTORY_CHARS
-from wmo.simulation.ingest import get_adapter
-from wmo.simulation.model import split_holdout
-from wmo.simulation.scenarios.spec import Scenario, scenarios_from_traces, tools_hint_from_traces
-from wmo.simulation.serving.traces_source import TRACES_FILENAME, local_traces_path
 
 if TYPE_CHECKING:
-    from wmo.common.core.types import Trace
     from wmo.runtime.environment import Env
     from wmo.simulation.model.world_model import WorldModel
 
@@ -138,7 +134,8 @@ class SweepPlan(BaseModel):
     model_dir: Path
     out_path: Path
     pool: ModelPool
-    scenarios: tuple[Scenario, ...]
+    task_set_id: str
+    tasks: tuple[TaskCase, ...]
     episodes: int
     max_steps: int
     tools_hint: str | None
@@ -154,16 +151,15 @@ class SweepPlan(BaseModel):
     # measurement takes, never what a cell measures, so a run resumed at a different value
     # continues the same cohort rather than re-buying it. 1 is the sequential default.
     max_concurrency: int = Field(default=1, ge=1)
-    trace_count: int  # traces the corpus ingested, which is what decides `tiny_corpus`
-    tiny_corpus: bool  # too small for a held-out band, so the scenarios are not leak-free
+    underfilled: bool  # selected held-out task count is below the requested sweep cap
     assume_input_tokens: int
     assume_output_tokens: int
     cost_lines: tuple[CostLine, ...]
 
     @property
     def cells(self) -> int:
-        """Cells the sweep will run: candidates x scenarios x episodes."""
-        return len(self.pool.models) * len(self.scenarios) * self.episodes
+        """Cells the sweep will run: candidates x tasks x episodes."""
+        return len(self.pool.models) * len(self.tasks) * self.episodes
 
     @property
     def total_usd(self) -> float:
@@ -182,20 +178,12 @@ class SweepPlan(BaseModel):
         """
         return PlanIdentity(
             pool=_pool_digest(self.pool),
-            scenarios=tuple(scenario_id(scenario) for scenario in self.scenarios),
+            scenarios=tuple(task_id(task) for task in self.tasks),
             episodes=self.episodes,
             max_steps=self.max_steps,
             history_chars=self.history_chars,
             compression=compression_signature(self.compression),
         )
-
-
-def resolve_config(model_dir: Path) -> HarnessConfig:
-    """The built model's config, or a `SweepError` naming why it could not be read."""
-    try:
-        return load_config(model_dir)
-    except (FileNotFoundError, ValueError) as exc:
-        raise SweepError(str(exc)) from exc
 
 
 def preflight_pool(pool_file: Path) -> PoolPreflight:
@@ -276,10 +264,9 @@ def preflight_pool(pool_file: Path) -> PoolPreflight:
 def plan_sweep(
     *,
     model_dir: Path,
-    config: HarnessConfig,
     pool: ModelPool,
     out_path: Path,
-    traces_file: Path | None,
+    task_set: LoadedTaskSet,
     scenarios: int,
     episodes: int,
     max_steps: int,
@@ -289,11 +276,11 @@ def plan_sweep(
     compression: CompressionConfig | None = None,
     max_concurrency: int = 1,
 ) -> SweepPlan:
-    """Cut the held-out scenario set and project the spend, without touching the filesystem.
+    """Select held-out immutable tasks and project sweep spend without source rereads.
 
-    Everything knowable without spending is settled here: an `out_path` that cannot be written
-    and a corpus that carries no task prompt are both boundary errors, raised before a caller
-    asks its operator to authorize anything.
+    The caller supplies a digest-verified ``LoadedTaskSet``. This function deliberately has no
+    trace-file argument, so a routing sweep cannot reopen source evidence or recreate the removed
+    scenario path after canonical task mining has completed.
 
     `max_concurrency` is how many cells the sweep runs at once (1 = sequential). It is on the
     PLAN because an operator confirms the plan, and how hard a run leans on a provider's rate
@@ -301,8 +288,8 @@ def plan_sweep(
     because it changes nothing about what a cell measures.
 
     Raises:
-        SweepError: The destination is unwritable, the corpus is missing or unreadable, the
-            held-out band carries no task prompt to measure, or `max_concurrency` is below 1.
+        SweepError: The destination is unwritable, the task set has no held-out tasks, or
+            ``max_concurrency`` is below one.
     """
     if max_concurrency < 1:
         raise SweepError(
@@ -310,32 +297,32 @@ def plan_sweep(
             "a time, higher runs that many at once"
         )
     _check_out_writable(out_path)
-    traces = _corpus_traces(model_dir, config.trace_adapter, traces_file)
-    train, holdout, tiny_corpus = split_holdout(
-        traces, config.train_split, (1.0 - config.train_split) / 2
+    fit_tasks = tuple(task for task in task_set.tasks if task.partition == "fit")
+    held_out_tasks = tuple(
+        sorted(
+            (task for task in task_set.tasks if task.partition == "held_out"),
+            key=lambda task: task.task_id,
+        )
     )
-    # Sorted by trace id first, so `scenarios` always cuts the same prefix of the same corpus.
-    ordered = sorted(holdout, key=lambda trace: trace.trace_id)
-    cut = scenarios_from_traces(ordered)[:scenarios]
+    cut = held_out_tasks[:scenarios]
     if not cut:
         raise SweepError(
-            f"the {len(holdout)} held-out trace(s) of world model '{model_dir.name}' carry no "
-            "task prompt, so there is nothing to measure; rebuild from a corpus whose traces "
-            "record the instruction they were given"
+            f"task set {task_set.task_set.task_set_id} has no held-out task to measure; "
+            "rebuild from canonical trace evidence with eligible held-out lineage groups"
         )
     return SweepPlan(
         model_dir=model_dir,
         out_path=out_path,
         pool=pool,
-        scenarios=tuple(cut),
+        task_set_id=task_set.task_set.task_set_id,
+        tasks=tuple(cut),
         episodes=episodes,
         max_steps=max_steps,
-        tools_hint=tools_hint_from_traces(train) or None,
+        tools_hint=_task_tools_hint(fit_tasks) or None,
         history_chars=history_chars,
         compression=compression,
         max_concurrency=max_concurrency,
-        trace_count=len(traces),
-        tiny_corpus=tiny_corpus,
+        underfilled=len(cut) < scenarios,
         assume_input_tokens=assume_input_tokens,
         assume_output_tokens=assume_output_tokens,
         cost_lines=tuple(
@@ -566,7 +553,7 @@ def _resume(plan: SweepPlan, remeasure: frozenset[CellKey]) -> _Resume:
         if key not in remeasure:
             reusable[key.model_dump_json()] = row
     pending: list[PoolCell] = []
-    for cell in pool_cells(plan.pool, list(plan.scenarios), episodes_per_scenario=plan.episodes):
+    for cell in pool_cells(plan.pool, list(plan.tasks), episodes_per_scenario=plan.episodes):
         if cell.key.model_dump_json() in reusable:
             continue
         pending.append(cell.model_copy(update={"remeasured": cell.key in remeasure}))
@@ -593,7 +580,7 @@ def _assemble(
     """
     fresh = {CellKey.of(outcome).model_dump_json(): outcome for outcome in measured}
     ordered: list[ScenarioOutcome] = []
-    for cell in pool_cells(plan.pool, list(plan.scenarios), episodes_per_scenario=plan.episodes):
+    for cell in pool_cells(plan.pool, list(plan.tasks), episodes_per_scenario=plan.episodes):
         key = cell.key.model_dump_json()
         # This attempt's row wins over a reused one: a remeasured cell is measured precisely to
         # replace what the sidecar holds. A cell in neither is one no attempt has run, which the
@@ -829,38 +816,15 @@ def _check_out_writable(out_path: Path) -> None:
         )
 
 
-def _corpus_traces(model_dir: Path, adapter_name: str, explicit: Path | None) -> list[Trace]:
-    """Ingest the corpus the sweep takes its scenarios from: the explicit file, else the model's.
-
-    A build does NOT persist the corpus it read (it keeps prompts, metrics and the retrieval
-    index), so `local_traces_path` finds a file only for a Hub-downloaded model or a shipped
-    example. `--traces` supplies the corpus when no local copy exists, and the failure names it.
-    """
-    if explicit is not None:
-        if not explicit.is_file():
-            raise SweepError(f"no trace file at {explicit} (--traces)")
-        path = explicit
-    else:
-        found = local_traces_path(model_dir)
-        if found is None:
-            raise SweepError(
-                f"no trace corpus for world model '{model_dir.name}': looked for "
-                f"{model_dir / TRACES_FILENAME} and {model_dir.parent.parent / TRACES_FILENAME}. "
-                "Sweep scenarios are the model's OWN held-out task prompts, and a build keeps no "
-                "copy of the corpus it read, so pass `--traces <the file wmo build --file read>` "
-                f"or put that file at {model_dir / TRACES_FILENAME}"
-            )
-        path = found
-    try:
-        traces = get_adapter(adapter_name).from_file(str(path))
-    except (OSError, ValueError) as exc:  # unknown adapter, unreadable or malformed corpus
-        raise SweepError(f"cannot ingest {path}: {exc}") from exc
-    if not traces:
-        raise SweepError(
-            f"{path} ingested no traces with the '{adapter_name}' adapter, so there are no "
-            "scenarios to sweep"
-        )
-    return traces
+def _task_tools_hint(tasks: tuple[TaskCase, ...]) -> str:
+    """Render the fit-task tool surface without looking at held-out task evidence."""
+    rendered: dict[str, str] = {}
+    for task in tasks:
+        for tool in task.tools:
+            properties = tool.input_schema.get("properties")
+            names = sorted(properties) if isinstance(properties, dict) else []
+            rendered[tool.name] = f"{tool.name}({', '.join(names)})"
+    return "\n".join(rendered[name] for name in sorted(rendered))
 
 
 def _estimate_cost(

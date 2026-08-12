@@ -20,7 +20,6 @@ environment is stale or hand-rolled, rather than that an optional install step w
 
 if TYPE_CHECKING:
     from wmo.common.providers import ProviderConfig, ProviderKind
-    from wmo.common.providers.base import Embedder, Provider
     from wmo.common.providers.models import ProviderModel
 
 
@@ -213,68 +212,3 @@ def _worker_role_provider_config(
     if deployment is not None:
         config = config.model_copy(update={"deployment": deployment})
     return config
-
-
-def _scenario_role_llms(
-    provider: str | None, model: str | None, region: str | None
-) -> tuple[Provider, Provider, Provider]:
-    """(summary, worker, judge) providers for scenario construction.
-
-    Explicit `--provider`/`--model` flags pin ALL roles to that one model (the pre-roles
-    behavior); half a pair completes from the configured worker role rather than from bedrock.
-    Otherwise each role resolves from `.wmo/settings.toml`, falling back to worker, then to the
-    built-in default. Judging benefits from a different family than the worker: a same-family
-    judge carries self-preference bias toward the generator's outputs.
-    """
-    import wmo.common.providers as providers
-
-    if provider is not None or model is not None:
-        llm = providers.get_provider(_worker_role_provider_config(provider, model, region))
-        return llm, llm, llm
-    default = _provider_config(_DEFAULT_WORKER_PROVIDER, _DEFAULT_WORKER_MODEL, region)
-    cache: dict[str, Provider] = {}
-    by_role: dict[str, Provider] = {}
-    for role in ("summary", "worker", "judge"):
-        config = _role_provider_config(role, region) or default
-        key = f"{config.kind.value}:{config.model}:{config.endpoint}:{config.region}"
-        if key not in cache:
-            cache[key] = providers.get_provider(config)
-        by_role[role] = cache[key]
-    return by_role["summary"], by_role["worker"], by_role["judge"]
-
-
-def _resolve_scenario_embedder(
-    embed_provider: str, embed_model: str | None, embed_dim: int, region: str | None
-) -> Embedder:
-    import wmo.common.providers as providers
-    from wmo.common.providers import ProviderConfig
-    from wmo.common.providers.base import EmbedderKind
-    from wmo.simulation.retrieval import HashingEmbedder
-
-    try:
-        kind = EmbedderKind(embed_provider)
-    except ValueError:
-        kinds = ", ".join(k.value for k in EmbedderKind)
-        raise typer.BadParameter(
-            f"unknown embed provider {embed_provider!r}; choose one of: {kinds}"
-        ) from None
-    if kind is EmbedderKind.HASHING:
-        return HashingEmbedder(dim=embed_dim)
-    if kind is EmbedderKind.LOCAL:
-        from wmo.common.providers.local_embed import LocalEmbedder
-
-        return LocalEmbedder(embed_model, dim=embed_dim)
-    if not embed_model:
-        raise typer.BadParameter(
-            f"--embed-provider {kind.value} requires --embed-model "
-            "(the embeddings model id / Azure embedding deployment)"
-        )
-    return providers.get_provider(
-        ProviderConfig(
-            kind=kind.provider_kind(),
-            model=embed_model,
-            embed_model=embed_model,
-            embed_dim=embed_dim,
-            region=region,
-        )
-    )

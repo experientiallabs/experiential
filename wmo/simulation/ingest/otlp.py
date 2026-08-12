@@ -148,6 +148,9 @@ def normalize_otlp_payload(
 
     Returns:
         Valid canonical traces and explicit validation exclusions.
+
+    Raises:
+        OtlpTraceFormatError: The semantic convention version is blank.
     """
     return normalize_otlp_payloads(
         (payload,),
@@ -173,6 +176,9 @@ def normalize_otlp_payloads(
 
     Returns:
         Valid canonical traces and explicit validation exclusions.
+
+    Raises:
+        OtlpTraceFormatError: The semantic convention version is blank.
     """
     if not semantic_convention_version.strip():
         raise OtlpTraceFormatError("semantic convention version must not be blank")

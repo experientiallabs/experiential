@@ -15,6 +15,8 @@ from rich.table import Table
 
 from wmo.cli.consent import require_spend_consent
 from wmo.common.config import ARTIFACT_DIR, WorldModelStore
+from wmo.common.project import ArtifactStoreError, ProjectStore
+from wmo.common.tasks import resolve_task_set
 
 if TYPE_CHECKING:
     # Type-only: real imports are local to the commands and helpers that construct or inspect
@@ -44,21 +46,24 @@ def sweep(
         # otherwise swallows them and prints an empty pair.
         help="Candidate pool TOML: one \\[\\[model]] table per candidate.",
     ),
-    traces_file: str = typer.Option(
+    project: str = typer.Option(
+        "default",
+        "--project",
+        help="Project that owns the immutable task set built from canonical trace evidence.",
+    ),
+    task_set: str | None = typer.Option(
         None,
-        "--traces",
-        help="Trace corpus the scenarios come from (default: the model's own "
-        "traces.otel.jsonl when available). A build does not keep a copy of the corpus it read, "
-        "so pass the file here.",
+        "--task-set",
+        help="Immutable task-set ID. Omit only when the project has exactly one task set.",
     ),
     scenarios: int = typer.Option(
         20,
         "--scenarios",
         min=1,
-        help="Cap on held-out scenarios measured (a deterministic prefix by trace id).",
+        help="Cap on held-out immutable tasks measured (a deterministic task-ID prefix).",
     ),
     episodes: int = typer.Option(
-        1, "--episodes", min=1, help="Episodes per (candidate, scenario) cell."
+        1, "--episodes", min=1, help="Episodes per (candidate, task) cell."
     ),
     max_steps: int = typer.Option(
         20, "--max-steps", min=1, help="Step budget per episode (also the cost estimate's cap)."
@@ -135,22 +140,16 @@ def sweep(
 
     This is step one of the routing workflow: nothing else produces an `OutcomeMatrix`.
 
-        wmo optimize route sweep support --traces traces.otel.jsonl --pool .wmo/pool.toml
+        wmo optimize route sweep support --project support --pool .wmo/pool.toml
         wmo optimize route fit matrix.json --kind knn
 
     Every (candidate, scenario, episode) cell runs one full episode against the world model,
     which scores it (`WorldModelEnv(..., score_on_close=True)`): a matrix without verified
-    rewards is not evidence. Scenarios are the task prompts of the corpus's TEST band, the third
-    band of the build's deterministic 3-way split, which prompt optimization and knowledge
-    extraction never saw; the candidates' tool surface is summarized from the TRAIN band only
-    (the same discipline), so a candidate is not scored on guessing what tools exist. What that
-    buys is a policy fitted on prompts no GEPA candidate was SELECTED on. It is not isolation
-    from the environment: a build indexes the full corpus for serving, so the world model can
-    still retrieve a held-out trace's own recorded steps as demos when it simulates that
-    scenario. Bands are also cut per trace id, not per task text, so a task repeated across
-    traces can appear on both sides. The whole sweep runs the world model frozen, so no cell's
-    predictions become another cell's retrieved demos and the result does not depend on sweep
-    order.
+    rewards is not evidence. Tasks come only from the project's immutable held-out TaskSet
+    partition. The candidate tool surface is summarized from fit tasks only, so a candidate is
+    not scored on guessing tools visible only in held-out evidence. The whole sweep runs the
+    world model frozen, so no cell's predictions become another cell's retrieved demos and the
+    result does not depend on sweep order.
 
     Nothing measured is lost, and nothing measured is bought twice. Every cell lands in
     `<out>.partial.jsonl` the moment it completes, so a sweep killed at hour five keeps the cells
@@ -205,9 +204,10 @@ def sweep(
     Args:
         model: Built world model to simulate while measuring candidates.
         pool_file: Candidate pool TOML to measure.
-        traces_file: Optional source corpus for held-out scenarios.
-        scenarios: Maximum number of held-out scenarios to include.
-        episodes: Episode attempts per candidate and scenario.
+        project: Project that owns the immutable canonical task-set artifact.
+        task_set: Optional exact task-set artifact ID when the project has several.
+        scenarios: Maximum number of held-out tasks to include.
+        episodes: Episode attempts per candidate and task.
         max_steps: Per-episode agent step limit.
         concurrency: Concurrent cells, which changes duration but not measured evidence.
         history_chars: Observation history retained for each agent step.
@@ -230,7 +230,6 @@ def sweep(
         execute_sweep,
         plan_sweep,
         preflight_pool,
-        resolve_config,
         resumable_cells,
     )
     from wmo.simulation import WorldModelEnv
@@ -264,18 +263,17 @@ def sweep(
     # backend cannot even be constructed, or an --out that cannot be written, would otherwise
     # surface after the sweep had already paid for cells it then throws away.
     try:
-        config = resolve_config(model_dir)
+        tasks = resolve_task_set(ProjectStore(Path(root), project).artifacts, task_set)
         preflight = preflight_pool(Path(pool_file))
-    except SweepError as exc:
+    except (ArtifactStoreError, SweepError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     print_deferred_risks(_console, preflight.deferred)
     try:
         plan = plan_sweep(
             model_dir=model_dir,
-            config=config,
             pool=preflight.pool,
             out_path=out_path,
-            traces_file=Path(traces_file) if traces_file is not None else None,
+            task_set=tasks,
             scenarios=scenarios,
             episodes=episodes,
             max_steps=max_steps,
@@ -285,9 +283,9 @@ def sweep(
             compression=sweep_compression,
             max_concurrency=concurrency,
         )
-    except SweepError as exc:
+    except (SweepError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    print_tiny_corpus_note(_console, plan)
+    print_underfilled_task_note(_console, plan)
     try:
         # Before the money question, not after it: a sidecar left by a run of a DIFFERENT plan is
         # refused here, while refusing still costs nothing.
@@ -300,8 +298,8 @@ def sweep(
     _confirm_cost(plan, yes=yes)
 
     _console.print(
-        f"sweeping {len(plan.pool.models)} candidate(s) over {len(plan.scenarios)} held-out "
-        f"scenario(s) of [bold]{escape(model_dir.name)}[/bold], {episodes} episode(s) each…"
+        f"sweeping {len(plan.pool.models)} candidate(s) over {len(plan.tasks)} held-out "
+        f"task(s) from [bold]{escape(plan.task_set_id)}[/bold], {episodes} episode(s) each…"
     )
     run = execute_sweep(
         plan,
@@ -379,19 +377,19 @@ def print_deferred_risks(console: Console, deferred: tuple[DeferredRisk, ...]) -
         console.print(f"  {escape(risk.candidate)} (kind={risk.kind.value}): {risk.risk}")
 
 
-def print_tiny_corpus_note(console: Console, plan: SweepPlan) -> None:
-    """Say when the corpus was too small to leave a held-out band to measure on.
+def print_underfilled_task_note(console: Console, plan: SweepPlan) -> None:
+    """Say when an immutable task set has fewer held-out tasks than the requested sweep cap.
 
     Args:
         console: Destination for the operator-facing note.
-        plan: Sweep plan whose corpus split is being described.
+        plan: Sweep plan whose held-out task selection is being described.
     """
-    if not plan.tiny_corpus:
+    if not plan.underfilled:
         return
     console.print(
-        f"[yellow]note[/yellow] {plan.trace_count} trace(s) is too few for a held-out band, so "
-        "these scenarios come from the FULL corpus: they are not leak-free, and a policy "
-        "fitted on them is a smoke test, not evidence"
+        f"[yellow]note[/yellow] task set {plan.task_set_id} has only {len(plan.tasks)} held-out "
+        "task(s) for this sweep cap. Coverage remains immutable; inspect coverage.json before "
+        "treating the fitted policy as broad traffic evidence."
     )
 
 
@@ -593,7 +591,7 @@ def print_cost_estimate(console: Console, plan: SweepPlan, *, already_measured: 
     console.print(table)
     console.print(
         f"{plan.cells} cell(s) = {len(plan.cost_lines)} candidate(s) x "
-        f"{len(plan.scenarios)} held-out scenario(s) x {plan.episodes} episode(s); estimated "
+        f"{len(plan.tasks)} held-out task(s) x {plan.episodes} episode(s); estimated "
         f"total ${plan.total_usd:.2f}"
     )
     if already_measured:

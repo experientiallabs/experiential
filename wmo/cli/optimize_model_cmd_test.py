@@ -332,8 +332,8 @@ def test_the_plan_table_shows_the_pace_and_what_a_resume_will_not_rebuy(
         PartialHeader(identity=plan.identity).model_dump_json()
         + "\n"
         + ScenarioOutcome(
-            scenario_id=scenario_id(plan.scenarios[0]),
-            task=plan.scenarios[0].task,
+            scenario_id=task_id(plan.tasks[0]),
+            task=plan.tasks[0].instruction,
             model="cheap",
             reward=0.5,
         ).model_dump_json()

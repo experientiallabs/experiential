@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import itertools
 import json
@@ -9,6 +10,7 @@ import sys
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -21,9 +23,11 @@ import wmo.simulation as env_module
 from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.common.config import HarnessConfig, save_config
+from wmo.common.core.artifacts import canonical_json_bytes
 from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
 from wmo.common.judging.episode import EpisodeScore
 from wmo.common.observability import Phase, RunRecord, UsageTotals, load_runs
+from wmo.common.project import ProjectConfig, ProjectStore
 from wmo.common.providers import pool as pool_module
 from wmo.common.providers.base import (
     Completion,
@@ -37,6 +41,7 @@ from wmo.common.providers.base import (
 from wmo.common.providers.openrouter import OPENROUTER_API_KEY_ENV
 from wmo.common.providers.pool import PoolEntry, load_pool
 from wmo.common.providers.registry import get_provider as registry_get_provider
+from wmo.common.tasks import TaskCase, TaskSet, ToolSchema
 from wmo.optimize.model.store import DistillModelCard
 from wmo.optimize.routing import evaluate_policy
 from wmo.optimize.routing.compression import (
@@ -51,9 +56,7 @@ from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.routing.policy import POLICY_FILENAME, RoutingPolicy, select_model
 from wmo.optimize.routing.sweep_partial import PartialHeader, PlanIdentity
 from wmo.runtime.agents.llm import DEFAULT_HISTORY_CHARS
-from wmo.simulation.ingest.otel_writer import write_traces_jsonl
 from wmo.simulation.model.world_model import WorldModel
-from wmo.simulation.serving.traces_source import TRACES_FILENAME
 
 runner = CliRunner()
 
@@ -333,20 +336,67 @@ def _corpus(count: int = 30) -> list[Trace]:
     return traces
 
 
-def _project(tmp_path: Path, *, traces: list[Trace] | None, train_split: float = 0.8) -> Path:
-    """Write a minimal built-model artifact (config + its own corpus) and return the root."""
+def _write_task_set(root: Path, traces: list[Trace]) -> None:
+    """Persist a verified immutable task set for direct routing command fixtures."""
+    project = ProjectStore(root, "default")
+    project.initialize(ProjectConfig(project_id="default"))
+    ordered = tuple(sorted(traces, key=lambda trace: trace.trace_id))
+    held_out_ids = set(_HELD_OUT_IDS).intersection(trace.trace_id for trace in ordered)
+    if not held_out_ids:
+        held_out_ids = {trace.trace_id for trace in ordered[: min(2, len(ordered))]}
+    tasks = tuple(
+        TaskCase(
+            task_id=trace.trace_id,
+            lineage_group_id=f"lineage-{trace.trace_id}",
+            partition="held_out" if trace.trace_id in held_out_ids else "fit",
+            instruction=trace.steps[0].task or f"task {trace.trace_id}",
+            tools=(
+                ToolSchema(
+                    name=trace.steps[0].action.name or "message",
+                    description="Fixture task tool.",
+                    input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+                ),
+            ),
+            workload_weight=1.0,
+            source_trace_ids=(trace.trace_id,),
+        )
+        for trace in ordered
+    )
+    payload = b"\n".join(canonical_json_bytes(task) for task in tasks) + b"\n"
+    task_set = TaskSet(
+        schema_version=1,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="test",
+        task_set_id="task-set-routing",
+        task_ids=tuple(task.task_id for task in tasks),
+        tasks_path="tasks.jsonl",
+        tasks_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    project.artifacts.write(
+        artifact_id=task_set.task_set_id,
+        artifact_type="task-set",
+        envelope=task_set,
+        files={
+            "tasks.jsonl": payload,
+            "task-set.json": canonical_json_bytes(task_set),
+        },
+    )
+
+
+def _project(tmp_path: Path, *, traces: list[Trace] | None) -> Path:
+    """Write a minimal model config and direct immutable task-set fixture root."""
     root = tmp_path / ".wmo"
     model_dir = root / "models" / "support"
     save_config(
         HarnessConfig(
             providers=[ProviderConfig(kind=ProviderKind.ANTHROPIC, model="fake-serve")],
             serve_provider=ProviderKind.ANTHROPIC,
-            train_split=train_split,
+            train_split=0.8,
         ),
         model_dir,
     )
     if traces is not None:
-        write_traces_jsonl(traces, model_dir / TRACES_FILENAME)
+        _write_task_set(root, traces)
     return root
 
 
@@ -780,9 +830,7 @@ __all__ = (
     "PartialHeader",
     "PlanIdentity",
     "DEFAULT_HISTORY_CHARS",
-    "write_traces_jsonl",
     "WorldModel",
-    "TRACES_FILENAME",
     "runner",
     "_local_model_uncached",
     "_arm",
@@ -798,6 +846,7 @@ __all__ = (
     "_HELD_OUT_IDS",
     "_HELD_OUT_TOOL",
     "_corpus",
+    "_write_task_set",
     "_project",
     "_pool_file",
     "_FakeWorldModel",

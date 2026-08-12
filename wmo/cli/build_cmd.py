@@ -1,566 +1,209 @@
-"""Build command and input validation for trace-backed world models."""
+"""Canonical local trace-to-task-set build command."""
 
 from __future__ import annotations
 
-import json
-import uuid
+import subprocess
+import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
-from rich.markup import escape
 
-from wmo.cli.model_roles import load_settings_or_abort
-from wmo.common.config import (
-    ARTIFACT_DIR,
-    DEFAULT_MODEL_NAME,
-    FIDELITY_TIERS,
-    ArtifactPaths,
-    FidelityTier,
-    HarnessConfig,
-    WorldModelStore,
-    normalize_name,
-    validate_name,
+from wmo.common.config import ARTIFACT_DIR
+from wmo.common.observability import RunRecord
+from wmo.common.observability.telemetry import BuildTelemetryStats, capture_build_completed
+from wmo.common.project import ArtifactStoreError, ProjectConfig, ProjectStore, ProjectStoreError
+from wmo.simulation.build import TaskSetBuild, build_task_set
+from wmo.simulation.ingest.otlp import (
+    OtlpTraceFormatError,
+    TraceNormalizationResult,
+    load_otlp_file,
 )
-
-if TYPE_CHECKING:
-    from wmo.common.providers import ProviderConfig
-    from wmo.common.providers.base import Provider
-
-from wmo.cli.command_common import _credential_hint
+from wmo.simulation.ingest.posthog import PostHogPullError, load_posthog_file
 
 _console = Console()
-_CHECK = "[green]✓[/green]"
-
-# The serve provider `wmo build` falls back to when neither `--provider` nor a configured worker
-# role names one.
-_BUILD_PROVIDER = "bedrock"
-# Sources that read a live database rather than an export. `wmo build` has no transport flags for
-# them (`VendorPull.dsn/table` are only reachable from `wmo ingest`), so it rejects them up front
-# instead of failing inside the adapter with advice about flags it does not define.
-_DB_SOURCES = ("postgres",)
-
-
-def _check_build_source(source: str) -> None:
-    """Reject a `--source` that `wmo build` cannot drive, naming the `wmo ingest` two-step."""
-    from wmo.simulation.ingest import list_adapters
-
-    if source not in list_adapters():
-        raise typer.BadParameter(
-            f"unknown --source {source!r}; choose one of: {', '.join(list_adapters())}"
-        )
-    if source in _DB_SOURCES:
-        raise typer.BadParameter(
-            f"--source {source} reads a live database, which `wmo build` has no connection flags "
-            f"for: normalize first with `wmo ingest --source {source} --dsn <dsn> --table <table> "
-            "--out traces.otel.jsonl`, then `wmo build --file traces.otel.jsonl`"
-        )
-
-
-def _check_build_file(file: str) -> None:
-    """Reject a missing/unreadable `--file` before the provider ping, not inside the adapter."""
-    path = Path(file)
-    if not path.exists():
-        raise typer.BadParameter(
-            f"trace file not found: {file} (export one with `wmo ingest --file <export> --out "
-            f"{file}`, or pass an existing path)"
-        )
-    if path.is_dir():
-        raise typer.BadParameter(f"--file must be a trace export, not a directory: {file}")
-
-
-def _empty_corpus_error(file: str | None, source: str) -> typer.BadParameter:
-    """Explain an empty ingest: usually `--source` does not match the export's real format."""
-    from wmo.simulation.ingest.base import load_payloads
-    from wmo.simulation.ingest.detect import detect_format
-
-    if file is None:
-        return typer.BadParameter(
-            f"the --source {source} pull returned no traces; widen --since/--limit or check the "
-            "--project"
-        )
-    detected: str | None = None
-    try:
-        detected = detect_format(load_payloads(Path(file).read_text(encoding="utf-8")))
-    except (ValueError, OSError):
-        detected = None
-    if detected is not None and detected != source:
-        return typer.BadParameter(
-            f"no traces ingested from {file} with --source {source}: it looks like {detected}. "
-            f"Retry with `--source {detected}`, or let `wmo ingest --file {file} --out "
-            "traces.otel.jsonl` auto-detect the format and build from its output."
-        )
-    return typer.BadParameter(
-        f"no traces ingested from {file} with --source {source} (build never auto-detects): "
-        f"check that the export carries agent steps and that --source names its format, or run "
-        f"`wmo ingest --file {file} --out traces.otel.jsonl` to auto-detect and normalize it "
-        "first"
-    )
-
-
-def _chain_bad_parameter(err: ValueError) -> typer.BadParameter:
-    """Render a failover-chain resolution failure as a usage error naming the file to write."""
-    from wmo.common.providers.waterfall import FALLBACK_CONFIG_PATH
-
-    return typer.BadParameter(
-        f"{err}. Write {FALLBACK_CONFIG_PATH} as [[chain.<name>]] rung tables (one table per "
-        "fallback rung, keys kind/model/profile/region; format in docs/reference/failover.md), "
-        "or drop --chain to serve from --provider alone"
-    )
-
-
-def _provider_or_chain_or_abort(config: ProviderConfig, chain: str | None) -> Provider:
-    """`providers.provider_or_chain`, with chain-resolution errors as clean usage errors."""
-    import wmo.common.providers as providers
-
-    try:
-        return providers.provider_or_chain(config, chain=chain)
-    except ValueError as err:
-        raise _chain_bad_parameter(err) from None
+_DEFAULT_PROJECT_ID = "default"
+_CANONICAL_SOURCES = ("otlp", "posthog")
+_TRACE_FILE_ARGUMENT = typer.Argument(
+    None,
+    metavar="TRACE_FILE",
+    help="OTLP JSON or JSONL, or a PostHog LLM-observability export.",
+)
+_TRACE_FILE_OPTION = typer.Option(
+    None,
+    "--file",
+    help="Named form of TRACE_FILE for scripts that prefer an option.",
+)
+_ROOT_OPTION = typer.Option(Path(ARTIFACT_DIR), "--root", help="Local .wmo artifact root.")
 
 
 def build(
-    name: str = typer.Option(None, "--name", help="Name for this world model."),
+    trace_file: Path | None = _TRACE_FILE_ARGUMENT,
+    file: Path | None = _TRACE_FILE_OPTION,
     source: str = typer.Option(
-        "otel-genai",
+        "otlp",
         "--source",
-        help="Trace source adapter, pinned (build never auto-detects): otel-genai, chat-json, "
-        "braintrust, phoenix, langfuse, langsmith, posthog, mastra. To auto-detect an export's "
-        "format, normalize it first with `wmo ingest --file <export>`.",
+        help="Canonical source format: otlp (default) or posthog.",
     ),
-    file: str = typer.Option(None, "--file", help="Path to an exported traces file for --source."),
-    pull: bool = typer.Option(
-        False, "--pull", help="Pull traces live from the source's vendor API (instead of --file)."
-    ),
-    project: str = typer.Option(None, "--project", help="Vendor project/workspace id (--pull)."),
-    api_key: str = typer.Option(None, "--api-key", help="Vendor API key (else env var)."),
-    since: str = typer.Option(None, "--since", help="Only pull traces since this ISO timestamp."),
-    limit: int = typer.Option(
+    project: str | None = typer.Option(
         None,
-        "--limit",
-        help="Only use the first N traces (caps a --file export too, not just --pull); cost "
-        "control for a first build over a large corpus. A --pull is capped at fetch time, so "
-        "with --drop-degenerate it can yield fewer than N; a --file export yields N usable.",
+        "--project",
+        help="Local project ID below <root>/projects (default: default).",
     ),
-    vendor: str = typer.Option(
-        None, "--vendor", help="\\[deprecated] alias for --source <name> --pull."
-    ),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding all world models."),
-    provider: str = typer.Option(
-        None, "--provider", help=f"Provider that serves the model (default: {_BUILD_PROVIDER})."
-    ),
-    model: str = typer.Option(
-        None, help="Canonical serve model type (default: the provider's suggested model)."
-    ),
-    judge_model: str = typer.Option(
-        None, "--judge-model", help="Canonical GEPA judge model type (default: cheap per provider)."
-    ),
-    region: str = typer.Option(None, help="AWS region (Bedrock)."),
-    fidelity: str = typer.Option(
-        "low",
-        help="Build effort (all searching tiers are floored at low's estimate - more effort "
-        "never ships worse than low): low (default; free - the estimated-best config, no "
-        "search) | medium (+light GEPA + cheap-lever search) | high (+GEPA + config search) | "
-        "max (deep GEPA + full config search). Searching tiers cost real money: one observed "
-        "medium build spent 73% of its total on GEPA. The chosen config serves under "
-        "`--max-fidelity`.",
-    ),
-    chain: str = typer.Option(
-        None, "--chain", help="Named failover chain from .wmo/fallback.toml (default: its default)."
-    ),
-    train_split: float = typer.Option(
-        0.8,
-        help="Train/held-out ratio for GEPA's internal split (lower = bigger valset). Shares "
-        "`wmo eval`'s default: both cut the same trace-id hash line, so a mismatch leaks train "
-        "traces into the eval holdout.",
-    ),
-    embed_provider: str = typer.Option(
-        "hashing", help="phi embedder: hashing (offline) | bedrock | openai | azure."
-    ),
-    embed_model: str = typer.Option(None, help="Embeddings model id / Azure embedding deployment."),
-    embed_dim: int = typer.Option(512, help="phi dimensionality (index + query must agree)."),
-    knowledge: bool = typer.Option(
-        False,
-        "--knowledge/--no-knowledge",
-        help="Seed a knowledge base (rules/entities/schemas markdown) from the train traces.",
-    ),
-    reasoning: bool = typer.Option(
-        False,
-        "--reasoning/--no-reasoning",
-        help="Serve with the deliberate-then-answer output contract.",
-    ),
-    grounder: str = typer.Option(
-        "none",
-        help="Web grounding for unknown entities: none | brave (needs BRAVE_SEARCH_API_KEY).",
-    ),
-    drop_degenerate: bool = typer.Option(
-        False,
-        "--drop-degenerate",
-        help="Drop all-empty-observation traces (failed captures) before building "
-        "(swe-bench is ~66% such junk).",
-    ),
-    interactive: bool = typer.Option(
+    name: str | None = typer.Option(
         None,
-        "--interactive/--no-interactive",
-        help="Guided creation wizard. Default: on at a TTY when inputs are missing.",
+        "--name",
+        help="Compatibility spelling for --project while existing local scripts migrate.",
     ),
+    root: Path = _ROOT_OPTION,
 ) -> None:
-    """Ingest traces (file upload or vendor SDK pull) and build a named world model.
+    """Build an immutable representative task set from one local canonical trace export.
 
-    Stores the artifact under `<root>/models/<name>/`: ingest -> normalize -> split(train/test) ->
-    embed/index -> GEPA optimize -> write. Re-running with the same `--name` rebuilds it.
-
-    With no `--name`/`--file` on an interactive terminal, this launches a guided creation wizard;
-    pass `--no-interactive` (or any of those flags) to stay fully scriptable.
+    The command performs exactly one raw-source read inside the selected OTLP or PostHog loader.
+    It persists that normalized evidence as a ``TraceDataset`` and mines a dependent immutable
+    ``TaskSet`` with the approved 50-fit and 20-held-out defaults. It performs no provider,
+    model, or network operation.
 
     Args:
-        name: Artifact name, or a prompt to choose one in the interactive wizard.
-        source: Registered trace adapter used to normalize the corpus.
-        file: Exported trace file for a local build.
-        root: Project artifact directory where the model is written.
+        trace_file: Positional local trace export path.
+        file: Optional named local trace export path.
+        source: Explicit canonical OTLP or PostHog local-export format.
+        project: Destination project identifier for immutable local artifacts.
+        name: Compatibility spelling for the destination project identifier.
+        root: Local `.wmo` artifact root.
 
     Raises:
-        typer.BadParameter: Required inputs or provider settings are invalid.
+        typer.BadParameter: Source selection, local evidence, or immutable artifact validation
+            fails.
     """
-    # `--vendor <name>` is the deprecated alias for `--source <name> --pull`: it names the source
-    # adapter and implies a live pull.
-    import wmo.common.providers as providers
-    from wmo.cli.ui import (
-        BuildParams,
-        RichBuildReporter,
-        build_summary_panel,
-        judge_model_default,
-        run_build_wizard,
-        serve_model_default,
-    )
-    from wmo.common.config.card import make_build_card, save_card
-    from wmo.common.observability import (
-        MeteredProvider,
-        Phase,
-        RunTracker,
-        classify_build_call,
-        save_run,
-    )
-    from wmo.common.observability.telemetry import (
-        BuildTelemetryStats,
-        TelemetryBuildReporter,
-        capture_build_completed,
-    )
-    from wmo.common.providers import ProviderKind
-    from wmo.common.providers.base import EmbedderKind
-    from wmo.simulation.ingest import VendorPull
-    from wmo.simulation.model.build import EmptyCorpusError
-    from wmo.simulation.model.build import build as run_build
-    from wmo.simulation.model.grounding import GROUNDER_KINDS
-    from wmo.simulation.retrieval import get_embedder
-
-    if vendor:
-        source = vendor
-        pull = True
-
-    # Decide whether to run the wizard: explicit flag wins; otherwise auto when at a TTY and the
-    # essential inputs (a name and a trace source - a file or a live pull) were not supplied.
-    needs_input = name is None or (file is None and not pull)
-    use_wizard = interactive if interactive is not None else (_console.is_terminal and needs_input)
-
-    configured_worker = load_settings_or_abort(root).models.resolve("worker")
-    use_configured_worker = configured_worker is not None and (
-        provider is None or provider == configured_worker.provider
-    )
-    # Settle the serve provider here so the model default can follow it. A single hard-coded
-    # Anthropic default wrote artifacts configured to call e.g. OpenAI with `claude-opus-4-8`.
-    resolved_provider = (
-        provider or (configured_worker.provider if configured_worker else None) or _BUILD_PROVIDER
-    )
-    resolved_model = (
-        model
-        or (configured_worker.model if use_configured_worker and configured_worker else None)
-        or serve_model_default(resolved_provider)
-    )
-    if resolved_model is None and not use_wizard:
+    started = time.monotonic()
+    path = _resolve_trace_file(trace_file, file)
+    project_id = _resolve_project_id(project, name)
+    normalized = _load_canonical_traces(path, source)
+    if not normalized.traces:
         raise typer.BadParameter(
-            f"--provider {resolved_provider} has no default serve model: pass `--model <id>` "
-            f"(`wmo build --provider {resolved_provider} --model <id> --file <export>`)"
-        )
-    params = BuildParams(
-        name=name or DEFAULT_MODEL_NAME,
-        source=source,
-        file=file,
-        pull=pull,
-        project=project,
-        api_key=api_key,
-        since=since,
-        limit=limit,
-        provider=provider or (configured_worker.provider if configured_worker else None),
-        # A wizard run re-picks provider and model from its own per-provider lists, so an
-        # unresolved default here is only an unused suggestion; the flag path errored above.
-        model=resolved_model or "",
-        region=(
-            region
-            or (configured_worker.region if use_configured_worker and configured_worker else None)
-        ),
-        fidelity=fidelity,
-        train_split=train_split,
-        judge_model=judge_model,
-        embed_provider=embed_provider,
-        embed_model=embed_model,
-        embed_dim=embed_dim,
-    )
-    if use_wizard:
-        params = run_build_wizard(_console, params)
-    elif params.file is None and not params.pull:
-        # This guard also required `name is None`, so `wmo build --name x` (verbatim the
-        # empty-state hint `wmo list` prints) fell through to a raw ValueError from the ingest
-        # seam instead. A name is not a corpus: what is missing is the trace source.
-        raise typer.BadParameter(
-            "provide --file <export> or --pull (with --source), or run `wmo build` interactively"
-        )
-    if params.file and params.pull:
-        raise typer.BadParameter("pass either --file or --pull, not both")
-    _check_build_source(params.source)
-    if params.file is not None:
-        _check_build_file(params.file)
-    if params.limit is not None and params.limit < 1:
-        raise typer.BadParameter(f"--limit must be at least 1, got {params.limit}")
-    # The wizard always resolves a provider; the flag path keeps its historical default.
-    params.provider = params.provider or _BUILD_PROVIDER
-    # The wizard may replace the configured worker's provider. Re-evaluate the match before
-    # carrying provider-specific connection fields into the build config.
-    use_configured_worker = (
-        configured_worker is not None and params.provider == configured_worker.provider
-    )
-
-    # Flag-supplied names get the same whitespace-to-dash normalization as the wizard.
-    params.name = normalize_name(params.name)
-    try:
-        validate_name(params.name)
-    except ValueError as err:
-        raise typer.BadParameter(str(err)) from None
-    if params.name == "harbor":
-        raise typer.BadParameter(
-            "world model name 'harbor' is reserved: `wmo optimize harness <agent> harbor` selects "
-            "the harbor benchmark environment; choose another name"
+            "no valid canonical traces were produced; inspect normalization-issues.json input "
+            "and provide an OTLP or PostHog LLM-observability export with at least one valid trace"
         )
     try:
-        tier = FidelityTier(params.fidelity)
-    except ValueError:
-        tiers = ", ".join(t.value for t in FidelityTier)
-        raise typer.BadParameter(
-            f"unknown fidelity {params.fidelity!r}; choose one of: {tiers}"
-        ) from None
-    spec = FIDELITY_TIERS[tier]
-    try:
-        serve_provider = ProviderKind(params.provider)
-    except ValueError:
-        kinds = ", ".join(k.value for k in ProviderKind)
-        raise typer.BadParameter(
-            f"unknown provider {params.provider!r}; choose one of: {kinds}"
-        ) from None
-    try:
-        embed_kind = EmbedderKind(params.embed_provider)
-    except ValueError:
-        kinds = ", ".join(k.value for k in EmbedderKind)
-        raise typer.BadParameter(
-            f"unknown embed provider {params.embed_provider!r}; choose one of: {kinds}"
-        ) from None
-    # A provider-backed embedder needs an embeddings model; fail fast, not deep inside embed().
-    # The in-process kinds need none: hashing has no model, local carries its own default.
-    if embed_kind not in (EmbedderKind.HASHING, EmbedderKind.LOCAL) and not params.embed_model:
-        raise typer.BadParameter(
-            f"--embed-provider {embed_kind.value} requires --embed-model "
-            "(the embeddings model id / Azure embedding deployment)"
+        store = _project_store(root, project_id)
+        completed = build_task_set(
+            normalized,
+            store.artifacts,
+            created_at=datetime.now(UTC),
+            code_revision=_current_revision(),
         )
-
-    store = WorldModelStore(root)
-    model_dir = str(store.model_dir(params.name))
-    # Provider wiring (reuse-vs-separate embed config) lives in HarnessConfig.for_build, not here.
-    config = HarnessConfig.for_build(
-        serve_provider=serve_provider,
-        serve_model=params.model,
-        region=params.region,
-        embed_provider=embed_kind,
-        embed_model=params.embed_model,
-        embed_dim=params.embed_dim,
-        gepa_budget=spec.gepa_budget,
-        train_split=params.train_split,
-        judge_model=params.judge_model or judge_model_default(params.provider, params.model),
-        trace_adapter=params.source,
+    except (ArtifactStoreError, ProjectStoreError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from None
+    _capture_local_build_telemetry(
+        completed,
+        root=root,
+        duration_seconds=time.monotonic() - started,
     )
-    if use_configured_worker and configured_worker is not None:
-        config.providers[0] = config.providers[0].model_copy(
-            update={
-                "endpoint": configured_worker.endpoint,
-                "deployment": configured_worker.deployment,
-                "api_version": configured_worker.api_version,
-            }
-        )
-    if grounder not in GROUNDER_KINDS:
-        raise typer.BadParameter(
-            f"unknown grounder {grounder!r}; choose one of: {', '.join(GROUNDER_KINDS)}"
-        )
-    # Agentic-mode flags (CLI-only, not in the wizard): persisted to config.toml so serve/load
-    # pick them up; knowledge additionally seeds knowledge/ during this build.
-    config.knowledge = knowledge
-    config.reasoning = reasoning
-    config.grounder = grounder
-    # Fail fast: ping the serve provider (and the embed path, if provider-backed) before spending
-    # any rollouts. A missing SDK or bad creds otherwise surfaces only deep inside GEPA, which
-    # silently swallows it and "succeeds" with a useless held-out-0.0 model.
-    if not use_wizard:
-        # The wizard already live-pinged the serve provider and embedder inline.
-        _verify_or_abort(config, chain=chain)
+    _render_completed_build(completed)
 
-    # Meter the build at the provider boundary; `classify_build_call` splits judge vs GEPA by
-    # system prompt. Rollouts/reflection may ride the failover chain, but the judge (GEPA's
-    # fitness metric) is PINNED to the single configured backend - a judge that silently switches
-    # models mid-build scores candidates on different scales. Both wrappers share one tracker,
-    # so cost/tokens still land in a single run record.
-    tracker = RunTracker(run_id=uuid.uuid4().hex, kind="build")
-    metered = MeteredProvider(
-        _provider_or_chain_or_abort(config.serve_provider_config(), chain),
-        tracker,
-        classify=classify_build_call,
-    )
-    metered_judge = metered
-    if config.judge_model and config.judge_model != config.serve_provider_config().model:
-        judge_cfg = config.serve_provider_config().model_copy(update={"model": config.judge_model})
-        metered_judge = MeteredProvider(
-            providers.get_provider(judge_cfg), tracker, classify=classify_build_call
-        )
-    build_stats = BuildTelemetryStats()
-    with tracker.timed(), RichBuildReporter(_console, params.name) as reporter:
-        try:
-            result = run_build(
-                config,
-                file=None if params.pull else params.file,
-                vendor=(
-                    VendorPull(
-                        api_key=params.api_key,
-                        project=params.project,
-                        since=params.since,
-                        limit=params.limit,
-                    )
-                    if params.pull
-                    else None
-                ),
-                root=model_dir,
-                serve_provider=metered,
-                judge_provider=metered_judge,
-                embedder=get_embedder(config),
-                reporter=TelemetryBuildReporter(reporter, build_stats),
-                max_fidelity=spec.config_search,
-                fidelity_budget=spec.search_budget,
-                full_search=spec.full_ladder,
-                cheap_search=spec.cheap_frontier_only,
-                estimate_only=spec.estimate_only,
-                drop_degenerate=drop_degenerate,
-                gepa_val_cap=spec.gepa_val_cap or None,
-                # One cap per build, never both: a pull is already sliced to `--limit` inside
-                # `from_vendor`, so repeating it post-filter cannot restore what
-                # `--drop-degenerate` removed and would only read as a promise of N usable
-                # traces that the pull transport cannot keep.
-                limit=None if params.pull else params.limit,
-            )
-        except EmptyCorpusError:
-            # The one ingest outcome a user causes and can fix: the export does not parse under
-            # the pinned --source. Only this type is caught, so real build bugs still surface.
-            raise _empty_corpus_error(None if params.pull else params.file, params.source) from None
-    record = tracker.record_summary()
-    save_run(record, ArtifactPaths(model_dir).runs)
-    # The card is additive metadata; a write failure (disk full, permissions) must not make an
-    # otherwise-complete build exit non-zero and then block retries with "already exists".
+
+def _resolve_trace_file(trace_file: Path | None, file: Path | None) -> Path:
+    """Validate one explicit local trace-file selection without opening its content."""
+    if trace_file is not None and file is not None:
+        raise typer.BadParameter("pass either TRACE_FILE or --file, not both")
+    resolved = trace_file or file
+    if resolved is None:
+        raise typer.BadParameter("provide TRACE_FILE or --file <export>")
+    if not resolved.exists():
+        raise typer.BadParameter(f"trace file not found: {resolved}")
+    if not resolved.is_file():
+        raise typer.BadParameter(f"--file must be a trace export, not a directory: {resolved}")
+    return resolved
+
+
+def _resolve_project_id(project: str | None, name: str | None) -> str:
+    """Resolve the one local destination project while rejecting ambiguous legacy input."""
+    if project is not None and name is not None and project != name:
+        raise typer.BadParameter("--project and --name must match when both are supplied")
+    return project or name or _DEFAULT_PROJECT_ID
+
+
+def _load_canonical_traces(path: Path, source: str) -> TraceNormalizationResult:
+    """Perform the build's one raw-source read through an explicit canonical loader."""
+    normalized_source = source.strip().casefold()
     try:
-        save_card(
-            make_build_card(
-                name=params.name,
-                provider=params.provider,
-                model_id=params.model,
-                traces=build_stats.input_trace_count,
-                steps=build_stats.input_step_count,
-                built_at=datetime.now(UTC).isoformat(),
-                source=Path(params.file).name if params.file else params.vendor,
-            ),
-            model_dir,
-        )
-    except OSError as err:
-        _console.print(f"[yellow]warning[/yellow]: could not write card.json: {err}")
+        if normalized_source == "otlp":
+            return load_otlp_file(path)
+        if normalized_source == "posthog":
+            return load_posthog_file(path)
+    except (OtlpTraceFormatError, PostHogPullError, ValueError) as exc:
+        raise typer.BadParameter(f"{normalized_source} trace normalization failed: {exc}") from None
+    choices = ", ".join(_CANONICAL_SOURCES)
+    raise typer.BadParameter(f"unsupported --source {source!r}; choose one of: {choices}")
+
+
+def _project_store(root: Path, project_id: str) -> ProjectStore:
+    """Open or initialize the one local project that owns this build's immutable artifacts."""
+    store = ProjectStore(root, project_id)
+    if store.paths.project_toml.exists():
+        store.load_project()
+    else:
+        store.initialize(ProjectConfig(project_id=project_id))
+    return store
+
+
+def _current_revision() -> str:
+    """Return the local Git revision when available without changing repository state."""
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    revision = result.stdout.strip()
+    return revision if result.returncode == 0 and revision else "local-unversioned"
+
+
+def _capture_local_build_telemetry(
+    completed: TaskSetBuild, *, root: Path, duration_seconds: float
+) -> None:
+    """Preserve anonymous aggregate build telemetry outside the canonical data pipeline.
+
+    The direct build has no provider, indexing, or optimization calls. The established event is
+    therefore retained with only aggregate local evidence counts and a zero-usage run record.
+    This best-effort call happens after immutable artifact persistence and never participates in
+    trace ingestion, mining, or artifact identity.
+    """
+    tasks = completed.mining.tasks
     capture_build_completed(
-        stats=build_stats,
-        gepa_budget=spec.gepa_budget,
-        rollouts_used=result.metrics.rollouts_used,
-        frontier_size=len(result.frontier),
-        record=record,
+        stats=BuildTelemetryStats(
+            input_trace_count=len(completed.trace_dataset.traces),
+            input_step_count=sum(len(trace.spans) for trace in completed.trace_dataset.traces),
+            train_trace_count=sum(task.partition == "fit" for task in tasks),
+            val_trace_count=0,
+            heldout_trace_count=sum(task.partition == "held_out" for task in tasks),
+            indexed_step_count=0,
+        ),
+        gepa_budget=0,
+        rollouts_used=0,
+        frontier_size=0,
+        record=RunRecord(
+            run_id=f"build-{completed.task_set.task_set_id}",
+            kind="build",
+            duration_seconds=max(duration_seconds, 0.0),
+        ),
         root=root,
     )
 
-    _console.print(build_summary_panel(store.info(params.name), model_dir))
-    auto_report = Path(model_dir) / "auto_fidelity.json"
-    if auto_report.exists():
-        auto = json.loads(auto_report.read_text(encoding="utf-8"))
-        # The low tier writes an estimate with no scores (no search ran); higher tiers write
-        # the searched scores. Render each honestly rather than an empty "(; 0 traces)".
-        if auto.get("scores"):
-            scores = ", ".join(f"{k}={v:.3f}" for k, v in auto["scores"].items())
-            provenance = f"searched: {scores}; {auto['val_traces']} held-out traces"
-        else:
-            provenance = "signature estimate - no search"
-        _console.print(
-            f"[bold]max-fidelity config[/bold]: [bold]{auto['winner_label']}[/bold] "
-            f"({provenance}) - activate with `wmo serve --max-fidelity`"
-        )
+
+def _render_completed_build(completed: TaskSetBuild) -> None:
+    """Present immutable artifact identities without reading or invoking external systems."""
+    dataset = completed.trace_dataset.dataset
+    task_set = completed.task_set
     _console.print(
-        f"[bold]run[/bold] {record.run_id[:8]}: {record.duration_seconds:.1f}s, "
-        f"{record.total.total_tokens} tokens, ${record.total.cost_usd:.4f} "
-        f"({record.total.calls} calls)"
+        f"[green]built[/green] TraceDataset {dataset.dataset_id} "
+        f"({len(dataset.trace_ids)} valid, {dataset.invalid_trace_count} excluded)"
     )
-    for phase in (Phase.GEPA, Phase.JUDGE):
-        bucket = record.by_phase.get(phase)
-        if bucket is not None:
-            _console.print(
-                f"  {phase.value}: {bucket.total_tokens} tokens, "
-                f"${bucket.cost_usd:.4f} ({bucket.calls} calls)"
-            )
-
-
-def _verify_or_abort(config: HarnessConfig, chain: str | None = None) -> None:
-    """Ping the serve provider (and any provider-backed embedder) and abort on failure.
-
-    Runs before any rollouts so a missing SDK or bad creds fails loudly and immediately, instead of
-    being swallowed inside GEPA and yielding a useless model. Raises `typer.Exit(1)` with an
-    actionable hint (`uv sync` for a missing SDK; "check creds / model id" otherwise).
-    """
-    import wmo.common.providers as providers
-    from wmo.common.providers import verify_all, verify_embedder
-    from wmo.common.providers.base import EmbedderKind
-
-    checks = [(config.serve_provider_config(), False)]
-    if config.embed_provider not in (EmbedderKind.HASHING, EmbedderKind.LOCAL):
-        checks.append((config.embed_provider_config(), True))
-
-    failed = False
-    for cfg, is_embed in checks:
-        label = f"embed:{cfg.kind.value}" if is_embed else cfg.kind.value
-        serve_provider = None if is_embed else _provider_or_chain_or_abort(cfg, chain)
-        if is_embed:
-            _console.print(f"verifying {label}…")
-            result = verify_embedder(cfg)
-        elif isinstance(serve_provider, providers.WaterfallProvider):
-            # Verify the provider the build will actually use - with a chain active, that means
-            # pinging every rung (a broken fallback must fail here, not hours into the build).
-            label = f"{label} chain (.wmo/fallback.toml)"
-            _console.print(f"verifying {label}…")
-            result = serve_provider.verify()
-        else:
-            _console.print(f"verifying {label}…")
-            result = verify_all([cfg])[0]
-        if result.ok:
-            _console.print(f"  {_CHECK} {label} ({result.model}) reachable")
-            continue
-        failed = True
-        _console.print(f"  [red]✗ {label} ({result.model}) failed[/red]: {result.detail}")
-        hint = escape(_credential_hint(cfg.kind, result.detail))
-        _console.print(f"    [yellow]{hint}[/yellow]")
-    if failed:
-        raise typer.Exit(1)
+    _console.print(
+        f"[green]mined[/green] TaskSet {task_set.task_set_id} "
+        f"({sum(task.partition == 'fit' for task in completed.mining.tasks)} fit, "
+        f"{sum(task.partition == 'held_out' for task in completed.mining.tasks)} held_out)"
+    )

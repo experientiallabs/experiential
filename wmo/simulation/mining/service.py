@@ -250,7 +250,11 @@ def persist_task_set(
         artifact_id=task_set_id,
         artifact_type="task-set",
         envelope=task_set,
-        files={"tasks.jsonl": task_payload, "coverage.json": coverage_payload},
+        files={
+            "tasks.jsonl": task_payload,
+            "coverage.json": coverage_payload,
+            "task-set.json": canonical_json_bytes(task_set),
+        },
     )
     return task_set
 

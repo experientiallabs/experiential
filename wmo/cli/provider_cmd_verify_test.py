@@ -2,6 +2,29 @@
 
 # ruff: noqa: F403, F405
 from wmo.cli.cli_fixtures_test import *
+from wmo.common.config import save_config
+
+
+def _write_model_config(root: Path, name: str, *, embed_model: str | None = None) -> HarnessConfig:
+    """Persist a legacy world-model configuration for provider verification only.
+
+    Provider verification still supports existing world-model artifacts. This fixture creates
+    their configuration directly and never invokes the removed trace-to-world-model build path.
+    """
+    config = HarnessConfig(
+        providers=[
+            ProviderConfig(
+                kind=ProviderKind.BEDROCK,
+                model_type="claude-opus-4-8",
+                model="us.anthropic.claude-opus-4-8",
+                embed_model=embed_model,
+            )
+        ],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_provider=EmbedderKind.BEDROCK if embed_model is not None else EmbedderKind.HASHING,
+    )
+    save_config(config, root=root / "models" / name)
+    return config
 
 
 def test_providers_verify_unknown_model_is_clean_error(tmp_path) -> None:  # noqa: ANN001
@@ -167,42 +190,21 @@ def test_providers_verify_missing_optional_sdk_points_at_the_install(
     assert "credentials are set" not in flat
 
 
-def test_providers_verify_reports_built_model_provider(patched_provider, tmp_path) -> None:  # noqa: ANN001
+def test_providers_verify_reports_existing_model_provider(patched_provider, tmp_path) -> None:  # noqa: ANN001
     root = tmp_path / ".wmo"
-    _build(root, "airline", tmp_path)
+    _write_model_config(root, "airline")
     result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
     assert result.exit_code == 0, result.output
     # The bedrock provider configured at build time shows up in the verify report.
     assert "bedrock" in result.output
 
 
-def test_providers_verify_checks_a_built_model_embed_path(
+def test_providers_verify_checks_an_existing_model_embed_path(
     patched_provider: None, tmp_path: Path
 ) -> None:
-    # A provider-backed embedder is verified alongside the completion provider; that check is
-    # the half a world model is genuinely needed for.
+    # A provider-backed embedder is verified alongside the completion provider.
     root = tmp_path / ".wmo"
-    result = runner.invoke(
-        app,
-        [
-            "build",
-            "--name",
-            "airline",
-            "--file",
-            _traces_file(tmp_path),
-            "--root",
-            str(root),
-            "--provider",
-            "bedrock",
-            "--embed-provider",
-            "bedrock",
-            "--embed-model",
-            "amazon.titan-embed-text-v2:0",
-            "--fidelity",
-            "low",
-        ],
-    )
-    assert result.exit_code == 0, result.output
+    _write_model_config(root, "airline", embed_model="amazon.titan-embed-text-v2:0")
 
     result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
 
@@ -211,14 +213,12 @@ def test_providers_verify_checks_a_built_model_embed_path(
     assert "embed path: skipped" not in result.output
 
 
-def test_providers_verify_pings_a_role_shared_with_a_built_model_once(
+def test_providers_verify_pings_a_role_shared_with_an_existing_model_once(
     patched_provider: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # Dedup spans both sources, so pointing the worker role at the model you already built does
-    # not bill a second ping, and the built artifact's own config is the one exercised.
+    # Dedup spans both sources, so a role sharing a persisted model does not bill a second ping.
     root = tmp_path / ".wmo"
-    _build(root, "airline", tmp_path)
-    built = load_config(str(root / "models" / "airline")).providers[0]
+    built = _write_model_config(root, "airline").providers[0]
     settings = load_settings(root)
     settings.models.worker = ModelRole(provider=built.kind.value, model=built.model)
     save_settings(settings, root)
@@ -239,8 +239,7 @@ def test_providers_verify_does_not_collapse_two_regions_of_one_model(
     # Collapsing them would ping one and report the OTHER as verified, which is a false pass on
     # exactly the credential question this command exists to answer.
     root = tmp_path / ".wmo"
-    _build(root, "airline", tmp_path)
-    built = load_config(str(root / "models" / "airline")).providers[0]
+    built = _write_model_config(root, "airline").providers[0]
     assert built.region is None
     settings = load_settings(root)
     settings.models.worker = ModelRole(
@@ -284,34 +283,14 @@ def test_providers_verify_does_not_collapse_two_azure_deployments(
 def test_providers_verify_checks_both_embed_models_on_one_backend(
     patched_provider: None, tmp_path: Path
 ) -> None:
-    # Two world models sharing a completion backend but embedding through different models: one
-    # completion ping, and BOTH embed paths checked (embed_model is what the embed call sends).
+    # Two persisted artifacts share a completion backend but embed through different models: one
+    # completion ping, and BOTH embed paths are checked (embed_model is what the call sends).
     root = tmp_path / ".wmo"
     for model_name, embed_model in (
         ("a", "amazon.titan-embed-text-v1"),
         ("b", "amazon.titan-embed-text-v2:0"),
     ):
-        built = runner.invoke(
-            app,
-            [
-                "build",
-                "--name",
-                model_name,
-                "--file",
-                _traces_file(tmp_path),
-                "--root",
-                str(root),
-                "--provider",
-                "bedrock",
-                "--embed-provider",
-                "bedrock",
-                "--embed-model",
-                embed_model,
-                "--fidelity",
-                "low",
-            ],
-        )
-        assert built.exit_code == 0, built.output
+        _write_model_config(root, model_name, embed_model=embed_model)
 
     result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
 
@@ -328,7 +307,7 @@ def test_providers_verify_name_scopes_the_report_to_one_world_model(
     # `--name` answers "is THIS model's provider reachable?"; pulling the project's roles in
     # would bill for a question the caller did not ask.
     root = tmp_path / ".wmo"
-    _build(root, "airline", tmp_path)
+    _write_model_config(root, "airline")
     settings = load_settings(root)
     settings.models.worker = ModelRole(provider="openai", model="gpt-5.4-mini")
     save_settings(settings, root)

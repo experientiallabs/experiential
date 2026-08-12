@@ -25,10 +25,18 @@ class PostHogResponse(Protocol):
     """Small response surface needed from an injected PostHog HTTP client."""
 
     def raise_for_status(self) -> None:
-        """Raise for a non-success HTTP response."""
+        """Raise for a non-success HTTP response.
+
+        Raises:
+            httpx.HTTPStatusError: If the response is not successful.
+        """
 
     def json(self) -> JsonValue:
-        """Return the decoded JSON response body."""
+        """Return the decoded JSON response body.
+
+        Returns:
+            The response payload decoded as a JSON value.
+        """
 
 
 class PostHogHttpClient(Protocol):
@@ -42,7 +50,17 @@ class PostHogHttpClient(Protocol):
         json: JsonObject,
         timeout: float,
     ) -> PostHogResponse:
-        """POST one bounded HogQL query and return its response."""
+        """POST one bounded HogQL query and return its response.
+
+        Args:
+            url: Absolute PostHog query endpoint.
+            headers: Request headers containing the authorized bearer token.
+            json: Bounded HogQL request body.
+            timeout: Maximum request duration in seconds.
+
+        Returns:
+            A response object whose status and JSON payload can be verified.
+        """
 
 
 @dataclass(frozen=True)
@@ -80,6 +98,9 @@ def pull_posthog_traces(
 
     Returns:
         Canonical traces and source exclusions from the focused PostHog converter.
+
+    Raises:
+        PostHogPullError: Credentials, endpoint settings, or response data are invalid.
     """
     api_key = request.api_key or os.environ.get("POSTHOG_API_KEY")
     if not api_key:

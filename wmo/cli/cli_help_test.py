@@ -28,8 +28,6 @@ from wmo.cli.cli_fixtures_test import app, runner
         ["optimize", "route", "student", "--help"],
         ["optimize", "route", "pin", "--help"],
         ["optimize", "route", "convert-deepswe", "--help"],
-        ["scenarios", "build", "--help"],
-        ["scenarios", "verify", "--help"],
     ],
     ids=[
         "root",
@@ -50,8 +48,6 @@ from wmo.cli.cli_fixtures_test import app, runner
         "route-student",
         "route-pin",
         "route-deepswe",
-        "scenarios-build",
-        "scenarios-verify",
     ],
 )
 def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:

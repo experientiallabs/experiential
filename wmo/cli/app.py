@@ -14,16 +14,14 @@ from wmo.cli.eval_cmd import eval_
 from wmo.cli.knowledge_cmd import knowledge_
 from wmo.cli.provider_cmd import providers_app
 from wmo.cli.run_cmd import register as register_run_command
-from wmo.cli.scenarios_cmd import scenarios_app
 from wmo.common.config import load_env_file
 
 app = typer.Typer(
-    help="Run agents, build world models from traces, and optimize agent harnesses.",
+    help="Run agents, mine immutable task sets from local traces, and optimize agent harnesses.",
     no_args_is_help=True,
 )
 app.add_typer(providers_app, name="providers")
 app.add_typer(config_app, name="config")
-app.add_typer(scenarios_app, name="scenarios")
 add_deferred_typer(
     app,
     name="optimize",
@@ -32,7 +30,7 @@ add_deferred_typer(
     help="Optimizers behind one switch.",
     known_names=("route", "distill", "model"),
 )
-app.command("build", help="Build a world model from an exported trace corpus.")(build)
+app.command("build", help="Build an immutable task set from a local OTLP or PostHog export.")(build)
 app.command("list", help="List locally available world-model artifacts.")(list_models)
 app.command("download", help="Download a published benchmark bundle.")(download)
 app.command(
@@ -53,16 +51,6 @@ app.command(
     ),
 )(eval_)
 app.command("knowledge", help="Inspect editable knowledge stored with a world model.")(knowledge_)
-
-
-def _register_ingest() -> None:
-    """Register the focused trace-normalization command."""
-    from wmo.cli.ingest_cmd import ingest
-
-    app.command("ingest")(ingest)
-
-
-_register_ingest()
 register_run_command(app)
 
 

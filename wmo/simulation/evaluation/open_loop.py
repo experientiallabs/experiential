@@ -15,10 +15,13 @@ from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
 
+from wmo.common.core.artifacts import JsonObject
+from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
 from wmo.common.judging.fidelity import FidelityJudge
 from wmo.common.providers.base import Embedder, Provider
-from wmo.simulation.ingest import get_adapter
-from wmo.simulation.model.build import DEFAULT_TRAIN_SPLIT, split_holdout
+from wmo.common.traces import Trace as CanonicalTrace
+from wmo.simulation.ingest.otlp import OtlpTraceFormatError, load_otlp_file
+from wmo.simulation.model import DEFAULT_TRAIN_SPLIT, split_holdout
 from wmo.simulation.model.knowledge import seeded_knowledge_text
 from wmo.simulation.model.replay import ReplayReport, replay, valid_scores
 from wmo.simulation.retrieval import EmbeddingRetriever
@@ -67,7 +70,6 @@ def evaluate_files(
     top_k: int = 5,
     sample_turns: str = "all",
     seed: int = 0,
-    adapter_name: str = "otel-genai",
     max_holdout_traces: int | None = None,
     knowledge: bool = False,
     reasoning: bool = False,
@@ -95,10 +97,9 @@ def evaluate_files(
     agentic mode. Closed-loop evals get agentic mode from the ARTIFACT instead (the served
     WorldModel's config / --max-fidelity winner), not from these flags.
     """
-    adapter = get_adapter(adapter_name)
     per_file: dict[str, ReplayReport] = {}
     for path in files:
-        traces = adapter.from_file(str(path))
+        traces = _load_replay_traces(path)
         if not traces:
             continue
         # 3-way when `val_frac` is a positive band, 2-way otherwise; a tiny corpus with no
@@ -160,7 +161,6 @@ class OpenLoopEval:
         top_k: int = 5,
         sample_turns: str = "all",
         seed: int = 0,
-        adapter_name: str = "otel-genai",
         knowledge: bool = False,
         reasoning: bool = False,
     ) -> None:
@@ -173,7 +173,6 @@ class OpenLoopEval:
         self._top_k = top_k
         self._sample_turns = sample_turns
         self._seed = seed
-        self._adapter_name = adapter_name
         self._knowledge = knowledge
         self._reasoning = reasoning
 
@@ -188,7 +187,92 @@ class OpenLoopEval:
             top_k=self._top_k,
             sample_turns=self._sample_turns,
             seed=self._seed,
-            adapter_name=self._adapter_name,
             knowledge=self._knowledge,
             reasoning=self._reasoning,
         )
+
+
+def _load_replay_traces(path: Path) -> list[Trace]:
+    """Read OTLP once and project its canonical evidence into legacy replay transitions.
+
+    Replay is an older evaluation surface that still consumes in-memory ``common.core`` traces.
+    It is intentionally fed only by the strict canonical OTLP loader, never by a generic source
+    adapter or format detector.
+
+    Args:
+        path: Local OTLP JSON or JSONL evidence file.
+
+    Returns:
+        Legacy replay records derived from valid canonical traces in deterministic order.
+    """
+    try:
+        normalized = load_otlp_file(path)
+    except OtlpTraceFormatError as exc:
+        if str(exc) == "OTLP JSONL file contains no records":
+            return []
+        raise ValueError(f"cannot normalize OTLP trace evidence {path}: {exc}") from exc
+    return [_to_replay_trace(trace) for trace in normalized.traces]
+
+
+def _to_replay_trace(canonical: CanonicalTrace) -> Trace:
+    """Project one canonical trace into replay transitions without reopening source evidence."""
+    pending = Action(kind=ActionKind.MESSAGE, content=canonical.task)
+    steps: list[Step] = []
+    for span in canonical.spans:
+        operation = span.attributes.get("gen_ai.operation.name")
+        if operation != "execute_tool":
+            pending = _action_from_span(span.attributes, canonical.task)
+            continue
+        steps.append(
+            Step(
+                action=pending,
+                observation=Observation(
+                    content=_observation_from_span(span.attributes),
+                    is_error=span.failure is not None,
+                ),
+                task=canonical.task,
+                raw_span_ids=[span.span_id],
+            )
+        )
+    if not steps:
+        first = canonical.spans[0]
+        steps.append(
+            Step(
+                action=_action_from_span(first.attributes, canonical.task),
+                observation=Observation(
+                    content=_observation_from_span(first.attributes),
+                    is_error=first.failure is not None,
+                ),
+                task=canonical.task,
+                raw_span_ids=[first.span_id],
+            )
+        )
+    return Trace(
+        trace_id=canonical.trace_id,
+        steps=steps,
+        source=canonical.source.identity.source_id,
+        metadata={"canonical_trace_id": canonical.trace_id},
+    )
+
+
+def _action_from_span(attributes: JsonObject, task: str) -> Action:
+    """Map visible canonical tool attributes to one legacy replay action."""
+    name = attributes.get("gen_ai.tool.name")
+    if isinstance(name, str) and name:
+        return Action(kind=ActionKind.TOOL_CALL, name=name)
+    return Action(kind=ActionKind.MESSAGE, content=task)
+
+
+def _observation_from_span(attributes: JsonObject) -> str:
+    """Choose the recorded output text available to the legacy replay scorer."""
+    for key in (
+        "gen_ai.tool.message",
+        "gen_ai.tool.result",
+        "gen_ai.completion",
+        "gen_ai.response.text",
+        "error.message",
+    ):
+        value = attributes.get(key)
+        if isinstance(value, str):
+            return value
+    return ""

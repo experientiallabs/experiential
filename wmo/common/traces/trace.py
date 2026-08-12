@@ -88,16 +88,27 @@ class Trace(ContractModel):
 
 
 class TraceDataset(ArtifactEnvelope):
-    """A frozen normalized trace-dataset manifest."""
+    """A frozen normalized trace-dataset manifest with auditable exclusions."""
 
     dataset_id: ArtifactId
+    semantic_convention_version: str = Field(min_length=1, max_length=128)
     traces_path: str = Field(min_length=1)
     traces_sha256: Sha256
+    issues_path: str | None = None
+    issues_sha256: Sha256 | None = None
+    invalid_trace_count: int = Field(default=0, ge=0)
     trace_ids: tuple[str, ...]
 
     @field_validator("traces_path")
     @classmethod
     def _require_safe_traces_path(cls, value: str) -> str:
+        return validate_artifact_file_path(value).as_posix()
+
+    @field_validator("issues_path")
+    @classmethod
+    def _require_safe_issues_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         return validate_artifact_file_path(value).as_posix()
 
     @field_validator("trace_ids")
@@ -108,3 +119,11 @@ class TraceDataset(ArtifactEnvelope):
         if len(set(value)) != len(value):
             raise ValueError("trace_ids must not contain duplicates")
         return value
+
+    @model_validator(mode="after")
+    def _require_complete_issue_reference(self) -> TraceDataset:
+        if (self.issues_path is None) != (self.issues_sha256 is None):
+            raise ValueError("trace-dataset issues path and digest must be set together")
+        if self.invalid_trace_count and self.issues_path is None:
+            raise ValueError("invalid trace count requires an immutable issues report")
+        return self

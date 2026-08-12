@@ -13,18 +13,21 @@ from wmo.simulation.serving.traces_source import (
     TracesDownloader,
     local_traces_path,
     resolve_url,
-    scenarios_from_traces,
+    trace_summaries_from_otlp,
 )
 
 
 def _write_otel(path: Path) -> None:
     span_llm = {
         "traceId": "a" * 32,
-        "spanId": "s1",
+        "spanId": "1" * 16,
         "name": "chat",
-        "startTimeUnixNano": 1,
+        "startTimeUnixNano": "1760000000000000000",
+        "endTimeUnixNano": "1760000001000000000",
         "attributes": [
             {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+            {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
+            {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-test"}},
             {"key": "gen_ai.tool.name", "value": {"stringValue": "get_user"}},
             {"key": "gen_ai.tool.call.arguments", "value": {"stringValue": '{"id": "u1"}'}},
             {"key": "gen_ai.prompt", "value": {"stringValue": "look up u1"}},
@@ -32,9 +35,11 @@ def _write_otel(path: Path) -> None:
     }
     span_tool = {
         "traceId": "a" * 32,
-        "spanId": "s2",
+        "spanId": "2" * 16,
+        "parentSpanId": "1" * 16,
         "name": "execute_tool",
-        "startTimeUnixNano": 2,
+        "startTimeUnixNano": "1760000001000000000",
+        "endTimeUnixNano": "1760000002000000000",
         "attributes": [
             {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
             {"key": "gen_ai.tool.message", "value": {"stringValue": "found u1"}},
@@ -65,15 +70,14 @@ def test_local_traces_prefers_downloaded_over_sibling(tmp_path: Path) -> None:
     assert local_traces_path(tmp_path / "nowhere") is None
 
 
-def test_scenarios_from_traces_groups_by_trace(tmp_path: Path) -> None:
+def test_trace_summaries_from_otlp_groups_by_trace(tmp_path: Path) -> None:
     path = tmp_path / TRACES_FILENAME
     _write_otel(path)
-    scenarios = scenarios_from_traces(path)
-    assert len(scenarios) == 1
-    steps = scenarios[0].steps
-    assert steps[0].action.name == "get_user"
-    assert steps[0].action_label.startswith("get_user")
-    assert steps[0].observation == "found u1"
+    summaries = trace_summaries_from_otlp(path)
+    assert len(summaries) == 1
+    steps = summaries[0].steps
+    assert steps[0].name == "chat"
+    assert steps[1].detail == "found u1"
     assert steps[0].is_error is False
 
 

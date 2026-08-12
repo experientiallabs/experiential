@@ -245,7 +245,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     _require_scorable_steps(
         report,
         args,
-        next_step=f"check the export with `wmo ingest --file {args[0]}`, or add "
+        next_step=f"check the export with `wmo build --file {args[0]}`, or add "
         "`--mode closed-loop` for a tasks file",
     )
     _print_eval_report(report)
@@ -277,7 +277,7 @@ def _eval_options(
     knowledge: bool | None = None,
     reasoning: bool | None = None,
 ) -> _EvalOptions:
-    from wmo.simulation.model.build import DEFAULT_TRAIN_SPLIT
+    from wmo.simulation.model import DEFAULT_TRAIN_SPLIT
 
     split = DEFAULT_TRAIN_SPLIT if train_split is None else train_split
     dim = 512 if embed_dim is None else embed_dim

@@ -134,6 +134,9 @@ def normalize_posthog_payload(
 
     Returns:
         Valid canonical traces and explicit invalid event or trace exclusions.
+
+    Raises:
+        PostHogPullError: The semantic convention version is blank.
     """
     if not semantic_convention_version.strip():
         raise PostHogPullError("semantic convention version must not be blank")

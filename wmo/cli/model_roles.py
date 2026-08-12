@@ -95,7 +95,7 @@ def configured_role_configs(root: str) -> list[tuple[ModelRoleName, ProviderConf
     The model is canonicalized through the built-in catalog, because that is what a role holds:
     `wmo providers set` stores the canonical TYPE (`claude-opus-4-8`), not the backend's runtime
     id (`us.anthropic.claude-opus-4-8`), so a caller that wants to reach the backend has to
-    resolve it (`wmo scenarios` does the same). Unknown ids pass through unchanged, which is
+    resolve it before invoking a provider. Unknown ids pass through unchanged, which is
     what a self-hosted model or a `tinker://` weights path needs.
 
     Args:

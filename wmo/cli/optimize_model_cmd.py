@@ -31,6 +31,8 @@ from wmo.cli.optimize_model_plan import (
 )
 from wmo.cli.optimize_model_stages import _print_payoff, _run_stages
 from wmo.common.config import ARTIFACT_DIR, WorldModelStore
+from wmo.common.project import ArtifactStoreError, ProjectStore
+from wmo.common.tasks import resolve_task_set
 
 if TYPE_CHECKING:
     from wmo.optimize.routing.compression import CompressionConfig
@@ -51,24 +53,28 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         help="Candidate pool TOML the router chooses between: one \\[\\[model]] table per "
         "candidate, as `wmo providers set` writes it.",
     ),
-    traces_file: str = typer.Option(
+    project: str = typer.Option(
+        "default",
+        "--project",
+        help="Project that owns the immutable task set built from canonical trace evidence.",
+    ),
+    task_set: str | None = typer.Option(
         None,
-        "--traces",
-        help="Trace corpus the held-out scenarios come from (default: the model's own "
-        "traces.otel.jsonl). A build keeps no copy of the corpus it read, so pass the file here.",
+        "--task-set",
+        help="Immutable task-set ID. Omit only when the project has exactly one task set.",
     ),
     scenarios: int = typer.Option(
         DEFAULT_SCENARIOS,
         "--scenarios",
         min=1,
-        help="Cap on held-out scenarios measured. More scenarios is better evidence and more "
+        help="Cap on held-out immutable tasks measured. More tasks are better evidence and more "
         "spend, linearly.",
     ),
     episodes: int = typer.Option(
         DEFAULT_EPISODES,
         "--episodes",
         min=1,
-        help="Episodes per (candidate, scenario) cell. Raise it when your rewards are noisy.",
+        help="Episodes per (candidate, task) cell. Raise it when your rewards are noisy.",
     ),
     max_steps: int = typer.Option(
         DEFAULT_MAX_STEPS, "--max-steps", min=1, help="Step budget per episode."
@@ -178,7 +184,8 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         wmo optimize model support
 
     Stage by stage that is `route sweep` (the only paid step: every candidate runs the model's own
-    held-out scenarios closed-loop), `route fit --kind knn`, `route tune`, and `route report`. One
+    held-out immutable tasks closed-loop), `route fit --kind knn`, `route tune`, and `route
+    report`. One
     plan table prints before anything spends, showing what each stage will do and what it is
     projected to cost, and one confirmation covers the run.
 
@@ -207,16 +214,17 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     Args:
         world_model: Built world model to optimize, or the only model under `root`.
         pool_file: Candidate roster measured by the sweep.
-        traces_file: Optional trace corpus used to construct held-out scenarios.
+        project: Project that owns the immutable canonical task-set artifact.
+        task_set: Optional exact task-set artifact ID when the project has several.
         max_usd: Run-wide spend ceiling covering candidate and simulation costs.
         dry_run: Whether to render the plan without writing artifacts or spending.
 
     Raises:
         typer.BadParameter: A flag, model, pool entry, or planned stage is invalid.
     """
-    from wmo.cli.route_sweep_cmd import print_deferred_risks, print_tiny_corpus_note
+    from wmo.cli.route_sweep_cmd import print_deferred_risks, print_underfilled_task_note
     from wmo.optimize.routing.compression import resolve_compression
-    from wmo.optimize.routing.evaluation import scenario_id
+    from wmo.optimize.routing.evaluation import task_id
     from wmo.optimize.routing.outcomes import split_router_scenarios
     from wmo.optimize.routing.pipeline import (
         MANIFEST_DIRNAME,
@@ -231,7 +239,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         project_sweep_spend,
     )
     from wmo.optimize.routing.policy import POLICY_FILENAME, probe_embedder
-    from wmo.optimize.routing.sweep import SweepError, plan_sweep, resolve_config, resumable_cells
+    from wmo.optimize.routing.sweep import SweepError, plan_sweep, resumable_cells
     from wmo.optimize.routing.sweep import preflight_pool as run_preflight
 
     if distill is not None:
@@ -281,15 +289,14 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     # usable and what prices them, and both have to be true before an operator is asked to
     # authorize anything. It spends nothing, so running it unconditionally costs only time.
     try:
-        config = resolve_config(model_dir)
+        tasks = resolve_task_set(ProjectStore(Path(root), project).artifacts, task_set)
         preflight = run_preflight(Path(pool_file))
         print_deferred_risks(_console, preflight.deferred)
         plan = plan_sweep(
             model_dir=model_dir,
-            config=config,
             pool=preflight.pool,
             out_path=paths.matrix,
-            traces_file=Path(traces_file) if traces_file is not None else None,
+            task_set=tasks,
             scenarios=scenarios,
             episodes=episodes,
             max_steps=max_steps,
@@ -301,13 +308,13 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         # Read before the plan table so the sweep row can say how much of the grid a previous
         # attempt already bought, and so a sidecar from a different plan is refused for free.
         already_measured = resumable_cells(plan)
-    except SweepError as exc:
+    except (ArtifactStoreError, SweepError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     try:
-        split_router_scenarios([scenario_id(scenario) for scenario in plan.scenarios])
+        split_router_scenarios([task_id(task) for task in plan.tasks])
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    print_tiny_corpus_note(_console, plan)
+    print_underfilled_task_note(_console, plan)
     # Both flags name a pool candidate, and the pool is loaded by the pre-flight above, so a typo
     # is knowable here for free: a boundary error rather than a surprise after the sweep has been
     # paid for and the fit written. --fallback used to survive this far and then be printed in the

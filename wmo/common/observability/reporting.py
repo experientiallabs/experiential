@@ -3,7 +3,7 @@
 The build emits coarse lifecycle events (ingest, split, index, optimize, persist) plus fine-grained
 GEPA rollout events to a `BuildReporter`. The simulation depends only on this shared protocol, so
 the pipeline stays headless and testable. The CLI supplies a rich-backed reporter
-(`wmo.cli.ui.RichBuildReporter`); everything else uses `NullReporter`.
+(historically a CLI reporter); everything else uses `NullReporter`.
 """
 
 from __future__ import annotations

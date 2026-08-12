@@ -12,6 +12,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -30,6 +31,7 @@ from wmo.common.providers.base import (
     VerifyResult,
 )
 from wmo.common.providers.pool import PoolEntry, load_pool
+from wmo.common.tasks import LoadedTaskSet, TaskCase, TaskSet
 from wmo.optimize.routing.compression import CompressionConfig
 from wmo.optimize.routing.evaluation import CellKey
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
@@ -42,13 +44,10 @@ from wmo.optimize.routing.sweep import (
     execute_sweep,
     plan_sweep,
     preflight_pool,
-    resolve_config,
     resumable_cells,
     unevenness,
 )
 from wmo.optimize.routing.sweep_partial import partial_path
-from wmo.simulation.ingest.otel_writer import write_traces_jsonl
-from wmo.simulation.serving.traces_source import TRACES_FILENAME
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -73,7 +72,7 @@ def _traces(count: int = 30) -> list[Trace]:
     ]
 
 
-def _model_dir(tmp_path: Path, *, with_corpus: bool = True) -> Path:
+def _model_dir(tmp_path: Path) -> Path:
     model_dir = tmp_path / ".wmo" / "models" / "support"
     save_config(
         HarnessConfig(
@@ -83,9 +82,35 @@ def _model_dir(tmp_path: Path, *, with_corpus: bool = True) -> Path:
         ),
         model_dir,
     )
-    if with_corpus:
-        write_traces_jsonl(_traces(), model_dir / TRACES_FILENAME)
     return model_dir
+
+
+def _task_set(count: int = 30) -> LoadedTaskSet:
+    """Build direct immutable task data without reopening a trace corpus."""
+    traces = sorted(_traces(count), key=lambda trace: trace.trace_id)
+    tasks = tuple(
+        TaskCase(
+            task_id=trace.trace_id,
+            lineage_group_id=f"lineage-{trace.trace_id}",
+            partition="held_out" if index % 5 == 0 else "fit",
+            instruction=trace.steps[0].task or trace.trace_id,
+            workload_weight=1.0,
+            source_trace_ids=(trace.trace_id,),
+        )
+        for index, trace in enumerate(traces)
+    )
+    return LoadedTaskSet(
+        task_set=TaskSet(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            code_revision="test",
+            task_set_id="task-set-sweep",
+            task_ids=tuple(task.task_id for task in tasks),
+            tasks_path="tasks.jsonl",
+            tasks_sha256="0" * 64,
+        ),
+        tasks=tasks,
+    )
 
 
 def _pool_file(tmp_path: Path) -> Path:
@@ -115,10 +140,9 @@ def _plan(
     model_dir = _model_dir(tmp_path)
     return plan_sweep(
         model_dir=model_dir,
-        config=resolve_config(model_dir),
         pool=load_pool(_pool_file(tmp_path)),
         out_path=tmp_path / out_name,
-        traces_file=None,
+        task_set=_task_set(),
         assume_input_tokens=2000,
         assume_output_tokens=250,
         scenarios=scenarios,
@@ -134,11 +158,9 @@ def test_the_plan_cuts_the_same_held_out_prefix_every_time(tmp_path: Path) -> No
     # a matrix is only comparable to another one measured on the same scenario set.
     first = _plan(tmp_path)
     second = _plan(tmp_path)
-    assert [scenario.task for scenario in first.scenarios] == [
-        scenario.task for scenario in second.scenarios
-    ]
-    assert len(first.scenarios) == 3
-    assert not first.tiny_corpus
+    assert [task.instruction for task in first.tasks] == [task.instruction for task in second.tasks]
+    assert len(first.tasks) == 3
+    assert not first.underfilled
 
 
 def test_the_cost_projection_multiplies_real_cell_counts_by_the_assumed_tokens(
@@ -160,15 +182,19 @@ def test_a_bigger_step_budget_projects_proportionally_more(tmp_path: Path) -> No
     )
 
 
-def test_a_corpus_the_build_did_not_keep_says_where_to_pass_it(tmp_path: Path) -> None:
-    model_dir = _model_dir(tmp_path, with_corpus=False)
+def test_a_task_set_without_held_out_tasks_is_refused(tmp_path: Path) -> None:
+    model_dir = _model_dir(tmp_path)
+    task_set = _task_set(5)
+    task_set = LoadedTaskSet(
+        task_set=task_set.task_set,
+        tasks=tuple(task.model_copy(update={"partition": "fit"}) for task in task_set.tasks),
+    )
     with pytest.raises(SweepError) as caught:
         plan_sweep(
             model_dir=model_dir,
-            config=resolve_config(model_dir),
             pool=load_pool(_pool_file(tmp_path)),
             out_path=tmp_path / "matrix.json",
-            traces_file=None,
+            task_set=task_set,
             scenarios=3,
             episodes=1,
             max_steps=4,
@@ -176,7 +202,7 @@ def test_a_corpus_the_build_did_not_keep_says_where_to_pass_it(tmp_path: Path) -
             assume_output_tokens=250,
         )
     message = str(caught.value)
-    assert "no trace corpus" in message and "--traces" in message
+    assert "no held-out task" in message and "task-set-sweep" in message
 
 
 def test_an_unwritable_destination_is_refused_before_anything_is_spent(tmp_path: Path) -> None:
@@ -186,10 +212,9 @@ def test_an_unwritable_destination_is_refused_before_anything_is_spent(tmp_path:
     with pytest.raises(SweepError, match="cannot write the outcome matrix"):
         plan_sweep(
             model_dir=model_dir,
-            config=resolve_config(model_dir),
             pool=load_pool(_pool_file(tmp_path)),
             out_path=blocker / "matrix.json",
-            traces_file=None,
+            task_set=_task_set(),
             scenarios=3,
             episodes=1,
             max_steps=4,

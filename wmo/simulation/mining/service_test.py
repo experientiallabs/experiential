@@ -13,7 +13,7 @@ import pytest
 from wmo.common.core.artifacts import FailureCode, JsonObject, SourceIdentity, StructuredFailure
 from wmo.common.project import ArtifactStore
 from wmo.common.project.paths import ProjectPaths
-from wmo.common.tasks import ToolSchema
+from wmo.common.tasks import TaskSet, ToolSchema
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.simulation.mining.descriptors import routing_descriptor
 from wmo.simulation.mining.lineage import assign_source_lineages
@@ -496,3 +496,4 @@ def test_persisted_task_set_reuses_the_w2_task_and_artifact_contracts(tmp_path: 
 
     assert task_set.task_ids == tuple(task.task_id for task in result.tasks)
     assert store.read("tasks-a").manifest.artifact_type == "task-set"
+    assert TaskSet.model_validate_json(store.read_bytes("tasks-a", "task-set.json")) == task_set

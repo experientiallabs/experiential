@@ -39,7 +39,6 @@ Measurement notes:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import threading
 import time
@@ -59,12 +58,12 @@ from wmo.common.providers.base import (
     VerifyResult,
 )
 from wmo.common.providers.pool import ModelPool, PoolEntry, pool_provider
+from wmo.common.tasks import TaskCase
 from wmo.optimize.routing.compression import CompressionConfig, estimate_tokens, get_compressor
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.runtime.agents.llm import DEFAULT_HISTORY_CHARS, LLMAgent
 from wmo.runtime.environment import Env
 from wmo.runtime.episode import run_episode
-from wmo.simulation.scenarios.spec import Scenario
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -215,15 +214,9 @@ def _read_episode_score(env: Env) -> tuple[EpisodeScore | None, str | None]:
     return raw, None
 
 
-def scenario_id(scenario: Scenario) -> str:
-    """Stable id for a scenario: its first provenance trace id, else a hash of the task.
-
-    Provisional until wm-create's generate contract ships first-class scenario ids
-    (DECISIONS.md 2026-07-23); both forms are deterministic across runs.
-    """
-    if scenario.provenance:
-        return scenario.provenance[0]
-    return hashlib.sha256(scenario.task.encode("utf-8")).hexdigest()[:12]
+def task_id(task: TaskCase) -> str:
+    """Return the immutable task identity used by every routing evaluation cell."""
+    return task.task_id
 
 
 class CellKey(BaseModel):
@@ -250,12 +243,12 @@ class CellKey(BaseModel):
 
 
 class PoolCell(BaseModel):
-    """One unit of closed-loop work: this candidate, on this scenario, for this episode index."""
+    """One unit of closed-loop work: this candidate, task, and episode index."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     entry: PoolEntry
-    scenario: Scenario
+    task: TaskCase
     episode: int
     # Set when this cell is being measured AGAIN after an earlier attempt (a transport fault, a
     # throttled judge). Rides onto the row so a matrix says which of its cells are re-runs: the
@@ -264,15 +257,13 @@ class PoolCell(BaseModel):
 
     @property
     def key(self) -> CellKey:
-        return CellKey(
-            scenario_id=scenario_id(self.scenario), model=self.entry.name, episode=self.episode
-        )
+        return CellKey(scenario_id=task_id(self.task), model=self.entry.name, episode=self.episode)
 
 
 def pool_cells(
-    pool: ModelPool, scenarios: list[Scenario], *, episodes_per_scenario: int = 1
+    pool: ModelPool, tasks: list[TaskCase], *, episodes_per_scenario: int = 1
 ) -> list[PoolCell]:
-    """Every cell of the grid, in the canonical order: pool order, scenario order, episode index.
+    """Every cell of the grid, in canonical pool, task, and episode order.
 
     THE order, not an order: it is what a matrix's rows are sorted into whatever sequence they
     were measured in, so two runs of the same plan at different concurrencies produce the same
@@ -280,9 +271,9 @@ def pool_cells(
     building their own, so the subset's rows still land in the same places.
     """
     return [
-        PoolCell(entry=entry, scenario=scenario, episode=episode)
+        PoolCell(entry=entry, task=task, episode=episode)
         for entry in pool.models
-        for scenario in scenarios
+        for task in tasks
         for episode in range(episodes_per_scenario)
     ]
 
@@ -298,7 +289,7 @@ def run_cell(
     provider_factory: Callable[[PoolEntry], Provider] = pool_provider,
     compression: CompressionConfig | None = None,
 ) -> ScenarioOutcome:
-    """Measure ONE cell: one episode of one candidate on one scenario, against a fresh env.
+    """Measure ONE cell: one episode of one candidate on one immutable task, against a fresh env.
 
     Everything the cell owns is built here rather than shared: its candidate provider (so
     per-episode provider state stays per episode, and so concurrent cells never share a client),
@@ -317,7 +308,7 @@ def run_cell(
         history_chars=history_chars,
     )
     env = env_factory()
-    result = run_episode(env, agent, cell.scenario.task, max_steps=max_steps)
+    result = run_episode(env, agent, cell.task.instruction, max_steps=max_steps)
     score, score_error = _read_episode_score(env)
     error = result.error
     if score_error is not None:
@@ -331,8 +322,8 @@ def run_cell(
         critique = f"{_SALVAGE_PREFIX}{critique}" if critique else ""
         score = None
     return ScenarioOutcome(
-        scenario_id=scenario_id(cell.scenario),
-        task=cell.scenario.task,
+        scenario_id=task_id(cell.task),
+        task=cell.task.instruction,
         model=cell.entry.name,
         episode=cell.episode,
         reward=score.reward if score else None,
@@ -464,7 +455,7 @@ def _measure_concurrently(
 def evaluate_pool(
     env_factory: Callable[[], Env],
     pool: ModelPool,
-    scenarios: list[Scenario],
+    tasks: list[TaskCase],
     *,
     episodes_per_scenario: int = 1,
     max_steps: int = 20,
@@ -476,7 +467,7 @@ def evaluate_pool(
     compression: CompressionConfig | None = None,
     max_concurrency: int = 1,
 ) -> OutcomeMatrix:
-    """Run every pool candidate over `scenarios`, one fresh env per episode.
+    """Run every pool candidate over immutable canonical tasks, one fresh env per episode.
 
     The env must score episodes on close (`WorldModelEnv(..., score_on_close=True)`): a matrix
     without verified rewards is not evidence. Episodes that error, and episodes whose scoring
@@ -504,7 +495,7 @@ def evaluate_pool(
     return OutcomeMatrix(
         pool=pool.models,
         outcomes=run_cells(
-            pool_cells(pool, scenarios, episodes_per_scenario=episodes_per_scenario),
+            pool_cells(pool, tasks, episodes_per_scenario=episodes_per_scenario),
             env_factory,
             max_steps=max_steps,
             agent_temperature=agent_temperature,

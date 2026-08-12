@@ -1,4 +1,4 @@
-"""Benchmark download and split-default tests."""
+"""Benchmark download command tests."""
 
 # ruff: noqa: F403, F405
 from wmo.cli.cli_fixtures_test import *
@@ -207,66 +207,3 @@ def test_download_picker_lists_published_and_fetches_choice(
     assert result.exit_code == 0, result.output
     assert fetched == ["gaia2"]
     assert "not downloaded" in result.output  # picker showed local status
-
-
-def test_build_and_eval_share_one_default_train_split() -> None:
-    # `wmo build` and `wmo eval` cut the SAME deterministic trace-id hash line of the SAME corpus,
-    # so their defaults are not two independent knobs: they are one number. They drifted apart
-    # (build 0.8, eval 0.7), which leaked the [0.7, 0.8) band of GEPA's training traces into every
-    # default eval as "held-out". Both must read `DEFAULT_TRAIN_SPLIT` and nothing else.
-    assert _build_cli_train_split_default() == DEFAULT_TRAIN_SPLIT
-    assert _eval_cli_train_split_default() == DEFAULT_TRAIN_SPLIT
-    # Pinned to each other too, so a future edit to one alone is a failure and not a silent leak.
-    assert _build_cli_train_split_default() == _eval_cli_train_split_default()
-    assert HarnessConfig().train_split == DEFAULT_TRAIN_SPLIT
-
-
-def test_default_eval_holdout_contains_no_build_training_trace() -> None:
-    # The measurement-validity invariant behind the shared constant, checked end to end on the
-    # real split functions: nothing GEPA trained on may be scored as held-out.
-    traces = [Trace(trace_id=f"trace-{i}") for i in range(400)]
-    build_split = _build_cli_train_split_default()
-    # Mirrors `wmo.simulation.model.build.build`: train / val / test on one hash line.
-    gepa_train, _val, _test = split_traces_3way(traces, build_split, (1.0 - build_split) / 2)
-    # Mirrors `wmo.simulation.evaluation.open_loop.evaluate_files` on the ad hoc
-    # `wmo eval <file>` path.
-    _eval_train, holdout = split_traces(traces, _eval_cli_train_split_default())
-    assert gepa_train, "sanity: the corpus must actually produce a training split"
-    assert holdout, "sanity: the corpus must actually produce a holdout"
-    leaked = {t.trace_id for t in gepa_train} & {t.trace_id for t in holdout}
-    assert leaked == set(), f"{len(leaked)} GEPA training traces scored as held-out"
-
-
-def test_build_defaults_to_the_free_fidelity_tier(patched_provider, tmp_path) -> None:  # noqa: ANN001
-    """A plain `wmo build` must not spend on search.
-
-    The default was `medium`, which runs GEPA plus a cheap-lever config search; in one observed
-    build that was 73% of total spend. `low` is `estimate_only` with `gepa_budget=0` and no
-    config search, so the documented quickstart no longer bills a first-time user by default.
-    `auto_fidelity.json` records the difference: the low tier writes a signature estimate with
-    no `scores`, while every searching tier writes the scores it paid for.
-    """
-    spec = FIDELITY_TIERS[FidelityTier.LOW]
-    assert spec.gepa_budget == 0 and spec.config_search is False, "low is no longer the free tier"
-
-    root = tmp_path / ".wmo"
-    result = runner.invoke(
-        app,
-        [
-            "build",
-            "--name",
-            "defaulted",
-            "--file",
-            _traces_file(tmp_path),
-            "--root",
-            str(root),
-            "--provider",
-            "bedrock",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    auto = json.loads(
-        (root / "models" / "defaulted" / "auto_fidelity.json").read_text(encoding="utf-8")
-    )
-    assert not auto.get("scores"), f"default build paid for a config search: {auto['scores']}"

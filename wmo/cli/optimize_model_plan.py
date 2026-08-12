@@ -455,10 +455,10 @@ def _report_anchor(policy_path: Path, *, baseline: str | None, fallback: str | N
 
 
 def _scenario_identity(plan: SweepPlan) -> str:
-    """The scenario SET the sweep will measure, as an id list a change is visible in."""
-    from wmo.optimize.routing.evaluation import scenario_id
+    """The immutable task set the sweep will measure, as an ordered ID list."""
+    from wmo.optimize.routing.evaluation import task_id
 
-    return ",".join(scenario_id(scenario) for scenario in plan.scenarios)
+    return ",".join(task_id(task) for task in plan.tasks)
 
 
 def _policy_fit_identity(policy_path: Path) -> str:
@@ -495,18 +495,18 @@ def _stage_plan_text(
 ) -> str:
     """One line saying what this stage will actually do, in the operator's terms."""
     from wmo.optimize.routing.compression import compression_signature
-    from wmo.optimize.routing.evaluation import scenario_id
+    from wmo.optimize.routing.evaluation import task_id
     from wmo.optimize.routing.knn import cost_quality_named_point
     from wmo.optimize.routing.outcomes import split_router_scenarios
     from wmo.optimize.routing.pipeline import Stage
 
-    router_split = split_router_scenarios([scenario_id(scenario) for scenario in plan.scenarios])
+    router_split = split_router_scenarios([task_id(task) for task in plan.tasks])
     match stage:
         case Stage.PREFLIGHT:
             return f"resolve {len(plan.pool.models)} backend(s), check prices"
         case Stage.SWEEP:
             grid = (
-                f"{len(plan.pool.models)} candidate(s) x {len(plan.scenarios)} scenario(s) "
+                f"{len(plan.pool.models)} candidate(s) x {len(plan.tasks)} task(s) "
                 f"x {plan.episodes} episode(s)"
             )
             pace = f", {plan.max_concurrency} at a time" if plan.max_concurrency > 1 else ""
