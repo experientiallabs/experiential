@@ -886,13 +886,23 @@ def _event_timestamp(
 ) -> datetime:
     """Return an ordered event timestamp without manufacturing wall-clock provenance.
 
-    A supplied timezone-aware Pi timestamp is used unless it would move ordering backwards. A
-    missing timestamp becomes the Unix epoch plus its one-based JSONL line number in microseconds.
-    That explicit synthetic policy keeps all-missing transcripts deterministic and source-ordered.
+    A supplied timezone-aware Pi timestamp or finite Unix-millisecond value is used unless it
+    would move ordering backwards. A missing timestamp becomes the Unix epoch plus its one-based
+    JSONL line number in microseconds. That explicit synthetic policy keeps all-missing
+    transcripts deterministic and source-ordered.
     """
     raw_timestamp = event.get("timestamp")
     if raw_timestamp is None:
         timestamp = _DETERMINISTIC_EVENT_EPOCH + timedelta(microseconds=line_number)
+    elif isinstance(raw_timestamp, (int, float)) and not isinstance(raw_timestamp, bool):
+        if not math.isfinite(raw_timestamp):
+            raise PiTranscriptError(f"Pi JSON event line {line_number} has an invalid timestamp")
+        try:
+            timestamp = _DETERMINISTIC_EVENT_EPOCH + timedelta(milliseconds=raw_timestamp)
+        except OverflowError as exc:
+            raise PiTranscriptError(
+                f"Pi JSON event line {line_number} has an invalid timestamp"
+            ) from exc
     elif not isinstance(raw_timestamp, str):
         raise PiTranscriptError(f"Pi JSON event line {line_number} has a non-string timestamp")
     else:

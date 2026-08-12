@@ -70,6 +70,17 @@ def test_default_pi_runtime_binds_the_injected_model_and_environment(
     }
 
 
+def test_installed_pi_parses_a_0731_numeric_millisecond_timestamp(tmp_path: Path) -> None:
+    """Pi 0.73.1 JSON mode preserves numeric assistant message timestamps through WMO."""
+    runtime = PiAgentRuntime(executable=str(_write_pi_0731_timestamp_fixture(tmp_path)))
+
+    episode = execute_agent_episode(runtime, _EnvironmentRuntime(), _task(), _Model())
+
+    expected_timestamp = datetime(2024, 12, 3, 14, 2, 47, 890000, tzinfo=UTC)
+    assert episode.events[0].started_at == expected_timestamp
+    assert episode.events[0].ended_at == expected_timestamp
+
+
 @pytest.mark.parametrize(
     ("pi_stop_reason", "code", "attribution"),
     [
@@ -405,6 +416,43 @@ events = [
         "isError": False,
     }},
     {{"type": "agent_end"}},
+]
+sys.stdout.write("\\n".join(json.dumps(event) for event in events) + "\\n")
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(executable.stat().st_mode | S_IXUSR)
+    return executable
+
+
+def _write_pi_0731_timestamp_fixture(tmp_path: Path) -> Path:
+    """Write a static Pi 0.73.1 JSON-mode transcript with a numeric message timestamp."""
+    executable = tmp_path / "pi-0731-timestamp-fixture"
+    executable.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+
+message = {{
+    "role": "assistant",
+    "content": [{{"type": "text", "text": "Pi completed the timestamp fixture."}}],
+    "api": "openai-responses",
+    "provider": "wmo-injected",
+    "model": "wmo-injected-model",
+    "usage": {{
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+    }},
+    "stopReason": "stop",
+    "timestamp": 1733234567890,
+}}
+events = [
+    {{"type": "message_end", "message": message}},
+    {{"type": "agent_end", "messages": [message]}},
 ]
 sys.stdout.write("\\n".join(json.dumps(event) for event in events) + "\\n")
 """,
