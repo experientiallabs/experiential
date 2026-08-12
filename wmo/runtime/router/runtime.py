@@ -454,18 +454,11 @@ class RouterRuntime:
         self, episode_decision: RoutingDecision, request_sha256: Sha256
     ) -> RoutingDecision:
         """Bind a later episode turn to the original selected alias and evidence."""
-        material = {
-            "policy_id": episode_decision.policy_id,
-            "policy_sha256": episode_decision.policy_sha256,
-            "request_sha256": request_sha256,
-            "episode_id_sha256": episode_decision.episode_id_sha256,
-            "selected_alias": episode_decision.selected_alias,
-        }
-        return episode_decision.model_copy(
-            update={
-                "decision_id": stable_id("routing-decision", material),
-                "request_sha256": request_sha256,
-            }
+        material = episode_decision.model_copy(update={"request_sha256": request_sha256})
+        identity_material = material.model_dump(mode="json")
+        del identity_material["decision_id"]
+        return material.model_copy(
+            update={"decision_id": stable_id("routing-decision", identity_material)}
         )
 
     def _record(self, decision: RoutingDecision) -> RoutingDecision:

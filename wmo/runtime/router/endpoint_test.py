@@ -133,6 +133,8 @@ def test_endpoint_provider_retry_reuses_exact_cached_request_decision() -> None:
         },
         {"tool_choice": {"function": {"name": "missing"}}},
         {"max_completion_tokens": 0},
+        {"messages": [{"role": "system", "content": "no user"}]},
+        {"messages": [{"role": "assistant", "content": "no user"}]},
     ],
 )
 def test_invalid_http_request_never_reaches_selection_or_provider(

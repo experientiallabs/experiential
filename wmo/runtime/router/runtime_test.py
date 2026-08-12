@@ -543,6 +543,28 @@ def test_cached_selection_and_completion_recheck_integrity_without_consumption()
         runtime.select(request, episode_id="episode-a")
 
 
+def test_sticky_decision_identity_hashes_all_retained_evidence() -> None:
+    """Unequal first-turn evidence cannot collide for the same later request and episode."""
+    runtime, _client = _runtime()
+    first = runtime.select(_request(tool_name="read"), episode_id="episode-a")
+    changed = first.model_copy(
+        update={
+            "neighbor_count": first.neighbor_count + 1,
+            "paired_count": first.paired_count + 1,
+            "best_similarity": 0.5,
+        }
+    )
+    request_sha256 = "f" * 64
+
+    sticky = runtime._sticky_decision(first, request_sha256)  # noqa: SLF001 - identity probe
+    changed_sticky = runtime._sticky_decision(  # noqa: SLF001 - identity probe
+        changed, request_sha256
+    )
+
+    assert sticky != changed_sticky
+    assert sticky.decision_id != changed_sticky.decision_id
+
+
 def test_complete_validates_one_prior_decision_without_selecting_again() -> None:
     """Python completion validates and reuses the exact cached supplied decision."""
     policy, manifest, bank, snapshots, client = _fixture()

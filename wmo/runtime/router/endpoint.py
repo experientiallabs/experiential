@@ -172,6 +172,8 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
 
 def _model_request(request: HttpChatRequest) -> ModelRequest:
     """Preserve ordered text, assistant tool calls, tool results, and request tool schemas."""
+    if not any(message.role == "user" for message in request.messages):
+        raise ValueError("routed requests require at least one user message")
     messages = []
     for message in request.messages:
         role = "system" if message.role == "developer" else message.role
