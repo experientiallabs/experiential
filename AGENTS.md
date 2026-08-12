@@ -39,11 +39,12 @@ uv run pytest -q
   remove an entry and retain its tombstone; reintroduction is rejected.
 - There is no 800-line warning and no numeric modules-per-directory gate.
 
-Current migration state: the checkout still contains current-main legacy surfaces and 30 active
+Current migration state: the checkout still contains current-main legacy surfaces and 31 active
 oversized-file inventory entries owned by the deletion and domain workstreams. The transition
 inventories name those paths and commands so they cannot grow while their owners remove or split
-them. The active size inventory is temporary migration state, not a permanent exemption, and must
-be empty by the final release audit.
+them. An active oversized file changed after the frozen W1 baseline must reach 999 lines or fewer
+and be tombstoned in that same pull request. The active size inventory is temporary migration
+state, not a permanent exemption, and must be empty by the final release audit.
 
 ## World models and trace lifecycle
 

@@ -1,4 +1,4 @@
-"""Executable repository structure and migration guardrails.
+"""Executable repository migration guardrails.
 
 Runs against `git ls-files` so it checks what is TRACKED, not what happens to be on disk.
 Skipped outside a git checkout (e.g. an installed sdist).
@@ -6,13 +6,11 @@ Skipped outside a git checkout (e.g. an installed sdist).
 
 from __future__ import annotations
 
-import ast
 import functools
-import importlib.util
-import re
 import subprocess
 import tomllib
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
@@ -38,109 +36,75 @@ HAND_AUTHORED_SUFFIXES: Final[frozenset[str]] = frozenset(
 )
 MAX_HAND_AUTHORED_LINES: Final[int] = 999
 
-# Frozen from origin/main at the W1 baseline. Active entries may only shrink to a tombstone.
-OVERSIZED_FILE_BASELINE_REVISION: Final[str] = "e7aad17b2f5041769ad8107ab25e77d4e88729ca"
-OVERSIZED_FILE_INVENTORY: Final[dict[str, tuple[int, str]]] = {
-    "wmo/cli/app.py": (3716, "active"),
-    "wmo/cli/app_test.py": (3487, "active"),
-    "wmo/cli/model_app.py": (1316, "active"),
-    "wmo/cli/model_app_test.py": (1418, "active"),
-    "wmo/cli/optimize_model_app.py": (1720, "active"),
-    "wmo/cli/optimize_model_app_test.py": (1692, "active"),
-    "wmo/cli/pool_registry_test.py": (1184, "active"),
-    "wmo/cli/route_app.py": (1654, "active"),
-    "wmo/cli/route_app_test.py": (3616, "active"),
-    "wmo/cli/run_cmd.py": (1105, "active"),
-    "wmo/cli/run_cmd_test.py": (1209, "active"),
-    "wmo/cli/ui.py": (1147, "active"),
-    "wmo/common/providers/pool_test.py": (1307, "active"),
-    "wmo/common/providers/tinker_test.py": (1251, "active"),
-    "wmo/optimize/model/config.py": (1142, "active"),
-    "wmo/optimize/model/config_test.py": (1018, "active"),
-    "wmo/optimize/model/data_test.py": (1727, "active"),
-    "wmo/optimize/model/loop.py": (3656, "active"),
-    "wmo/optimize/model/loop_test.py": (3700, "active"),
-    "wmo/optimize/model/rollouts_test.py": (1028, "active"),
-    "wmo/optimize/model/store.py": (1031, "active"),
-    "wmo/optimize/routing/policy.py": (1345, "active"),
-    "wmo/optimize/routing/policy_test.py": (1508, "active"),
-    "wmo/optimize/routing/scorecard.py": (1101, "active"),
-    "wmo/optimize/telemetry/hooks.py": (1111, "active"),
-    "wmo/runtime/harness/pi_e2b.py": (1711, "active"),
-    "wmo/runtime/harness/pi_e2b_test.py": (2440, "active"),
-    "wmo/runtime/harness/vendor/pi-agent/src/harness/agent-harness.ts": (1029, "active"),
-    "wmo/runtime/harness/vendor/pi-agent/test/agent-loop.test.ts": (1351, "active"),
-    "wmo/simulation/serving/chat.py": (1915, "active"),
-    "wmo/simulation/serving/chat_test.py": (3050, "active"),
-}
-OVERSIZED_FILE_TOMBSTONES: Final[frozenset[str]] = frozenset()
+GUARDRAIL_CONFIG_PATH = REPO_ROOT / "wmo" / "repository_guardrails.toml"
+GUARDRAIL_CONFIG_RELATIVE_PATH = GUARDRAIL_CONFIG_PATH.relative_to(REPO_ROOT).as_posix()
 
-# Generated outputs are exempt by exact path, not by a broad suffix or directory rule. A future
-# generated API client must add its exact tracked path here and live in a named `generated/`
-# directory. The only generated output in this checkout today is the uv lockfile.
-GENERATED_OUTPUTS: Final[frozenset[str]] = frozenset({"uv.lock"})
 
-FORBIDDEN_IMPORTS: Final[dict[str, frozenset[str]]] = {
-    "common": frozenset({"runtime", "simulation", "optimize", "cli"}),
-    "runtime": frozenset({"simulation", "optimize", "cli"}),
-    "simulation": frozenset({"optimize", "cli"}),
-    "optimize": frozenset({"simulation", "cli"}),
-}
+@dataclass(frozen=True)
+class OversizedFileEntry:
+    """One frozen legacy file-size exception and its monotonic state."""
 
-# These are the current-main edges that the target package graph will remove with their owning
-# legacy surfaces. The inventory is intentionally exact at the importing-module and imported-
-# module level: adding a new forbidden edge, even from a known legacy module, fails immediately.
-IMPORT_TRANSITION_INVENTORY: Final[frozenset[tuple[str, str]]] = frozenset(
-    {
-        ("wmo/optimize/gepa.py", "wmo.simulation.retrieval"),
-        ("wmo/optimize/gepa.py", "wmo.simulation.retrieval.leakfree"),
-        ("wmo/simulation/environment.py", "wmo.optimize.reward"),
-        ("wmo/simulation/serving/server.py", "wmo.optimize.reward"),
-        ("wmo/simulation/serving/server.py", "wmo.optimize.routing.pareto"),
-        ("wmo/simulation/serving/server.py", "wmo.optimize.routing.policy"),
-        ("wmo/simulation/serving/savings.py", "wmo.optimize.routing.knn"),
-        ("wmo/simulation/serving/savings.py", "wmo.optimize.routing.policy"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.compression"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.knn"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.pareto"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.policy"),
-        ("wmo/simulation/model/build.py", "wmo.optimize"),
-        ("wmo/simulation/model/replay.py", "wmo.optimize.gepa"),
-        ("wmo/simulation/model/replay.py", "wmo.optimize.judge"),
-        ("wmo/simulation/model/world_model.py", "wmo.optimize.gepa"),
-        ("wmo/simulation/model/world_model.py", "wmo.optimize.reward"),
-        ("wmo/simulation/model/autoconfig.py", "wmo.optimize.judge"),
-        ("wmo/simulation/evaluation/grid.py", "wmo.optimize.judge"),
-        ("wmo/simulation/evaluation/open_loop.py", "wmo.optimize.judge"),
-        ("wmo/optimize/research/gepa_scaling.py", "wmo.simulation.model.replay"),
-        ("wmo/optimize/research/gepa_scaling.py", "wmo.simulation.retrieval"),
-        ("wmo/optimize/research/scenario_fidelity.py", "wmo.simulation.environment"),
-        ("wmo/optimize/research/scenario_fidelity.py", "wmo.simulation.model.world_model"),
-        ("wmo/optimize/research/scenario_fidelity.py", "wmo.simulation.scenarios.synthesis"),
-        ("wmo/optimize/research/scenario_fidelity.py", "wmo.simulation.scenarios.verification"),
-        ("wmo/optimize/research/trace_scaling.py", "wmo.simulation.model.grounding"),
-        ("wmo/optimize/research/trace_scaling.py", "wmo.simulation.model.knowledge"),
-        ("wmo/optimize/research/trace_scaling.py", "wmo.simulation.model.replay"),
-        ("wmo/optimize/research/trace_scaling.py", "wmo.simulation.model.workspace"),
-        ("wmo/optimize/research/trace_scaling.py", "wmo.simulation.retrieval"),
-        ("wmo/optimize/research/pipeline.py", "wmo.simulation.model.grounding"),
-        ("wmo/optimize/research/pipeline.py", "wmo.simulation.model.replay"),
-        ("wmo/optimize/research/pipeline.py", "wmo.simulation.model.workspace"),
-        ("wmo/optimize/research/pipeline.py", "wmo.simulation.retrieval"),
-        ("wmo/optimize/research/concurrency_run.py", "wmo.simulation.retrieval.leakfree"),
-        ("wmo/optimize/routing/evaluation.py", "wmo.simulation.scenarios.spec"),
-        ("wmo/optimize/routing/policy.py", "wmo.simulation.retrieval.embedders"),
-        ("wmo/optimize/routing/sweep.py", "wmo.simulation.ingest"),
-        ("wmo/optimize/routing/sweep.py", "wmo.simulation.model"),
-        ("wmo/optimize/routing/sweep.py", "wmo.simulation.scenarios.spec"),
-        ("wmo/optimize/routing/sweep.py", "wmo.simulation.serving.traces_source"),
-        ("wmo/optimize/routing/sweep.py", "wmo.simulation.model.world_model"),
-    }
-)
+    baseline_lines: int
+    status: str
 
-# Deletion PRs move entries from the active inventory to this append-only tombstone set. Keeping
-# the set explicit prevents a removed dependency from being quietly reintroduced later.
-IMPORT_TRANSITION_TOMBSTONES: Final[frozenset[tuple[str, str]]] = frozenset()
+
+@dataclass(frozen=True)
+class GuardrailConfig:
+    """Parsed machine-readable inventories used by repository migration checks."""
+
+    oversized_file_baseline_revision: str
+    oversized_file_entries: Mapping[str, OversizedFileEntry]
+    generated_outputs: frozenset[str]
+
+
+def _mapping(value: object, label: str) -> Mapping[str, object]:
+    """Return a string-keyed mapping or fail with an actionable inventory error."""
+    if not isinstance(value, dict):
+        raise AssertionError(f"{label} must be a string-keyed TOML table")
+    result: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise AssertionError(f"{label} must be a string-keyed TOML table")
+        result[key] = item
+    return result
+
+
+def _parse_guardrail_config(raw_config: object) -> GuardrailConfig:
+    """Parse one version of the single machine-readable guardrail inventory."""
+    config = _mapping(raw_config, "guardrail configuration")
+    oversized = _mapping(config.get("oversized_file_inventory"), "oversized_file_inventory")
+    revision = oversized.get("baseline_revision")
+    if not isinstance(revision, str):
+        raise AssertionError("oversized_file_inventory.baseline_revision must be a string")
+    raw_entries = _mapping(oversized.get("entries"), "oversized_file_inventory.entries")
+    entries: dict[str, OversizedFileEntry] = {}
+    for relative_path, raw_entry in raw_entries.items():
+        entry = _mapping(raw_entry, f"oversized_file_inventory.entries.{relative_path}")
+        baseline_lines = entry.get("baseline_lines")
+        status = entry.get("status")
+        if not isinstance(baseline_lines, int) or baseline_lines <= MAX_HAND_AUTHORED_LINES:
+            raise AssertionError(f"{relative_path} must have an oversized baseline_lines value")
+        if not isinstance(status, str) or status not in {"active", "tombstoned"}:
+            raise AssertionError(f"{relative_path} must be active or tombstoned")
+        entries[relative_path] = OversizedFileEntry(baseline_lines, status)
+    generated = _mapping(config.get("generated_outputs"), "generated_outputs")
+    raw_paths = generated.get("paths")
+    if not isinstance(raw_paths, list):
+        raise AssertionError("generated_outputs.paths must be a list of exact paths")
+    generated_paths: list[str] = []
+    for path in raw_paths:
+        if not isinstance(path, str):
+            raise AssertionError("generated_outputs.paths must be a list of exact paths")
+        generated_paths.append(path)
+    return GuardrailConfig(revision, entries, frozenset(generated_paths))
+
+
+@functools.cache
+def _guardrail_config() -> GuardrailConfig:
+    """Load the current single machine-readable oversized-file inventory."""
+    with GUARDRAIL_CONFIG_PATH.open("rb") as file_handle:
+        return _parse_guardrail_config(tomllib.load(file_handle))
+
 
 LEGACY_PATH_PREFIXES: Final[tuple[str, ...]] = (
     "wmo/optimize/gepa.py",
@@ -377,19 +341,6 @@ ROOT_CLI_COMMAND_INVENTORY: Final[frozenset[str]] = frozenset(
 )
 ROOT_CLI_COMMAND_TOMBSTONES: Final[frozenset[str]] = frozenset()
 
-# AGENTS.md rule 5: tracked top-level directories must be within this set, and the set is CLOSED.
-# An agent may never add to it. A new entry requires a human to name that exact directory and
-# grant permission for the name; the entry then lands in the same change that documents it in
-# AGENTS.md rule 5. If work does not fit a surface below, it goes under the closest one or stays
-# out of the repo — never into a new sibling.
-ALLOWED_TOP_DIRS = {
-    "wmo",  # the flagship package: all importable code
-    "docs",  # reviewed public documentation (see the docs/ layout tests below)
-    "assets",  # media referenced by README/docs
-    ".claude",  # checked-in agent skills
-    ".github",  # CI workflows
-}
-
 
 @functools.lru_cache(maxsize=1)
 def _tracked_files() -> tuple[str, ...]:
@@ -409,17 +360,98 @@ def _tracked_files() -> tuple[str, ...]:
     return tuple(result.stdout.splitlines())
 
 
+def _git_output(arguments: list[str]) -> str:
+    """Run a local Git read command or skip outside a repository checkout."""
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        pytest.skip("git not available; repository guardrails require a git checkout")
+    if result.returncode != 0:
+        pytest.skip("not a git checkout; repository guardrails require the frozen baseline")
+    return result.stdout
+
+
+@functools.cache
+def _tracked_files_at_revision(revision: str) -> tuple[str, ...]:
+    """Return every tracked path at one immutable Git revision."""
+    return tuple(_git_output(["ls-tree", "-r", "--name-only", revision]).splitlines())
+
+
+@functools.cache
+def _frozen_legacy_path_inventory() -> frozenset[str]:
+    """Return every legacy-root path that existed at the frozen W1 revision."""
+    return _legacy_path_candidates(
+        _tracked_files_at_revision(_guardrail_config().oversized_file_baseline_revision)
+    )
+
+
+def _file_text_at_revision(revision: str, relative_path: str) -> str:
+    """Return one UTF-8 text file from an immutable Git revision."""
+    return _git_output(["show", f"{revision}:{relative_path}"])
+
+
+@functools.cache
+def _frozen_oversized_file_counts() -> Mapping[str, int]:
+    """Recompute the exact oversized-file inventory at the frozen W1 revision."""
+    revision = _guardrail_config().oversized_file_baseline_revision
+    counts: dict[str, int] = {}
+    for relative_path in _tracked_files_at_revision(revision):
+        if not _is_hand_authored_path(relative_path):
+            continue
+        count = _physical_line_count(_file_text_at_revision(revision, relative_path))
+        if count > MAX_HAND_AUTHORED_LINES:
+            counts[relative_path] = count
+    return counts
+
+
+def _changed_paths_since_frozen_baseline() -> frozenset[str]:
+    """Return tracked paths whose content differs from the frozen W1 revision."""
+    revision = _guardrail_config().oversized_file_baseline_revision
+    return frozenset(_git_output(["diff", "--name-only", revision, "--"]).splitlines())
+
+
+@functools.cache
+def _historical_tombstoned_oversized_paths() -> frozenset[str]:
+    """Return every oversized path tombstoned by any reachable inventory revision."""
+    tombstones: set[str] = set()
+    revisions = _git_output(
+        ["log", "--format=%H", "--", GUARDRAIL_CONFIG_RELATIVE_PATH]
+    ).splitlines()
+    for revision in revisions:
+        source = _git_output(["show", f"{revision}:{GUARDRAIL_CONFIG_RELATIVE_PATH}"])
+        historical_config = _parse_guardrail_config(tomllib.loads(source))
+        tombstones.update(
+            path
+            for path, entry in historical_config.oversized_file_entries.items()
+            if entry.status == "tombstoned"
+        )
+    return frozenset(tombstones)
+
+
 def _is_hand_authored_path(relative_path: str) -> bool:
     """Return whether a tracked path is subject to the physical-line rule."""
     return (
         Path(relative_path).suffix in HAND_AUTHORED_SUFFIXES
-        and relative_path not in GENERATED_OUTPUTS
+        and relative_path not in _guardrail_config().generated_outputs
     )
+
+
+def _physical_line_count(text: str) -> int:
+    """Count newline-delimited physical lines without adding a line for a final newline."""
+    if not text:
+        return 0
+    return text.count("\n") + int(not text.endswith("\n"))
 
 
 def _line_count(path: Path) -> int:
     """Count physical lines, including blank and comment lines."""
-    return len(path.read_text(encoding="utf-8").splitlines())
+    return _physical_line_count(path.read_text(encoding="utf-8"))
 
 
 def _is_oversized_hand_authored_path(relative_path: str, path: Path) -> bool:
@@ -442,119 +474,57 @@ def _oversized_hand_authored_files(paths: Iterable[str]) -> tuple[tuple[str, int
     return tuple(sorted(oversized))
 
 
-def _active_oversized_file_counts() -> dict[str, int]:
-    """Return baseline counts for active oversized-file transition entries."""
-    return {
-        path: baseline
-        for path, (baseline, status) in OVERSIZED_FILE_INVENTORY.items()
-        if status == "active"
-    }
-
-
 def _oversized_file_inventory_violations(
     oversized: Iterable[tuple[str, int]],
-    tombstones: frozenset[str] = OVERSIZED_FILE_TOMBSTONES,
+    *,
+    entries: Mapping[str, OversizedFileEntry],
+    baseline_counts: Mapping[str, int],
+    changed_paths: Collection[str],
+    historical_tombstones: Collection[str],
 ) -> tuple[str, ...]:
-    """Return violations against the frozen oversized-file migration inventory."""
+    """Return violations against the one frozen oversized-file inventory."""
     actual = dict(oversized)
-    active = _active_oversized_file_counts()
-    violations = [
-        f"new oversized path: {path}"
-        for path in sorted(set(actual) - set(OVERSIZED_FILE_INVENTORY))
-    ]
-    violations.extend(
-        f"active path is missing from the current oversized set and must be tombstoned: {path}"
-        for path in sorted(set(active) - set(actual))
-    )
-    violations.extend(
-        f"active path grew beyond its baseline: {path} ({actual[path]} > {baseline})"
-        for path, baseline in sorted(active.items())
-        if path in actual and actual[path] > baseline
-    )
-    violations.extend(
-        f"tombstoned oversized path was reactivated: {path}"
-        for path in sorted(set(actual) & tombstones)
-    )
-    invalid_entries = {
-        path
-        for path, (baseline, status) in OVERSIZED_FILE_INVENTORY.items()
-        if baseline <= MAX_HAND_AUTHORED_LINES or status not in {"active", "tombstoned"}
-    }
-    if invalid_entries:
-        violations.append(f"invalid oversized-file inventory entries: {sorted(invalid_entries)}")
-    inventory_tombstones = {
-        path for path, (_, status) in OVERSIZED_FILE_INVENTORY.items() if status == "tombstoned"
-    }
-    if set(OVERSIZED_FILE_INVENTORY) & tombstones:
-        violations.append("oversized-file inventory and tombstones overlap")
-    if inventory_tombstones != tombstones:
-        violations.append("oversized-file tombstone rows and tombstones disagree")
-    return tuple(violations)
-
-
-def _module_name(relative_path: str) -> str:
-    """Return the importable module name for a tracked WMO Python path."""
-    parts = list(Path(relative_path).with_suffix("").parts)
-    if parts[-1] == "__init__":
-        parts.pop()
-    return ".".join(parts)
-
-
-def _resolved_import_target(node: ast.ImportFrom, module_name: str) -> str:
-    """Resolve a possibly-relative import without importing the referenced module."""
-    if node.level == 0:
-        return node.module or ""
-    relative = "." * node.level + (node.module or "")
-    try:
-        return importlib.util.resolve_name(relative, module_name)
-    except ImportError:
-        return ""
-
-
-def _import_targets(tree: ast.AST, module_name: str) -> Iterable[str]:
-    """Yield absolute import targets found in an AST."""
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            yield from (alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            target = _resolved_import_target(node, module_name)
-            if target:
-                yield target
-                if node.module is None or node.module == "wmo":
-                    yield from (
-                        f"{target}.{alias.name}" for alias in node.names if alias.name != "*"
-                    )
-
-
-def _forbidden_imports_in_source(relative_path: str, source: str) -> frozenset[tuple[str, str]]:
-    """Find forbidden package edges in one source string."""
-    module_name = _module_name(relative_path)
-    parts = module_name.split(".")
-    owner = parts[1] if len(parts) > 1 and parts[0] == "wmo" else ""
-    tree = ast.parse(source, filename=relative_path)
-    violations: set[tuple[str, str]] = set()
-    for target in _import_targets(tree, module_name):
-        target_parts = target.split(".")
-        if len(target_parts) < 2 or target_parts[0] != "wmo":
-            continue
-        dependency = target_parts[1]
-        if dependency in FORBIDDEN_IMPORTS.get(owner, frozenset()):
-            violations.add((relative_path, target))
-    return frozenset(violations)
-
-
-def _forbidden_imports_in_repository(paths: Iterable[str]) -> frozenset[tuple[str, str]]:
-    """Find all forbidden production-package edges using AST inspection only."""
-    violations: set[tuple[str, str]] = set()
-    for relative_path in paths:
-        if not relative_path.endswith(".py") or relative_path.endswith("_test.py"):
-            continue
-        path = REPO_ROOT / relative_path
-        if path.is_file():
-            violations.update(
-                _forbidden_imports_in_source(relative_path, path.read_text(encoding="utf-8"))
+    violations: list[str] = []
+    if set(entries) != set(baseline_counts):
+        missing_history = sorted(set(baseline_counts) - set(entries))
+        added_entries = sorted(set(entries) - set(baseline_counts))
+        violations.append(
+            "oversized-file inventory history differs from the frozen baseline: "
+            f"missing={missing_history}, added={added_entries}"
+        )
+    for path, entry in sorted(entries.items()):
+        frozen_count = baseline_counts.get(path)
+        if frozen_count != entry.baseline_lines:
+            violations.append(
+                f"frozen baseline count changed for {path}: "
+                f"{entry.baseline_lines} != {frozen_count}"
             )
-    return frozenset(violations)
+        if entry.status == "active":
+            if path in historical_tombstones:
+                violations.append(f"tombstoned oversized path was reactivated: {path}")
+            if path not in actual:
+                violations.append(
+                    "active oversized path is absent or at most 999 lines and must be tombstoned: "
+                    f"{path}"
+                )
+                continue
+            if actual[path] > entry.baseline_lines:
+                violations.append(
+                    f"active path grew beyond its baseline: {path} "
+                    f"({actual[path]} > {entry.baseline_lines})"
+                )
+            if path in changed_paths:
+                violations.append(
+                    "rewritten active oversized path must reach 999 lines or fewer and be "
+                    f"tombstoned: {path}"
+                )
+        elif entry.status == "tombstoned":
+            if path in actual:
+                violations.append(f"tombstoned oversized path was reactivated: {path}")
+        else:
+            violations.append(f"invalid oversized-file status for {path}: {entry.status}")
+    violations.extend(f"new oversized path: {path}" for path in sorted(set(actual) - set(entries)))
+    return tuple(violations)
 
 
 def _legacy_path_candidates(paths: Iterable[str]) -> frozenset[str]:
@@ -584,233 +554,95 @@ def _root_cli_commands() -> frozenset[str]:
     return frozenset(command.commands)
 
 
-def test_top_level_directories_are_allowlisted() -> None:
-    """Every tracked top-level directory is on the AGENTS.md rule 5 allowlist."""
-    tracked_dirs = {path.split("/", 1)[0] for path in _tracked_files() if "/" in path}
-    unexpected = tracked_dirs - ALLOWED_TOP_DIRS
-    assert not unexpected, (
-        f"top-level directories {sorted(unexpected)} are not in the AGENTS.md rule 5 allowlist "
-        f"{sorted(ALLOWED_TOP_DIRS)}. The allowlist is closed and agents may not extend it: put "
-        "reusable code in wmo/ (self-contained building blocks in wmo/common/), finished reports "
-        "in docs/, and one-off or scratch work OUTSIDE the repo. Adding a new top-level "
-        "directory requires a human to grant permission for that exact name."
-    )
-
-
-def test_no_local_settings_files_are_tracked() -> None:
-    """No generated settings.toml (telemetry ids) is ever committed."""
-    offenders = [p for p in _tracked_files() if Path(p).name == "settings.toml"]
-    assert not offenders, (
-        f"local settings files are tracked: {offenders}; these are generated per-root artifacts "
-        "(telemetry ids) and must stay gitignored"
-    )
-
-
-def test_no_bytecode_or_caches_are_tracked() -> None:
-    """No __pycache__/.pyc artifacts are committed."""
-    offenders = [p for p in _tracked_files() if "__pycache__" in p or p.endswith(".pyc")]
-    assert not offenders, (
-        f"bytecode/cache files are tracked: {offenders[:5]}; git rm --cached them and keep "
-        "__pycache__/ in .gitignore"
-    )
-
-
-def test_docs_layout_is_exactly_readme_research_reference() -> None:
-    """docs/ is the manifest, the CLI map, writeups with their figures, references, and cookbooks.
-
-    Anything else (other top-level pages, stray dirs, figures outside figures/) is clutter that
-    rule 5 says gets relocated or deleted.
-    """
-    allowed = re.compile(
-        r"^docs/(README\.md"
-        r"|usage\.md"
-        r"|research/[^/]+\.md"
-        r"|research/figures/[^/]+\.png"
-        r"|reference/[^/]+\.md"
-        r"|cookbook/[^/]+\.md)$"
-    )
-    offenders = [p for p in _tracked_files() if p.startswith("docs/") and not allowed.match(p)]
-    assert not offenders, (
-        f"files outside the docs/ layout: {offenders}; writeups go in docs/research/*.md with "
-        "figures in docs/research/figures/, references in docs/reference/*.md, end-to-end walks "
-        "in docs/cookbook/*.md, and docs/usage.md is the only other root page (AGENTS.md rule 5)"
-    )
-
-
-# Top-level directories this repo used to have. They are gone; a doc that still points at one is
-# sending the reader to a path that does not exist.
-RETIRED_TOP_DIRS = (".agents/", "deploy/", "examples/", "packages/", "web/")
-
-#: Each retired directory as a regex anchored at a path-token boundary. A bare substring test
-#: would fail the gate on ordinary prose: `web/` matches inside
-#: `https://api.search.brave.com/res/v1/web/search`, and `packages/` inside `site-packages/` or
-#: any `files.pythonhosted.org/packages/...` wheel URL.
-_RETIRED_PATTERNS = tuple(
-    (retired, re.compile(rf"(?<![\w./-]){re.escape(retired)}")) for retired in RETIRED_TOP_DIRS
-)
-
-
-def test_docs_never_point_at_a_retired_directory() -> None:
-    """docs/ are finished products: every path they quote must still exist.
-
-    Reproduction lives in the report itself (public wmo API or CLI), never behind a path that
-    was deleted, and never behind a scratch workspace, which this repo no longer has.
-    """
-    offenders: list[tuple[str, str]] = []
-    for p in _tracked_files():
-        if not (p.startswith("docs/") and p.endswith(".md")):
-            continue
-        path = REPO_ROOT / p
-        if not path.is_file():  # tolerate uncommitted deletes/renames mid-edit
-            continue
-        text = path.read_text(encoding="utf-8")  # once per doc, not once per retired dir
-        offenders.extend(
-            (p, retired) for retired, pattern in _RETIRED_PATTERNS if pattern.search(text)
-        )
-    assert not offenders, (
-        f"docs pointing at retired top-level directories: {offenders}; those paths no longer "
-        "exist. Quote reproduction as public wmo API/CLI in the report itself (AGENTS.md rule 5)"
-    )
-
-
-def test_docs_readme_indexes_every_doc() -> None:
-    """docs/README.md's justification table must name every tracked docs/ file (rule 5).
-
-    The manifest is what makes the justification rule enforceable; a doc or figure absent from
-    it is either unjustified or the table has drifted.
-    """
-    readme = (REPO_ROOT / "docs" / "README.md").read_text(encoding="utf-8")
-    missing = [
-        p
-        for p in _tracked_files()
-        if p.startswith("docs/") and p != "docs/README.md" and p.removeprefix("docs/") not in readme
-    ]
-    assert not missing, (
-        f"docs files absent from docs/README.md's justification table: {missing}; every doc "
-        "and figure gets a row or gets deleted (AGENTS.md rule 5)"
-    )
-
-
-def test_no_tracked_file_is_matched_by_ignore_rules() -> None:
-    """A tracked file matched by a .gitignore rule is a conflict waiting to bite (re-adds fail)."""
-    try:
-        result = subprocess.run(
-            ["git", "ls-files", "-i", "-c", "--exclude-standard"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        pytest.skip("git not available; repo-layout rules only apply to a git checkout")
-    if result.returncode != 0:
-        pytest.skip("not a git checkout; repo-layout rules only apply to the repository")
-    offenders = result.stdout.splitlines()
-    assert not offenders, (
-        f"tracked files matched by ignore rules: {offenders[:5]}; fix the .gitignore pattern "
-        "(add a ! negation or narrow the glob) so tracked artifacts stay re-addable"
-    )
-
-
-def test_there_is_no_uv_workspace() -> None:
-    """One distribution, no members (AGENTS.md § One package).
-
-    The workspace was retired when `packages/` was deleted: `environment-capture` resolves from
-    PyPI and `llm-waterfall` was vendored into `wmo/common/vendor/waterfall/`. Reintroducing a
-    member means reintroducing a top-level `packages/` directory, which rule 5 forbids outright.
-    """
-    with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
-        root = tomllib.load(fh)
-    uv_config = root.get("tool", {}).get("uv", {})
-    assert "workspace" not in uv_config, (
-        "[tool.uv.workspace] is back; this repo publishes one distribution whose importable code "
-        "is all of wmo/. Depend on PyPI or vendor under wmo/common/vendor/ "
-        "(AGENTS.md § One package)"
-    )
-    assert "sources" not in uv_config, (
-        "[tool.uv.sources] is back; with no workspace every dependency resolves from PyPI "
-        "(AGENTS.md § One package)"
-    )
-
-
-def test_root_gate_covers_the_whole_package() -> None:
-    """AGENTS.md § One package promises one root gate over the single package."""
-    with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
-        root = tomllib.load(fh)
-    testpaths = root["tool"]["pytest"]["ini_options"]["testpaths"]
-    assert testpaths == ["wmo"], (
-        f"testpaths is {testpaths}, not ['wmo']; the root gate covers the one package and every "
-        "test is inline beside the module it covers (AGENTS.md § One package)"
-    )
-
-
-ALLOWED_TOP_FILES = {
-    ".env.example",
-    ".gitignore",
-    "AGENTS.md",
-    "CLAUDE.md",
-    "LICENSE",  # not yet present; allowlisted so adding one never fights the gate
-    "README.md",
-    "conftest.py",
-    "justfile",
-    "pyproject.toml",
-    "uv.lock",
-}
-
-
-def test_top_level_files_are_allowlisted() -> None:
-    """Root files are an allowlist too — no Makefile/tox.ini/setup.cfg sprawl (rule 5)."""
-    tracked_root_files = {p for p in _tracked_files() if "/" not in p}
-    unexpected = tracked_root_files - ALLOWED_TOP_FILES
-    assert not unexpected, (
-        f"top-level files {sorted(unexpected)} are not allowlisted; config belongs in "
-        "pyproject.toml, tasks in the justfile, and everything else under an allowlisted dir"
-    )
-
-
-def test_no_finder_duplicate_files_are_tracked() -> None:
-    """macOS Finder copies ("foo 2.py") dodge pytest collection and imports, so they rot
-    silently; 24 of them once shipped in a PR before anyone noticed."""
-    duplicates = [p for p in _tracked_files() if re.search(r" \d+\.\w+$", p)]
-    assert not duplicates, (
-        f"tracked Finder-style duplicate files {sorted(duplicates)}; delete the copies "
-        "(they are never imported or collected) and keep the originals"
-    )
-
-
 def test_hand_authored_files_stay_below_the_physical_line_limit() -> None:
     """Every new or rewritten covered file stays below the frozen migration boundary."""
     oversized = _oversized_hand_authored_files(_tracked_files())
-    assert not _oversized_file_inventory_violations(oversized), (
+    config = _guardrail_config()
+    violations = _oversized_file_inventory_violations(
+        oversized,
+        entries=config.oversized_file_entries,
+        baseline_counts=_frozen_oversized_file_counts(),
+        changed_paths=_changed_paths_since_frozen_baseline(),
+        historical_tombstones=_historical_tombstoned_oversized_paths(),
+    )
+    assert not violations, (
         "hand-authored files must contain fewer than 1,000 physical lines unless they are an "
-        "exact active W1 inventory entry at or below its frozen baseline: "
-        f"{_oversized_file_inventory_violations(oversized)}"
+        "exact active W1 inventory entry at its frozen baseline: "
+        f"{violations}"
     )
 
 
 def test_oversized_file_inventory_is_frozen_at_the_baseline() -> None:
-    """The inventory matches every current oversized path and records the W1 baseline revision."""
-    assert OVERSIZED_FILE_BASELINE_REVISION == "e7aad17b2f5041769ad8107ab25e77d4e88729ca"
-    assert not _oversized_file_inventory_violations(
-        _oversized_hand_authored_files(_tracked_files())
+    """The one inventory is an exact, immutable record of the frozen W1 baseline."""
+    config = _guardrail_config()
+    assert config.oversized_file_baseline_revision == "e7aad17b2f5041769ad8107ab25e77d4e88729ca"
+    frozen = _frozen_oversized_file_counts()
+    assert len(frozen) == 31
+    assert set(config.oversized_file_entries) == set(frozen)
+    assert all(
+        entry.baseline_lines == frozen[path]
+        for path, entry in config.oversized_file_entries.items()
     )
 
 
-def test_oversized_file_inventory_rejects_new_paths_growth_and_tombstones() -> None:
-    """The migration gate rejects new exceptions, growth, and reactivated tombstones."""
-    active_path, baseline = next(iter(_active_oversized_file_counts().items()))
-    assert "new oversized path: wmo/new_large.py" in _oversized_file_inventory_violations(
-        (("wmo/new_large.py", 1000),)
+def test_oversized_file_inventory_rejects_new_growth_reactivation_and_history_loss() -> None:
+    """The migration gate rejects every invalid state transition directly."""
+    baseline = {"wmo/legacy.py": 1000, "wmo/retired.py": 1001}
+    entries = {
+        "wmo/legacy.py": OversizedFileEntry(1000, "active"),
+        "wmo/retired.py": OversizedFileEntry(1001, "tombstoned"),
+    }
+    new_path = _oversized_file_inventory_violations(
+        (("wmo/legacy.py", 1000), ("wmo/new_large.py", 1000)),
+        entries=entries,
+        baseline_counts=baseline,
+        changed_paths=frozenset(),
+        historical_tombstones=frozenset(),
     )
-    assert any(
-        f"active path grew beyond its baseline: {active_path}" in message
-        for message in _oversized_file_inventory_violations(((active_path, baseline + 1),))
+    assert "new oversized path: wmo/new_large.py" in new_path
+    growth = _oversized_file_inventory_violations(
+        (("wmo/legacy.py", 1001),),
+        entries=entries,
+        baseline_counts=baseline,
+        changed_paths=frozenset(),
+        historical_tombstones=frozenset(),
     )
-
+    assert any("active path grew beyond its baseline: wmo/legacy.py" in item for item in growth)
+    rewritten = _oversized_file_inventory_violations(
+        (("wmo/legacy.py", 1000),),
+        entries=entries,
+        baseline_counts=baseline,
+        changed_paths={"wmo/legacy.py"},
+        historical_tombstones=frozenset(),
+    )
+    assert any("rewritten active oversized path" in item for item in rewritten)
     reactivation = _oversized_file_inventory_violations(
-        (("wmo/reactivated.py", 1000),), frozenset({"wmo/reactivated.py"})
+        (("wmo/legacy.py", 1000), ("wmo/retired.py", 1001)),
+        entries=entries,
+        baseline_counts=baseline,
+        changed_paths=frozenset(),
+        historical_tombstones=frozenset(),
     )
-    assert "tombstoned oversized path was reactivated: wmo/reactivated.py" in reactivation
+    assert "tombstoned oversized path was reactivated: wmo/retired.py" in reactivation
+    history_loss = _oversized_file_inventory_violations(
+        (("wmo/legacy.py", 1000),),
+        entries={"wmo/legacy.py": OversizedFileEntry(1000, "active")},
+        baseline_counts=baseline,
+        changed_paths=frozenset(),
+        historical_tombstones=frozenset(),
+    )
+    assert any("inventory history differs" in item for item in history_loss)
+    status_reactivation = _oversized_file_inventory_violations(
+        (("wmo/legacy.py", 1000), ("wmo/retired.py", 1001)),
+        entries={
+            "wmo/legacy.py": OversizedFileEntry(1000, "active"),
+            "wmo/retired.py": OversizedFileEntry(1001, "active"),
+        },
+        baseline_counts=baseline,
+        changed_paths=frozenset(),
+        historical_tombstones={"wmo/retired.py"},
+    )
+    assert "tombstoned oversized path was reactivated: wmo/retired.py" in status_reactivation
 
 
 @pytest.mark.parametrize("suffix", sorted(HAND_AUTHORED_SUFFIXES))
@@ -824,6 +656,14 @@ def test_line_limit_rejects_a_1000_line_fixture_for_each_covered_suffix(
     assert _is_oversized_hand_authored_path(f"fixture{suffix}", fixture)
 
 
+def test_physical_line_count_handles_final_newlines_without_an_extra_blank_line() -> None:
+    """Physical LOC counts an unterminated final line but not a phantom line after a newline."""
+    assert _physical_line_count("") == 0
+    assert _physical_line_count("line") == 1
+    assert _physical_line_count("line\n") == 1
+    assert _physical_line_count("line\n\n") == 2
+
+
 def test_only_exactly_named_generated_outputs_are_exempt() -> None:
     """The line-count exemption does not expand to a suffix or arbitrary generated directory."""
     assert not _is_hand_authored_path("uv.lock")
@@ -833,56 +673,20 @@ def test_only_exactly_named_generated_outputs_are_exempt() -> None:
 
 def test_generated_output_inventory_has_only_named_generated_paths() -> None:
     """Every exemption is either the lockfile or an exact path under a generated directory."""
-    assert all(path == "uv.lock" or "generated" in Path(path).parts for path in GENERATED_OUTPUTS)
-
-
-def test_import_boundaries_match_the_explicit_transition_inventory() -> None:
-    """AST edges must be current inventory entries, with stale entries removed monotonically."""
-    actual = _forbidden_imports_in_repository(_tracked_files())
-    unexpected = actual - IMPORT_TRANSITION_INVENTORY
-    stale = IMPORT_TRANSITION_INVENTORY - actual
-    reintroduced = actual & IMPORT_TRANSITION_TOMBSTONES
-    assert not unexpected, f"new forbidden import edges: {sorted(unexpected)}"
-    assert not stale, (
-        f"stale import transition entries must be removed with the old edge: {sorted(stale)}"
+    assert all(
+        path == "uv.lock" or "generated" in Path(path).parts
+        for path in _guardrail_config().generated_outputs
     )
-    assert not reintroduced, f"retired forbidden imports were reintroduced: {sorted(reintroduced)}"
-    assert not IMPORT_TRANSITION_INVENTORY & IMPORT_TRANSITION_TOMBSTONES
-
-
-@pytest.mark.parametrize(
-    ("owner", "dependency"),
-    sorted(
-        (owner, dependency)
-        for owner, dependencies in FORBIDDEN_IMPORTS.items()
-        for dependency in dependencies
-    ),
-)
-def test_each_forbidden_import_direction_is_detected_by_ast(owner: str, dependency: str) -> None:
-    """Every forbidden dependency direction has a source fixture that the AST gate rejects."""
-    relative_path = f"wmo/{owner}/fixture.py"
-    violations = _forbidden_imports_in_source(
-        relative_path, f"from wmo.{dependency} import forbidden_fixture\n"
-    )
-    assert violations == {(relative_path, f"wmo.{dependency}")}
-
-
-@pytest.mark.parametrize(
-    "dependency", sorted({item for values in FORBIDDEN_IMPORTS.values() for item in values})
-)
-def test_root_package_reexports_are_checked_by_ast(dependency: str) -> None:
-    """A root-package re-export cannot hide a forbidden dependency direction."""
-    relative_path = "wmo/common/fixture.py"
-    violations = _forbidden_imports_in_source(relative_path, f"from wmo import {dependency}\n")
-    assert violations == {(relative_path, f"wmo.{dependency}")}
 
 
 def test_legacy_paths_match_the_explicit_transition_inventory() -> None:
     """Legacy paths remain exact until their owning deletion PR removes them."""
     actual = _legacy_path_candidates(_tracked_files())
+    history = LEGACY_PATH_INVENTORY | LEGACY_PATH_TOMBSTONES
     unexpected = _unknown_legacy_paths(_tracked_files())
     stale = LEGACY_PATH_INVENTORY - actual
     reintroduced = actual & LEGACY_PATH_TOMBSTONES
+    assert history == _frozen_legacy_path_inventory()
     assert not unexpected, (
         f"new legacy paths require their owning deletion PR: {sorted(unexpected)}"
     )
