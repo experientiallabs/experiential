@@ -78,15 +78,13 @@ def optimize_model(
         raise typer.BadParameter(str(exc)) from None
 
     if preflight.completed_result is None:
-        if config.training.maximum_cost_usd is None:
-            spend = "the explicitly unbudgeted managed Tinker SFT run selected in immutable config"
-        else:
-            assert preflight.conservative_schedule_cost_usd is not None
-            spend = (
-                "the managed Tinker SFT run bounded by immutable maximum_cost_usd "
-                f"${config.training.maximum_cost_usd:.2f} with a full-schedule conservative "
-                f"upper bound of ${preflight.conservative_schedule_cost_usd.value:.2f}"
-            )
+        assert config.training.maximum_cost_usd is not None
+        assert preflight.conservative_schedule_cost_usd is not None
+        spend = (
+            "the managed Tinker SFT run bounded by immutable maximum_cost_usd "
+            f"${config.training.maximum_cost_usd:.2f} with a full-schedule conservative "
+            f"upper bound of ${preflight.conservative_schedule_cost_usd.value:.2f}"
+        )
         if not require_spend_consent(
             _console,
             yes=yes,

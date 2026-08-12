@@ -24,7 +24,6 @@ Examples:
             tinker_connection="tinker",
             base_model_alias="base",
             training=training_spec,
-            allow_unbudgeted=True,
             created_at=created_at,
             code_revision=revision,
         )
@@ -55,10 +54,11 @@ Examples:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Never
+from typing import Never
 
 from pydantic import model_validator
 
@@ -116,6 +116,16 @@ class SFTModelOptimizationPreflightError(SFTModelOptimizationError):
     """Read-only validation found a condition that must block managed SFT dispatch."""
 
 
+def _required_maximum_cost_usd(training: TinkerSFTSpec) -> float:
+    """Return the immutable cap when it is a finite positive amount."""
+    maximum_cost_usd = training.maximum_cost_usd
+    if maximum_cost_usd is None or not math.isfinite(maximum_cost_usd) or maximum_cost_usd <= 0:
+        raise ValueError(
+            "SFT model optimization configs require a finite maximum_cost_usd greater than zero"
+        )
+    return maximum_cost_usd
+
+
 class SFTModelOptimizationConfig(ArtifactEnvelope):
     """Immutable W14M intent naming one verified W12 dataset and local trained-model alias."""
 
@@ -127,7 +137,6 @@ class SFTModelOptimizationConfig(ArtifactEnvelope):
     base_model: ModelSnapshot
     connection_config_sha256: Sha256
     training: TinkerSFTSpec
-    allow_unbudgeted: Literal[True] | None = None
 
     @model_validator(mode="after")
     def _require_exact_bindings(self) -> SFTModelOptimizationConfig:
@@ -136,13 +145,7 @@ class SFTModelOptimizationConfig(ArtifactEnvelope):
             raise ValueError("SFT model optimization configs must name exactly their W12 dataset")
         if self.training.base_model != self.base_model.model_id:
             raise ValueError("SFT training base_model must match the frozen base model snapshot")
-        if self.training.maximum_cost_usd is None and self.allow_unbudgeted is not True:
-            raise ValueError(
-                "an SFT model optimization config without maximum_cost_usd must explicitly "
-                "set allow_unbudgeted=true"
-            )
-        if self.training.maximum_cost_usd is not None and self.allow_unbudgeted is not None:
-            raise ValueError("allow_unbudgeted is only valid when maximum_cost_usd is absent")
+        _required_maximum_cost_usd(self.training)
         expected_config_id = _config_id(
             dataset=self.dataset,
             model_alias=self.model_alias,
@@ -151,7 +154,6 @@ class SFTModelOptimizationConfig(ArtifactEnvelope):
             base_model=self.base_model,
             connection_config_sha256=self.connection_config_sha256,
             training=self.training,
-            allow_unbudgeted=self.allow_unbudgeted,
         )
         if self.config_id != expected_config_id:
             raise ValueError("SFT model optimization config ID is not content-addressed")
@@ -228,7 +230,6 @@ def create_sft_model_optimization_config(
     tinker_connection: ArtifactId,
     base_model_alias: ArtifactId,
     training: TinkerSFTSpec,
-    allow_unbudgeted: bool | None = None,
     created_at: datetime,
     code_revision: str,
 ) -> SFTModelOptimizationConfig:
@@ -244,8 +245,7 @@ def create_sft_model_optimization_config(
         model_alias: New local ``models.toml`` alias for the completed sampling handle.
         tinker_connection: Existing local connection name whose provider is ``tinker``.
         base_model_alias: Existing catalog alias frozen as W13's exact base model.
-        training: Frozen W13 Tinker SFT settings.
-        allow_unbudgeted: Must be ``True`` in immutable config when no cost cap is configured.
+        training: Frozen W13 Tinker SFT settings with a finite maximum cost cap.
         created_at: Time the immutable config is created.
         code_revision: Exact revision that created the config.
 
@@ -257,9 +257,7 @@ def create_sft_model_optimization_config(
     """
     dataset_input = _verified_dataset_input(store, dataset_id)
     try:
-        if allow_unbudgeted not in {None, True}:
-            raise ValueError("allow_unbudgeted must be true when it is specified")
-        immutable_unbudgeted: Literal[True] | None = True if allow_unbudgeted is True else None
+        _required_maximum_cost_usd(training)
         resolved_base_model = _resolve_base_model(
             _load_tinker_catalog(store, tinker_connection),
             tinker_connection=tinker_connection,
@@ -274,7 +272,6 @@ def create_sft_model_optimization_config(
             base_model=resolved_base_model.snapshot,
             connection_config_sha256=resolved_base_model.connection_config_sha256,
             training=training,
-            allow_unbudgeted=immutable_unbudgeted,
         )
         return SFTModelOptimizationConfig(
             schema_version=1,
@@ -289,7 +286,6 @@ def create_sft_model_optimization_config(
             base_model=resolved_base_model.snapshot,
             connection_config_sha256=resolved_base_model.connection_config_sha256,
             training=training,
-            allow_unbudgeted=immutable_unbudgeted,
         )
     except (SFTModelOptimizationPreflightError, ValueError) as exc:
         raise SFTModelOptimizationError(f"SFT model optimization config is invalid: {exc}") from exc
@@ -401,7 +397,8 @@ def preflight_sft_model_optimization(
     """Perform all read-only checks before a caller can consent to managed SFT dispatch.
 
     The preflight validates the persisted W12 dataset, local Tinker connection, target alias,
-    maximum-cost estimator, and any claimed completed W13 result.  It never calls ``backend.open``.
+    finite maximum-cost estimator, and any claimed completed W13 result. It never calls
+    ``backend.open``.
 
     Args:
         store: Project store holding the W12 dataset and local model catalog.
@@ -442,17 +439,21 @@ def preflight_sft_model_optimization(
             )
     planned_batch_counts = _planned_batch_counts(dataset.rows, config.training)
     conservative_schedule_cost: NumericMeasurement | None = None
-    if config.training.maximum_cost_usd is not None and completed is None:
+    try:
+        maximum_cost_usd = _required_maximum_cost_usd(config.training)
+    except ValueError as exc:
+        raise SFTModelOptimizationPreflightError(f"{exc} before Tinker dispatch") from exc
+    if completed is None:
         conservative_schedule_cost = _full_schedule_cost_upper_bound(
             backend,
             config.training,
             planned_batch_counts,
         )
-        if conservative_schedule_cost.value > config.training.maximum_cost_usd:
+        if conservative_schedule_cost.value > maximum_cost_usd:
             raise SFTModelOptimizationPreflightError(
                 "full Tinker SFT schedule conservative cost upper bound "
                 f"${conservative_schedule_cost.value:.2f} exceeds maximum_cost_usd "
-                f"${config.training.maximum_cost_usd:.2f}; no provider call was dispatched"
+                f"${maximum_cost_usd:.2f}; no provider call was dispatched"
             )
     return SFTModelOptimizationPreflight(
         config=config,
@@ -692,7 +693,6 @@ def _config_id(
     base_model: ModelSnapshot,
     connection_config_sha256: Sha256,
     training: TinkerSFTSpec,
-    allow_unbudgeted: Literal[True] | None,
 ) -> ArtifactId:
     """Compute the content ID for all immutable dispatch-relevant W14M bindings."""
     return stable_id(
@@ -705,7 +705,6 @@ def _config_id(
             "base_model": base_model.model_dump(mode="json"),
             "connection_config_sha256": connection_config_sha256,
             "training": training.model_dump(mode="json"),
-            "allow_unbudgeted": allow_unbudgeted,
         },
     )
 
@@ -823,8 +822,8 @@ def _full_schedule_cost_upper_bound(
             ) from exc
         if estimate is None:
             raise SFTModelOptimizationPreflightError(
-                "maximum_cost_usd is configured, but Tinker has no supported conservative cost "
-                "estimate for every planned batch; no provider call was dispatched"
+                "Tinker has no supported conservative cost estimate for every planned batch; "
+                "no provider call was dispatched"
             )
         if estimate.value < 0:
             raise SFTModelOptimizationPreflightError(

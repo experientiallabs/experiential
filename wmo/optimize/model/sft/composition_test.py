@@ -49,8 +49,6 @@ class _Prepared:
 def _prepared(
     tmp_path: Path,
     training: TinkerSFTSpec | None = None,
-    *,
-    allow_unbudgeted: bool | None = None,
 ) -> _Prepared:
     """Create one project with a persisted accepted W12 dataset and Tinker catalog connection."""
     fixture = _persisted_dataset(tmp_path)
@@ -61,7 +59,7 @@ def _prepared(
             models={"base": ModelRecord(connection="tinker", model="test-base-model")},
         ),
     )
-    resolved_training = _spec() if training is None else training
+    resolved_training = _spec(maximum_cost_usd=1.0) if training is None else training
     config = create_sft_model_optimization_config(
         fixture.store,
         dataset_id=fixture.artifact.dataset.dataset_id,
@@ -69,11 +67,6 @@ def _prepared(
         tinker_connection="tinker",
         base_model_alias="base",
         training=resolved_training,
-        allow_unbudgeted=(
-            (True if resolved_training.maximum_cost_usd is None else None)
-            if allow_unbudgeted is None
-            else allow_unbudgeted
-        ),
         created_at=_TIME,
         code_revision="w14m-test",
     )
@@ -227,6 +220,22 @@ def test_budgeted_tinker_run_fails_before_backend_open_when_no_estimate_exists(
 
     assert backend.open_resume_paths == []
     assert backend.train_calls == 0
+
+
+def test_config_requires_an_explicit_finite_maximum_cost_usd(tmp_path: Path) -> None:
+    """W14M never creates a config without a finite cap even if W13 permits one in isolation."""
+    with pytest.raises(SFTModelOptimizationError, match="require a finite maximum_cost_usd"):
+        _prepared(tmp_path, _spec(maximum_cost_usd=None))
+
+
+def test_config_rejects_a_nonfinite_maximum_cost_usd(tmp_path: Path) -> None:
+    """W14M also rejects a nonfinite cap from an otherwise valid model instance."""
+    nonfinite_training = _spec(maximum_cost_usd=1.0).model_copy(
+        update={"maximum_cost_usd": float("inf")}
+    )
+
+    with pytest.raises(SFTModelOptimizationError, match="require a finite maximum_cost_usd"):
+        _prepared(tmp_path, nonfinite_training)
 
 
 def test_full_schedule_budget_preflight_blocks_before_any_backend_dispatch(tmp_path: Path) -> None:
@@ -427,8 +436,7 @@ def test_unbound_config_id_cannot_train_even_when_its_object_was_just_created(
         model_alias="trained",
         tinker_connection="tinker",
         base_model_alias="base",
-        training=_spec(),
-        allow_unbudgeted=True,
+        training=_spec(maximum_cost_usd=1.0),
         created_at=_TIME,
         code_revision="w14m-test",
     )

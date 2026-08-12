@@ -46,7 +46,6 @@ def _configured_project(tmp_path: Path, training: TinkerSFTSpec) -> _ConfiguredP
         tinker_connection="tinker",
         base_model_alias="base",
         training=training,
-        allow_unbudgeted=True if training.maximum_cost_usd is None else None,
         created_at=_TIME,
         code_revision="w14m-test",
     )
@@ -70,9 +69,9 @@ def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The customer path trains once with --yes and later verifies a completed run without spend."""
-    configured = _configured_project(tmp_path, _spec())
+    configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
     command = importlib.import_module("wmo.cli.model_optimize")
-    first_backend = _FakeBackend()
+    first_backend = _FakeBackend(conservative_cost_per_batch=0.10)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda: first_backend)
     monkeypatch.setattr(command, "_current_revision", lambda: "w14m-test")
     runner = CliRunner()
@@ -91,8 +90,9 @@ def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(
 
     assert first.exit_code == 0, first.output
     assert "registered model alias" in first.output
+    assert first_backend.cost_calls > 0
     assert first_backend.open_resume_paths == [None]
-    second_backend = _FakeBackend()
+    second_backend = _FakeBackend(conservative_cost_per_batch=0.10)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda: second_backend)
 
     second = runner.invoke(
