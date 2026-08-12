@@ -475,7 +475,7 @@ class SFTInspectionReport(ContractModel):
 class SFTDatasetMetadata(ContractModel):
     """All non-row frozen manifest data persisted beside canonical SFT JSONL examples."""
 
-    build_spec: SFTBuildSpec
+    build_spec: SFTBuildSpec | None = None
     dataset: SFTDataset
     sources: tuple[SFTSourceReference, ...]
     partitions: tuple[SFTPartition, ...]
@@ -486,7 +486,7 @@ class SFTDatasetMetadata(ContractModel):
 class SFTDatasetArtifact(ContractModel):
     """Materialized dataset rows plus the immutable metadata required to reload and inspect them."""
 
-    build_spec: SFTBuildSpec
+    build_spec: SFTBuildSpec | None = None
     dataset: SFTDataset
     sources: tuple[SFTSourceReference, ...]
     partitions: tuple[SFTPartition, ...]

@@ -24,7 +24,7 @@ from wmo.optimize.model.sft.builder_test import (
 from wmo.optimize.model.sft.builder_test import (
     _write_production_source,
 )
-from wmo.optimize.model.sft.contracts import SFTDatasetArtifact, SFTExample
+from wmo.optimize.model.sft.contracts import SFTBuildSpec, SFTDatasetArtifact, SFTExample
 from wmo.optimize.model.sft.rendering import (
     canonical_partitioned_rows_jsonl,
     partitioned_rows_sha256,
@@ -158,6 +158,28 @@ def _persisted_dataset(tmp_path: Path) -> _PersistedDataset:
     return _PersistedDataset(store=store, artifact=artifact)
 
 
+def _legacy_w12_dataset(tmp_path: Path) -> _PersistedDataset:
+    """Persist the exact W12 metadata shape that predates the build-spec field."""
+    store = _fixture_store(tmp_path / "project")
+    sources = (
+        _write_production_source(store, "train-source-a"),
+        _write_production_source(store, "train-source-b"),
+    )
+    artifact = _build_fixture_dataset(store, production=sources)
+    metadata = artifact.metadata().model_dump(mode="json", exclude_none=False)
+    metadata.pop("build_spec")
+    store.artifacts.write(
+        artifact_id=artifact.dataset.dataset_id,
+        artifact_type="sft-dataset",
+        envelope=artifact.dataset,
+        files={
+            "dataset.json": canonical_json_bytes(metadata),
+            "examples.jsonl": canonical_partitioned_rows_jsonl(artifact.rows),
+        },
+    )
+    return _PersistedDataset(store=store, artifact=artifact)
+
+
 def _spec(**overrides: int | float | str | None) -> TinkerSFTSpec:
     """Return one small deterministic training specification."""
     fields: dict[str, int | float | str | None] = {
@@ -180,6 +202,7 @@ def _run(
     backend: _FakeBackend,
     *,
     spec: TinkerSFTSpec | None = None,
+    legacy_build_spec: SFTBuildSpec | None = None,
 ) -> TinkerSFTResult:
     """Run the public operation with immutable test provenance."""
     return train_tinker_sft(
@@ -190,6 +213,7 @@ def _run(
         backend=backend,
         created_at=_TIME,
         code_revision="w13-test",
+        legacy_build_spec=legacy_build_spec,
     )
 
 
@@ -233,6 +257,52 @@ def test_fake_backend_consumes_only_train_rows_and_writes_terminal_provenance(
         "checkpoint",
     ]
     assert "quality" not in json.dumps(terminal)
+
+
+def test_legacy_w12_dataset_requires_and_verifies_its_original_build_spec(
+    tmp_path: Path,
+) -> None:
+    """Legacy W12 metadata trains only after its original build settings reproduce it."""
+    fixture = _legacy_w12_dataset(tmp_path)
+    missing_backend = _FakeBackend()
+
+    with pytest.raises(TinkerSFTError, match="legacy_build_spec"):
+        _run(fixture, tmp_path / "missing-spec", missing_backend)
+
+    assert missing_backend.open_resume_paths == []
+    assert fixture.artifact.build_spec is not None
+    backend = _FakeBackend()
+
+    result = _run(
+        fixture,
+        tmp_path / "migrated-run",
+        backend,
+        legacy_build_spec=fixture.artifact.build_spec,
+    )
+
+    assert result.dataset_id == fixture.artifact.dataset.dataset_id
+    assert backend.open_resume_paths == [None]
+
+
+def test_legacy_w12_dataset_rejects_a_nonmatching_migration_build_spec(
+    tmp_path: Path,
+) -> None:
+    """A caller-supplied legacy spec cannot rewrite the frozen W12 evidence chain."""
+    fixture = _legacy_w12_dataset(tmp_path)
+    backend = _FakeBackend()
+
+    with pytest.raises(TinkerSFTError, match="does not equal its canonical evidence rebuild"):
+        _run(
+            fixture,
+            tmp_path / "wrong-spec",
+            backend,
+            legacy_build_spec=SFTBuildSpec(
+                held_out_fraction=0.2,
+                representative_sample_count=2,
+            ),
+        )
+
+    assert backend.open_resume_paths == []
 
 
 def test_resume_uses_last_durable_checkpoint_without_replaying_completed_batch(
