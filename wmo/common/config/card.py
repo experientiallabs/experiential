@@ -1,9 +1,8 @@
 """The v0 ModelCard: descriptive metadata a built world model carries in its artifact.
 
-`card.json` sits in the artifact root next to `config.toml` and is what distribution surfaces
-(the website gallery, `GET /world_models`, future `wmo export`/`pull`) render. The shape follows
-the registry contract sketch in the coordination plan (PLAN.md §2.1); WS-A4 owns and extends it.
-A model without a card still loads everywhere - cards are additive metadata, never required.
+`card.json` sits in the artifact root next to `config.toml`. `WorldModelStore.card` exposes it to
+local Python callers; no HTTP route owns or renders it. A model without a card still loads
+everywhere because cards are additive metadata, never required.
 """
 
 from __future__ import annotations
@@ -40,11 +39,9 @@ class CardFidelity(BaseModel):
 
 
 class TracesSource(BaseModel):
-    """Where this model's trace corpus lives on the Hugging Face Hub.
+    """Descriptive Hugging Face location of this model's trace corpus.
 
-    The traces are the raw agent sessions (`traces.otel.jsonl`), which are large and need not be
-    committed: when they are absent locally, the serve backend fetches them from here on demand
-    over the public resolve URL (no auth, no client-side Hub API). A local copy always supersedes.
+    The card records provenance only. Loading a card never downloads the corpus.
     """
 
     repo: str  # e.g. "experientiallabs/wmo-tau-bench"
@@ -70,7 +67,7 @@ class ModelCard(BaseModel):
     built_at: str | None = None  # ISO-8601 UTC
     license: str | None = None
     tags: list[str] = Field(default_factory=list)
-    traces_hf: TracesSource | None = None  # Hub source for on-demand trace download
+    traces_hf: TracesSource | None = None  # Optional provenance for an external trace corpus
 
 
 def make_build_card(
@@ -88,9 +85,8 @@ def make_build_card(
 ) -> ModelCard:
     """Assemble the card a completed build writes.
 
-    The single card-construction site for both build paths (`wmo build` and serve-side builds),
-    so their cards never drift. `fidelity`/cost/latency stay unset here - they are stamped later
-    from eval results, not known at build time.
+    This helper defines one deterministic card shape for local build composition.
+    `fidelity`/cost/latency stay unset because they are not known at build time.
     """
     return ModelCard(
         name=name,
