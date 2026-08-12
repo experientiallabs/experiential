@@ -11,7 +11,7 @@ import typer
 from rich.console import Console
 
 from wmo.cli.consent import require_spend_consent
-from wmo.common.observability.telemetry import capture
+from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.project import ProjectStore, ProjectStoreError
 from wmo.optimize.model.sft import (
     SFTModelOptimizationError,
@@ -114,7 +114,13 @@ def optimize_model(
     }
     if completed.training_result.total_cost_usd is not None:
         properties["cost_usd"] = completed.training_result.total_cost_usd.value
-    capture("wmo sft completed", properties, root=root)
+    if completed.catalog_updated:
+        capture_completion_once(
+            "wmo sft completed",
+            completed.training_result.result_id,
+            properties,
+            root=root,
+        )
     if completed.catalog_updated:
         _console.print(
             f"Verified completed W13 SFT and registered model alias {config.model_alias!r}."

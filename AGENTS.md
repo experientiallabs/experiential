@@ -43,9 +43,9 @@ uv run pytest -q
 - `wmo build TRACE_FILE --source otlp|posthog --project PROJECT --root ROOT` is the only CLI path
   from local traces to immutable task evidence. It accepts 100 through 1000 normalized traces,
   writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, and makes no
-  model, provider, or judge calls. Route each corpus through the registered `TraceAdapter` seam.
-- New trace sources belong in `wmo/simulation/ingest/`, normalize into the `Trace` and `Step`
-  contracts in `wmo/common/core/types.py`, support file ingestion, and register from
+  model, provider, or judge calls. Route each corpus through an explicit canonical source loader.
+- New trace sources belong in `wmo/simulation/ingest/`, normalize into the `Trace` and `TraceSpan`
+  contracts in `wmo/common/traces/`, support file ingestion, and register from
   `wmo/simulation/ingest/__init__.py`.
 - Python applications use `wmo.compose_router` to complete review, plan-bound simulation,
   judgment, fitting, held-out verification, reporting, and runtime loading. Callers inject the
@@ -112,8 +112,8 @@ uv run pytest -q
   one-line docstrings for simple/self-explanatory classes and functions.
 - **Never `print`.** All diagnostic/progress output goes through a module logger
   (`logging.getLogger(__name__)`), never the `print` builtin — enforced by ruff's `T20` rules.
-  The one exception is deliberate user-facing CLI presentation, which goes through the rich
-  `Console` in `wmo/cli/ui.py` (that is product output, not logging).
+  The one exception is deliberate user-facing CLI presentation, which goes through a local rich
+  `Console` owned by the command module (that is product output, not logging).
 
 ## Writing
 
@@ -213,11 +213,11 @@ uv run pytest -q
    feature, write the call site first — the Python snippet or CLI invocation an outside developer
    would type — and judge it: is it obvious, minimal, and hard to misuse? Public surfaces (the
    `wmo` Python API, CLI commands, pydantic models) stay small, composable, and explicitly typed.
-   Extend via the existing seam for that concern (a new `TraceAdapter`, simulator, provider, or
-   router catalog) when that seam matches the new behavior. If it does not, introduce a focused abstraction
-   and document why; do not force distinct semantics through an ill-fitting seam or accumulate
-   special-case flags. Error messages are part of the interface: a failure a user can hit must say
-   what went wrong *and* what to do about it.
+   Extend via the existing seam for that concern (a canonical trace loader, simulator, runtime
+   model client, or router catalog) when that seam matches the new behavior. If it does not,
+   introduce a focused abstraction and document why; do not force distinct semantics through an
+   ill-fitting seam or accumulate special-case flags. Error messages are part of the interface: a
+   failure a user can hit must say what went wrong *and* what to do about it.
 
 10. **Tests protect behavior.** Add regression coverage for evidence, simulation, runtime, router,
     and SFT changes. When practical, start with a failing test. Bug fixes should capture the repro

@@ -24,8 +24,12 @@ def test_common_domains_are_nested() -> None:
         "tasks",
         "traces",
     }
-    missing_dirs = sorted(name for name in expected_dirs if not (COMMON_DIR / name).is_dir())
-    assert not missing_dirs, f"common packages missing under wmo/common: {missing_dirs}"
+    actual_dirs = {
+        path.name for path in COMMON_DIR.iterdir() if path.is_dir() and path.name != "__pycache__"
+    }
+    assert actual_dirs == expected_dirs, (
+        f"common packages are {sorted(actual_dirs)}, expected {sorted(expected_dirs)}"
+    )
 
     legacy_dirs = sorted(
         name

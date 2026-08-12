@@ -9,8 +9,12 @@ WMO_DIR = RUNTIME_DIR.parent
 def test_runtime_domains_are_nested() -> None:
     """Agent execution ownership stays visible in the package tree."""
     expected_dirs = {"agents", "environments", "models", "router"}
-    missing_dirs = sorted(name for name in expected_dirs if not (RUNTIME_DIR / name).is_dir())
-    assert not missing_dirs, f"runtime packages missing under wmo/runtime: {missing_dirs}"
+    actual_dirs = {
+        path.name for path in RUNTIME_DIR.iterdir() if path.is_dir() and path.name != "__pycache__"
+    }
+    assert actual_dirs == expected_dirs, (
+        f"runtime packages are {sorted(actual_dirs)}, expected {sorted(expected_dirs)}"
+    )
 
     retired = sorted(
         name

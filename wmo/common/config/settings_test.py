@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -40,7 +41,34 @@ def test_ensure_telemetry_anonymous_id_persists_value(tmp_path: Path) -> None:
     first = ensure_telemetry_anonymous_id(root)
     second = ensure_telemetry_anonymous_id(root)
     assert first == second
-    assert len(first) == 32
+    assert re.fullmatch(r"[0-9a-f]{32}", first)
+
+
+@pytest.mark.parametrize(
+    "anonymous_id",
+    [
+        "customer@example.com",
+        "0123456789ABCDEF0123456789ABCDEF",
+        "0123456789abcdef0123456789abcde",
+        "0123456789abcdef0123456789abcdef0",
+        "01234567-89ab-cdef-0123-456789abcdef",
+    ],
+)
+def test_invalid_or_pii_shaped_anonymous_ids_fail_closed(tmp_path: Path, anonymous_id: str) -> None:
+    """Stored telemetry identity is exactly lowercase UUID hex, never arbitrary legacy text."""
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    settings_path(root).write_text(
+        f'[telemetry]\nenabled = true\nanonymous_id = "{anonymous_id}"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="does not match the current settings schema"):
+        load_settings(root)
+    with pytest.raises(ValueError, match="does not match the current settings schema"):
+        ensure_telemetry_anonymous_id(root)
+
+    assert anonymous_id in settings_path(root).read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(

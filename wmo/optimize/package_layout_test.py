@@ -27,8 +27,12 @@ ROUTING_MODULES = {
 def test_optimization_domains_are_nested() -> None:
     """Current router and model optimization ownership stays visible in the package tree."""
     expected = {"router", "model"}
-    missing = sorted(name for name in expected if not (OPTIMIZE_DIR / name).is_dir())
-    assert not missing, f"optimization domain packages missing under wmo/optimize: {missing}"
+    actual = {
+        path.name for path in OPTIMIZE_DIR.iterdir() if path.is_dir() and path.name != "__pycache__"
+    }
+    assert actual == expected, (
+        f"optimization packages are {sorted(actual)}, expected {sorted(expected)}"
+    )
 
     legacy = sorted(name for name in ("distill", "harness") if (WMO_DIR / name).exists())
     assert not legacy, f"optimization packages returned to the flat wmo namespace: {legacy}"

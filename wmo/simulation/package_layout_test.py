@@ -15,15 +15,21 @@ def test_simulation_domains_are_nested() -> None:
         "orchestration",
         "specs",
     }
-    missing_dirs = sorted(name for name in expected_dirs if not (SIMULATION_DIR / name).is_dir())
-    assert not missing_dirs, f"simulation packages missing under wmo/simulation: {missing_dirs}"
+    actual_dirs = {
+        path.name
+        for path in SIMULATION_DIR.iterdir()
+        if path.is_dir() and path.name != "__pycache__"
+    }
+    assert actual_dirs == expected_dirs, (
+        f"simulation packages are {sorted(actual_dirs)}, expected {sorted(expected_dirs)}"
+    )
 
     expected_modules = {"build.py", "comparison.py"}
-    missing_modules = sorted(
-        name for name in expected_modules if not (SIMULATION_DIR / name).is_file()
-    )
-    assert not missing_modules, (
-        f"simulation modules missing under wmo/simulation: {missing_modules}"
+    actual_modules = {
+        path.name for path in SIMULATION_DIR.glob("*.py") if not path.name.endswith("_test.py")
+    }
+    assert actual_modules == {"__init__.py", *expected_modules}, (
+        f"simulation modules are {sorted(actual_modules)}, expected current build and comparison"
     )
 
     retired = sorted(

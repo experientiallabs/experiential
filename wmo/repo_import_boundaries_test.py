@@ -35,23 +35,32 @@ def _module_package(path: Path) -> str:
 
 def _dynamic_targets(tree: ast.AST) -> Iterable[str]:
     """Yield literal dynamic import targets."""
-    importlib_aliases = {"importlib"}
-    function_aliases = {"import_module"}
+    importlib_aliases: set[str] = set()
+    function_aliases: set[str] = set()
+    builtin_module_aliases: set[str] = set()
+    builtin_function_aliases = {"__import__"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             importlib_aliases.update(
                 alias.asname or alias.name for alias in node.names if alias.name == "importlib"
             )
+            builtin_module_aliases.update(
+                alias.asname or alias.name for alias in node.names if alias.name == "builtins"
+            )
         elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
             function_aliases.update(
                 alias.asname or alias.name for alias in node.names if alias.name == "import_module"
             )
+        elif isinstance(node, ast.ImportFrom) and node.module == "builtins":
+            builtin_function_aliases.update(
+                alias.asname or alias.name for alias in node.names if alias.name == "__import__"
+            )
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not node.args:
+        if not isinstance(node, ast.Call):
             continue
         function = node.func
         literal_import = isinstance(function, ast.Name) and function.id in {
-            "__import__",
+            *builtin_function_aliases,
             *function_aliases,
         }
         attribute_import = (
@@ -60,8 +69,21 @@ def _dynamic_targets(tree: ast.AST) -> Iterable[str]:
             and function.value.id in importlib_aliases
             and function.attr == "import_module"
         )
-        argument = node.args[0]
-        if (literal_import or attribute_import) and isinstance(argument, ast.Constant):
+        builtin_attribute_import = (
+            isinstance(function, ast.Attribute)
+            and isinstance(function.value, ast.Name)
+            and function.value.id in builtin_module_aliases
+            and function.attr == "__import__"
+        )
+        argument = node.args[0] if node.args else None
+        if argument is None:
+            argument = next(
+                (keyword.value for keyword in node.keywords if keyword.arg == "name"),
+                None,
+            )
+        if (literal_import or attribute_import or builtin_attribute_import) and isinstance(
+            argument, ast.Constant
+        ):
             if isinstance(argument.value, str):
                 yield argument.value
 
@@ -89,7 +111,14 @@ def _import_targets(tree: ast.AST, package: str) -> Iterable[str]:
                         for alias in node.names
                         if alias.name in FORBIDDEN_IMPORTS
                     )
-    yield from _dynamic_targets(tree)
+    for target in _dynamic_targets(tree):
+        if target.startswith("."):
+            try:
+                yield importlib.util.resolve_name(target, package)
+            except ImportError:
+                continue
+        else:
+            yield target
 
 
 def _violations(path: Path, source: str) -> frozenset[tuple[str, str]]:
@@ -144,3 +173,37 @@ def test_relative_and_dynamic_imports_are_detected() -> None:
     assert _violations(dynamic, "from wmo import optimize\n") == {
         ("wmo/simulation/fixture.py", "wmo.optimize")
     }
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'import importlib\nimportlib.import_module("wmo.optimize")\n',
+        'import importlib as loader\nloader.import_module(name="wmo.optimize")\n',
+        'from importlib import import_module\nimport_module("wmo.optimize")\n',
+        'from importlib import import_module as loader\nloader(name="wmo.optimize")\n',
+        'from importlib import import_module\nimport_module("...optimize", package=__package__)\n',
+        '__import__(name="wmo.optimize")\n',
+        'from builtins import __import__ as loader\nloader("wmo.optimize")\n',
+        'import builtins as builtin_loader\nbuiltin_loader.__import__(name="wmo.optimize")\n',
+    ],
+)
+def test_literal_dynamic_import_forms_are_detected(source: str) -> None:
+    """Positional, keyword, aliased, relative, and builtin literal imports are checked."""
+    path = WMO_DIR / "simulation" / "nested" / "fixture.py"
+    assert _violations(path, source) == {("wmo/simulation/nested/fixture.py", "wmo.optimize")}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'name = "wmo.optimize"\n__import__(name)\n',
+        'def import_module(name):\n    return name\nimport_module("wmo.optimize")\n',
+        'loader(name="wmo.optimize")\n',
+        'import importlib\nimportlib.import_module("wmo.common")\n',
+    ],
+)
+def test_nonliteral_unrelated_and_inward_dynamic_imports_are_not_flagged(source: str) -> None:
+    """The guard avoids guessing variable values, local functions, or permitted inward edges."""
+    path = WMO_DIR / "simulation" / "fixture.py"
+    assert not _violations(path, source)

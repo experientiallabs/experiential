@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import cast
+from uuid import UUID
 
 import pytest
 
 import wmo.common.observability.telemetry as telemetry
 from wmo.common.config.settings import set_telemetry_enabled
-from wmo.common.observability.telemetry import capture
+from wmo.common.observability.telemetry import capture, capture_completion_once
 
 
 class _FakePosthog:
@@ -232,3 +233,111 @@ def test_capture_isolates_posthog_delivery_failures(
     )
     assert len(clients) == 1
     assert len(clients[0].calls) == 1
+
+
+def test_completion_capture_persists_receipt_before_exactly_one_delivery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Immutable replay sees one receipt, one stable event UUID, and no second delivery."""
+    clients = _install_fake_posthog(monkeypatch)
+    monkeypatch.setenv("WMO_TELEMETRY", "1")
+    monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
+    root = tmp_path / ".wmo"
+    properties = {"success": True, "rollout_count": 2, "cost_usd": 0.25}
+
+    assert capture_completion_once(
+        "wmo simulation completed",
+        "router-report-abc123",
+        properties,
+        root=root,
+    )
+    assert not capture_completion_once(
+        "wmo simulation completed",
+        "router-report-abc123",
+        properties,
+        root=root,
+    )
+
+    receipts = tuple((root / "telemetry-receipts").glob("*.json"))
+    assert len(receipts) == 1
+    assert b"router-report-abc123" in receipts[0].read_bytes()
+    assert len(clients) == 1
+    assert len(clients[0].calls) == 1
+    _event, kwargs = clients[0].calls[0]
+    assert isinstance(kwargs["uuid"], UUID)
+
+
+def test_completion_receipt_closes_delivery_crash_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A delivery exception after receipt persistence is never retried into a duplicate event."""
+    clients = _install_fake_posthog(monkeypatch)
+    _FakePosthog.raise_on_capture = True
+    monkeypatch.setenv("WMO_TELEMETRY", "1")
+    monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
+    root = tmp_path / ".wmo"
+    properties = {"success": True, "training_step_count": 2}
+
+    assert not capture_completion_once(
+        "wmo sft completed",
+        "tinker-sft-result-abc123",
+        properties,
+        root=root,
+    )
+    _FakePosthog.raise_on_capture = False
+    assert not capture_completion_once(
+        "wmo sft completed",
+        "tinker-sft-result-abc123",
+        properties,
+        root=root,
+    )
+
+    assert len(tuple((root / "telemetry-receipts").glob("*.json"))) == 1
+    assert len(clients[0].calls) == 1
+
+
+def test_completion_capture_honors_opt_out_without_persisting_a_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Privacy opt-out wins before local telemetry state or delivery is created."""
+    clients = _install_fake_posthog(monkeypatch)
+    monkeypatch.setenv("WMO_TELEMETRY", "1")
+    monkeypatch.setenv("DO_NOT_TRACK", "1")
+    root = tmp_path / ".wmo"
+
+    assert not capture_completion_once(
+        "wmo router completed",
+        "router-report-abc123",
+        {"success": True, "candidate_count": 1},
+        root=root,
+    )
+
+    assert clients == []
+    assert not (root / "telemetry-receipts").exists()
+
+
+def test_tampered_completion_receipt_fails_closed_without_delivery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Corrupt or PII-shaped receipt content cannot trigger a replacement or PostHog event."""
+    clients = _install_fake_posthog(monkeypatch)
+    monkeypatch.setenv("WMO_TELEMETRY", "1")
+    monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
+    root = tmp_path / ".wmo"
+    receipt = telemetry._completion_receipt_path(
+        root,
+        "wmo sft completed",
+        "tinker-sft-result-abc123",
+    )
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text('{"email":"customer@example.com"}\n', encoding="utf-8")
+
+    assert not capture_completion_once(
+        "wmo sft completed",
+        "tinker-sft-result-abc123",
+        {"success": True, "training_step_count": 2},
+        root=root,
+    )
+
+    assert clients == []
+    assert receipt.read_text(encoding="utf-8") == '{"email":"customer@example.com"}\n'

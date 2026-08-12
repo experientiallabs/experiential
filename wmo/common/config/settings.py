@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from wmo.common.config.paths import ARTIFACT_DIR
 from wmo.common.core.files import write_text_atomic
+from wmo.common.core.locks import file_write_lock
 
 SETTINGS_FILENAME = "settings.toml"
 
@@ -19,7 +20,12 @@ class TelemetrySettings(BaseModel):
     """Usage telemetry preferences for this harness project."""
 
     enabled: bool = True
-    anonymous_id: str | None = None
+    anonymous_id: str | None = Field(
+        default=None,
+        min_length=32,
+        max_length=32,
+        pattern=r"^[0-9a-f]{32}$",
+    )
 
 
 class ProjectSettings(BaseModel):
@@ -93,9 +99,11 @@ def set_telemetry_enabled(enabled: bool, root: str | Path = ARTIFACT_DIR) -> Pro
     Returns:
         The updated settings.
     """
-    settings = load_settings(root)
-    settings.telemetry.enabled = enabled
-    save_settings(settings, root)
+    path = settings_path(root)
+    with file_write_lock(path, what="product telemetry settings"):
+        settings = load_settings(root)
+        settings.telemetry.enabled = enabled
+        save_settings(settings, root)
     return settings
 
 
@@ -108,8 +116,11 @@ def ensure_telemetry_anonymous_id(root: str | Path = ARTIFACT_DIR) -> str:
     Returns:
         The stable anonymous identifier.
     """
-    settings = load_settings(root)
-    if settings.telemetry.anonymous_id is None:
-        settings.telemetry.anonymous_id = uuid.uuid4().hex
-        save_settings(settings, root)
+    path = settings_path(root)
+    with file_write_lock(path, what="product telemetry identity"):
+        settings = load_settings(root)
+        if settings.telemetry.anonymous_id is None:
+            settings.telemetry.anonymous_id = uuid.uuid4().hex
+            save_settings(settings, root)
+    assert settings.telemetry.anonymous_id is not None
     return settings.telemetry.anonymous_id

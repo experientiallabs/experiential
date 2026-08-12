@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -28,6 +29,33 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "tomli-w",
         "typer",
         "uvicorn",
+    }
+)
+REQUIRED_WHEEL_MODULES = frozenset(
+    {
+        "wmo/common/models/model.py",
+        "wmo/runtime/models/registry.py",
+        "wmo/workflow/router.py",
+    }
+)
+REQUIRED_SDIST_MEMBERS = frozenset({"README.md", "pyproject.toml", "wmo/workflow/router.py"})
+FORBIDDEN_ARCHIVE_PREFIXES = (
+    "assets/",
+    "wmo/common/providers/",
+    "wmo/common/vendor/",
+    "wmo/optimize/research/",
+)
+FORBIDDEN_ARCHIVE_MEMBERS = frozenset(
+    {
+        "docs/reference/repository_guardrails.md",
+        "wmo/cli/repo_metrics.py",
+        "wmo/common/core/parsing.py",
+        "wmo/common/core/render.py",
+        "wmo/common/core/types.py",
+        "wmo/repo_docstrings_test.py",
+        "wmo/repo_structure_test.py",
+        "wmo/repository_guardrails.toml",
+        "wmo/simulation/hub.py",
     }
 )
 
@@ -72,6 +100,49 @@ def _core_requirement_names(metadata: str) -> frozenset[str]:
     return frozenset(names)
 
 
+def _assert_current_archive_members(
+    names: tuple[str, ...],
+    *,
+    required: frozenset[str],
+    allow_tests: bool,
+) -> None:
+    """Reject missing current members or any retired package, module, test, or asset member."""
+    file_names = frozenset(name for name in names if name and not name.endswith("/"))
+    assert required.issubset(file_names), (
+        f"archive is missing current members: {required - file_names}"
+    )
+    forbidden = sorted(
+        name
+        for name in file_names
+        if name in FORBIDDEN_ARCHIVE_MEMBERS
+        or any(name.startswith(prefix) for prefix in FORBIDDEN_ARCHIVE_PREFIXES)
+        or not allow_tests
+        and (name.endswith("_test.py") or name == "wmo/conftest.py")
+    )
+    assert not forbidden, f"archive contains forbidden stale members: {forbidden}"
+
+
+def _tracked_sdist_members() -> frozenset[str]:
+    """Return current tracked members admitted by the explicit sdist include contract."""
+    result = subprocess.run(
+        ["git", "ls-files", ".gitignore", "README.md", "pyproject.toml", "conftest.py", "wmo"],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return frozenset(result.stdout.splitlines())
+
+
+def _tracked_wheel_members() -> frozenset[str]:
+    """Return the exact current source members admitted by the wheel contract."""
+    return frozenset(
+        name
+        for name in _tracked_sdist_members()
+        if name.startswith("wmo/") and not name.endswith("_test.py") and name != "wmo/conftest.py"
+    )
+
+
 def test_built_archives_match_current_package_contract() -> None:
     """Fresh wheel and sdist contain current code and minimal dependency metadata."""
     configured_dir = os.environ.get(BUILT_DIST_ENV)
@@ -86,19 +157,26 @@ def test_built_archives_match_current_package_contract() -> None:
     with zipfile.ZipFile(wheels[0]) as wheel:
         names = tuple(_normalized_path(name) for name in wheel.namelist())
         metadata = _wheel_metadata(wheel)
-        assert "wmo/common/models/model.py" in names
-        assert "wmo/runtime/models/registry.py" in names
-        assert "wmo/workflow/router.py" in names
-        assert not any(name.endswith("_test.py") or name == "wmo/conftest.py" for name in names)
+        _assert_current_archive_members(
+            names,
+            required=REQUIRED_WHEEL_MODULES,
+            allow_tests=False,
+        )
+        assert frozenset(name for name in names if name.startswith("wmo/")) == (
+            _tracked_wheel_members()
+        )
         assert RETIRED_REQUIREMENT.search(metadata) is None
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
-        names = tuple(_normalized_path(member.name) for member in sdist.getmembers())
+        names = tuple(
+            _normalized_path(member.name) for member in sdist.getmembers() if member.isfile()
+        )
         metadata = _sdist_metadata(sdist)
-        assert "README.md" in names
-        assert "pyproject.toml" in names
-        assert "wmo/workflow/router.py" in names
+        _assert_current_archive_members(names, required=REQUIRED_SDIST_MEMBERS, allow_tests=True)
+        assert frozenset(name for name in names if name and not name.endswith("/")) == (
+            _tracked_sdist_members() | {"PKG-INFO"}
+        )
         assert RETIRED_REQUIREMENT.search(metadata) is None
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
@@ -117,3 +195,25 @@ def test_requirement_scanner_rejects_removed_dependencies() -> None:
         "transformers",
     ):
         assert RETIRED_REQUIREMENT.search(f"Requires-Dist: {dependency}>=1\n") is not None
+
+
+@pytest.mark.parametrize(
+    "stale_member",
+    [
+        "assets/world-model-agent-loop.svg",
+        "wmo/common/providers/openai.py",
+        "wmo/common/vendor/sdk.py",
+        "wmo/optimize/research/runner.py",
+        "wmo/common/core/types.py",
+        "wmo/simulation/hub.py",
+        "wmo/repository_guardrails.toml",
+    ],
+)
+def test_archive_member_scanner_rejects_synthetic_stale_members(stale_member: str) -> None:
+    """Every removed asset, owner, helper, and guard family fails a direct synthetic scan."""
+    with pytest.raises(AssertionError, match="forbidden stale members"):
+        _assert_current_archive_members(
+            tuple((*REQUIRED_WHEEL_MODULES, stale_member)),
+            required=REQUIRED_WHEEL_MODULES,
+            allow_tests=False,
+        )

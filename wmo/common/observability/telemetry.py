@@ -10,11 +10,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Literal
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from posthog import Posthog
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from wmo.common.config import ARTIFACT_DIR
 from wmo.common.config.settings import ensure_telemetry_anonymous_id, load_settings
+from wmo.common.core.artifacts import canonical_json_bytes, sha256_json, validate_artifact_id
+from wmo.common.core.files import write_bytes_atomic
+from wmo.common.core.locks import file_write_lock
 
 POSTHOG_PROJECT_API_KEY = "phc_rPFfCufWpxyctR7duEZTTXovP4k5kbHqSqzd4Z4MQJdL"
 POSTHOG_HOST = "https://us.i.posthog.com"
@@ -25,6 +31,7 @@ TelemetryProperties = Mapping[str, TelemetryValue]
 _FALSE_VALUES = {"0", "false", "off", "no"}
 _TRUE_VALUES = {"1", "true", "on", "yes"}
 _CLIENTS: dict[tuple[str, str], Posthog] = {}
+_COMPLETION_RECEIPT_DIRECTORY = "telemetry-receipts"
 _ALLOWED_EVENT_PROPERTIES: dict[str, frozenset[str]] = {
     "wmo build completed": frozenset(
         {
@@ -100,6 +107,17 @@ _COUNT_PROPERTIES = frozenset(
 _NONNEGATIVE_MEASUREMENTS = frozenset({"duration_seconds", "cost_usd"})
 
 
+class _CompletionTelemetryReceipt(BaseModel):
+    """Immutable local proof that one durable completion was handled for telemetry."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    event: str
+    completion_id: str
+    properties: dict[str, TelemetryValue]
+
+
 @dataclass
 class BuildTelemetryStats:
     """Corpus and split sizes a build reported, accumulated for one telemetry event."""
@@ -127,8 +145,70 @@ def capture(
 ) -> bool:
     """Send one anonymous metadata-only event. Returns False when skipped or failed."""
     safe_properties = _sanitize_properties(event, properties)
-    if safe_properties is None:
+    if safe_properties is None or not _enabled(root):
         return False
+    return _capture_sanitized(event, safe_properties, root=root)
+
+
+def capture_completion_once(
+    event: str,
+    completion_id: str,
+    properties: TelemetryProperties,
+    *,
+    root: str | Path = ARTIFACT_DIR,
+) -> bool:
+    """Persist one metadata-only completion receipt and make at most one delivery attempt.
+
+    The caller invokes this only when its current operation created the named durable completion.
+    A receipt is written before PostHog delivery, so a crash after delivery cannot make replay send
+    the event again. The deterministic PostHog UUID provides a second ingestion deduplication key.
+
+    Args:
+        event: One allowlisted completion event.
+        completion_id: Canonical immutable artifact ID for the durable completion.
+        properties: Allowlisted aggregate metadata without user content.
+        root: Project root that owns telemetry settings and receipts.
+
+    Returns:
+        True only when this call created the receipt and PostHog accepted the delivery attempt.
+    """
+    safe_properties = _sanitize_properties(event, properties)
+    if safe_properties is None or not _enabled(root):
+        return False
+    try:
+        validated_completion_id = validate_artifact_id(completion_id)
+        if len(validated_completion_id) > 128:
+            return False
+        receipt = _CompletionTelemetryReceipt(
+            event=event,
+            completion_id=validated_completion_id,
+            properties=dict(safe_properties),
+        )
+        receipt_bytes = canonical_json_bytes(receipt) + b"\n"
+        receipt_path = _completion_receipt_path(root, event, validated_completion_id)
+        with file_write_lock(receipt_path, what="anonymous completion telemetry receipt"):
+            if receipt_path.exists():
+                _verify_completion_receipt(receipt_path, event, validated_completion_id)
+                return False
+            write_bytes_atomic(receipt_path, receipt_bytes)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return _capture_sanitized(
+        event,
+        safe_properties,
+        root=root,
+        event_uuid=_completion_event_uuid(event, validated_completion_id),
+    )
+
+
+def _capture_sanitized(
+    event: str,
+    safe_properties: Mapping[str, TelemetryValue],
+    *,
+    root: str | Path,
+    event_uuid: UUID | None = None,
+) -> bool:
+    """Deliver already validated aggregate metadata with failure isolation."""
     if not _enabled(root):
         return False
     api_key = os.getenv("WMO_POSTHOG_PROJECT_API_KEY", POSTHOG_PROJECT_API_KEY).strip()
@@ -143,11 +223,20 @@ def capture(
             "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
         }
         event_properties.update(safe_properties)
-        message_id = _posthog_client(api_key, host).capture(
-            event,
-            distinct_id=distinct_id,
-            properties=event_properties,
-        )
+        client = _posthog_client(api_key, host)
+        if event_uuid is None:
+            message_id = client.capture(
+                event,
+                distinct_id=distinct_id,
+                properties=event_properties,
+            )
+        else:
+            message_id = client.capture(
+                event,
+                distinct_id=distinct_id,
+                properties=event_properties,
+                uuid=event_uuid,
+            )
         return message_id is not None
     except Exception:  # noqa: BLE001
         return False
@@ -184,6 +273,33 @@ def capture_build_completed(
         },
         root=root,
     )
+
+
+def _completion_receipt_path(root: str | Path, event: str, completion_id: str) -> Path:
+    """Return the content-addressed local receipt path for one completion event."""
+    receipt_id = sha256_json({"event": event, "completion_id": completion_id})
+    return Path(root) / _COMPLETION_RECEIPT_DIRECTORY / f"{receipt_id}.json"
+
+
+def _completion_event_uuid(event: str, completion_id: str) -> UUID:
+    """Return the deterministic PostHog ingestion UUID for one immutable completion."""
+    return uuid5(NAMESPACE_URL, f"world-model-optimizer:{event}:{completion_id}")
+
+
+def _verify_completion_receipt(path: Path, event: str, completion_id: str) -> None:
+    """Fail closed unless one stored receipt is canonical and matches its addressed completion."""
+    try:
+        payload = path.read_bytes()
+        receipt = _CompletionTelemetryReceipt.model_validate_json(payload)
+    except (OSError, ValidationError, ValueError) as exc:
+        raise ValueError("completion telemetry receipt is invalid") from exc
+    if (
+        receipt.event != event
+        or receipt.completion_id != completion_id
+        or canonical_json_bytes(receipt) + b"\n" != payload
+        or _sanitize_properties(receipt.event, receipt.properties) != receipt.properties
+    ):
+        raise ValueError("completion telemetry receipt does not match its durable completion")
 
 
 def _sanitize_properties(
