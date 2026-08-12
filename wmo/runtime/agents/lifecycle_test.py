@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 
 from wmo.common.core.artifacts import FailureAttribution, FailureCode, StructuredFailure
-from wmo.common.models import AssistantAction, ToolCall
+from wmo.common.models import AssistantAction, ModelClient, ModelRequest, ModelResponse, ToolCall
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.agents.interface import AgentAdapterPreflightError, AgentEpisode, AgentRuntime
@@ -221,14 +221,18 @@ def test_preflight_names_the_required_customer_adapter_change() -> None:
 
 
 class _Model:
-    """A temporary stand-in that must conform to ModelClient during the W3 restack."""
+    """A canonical model client that is never called by these lifecycle fixtures."""
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Reject unexpected completion calls outside an agent-owned loop."""
+        raise AssertionError(f"unexpected model request: {request!r}")
 
 
 class _SuccessfulAgent:
     """Returns a complete result after one execute-only environment call."""
 
     def __init__(self) -> None:
-        self.model: object | None = None
+        self.model: ModelClient | None = None
         self.observation: Observation | None = None
         self.saw_reset = False
         self.saw_close = False
@@ -237,7 +241,7 @@ class _SuccessfulAgent:
         self,
         task: TaskCase,
         *,
-        model: object,
+        model: ModelClient,
         environment: EnvironmentSession,
     ) -> AgentEpisode:
         self.model = model
@@ -261,7 +265,7 @@ class _AdversarialAgent:
         self,
         task: TaskCase,
         *,
-        model: object,
+        model: ModelClient,
         environment: EnvironmentSession,
     ) -> AgentEpisode:
         self.environment = environment
@@ -276,7 +280,7 @@ class _TimeoutAgent:
         self,
         task: TaskCase,
         *,
-        model: object,
+        model: ModelClient,
         environment: EnvironmentSession,
     ) -> AgentEpisode:
         raise TimeoutError("agent turn exceeded its deadline")
@@ -289,7 +293,7 @@ class _ReportedModelFailureAgent:
         self,
         task: TaskCase,
         *,
-        model: object,
+        model: ModelClient,
         environment: EnvironmentSession,
     ) -> AgentEpisode:
         failure = StructuredFailure(
@@ -311,7 +315,7 @@ class _FailingAgent:
         self,
         task: TaskCase,
         *,
-        model: object,
+        model: ModelClient,
         environment: EnvironmentSession,
     ) -> AgentEpisode:
         raise RuntimeError("customer code failed")
@@ -324,7 +328,7 @@ class _InvalidResultAgent:
         self,
         task: TaskCase,
         *,
-        model: object,
+        model: ModelClient,
         environment: EnvironmentSession,
     ) -> str:
         return "not an episode"
@@ -337,7 +341,7 @@ class _ToolFailureAgent:
         self,
         task: TaskCase,
         *,
-        model: object,
+        model: ModelClient,
         environment: EnvironmentSession,
     ) -> AgentEpisode:
         environment.execute(ToolCall(call_id="call-1", name="run", arguments={}))

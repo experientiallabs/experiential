@@ -9,14 +9,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from stat import S_IXUSR
 from types import TracebackType
-from typing import Protocol
 
 import pytest
 
 from wmo.common.core.artifacts import FailureAttribution, FailureCode
 from wmo.common.models import (
     AssistantAction,
-    ModelMessage,
+    ModelRequest,
     ModelResponse,
     ModelSnapshot,
     OperationEconomics,
@@ -274,13 +273,13 @@ def test_pi_rejects_a_transcript_that_ends_before_agent_end() -> None:
 
 
 class _Model:
-    """A deterministic W2 temporary model client used by the Pi binding fixture."""
+    """A deterministic canonical model client used by the Pi binding fixture."""
 
     def __init__(self) -> None:
-        self.requests: list[_PiRequestView] = []
+        self.requests: list[ModelRequest] = []
 
-    def complete(self, request: _PiRequestView) -> ModelResponse:
-        """Record the private bridge request and return a deterministic injected completion."""
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Record the canonical request and return a deterministic injected completion."""
         self.requests.append(request)
         return ModelResponse(
             output=AssistantAction(
@@ -293,21 +292,10 @@ class _Model:
                 provider="fixture",
                 model_id="fixture-model",
                 capabilities_sha256=_DIGEST,
+                connection_sha256=_DIGEST,
             ),
             economics=OperationEconomics(),
         )
-
-
-class _PiRequestView(Protocol):
-    """The W2 bridge fields the deterministic fixture needs to inspect."""
-
-    @property
-    def messages(self) -> tuple[ModelMessage, ...]:
-        """Return the WMO-visible messages forwarded from Pi."""
-
-    @property
-    def tools(self) -> tuple[ToolSchema, ...]:
-        """Return the task-visible tools forwarded from Pi."""
 
 
 class _Environment:

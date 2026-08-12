@@ -7,7 +7,6 @@ import math
 import os
 import subprocess
 import threading
-from collections.abc import Callable
 from contextlib import AbstractContextManager
 from contextvars import copy_context
 from dataclasses import dataclass
@@ -23,13 +22,19 @@ from urllib.parse import unquote, urlparse
 from pydantic import TypeAdapter, ValidationError
 
 from wmo.common.core.artifacts import (
-    ContractModel,
     FailureAttribution,
     FailureCode,
     JsonObject,
     StructuredFailure,
 )
-from wmo.common.models import AssistantAction, ModelMessage, ModelResponse, ToolCall
+from wmo.common.models import (
+    AssistantAction,
+    ModelClient,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ToolCall,
+)
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase, ToolSchema
 from wmo.runtime.agents.interface import AgentEpisode
@@ -52,18 +57,6 @@ class PiInvocationTimeoutError(TimeoutError):
 
 class PiTranscriptError(ValueError):
     """An installed Pi JSON event stream cannot be represented as an agent episode."""
-
-
-class _PiModelRequest(ContractModel):
-    """Temporary private request mapping for the W3 ModelClient restack.
-
-    This is only the wire conversion required by the installed-Pi bridge while this worktree is
-    still based on W2. The W3 restack replaces it with common ``ModelRequest`` and the injected
-    ``ModelClient`` annotation, without changing Pi's process invocation or tool bridge.
-    """
-
-    messages: tuple[ModelMessage, ...]
-    tools: tuple[ToolSchema, ...]
 
 
 @dataclass(frozen=True)
@@ -115,14 +108,14 @@ class PiAgentRuntime:
         self,
         task: TaskCase,
         *,
-        model: object,  # W3 restack: replace with the canonical ModelClient.
+        model: ModelClient,
         environment: EnvironmentSession,
     ) -> AgentEpisode:
         """Run Pi and normalize its final local JSON event stream to an episode.
 
         Args:
             task: Task and tool schemas for the installed Pi process.
-            model: Candidate model supplied by WMO's pending common model-client contract.
+            model: Candidate model supplied through WMO's canonical model-client contract.
             environment: Execute-only session supplied by the simulator.
 
         Returns:
@@ -156,7 +149,12 @@ class PiAgentRuntime:
 class _PiBridge(AbstractContextManager["_PiBridge"]):
     """Bind one Pi process to one WMO model and execute-only environment session."""
 
-    def __init__(self, task: TaskCase, model: object, environment: EnvironmentSession) -> None:
+    def __init__(
+        self,
+        task: TaskCase,
+        model: ModelClient,
+        environment: EnvironmentSession,
+    ) -> None:
         self._task = task
         self._model = model
         self._environment = environment
@@ -259,26 +257,13 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
         )
 
     def complete_model(self, payload: JsonObject) -> ModelResponse:
-        """Convert one Pi OpenAI-compatible request and call the WMO-injected model object."""
-        completion = getattr(self._model, "complete", None)
-        if not callable(completion):
-            raise _PiBridgeError(
-                "WMO's injected model must provide complete(request) for the installed Pi adapter"
-            )
-        request = _PiModelRequest(
+        """Convert one Pi OpenAI-compatible request and call the WMO-injected model client."""
+        request = ModelRequest(
             messages=_model_messages_from_pi(payload),
             tools=self._task.tools,
         )
         with self._model_lock:
-            response = self._model_context.run(
-                cast(Callable[[_PiModelRequest], object], completion), request
-            )
-        if not isinstance(response, ModelResponse):
-            raise _PiBridgeError(
-                "WMO's injected model returned an unsupported completion for the installed Pi "
-                "adapter"
-            )
-        return response
+            return self._model_context.run(self._model.complete, request)
 
     def execute_tool(self, tool_name: str, payload: JsonObject) -> Observation:
         """Execute one Pi extension tool through WMO's supplied environment session."""
@@ -489,7 +474,7 @@ def _invoke_installed_pi(
 
 
 def _model_messages_from_pi(payload: JsonObject) -> tuple[ModelMessage, ...]:
-    """Map Pi's OpenAI-compatible request messages to WMO's temporary W2 bridge shape."""
+    """Map Pi's OpenAI-compatible request messages to WMO's canonical request shape."""
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list) or not raw_messages:
         raise _PiBridgeError("Pi model bridge request requires a non-empty messages list")

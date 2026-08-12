@@ -14,7 +14,7 @@ from wmo.common.core.artifacts import (
     JsonObject,
     StructuredFailure,
 )
-from wmo.common.models import ToolCall
+from wmo.common.models import ModelClient, ToolCall
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.agents.interface import AgentEpisode, AgentRuntime, preflight_agent_runtime
@@ -34,7 +34,7 @@ def execute_agent_episode(
     agent: AgentRuntime,
     environment_runtime: EnvironmentRuntime,
     task: TaskCase,
-    model: object,  # W3 restack: replace with the canonical ModelClient.
+    model: ModelClient,
 ) -> AgentEpisode:
     """Run one agent while retaining reset, cleanup, and exception evidence.
 
@@ -86,7 +86,7 @@ def execute_agent_episode(
 def _run_agent(
     agent: AgentRuntime,
     task: TaskCase,
-    model: object,  # W3 restack: replace with the canonical ModelClient.
+    model: ModelClient,
     environment: EnvironmentSession,
 ) -> AgentEpisode:
     """Call the customer adapter while preserving its exception as a typed episode failure."""

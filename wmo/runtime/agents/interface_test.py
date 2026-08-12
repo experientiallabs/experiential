@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.common.core.artifacts import FailureAttribution, FailureCode, StructuredFailure
+from wmo.common.models import ModelClient
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.agents.interface import (
@@ -56,13 +57,13 @@ def test_preflight_rejects_positional_only_model_injection() -> None:
 
 
 class _ConformingAgent:
-    """Implements the temporary model seam pending the mandatory W3 fake-client restack."""
+    """Implements the canonical model-injection seam."""
 
     def run(
         self,
         task: TaskCase,
         *,
-        model: object,
+        model: ModelClient,
         environment: EnvironmentSession,
     ) -> AgentEpisode:
         return AgentEpisode(stop_reason=StopReason.COMPLETED)
@@ -74,7 +75,7 @@ class _PositionalModelAgent:
     def run(
         self,
         task: TaskCase,
-        model: object,
+        model: ModelClient,
         /,
         *,
         environment: EnvironmentSession,
