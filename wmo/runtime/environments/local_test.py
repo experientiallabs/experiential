@@ -272,6 +272,15 @@ def test_unsupported_platform_fails_before_customer_or_worker_spawn(
     assert _local_worker_threads() == before_threads
 
 
+def test_darwin_without_kqueue_binding_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Darwin build without the kernel-notification binding cannot open local execution."""
+    monkeypatch.setattr(local_module.sys, "platform", "darwin")
+    monkeypatch.delattr(local_module.select, "kqueue", raising=False)
+
+    with pytest.raises(LocalProcessCleanupError, match="requires Darwin"):
+        local_module._require_containment_support()
+
+
 def test_snapshot_failure_after_gated_spawn_is_cleaned_without_masking(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

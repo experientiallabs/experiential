@@ -26,7 +26,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import cast
+from typing import Protocol, cast
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import ToolCall
@@ -61,6 +61,41 @@ class _ProcessRecord:
     zombie: bool
 
 
+class _KqueueEvent(Protocol):
+    fflags: int
+
+
+class _Kqueue(Protocol):
+    """The Darwin queue operations owned by one descendant tracker."""
+
+    def close(self) -> None: ...
+
+    def control(self, changes: object, max_events: int, timeout: int) -> list[_KqueueEvent]: ...
+
+
+class _KqueueFactory(Protocol):
+    def __call__(self) -> _Kqueue: ...
+
+
+class _KeventFactory(Protocol):
+    """Create one Darwin process-notification registration event."""
+
+    def __call__(self, ident: int, *, filter: int, flags: int, fflags: int) -> object: ...
+
+
+@dataclass(frozen=True)
+class _DarwinKqueueBindings:
+    """Dynamically loaded Darwin-only ``select`` bindings for containment proof."""
+
+    kqueue: _KqueueFactory
+    kevent: _KeventFactory
+    filter_process: int
+    event_add: int
+    event_clear: int
+    note_fork: int
+    note_exit: int
+
+
 class _DarwinProcBsdInfo(ctypes.Structure):
     """ABI layout returned by Darwin ``PROC_PIDTBSDINFO``."""
 
@@ -93,7 +128,11 @@ class _DarwinProcBsdInfo(ctypes.Structure):
 class _DescendantTracker:
     """Track exact descendants and kernel fork evidence without trusting numeric groups."""
 
-    def __init__(self, root_identity: _ProcessIdentity) -> None:
+    def __init__(
+        self,
+        root_identity: _ProcessIdentity,
+        bindings: _DarwinKqueueBindings,
+    ) -> None:
         snapshot = _process_snapshot()
         root = snapshot.get(root_identity.pid)
         if root is None or root.identity != root_identity:
@@ -104,13 +143,14 @@ class _DescendantTracker:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._failure: Exception | None = None
-        self._kqueue = select.kqueue()
+        self._bindings = bindings
+        self._kqueue = bindings.kqueue()
         try:
-            event = select.kevent(
+            event = bindings.kevent(
                 root_identity.pid,
-                filter=select.KQ_FILTER_PROC,
-                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                fflags=select.KQ_NOTE_FORK | select.KQ_NOTE_EXIT,
+                filter=bindings.filter_process,
+                flags=bindings.event_add | bindings.event_clear,
+                fflags=bindings.note_fork | bindings.note_exit,
             )
             self._kqueue.control((event,), 0, 0)
             self._thread = threading.Thread(
@@ -175,7 +215,7 @@ class _DescendantTracker:
     def _read_kernel_events(self) -> None:
         """Latch kernel fork evidence even when no numeric child PID remains observable."""
         for event in self._kqueue.control(None, 8, 0):
-            if event.fflags & select.KQ_NOTE_FORK:
+            if event.fflags & self._bindings.note_fork:
                 with self._lock:
                     self._fork_observed = True
 
@@ -210,12 +250,30 @@ def _process_snapshot() -> dict[int, _ProcessRecord]:
     raise LocalProcessCleanupError("local descendant tracking requires Darwin or Linux")
 
 
-def _require_containment_support() -> None:
-    """Fail before resource allocation when kernel fork evidence is unavailable."""
-    if sys.platform != "darwin" or not hasattr(select, "kqueue"):
+def _require_containment_support() -> _DarwinKqueueBindings:
+    """Load required Darwin queue bindings before allocating process resources."""
+    if sys.platform != "darwin":
         raise LocalProcessCleanupError(
             "local process containment requires Darwin kernel fork notifications"
         )
+
+    def binding(name: str) -> object:
+        return getattr(select, name)
+
+    try:
+        return _DarwinKqueueBindings(
+            kqueue=cast(_KqueueFactory, binding("kqueue")),
+            kevent=cast(_KeventFactory, binding("kevent")),
+            filter_process=cast(int, binding("KQ_FILTER_PROC")),
+            event_add=cast(int, binding("KQ_EV_ADD")),
+            event_clear=cast(int, binding("KQ_EV_CLEAR")),
+            note_fork=cast(int, binding("KQ_NOTE_FORK")),
+            note_exit=cast(int, binding("KQ_NOTE_EXIT")),
+        )
+    except AttributeError as error:
+        raise LocalProcessCleanupError(
+            "local process containment requires Darwin kernel fork notifications"
+        ) from error
 
 
 def _read_process_identity(pid: int) -> _ProcessIdentity:
@@ -494,7 +552,7 @@ class _LocalProcessSession:
 
     def start(self, task: TaskCase) -> None:
         """Create workspace, launch the child, and verify the mandatory ready response."""
-        _require_containment_support()
+        bindings = _require_containment_support()
         workspace_parent = self._workspace_parent
         if workspace_parent is not None:
             workspace_parent.mkdir(parents=True, exist_ok=True)
@@ -543,7 +601,7 @@ class _LocalProcessSession:
         root_identity: _ProcessIdentity | None = None
         try:
             root_identity = _read_process_identity(self._process.pid)
-            self._descendants = _DescendantTracker(root_identity)
+            self._descendants = _DescendantTracker(root_identity, bindings)
             os.write(gate_write, b"1")
             _close_fd(gate_write)
         except BaseException as error:  # noqa: BLE001 - preserve startup errors after no-fail cleanup
