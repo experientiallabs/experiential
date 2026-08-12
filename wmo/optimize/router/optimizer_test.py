@@ -537,7 +537,7 @@ def _row(
 ) -> EvaluationRow:
     """Create one observed row with useful candidate data and unrelated run spend."""
     baseline = alias == "candidate-baseline"
-    score = 0.8 if baseline else (0.9 if task.partition == "fit" else 0.85)
+    score = 0.5 if baseline else (1.0 if task.partition == "fit" else 0.85)
     cost = 0.5 if baseline else 0.1
     suffix = f"{task.task_id}-{alias}"
     return EvaluationRow(

@@ -26,9 +26,9 @@ def test_cheapest_safe_candidate_wins_deterministic_quality_and_alias_ties() -> 
     """Equal-cost, equal-quality candidates break their tie by stable alias."""
     scores = np.asarray(
         (
-            (0.8, 0.9, 0.9),
-            (0.8, 0.9, 0.9),
-            (0.8, 0.9, 0.9),
+            (0.5, 1.0, 1.0),
+            (0.5, 1.0, 1.0),
+            (0.5, 1.0, 1.0),
         ),
         dtype=np.float32,
     )
@@ -41,7 +41,8 @@ def test_cheapest_safe_candidate_wins_deterministic_quality_and_alias_ties() -> 
     assert decision.baseline_alias == "candidate-baseline"
     assert decision.neighbor_count == 8
     assert decision.paired_count == 8
-    assert decision.estimated_quality_difference == pytest.approx(0.1)
+    assert decision.estimated_quality_difference == pytest.approx(0.5)
+    assert decision.uncertainty == pytest.approx(0.5 / np.sqrt(8))
     assert decision.fallback_reason is None
 
 
@@ -105,6 +106,20 @@ def test_thin_identical_pairs_fall_back_and_design_threshold_can_route() -> None
     assert thin.paired_count == 2
     assert thin.fallback_reason == "insufficient_pairs"
 
+    modest_scores = scores.copy()
+    modest_scores[:, 1] = 0.6
+    modest_bank = _fixture(modest_scores, costs)[2]
+    modest_manifest = manifest.model_copy(
+        update={"bank_sha256": hashlib.sha256(bank_bytes(modest_bank)).hexdigest()}
+    )
+    modest_policy = policy.model_copy(update={"bank_sha256": modest_manifest.bank_sha256})
+    modest = _select(modest_policy, modest_manifest, modest_bank, np.asarray((1.0, 0.0)))
+
+    assert modest.selected_alias == policy.baseline_alias
+    assert modest.paired_count == 8
+    assert modest.uncertainty == pytest.approx(0.5 / np.sqrt(8))
+    assert modest.fallback_reason == "uncertainty"
+
     threshold_scores = scores.copy()
     threshold_scores[:, 1] = 0.9
     threshold_bank = _fixture(threshold_scores, costs)[2]
@@ -122,6 +137,21 @@ def test_thin_identical_pairs_fall_back_and_design_threshold_can_route() -> None
 
     assert threshold.selected_alias == "candidate-b"
     assert threshold.paired_count == 8
+    assert threshold.uncertainty == pytest.approx(0.5 / np.sqrt(8))
+
+    large_scores = np.asarray(((0.5, 0.6, 0.0),) * 100, dtype=np.float32)
+    large_costs = np.asarray(((0.5, 0.1, 0.6),) * 100, dtype=np.float64)
+    large_policy, large_manifest, large_bank = _fixture(large_scores, large_costs)
+    large = _select(
+        large_policy,
+        large_manifest,
+        large_bank,
+        np.asarray((1.0, 0.0)),
+    )
+
+    assert large.selected_alias == "candidate-b"
+    assert large.paired_count == 100
+    assert large.uncertainty == pytest.approx(0.5 / np.sqrt(100))
 
 
 @pytest.mark.parametrize(

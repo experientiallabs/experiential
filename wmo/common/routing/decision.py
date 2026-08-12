@@ -277,11 +277,16 @@ def _estimate_candidate(
     paired_count = int(differences.size)
     if paired_count:
         mean_difference = float(np.mean(differences))
-        standard_error = (
+        empirical_standard_error = (
             float(np.std(differences, ddof=1)) / math.sqrt(paired_count)
             if paired_count > 1
             else 0.0
         )
+        # Score differences lie in [-1, 1]. With no variance prior, Popoviciu's
+        # bound gives a maximum population standard deviation of range / 2 = 1.
+        # Use its finite-sample width, 1 / sqrt(n), as a conservative floor on
+        # empirical SE so constant samples never manufacture zero uncertainty.
+        standard_error = max(empirical_standard_error, 1.0 / math.sqrt(paired_count))
     else:
         mean_difference = 0.0
         standard_error = 0.0
