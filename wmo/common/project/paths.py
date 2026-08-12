@@ -87,6 +87,9 @@ class ProjectPaths:
 
         Returns:
             A checked descendant path.
+
+        Raises:
+            ProjectPathError: If the artifact ID or relative path is unsafe.
         """
         directory = self.artifact_directory(artifact_id)
         try:

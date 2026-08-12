@@ -168,6 +168,9 @@ class ArtifactStore:
 
         Returns:
             The completed digest-verified manifest.
+
+        Raises:
+            ArtifactStoreError: If a path or record violates the artifact contract.
         """
         serialized_files: dict[str, bytes] = {}
         for relative_path, value in files.items():
@@ -290,6 +293,10 @@ class ArtifactStore:
 
         Returns:
             Complete verified file bytes.
+
+        Raises:
+            ArtifactCorruptionError: If the artifact or requested file is invalid.
+            ValueError: If the relative path is not a safe artifact file path.
         """
         stored = self.read(artifact_id)
         validated_path = validate_artifact_file_path(relative_path).as_posix()
@@ -300,7 +307,11 @@ class ArtifactStore:
         return (stored.directory / validated_path).read_bytes()
 
     def list_ids(self) -> tuple[str, ...]:
-        """Return completed artifact IDs, excluding partial directories and lock files."""
+        """Return completed artifact IDs, excluding partial directories and lock files.
+
+        Returns:
+            Sorted IDs for completed artifact directories that pass local ID validation.
+        """
         directory = self._paths.artifacts_directory
         if not directory.is_dir():
             return ()
@@ -357,7 +368,14 @@ class ProjectStore:
                 raise ProjectStoreError(str(exc)) from exc
 
     def load_project(self) -> ProjectConfig:
-        """Load this store's typed immutable project configuration."""
+        """Load this store's typed immutable project configuration.
+
+        Returns:
+            The parsed project configuration.
+
+        Raises:
+            ProjectStoreError: If the configuration is missing or invalid.
+        """
         try:
             return load_project_config(self.paths.project_toml)
         except ValueError as exc:
@@ -379,7 +397,14 @@ class ProjectStore:
         write_bytes_atomic(self.paths.review_json, canonical_json_bytes(review))
 
     def read_review(self) -> JsonValue | None:
-        """Load the mutable review draft, returning ``None`` before any draft exists."""
+        """Load the mutable review draft, returning ``None`` before any draft exists.
+
+        Returns:
+            The parsed review JSON, or ``None`` when no draft exists.
+
+        Raises:
+            ProjectStoreError: If the draft cannot be read or is not valid JSON.
+        """
         if not self.paths.review_json.exists():
             return None
         try:
