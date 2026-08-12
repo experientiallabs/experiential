@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
+from typing import Literal
 
 import numpy as np
 
@@ -17,6 +18,7 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.evaluations import (
     EvaluationDataset,
+    EvaluationPlan,
     EvaluationProtocol,
     FidelityReport,
     load_evaluation_dataset,
@@ -74,7 +76,7 @@ class RouterOptimizer:
         Args:
             store: Project-local immutable artifact store.
             embedder: Exact embedding implementation represented in each optimization spec.
-            feature_extractor: Optional exact request-visible v1 implementation.
+            feature_extractor: Optional exact request-visible v2 implementation.
         """
         self._store = store
         self._embedder = embedder
@@ -118,6 +120,12 @@ class RouterOptimizer:
             task_input,
             plan.inputs,
             plan.candidate_snapshots,
+        )
+        _require_plan_task_seal(
+            dataset,
+            plan,
+            loaded_tasks.tasks,
+            expected_purpose="fit",
         )
         if task_input not in dataset.manifest.inputs:
             raise RouterOptimizationError(
@@ -224,6 +232,7 @@ class RouterOptimizer:
         if not isinstance(created_at, datetime):
             raise RouterOptimizationError("held-out report time must be a datetime")
         policy = _load_locked_policy(self._store, locked.policy)
+        self._require_policy_feature_identity(policy)
         bank_manifest, bank = load_knn_bank(
             self._store,
             locked.bank.bank_artifact_id,
@@ -250,6 +259,12 @@ class RouterOptimizer:
         _require_fit_lock(fit_dataset, policy, bank_manifest)
         if fit_task_input.sha256 != policy.task_set_sha256:
             raise RouterOptimizationError("fit task-set digest has drifted from the locked policy")
+        _require_plan_task_seal(
+            fit_dataset,
+            fit_plan,
+            fit_tasks.tasks,
+            expected_purpose="fit",
+        )
         _require_dataset_tasks(fit_dataset, fit_tasks.tasks)
         pricing, pricing_sha256 = load_pricing_snapshot(self._store, policy.pricing_snapshot_id)
         pricing_input = artifact_input(self._store.read(policy.pricing_snapshot_id).manifest)
@@ -281,6 +296,12 @@ class RouterOptimizer:
             raise RouterOptimizationError(
                 "held-out task-set digest differs from the locked fit scope"
             )
+        _require_plan_task_seal(
+            dataset,
+            plan,
+            loaded_tasks.tasks,
+            expected_purpose="held_out",
+        )
         _require_dataset_tasks(dataset, loaded_tasks.tasks)
         reports, _report_inputs = _load_reports(self._store, dataset)
         policy_input = artifact_input(self._store.read(policy.policy_id).manifest)
@@ -309,6 +330,16 @@ class RouterOptimizer:
         ):
             raise RouterOptimizationError(
                 "router feature implementation differs from the optimization spec"
+            )
+
+    def _require_policy_feature_identity(self, policy: KnnRouterPolicy) -> None:
+        """Require reporting to reuse the exact request-visible feature implementation."""
+        if (
+            self._feature_extractor.extractor_id != policy.feature_extractor_id
+            or self._feature_extractor.schema_sha256 != policy.feature_schema_sha256
+        ):
+            raise RouterOptimizationError(
+                "router feature implementation differs from the locked policy"
             )
 
 
@@ -348,6 +379,94 @@ def _require_plan_scope(
         raise RouterOptimizationError("evaluation candidates differ from its stored plan")
     if plan_input not in manifest.inputs:
         raise RouterOptimizationError("evaluation manifest does not retain its plan input")
+
+
+def _require_plan_task_seal(
+    dataset: EvaluationDataset,
+    plan: EvaluationPlan,
+    tasks: Sequence[TaskCase],
+    *,
+    expected_purpose: Literal["fit", "held_out"],
+) -> None:
+    """Bind exact dataset rows to a fully sealed plan and task-set partition."""
+    tasks_by_id = {task.task_id: task for task in tasks}
+    if len(tasks_by_id) != len(tasks):
+        raise RouterOptimizationError("plan-bound task set repeats a task ID")
+    planned: dict[str, set[ArtifactId]] = {"fit": set(), "held_out": set()}
+    for cell in plan.cells:
+        task = tasks_by_id.get(cell.task_id)
+        if task is None:
+            raise RouterOptimizationError("evaluation plan names a task outside its task set")
+        if cell.purpose == "fidelity":
+            if task.partition != "fit":
+                raise RouterOptimizationError("evaluation fidelity cell names a non-fit task")
+            continue
+        if task.partition != cell.purpose:
+            raise RouterOptimizationError(
+                "evaluation plan cell purpose differs from its task partition"
+            )
+        planned[cell.purpose].add(cell.task_id)
+    partitioned = {
+        partition: {task.task_id for task in tasks if task.partition == partition}
+        for partition in ("fit", "held_out")
+    }
+    if planned != partitioned or not planned["fit"] or not planned["held_out"]:
+        raise RouterOptimizationError(
+            "evaluation plan cells do not cover the exact fit and held-out task set"
+        )
+    expected_task_ids = tuple(task.task_id for task in tasks if task.partition == expected_purpose)
+    manifest_task_ids = (
+        dataset.manifest.fit_task_ids
+        if expected_purpose == "fit"
+        else dataset.manifest.held_out_task_ids
+    )
+    if manifest_task_ids != expected_task_ids:
+        raise RouterOptimizationError(
+            "evaluation manifest does not name the exact ordered plan partition"
+        )
+    selected_cells = tuple(cell for cell in plan.cells if cell.purpose == expected_purpose)
+    if len(dataset.rows) != len(selected_cells):
+        raise RouterOptimizationError("evaluation rows do not cover the exact ordered plan cells")
+    for row, cell in zip(dataset.rows, selected_cells, strict=True):
+        if (
+            row.cell_id,
+            row.task_id,
+            row.candidate_alias,
+            row.repeat,
+            row.purpose,
+        ) != (
+            cell.cell_id,
+            cell.task_id,
+            cell.candidate_alias,
+            cell.repeat,
+            cell.purpose,
+        ):
+            raise RouterOptimizationError(
+                "evaluation row identity differs from its exact ordered plan cell"
+            )
+        if cell.execution == "observed" and (
+            row.status != "observed" or row.rollout_id != cell.observed_rollout_id
+        ):
+            raise RouterOptimizationError(
+                "observed evaluation row differs from its planned rollout"
+            )
+        if cell.execution == "simulate" and row.status == "observed":
+            raise RouterOptimizationError(
+                "simulated evaluation cell cannot contain observed evidence"
+            )
+    fit_tasks = tuple(tasks_by_id[task_id] for task_id in sorted(planned["fit"]))
+    held_out_tasks = tuple(tasks_by_id[task_id] for task_id in sorted(planned["held_out"]))
+    fit_lineages = {task.lineage_group_id for task in fit_tasks}
+    held_out_lineages = {task.lineage_group_id for task in held_out_tasks}
+    if fit_lineages.intersection(held_out_lineages):
+        raise RouterOptimizationError("router fit and held-out lineages are not sealed")
+    feature_extractor = RouterFeatureExtractor()
+    fit_fingerprints = {feature_extractor.from_task(task) for task in fit_tasks}
+    held_out_fingerprints = {feature_extractor.from_task(task) for task in held_out_tasks}
+    if fit_fingerprints.intersection(held_out_fingerprints):
+        raise RouterOptimizationError(
+            "router fit and held-out request-visible fingerprints are not sealed"
+        )
 
 
 def _require_pricing_scope(
@@ -497,30 +616,20 @@ def _require_dataset_tasks(
     dataset: EvaluationDataset,
     tasks: Sequence[TaskCase],
 ) -> None:
-    """Require exact task scope and a sealed lineage boundary before any embedding."""
+    """Require every dataset task to exist in the bound task set and partition."""
     tasks_by_id = {task.task_id: task for task in tasks}
     expected = (*dataset.manifest.fit_task_ids, *dataset.manifest.held_out_task_ids)
     if len(tasks_by_id) != len(tasks) or not set(expected).issubset(tasks_by_id):
         raise RouterOptimizationError("evaluation tasks are absent from the bound task set")
-    fit_lineages = {
-        tasks_by_id[task_id].lineage_group_id for task_id in dataset.manifest.fit_task_ids
-    }
-    held_out_lineages = {
-        tasks_by_id[task_id].lineage_group_id for task_id in dataset.manifest.held_out_task_ids
-    }
-    if fit_lineages.intersection(held_out_lineages):
-        raise RouterOptimizationError("router fit and held-out lineages are not sealed")
-    extractor = RouterFeatureExtractor()
-    fit_fingerprints = {
-        extractor.from_task(tasks_by_id[task_id]) for task_id in dataset.manifest.fit_task_ids
-    }
-    held_out_fingerprints = {
-        extractor.from_task(tasks_by_id[task_id]) for task_id in dataset.manifest.held_out_task_ids
-    }
-    if fit_fingerprints.intersection(held_out_fingerprints):
-        raise RouterOptimizationError(
-            "router fit and held-out request-visible fingerprints are not sealed"
+    if any(
+        tasks_by_id[task_id].partition != partition
+        for partition, task_ids in (
+            ("fit", dataset.manifest.fit_task_ids),
+            ("held_out", dataset.manifest.held_out_task_ids),
         )
+        for task_id in task_ids
+    ):
+        raise RouterOptimizationError("evaluation task partition differs from the bound task set")
 
 
 def _require_fit_only_dataset(dataset: EvaluationDataset) -> None:

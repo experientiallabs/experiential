@@ -31,7 +31,7 @@ from wmo.common.models import (
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
 from wmo.common.routing import KnnGuard
 from wmo.common.routing.bank import load_knn_bank
-from wmo.common.tasks import TaskCase, TaskSet
+from wmo.common.tasks import TaskCase, TaskSet, ToolSchema
 from wmo.optimize.router import RouterOptimizationError, RouterOptimizationSpec, RouterOptimizer
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
@@ -222,6 +222,82 @@ def test_fit_rejects_missing_wrong_type_invented_or_candidate_drifted_pricing(
     assert embedder.call_sizes == []
 
 
+@pytest.mark.parametrize("seal_leak", ["lineage", "request-visible"])
+def test_fit_rejects_full_plan_partition_leaks_before_embedding_or_writes(
+    tmp_path: Path,
+    seal_leak: Literal["lineage", "request-visible"],
+) -> None:
+    """Distinct task IDs cannot hide a shared lineage or request-visible v2 fingerprint."""
+    fixture = _optimizer_fixture(tmp_path, seal_leak=seal_leak)
+    artifact_ids_before = fixture.store.list_ids()
+
+    with pytest.raises(RouterOptimizationError, match="not sealed"):
+        fixture.optimizer.fit(fixture.spec)
+
+    assert fixture.embedder.call_sizes == []
+    assert fixture.store.list_ids() == artifact_ids_before
+    assert not any(
+        fixture.store.read(artifact_id).manifest.artifact_type
+        in {"knn-bank", "router-policy", "router-report"}
+        for artifact_id in fixture.store.list_ids()
+    )
+
+
+def test_fit_rejects_incomplete_plan_cells_before_embedding_or_writes(tmp_path: Path) -> None:
+    """A fit artifact cannot omit a cell while retaining the exact frozen plan digest."""
+    fixture = _optimizer_fixture(tmp_path)
+    invalid_evaluation_id = _persist_evaluation(
+        fixture.store,
+        fixture.fit,
+        "task-set-a",
+        fixture.plan_input,
+        fixture.evaluation_inputs,
+        evaluation_salt="omitted-fit-cell",
+        omit_last_row=True,
+    )
+    invalid_spec = fixture.spec.model_copy(update={"fit_evaluation_id": invalid_evaluation_id})
+    artifact_ids_before = fixture.store.list_ids()
+
+    with pytest.raises(RouterOptimizationError, match="exact ordered plan cells"):
+        fixture.optimizer.fit(invalid_spec)
+
+    assert fixture.embedder.call_sizes == []
+    assert fixture.store.list_ids() == artifact_ids_before
+
+
+def test_report_rejects_incomplete_plan_cells_before_held_out_embedding_or_write(
+    tmp_path: Path,
+) -> None:
+    """Reporting rechecks the stored plan cells before opening the embedding boundary."""
+    fixture = _optimizer_fixture(tmp_path)
+    locked = fixture.optimizer.fit(fixture.spec)
+    invalid_evaluation_id = _persist_evaluation(
+        fixture.store,
+        fixture.held_out,
+        "task-set-a",
+        fixture.plan_input,
+        fixture.evaluation_inputs,
+        evaluation_salt="omitted-held-cell",
+        omit_last_row=True,
+    )
+    artifact_ids_before = fixture.store.list_ids()
+
+    with pytest.raises(RouterOptimizationError, match="exact ordered plan cells"):
+        fixture.optimizer.report(
+            locked,
+            held_out_evaluation_id=invalid_evaluation_id,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+
+    assert fixture.embedder.call_sizes == [8]
+    assert fixture.store.list_ids() == artifact_ids_before
+    assert not any(
+        fixture.store.read(artifact_id).manifest.artifact_type == "router-report"
+        for artifact_id in fixture.store.list_ids()
+    )
+
+
 def test_report_rejects_mutated_lock_and_all_held_out_identity_drift_before_embedding(
     tmp_path: Path,
 ) -> None:
@@ -306,15 +382,35 @@ def test_report_rejects_mutated_lock_and_all_held_out_identity_drift_before_embe
     assert embedder.call_sizes == [8]
 
 
-def _optimizer_fixture(tmp_path: Path) -> _OptimizerFixture:
+def _optimizer_fixture(
+    tmp_path: Path,
+    *,
+    seal_leak: Literal["lineage", "request-visible"] | None = None,
+) -> _OptimizerFixture:
     """Create one valid direct-API fixture with exact stored plan, task, and pricing."""
     store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
     fit = tuple(_task(f"task-fit-{index:02d}", "fit") for index in range(8))
     held_out = tuple(_task(f"task-held-{index:02d}", "held_out") for index in range(2))
+    calibration_input = _persist_calibration(store, fit, held_out)
+    if seal_leak == "lineage":
+        held_out = (
+            held_out[0].model_copy(update={"lineage_group_id": fit[0].lineage_group_id}),
+            *held_out[1:],
+        )
+    elif seal_leak == "request-visible":
+        held_out = (
+            held_out[0].model_copy(
+                update={
+                    "instruction": fit[0].instruction,
+                    "initial_context": fit[0].initial_context,
+                    "tools": fit[0].tools,
+                }
+            ),
+            *held_out[1:],
+        )
     task_input = _persist_task_set(store, (*fit, *held_out), task_set_id="task-set-a")
     plan_input = _persist_plan(store, (*fit, *held_out), task_input)
     pricing_input = _persist_pricing(store)
-    calibration_input = _persist_calibration(store, fit, held_out)
     evaluation_inputs = tuple(
         sorted(
             (calibration_input, plan_input, pricing_input, task_input),
@@ -371,6 +467,7 @@ def _persist_evaluation(
     evaluation_plan_sha256: str | None = None,
     protocol_pricing_id: str = "pricing-a",
     candidates: tuple[RoutedCandidateSnapshot, ...] | None = None,
+    omit_last_row: bool = False,
 ) -> str:
     """Persist a complete observed matrix with candidate and run costs kept separate."""
     protocol = EvaluationProtocol(
@@ -387,6 +484,8 @@ def _persist_evaluation(
         for task in tasks
         for alias in ("candidate-baseline", "candidate-cheap")
     )
+    if omit_last_row:
+        rows = rows[:-1]
     rows_payload = b"\n".join(canonical_json_bytes(row) for row in rows) + b"\n"
     rows_sha256 = hashlib.sha256(rows_payload).hexdigest()
     evaluation_id = stable_id(
@@ -607,6 +706,17 @@ def _task(task_id: str, partition: Literal["fit", "held_out"]) -> TaskCase:
         lineage_group_id=f"lineage-{task_id}",
         partition=partition,
         instruction=f"Resolve {task_id}.",
+        initial_context={"account_id": task_id, "tags": ["standard"]},
+        tools=(
+            ToolSchema(
+                name="lookup",
+                description="Look up the account.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"account_id": {"type": "string"}},
+                },
+            ),
+        ),
         workload_weight=1.0,
         source_trace_ids=(f"trace-{task_id}",),
     )

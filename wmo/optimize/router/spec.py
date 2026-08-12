@@ -49,7 +49,7 @@ class RouterOptimizationSpec(ContractModel):
     @model_validator(mode="after")
     def _require_current_conservative_rules(self) -> RouterOptimizationSpec:
         if self.feature_extractor_id != ROUTER_FEATURE_EXTRACTOR_ID:
-            raise ValueError("router fitting supports only the request-visible v1 extractor")
+            raise ValueError("router fitting supports only the request-visible v2 extractor")
         if self.feature_schema_sha256 != ROUTER_FEATURE_SCHEMA_SHA256:
             raise ValueError("router feature schema digest does not match the v1 extractor")
         if self.guard.quality_tolerance < 0:
