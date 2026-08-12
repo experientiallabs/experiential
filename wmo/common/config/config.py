@@ -1,7 +1,4 @@
-"""Project config + the `.wmo/` artifact layout.
-
-`.wmo/` holds everything `wmo build` produces and `WorldModel.load` consumes.
-"""
+"""Legacy project config and the `.wmo/` artifact layout."""
 
 from __future__ import annotations
 
@@ -20,9 +17,8 @@ from wmo.common.providers.models import resolve_provider_model
 
 ARTIFACT_DIR = ".wmo"
 
-# Mirror of `wmo.simulation.model.splits.DEFAULT_TRAIN_SPLIT`, the legacy trace-id split used by
-# open-loop evaluation. The canonical task miner owns the W5 50/20 task partition. Config cannot
-# import the simulation split module without a dependency cycle, so `config_test.py` pins equality.
+# Historical trace-id split retained only for loading older config artifacts. The canonical task
+# miner owns the current W5 50/20 task partition.
 _DEFAULT_TRAIN_SPLIT = 0.8
 
 
@@ -158,7 +154,7 @@ missing kind silently degrades all three to "no credentials known"."""
 
 
 class HarnessConfig(BaseModel):
-    """Persisted to `.wmo/config.toml` and reloaded by `WorldModel.load`."""
+    """Legacy settings persisted to `.wmo/config.toml`."""
 
     providers: list[ProviderConfig] = Field(default_factory=list)
     serve_provider: ProviderKind = ProviderKind.ANTHROPIC  # serves the live world model
@@ -179,7 +175,7 @@ class HarnessConfig(BaseModel):
     # `knowledge`: seed a knowledge base from train traces at build and render it into the env
     # prompt at serve. `reasoning`: deliberate-then-answer output contract. `grounder`: web-search
     # backend for grounding unknown entities ("none" keeps everything hermetic; see
-    # `wmo.simulation.model.grounding` for backends).
+    # Older artifacts may still carry a grounding-backend name.
     knowledge: bool = False
     reasoning: bool = False
     grounder: str = "none"

@@ -25,16 +25,11 @@ FORBIDDEN_IMPORTS: Final[dict[str, frozenset[str]]] = {
     "optimize": frozenset({"simulation", "cli"}),
 }
 
-IMPORT_TRANSITION_INVENTORY: Final[frozenset[tuple[str, str]]] = frozenset(
+IMPORT_TRANSITION_INVENTORY: Final[frozenset[tuple[str, str]]] = frozenset(set())
+IMPORT_TRANSITION_TOMBSTONES: Final[frozenset[tuple[str, str]]] = frozenset(
     {
         ("wmo/optimize/gepa.py", "wmo.simulation.retrieval"),
         ("wmo/optimize/gepa.py", "wmo.simulation.retrieval.leakfree"),
-        ("wmo/simulation/model/replay.py", "wmo.optimize.gepa"),
-        ("wmo/simulation/model/world_model.py", "wmo.optimize.gepa"),
-    }
-)
-IMPORT_TRANSITION_TOMBSTONES: Final[frozenset[tuple[str, str]]] = frozenset(
-    {
         ("wmo/optimize/routing/policy.py", "wmo.simulation.retrieval.embedders"),
         ("wmo/optimize/routing/sweep.py", "wmo.simulation.model.world_model"),
         ("wmo/optimize/routing/evaluation.py", "wmo.simulation.scenarios.spec"),
@@ -64,7 +59,9 @@ IMPORT_TRANSITION_TOMBSTONES: Final[frozenset[tuple[str, str]]] = frozenset(
         ("wmo/simulation/model/autoconfig.py", "wmo.optimize.judge"),
         ("wmo/simulation/model/build.py", "wmo.optimize"),
         ("wmo/simulation/model/replay.py", "wmo.optimize.judge"),
+        ("wmo/simulation/model/replay.py", "wmo.optimize.gepa"),
         ("wmo/simulation/model/world_model.py", "wmo.optimize.reward"),
+        ("wmo/simulation/model/world_model.py", "wmo.optimize.gepa"),
         ("wmo/simulation/serving/server.py", "wmo.optimize.reward"),
         ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.compression"),
         ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.knn"),

@@ -956,12 +956,12 @@ def test_cancellation_is_observed_before_any_spend(tmp_path: Path) -> None:
 def test_wmo_import_pulls_neither_harbor_nor_e2b() -> None:
     """The packaging contract keeps optional imports out of the core packages.
 
-    Importing `wmo` and `wmo.simulation.evaluation` stays clean, and even the harbor subpackage
-    never imports the e2b SDK (that loads only through harbor's
+    Importing `wmo` stays clean, and even the harbor subpackage never imports the e2b SDK
+    (that loads only through harbor's
     environment factory when a job actually targets E2B)."""
     code = (
         "import sys\n"
-        "import wmo, wmo.simulation.evaluation\n"
+        "import wmo\n"
         "bad = [m for m in sys.modules if m.split('.')[0] in ('harbor', 'e2b')]\n"
         "assert not bad, f'eager optional imports: {bad}'\n"
         "import wmo.runtime.evaluation.harbor\n"

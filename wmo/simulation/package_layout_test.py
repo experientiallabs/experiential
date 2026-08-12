@@ -7,23 +7,31 @@ WMO_DIR = SIMULATION_DIR.parent
 
 
 def test_simulation_domains_are_nested() -> None:
-    """World-model construction and evaluation stay under one package."""
+    """Current ingestion and execution domains stay under the simulation package."""
     expected_dirs = {
-        "evaluation",
         "ingest",
-        "model",
-        "retrieval",
+        "engines",
+        "mining",
+        "orchestration",
+        "specs",
     }
     missing_dirs = sorted(name for name in expected_dirs if not (SIMULATION_DIR / name).is_dir())
     assert not missing_dirs, f"simulation packages missing under wmo/simulation: {missing_dirs}"
 
-    expected_modules = {"environment.py", "hub.py"}
+    expected_modules = {"build.py", "comparison.py", "hub.py"}
     missing_modules = sorted(
         name for name in expected_modules if not (SIMULATION_DIR / name).is_file()
     )
     assert not missing_modules, (
         f"simulation modules missing under wmo/simulation: {missing_modules}"
     )
+
+    retired = sorted(
+        name
+        for name in ("evaluation", "model", "retrieval", "environment.py")
+        if (SIMULATION_DIR / name).is_file() or any((SIMULATION_DIR / name).rglob("*.py"))
+    )
+    assert not retired, f"retired simulation owners returned: {retired}"
 
     legacy_dirs = sorted(
         name

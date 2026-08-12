@@ -45,7 +45,6 @@ banned = (
     "wmo.simulation.serving.server",
     "wmo.optimize.model",
     "wmo.cli.route_app",
-    "wmo.simulation.evaluation.open_loop",
 )
 roots = {k.split(".")[0] for k in sys.modules}
 bad = []

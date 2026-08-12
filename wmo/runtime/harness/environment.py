@@ -1,11 +1,8 @@
 """The environment seam: the agent loop talks to an interface, not to any backend directly.
 
-The `AgentEnvironment` protocol is the substitution point: closed-loop eval binds it to the world
-model (`wmo.simulation.evaluation.closed_loop.WorldModelEnvironment`, with every tool call
-answered by `WorldModel.step`), and a real execution backend implements the same two
-methods, so the *same* agent loop and scoring can run against reality when one is available. That
-symmetry makes simulated reports comparable to real ones
-(`wmo.simulation.evaluation.agreement`).
+The `AgentEnvironment` protocol is the substitution point between the fixed agent loop and an
+execution backend. The retired text-model environment implemented the same two methods as real
+backends, so one loop and scoring contract can target either without importing backend mechanics.
 """
 
 from __future__ import annotations

@@ -1,9 +1,8 @@
 """Represent, run, store, and score one agent harness.
 
 A minimal, fixed agent loop (`AgentRuntime`) drives one action at a time against an
-`AgentEnvironment`, an interface rather than a backend. Closed-loop evaluation in
-`wmo.simulation.evaluation.closed_loop` binds it to the world model, and a real execution backend
-can bind the same loop to reality.
+`AgentEnvironment`, an interface rather than a backend. The retired closed-loop text evaluator
+bound that seam to the former world model; a real backend can bind the same loop to reality.
 What the loop runs with is a `HarnessDoc` - a typed document of identity-keyed surfaces
 (prompt sections, tool policy, loop params, skills) stored as immutable versions with movable
 aliases (`wmo.runtime.harness.store`).

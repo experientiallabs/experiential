@@ -115,13 +115,13 @@ def build_env_prompt(
     Mirrors DreamGym Eq. 4 ``M_exp(R_t | {(s_i,a_i)}, {d_j}, tau)``: the base/optimized prompt is
     the system message; the task, current state, recent history, retrieved demos, and the incoming
     action form the user message. This is the *single* assembly used by both the serving engine
-    (`wmo.simulation.model.prompts`) and the GEPA optimizer, so prompts are evolved against
+    and the former prompt optimizer, so prompts were evolved against
     exactly what the world model serves.
 
     `knowledge`/`reasoning`/`grounding`/`confidence` are the opt-in agentic-mode extensions; at
     their defaults the rendering is byte-identical to the pre-knowledge shape (pinned in
     render_test), so prebuilt models keep serving unchanged. `knowledge` (the cross-session
-    knowledge base, rendered by `wmo.simulation.model.knowledge`) becomes an authoritative facts
+    knowledge base becomes an authoritative facts
     section;
     `reasoning` switches the output contract to deliberate-then-answer; `grounding` offers the
     `ground_query` escape hatch (pass it only when a live grounder will actually serve it).
@@ -215,7 +215,7 @@ _STATE_NOTE_FIELD = (
 # risk-coverage sweep, coarse enough not to invite false precision. The optional `confidence_why`
 # one-liner comes BEFORE the number (justify-then-rate) so the rating conditions on the
 # articulated reason. Stated confidence is analysis-only: the judge and GEPA never see it
-# (guarded by tests in judge_test/gepa_test).
+# (guarded by the legacy rendering tests).
 _CONFIDENCE_WHY_FIELD = (
     ', "confidence_why": "<one short sentence: the strongest reason to trust or doubt the'
     ' "output" above>"'

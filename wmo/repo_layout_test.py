@@ -126,7 +126,6 @@ LEGACY_PATH_PREFIXES: Final[tuple[str, ...]] = (
 # derived at runtime, so a new path under a legacy root fails immediately.
 LEGACY_PATH_INVENTORY: Final[frozenset[str]] = frozenset(
     {
-        "wmo/optimize/gepa.py",
         "wmo/runtime/evaluation/harbor/__init__.py",
         "wmo/runtime/evaluation/harbor/agent.py",
         "wmo/runtime/evaluation/harbor/agent_test.py",
@@ -197,6 +196,11 @@ LEGACY_PATH_INVENTORY: Final[frozenset[str]] = frozenset(
         "wmo/runtime/harness/vendor/pi-agent/tsconfig.build.json",
         "wmo/runtime/harness/vendor/pi-agent/vitest.config.ts",
         "wmo/runtime/harness/vendor/pi-agent/vitest.harness.config.ts",
+    }
+)
+LEGACY_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
+    {
+        "wmo/optimize/gepa.py",
         "wmo/simulation/evaluation/__init__.py",
         "wmo/simulation/evaluation/agreement.py",
         "wmo/simulation/evaluation/agreement_test.py",
@@ -208,10 +212,6 @@ LEGACY_PATH_INVENTORY: Final[frozenset[str]] = frozenset(
         "wmo/simulation/evaluation/open_loop_test.py",
         "wmo/simulation/evaluation/tasks.py",
         "wmo/simulation/evaluation/tasks_test.py",
-    }
-)
-LEGACY_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
-    {
         "wmo/simulation/serving/__init__.py",
         "wmo/simulation/serving/chat.py",
         "wmo/simulation/serving/chat_openai_client_test.py",
@@ -344,6 +344,22 @@ ROOT_CLI_COMMAND_TOMBSTONES: Final[frozenset[str]] = frozenset(
         "scenarios",
         "serve",
         "status",
+    }
+)
+
+# W8.6 is a clean break. Exact standalone files and every descendant of the retired package
+# roots remain forbidden so later work cannot reintroduce an old world-model compatibility shim.
+W8_RETIRED_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
+    {
+        "wmo/optimize/base.py",
+        "wmo/optimize/base_test.py",
+        "wmo/optimize/gepa.py",
+        "wmo/optimize/gepa_test.py",
+        "wmo/simulation/environment.py",
+        "wmo/simulation/environment_test.py",
+        "wmo/simulation/evaluation",
+        "wmo/simulation/model",
+        "wmo/simulation/retrieval",
     }
 )
 
@@ -560,6 +576,18 @@ def _root_cli_commands() -> frozenset[str]:
     return frozenset(command.commands)
 
 
+def _retired_w8_paths(paths: Iterable[str]) -> frozenset[str]:
+    """Return paths that reintroduce an exact file or descendant of a W8.6 tombstone."""
+    return frozenset(
+        path
+        for path in paths
+        if any(
+            path == tombstone or path.startswith(f"{tombstone}/")
+            for tombstone in W8_RETIRED_PATH_TOMBSTONES
+        )
+    )
+
+
 def test_hand_authored_files_stay_below_the_physical_line_limit() -> None:
     """Every new or rewritten covered file stays below the frozen migration boundary."""
     oversized = _oversized_hand_authored_files(_tracked_files())
@@ -705,6 +733,17 @@ def test_new_paths_under_a_legacy_root_are_rejected_by_the_transition_helper() -
     """A new file under an inventoried legacy root is visible to the transition gate."""
     candidate = "wmo/optimize/research/new_surface.py"
     assert candidate in _unknown_legacy_paths((*_tracked_files(), candidate))
+
+
+def test_w8_retired_paths_remain_tombstoned() -> None:
+    """Deleted GEPA and text-world-model owners cannot return under compatibility paths."""
+    assert not _retired_w8_paths(_tracked_files())
+
+
+def test_w8_tombstones_reject_new_descendants() -> None:
+    """A new module below a deleted W8.6 package root is rejected directly."""
+    candidate = "wmo/simulation/model/compatibility.py"
+    assert _retired_w8_paths((*_tracked_files(), candidate)) == {candidate}
 
 
 def test_root_cli_commands_match_the_explicit_transition_inventory() -> None:

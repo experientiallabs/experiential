@@ -630,6 +630,7 @@ DOCSTRING_TOMBSTONES: frozenset[DocstringViolation] = frozenset(
 DELETED_OWNER_DOCSTRING_PATHS: Final[frozenset[str]] = frozenset(
     """wmo/cli/eval_closed_loop.py wmo/cli/model_app.py wmo/cli/optimize_model_app.py
 wmo/cli/pool_registry.py wmo/cli/run_cmd.py wmo/cli/ui.py
+wmo/optimize/base.py wmo/optimize/gepa.py
 wmo/optimize/routing/__init__.py
 wmo/optimize/routing/cluster_labels.py wmo/optimize/routing/compression.py
 wmo/optimize/routing/deepswe.py wmo/optimize/routing/embedding_cache.py
@@ -644,6 +645,8 @@ wmo/simulation/serving/__init__.py wmo/simulation/serving/chat.py
 wmo/simulation/serving/endpoint_config.py wmo/simulation/serving/query_embeddings.py
 wmo/simulation/serving/savings.py wmo/simulation/serving/server.py
 wmo/simulation/serving/traces_source.py
+wmo/simulation/environment.py wmo/simulation/evaluation
+wmo/simulation/model wmo/simulation/retrieval
 """.split()
 )
 
@@ -884,7 +887,12 @@ def test_public_docstring_transition_inventory_is_monotonic() -> None:
     baseline = _baseline_docstring_violations()
     current = _docstring_violations(_tracked_files())
     deletion_tombstones = frozenset(
-        violation for violation in baseline if violation.path in DELETED_OWNER_DOCSTRING_PATHS
+        violation
+        for violation in baseline
+        if any(
+            violation.path == owner or violation.path.startswith(f"{owner}/")
+            for owner in DELETED_OWNER_DOCSTRING_PATHS
+        )
     )
     tombstones = DOCSTRING_TOMBSTONES | deletion_tombstones
     new_violations = current - baseline

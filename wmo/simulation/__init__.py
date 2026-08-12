@@ -10,8 +10,6 @@ from wmo.simulation.comparison import (
     persist_comparison,
     persist_comparison_spec,
 )
-from wmo.simulation.environment import WorldModelEnv
-from wmo.simulation.model import WorldModel
 from wmo.simulation.orchestration.interface import (
     SimulationModeUnsupportedError,
     Simulator,
@@ -34,8 +32,6 @@ __all__ = [
     "SimulationSpec",
     "Simulator",
     "SimulationModeUnsupportedError",
-    "WorldModel",
-    "WorldModelEnv",
     "WorldModelSettings",
     "compare_text_and_sandbox",
     "persist_comparison",
