@@ -68,11 +68,9 @@ def test_sandbox_persists_each_rollout_and_resumes_without_reexecution(tmp_path:
         agent_factory=_ToolAgent,
     )
     spec = _spec(plan_input, task_input, ("cell-a",))
-
     first = simulator.run(spec)
     rollout = _load_rollout(store, first.artifact_ids[0])
     resumed = simulator.run(spec)
-
     assert resumed == first
     assert runtime.opened_task_ids == ["task-a"]
     assert runtime.close_calls == 1
