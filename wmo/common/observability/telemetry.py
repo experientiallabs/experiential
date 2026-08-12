@@ -15,8 +15,6 @@ from posthog import Posthog
 
 from wmo.common.config import ARTIFACT_DIR
 from wmo.common.config.settings import ensure_telemetry_anonymous_id, load_settings
-from wmo.common.observability.reporting import BuildReporter
-from wmo.common.observability.tracker import RunRecord
 
 POSTHOG_PROJECT_API_KEY = "phc_rPFfCufWpxyctR7duEZTTXovP4k5kbHqSqzd4Z4MQJdL"
 POSTHOG_HOST = "https://us.i.posthog.com"
@@ -107,41 +105,13 @@ class BuildTelemetryStats:
     val_trace_count: int = 0
     heldout_trace_count: int = 0
     indexed_step_count: int = 0
-
-
-class TelemetryBuildReporter:
-    """A `BuildReporter` that records the counts it forwards into `BuildTelemetryStats`."""
-
-    def __init__(self, inner: BuildReporter, stats: BuildTelemetryStats) -> None:
-        self._inner = inner
-        self._stats = stats
-
-    def ingest_done(self, traces: int, steps: int) -> None:
-        self._stats.input_trace_count = traces
-        self._stats.input_step_count = steps
-        self._inner.ingest_done(traces, steps)
-
-    def split_done(self, train: int, val: int, test: int) -> None:
-        self._stats.train_trace_count = train
-        self._stats.val_trace_count = val
-        self._stats.heldout_trace_count = test
-        self._inner.split_done(train, val, test)
-
-    def index_done(self, steps: int) -> None:
-        self._stats.indexed_step_count = steps
-        self._inner.index_done(steps)
-
-    def optimize_start(self, budget: int) -> None:
-        self._inner.optimize_start(budget)
-
-    def activity(self, line: str) -> None:
-        self._inner.activity(line)
-
-    def rollout(self, done: int, budget: int, score: float | None) -> None:
-        self._inner.rollout(done, budget, score)
-
-    def optimize_done(self, held_out_accuracy: float, frontier_size: int, rollouts: int) -> None:
-        self._inner.optimize_done(held_out_accuracy, frontier_size, rollouts)
+    rollouts_used: int = 0
+    frontier_size: int = 0
+    duration_seconds: float = 0.0
+    llm_call_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
 
 
 def capture(
@@ -181,12 +151,14 @@ def capture(
 def capture_build_completed(
     *,
     stats: BuildTelemetryStats,
-    gepa_budget: int,
-    rollouts_used: int,
-    frontier_size: int,
-    record: RunRecord,
     root: str | Path,
 ) -> None:
+    """Capture one metadata-only aggregate for a completed local build.
+
+    Args:
+        stats: Aggregate build measurements without prompt or response content.
+        root: Project root that owns telemetry preferences and identity.
+    """
     capture(
         "wmo build completed",
         {
@@ -197,13 +169,13 @@ def capture_build_completed(
             "val_trace_count": stats.val_trace_count,
             "heldout_trace_count": stats.heldout_trace_count,
             "indexed_step_count": stats.indexed_step_count,
-            "rollouts_used": rollouts_used,
-            "frontier_size": frontier_size,
-            "duration_seconds": round(record.duration_seconds, 3),
-            "llm_call_count": record.total.calls,
-            "input_tokens": record.total.input_tokens,
-            "output_tokens": record.total.output_tokens,
-            "cost_usd": round(record.total.cost_usd, 6),
+            "rollouts_used": stats.rollouts_used,
+            "frontier_size": stats.frontier_size,
+            "duration_seconds": round(stats.duration_seconds, 3),
+            "llm_call_count": stats.llm_call_count,
+            "input_tokens": stats.input_tokens,
+            "output_tokens": stats.output_tokens,
+            "cost_usd": round(stats.cost_usd, 6),
         },
         root=root,
     )

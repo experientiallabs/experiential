@@ -93,8 +93,9 @@ rule. In particular verify:
 - NO new top-level directory or file, of any name, unless the PR description records that a
   human granted permission for that exact name (AGENTS.md rule 5). The tracked top level is
   closed: `wmo/`, `docs/`, `assets/`, `.claude/`, `.github/`. Reusable code goes in `wmo/`
-  (self-contained building blocks in `wmo/common/vendor/`), finished reports in `docs/`, and scratch
-  work outside the repo entirely. Benchmark data is a dependency, never a directory.
+  (shared contracts in `wmo/common/` and runtime adapters in `wmo/runtime/`), finished reports in
+  `docs/`, and scratch work outside the repo entirely. Benchmark data is a dependency, never a
+  directory.
 - Imports at module scope, fail-fast; no silent `ImportError` fallbacks.
 - End-to-end verification was actually done for anything with a runtime surface — drive it,
   don't just trust exit codes.

@@ -89,6 +89,24 @@ def test_capture_posts_anonymous_metadata_event(
     }
 
 
+def test_capture_honors_explicit_posthog_host_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    clients = _install_fake_posthog(monkeypatch)
+    monkeypatch.setenv("WMO_TELEMETRY", "1")
+    monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_override")
+    monkeypatch.setenv("WMO_POSTHOG_HOST", "https://eu.i.posthog.com/")
+
+    assert capture(
+        "wmo generated trace started",
+        {"generated_trace_count": 1},
+        root=tmp_path / ".wmo",
+    )
+
+    assert clients[0].project_api_key == "phc_override"
+    assert clients[0].kwargs["host"] == "https://eu.i.posthog.com"
+
+
 def test_capture_respects_project_opt_out(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     clients = _install_fake_posthog(monkeypatch)
 

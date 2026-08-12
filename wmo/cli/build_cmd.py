@@ -11,7 +11,6 @@ import typer
 from rich.console import Console
 
 from wmo.common.config import ARTIFACT_DIR
-from wmo.common.observability import RunRecord
 from wmo.common.observability.telemetry import BuildTelemetryStats, capture_build_completed
 from wmo.common.project import ArtifactStoreError, ProjectConfig, ProjectStore, ProjectStoreError
 from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project
@@ -169,13 +168,6 @@ def _capture_local_build_telemetry(
             val_trace_count=0,
             heldout_trace_count=sum(task.partition == "held_out" for task in tasks),
             indexed_step_count=0,
-        ),
-        gepa_budget=0,
-        rollouts_used=0,
-        frontier_size=0,
-        record=RunRecord(
-            run_id=f"build-{completed.task_set.task_set_id}",
-            kind="build",
             duration_seconds=max(duration_seconds, 0.0),
         ),
         root=root,

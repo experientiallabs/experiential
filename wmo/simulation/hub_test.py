@@ -198,24 +198,6 @@ def test_fetch_downloads_the_prebuilt_model(
         assert (bench / remote_path).read_bytes() == content
 
 
-def test_fetch_places_artifacts_where_existing_discovery_looks(
-    data_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The remote layout mirrors the local one, so nothing downstream needs a Hub special case.
-
-    This asserts against the real resolver rather than restating paths: the store that every
-    read command walks (`<data root>/<benchmark>/models/<name>/`). Renaming that layout on the
-    Hub breaks here instead of at a user's first `wmo serve`.
-    """
-    from wmo.common.config.store import WorldModelStore
-
-    _fake_hub(monkeypatch, _PREBUILT)
-
-    fetch_corpus("tau-bench")
-
-    assert WorldModelStore(data_root / "tau-bench").list_names() == ["tau-bench"]
-
-
 def test_fetch_keeps_a_local_artifact_unless_forced(
     data_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -19,7 +19,7 @@ baseline_revision = "e7aad17b2f5041769ad8107ab25e77d4e88729ca"
 "wmo/cli/run_cmd.py" = { baseline_lines = 1105, status = "tombstoned" }
 "wmo/cli/run_cmd_test.py" = { baseline_lines = 1209, status = "tombstoned" }
 "wmo/cli/ui.py" = { baseline_lines = 1147, status = "tombstoned" }
-"wmo/common/providers/pool_test.py" = { baseline_lines = 1307, status = "active" }
+"wmo/common/providers/pool_test.py" = { baseline_lines = 1307, status = "tombstoned" }
 "wmo/common/providers/tinker_test.py" = { baseline_lines = 1251, status = "tombstoned" }
 "wmo/optimize/model/config.py" = { baseline_lines = 1142, status = "tombstoned" }
 "wmo/optimize/model/config_test.py" = { baseline_lines = 1018, status = "tombstoned" }

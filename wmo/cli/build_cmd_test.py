@@ -9,7 +9,6 @@ import pytest
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
-from wmo.common.observability import RunRecord
 from wmo.common.observability.telemetry import BuildTelemetryStats
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.tasks import TaskSet
@@ -122,7 +121,6 @@ def test_build_reads_the_raw_otlp_file_once_and_persists_the_immutable_boundary(
     original_read_bytes = Path.read_bytes
     reads = 0
     captured: list[BuildTelemetryStats] = []
-    telemetry_calls: list[RunRecord] = []
 
     def count_source_reads(path: Path) -> bytes:
         nonlocal reads
@@ -132,9 +130,8 @@ def test_build_reads_the_raw_otlp_file_once_and_persists_the_immutable_boundary(
 
     monkeypatch.setattr(Path, "read_bytes", count_source_reads)
 
-    def capture(*, stats: BuildTelemetryStats, record: RunRecord, **_kwargs: object) -> None:
+    def capture(*, stats: BuildTelemetryStats, **_kwargs: object) -> None:
         captured.append(stats)
-        telemetry_calls.append(record)
 
     monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", capture)
     root = tmp_path / ".wmo"
@@ -168,7 +165,10 @@ def test_build_reads_the_raw_otlp_file_once_and_persists_the_immutable_boundary(
     assert stats.input_trace_count == 100
     assert stats.train_trace_count == 50
     assert stats.heldout_trace_count == 20
-    assert telemetry_calls[0].total.calls == 0
+    assert stats.llm_call_count == 0
+    assert stats.input_tokens == 0
+    assert stats.output_tokens == 0
+    assert stats.cost_usd == 0.0
 
 
 def test_build_accepts_a_local_posthog_export_without_using_the_hogql_transport(

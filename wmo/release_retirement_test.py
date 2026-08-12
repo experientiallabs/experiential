@@ -1,4 +1,4 @@
-"""Release regressions for retired W8.6 documentation, modules, and dependencies."""
+"""Release regressions for retired workflow and provider modules and dependencies."""
 
 from __future__ import annotations
 
@@ -40,11 +40,16 @@ FORBIDDEN_ARCHIVE_PATHS: Final[frozenset[str]] = frozenset(
     }
 )
 FORBIDDEN_ARCHIVE_PREFIXES: Final[tuple[str, ...]] = (
+    "wmo/common/providers/",
+    "wmo/common/vendor/",
     "wmo/simulation/model/",
     "wmo/simulation/evaluation/",
     "wmo/simulation/retrieval/",
 )
 GEPA_REQUIREMENT = re.compile(r"(?mi)^Requires-Dist:\s*gepa(?:\s|[<>=;~!])")
+RETIRED_PROVIDER_REQUIREMENT = re.compile(
+    r"(?mi)^Requires-Dist:\s*(?:anthropic|boto3|mlx-lm|openai|transformers)(?:\s|[<>=;~!])"
+)
 
 
 def _tracked_document_paths() -> tuple[Path, ...]:
@@ -136,9 +141,11 @@ def test_built_archives_exclude_retired_w8_content() -> None:
     with zipfile.ZipFile(wheels[0]) as wheel:
         assert not _retired_archive_members(wheel.namelist())
         assert GEPA_REQUIREMENT.search(_wheel_metadata(wheel)) is None
+        assert RETIRED_PROVIDER_REQUIREMENT.search(_wheel_metadata(wheel)) is None
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
         assert not _retired_archive_members(member.name for member in sdist.getmembers())
         assert GEPA_REQUIREMENT.search(_sdist_metadata(sdist)) is None
+        assert RETIRED_PROVIDER_REQUIREMENT.search(_sdist_metadata(sdist)) is None
 
 
 def test_archive_scanner_rejects_retired_module_descendants() -> None:
@@ -146,8 +153,15 @@ def test_archive_scanner_rejects_retired_module_descendants() -> None:
         "world_model_optimizer-0.3.0/wmo/simulation/model/compat.py",
         "wmo/optimize/gepa.py",
         "wmo/runtime/router/runtime.py",
+        "wmo/common/providers/compat.py",
+        "wmo/common/vendor/waterfall.py",
     )
-    assert frozenset(_retired_archive_members(members)) == frozenset(members[:2])
+    assert frozenset(_retired_archive_members(members)) == {
+        members[0],
+        members[1],
+        members[3],
+        members[4],
+    }
 
 
 @pytest.mark.parametrize(

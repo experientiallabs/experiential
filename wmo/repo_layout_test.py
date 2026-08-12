@@ -381,6 +381,42 @@ W4_RETIRED_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
     }
 )
 
+# W3D removes the compatibility provider stack after every supported caller moved to canonical
+# model contracts, runtime HTTP clients, and the minimal telemetry configuration owner.
+W3D_RETIRED_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
+    {
+        "wmo/cli/command_common.py",
+        "wmo/cli/model_roles.py",
+        "wmo/cli/model_roles_test.py",
+        "wmo/common/config/card.py",
+        "wmo/common/config/card_test.py",
+        "wmo/common/config/config.py",
+        "wmo/common/config/config_test.py",
+        "wmo/common/config/store.py",
+        "wmo/common/config/store_test.py",
+        "wmo/common/judging/assertions.py",
+        "wmo/common/judging/assertions_test.py",
+        "wmo/common/judging/checklist.py",
+        "wmo/common/judging/checklist_test.py",
+        "wmo/common/judging/episode.py",
+        "wmo/common/judging/episode_test.py",
+        "wmo/common/judging/fidelity.py",
+        "wmo/common/judging/fidelity_test.py",
+        "wmo/common/observability/clock.py",
+        "wmo/common/observability/metered.py",
+        "wmo/common/observability/metered_test.py",
+        "wmo/common/observability/pricing.py",
+        "wmo/common/observability/pricing_test.py",
+        "wmo/common/observability/reporting.py",
+        "wmo/common/observability/store.py",
+        "wmo/common/observability/store_test.py",
+        "wmo/common/observability/tracker.py",
+        "wmo/common/observability/tracker_test.py",
+        "wmo/common/providers",
+        "wmo/common/vendor",
+    }
+)
+
 
 @functools.lru_cache(maxsize=1)
 def _tracked_files() -> tuple[str, ...]:
@@ -618,6 +654,18 @@ def _retired_w4_paths(paths: Iterable[str]) -> frozenset[str]:
     )
 
 
+def _retired_w3d_paths(paths: Iterable[str]) -> frozenset[str]:
+    """Return paths that reintroduce a W3D owner or a descendant of a retired package root."""
+    return frozenset(
+        path
+        for path in paths
+        if any(
+            path == tombstone or path.startswith(f"{tombstone}/")
+            for tombstone in W3D_RETIRED_PATH_TOMBSTONES
+        )
+    )
+
+
 def test_hand_authored_files_stay_below_the_physical_line_limit() -> None:
     """Every new or rewritten covered file stays below the frozen migration boundary."""
     oversized = _oversized_hand_authored_files(_tracked_files())
@@ -785,6 +833,17 @@ def test_w4_tombstones_reject_new_descendants() -> None:
     """A new module below a deleted W4.5 package root is rejected directly."""
     candidate = "wmo/runtime/harness/compatibility.py"
     assert _retired_w4_paths((*_tracked_files(), candidate)) == {candidate}
+
+
+def test_w3d_retired_paths_remain_tombstoned() -> None:
+    """Deleted providers and their compatibility callers cannot return."""
+    assert not _retired_w3d_paths(_tracked_files())
+
+
+def test_w3d_tombstones_reject_new_descendants() -> None:
+    """A new compatibility module below the deleted provider root is rejected directly."""
+    candidate = "wmo/common/providers/compatibility.py"
+    assert _retired_w3d_paths((*_tracked_files(), candidate)) == {candidate}
 
 
 def test_root_cli_commands_match_the_explicit_transition_inventory() -> None:

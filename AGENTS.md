@@ -39,12 +39,9 @@ uv run pytest -q
   remove an entry and retain its tombstone; reintroduction is rejected.
 - There is no 800-line warning and no numeric modules-per-directory gate.
 
-Current migration state: one active oversized-file inventory entry remains under the W3D-owned
-legacy provider package. The transition inventories name paths and commands so they cannot grow
-while their owners remove or split them. An active oversized file changed after the frozen W1
-baseline must reach 999 lines or fewer and be tombstoned in that same pull request. The active size
-inventory is temporary migration state, not a permanent exemption, and must be empty by the final
-release audit.
+Current migration state: the oversized-file inventory has no active entries. All 31 frozen W1
+entries remain as permanent tombstones, and reintroducing one is rejected. Transition inventories
+for deleted paths and commands remain append-only history.
 
 ## Evidence, simulation, and routing lifecycle
 
@@ -154,10 +151,11 @@ release audit.
 4. **Keep the structure coherent and the command surface intentional.** Agent execution is nested
    under `wmo/runtime/`; evidence construction, simulation, and orchestration are nested under
    `wmo/simulation/`; offline router fitting and SFT are nested under `wmo/optimize/`; public
-   workflow composition is under `wmo/workflow/`; shared contracts, config, providers,
-   observability, and vendored utilities are under `wmo/common/`. Common code must not import a
-   product domain, and runtime code must not import simulation or optimization. Keep the locked
-   CLI small and do not return production modules to the flat `wmo/` namespace.
+   workflow composition is under `wmo/workflow/`; shared contracts, model metadata, minimal
+   configuration, and product telemetry are under `wmo/common/`. Provider execution belongs under
+   `wmo/runtime/models/providers/`. Common code must not import a product domain, and runtime code
+   must not import simulation or optimization. Keep the locked CLI small and do not return
+   production modules to the flat `wmo/` namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
    `docs/`, `assets/`, `web/`, `.claude/`, `.github/`. That list is closed.
@@ -192,9 +190,9 @@ release audit.
      `.wmo/` root, distribution archives under ignored `dist/`, and downloaded benchmark bundles.
      Never commit local settings files (`settings.toml` anywhere).
    - `wmo/` is the flagship package and the only importable code. Domain subpackages own their
-     area under the rule 4 hierarchy. `wmo/common/vendor/` holds self-contained building blocks
-     with no import back into WMO product domains, including the waterfall chain and its MIT
-     `LICENSE`.
+     area under the rule 4 hierarchy. Provider-neutral model contracts live under
+     `wmo/common/models/`, and explicit HTTP-backed clients live under
+     `wmo/runtime/models/providers/`.
    - `web/` is the local-only TypeScript review workbench. It proxies only to the loopback WMO
      review adapter and must not add provider, credential, tenant, or deployment integrations.
    - `assets/` — media referenced by README/docs (demo GIFs, logos).
@@ -269,18 +267,16 @@ release audit.
 ## One package
 
 This repo publishes **one distribution**: `world-model-optimizer`, whose importable code is all of
-`wmo/` and nothing else. It was a uv workspace until the `packages/` members were retired —
-`environment-capture` to PyPI, `llm-waterfall` into `wmo/common/vendor/waterfall/`. Rules of the road:
+`wmo/` and nothing else. It was a uv workspace until `environment-capture` moved to PyPI and the
+legacy provider stack was retired. Rules of the road:
 
 - **No workspace, no members**: there is no `[tool.uv.workspace]` and no `[tool.uv.sources]`. A
   dependency is either a normal PyPI requirement in `[project.dependencies]` or it is code under
   `wmo/`. Do not reintroduce a member directory (rule 5 forbids the top-level dir anyway).
-- **Vendor or depend, decide once**: a shared building block goes to PyPI and is depended on
-  (`environment-capture`), or it is vendored under `wmo/common/vendor/` with its upstream
-  `LICENSE` (`wmo/common/vendor/waterfall/`). Vendoring is for code we alone consume; keep it
-  free of imports back into `wmo` so it stays independently testable. The current model catalog,
-  role configuration, and immutable model snapshots live under `wmo/common/models/`; releases do
-  not depend on an unpublished workspace member.
+- **Keep dependency ownership explicit**: published shared building blocks are normal PyPI
+  requirements. Provider-neutral catalog metadata and immutable snapshots live under
+  `wmo/common/models/`; explicit runtime clients use the shared HTTP transport. Releases do not
+  depend on an unpublished workspace member or a copied provider stack.
 - **Gate scoping**: the root gate is `uv run ruff check .`, `uv run ty check`, `uv run pytest -q`,
   all over the single `testpaths = ["wmo"]`. Tests are inline `*_test.py` beside the module they
   cover. There is exactly one ruff config and one ty config, at the root.

@@ -2,10 +2,9 @@
 
 Every publishable benchmark's bundle lives in a dataset repo under the org: the trace corpus, its
 task data / gold / evidence dirs, and the prebuilt world model built from that corpus (see
-``_ARTIFACT_DIRS``). This is the READ core behind `wmo download`, plus
-the "is it local, and where" resolver (`corpus_path`) that decides whether to fetch or serve
-from disk. Plain HTTP against the Hub's public REST API, so it needs no extra dependency and no
-token for public repos (pass ``token`` for private ones).
+``_ARTIFACT_DIRS``). This retained library helper fetches dataset bundles and resolves whether a
+corpus is local through ``corpus_path``. Plain HTTP against the Hub's public REST API means it
+needs no extra dependency and no token for public repos (pass ``token`` for private ones).
 
 Bundles are local-first: capture writes into the benchmark dir, nothing here deletes local
 files, and fetching never overwrites an existing file unless forced. Downloads stream to a
@@ -64,8 +63,8 @@ _MISSING_REPO_CODES = frozenset({401, 403, 404})
 #
 # The remote paths mirror the local layout EXACTLY: `models/<name>/` holding
 # `{card.json,config.toml,metrics.json,prompts/,index/}`, landing under
-# `<data root>/<benchmark>/`. That is what `WorldModelStore` walks, so a downloaded bundle is
-# found by the same code as a locally captured one, with no special case for "came from the Hub".
+# `<data root>/<benchmark>/`. Keeping the published bundle layout stable lets downstream readers
+# treat downloaded and locally captured bundles identically.
 _ARTIFACT_DIRS = ("models",)
 
 # on_progress(files_done, files_total, bytes_total): called after every streamed chunk, across ALL

@@ -1,38 +1,9 @@
-"""Run tracking: time + cost + tokens across the harness lifecycle.
+"""Metadata-only anonymous product telemetry."""
 
-Instrument at the provider boundary (`MeteredProvider`) so the world model, GEPA, and the judge are
-all metered without changes to those modules. `RunTracker` aggregates `UsageEvent`s into
-`UsageTotals` (priced via `wmo.common.observability.pricing`) plus a wall-clock duration from an
-injectable `Clock`; `RunRecord`s persist under `.wmo/runs/`.
-"""
-
-from wmo.common.observability.clock import Clock, SystemClock
-from wmo.common.observability.metered import MeteredProvider, classify_build_call
-from wmo.common.observability.pricing import ModelPrice, cost_usd, price_for
-from wmo.common.observability.store import load_runs, save_run
-from wmo.common.observability.tracker import (
-    Phase,
-    RunRecord,
-    RunTracker,
-    UsageEvent,
-    UsageTotals,
-    merge_run_records,
-)
+from wmo.common.observability.telemetry import BuildTelemetryStats, capture, capture_build_completed
 
 __all__ = [
-    "Clock",
-    "SystemClock",
-    "MeteredProvider",
-    "classify_build_call",
-    "ModelPrice",
-    "cost_usd",
-    "price_for",
-    "load_runs",
-    "save_run",
-    "Phase",
-    "RunRecord",
-    "RunTracker",
-    "UsageEvent",
-    "UsageTotals",
-    "merge_run_records",
+    "BuildTelemetryStats",
+    "capture",
+    "capture_build_completed",
 ]

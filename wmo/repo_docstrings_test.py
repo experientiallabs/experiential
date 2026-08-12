@@ -650,6 +650,14 @@ wmo/simulation/model wmo/simulation/retrieval
 wmo/runtime/agents/default.py wmo/runtime/agents/llm.py
 wmo/runtime/environment.py wmo/runtime/episode.py
 wmo/runtime/evaluation wmo/runtime/harness
+wmo/cli/command_common.py wmo/cli/model_roles.py
+wmo/common/config/card.py wmo/common/config/config.py wmo/common/config/store.py
+wmo/common/judging/assertions.py wmo/common/judging/checklist.py
+wmo/common/judging/episode.py wmo/common/judging/fidelity.py
+wmo/common/observability/clock.py wmo/common/observability/metered.py
+wmo/common/observability/pricing.py wmo/common/observability/reporting.py
+wmo/common/observability/store.py wmo/common/observability/tracker.py
+wmo/common/providers wmo/common/vendor
 """.split()
 )
 

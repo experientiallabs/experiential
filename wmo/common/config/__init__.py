@@ -1,21 +1,8 @@
-"""Project config + the `.wmo/` artifact layout."""
+"""Minimal environment, path, and product-telemetry configuration exports."""
 
-from wmo.common.config.config import (
-    ARTIFACT_DIR,
-    FIDELITY_TIERS,
-    PROVIDER_ENV_VARS,
-    ArtifactPaths,
-    FidelityTier,
-    HarnessConfig,
-    TierSpec,
-    load_config,
-    save_config,
-)
-from wmo.common.config.dotenv import load_env_file, upsert_env_var
-from wmo.common.config.paths import ENV_HOME, wmo_home
+from wmo.common.config.dotenv import load_env_file
+from wmo.common.config.paths import ARTIFACT_DIR, ENV_HOME, wmo_home
 from wmo.common.config.settings import (
-    ModelRole,
-    ModelsSettings,
     ProjectSettings,
     TelemetrySettings,
     ensure_telemetry_anonymous_id,
@@ -24,40 +11,17 @@ from wmo.common.config.settings import (
     set_telemetry_enabled,
     settings_path,
 )
-from wmo.common.config.store import (
-    DEFAULT_MODEL_NAME,
-    ModelInfo,
-    WorldModelStore,
-    normalize_name,
-    validate_name,
-)
 
 __all__ = [
     "ARTIFACT_DIR",
-    "DEFAULT_MODEL_NAME",
     "ENV_HOME",
-    "FIDELITY_TIERS",
-    "FidelityTier",
-    "TierSpec",
-    "PROVIDER_ENV_VARS",
-    "ArtifactPaths",
-    "HarnessConfig",
-    "ModelInfo",
-    "ModelRole",
-    "ModelsSettings",
     "ProjectSettings",
     "TelemetrySettings",
-    "WorldModelStore",
     "ensure_telemetry_anonymous_id",
-    "load_config",
     "load_env_file",
     "load_settings",
-    "normalize_name",
-    "save_config",
     "save_settings",
     "set_telemetry_enabled",
     "settings_path",
-    "upsert_env_var",
-    "validate_name",
     "wmo_home",
 ]

@@ -33,7 +33,7 @@ app.command("run", help="Run one frozen project router on a development-only loo
 
 def _quiet_http_logs() -> None:
     """Cap noisy per-request loggers at WARNING."""
-    for name in ("httpx", "httpcore", "openai", "botocore", "urllib3", "anthropic"):
+    for name in ("httpx", "httpcore", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
 

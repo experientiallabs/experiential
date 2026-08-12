@@ -8,7 +8,7 @@ default:
 setup:
     @test -f .env && echo ".env exists, leaving it alone" || (cp .env.example .env && echo "created .env from .env.example; fill in the keys you have")
     uv sync --extra dev
-    @echo "next: put credentials in .env, then register models with 'uv run wmo providers set'"
+    @echo "next: run 'uv run wmo build --help' and start from an explicit local trace export"
 
 # The whole-repo gate (AGENTS.md rule 1).
 gate:

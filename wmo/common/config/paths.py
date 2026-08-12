@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 ENV_HOME = "WMO_HOME"
+ARTIFACT_DIR = ".wmo"
 
 
 def wmo_home() -> Path:
