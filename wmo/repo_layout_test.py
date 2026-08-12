@@ -86,6 +86,12 @@ UNTESTED_MODULE_NAMES = {"__init__.py", "__main__.py", "conftest.py"}
 # path in the same change that documents it in AGENTS.md rule 2.
 CROSS_CUTTING_TESTS = {"wmo/repo_layout_test.py": "the repo layout itself: this file"}
 
+# The vendored trees, listed rather than matched on the name `vendor`: they are verbatim upstream
+# copies, so their own `test/` layout is theirs and not ours, and that exemption must not extend to a
+# product package that merely happens to be called `vendor`. A new vendored tree is added here in
+# the change that vendors it.
+VENDORED_TREES = ("wmo/common/vendor/", "wmo/runtime/harness/vendor/")
+
 
 def _tracked_python_files() -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Every tracked `.py` path, split into (production modules, test suites)."""
@@ -153,7 +159,9 @@ def test_there_is_no_tests_directory() -> None:
     layout is theirs, not ours.
     """
     offenders = sorted(
-        p for p in _tracked_files() if re.search(r"(^|/)tests?/", p) and "/vendor/" not in p
+        p
+        for p in _tracked_files()
+        if re.search(r"(^|/)tests?/", p) and not p.startswith(VENDORED_TREES)
     )
     assert not offenders, (
         f"tracked files under a tests/ directory: {offenders}; every suite lives beside the "
