@@ -9,7 +9,16 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, JsonObject, stable_id
-from wmo.common.judging.proposal import RubricProposal
+from wmo.common.judging.proposal import (
+    RubricProposal,
+    RubricProposalError,
+    write_rubric_proposal_evidence,
+)
+from wmo.common.judging.provenance import (
+    JudgingProvenanceError,
+    resolve_artifact,
+    sorted_verified_inputs,
+)
 from wmo.common.judging.rubric import Rubric, RubricDimension, ScoreAnchor
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
 
@@ -337,20 +346,66 @@ class RubricReview:
         if not self._draft.dimensions:
             raise RubricReviewError("cannot finalize a rubric review without dimensions")
         created_at = self._now()
+        try:
+            _task_set, task_set_input = resolve_artifact(
+                self._store,
+                artifact_id=self._draft.source_task_set_id,
+                expected_artifact_type="task-set",
+            )
+        except JudgingProvenanceError as exc:
+            raise RubricReviewError(
+                "cannot finalize a rubric without a completed source task-set artifact"
+            ) from exc
+        accepted_dimension_ids = {item.dimension_id for item in self._draft.dimensions}
+        accepted_proposals = tuple(
+            proposal
+            for proposal in self._draft.proposals
+            if accepted_dimension_ids.intersection(
+                item.dimension.dimension_id for item in proposal.dimensions
+            )
+        )
+        try:
+            proposal_evidence_ids = tuple(
+                sorted(
+                    write_rubric_proposal_evidence(
+                        self._store,
+                        proposal=proposal,
+                        source_task_set_input=task_set_input,
+                        code_revision=self._draft.code_revision,
+                        created_at=created_at,
+                    ).proposal_evidence_id
+                    for proposal in accepted_proposals
+                )
+            )
+            proposal_inputs = tuple(
+                resolve_artifact(
+                    self._store,
+                    artifact_id=proposal_evidence_id,
+                    expected_artifact_type="rubric-proposal-evidence",
+                )[1]
+                for proposal_evidence_id in proposal_evidence_ids
+            )
+        except (JudgingProvenanceError, RubricProposalError) as exc:
+            raise RubricReviewError("cannot persist accepted rubric proposal evidence") from exc
+        inputs = sorted_verified_inputs((task_set_input, *proposal_inputs))
         rubric_id = stable_id(
             "rubric",
             {
                 "source_task_set_id": self._draft.source_task_set_id,
                 "dimensions": [item.model_dump(mode="json") for item in self._draft.dimensions],
+                "accepted_proposal_evidence_ids": proposal_evidence_ids,
+                "inputs": [item.model_dump(mode="json") for item in inputs],
             },
         )
         rubric = Rubric(
             schema_version=1,
             created_at=created_at,
+            inputs=inputs,
             code_revision=self._draft.code_revision,
             rubric_id=rubric_id,
             dimensions=self._draft.dimensions,
             source_task_set_id=self._draft.source_task_set_id,
+            accepted_proposal_evidence_ids=proposal_evidence_ids,
             status="human_approved",
             approved_at=created_at,
         )
@@ -490,6 +545,7 @@ def _same_rubric_identity(left: Rubric, right: Rubric) -> bool:
         and left.rubric_id == right.rubric_id
         and left.dimensions == right.dimensions
         and left.source_task_set_id == right.source_task_set_id
+        and left.accepted_proposal_evidence_ids == right.accepted_proposal_evidence_ids
         and left.status == right.status == "human_approved"
         and left.code_revision == right.code_revision
         and left.inputs == right.inputs

@@ -12,8 +12,14 @@ from pydantic import Field, field_validator
 from wmo.common.core.artifacts import ArtifactId, ContractModel, stable_id
 from wmo.common.judging.judgment import DimensionJudgment, Judgment
 from wmo.common.judging.prompts import PromptDefinition
+from wmo.common.judging.provenance import (
+    JudgingProvenanceError,
+    read_artifact_json,
+    sorted_verified_inputs,
+)
 from wmo.common.judging.rubric import JudgeCalibration, Rubric
 from wmo.common.models import ModelClient, ModelMessage, ModelRequest, ToolCall
+from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
 from wmo.common.rollouts import RolloutArtifact
 
 
@@ -53,11 +59,17 @@ class LMJudge:
         model: ModelClient,
         prompt: PromptDefinition,
         *,
+        code_revision: str,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        """Bind an injected model client, prompt, and optional deterministic clock."""
+        """Bind an injected model client, prompt, judging revision, and optional clock."""
+        if not code_revision.strip() or len(code_revision) > 256:
+            raise JudgmentError(
+                "judging code revision must be a nonempty value of at most 256 characters"
+            )
         self._model = model
         self._prompt = prompt
+        self._code_revision = code_revision
         self._clock = _utc_now if clock is None else clock
 
     def judge(
@@ -103,7 +115,7 @@ class LMJudge:
         return Judgment(
             schema_version=1,
             created_at=created_at,
-            code_revision=rollout.code_revision,
+            code_revision=self._code_revision,
             judgment_id=stable_id(
                 "judgment",
                 {
@@ -113,6 +125,7 @@ class LMJudge:
                     "dimensions": [item.model_dump(mode="json") for item in dimensions],
                     "judge_model": response.model.model_dump(mode="json"),
                     "judge_prompt_sha256": self._prompt.sha256,
+                    "judging_code_revision": self._code_revision,
                 },
             ),
             rollout_id=rollout.rollout_id,
@@ -125,6 +138,108 @@ class LMJudge:
             overall_score=overall_score,
             judge_economics=response.economics,
         )
+
+    def judge_and_write(
+        self,
+        store: ProjectStore,
+        *,
+        rollout_artifact_id: ArtifactId,
+        rubric_artifact_id: ArtifactId,
+        calibration_artifact_id: ArtifactId,
+    ) -> Judgment:
+        """Judge persisted evidence and write one final judgment with verified input hashes.
+
+        Args:
+            store: Project store that owns completed rollout, rubric, calibration, and
+                judgment artifacts.
+            rollout_artifact_id: Completed source rollout artifact directory to score.
+            rubric_artifact_id: Completed rubric artifact directory used to score the rollout.
+            calibration_artifact_id: Completed calibration artifact directory used for score
+                mapping.
+
+        Returns:
+            A stored judgment whose inputs are canonical manifest hashes for all three sources.
+
+        Raises:
+            JudgmentError: A required source is absent, wrong-typed, inconsistent, or
+                conflicts on retry.
+        """
+        try:
+            rollout, rollout_input = read_artifact_json(
+                store,
+                artifact_id=rollout_artifact_id,
+                expected_artifact_type="rollout",
+                relative_path="rollout.json",
+                model_type=RolloutArtifact,
+            )
+            rubric, rubric_input = read_artifact_json(
+                store,
+                artifact_id=rubric_artifact_id,
+                expected_artifact_type="rubric",
+                relative_path="rubric.json",
+                model_type=Rubric,
+            )
+            calibration, calibration_input = read_artifact_json(
+                store,
+                artifact_id=calibration_artifact_id,
+                expected_artifact_type="judge-calibration",
+                relative_path="calibration.json",
+                model_type=JudgeCalibration,
+            )
+        except JudgingProvenanceError as exc:
+            raise JudgmentError(
+                "final judgment requires completed immutable source artifacts"
+            ) from exc
+        if rollout.artifact_id != rollout_artifact_id:
+            raise JudgmentError("stored rollout record does not match its artifact identity")
+        if rubric.rubric_id != rubric_artifact_id:
+            raise JudgmentError("stored rubric record does not match its artifact identity")
+        if calibration.calibration_id != calibration_artifact_id:
+            raise JudgmentError("stored calibration record does not match its artifact identity")
+        draft = self.judge(rollout, rubric, calibration)
+        inputs = sorted_verified_inputs((rollout_input, rubric_input, calibration_input))
+        judgment = draft.model_copy(
+            update={
+                "inputs": inputs,
+                "judgment_id": stable_id(
+                    "judgment",
+                    {
+                        "rollout_id": rollout.rollout_id,
+                        "rubric_id": rubric.rubric_id,
+                        "calibration_id": calibration.calibration_id,
+                        "dimensions": [item.model_dump(mode="json") for item in draft.dimensions],
+                        "judge_model": draft.judge_model.model_dump(mode="json"),
+                        "judge_prompt_sha256": draft.judge_prompt_sha256,
+                        "judging_code_revision": self._code_revision,
+                        "inputs": [item.model_dump(mode="json") for item in inputs],
+                    },
+                ),
+            }
+        )
+        try:
+            store.artifacts.write_json(
+                artifact_id=judgment.judgment_id,
+                artifact_type="judgment",
+                envelope=judgment,
+                files={"judgment.json": judgment},
+            )
+        except ArtifactAlreadyExistsError:
+            try:
+                stored, _stored_input = read_artifact_json(
+                    store,
+                    artifact_id=judgment.judgment_id,
+                    expected_artifact_type="judgment",
+                    relative_path="judgment.json",
+                    model_type=Judgment,
+                )
+            except JudgingProvenanceError as exc:
+                raise JudgmentError("existing judgment artifact cannot be resumed safely") from exc
+            if not _same_judgment_identity(stored, judgment):
+                raise JudgmentError(
+                    "existing judgment artifact conflicts with this judgment"
+                ) from None
+            return stored
+        return judgment
 
 
 def _validate_bindings(
@@ -237,3 +352,23 @@ def _render_judgment_request(rollout: RolloutArtifact, rubric: Rubric) -> str:
 def _utc_now() -> datetime:
     """Return the default timezone-aware timestamp for immutable judgments."""
     return datetime.now(UTC)
+
+
+def _same_judgment_identity(left: Judgment, right: Judgment) -> bool:
+    """Compare persisted judgment content while permitting a safe retry at a later time."""
+    return (
+        left.schema_version == right.schema_version
+        and left.judgment_id == right.judgment_id
+        and left.rollout_id == right.rollout_id
+        and left.rubric_id == right.rubric_id
+        and left.calibration_id == right.calibration_id
+        and left.judge_model == right.judge_model
+        and left.judge_prompt_id == right.judge_prompt_id
+        and left.judge_prompt_sha256 == right.judge_prompt_sha256
+        and left.dimensions == right.dimensions
+        and left.overall_score == right.overall_score
+        and left.judge_economics == right.judge_economics
+        and left.inputs == right.inputs
+        and left.code_revision == right.code_revision
+        and left.source == right.source
+    )

@@ -8,13 +8,17 @@ from wmo.common.judging.calibration import (
     JudgeCalibrationService,
     JudgeScoreObservation,
     OutOfFoldPrediction,
-    RouterLineageSplit,
     WorstDisagreement,
     utc_now,
 )
 from wmo.common.judging.interface import Judge
 from wmo.common.judging.judgment import DimensionJudgment, Judgment
 from wmo.common.judging.labels import HumanLabelSet, HumanScore, HumanScoreHistory, HumanScoreReview
+from wmo.common.judging.lineage import (
+    RouterLineageAssignment,
+    RouterLineageSplit,
+    write_router_lineage_split,
+)
 from wmo.common.judging.lm import JudgmentError, LMJudge
 from wmo.common.judging.prompts import PromptDefinition
 from wmo.common.judging.proposal import (
@@ -23,6 +27,8 @@ from wmo.common.judging.proposal import (
     RepresentativeRollout,
     RubricProposal,
     RubricProposalError,
+    RubricProposalEvidence,
+    write_rubric_proposal_evidence,
 )
 from wmo.common.judging.review import (
     RubricReview,
@@ -63,6 +69,7 @@ __all__ = [
     "RepresentativeRollout",
     "Rubric",
     "RubricProposal",
+    "RubricProposalEvidence",
     "RubricProposalError",
     "RubricDimension",
     "RubricReview",
@@ -70,7 +77,10 @@ __all__ = [
     "RubricReviewError",
     "RubricReviewEvent",
     "RouterLineageSplit",
+    "RouterLineageAssignment",
     "ScoreAnchor",
     "WorstDisagreement",
+    "write_router_lineage_split",
+    "write_rubric_proposal_evidence",
     "utc_now",
 ]

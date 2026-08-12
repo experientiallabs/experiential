@@ -45,6 +45,7 @@ class Rubric(ArtifactEnvelope):
     rubric_id: ArtifactId
     dimensions: tuple[RubricDimension, ...]
     source_task_set_id: ArtifactId
+    accepted_proposal_evidence_ids: tuple[ArtifactId, ...] = ()
     status: Literal["provisional", "human_approved"]
     approved_at: datetime | None = None
 
@@ -60,8 +61,26 @@ class Rubric(ArtifactEnvelope):
             raise ValueError("rubric dimensions must have unique IDs")
         return value
 
+    @field_validator("accepted_proposal_evidence_ids")
+    @classmethod
+    def _require_sorted_unique_proposal_evidence(
+        cls, value: tuple[ArtifactId, ...]
+    ) -> tuple[ArtifactId, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("rubric accepted proposal evidence IDs must not repeat")
+        if value != tuple(sorted(value)):
+            raise ValueError("rubric accepted proposal evidence IDs must be sorted")
+        return value
+
     @model_validator(mode="after")
     def _require_consistent_approval(self) -> Rubric:
+        expected_input_ids = tuple(
+            sorted((self.source_task_set_id, *self.accepted_proposal_evidence_ids))
+        )
+        if tuple(item.artifact_id for item in self.inputs) != expected_input_ids:
+            raise ValueError(
+                "rubrics must hash their source task set and accepted proposal evidence"
+            )
         if self.status == "human_approved" and self.approved_at is None:
             raise ValueError("human-approved rubrics require approved_at")
         if self.status == "provisional" and self.approved_at is not None:
@@ -122,6 +141,7 @@ class JudgeCalibration(ArtifactEnvelope):
     excluded_router_held_out_lineage_ids: tuple[ArtifactId, ...]
     validation_method: Literal["grouped_k_fold"]
     out_of_fold_report_id: ArtifactId
+    out_of_fold_report_sha256: Sha256
     score_maps: tuple[DimensionScoreMap, ...]
     label_count: int = Field(default=0, ge=0)
     recommended_label_count: Literal[10] = 10

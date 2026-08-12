@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from wmo.common.core.artifacts import ArtifactEnvelope
 from wmo.common.judging import (
     ProposedRubricDimension,
     RubricDimension,
@@ -16,7 +17,7 @@ from wmo.common.judging import (
     ScoreAnchor,
 )
 from wmo.common.models import ModelSnapshot
-from wmo.common.project import ProjectConfig, ProjectStore
+from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
 
 _DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 11, tzinfo=UTC)
@@ -78,9 +79,24 @@ def _store(tmp_path: Path) -> ProjectStore:
     return store
 
 
+def _write_task_set(store: ProjectStore) -> None:
+    """Write the immutable task-set evidence required by rubric finalization."""
+    store.artifacts.write_json(
+        artifact_id="task-set-1",
+        artifact_type="task-set",
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=_TIME,
+            code_revision="w6-test",
+        ),
+        files={"tasks.json": {"task_set_id": "task-set-1"}},
+    )
+
+
 def test_review_accepts_edits_orders_replaces_resumes_and_finalizes(tmp_path: Path) -> None:
     """All rubric transitions share one draft and finalization creates an immutable artifact."""
     store = _store(tmp_path)
+    _write_task_set(store)
     proposal = _proposal()
     review = RubricReview.open(
         store,
@@ -112,6 +128,17 @@ def test_review_accepts_edits_orders_replaces_resumes_and_finalizes(tmp_path: Pa
 
     assert rubric.status == "human_approved"
     assert store.artifacts.read(rubric.rubric_id).manifest.artifact_type == "rubric"
+    task_input = artifact_input(store.artifacts.read("task-set-1").manifest)
+    assert tuple(item.artifact_id for item in rubric.inputs) == tuple(
+        sorted((task_input.artifact_id, *rubric.accepted_proposal_evidence_ids))
+    )
+    assert len(rubric.accepted_proposal_evidence_ids) == 1
+    evidence = store.artifacts.read(rubric.accepted_proposal_evidence_ids[0])
+    assert evidence.manifest.artifact_type == "rubric-proposal-evidence"
+    evidence_input = artifact_input(evidence.manifest)
+    assert rubric.inputs == tuple(
+        sorted((task_input, evidence_input), key=lambda value: value.artifact_id)
+    )
     assert resumed.finalize() == rubric
     with pytest.raises(RubricReviewError, match="immutable"):
         resumed.add(_dimension("extra", "Extra"))
@@ -144,6 +171,7 @@ def test_review_rejects_mismatched_resume_and_invalid_order(tmp_path: Path) -> N
 def test_review_finalize_recovers_after_artifact_write_before_draft_lock(tmp_path: Path) -> None:
     """A retry locks the existing rubric instead of overwriting or conflicting with it."""
     store = _store(tmp_path)
+    _write_task_set(store)
     proposal = _proposal()
     review = RubricReview.open(
         store,

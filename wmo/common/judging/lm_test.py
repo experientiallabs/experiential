@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
-from wmo.common.core.artifacts import SourceIdentity
+from wmo.common.core.artifacts import ArtifactInput, SourceIdentity
 from wmo.common.judging import (
     DimensionScoreMap,
     Judge,
@@ -28,6 +29,7 @@ from wmo.common.models import (
     OperationEconomics,
     ToolCall,
 )
+from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
 from wmo.common.rollouts import (
     ProductionSimulatorSnapshot,
     RolloutArtifact,
@@ -77,6 +79,7 @@ def _rubric() -> Rubric:
     return Rubric(
         schema_version=1,
         created_at=_TIME,
+        inputs=(ArtifactInput(artifact_id="task-set-1", sha256=_DIGEST),),
         code_revision="w6-test",
         rubric_id="rubric-1",
         dimensions=(
@@ -115,6 +118,7 @@ def _calibration(prompt: PromptDefinition) -> JudgeCalibration:
         excluded_router_held_out_lineage_ids=("lineage-held-out",),
         validation_method="grouped_k_fold",
         out_of_fold_report_id="report-1",
+        out_of_fold_report_sha256=_DIGEST,
         score_maps=(
             DimensionScoreMap(
                 dimension_id="task-success",
@@ -129,7 +133,7 @@ def _rollout() -> RolloutArtifact:
     return RolloutArtifact(
         schema_version=1,
         created_at=_TIME,
-        code_revision="w6-test",
+        code_revision="rollout-revision",
         artifact_id="artifact-rollout-1",
         simulation_id="simulation-1",
         cell_id="cell-1",
@@ -175,11 +179,23 @@ def _valid_output(span_id: str = "span-1") -> str:
     )
 
 
+def _store(tmp_path: Path) -> ProjectStore:
+    """Create an isolated local artifact store for final-judgment persistence coverage."""
+    store = ProjectStore(tmp_path / ".wmo", "support-project")
+    store.initialize(ProjectConfig(project_id="support-project"))
+    return store
+
+
 def test_lm_judge_requires_exact_identity_and_cited_rollout_evidence() -> None:
     """Structured output receives a calibration map only when its model and evidence match."""
     prompt = PromptDefinition.from_text("judge-prompt-v1", "Return only structured scores.")
     client = _FakeJudgeClient(_valid_output())
-    judge = LMJudge(client, prompt, clock=lambda: _TIME)
+    judge = LMJudge(
+        client,
+        prompt,
+        code_revision="judging-revision",
+        clock=lambda: _TIME,
+    )
 
     judgment = judge.judge(_rollout(), _rubric(), _calibration(prompt))
 
@@ -188,6 +204,7 @@ def test_lm_judge_requires_exact_identity_and_cited_rollout_evidence() -> None:
     assert judgment.dimensions[0].calibrated_score == 4.0
     assert judgment.judge_model == _model()
     assert judgment.judge_prompt_sha256 == prompt.sha256
+    assert judgment.code_revision == "judging-revision"
     request_content = client.requests[0].messages[1].content
     assert request_content is not None
     assert "span-1" in request_content
@@ -200,9 +217,12 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs() -
     rollout = _rollout()
 
     with pytest.raises(JudgmentError, match="malformed"):
-        LMJudge(_FakeJudgeClient("not-json"), prompt, clock=lambda: _TIME).judge(
-            rollout, _rubric(), calibration
-        )
+        LMJudge(
+            _FakeJudgeClient("not-json"),
+            prompt,
+            code_revision="judging-revision",
+            clock=lambda: _TIME,
+        ).judge(rollout, _rubric(), calibration)
     with pytest.raises(JudgmentError, match="tool calls"):
         LMJudge(
             _FakeJudgeClient(
@@ -210,11 +230,15 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs() -
                 tool_calls=(ToolCall(call_id="call-1", name="score", arguments={}),),
             ),
             prompt,
+            code_revision="judging-revision",
             clock=lambda: _TIME,
         ).judge(rollout, _rubric(), calibration)
     with pytest.raises(JudgmentError, match="do not exist"):
         LMJudge(
-            _FakeJudgeClient(_valid_output("invented-span")), prompt, clock=lambda: _TIME
+            _FakeJudgeClient(_valid_output("invented-span")),
+            prompt,
+            code_revision="judging-revision",
+            clock=lambda: _TIME,
         ).judge(rollout, _rubric(), calibration)
     wrong_model = ModelSnapshot(
         provider="fake",
@@ -223,12 +247,82 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs() -
     )
     with pytest.raises(JudgmentError, match="model identity"):
         LMJudge(
-            _FakeJudgeClient(_valid_output(), model=wrong_model), prompt, clock=lambda: _TIME
+            _FakeJudgeClient(_valid_output(), model=wrong_model),
+            prompt,
+            code_revision="judging-revision",
+            clock=lambda: _TIME,
         ).judge(rollout, _rubric(), calibration)
     changed_prompt = PromptDefinition.from_text(
         "judge-prompt-v1", "Return only structured scores with revised wording."
     )
     with pytest.raises(JudgmentError, match="prompt digest"):
-        LMJudge(_FakeJudgeClient(_valid_output()), changed_prompt, clock=lambda: _TIME).judge(
-            rollout, _rubric(), calibration
+        LMJudge(
+            _FakeJudgeClient(_valid_output()),
+            changed_prompt,
+            code_revision="judging-revision",
+            clock=lambda: _TIME,
+        ).judge(rollout, _rubric(), calibration)
+
+
+def test_lm_judge_writes_final_judgment_with_verified_artifact_inputs(tmp_path: Path) -> None:
+    """Final judgments name manifest-verified rollout, rubric, and calibration inputs."""
+    store = _store(tmp_path)
+    prompt = PromptDefinition.from_text("judge-prompt-v1", "Return only structured scores.")
+    rollout = _rollout()
+    rubric = _rubric()
+    calibration = _calibration(prompt)
+    rollout_input = artifact_input(
+        store.artifacts.write_json(
+            artifact_id=rollout.artifact_id,
+            artifact_type="rollout",
+            envelope=rollout,
+            files={"rollout.json": rollout},
         )
+    )
+    rubric_input = artifact_input(
+        store.artifacts.write_json(
+            artifact_id=rubric.rubric_id,
+            artifact_type="rubric",
+            envelope=rubric,
+            files={"rubric.json": rubric},
+        )
+    )
+    calibration_input = artifact_input(
+        store.artifacts.write_json(
+            artifact_id=calibration.calibration_id,
+            artifact_type="judge-calibration",
+            envelope=calibration,
+            files={"calibration.json": calibration},
+        )
+    )
+    judge = LMJudge(
+        _FakeJudgeClient(_valid_output()),
+        prompt,
+        code_revision="judging-revision",
+        clock=lambda: _TIME,
+    )
+
+    judgment = judge.judge_and_write(
+        store,
+        rollout_artifact_id=rollout.artifact_id,
+        rubric_artifact_id=rubric.rubric_id,
+        calibration_artifact_id=calibration.calibration_id,
+    )
+
+    assert judgment.code_revision == "judging-revision"
+    assert judgment.inputs == tuple(
+        sorted(
+            (rollout_input, rubric_input, calibration_input),
+            key=lambda value: value.artifact_id,
+        )
+    )
+    assert store.artifacts.read(judgment.judgment_id).manifest.artifact_type == "judgment"
+    assert (
+        judge.judge_and_write(
+            store,
+            rollout_artifact_id=rollout.artifact_id,
+            rubric_artifact_id=rubric.rubric_id,
+            calibration_artifact_id=calibration.calibration_id,
+        )
+        == judgment
+    )

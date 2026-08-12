@@ -14,6 +14,8 @@ from wmo.common.core.artifacts import (
     JsonObject,
     stable_id,
 )
+from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
+from wmo.common.judging.rubric import Rubric
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
 
 
@@ -144,6 +146,8 @@ class HumanLabelSet(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_consistent_history(self) -> HumanLabelSet:
+        if tuple(item.artifact_id for item in self.inputs) != (self.rubric_id,):
+            raise ValueError("human label sets must hash exactly their finalized rubric")
         if any(score.rubric_id != self.rubric_id for score in self.history.scores):
             raise ValueError("human label sets must contain labels for one rubric")
         expected_active_ids = tuple(score.label_id for score in self.history.active_scores())
@@ -234,16 +238,32 @@ class HumanScoreReview:
         """
         if created_at.tzinfo is None or created_at.utcoffset() is None:
             raise ValueError("human label-set times must include a timezone")
+        try:
+            rubric, rubric_input = read_artifact_json(
+                self._store,
+                artifact_id=rubric_id,
+                expected_artifact_type="rubric",
+                relative_path="rubric.json",
+                model_type=Rubric,
+            )
+        except JudgingProvenanceError as exc:
+            raise ValueError(
+                "human label sets require a completed immutable finalized rubric"
+            ) from exc
+        if rubric.rubric_id != rubric_id:
+            raise ValueError("stored rubric record does not match its artifact identity")
         history = self._history.for_rubric(rubric_id)
         label_set = HumanLabelSet(
             schema_version=1,
             created_at=created_at,
+            inputs=(rubric_input,),
             code_revision=code_revision,
             label_set_id=stable_id(
                 "human-label-set",
                 {
                     "rubric_id": rubric_id,
                     "history": history.model_dump(mode="json"),
+                    "inputs": [rubric_input.model_dump(mode="json")],
                 },
             ),
             rubric_id=rubric_id,

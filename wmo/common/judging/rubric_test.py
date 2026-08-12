@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.judging import (
     DimensionScoreMap,
     JudgeCalibration,
@@ -41,6 +42,7 @@ def test_rubric_and_calibration_round_trip() -> None:
     rubric = Rubric(
         schema_version=1,
         created_at=approved_at,
+        inputs=(ArtifactInput(artifact_id="task-set-v1", sha256=_DIGEST),),
         code_revision="e7aad17",
         rubric_id="support-rubric-v1",
         dimensions=(_dimension(),),
@@ -67,6 +69,7 @@ def test_rubric_and_calibration_round_trip() -> None:
         excluded_router_held_out_lineage_ids=("lineage-held-out-1",),
         validation_method="grouped_k_fold",
         out_of_fold_report_id="judge-report-v1",
+        out_of_fold_report_sha256=_DIGEST,
         score_maps=(
             DimensionScoreMap(
                 dimension_id="task-success",
@@ -95,6 +98,7 @@ def test_rubric_requires_ordered_complete_anchors_and_approval_time() -> None:
         Rubric(
             schema_version=1,
             created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            inputs=(ArtifactInput(artifact_id="task-set-v1", sha256=_DIGEST),),
             code_revision="e7aad17",
             rubric_id="support-rubric-v1",
             dimensions=(_dimension(),),
@@ -121,6 +125,7 @@ def test_rubric_requires_ordered_complete_anchors_and_approval_time() -> None:
             excluded_router_held_out_lineage_ids=("lineage-1",),
             validation_method="grouped_k_fold",
             out_of_fold_report_id="judge-report-v1",
+            out_of_fold_report_sha256=_DIGEST,
             score_maps=(
                 DimensionScoreMap(
                     dimension_id="task-success",

@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from wmo.common.core.artifacts import ArtifactId, ContractModel, Sha256, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactId,
+    ArtifactInput,
+    ContractModel,
+    Sha256,
+    stable_id,
+)
 from wmo.common.judging.prompts import PromptDefinition
+from wmo.common.judging.provenance import JudgingProvenanceError, resolve_artifact
 from wmo.common.judging.rubric import RubricDimension
 from wmo.common.models import ModelClient, ModelMessage, ModelRequest, ModelSnapshot, ToolCall
+from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
 from wmo.common.rollouts import RolloutArtifact
 
 
@@ -127,6 +137,22 @@ class RubricProposal(ContractModel):
         return self
 
 
+class RubricProposalEvidence(ArtifactEnvelope):
+    """One immutable persisted proposal that may become accepted rubric evidence."""
+
+    proposal_evidence_id: ArtifactId
+    source_task_set_id: ArtifactId
+    proposal: RubricProposal
+
+    @model_validator(mode="after")
+    def _require_task_set_input(self) -> RubricProposalEvidence:
+        if self.proposal.source_task_set_id != self.source_task_set_id:
+            raise ValueError("proposal evidence must retain its proposal task-set identity")
+        if tuple(item.artifact_id for item in self.inputs) != (self.source_task_set_id,):
+            raise ValueError("proposal evidence must hash exactly its source task set")
+        return self
+
+
 class _RawProposal(ContractModel):
     """Strict structured response accepted from the configured rubric proposer."""
 
@@ -226,6 +252,99 @@ class LMRubricProposer:
             source_lineage_ids=source_lineage_ids,
             excluded_router_held_out_lineage_ids=excluded_lineage_ids,
         )
+
+
+def write_rubric_proposal_evidence(
+    store: ProjectStore,
+    *,
+    proposal: RubricProposal,
+    source_task_set_input: ArtifactInput,
+    code_revision: str,
+    created_at: datetime,
+) -> RubricProposalEvidence:
+    """Persist one reviewed-proposal input after its task-set manifest is verified.
+
+    Args:
+        store: Project store that owns the immutable proposal-evidence artifact.
+        proposal: Structured model proposal whose citations seeded a human review.
+        source_task_set_input: Manifest-derived input for the proposal's source task set.
+        code_revision: Exact revision that froze the evidence artifact.
+        created_at: Time the evidence artifact is materialized.
+
+    Returns:
+        The stored immutable proposal evidence, including safe idempotent retry recovery.
+
+    Raises:
+        RubricProposalError: The proposal conflicts with its task-set evidence or stored artifact.
+    """
+    try:
+        _task_set, verified_task_set_input = resolve_artifact(
+            store,
+            artifact_id=source_task_set_input.artifact_id,
+            expected_artifact_type="task-set",
+            expected_input=source_task_set_input,
+        )
+    except JudgingProvenanceError as exc:
+        raise RubricProposalError(
+            "proposal evidence requires a completed immutable source task set"
+        ) from exc
+    if proposal.source_task_set_id != verified_task_set_input.artifact_id:
+        raise RubricProposalError(
+            "proposal source task set does not match verified task-set evidence"
+        )
+    evidence = RubricProposalEvidence(
+        schema_version=1,
+        created_at=created_at,
+        inputs=(verified_task_set_input,),
+        code_revision=code_revision,
+        proposal_evidence_id=stable_id(
+            "rubric-proposal-evidence",
+            {
+                "proposal": proposal.model_dump(mode="json"),
+                "source_task_set_input": verified_task_set_input.model_dump(mode="json"),
+                "code_revision": code_revision,
+            },
+        ),
+        source_task_set_id=proposal.source_task_set_id,
+        proposal=proposal,
+    )
+    try:
+        store.artifacts.write_json(
+            artifact_id=evidence.proposal_evidence_id,
+            artifact_type="rubric-proposal-evidence",
+            envelope=evidence,
+            files={"proposal.json": evidence},
+        )
+    except ArtifactAlreadyExistsError:
+        try:
+            stored = RubricProposalEvidence.model_validate_json(
+                store.artifacts.read_bytes(evidence.proposal_evidence_id, "proposal.json")
+            )
+        except ValueError as exc:
+            raise RubricProposalError(
+                "existing rubric proposal evidence cannot be resumed safely"
+            ) from exc
+        if not _same_proposal_evidence_identity(stored, evidence):
+            raise RubricProposalError(
+                "existing rubric proposal evidence conflicts with this proposal"
+            ) from None
+        return stored
+    return evidence
+
+
+def _same_proposal_evidence_identity(
+    left: RubricProposalEvidence, right: RubricProposalEvidence
+) -> bool:
+    """Compare stable proposal evidence while permitting a retry at a later clock time."""
+    return (
+        left.schema_version == right.schema_version
+        and left.proposal_evidence_id == right.proposal_evidence_id
+        and left.source_task_set_id == right.source_task_set_id
+        and left.proposal == right.proposal
+        and left.inputs == right.inputs
+        and left.code_revision == right.code_revision
+        and left.source == right.source
+    )
 
 
 def _parse_proposal_response(content: str | None, tool_calls: tuple[ToolCall, ...]) -> _RawProposal:
