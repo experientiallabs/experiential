@@ -1,41 +1,351 @@
-"""Executable form of AGENTS.md rules 2, 4, and 5: the layout of this repo, in one file.
+"""Executable repository migration guardrails.
 
-Test pairing, the package tree and its import direction, and the top level as an allowlist. Most
-checks run against `git ls-files`, so they check what is TRACKED rather than what happens to be on
-disk, and are skipped outside a git checkout (e.g. an installed sdist).
-
-The per-package `package_layout_test.py` suites used to live one per domain. They are here now:
-five files asserted one property (the tree AGENTS.md rule 4 describes is the tree on disk), none of
-them paired with a module, and splitting them per package made each boundary BETWEEN two domains
-the property of whichever one happened to hold the assertion.
+Runs against `git ls-files` so it checks what is TRACKED, not what happens to be on disk.
+Skipped outside a git checkout (e.g. an installed sdist).
 """
 
 from __future__ import annotations
 
-import ast
 import functools
-import re
 import subprocess
 import tomllib
+from collections.abc import Collection, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Final
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-WMO_DIR = Path(__file__).resolve().parent
 
-# AGENTS.md rule 5: tracked top-level directories must be within this set, and the set is CLOSED.
-# An agent may never add to it. A new entry requires a human to name that exact directory and
-# grant permission for the name; the entry then lands in the same change that documents it in
-# AGENTS.md rule 5. If work does not fit a surface below, it goes under the closest one or stays
-# out of the repo — never into a new sibling.
-ALLOWED_TOP_DIRS = {
-    "wmo",  # the flagship package: all importable code
-    "docs",  # reviewed public documentation (see the docs/ layout tests below)
-    "assets",  # media referenced by README/docs
-    ".claude",  # checked-in agent skills
-    ".github",  # CI workflows
-}
+HAND_AUTHORED_SUFFIXES: Final[frozenset[str]] = frozenset(
+    {
+        ".py",
+        ".pyi",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".sh",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".md",
+        ".rst",
+    }
+)
+MAX_HAND_AUTHORED_LINES: Final[int] = 999
+
+GUARDRAIL_CONFIG_PATH = REPO_ROOT / "wmo" / "repository_guardrails.toml"
+GUARDRAIL_CONFIG_RELATIVE_PATH = GUARDRAIL_CONFIG_PATH.relative_to(REPO_ROOT).as_posix()
+
+
+@dataclass(frozen=True)
+class OversizedFileEntry:
+    """One frozen legacy file-size exception and its monotonic state."""
+
+    baseline_lines: int
+    status: str
+
+
+@dataclass(frozen=True)
+class GuardrailConfig:
+    """Parsed machine-readable inventories used by repository migration checks."""
+
+    oversized_file_baseline_revision: str
+    oversized_file_entries: Mapping[str, OversizedFileEntry]
+    generated_outputs: frozenset[str]
+
+
+def _mapping(value: object, label: str) -> Mapping[str, object]:
+    """Return a string-keyed mapping or fail with an actionable inventory error."""
+    if not isinstance(value, dict):
+        raise AssertionError(f"{label} must be a string-keyed TOML table")
+    result: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise AssertionError(f"{label} must be a string-keyed TOML table")
+        result[key] = item
+    return result
+
+
+def _parse_guardrail_config(raw_config: object) -> GuardrailConfig:
+    """Parse one version of the single machine-readable guardrail inventory."""
+    config = _mapping(raw_config, "guardrail configuration")
+    oversized = _mapping(config.get("oversized_file_inventory"), "oversized_file_inventory")
+    revision = oversized.get("baseline_revision")
+    if not isinstance(revision, str):
+        raise AssertionError("oversized_file_inventory.baseline_revision must be a string")
+    raw_entries = _mapping(oversized.get("entries"), "oversized_file_inventory.entries")
+    entries: dict[str, OversizedFileEntry] = {}
+    for relative_path, raw_entry in raw_entries.items():
+        entry = _mapping(raw_entry, f"oversized_file_inventory.entries.{relative_path}")
+        baseline_lines = entry.get("baseline_lines")
+        status = entry.get("status")
+        if not isinstance(baseline_lines, int) or baseline_lines <= MAX_HAND_AUTHORED_LINES:
+            raise AssertionError(f"{relative_path} must have an oversized baseline_lines value")
+        if not isinstance(status, str) or status not in {"active", "tombstoned"}:
+            raise AssertionError(f"{relative_path} must be active or tombstoned")
+        entries[relative_path] = OversizedFileEntry(baseline_lines, status)
+    generated = _mapping(config.get("generated_outputs"), "generated_outputs")
+    raw_paths = generated.get("paths")
+    if not isinstance(raw_paths, list):
+        raise AssertionError("generated_outputs.paths must be a list of exact paths")
+    generated_paths: list[str] = []
+    for path in raw_paths:
+        if not isinstance(path, str):
+            raise AssertionError("generated_outputs.paths must be a list of exact paths")
+        generated_paths.append(path)
+    return GuardrailConfig(revision, entries, frozenset(generated_paths))
+
+
+@functools.cache
+def _guardrail_config() -> GuardrailConfig:
+    """Load the current single machine-readable oversized-file inventory."""
+    with GUARDRAIL_CONFIG_PATH.open("rb") as file_handle:
+        return _parse_guardrail_config(tomllib.load(file_handle))
+
+
+LEGACY_PATH_PREFIXES: Final[tuple[str, ...]] = (
+    "wmo/optimize/gepa.py",
+    "wmo/optimize/judge.py",
+    "wmo/optimize/judge_quality.py",
+    "wmo/optimize/research",
+    "wmo/optimize/reward.py",
+    "wmo/optimize/telemetry",
+    "wmo/runtime/evaluation/harbor",
+    "wmo/runtime/harness/vendor/pi-agent",
+    "wmo/runtime/platform",
+    "wmo/runtime/runs",
+    "wmo/simulation/context",
+    "wmo/simulation/evaluation",
+    "wmo/simulation/serving",
+)
+
+# Exact tracked paths under the current legacy roots. This is deliberately explicit rather than
+# derived at runtime, so a new path under a legacy root fails immediately.
+LEGACY_PATH_INVENTORY: Final[frozenset[str]] = frozenset(
+    {
+        "wmo/optimize/gepa.py",
+        "wmo/optimize/judge.py",
+        "wmo/optimize/judge_quality.py",
+        "wmo/optimize/research/__init__.py",
+        "wmo/optimize/research/ablation.py",
+        "wmo/optimize/research/ablation_test.py",
+        "wmo/optimize/research/concurrency_plot.py",
+        "wmo/optimize/research/concurrency_plot_test.py",
+        "wmo/optimize/research/concurrency_run.py",
+        "wmo/optimize/research/concurrency_run_test.py",
+        "wmo/optimize/research/concurrency_scaling.py",
+        "wmo/optimize/research/concurrency_scaling_test.py",
+        "wmo/optimize/research/gepa_scaling.py",
+        "wmo/optimize/research/gepa_scaling_test.py",
+        "wmo/optimize/research/pipeline.py",
+        "wmo/optimize/research/pipeline_test.py",
+        "wmo/optimize/research/scaling_split.py",
+        "wmo/optimize/research/scaling_split_test.py",
+        "wmo/optimize/research/scenario_fidelity.py",
+        "wmo/optimize/research/scenario_fidelity_test.py",
+        "wmo/optimize/research/scenario_recovery.py",
+        "wmo/optimize/research/scenario_recovery_test.py",
+        "wmo/optimize/research/seed_stability.py",
+        "wmo/optimize/research/seed_stability_test.py",
+        "wmo/optimize/research/trace_scaling.py",
+        "wmo/optimize/research/trace_scaling_test.py",
+        "wmo/optimize/reward.py",
+        "wmo/optimize/telemetry/__init__.py",
+        "wmo/optimize/telemetry/backfill.py",
+        "wmo/optimize/telemetry/backfill_test.py",
+        "wmo/optimize/telemetry/conftest.py",
+        "wmo/optimize/telemetry/hooks.py",
+        "wmo/optimize/telemetry/hooks_test.py",
+        "wmo/runtime/evaluation/harbor/__init__.py",
+        "wmo/runtime/evaluation/harbor/agent.py",
+        "wmo/runtime/evaluation/harbor/agent_test.py",
+        "wmo/runtime/evaluation/harbor/ctrf.py",
+        "wmo/runtime/evaluation/harbor/ctrf_test.py",
+        "wmo/runtime/evaluation/harbor/e2b_environment.py",
+        "wmo/runtime/evaluation/harbor/e2b_environment_test.py",
+        "wmo/runtime/evaluation/harbor/e2b_template_policy.py",
+        "wmo/runtime/evaluation/harbor/scorer.py",
+        "wmo/runtime/evaluation/harbor/scorer_test.py",
+        "wmo/runtime/evaluation/harbor/tasks.py",
+        "wmo/runtime/evaluation/harbor/tasks_test.py",
+        "wmo/runtime/harness/vendor/pi-agent/CHANGELOG.md",
+        "wmo/runtime/harness/vendor/pi-agent/LICENSE",
+        "wmo/runtime/harness/vendor/pi-agent/README.md",
+        "wmo/runtime/harness/vendor/pi-agent/VENDOR.md",
+        "wmo/runtime/harness/vendor/pi-agent/docs/agent-harness.md",
+        "wmo/runtime/harness/vendor/pi-agent/docs/durable-harness.md",
+        "wmo/runtime/harness/vendor/pi-agent/docs/hooks.md",
+        "wmo/runtime/harness/vendor/pi-agent/docs/models.md",
+        "wmo/runtime/harness/vendor/pi-agent/docs/observability.md",
+        "wmo/runtime/harness/vendor/pi-agent/package.json",
+        "wmo/runtime/harness/vendor/pi-agent/src/agent-loop.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/agent.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/agent-harness.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/compaction/branch-summarization.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/compaction/compaction.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/compaction/utils.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/env/nodejs.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/messages.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/prompt-templates.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/session/jsonl-repo.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/session/jsonl-storage.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/session/memory-repo.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/session/memory-storage.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/session/repo-utils.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/session/session.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/session/uuid.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/skills.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/system-prompt.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/types.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/utils/shell-output.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/harness/utils/truncate.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/index.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/node.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/proxy.ts",
+        "wmo/runtime/harness/vendor/pi-agent/src/types.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/agent-loop.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/agent.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/e2e.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/agent-harness-stream.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/agent-harness.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/compaction.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/nodejs-env.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/prompt-templates.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/repo.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/resource-formatting.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/session-test-utils.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/session-uuid.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/session.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/skills.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/storage.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/system-prompt.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/harness/truncate.test.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/scratch/simple.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/utils/calculate.ts",
+        "wmo/runtime/harness/vendor/pi-agent/test/utils/get-current-time.ts",
+        "wmo/runtime/harness/vendor/pi-agent/tsconfig.build.json",
+        "wmo/runtime/harness/vendor/pi-agent/vitest.config.ts",
+        "wmo/runtime/harness/vendor/pi-agent/vitest.harness.config.ts",
+        "wmo/runtime/platform/__init__.py",
+        "wmo/runtime/platform/auth.py",
+        "wmo/runtime/platform/auth_test.py",
+        "wmo/runtime/platform/client.py",
+        "wmo/runtime/platform/client_test.py",
+        "wmo/runtime/platform/credentials.py",
+        "wmo/runtime/platform/credentials_test.py",
+        "wmo/runtime/platform/transfer.py",
+        "wmo/runtime/platform/transfer_test.py",
+        "wmo/runtime/runs/__init__.py",
+        "wmo/runtime/runs/client.py",
+        "wmo/runtime/runs/client_test.py",
+        "wmo/runtime/runs/conftest.py",
+        "wmo/runtime/runs/ledger.py",
+        "wmo/runtime/runs/ledger_test.py",
+        "wmo/runtime/runs/reader.py",
+        "wmo/runtime/runs/reader_test.py",
+        "wmo/runtime/runs/schema.py",
+        "wmo/runtime/runs/schema_test.py",
+        "wmo/simulation/context/__init__.py",
+        "wmo/simulation/context/apps.py",
+        "wmo/simulation/context/apps_test.py",
+        "wmo/simulation/context/brave.py",
+        "wmo/simulation/context/brave_test.py",
+        "wmo/simulation/context/connector.py",
+        "wmo/simulation/context/connector_test.py",
+        "wmo/simulation/context/credentials.py",
+        "wmo/simulation/context/credentials_test.py",
+        "wmo/simulation/context/github.py",
+        "wmo/simulation/context/github_test.py",
+        "wmo/simulation/context/google.py",
+        "wmo/simulation/context/google_test.py",
+        "wmo/simulation/context/notion.py",
+        "wmo/simulation/context/notion_test.py",
+        "wmo/simulation/context/oauth.py",
+        "wmo/simulation/context/oauth_test.py",
+        "wmo/simulation/context/slack.py",
+        "wmo/simulation/context/slack_test.py",
+        "wmo/simulation/context/store.py",
+        "wmo/simulation/context/store_test.py",
+        "wmo/simulation/context/types.py",
+        "wmo/simulation/context/types_test.py",
+        "wmo/simulation/evaluation/__init__.py",
+        "wmo/simulation/evaluation/agreement.py",
+        "wmo/simulation/evaluation/agreement_test.py",
+        "wmo/simulation/evaluation/base.py",
+        "wmo/simulation/evaluation/base_test.py",
+        "wmo/simulation/evaluation/closed_loop.py",
+        "wmo/simulation/evaluation/closed_loop_test.py",
+        "wmo/simulation/evaluation/failover.py",
+        "wmo/simulation/evaluation/failover_test.py",
+        "wmo/simulation/evaluation/gold.py",
+        "wmo/simulation/evaluation/gold_test.py",
+        "wmo/simulation/evaluation/grid.py",
+        "wmo/simulation/evaluation/grid_plot.py",
+        "wmo/simulation/evaluation/grid_plot_test.py",
+        "wmo/simulation/evaluation/grid_test.py",
+        "wmo/simulation/evaluation/open_loop.py",
+        "wmo/simulation/evaluation/open_loop_test.py",
+        "wmo/simulation/evaluation/tasks.py",
+        "wmo/simulation/evaluation/tasks_test.py",
+        "wmo/simulation/serving/__init__.py",
+        "wmo/simulation/serving/builds.py",
+        "wmo/simulation/serving/builds_test.py",
+        "wmo/simulation/serving/chat.py",
+        "wmo/simulation/serving/chat_openai_client_test.py",
+        "wmo/simulation/serving/chat_test.py",
+        "wmo/simulation/serving/endpoint_config.py",
+        "wmo/simulation/serving/endpoint_config_test.py",
+        "wmo/simulation/serving/query_embeddings.py",
+        "wmo/simulation/serving/query_embeddings_test.py",
+        "wmo/simulation/serving/savings.py",
+        "wmo/simulation/serving/savings_test.py",
+        "wmo/simulation/serving/server.py",
+        "wmo/simulation/serving/server_test.py",
+        "wmo/simulation/serving/traces_source.py",
+        "wmo/simulation/serving/traces_source_test.py",
+    }
+)
+LEGACY_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
+    {
+        # Folded into `wmo/simulation/context/connector_test.py`, the suite for the module the
+        # package is about, so the package surface is asserted beside code instead of on its own
+        # (AGENTS.md rule 2).
+        "wmo/simulation/context/api_test.py",
+    }
+)
+
+# Exact current root commands. The target CLI is smaller, but deletion owners remove these
+# entries with their commands. A command absent from this set fails before it can become an
+# accidental supported surface.
+ROOT_CLI_COMMAND_INVENTORY: Final[frozenset[str]] = frozenset(
+    {
+        "build",
+        "config",
+        "demo",
+        "download",
+        "eval",
+        "ingest",
+        "knowledge",
+        "list",
+        "login",
+        "logout",
+        "optimize",
+        "play",
+        "providers",
+        "pull",
+        "push",
+        "research",
+        "run",
+        "runs",
+        "scenarios",
+        "serve",
+        "status",
+    }
+)
+ROOT_CLI_COMMAND_TOMBSTONES: Final[frozenset[str]] = frozenset()
 
 
 @functools.lru_cache(maxsize=1)
@@ -56,421 +366,356 @@ def _tracked_files() -> tuple[str, ...]:
     return tuple(result.stdout.splitlines())
 
 
-def test_top_level_directories_are_allowlisted() -> None:
-    """Every tracked top-level directory is on the AGENTS.md rule 5 allowlist."""
-    tracked_dirs = {path.split("/", 1)[0] for path in _tracked_files() if "/" in path}
-    unexpected = tracked_dirs - ALLOWED_TOP_DIRS
-    assert not unexpected, (
-        f"top-level directories {sorted(unexpected)} are not in the AGENTS.md rule 5 allowlist "
-        f"{sorted(ALLOWED_TOP_DIRS)}. The allowlist is closed and agents may not extend it: put "
-        "reusable code in wmo/ (self-contained building blocks in wmo/common/), finished reports "
-        "in docs/, and one-off or scratch work OUTSIDE the repo. Adding a new top-level "
-        "directory requires a human to grant permission for that exact name."
-    )
-
-
-# AGENTS.md rule 2: a module needs no sibling suite when it has no behavior of its own to cover.
-# `__init__.py` is a re-export surface (what it promises is asserted from the suite of whichever
-# module the package is mostly about), `__main__.py` is the `python -m` shim over an already-tested
-# entry point, and `conftest.py` is pytest wiring that every suite exercises by running at all.
-UNTESTED_MODULE_NAMES = {"__init__.py", "__main__.py", "conftest.py"}
-
-# AGENTS.md rule 2: the CLOSED set of suites that cover something other than one sibling module.
-# There is exactly ONE, and it is this file, which has no module to pair with by construction: the
-# repo layout is its subject. Everything else lives beside what it covers, including the seam suites
-# that used to sit here (a cross-backend contract is a section of each backend's own suite, a live
-# end-to-end path a section of the pipeline's, a package's public surface a section of the suite for
-# the module the package is about). An agent may never extend this list: a new test file either sits
-# beside the module it covers or merges into that module's suite. Adding an entry, and with it the
-# argument for why nothing beside a module could hold the test, requires a human to grant that exact
-# path in the same change that documents it in AGENTS.md rule 2.
-CROSS_CUTTING_TESTS = {"wmo/repo_layout_test.py": "the repo layout itself: this file"}
-
-# The vendored trees, listed rather than matched on the name `vendor`: they are verbatim upstream
-# copies, so their own `test/` layout is theirs and not ours, and that exemption must not extend to
-# a product package that merely happens to be called `vendor`. A new vendored tree is added here in
-# the change that vendors it.
-VENDORED_TREES = ("wmo/common/vendor/", "wmo/runtime/harness/vendor/")
-
-
-def _tracked_python_files() -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Every tracked `.py` path, split into (production modules, test suites)."""
-    paths = [p for p in _tracked_files() if p.endswith(".py")]
-    return (
-        tuple(p for p in paths if not p.endswith("_test.py")),
-        tuple(p for p in paths if p.endswith("_test.py")),
-    )
-
-
-def test_every_module_has_a_sibling_test() -> None:
-    """AGENTS.md rule 2: `foo.py` is covered by `foo_test.py` in the same directory."""
-    modules, tests = _tracked_python_files()
-    suites = set(tests)
-    missing = sorted(
-        p
-        for p in modules
-        if Path(p).name not in UNTESTED_MODULE_NAMES
-        and p.removesuffix(".py") + "_test.py" not in suites
-    )
-    assert not missing, (
-        f"modules with no sibling test: {missing}; add `<module>_test.py` beside each one "
-        f"(AGENTS.md rule 2). Only {sorted(UNTESTED_MODULE_NAMES)} are exempt, and coverage "
-        "living in some other file does not count: the pairing is what makes it findable"
-    )
-
-
-def test_every_test_covers_the_module_beside_it() -> None:
-    """AGENTS.md rule 2, the other direction: no test file without the module it names.
-
-    A `foo_test.py` whose `foo.py` was renamed or deleted keeps passing while covering nothing,
-    which is worse than no test at all: the suite reports green over code that is gone.
-    """
-    modules, tests = _tracked_python_files()
-    known = set(modules)
-    orphans = sorted(
-        p
-        for p in tests
-        if p not in CROSS_CUTTING_TESTS and p.removesuffix("_test.py") + ".py" not in known
-    )
-    assert not orphans, (
-        f"test files with no module beside them: {orphans}; rename them to match the module they "
-        "cover, fold them into the sibling suite for that module, or (for a genuinely "
-        "cross-cutting suite) have a human add the exact path to CROSS_CUTTING_TESTS in "
-        "wmo/repo_layout_test.py in the same change that documents it in AGENTS.md rule 2"
-    )
-
-
-def test_the_cross_cutting_allowlist_has_no_stale_entries() -> None:
-    """An allowlisted path that no longer exists would silently license a future file's name."""
-    _modules, tests = _tracked_python_files()
-    stale = sorted(set(CROSS_CUTTING_TESTS) - set(tests))
-    assert not stale, (
-        f"CROSS_CUTTING_TESTS names paths that are not tracked test files: {stale}; drop the "
-        "entries so the exception list keeps describing what actually exists"
-    )
-
-
-def test_there_is_no_tests_directory() -> None:
-    """AGENTS.md rule 2: tests are inline, so no directory anywhere collects them.
-
-    Every tracked path counts, not just `.py` files: a fixture, snapshot, or README under
-    `tests/` is the beginning of the directory this rule forbids, and the suite that reads it
-    follows. Vendored trees are exempt: they are verbatim upstream copies whose own `test/`
-    layout is theirs, not ours.
-    """
-    offenders = sorted(
-        p
-        for p in _tracked_files()
-        if re.search(r"(^|/)tests?/", p) and not p.startswith(VENDORED_TREES)
-    )
-    assert not offenders, (
-        f"tracked files under a tests/ directory: {offenders}; every suite lives beside the "
-        "module it covers (AGENTS.md rule 2)"
-    )
-
-
-def test_no_local_settings_files_are_tracked() -> None:
-    """No generated settings.toml (telemetry ids) is ever committed."""
-    offenders = [p for p in _tracked_files() if Path(p).name == "settings.toml"]
-    assert not offenders, (
-        f"local settings files are tracked: {offenders}; these are generated per-root artifacts "
-        "(telemetry ids) and must stay gitignored"
-    )
-
-
-def test_no_bytecode_or_caches_are_tracked() -> None:
-    """No __pycache__/.pyc artifacts are committed."""
-    offenders = [p for p in _tracked_files() if "__pycache__" in p or p.endswith(".pyc")]
-    assert not offenders, (
-        f"bytecode/cache files are tracked: {offenders[:5]}; git rm --cached them and keep "
-        "__pycache__/ in .gitignore"
-    )
-
-
-def test_docs_layout_is_exactly_readme_research_reference() -> None:
-    """docs/ is the manifest, the CLI map, writeups with their figures, references, and cookbooks.
-
-    Anything else (other top-level pages, stray dirs, figures outside figures/) is clutter that
-    rule 5 says gets relocated or deleted.
-    """
-    allowed = re.compile(
-        r"^docs/(README\.md"
-        r"|usage\.md"
-        r"|research/[^/]+\.md"
-        r"|research/figures/[^/]+\.png"
-        r"|reference/[^/]+\.md"
-        r"|cookbook/[^/]+\.md)$"
-    )
-    offenders = [p for p in _tracked_files() if p.startswith("docs/") and not allowed.match(p)]
-    assert not offenders, (
-        f"files outside the docs/ layout: {offenders}; writeups go in docs/research/*.md with "
-        "figures in docs/research/figures/, references in docs/reference/*.md, end-to-end walks "
-        "in docs/cookbook/*.md, and docs/usage.md is the only other root page (AGENTS.md rule 5)"
-    )
-
-
-# Top-level directories this repo used to have. They are gone; a doc that still points at one is
-# sending the reader to a path that does not exist.
-RETIRED_TOP_DIRS = (".agents/", "deploy/", "examples/", "packages/", "web/")
-
-#: Each retired directory as a regex anchored at a path-token boundary. A bare substring test
-#: would fail the gate on ordinary prose: `web/` matches inside
-#: `https://api.search.brave.com/res/v1/web/search`, and `packages/` inside `site-packages/` or
-#: any `files.pythonhosted.org/packages/...` wheel URL.
-_RETIRED_PATTERNS = tuple(
-    (retired, re.compile(rf"(?<![\w./-]){re.escape(retired)}")) for retired in RETIRED_TOP_DIRS
-)
-
-
-def test_docs_never_point_at_a_retired_directory() -> None:
-    """docs/ are finished products: every path they quote must still exist.
-
-    Reproduction lives in the report itself (public wmo API or CLI), never behind a path that
-    was deleted, and never behind a scratch workspace, which this repo no longer has.
-    """
-    offenders: list[tuple[str, str]] = []
-    for p in _tracked_files():
-        if not (p.startswith("docs/") and p.endswith(".md")):
-            continue
-        path = REPO_ROOT / p
-        if not path.is_file():  # tolerate uncommitted deletes/renames mid-edit
-            continue
-        text = path.read_text(encoding="utf-8")  # once per doc, not once per retired dir
-        offenders.extend(
-            (p, retired) for retired, pattern in _RETIRED_PATTERNS if pattern.search(text)
-        )
-    assert not offenders, (
-        f"docs pointing at retired top-level directories: {offenders}; those paths no longer "
-        "exist. Quote reproduction as public wmo API/CLI in the report itself (AGENTS.md rule 5)"
-    )
-
-
-def test_docs_readme_indexes_every_doc() -> None:
-    """docs/README.md's justification table must name every tracked docs/ file (rule 5).
-
-    The manifest is what makes the justification rule enforceable; a doc or figure absent from
-    it is either unjustified or the table has drifted.
-    """
-    readme = (REPO_ROOT / "docs" / "README.md").read_text(encoding="utf-8")
-    missing = [
-        p
-        for p in _tracked_files()
-        if p.startswith("docs/") and p != "docs/README.md" and p.removeprefix("docs/") not in readme
-    ]
-    assert not missing, (
-        f"docs files absent from docs/README.md's justification table: {missing}; every doc "
-        "and figure gets a row or gets deleted (AGENTS.md rule 5)"
-    )
-
-
-def test_no_tracked_file_is_matched_by_ignore_rules() -> None:
-    """A tracked file matched by a .gitignore rule is a conflict waiting to bite (re-adds fail)."""
+def _git_output(arguments: list[str]) -> str:
+    """Run a local Git read command or skip outside a repository checkout."""
     try:
         result = subprocess.run(
-            ["git", "ls-files", "-i", "-c", "--exclude-standard"],
+            ["git", *arguments],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
             check=False,
         )
     except FileNotFoundError:
-        pytest.skip("git not available; repo-layout rules only apply to a git checkout")
+        pytest.skip("git not available; repository guardrails require a git checkout")
     if result.returncode != 0:
-        pytest.skip("not a git checkout; repo-layout rules only apply to the repository")
-    offenders = result.stdout.splitlines()
-    assert not offenders, (
-        f"tracked files matched by ignore rules: {offenders[:5]}; fix the .gitignore pattern "
-        "(add a ! negation or narrow the glob) so tracked artifacts stay re-addable"
+        pytest.skip("not a git checkout; repository guardrails require the frozen baseline")
+    return result.stdout
+
+
+@functools.cache
+def _tracked_files_at_revision(revision: str) -> tuple[str, ...]:
+    """Return every tracked path at one immutable Git revision."""
+    return tuple(_git_output(["ls-tree", "-r", "--name-only", revision]).splitlines())
+
+
+@functools.cache
+def _frozen_legacy_path_inventory() -> frozenset[str]:
+    """Return every legacy-root path that existed at the frozen W1 revision."""
+    return _legacy_path_candidates(
+        _tracked_files_at_revision(_guardrail_config().oversized_file_baseline_revision)
     )
 
 
-def test_there_is_no_uv_workspace() -> None:
-    """One distribution, no members (AGENTS.md § One package).
-
-    The workspace was retired when `packages/` was deleted: `environment-capture` resolves from
-    PyPI and `llm-waterfall` was vendored into `wmo/common/vendor/waterfall/`. Reintroducing a
-    member means reintroducing a top-level `packages/` directory, which rule 5 forbids outright.
-    """
-    with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
-        root = tomllib.load(fh)
-    uv_config = root.get("tool", {}).get("uv", {})
-    assert "workspace" not in uv_config, (
-        "[tool.uv.workspace] is back; this repo publishes one distribution whose importable code "
-        "is all of wmo/. Depend on PyPI or vendor under wmo/common/vendor/ "
-        "(AGENTS.md § One package)"
-    )
-    assert "sources" not in uv_config, (
-        "[tool.uv.sources] is back; with no workspace every dependency resolves from PyPI "
-        "(AGENTS.md § One package)"
-    )
+def _file_text_at_revision(revision: str, relative_path: str) -> str:
+    """Return one UTF-8 text file from an immutable Git revision."""
+    return _git_output(["show", f"{revision}:{relative_path}"])
 
 
-def test_root_gate_covers_the_whole_package() -> None:
-    """AGENTS.md § One package promises one root gate over the single package."""
-    with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
-        root = tomllib.load(fh)
-    testpaths = root["tool"]["pytest"]["ini_options"]["testpaths"]
-    assert testpaths == ["wmo"], (
-        f"testpaths is {testpaths}, not ['wmo']; the root gate covers the one package and every "
-        "test is inline beside the module it covers (AGENTS.md § One package)"
-    )
-
-
-ALLOWED_TOP_FILES = {
-    ".env.example",
-    ".gitignore",
-    "AGENTS.md",
-    "CLAUDE.md",
-    "LICENSE",  # not yet present; allowlisted so adding one never fights the gate
-    "README.md",
-    "conftest.py",
-    "justfile",
-    "pyproject.toml",
-    "uv.lock",
-}
-
-
-def test_top_level_files_are_allowlisted() -> None:
-    """Root files are an allowlist too — no Makefile/tox.ini/setup.cfg sprawl (rule 5)."""
-    tracked_root_files = {p for p in _tracked_files() if "/" not in p}
-    unexpected = tracked_root_files - ALLOWED_TOP_FILES
-    assert not unexpected, (
-        f"top-level files {sorted(unexpected)} are not allowlisted; config belongs in "
-        "pyproject.toml, tasks in the justfile, and everything else under an allowlisted dir"
-    )
-
-
-#: AGENTS.md rule 4: the package tree, as one table. Every domain names the subpackages it owns, so
-#: a responsibility that quietly moves out of its domain (the `wmo/evals/harbor` and
-#: `wmo/optimize/harness` shapes this repo has already had and retired) fails here instead of in a
-#: reviewer's memory. A domain may grow a new subpackage without editing this table; only `wmo`
-#: itself is a closed set, because a package directly under it is a new product domain.
-PACKAGE_TREE = {
-    "wmo": {"cli", "common", "optimize", "runtime", "simulation"},
-    "wmo/common": {"config", "core", "observability", "providers", "vendor"},
-    "wmo/optimize": {"routing", "model", "research"},
-    "wmo/runtime": {"agents", "evaluation", "harness", "platform", "runs"},
-    "wmo/simulation": {
-        "context",
-        "evaluation",
-        "ingest",
-        "model",
-        "retrieval",
-        "scenarios",
-        "serving",
-    },
-}
-
-#: Modules that must stay at a domain's root: each is the domain's own contract, not a detail of
-#: one of its subpackages, so moving it down would hide the seam the domain is entered through.
-DOMAIN_ROOT_MODULES = {
-    "wmo/runtime": {"environment.py", "episode.py"},
-    "wmo/simulation": {"environment.py", "hub.py"},
-}
-
-
-def _subpackages(package: str) -> set[str]:
-    """The directory names directly under a package, ignoring bytecode caches."""
-    return {
-        path.name
-        for path in (REPO_ROOT / package).iterdir()
-        if path.is_dir() and path.name != "__pycache__"
-    }
-
-
-def test_every_domain_still_owns_the_subpackages_it_is_named_for() -> None:
-    """AGENTS.md rule 4: a responsibility never quietly leaves the domain that owns it."""
-    missing = {
-        package: sorted(expected - _subpackages(package))
-        for package, expected in PACKAGE_TREE.items()
-        if expected - _subpackages(package)
-    }
-    assert not missing, (
-        f"subpackages missing from the domain that owns them: {missing}; the tree in AGENTS.md "
-        "rule 4 changes with the rule 4 text, in the same change"
-    )
-
-
-def test_the_wmo_root_is_the_closed_set_of_product_domains() -> None:
-    """A directory directly under `wmo/` is a new product domain, so the set is closed (rule 4)."""
-    actual = _subpackages("wmo")
-    unexpected = actual - PACKAGE_TREE["wmo"]
-    assert not unexpected, (
-        f"new packages directly under wmo/: {sorted(unexpected)}; nest the work under the domain "
-        "that owns its concern (rule 4's four domains plus the CLI), and add a fifth domain only "
-        "with the rule 4 text in the same change"
-    )
-
-
-def test_each_domain_keeps_its_own_entry_modules_at_its_root() -> None:
-    """AGENTS.md rule 4: a domain's own contract stays at its root, not inside a subpackage."""
-    missing = {
-        package: sorted(name for name in expected if not (REPO_ROOT / package / name).is_file())
-        for package, expected in DOMAIN_ROOT_MODULES.items()
-    }
-    offenders = {package: names for package, names in missing.items() if names}
-    assert not offenders, f"domain entry modules missing from their package root: {offenders}"
-
-
-def test_no_production_module_sits_in_the_flat_wmo_namespace() -> None:
-    """AGENTS.md rule 4: `wmo/` holds the domains, not modules of its own.
-
-    Only the package shims live here: `__init__.py`, the `python -m` entry point, pytest wiring,
-    and this gate.
-    """
-    flat = sorted(
-        path.name
-        for path in WMO_DIR.glob("*.py")
-        if path.name not in UNTESTED_MODULE_NAMES and not path.name.endswith("_test.py")
-    )
-    assert not flat, (
-        f"production modules returned to the flat wmo namespace: {flat}; move each under the "
-        "domain that owns it (AGENTS.md rule 4)"
-    )
-
-
-def test_imports_point_inward_from_common_and_runtime() -> None:
-    """AGENTS.md rule 4: common is a leaf, and runtime does not know simulation or optimization.
-
-    This is the one rule the tree cannot show: the directories can be perfect while an import
-    inverts the dependency, and the cycle only surfaces later as an unimportable package.
-    """
-    violations = _banned_imports(
-        WMO_DIR / "common", {"wmo.cli", "wmo.optimize", "wmo.runtime", "wmo.simulation"}
-    ) + _banned_imports(WMO_DIR / "runtime", {"wmo.cli", "wmo.optimize", "wmo.simulation"})
-    assert not violations, (
-        f"imports point outward: {violations}; shared code belongs in wmo/common only if every "
-        "domain may depend on it, and runtime may not reach into simulation or optimization "
-        "(AGENTS.md rule 4)"
-    )
-
-
-def _banned_imports(root: Path, banned: set[str]) -> list[str]:
-    """Every `<path>:<line> imports <module>` under `root` that names a banned package."""
-    violations: list[str] = []
-    for path in sorted(root.rglob("*.py")):
-        if path.name == "conftest.py" or path.name.endswith("_test.py"):
+@functools.cache
+def _frozen_oversized_file_counts() -> Mapping[str, int]:
+    """Recompute the exact oversized-file inventory at the frozen W1 revision."""
+    revision = _guardrail_config().oversized_file_baseline_revision
+    counts: dict[str, int] = {}
+    for relative_path in _tracked_files_at_revision(revision):
+        if not _is_hand_authored_path(relative_path):
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            modules: list[str] = []
-            if isinstance(node, ast.Import):
-                modules = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module is not None:
-                modules = [node.module]
-            violations.extend(
-                f"{path.relative_to(WMO_DIR)}:{getattr(node, 'lineno', 0)} imports {module}"
-                for module in modules
-                if any(module == prefix or module.startswith(f"{prefix}.") for prefix in banned)
-            )
-    return violations
+        count = _physical_line_count(_file_text_at_revision(revision, relative_path))
+        if count > MAX_HAND_AUTHORED_LINES:
+            counts[relative_path] = count
+    return counts
 
 
-def test_no_finder_duplicate_files_are_tracked() -> None:
-    """macOS Finder copies ("foo 2.py") dodge pytest collection and imports, so they rot
-    silently; 24 of them once shipped in a PR before anyone noticed."""
-    duplicates = [p for p in _tracked_files() if re.search(r" \d+\.\w+$", p)]
-    assert not duplicates, (
-        f"tracked Finder-style duplicate files {sorted(duplicates)}; delete the copies "
-        "(they are never imported or collected) and keep the originals"
+def _changed_paths_since_frozen_baseline() -> frozenset[str]:
+    """Return tracked paths whose content differs from the frozen W1 revision."""
+    revision = _guardrail_config().oversized_file_baseline_revision
+    return frozenset(_git_output(["diff", "--name-only", revision, "--"]).splitlines())
+
+
+@functools.cache
+def _historical_tombstoned_oversized_paths() -> frozenset[str]:
+    """Return every oversized path tombstoned by any reachable inventory revision."""
+    tombstones: set[str] = set()
+    revisions = _git_output(
+        ["log", "--format=%H", "--", GUARDRAIL_CONFIG_RELATIVE_PATH]
+    ).splitlines()
+    for revision in revisions:
+        source = _git_output(["show", f"{revision}:{GUARDRAIL_CONFIG_RELATIVE_PATH}"])
+        historical_config = _parse_guardrail_config(tomllib.loads(source))
+        tombstones.update(
+            path
+            for path, entry in historical_config.oversized_file_entries.items()
+            if entry.status == "tombstoned"
+        )
+    return frozenset(tombstones)
+
+
+def _is_hand_authored_path(relative_path: str) -> bool:
+    """Return whether a tracked path is subject to the physical-line rule."""
+    return (
+        Path(relative_path).suffix in HAND_AUTHORED_SUFFIXES
+        and relative_path not in _guardrail_config().generated_outputs
     )
+
+
+def _physical_line_count(text: str) -> int:
+    """Count newline-delimited physical lines without adding a line for a final newline."""
+    if not text:
+        return 0
+    return text.count("\n") + int(not text.endswith("\n"))
+
+
+def _line_count(path: Path) -> int:
+    """Count physical lines, including blank and comment lines."""
+    return _physical_line_count(path.read_text(encoding="utf-8"))
+
+
+def _is_oversized_hand_authored_path(relative_path: str, path: Path) -> bool:
+    """Return whether one covered path exceeds the physical-line limit."""
+    return _is_hand_authored_path(relative_path) and _line_count(path) > MAX_HAND_AUTHORED_LINES
+
+
+def _oversized_hand_authored_files(paths: Iterable[str]) -> tuple[tuple[str, int], ...]:
+    """Return covered tracked files that reach the 1,000-line boundary."""
+    oversized: list[tuple[str, int]] = []
+    for relative_path in paths:
+        if not _is_hand_authored_path(relative_path):
+            continue
+        path = REPO_ROOT / relative_path
+        if not path.is_file():
+            continue
+        lines = _line_count(path)
+        if lines > MAX_HAND_AUTHORED_LINES:
+            oversized.append((relative_path, lines))
+    return tuple(sorted(oversized))
+
+
+def _oversized_file_inventory_violations(
+    oversized: Iterable[tuple[str, int]],
+    *,
+    entries: Mapping[str, OversizedFileEntry],
+    baseline_counts: Mapping[str, int],
+    changed_paths: Collection[str],
+    historical_tombstones: Collection[str],
+) -> tuple[str, ...]:
+    """Return violations against the one frozen oversized-file inventory."""
+    actual = dict(oversized)
+    violations: list[str] = []
+    if set(entries) != set(baseline_counts):
+        missing_history = sorted(set(baseline_counts) - set(entries))
+        added_entries = sorted(set(entries) - set(baseline_counts))
+        violations.append(
+            "oversized-file inventory history differs from the frozen baseline: "
+            f"missing={missing_history}, added={added_entries}"
+        )
+    for path, entry in sorted(entries.items()):
+        frozen_count = baseline_counts.get(path)
+        if frozen_count != entry.baseline_lines:
+            violations.append(
+                f"frozen baseline count changed for {path}: "
+                f"{entry.baseline_lines} != {frozen_count}"
+            )
+        if entry.status == "active":
+            if path in historical_tombstones:
+                violations.append(f"tombstoned oversized path was reactivated: {path}")
+            if path not in actual:
+                violations.append(
+                    "active oversized path is absent or at most 999 lines and must be tombstoned: "
+                    f"{path}"
+                )
+                continue
+            if actual[path] > entry.baseline_lines:
+                violations.append(
+                    f"active path grew beyond its baseline: {path} "
+                    f"({actual[path]} > {entry.baseline_lines})"
+                )
+            if path in changed_paths:
+                violations.append(
+                    "rewritten active oversized path must reach 999 lines or fewer and be "
+                    f"tombstoned: {path}"
+                )
+        elif entry.status == "tombstoned":
+            if path in actual:
+                violations.append(f"tombstoned oversized path was reactivated: {path}")
+        else:
+            violations.append(f"invalid oversized-file status for {path}: {entry.status}")
+    violations.extend(f"new oversized path: {path}" for path in sorted(set(actual) - set(entries)))
+    return tuple(violations)
+
+
+def _legacy_path_candidates(paths: Iterable[str]) -> frozenset[str]:
+    """Return tracked paths under the explicitly inventoried legacy roots."""
+    return frozenset(
+        path
+        for path in paths
+        if any(path == prefix or path.startswith(f"{prefix}/") for prefix in LEGACY_PATH_PREFIXES)
+    )
+
+
+def _unknown_legacy_paths(paths: Iterable[str]) -> frozenset[str]:
+    """Return legacy-root paths absent from the frozen transition inventory."""
+    return _legacy_path_candidates(paths) - LEGACY_PATH_INVENTORY
+
+
+def _root_cli_commands() -> frozenset[str]:
+    """Read the root Typer command map without dispatching a command or loading credentials."""
+    from typer.core import TyperGroup
+    from typer.main import get_command
+
+    from wmo.cli.app import app
+
+    command = get_command(app)
+    if not isinstance(command, TyperGroup):
+        raise AssertionError("the root Typer app did not produce a command group")
+    return frozenset(command.commands)
+
+
+def test_hand_authored_files_stay_below_the_physical_line_limit() -> None:
+    """Every new or rewritten covered file stays below the frozen migration boundary."""
+    oversized = _oversized_hand_authored_files(_tracked_files())
+    config = _guardrail_config()
+    violations = _oversized_file_inventory_violations(
+        oversized,
+        entries=config.oversized_file_entries,
+        baseline_counts=_frozen_oversized_file_counts(),
+        changed_paths=_changed_paths_since_frozen_baseline(),
+        historical_tombstones=_historical_tombstoned_oversized_paths(),
+    )
+    assert not violations, (
+        "hand-authored files must contain fewer than 1,000 physical lines unless they are an "
+        "exact active W1 inventory entry at its frozen baseline: "
+        f"{violations}"
+    )
+
+
+def test_oversized_file_inventory_is_frozen_at_the_baseline() -> None:
+    """The one inventory is an exact, immutable record of the frozen W1 baseline."""
+    config = _guardrail_config()
+    assert config.oversized_file_baseline_revision == "e7aad17b2f5041769ad8107ab25e77d4e88729ca"
+    frozen = _frozen_oversized_file_counts()
+    assert len(frozen) == 31
+    assert set(config.oversized_file_entries) == set(frozen)
+    assert all(
+        entry.baseline_lines == frozen[path]
+        for path, entry in config.oversized_file_entries.items()
+    )
+
+
+def test_oversized_file_inventory_rejects_new_growth_reactivation_and_history_loss() -> None:
+    """The migration gate rejects every invalid state transition directly."""
+    baseline = {"wmo/legacy.py": 1000, "wmo/retired.py": 1001}
+    entries = {
+        "wmo/legacy.py": OversizedFileEntry(1000, "active"),
+        "wmo/retired.py": OversizedFileEntry(1001, "tombstoned"),
+    }
+    new_path = _oversized_file_inventory_violations(
+        (("wmo/legacy.py", 1000), ("wmo/new_large.py", 1000)),
+        entries=entries,
+        baseline_counts=baseline,
+        changed_paths=frozenset(),
+        historical_tombstones=frozenset(),
+    )
+    assert "new oversized path: wmo/new_large.py" in new_path
+    growth = _oversized_file_inventory_violations(
+        (("wmo/legacy.py", 1001),),
+        entries=entries,
+        baseline_counts=baseline,
+        changed_paths=frozenset(),
+        historical_tombstones=frozenset(),
+    )
+    assert any("active path grew beyond its baseline: wmo/legacy.py" in item for item in growth)
+    rewritten = _oversized_file_inventory_violations(
+        (("wmo/legacy.py", 1000),),
+        entries=entries,
+        baseline_counts=baseline,
+        changed_paths={"wmo/legacy.py"},
+        historical_tombstones=frozenset(),
+    )
+    assert any("rewritten active oversized path" in item for item in rewritten)
+    reactivation = _oversized_file_inventory_violations(
+        (("wmo/legacy.py", 1000), ("wmo/retired.py", 1001)),
+        entries=entries,
+        baseline_counts=baseline,
+        changed_paths=frozenset(),
+        historical_tombstones=frozenset(),
+    )
+    assert "tombstoned oversized path was reactivated: wmo/retired.py" in reactivation
+    history_loss = _oversized_file_inventory_violations(
+        (("wmo/legacy.py", 1000),),
+        entries={"wmo/legacy.py": OversizedFileEntry(1000, "active")},
+        baseline_counts=baseline,
+        changed_paths=frozenset(),
+        historical_tombstones=frozenset(),
+    )
+    assert any("inventory history differs" in item for item in history_loss)
+    status_reactivation = _oversized_file_inventory_violations(
+        (("wmo/legacy.py", 1000), ("wmo/retired.py", 1001)),
+        entries={
+            "wmo/legacy.py": OversizedFileEntry(1000, "active"),
+            "wmo/retired.py": OversizedFileEntry(1001, "active"),
+        },
+        baseline_counts=baseline,
+        changed_paths=frozenset(),
+        historical_tombstones={"wmo/retired.py"},
+    )
+    assert "tombstoned oversized path was reactivated: wmo/retired.py" in status_reactivation
+
+
+@pytest.mark.parametrize("suffix", sorted(HAND_AUTHORED_SUFFIXES))
+def test_line_limit_rejects_a_1000_line_fixture_for_each_covered_suffix(
+    tmp_path: Path, suffix: str
+) -> None:
+    """A 1,000-line fixture is rejected for every covered hand-authored suffix."""
+    fixture = tmp_path / f"fixture{suffix}"
+    fixture.write_text("line\n" * (MAX_HAND_AUTHORED_LINES + 1), encoding="utf-8")
+    assert _line_count(fixture) > MAX_HAND_AUTHORED_LINES
+    assert _is_oversized_hand_authored_path(f"fixture{suffix}", fixture)
+
+
+def test_physical_line_count_handles_final_newlines_without_an_extra_blank_line() -> None:
+    """Physical LOC counts an unterminated final line but not a phantom line after a newline."""
+    assert _physical_line_count("") == 0
+    assert _physical_line_count("line") == 1
+    assert _physical_line_count("line\n") == 1
+    assert _physical_line_count("line\n\n") == 2
+
+
+def test_only_exactly_named_generated_outputs_are_exempt() -> None:
+    """The line-count exemption does not expand to a suffix or arbitrary generated directory."""
+    assert not _is_hand_authored_path("uv.lock")
+    assert _is_hand_authored_path("wmo/generated/api_client.py")
+    assert _is_hand_authored_path("wmo/generated/large_output.py")
+
+
+def test_generated_output_inventory_has_only_named_generated_paths() -> None:
+    """Every exemption is either the lockfile or an exact path under a generated directory."""
+    assert all(
+        path == "uv.lock" or "generated" in Path(path).parts
+        for path in _guardrail_config().generated_outputs
+    )
+
+
+def test_legacy_paths_match_the_explicit_transition_inventory() -> None:
+    """Legacy paths remain exact until their owning deletion PR removes them."""
+    actual = _legacy_path_candidates(_tracked_files())
+    history = LEGACY_PATH_INVENTORY | LEGACY_PATH_TOMBSTONES
+    unexpected = _unknown_legacy_paths(_tracked_files())
+    stale = LEGACY_PATH_INVENTORY - actual
+    reintroduced = actual & LEGACY_PATH_TOMBSTONES
+    assert history == _frozen_legacy_path_inventory()
+    assert not unexpected, (
+        f"new legacy paths require their owning deletion PR: {sorted(unexpected)}"
+    )
+    assert not stale, f"stale legacy inventory entries: {sorted(stale)}"
+    assert not reintroduced, f"retired legacy paths were reintroduced: {sorted(reintroduced)}"
+    assert not LEGACY_PATH_INVENTORY & LEGACY_PATH_TOMBSTONES
+
+
+def test_new_paths_under_a_legacy_root_are_rejected_by_the_transition_helper() -> None:
+    """A new file under an inventoried legacy root is visible to the transition gate."""
+    candidate = "wmo/optimize/research/new_surface.py"
+    assert candidate in _unknown_legacy_paths((*_tracked_files(), candidate))
+
+
+def test_root_cli_commands_match_the_explicit_transition_inventory() -> None:
+    """The root CLI cannot grow a command outside its reviewed transition snapshot."""
+    actual = _root_cli_commands()
+    unexpected = actual - ROOT_CLI_COMMAND_INVENTORY
+    missing = ROOT_CLI_COMMAND_INVENTORY - actual
+    reintroduced = actual & ROOT_CLI_COMMAND_TOMBSTONES
+    assert not unexpected, f"new root CLI commands: {sorted(unexpected)}"
+    assert not missing, (
+        f"root CLI inventory drifted without its owning deletion PR: {sorted(missing)}"
+    )
+    assert not reintroduced, f"retired root CLI commands were reintroduced: {sorted(reintroduced)}"
+    assert not ROOT_CLI_COMMAND_INVENTORY & ROOT_CLI_COMMAND_TOMBSTONES

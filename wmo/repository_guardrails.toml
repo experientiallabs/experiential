@@ -1,0 +1,43 @@
+# Frozen migration inventories for repository guardrails.
+#
+# Every entry remains in this file forever. A deletion owner changes only `status` from
+# `active` to `tombstoned`; removing an entry or changing its frozen count fails the gate.
+
+[oversized_file_inventory]
+baseline_revision = "e7aad17b2f5041769ad8107ab25e77d4e88729ca"
+
+[oversized_file_inventory.entries]
+"wmo/cli/app.py" = { baseline_lines = 3716, status = "active" }
+"wmo/cli/app_test.py" = { baseline_lines = 3487, status = "active" }
+"wmo/cli/model_app.py" = { baseline_lines = 1316, status = "active" }
+"wmo/cli/model_app_test.py" = { baseline_lines = 1418, status = "active" }
+"wmo/cli/optimize_model_app.py" = { baseline_lines = 1720, status = "active" }
+"wmo/cli/optimize_model_app_test.py" = { baseline_lines = 1692, status = "active" }
+"wmo/cli/pool_registry_test.py" = { baseline_lines = 1184, status = "active" }
+"wmo/cli/route_app.py" = { baseline_lines = 1654, status = "active" }
+"wmo/cli/route_app_test.py" = { baseline_lines = 3616, status = "active" }
+"wmo/cli/run_cmd.py" = { baseline_lines = 1105, status = "active" }
+"wmo/cli/run_cmd_test.py" = { baseline_lines = 1209, status = "active" }
+"wmo/cli/ui.py" = { baseline_lines = 1147, status = "active" }
+"wmo/common/providers/pool_test.py" = { baseline_lines = 1307, status = "active" }
+"wmo/common/providers/tinker_test.py" = { baseline_lines = 1251, status = "active" }
+"wmo/optimize/model/config.py" = { baseline_lines = 1142, status = "active" }
+"wmo/optimize/model/config_test.py" = { baseline_lines = 1018, status = "active" }
+"wmo/optimize/model/data_test.py" = { baseline_lines = 1727, status = "active" }
+"wmo/optimize/model/loop.py" = { baseline_lines = 3656, status = "active" }
+"wmo/optimize/model/loop_test.py" = { baseline_lines = 3700, status = "active" }
+"wmo/optimize/model/rollouts_test.py" = { baseline_lines = 1028, status = "active" }
+"wmo/optimize/model/store.py" = { baseline_lines = 1031, status = "active" }
+"wmo/optimize/routing/policy.py" = { baseline_lines = 1345, status = "active" }
+"wmo/optimize/routing/policy_test.py" = { baseline_lines = 1508, status = "active" }
+"wmo/optimize/routing/scorecard.py" = { baseline_lines = 1101, status = "active" }
+"wmo/optimize/telemetry/hooks.py" = { baseline_lines = 1111, status = "active" }
+"wmo/runtime/harness/pi_e2b.py" = { baseline_lines = 1711, status = "active" }
+"wmo/runtime/harness/pi_e2b_test.py" = { baseline_lines = 2440, status = "active" }
+"wmo/runtime/harness/vendor/pi-agent/src/harness/agent-harness.ts" = { baseline_lines = 1029, status = "active" }
+"wmo/runtime/harness/vendor/pi-agent/test/agent-loop.test.ts" = { baseline_lines = 1351, status = "active" }
+"wmo/simulation/serving/chat.py" = { baseline_lines = 1915, status = "active" }
+"wmo/simulation/serving/chat_test.py" = { baseline_lines = 3050, status = "active" }
+
+[generated_outputs]
+paths = ["uv.lock"]
