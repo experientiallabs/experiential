@@ -8,6 +8,17 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.common.judging import DimensionJudgment, Judgment
+from wmo.common.models import ModelSnapshot
+
+_DIGEST = "a" * 64
+
+
+def _judge_model() -> ModelSnapshot:
+    return ModelSnapshot(
+        provider="openai",
+        model_id="gpt-5.4-mini",
+        capabilities_sha256=_DIGEST,
+    )
 
 
 def _dimension_judgment() -> DimensionJudgment:
@@ -30,6 +41,9 @@ def test_judgment_round_trip() -> None:
         rollout_id="rollout-1",
         rubric_id="support-rubric-v1",
         calibration_id="judge-calibration-v1",
+        judge_model=_judge_model(),
+        judge_prompt_id="judge-prompt-v1",
+        judge_prompt_sha256=_DIGEST,
         dimensions=(_dimension_judgment(),),
         overall_score=0.76,
     )
@@ -48,6 +62,9 @@ def test_judgment_rejects_duplicate_dimensions_and_nonfinite_scores() -> None:
             rollout_id="rollout-1",
             rubric_id="support-rubric-v1",
             calibration_id="judge-calibration-v1",
+            judge_model=_judge_model(),
+            judge_prompt_id="judge-prompt-v1",
+            judge_prompt_sha256=_DIGEST,
             dimensions=(_dimension_judgment(), _dimension_judgment()),
             overall_score=0.76,
         )
@@ -68,6 +85,9 @@ def test_judgment_rejects_duplicate_dimensions_and_nonfinite_scores() -> None:
             rollout_id="rollout-1",
             rubric_id="support-rubric-v1",
             calibration_id="judge-calibration-v1",
+            judge_model=_judge_model(),
+            judge_prompt_id="judge-prompt-v1",
+            judge_prompt_sha256=_DIGEST,
             dimensions=(_dimension_judgment(),),
             overall_score=0.75,
         )

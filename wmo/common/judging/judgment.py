@@ -7,8 +7,8 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel
-from wmo.common.models import OperationEconomics
+from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel, Sha256
+from wmo.common.models import ModelSnapshot, OperationEconomics
 
 
 class DimensionJudgment(ContractModel):
@@ -46,6 +46,9 @@ class Judgment(ArtifactEnvelope):
     rollout_id: ArtifactId
     rubric_id: ArtifactId
     calibration_id: ArtifactId
+    judge_model: ModelSnapshot
+    judge_prompt_id: str = Field(min_length=1, max_length=256)
+    judge_prompt_sha256: Sha256
     dimensions: tuple[DimensionJudgment, ...]
     overall_score: float = Field(ge=0, le=1)
     judge_economics: OperationEconomics | None = None

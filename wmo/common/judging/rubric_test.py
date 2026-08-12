@@ -61,6 +61,7 @@ def test_rubric_and_calibration_round_trip() -> None:
             connection_sha256=_DIGEST,
         ),
         judge_prompt_id="judge-prompt-v1",
+        judge_prompt_sha256=_DIGEST,
         label_set_id="label-set-v1",
         calibration_lineage_ids=("lineage-fit-1",),
         excluded_router_held_out_lineage_ids=("lineage-held-out-1",),
@@ -72,6 +73,8 @@ def test_rubric_and_calibration_round_trip() -> None:
                 calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
             ),
         ),
+        label_count=10,
+        status="human_calibrated",
         approved_at=approved_at,
     )
 
@@ -112,6 +115,7 @@ def test_rubric_requires_ordered_complete_anchors_and_approval_time() -> None:
                 connection_sha256=_DIGEST,
             ),
             judge_prompt_id="judge-prompt-v1",
+            judge_prompt_sha256=_DIGEST,
             label_set_id="label-set-v1",
             calibration_lineage_ids=("lineage-1",),
             excluded_router_held_out_lineage_ids=("lineage-1",),

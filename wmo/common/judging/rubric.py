@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel
+from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel, Sha256
 from wmo.common.models import ModelSnapshot
 
 
@@ -92,6 +92,22 @@ class DimensionScoreMap(ContractModel):
             raise ValueError("calibrated rubric scores must be monotonic")
         return value
 
+    def apply(self, raw_score: int) -> float:
+        """Return the calibrated value for one integer raw judge score.
+
+        Args:
+            raw_score: Raw zero-to-five score emitted by the structured judge.
+
+        Returns:
+            The frozen monotonic calibrated score.
+
+        Raises:
+            ValueError: The raw score is outside the supported zero-to-five range.
+        """
+        if raw_score not in range(6):
+            raise ValueError("raw judge scores must be integers from zero through five")
+        return self.calibrated_scores[raw_score]
+
 
 class JudgeCalibration(ArtifactEnvelope):
     """Frozen judge model, prompt, label lineage, and score maps for one rubric."""
@@ -100,12 +116,16 @@ class JudgeCalibration(ArtifactEnvelope):
     rubric_id: ArtifactId
     judge_model: ModelSnapshot
     judge_prompt_id: str = Field(min_length=1, max_length=256)
+    judge_prompt_sha256: Sha256
     label_set_id: ArtifactId
     calibration_lineage_ids: tuple[ArtifactId, ...]
     excluded_router_held_out_lineage_ids: tuple[ArtifactId, ...]
     validation_method: Literal["grouped_k_fold"]
     out_of_fold_report_id: ArtifactId
     score_maps: tuple[DimensionScoreMap, ...]
+    label_count: int = Field(default=0, ge=0)
+    recommended_label_count: Literal[10] = 10
+    status: Literal["provisional", "insufficient", "human_calibrated"] = "provisional"
     approved_at: datetime | None = None
 
     @field_validator("calibration_lineage_ids", "excluded_router_held_out_lineage_ids")
@@ -133,6 +153,25 @@ class JudgeCalibration(ArtifactEnvelope):
             self.excluded_router_held_out_lineage_ids
         ):
             raise ValueError("calibration lineages must exclude router-held-out lineages")
+        if self.status == "human_calibrated" and self.approved_at is None:
+            raise ValueError("human-calibrated judge calibrations require approved_at")
+        if self.status != "human_calibrated" and self.approved_at is not None:
+            raise ValueError("unapproved judge calibrations must not set approved_at")
+        if self.status == "provisional" and self.label_count != 0:
+            raise ValueError("provisional judge calibrations require zero human labels")
+        if self.status == "provisional" and any(
+            score_map.calibrated_scores != (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+            for score_map in self.score_maps
+        ):
+            raise ValueError("provisional judge calibrations require identity score maps")
+        if self.status == "insufficient" and self.label_count == 0:
+            raise ValueError("insufficient judge calibrations require at least one human label")
+        if self.status == "insufficient" and not self.calibration_lineage_ids:
+            raise ValueError("insufficient judge calibrations require fit lineages")
+        if self.status == "human_calibrated" and self.label_count == 0:
+            raise ValueError("human-calibrated judge calibrations require human labels")
+        if self.status == "human_calibrated" and not self.calibration_lineage_ids:
+            raise ValueError("human-calibrated judge calibrations require fit lineages")
         if self.approved_at is not None and (
             self.approved_at.tzinfo is None or self.approved_at.utcoffset() is None
         ):

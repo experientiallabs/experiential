@@ -1,0 +1,308 @@
+"""Append-only human score and correction-history contracts for calibration."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import JsonValue, field_validator, model_validator
+
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactId,
+    ContractModel,
+    JsonObject,
+    stable_id,
+)
+from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
+
+
+class HumanScore(ContractModel):
+    """One immutable human rating, optionally correcting an earlier rating."""
+
+    label_id: ArtifactId
+    rubric_id: ArtifactId
+    rollout_id: ArtifactId
+    lineage_id: ArtifactId
+    dimension_id: ArtifactId
+    score: Literal[0, 1, 2, 3, 4, 5]
+    created_at: datetime
+    supersedes_label_id: ArtifactId | None = None
+
+    @field_validator("created_at")
+    @classmethod
+    def _require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("human score timestamps must include a timezone")
+        return value
+
+
+class HumanScoreHistory(ContractModel):
+    """An append-only label history whose active scores retain every correction."""
+
+    scores: tuple[HumanScore, ...] = ()
+
+    @model_validator(mode="after")
+    def _require_linear_correction_history(self) -> HumanScoreHistory:
+        known: dict[str, HumanScore] = {}
+        superseded: set[str] = set()
+        active_by_target: dict[tuple[str, str, str, str], str] = {}
+        for score in self.scores:
+            if score.label_id in known:
+                raise ValueError("human score history label IDs must not repeat")
+            target = _target_key(score)
+            if score.supersedes_label_id is not None:
+                prior = known.get(score.supersedes_label_id)
+                if prior is None:
+                    raise ValueError("human score corrections must reference an earlier label")
+                if prior.label_id in superseded:
+                    raise ValueError("human score labels can have only one direct correction")
+                if _target_key(prior) != _target_key(score):
+                    raise ValueError("human score corrections must keep the same rollout and scale")
+                if active_by_target.get(target) != prior.label_id:
+                    raise ValueError("human score corrections must supersede the active label")
+                superseded.add(prior.label_id)
+            elif target in active_by_target:
+                raise ValueError(
+                    "new human scores must correct an existing active rollout and scale"
+                )
+            known[score.label_id] = score
+            active_by_target[target] = score.label_id
+        return self
+
+    def active_scores(self) -> tuple[HumanScore, ...]:
+        """Return the current label for each rollout and rubric dimension.
+
+        Returns:
+            Every history entry that has not been superseded by a later correction.
+        """
+        superseded = {
+            score.supersedes_label_id
+            for score in self.scores
+            if score.supersedes_label_id is not None
+        }
+        return tuple(score for score in self.scores if score.label_id not in superseded)
+
+    def append(self, score: HumanScore) -> HumanScoreHistory:
+        """Return a new history with one original human score appended.
+
+        Args:
+            score: New score that must not supersede an existing label.
+
+        Returns:
+            A validated append-only history with the supplied score at its end.
+
+        Raises:
+            ValueError: The supplied score is expressed as a correction.
+        """
+        if score.supersedes_label_id is not None:
+            raise ValueError("append accepts original labels; use correct for a correction")
+        return HumanScoreHistory(scores=(*self.scores, score))
+
+    def correct(self, score: HumanScore) -> HumanScoreHistory:
+        """Return a new history with one correction appended.
+
+        Args:
+            score: New score that explicitly supersedes an earlier active label.
+
+        Returns:
+            A validated append-only history retaining both the old and new labels.
+
+        Raises:
+            ValueError: The supplied score does not declare a predecessor.
+        """
+        if score.supersedes_label_id is None:
+            raise ValueError("correct requires supersedes_label_id")
+        return HumanScoreHistory(scores=(*self.scores, score))
+
+    def for_rubric(self, rubric_id: ArtifactId) -> HumanScoreHistory:
+        """Return this complete correction history restricted to one rubric version.
+
+        Args:
+            rubric_id: Immutable rubric whose labels should be frozen for calibration.
+
+        Returns:
+            An append-only history containing only labels for the requested rubric.
+        """
+        return HumanScoreHistory(
+            scores=tuple(score for score in self.scores if score.rubric_id == rubric_id)
+        )
+
+
+def _target_key(score: HumanScore) -> tuple[str, str, str, str]:
+    """Return the stable target of a human rubric label."""
+    return (score.rubric_id, score.rollout_id, score.lineage_id, score.dimension_id)
+
+
+class HumanLabelSet(ArtifactEnvelope):
+    """Immutable append-only human-label history frozen for one rubric calibration."""
+
+    label_set_id: ArtifactId
+    rubric_id: ArtifactId
+    history: HumanScoreHistory
+    active_label_ids: tuple[ArtifactId, ...]
+
+    @model_validator(mode="after")
+    def _require_consistent_history(self) -> HumanLabelSet:
+        if any(score.rubric_id != self.rubric_id for score in self.history.scores):
+            raise ValueError("human label sets must contain labels for one rubric")
+        expected_active_ids = tuple(score.label_id for score in self.history.active_scores())
+        if self.active_label_ids != expected_active_ids:
+            raise ValueError("human label sets must list exactly their active label IDs")
+        return self
+
+
+class HumanScoreReview:
+    """Persist append-only human-score history inside the sole mutable project review draft."""
+
+    def __init__(
+        self, store: ProjectStore, root_review: JsonObject, history: HumanScoreHistory
+    ) -> None:
+        """Construct the history service from validated review-draft state."""
+        self._store = store
+        self._root_review = root_review
+        self._history = history
+
+    @classmethod
+    def open(cls, store: ProjectStore) -> HumanScoreReview:
+        """Create or resume the append-only human score history for one project.
+
+        Args:
+            store: Project-local storage containing the sole mutable review JSON file.
+
+        Returns:
+            A history service whose every append preserves all prior labels.
+
+        Raises:
+            ValueError: The saved review data is not a valid JSON object or score history.
+        """
+        root_review = _read_root_review(store)
+        saved = root_review.get("human_score_history")
+        if saved is None:
+            history = HumanScoreHistory()
+        else:
+            try:
+                history = HumanScoreHistory.model_validate(saved)
+            except ValueError as exc:
+                raise ValueError("review.json contains an invalid human score history") from exc
+        review = cls(store, root_review, history)
+        review._save()
+        return review
+
+    @property
+    def history(self) -> HumanScoreHistory:
+        """Return the complete append-only score and correction history."""
+        return self._history
+
+    def append(self, score: HumanScore) -> None:
+        """Persist one original human score without modifying prior labels.
+
+        Args:
+            score: New score with no correction predecessor.
+        """
+        self._history = self._history.append(score)
+        self._save()
+
+    def correct(self, score: HumanScore) -> None:
+        """Persist one correction while retaining its superseded historical label.
+
+        Args:
+            score: New score that names the earlier label it supersedes.
+        """
+        self._history = self._history.correct(score)
+        self._save()
+
+    def finalize(
+        self,
+        *,
+        rubric_id: ArtifactId,
+        code_revision: str,
+        created_at: datetime,
+    ) -> HumanLabelSet:
+        """Freeze one rubric-specific label history as an immutable calibration input.
+
+        Args:
+            rubric_id: Immutable rubric whose human labels should be frozen.
+            code_revision: Exact code revision producing the label-set artifact.
+            created_at: Time the frozen set is materialized.
+
+        Returns:
+            The immutable label-set artifact containing full correction history and active labels.
+
+        Raises:
+            ValueError: The supplied finalization time has no timezone.
+        """
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise ValueError("human label-set times must include a timezone")
+        history = self._history.for_rubric(rubric_id)
+        label_set = HumanLabelSet(
+            schema_version=1,
+            created_at=created_at,
+            code_revision=code_revision,
+            label_set_id=stable_id(
+                "human-label-set",
+                {
+                    "rubric_id": rubric_id,
+                    "history": history.model_dump(mode="json"),
+                },
+            ),
+            rubric_id=rubric_id,
+            history=history,
+            active_label_ids=tuple(score.label_id for score in history.active_scores()),
+        )
+        try:
+            self._store.artifacts.write_json(
+                artifact_id=label_set.label_set_id,
+                artifact_type="human-label-set",
+                envelope=label_set,
+                files={"labels.json": label_set},
+            )
+        except ArtifactAlreadyExistsError:
+            try:
+                stored = HumanLabelSet.model_validate_json(
+                    self._store.artifacts.read_bytes(label_set.label_set_id, "labels.json")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "existing human label-set artifact cannot be resumed safely"
+                ) from exc
+            if not _same_label_set_identity(stored, label_set):
+                raise ValueError(
+                    "existing human label-set artifact conflicts with this review"
+                ) from None
+            label_set = stored
+        return label_set
+
+    def _save(self) -> None:
+        """Persist this namespace while preserving rubric and future review state."""
+        self._root_review["human_score_history"] = self._history.model_dump(mode="json")
+        self._store.write_review(self._root_review)
+
+
+def _read_root_review(store: ProjectStore) -> JsonObject:
+    """Read the mutable review root as a JSON object for namespace-preserving writes."""
+    review: JsonValue | None = store.read_review()
+    if review is None:
+        return {}
+    if not isinstance(review, dict):
+        raise ValueError("review.json must be a JSON object")
+    root: JsonObject = {}
+    for key, value in review.items():
+        if not isinstance(key, str):
+            raise ValueError("review.json must use string field names")
+        root[key] = value
+    return root
+
+
+def _same_label_set_identity(left: HumanLabelSet, right: HumanLabelSet) -> bool:
+    """Compare one frozen label set without retry-time artifact timestamps."""
+    return (
+        left.schema_version == right.schema_version
+        and left.label_set_id == right.label_set_id
+        and left.rubric_id == right.rubric_id
+        and left.history == right.history
+        and left.active_label_ids == right.active_label_ids
+        and left.code_revision == right.code_revision
+        and left.inputs == right.inputs
+        and left.source == right.source
+    )

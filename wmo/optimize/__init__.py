@@ -8,7 +8,6 @@ Shared protocols, prompt evolution, rewards, and judges stay at this package roo
 from wmo.optimize.base import ArtifactRef, OptimizeMetrics, Optimizer, OptimizeResult
 from wmo.optimize.gepa import GEPAOptimizer
 from wmo.optimize.judge import Judge, JudgeResult, RubricJudge
-from wmo.optimize.numeric import NumericJudge
 from wmo.optimize.reward import EpisodeRewardJudge, EpisodeScore
 
 __all__ = [
@@ -21,6 +20,5 @@ __all__ = [
     "Optimizer",
     "Judge",
     "JudgeResult",
-    "NumericJudge",
     "RubricJudge",
 ]
