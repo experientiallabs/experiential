@@ -67,6 +67,8 @@ class EvaluationPlan(ArtifactEnvelope):
     plan_id: ArtifactId
     task_set_id: ArtifactId
     candidate_snapshots: tuple[RoutedCandidateSnapshot, ...]
+    pricing_snapshot_id: ArtifactId
+    pricing_snapshot_sha256: Sha256
     fidelity_thresholds_id: ArtifactId
     fidelity_thresholds_sha256: Sha256
     fidelity_protocol_sha256: Sha256

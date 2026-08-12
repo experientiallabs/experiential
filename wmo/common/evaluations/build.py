@@ -35,7 +35,7 @@ from wmo.common.evaluations.evidence import (
 )
 from wmo.common.evaluations.plan import EvaluationCell, EvaluationPlan
 from wmo.common.judging import JudgeCalibration, Judgment
-from wmo.common.models import RoutedCandidateSnapshot
+from wmo.common.models import RoutedCandidateSnapshot, load_pricing_snapshot
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
 from wmo.common.rollouts import (
     RolloutArtifact,
@@ -50,6 +50,7 @@ def build_evaluation_dataset(
     store: ArtifactStore,
     *,
     evaluation_plan_id: ArtifactId,
+    pricing_snapshot_id: ArtifactId,
     protocols: Sequence[EvaluationProtocol],
     cell_evidence: Sequence[EvaluationCellEvidence],
     fidelity_report_ids: Sequence[ArtifactId] = (),
@@ -66,6 +67,7 @@ def build_evaluation_dataset(
     Args:
         store: Project-local immutable artifact store.
         evaluation_plan_id: Exact sparse plan to materialize.
+        pricing_snapshot_id: Exact pricing artifact already pinned by the plan.
         protocols: Frozen production, world-model, or sandbox evidence protocols.
         cell_evidence: One explicit execution assignment for every plan cell.
         fidelity_report_ids: Fidelity reports available to qualify world-model evidence.
@@ -83,7 +85,28 @@ def build_evaluation_dataset(
     task_input = artifact_input(store.read(plan.task_set_id).manifest)
     if task_input not in plan.inputs:
         raise EvaluationEvidenceError("evaluation plan does not hash its source task set")
+    try:
+        pricing, pricing_sha256 = load_pricing_snapshot(store, pricing_snapshot_id)
+        pricing_input = artifact_input(store.read(pricing_snapshot_id).manifest)
+    except (ArtifactCorruptionError, ValueError) as exc:
+        raise EvaluationEvidenceError(
+            f"required pricing snapshot is unavailable or invalid: {pricing_snapshot_id}"
+        ) from exc
+    if (
+        pricing_snapshot_id != plan.pricing_snapshot_id
+        or pricing_sha256 != plan.pricing_snapshot_sha256
+        or pricing_input not in plan.inputs
+    ):
+        raise EvaluationEvidenceError("evaluation pricing differs from its frozen plan")
+    if tuple(item.candidate_alias for item in pricing.candidate_prices) != tuple(
+        item.alias for item in plan.candidate_snapshots
+    ):
+        raise EvaluationEvidenceError("pricing candidates differ from the evaluation plan")
     protocol_by_id = _index_protocols(protocols)
+    if any(
+        protocol.pricing_snapshot_id != pricing_snapshot_id for protocol in protocol_by_id.values()
+    ):
+        raise EvaluationEvidenceError("evaluation protocol pricing differs from the frozen plan")
     selected_purposes = tuple(sorted(set(purposes)))
     if not selected_purposes:
         raise EvaluationEvidenceError("evaluation materialization needs at least one purpose")
@@ -98,6 +121,7 @@ def build_evaluation_dataset(
     verified_inputs: list[ArtifactInput] = [
         plan_input,
         task_input,
+        pricing_input,
         *report_inputs,
         *calibration_inputs,
     ]

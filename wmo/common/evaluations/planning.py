@@ -27,8 +27,8 @@ from wmo.common.evaluations.plan import (
     FidelityGate,
     FidelityThresholds,
 )
-from wmo.common.models import RoutedCandidateSnapshot
-from wmo.common.project import ArtifactStore, artifact_input
+from wmo.common.models import RoutedCandidateSnapshot, load_pricing_snapshot
+from wmo.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact
 from wmo.common.routing import RouterFeatureExtractor
 from wmo.common.tasks import TaskCase, load_task_set
@@ -98,6 +98,7 @@ def build_evaluation_plan(
     *,
     task_set_id: ArtifactId,
     candidate_snapshots: Sequence[RoutedCandidateSnapshot],
+    pricing_snapshot_id: ArtifactId,
     observed_cells: Sequence[ObservedProductionCell],
     fidelity_thresholds_id: ArtifactId,
     fidelity_protocol_sha256: Sha256,
@@ -115,6 +116,7 @@ def build_evaluation_plan(
         store: Project-local immutable artifact store containing tasks, gate, and rollouts.
         task_set_id: Frozen representative task-set artifact.
         candidate_snapshots: Exact aliases and model identities to evaluate.
+        pricing_snapshot_id: Exact candidate-pricing artifact bound to the plan.
         observed_cells: Production rollout assignments that already fill matrix cells.
         fidelity_gate_id: Precommitted world-model fidelity gate artifact.
         repeats: Nonnegative repeat indexes planned for every task and candidate.
@@ -134,6 +136,17 @@ def build_evaluation_plan(
     thresholds, thresholds_input = read_fidelity_thresholds(store, fidelity_thresholds_id)
     candidates = tuple(sorted(candidate_snapshots, key=lambda item: item.alias))
     _require_unique_candidates(candidates)
+    try:
+        pricing, pricing_sha256 = load_pricing_snapshot(store, pricing_snapshot_id)
+        pricing_input = artifact_input(store.read(pricing_snapshot_id).manifest)
+    except (ArtifactCorruptionError, ValueError) as exc:
+        raise EvaluationEvidenceError(
+            f"required pricing snapshot is unavailable or invalid: {pricing_snapshot_id}"
+        ) from exc
+    if tuple(item.candidate_alias for item in pricing.candidate_prices) != tuple(
+        item.alias for item in candidates
+    ):
+        raise EvaluationEvidenceError("pricing snapshot candidates differ from the evaluation plan")
     repeat_ids = _normalized_repeats(repeats)
     tasks_by_id = {task.task_id: task for task in loaded_tasks.tasks}
     if len(tasks_by_id) != len(loaded_tasks.tasks):
@@ -180,27 +193,32 @@ def build_evaluation_plan(
         planned_overlaps=thresholds.planned_overlaps,
     )
     cells = (*main_cells, *fidelity_cells)
-    plan_inputs = sorted_evaluation_inputs((task_input, thresholds_input, *observed_inputs))
+    plan_inputs = sorted_evaluation_inputs(
+        (task_input, pricing_input, thresholds_input, *observed_inputs)
+    )
     plan_id = stable_id(
         "evaluation-plan",
         {
-            "version": "sparse-evaluation-plan-v1",
+            "version": "sparse-evaluation-plan-v2",
             "inputs": [item.model_dump(mode="json") for item in plan_inputs],
             "task_set": task_input.model_dump(mode="json"),
             "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
+            "pricing_snapshot": pricing_input.model_dump(mode="json"),
             "fidelity_thresholds": thresholds_input.model_dump(mode="json"),
             "fidelity_protocol_sha256": fidelity_protocol_sha256,
             "cells": [cell.model_dump(mode="json") for cell in cells],
         },
     )
     plan = EvaluationPlan(
-        schema_version=1,
+        schema_version=2,
         created_at=created_at,
         inputs=plan_inputs,
         code_revision=code_revision,
         plan_id=plan_id,
         task_set_id=task_set_id,
         candidate_snapshots=candidates,
+        pricing_snapshot_id=pricing_snapshot_id,
+        pricing_snapshot_sha256=pricing_sha256,
         fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
         fidelity_thresholds_sha256=thresholds_input.sha256,
         fidelity_protocol_sha256=fidelity_protocol_sha256,

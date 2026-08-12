@@ -120,6 +120,7 @@ def fit(
     dataset = build_evaluation_dataset(
         store,
         evaluation_plan_id=value.evaluation.evaluation_plan_id,
+        pricing_snapshot_id=value.pricing_snapshot_id,
         protocols=value.evaluation.protocols,
         cell_evidence=tuple(
             item for item in value.evaluation.cell_evidence if item.cell_id in fit_cells
@@ -199,6 +200,7 @@ def report(
     dataset = build_evaluation_dataset(
         store,
         evaluation_plan_id=value.evaluation.evaluation_plan_id,
+        pricing_snapshot_id=policy.pricing_snapshot_id,
         protocols=value.evaluation.protocols,
         cell_evidence=tuple(
             item for item in value.evaluation.cell_evidence if item.cell_id in held_out_cells

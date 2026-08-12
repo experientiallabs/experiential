@@ -134,6 +134,12 @@ class RouterOptimizer:
         _require_dataset_tasks(dataset, loaded_tasks.tasks)
         pricing, pricing_sha256 = load_pricing_snapshot(self._store, spec.pricing_snapshot_id)
         pricing_input = artifact_input(self._store.read(spec.pricing_snapshot_id).manifest)
+        _require_plan_pricing_scope(
+            plan,
+            pricing_snapshot_id=spec.pricing_snapshot_id,
+            pricing_snapshot_sha256=pricing_sha256,
+            pricing_input=pricing_input,
+        )
         _require_pricing_scope(
             dataset,
             pricing_snapshot_id=spec.pricing_snapshot_id,
@@ -268,6 +274,12 @@ class RouterOptimizer:
         _require_dataset_tasks(fit_dataset, fit_tasks.tasks)
         pricing, pricing_sha256 = load_pricing_snapshot(self._store, policy.pricing_snapshot_id)
         pricing_input = artifact_input(self._store.read(policy.pricing_snapshot_id).manifest)
+        _require_plan_pricing_scope(
+            fit_plan,
+            pricing_snapshot_id=policy.pricing_snapshot_id,
+            pricing_snapshot_sha256=pricing_sha256,
+            pricing_input=pricing_input,
+        )
         _require_pricing_scope(
             fit_dataset,
             pricing_snapshot_id=policy.pricing_snapshot_id,
@@ -494,6 +506,22 @@ def _require_pricing_scope(
         raise RouterOptimizationError(
             "evaluation protocol pricing differs from the locked snapshot"
         )
+
+
+def _require_plan_pricing_scope(
+    plan: EvaluationPlan,
+    *,
+    pricing_snapshot_id: ArtifactId,
+    pricing_snapshot_sha256: Sha256,
+    pricing_input: ArtifactInput,
+) -> None:
+    """Require the exact pricing artifact to be frozen into the evaluation plan."""
+    if (
+        plan.pricing_snapshot_id != pricing_snapshot_id
+        or plan.pricing_snapshot_sha256 != pricing_snapshot_sha256
+        or pricing_input not in plan.inputs
+    ):
+        raise RouterOptimizationError("router pricing differs from the frozen evaluation plan")
 
 
 def _load_locked_policy(store: ArtifactStore, supplied: KnnRouterPolicy) -> KnnRouterPolicy:

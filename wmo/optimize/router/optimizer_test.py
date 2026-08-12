@@ -5,30 +5,52 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
 import pytest
 
-from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactInput,
+    SourceIdentity,
+    canonical_json_bytes,
+    stable_id,
+)
 from wmo.common.evaluations import (
     EvaluationCell,
+    EvaluationCellEvidence,
     EvaluationDatasetManifest,
     EvaluationPlan,
     EvaluationProtocol,
     EvaluationRow,
+    build_evaluation_dataset,
+    load_evaluation_dataset,
 )
-from wmo.common.judging import DimensionScoreMap, JudgeCalibration
+from wmo.common.judging import (
+    DimensionJudgment,
+    DimensionScoreMap,
+    JudgeCalibration,
+    Judgment,
+)
 from wmo.common.models import (
     CandidateTokenPrice,
     Embedding,
     ModelSnapshot,
     NumericMeasurement,
+    OperationEconomics,
     PricingSnapshot,
     RoutedCandidateSnapshot,
 )
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
+from wmo.common.rollouts import (
+    ProductionSimulatorSnapshot,
+    RolloutArtifact,
+    RolloutEventKind,
+    RolloutSpan,
+    SimulationMode,
+    StopReason,
+)
 from wmo.common.routing import KnnGuard
 from wmo.common.routing.bank import load_knn_bank
 from wmo.common.tasks import TaskCase, TaskSet, ToolSchema
@@ -83,8 +105,8 @@ def test_optimizer_locks_fit_policy_then_reports_held_out_with_separate_spend(
     held_out = tuple(_task(f"task-held-{index:02d}", "held_out") for index in range(2))
     all_tasks = (*fit, *held_out)
     task_input = _persist_task_set(store, all_tasks, task_set_id="task-set-a")
-    plan_input = _persist_plan(store, all_tasks, task_input)
     pricing_input = _persist_pricing(store)
+    plan_input = _persist_plan(store, all_tasks, task_input, pricing_input)
     calibration_input = _persist_calibration(store, fit, held_out)
     evaluation_inputs = tuple(
         sorted(
@@ -220,6 +242,35 @@ def test_fit_rejects_missing_wrong_type_invented_or_candidate_drifted_pricing(
         with pytest.raises(RouterOptimizationError):
             optimizer.fit(invalid)
     assert embedder.call_sizes == []
+
+
+def test_canonical_builder_fit_lock_held_out_report_and_replay(tmp_path: Path) -> None:
+    """Real canonical evidence composes through the public service and exact replay."""
+    fixture = _optimizer_fixture(tmp_path)
+    fit_dataset = load_evaluation_dataset(fixture.store, fixture.spec.fit_evaluation_id)
+    pricing_input = artifact_input(fixture.store.read(fixture.pricing_input.artifact_id).manifest)
+    assert pricing_input in fit_dataset.manifest.inputs
+
+    locked = fixture.optimizer.fit(fixture.spec)
+    result = fixture.optimizer.report(
+        locked,
+        held_out_evaluation_id=fixture.held_evaluation_id,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+    replayed_lock = fixture.optimizer.fit(fixture.spec)
+    replayed_result = fixture.optimizer.report(
+        replayed_lock,
+        held_out_evaluation_id=fixture.held_evaluation_id,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+
+    assert replayed_lock == locked
+    assert replayed_result == result
+    assert result.policy.pricing_snapshot_id == fixture.pricing_input.artifact_id
+    assert result.policy.pricing_snapshot_sha256 == fixture.pricing_input.sha256
+    assert fixture.embedder.call_sizes == [8, 2, 8, 2]
 
 
 @pytest.mark.parametrize("seal_leak", ["lineage", "request-visible"])
@@ -409,18 +460,28 @@ def _optimizer_fixture(
             *held_out[1:],
         )
     task_input = _persist_task_set(store, (*fit, *held_out), task_set_id="task-set-a")
-    plan_input = _persist_plan(store, (*fit, *held_out), task_input)
     pricing_input = _persist_pricing(store)
+    plan_input = _persist_plan(store, (*fit, *held_out), task_input, pricing_input)
     evaluation_inputs = tuple(
         sorted(
             (calibration_input, plan_input, pricing_input, task_input),
             key=lambda item: item.artifact_id,
         )
     )
-    fit_evaluation_id = _persist_evaluation(store, fit, "task-set-a", plan_input, evaluation_inputs)
-    held_evaluation_id = _persist_evaluation(
-        store, held_out, "task-set-a", plan_input, evaluation_inputs
-    )
+    if seal_leak is None:
+        fit_evaluation_id = _persist_canonical_evaluation(
+            store, fit, plan_input, calibration_input, purpose="fit"
+        )
+        held_evaluation_id = _persist_canonical_evaluation(
+            store, held_out, plan_input, calibration_input, purpose="held_out"
+        )
+    else:
+        fit_evaluation_id = _persist_evaluation(
+            store, fit, "task-set-a", plan_input, evaluation_inputs
+        )
+        held_evaluation_id = _persist_evaluation(
+            store, held_out, "task-set-a", plan_input, evaluation_inputs
+        )
     embedder = _LockCheckingEmbedder(store, fit_count=len(fit))
     spec = RouterOptimizationSpec(
         fit_evaluation_id=fit_evaluation_id,
@@ -453,6 +514,129 @@ def _optimizer_fixture(
         optimizer=RouterOptimizer(store, embedder),
         spec=spec,
     )
+
+
+def _persist_canonical_evaluation(
+    store: ArtifactStore,
+    tasks: tuple[TaskCase, ...],
+    plan_input: ArtifactInput,
+    calibration_input: ArtifactInput,
+    *,
+    purpose: Literal["fit", "held_out"],
+) -> str:
+    """Materialize one partition through real persisted rollouts and judgments."""
+    protocol = EvaluationProtocol(
+        protocol_id="protocol-production",
+        evidence_source="production",
+        agent_id="agent-a",
+        simulator_id="production-import-v1",
+        rubric_id="rubric-a",
+        judge_calibration_id="calibration-a",
+        pricing_snapshot_id="pricing-a",
+    )
+    evidence = []
+    for task in tasks:
+        for alias in ("candidate-baseline", "candidate-cheap"):
+            cell_id = f"cell-{task.task_id}-{alias}"
+            rollout_id = f"rollout-{task.task_id}-{alias}"
+            judgment_id = f"judgment-{task.task_id}-{alias}"
+            score = 0.5 if alias == "candidate-baseline" else (1.0 if purpose == "fit" else 0.85)
+            candidate_cost = 0.5 if alias == "candidate-baseline" else 0.1
+            span = RolloutSpan(
+                span_id=f"span-{rollout_id}",
+                kind=RolloutEventKind.AGENT_MODEL_CALL,
+                started_at=_TIME,
+                ended_at=_TIME + timedelta(seconds=1),
+                model=_snapshot(alias),
+            )
+            rollout = RolloutArtifact(
+                schema_version=1,
+                created_at=_TIME,
+                inputs=(plan_input,),
+                code_revision="test-revision",
+                artifact_id=rollout_id,
+                simulation_id="production-import",
+                cell_id=cell_id,
+                mode=SimulationMode.WORLD_MODEL,
+                rollout_id=rollout_id,
+                trace_id=task.source_trace_ids[0],
+                evidence_source="production",
+                source_run_id=f"run-{rollout_id}",
+                task_id=task.task_id,
+                candidate=_snapshot(alias),
+                agent_id="agent-a",
+                simulator=ProductionSimulatorSnapshot(
+                    source=SourceIdentity(kind="production", source_id=f"source-{rollout_id}")
+                ),
+                repeat=0,
+                spans=(span,),
+                stop_reason=StopReason.COMPLETED,
+                candidate_economics=OperationEconomics(cost_usd=_money(candidate_cost)),
+                world_model_economics=OperationEconomics(cost_usd=_money(10.0)),
+                sandbox_economics=OperationEconomics(cost_usd=_money(20.0)),
+                orchestration_economics=OperationEconomics(cost_usd=_money(30.0)),
+            )
+            rollout_manifest = store.write_json(
+                artifact_id=rollout_id,
+                artifact_type="rollout",
+                envelope=rollout,
+                files={"rollout.json": rollout},
+            )
+            judgment = Judgment(
+                schema_version=1,
+                created_at=_TIME,
+                inputs=tuple(
+                    sorted(
+                        (artifact_input(rollout_manifest), calibration_input),
+                        key=lambda item: item.artifact_id,
+                    )
+                ),
+                code_revision="test-revision",
+                judgment_id=judgment_id,
+                rollout_id=rollout_id,
+                rubric_id="rubric-a",
+                calibration_id="calibration-a",
+                judge_model=_snapshot("judge-model"),
+                judge_prompt_id="judge-prompt-v1",
+                judge_prompt_sha256=_DIGEST,
+                dimensions=(
+                    DimensionJudgment(
+                        dimension_id="dimension-a",
+                        raw_score=5 if score > 0.9 else (4 if score > 0.8 else 3),
+                        calibrated_score=score * 5,
+                        evidence_span_ids=(span.span_id,),
+                        feedback="The response met the expected behavior.",
+                    ),
+                ),
+                overall_score=score,
+                judge_economics=OperationEconomics(cost_usd=_money(40.0)),
+            )
+            store.write_json(
+                artifact_id=judgment_id,
+                artifact_type="judgment",
+                envelope=judgment,
+                files={"judgment.json": judgment},
+            )
+            evidence.append(
+                EvaluationCellEvidence(
+                    cell_id=cell_id,
+                    protocol_id=protocol.protocol_id,
+                    rollout_artifact_id=rollout_id,
+                    judgment_artifact_id=judgment_id,
+                    source_run_id=rollout.source_run_id,
+                )
+            )
+    dataset = build_evaluation_dataset(
+        store,
+        evaluation_plan_id=plan_input.artifact_id,
+        pricing_snapshot_id="pricing-a",
+        protocols=(protocol,),
+        cell_evidence=tuple(evidence),
+        purposes=(purpose,),
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+    return dataset.manifest.evaluation_id
 
 
 def _persist_evaluation(
@@ -591,6 +775,7 @@ def _persist_plan(
     store: ArtifactStore,
     tasks: tuple[TaskCase, ...],
     task_input: ArtifactInput,
+    pricing_input: ArtifactInput,
 ) -> ArtifactInput:
     """Persist the one exact plan shared by sealed fit and held-out evaluations."""
     cells = tuple(
@@ -609,7 +794,7 @@ def _persist_plan(
     plan = EvaluationPlan(
         schema_version=1,
         created_at=_TIME,
-        inputs=(task_input,),
+        inputs=tuple(sorted((pricing_input, task_input), key=lambda item: item.artifact_id)),
         code_revision="test-revision",
         plan_id="plan-a",
         task_set_id="task-set-a",
@@ -617,6 +802,8 @@ def _persist_plan(
             _candidate("candidate-baseline"),
             _candidate("candidate-cheap"),
         ),
+        pricing_snapshot_id=pricing_input.artifact_id,
+        pricing_snapshot_sha256=pricing_input.sha256,
         fidelity_thresholds_id="fidelity-thresholds-a",
         fidelity_thresholds_sha256=_DIGEST,
         fidelity_protocol_sha256=_DIGEST,

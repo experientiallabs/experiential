@@ -34,9 +34,11 @@ from wmo.common.evaluations.evidence import (
 from wmo.common.evaluations.fidelity import build_fidelity_report
 from wmo.common.judging import DimensionJudgment, DimensionScoreMap, JudgeCalibration, Judgment
 from wmo.common.models import (
+    CandidateTokenPrice,
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
+    PricingSnapshot,
     RoutedCandidateSnapshot,
 )
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
@@ -95,6 +97,73 @@ def test_plan_observed_precedence_and_separate_fit_only_fidelity(tmp_path: Path)
         {cell.cell_id for cell in observed_a}
     )
     assert store.read(plan.plan_id).manifest.artifact_type == "evaluation-plan"
+
+
+def test_plan_rejects_pricing_candidate_scope_before_write(tmp_path: Path) -> None:
+    """Planning cannot freeze incomplete or reordered candidate pricing."""
+    store, plan, observed = _planned_fixture(tmp_path)
+    pricing = PricingSnapshot(
+        schema_version=1,
+        created_at=_TIME,
+        code_revision="test-revision",
+        pricing_snapshot_id="pricing-subset",
+        candidate_prices=(
+            CandidateTokenPrice(
+                candidate_alias="candidate-a",
+                input_usd_per_million_tokens=1.0,
+                output_usd_per_million_tokens=2.0,
+            ),
+        ),
+    )
+    store.write_json(
+        artifact_id=pricing.pricing_snapshot_id,
+        artifact_type="pricing-snapshot",
+        envelope=pricing,
+        files={"pricing.json": pricing},
+    )
+    reversed_pricing = pricing.model_copy(
+        update={
+            "pricing_snapshot_id": "pricing-reversed",
+            "candidate_prices": tuple(
+                CandidateTokenPrice(
+                    candidate_alias=candidate.alias,
+                    input_usd_per_million_tokens=1.0,
+                    output_usd_per_million_tokens=2.0,
+                )
+                for candidate in reversed(plan.candidate_snapshots)
+            ),
+        }
+    )
+    store.write_json(
+        artifact_id=reversed_pricing.pricing_snapshot_id,
+        artifact_type="pricing-snapshot",
+        envelope=reversed_pricing,
+        files={"pricing.json": reversed_pricing},
+    )
+    artifact_ids_before = store.list_ids()
+
+    for pricing_snapshot_id in (pricing.pricing_snapshot_id, reversed_pricing.pricing_snapshot_id):
+        with pytest.raises(EvaluationEvidenceError, match="pricing snapshot candidates"):
+            build_evaluation_plan(
+                store,
+                task_set_id=plan.task_set_id,
+                candidate_snapshots=plan.candidate_snapshots,
+                pricing_snapshot_id=pricing_snapshot_id,
+                observed_cells=tuple(
+                    ObservedProductionCell(
+                        task_id=task_id,
+                        candidate_alias="candidate-a",
+                        repeat=0,
+                        rollout_artifact_id=rollout_id,
+                    )
+                    for task_id, rollout_id in observed.items()
+                ),
+                fidelity_thresholds_id=plan.fidelity_thresholds_id,
+                fidelity_protocol_sha256=plan.fidelity_protocol_sha256,
+                created_at=_TIME,
+                code_revision="test-revision",
+            )
+    assert store.list_ids() == artifact_ids_before
 
 
 def test_fidelity_failure_keeps_all_ten_denominator_cells(tmp_path: Path) -> None:
@@ -164,6 +233,7 @@ def test_materialization_retains_missing_failures_and_separate_spend(tmp_path: P
     dataset = build_evaluation_dataset(
         store,
         evaluation_plan_id=plan.plan_id,
+        pricing_snapshot_id="pricing-a",
         protocols=protocols,
         cell_evidence=evidence,
         created_at=_TIME,
@@ -173,12 +243,14 @@ def test_materialization_retains_missing_failures_and_separate_spend(tmp_path: P
     replayed = build_evaluation_dataset(
         store,
         evaluation_plan_id=plan.plan_id,
+        pricing_snapshot_id="pricing-a",
         protocols=protocols,
         cell_evidence=evidence,
         created_at=_TIME,
         code_revision="test-revision",
     )
     assert replayed == dataset
+    assert artifact_input(store.read("pricing-a").manifest) in dataset.manifest.inputs
     rows = {row.cell_id: row for row in dataset.rows}
 
     assert tuple(row.status for row in dataset.rows) == (
@@ -212,6 +284,7 @@ def test_materialization_rejects_candidate_connection_alias_drift(tmp_path: Path
         build_evaluation_dataset(
             store,
             evaluation_plan_id=plan.plan_id,
+            pricing_snapshot_id="pricing-a",
             protocols=protocols,
             cell_evidence=evidence,
             created_at=_TIME,
@@ -229,11 +302,91 @@ def test_materialization_rejects_held_out_judge_calibration_leakage(tmp_path: Pa
         build_evaluation_dataset(
             store,
             evaluation_plan_id=plan.plan_id,
+            pricing_snapshot_id="pricing-a",
             protocols=protocols,
             cell_evidence=evidence,
             created_at=_TIME,
             code_revision="test-revision",
         )
+
+
+def test_materialization_rejects_missing_or_plan_mismatched_pricing_before_write(
+    tmp_path: Path,
+) -> None:
+    """Canonical materialization fails before writing when pricing is absent or unrelated."""
+    store, plan, protocols, evidence = _materialization_fixture(tmp_path)
+    pricing_b = PricingSnapshot(
+        schema_version=1,
+        created_at=_TIME,
+        code_revision="test-revision",
+        pricing_snapshot_id="pricing-b",
+        candidate_prices=tuple(
+            CandidateTokenPrice(
+                candidate_alias=candidate.alias,
+                input_usd_per_million_tokens=1.0,
+                output_usd_per_million_tokens=2.0,
+            )
+            for candidate in plan.candidate_snapshots
+        ),
+    )
+    store.write_json(
+        artifact_id=pricing_b.pricing_snapshot_id,
+        artifact_type="pricing-snapshot",
+        envelope=pricing_b,
+        files={"pricing.json": pricing_b},
+    )
+    artifact_ids_before = store.list_ids()
+
+    for pricing_snapshot_id in ("pricing-missing", plan.task_set_id, "pricing-b"):
+        with pytest.raises(EvaluationEvidenceError):
+            build_evaluation_dataset(
+                store,
+                evaluation_plan_id=plan.plan_id,
+                pricing_snapshot_id=pricing_snapshot_id,
+                protocols=protocols,
+                cell_evidence=evidence,
+                created_at=_TIME,
+                code_revision="test-revision",
+            )
+    drifted_protocols = tuple(
+        protocol.model_copy(update={"pricing_snapshot_id": "pricing-b"}) for protocol in protocols
+    )
+    with pytest.raises(EvaluationEvidenceError, match="protocol pricing"):
+        build_evaluation_dataset(
+            store,
+            evaluation_plan_id=plan.plan_id,
+            pricing_snapshot_id="pricing-a",
+            protocols=drifted_protocols,
+            cell_evidence=evidence,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+    assert store.list_ids() == artifact_ids_before
+
+    tampered_plan = plan.model_copy(
+        update={
+            "plan_id": "plan-invented-pricing-digest",
+            "pricing_snapshot_sha256": "b" * 64,
+        }
+    )
+    store.write_json(
+        artifact_id=tampered_plan.plan_id,
+        artifact_type="evaluation-plan",
+        envelope=tampered_plan,
+        files={"plan.json": tampered_plan},
+    )
+    artifact_ids_before_tampered_attempt = store.list_ids()
+    with pytest.raises(EvaluationEvidenceError, match="pricing differs"):
+        build_evaluation_dataset(
+            store,
+            evaluation_plan_id=tampered_plan.plan_id,
+            pricing_snapshot_id="pricing-a",
+            protocols=protocols,
+            cell_evidence=evidence,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+    assert store.list_ids() == artifact_ids_before_tampered_attempt
 
 
 def _planned_fixture(
@@ -248,6 +401,7 @@ def _planned_fixture(
     gate = default_fidelity_thresholds(created_at=_TIME, code_revision="test-revision")
     persist_fidelity_thresholds(store, gate)
     candidates = (_candidate("candidate-a"), _candidate("candidate-b"))
+    _persist_pricing(store, candidates)
     observed = {}
     observed_cells = []
     for task in tasks[:10]:
@@ -274,6 +428,7 @@ def _planned_fixture(
         store,
         task_set_id="task-set-plan",
         candidate_snapshots=candidates,
+        pricing_snapshot_id="pricing-a",
         observed_cells=observed_cells,
         fidelity_thresholds_id=gate.fidelity_thresholds_id,
         fidelity_protocol_sha256=evaluation_protocol_digest(_world_protocol()),
@@ -301,6 +456,7 @@ def _materialization_fixture(
     task_input = _persist_task_set(store, "task-set-materialize", (fit_task, held_out_task))
     baseline = _candidate("candidate-a")
     cheap = _candidate("candidate-b")
+    pricing_input = _persist_pricing(store, (baseline, cheap))
     rollout = _production_rollout(
         "rollout-observed",
         cell_id="cell-observed",
@@ -387,11 +543,13 @@ def _materialization_fixture(
     plan = EvaluationPlan(
         schema_version=1,
         created_at=_TIME,
-        inputs=(task_input,),
+        inputs=tuple(sorted((pricing_input, task_input), key=lambda item: item.artifact_id)),
         code_revision="test-revision",
         plan_id="plan-materialize",
         task_set_id="task-set-materialize",
         candidate_snapshots=(baseline, cheap),
+        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_sha256=pricing_input.sha256,
         fidelity_thresholds_id="fidelity-thresholds-a",
         fidelity_thresholds_sha256=_DIGEST,
         fidelity_protocol_sha256=_DIGEST,
@@ -504,6 +662,34 @@ def _persist_task_set(
         artifact_type="task-set",
         envelope=task_set,
         files={"task-set.json": canonical_json_bytes(task_set), "tasks.jsonl": payload},
+    )
+    return artifact_input(manifest)
+
+
+def _persist_pricing(
+    store: ArtifactStore,
+    candidates: tuple[RoutedCandidateSnapshot, ...],
+) -> ArtifactInput:
+    """Persist exact candidate pricing and return its verified manifest input."""
+    pricing = PricingSnapshot(
+        schema_version=1,
+        created_at=_TIME,
+        code_revision="test-revision",
+        pricing_snapshot_id="pricing-a",
+        candidate_prices=tuple(
+            CandidateTokenPrice(
+                candidate_alias=candidate.alias,
+                input_usd_per_million_tokens=1.0,
+                output_usd_per_million_tokens=2.0,
+            )
+            for candidate in candidates
+        ),
+    )
+    manifest = store.write_json(
+        artifact_id=pricing.pricing_snapshot_id,
+        artifact_type="pricing-snapshot",
+        envelope=pricing,
+        files={"pricing.json": pricing},
     )
     return artifact_input(manifest)
 

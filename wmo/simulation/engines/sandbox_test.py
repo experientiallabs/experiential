@@ -586,6 +586,8 @@ def _persist_fixture(
         plan_id="plan-1",
         task_set_id=task_set.task_set_id,
         candidate_snapshots=(RoutedCandidateSnapshot(alias="candidate-a", model=_snapshot()),),
+        pricing_snapshot_id="pricing-1",
+        pricing_snapshot_sha256="d" * 64,
         fidelity_thresholds_id="fidelity-thresholds-1",
         fidelity_thresholds_sha256="f" * 64,
         fidelity_protocol_sha256="e" * 64,
