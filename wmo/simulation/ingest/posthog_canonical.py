@@ -21,7 +21,7 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
 )
 from wmo.common.core.text import normalize_durable_text
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import ConnectionConfig, ModelSnapshot
 from wmo.common.tasks import ToolSchema
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.simulation.ingest.otlp import (
@@ -822,12 +822,31 @@ def _model_snapshot(properties: JsonObject) -> ModelSnapshot | None:
         raise PostHogPullError("PostHog model identity has a model but no provider")
     revision = _first_property_text(properties, ("$ai_model_revision", "model_revision"))
     digest = hashlib.sha256(f"{provider}\0{model_id}\0{revision or ''}".encode()).hexdigest()
+    connection_sha256 = _connection_sha256(properties, provider)
     return ModelSnapshot(
         provider=provider,
         model_id=model_id,
         revision=revision,
         capabilities_sha256=digest,
+        connection_sha256=connection_sha256,
     )
+
+
+def _connection_sha256(properties: JsonObject, provider: str) -> str:
+    """Return declared connection evidence or the provider's standard endpoint identity.
+
+    PostHog exports do not reliably retain a safe endpoint spelling. Producers can include the
+    canonical digest directly. Otherwise the provider-only identity records that the trace used
+    the provider's standard endpoint without copying a credential or raw endpoint into WMO.
+    """
+    declared_connection = properties.get("wmo.model.connection_sha256")
+    if declared_connection is not None:
+        if not isinstance(declared_connection, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", declared_connection
+        ):
+            raise PostHogPullError("wmo.model.connection_sha256 must be a SHA-256 digest")
+        return declared_connection
+    return ConnectionConfig(provider=provider).identity_sha256()
 
 
 def _event_failure(properties: JsonObject) -> StructuredFailure | None:

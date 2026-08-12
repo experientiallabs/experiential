@@ -10,6 +10,7 @@ from pathlib import Path
 from pydantic import JsonValue
 
 from wmo.common.core.artifacts import JsonObject, SourceIdentity
+from wmo.common.models import ConnectionConfig
 from wmo.common.traces import Trace
 from wmo.simulation.ingest.otlp import normalize_otlp_payload
 from wmo.simulation.ingest.posthog import (
@@ -228,6 +229,34 @@ def test_posthog_and_otlp_equivalent_fixtures_produce_equivalent_visible_evidenc
     assert posthog.traces[0].trace_id == _TRACE_ID
     assert all(len(span.span_id) == 16 for span in posthog.traces[0].spans)
     assert posthog.traces[0].spans[0].started_at < posthog.traces[0].spans[1].started_at
+    assert posthog.traces[0].spans[0].model is not None
+    assert (
+        posthog.traces[0].spans[0].model.connection_sha256
+        == ConnectionConfig(provider="openai").identity_sha256()
+    )
+
+
+def test_posthog_retains_a_declared_model_connection_digest() -> None:
+    """A PostHog producer can supply the canonical connection digest without an endpoint URL."""
+    events = _posthog_events()
+    _event_properties(events[0])["wmo.model.connection_sha256"] = "d" * 64
+
+    result = normalize_posthog_payload(events, source=_source())
+
+    assert result.issues == ()
+    assert result.traces[0].spans[0].model is not None
+    assert result.traces[0].spans[0].model.connection_sha256 == "d" * 64
+
+
+def test_posthog_rejects_an_invalid_declared_model_connection_digest() -> None:
+    """Unstructured endpoint data cannot be persisted as a model connection digest."""
+    events = _posthog_events()
+    _event_properties(events[0])["wmo.model.connection_sha256"] = "not-a-digest"
+
+    result = normalize_posthog_payload(events, source=_source())
+
+    assert result.traces == ()
+    assert "connection_sha256" in result.issues[0].message
 
 
 def test_posthog_error_and_jsonl_export_are_retained_as_canonical_failure_evidence(

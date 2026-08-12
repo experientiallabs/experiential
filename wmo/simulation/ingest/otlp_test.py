@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import cast
 
 from wmo.common.core.artifacts import SourceIdentity
+from wmo.common.models import ConnectionConfig
 from wmo.simulation.ingest.otlp import load_otlp_file, normalize_otlp_payload
 from wmo.simulation.mining.descriptors import routing_descriptor
 
@@ -183,7 +184,36 @@ def test_normalizes_w3c_genai_trace_and_wmo_outcome_extensions() -> None:
     assert trace.outcome is not None and trace.outcome.status == "success"
     assert trace.spans[0].model is not None
     assert trace.spans[0].model.provider == "openai"
+    assert (
+        trace.spans[0].model.connection_sha256
+        == ConnectionConfig(provider="openai").identity_sha256()
+    )
     assert trace.spans[1].parent_span_id == _CALL_SPAN_ID
+
+
+def test_otlp_retains_a_declared_model_connection_digest() -> None:
+    """An exporter can retain exact secret-free connection evidence without an endpoint URL."""
+    payload = _payload()
+    attributes = cast(list[dict[str, object]], _span(payload, 0)["attributes"])
+    attributes.append(_attribute("wmo.model.connection_sha256", "d" * 64))
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.issues == ()
+    assert result.traces[0].spans[0].model is not None
+    assert result.traces[0].spans[0].model.connection_sha256 == "d" * 64
+
+
+def test_otlp_rejects_an_invalid_declared_model_connection_digest() -> None:
+    """Connection evidence must be a canonical SHA-256 digest, not unstructured endpoint data."""
+    payload = _payload()
+    attributes = cast(list[dict[str, object]], _span(payload, 0)["attributes"])
+    attributes.append(_attribute("wmo.model.connection_sha256", "not-a-digest"))
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.traces == ()
+    assert "connection_sha256" in result.issues[0].message
 
 
 def test_otlp_accepts_a_causal_matching_tool_pair() -> None:

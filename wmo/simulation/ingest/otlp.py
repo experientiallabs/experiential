@@ -19,7 +19,7 @@ from pydantic import JsonValue
 
 from wmo.common.core.artifacts import FailureCode, JsonObject, SourceIdentity, StructuredFailure
 from wmo.common.core.text import normalize_durable_text
-from wmo.common.models import ModelSnapshot, Usage
+from wmo.common.models import ConnectionConfig, ModelSnapshot, Usage
 from wmo.common.tasks import ToolSchema
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 
@@ -474,12 +474,31 @@ def _model_snapshot(attributes: JsonObject, operation: str) -> ModelSnapshot | N
         capabilities_sha256 = hashlib.sha256(
             f"{provider}\0{model_id}\0{revision or ''}".encode()
         ).hexdigest()
+    connection_sha256 = _connection_sha256(attributes, provider)
     return ModelSnapshot(
         provider=provider,
         model_id=model_id,
         revision=revision,
         capabilities_sha256=capabilities_sha256,
+        connection_sha256=connection_sha256,
     )
+
+
+def _connection_sha256(attributes: JsonObject, provider: str) -> str:
+    """Return declared connection evidence or the provider's standard endpoint identity.
+
+    An imported trace cannot safely infer an endpoint from arbitrary telemetry attributes. An
+    exporter may therefore provide the secret-free canonical digest explicitly. When it does
+    not, the provider-only connection identity represents that provider's standard endpoint.
+    """
+    declared_connection = attributes.get("wmo.model.connection_sha256")
+    if declared_connection is not None:
+        if not isinstance(declared_connection, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", declared_connection
+        ):
+            raise OtlpTraceFormatError("wmo.model.connection_sha256 must be a SHA-256 digest")
+        return declared_connection
+    return ConnectionConfig(provider=provider).identity_sha256()
 
 
 def _usage(attributes: JsonObject) -> Usage | None:
