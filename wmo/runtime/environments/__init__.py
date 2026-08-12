@@ -1,7 +1,10 @@
 """Customer executable-environment contracts."""
 
 from wmo.runtime.environments.harbor import (
+    BOUNDED_CLEANUP_CONTRACT,
     E2BTemplateResources,
+    HarborCleanupResult,
+    HarborCleanupTimeoutError,
     HarborCleanupUnprovenError,
     HarborCommandResult,
     HarborEnvironmentRuntime,
@@ -31,11 +34,14 @@ from wmo.runtime.environments.local import (
 )
 
 __all__ = [
+    "BOUNDED_CLEANUP_CONTRACT",
     "EnvironmentResetError",
     "EnvironmentRuntime",
     "EnvironmentSession",
     "E2BTemplateResources",
     "HarborCommandResult",
+    "HarborCleanupResult",
+    "HarborCleanupTimeoutError",
     "HarborCleanupUnprovenError",
     "HarborEnvironmentRuntime",
     "HarborExecutableSession",

@@ -122,9 +122,9 @@ LEGACY_PATH_PREFIXES: Final[tuple[str, ...]] = (
     "wmo/simulation/serving",
 )
 
-# Exact tracked paths under the current legacy roots. This is deliberately explicit rather than
-# derived at runtime, so a new path under a legacy root fails immediately.
-LEGACY_PATH_INVENTORY: Final[frozenset[str]] = frozenset(
+# W4.5 retired the final active paths below the frozen legacy roots. The exact set remains here as
+# permanent history, while the active inventory is now empty.
+W4_5_LEGACY_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
     {
         "wmo/runtime/evaluation/harbor/__init__.py",
         "wmo/runtime/evaluation/harbor/agent.py",
@@ -198,7 +198,8 @@ LEGACY_PATH_INVENTORY: Final[frozenset[str]] = frozenset(
         "wmo/runtime/harness/vendor/pi-agent/vitest.harness.config.ts",
     }
 )
-LEGACY_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
+LEGACY_PATH_INVENTORY: Final[frozenset[str]] = frozenset()
+LEGACY_PATH_TOMBSTONES: Final[frozenset[str]] = W4_5_LEGACY_PATH_TOMBSTONES | frozenset(
     {
         "wmo/optimize/gepa.py",
         "wmo/simulation/evaluation/__init__.py",
@@ -360,6 +361,23 @@ W8_RETIRED_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
         "wmo/simulation/evaluation",
         "wmo/simulation/model",
         "wmo/simulation/retrieval",
+    }
+)
+
+# W4.5 is the matching clean break for the old agent and environment runtime. Package roots block
+# every descendant, and standalone modules block compatibility files at their former locations.
+W4_RETIRED_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
+    {
+        "docs/reference/harness_delta.md",
+        "wmo/runtime/__init__.py",
+        "wmo/runtime/agents/default.py",
+        "wmo/runtime/agents/llm.py",
+        "wmo/runtime/agents/llm_test.py",
+        "wmo/runtime/environment.py",
+        "wmo/runtime/episode.py",
+        "wmo/runtime/episode_test.py",
+        "wmo/runtime/evaluation",
+        "wmo/runtime/harness",
     }
 )
 
@@ -588,6 +606,18 @@ def _retired_w8_paths(paths: Iterable[str]) -> frozenset[str]:
     )
 
 
+def _retired_w4_paths(paths: Iterable[str]) -> frozenset[str]:
+    """Return paths that reintroduce an exact file or descendant of a W4.5 tombstone."""
+    return frozenset(
+        path
+        for path in paths
+        if any(
+            path == tombstone or path.startswith(f"{tombstone}/")
+            for tombstone in W4_RETIRED_PATH_TOMBSTONES
+        )
+    )
+
+
 def test_hand_authored_files_stay_below_the_physical_line_limit() -> None:
     """Every new or rewritten covered file stays below the frozen migration boundary."""
     oversized = _oversized_hand_authored_files(_tracked_files())
@@ -744,6 +774,17 @@ def test_w8_tombstones_reject_new_descendants() -> None:
     """A new module below a deleted W8.6 package root is rejected directly."""
     candidate = "wmo/simulation/model/compatibility.py"
     assert _retired_w8_paths((*_tracked_files(), candidate)) == {candidate}
+
+
+def test_w4_retired_paths_remain_tombstoned() -> None:
+    """Deleted harness and duplicate runtime owners cannot return through compatibility paths."""
+    assert not _retired_w4_paths(_tracked_files())
+
+
+def test_w4_tombstones_reject_new_descendants() -> None:
+    """A new module below a deleted W4.5 package root is rejected directly."""
+    candidate = "wmo/runtime/harness/compatibility.py"
+    assert _retired_w4_paths((*_tracked_files(), candidate)) == {candidate}
 
 
 def test_root_cli_commands_match_the_explicit_transition_inventory() -> None:

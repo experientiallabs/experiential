@@ -34,7 +34,7 @@ def test_optimization_domains_are_nested() -> None:
     assert not legacy, f"optimization packages returned to the flat wmo namespace: {legacy}"
 
     assert not (OPTIMIZE_DIR / "harness").exists(), (
-        "agent execution belongs under wmo/runtime/harness, not wmo/optimize/harness"
+        "agent execution belongs under wmo/runtime/agents, not wmo/optimize/harness"
     )
 
     retired_modules = sorted(

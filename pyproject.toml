@@ -1,19 +1,13 @@
 [project]
 name = "world-model-optimizer"
 version = "0.3.0"
-description = "Run agents, build world models from traces, and optimize agent harnesses."
+description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
-# harbor 0.20.0 requires Python >=3.12; the harbor evaluator is a first-class optimize
-# environment, so the whole package moves to 3.12 (deliberate 3.11 drop, noted in the PR body).
 requires-python = ">=3.12"
 dependencies = [
-    # Cross-platform advisory file locking for the durable registries wmo edits in place (the
-    # candidate pool, the harness and adapter alias tables). Declared directly because
-    # `wmo.common.core.locks` imports it; it was already in the resolved graph via torch/datasets/
-    # huggingface-hub/harbor. It is what keeps a Unix-only `fcntl` off wmo's import path.
+    # Cross-platform advisory locking for durable registries edited in place. Declared directly
+    # because `wmo.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
     "filelock>=3.12",
-    # typer/rich/fastapi/uvicorn floors match harbor 0.20.0's requirements so the harbor
-    # extra resolves against the core install without downgrades.
     "typer>=0.16",
     "click>=8.2",  # pins no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
     "fastapi>=0.128",
@@ -36,20 +30,6 @@ dependencies = [
 
 [project.optional-dependencies]
 otel = ["opentelemetry-proto>=1.24"]
-# The e2b harness backend (`--harness-backend e2b`): the pi-node harness PROCESS executes in
-# pooled E2B microVMs while the environment stays the world model. Only those runs need it —
-# local runs stay sandbox-free — so it is an optional extra imported lazily
-# (wmo.runtime.harness.e2b_sandbox / wmo.runtime.harness.pi_e2b). Exact pin: the harbor E2B
-# environment
-# (wmo.runtime.evaluation.harbor.e2b_environment) depends on version-sensitive template-build API behavior
-# and embeds the e2b version in template alias derivation.
-e2b = ["e2b==2.31.0"]
-# The harbor evaluator (`wmo.runtime.evaluation.harbor`): scores harness candidates on real
-# Terminal-Bench-2-style tasks through the harbor runner. Imported lazily, same contract as
-# the e2b extra. Exact pin: our E2B template alias derivation embeds harbor's version and
-# tracks its build behavior. Running harbor task environments ON E2B additionally needs
-# `wmo[harbor,e2b]` plus harbor's own e2b extra (`harbor[e2b]`, for dockerfile-parse).
-harbor = ["harbor==0.20.0"]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
 sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
 # The in-process local embedder (`wmo.common.providers.local_embed`, EmbedderKind.LOCAL): Qwen3
@@ -67,7 +47,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-optimizer[otel,e2b,harbor,sft,local]",
+    "world-model-optimizer[otel,sft,local]",
 ]
 
 [dependency-groups]
@@ -159,22 +139,6 @@ convention = "google"
 "wmo/optimize/research/gepa_scaling.py" = ["D102"]
 "wmo/optimize/research/seed_stability.py" = ["D102"]
 "wmo/optimize/research/trace_scaling.py" = ["D102"]
-"wmo/runtime/agents/llm.py" = ["D102"]
-"wmo/runtime/episode.py" = ["D102"]
-"wmo/runtime/evaluation/harbor/agent.py" = ["D102"]
-"wmo/runtime/evaluation/harbor/scorer.py" = ["D102"]
-"wmo/runtime/evaluation/harbor/tasks.py" = ["D102"]
-"wmo/runtime/harness/code_runtime.py" = ["D102"]
-"wmo/runtime/harness/doc.py" = ["D102"]
-"wmo/runtime/harness/e2b_sandbox.py" = ["D102"]
-"wmo/runtime/harness/live_session.py" = ["D102"]
-"wmo/runtime/harness/pi_e2b.py" = ["D102"]
-"wmo/runtime/harness/pi_runtime.py" = ["D102"]
-"wmo/runtime/harness/runner_link.py" = ["D102", "D103"]
-"wmo/runtime/harness/runtime.py" = ["D102"]
-"wmo/runtime/harness/scoring.py" = ["D102"]
-"wmo/runtime/harness/skills.py" = ["D102"]
-"wmo/runtime/harness/store.py" = ["D102"]
 "wmo/runtime/platform/auth.py" = ["D102"]
 "wmo/runtime/platform/client.py" = ["D102"]
 "wmo/simulation/ingest/adapter.py" = ["D103"]

@@ -39,8 +39,13 @@ from wmo.common.rollouts import (
 from wmo.common.tasks import TaskCase, TaskSet
 from wmo.runtime.agents import AgentEpisode, AgentRuntime
 from wmo.runtime.environments import EnvironmentRuntime, EnvironmentSession, Observation
-from wmo.runtime.environments.harbor import HarborCommandResult, HarborEnvironmentRuntime
-from wmo.runtime.harness.e2b_ledger import SandboxLedger, read_ledger_files
+from wmo.runtime.environments.harbor import (
+    BOUNDED_CLEANUP_CONTRACT,
+    HarborCleanupResult,
+    HarborCommandResult,
+    HarborEnvironmentRuntime,
+)
+from wmo.runtime.environments.sandbox_ledger import read_ledger_files
 from wmo.simulation.engines.sandbox import (
     CandidateBinding,
     EnvironmentCostBinding,
@@ -506,12 +511,12 @@ def test_harbor_cleanup_failure_or_hang_holds_ledger_and_partial_transcript(
     """Harbor evidence survives bounded cleanup failure and remains reaper-owned."""
     store, plan, plan_input, task_input = _persist_fixture(tmp_path, ("task-a",))
     backend = _HarborSession(hang_cleanup=hang_cleanup)
-    ledger = SandboxLedger(tmp_path / "harbor-ledger", pid=901)
+    state_directory = tmp_path / "harbor-state"
     harbor = HarborEnvironmentRuntime(
         _HarborFactory(backend),
         environment_id="customer-environment",
         template_name="wmo-hb-v1-fixture",
-        ledger=ledger,
+        state_directory=state_directory,
         retry_delays_seconds=(),
     )
     simulator = _simulator(
@@ -543,7 +548,7 @@ def test_harbor_cleanup_failure_or_hang_holds_ledger_and_partial_transcript(
     assert rollout.failure.details["phase"] == expected_phase
     assert observations[0].payload["content"] == "partial output"
     assert observations[0].failure is not None
-    ledger_state = read_ledger_files(tmp_path / "harbor-ledger")[0]
+    ledger_state = read_ledger_files(state_directory)[0]
     assert tuple(item.sandbox_id for item in ledger_state.held) == ("sandbox-harbor",)
     assert ledger_state.released_ids == ()
 
@@ -931,6 +936,8 @@ class _EnvironmentSession:
 class _HarborFactory:
     """Open one deterministic Harbor-shaped backend session."""
 
+    cleanup_contract: Literal["bounded-close-v1"] = BOUNDED_CLEANUP_CONTRACT
+
     def __init__(self, session: _HarborSession) -> None:
         self._session = session
 
@@ -939,36 +946,11 @@ class _HarborFactory:
         task: TaskCase,
         *,
         template_name: str,
-    ) -> AbstractContextManager[_HarborSession]:
+    ) -> _HarborSession:
         """Bind the expected task and frozen template identity."""
         assert task.task_id == "task-a"
         assert template_name == "wmo-hb-v1-fixture"
-        return _HarborContext(self._session)
-
-
-class _HarborContext(AbstractContextManager["_HarborSession"]):
-    """Close the backend while deliberately withholding cleanup proof."""
-
-    def __init__(self, session: _HarborSession) -> None:
-        self._session = session
-
-    def __enter__(self) -> _HarborSession:
-        """Return the scriptable backend."""
         return self._session
-
-    def __exit__(
-        self,
-        exception_type: type[BaseException] | None,
-        exception: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> bool:
-        """Close without making the adapter's stronger cleanup claim true."""
-        del exception_type, exception, traceback
-        self._session.closed = True
-        if self._session.hang_cleanup:
-            while True:
-                pass
-        return False
 
 
 class _HarborSession:
@@ -994,6 +976,14 @@ class _HarborSession:
         self.commands.append((command, environment))
         return HarborCommandResult(stdout="partial output", exit_code=7)
 
-    def cleanup_verified(self) -> bool:
-        """Deny cleanup proof so the durable ledger remains held for a reaper."""
-        return self.hang_cleanup
+    def close(self, *, sandbox_id: str, timeout_seconds: float) -> HarborCleanupResult:
+        """Return deterministic bounded timeout or unproven cleanup evidence."""
+        assert sandbox_id == "sandbox-harbor"
+        assert timeout_seconds > 0
+        self.closed = not self.hang_cleanup
+        return HarborCleanupResult(
+            sandbox_id=sandbox_id,
+            released=False,
+            timed_out=self.hang_cleanup,
+            failure=None if self.hang_cleanup else "cleanup was not proven",
+        )

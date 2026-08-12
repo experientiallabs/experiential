@@ -1,8 +1,9 @@
 """Harbor and E2B executable-environment adapters behind the canonical runtime seam.
 
 The optional Harbor and E2B dependencies stay outside this module's import path. A caller gives
-this adapter a narrow synchronous session factory, normally backed by Harbor's E2B lifecycle, so
-the simulator still owns one context exit, partial transcript, and cleanup ledger.
+this adapter a narrow synchronous session factory whose backend owns a finite close primitive.
+The simulator retains partial transcripts and an exact cleanup ledger without spawning workers to
+outlive a timed-out cleanup attempt.
 """
 
 from __future__ import annotations
@@ -10,11 +11,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Literal, Protocol, runtime_checkable
 
@@ -22,7 +24,7 @@ from wmo.common.core.artifacts import ContractModel, JsonObject
 from wmo.common.models import OperationEconomics, ToolCall
 from wmo.common.tasks import TaskCase
 from wmo.runtime.environments.interface import EnvironmentSession, Observation
-from wmo.runtime.harness.e2b_ledger import SandboxLedger
+from wmo.runtime.environments.sandbox_ledger import SandboxLedger
 
 E2B_TEMPLATE_POLICY_VERSION = "1"
 """Version pinned into E2B template resource identities."""
@@ -32,6 +34,9 @@ E2B_DEFAULT_MEMORY_MB = 1024
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 240
 DEFAULT_RETRY_DELAYS_SECONDS = (0.25, 0.5, 1.0, 2.0, 4.0)
 DEFAULT_MAXIMUM_OBSERVATION_CHARACTERS = 20_000
+DEFAULT_CLEANUP_TIMEOUT_SECONDS = 5.0
+BOUNDED_CLEANUP_CONTRACT = "bounded-close-v1"
+_SANDBOX_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
 
 
 class HarborRetryableCommandError(RuntimeError):
@@ -44,6 +49,19 @@ class HarborTemplateStatusError(RuntimeError):
 
 class HarborCleanupUnprovenError(RuntimeError):
     """An injected Harbor context returned without proving that its sandbox was released."""
+
+
+class HarborCleanupTimeoutError(TimeoutError):
+    """An injected Harbor cleanup operation exceeded its local finite bound."""
+
+
+class HarborCleanupResult(ContractModel):
+    """Typed result returned by an adapter-owned finite cleanup operation."""
+
+    sandbox_id: str
+    released: bool
+    timed_out: bool = False
+    failure: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,32 +114,38 @@ class HarborExecutableSession(Protocol):
             Normalized exit, output, and economics evidence.
         """
 
-    def cleanup_verified(self) -> bool:
-        """Return whether the backing service proved the exact sandbox is no longer live.
+    def close(self, *, sandbox_id: str, timeout_seconds: float) -> HarborCleanupResult:
+        """Bound cleanup and return proof for the immutable captured sandbox ID.
+
+        Args:
+            sandbox_id: Immutable resource ID captured when the session was created.
+            timeout_seconds: Finite deadline the adapter must enforce internally.
 
         Returns:
-            Whether cleanup conclusively released this session's sandbox.
+            Exact release, timeout, or failure evidence after all adapter workers have stopped.
         """
 
 
 @runtime_checkable
 class HarborSessionFactory(Protocol):
-    """Opens an optional Harbor or E2B environment for exactly one canonical task."""
+    """Opens one task environment only after declaring adapter-owned bounded cleanup."""
+
+    cleanup_contract: Literal["bounded-close-v1"]
 
     def open(
         self,
         task: TaskCase,
         *,
         template_name: str,
-    ) -> AbstractContextManager[HarborExecutableSession]:
-        """Create an externally-managed session whose context exit proves cleanup.
+    ) -> HarborExecutableSession:
+        """Create one session with an adapter-owned bounded close primitive.
 
         Args:
             task: Canonical task to execute in the environment.
             template_name: Resource-qualified template selected for the task.
 
         Returns:
-            Context manager that yields one executable environment session.
+            Executable environment session whose ``close`` method owns bounded cleanup.
         """
 
 
@@ -138,7 +162,8 @@ class HarborEnvironmentRuntime:
         *,
         environment_id: str,
         template_name: str,
-        ledger: SandboxLedger | None = None,
+        state_directory: Path,
+        cleanup_timeout_seconds: float = DEFAULT_CLEANUP_TIMEOUT_SECONDS,
         command_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
         retry_delays_seconds: Sequence[float] = DEFAULT_RETRY_DELAYS_SECONDS,
         maximum_observation_characters: int = DEFAULT_MAXIMUM_OBSERVATION_CHARACTERS,
@@ -150,18 +175,25 @@ class HarborEnvironmentRuntime:
             factory: Injected optional Harbor or E2B implementation.
             environment_id: Stable customer environment identity recorded in rollout provenance.
             template_name: Resource-qualified E2B template alias selected by the caller.
-            ledger: Durable sandbox ledger. The default preserves legacy orphan-reaping behavior.
+            state_directory: Explicit caller-owned state root for the durable sandbox ledger.
+            cleanup_timeout_seconds: Finite deadline enforced by the injected close primitive.
             command_timeout_seconds: Finite limit forwarded to every environment command.
             retry_delays_seconds: Retry delays used only for read-only transport failures.
             maximum_observation_characters: Bound for tool text retained in a rollout transcript.
             workspace_root: Absolute task root used to confine canonical file tools.
         """
+        if getattr(factory, "cleanup_contract", None) != BOUNDED_CLEANUP_CONTRACT:
+            raise ValueError(
+                "Harbor factories must implement the bounded-close-v1 cleanup contract"
+            )
         if not environment_id:
             raise ValueError("Harbor environment_id must be nonempty")
         if not template_name:
             raise ValueError("Harbor template_name must be nonempty")
         if isinstance(command_timeout_seconds, bool) or command_timeout_seconds < 1:
             raise ValueError("Harbor command_timeout_seconds must be a positive integer")
+        if isinstance(cleanup_timeout_seconds, bool) or cleanup_timeout_seconds <= 0:
+            raise ValueError("Harbor cleanup_timeout_seconds must be positive")
         if isinstance(maximum_observation_characters, bool) or maximum_observation_characters < 1:
             raise ValueError("Harbor maximum_observation_characters must be a positive integer")
         normalized_root = PurePosixPath(workspace_root)
@@ -173,7 +205,8 @@ class HarborEnvironmentRuntime:
         self._factory = factory
         self.environment_id = environment_id
         self.template_name = template_name
-        self._ledger = ledger or SandboxLedger()
+        self._ledger = SandboxLedger(state_directory)
+        self._cleanup_timeout_seconds = float(cleanup_timeout_seconds)
         self._command_timeout_seconds = command_timeout_seconds
         self._retry_delays_seconds = normalized_delays
         self._maximum_observation_characters = maximum_observation_characters
@@ -192,43 +225,41 @@ class HarborEnvironmentRuntime:
 
 
 class _HarborSessionContext(AbstractContextManager[EnvironmentSession]):
-    """Records a created sandbox before use and releases it only after a successful context exit."""
+    """Record before use and release only from one exact adapter-owned cleanup result."""
 
     def __init__(self, runtime: HarborEnvironmentRuntime, task: TaskCase) -> None:
         self._runtime = runtime
         self._task = task
-        self._context: AbstractContextManager[HarborExecutableSession] | None = None
         self._session: HarborExecutableSession | None = None
+        self._sandbox_id: str | None = None
 
     def __enter__(self) -> EnvironmentSession:
-        """Open, ledger-record, and adapt one task-local Harbor session."""
-        context = self._runtime._factory.open(self._task, template_name=self._runtime.template_name)
-        self._context = context
-        try:
-            session = context.__enter__()
-        except Exception:
-            self._context = None
-            raise
-        if not session.sandbox_id or not session.template_id:
-            try:
-                context.__exit__(None, None, None)
-            finally:
-                self._context = None
-            raise ValueError(
-                "Harbor executable sessions must expose nonempty sandbox and template IDs"
-            )
+        """Open, identity-record, validate, and adapt one task-local Harbor session."""
+        session = self._runtime._factory.open(
+            self._task,
+            template_name=self._runtime.template_name,
+        )
+        sandbox_id = _validate_sandbox_id(session.sandbox_id)
         self._session = session
-        self._runtime._ledger.record_created(
-            sandbox_id=session.sandbox_id,
-            template_id=session.template_id,
-        )
-        return _HarborEnvironmentSession(
-            session,
-            command_timeout_seconds=self._runtime._command_timeout_seconds,
-            retry_delays_seconds=self._runtime._retry_delays_seconds,
-            maximum_observation_characters=self._runtime._maximum_observation_characters,
-            workspace_root=self._runtime._workspace_root,
-        )
+        self._sandbox_id = sandbox_id
+        self._runtime._ledger.record_created(sandbox_id=sandbox_id)
+        try:
+            template_id = session.template_id
+            if not isinstance(template_id, str) or not template_id.strip():
+                raise ValueError("Harbor executable sessions must expose a nonempty template ID")
+            return _HarborEnvironmentSession(
+                session,
+                command_timeout_seconds=self._runtime._command_timeout_seconds,
+                retry_delays_seconds=self._runtime._retry_delays_seconds,
+                maximum_observation_characters=self._runtime._maximum_observation_characters,
+                workspace_root=self._runtime._workspace_root,
+            )
+        except BaseException as entry_error:
+            try:
+                self._finish_cleanup(type(entry_error), entry_error, entry_error.__traceback__)
+            except BaseException as cleanup_error:
+                raise cleanup_error from entry_error
+            raise
 
     def __exit__(
         self,
@@ -236,21 +267,56 @@ class _HarborSessionContext(AbstractContextManager[EnvironmentSession]):
         exception: BaseException | None,
         traceback: TracebackType | None,
     ) -> bool:
-        """Release a ledger entry only when the injected session cleanup actually returns."""
-        context = self._context
+        """Release a ledger entry only from the adapter's bounded exact cleanup result."""
+        return self._finish_cleanup(exception_type, exception, traceback)
+
+    def _finish_cleanup(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        """Consume one bounded cleanup result and release only the immutable captured ID."""
+        del exception_type, exception, traceback
         session = self._session
-        if context is None or session is None:
+        sandbox_id = self._sandbox_id
+        if session is None or sandbox_id is None:
             return False
         try:
-            suppressed = context.__exit__(exception_type, exception, traceback)
-        except Exception:
-            raise
-        if not session.cleanup_verified():
-            raise HarborCleanupUnprovenError(
-                "Harbor cleanup returned without proof that the sandbox was released"
+            result = session.close(
+                sandbox_id=sandbox_id,
+                timeout_seconds=self._runtime._cleanup_timeout_seconds,
             )
-        self._runtime._ledger.record_released(session.sandbox_id)
-        return bool(suppressed)
+        finally:
+            self._session = None
+            self._sandbox_id = None
+        if not isinstance(result, HarborCleanupResult):
+            raise TypeError("Harbor close must return HarborCleanupResult")
+        if result.sandbox_id != sandbox_id:
+            raise HarborCleanupUnprovenError(
+                "Harbor cleanup result did not match the captured sandbox ID"
+            )
+        if result.released and result.timed_out:
+            raise HarborCleanupUnprovenError(
+                "Harbor cleanup result cannot be both released and timed out"
+            )
+        if result.timed_out:
+            raise HarborCleanupTimeoutError(f"Harbor cleanup timed out for sandbox {sandbox_id!r}")
+        if not result.released:
+            detail = f": {result.failure}" if result.failure else ""
+            raise HarborCleanupUnprovenError(
+                f"Harbor cleanup returned without proof that sandbox {sandbox_id!r} was released"
+                f"{detail}"
+            )
+        self._runtime._ledger.record_released(sandbox_id)
+        return False
+
+
+def _validate_sandbox_id(value: object) -> str:
+    """Return one exact remote ID after syntax-only validation without normalization."""
+    if not isinstance(value, str) or _SANDBOX_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError("Harbor executable sessions must expose a valid nonempty sandbox ID")
+    return value
 
 
 class _HarborEnvironmentSession:

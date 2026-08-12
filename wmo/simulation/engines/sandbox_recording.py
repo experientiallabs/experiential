@@ -33,6 +33,7 @@ from wmo.common.tasks import TaskCase
 from wmo.runtime.agents import AgentEpisode, AgentRuntime
 from wmo.runtime.agents.lifecycle import execute_agent_episode
 from wmo.runtime.environments import EnvironmentRuntime, EnvironmentSession, Observation
+from wmo.runtime.environments.harbor import HarborCleanupTimeoutError
 
 
 class SandboxStepLimitError(RuntimeError):
@@ -462,7 +463,7 @@ class _RecordingEnvironmentContext(AbstractContextManager[EnvironmentSession]):
         try:
             suppressed = self._context.__exit__(exception_type, exception, traceback)
             self._owner._deadline.remaining()
-        except SandboxTimeLimitError as exc:
+        except (HarborCleanupTimeoutError, SandboxTimeLimitError) as exc:
             self._owner.limit_stop_reason = StopReason.MAXIMUM_TIME
             self._owner.limit_failure = StructuredFailure(
                 code=FailureCode.TIMEOUT,

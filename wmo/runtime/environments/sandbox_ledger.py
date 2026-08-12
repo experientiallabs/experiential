@@ -1,4 +1,4 @@
-"""A durable record of the E2B sandboxes this machine created, so they stay reapable by id.
+"""A durable record of remote sandboxes created through the executable environment seam.
 
 E2B caps concurrent sandboxes per account. Every wmo harbor trial creates one sandbox with a
 long timeout (hours), so a run that dies without graceful shutdown (crash, SIGKILL, budget
@@ -7,16 +7,15 @@ sweep then starves at the cap and every trial fails at sandbox creation with
 `RateLimitException: 429 ... maximum number of concurrent E2B sandboxes`, which in a distill
 run looks exactly like a model producing zero token spans.
 
-This ledger makes those orphans reapable BY EXACT ID: each create appends one line to a
-per-owning-process JSONL file under the user-global WMO state dir (`$WMO_HOME` or `~/.wmo`),
-and each proven cleanup appends a matching release line. Writes are append + fsync, so a hard
-kill still leaves the record on disk; a file whose every recorded id is released is deleted.
-Killing exactly the ids a dead process recorded is defensible, whereas pattern-matching the
-account is not, which is why `wmo e2b reap` treats this file as its primary evidence.
+This ledger makes those orphans identifiable by exact ID. Each create appends one line to a
+per-owning-process JSONL file under an explicit caller-owned state directory, and each proven
+cleanup appends a matching release line. Writes are append plus fsync, so a hard kill still leaves
+the record on disk. No global configuration or implicit home directory participates in this
+runtime boundary.
 
 Ledger bookkeeping is best-effort by design: a write failure logs a warning and never fails
-the trial that owns the sandbox. Nothing here imports the e2b SDK, so reading the ledger needs
-neither the optional extra nor credentials.
+the trial that owns the sandbox. Nothing here imports a sandbox SDK, so reading the ledger needs
+neither an adapter package nor credentials.
 """
 
 from __future__ import annotations
@@ -32,32 +31,34 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-from wmo.common.config.paths import wmo_home
-
 logger = logging.getLogger(__name__)
 
 LEDGER_DIRNAME = "e2b-sandboxes"
-"""Subdirectory of the WMO user state dir holding one JSONL file per owning process."""
-
-HARBOR_ENV_SESSION_SUFFIX = "__env"
-"""Harbor tags a trial's environment sandbox with `session_id = "<trial name>__env"`."""
+"""Ledger child directory below the explicit state root supplied by the caller."""
 
 
-def harbor_trial_name(session_id: str) -> str | None:
-    """The harbor trial name behind an environment session id, or None when it is not one."""
-    if not session_id.endswith(HARBOR_ENV_SESSION_SUFFIX):
-        return None
-    trial = session_id[: -len(HARBOR_ENV_SESSION_SUFFIX)]
-    return trial or None
+def ledger_dir(state_directory: Path) -> Path:
+    """Return the sandbox ledger directory below an explicit WMO state directory.
 
+    Args:
+        state_directory: Caller-owned state root. No environment variable or home-directory
+            fallback is consulted.
 
-def ledger_dir() -> Path:
-    """The ledger directory (`$WMO_HOME/e2b-sandboxes`, else `~/.wmo/e2b-sandboxes`)."""
-    return wmo_home() / LEDGER_DIRNAME
+    Returns:
+        The dedicated directory containing append-only sandbox ledger files.
+    """
+    return Path(state_directory) / LEDGER_DIRNAME
 
 
 def pid_is_alive(pid: int) -> bool:
-    """Whether the process that owns a ledger file still exists on this machine."""
+    """Return whether the process that owns a ledger file still exists.
+
+    Args:
+        pid: Process ID recorded as the ledger owner.
+
+    Returns:
+        True when the process exists or cannot be probed due to permissions.
+    """
     if pid <= 0:
         return False
     try:
@@ -76,7 +77,7 @@ class SandboxCreated(BaseModel):
 
     event: Literal["created"] = "created"
     sandbox_id: str
-    template_id: str
+    template_id: str | None = None
     """The template identity the sandbox was created from: for harbor trials that is the
     resource-qualified alias, which E2B accepts wherever it accepts a template id."""
 
@@ -122,20 +123,20 @@ class LedgerFile(BaseModel):
         return not self.held and bool(self.released_ids)
 
 
-def read_ledger_files(directory: Path | None = None) -> tuple[LedgerFile, ...]:
-    """Read every ledger file in `directory`, sorted by path.
+def read_ledger_files(state_directory: Path) -> tuple[LedgerFile, ...]:
+    """Read every ledger file below ``state_directory``, sorted by path.
 
     Unparseable lines are skipped: a hard kill can tear the last line of an append, and one
     torn record must not hide the intact records above it.
 
     Args:
-        directory: The ledger directory; defaults to the user-global one.
+        state_directory: Explicit caller-owned WMO state directory.
 
     Returns:
         One `LedgerFile` per readable `*.jsonl` file (an unreadable file is skipped with a
         warning, since a reap must still consider the rest).
     """
-    root = directory if directory is not None else ledger_dir()
+    root = ledger_dir(state_directory)
     if not root.is_dir():
         return ()
     files: list[LedgerFile] = []
@@ -191,6 +192,12 @@ def append_release(path: Path, *, sandbox_id: str, pid: int, released_at: dateti
     Records are single short lines appended to a file opened `O_APPEND`, so a reaper writing
     into another process's ledger cannot interleave with that process's own appends.
 
+    Args:
+        path: Existing owning-process ledger file.
+        sandbox_id: Exact remote resource ID whose cleanup was proved.
+        pid: Process ID that observed the cleanup proof.
+        released_at: Time at which cleanup was proved.
+
     Raises:
         OSError: If the record cannot be written; the caller decides whether that is fatal
             (`SandboxLedger` treats its own write failures as warnings).
@@ -199,7 +206,7 @@ def append_release(path: Path, *, sandbox_id: str, pid: int, released_at: dateti
 
 
 def prune_released_files(
-    directory: Path | None = None,
+    state_directory: Path,
     *,
     owner_alive: Callable[[int], bool] = pid_is_alive,
 ) -> tuple[Path, ...]:
@@ -210,14 +217,14 @@ def prune_released_files(
     record of a live sandbox.
 
     Args:
-        directory: The ledger directory; defaults to the user-global one.
+        state_directory: Explicit caller-owned WMO state directory.
         owner_alive: Liveness probe for a file's owning pid (injected in tests).
 
     Returns:
         The paths that were deleted.
     """
     removed: list[Path] = []
-    for ledger in read_ledger_files(directory):
+    for ledger in read_ledger_files(state_directory):
         if not ledger.fully_released or owner_alive(ledger.owner_pid):
             continue
         try:
@@ -240,13 +247,20 @@ class SandboxLedger:
 
     def __init__(
         self,
-        directory: Path | None = None,
+        state_directory: Path,
         *,
         pid: int | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
-        """Record into `directory` (default: the user-global ledger dir) as `pid`."""
-        self._directory = directory if directory is not None else ledger_dir()
+        """Record below an explicit state directory as one owning process.
+
+        Args:
+            state_directory: Caller-owned state root. The ledger uses its dedicated child
+                directory and never consults global configuration.
+            pid: Owning process ID, injectable for deterministic tests.
+            now: Clock used for record timestamps and the ledger filename.
+        """
+        self._directory = ledger_dir(state_directory)
         self._pid = pid if pid is not None else os.getpid()
         self._now = now
         self._lock = Lock()
@@ -254,7 +268,11 @@ class SandboxLedger:
 
     @property
     def path(self) -> Path:
-        """This process's ledger file (the name is fixed on first access)."""
+        """Return this process's ledger file, fixing its name on first access.
+
+        Returns:
+            The lazily named append-only JSONL path.
+        """
         with self._lock:
             if self._path is None:
                 stamp = self._now().strftime("%Y%m%dT%H%M%SZ")
@@ -265,10 +283,18 @@ class SandboxLedger:
         self,
         *,
         sandbox_id: str,
-        template_id: str,
+        template_id: str | None = None,
         trial_name: str | None = None,
     ) -> None:
-        """Record a sandbox that E2B just created, flushing it to disk before returning."""
+        """Record a newly created sandbox and flush it before returning.
+
+        Args:
+            sandbox_id: Exact resource ID returned by the remote backend.
+            template_id: Exact template identity when it was safe to read before recording. A
+                remote adapter may leave this absent so resource identity is durable before
+                secondary metadata validation.
+            trial_name: Optional external trial name for operator correlation.
+        """
         self._append(
             SandboxCreated(
                 sandbox_id=sandbox_id,
@@ -280,7 +306,11 @@ class SandboxLedger:
         )
 
     def record_released(self, sandbox_id: str) -> None:
-        """Record a sandbox whose kill this process proved, so no reaper considers it."""
+        """Record a sandbox whose exact cleanup this process proved.
+
+        Args:
+            sandbox_id: Exact resource ID positively confirmed as released.
+        """
         self._append(SandboxReleased(sandbox_id=sandbox_id, released_at=self._now(), pid=self._pid))
 
     def _append(self, record: SandboxCreated | SandboxReleased) -> None:
@@ -327,16 +357,3 @@ def _ensure_directory(directory: Path) -> None:
     for level in reversed(missing):
         with contextlib.suppress(FileExistsError):
             level.mkdir(mode=0o700)
-
-
-_DEFAULT_LEDGER: SandboxLedger | None = None
-_DEFAULT_GUARD = Lock()
-
-
-def default_ledger() -> SandboxLedger:
-    """The process-wide ledger every wmo-created E2B sandbox is recorded in."""
-    global _DEFAULT_LEDGER
-    with _DEFAULT_GUARD:
-        if _DEFAULT_LEDGER is None:
-            _DEFAULT_LEDGER = SandboxLedger()
-        return _DEFAULT_LEDGER

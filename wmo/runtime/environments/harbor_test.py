@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import gc
+import multiprocessing
 import os
 import subprocess
+import threading
+import weakref
 from collections.abc import Mapping
-from contextlib import AbstractContextManager
 from pathlib import Path
-from types import TracebackType
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 import pytest
 
 from wmo.common.models import ToolCall
 from wmo.common.tasks import TaskCase
 from wmo.runtime.environments.harbor import (
+    BOUNDED_CLEANUP_CONTRACT,
+    HarborCleanupResult,
+    HarborCleanupTimeoutError,
     HarborCleanupUnprovenError,
     HarborCommandResult,
     HarborEnvironmentRuntime,
@@ -26,7 +31,7 @@ from wmo.runtime.environments.harbor import (
     resolve_e2b_template_resources,
     retry_template_status,
 )
-from wmo.runtime.harness.e2b_ledger import SandboxLedger, read_ledger_files
+from wmo.runtime.environments.sandbox_ledger import read_ledger_files
 
 
 class _TranscriptEnvironmentSession(Protocol):
@@ -40,13 +45,12 @@ class _TranscriptEnvironmentSession(Protocol):
 
 def test_harbor_runtime_preserves_partial_transcript_and_proven_cleanup(tmp_path: Path) -> None:
     """The environment seam records create, tools, and release without benchmark ownership."""
-    ledger = SandboxLedger(tmp_path / "ledger", pid=827)
     session = _Session()
     runtime = HarborEnvironmentRuntime(
         _Factory(session),
         environment_id="customer-env",
         template_name="wmo-hb-v1-fixture",
-        ledger=ledger,
+        state_directory=tmp_path / "state",
         retry_delays_seconds=(),
     )
 
@@ -59,8 +63,9 @@ def test_harbor_runtime_preserves_partial_transcript_and_proven_cleanup(tmp_path
         partial = cast(_TranscriptEnvironmentSession, environment).partial_transcript
         assert partial[0].action.name == "read_file"
         assert partial[0].observation == observation
+        session.sandbox_id = "mutated-after-create"
 
-    ledgers = read_ledger_files(tmp_path / "ledger")
+    ledgers = read_ledger_files(tmp_path / "state")
     assert len(ledgers) == 1
     assert ledgers[0].held == ()
     assert ledgers[0].released_ids == ("sandbox-1",)
@@ -75,13 +80,12 @@ def test_harbor_runtime_preserves_partial_transcript_and_proven_cleanup(tmp_path
 
 def test_harbor_runtime_retries_only_read_only_transport_failures(tmp_path: Path) -> None:
     """A read can retry, while a mutation makes one exact environment call only."""
-    ledger = SandboxLedger(tmp_path / "ledger", pid=828)
     session = _Session(fail_read_once=True)
     runtime = HarborEnvironmentRuntime(
         _Factory(session),
         environment_id="customer-env",
         template_name="wmo-hb-v1-fixture",
-        ledger=ledger,
+        state_directory=tmp_path / "state",
         retry_delays_seconds=(0.0,),
     )
 
@@ -109,45 +113,164 @@ def test_harbor_runtime_retries_only_read_only_transport_failures(tmp_path: Path
     assert "WMO_FILE_PATH" in (session.commands[2][1] or {})
 
 
-def test_harbor_runtime_does_not_mark_unproven_cleanup_released(tmp_path: Path) -> None:
-    """A factory cleanup error leaves the durable ledger holding the sandbox for a reaper."""
-    ledger = SandboxLedger(tmp_path / "ledger", pid=829)
-    session = _Session()
-    runtime = HarborEnvironmentRuntime(
-        _Factory(session, fail_close=True),
-        environment_id="customer-env",
-        template_name="wmo-hb-v1-fixture",
-        ledger=ledger,
-    )
-
-    with pytest.raises(OSError, match="cleanup"):
-        with runtime.open(_task()):
-            pass
-
-    ledgers = read_ledger_files(tmp_path / "ledger")
-    assert len(ledgers) == 1
-    assert tuple(record.sandbox_id for record in ledgers[0].held) == ("sandbox-1",)
-
-
 def test_harbor_runtime_rejects_false_cleanup_proof_and_keeps_ledger_hold(
     tmp_path: Path,
 ) -> None:
     """A clean context return is insufficient when the backend reports cleanup as unverified."""
-    ledger = SandboxLedger(tmp_path / "ledger", pid=830)
     session = _Session(cleanup_proven=False)
     runtime = HarborEnvironmentRuntime(
         _Factory(session),
         environment_id="customer-env",
         template_name="wmo-hb-v1-fixture",
-        ledger=ledger,
+        state_directory=tmp_path / "state",
     )
 
     with pytest.raises(HarborCleanupUnprovenError, match="without proof"):
         with runtime.open(_task()):
             pass
 
-    ledgers = read_ledger_files(tmp_path / "ledger")
+    ledgers = read_ledger_files(tmp_path / "state")
     assert tuple(record.sandbox_id for record in ledgers[0].held) == ("sandbox-1",)
+
+
+def test_blank_template_and_false_proof_hold_the_exact_captured_id(tmp_path: Path) -> None:
+    """Bad secondary metadata cannot erase or replace the resource identity already returned."""
+    session = _MutatingTemplateSession(cleanup_proven=False)
+    runtime = HarborEnvironmentRuntime(
+        _Factory(session),
+        environment_id="customer-env",
+        template_name="wmo-hb-v1-fixture",
+        state_directory=tmp_path / "state",
+    )
+
+    with pytest.raises(HarborCleanupUnprovenError, match="sandbox-1"):
+        runtime.open(_task()).__enter__()
+
+    [ledger] = read_ledger_files(tmp_path / "state")
+    assert tuple(record.sandbox_id for record in ledger.held) == ("sandbox-1",)
+    assert session.close_ids == ["sandbox-1"]
+    assert session.sandbox_id == "corrupt-after-capture"
+
+
+def test_blank_template_and_throwing_proof_keep_created_held(tmp_path: Path) -> None:
+    """A proof exception is failure evidence, never permission to release the captured ID."""
+    session = _Session(template_id="", cleanup_error=RuntimeError("proof unavailable"))
+    runtime = HarborEnvironmentRuntime(
+        _Factory(session),
+        environment_id="customer-env",
+        template_name="wmo-hb-v1-fixture",
+        state_directory=tmp_path / "state",
+    )
+
+    with pytest.raises(RuntimeError, match="proof unavailable"):
+        runtime.open(_task()).__enter__()
+
+    [ledger] = read_ledger_files(tmp_path / "state")
+    assert tuple(record.sandbox_id for record in ledger.held) == ("sandbox-1",)
+
+
+def test_template_validation_failure_releases_only_after_true_exact_proof(tmp_path: Path) -> None:
+    """Invalid metadata still permits a proven exact cleanup to close its durable hold."""
+    session = _Session(template_id="", cleanup_proven=True)
+    runtime = HarborEnvironmentRuntime(
+        _Factory(session),
+        environment_id="customer-env",
+        template_name="wmo-hb-v1-fixture",
+        state_directory=tmp_path / "state",
+    )
+
+    with pytest.raises(ValueError, match="template ID"):
+        runtime.open(_task()).__enter__()
+
+    [ledger] = read_ledger_files(tmp_path / "state")
+    assert ledger.held == ()
+    assert ledger.released_ids == ("sandbox-1",)
+
+
+def test_bounded_close_exception_keeps_created_held(tmp_path: Path) -> None:
+    """Adapter cleanup failure remains visible and cannot synthesize a release record."""
+    session = _Session(cleanup_error=OSError("cleanup not proved"))
+    runtime = HarborEnvironmentRuntime(
+        _Factory(session),
+        environment_id="customer-env",
+        template_name="wmo-hb-v1-fixture",
+        state_directory=tmp_path / "state",
+    )
+
+    with pytest.raises(OSError, match="cleanup not proved"):
+        with runtime.open(_task()):
+            pass
+
+    [ledger] = read_ledger_files(tmp_path / "state")
+    assert tuple(record.sandbox_id for record in ledger.held) == ("sandbox-1",)
+    assert ledger.released_ids == ()
+
+
+def test_bounded_close_timeout_keeps_created_without_a_wmo_worker(tmp_path: Path) -> None:
+    """Adapter-reported timeout returns with the resource held and no WMO cleanup worker."""
+    session = _Session(cleanup_timed_out=True)
+    runtime = HarborEnvironmentRuntime(
+        _Factory(session),
+        environment_id="customer-env",
+        template_name="wmo-hb-v1-fixture",
+        state_directory=tmp_path / "state",
+        cleanup_timeout_seconds=0.01,
+    )
+
+    before = _wmo_cleanup_workers()
+    with pytest.raises(HarborCleanupTimeoutError, match="timed out"):
+        with runtime.open(_task()):
+            pass
+
+    [ledger] = read_ledger_files(tmp_path / "state")
+    assert tuple(record.sandbox_id for record in ledger.held) == ("sandbox-1",)
+    assert session.close_ids == ["sandbox-1"]
+    assert _wmo_cleanup_workers() == before
+
+
+def test_twenty_cleanup_timeouts_leave_no_workers_or_session_references(tmp_path: Path) -> None:
+    """Repeated bounded timeouts retain exact IDs without accumulating local cleanup state."""
+    factory = _TimeoutFactory()
+    runtime = HarborEnvironmentRuntime(
+        factory,
+        environment_id="customer-env",
+        template_name="wmo-hb-v1-fixture",
+        state_directory=tmp_path / "state",
+        cleanup_timeout_seconds=0.01,
+    )
+    before = _wmo_cleanup_workers()
+    assert before == ((), ())
+
+    for _ in range(20):
+        with pytest.raises(HarborCleanupTimeoutError):
+            with runtime.open(_task()):
+                pass
+
+    gc.collect()
+    [ledger] = read_ledger_files(tmp_path / "state")
+    assert tuple(record.sandbox_id for record in ledger.held) == tuple(
+        f"sandbox-timeout-{index}" for index in range(20)
+    )
+    assert all(reference() is None for reference in factory.session_references)
+    assert _wmo_cleanup_workers() == before
+
+
+def test_unbounded_context_factory_is_rejected_before_permanent_hang(tmp_path: Path) -> None:
+    """WMO never invokes an arbitrary generic context whose exit can hang permanently."""
+    factory = _PermanentHangFactory()
+    before = _wmo_cleanup_workers()
+    assert before == ((), ())
+
+    with pytest.raises(ValueError, match="bounded-close-v1"):
+        HarborEnvironmentRuntime(
+            factory,  # ty: ignore[invalid-argument-type]
+            environment_id="customer-env",
+            template_name="wmo-hb-v1-fixture",
+            state_directory=tmp_path / "state",
+        )
+
+    assert factory.open_calls == 0
+    assert _wmo_cleanup_workers() == before
 
 
 def test_harbor_file_tools_reject_lexical_and_symlink_path_escapes(tmp_path: Path) -> None:
@@ -163,7 +286,7 @@ def test_harbor_file_tools_reject_lexical_and_symlink_path_escapes(tmp_path: Pat
         _Factory(session),
         environment_id="customer-env",
         template_name="wmo-hb-v1-fixture",
-        ledger=SandboxLedger(tmp_path / "ledger", pid=831),
+        state_directory=tmp_path / "state",
         retry_delays_seconds=(),
         workspace_root=str(workspace),
     )
@@ -248,65 +371,96 @@ def test_template_status_retry_retries_only_the_idempotent_read() -> None:
 class _Factory:
     """Opens one in-memory optional Harbor session for deterministic adapter tests."""
 
-    def __init__(
-        self,
-        session: _Session | _ShellSession,
-        *,
-        fail_close: bool = False,
-    ) -> None:
+    cleanup_contract: Literal["bounded-close-v1"] = BOUNDED_CLEANUP_CONTRACT
+
+    def __init__(self, session: _Session | _ShellSession) -> None:
         self._session = session
-        self._fail_close = fail_close
 
     def open(
         self,
         task: TaskCase,
         *,
         template_name: str,
-    ) -> AbstractContextManager[_Session | _ShellSession]:
+    ) -> _Session | _ShellSession:
         assert task == _task()
         assert template_name == "wmo-hb-v1-fixture"
-        return _Context(self._session, fail_close=self._fail_close)
-
-
-class _Context(AbstractContextManager["_Session | _ShellSession"]):
-    """Makes successful and failed cleanup explicit in adapter lifecycle fixtures."""
-
-    def __init__(self, session: _Session | _ShellSession, *, fail_close: bool) -> None:
-        self._session = session
-        self._fail_close = fail_close
-
-    def __enter__(self) -> _Session | _ShellSession:
         return self._session
 
-    def __exit__(
+
+class _TimeoutFactory:
+    """Create one new deterministically timing-out bounded session per open call."""
+
+    cleanup_contract: Literal["bounded-close-v1"] = BOUNDED_CLEANUP_CONTRACT
+
+    def __init__(self) -> None:
+        self.session_references: list[weakref.ReferenceType[_Session]] = []
+
+    def open(
         self,
-        exception_type: type[BaseException] | None,
-        exception: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> bool:
-        del exception_type, exception, traceback
-        self._session.closed = True
-        if self._fail_close:
-            raise OSError("cleanup not proved")
+        task: TaskCase,
+        *,
+        template_name: str,
+    ) -> _Session:
+        assert task == _task()
+        assert template_name == "wmo-hb-v1-fixture"
+        session = _Session(
+            sandbox_id=f"sandbox-timeout-{len(self.session_references)}",
+            cleanup_timed_out=True,
+        )
+        self.session_references.append(weakref.ref(session))
+        return session
+
+
+class _PermanentHangFactory:
+    """Legacy generic-context shape that WMO must reject without invoking."""
+
+    def __init__(self) -> None:
+        self.open_calls = 0
+
+    def open(self, task: TaskCase, *, template_name: str) -> object:
+        del task, template_name
+        self.open_calls += 1
+        return _PermanentHangContext()
+
+
+class _PermanentHangContext:
+    """Adversarial old context whose exit would never return if WMO invoked it."""
+
+    def __enter__(self) -> _Session:
+        return _Session()
+
+    def __exit__(self, *_args: object) -> bool:
+        threading.Event().wait()
         return False
 
 
 class _Session:
     """A scriptable session that conforms to the narrow optional Harbor protocol."""
 
-    sandbox_id = "sandbox-1"
-    template_id = "wmo-hb-v1-fixture"
-
     def __init__(
         self,
         *,
         fail_read_once: bool = False,
         cleanup_proven: bool = True,
+        cleanup_timed_out: bool = False,
+        cleanup_error: BaseException | None = None,
+        sandbox_id: str = "sandbox-1",
+        template_id: str = "wmo-hb-v1-fixture",
     ) -> None:
         self._fail_read_once = fail_read_once
         self._cleanup_proven = cleanup_proven
+        self._cleanup_timed_out = cleanup_timed_out
+        self._cleanup_error = cleanup_error
+        self._template_id = template_id
+        self.sandbox_id = sandbox_id
         self.commands: list[tuple[str, Mapping[str, str] | None, int]] = []
+        self.close_ids: list[str] = []
         self.closed = False
+
+    @property
+    def template_id(self) -> str:
+        """Return scripted template metadata."""
+        return self._template_id
 
     def execute_command(
         self,
@@ -321,9 +475,28 @@ class _Session:
             raise HarborRetryableCommandError("temporary transport failure")
         return HarborCommandResult(stdout="fixture output", exit_code=0)
 
-    def cleanup_verified(self) -> bool:
-        """Report the scripted cleanup proof only after the context has closed."""
-        return self.closed and self._cleanup_proven
+    def close(self, *, sandbox_id: str, timeout_seconds: float) -> HarborCleanupResult:
+        """Return deterministic adapter-owned cleanup evidence within the supplied bound."""
+        assert timeout_seconds > 0
+        self.close_ids.append(sandbox_id)
+        if self._cleanup_error is not None:
+            raise self._cleanup_error
+        self.closed = not self._cleanup_timed_out
+        return HarborCleanupResult(
+            sandbox_id=sandbox_id,
+            released=self._cleanup_proven and not self._cleanup_timed_out,
+            timed_out=self._cleanup_timed_out,
+        )
+
+
+class _MutatingTemplateSession(_Session):
+    """Simulate hostile metadata access attempting to replace the returned sandbox identity."""
+
+    @property
+    def template_id(self) -> str:
+        """Mutate the live object after capture, then return invalid metadata."""
+        self.sandbox_id = "corrupt-after-capture"
+        return ""
 
 
 class _ShellSession:
@@ -359,9 +532,27 @@ class _ShellSession:
             exit_code=result.returncode,
         )
 
-    def cleanup_verified(self) -> bool:
-        """Return true once the deterministic local context has exited."""
-        return self.closed
+    def close(self, *, sandbox_id: str, timeout_seconds: float) -> HarborCleanupResult:
+        """Return exact bounded cleanup proof for the deterministic local session."""
+        assert timeout_seconds > 0
+        assert sandbox_id == "sandbox-shell"
+        self.closed = True
+        return HarborCleanupResult(sandbox_id=sandbox_id, released=True)
+
+
+def _wmo_cleanup_workers() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return WMO-owned cleanup threads and child processes visible to this test process."""
+    threads = tuple(
+        sorted(thread.name for thread in threading.enumerate() if "wmo-harbor" in thread.name)
+    )
+    processes = tuple(
+        sorted(
+            process.name
+            for process in multiprocessing.active_children()
+            if "wmo-harbor" in process.name
+        )
+    )
+    return threads, processes
 
 
 def _task() -> TaskCase:

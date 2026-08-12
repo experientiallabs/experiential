@@ -39,12 +39,12 @@ uv run pytest -q
   remove an entry and retain its tombstone; reintroduction is rejected.
 - There is no 800-line warning and no numeric modules-per-directory gate.
 
-Current migration state: the checkout still contains current-main legacy surfaces and 31 active
-oversized-file inventory entries owned by the deletion and domain workstreams. The transition
-inventories name those paths and commands so they cannot grow while their owners remove or split
-them. An active oversized file changed after the frozen W1 baseline must reach 999 lines or fewer
-and be tombstoned in that same pull request. The active size inventory is temporary migration
-state, not a permanent exemption, and must be empty by the final release audit.
+Current migration state: one active oversized-file inventory entry remains under the W3D-owned
+legacy provider package. The transition inventories name paths and commands so they cannot grow
+while their owners remove or split them. An active oversized file changed after the frozen W1
+baseline must reach 999 lines or fewer and be tombstoned in that same pull request. The active size
+inventory is temporary migration state, not a permanent exemption, and must be empty by the final
+release audit.
 
 ## Evidence, simulation, and routing lifecycle
 
@@ -73,24 +73,38 @@ state, not a permanent exemption, and must be empty by the final release audit.
 
 ## Worker-agent execution
 
-- Agent execution code lives under `wmo/runtime/`: agents, environments, harness documents and
-  execution, model clients, router runtime, and Harbor adapters. Runtime must not import
-  simulation or optimization algorithms.
-- Harness execution preserves the explicit local-execution consent boundary and file-tool jail.
-  E2B execution reuses warm sandboxes only within one score wave, isolates concurrent cells,
-  meters lifetime, retries uncertain transport in a fresh sandbox, and fails closed when cleanup
-  cannot be proved.
-- The root CLI is locked to `build`, `optimize`, `run`, and `config`. The optimize group is locked
-  to `router` and `model`; the config group is locked to `telemetry`. Do not restore removed root
-  commands, aliases, hosted-session flags, or separate fit and report commands.
+- Agent execution code lives under `wmo/runtime/`: whole-episode customer agents, executable
+  environments, model clients, and frozen router execution. Optimization may depend on runtime;
+  runtime code must not depend on simulation or optimization algorithms.
+- `wmo run` serves only a frozen local router policy. Simulation callers choose an `AgentRuntime`
+  and `EnvironmentRuntime` directly. There is no hosted-agent transport, run-control client,
+  benchmark evaluator, or harness-document execution surface in this repository.
+- Local Pi and process-environment adapters execute external code on the user's machine only when
+  a caller explicitly selects them. Preserve bounded processes, the explicit working directory,
+  and fail-closed support checks.
+- Customer agents implement the whole-episode `AgentRuntime` contract and receive only an injected
+  candidate model plus an execute-only `EnvironmentSession`. The built-in Pi adapter invokes an
+  installed external executable. WMO carries no Pi source.
+- Executable environments implement the lifecycle-owning `EnvironmentRuntime` contract. Local and
+  injected remote backends preserve exact resource identity, bounded execution, usage metering,
+  and fail-closed cleanup evidence. A remote adapter must declare and implement its own finite
+  close primitive before use; WMO does not place arbitrary cleanup in an unkillable thread. The
+  sandbox ledger releases an exact ID only after that bounded adapter positively proves cleanup.
 
 ## Optimization surfaces
 
+- Harness-search optimization, world-model delta search, Harbor benchmark scoring, and live agent
+  sessions moved to the private `agent-optimization` repo on 2026-08-03. Customer agent execution
+  lives only in `wmo/runtime/agents/`, executable environments live only in
+  `wmo/runtime/environments/`, and sandbox simulation lives only in
+  `wmo/simulation/engines/sandbox.py`. Do not grow harness documents, benchmark ownership, or
+  mutation machinery back into this repository.
 - `wmo/optimize/router/` owns provider-free offline fit, policy locking, held-out reporting, and
   their immutable artifacts. Online selection belongs to `wmo/runtime/router/`; customer workflow
   composition belongs to `wmo/workflow/router.py`. Keep those three boundaries explicit.
-- Harness-search and mutation machinery lives outside this repository. Do not grow it back into
-  `wmo/optimize/` or place runtime code under optimization.
+- The root CLI is locked to `build`, `optimize`, `run`, and `config`. The optimize group is locked
+  to `router` and `model`; the config group is locked to `telemetry`. Do not restore removed root
+  commands, aliases, hosted-session flags, or separate fit and report commands.
 - `wmo optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
   It never builds a dataset, creates teacher rollouts, changes routing roles, or launches a
   simulator. The config freezes the W12 manifest, native Tinker base-model snapshot, capability
