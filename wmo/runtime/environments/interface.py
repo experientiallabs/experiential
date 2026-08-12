@@ -20,6 +20,10 @@ class Observation(ContractModel):
     metadata: JsonObject = Field(default_factory=dict)
 
 
+class EnvironmentResetError(RuntimeError):
+    """An environment could not reset a clean session for one episode."""
+
+
 @runtime_checkable
 class EnvironmentSession(Protocol):
     """Executes actions inside one environment already opened by a simulator."""

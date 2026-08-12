@@ -13,6 +13,11 @@ from wmo.common.rollouts import RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.environments import EnvironmentSession
 
+# Mandatory W3 restack after c44569df is available in this worktree:
+# replace the temporary object annotations in AgentRuntime.run, lifecycle.py, and pi.py with
+# wmo.common.models.ModelClient. Update every temporary model fixture in interface_test.py,
+# lifecycle_test.py, and pi_test.py with a conforming fake. Do not define a local protocol.
+
 
 class AgentEpisode(ContractModel):
     """In-memory events and terminal state emitted by one customer-agent run."""
@@ -46,7 +51,7 @@ class AgentRuntime(Protocol):
         self,
         task: TaskCase,
         *,
-        model: object,
+        model: object,  # W3 restack: use the canonical common ModelClient.
         environment: EnvironmentSession,
     ) -> AgentEpisode:
         """Run the agent's own loop with an injected model and execute-only environment.

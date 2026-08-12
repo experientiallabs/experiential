@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
+from stat import S_IXUSR
 
 import pytest
 
 from wmo.common.core.artifacts import JsonObject
-from wmo.common.models import ToolCall
+from wmo.common.models import AssistantAction, ToolCall
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.agents.pi import PiAgentRuntime, PiRuntimePreflightError, PiTranscriptError
@@ -32,11 +35,41 @@ def test_pi_runner_receives_injected_model_and_normalizes_transcript() -> None:
     assert episode.events[0].payload == {"source": "installed-pi"}
 
 
-def test_pi_preflight_names_the_external_install_and_injected_bridge() -> None:
+def test_default_pi_runtime_invokes_the_installed_json_executable_and_translates_events(
+    tmp_path: Path,
+) -> None:
+    runtime = PiAgentRuntime(executable=str(_write_pi_json_fixture(tmp_path)))
+
+    episode = runtime.run(_task(), model=_Model(), environment=_Environment())
+
+    assert episode.stop_reason == StopReason.COMPLETED
+    assert episode.final_action == AssistantAction(
+        content="Pi completed the task",
+        tool_calls=(ToolCall(call_id="pi-call", name="lookup", arguments={"id": "record-1"}),),
+    )
+    assert [(event.kind, event.tool_name) for event in episode.events] == [
+        (RolloutEventKind.MESSAGE, None),
+        (RolloutEventKind.TOOL_CALL, "lookup"),
+        (RolloutEventKind.OBSERVATION, "lookup"),
+    ]
+    assert episode.events[0].payload == {
+        "source": "installed-pi",
+        "event": "message_end",
+        "role": "assistant",
+        "content": "Pi completed the task",
+    }
+    assert episode.events[2].payload == {
+        "source": "installed-pi",
+        "event": "tool_execution_end",
+        "is_error": False,
+    }
+
+
+def test_pi_runtime_names_the_missing_external_install() -> None:
     runtime = PiAgentRuntime(executable="wmo-pi-not-installed")
 
     with pytest.raises(PiRuntimePreflightError, match="Install Pi outside WMO"):
-        runtime.preflight()
+        runtime.run(_task(), model=_Model(), environment=_Environment())
 
 
 def test_pi_rejects_an_invalid_bridge_transcript() -> None:
@@ -47,7 +80,7 @@ def test_pi_rejects_an_invalid_bridge_transcript() -> None:
 
 
 class _Model:
-    """A deterministic stand-in for W3's pending ModelClient contract."""
+    """A temporary stand-in that must conform to ModelClient during the W3 restack."""
 
 
 class _Environment:
@@ -105,3 +138,66 @@ def _task() -> TaskCase:
         workload_weight=1.0,
         source_trace_ids=("trace-1",),
     )
+
+
+def _write_pi_json_fixture(tmp_path: Path) -> Path:
+    """Write a local executable that mimics Pi's documented JSON event stream."""
+    executable = tmp_path / "pi-json-fixture"
+    executable.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+
+expected = [
+    "--mode",
+    "json",
+    "--no-session",
+    "--no-context-files",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--offline",
+    "--no-tools",
+    "Complete the deterministic Pi fixture.",
+]
+if sys.argv[1:] != expected:
+    raise SystemExit(17)
+events = [
+    {{"type": "session", "version": 3}},
+    {{"type": "agent_start"}},
+    {{
+        "type": "message_end",
+        "message": {{
+            "role": "assistant",
+            "timestamp": "2026-08-11T00:00:00+00:00",
+            "content": [
+                {{"type": "text", "text": "Pi completed the task"}},
+                {{
+                    "type": "toolCall",
+                    "id": "pi-call",
+                    "name": "lookup",
+                    "arguments": {{"id": "record-1"}},
+                }},
+            ],
+        }},
+    }},
+    {{
+        "type": "tool_execution_start",
+        "timestamp": "2026-08-11T00:00:01+00:00",
+        "toolName": "lookup",
+    }},
+    {{
+        "type": "tool_execution_end",
+        "timestamp": "2026-08-11T00:00:02+00:00",
+        "toolName": "lookup",
+        "isError": False,
+    }},
+    {{"type": "agent_end"}},
+]
+sys.stdout.write("\\n".join(json.dumps(event) for event in events) + "\\n")
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(executable.stat().st_mode | S_IXUSR)
+    return executable

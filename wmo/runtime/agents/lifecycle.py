@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -15,14 +18,22 @@ from wmo.common.models import ToolCall
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.agents.interface import AgentEpisode, AgentRuntime, preflight_agent_runtime
-from wmo.runtime.environments import EnvironmentRuntime, EnvironmentSession, Observation
+from wmo.runtime.environments import (
+    EnvironmentResetError,
+    EnvironmentRuntime,
+    EnvironmentSession,
+    Observation,
+)
+
+_ExecuteAction = Callable[[ToolCall], Observation]
+_execute_action: ContextVar[_ExecuteAction | None] = ContextVar("wmo_execute_action", default=None)
 
 
 def execute_agent_episode(
     agent: AgentRuntime,
     environment_runtime: EnvironmentRuntime,
     task: TaskCase,
-    model: object,
+    model: object,  # W3 restack: replace with the canonical ModelClient.
 ) -> AgentEpisode:
     """Run one agent while retaining reset, cleanup, and exception evidence.
 
@@ -40,15 +51,29 @@ def execute_agent_episode(
         A complete in-memory episode with ordered events and structured failure attribution.
     """
     preflight_agent_runtime(agent)
-    opened = False
+    try:
+        environment_context = environment_runtime.open(task)
+    except EnvironmentResetError as exc:
+        return _failed_episode("reset", FailureAttribution.RESET, exc)
+    except Exception as exc:  # noqa: BLE001 - environment allocation is episode evidence
+        return _failed_episode("environment open", FailureAttribution.ENVIRONMENT, exc)
+
+    entered = False
     episode: AgentEpisode | None = None
     try:
-        with environment_runtime.open(task) as environment:
-            opened = True
-            episode = _run_agent(agent, task, model, _ExecuteOnlySession(environment))
-    except Exception as exc:  # noqa: BLE001 - every lifecycle failure becomes episode evidence
-        if not opened:
+        with environment_context as environment:
+            entered = True
+            with _execute_only_session(environment) as execute_session:
+                episode = _run_agent(agent, task, model, execute_session)
+    except EnvironmentResetError as exc:
+        if not entered:
             return _failed_episode("reset", FailureAttribution.RESET, exc)
+        if episode is None:
+            return _failed_episode("agent", FailureAttribution.AGENT, exc)
+        return _append_cleanup_failure(episode, exc)
+    except Exception as exc:  # noqa: BLE001 - every lifecycle failure becomes episode evidence
+        if not entered:
+            return _failed_episode("environment open", FailureAttribution.ENVIRONMENT, exc)
         if episode is None:
             return _failed_episode("agent", FailureAttribution.AGENT, exc)
         return _append_cleanup_failure(episode, exc)
@@ -60,7 +85,7 @@ def execute_agent_episode(
 def _run_agent(
     agent: AgentRuntime,
     task: TaskCase,
-    model: object,
+    model: object,  # W3 restack: replace with the canonical ModelClient.
     environment: EnvironmentSession,
 ) -> AgentEpisode:
     """Call the customer adapter while preserving its exception as a typed episode failure."""
@@ -72,7 +97,13 @@ def _run_agent(
             )
         return episode
     except _ToolExecutionError as exc:
-        return _failed_episode("tool", FailureAttribution.TOOL, exc.cause)
+        timeout = isinstance(exc.cause, TimeoutError)
+        return _failed_episode(
+            "tool timeout" if timeout else "tool",
+            FailureAttribution.TOOL,
+            exc.cause,
+            FailureCode.TIMEOUT if timeout else FailureCode.INTERNAL,
+        )
     except TimeoutError as exc:
         return _failed_episode("agent timeout", FailureAttribution.AGENT, exc, FailureCode.TIMEOUT)
     except Exception as exc:  # noqa: BLE001 - customer adapter failures are episode evidence
@@ -143,18 +174,35 @@ def _lifecycle_span(
     )
 
 
+@contextmanager
+def _execute_only_session(environment: EnvironmentSession) -> Iterator[EnvironmentSession]:
+    """Scope one raw session to a capability that exposes only execute.
+
+    The capability itself retains no raw-session attribute. The lifecycle owns the context-local
+    executor for the duration of the customer call, so reset and close remain unavailable through
+    the object passed to the agent.
+    """
+    token = _execute_action.set(environment.execute)
+    try:
+        yield _ExecuteOnlySession()
+    finally:
+        _execute_action.reset(token)
+
+
 class _ExecuteOnlySession:
-    """Hide simulator lifecycle methods from the customer agent."""
+    """A capability object that exposes only the current episode's execute operation."""
 
-    __slots__ = ("_environment",)
-
-    def __init__(self, environment: EnvironmentSession) -> None:
-        self._environment = environment
+    __slots__ = ()
 
     def execute(self, action: ToolCall) -> Observation:
-        """Forward one action to the simulator-owned session."""
+        """Execute one action through the lifecycle-owned session capability."""
+        executor = _execute_action.get()
+        if executor is None:
+            raise RuntimeError(
+                "the execute-only environment session is unavailable outside its episode"
+            )
         try:
-            return self._environment.execute(action)
+            return executor(action)
         except Exception as exc:  # noqa: BLE001 - tool boundary failures become episode evidence
             raise _ToolExecutionError(exc) from exc
 

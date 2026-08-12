@@ -56,7 +56,7 @@ def test_preflight_rejects_positional_only_model_injection() -> None:
 
 
 class _ConformingAgent:
-    """Implements the temporary W3-seam shape used by W4 local tests."""
+    """Implements the temporary model seam pending the mandatory W3 fake-client restack."""
 
     def run(
         self,

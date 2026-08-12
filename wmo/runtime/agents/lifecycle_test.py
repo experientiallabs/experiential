@@ -14,7 +14,7 @@ from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.agents.interface import AgentAdapterPreflightError, AgentEpisode, AgentRuntime
 from wmo.runtime.agents.lifecycle import execute_agent_episode
-from wmo.runtime.environments import EnvironmentSession, Observation
+from wmo.runtime.environments import EnvironmentResetError, EnvironmentSession, Observation
 
 _EVENT_TIME = datetime(2026, 8, 11, tzinfo=UTC)
 
@@ -47,6 +47,25 @@ def test_executable_environment_is_execute_only_to_the_customer_agent() -> None:
     assert runtime.close_calls == 1
 
 
+def test_execute_only_capability_does_not_expose_the_raw_lifecycle_owner() -> None:
+    runtime = _EnvironmentRuntime(_TextSession())
+    agent = _AdversarialAgent()
+
+    episode = execute_agent_episode(agent, runtime, _task(), _Model())
+
+    assert episode.stop_reason == StopReason.COMPLETED
+    assert agent.environment is not None
+    for attribute in ("_environment", "__dict__", "_ExecuteOnlySession__environment"):
+        with pytest.raises(AttributeError):
+            getattr(agent.environment, attribute)
+    capability = agent.environment.execute.__self__
+    assert capability is agent.environment
+    for lifecycle_method in ("reset", "close"):
+        with pytest.raises(AttributeError):
+            getattr(capability, lifecycle_method)
+    assert runtime.close_calls == 1
+
+
 def test_timeout_failure_is_retained_and_cleanup_runs_once() -> None:
     runtime = _EnvironmentRuntime(_TextSession())
 
@@ -57,6 +76,20 @@ def test_timeout_failure_is_retained_and_cleanup_runs_once() -> None:
     assert episode.failure.code == FailureCode.TIMEOUT
     assert episode.failure.attribution == FailureAttribution.AGENT
     assert _lifecycle_phases(episode) == ["agent timeout"]
+    assert runtime.close_calls == 1
+
+
+def test_execute_timeout_retains_timeout_classification() -> None:
+    runtime = _EnvironmentRuntime(_TimeoutToolSession())
+
+    episode = execute_agent_episode(_ToolFailureAgent(), runtime, _task(), _Model())
+
+    assert episode.stop_reason == StopReason.FAILURE
+    assert episode.failure is not None
+    assert episode.failure.code == FailureCode.TIMEOUT
+    assert episode.failure.attribution == FailureAttribution.TOOL
+    assert episode.failure.exception_type == "TimeoutError"
+    assert _lifecycle_phases(episode) == ["tool timeout"]
     assert runtime.close_calls == 1
 
 
@@ -114,7 +147,7 @@ def test_invalid_adapter_result_is_retained_as_an_agent_failure() -> None:
 
 
 def test_reset_failure_becomes_a_structured_episode_failure() -> None:
-    runtime = _EnvironmentRuntime(_TextSession(), fail_on_enter=True)
+    runtime = _EnvironmentRuntime(_TextSession(), fail_on_reset=True)
 
     episode = execute_agent_episode(_SuccessfulAgent(), runtime, _task(), _Model())
 
@@ -123,6 +156,20 @@ def test_reset_failure_becomes_a_structured_episode_failure() -> None:
     assert episode.failure.attribution == FailureAttribution.RESET
     assert _lifecycle_phases(episode) == ["reset"]
     assert runtime.close_calls == 1
+
+
+def test_environment_open_failure_is_not_classified_as_reset() -> None:
+    runtime = _EnvironmentRuntime(_TextSession(), fail_on_open=True)
+
+    episode = execute_agent_episode(_SuccessfulAgent(), runtime, _task(), _Model())
+
+    assert episode.stop_reason == StopReason.FAILURE
+    assert episode.failure is not None
+    assert episode.failure.code == FailureCode.INTERNAL
+    assert episode.failure.attribution == FailureAttribution.ENVIRONMENT
+    assert episode.failure.exception_type == "OSError"
+    assert _lifecycle_phases(episode) == ["environment open"]
+    assert runtime.close_calls == 0
 
 
 def test_cleanup_failure_replaces_terminal_state_and_preserves_ordered_events() -> None:
@@ -171,7 +218,7 @@ def test_preflight_names_the_required_customer_adapter_change() -> None:
 
 
 class _Model:
-    """A deterministic stand-in for W3's future injected ModelClient."""
+    """A temporary stand-in that must conform to ModelClient during the W3 restack."""
 
 
 class _SuccessfulAgent:
@@ -199,6 +246,24 @@ class _SuccessfulAgent:
             final_action=AssistantAction(content="finished"),
             stop_reason=StopReason.COMPLETED,
         )
+
+
+class _AdversarialAgent:
+    """Retains the supplied capability and probes for hidden lifecycle ownership."""
+
+    def __init__(self) -> None:
+        self.environment: EnvironmentSession | None = None
+
+    def run(
+        self,
+        task: TaskCase,
+        *,
+        model: object,
+        environment: EnvironmentSession,
+    ) -> AgentEpisode:
+        self.environment = environment
+        environment.execute(ToolCall(call_id="call-1", name="run", arguments={}))
+        return AgentEpisode(stop_reason=StopReason.COMPLETED)
 
 
 class _TimeoutAgent:
@@ -310,24 +375,35 @@ class _FailingToolSession:
         raise OSError("tool process exited unexpectedly")
 
 
+class _TimeoutToolSession:
+    """A fake executable session whose requested tool reaches its own deadline."""
+
+    def execute(self, action: ToolCall) -> Observation:
+        raise TimeoutError("tool process exceeded its deadline")
+
+
 class _EnvironmentRuntime:
     """Creates one deterministic session and records simulator-owned cleanup."""
 
     def __init__(
         self,
-        session: _TextSession | _ExecutableSession | _FailingToolSession,
+        session: _TextSession | _ExecutableSession | _FailingToolSession | _TimeoutToolSession,
         *,
-        fail_on_enter: bool = False,
+        fail_on_open: bool = False,
+        fail_on_reset: bool = False,
         fail_on_exit: bool = False,
     ) -> None:
         self._session = session
-        self._fail_on_enter = fail_on_enter
+        self._fail_on_open = fail_on_open
+        self._fail_on_reset = fail_on_reset
         self._fail_on_exit = fail_on_exit
         self.open_calls = 0
         self.close_calls = 0
 
     def open(self, task: TaskCase) -> _EnvironmentContext:
         self.open_calls += 1
+        if self._fail_on_open:
+            raise OSError("environment transport allocation failed")
         return _EnvironmentContext(self)
 
 
@@ -337,10 +413,12 @@ class _EnvironmentContext:
     def __init__(self, runtime: _EnvironmentRuntime) -> None:
         self._runtime = runtime
 
-    def __enter__(self) -> _TextSession | _ExecutableSession | _FailingToolSession:
-        if self._runtime._fail_on_enter:
+    def __enter__(
+        self,
+    ) -> _TextSession | _ExecutableSession | _FailingToolSession | _TimeoutToolSession:
+        if self._runtime._fail_on_reset:
             self._runtime.close_calls += 1
-            raise RuntimeError("environment reset failed")
+            raise EnvironmentResetError("environment reset failed")
         return self._runtime._session
 
     def __exit__(
