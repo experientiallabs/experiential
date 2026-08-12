@@ -443,16 +443,12 @@ def _prepare_teacher_source(source: TeacherSFTSource) -> tuple[_PreparedSource, 
     """Normalize one teacher bundle and verify its immutable acceptance chain."""
     rollout_sha256 = sha256_json(source.rollout)
     evidence_sha256 = sha256_json(source.acceptance_evidence)
-    lineage_group_id = stable_id(
-        "sft-lineage",
-        {"kind": "teacher_rollout", "source_lineage": source.rollout.task_id},
-    )
     prepared = _PreparedSource(
         kind="teacher_rollout",
         source_id=source.rollout.rollout_id,
         source_sha256=rollout_sha256,
-        leakage_group_id=lineage_group_id,
-        task=source.task,
+        leakage_group_id=source.task.lineage_group_id,
+        task=source.task.instruction,
         transcript_events=source.transcript.events,
         example_source=RolloutExampleSource(
             rollout_id=source.rollout.rollout_id,
@@ -527,6 +523,10 @@ def _teacher_acceptance_error(source: TeacherSFTSource, rollout_sha256: Sha256) 
         return "teacher rollout has a recorded infrastructure span failure"
     if source.rollout.evidence_source not in {"world_model", "sandbox"}:
         return "teacher rollout must come from a world-model or sandbox simulation"
+    if source.rollout.task_id != source.task.task_id:
+        return "teacher rollout names a different canonical task"
+    if source.task.task_id not in source.task_set.task_ids:
+        return "teacher task is not a member of the supplied task set"
     if evidence.rollout_id != source.rollout.rollout_id:
         return "teacher acceptance evidence names a different rollout"
     if evidence.rollout_sha256 != rollout_sha256:
@@ -803,6 +803,7 @@ def _teacher_inputs(source: TeacherSFTSource) -> tuple[ArtifactInput, ...]:
             artifact_id=source.rollout.artifact_id,
             sha256=sha256_json(source.rollout),
         ),
+        _model_input(source.task_set.task_set_id, source.task_set),
         _model_input(source.acceptance_rule.acceptance_rule_id, source.acceptance_rule),
         _model_input(source.acceptance_evidence.acceptance_evidence_id, source.acceptance_evidence),
         _model_input(source.judgment.judgment_id, source.judgment),

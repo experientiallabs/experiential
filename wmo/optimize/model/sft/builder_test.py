@@ -15,7 +15,7 @@ from wmo.common.core.artifacts import (
     StructuredFailure,
     sha256_json,
 )
-from wmo.common.evaluations import FidelityReport
+from wmo.common.evaluations import FidelityFailure, FidelityReport
 from wmo.common.judging import DimensionJudgment, DimensionScoreMap, JudgeCalibration, Judgment
 from wmo.common.models import AssistantAction, ModelSnapshot, OperationEconomics, ToolCall
 from wmo.common.project import ProjectConfig, ProjectStore
@@ -27,6 +27,7 @@ from wmo.common.rollouts import (
     StopReason,
     WorldModelSimulatorSnapshot,
 )
+from wmo.common.tasks import TaskCase, TaskSet
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.optimize.model.sft.builder import (
     SFTBuildError,
@@ -63,7 +64,12 @@ def _inputs(*items: ArtifactInput) -> tuple[ArtifactInput, ...]:
 
 
 def _model() -> ModelSnapshot:
-    return ModelSnapshot(provider="test", model_id="teacher-v1", capabilities_sha256=_DIGEST)
+    return ModelSnapshot(
+        provider="test",
+        model_id="teacher-v1",
+        capabilities_sha256=_DIGEST,
+        connection_sha256=_DIGEST,
+    )
 
 
 def _trace(trace_id: str, conversation_id: str, task: str) -> Trace:
@@ -198,7 +204,30 @@ def _human_approved_production_source(tag: str) -> ProductionSFTSource:
     return source.model_copy(update={"acceptance_evidence": evidence, "human_approval": approval})
 
 
-def _rollout(tag: str) -> RolloutArtifact:
+def _task_case(tag: str, instruction: str) -> TaskCase:
+    return TaskCase(
+        task_id=f"task-{tag}",
+        lineage_group_id=f"task-lineage-{tag}",
+        partition="fit",
+        instruction=instruction,
+        workload_weight=1.0,
+        source_trace_ids=(f"teacher-trace-{tag}",),
+    )
+
+
+def _task_set(task: TaskCase) -> TaskSet:
+    return TaskSet(
+        schema_version=1,
+        created_at=_TIME,
+        code_revision="w12-test",
+        task_set_id=f"task-set-{task.task_id.removeprefix('task-')}",
+        task_ids=(task.task_id,),
+        tasks_path="tasks.jsonl",
+        tasks_sha256=_DIGEST,
+    )
+
+
+def _rollout(tag: str, task_id: str) -> RolloutArtifact:
     model = _model()
     return RolloutArtifact(
         schema_version=1,
@@ -212,7 +241,7 @@ def _rollout(tag: str) -> RolloutArtifact:
         trace_id=f"teacher-trace-{tag}",
         evidence_source="world_model",
         source_run_id=f"run-{tag}",
-        task_id=f"task-{tag}",
+        task_id=task_id,
         candidate=model,
         agent_id="customer-agent",
         simulator=WorldModelSimulatorSnapshot(
@@ -277,7 +306,9 @@ def _teacher_source(
     calibration_status: Literal["human_calibrated", "insufficient"] = "human_calibrated",
     fidelity_status: Literal["approved", "rejected", "insufficient"] = "approved",
 ) -> TeacherSFTSource:
-    rollout = _rollout(tag)
+    task_case = _task_case(tag, task)
+    task_set = _task_set(task_case)
+    rollout = _rollout(tag, task_case.task_id)
     calibration = _calibration(tag, status=calibration_status)
     raw_score = 5 if score == 1.0 else 4
     judgment = Judgment(
@@ -308,6 +339,13 @@ def _teacher_source(
         usable_overlap_count, score_mae = 8, 0.12
     else:
         usable_overlap_count, score_mae = 7, None
+    failures = tuple(
+        FidelityFailure(
+            cell_id=f"fidelity-cell-{tag}-{index}",
+            failure=StructuredFailure(code=FailureCode.TIMEOUT, message="overlap unavailable"),
+        )
+        for index in range(usable_overlap_count, 10)
+    )
     fidelity = FidelityReport(
         schema_version=1,
         created_at=_TIME,
@@ -317,8 +355,9 @@ def _teacher_source(
         overlap_cell_ids=tuple(f"fidelity-cell-{tag}-{index}" for index in range(10)),
         planned_overlap_count=10,
         usable_overlap_count=usable_overlap_count,
-        failed_overlap_count=0,
+        failed_overlap_count=len(failures),
         score_mae=score_mae,
+        failures=failures,
         gate_id=f"fidelity-gate-{tag}",
         gate_sha256=_DIGEST,
         status=fidelity_status,
@@ -362,7 +401,8 @@ def _teacher_source(
     )
     return TeacherSFTSource(
         rollout=rollout,
-        task=task,
+        task=task_case,
+        task_set=task_set,
         transcript=_transcript(),
         acceptance_rule=rule,
         acceptance_evidence=evidence,
@@ -613,6 +653,18 @@ def test_teacher_acceptance_requires_every_immutable_prerequisite() -> None:
             )
         }
     )
+    mismatched_task = _teacher_source("task-mismatch")
+    mismatched_task = mismatched_task.model_copy(
+        update={"task": _task_case("different", "A different canonical task.")}
+    )
+    task_outside_set = _teacher_source("task-outside-set")
+    task_outside_set = task_outside_set.model_copy(
+        update={
+            "task_set": task_outside_set.task_set.model_copy(
+                update={"task_ids": ("task-not-this-one",)}
+            )
+        }
+    )
     unproven = _teacher_source("unproven")
     unproven = unproven.model_copy(
         update={
@@ -633,6 +685,8 @@ def test_teacher_acceptance_requires_every_immutable_prerequisite() -> None:
             insufficient_fidelity,
             low_score,
             unfinished,
+            mismatched_task,
+            task_outside_set,
             unproven,
         )
     )
@@ -642,6 +696,7 @@ def test_teacher_acceptance_requires_every_immutable_prerequisite() -> None:
         for row in artifact.rows
         if isinstance(row.example.source, RolloutExampleSource)
     } == {"rollout-valid"}
+    assert "task-set-valid" in {item.artifact_id for item in artifact.dataset.inputs}
     excluded_ids = {
         exclusion.source_id
         for exclusion in artifact.inspection.exclusions
@@ -658,6 +713,8 @@ def test_teacher_acceptance_requires_every_immutable_prerequisite() -> None:
         "rollout-fidelity-insufficient",
         "rollout-score",
         "rollout-unfinished",
+        "rollout-task-mismatch",
+        "rollout-task-outside-set",
         "rollout-unproven",
     }
 

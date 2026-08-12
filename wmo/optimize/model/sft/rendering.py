@@ -91,7 +91,14 @@ def context_target_fingerprint(
 
 
 def canonical_partitioned_rows_jsonl(rows: Sequence[PartitionedSFTExample]) -> bytes:
-    """Render ordered partitioned SFT rows as deterministic newline-terminated JSONL."""
+    """Render ordered partitioned SFT rows as deterministic newline-terminated JSONL.
+
+    Args:
+        rows: Already ordered examples to serialize into the frozen dataset payload.
+
+    Returns:
+        Canonical JSONL bytes, or empty bytes when no examples are present.
+    """
     if not rows:
         return b""
     return b"\n".join(canonical_json_bytes(row) for row in rows) + b"\n"

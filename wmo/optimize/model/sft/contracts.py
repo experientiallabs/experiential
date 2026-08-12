@@ -20,6 +20,7 @@ from wmo.common.evaluations import FidelityReport
 from wmo.common.judging import JudgeCalibration, Judgment
 from wmo.common.models import AssistantAction
 from wmo.common.rollouts import RolloutArtifact
+from wmo.common.tasks import TaskCase, TaskSet
 from wmo.common.traces import Trace
 
 
@@ -258,7 +259,8 @@ class TeacherSFTSource(ContractModel):
     """One teacher rollout, canonical transcript, and immutable accepted quality evidence."""
 
     rollout: RolloutArtifact
-    task: str = Field(min_length=1)
+    task: TaskCase
+    task_set: TaskSet
     transcript: SFTTranscript
     acceptance_rule: TeacherAcceptanceRule
     acceptance_evidence: TeacherAcceptanceEvidence
