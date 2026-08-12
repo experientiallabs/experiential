@@ -30,7 +30,6 @@ from wmo.optimize.model.sft.contracts import (
     InfrastructureFailureEvent,
     PartitionedSFTExample,
     ProductionSFTSource,
-    RolloutExampleSource,
     SFTContextEvent,
     SFTDataset,
     SFTDatasetArtifact,
@@ -50,6 +49,12 @@ from wmo.optimize.model.sft.rendering import (
     context_target_fingerprint,
     partitioned_rows_sha256,
 )
+from wmo.optimize.model.sft.sources import (
+    PreparedSFTSource,
+    SFTSourceVerificationError,
+    resolve_production_source,
+    resolve_teacher_source,
+)
 
 
 class SFTBuildError(ValueError):
@@ -65,29 +70,10 @@ class SFTBuildSpec(ContractModel):
 
 
 @dataclass(frozen=True)
-class _PreparedSource:
-    """One accepted source normalized before transcript scanning."""
-
-    kind: Literal["production_trace", "teacher_rollout"]
-    source_id: str
-    source_sha256: Sha256
-    leakage_group_id: ArtifactId
-    task: str
-    transcript_events: tuple[
-        SFTMessage | AssistantActionEvent | ToolEvent | InfrastructureFailureEvent, ...
-    ]
-    example_source: TraceExampleSource | RolloutExampleSource
-    score: float | None
-    direct_inputs: tuple[ArtifactInput, ...]
-    acceptance_rule_id: ArtifactId
-    acceptance_evidence_id: ArtifactId
-
-
-@dataclass(frozen=True)
 class _ScannedAction:
     """A canonical target discovered before partition assignment or row emission."""
 
-    source: _PreparedSource
+    source: PreparedSFTSource
     source_step_index: int
     history: tuple[SFTContextEvent, ...]
     fingerprint: Sha256
@@ -122,6 +108,7 @@ class _UnionFind:
 
 def build_sft_dataset(
     *,
+    store: ProjectStore,
     production_sources: Sequence[ProductionSFTSource],
     teacher_sources: Sequence[TeacherSFTSource],
     spec: SFTBuildSpec,
@@ -131,8 +118,9 @@ def build_sft_dataset(
     """Build one deterministic SFT dataset from accepted production and teacher evidence.
 
     Args:
-        production_sources: Typed production traces with immutable acceptance decisions.
-        teacher_sources: Typed teacher rollouts with judgment, calibration, and fidelity evidence.
+        store: One project-local immutable artifact store that owns every source chain.
+        production_sources: Pointers to persisted production-acceptance artifacts.
+        teacher_sources: Pointers to persisted teacher-acceptance artifacts.
         spec: Frozen split and sampling controls for this build.
         created_at: Time recorded in the resulting immutable dataset envelope.
         code_revision: Exact revision that built the artifact.
@@ -141,72 +129,39 @@ def build_sft_dataset(
         A complete in-memory dataset, including rows, manifest metadata, and exclusions.
 
     Raises:
-        SFTBuildError: Source identities repeat or a computed leakage invariant is violated.
+        SFTBuildError: A source cannot be verified from ``store``, identities repeat, or a
+            computed leakage invariant is violated.
     """
     _require_timezone(created_at, label="dataset creation")
     if not code_revision:
         raise SFTBuildError("code_revision must be non-empty")
 
-    prepared: list[_PreparedSource] = []
+    prepared: list[PreparedSFTSource] = []
     source_references: list[SFTSourceReference] = []
     exclusions: list[SFTExclusion] = []
     seen_source_keys: set[tuple[str, str]] = set()
 
-    for source in sorted(production_sources, key=lambda item: item.trace.trace_id):
-        source_key = ("production_trace", source.trace.trace_id)
-        _require_unique_source_key(seen_source_keys, source_key)
-        candidate, error = _prepare_production_source(source)
-        source_references.append(
-            SFTSourceReference(
-                kind="production_trace",
-                source_id=candidate.source_id,
-                source_sha256=candidate.source_sha256,
-                leakage_group_id=candidate.leakage_group_id,
-                acceptance_evidence_id=source.acceptance_evidence.acceptance_evidence_id,
-                acceptance_evidence_sha256=sha256_json(source.acceptance_evidence),
-                accepted=error is None,
-                exclusion_reason=error,
-            )
-        )
-        if error is not None:
-            exclusions.append(
-                SFTExclusion(
-                    source_kind="production_trace",
-                    source_id=candidate.source_id,
-                    reason="invalid_production_acceptance",
-                    detail=error,
-                )
-            )
-            continue
+    for source in sorted(production_sources, key=lambda item: item.acceptance_evidence_id):
+        try:
+            candidate = resolve_production_source(store, source)
+        except SFTSourceVerificationError as exc:
+            raise SFTBuildError(
+                f"production source {source.acceptance_evidence_id} is not accepted evidence: {exc}"
+            ) from exc
+        _require_unique_source_key(seen_source_keys, (candidate.kind, candidate.source_id))
         prepared.append(candidate)
+        source_references.append(candidate.reference())
 
-    for source in sorted(teacher_sources, key=lambda item: item.rollout.rollout_id):
-        source_key = ("teacher_rollout", source.rollout.rollout_id)
-        _require_unique_source_key(seen_source_keys, source_key)
-        candidate, error = _prepare_teacher_source(source)
-        source_references.append(
-            SFTSourceReference(
-                kind="teacher_rollout",
-                source_id=candidate.source_id,
-                source_sha256=candidate.source_sha256,
-                leakage_group_id=candidate.leakage_group_id,
-                acceptance_evidence_id=source.acceptance_evidence.acceptance_evidence_id,
-                acceptance_evidence_sha256=sha256_json(source.acceptance_evidence),
-                accepted=error is None,
-                exclusion_reason=error,
-            )
-        )
-        if error is not None:
-            exclusions.append(
-                SFTExclusion(
-                    source_kind="teacher_rollout",
-                    source_id=candidate.source_id,
-                    reason="invalid_teacher_acceptance",
-                    detail=error,
-                )
-            )
-            continue
+    for source in sorted(teacher_sources, key=lambda item: item.acceptance_evidence_id):
+        try:
+            candidate = resolve_teacher_source(store, source)
+        except SFTSourceVerificationError as exc:
+            raise SFTBuildError(
+                f"teacher source {source.acceptance_evidence_id} is not accepted evidence: {exc}"
+            ) from exc
+        _require_unique_source_key(seen_source_keys, (candidate.kind, candidate.source_id))
         prepared.append(candidate)
+        source_references.append(candidate.reference())
 
     scanned_actions: list[_ScannedAction] = []
     for source in prepared:
@@ -408,169 +363,8 @@ def load_sft_dataset(
     return artifact
 
 
-def _prepare_production_source(
-    source: ProductionSFTSource,
-) -> tuple[_PreparedSource, str | None]:
-    """Normalize one production bundle and verify its immutable acceptance chain."""
-    trace_sha256 = sha256_json(source.trace)
-    evidence_sha256 = sha256_json(source.acceptance_evidence)
-    lineage_key = source.trace.conversation_id or source.trace.trace_id
-    lineage_group_id = stable_id(
-        "sft-lineage",
-        {"kind": "production_trace", "source_lineage": lineage_key},
-    )
-    prepared = _PreparedSource(
-        kind="production_trace",
-        source_id=source.trace.trace_id,
-        source_sha256=trace_sha256,
-        leakage_group_id=lineage_group_id,
-        task=source.trace.task,
-        transcript_events=source.transcript.events,
-        example_source=TraceExampleSource(
-            trace_id=source.trace.trace_id,
-            acceptance_evidence_id=source.acceptance_evidence.acceptance_evidence_id,
-            acceptance_evidence_sha256=evidence_sha256,
-        ),
-        score=None,
-        direct_inputs=_production_inputs(source),
-        acceptance_rule_id=source.acceptance_rule.acceptance_rule_id,
-        acceptance_evidence_id=source.acceptance_evidence.acceptance_evidence_id,
-    )
-    return prepared, _production_acceptance_error(source, trace_sha256)
-
-
-def _prepare_teacher_source(source: TeacherSFTSource) -> tuple[_PreparedSource, str | None]:
-    """Normalize one teacher bundle and verify its immutable acceptance chain."""
-    rollout_sha256 = sha256_json(source.rollout)
-    evidence_sha256 = sha256_json(source.acceptance_evidence)
-    prepared = _PreparedSource(
-        kind="teacher_rollout",
-        source_id=source.rollout.rollout_id,
-        source_sha256=rollout_sha256,
-        leakage_group_id=source.task.lineage_group_id,
-        task=source.task.instruction,
-        transcript_events=source.transcript.events,
-        example_source=RolloutExampleSource(
-            rollout_id=source.rollout.rollout_id,
-            acceptance_evidence_id=source.acceptance_evidence.acceptance_evidence_id,
-            acceptance_evidence_sha256=evidence_sha256,
-        ),
-        score=source.acceptance_evidence.observed_overall_score,
-        direct_inputs=_teacher_inputs(source),
-        acceptance_rule_id=source.acceptance_rule.acceptance_rule_id,
-        acceptance_evidence_id=source.acceptance_evidence.acceptance_evidence_id,
-    )
-    return prepared, _teacher_acceptance_error(source, rollout_sha256)
-
-
-def _production_acceptance_error(source: ProductionSFTSource, trace_sha256: Sha256) -> str | None:
-    """Return the first explicit production-acceptance failure, if any."""
-    try:
-        ProductionSFTSource.model_validate(source.model_dump(mode="python"))
-    except ValidationError:
-        return "production source contains invalid immutable acceptance evidence"
-    evidence = source.acceptance_evidence
-    rule = source.acceptance_rule
-    if evidence.trace_id != source.trace.trace_id:
-        return "acceptance evidence names a different production trace"
-    if evidence.trace_sha256 != trace_sha256:
-        return "production trace digest does not match acceptance evidence"
-    if evidence.acceptance_rule_id != rule.acceptance_rule_id:
-        return "production acceptance evidence names a different rule"
-    if evidence.acceptance_rule_sha256 != sha256_json(rule):
-        return "production acceptance-rule digest does not match"
-    if source.trace.outcome is not None and source.trace.outcome.status == "failure":
-        return "production trace has a terminal infrastructure failure"
-    if any(span.failure is not None for span in source.trace.spans):
-        return "production trace has a recorded infrastructure span failure"
-    if evidence.decision == "trusted_outcome":
-        outcome = source.trace.outcome
-        if outcome is None or outcome.status != "success":
-            return "trusted-outcome evidence requires a successful production outcome"
-        if evidence.outcome_sha256 != sha256_json(outcome):
-            return "production outcome digest does not match acceptance evidence"
-        if outcome.outcome_name not in rule.accepted_outcomes:
-            return "production outcome is not trusted by the acceptance rule"
-        return None
-    approval = source.human_approval
-    if not rule.allow_human_approval:
-        return "production acceptance rule does not allow human approval"
-    if approval is None:
-        return "human-approval evidence requires the immutable approval record"
-    if approval.trace_id != source.trace.trace_id:
-        return "human approval names a different production trace"
-    if evidence.human_approval_id != approval.approval_id:
-        return "human approval identity does not match acceptance evidence"
-    if evidence.human_approval_sha256 != sha256_json(approval):
-        return "human approval digest does not match acceptance evidence"
-    return None
-
-
-def _teacher_acceptance_error(source: TeacherSFTSource, rollout_sha256: Sha256) -> str | None:
-    """Return the first explicit teacher-acceptance failure, if any."""
-    try:
-        TeacherSFTSource.model_validate(source.model_dump(mode="python"))
-    except ValidationError:
-        return "teacher source contains invalid immutable acceptance evidence"
-    evidence = source.acceptance_evidence
-    rule = source.acceptance_rule
-    judgment_sha256 = sha256_json(source.judgment)
-    calibration_sha256 = sha256_json(source.calibration)
-    fidelity_sha256 = sha256_json(source.fidelity)
-    if source.rollout.failure is not None or source.rollout.stop_reason != "completed":
-        return "teacher rollout has an infrastructure or execution failure"
-    if any(span.failure is not None for span in source.rollout.spans):
-        return "teacher rollout has a recorded infrastructure span failure"
-    if source.rollout.evidence_source not in {"world_model", "sandbox"}:
-        return "teacher rollout must come from a world-model or sandbox simulation"
-    if source.rollout.task_id != source.task.task_id:
-        return "teacher rollout names a different canonical task"
-    if source.task.task_id not in source.task_set.task_ids:
-        return "teacher task is not a member of the supplied task set"
-    if evidence.rollout_id != source.rollout.rollout_id:
-        return "teacher acceptance evidence names a different rollout"
-    if evidence.rollout_sha256 != rollout_sha256:
-        return "teacher rollout digest does not match acceptance evidence"
-    if evidence.judgment_id != source.judgment.judgment_id:
-        return "teacher acceptance evidence names a different judgment"
-    if evidence.judgment_sha256 != judgment_sha256:
-        return "teacher judgment digest does not match acceptance evidence"
-    if evidence.calibration_id != source.calibration.calibration_id:
-        return "teacher acceptance evidence names a different calibration"
-    if evidence.calibration_sha256 != calibration_sha256:
-        return "teacher calibration digest does not match acceptance evidence"
-    if evidence.fidelity_report_id != source.fidelity.fidelity_report_id:
-        return "teacher acceptance evidence names a different fidelity report"
-    if evidence.fidelity_report_sha256 != fidelity_sha256:
-        return "teacher fidelity digest does not match acceptance evidence"
-    if evidence.acceptance_rule_id != rule.acceptance_rule_id:
-        return "teacher acceptance evidence names a different rule"
-    if evidence.acceptance_rule_sha256 != sha256_json(rule):
-        return "teacher acceptance-rule digest does not match"
-    if source.judgment.rollout_id != source.rollout.rollout_id:
-        return "teacher judgment does not belong to the accepted rollout"
-    if source.judgment.calibration_id != source.calibration.calibration_id:
-        return "teacher judgment does not use the accepted calibration"
-    if source.calibration.status != "human_calibrated" or source.calibration.approved_at is None:
-        return "teacher rollout requires an approved human-calibrated judge"
-    if rule.required_calibration_id != source.calibration.calibration_id:
-        return "teacher acceptance rule requires a different calibration"
-    if source.fidelity.status != "approved" or source.fidelity.approved_at is None:
-        return "teacher rollout requires approved fidelity evidence"
-    if not math.isclose(
-        evidence.observed_overall_score,
-        source.judgment.overall_score,
-        rel_tol=1e-12,
-        abs_tol=1e-12,
-    ):
-        return "teacher acceptance score does not match the frozen judgment"
-    if evidence.observed_overall_score < rule.minimum_overall_score:
-        return "teacher judgment score does not meet the acceptance rule"
-    return None
-
-
 def _scan_source_actions(
-    source: _PreparedSource,
+    source: PreparedSFTSource,
 ) -> tuple[list[_ScannedAction], list[SFTExclusion]]:
     """Scan targets and fingerprints without emitting examples or assigning a partition."""
     history: list[SFTContextEvent] = []
@@ -783,41 +577,6 @@ def _globally_deduplicate(
                 )
             )
     return tuple(kept), tuple(exclusions)
-
-
-def _production_inputs(source: ProductionSFTSource) -> tuple[ArtifactInput, ...]:
-    """Collect immutable production provenance retained by the final dataset envelope."""
-    inputs = [
-        _model_input(source.acceptance_rule.acceptance_rule_id, source.acceptance_rule),
-        _model_input(source.acceptance_evidence.acceptance_evidence_id, source.acceptance_evidence),
-    ]
-    if source.human_approval is not None:
-        inputs.append(_model_input(source.human_approval.approval_id, source.human_approval))
-    return tuple(inputs)
-
-
-def _teacher_inputs(source: TeacherSFTSource) -> tuple[ArtifactInput, ...]:
-    """Collect immutable teacher provenance retained by the final dataset envelope."""
-    return (
-        ArtifactInput(
-            artifact_id=source.rollout.artifact_id,
-            sha256=sha256_json(source.rollout),
-        ),
-        _model_input(source.task_set.task_set_id, source.task_set),
-        _model_input(source.acceptance_rule.acceptance_rule_id, source.acceptance_rule),
-        _model_input(source.acceptance_evidence.acceptance_evidence_id, source.acceptance_evidence),
-        _model_input(source.judgment.judgment_id, source.judgment),
-        _model_input(source.calibration.calibration_id, source.calibration),
-        ArtifactInput(
-            artifact_id=source.fidelity.fidelity_report_id,
-            sha256=sha256_json(source.fidelity),
-        ),
-    )
-
-
-def _model_input(artifact_id: ArtifactId, value: ContractModel) -> ArtifactInput:
-    """Create a deterministic artifact-style reference for one frozen typed record."""
-    return ArtifactInput(artifact_id=artifact_id, sha256=sha256_json(value))
 
 
 def _sorted_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactInput, ...]:

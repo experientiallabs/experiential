@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.models import AssistantAction, ToolCall
 from wmo.optimize.model.sft.contracts import (
     AssistantActionEvent,
@@ -77,8 +78,10 @@ def test_structured_example_round_trips_with_complete_target_and_tool_context() 
         target=_action(),
         source=TraceExampleSource(
             trace_id="trace-1",
-            acceptance_evidence_id="production-evidence-1",
-            acceptance_evidence_sha256=_DIGEST,
+            acceptance_evidence=ArtifactInput(
+                artifact_id="production-evidence-1",
+                sha256=_DIGEST,
+            ),
         ),
         source_step_index=1,
     )
@@ -100,8 +103,10 @@ def test_teacher_structured_example_round_trips_with_complete_target_and_tool_co
         target=_action(),
         source=RolloutExampleSource(
             rollout_id="rollout-1",
-            acceptance_evidence_id="teacher-evidence-1",
-            acceptance_evidence_sha256=_DIGEST,
+            acceptance_evidence=ArtifactInput(
+                artifact_id="teacher-evidence-1",
+                sha256=_DIGEST,
+            ),
         ),
         source_step_index=3,
         score=1.0,

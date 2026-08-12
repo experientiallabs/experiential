@@ -1,24 +1,49 @@
-"""Focused tests for accepted, leakage-safe frozen SFT dataset construction."""
+"""Store-backed regression tests for frozen, leakage-safe SFT dataset construction."""
 
 from __future__ import annotations
 
+import hashlib
+import json
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
 
 import pytest
+from pydantic import ValidationError
 
 from wmo.common.core.artifacts import (
     ArtifactInput,
     FailureCode,
     SourceIdentity,
     StructuredFailure,
+    canonical_json_bytes,
     sha256_json,
 )
-from wmo.common.evaluations import FidelityFailure, FidelityReport
-from wmo.common.judging import DimensionJudgment, DimensionScoreMap, JudgeCalibration, Judgment
-from wmo.common.models import AssistantAction, ModelSnapshot, OperationEconomics, ToolCall
-from wmo.common.project import ProjectConfig, ProjectStore
+from wmo.common.evaluations import FidelityReport
+from wmo.common.judging import (
+    HumanScore,
+    HumanScoreReview,
+    JudgeCalibration,
+    JudgeCalibrationService,
+    JudgeScoreObservation,
+    Judgment,
+    LMJudge,
+    PromptDefinition,
+    RouterLineageAssignment,
+    RouterLineageSplit,
+    Rubric,
+    RubricDimension,
+    ScoreAnchor,
+    write_router_lineage_split,
+)
+from wmo.common.models import (
+    AssistantAction,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+    OperationEconomics,
+)
+from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
 from wmo.common.rollouts import (
     RolloutArtifact,
     RolloutEventKind,
@@ -44,42 +69,96 @@ from wmo.optimize.model.sft.contracts import (
     ProductionAcceptanceEvidence,
     ProductionAcceptanceRule,
     ProductionSFTSource,
-    RolloutExampleSource,
     SFTDatasetArtifact,
     SFTMessage,
     SFTTranscript,
     TeacherAcceptanceEvidence,
     TeacherAcceptanceRule,
     TeacherSFTSource,
-    ToolEvent,
-    TraceExampleSource,
 )
+from wmo.simulation.ingest.dataset import persist_trace_dataset
+from wmo.simulation.ingest.otlp import TraceNormalizationResult
 
 _DIGEST = "a" * 64
-_TIME = datetime(2026, 8, 11, tzinfo=UTC)
+_TIME = datetime(2026, 8, 12, tzinfo=UTC)
 
 
-def _inputs(*items: ArtifactInput) -> tuple[ArtifactInput, ...]:
-    return tuple(sorted(items, key=lambda item: item.artifact_id))
+class _FakeJudgeClient:
+    """Return one fixed structured judgment without network access or provider credentials."""
+
+    def __init__(self, model: ModelSnapshot, content: str) -> None:
+        self._model = model
+        self._content = content
+        self.requests: list[ModelRequest] = []
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Return the configured model identity and structured payload."""
+        self.requests.append(request)
+        return ModelResponse(
+            output=AssistantAction(content=self._content),
+            model=self._model,
+            economics=OperationEconomics(),
+        )
 
 
-def _model() -> ModelSnapshot:
+@dataclass(frozen=True)
+class _TeacherFixture:
+    """Verified teacher-evidence IDs retained for adversarial SFT consumption tests."""
+
+    source: TeacherSFTSource
+    evidence: TeacherAcceptanceEvidence
+    rollout_input: ArtifactInput
+    task_set_input: ArtifactInput
+    judgment_input: ArtifactInput
+    calibration_input: ArtifactInput
+    fidelity_input: ArtifactInput
+    rule_input: ArtifactInput
+    transcript: SFTTranscript
+
+
+def _store(tmp_path: Path, project_id: str = "sft-project") -> ProjectStore:
+    """Create one initialized project-local immutable store."""
+    store = ProjectStore(tmp_path / ".wmo", project_id)
+    store.initialize(ProjectConfig(project_id=project_id))
+    return store
+
+
+def _inputs(*values: ArtifactInput) -> tuple[ArtifactInput, ...]:
+    """Return exact artifact references in the canonical input ordering."""
+    return tuple(sorted(values, key=lambda value: value.artifact_id))
+
+
+def _model(model_id: str = "judge-model") -> ModelSnapshot:
+    """Build one fixed resolved model identity for local immutable test evidence."""
     return ModelSnapshot(
         provider="test",
-        model_id="teacher-v1",
+        model_id=model_id,
         capabilities_sha256=_DIGEST,
         connection_sha256=_DIGEST,
     )
 
 
-def _trace(trace_id: str, conversation_id: str, task: str) -> Trace:
+def _transcript(tag: str) -> SFTTranscript:
+    """Build one canonical source transcript with two trainable assistant actions."""
+    return SFTTranscript(
+        events=(
+            SFTMessage(role="system", content="Follow the support policy."),
+            SFTMessage(role="user", content=f"Resolve support request {tag}."),
+            AssistantActionEvent(action=AssistantAction(content=f"Investigating {tag}.")),
+            AssistantActionEvent(action=AssistantAction(content=f"Resolved {tag}.")),
+        )
+    )
+
+
+def _trace(tag: str, *, task: str | None = None) -> Trace:
+    """Build one normalized successful production trace eligible for trace-dataset storage."""
     return Trace(
-        trace_id=trace_id,
-        conversation_id=conversation_id,
-        task=task,
+        trace_id=f"trace-{tag}",
+        conversation_id=f"conversation-{tag}",
+        task=task or f"Resolve support request {tag}.",
         spans=(
             TraceSpan(
-                span_id=f"span-{trace_id}",
+                span_id=f"trace-span-{tag}",
                 name="agent.model_call",
                 started_at=_TIME,
                 ended_at=_TIME + timedelta(seconds=1),
@@ -87,56 +166,34 @@ def _trace(trace_id: str, conversation_id: str, task: str) -> Trace:
         ),
         outcome=TraceOutcome(status="success", outcome_name="resolved"),
         source=TraceSource(
-            identity=SourceIdentity(kind="production", source_id=f"source-{trace_id}"),
-            semantic_convention_version="1.0",
+            identity=SourceIdentity(kind="otlp", source_id="fixture", sha256=_DIGEST),
+            semantic_convention_version="1.37.0",
         ),
     )
 
 
-def _tool_action() -> AssistantAction:
-    return AssistantAction(
-        content="I will verify the order and issue the refund.",
-        tool_calls=(
-            ToolCall(call_id="lookup-1", name="lookup_order", arguments={"order_id": "o-17"}),
-            ToolCall(call_id="refund-1", name="issue_refund", arguments={"order_id": "o-17"}),
-        ),
+def _write_trace_dataset(store: ProjectStore, trace: Trace) -> ArtifactInput:
+    """Persist canonical W5-style trace evidence and return its manifest-derived input."""
+    persisted = persist_trace_dataset(
+        TraceNormalizationResult(traces=(trace,), issues=()),
+        store.artifacts,
+        created_at=_TIME,
+        code_revision="w12-test",
     )
+    return artifact_input(persisted.manifest)
 
 
-def _transcript(*, approved: bool = True, failed: bool = False) -> SFTTranscript:
-    events = [
-        SFTMessage(role="system", content="Follow the support policy."),
-        SFTMessage(role="user", content="Please refund order o-17."),
-        AssistantActionEvent(action=_tool_action(), approved=approved),
-        ToolEvent(tool_call_id="lookup-1", tool_name="lookup_order", content="order is eligible"),
-        ToolEvent(tool_call_id="refund-1", tool_name="issue_refund", content="refund issued"),
-    ]
-    if failed:
-        events.append(
-            InfrastructureFailureEvent(
-                action_index=2,
-                failure=StructuredFailure(
-                    code=FailureCode.TIMEOUT, message="tool transport timed out"
-                ),
-            )
-        )
-    else:
-        events.append(
-            AssistantActionEvent(
-                action=AssistantAction(content="Your refund is complete."), approved=approved
-            )
-        )
-    return SFTTranscript(events=tuple(events))
-
-
-def _production_source(
+def _write_production_source(
+    store: ProjectStore,
     tag: str,
     *,
-    task: str = "Refund order o-17.",
-    approved: bool = True,
-    failed: bool = False,
+    human_approval: bool = False,
+    task: str | None = None,
+    transcript: SFTTranscript | None = None,
 ) -> ProductionSFTSource:
-    trace = _trace(f"trace-{tag}", f"conversation-{tag}", task)
+    """Persist production acceptance evidence whose transcript is owned by that artifact."""
+    trace = _trace(tag, task=task)
+    trace_input = _write_trace_dataset(store, trace)
     rule = ProductionAcceptanceRule(
         schema_version=1,
         created_at=_TIME,
@@ -145,90 +202,138 @@ def _production_source(
         accepted_outcomes=("resolved",),
         allow_human_approval=True,
     )
+    rule_input = artifact_input(
+        store.artifacts.write_json(
+            artifact_id=rule.acceptance_rule_id,
+            artifact_type="sft-production-acceptance-rule",
+            envelope=rule,
+            files={"rule.json": rule},
+        )
+    )
+    approval_input: ArtifactInput | None = None
+    if human_approval:
+        approval = HumanApproval(
+            schema_version=1,
+            created_at=_TIME,
+            inputs=(trace_input,),
+            code_revision="w12-test",
+            approval_id=f"human-approval-{tag}",
+            trace_dataset=trace_input,
+            trace_id=trace.trace_id,
+            approved_at=_TIME,
+        )
+        approval_input = artifact_input(
+            store.artifacts.write_json(
+                artifact_id=approval.approval_id,
+                artifact_type="sft-human-approval",
+                envelope=approval,
+                files={"approval.json": approval},
+            )
+        )
+    transcript = transcript or _transcript(tag)
+    transcript_payload = canonical_json_bytes(transcript)
     evidence = ProductionAcceptanceEvidence(
         schema_version=1,
         created_at=_TIME,
-        inputs=_inputs(
-            ArtifactInput(artifact_id=rule.acceptance_rule_id, sha256=sha256_json(rule))
+        inputs=(
+            _inputs(trace_input, rule_input)
+            if approval_input is None
+            else _inputs(trace_input, rule_input, approval_input)
         ),
         code_revision="w12-test",
         acceptance_evidence_id=f"production-evidence-{tag}",
+        trace_dataset=trace_input,
         trace_id=trace.trace_id,
         trace_sha256=sha256_json(trace),
-        acceptance_rule_id=rule.acceptance_rule_id,
-        acceptance_rule_sha256=sha256_json(rule),
-        decision="trusted_outcome",
-        outcome_sha256=sha256_json(trace.outcome),
+        acceptance_rule=rule_input,
+        decision="human_approval" if approval_input is not None else "trusted_outcome",
+        outcome_sha256=None if approval_input is not None else sha256_json(trace.outcome),
+        human_approval=approval_input,
+        transcript_path="transcript.json",
+        transcript_sha256=hashlib.sha256(transcript_payload).hexdigest(),
         accepted_at=_TIME,
     )
-    return ProductionSFTSource(
-        trace=trace,
-        transcript=_transcript(approved=approved, failed=failed),
-        acceptance_rule=rule,
-        acceptance_evidence=evidence,
+    store.artifacts.write(
+        artifact_id=evidence.acceptance_evidence_id,
+        artifact_type="sft-production-acceptance",
+        envelope=evidence,
+        files={
+            "evidence.json": canonical_json_bytes(evidence),
+            "transcript.json": transcript_payload,
+        },
     )
+    return ProductionSFTSource(acceptance_evidence_id=evidence.acceptance_evidence_id)
 
 
-def _human_approved_production_source(tag: str) -> ProductionSFTSource:
-    """Build a locally approved production source with complete immutable references."""
-    source = _production_source(tag)
-    approval = HumanApproval(
-        schema_version=1,
-        created_at=_TIME,
-        code_revision="w12-test",
-        approval_id=f"human-approval-{tag}",
-        trace_id=source.trace.trace_id,
-        approved_at=_TIME,
-    )
-    evidence = ProductionAcceptanceEvidence(
-        schema_version=1,
-        created_at=_TIME,
-        inputs=_inputs(
-            ArtifactInput(
-                artifact_id=source.acceptance_rule.acceptance_rule_id,
-                sha256=sha256_json(source.acceptance_rule),
-            ),
-            ArtifactInput(artifact_id=approval.approval_id, sha256=sha256_json(approval)),
-        ),
-        code_revision="w12-test",
-        acceptance_evidence_id=f"human-evidence-{tag}",
-        trace_id=source.trace.trace_id,
-        trace_sha256=sha256_json(source.trace),
-        acceptance_rule_id=source.acceptance_rule.acceptance_rule_id,
-        acceptance_rule_sha256=sha256_json(source.acceptance_rule),
-        decision="human_approval",
-        human_approval_id=approval.approval_id,
-        human_approval_sha256=sha256_json(approval),
-        accepted_at=_TIME,
-    )
-    return source.model_copy(update={"acceptance_evidence": evidence, "human_approval": approval})
-
-
-def _task_case(tag: str, instruction: str) -> TaskCase:
-    return TaskCase(
-        task_id=f"task-{tag}",
-        lineage_group_id=f"task-lineage-{tag}",
+def _task_set(store: ProjectStore) -> tuple[TaskCase, TaskSet, ArtifactInput]:
+    """Persist a W5-shaped task set with trace-input lineage and exact task payload bytes."""
+    source_trace = _trace("task-source")
+    source_input = _write_trace_dataset(store, source_trace)
+    task = TaskCase(
+        task_id="task-teacher",
+        lineage_group_id="task-lineage-teacher",
         partition="fit",
-        instruction=instruction,
+        instruction="Resolve the teacher support request.",
         workload_weight=1.0,
-        source_trace_ids=(f"teacher-trace-{tag}",),
+        source_trace_ids=(source_trace.trace_id,),
     )
-
-
-def _task_set(task: TaskCase) -> TaskSet:
-    return TaskSet(
+    task_payload = canonical_json_bytes(task) + b"\n"
+    task_set = TaskSet(
         schema_version=1,
         created_at=_TIME,
+        inputs=(source_input,),
         code_revision="w12-test",
-        task_set_id=f"task-set-{task.task_id.removeprefix('task-')}",
+        task_set_id="task-set-teacher",
         task_ids=(task.task_id,),
         tasks_path="tasks.jsonl",
-        tasks_sha256=_DIGEST,
+        tasks_sha256=hashlib.sha256(task_payload).hexdigest(),
+    )
+    task_set_input = artifact_input(
+        store.artifacts.write(
+            artifact_id=task_set.task_set_id,
+            artifact_type="task-set",
+            envelope=task_set,
+            files={
+                "task-set.json": canonical_json_bytes(task_set),
+                "tasks.jsonl": task_payload,
+            },
+        )
+    )
+    return task, task_set, task_set_input
+
+
+def _rubric(task_set_input: ArtifactInput) -> Rubric:
+    """Build a one-dimensional, human-approved rubric tied to one canonical task set."""
+    return Rubric(
+        schema_version=1,
+        created_at=_TIME,
+        inputs=(task_set_input,),
+        code_revision="w12-test",
+        rubric_id="rubric-teacher",
+        dimensions=(
+            RubricDimension(
+                dimension_id="quality",
+                name="Quality",
+                description="Whether the rollout resolved the requested support work.",
+                anchors=(
+                    ScoreAnchor(score=0, description="Quality level 0."),
+                    ScoreAnchor(score=1, description="Quality level 1."),
+                    ScoreAnchor(score=2, description="Quality level 2."),
+                    ScoreAnchor(score=3, description="Quality level 3."),
+                    ScoreAnchor(score=4, description="Quality level 4."),
+                    ScoreAnchor(score=5, description="Quality level 5."),
+                ),
+            ),
+        ),
+        source_task_set_id=task_set_input.artifact_id,
+        status="human_approved",
+        approved_at=_TIME,
     )
 
 
 def _rollout(tag: str, task_id: str) -> RolloutArtifact:
-    model = _model()
+    """Build one successful world-model rollout suitable for authoritative W6 judging."""
+    model = _model("candidate-model")
     return RolloutArtifact(
         schema_version=1,
         created_at=_TIME,
@@ -250,7 +355,7 @@ def _rollout(tag: str, task_id: str) -> RolloutArtifact:
             world_model=model,
         ),
         world_model=model,
-        seed=7,
+        seed=1,
         repeat=0,
         spans=(
             RolloutSpan(
@@ -258,564 +363,591 @@ def _rollout(tag: str, task_id: str) -> RolloutArtifact:
                 kind=RolloutEventKind.AGENT_MODEL_CALL,
                 started_at=_TIME,
                 ended_at=_TIME + timedelta(seconds=1),
+                payload={"result": "resolved"},
                 model=model,
             ),
         ),
+        final_output=AssistantAction(content="Resolved support request."),
         stop_reason=StopReason.COMPLETED,
         candidate_economics=OperationEconomics(),
         simulation_spec_sha256=_DIGEST,
     )
 
 
-def _calibration(
-    tag: str, *, status: Literal["human_calibrated", "insufficient"] = "human_calibrated"
-) -> JudgeCalibration:
-    return JudgeCalibration(
-        schema_version=1,
-        created_at=_TIME,
-        code_revision="w12-test",
-        calibration_id=f"calibration-{tag}",
-        rubric_id=f"rubric-{tag}",
-        judge_model=_model(),
-        judge_prompt_id="judge-prompt-v1",
-        judge_prompt_sha256=_DIGEST,
-        label_set_id=f"labels-{tag}",
-        calibration_lineage_ids=(f"lineage-{tag}",),
-        excluded_router_held_out_lineage_ids=(),
-        validation_method="grouped_k_fold",
-        out_of_fold_report_id=f"calibration-report-{tag}",
-        out_of_fold_report_sha256=_DIGEST,
-        score_maps=(
-            DimensionScoreMap(
-                dimension_id="quality",
-                calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
-            ),
-        ),
-        label_count=1,
-        status=status,
-        approved_at=_TIME if status == "human_calibrated" else None,
+def _write_teacher_source(store: ProjectStore) -> _TeacherFixture:
+    """Persist a complete W5, W6, rollout, fidelity, and acceptance chain for one teacher row."""
+    task, task_set, task_set_input = _task_set(store)
+    rubric = _rubric(task_set_input)
+    store.artifacts.write_json(
+        artifact_id=rubric.rubric_id,
+        artifact_type="rubric",
+        envelope=rubric,
+        files={"rubric.json": rubric},
     )
-
-
-def _teacher_source(
-    tag: str,
-    *,
-    task: str = "Refund order o-17.",
-    score: float = 1.0,
-    minimum_score: float = 0.8,
-    calibration_status: Literal["human_calibrated", "insufficient"] = "human_calibrated",
-    fidelity_status: Literal["approved", "rejected", "insufficient"] = "approved",
-) -> TeacherSFTSource:
-    task_case = _task_case(tag, task)
-    task_set = _task_set(task_case)
-    rollout = _rollout(tag, task_case.task_id)
-    calibration = _calibration(tag, status=calibration_status)
-    raw_score = 5 if score == 1.0 else 4
-    judgment = Judgment(
-        schema_version=1,
-        created_at=_TIME,
-        code_revision="w12-test",
-        judgment_id=f"judgment-{tag}",
-        rollout_id=rollout.rollout_id,
-        rubric_id=calibration.rubric_id,
-        calibration_id=calibration.calibration_id,
-        judge_model=_model(),
-        judge_prompt_id="judge-prompt-v1",
-        judge_prompt_sha256=_DIGEST,
-        dimensions=(
-            DimensionJudgment(
-                dimension_id="quality",
-                raw_score=raw_score,
-                calibrated_score=score * 5,
-                evidence_span_ids=(f"rollout-span-{tag}",),
-                feedback="The rollout completed the requested action.",
-            ),
-        ),
-        overall_score=score,
-    )
-    if fidelity_status == "approved":
-        usable_overlap_count, score_mae = 8, 0.08
-    elif fidelity_status == "rejected":
-        usable_overlap_count, score_mae = 8, 0.12
-    else:
-        usable_overlap_count, score_mae = 7, None
-    failures = tuple(
-        FidelityFailure(
-            cell_id=f"fidelity-cell-{tag}-{index}",
-            failure=StructuredFailure(code=FailureCode.TIMEOUT, message="overlap unavailable"),
+    prompt = PromptDefinition.from_text("judge-prompt-v1", "Return structured judgment JSON.")
+    model = _model()
+    rollouts = tuple(_rollout(f"calibration-{index}", task.task_id) for index in range(2))
+    rollout_inputs: list[ArtifactInput] = []
+    for rollout in rollouts:
+        rollout_inputs.append(
+            artifact_input(
+                store.artifacts.write_json(
+                    artifact_id=rollout.artifact_id,
+                    artifact_type="rollout",
+                    envelope=rollout,
+                    files={"rollout.json": rollout},
+                )
+            )
         )
-        for index in range(usable_overlap_count, 10)
+    split = write_router_lineage_split(
+        store,
+        RouterLineageSplit(
+            schema_version=1,
+            created_at=_TIME,
+            inputs=(task_set_input,),
+            code_revision="w12-test",
+            split_id="router-lineage-split-teacher",
+            source_task_set_id=task_set.task_set_id,
+            fit_lineage_ids=("calibration-lineage-0", "calibration-lineage-1"),
+            held_out_lineage_ids=(),
+            assignments=tuple(
+                RouterLineageAssignment(
+                    rollout_id=rollout.rollout_id,
+                    lineage_id=f"calibration-lineage-{index}",
+                )
+                for index, rollout in enumerate(rollouts)
+            ),
+        ),
     )
+    review = HumanScoreReview.open(store)
+    empty_labels = review.finalize(
+        rubric_id=rubric.rubric_id,
+        code_revision="w12-test",
+        created_at=_TIME,
+    )
+    calibration_service = JudgeCalibrationService()
+    provisional = calibration_service.bootstrap_provisional(
+        store,
+        rubric_id=rubric.rubric_id,
+        label_set_id=empty_labels.label_set_id,
+        router_lineage_split_id=split.split_id,
+        judge_model=model,
+        judge_prompt=prompt,
+        created_at=_TIME,
+        code_revision="w12-test",
+    )
+    observations: list[JudgeScoreObservation] = []
+    for index, rollout in enumerate(rollouts):
+        span_id = rollout.spans[0].span_id
+        judgment = LMJudge(
+            _FakeJudgeClient(
+                model,
+                json.dumps(
+                    {
+                        "dimensions": [
+                            {
+                                "dimension_id": "quality",
+                                "raw_score": 5,
+                                "evidence_span_ids": [span_id],
+                                "feedback": "The rollout resolved the request.",
+                            }
+                        ]
+                    }
+                ),
+            ),
+            prompt,
+            code_revision="w12-test",
+            clock=lambda: _TIME,
+        ).judge_and_write(
+            store,
+            rollout_artifact_id=rollout.artifact_id,
+            rubric_artifact_id=rubric.rubric_id,
+            calibration_artifact_id=provisional.calibration_id,
+        )
+        judgment_input = artifact_input(store.artifacts.read(judgment.judgment_id).manifest)
+        observations.append(
+            JudgeScoreObservation(
+                judgment=judgment_input,
+                source_rollout=rollout_inputs[index],
+                dimension_id="quality",
+                raw_score=5,
+                evidence_span_ids=(span_id,),
+            )
+        )
+        review.append(
+            HumanScore(
+                label_id=f"human-label-{index}",
+                rubric_id=rubric.rubric_id,
+                rollout_id=rollout.rollout_id,
+                lineage_id=f"calibration-lineage-{index}",
+                dimension_id="quality",
+                score=5,
+                created_at=_TIME,
+            )
+        )
+    labels = review.finalize(
+        rubric_id=rubric.rubric_id,
+        code_revision="w12-test",
+        created_at=_TIME,
+    )
+    report = calibration_service.build_report(
+        store,
+        rubric_id=rubric.rubric_id,
+        label_set_id=labels.label_set_id,
+        router_lineage_split_id=split.split_id,
+        observations=tuple(observations),
+        created_at=_TIME,
+        code_revision="w12-test",
+    )
+    calibration_service.write_report(store, report)
+    calibration = calibration_service.write_calibration(
+        store,
+        report=report,
+        calibration=calibration_service.approve(
+            store,
+            report,
+            approved_at=_TIME,
+            accept_insufficient_labels=True,
+        ),
+    )
+    calibration_input = artifact_input(store.artifacts.read(calibration.calibration_id).manifest)
+    final_rollout = _rollout("teacher", task.task_id)
+    rollout_input = artifact_input(
+        store.artifacts.write_json(
+            artifact_id=final_rollout.artifact_id,
+            artifact_type="rollout",
+            envelope=final_rollout,
+            files={"rollout.json": final_rollout},
+        )
+    )
+    final_judgment = LMJudge(
+        _FakeJudgeClient(
+            model,
+            json.dumps(
+                {
+                    "dimensions": [
+                        {
+                            "dimension_id": "quality",
+                            "raw_score": 5,
+                            "evidence_span_ids": [final_rollout.spans[0].span_id],
+                            "feedback": "The teacher resolved the request.",
+                        }
+                    ]
+                }
+            ),
+        ),
+        prompt,
+        code_revision="w12-test",
+        clock=lambda: _TIME,
+    ).judge_and_write(
+        store,
+        rollout_artifact_id=final_rollout.artifact_id,
+        rubric_artifact_id=rubric.rubric_id,
+        calibration_artifact_id=calibration.calibration_id,
+    )
+    judgment_input = artifact_input(store.artifacts.read(final_judgment.judgment_id).manifest)
     fidelity = FidelityReport(
         schema_version=1,
         created_at=_TIME,
+        inputs=(task_set_input,),
         code_revision="w12-test",
-        fidelity_report_id=f"fidelity-{tag}",
+        fidelity_report_id="fidelity-teacher",
         protocol_sha256=_DIGEST,
-        overlap_cell_ids=tuple(f"fidelity-cell-{tag}-{index}" for index in range(10)),
-        planned_overlap_count=10,
-        usable_overlap_count=usable_overlap_count,
-        failed_overlap_count=len(failures),
-        score_mae=score_mae,
-        failures=failures,
-        gate_id=f"fidelity-gate-{tag}",
+        overlap_cell_ids=tuple(f"fidelity-cell-{index}" for index in range(8)),
+        planned_overlap_count=8,
+        usable_overlap_count=8,
+        failed_overlap_count=0,
+        score_mae=0.05,
+        gate_id="fidelity-gate-teacher",
         gate_sha256=_DIGEST,
-        status=fidelity_status,
-        approved_at=_TIME if fidelity_status == "approved" else None,
+        status="approved",
+        approved_at=_TIME,
+    )
+    fidelity_input = artifact_input(
+        store.artifacts.write_json(
+            artifact_id=fidelity.fidelity_report_id,
+            artifact_type="fidelity-report",
+            envelope=fidelity,
+            files={"fidelity-report.json": fidelity},
+        )
     )
     rule = TeacherAcceptanceRule(
         schema_version=1,
         created_at=_TIME,
+        inputs=(calibration_input,),
         code_revision="w12-test",
-        acceptance_rule_id=f"teacher-rule-{tag}",
-        minimum_overall_score=minimum_score,
-        required_calibration_id=calibration.calibration_id,
+        acceptance_rule_id="teacher-rule",
+        minimum_overall_score=0.8,
+        required_calibration=calibration_input,
     )
+    rule_input = artifact_input(
+        store.artifacts.write_json(
+            artifact_id=rule.acceptance_rule_id,
+            artifact_type="sft-teacher-acceptance-rule",
+            envelope=rule,
+            files={"rule.json": rule},
+        )
+    )
+    transcript = _transcript("teacher")
+    transcript_payload = canonical_json_bytes(transcript)
     evidence = TeacherAcceptanceEvidence(
         schema_version=1,
         created_at=_TIME,
         inputs=_inputs(
-            ArtifactInput(artifact_id=rollout.rollout_id, sha256=sha256_json(rollout)),
-            ArtifactInput(artifact_id=judgment.judgment_id, sha256=sha256_json(judgment)),
-            ArtifactInput(artifact_id=calibration.calibration_id, sha256=sha256_json(calibration)),
-            ArtifactInput(
-                artifact_id=fidelity.fidelity_report_id,
-                sha256=sha256_json(fidelity),
-            ),
-            ArtifactInput(artifact_id=rule.acceptance_rule_id, sha256=sha256_json(rule)),
+            rollout_input,
+            task_set_input,
+            judgment_input,
+            calibration_input,
+            fidelity_input,
+            rule_input,
         ),
         code_revision="w12-test",
-        acceptance_evidence_id=f"teacher-evidence-{tag}",
-        rollout_id=rollout.rollout_id,
-        rollout_sha256=sha256_json(rollout),
-        judgment_id=judgment.judgment_id,
-        judgment_sha256=sha256_json(judgment),
-        calibration_id=calibration.calibration_id,
-        calibration_sha256=sha256_json(calibration),
-        fidelity_report_id=fidelity.fidelity_report_id,
-        fidelity_report_sha256=sha256_json(fidelity),
-        acceptance_rule_id=rule.acceptance_rule_id,
-        acceptance_rule_sha256=sha256_json(rule),
-        observed_overall_score=score,
+        acceptance_evidence_id="teacher-evidence",
+        rollout=rollout_input,
+        task_set=task_set_input,
+        task_set_tasks_sha256=task_set.tasks_sha256,
+        task_set_inputs=task_set.inputs,
+        task_id=task.task_id,
+        task_sha256=sha256_json(task),
+        judgment=judgment_input,
+        calibration=calibration_input,
+        fidelity_report=fidelity_input,
+        acceptance_rule=rule_input,
+        transcript_path="transcript.json",
+        transcript_sha256=hashlib.sha256(transcript_payload).hexdigest(),
         accepted_at=_TIME,
     )
-    return TeacherSFTSource(
-        rollout=rollout,
-        task=task_case,
-        task_set=task_set,
-        transcript=_transcript(),
-        acceptance_rule=rule,
-        acceptance_evidence=evidence,
-        judgment=judgment,
-        calibration=calibration,
-        fidelity=fidelity,
+    store.artifacts.write(
+        artifact_id=evidence.acceptance_evidence_id,
+        artifact_type="sft-teacher-acceptance",
+        envelope=evidence,
+        files={
+            "evidence.json": canonical_json_bytes(evidence),
+            "transcript.json": transcript_payload,
+        },
+    )
+    return _TeacherFixture(
+        source=TeacherSFTSource(acceptance_evidence_id=evidence.acceptance_evidence_id),
+        evidence=evidence,
+        rollout_input=rollout_input,
+        task_set_input=task_set_input,
+        judgment_input=judgment_input,
+        calibration_input=calibration_input,
+        fidelity_input=fidelity_input,
+        rule_input=rule_input,
+        transcript=transcript,
     )
 
 
 def _build(
+    store: ProjectStore,
+    *,
     production: tuple[ProductionSFTSource, ...] = (),
     teacher: tuple[TeacherSFTSource, ...] = (),
-    *,
-    created_at: datetime = _TIME,
 ) -> SFTDatasetArtifact:
+    """Build one SFT dataset through the public store-backed composition boundary."""
     return build_sft_dataset(
+        store=store,
         production_sources=production,
         teacher_sources=teacher,
         spec=SFTBuildSpec(held_out_fraction=0.5, representative_sample_count=2),
-        created_at=created_at,
+        created_at=_TIME,
         code_revision="w12-test",
     )
 
 
-def test_production_acceptance_filters_unapproved_failed_and_observation_events() -> None:
-    """Only accepted assistant actions become targets, never tools, failures, or unapproved turns.
+def test_store_backed_sources_hydrate_transcripts_and_preserve_full_actions(tmp_path: Path) -> None:
+    """Production and teacher rows come from verified evidence, not caller-owned transcripts."""
+    store = _store(tmp_path)
+    production = _write_production_source(store, "production", human_approval=True)
+    teacher = _write_teacher_source(store)
 
-    The source ledger still records why excluded events were not targets.
-    """
-    valid = _production_source("valid")
-    invalid_evidence = _production_source("invalid")
-    invalid_evidence = invalid_evidence.model_copy(
-        update={
-            "acceptance_evidence": invalid_evidence.acceptance_evidence.model_copy(
-                update={"trace_sha256": "f" * 64}
-            )
-        }
-    )
-    unapproved = _production_source("unapproved", approved=False)
-    failed = _production_source("failed", failed=True)
+    artifact = _build(store, production=(production,), teacher=(teacher.source,))
 
-    artifact = _build((valid, invalid_evidence, unapproved, failed))
-
+    assert {row.example.source.kind for row in artifact.rows} == {
+        "production_trace",
+        "teacher_rollout",
+    }
     assert {row.example.target.content for row in artifact.rows} == {
-        "I will verify the order and issue the refund.",
-        "Your refund is complete.",
+        "Investigating production.",
+        "Resolved production.",
+        "Investigating teacher.",
+        "Resolved teacher.",
     }
-    reasons = {exclusion.reason for exclusion in artifact.inspection.exclusions}
-    assert "invalid_production_acceptance" in reasons
-    assert "unapproved_action" in reasons
-    assert "infrastructure_failure" in reasons
-    assert "observation_context_only" in reasons
-    assert all(row.example.source.kind == "production_trace" for row in artifact.rows)
-
-
-def test_ineligible_assistant_actions_remain_visible_context_for_later_targets() -> None:
-    """An excluded assistant action is not learned, but later visible context remains faithful."""
-    source = _production_source("context")
-    excluded_action = AssistantActionEvent(
-        action=AssistantAction(content="This action was not approved."), approved=False
-    )
-    accepted_action = AssistantActionEvent(
-        action=AssistantAction(content="This approved action follows it.")
-    )
-    source = source.model_copy(
-        update={
-            "transcript": SFTTranscript(
-                events=(
-                    SFTMessage(role="user", content="Complete the request."),
-                    excluded_action,
-                    accepted_action,
-                )
-            )
-        }
-    )
-
-    artifact = _build((source,))
-
-    assert len(artifact.rows) == 1
-    assert artifact.rows[0].example.target == accepted_action.action
-    assert artifact.rows[0].example.history[-1] == excluded_action
-
-
-def test_production_acceptance_requires_verified_outcome_or_human_references() -> None:
-    """Every production evidence branch rejects missing or mismatched immutable references."""
-    valid_human_approval = _human_approved_production_source("human-valid")
-    missing_human_approval = _human_approved_production_source("human-missing")
-    missing_human_approval = missing_human_approval.model_copy(update={"human_approval": None})
-    mismatched_human_approval = _human_approved_production_source("human-hash")
-    mismatched_human_approval = mismatched_human_approval.model_copy(
-        update={
-            "acceptance_evidence": mismatched_human_approval.acceptance_evidence.model_copy(
-                update={"human_approval_sha256": "d" * 64}
-            )
-        }
-    )
-    mismatched_trace = _production_source("trace-hash")
-    mismatched_trace = mismatched_trace.model_copy(
-        update={
-            "acceptance_evidence": mismatched_trace.acceptance_evidence.model_copy(
-                update={"trace_sha256": "d" * 64}
-            )
-        }
-    )
-    mismatched_rule = _production_source("rule-hash")
-    mismatched_rule = mismatched_rule.model_copy(
-        update={
-            "acceptance_evidence": mismatched_rule.acceptance_evidence.model_copy(
-                update={"acceptance_rule_sha256": "d" * 64}
-            )
-        }
-    )
-    mismatched_outcome = _production_source("outcome-hash")
-    mismatched_outcome = mismatched_outcome.model_copy(
-        update={
-            "acceptance_evidence": mismatched_outcome.acceptance_evidence.model_copy(
-                update={"outcome_sha256": "d" * 64}
-            )
-        }
-    )
-    disallowed_human_approval = _human_approved_production_source("human-disallowed")
-    disallowed_rule = disallowed_human_approval.acceptance_rule.model_copy(
-        update={"allow_human_approval": False}
-    )
-    approval = disallowed_human_approval.human_approval
-    assert approval is not None
-    disallowed_human_approval = disallowed_human_approval.model_copy(
-        update={
-            "acceptance_rule": disallowed_rule,
-            "acceptance_evidence": disallowed_human_approval.acceptance_evidence.model_copy(
-                update={
-                    "acceptance_rule_sha256": sha256_json(disallowed_rule),
-                    "inputs": _inputs(
-                        ArtifactInput(
-                            artifact_id=disallowed_rule.acceptance_rule_id,
-                            sha256=sha256_json(disallowed_rule),
-                        ),
-                        ArtifactInput(
-                            artifact_id=approval.approval_id,
-                            sha256=sha256_json(approval),
-                        ),
-                    ),
-                }
-            ),
-        }
-    )
-    untrusted_outcome = _production_source("untrusted-outcome")
-    alternate_outcome = TraceOutcome(status="success", outcome_name="declined")
-    alternate_trace = untrusted_outcome.trace.model_copy(update={"outcome": alternate_outcome})
-    untrusted_outcome = untrusted_outcome.model_copy(
-        update={
-            "trace": alternate_trace,
-            "acceptance_evidence": untrusted_outcome.acceptance_evidence.model_copy(
-                update={
-                    "trace_sha256": sha256_json(alternate_trace),
-                    "outcome_sha256": sha256_json(alternate_outcome),
-                }
-            ),
-        }
-    )
-
-    artifact = _build(
-        (
-            valid_human_approval,
-            missing_human_approval,
-            mismatched_human_approval,
-            mismatched_trace,
-            mismatched_rule,
-            mismatched_outcome,
-            disallowed_human_approval,
-            untrusted_outcome,
+    assert "transcript" not in ProductionSFTSource.model_fields
+    assert "transcript" not in TeacherSFTSource.model_fields
+    assert "observed_overall_score" not in TeacherAcceptanceEvidence.model_fields
+    assert teacher.task_set_input in artifact.dataset.inputs
+    assert teacher.calibration_input in artifact.dataset.inputs
+    assert teacher.evidence.task_set_tasks_sha256
+    with pytest.raises(ValidationError):
+        ProductionSFTSource.model_validate(
+            {
+                "acceptance_evidence_id": production.acceptance_evidence_id,
+                "transcript": _transcript("caller-controlled").model_dump(mode="json"),
+            }
         )
-    )
-
-    assert {
-        row.example.source.trace_id
-        for row in artifact.rows
-        if isinstance(row.example.source, TraceExampleSource)
-    } == {"trace-human-valid"}
-    excluded_ids = {
-        exclusion.source_id
-        for exclusion in artifact.inspection.exclusions
-        if exclusion.reason == "invalid_production_acceptance"
-    }
-    assert excluded_ids == {
-        "trace-human-missing",
-        "trace-human-hash",
-        "trace-trace-hash",
-        "trace-rule-hash",
-        "trace-outcome-hash",
-        "trace-human-disallowed",
-        "trace-untrusted-outcome",
-    }
 
 
-def test_teacher_acceptance_requires_every_immutable_prerequisite() -> None:
-    """Every teacher evidence reference and acceptance gate must be proven before training."""
-    valid = _teacher_source("valid")
-    bad_rollout_hash = _teacher_source("rollout-hash")
-    bad_rollout_hash = bad_rollout_hash.model_copy(
-        update={
-            "acceptance_evidence": bad_rollout_hash.acceptance_evidence.model_copy(
-                update={"rollout_sha256": "c" * 64}
-            )
-        }
-    )
-    bad_judgment_hash = _teacher_source("judgment-hash")
-    bad_judgment_hash = bad_judgment_hash.model_copy(
-        update={
-            "acceptance_evidence": bad_judgment_hash.acceptance_evidence.model_copy(
-                update={"judgment_sha256": "c" * 64}
-            )
-        }
-    )
-    bad_calibration_hash = _teacher_source("calibration-hash")
-    bad_calibration_hash = bad_calibration_hash.model_copy(
-        update={
-            "acceptance_evidence": bad_calibration_hash.acceptance_evidence.model_copy(
-                update={"calibration_sha256": "c" * 64}
-            )
-        }
-    )
-    bad_fidelity_hash = _teacher_source("fidelity-hash")
-    bad_fidelity_hash = bad_fidelity_hash.model_copy(
-        update={
-            "acceptance_evidence": bad_fidelity_hash.acceptance_evidence.model_copy(
-                update={"fidelity_report_sha256": "c" * 64}
-            )
-        }
-    )
-    bad_rule_hash = _teacher_source("rule-hash")
-    bad_rule_hash = bad_rule_hash.model_copy(
-        update={
-            "acceptance_evidence": bad_rule_hash.acceptance_evidence.model_copy(
-                update={"acceptance_rule_sha256": "c" * 64}
-            )
-        }
-    )
-    insufficient_calibration = _teacher_source("calibration", calibration_status="insufficient")
-    rejected_fidelity = _teacher_source("fidelity-rejected", fidelity_status="rejected")
-    insufficient_fidelity = _teacher_source("fidelity-insufficient", fidelity_status="insufficient")
-    low_score = _teacher_source("score", score=0.8, minimum_score=0.9)
-    unfinished = _teacher_source("unfinished")
-    unfinished = unfinished.model_copy(
-        update={
-            "rollout": unfinished.rollout.model_copy(
-                update={"stop_reason": StopReason.MAXIMUM_STEPS}
-            )
-        }
-    )
-    mismatched_task = _teacher_source("task-mismatch")
-    mismatched_task = mismatched_task.model_copy(
-        update={"task": _task_case("different", "A different canonical task.")}
-    )
-    task_outside_set = _teacher_source("task-outside-set")
-    task_outside_set = task_outside_set.model_copy(
-        update={
-            "task_set": task_outside_set.task_set.model_copy(
-                update={"task_ids": ("task-not-this-one",)}
-            )
-        }
-    )
-    unproven = _teacher_source("unproven")
-    unproven = unproven.model_copy(
-        update={
-            "acceptance_evidence": unproven.acceptance_evidence.model_copy(update={"inputs": ()})
-        }
-    )
-
-    artifact = _build(
-        teacher=(
-            valid,
-            bad_rollout_hash,
-            bad_judgment_hash,
-            bad_calibration_hash,
-            bad_fidelity_hash,
-            bad_rule_hash,
-            insufficient_calibration,
-            rejected_fidelity,
-            insufficient_fidelity,
-            low_score,
-            unfinished,
-            mismatched_task,
-            task_outside_set,
-            unproven,
-        )
-    )
-
-    assert {
-        row.example.source.rollout_id
-        for row in artifact.rows
-        if isinstance(row.example.source, RolloutExampleSource)
-    } == {"rollout-valid"}
-    assert "task-set-valid" in {item.artifact_id for item in artifact.dataset.inputs}
-    excluded_ids = {
-        exclusion.source_id
-        for exclusion in artifact.inspection.exclusions
-        if exclusion.reason == "invalid_teacher_acceptance"
-    }
-    assert excluded_ids == {
-        "rollout-rollout-hash",
-        "rollout-judgment-hash",
-        "rollout-calibration-hash",
-        "rollout-fidelity-hash",
-        "rollout-rule-hash",
-        "rollout-calibration",
-        "rollout-fidelity-rejected",
-        "rollout-fidelity-insufficient",
-        "rollout-score",
-        "rollout-unfinished",
-        "rollout-task-mismatch",
-        "rollout-task-outside-set",
-        "rollout-unproven",
-    }
-
-
-def test_shared_fingerprints_union_lineages_before_split_and_deduplicate_globally() -> None:
-    """Identical context-target content cannot leak across partitions and keeps one row globally."""
-    first = _production_source("one")
-    second = _production_source("two")
-    distinct = _production_source("three", task="Cancel order o-17.")
-
-    artifact = _build((first, second, distinct))
-
-    references = {source.source_id: source for source in artifact.sources}
-    first_group = references["trace-one"].leakage_group_id
-    second_group = references["trace-two"].leakage_group_id
-    shared_partition = next(
-        partition for partition in artifact.partitions if first_group in partition.leakage_group_ids
-    )
-    assert second_group in shared_partition.leakage_group_ids
-    assert any(
-        exclusion.reason == "duplicate_normalized_example"
-        for exclusion in artifact.inspection.exclusions
-    )
-    fingerprints_by_partition: dict[str, set[str]] = {"train": set(), "held_out": set()}
-    for row in artifact.rows:
-        fingerprints_by_partition[row.partition].add(row.fingerprint)
-    assert not fingerprints_by_partition["train"].intersection(
-        fingerprints_by_partition["held_out"]
-    )
-
-
-def test_cross_split_fingerprint_is_explicitly_rejected() -> None:
-    """Corrupt rows cannot place one normalized example in both train and held-out data."""
-    row = _build((_production_source("cross-split"),)).rows[0]
-    held_out_copy = row.model_copy(update={"partition": "held_out"})
-
-    with pytest.raises(SFTBuildError, match="appears in both"):
-        ensure_no_cross_split_fingerprints((row, held_out_copy))
-
-
-def test_same_sources_produce_the_same_digest_regardless_of_input_order_or_build_time() -> None:
-    """The semantic digest is stable while materialization time remains provenance."""
-    first = _production_source("first")
-    second = _production_source("second", task="Cancel order o-17.")
-
-    forward = _build((first, second), created_at=_TIME)
-    reversed_build = _build((second, first), created_at=_TIME + timedelta(days=1))
-
-    assert forward.dataset.build_sha256 == reversed_build.dataset.build_sha256
-    assert forward.dataset.dataset_id == reversed_build.dataset.dataset_id
-    assert forward.rows == reversed_build.rows
-
-
-def test_frozen_artifact_contains_provenance_samples_exclusions_and_training_gate(
+def test_store_backed_source_rejects_corrupt_transcript_and_cross_store_pointer(
     tmp_path: Path,
 ) -> None:
-    """Only a prior accepted immutable artifact can be loaded for later training consumption."""
-    accepted = _build((_production_source("artifact"), _production_source("other", task="Other.")))
-    store = ProjectStore(tmp_path / ".wmo", "sft-project")
-    store.initialize(ProjectConfig(project_id="sft-project"))
-
-    written = write_sft_dataset(store, accepted)
-    loaded = load_sft_dataset(store, written.dataset.dataset_id)
-    stored = store.artifacts.read(written.dataset.dataset_id)
-    metadata = written.metadata()
-
-    assert loaded == written
-    assert {file.path for file in stored.manifest.files} == {"dataset.json", "examples.jsonl"}
-    assert metadata.sources
-    assert metadata.partitions
-    assert metadata.inspection.exclusions
-    assert metadata.representative_samples
-    source_reference = next(source for source in metadata.sources if source.accepted)
-    assert source_reference.acceptance_evidence_id == "production-evidence-artifact"
-    assert source_reference.acceptance_evidence_sha256 == sha256_json(
-        _production_source("artifact").acceptance_evidence
+    """An accepted pointer cannot inject arbitrary transcript bytes or cross project boundaries."""
+    source_store = _store(tmp_path / "source")
+    source = _write_production_source(source_store, "corrupt")
+    transcript_path = (
+        source_store.artifacts.read(source.acceptance_evidence_id).directory / "transcript.json"
     )
-    assert {item.artifact_id for item in metadata.dataset.inputs} == {
-        "production-evidence-artifact",
-        "production-evidence-other",
-        "production-rule-artifact",
-        "production-rule-other",
-    }
-    assert metadata.inspection.dataset_id == metadata.dataset.dataset_id
-    assert all(sample in written.rows for sample in metadata.representative_samples)
+    transcript_path.write_text('{"events":[]}\n', encoding="utf-8")
 
-    invalid = _production_source("nope")
-    invalid = invalid.model_copy(
+    with pytest.raises(SFTBuildError, match="not accepted evidence"):
+        _build(source_store, production=(source,))
+
+    other_store = _store(tmp_path / "other")
+    with pytest.raises(SFTBuildError, match="not accepted evidence"):
+        _build(other_store, production=(source,))
+
+    teacher_source = _write_teacher_source(source_store)
+    with pytest.raises(SFTBuildError, match="not accepted evidence"):
+        _build(other_store, teacher=(teacher_source.source,))
+
+
+def test_teacher_rejects_forged_score_and_recursively_unverifiable_calibration(
+    tmp_path: Path,
+) -> None:
+    """Teacher acceptance recomputes score and invokes W6 recursive calibration verification."""
+    store = _store(tmp_path)
+    fixture = _write_teacher_source(store)
+    original = Judgment.model_validate_json(
+        store.artifacts.read_bytes(fixture.judgment_input.artifact_id, "judgment.json")
+    )
+    forged_dimension = original.dimensions[0].model_copy(update={"calibrated_score": 4.0})
+    forged_judgment = original.model_copy(
         update={
-            "acceptance_evidence": invalid.acceptance_evidence.model_copy(
-                update={"acceptance_rule_sha256": "d" * 64}
-            )
+            "judgment_id": "forged-teacher-judgment",
+            "dimensions": (forged_dimension,),
+            "overall_score": 0.8,
         }
     )
-    insufficient = _build((invalid,))
-    write_sft_dataset(store, insufficient)
-    with pytest.raises(ValueError, match="insufficient"):
-        load_sft_dataset(store, insufficient.dataset.dataset_id)
-    assert (
-        load_sft_dataset(
-            store, insufficient.dataset.dataset_id, require_accepted=False
-        ).dataset.status
-        == "insufficient"
+    forged_judgment_input = artifact_input(
+        store.artifacts.write_json(
+            artifact_id=forged_judgment.judgment_id,
+            artifact_type="judgment",
+            envelope=forged_judgment,
+            files={"judgment.json": forged_judgment},
+        )
+    )
+    forged_evidence = fixture.evidence.model_copy(
+        update={
+            "acceptance_evidence_id": "teacher-evidence-forged-score",
+            "inputs": _inputs(
+                fixture.rollout_input,
+                fixture.task_set_input,
+                forged_judgment_input,
+                fixture.calibration_input,
+                fixture.fidelity_input,
+                fixture.rule_input,
+            ),
+            "judgment": forged_judgment_input,
+        }
+    )
+    store.artifacts.write(
+        artifact_id=forged_evidence.acceptance_evidence_id,
+        artifact_type="sft-teacher-acceptance",
+        envelope=forged_evidence,
+        files={
+            "evidence.json": canonical_json_bytes(forged_evidence),
+            "transcript.json": canonical_json_bytes(fixture.transcript),
+        },
+    )
+    with pytest.raises(SFTBuildError, match="calibrated dimension"):
+        _build(
+            store,
+            teacher=(
+                TeacherSFTSource(acceptance_evidence_id=forged_evidence.acceptance_evidence_id),
+            ),
+        )
+
+    calibration = JudgeCalibration.model_validate_json(
+        store.artifacts.read_bytes(fixture.calibration_input.artifact_id, "calibration.json")
+    )
+    forged_calibration = calibration.model_copy(
+        update={
+            "calibration_id": "forged-teacher-calibration",
+            "out_of_fold_report_sha256": "b" * 64,
+        }
+    )
+    forged_calibration_input = artifact_input(
+        store.artifacts.write_json(
+            artifact_id=forged_calibration.calibration_id,
+            artifact_type="judge-calibration",
+            envelope=forged_calibration,
+            files={"calibration.json": forged_calibration},
+        )
+    )
+    forged_rule = TeacherAcceptanceRule(
+        schema_version=1,
+        created_at=_TIME,
+        inputs=(forged_calibration_input,),
+        code_revision="w12-test",
+        acceptance_rule_id="teacher-rule-forged-calibration",
+        minimum_overall_score=0.8,
+        required_calibration=forged_calibration_input,
+    )
+    forged_rule_input = artifact_input(
+        store.artifacts.write_json(
+            artifact_id=forged_rule.acceptance_rule_id,
+            artifact_type="sft-teacher-acceptance-rule",
+            envelope=forged_rule,
+            files={"rule.json": forged_rule},
+        )
+    )
+    forged_calibration_evidence = fixture.evidence.model_copy(
+        update={
+            "acceptance_evidence_id": "teacher-evidence-forged-calibration",
+            "inputs": _inputs(
+                fixture.rollout_input,
+                fixture.task_set_input,
+                fixture.judgment_input,
+                forged_calibration_input,
+                fixture.fidelity_input,
+                forged_rule_input,
+            ),
+            "calibration": forged_calibration_input,
+            "acceptance_rule": forged_rule_input,
+        }
+    )
+    store.artifacts.write(
+        artifact_id=forged_calibration_evidence.acceptance_evidence_id,
+        artifact_type="sft-teacher-acceptance",
+        envelope=forged_calibration_evidence,
+        files={
+            "evidence.json": canonical_json_bytes(forged_calibration_evidence),
+            "transcript.json": canonical_json_bytes(fixture.transcript),
+        },
+    )
+    with pytest.raises(SFTBuildError, match="recursive W6 provenance"):
+        _build(
+            store,
+            teacher=(
+                TeacherSFTSource(
+                    acceptance_evidence_id=forged_calibration_evidence.acceptance_evidence_id
+                ),
+            ),
+        )
+
+
+def test_teacher_rejects_corrupt_full_task_case_and_preserves_task_set_lineage(
+    tmp_path: Path,
+) -> None:
+    """Task IDs alone never authorize teacher data, task bytes and task-set inputs are verified."""
+    store = _store(tmp_path)
+    fixture = _write_teacher_source(store)
+    task_path = store.artifacts.read(fixture.task_set_input.artifact_id).directory / "tasks.jsonl"
+    task_path.write_text('{"task_id":"task-teacher"}\n', encoding="utf-8")
+
+    with pytest.raises(SFTBuildError, match="not accepted evidence"):
+        _build(store, teacher=(fixture.source,))
+
+
+def test_ineligible_actions_remain_context_but_never_become_sft_targets(tmp_path: Path) -> None:
+    """Verified transcript events retain context while excluding failed and unapproved targets."""
+    store = _store(tmp_path)
+    unapproved = AssistantActionEvent(
+        action=AssistantAction(content="This action was not approved."), approved=False
+    )
+    failed = AssistantActionEvent(action=AssistantAction(content="This action failed."))
+    accepted = AssistantActionEvent(action=AssistantAction(content="This action is approved."))
+    source = _write_production_source(
+        store,
+        "context",
+        transcript=SFTTranscript(
+            events=(
+                SFTMessage(role="user", content="Complete the request."),
+                unapproved,
+                failed,
+                InfrastructureFailureEvent(
+                    action_index=2,
+                    failure=StructuredFailure(
+                        code=FailureCode.TIMEOUT,
+                        message="tool transport timed out",
+                    ),
+                ),
+                accepted,
+            )
+        ),
+    )
+
+    artifact = _build(store, production=(source,))
+
+    assert [row.example.target for row in artifact.rows] == [accepted.action]
+    assert artifact.rows[0].example.history[-1] == failed
+    assert {item.reason for item in artifact.inspection.exclusions} == {
+        "infrastructure_failure",
+        "unapproved_action",
+    }
+
+
+def test_shared_fingerprints_union_lineages_and_build_digest_is_order_independent(
+    tmp_path: Path,
+) -> None:
+    """Keep duplicate verified examples in one split and preserve source-order invariance."""
+    store = _store(tmp_path)
+    shared_transcript = SFTTranscript(
+        events=(
+            SFTMessage(role="user", content="Resolve the shared request."),
+            AssistantActionEvent(action=AssistantAction(content="Resolved the shared request.")),
+        )
+    )
+    first = _write_production_source(
+        store,
+        "shared-one",
+        task="Resolve the shared request.",
+        transcript=shared_transcript,
+    )
+    second = _write_production_source(
+        store,
+        "shared-two",
+        task="Resolve the shared request.",
+        transcript=shared_transcript,
+    )
+    distinct = _write_production_source(store, "distinct")
+
+    forward = _build(store, production=(first, second, distinct))
+    reversed_build = _build(store, production=(distinct, second, first))
+
+    references = {item.source_id: item for item in forward.sources}
+    shared_partition = next(
+        item
+        for item in forward.partitions
+        if references["trace-shared-one"].leakage_group_id in item.leakage_group_ids
+    )
+    assert references["trace-shared-two"].leakage_group_id in shared_partition.leakage_group_ids
+    assert any(
+        item.reason == "duplicate_normalized_example" for item in forward.inspection.exclusions
+    )
+    assert forward.dataset.build_sha256 == reversed_build.dataset.build_sha256
+    assert forward.rows == reversed_build.rows
+
+    row = forward.rows[0]
+    with pytest.raises(SFTBuildError, match="appears in both"):
+        ensure_no_cross_split_fingerprints((row, row.model_copy(update={"partition": "held_out"})))
+
+
+def test_frozen_dataset_round_trips_only_after_store_backed_build(tmp_path: Path) -> None:
+    """A persisted SFT artifact retains verified source manifests and rejects later corruption."""
+    store = _store(tmp_path)
+    artifact = _build(
+        store,
+        production=(
+            _write_production_source(store, "one"),
+            _write_production_source(store, "two"),
+        ),
+    )
+    written = write_sft_dataset(store, artifact)
+
+    assert load_sft_dataset(store, written.dataset.dataset_id) == written
+    assert all(reference.source_artifact in written.dataset.inputs for reference in written.sources)
+    assert all(
+        reference.acceptance_evidence in written.dataset.inputs for reference in written.sources
     )

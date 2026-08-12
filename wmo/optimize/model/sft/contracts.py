@@ -11,17 +11,13 @@ from pydantic import Field, field_validator, model_validator
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactId,
+    ArtifactInput,
     ContractModel,
     Sha256,
     StructuredFailure,
     validate_artifact_file_path,
 )
-from wmo.common.evaluations import FidelityReport
-from wmo.common.judging import JudgeCalibration, Judgment
 from wmo.common.models import AssistantAction
-from wmo.common.rollouts import RolloutArtifact
-from wmo.common.tasks import TaskCase, TaskSet
-from wmo.common.traces import Trace
 
 
 def _require_timezone(value: datetime, *, label: str) -> datetime:
@@ -135,7 +131,7 @@ class TeacherAcceptanceRule(ArtifactEnvelope):
 
     acceptance_rule_id: ArtifactId
     minimum_overall_score: float = Field(ge=0, le=1)
-    required_calibration_id: ArtifactId
+    required_calibration: ArtifactInput
     require_approved_fidelity: Literal[True] = True
 
     @field_validator("minimum_overall_score")
@@ -145,11 +141,18 @@ class TeacherAcceptanceRule(ArtifactEnvelope):
             raise ValueError("teacher acceptance score must be finite")
         return value
 
+    @model_validator(mode="after")
+    def _require_calibration_binding(self) -> TeacherAcceptanceRule:
+        if self.inputs != (self.required_calibration,):
+            raise ValueError("teacher acceptance rules must hash exactly their calibration")
+        return self
+
 
 class HumanApproval(ArtifactEnvelope):
     """One explicit immutable human approval bound to a production trace."""
 
     approval_id: ArtifactId
+    trace_dataset: ArtifactInput
     trace_id: str = Field(min_length=1, max_length=512)
     decision: Literal["approved"] = "approved"
     approved_at: datetime
@@ -159,20 +162,32 @@ class HumanApproval(ArtifactEnvelope):
     def _require_approved_at_timezone(cls, value: datetime) -> datetime:
         return _require_timezone(value, label="human approval time")
 
+    @model_validator(mode="after")
+    def _require_trace_dataset_binding(self) -> HumanApproval:
+        if self.inputs != (self.trace_dataset,):
+            raise ValueError("human approvals must hash exactly their trace-dataset artifact")
+        return self
+
 
 class ProductionAcceptanceEvidence(ArtifactEnvelope):
     """Immutable evidence that one production trace satisfies a production acceptance rule."""
 
     acceptance_evidence_id: ArtifactId
+    trace_dataset: ArtifactInput
     trace_id: str = Field(min_length=1, max_length=512)
     trace_sha256: Sha256
-    acceptance_rule_id: ArtifactId
-    acceptance_rule_sha256: Sha256
+    acceptance_rule: ArtifactInput
     decision: Literal["trusted_outcome", "human_approval"]
     outcome_sha256: Sha256 | None = None
-    human_approval_id: ArtifactId | None = None
-    human_approval_sha256: Sha256 | None = None
+    human_approval: ArtifactInput | None = None
+    transcript_path: str = Field(min_length=1)
+    transcript_sha256: Sha256
     accepted_at: datetime
+
+    @field_validator("transcript_path")
+    @classmethod
+    def _require_safe_transcript_path(cls, value: str) -> str:
+        return validate_artifact_file_path(value).as_posix()
 
     @field_validator("accepted_at")
     @classmethod
@@ -181,20 +196,19 @@ class ProductionAcceptanceEvidence(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_complete_evidence_branch(self) -> ProductionAcceptanceEvidence:
-        expected_inputs = {self.acceptance_rule_id: self.acceptance_rule_sha256}
+        expected_inputs = [self.trace_dataset, self.acceptance_rule]
         if self.decision == "trusted_outcome":
             if self.outcome_sha256 is None:
                 raise ValueError("trusted-outcome evidence requires an outcome digest")
-            if self.human_approval_id is not None or self.human_approval_sha256 is not None:
+            if self.human_approval is not None:
                 raise ValueError("trusted-outcome evidence must not name human approval")
         else:
             if self.outcome_sha256 is not None:
                 raise ValueError("human-approval evidence must not name an outcome digest")
-            if self.human_approval_id is None or self.human_approval_sha256 is None:
-                raise ValueError("human-approval evidence requires approval identity and digest")
-            expected_inputs[self.human_approval_id] = self.human_approval_sha256
-        actual_inputs = {item.artifact_id: item.sha256 for item in self.inputs}
-        if actual_inputs != expected_inputs:
+            if self.human_approval is None:
+                raise ValueError("human-approval evidence requires an approval artifact")
+            expected_inputs.append(self.human_approval)
+        if self.inputs != tuple(sorted(expected_inputs, key=lambda item: item.artifact_id)):
             raise ValueError("production acceptance evidence inputs must match its references")
         return self
 
@@ -203,25 +217,35 @@ class TeacherAcceptanceEvidence(ArtifactEnvelope):
     """Immutable evidence that one teacher rollout passed all required quality gates."""
 
     acceptance_evidence_id: ArtifactId
-    rollout_id: ArtifactId
-    rollout_sha256: Sha256
-    judgment_id: ArtifactId
-    judgment_sha256: Sha256
-    calibration_id: ArtifactId
-    calibration_sha256: Sha256
-    fidelity_report_id: ArtifactId
-    fidelity_report_sha256: Sha256
-    acceptance_rule_id: ArtifactId
-    acceptance_rule_sha256: Sha256
-    observed_overall_score: float = Field(ge=0, le=1)
+    rollout: ArtifactInput
+    task_set: ArtifactInput
+    task_set_tasks_sha256: Sha256
+    task_set_inputs: tuple[ArtifactInput, ...]
+    task_id: ArtifactId
+    task_sha256: Sha256
+    judgment: ArtifactInput
+    calibration: ArtifactInput
+    fidelity_report: ArtifactInput
+    acceptance_rule: ArtifactInput
+    transcript_path: str = Field(min_length=1)
+    transcript_sha256: Sha256
     accepted_at: datetime
 
-    @field_validator("observed_overall_score")
+    @field_validator("task_set_inputs")
     @classmethod
-    def _require_finite_score(cls, value: float) -> float:
-        if not math.isfinite(value):
-            raise ValueError("teacher acceptance score must be finite")
+    def _require_sorted_unique_task_set_inputs(
+        cls, value: tuple[ArtifactInput, ...]
+    ) -> tuple[ArtifactInput, ...]:
+        if len({item.artifact_id for item in value}) != len(value):
+            raise ValueError("teacher task-set inputs must not repeat artifact IDs")
+        if value != tuple(sorted(value, key=lambda item: item.artifact_id)):
+            raise ValueError("teacher task-set inputs must be sorted by artifact ID")
         return value
+
+    @field_validator("transcript_path")
+    @classmethod
+    def _require_safe_transcript_path(cls, value: str) -> str:
+        return validate_artifact_file_path(value).as_posix()
 
     @field_validator("accepted_at")
     @classmethod
@@ -230,15 +254,20 @@ class TeacherAcceptanceEvidence(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_complete_references(self) -> TeacherAcceptanceEvidence:
-        expected_inputs = {
-            self.rollout_id: self.rollout_sha256,
-            self.judgment_id: self.judgment_sha256,
-            self.calibration_id: self.calibration_sha256,
-            self.fidelity_report_id: self.fidelity_report_sha256,
-            self.acceptance_rule_id: self.acceptance_rule_sha256,
-        }
-        actual_inputs = {item.artifact_id: item.sha256 for item in self.inputs}
-        if actual_inputs != expected_inputs:
+        expected_inputs = tuple(
+            sorted(
+                (
+                    self.rollout,
+                    self.task_set,
+                    self.judgment,
+                    self.calibration,
+                    self.fidelity_report,
+                    self.acceptance_rule,
+                ),
+                key=lambda item: item.artifact_id,
+            )
+        )
+        if self.inputs != expected_inputs:
             raise ValueError(
                 "teacher acceptance evidence inputs must match every required reference"
             )
@@ -246,27 +275,15 @@ class TeacherAcceptanceEvidence(ArtifactEnvelope):
 
 
 class ProductionSFTSource(ContractModel):
-    """One production trace, canonical transcript, and immutable acceptance chain."""
+    """A pointer to one persisted production-acceptance evidence artifact."""
 
-    trace: Trace
-    transcript: SFTTranscript
-    acceptance_rule: ProductionAcceptanceRule
-    acceptance_evidence: ProductionAcceptanceEvidence
-    human_approval: HumanApproval | None = None
+    acceptance_evidence_id: ArtifactId
 
 
 class TeacherSFTSource(ContractModel):
-    """One teacher rollout, canonical transcript, and immutable accepted quality evidence."""
+    """A pointer to one persisted teacher-acceptance evidence artifact."""
 
-    rollout: RolloutArtifact
-    task: TaskCase
-    task_set: TaskSet
-    transcript: SFTTranscript
-    acceptance_rule: TeacherAcceptanceRule
-    acceptance_evidence: TeacherAcceptanceEvidence
-    judgment: Judgment
-    calibration: JudgeCalibration
-    fidelity: FidelityReport
+    acceptance_evidence_id: ArtifactId
 
 
 class TraceExampleSource(ContractModel):
@@ -274,8 +291,7 @@ class TraceExampleSource(ContractModel):
 
     kind: Literal["production_trace"] = "production_trace"
     trace_id: str = Field(min_length=1, max_length=512)
-    acceptance_evidence_id: ArtifactId
-    acceptance_evidence_sha256: Sha256
+    acceptance_evidence: ArtifactInput
 
 
 class RolloutExampleSource(ContractModel):
@@ -283,8 +299,7 @@ class RolloutExampleSource(ContractModel):
 
     kind: Literal["teacher_rollout"] = "teacher_rollout"
     rollout_id: ArtifactId
-    acceptance_evidence_id: ArtifactId
-    acceptance_evidence_sha256: Sha256
+    acceptance_evidence: ArtifactInput
 
 
 SFTExampleSource = Annotated[
@@ -346,10 +361,10 @@ class SFTSourceReference(ContractModel):
 
     kind: Literal["production_trace", "teacher_rollout"]
     source_id: str = Field(min_length=1, max_length=512)
-    source_sha256: Sha256
+    source_artifact: ArtifactInput
+    source_record_sha256: Sha256
     leakage_group_id: ArtifactId
-    acceptance_evidence_id: ArtifactId
-    acceptance_evidence_sha256: Sha256
+    acceptance_evidence: ArtifactInput
     accepted: bool
     exclusion_reason: str | None = None
 
