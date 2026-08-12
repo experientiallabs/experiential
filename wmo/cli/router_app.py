@@ -87,13 +87,25 @@ def _load_config(path: Path, model_type: type[ContractModel]) -> ContractModel:
         raise typer.BadParameter(f"invalid router command config {path}: {exc}") from exc
 
 
-@router_app.command("fit")
+@router_app.command(
+    "fit",
+    help="Materialize fit evidence and persist one frozen bank and policy.",
+)
 def fit(
     project: str = typer.Argument(..., help="Canonical project ID."),
     config: Path = _CONFIG_OPTION,
     root: Path = _ROOT_OPTION,
 ) -> None:
-    """Materialize fit-only evidence and persist the frozen bank and policy."""
+    """Materialize fit-only evidence and persist the frozen bank and policy.
+
+    Args:
+        project: Canonical project identifier.
+        config: Local JSON configuration containing immutable fit inputs.
+        root: Root directory for project artifacts.
+
+    Raises:
+        typer.BadParameter: If an input artifact is missing, inconsistent, or unapproved.
+    """
     value = _load_config(config, RouterFitCommandConfig)
     assert isinstance(value, RouterFitCommandConfig)
     store = _store(project, root)
@@ -137,13 +149,25 @@ def fit(
     typer.echo(f"policy: {result.policy.policy_id}")
 
 
-@router_app.command("report")
+@router_app.command(
+    "report",
+    help="Open held-out evidence after policy lock and persist the router report.",
+)
 def report(
     project: str = typer.Argument(..., help="Canonical project ID."),
     config: Path = _CONFIG_OPTION,
     root: Path = _ROOT_OPTION,
 ) -> None:
-    """Open held-out inputs after policy lock and persist the weighted router report."""
+    """Open held-out inputs after policy lock and persist the weighted router report.
+
+    Args:
+        project: Canonical project identifier.
+        config: Local JSON configuration containing held-out report inputs.
+        root: Root directory for project artifacts.
+
+    Raises:
+        typer.BadParameter: If policy-locked inputs drift or held-out evidence is invalid.
+    """
     value = _load_config(config, RouterReportCommandConfig)
     assert isinstance(value, RouterReportCommandConfig)
     store = _store(project, root)

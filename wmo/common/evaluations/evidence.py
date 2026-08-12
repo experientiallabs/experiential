@@ -124,7 +124,15 @@ def read_fidelity_gate(
 def read_fidelity_thresholds(
     store: ArtifactStore, artifact_id: ArtifactId
 ) -> tuple[FidelityThresholds, ArtifactInput]:
-    """Load verified reusable fidelity thresholds without approval authority."""
+    """Load verified reusable fidelity thresholds without approval authority.
+
+    Args:
+        store: Project-local immutable artifact store.
+        artifact_id: Fidelity-threshold artifact identity.
+
+    Returns:
+        Parsed thresholds plus the exact digest of their generic artifact manifest.
+    """
     value, input_record = _read_json(
         store,
         artifact_id=artifact_id,

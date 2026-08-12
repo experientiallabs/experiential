@@ -20,7 +20,10 @@ from rich.console import Console
 from typer.testing import CliRunner, Result
 
 from wmo.cli import app
+from wmo.cli.model_app import PROBE_EXIT_INSUFFICIENT, PROBE_EXIT_NO_GAP
 from wmo.common.config.settings import load_settings
+from wmo.common.providers.base import ProviderKind, TokenUsage
+from wmo.common.providers.pool import PoolEntry
 from wmo.optimize.model.config import DistillConfig
 from wmo.optimize.model.gate import DistillGateRecord
 from wmo.optimize.model.loop import (
@@ -38,6 +41,7 @@ from wmo.optimize.model.loop import (
 )
 from wmo.optimize.model.rollouts import E2B_SANDBOXES_PER_TRIAL
 from wmo.optimize.model.store import DEFAULT_TINKER_OPENAI_ENDPOINT, AdapterStore, DistillRunStore
+from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.runtime.agents.default import default_agent
 from wmo.runtime.harness.doc import HarnessDoc
 from wmo.runtime.harness.e2b_reap import CapacityCheck, ReapOutcome
@@ -1317,3 +1321,98 @@ def test_report_refuses_a_last_metrics_line_that_parses_into_a_non_object(tmp_pa
     assert "expected a JSON object" in flat
     assert "ignoring a half-written last line" not in flat
     assert "Traceback" not in result.output
+
+
+# -- `probe`: the teacher-search gate over a measured matrix ------------------------------------
+
+
+def _probe(matrix_file: Path, *extra: str) -> Result:
+    return runner.invoke(app, ["optimize", "distill", "probe", str(matrix_file), *extra])
+
+
+def _matrix_file(tmp_path: Path, *, gain: float, scenarios: int = 12) -> Path:
+    """A two-candidate matrix where the dearer model is `gain` reward points better."""
+    pool = [
+        PoolEntry(
+            name=name,
+            kind=ProviderKind.OPENAI,
+            model=f"{name}-runtime",
+            tier="open",
+            input_per_mtok=rate,
+            output_per_mtok=rate,
+        )
+        for name, rate in (("small", 0.10), ("big", 1.15))
+    ]
+    outcomes = [
+        ScenarioOutcome(
+            scenario_id=f"s{i:02d}",
+            task=f"task {i}",
+            model=name,
+            reward=0.30 + (gain + (0.02 if i % 2 else -0.02) if name == "big" else 0.0),
+            success=True,
+            usage=TokenUsage(input_tokens=100, output_tokens=50),
+            # Distinct per-episode spend, so the measured ladder has a cheapest model to pick
+            # the student from rather than a tie.
+            cost_usd=0.002 if name == "small" else 0.020,
+        )
+        for name in ("small", "big")
+        for i in range(scenarios)
+    ]
+    path = tmp_path / "matrix.json"
+    OutcomeMatrix(pool=pool, outcomes=outcomes).save(path)
+    return path
+
+
+def test_probe_exits_zero_and_names_the_teacher_when_the_gap_is_real(tmp_path: Path) -> None:
+    result = _probe(_matrix_file(tmp_path, gain=0.30))
+
+    assert result.exit_code == 0, result.output
+    flat = _flat(result)
+    assert "distill" in flat
+    assert "big *" in flat  # the gain table stars the chosen teacher
+    assert "+30.0" in flat
+
+
+def test_probe_exits_three_when_the_matrix_shows_no_gap(tmp_path: Path) -> None:
+    """The documented no-gap code: a script branches on it without parsing the sentence."""
+    result = _probe(_matrix_file(tmp_path, gain=0.02))
+
+    assert result.exit_code == PROBE_EXIT_NO_GAP
+    assert "DO NOT DISTILL" in _flat(result)
+
+
+def test_probe_exits_four_when_the_matrix_is_too_thin_to_decide(tmp_path: Path) -> None:
+    result = _probe(_matrix_file(tmp_path, gain=0.30, scenarios=3))
+
+    assert result.exit_code == PROBE_EXIT_INSUFFICIENT
+    assert "INSUFFICIENT EVIDENCE" in _flat(result)
+
+
+def test_probe_takes_the_bar_and_the_student_from_the_caller(tmp_path: Path) -> None:
+    matrix_file = _matrix_file(tmp_path, gain=0.30)
+
+    lowered = _probe(matrix_file, "--min-gap", "0.5")
+    assert lowered.exit_code == PROBE_EXIT_NO_GAP  # +30 points no longer clears a 50-point bar
+
+    inverted = _probe(matrix_file, "--student", "big")
+    assert inverted.exit_code == PROBE_EXIT_NO_GAP  # the small model is 30 points WORSE
+    assert "against 'big'" in _flat(inverted)
+
+
+def test_probe_on_a_missing_matrix_says_which_command_writes_one(tmp_path: Path) -> None:
+    result = _probe(tmp_path / "nope.json")
+
+    assert result.exit_code == 2
+    flat = _flat(result)
+    assert "no outcome matrix at" in flat
+    assert "wmo optimize route sweep" in flat
+
+
+def test_probe_on_a_file_that_is_not_a_matrix_says_so(tmp_path: Path) -> None:
+    path = tmp_path / "matrix.json"
+    path.write_text('{"pool": []}', encoding="utf-8")
+
+    result = _probe(path)
+
+    assert result.exit_code == 2
+    assert "is not a readable outcome matrix" in _flat(result)

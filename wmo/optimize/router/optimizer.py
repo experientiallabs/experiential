@@ -152,7 +152,20 @@ class RouterOptimizer:
         created_at: object,
         code_revision: str,
     ) -> RouterOptimizationResult:
-        """Open a separate held-out artifact only after policy and bank are frozen."""
+        """Open held-out evidence only after policy and bank are frozen.
+
+        Args:
+            locked: Persisted fit result whose policy and bank identities are immutable.
+            held_out_evaluation_id: Separate held-out evaluation artifact to report.
+            created_at: Timezone-aware report creation time.
+            code_revision: Non-empty source revision recorded in the report.
+
+        Returns:
+            Persisted held-out report alongside the locked policy and bank.
+
+        Raises:
+            RouterOptimizationError: If evidence is incompatible, incomplete, or drifted.
+        """
         from datetime import datetime
 
         if not isinstance(created_at, datetime):

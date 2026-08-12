@@ -77,11 +77,23 @@ from wmo.optimize.model.sft.contracts import (
     TeacherAcceptanceRule,
     TeacherSFTSource,
 )
+from wmo.optimize.model.sft.fidelity_support_test import usable_fidelity_pairs
 from wmo.simulation.ingest.dataset import persist_trace_dataset
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 
 _DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
+
+
+def _judge_content(span_id: str, feedback: str) -> str:
+    """Build one deterministic fake-judge response."""
+    dimension = {
+        "dimension_id": "quality",
+        "raw_score": 5,
+        "evidence_span_ids": [span_id],
+        "feedback": feedback,
+    }
+    return json.dumps({"dimensions": [dimension]})
 
 
 class _FakeJudgeClient:
@@ -477,18 +489,7 @@ def _write_teacher_source(
         judgment = LMJudge(
             _FakeJudgeClient(
                 model,
-                json.dumps(
-                    {
-                        "dimensions": [
-                            {
-                                "dimension_id": "quality",
-                                "raw_score": 5,
-                                "evidence_span_ids": [span_id],
-                                "feedback": "The rollout resolved the request.",
-                            }
-                        ]
-                    }
-                ),
+                _judge_content(span_id, "The rollout resolved the request."),
             ),
             prompt,
             code_revision="w12-test",
@@ -561,18 +562,7 @@ def _write_teacher_source(
     final_judgment = LMJudge(
         _FakeJudgeClient(
             model,
-            json.dumps(
-                {
-                    "dimensions": [
-                        {
-                            "dimension_id": "quality",
-                            "raw_score": 5,
-                            "evidence_span_ids": [final_rollout.spans[0].span_id],
-                            "feedback": "The teacher resolved the request.",
-                        }
-                    ]
-                }
-            ),
+            _judge_content(final_rollout.spans[0].span_id, "The teacher resolved the request."),
         ),
         prompt,
         code_revision="w12-test",
@@ -584,18 +574,26 @@ def _write_teacher_source(
         calibration_artifact_id=calibration.calibration_id,
     )
     judgment_input = artifact_input(store.artifacts.read(final_judgment.judgment_id).manifest)
+    overlap_cell_ids = tuple(f"fidelity-cell-{index}" for index in range(8))
     fidelity = FidelityReport(
         schema_version=1,
         created_at=_TIME,
         inputs=_inputs(task_set_input, fidelity_rollout_input),
         code_revision="w12-test",
         fidelity_report_id="fidelity-teacher",
+        evaluation_plan_id="evaluation-plan-teacher",
+        evaluation_plan_sha256=_DIGEST,
         protocol_sha256=_DIGEST,
-        overlap_cell_ids=tuple(f"fidelity-cell-{index}" for index in range(8)),
+        overlap_cell_ids=overlap_cell_ids,
         planned_overlap_count=8,
         usable_overlap_count=8,
         failed_overlap_count=0,
         score_mae=0.05,
+        pairs=usable_fidelity_pairs(
+            overlap_cell_ids,
+            final_rollout.artifact_id,
+            fidelity_rollout_input.artifact_id,
+        ),
         gate_id="fidelity-gate-teacher",
         gate_sha256=_DIGEST,
         status="approved",

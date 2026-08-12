@@ -53,7 +53,18 @@ class PricingSnapshot(ArtifactEnvelope):
 def load_pricing_snapshot(
     store: ArtifactStore, artifact_id: ArtifactId
 ) -> tuple[PricingSnapshot, str]:
-    """Load a manifest-verified pricing artifact and return its exact manifest digest."""
+    """Load a manifest-verified pricing artifact and its exact manifest digest.
+
+    Args:
+        store: Project-local immutable artifact store.
+        artifact_id: Pricing-snapshot artifact identity.
+
+    Returns:
+        Parsed pricing snapshot and its exact manifest digest.
+
+    Raises:
+        ValueError: If the artifact type or embedded identity is inconsistent.
+    """
     stored = store.read(artifact_id)
     if stored.manifest.artifact_type != "pricing-snapshot":
         raise ValueError(f"artifact {artifact_id} is not a pricing snapshot")
