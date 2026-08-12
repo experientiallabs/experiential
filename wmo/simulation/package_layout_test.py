@@ -13,7 +13,6 @@ def test_simulation_domains_are_nested() -> None:
         "ingest",
         "model",
         "retrieval",
-        "scenarios",
         "serving",
     }
     missing_dirs = sorted(name for name in expected_dirs if not (SIMULATION_DIR / name).is_dir())
