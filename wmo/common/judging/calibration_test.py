@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,24 +14,31 @@ from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactInput, SourceIde
 from wmo.common.judging import (
     CalibrationError,
     CalibrationReport,
-    DimensionJudgment,
-    DimensionScoreMap,
     HumanLabelSet,
     HumanScore,
-    HumanScoreHistory,
+    HumanScoreReview,
     JudgeCalibration,
     JudgeCalibrationService,
     JudgeScoreObservation,
     Judgment,
+    JudgmentError,
+    LMJudge,
     PromptDefinition,
     RouterLineageAssignment,
     RouterLineageSplit,
     Rubric,
     RubricDimension,
     ScoreAnchor,
+    verify_persisted_calibration,
     write_router_lineage_split,
 )
-from wmo.common.models import AssistantAction, ModelSnapshot, OperationEconomics
+from wmo.common.models import (
+    AssistantAction,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+    OperationEconomics,
+)
 from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
 from wmo.common.rollouts import (
     ProductionSimulatorSnapshot,
@@ -44,6 +52,22 @@ from wmo.common.rollouts import (
 _DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 11, tzinfo=UTC)
 Score = Literal[0, 1, 2, 3, 4, 5]
+
+
+class _FakeJudgeClient:
+    """Return one deterministic structured judgment with a frozen model identity."""
+
+    def __init__(self, model: ModelSnapshot, content: str) -> None:
+        self._model = model
+        self._content = content
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        del request
+        return ModelResponse(
+            output=AssistantAction(content=self._content),
+            model=self._model,
+            economics=OperationEconomics(),
+        )
 
 
 @dataclass(frozen=True)
@@ -142,43 +166,12 @@ def _write_graph(
         status="human_approved",
         approved_at=_TIME,
     )
-    rubric_manifest = store.artifacts.write_json(
+    store.artifacts.write_json(
         artifact_id=rubric.rubric_id,
         artifact_type="rubric",
         envelope=rubric,
         files={"rubric.json": rubric},
     )
-    rubric_input = artifact_input(rubric_manifest)
-    history = HumanScoreHistory()
-    for entry in entries:
-        history = history.append(
-            HumanScore(
-                label_id=f"label-{entry.rollout_id}-{entry.dimension_id}",
-                rubric_id=rubric.rubric_id,
-                rollout_id=entry.rollout_id,
-                lineage_id=entry.label_lineage_id or entry.lineage_id,
-                dimension_id=entry.dimension_id,
-                score=entry.human_score,
-                created_at=_TIME,
-            )
-        )
-    label_set = HumanLabelSet(
-        schema_version=1,
-        created_at=_TIME,
-        inputs=(rubric_input,),
-        code_revision="w6-test",
-        label_set_id="label-set-1",
-        rubric_id=rubric.rubric_id,
-        history=history,
-        active_label_ids=tuple(score.label_id for score in history.active_scores()),
-    )
-    label_manifest = store.artifacts.write_json(
-        artifact_id=label_set.label_set_id,
-        artifact_type="human-label-set",
-        envelope=label_set,
-        files={"labels.json": label_set},
-    )
-    label_input = artifact_input(label_manifest)
     assignments = tuple(
         RouterLineageAssignment(rollout_id=rollout_id, lineage_id=lineage_id)
         for rollout_id, lineage_id in sorted(
@@ -192,19 +185,27 @@ def _write_graph(
         code_revision="w6-test",
         split_id="router-lineage-split-1",
         source_task_set_id="task-set-1",
-        fit_lineage_ids=tuple(sorted({entry.lineage_id for entry in entries})),
+        fit_lineage_ids=tuple(
+            sorted({entry.lineage_id for entry in entries} - {"lineage-held-out"})
+        ),
         held_out_lineage_ids=("lineage-held-out",),
         assignments=assignments,
     )
     split = write_router_lineage_split(store, split)
-    split_input = artifact_input(store.artifacts.read(split.split_id).manifest)
+    label_review = HumanScoreReview.open(store)
+    empty_label_set = label_review.finalize(
+        rubric_id=rubric.rubric_id,
+        code_revision="w6-test",
+        created_at=_TIME,
+    )
     by_rollout: dict[str, list[_Entry]] = {}
     for entry in entries:
         by_rollout.setdefault(entry.rollout_id, []).append(entry)
-    bootstrap_inputs: dict[tuple[ModelSnapshot, PromptDefinition], ArtifactInput] = {}
+    bootstrap_calibration_ids: dict[tuple[ModelSnapshot, PromptDefinition], str] = {}
     observations: list[JudgeScoreObservation] = []
     rollout_inputs: dict[str, ArtifactInput] = {}
-    for index, (rollout_id, rollout_entries) in enumerate(sorted(by_rollout.items()), start=1):
+    calibration_service = JudgeCalibrationService()
+    for rollout_id, rollout_entries in sorted(by_rollout.items()):
         model = rollout_entries[0].judge_model or _model()
         prompt = rollout_entries[0].prompt or _prompt()
         if any((entry.judge_model or _model()) != model for entry in rollout_entries):
@@ -212,57 +213,19 @@ def _write_graph(
         if any((entry.prompt or _prompt()) != prompt for entry in rollout_entries):
             raise ValueError("one rollout fixture cannot use several judge prompts")
         binding = (model, prompt)
-        calibration_input = bootstrap_inputs.get(binding)
-        calibration_id = f"bootstrap-calibration-{index}"
-        if calibration_input is None:
-            report_id = f"bootstrap-report-{index}"
-            report_manifest = store.artifacts.write_json(
-                artifact_id=report_id,
-                artifact_type="judge-calibration-report",
-                envelope=ArtifactEnvelope(
-                    schema_version=1,
-                    created_at=_TIME,
-                    inputs=_inputs(rubric_input, label_input, split_input),
-                    code_revision="w6-test",
-                ),
-                files={"report.json": {"report_id": report_id}},
-            )
-            report_input = artifact_input(report_manifest)
-            calibration = JudgeCalibration(
-                schema_version=1,
-                created_at=_TIME,
-                inputs=_inputs(report_input, rubric_input, label_input, split_input),
-                code_revision="w6-test",
-                calibration_id=calibration_id,
+        calibration_id = bootstrap_calibration_ids.get(binding)
+        if calibration_id is None:
+            calibration_id = calibration_service.bootstrap_provisional(
+                store,
                 rubric_id=rubric.rubric_id,
+                label_set_id=empty_label_set.label_set_id,
+                router_lineage_split_id=split.split_id,
                 judge_model=model,
-                judge_prompt_id=prompt.prompt_id,
-                judge_prompt_sha256=prompt.sha256,
-                label_set_id=label_set.label_set_id,
-                calibration_lineage_ids=(),
-                excluded_router_held_out_lineage_ids=("lineage-held-out",),
-                validation_method="grouped_k_fold",
-                out_of_fold_report_id=report_id,
-                out_of_fold_report_sha256=report_input.sha256,
-                score_maps=tuple(
-                    DimensionScoreMap(
-                        dimension_id=dimension_id,
-                        calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
-                    )
-                    for dimension_id in dimension_ids
-                ),
-                status="provisional",
-            )
-            calibration_manifest = store.artifacts.write_json(
-                artifact_id=calibration.calibration_id,
-                artifact_type="judge-calibration",
-                envelope=calibration,
-                files={"calibration.json": calibration},
-            )
-            calibration_input = artifact_input(calibration_manifest)
-            bootstrap_inputs[binding] = calibration_input
-        else:
-            calibration_id = calibration_input.artifact_id
+                judge_prompt=prompt,
+                created_at=_TIME,
+                code_revision="bootstrap-revision",
+            ).calibration_id
+            bootstrap_calibration_ids[binding] = calibration_id
         span_id = f"span-{rollout_id}"
         rollout = RolloutArtifact(
             schema_version=1,
@@ -304,39 +267,67 @@ def _write_graph(
         )
         rollout_input = artifact_input(rollout_manifest)
         rollout_inputs[rollout_id] = rollout_input
-        dimensions = tuple(
-            DimensionJudgment(
-                dimension_id=entry.dimension_id,
-                raw_score=entry.raw_score,
-                calibrated_score=float(entry.raw_score),
-                evidence_span_ids=(entry.citation_id or span_id,),
-                feedback=f"Score for {entry.dimension_id}.",
-            )
-            for entry in rollout_entries
+        entries_by_dimension = {entry.dimension_id: entry for entry in rollout_entries}
+        content = json.dumps(
+            {
+                "dimensions": [
+                    {
+                        "dimension_id": dimension_id,
+                        "raw_score": (
+                            entries_by_dimension[dimension_id].raw_score
+                            if dimension_id in entries_by_dimension
+                            else 0
+                        ),
+                        "evidence_span_ids": [span_id],
+                        "feedback": f"Score for {dimension_id}.",
+                    }
+                    for dimension_id in dimension_ids
+                ]
+            }
         )
-        judgment = Judgment(
-            schema_version=1,
-            created_at=_TIME,
-            inputs=_inputs(rollout_input, rubric_input, calibration_input),
+        judgment = LMJudge(
+            _FakeJudgeClient(model, content),
+            prompt,
             code_revision="judging-revision",
-            judgment_id=f"judgment-{rollout_id}",
-            rollout_id=rollout.rollout_id,
-            rubric_id=rollout_entries[0].judgment_rubric_id or rubric.rubric_id,
-            calibration_id=calibration_id,
-            judge_model=model,
-            judge_prompt_id=prompt.prompt_id,
-            judge_prompt_sha256=prompt.sha256,
-            dimensions=dimensions,
-            overall_score=sum(item.calibrated_score / 5 for item in dimensions) / len(dimensions),
-            judge_economics=OperationEconomics(),
+            clock=lambda: _TIME,
+        ).judge_and_write(
+            store,
+            rollout_artifact_id=rollout.artifact_id,
+            rubric_artifact_id=rubric.rubric_id,
+            calibration_artifact_id=calibration_id,
         )
-        judgment_manifest = store.artifacts.write_json(
-            artifact_id=judgment.judgment_id,
-            artifact_type="judgment",
-            envelope=judgment,
-            files={"judgment.json": judgment},
+        malformed_rubric = next(
+            (
+                entry.judgment_rubric_id
+                for entry in rollout_entries
+                if entry.judgment_rubric_id is not None
+            ),
+            rubric.rubric_id,
         )
-        judgment_input = artifact_input(judgment_manifest)
+        malformed_dimensions = tuple(
+            dimension.model_copy(update={"evidence_span_ids": (entry.citation_id,)})
+            if (entry := entries_by_dimension.get(dimension.dimension_id)) is not None
+            and entry.citation_id is not None
+            else dimension
+            for dimension in judgment.dimensions
+        )
+        if malformed_rubric != rubric.rubric_id or malformed_dimensions != judgment.dimensions:
+            judgment = judgment.model_copy(
+                update={
+                    "judgment_id": f"{judgment.judgment_id}-forged",
+                    "rubric_id": malformed_rubric,
+                    "dimensions": malformed_dimensions,
+                }
+            )
+            judgment_manifest = store.artifacts.write_json(
+                artifact_id=judgment.judgment_id,
+                artifact_type="judgment",
+                envelope=judgment,
+                files={"judgment.json": judgment},
+            )
+            judgment_input = artifact_input(judgment_manifest)
+        else:
+            judgment_input = artifact_input(store.artifacts.read(judgment.judgment_id).manifest)
         observations.extend(
             JudgeScoreObservation(
                 judgment=judgment_input,
@@ -347,6 +338,23 @@ def _write_graph(
             )
             for entry in rollout_entries
         )
+    for entry in entries:
+        label_review.append(
+            HumanScore(
+                label_id=f"label-{entry.rollout_id}-{entry.dimension_id}",
+                rubric_id=rubric.rubric_id,
+                rollout_id=entry.rollout_id,
+                lineage_id=entry.label_lineage_id or entry.lineage_id,
+                dimension_id=entry.dimension_id,
+                score=entry.human_score,
+                created_at=_TIME,
+            )
+        )
+    label_set = label_review.finalize(
+        rubric_id=rubric.rubric_id,
+        code_revision="w6-test",
+        created_at=_TIME,
+    )
     return _Graph(
         store=store,
         rubric=rubric,
@@ -387,6 +395,160 @@ def _build(graph: _Graph) -> CalibrationReport:
     )
 
 
+def _write_forged_provisional_pair(
+    graph: _Graph,
+) -> tuple[JudgeCalibration, ArtifactInput]:
+    """Inject a deliberately noncanonical report and calibration for rejection coverage."""
+    source_judgment = Judgment.model_validate_json(
+        graph.store.artifacts.read_bytes(
+            graph.observations[0].judgment.artifact_id, "judgment.json"
+        )
+    )
+    calibration, _calibration_input = verify_persisted_calibration(
+        graph.store, source_judgment.calibration_id
+    )
+    report = CalibrationReport.model_validate_json(
+        graph.store.artifacts.read_bytes(calibration.out_of_fold_report_id, "report.json")
+    )
+    forged_report = report.model_copy(update={"report_id": "forged-bootstrap-report"})
+    forged_report_input = artifact_input(
+        graph.store.artifacts.write_json(
+            artifact_id=forged_report.report_id,
+            artifact_type="judge-calibration-report",
+            envelope=forged_report,
+            files={"report.json": forged_report},
+        )
+    )
+    forged_calibration = calibration.model_copy(
+        update={
+            "calibration_id": "forged-bootstrap-calibration",
+            "inputs": _inputs(forged_report_input, *report.inputs),
+            "out_of_fold_report_id": forged_report.report_id,
+            "out_of_fold_report_sha256": forged_report_input.sha256,
+        }
+    )
+    forged_calibration_input = artifact_input(
+        graph.store.artifacts.write_json(
+            artifact_id=forged_calibration.calibration_id,
+            artifact_type="judge-calibration",
+            envelope=forged_calibration,
+            files={"calibration.json": forged_calibration},
+        )
+    )
+    return forged_calibration, forged_calibration_input
+
+
+def test_canonical_provisional_bootstrap_persists_identity_maps_and_provenance(
+    tmp_path: Path,
+) -> None:
+    """A zero-label set creates the one supported provisional judging starting point."""
+    graph = _write_graph(tmp_path, _entries(1), dimension_ids=("task-success", "policy-compliance"))
+    source_judgment = Judgment.model_validate_json(
+        graph.store.artifacts.read_bytes(
+            graph.observations[0].judgment.artifact_id, "judgment.json"
+        )
+    )
+    calibration, calibration_input = verify_persisted_calibration(
+        graph.store, source_judgment.calibration_id
+    )
+    report = CalibrationReport.model_validate_json(
+        graph.store.artifacts.read_bytes(calibration.out_of_fold_report_id, "report.json")
+    )
+    empty_label_set = HumanLabelSet.model_validate_json(
+        graph.store.artifacts.read_bytes(calibration.label_set_id, "labels.json")
+    )
+    report_input = artifact_input(graph.store.artifacts.read(report.report_id).manifest)
+    expected_report_inputs = _inputs(
+        artifact_input(graph.store.artifacts.read(graph.rubric.rubric_id).manifest),
+        artifact_input(graph.store.artifacts.read(empty_label_set.label_set_id).manifest),
+        artifact_input(graph.store.artifacts.read(graph.split.split_id).manifest),
+    )
+
+    assert empty_label_set.history.scores == ()
+    assert report.status == calibration.status == "provisional"
+    assert report.eligible_label_count == calibration.label_count == 0
+    assert all(metric.label_count == 0 for metric in report.dimension_metrics)
+    assert report.inputs == expected_report_inputs
+    assert calibration.inputs == _inputs(report_input, *expected_report_inputs)
+    assert report.judge_model == calibration.judge_model == _model()
+    assert report.judge_prompt_id == calibration.judge_prompt_id == _prompt().prompt_id
+    assert report.judge_prompt_sha256 == calibration.judge_prompt_sha256 == _prompt().sha256
+    assert calibration_input == artifact_input(
+        graph.store.artifacts.read(calibration.calibration_id).manifest
+    )
+    assert all(
+        score_map.calibrated_scores == (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+        for score_map in calibration.score_maps
+    )
+    with pytest.raises(CalibrationError, match="zero-label"):
+        JudgeCalibrationService().bootstrap_provisional(
+            graph.store,
+            rubric_id=graph.rubric.rubric_id,
+            label_set_id=graph.label_set.label_set_id,
+            router_lineage_split_id=graph.split.split_id,
+            judge_model=_model(),
+            judge_prompt=_prompt(),
+            created_at=_TIME,
+            code_revision="bootstrap-revision",
+        )
+
+
+def test_forged_calibration_report_pair_is_rejected_by_judging_and_observation_building(
+    tmp_path: Path,
+) -> None:
+    """Consumers reject a manually injected pair that cannot be rebuilt from frozen sources."""
+    graph = _write_graph(tmp_path, _entries())
+    forged_calibration, forged_calibration_input = _write_forged_provisional_pair(graph)
+    source_observation = graph.observations[0]
+    source_judgment = Judgment.model_validate_json(
+        graph.store.artifacts.read_bytes(source_observation.judgment.artifact_id, "judgment.json")
+    )
+    with pytest.raises(JudgmentError, match="verified persisted calibration"):
+        LMJudge(
+            _FakeJudgeClient(_model(), json.dumps({"dimensions": []})),
+            _prompt(),
+            code_revision="judging-revision",
+            clock=lambda: _TIME,
+        ).judge_and_write(
+            graph.store,
+            rollout_artifact_id=source_observation.source_rollout.artifact_id,
+            rubric_artifact_id=graph.rubric.rubric_id,
+            calibration_artifact_id=forged_calibration.calibration_id,
+        )
+    forged_judgment = source_judgment.model_copy(
+        update={
+            "judgment_id": "forged-source-judgment",
+            "calibration_id": forged_calibration.calibration_id,
+            "inputs": _inputs(
+                source_observation.source_rollout,
+                artifact_input(graph.store.artifacts.read(graph.rubric.rubric_id).manifest),
+                forged_calibration_input,
+            ),
+        }
+    )
+    forged_judgment_input = artifact_input(
+        graph.store.artifacts.write_json(
+            artifact_id=forged_judgment.judgment_id,
+            artifact_type="judgment",
+            envelope=forged_judgment,
+            files={"judgment.json": forged_judgment},
+        )
+    )
+    with pytest.raises(CalibrationError, match="verified calibration"):
+        JudgeCalibrationService().build_report(
+            graph.store,
+            rubric_id=graph.rubric.rubric_id,
+            label_set_id=graph.label_set.label_set_id,
+            router_lineage_split_id=graph.split.split_id,
+            observations=(
+                source_observation.model_copy(update={"judgment": forged_judgment_input}),
+                *graph.observations[1:],
+            ),
+            created_at=_TIME,
+            code_revision="calibration-revision",
+        )
+
+
 def test_calibration_binds_every_report_input_to_verified_manifest_evidence(tmp_path: Path) -> None:
     graph = _write_graph(tmp_path, _entries())
     service = JudgeCalibrationService()
@@ -424,6 +586,24 @@ def test_calibration_binds_every_report_input_to_verified_manifest_evidence(tmp_
             graph.store,
             report.model_copy(update={"judge_model": _model("caller-claimed-model")}),
         )
+
+
+def test_router_held_out_labels_are_reported_but_excluded_from_calibration_maps(
+    tmp_path: Path,
+) -> None:
+    """Held-out labels remain auditable without entering grouped OOF map fitting."""
+    held_out = _Entry("rollout-held-out", "lineage-held-out", "task-success", 5, 0)
+    graph = _write_graph(tmp_path, (*_entries(), held_out))
+    report = _build(graph)
+
+    assert report.eligible_label_count == 10
+    assert report.excluded_held_out_label_count == 1
+    assert report.eligible_lineage_ids == tuple(f"lineage-{index:02d}" for index in range(1, 11))
+    assert report.excluded_held_out_lineage_ids == ("lineage-held-out",)
+    assert all(
+        prediction.rollout_id != held_out.rollout_id
+        for prediction in report.out_of_fold_predictions
+    )
 
 
 @pytest.mark.parametrize(
@@ -591,7 +771,9 @@ def test_single_lineage_emits_no_empty_training_fold_and_stays_insufficient(tmp_
     assert report.out_of_fold_predictions == ()
 
 
-def test_valid_multilineage_grouped_oof_can_be_approved(tmp_path: Path) -> None:
+def test_human_labels_after_provisional_judgments_build_and_approve_grouped_oof(
+    tmp_path: Path,
+) -> None:
     graph = _write_graph(tmp_path, _entries())
     service = JudgeCalibrationService()
     report = _build(graph)

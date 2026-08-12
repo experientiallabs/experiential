@@ -7,21 +7,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
-
 from wmo.common.core.artifacts import (
-    ArtifactEnvelope,
     ArtifactId,
     ArtifactInput,
-    ContractModel,
     Sha256,
     stable_id,
+)
+from wmo.common.judging.calibration_contracts import (
+    CalibrationReport,
+    JudgeScoreObservation,
 )
 from wmo.common.judging.calibration_metrics import (
     CalibrationDatum,
     DimensionCalibrationMetrics,
     OutOfFoldPrediction,
-    WorstDisagreement,
     fit_score_map,
     grouped_predictions_and_metrics,
     has_valid_grouped_oof,
@@ -30,13 +29,14 @@ from wmo.common.judging.calibration_metrics import (
 from wmo.common.judging.judgment import Judgment
 from wmo.common.judging.labels import HumanLabelSet, HumanScore
 from wmo.common.judging.lineage import RouterLineageSplit
+from wmo.common.judging.prompts import PromptDefinition
 from wmo.common.judging.provenance import (
     JudgingProvenanceError,
     read_artifact_json,
     resolve_artifact,
     sorted_verified_inputs,
 )
-from wmo.common.judging.rubric import DimensionScoreMap, JudgeCalibration, Rubric
+from wmo.common.judging.rubric import JudgeCalibration, Rubric
 from wmo.common.models import ModelSnapshot
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
 from wmo.common.rollouts import RolloutArtifact
@@ -44,109 +44,6 @@ from wmo.common.rollouts import RolloutArtifact
 
 class CalibrationError(ValueError):
     """Raised when calibration evidence, validation, or approval is invalid."""
-
-
-class JudgeScoreObservation(ContractModel):
-    """Raw dimension evidence cryptographically bound to a stored judgment and rollout."""
-
-    judgment: ArtifactInput
-    source_rollout: ArtifactInput
-    dimension_id: ArtifactId
-    raw_score: Literal[0, 1, 2, 3, 4, 5]
-    evidence_span_ids: tuple[str, ...]
-
-    @field_validator("evidence_span_ids")
-    @classmethod
-    def _require_unique_evidence_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value:
-            raise ValueError("calibration observations require cited rollout spans")
-        if len(set(value)) != len(value):
-            raise ValueError("calibration observation citations must not repeat")
-        return value
-
-
-class CalibrationReport(ArtifactEnvelope):
-    """Frozen per-dimension OOF evidence and full eligible-label refit maps."""
-
-    report_id: ArtifactId
-    rubric_id: ArtifactId
-    rubric_dimension_ids: tuple[ArtifactId, ...]
-    judge_model: ModelSnapshot
-    judge_prompt_id: str = Field(min_length=1, max_length=256)
-    judge_prompt_sha256: Sha256
-    label_set_id: ArtifactId
-    router_lineage_split_id: ArtifactId
-    router_lineages: RouterLineageSplit
-    observations: tuple[JudgeScoreObservation, ...]
-    eligible_label_count: int = Field(ge=0)
-    eligible_rollout_count: int = Field(ge=0)
-    eligible_lineage_ids: tuple[ArtifactId, ...]
-    eligible_lineage_count: int = Field(ge=0)
-    excluded_held_out_label_count: int = Field(ge=0)
-    excluded_held_out_rollout_count: int = Field(ge=0)
-    excluded_held_out_lineage_ids: tuple[ArtifactId, ...]
-    excluded_held_out_lineage_count: int = Field(ge=0)
-    recommended_label_count: Literal[10] = 10
-    status: Literal["provisional", "insufficient", "ready_for_approval"]
-    score_maps: tuple[DimensionScoreMap, ...]
-    dimension_metrics: tuple[DimensionCalibrationMetrics, ...]
-    out_of_fold_predictions: tuple[OutOfFoldPrediction, ...]
-    worst_disagreements: tuple[WorstDisagreement, ...]
-
-    @field_validator(
-        "rubric_dimension_ids", "eligible_lineage_ids", "excluded_held_out_lineage_ids"
-    )
-    @classmethod
-    def _require_unique_ids(cls, value: tuple[ArtifactId, ...]) -> tuple[ArtifactId, ...]:
-        if len(set(value)) != len(value):
-            raise ValueError("calibration report IDs must not repeat")
-        return value
-
-    @field_validator("eligible_lineage_ids", "excluded_held_out_lineage_ids")
-    @classmethod
-    def _require_sorted_lineages(cls, value: tuple[ArtifactId, ...]) -> tuple[ArtifactId, ...]:
-        if value != tuple(sorted(value)):
-            raise ValueError("calibration report eligible lineages must be sorted")
-        return value
-
-    @model_validator(mode="after")
-    def _require_coherent_report(self) -> CalibrationReport:
-        metric_ids = tuple(item.dimension_id for item in self.dimension_metrics)
-        map_ids = tuple(item.dimension_id for item in self.score_maps)
-        if not self.rubric_dimension_ids:
-            raise ValueError("calibration reports require every rubric dimension")
-        if set(metric_ids) != set(self.rubric_dimension_ids):
-            raise ValueError("calibration report metrics must cover every rubric dimension")
-        if set(map_ids) != set(self.rubric_dimension_ids):
-            raise ValueError("calibration report score maps must cover every rubric dimension")
-        if self.router_lineages.split_id != self.router_lineage_split_id:
-            raise ValueError("calibration report must retain its exact lineage split")
-        eligible = set(self.eligible_lineage_ids)
-        fit = set(self.router_lineages.fit_lineage_ids)
-        held_out = set(self.router_lineages.held_out_lineage_ids)
-        if not eligible.issubset(fit) or eligible.intersection(held_out):
-            raise ValueError("calibration report lineages must be eligible router fit lineages")
-        if any(item.lineage_id not in eligible for item in self.out_of_fold_predictions):
-            raise ValueError("out-of-fold predictions must use eligible calibration lineages")
-        if self.eligible_lineage_count != len(self.eligible_lineage_ids):
-            raise ValueError("calibration report eligible lineage denominator must be exact")
-        if self.excluded_held_out_lineage_count != len(self.excluded_held_out_lineage_ids):
-            raise ValueError("calibration report held-out lineage denominator must be exact")
-        input_ids = tuple(item.artifact_id for item in self.inputs)
-        expected_input_ids = tuple(
-            sorted(
-                {
-                    self.rubric_id,
-                    self.label_set_id,
-                    self.router_lineage_split_id,
-                    *(item.judgment.artifact_id for item in self.observations),
-                    *(item.source_rollout.artifact_id for item in self.observations),
-                }
-            )
-        )
-        if input_ids != expected_input_ids:
-            raise ValueError("calibration reports must hash exactly their frozen source artifacts")
-        return self
 
 
 @dataclass(frozen=True)
@@ -196,12 +93,7 @@ class JudgeCalibrationService:
         rubric, rubric_input = _load_rubric(store, rubric_id)
         label_set, label_set_input = _load_label_set(store, label_set_id)
         split, split_input = _load_lineage_split(store, router_lineage_split_id)
-        if label_set.rubric_id != rubric.rubric_id:
-            raise CalibrationError("human label set belongs to a different frozen rubric")
-        if label_set.inputs != (rubric_input,):
-            raise CalibrationError(
-                "human label set does not hash the exact finalized rubric manifest"
-            )
+        _require_label_set_rubric_binding(label_set, rubric, rubric_input)
         verified = _resolve_observations(
             store,
             rubric=rubric,
@@ -279,19 +171,63 @@ class JudgeCalibrationService:
             worst_disagreements=worst_disagreements(predictions),
         )
 
-    def provisional_calibration(
-        self, store: ProjectStore, report: CalibrationReport
+    def bootstrap_provisional(
+        self,
+        store: ProjectStore,
+        *,
+        rubric_id: ArtifactId,
+        label_set_id: ArtifactId,
+        router_lineage_split_id: ArtifactId,
+        judge_model: ModelSnapshot,
+        judge_prompt: PromptDefinition,
+        created_at: datetime,
+        code_revision: str,
     ) -> JudgeCalibration:
-        """Create a persisted-report-bound identity calibration for a zero-label report."""
-        stored_report, report_input = _require_persisted_report(store, report)
-        if stored_report.status != "provisional" or stored_report.eligible_label_count != 0:
-            raise CalibrationError("provisional calibration requires a zero-label report")
-        return _calibration_from_report(
+        """Create and persist the canonical zero-label identity-map calibration.
+
+        Args:
+            store: Project store containing finalized immutable bootstrap artifacts.
+            rubric_id: Finalized rubric artifact used for every judged dimension.
+            label_set_id: Finalized empty human-label-set artifact for the rubric.
+            router_lineage_split_id: Frozen router lineage split for later human calibration.
+            judge_model: Exact snapshot of the configured LM judge.
+            judge_prompt: Immutable prompt definition supplied to the configured LM judge.
+            created_at: Time the provisional report and calibration are materialized.
+            code_revision: Exact revision responsible for the bootstrap artifacts.
+
+        Returns:
+            A persisted provisional calibration with one identity map per rubric dimension.
+
+        Raises:
+            CalibrationError: A source is unavailable, has labels, or cannot form the bootstrap.
+        """
+        _require_timezone(created_at)
+        rubric, rubric_input = _load_rubric(store, rubric_id)
+        label_set, label_set_input = _load_label_set(store, label_set_id)
+        split, split_input = _load_lineage_split(store, router_lineage_split_id)
+        _require_label_set_rubric_binding(label_set, rubric, rubric_input)
+        report = _build_provisional_report(
+            rubric=rubric,
+            rubric_input=rubric_input,
+            label_set=label_set,
+            label_set_input=label_set_input,
+            split=split,
+            split_input=split_input,
+            judge_model=judge_model,
+            judge_prompt_id=judge_prompt.prompt_id,
+            judge_prompt_sha256=judge_prompt.sha256,
+            created_at=created_at,
+            code_revision=code_revision,
+        )
+        stored_report = self.write_report(store, report)
+        stored_report, report_input = _require_persisted_report(store, stored_report)
+        calibration = _calibration_from_report(
             stored_report,
             report_input=report_input,
             status="provisional",
             approved_at=None,
         )
+        return self.write_calibration(store, report=stored_report, calibration=calibration)
 
     def insufficient_calibration(
         self, store: ProjectStore, report: CalibrationReport
@@ -471,6 +407,16 @@ def _load_label_set(
     return label_set, label_set_input
 
 
+def _require_label_set_rubric_binding(
+    label_set: HumanLabelSet, rubric: Rubric, rubric_input: ArtifactInput
+) -> None:
+    """Require a frozen label set to name and hash the exact finalized rubric."""
+    if label_set.rubric_id != rubric.rubric_id:
+        raise CalibrationError("human label set belongs to a different frozen rubric")
+    if label_set.inputs != (rubric_input,):
+        raise CalibrationError("human label set does not hash the exact finalized rubric manifest")
+
+
 def _load_lineage_split(
     store: ProjectStore, split_id: ArtifactId
 ) -> tuple[RouterLineageSplit, ArtifactInput]:
@@ -632,18 +578,15 @@ def _require_final_judgment_provenance(
     rubric_input: ArtifactInput,
 ) -> None:
     """Require a source judgment to already hash its rollout, rubric, and calibration inputs."""
+    # The verifier rebuilds reports through this module, so importing it above would cycle.
+    from wmo.common.judging.calibration_provenance import verify_persisted_calibration
+
     try:
-        calibration, calibration_input = read_artifact_json(
-            store,
-            artifact_id=judgment.calibration_id,
-            expected_artifact_type="judge-calibration",
-            relative_path="calibration.json",
-            model_type=JudgeCalibration,
+        calibration, calibration_input = verify_persisted_calibration(
+            store, judgment.calibration_id
         )
-    except JudgingProvenanceError as exc:
-        raise CalibrationError("uncalibrated judgment has no completed calibration input") from exc
-    if calibration.calibration_id != judgment.calibration_id:
-        raise CalibrationError("uncalibrated judgment calibration record has the wrong identity")
+    except CalibrationError as exc:
+        raise CalibrationError("uncalibrated judgment has no verified calibration input") from exc
     if (
         calibration.rubric_id != judgment.rubric_id
         or calibration.judge_model != judgment.judge_model
@@ -752,7 +695,7 @@ def _report_status(
 ) -> Literal["provisional", "insufficient", "ready_for_approval"]:
     """Classify readiness while treating missing per-dimension OOF evidence as insufficient."""
     if not data:
-        return "provisional"
+        return "insufficient"
     if not _has_complete_dimension_oof(
         tuple(dimension.dimension_id for dimension in rubric.dimensions), metrics, predictions
     ):
@@ -794,8 +737,75 @@ def _report_has_complete_dimension_oof(report: CalibrationReport) -> bool:
     )
 
 
+def _build_provisional_report(
+    *,
+    rubric: Rubric,
+    rubric_input: ArtifactInput,
+    label_set: HumanLabelSet,
+    label_set_input: ArtifactInput,
+    split: RouterLineageSplit,
+    split_input: ArtifactInput,
+    judge_model: ModelSnapshot,
+    judge_prompt_id: str,
+    judge_prompt_sha256: Sha256,
+    created_at: datetime,
+    code_revision: str,
+) -> CalibrationReport:
+    """Derive the narrow zero-label report exception from frozen bootstrap evidence."""
+    if label_set.history.scores:
+        raise CalibrationError("provisional bootstrap requires a finalized zero-label set")
+    inputs = sorted_verified_inputs((rubric_input, label_set_input, split_input))
+    score_maps = tuple(fit_score_map(dimension.dimension_id, ()) for dimension in rubric.dimensions)
+    predictions, metrics = grouped_predictions_and_metrics(rubric, ())
+    report_id = stable_id(
+        "judge-calibration-report",
+        {
+            "rubric_id": rubric.rubric_id,
+            "label_set_id": label_set.label_set_id,
+            "router_lineage_split_id": split.split_id,
+            "judge_model": judge_model.model_dump(mode="json"),
+            "judge_prompt_id": judge_prompt_id,
+            "judge_prompt_sha256": judge_prompt_sha256,
+            "inputs": [item.model_dump(mode="json") for item in inputs],
+            "code_revision": code_revision,
+        },
+    )
+    return CalibrationReport(
+        schema_version=1,
+        created_at=created_at,
+        inputs=inputs,
+        code_revision=code_revision,
+        report_id=report_id,
+        rubric_id=rubric.rubric_id,
+        rubric_dimension_ids=tuple(dimension.dimension_id for dimension in rubric.dimensions),
+        judge_model=judge_model,
+        judge_prompt_id=judge_prompt_id,
+        judge_prompt_sha256=judge_prompt_sha256,
+        label_set_id=label_set.label_set_id,
+        router_lineage_split_id=split.split_id,
+        router_lineages=split,
+        observations=(),
+        eligible_label_count=0,
+        eligible_rollout_count=0,
+        eligible_lineage_ids=(),
+        eligible_lineage_count=0,
+        excluded_held_out_label_count=0,
+        excluded_held_out_rollout_count=0,
+        excluded_held_out_lineage_ids=(),
+        excluded_held_out_lineage_count=0,
+        status="provisional",
+        score_maps=score_maps,
+        dimension_metrics=metrics,
+        out_of_fold_predictions=predictions,
+        worst_disagreements=(),
+    )
+
+
 def _verify_report_sources(store: ProjectStore, report: CalibrationReport) -> None:
     """Re-resolve report sources and reject caller-supplied or stale digests before writing."""
+    if report.status == "provisional":
+        _verify_provisional_report_sources(store, report)
+        return
     expected = JudgeCalibrationService().build_report(
         store,
         rubric_id=report.rubric_id,
@@ -808,6 +818,31 @@ def _verify_report_sources(store: ProjectStore, report: CalibrationReport) -> No
     if expected != report:
         raise CalibrationError(
             "calibration report content is not derived from its verified immutable evidence"
+        )
+
+
+def _verify_provisional_report_sources(store: ProjectStore, report: CalibrationReport) -> None:
+    """Rebuild a zero-label bootstrap without requiring a nonexistent source judgment."""
+    rubric, rubric_input = _load_rubric(store, report.rubric_id)
+    label_set, label_set_input = _load_label_set(store, report.label_set_id)
+    split, split_input = _load_lineage_split(store, report.router_lineage_split_id)
+    _require_label_set_rubric_binding(label_set, rubric, rubric_input)
+    expected = _build_provisional_report(
+        rubric=rubric,
+        rubric_input=rubric_input,
+        label_set=label_set,
+        label_set_input=label_set_input,
+        split=split,
+        split_input=split_input,
+        judge_model=report.judge_model,
+        judge_prompt_id=report.judge_prompt_id,
+        judge_prompt_sha256=report.judge_prompt_sha256,
+        created_at=report.created_at,
+        code_revision=report.code_revision,
+    )
+    if expected != report:
+        raise CalibrationError(
+            "provisional calibration report is not derived from its verified bootstrap evidence"
         )
 
 

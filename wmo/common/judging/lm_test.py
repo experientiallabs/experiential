@@ -8,17 +8,22 @@ from pathlib import Path
 
 import pytest
 
-from wmo.common.core.artifacts import ArtifactInput, SourceIdentity
+from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactInput, SourceIdentity
 from wmo.common.judging import (
     DimensionScoreMap,
+    HumanScoreReview,
     Judge,
     JudgeCalibration,
+    JudgeCalibrationService,
     JudgmentError,
     LMJudge,
     PromptDefinition,
+    RouterLineageAssignment,
+    RouterLineageSplit,
     Rubric,
     RubricDimension,
     ScoreAnchor,
+    write_router_lineage_split,
 )
 from wmo.common.models import (
     AssistantAction,
@@ -75,11 +80,15 @@ def _model() -> ModelSnapshot:
     )
 
 
-def _rubric() -> Rubric:
+def _rubric(*, task_set_input: ArtifactInput | None = None) -> Rubric:
     return Rubric(
         schema_version=1,
         created_at=_TIME,
-        inputs=(ArtifactInput(artifact_id="task-set-1", sha256=_DIGEST),),
+        inputs=(
+            ArtifactInput(artifact_id="task-set-1", sha256=_DIGEST)
+            if task_set_input is None
+            else task_set_input,
+        ),
         code_revision="w6-test",
         rubric_id="rubric-1",
         dimensions=(
@@ -186,6 +195,74 @@ def _store(tmp_path: Path) -> ProjectStore:
     return store
 
 
+def _write_bootstrap_sources(
+    store: ProjectStore,
+) -> tuple[RolloutArtifact, Rubric, JudgeCalibration, PromptDefinition]:
+    """Write upstream fixtures and bootstrap the supported provisional calibration."""
+    task_set_input = artifact_input(
+        store.artifacts.write_json(
+            artifact_id="task-set-1",
+            artifact_type="task-set",
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=_TIME,
+                code_revision="w6-test",
+            ),
+            files={"task-set.json": {"task_set_id": "task-set-1"}},
+        )
+    )
+    rubric = _rubric(task_set_input=task_set_input)
+    store.artifacts.write_json(
+        artifact_id=rubric.rubric_id,
+        artifact_type="rubric",
+        envelope=rubric,
+        files={"rubric.json": rubric},
+    )
+    label_set = HumanScoreReview.open(store).finalize(
+        rubric_id=rubric.rubric_id,
+        code_revision="w6-test",
+        created_at=_TIME,
+    )
+    rollout = _rollout()
+    store.artifacts.write_json(
+        artifact_id=rollout.artifact_id,
+        artifact_type="rollout",
+        envelope=rollout,
+        files={"rollout.json": rollout},
+    )
+    split = write_router_lineage_split(
+        store,
+        RouterLineageSplit(
+            schema_version=1,
+            created_at=_TIME,
+            inputs=(task_set_input,),
+            code_revision="w6-test",
+            split_id="router-lineage-split-1",
+            source_task_set_id="task-set-1",
+            fit_lineage_ids=("lineage-fit-1",),
+            held_out_lineage_ids=("lineage-held-out",),
+            assignments=(
+                RouterLineageAssignment(
+                    rollout_id=rollout.rollout_id,
+                    lineage_id="lineage-fit-1",
+                ),
+            ),
+        ),
+    )
+    prompt = PromptDefinition.from_text("judge-prompt-v1", "Return only structured scores.")
+    calibration = JudgeCalibrationService().bootstrap_provisional(
+        store,
+        rubric_id=rubric.rubric_id,
+        label_set_id=label_set.label_set_id,
+        router_lineage_split_id=split.split_id,
+        judge_model=_model(),
+        judge_prompt=prompt,
+        created_at=_TIME,
+        code_revision="bootstrap-revision",
+    )
+    return rollout, rubric, calibration, prompt
+
+
 def test_lm_judge_requires_exact_identity_and_cited_rollout_evidence() -> None:
     """Structured output receives a calibration map only when its model and evidence match."""
     prompt = PromptDefinition.from_text("judge-prompt-v1", "Return only structured scores.")
@@ -264,37 +341,15 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs() -
         ).judge(rollout, _rubric(), calibration)
 
 
-def test_lm_judge_writes_final_judgment_with_verified_artifact_inputs(tmp_path: Path) -> None:
+def test_persisted_bootstrap_creates_final_judgment_with_verified_artifact_inputs(
+    tmp_path: Path,
+) -> None:
     """Final judgments name manifest-verified rollout, rubric, and calibration inputs."""
     store = _store(tmp_path)
-    prompt = PromptDefinition.from_text("judge-prompt-v1", "Return only structured scores.")
-    rollout = _rollout()
-    rubric = _rubric()
-    calibration = _calibration(prompt)
-    rollout_input = artifact_input(
-        store.artifacts.write_json(
-            artifact_id=rollout.artifact_id,
-            artifact_type="rollout",
-            envelope=rollout,
-            files={"rollout.json": rollout},
-        )
-    )
-    rubric_input = artifact_input(
-        store.artifacts.write_json(
-            artifact_id=rubric.rubric_id,
-            artifact_type="rubric",
-            envelope=rubric,
-            files={"rubric.json": rubric},
-        )
-    )
-    calibration_input = artifact_input(
-        store.artifacts.write_json(
-            artifact_id=calibration.calibration_id,
-            artifact_type="judge-calibration",
-            envelope=calibration,
-            files={"calibration.json": calibration},
-        )
-    )
+    rollout, rubric, calibration, prompt = _write_bootstrap_sources(store)
+    rollout_input = artifact_input(store.artifacts.read(rollout.artifact_id).manifest)
+    rubric_input = artifact_input(store.artifacts.read(rubric.rubric_id).manifest)
+    calibration_input = artifact_input(store.artifacts.read(calibration.calibration_id).manifest)
     judge = LMJudge(
         _FakeJudgeClient(_valid_output()),
         prompt,

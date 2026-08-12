@@ -10,6 +10,8 @@ from typing import Literal
 from pydantic import Field, field_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, stable_id
+from wmo.common.judging.calibration import CalibrationError
+from wmo.common.judging.calibration_provenance import verify_persisted_calibration
 from wmo.common.judging.judgment import DimensionJudgment, Judgment
 from wmo.common.judging.prompts import PromptDefinition
 from wmo.common.judging.provenance import (
@@ -179,16 +181,17 @@ class LMJudge:
                 relative_path="rubric.json",
                 model_type=Rubric,
             )
-            calibration, calibration_input = read_artifact_json(
-                store,
-                artifact_id=calibration_artifact_id,
-                expected_artifact_type="judge-calibration",
-                relative_path="calibration.json",
-                model_type=JudgeCalibration,
-            )
         except JudgingProvenanceError as exc:
             raise JudgmentError(
                 "final judgment requires completed immutable source artifacts"
+            ) from exc
+        try:
+            calibration, calibration_input = verify_persisted_calibration(
+                store, calibration_artifact_id
+            )
+        except CalibrationError as exc:
+            raise JudgmentError(
+                "final judgment requires a verified persisted calibration and report"
             ) from exc
         if rollout.artifact_id != rollout_artifact_id:
             raise JudgmentError("stored rollout record does not match its artifact identity")

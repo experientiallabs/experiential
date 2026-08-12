@@ -3,14 +3,16 @@
 from wmo.common.judging.calibration import (
     CalibrationDatum,
     CalibrationError,
-    CalibrationReport,
-    DimensionCalibrationMetrics,
     JudgeCalibrationService,
-    JudgeScoreObservation,
-    OutOfFoldPrediction,
-    WorstDisagreement,
     utc_now,
 )
+from wmo.common.judging.calibration_contracts import CalibrationReport, JudgeScoreObservation
+from wmo.common.judging.calibration_metrics import (
+    DimensionCalibrationMetrics,
+    OutOfFoldPrediction,
+    WorstDisagreement,
+)
+from wmo.common.judging.calibration_provenance import verify_persisted_calibration
 from wmo.common.judging.interface import Judge
 from wmo.common.judging.judgment import DimensionJudgment, Judgment
 from wmo.common.judging.labels import HumanLabelSet, HumanScore, HumanScoreHistory, HumanScoreReview
@@ -82,5 +84,6 @@ __all__ = [
     "WorstDisagreement",
     "write_router_lineage_split",
     "write_rubric_proposal_evidence",
+    "verify_persisted_calibration",
     "utc_now",
 ]
