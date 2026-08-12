@@ -22,6 +22,7 @@ from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.common.config import HarnessConfig, save_config
 from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
+from wmo.common.judging.episode import EpisodeScore
 from wmo.common.observability import Phase, RunRecord, UsageTotals, load_runs
 from wmo.common.providers import pool as pool_module
 from wmo.common.providers.base import (
@@ -37,7 +38,6 @@ from wmo.common.providers.openrouter import OPENROUTER_API_KEY_ENV
 from wmo.common.providers.pool import PoolEntry, load_pool
 from wmo.common.providers.registry import get_provider as registry_get_provider
 from wmo.optimize.model.store import DistillModelCard
-from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing import evaluate_policy
 from wmo.optimize.routing.compression import (
     CompressionConfig,

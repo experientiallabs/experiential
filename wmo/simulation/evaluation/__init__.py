@@ -21,7 +21,6 @@ from wmo.simulation.evaluation.closed_loop import (
     evaluate_closed_loop,
     evaluate_with_env,
 )
-from wmo.simulation.evaluation.gold import GoldJudge, GoldVerdict
 from wmo.simulation.evaluation.open_loop import EvalReport, OpenLoopEval, evaluate_files
 from wmo.simulation.evaluation.tasks import TaskSpec, load_tasks
 
@@ -32,8 +31,6 @@ __all__ = [
     "EvalReport",
     "EvalResult",
     "Evaluation",
-    "GoldJudge",
-    "GoldVerdict",
     "OpenLoopEval",
     "TaskOutcome",
     "TaskSpec",

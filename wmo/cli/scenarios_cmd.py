@@ -154,10 +154,11 @@ def scenarios_verify(
         typer.BadParameter: The scenario set, source corpus, or rollout configuration is invalid.
     """
     import wmo.common.providers as providers
+    from wmo.common.judging import ChecklistJudge
     from wmo.common.providers.retry import wrap_provider_with_retries
     from wmo.runtime.agents.llm import LLMAgent
     from wmo.simulation.model.world_model import WorldModel
-    from wmo.simulation.scenarios import ChecklistJudge, verify_scenarios
+    from wmo.simulation.scenarios import verify_scenarios
 
     scenario_set = _load_scenario_set(scenarios_file)
     traces = _ingest_scenario_corpus(file)

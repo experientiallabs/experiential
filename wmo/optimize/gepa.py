@@ -28,9 +28,9 @@ from gepa.core.adapter import EvaluationBatch, GEPAAdapter
 from wmo.common.core.parsing import dumps_observation_contract, parse_observation
 from wmo.common.core.render import build_env_prompt, encode_state_action
 from wmo.common.core.types import Action, EnvState, JsonValue, Observation, Step, Trace
+from wmo.common.judging.fidelity import FidelityJudge
 from wmo.common.providers.base import DEFAULT_MAX_TOKENS, Message, Provider
 from wmo.optimize.base import OptimizeMetrics, OptimizeResult
-from wmo.optimize.judge import Judge
 from wmo.simulation.retrieval import Retriever
 from wmo.simulation.retrieval.leakfree import DemoRetriever
 
@@ -239,7 +239,7 @@ class WorldModelGEPAAdapter(GEPAAdapter[_EvalStep, _StepTrajectory, Observation]
     def __init__(
         self,
         provider: Provider,
-        judge: Judge,
+        judge: FidelityJudge,
         on_rollout: RolloutCallback | None = None,
         on_activity: Callable[[str], None] | None = None,
     ) -> None:
@@ -539,7 +539,7 @@ class GEPAOptimizer:
     def __init__(
         self,
         provider: Provider,
-        judge: Judge,
+        judge: FidelityJudge,
         retriever: Retriever | None = None,
         on_rollout: RolloutCallback | None = None,
         *,

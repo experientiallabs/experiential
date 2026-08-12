@@ -13,6 +13,7 @@ import numpy as np
 from pydantic import BaseModel
 
 from wmo.common.core.types import Trace
+from wmo.common.judging.checklist import ChecklistJudge
 from wmo.common.providers.base import Embedder, Provider
 from wmo.simulation.scenarios.mining.clustering import cluster_facets, name_clusters, normalize_rows
 from wmo.simulation.scenarios.mining.facets import TraceFacet
@@ -23,7 +24,6 @@ from wmo.simulation.scenarios.mining.selection import (
     hybrid_select,
 )
 from wmo.simulation.scenarios.synthesis import EvalScenario, ScenarioSet, ScenarioSynthesizer
-from wmo.simulation.scenarios.verification import ChecklistJudge
 
 
 class ScenarioBuildConfig(BaseModel):

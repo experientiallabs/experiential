@@ -56,6 +56,7 @@ def _model() -> ModelSnapshot:
         provider="fake",
         model_id="rubric-proposer",
         capabilities_sha256=_DIGEST,
+        connection_sha256=_DIGEST,
     )
 
 

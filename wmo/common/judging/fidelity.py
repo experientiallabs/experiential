@@ -2,12 +2,12 @@
 
 The judge is both GEPA's fitness signal and the open-loop fidelity scorer: it returns a scalar
 score *and* a natural-language critique, and the critique is what GEPA reflects on to mutate the
-prompt. There is exactly one judge (`RubricJudge`); it scores five fidelity dimensions and reports
+prompt. The `FidelityRubricJudge` scores five fidelity dimensions and reports
 their factuality-weighted mean as the headline score, so optimization hill-climbs the same metric
 evaluation reports.
 
 Judge failures are not world-model failures: a reply that cannot be parsed into the five
-dimensions is retried once and, if still bad, flagged with `JudgeResult.valid=False` so callers
+dimensions is retried once and, if still bad, flagged with `FidelityResult.valid=False` so callers
 (`wmo.simulation.model.replay`) can exclude it from fidelity aggregates instead of recording a
 spurious 0.
 """
@@ -109,7 +109,7 @@ Respond with ONLY a JSON object, no prose:
  "quality": <0..1>, "critique": "<one or two sentences: what matched, what diverged>"}"""
 
 
-class JudgeResult(BaseModel):
+class FidelityResult(BaseModel):
     """One fidelity verdict: headline score, per-dimension scores, and the critique behind them."""
 
     score: float  # 0..1 headline fidelity: weighted mean of the rubric dimensions
@@ -121,10 +121,21 @@ class JudgeResult(BaseModel):
 
 
 @runtime_checkable
-class Judge(Protocol):
+class FidelityJudge(Protocol):
     """The fidelity-scoring seam: rate a predicted observation against the actual one."""
 
-    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult: ...
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> FidelityResult:
+        """Score one predicted observation against its observed result.
+
+        Args:
+            predicted: Observation emitted by the simulator.
+            actual: Observation returned by the real environment.
+            context: Agent step that produced both observations.
+
+        Returns:
+            FidelityResult containing the fidelity score and critique.
+        """
+        ...
 
 
 def _build_judge_prompt(predicted: Observation, actual: Observation, context: Step) -> str:
@@ -186,11 +197,11 @@ class _RawRubric(BaseModel):
     critique: str = ""
 
 
-class RubricJudge:
+class FidelityRubricJudge:
     """The reference-grounded 5-dimension fidelity judge.
 
     Scores the five `RUBRIC_DIMENSIONS` and reports their `RUBRIC_WEIGHTS`-weighted mean as the
-    headline `score`, with the per-dimension breakdown in `JudgeResult.dimensions`. A reply that
+    headline `score`, with the per-dimension breakdown in `FidelityResult.dimensions`. A reply that
     cannot be parsed into all five dimensions is retried once; if it is still unusable the result
     is flagged `valid=False` rather than scored 0.0, so judge failures never masquerade as
     world-model failures.
@@ -199,7 +210,17 @@ class RubricJudge:
     def __init__(self, provider: Provider) -> None:
         self._provider = provider
 
-    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> FidelityResult:
+        """Score a prediction with the configured provider-backed fidelity rubric.
+
+        Args:
+            predicted: Observation emitted by the simulator.
+            actual: Observation returned by the real environment.
+            context: Agent step that produced both observations.
+
+        Returns:
+            FidelityResult parsed from a validated judge response.
+        """
         user = _build_judge_prompt(predicted, actual, context)
         result = self._ask(user)
         if not result.valid:
@@ -213,7 +234,7 @@ class RubricJudge:
             )
         return result
 
-    def _ask(self, user: str) -> JudgeResult:
+    def _ask(self, user: str) -> FidelityResult:
         completion = self._provider.complete(
             JUDGE_SYSTEM,
             [Message(role="user", content=user)],
@@ -223,8 +244,8 @@ class RubricJudge:
         return _parse_rubric(completion.text)
 
 
-def _parse_rubric(text: str) -> JudgeResult:
-    """Parse the judge's reply into a JudgeResult (headline = weighted mean of dimensions).
+def _parse_rubric(text: str) -> FidelityResult:
+    """Parse the judge's reply into a FidelityResult (headline = weighted mean of dimensions).
 
     Accepts a bare JSON object, JSON inside a ```json fence, or JSON embedded in surrounding
     prose. A reply that is not JSON, is missing a dimension, or scores a dimension far outside
@@ -256,8 +277,8 @@ def _parse_rubric(text: str) -> JudgeResult:
             )
         dims[name] = _clamp(value)
     score = sum(RUBRIC_WEIGHTS[name] * dims[name] for name in RUBRIC_DIMENSIONS)
-    return JudgeResult(score=score, critique=parsed.critique.strip(), dimensions=dims)
+    return FidelityResult(score=score, critique=parsed.critique.strip(), dimensions=dims)
 
 
-def _invalid(critique: str) -> JudgeResult:
-    return JudgeResult(score=0.0, critique=critique, valid=False)
+def _invalid(critique: str) -> FidelityResult:
+    return FidelityResult(score=0.0, critique=critique, valid=False)

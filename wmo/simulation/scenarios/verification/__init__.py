@@ -1,10 +1,5 @@
-"""Verification: back-agreement + solvability gates and the checklist judge that powers them."""
+"""Scenario back-agreement and solvability verification services."""
 
-from wmo.simulation.scenarios.verification.judge import (
-    CHECKLIST_SYSTEM,
-    ChecklistJudge,
-    ChecklistResult,
-)
 from wmo.simulation.scenarios.verification.verify import (
     ScenarioVerdict,
     VerificationReport,
@@ -12,9 +7,6 @@ from wmo.simulation.scenarios.verification.verify import (
 )
 
 __all__ = [
-    "CHECKLIST_SYSTEM",
-    "ChecklistJudge",
-    "ChecklistResult",
     "ScenarioVerdict",
     "VerificationReport",
     "verify_scenarios",

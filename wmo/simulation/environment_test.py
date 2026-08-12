@@ -121,7 +121,7 @@ def test_recorded_history_snapshots_state_per_step() -> None:
 
 def test_score_on_close_captures_episode_score_before_session_ends() -> None:
     """RL rollouts: run_episode closes the env, so scoring must happen inside close()."""
-    from wmo.optimize.reward import EpisodeScore
+    from wmo.common.judging.episode import EpisodeScore
 
     env_reply = '{"output": "found u1", "is_error": false}'
     judge_reply = '{"success": true, "reward": 0.7, "step_rewards": [0.7], "critique": "nice"}'

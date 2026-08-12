@@ -78,6 +78,7 @@ def _model() -> ModelSnapshot:
         provider="fake",
         model_id="judge-model",
         capabilities_sha256=_DIGEST,
+        connection_sha256=_DIGEST,
     )
 
 
@@ -320,6 +321,7 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs(
         provider="fake",
         model_id="other-judge",
         capabilities_sha256=_DIGEST,
+        connection_sha256=_DIGEST,
     )
     with pytest.raises(JudgmentError, match="model identity"):
         LMJudge(

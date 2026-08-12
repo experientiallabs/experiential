@@ -12,10 +12,11 @@ import shutil
 
 from wmo.common.config import ArtifactPaths, HarnessConfig, save_config
 from wmo.common.core.types import Trace
+from wmo.common.judging.fidelity import FidelityRubricJudge
 from wmo.common.observability.reporting import BuildReporter, NullReporter
 from wmo.common.providers import get_provider
 from wmo.common.providers.base import Embedder, Provider
-from wmo.optimize import GEPAOptimizer, OptimizeResult, RubricJudge
+from wmo.optimize import GEPAOptimizer, OptimizeResult
 from wmo.simulation.ingest import VendorPull, drop_degenerate_traces, get_adapter
 from wmo.simulation.model.autoconfig import (
     DEFAULT_VAL_CAP,
@@ -260,14 +261,14 @@ def build(
         # RAG. OptimizeResult's zeroed metrics honestly say "nothing was optimized".
         result = OptimizeResult(prompt=BASE_ENV_PROMPT)
     else:
-        # Optimize against the SAME rubric we evaluate with (RubricJudge). NOTE: the judge MODEL
-        # may differ — config.judge_model defaults to a cheap per-provider model for GEPA cost,
+        # Optimize against the same rubric we evaluate with (FidelityRubricJudge). The judge model
+        # may differ: config.judge_model defaults to a cheap per-provider model for GEPA cost,
         # while `wmo eval` pins the judge to the requested serve-grade model — so
         # held_out_accuracy is only directly comparable to eval fidelity when --judge-model
         # matches the eval judge.
         optimizer = GEPAOptimizer(
             provider,
-            RubricJudge(judge_provider),
+            FidelityRubricJudge(judge_provider),
             retriever=EmbeddingRetriever(embed),
             on_rollout=_on_rollout,
             on_budget=_on_budget,
@@ -358,7 +359,7 @@ def build(
             train or traces,
             test or train,
             provider,
-            RubricJudge(judge_provider),
+            FidelityRubricJudge(judge_provider),
             embed,
             val_cap=fidelity_budget,
             # Pass the already-computed menu so the search doesn't recompute the identical

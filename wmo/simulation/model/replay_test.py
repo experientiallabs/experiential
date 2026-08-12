@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.judging.fidelity import FidelityResult
 from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
-from wmo.optimize.judge import JudgeResult
 from wmo.simulation.model.grounding import GroundingResult, SourceResolver
 from wmo.simulation.model.replay import replay
 from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
@@ -42,17 +42,17 @@ class FakeJudge:
         self._dimensions = dimensions or {}
         self.calls = 0
 
-    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> FidelityResult:
         self.calls += 1
-        return JudgeResult(score=self._score, critique="ok", dimensions=dict(self._dimensions))
+        return FidelityResult(score=self._score, critique="ok", dimensions=dict(self._dimensions))
 
 
 class PerActionJudge:
     """Scores by tool-call arg `i` (lets a trace produce a spread of per-step scores)."""
 
-    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> FidelityResult:
         i = context.action.arguments.get("i", 0)
-        return JudgeResult(score=1.0 if i == 0 else 0.0, critique="ok")
+        return FidelityResult(score=1.0 if i == 0 else 0.0, critique="ok")
 
 
 def _trace(tid: str, n: int = 2) -> Trace:
@@ -620,11 +620,11 @@ class InvalidOnceJudge:
     def __init__(self) -> None:
         self.calls = 0
 
-    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> FidelityResult:
         self.calls += 1
         if self.calls == 1:
-            return JudgeResult(score=0.0, critique="judge broke", valid=False)
-        return JudgeResult(score=0.8, critique="ok")
+            return FidelityResult(score=0.0, critique="judge broke", valid=False)
+        return FidelityResult(score=0.8, critique="ok")
 
 
 def test_replay_excludes_invalid_judgements_from_fidelity() -> None:
@@ -640,8 +640,10 @@ def test_replay_excludes_invalid_judgements_from_fidelity() -> None:
 
 def test_replay_all_invalid_judgements_report_zero_with_count() -> None:
     class AlwaysInvalid:
-        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
-            return JudgeResult(score=0.0, critique="judge broke", valid=False)
+        def score(
+            self, predicted: Observation, actual: Observation, context: Step
+        ) -> FidelityResult:
+            return FidelityResult(score=0.0, critique="judge broke", valid=False)
 
     provider = FakeProvider('{"output": "x"}')
     report = replay("BASE", [_trace("h", n=2)], provider, AlwaysInvalid())

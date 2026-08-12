@@ -17,9 +17,9 @@ import typer
 from rich.console import Console
 
 if TYPE_CHECKING:
+    from wmo.common.judging.assertions import GoldVerdict
     from wmo.runtime.harness.doc import HarnessDoc
     from wmo.simulation.evaluation.closed_loop import ClosedLoopReport
-    from wmo.simulation.evaluation.gold import GoldVerdict
 
 
 def run_closed_loop(
@@ -50,9 +50,9 @@ def run_closed_loop(
     """
     from wmo.cli.model_roles import resolve_opt_in_model_provider
     from wmo.common.config import WorldModelStore
+    from wmo.common.judging.assertions import GoldJudge
     from wmo.runtime.harness.runtime import DEFAULT_MAX_TURNS, AgentRuntime
     from wmo.simulation.evaluation.closed_loop import ClosedLoopEval
-    from wmo.simulation.evaluation.gold import GoldJudge
     from wmo.simulation.evaluation.tasks import load_tasks
     from wmo.simulation.model import load_world_model
 

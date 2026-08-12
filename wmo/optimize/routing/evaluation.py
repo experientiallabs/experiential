@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict
 
+from wmo.common.judging.episode import EpisodeScore
 from wmo.common.providers.base import (
     DEFAULT_MAX_TOKENS,
     Completion,
@@ -58,7 +59,6 @@ from wmo.common.providers.base import (
     VerifyResult,
 )
 from wmo.common.providers.pool import ModelPool, PoolEntry, pool_provider
-from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing.compression import CompressionConfig, estimate_tokens, get_compressor
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.runtime.agents.llm import DEFAULT_HISTORY_CHARS, LLMAgent

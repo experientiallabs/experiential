@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from wmo.common.core.types import Action, EnvState, Observation
+from wmo.common.judging.episode import EpisodeScore
 from wmo.common.observability import RunRecord
-from wmo.optimize.reward import EpisodeScore
 from wmo.simulation.model.world_model import WorldModel
 
 

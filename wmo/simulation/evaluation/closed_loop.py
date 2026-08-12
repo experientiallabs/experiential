@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from wmo.common.core.text import normalize_durable_text
 from wmo.common.core.types import Action, Observation
+from wmo.common.judging.assertions import GoldJudge, GoldVerdict
 from wmo.common.providers.base import Provider
 from wmo.runtime.harness.environment import AgentEnvironment
 from wmo.runtime.harness.runtime import (
@@ -34,7 +35,6 @@ from wmo.runtime.harness.runtime import (
     TokenUsage,
     combine_usage,
 )
-from wmo.simulation.evaluation.gold import GoldJudge, GoldVerdict
 from wmo.simulation.evaluation.tasks import TaskSpec
 from wmo.simulation.model.world_model import WorldModel
 

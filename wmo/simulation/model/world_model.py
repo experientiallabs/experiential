@@ -16,11 +16,11 @@ from pathlib import Path
 from wmo.common.config import ArtifactPaths, load_config
 from wmo.common.core.parsing import dumps_observation_contract, parse_observation
 from wmo.common.core.types import Action, EnvState, Observation, Session, Step
+from wmo.common.judging.episode import EpisodeRewardJudge, EpisodeScore
 from wmo.common.observability import MeteredProvider, Phase, RunRecord, RunTracker
 from wmo.common.observability.telemetry import capture
 from wmo.common.providers.base import Embedder, Message, Provider
 from wmo.optimize.gepa import VERIFY_INSTRUCTION
-from wmo.optimize.reward import EpisodeRewardJudge, EpisodeScore
 from wmo.simulation.model.autoconfig import AutoFidelityReport
 from wmo.simulation.model.grounding import Grounder, extract_get_url, get_grounder, render_grounding
 from wmo.simulation.model.knowledge import KnowledgeBase

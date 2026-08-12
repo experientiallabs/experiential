@@ -27,16 +27,12 @@ from wmo.simulation.scenarios.mining import (
 from wmo.simulation.scenarios.spec import Scenario, scenarios_from_traces, tools_hint_from_traces
 from wmo.simulation.scenarios.synthesis import EvalScenario, ScenarioSet, ScenarioSynthesizer
 from wmo.simulation.scenarios.verification import (
-    ChecklistJudge,
-    ChecklistResult,
     ScenarioVerdict,
     VerificationReport,
     verify_scenarios,
 )
 
 __all__ = [
-    "ChecklistJudge",
-    "ChecklistResult",
     "EvalScenario",
     "FacetExtractor",
     "Outcome",

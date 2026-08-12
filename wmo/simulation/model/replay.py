@@ -24,9 +24,9 @@ from pydantic import BaseModel, Field
 
 from wmo.common.core.render import render_action
 from wmo.common.core.types import Observation, Step, Trace
+from wmo.common.judging.fidelity import FidelityJudge
 from wmo.common.providers.base import Provider
 from wmo.optimize.gepa import distill_profile, predict_observation, verify_observation
-from wmo.optimize.judge import Judge
 from wmo.simulation.model.grounding import (
     Grounder,
     SourceResolver,
@@ -102,7 +102,7 @@ def replay(
     prompt: str,
     held_out: list[Trace],
     provider: Provider,
-    judge: Judge,
+    judge: FidelityJudge,
     *,
     retriever: Retriever | None = None,
     train: list[Trace] | None = None,
@@ -247,7 +247,7 @@ def _score_step(
     trace_id: str,
     step: Step,
     provider: Provider,
-    judge: Judge,
+    judge: FidelityJudge,
     demos: DemoRetriever,
     history: list[Step],
     *,

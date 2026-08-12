@@ -16,6 +16,7 @@ from typer.testing import CliRunner, Result
 
 from wmo.cli import app
 from wmo.common.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
+from wmo.common.judging.assertions import GoldJudge, GoldVerdict
 from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.runtime.harness.doc import (
     RUNTIME_KIND_ID,
@@ -28,11 +29,13 @@ from wmo.runtime.harness.environment import AgentEnvironment
 from wmo.runtime.harness.pi_e2b import E2BPiRuntime
 from wmo.runtime.harness.runtime import AgentRuntime, RunResult, Runtime
 from wmo.simulation.evaluation.closed_loop import ClosedLoopReport, TaskOutcome
-from wmo.simulation.evaluation.gold import GoldJudge, GoldVerdict
 from wmo.simulation.evaluation.tasks import TaskSpec
 
 eval_cl_module = importlib.import_module("wmo.cli.eval_closed_loop")
 model_roles_module = importlib.import_module("wmo.cli.model_roles")
+config_module = importlib.import_module("wmo.common.config")
+closed_loop_module = importlib.import_module("wmo.simulation.evaluation.closed_loop")
+simulation_model_module = importlib.import_module("wmo.simulation.model")
 
 runner = CliRunner()
 
@@ -143,9 +146,9 @@ def _patch_seams(monkeypatch: pytest.MonkeyPatch, seen: dict[str, object]) -> ob
         def run(self) -> ClosedLoopReport:
             return _report(self._label, self._k)
 
-    monkeypatch.setattr(eval_cl_module, "WorldModelStore", _FakeStore)
-    monkeypatch.setattr(eval_cl_module, "load_world_model", lambda d: (wm, world_provider))
-    monkeypatch.setattr(eval_cl_module, "ClosedLoopEval", _FakeEval)
+    monkeypatch.setattr(config_module, "WorldModelStore", _FakeStore)
+    monkeypatch.setattr(simulation_model_module, "load_world_model", lambda d: (wm, world_provider))
+    monkeypatch.setattr(closed_loop_module, "ClosedLoopEval", _FakeEval)
     seen["world_provider"] = world_provider
     return wm
 
@@ -315,9 +318,11 @@ def test_eval_e2b_runs_the_pi_harness_in_parallel_and_closes_its_runtime(
 def test_eval_local_rejects_parallel_pi_node(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Local pi runtimes are single-episode resources: local + --eval-concurrency>1 must not run."""
-    monkeypatch.setattr(eval_cl_module, "WorldModelStore", _FakeStore)
-    monkeypatch.setattr(eval_cl_module, "load_world_model", lambda d: (object(), _Provider()))
+    """Reject parallel local pi-node evaluation before any rollout starts."""
+    monkeypatch.setattr(config_module, "WorldModelStore", _FakeStore)
+    monkeypatch.setattr(
+        simulation_model_module, "load_world_model", lambda d: (object(), _Provider())
+    )
     monkeypatch.setattr(eval_cl_module, "_load_harness", lambda name, root: _pi_doc())
 
     result = _invoke(tmp_path, "--harness", "pi", "--eval-concurrency", "2")

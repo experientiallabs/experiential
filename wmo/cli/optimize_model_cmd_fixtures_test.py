@@ -27,6 +27,7 @@ from wmo.common.core.types import (
     Step,
     Trace,
 )
+from wmo.common.judging.episode import EpisodeScore
 from wmo.common.observability import Phase, RunRecord, UsageTotals, load_runs
 from wmo.common.providers.base import (
     Completion,
@@ -38,7 +39,6 @@ from wmo.common.providers.base import (
     VerifyResult,
 )
 from wmo.common.providers.pool import load_pool
-from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing.compression import CompressionConfig
 from wmo.optimize.routing.evaluation import scenario_id
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome

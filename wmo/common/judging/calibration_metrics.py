@@ -73,7 +73,15 @@ class WorstDisagreement(ContractModel):
 
 
 def fit_score_map(dimension_id: ArtifactId, data: Sequence[CalibrationDatum]) -> DimensionScoreMap:
-    """Fit a monotonic score map with deterministic interpolation for absent raw scores."""
+    """Fit a monotonic score map with deterministic interpolation for absent raw scores.
+
+    Args:
+        dimension_id: Rubric dimension represented by the calibration observations.
+        data: Active human scores paired with verified raw judge scores.
+
+    Returns:
+        Monotonic mapping from each raw score to a calibrated human-equivalent score.
+    """
     by_raw_score: dict[int, list[int]] = defaultdict(list)
     for item in data:
         by_raw_score[item.raw_score].append(item.human_score.score)
@@ -127,7 +135,15 @@ def fit_score_map(dimension_id: ArtifactId, data: Sequence[CalibrationDatum]) ->
 def grouped_predictions_and_metrics(
     rubric: Rubric, data: Sequence[CalibrationDatum]
 ) -> tuple[tuple[OutOfFoldPrediction, ...], tuple[DimensionCalibrationMetrics, ...]]:
-    """Fit only valid per-dimension lineage-grouped folds and summarize their predictions."""
+    """Fit valid lineage-grouped folds and summarize their held-out predictions.
+
+    Args:
+        rubric: Approved rubric whose dimensions define the calibration groups.
+        data: Active human score and raw-judge observation pairs.
+
+    Returns:
+        Held-out predictions followed by metrics for every rubric dimension.
+    """
     predictions: list[OutOfFoldPrediction] = []
     metrics: list[DimensionCalibrationMetrics] = []
     for dimension in rubric.dimensions:
@@ -158,7 +174,15 @@ def has_valid_grouped_oof(
     metrics: DimensionCalibrationMetrics,
     predictions: Sequence[OutOfFoldPrediction],
 ) -> bool:
-    """Return whether one dimension has complete nonempty grouped held-out evidence."""
+    """Return whether one dimension has complete nonempty grouped held-out evidence.
+
+    Args:
+        metrics: Summary metrics for one rubric dimension.
+        predictions: Held-out predictions for the same dimension.
+
+    Returns:
+        True when every expected grouped fold and label has valid held-out evidence.
+    """
     if metrics.label_count == 0 or metrics.lineage_count < 2:
         return False
     expected_fold_count = min(5, metrics.lineage_count)
@@ -179,7 +203,14 @@ def has_valid_grouped_oof(
 def worst_disagreements(
     predictions: Sequence[OutOfFoldPrediction],
 ) -> tuple[WorstDisagreement, ...]:
-    """Return the ten largest valid OOF disagreements with deterministic tie ordering."""
+    """Return the ten largest valid OOF disagreements with deterministic tie ordering.
+
+    Args:
+        predictions: Valid held-out calibrated predictions to inspect.
+
+    Returns:
+        Largest absolute-error disagreements, labeled by calibration direction.
+    """
     disagreements: list[WorstDisagreement] = []
     for prediction in sorted(predictions, key=lambda item: (-item.absolute_error, item.label_id))[
         :10

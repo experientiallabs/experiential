@@ -34,10 +34,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.common.config import ArtifactPaths, HarnessConfig, load_config
 from wmo.common.core.types import Action, EnvState, Observation
+from wmo.common.judging.episode import EpisodeScore
 from wmo.common.observability import RunRecord, merge_run_records, save_run
 from wmo.common.providers.base import ProviderKind, TokenUsage
 from wmo.common.providers.pool import ModelPool, load_pool, prepare_pool_provider
-from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing.compression import CompressionConfig, compression_signature
 from wmo.optimize.routing.evaluation import (
     CellKey,

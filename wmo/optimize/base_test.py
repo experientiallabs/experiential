@@ -19,8 +19,8 @@ from wmo.optimize.base import (
 from wmo.optimize.gepa import GEPAOptimizer
 
 if TYPE_CHECKING:
+    from wmo.common.judging.fidelity import FidelityJudge
     from wmo.common.providers.base import Provider
-    from wmo.optimize.judge import Judge
 
 
 def test_optimize_result_defaults_are_prompt_only() -> None:
@@ -72,7 +72,7 @@ def test_artifact_ref_rejects_unknown_kind() -> None:
 
 def test_gepa_optimizer_satisfies_the_protocol() -> None:
     provider = cast("Provider", None)  # protocol check needs no live backend
-    judge = cast("Judge", None)
+    judge = cast("FidelityJudge", None)
     assert isinstance(GEPAOptimizer(provider, judge), Optimizer)
 
 

@@ -552,6 +552,21 @@ _DOCSTRING_TOMBSTONE_ROWS: Final[tuple[str, ...]] = (
     'wmo/simulation/model/play.py|play_turn|function|missing-args-section',
     'wmo/simulation/model/play.py|play_turn|function|missing-returns-section',
     'wmo/simulation/model/play.py|play_turn|function|nontrivial-one-line-docstring',
+    'wmo/optimize/judge.py|Judge.score|method|missing-docstring',
+    'wmo/optimize/judge.py|RubricJudge.score|method|missing-docstring',
+    'wmo/optimize/judge_quality.py|JudgeQualityReport.failed|method|missing-docstring',
+    'wmo/optimize/judge_quality.py|JudgeQualityReport.n_passed|method|missing-docstring',
+    'wmo/optimize/judge_quality.py|JudgeQualityReport.n_total|method|missing-docstring',
+    'wmo/optimize/judge_quality.py|JudgeQualityReport.summary|method|missing-docstring',
+    'wmo/optimize/judge_quality.py|ScoreBand.holds|method|missing-docstring',
+    'wmo/optimize/judge_quality.py|run_judge_quality|function|missing-args-section',
+    'wmo/optimize/judge_quality.py|run_judge_quality|function|missing-returns-section',
+    'wmo/optimize/numeric.py|NumericJudge.score|method|missing-docstring',
+    'wmo/optimize/reward.py|EpisodeRewardJudge.score|method|missing-args-section',
+    'wmo/optimize/reward.py|EpisodeRewardJudge.score|method|missing-returns-section',
+    'wmo/simulation/evaluation/gold.py|GoldJudge.score|method|missing-docstring',
+    'wmo/simulation/scenarios/verification/judge.py|ChecklistJudge.score|method|missing-docstring',
+    'wmo/simulation/scenarios/verification/judge.py|ChecklistResult.pass_rate|method|missing-docstring',
 )
 # fmt: on
 DOCSTRING_TOMBSTONES: frozenset[DocstringViolation] = frozenset(

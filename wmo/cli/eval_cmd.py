@@ -314,7 +314,7 @@ def _run_eval_files(
     chain: str | None = None,
 ) -> EvalReport:
     import wmo.common.providers as providers
-    from wmo.optimize.judge import RubricJudge
+    from wmo.common.judging.fidelity import FidelityRubricJudge
     from wmo.simulation.evaluation.open_loop import OpenLoopEval
     from wmo.simulation.model.prompts import BASE_ENV_PROMPT
     from wmo.simulation.retrieval import HashingEmbedder
@@ -350,7 +350,7 @@ def _run_eval_files(
     # The judge is the metric: it stays PINNED to the single requested backend and never rides
     # the failover chain - a judge that silently switches models mid-run makes fidelity numbers
     # incomparable across steps. World-model prediction calls (above) may fail over freely.
-    scorer = RubricJudge(providers.get_provider(provider_config))
+    scorer = FidelityRubricJudge(providers.get_provider(provider_config))
     evaluation = OpenLoopEval(
         files,
         prompt,

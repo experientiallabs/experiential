@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import json
 
+from wmo.common.judging.assertions import GOLD_JUDGE_SYSTEM, GoldJudge, _parse
 from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
-from wmo.simulation.evaluation.gold import GOLD_JUDGE_SYSTEM, GoldJudge, _parse
 
 _GOLD = ["the file was created", "the tests pass"]
 

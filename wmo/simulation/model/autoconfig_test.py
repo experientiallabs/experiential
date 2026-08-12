@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.common.judging.fidelity import FidelityResult
 from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
-from wmo.optimize.judge import JudgeResult
 from wmo.simulation.model.autoconfig import (
     DEFAULT_CANDIDATES,
     FETCH_CANDIDATE,
@@ -46,8 +46,8 @@ class _ModeAwareJudge:
         self._scores = scores
         self.active_label = "base"
 
-    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
-        return JudgeResult(score=self._scores.get(self.active_label, 0.5), critique="ok")
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> FidelityResult:
+        return FidelityResult(score=self._scores.get(self.active_label, 0.5), critique="ok")
 
 
 def _traces(n: int) -> list[Trace]:

@@ -8,6 +8,7 @@ critique. We assert the optimizer runs a bounded loop and returns a valid fronti
 from __future__ import annotations
 
 from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.judging.fidelity import FidelityResult
 from wmo.common.providers.base import (
     DEFAULT_MAX_TOKENS,
     Completion,
@@ -25,7 +26,6 @@ from wmo.optimize.gepa import (
     _metric_call_budget,
     predict_observation,
 )
-from wmo.optimize.judge import JudgeResult
 
 
 def test_metric_call_budget_funds_exploration_not_just_seed_eval() -> None:
@@ -82,9 +82,9 @@ class FakeJudge:
         self._score = score
         self.calls = 0
 
-    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> FidelityResult:
         self.calls += 1
-        return JudgeResult(score=self._score, critique="add the item total to the response")
+        return FidelityResult(score=self._score, critique="add the item total to the response")
 
 
 def _trace(tid: str, n: int = 2) -> Trace:
@@ -301,9 +301,9 @@ class _PredictionJudge(FakeJudge):
         super().__init__()
         self._scores = scores
 
-    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> FidelityResult:
         self.calls += 1
-        return JudgeResult(score=self._scores.get(predicted.content, 0.0), critique="c")
+        return FidelityResult(score=self._scores.get(predicted.content, 0.0), critique="c")
 
 
 def _patched_gepa_optimize(monkeypatch, prompts: list[str], best_idx: int):  # noqa: ANN001, ANN202
@@ -359,10 +359,12 @@ def test_optimize_recheck_ignores_hard_filtered_valset(monkeypatch) -> None:  # 
     seen_contexts: list[str] = []
 
     class _ContextRecordingJudge(FakeJudge):
-        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+        def score(
+            self, predicted: Observation, actual: Observation, context: Step
+        ) -> FidelityResult:
             self.calls += 1
             seen_contexts.append(actual.content)
-            return JudgeResult(score=0.5, critique="c")
+            return FidelityResult(score=0.5, critique="c")
 
     valset_trace = _trace("val", n=2)  # steps real-0, real-1
     only_first = lambda step: step.observation.content == "real-0"  # noqa: E731
@@ -409,9 +411,11 @@ def test_optimize_recheck_raises_on_total_judge_outage(monkeypatch) -> None:  # 
     _patched_gepa_optimize(monkeypatch, ["BASE", "EVOLVED"], best_idx=1)
 
     class AlwaysInvalidJudge(FakeJudge):
-        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+        def score(
+            self, predicted: Observation, actual: Observation, context: Step
+        ) -> FidelityResult:
             self.calls += 1
-            return JudgeResult(score=0.0, critique="unparseable", valid=False)
+            return FidelityResult(score=0.0, critique="unparseable", valid=False)
 
     with pytest.raises(RuntimeError, match="judge outage"):
         GEPAOptimizer(_PromptSensitiveProvider(), AlwaysInvalidJudge()).optimize(
@@ -450,11 +454,15 @@ def test_optimize_recheck_can_use_disjoint_traces(monkeypatch) -> None:  # noqa:
     seen_contexts: list[str] = []
 
     class _ContextRecordingJudge(FakeJudge):
-        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+        def score(
+            self, predicted: Observation, actual: Observation, context: Step
+        ) -> FidelityResult:
             self.calls += 1
             seen_contexts.append(actual.content)
             # Winner loses on the recheck set: base-pred outscores evolved-pred.
-            return JudgeResult(score=0.9 if predicted.content == "base-pred" else 0.1, critique="c")
+            return FidelityResult(
+                score=0.9 if predicted.content == "base-pred" else 0.1, critique="c"
+            )
 
     result = GEPAOptimizer(_PromptSensitiveProvider(), _ContextRecordingJudge()).optimize(
         [_trace("tr1")], [_trace("te1")], "BASE", budget=4, recheck=[recheck_trace]
@@ -600,7 +608,9 @@ def test_adapter_evaluate_scores_and_captures_traces() -> None:
 
 def test_adapter_evaluate_survives_rollout_failure() -> None:
     class BoomJudge(FakeJudge):
-        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+        def score(
+            self, predicted: Observation, actual: Observation, context: Step
+        ) -> FidelityResult:
             raise RuntimeError("judge exploded")
 
     adapter = WorldModelGEPAAdapter(FakeProvider(), BoomJudge())
@@ -614,11 +624,13 @@ def test_adapter_imputes_neutral_score_for_invalid_judgements() -> None:
     # A judge failure (valid=False) says nothing about the prediction: it must not become a
     # phantom 0.0 in GEPA's fitness, and its parse-error critique must not reach reflection.
     class InvalidOnSecondJudge(FakeJudge):
-        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+        def score(
+            self, predicted: Observation, actual: Observation, context: Step
+        ) -> FidelityResult:
             self.calls += 1
             if self.calls == 2:
-                return JudgeResult(score=0.0, critique="Unparseable judge reply", valid=False)
-            return JudgeResult(score=0.8, critique="ok")
+                return FidelityResult(score=0.0, critique="Unparseable judge reply", valid=False)
+            return FidelityResult(score=0.8, critique="ok")
 
     adapter = WorldModelGEPAAdapter(FakeProvider(), InvalidOnSecondJudge())
     out = adapter.evaluate(_eval_batch(_trace("t", n=3)), {ENV_PROMPT_COMPONENT: "P"}, True)
@@ -635,8 +647,10 @@ def test_adapter_imputes_neutral_score_for_invalid_judgements() -> None:
 
 def test_adapter_all_invalid_judgements_fall_back_to_full_reflection() -> None:
     class AlwaysInvalidJudge(FakeJudge):
-        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
-            return JudgeResult(score=0.0, critique="Unparseable judge reply", valid=False)
+        def score(
+            self, predicted: Observation, actual: Observation, context: Step
+        ) -> FidelityResult:
+            return FidelityResult(score=0.0, critique="Unparseable judge reply", valid=False)
 
     adapter = WorldModelGEPAAdapter(FakeProvider(), AlwaysInvalidJudge())
     out = adapter.evaluate(_eval_batch(_trace("t", n=2)), {ENV_PROMPT_COMPONENT: "P"}, True)
@@ -657,11 +671,13 @@ def test_adapter_judge_exception_is_invalid_not_a_world_model_zero() -> None:
     # it must flow through the same valid=False machinery as a malformed reply, and the
     # successfully generated prediction must be kept.
     class RaisingJudge(FakeJudge):
-        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+        def score(
+            self, predicted: Observation, actual: Observation, context: Step
+        ) -> FidelityResult:
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("ThrottlingException: judge is down")
-            return JudgeResult(score=0.8, critique="ok")
+            return FidelityResult(score=0.8, critique="ok")
 
     adapter = WorldModelGEPAAdapter(FakeProvider(), RaisingJudge())
     out = adapter.evaluate(_eval_batch(_trace("t", n=2)), {ENV_PROMPT_COMPONENT: "P"}, True)

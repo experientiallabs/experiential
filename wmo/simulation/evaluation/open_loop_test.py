@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 
 from wmo.common.core.types import Observation, Step
+from wmo.common.judging.fidelity import FidelityResult
 from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
-from wmo.optimize.judge import JudgeResult
 from wmo.simulation.evaluation.open_loop import evaluate_files
 from wmo.simulation.retrieval import HashingEmbedder
 
@@ -37,8 +37,8 @@ class FakeJudge:
     def __init__(self, score: float) -> None:
         self._score = score
 
-    def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
-        return JudgeResult(score=self._score, critique="ok")
+    def score(self, predicted: Observation, actual: Observation, context: Step) -> FidelityResult:
+        return FidelityResult(score=self._score, critique="ok")
 
 
 def _write_corpus(path, n_traces: int) -> None:  # noqa: ANN001 - tmp_path fixture
@@ -134,11 +134,13 @@ def test_evaluate_files_excludes_invalid_judgements_from_overall(tmp_path) -> No
         def __init__(self) -> None:
             self.calls = 0
 
-        def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult:
+        def score(
+            self, predicted: Observation, actual: Observation, context: Step
+        ) -> FidelityResult:
             self.calls += 1
             if self.calls == 1:
-                return JudgeResult(score=0.0, critique="judge broke", valid=False)
-            return JudgeResult(score=0.6, critique="ok")
+                return FidelityResult(score=0.0, critique="judge broke", valid=False)
+            return FidelityResult(score=0.6, critique="ok")
 
     corpus = tmp_path / "bench.otel.jsonl"
     _write_corpus(corpus, n_traces=4)

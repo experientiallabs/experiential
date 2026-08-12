@@ -18,8 +18,8 @@ from statistics import fmean
 from pydantic import BaseModel, Field
 
 from wmo.common.core.types import Trace
+from wmo.common.judging.fidelity import FidelityJudge
 from wmo.common.providers.base import Embedder, Provider
-from wmo.optimize.judge import Judge
 from wmo.simulation.model.grounding import FetchGrounder, Grounder, SourceResolver, extract_get_url
 from wmo.simulation.model.knowledge import seeded_knowledge_text
 from wmo.simulation.model.replay import replay
@@ -264,7 +264,7 @@ def search_max_fidelity(
     train: list[Trace],
     val: list[Trace],
     provider: Provider,
-    judge: Judge,
+    judge: FidelityJudge,
     embedder: Embedder | None,
     *,
     val_cap: int = DEFAULT_VAL_CAP,

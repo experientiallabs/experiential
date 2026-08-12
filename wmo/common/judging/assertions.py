@@ -73,6 +73,17 @@ class GoldJudge:
         self._provider = provider
 
     def score(self, instruction: str, answer: str, transcript: str, gold: list[str]) -> GoldVerdict:
+        """Judge whether a completed run satisfies every gold assertion.
+
+        Args:
+            instruction: Task instruction given to the agent.
+            answer: Agent's final response.
+            transcript: Rendered record of the agent run.
+            gold: Required semantic success assertions.
+
+        Returns:
+            GoldVerdict with an all-assertions pass result and partial-credit fraction.
+        """
         if not gold:
             return GoldVerdict.trivially_passed()
         user = _build_prompt(instruction, answer, transcript, gold)

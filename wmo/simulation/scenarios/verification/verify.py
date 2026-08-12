@@ -16,12 +16,12 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 from wmo.common.core.types import Trace
+from wmo.common.judging.checklist import ChecklistJudge, ChecklistResult
 from wmo.runtime.episode import Agent, run_episode
 from wmo.simulation.environment import WorldModelEnv
 from wmo.simulation.model.world_model import WorldModel
 from wmo.simulation.scenarios.mining.facets import Outcome
 from wmo.simulation.scenarios.synthesis import EvalScenario, ScenarioSet
-from wmo.simulation.scenarios.verification.judge import ChecklistJudge, ChecklistResult
 
 
 class ScenarioVerdict(BaseModel):

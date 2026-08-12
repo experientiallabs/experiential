@@ -11,6 +11,7 @@ import threading
 import pytest
 
 from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step
+from wmo.common.judging.assertions import AssertionResult, GoldJudge, GoldVerdict
 from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.runtime.harness.e2b_sandbox import SandboxCleanupError
 from wmo.runtime.harness.environment import AgentEnvironment, is_env_action
@@ -21,7 +22,6 @@ from wmo.simulation.evaluation.closed_loop import (
     evaluate_closed_loop,
     evaluate_with_env,
 )
-from wmo.simulation.evaluation.gold import AssertionResult, GoldJudge, GoldVerdict
 from wmo.simulation.evaluation.tasks import TaskSpec
 from wmo.simulation.model.world_model import WorldModel
 from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder

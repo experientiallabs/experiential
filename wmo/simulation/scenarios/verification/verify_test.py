@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.common.judging.checklist import ChecklistJudge
 from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.simulation.model.world_model import WorldModel
 from wmo.simulation.scenarios.mining.facets import Outcome
 from wmo.simulation.scenarios.synthesis import EvalScenario, ScenarioSet
 from wmo.simulation.scenarios.verification import (
-    ChecklistJudge,
     ScenarioVerdict,
     VerificationReport,
     verify_scenarios,

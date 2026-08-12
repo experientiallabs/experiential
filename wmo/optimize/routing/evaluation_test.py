@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 
 from wmo.common.core.types import Action, EnvState, Observation
+from wmo.common.judging.episode import EpisodeScore
 from wmo.common.providers.base import (
     Completion,
     Message,
@@ -18,7 +19,6 @@ from wmo.common.providers.base import (
     VerifyResult,
 )
 from wmo.common.providers.pool import ModelPool, PoolEntry
-from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing.compression import CompressionConfig
 from wmo.optimize.routing.evaluation import evaluate_pool
 from wmo.optimize.routing.outcomes import ScenarioOutcome

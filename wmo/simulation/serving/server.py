@@ -29,8 +29,8 @@ from pydantic import BaseModel
 from wmo.common.config import ARTIFACT_DIR, WorldModelStore, validate_name
 from wmo.common.config.card import ModelCard, load_card
 from wmo.common.core.types import Action, EnvState, Observation, Session
+from wmo.common.judging.episode import EpisodeScore
 from wmo.common.observability import RunRecord
-from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing.pareto import PARETO_FILENAME, ParetoCurve
 from wmo.optimize.routing.policy import POLICY_FILENAME, RoutingPolicy
 from wmo.simulation.model.loader import load_world_model

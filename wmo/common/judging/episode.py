@@ -66,10 +66,14 @@ class EpisodeRewardJudge:
         self._provider = provider
 
     def score(self, task: str | None, steps: list[Step]) -> EpisodeScore:
-        """Judge one rollout; robust to malformed judge replies (flagged zero score, never raises).
+        """Judge one rollout, treating malformed responses as a zero reward.
 
-        `steps` is the episode in order (e.g. `EpisodeResult.steps` from `run_episode`, or a served
-        session's history). An empty rollout scores 0 without calling the LLM.
+        Args:
+            task: Optional task instruction that defines the intended outcome.
+            steps: Ordered episode steps from a runtime or served session.
+
+        Returns:
+            EpisodeScore with one normalized progress score per input step.
         """
         if not steps:
             return EpisodeScore(

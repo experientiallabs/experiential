@@ -49,6 +49,7 @@ def _proposal() -> RubricProposal:
             provider="fake",
             model_id="rubric-proposer",
             capabilities_sha256=_DIGEST,
+            connection_sha256=_DIGEST,
         ),
         prompt_id="rubric-prompt-v1",
         prompt_sha256=_DIGEST,

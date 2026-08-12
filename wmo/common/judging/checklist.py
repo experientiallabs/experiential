@@ -31,6 +31,7 @@ class ChecklistResult(BaseModel):
 
     @property
     def pass_rate(self) -> float:
+        """Return the fraction of checklist items the judge marked as passed."""
         return sum(self.passed) / len(self.passed) if self.passed else 0.0
 
 
@@ -47,6 +48,16 @@ class ChecklistJudge:
         self._provider = provider
 
     def score(self, task: str, checklist: list[str], steps: list[Step]) -> ChecklistResult:
+        """Judge one trajectory against a scenario checklist.
+
+        Args:
+            task: Natural-language task the agent was asked to complete.
+            checklist: Ordered success criteria for the task.
+            steps: Recorded trajectory to evaluate.
+
+        Returns:
+            ChecklistResult normalized to one Boolean result per criterion.
+        """
         prompt = _render_judge_prompt(task, checklist, steps)
         # Generous budget: reasoning judges spend completion tokens on thinking before the JSON;
         # a tight cap truncates the verdict mid-string and silently scores as failure.

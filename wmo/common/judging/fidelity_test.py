@@ -1,4 +1,4 @@
-"""Tests for the RubricJudge: prompt contract, weighted scoring, truncation, and validity."""
+"""Tests for the fidelity rubric judge and its strict scoring contract."""
 
 from __future__ import annotations
 
@@ -7,18 +7,18 @@ import re
 import pytest
 
 from wmo.common.core.types import Action, ActionKind, Observation, Step
-from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
-from wmo.optimize.judge import (
+from wmo.common.judging.fidelity import (
     JUDGE_MARKER,
     JUDGE_SYSTEM,
     OBSERVATION_HEAD_CHARS,
     OBSERVATION_TAIL_CHARS,
     RUBRIC_DIMENSIONS,
     RUBRIC_WEIGHTS,
-    Judge,
-    RubricJudge,
+    FidelityJudge,
+    FidelityRubricJudge,
     _build_judge_prompt,
 )
+from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 
 def test_judge_system_contains_marker() -> None:
@@ -99,12 +99,14 @@ def _rubric_reply(
 
 
 def test_rubric_judge_satisfies_protocol() -> None:
-    assert isinstance(RubricJudge(FakeProvider("{}")), Judge)
+    assert isinstance(FidelityRubricJudge(FakeProvider("{}")), FidelityJudge)
 
 
 def test_score_sees_both_observations_and_uses_judge_system() -> None:
     provider = FakeProvider(_rubric_reply())
-    RubricJudge(provider).score(Observation(content="pred"), Observation(content="actual"), _ctx())
+    FidelityRubricJudge(provider).score(
+        Observation(content="pred"), Observation(content="actual"), _ctx()
+    )
     assert provider.last_system == JUDGE_SYSTEM
     assert provider.last_user is not None
     assert "pred" in provider.last_user and "actual" in provider.last_user
@@ -126,7 +128,7 @@ def test_judge_prompt_makes_empty_prediction_explicit() -> None:
 
 def test_headline_score_is_weighted_mean_of_dimensions() -> None:
     reply = _rubric_reply(format=1.0, factuality=0.0, consistency=0.5, realism=1.0, quality=0.5)
-    result = RubricJudge(FakeProvider(reply)).score(
+    result = FidelityRubricJudge(FakeProvider(reply)).score(
         Observation(content="p"), Observation(content="a"), _ctx()
     )
     expected = (
@@ -165,7 +167,7 @@ def test_equal_dimensions_score_the_same_as_the_old_unweighted_mean() -> None:
     # Comparability guard: any reply with all dimensions equal is unaffected by the reweighting,
     # so uniformly-judged steps keep their pre-overhaul scores.
     reply = _rubric_reply(format=0.5, factuality=0.5, consistency=0.5, realism=0.5, quality=0.5)
-    result = RubricJudge(FakeProvider(reply)).score(
+    result = FidelityRubricJudge(FakeProvider(reply)).score(
         Observation(content="p"), Observation(content="a"), _ctx()
     )
     assert result.score == pytest.approx(0.5)
@@ -173,14 +175,14 @@ def test_equal_dimensions_score_the_same_as_the_old_unweighted_mean() -> None:
 
 def test_parse_handles_fenced_json_and_prose() -> None:
     fenced = f"Sure:\n```json\n{_rubric_reply(critique='fenced')}\n```\nDone."
-    result = RubricJudge(FakeProvider(fenced)).score(
+    result = FidelityRubricJudge(FakeProvider(fenced)).score(
         Observation(content="p"), Observation(content="a"), _ctx()
     )
     assert result.score == 1.0
     assert result.critique == "fenced"
     prose = f"My verdict is {_rubric_reply()} overall."
     assert (
-        RubricJudge(FakeProvider(prose))
+        FidelityRubricJudge(FakeProvider(prose))
         .score(Observation(content="p"), Observation(content="a"), _ctx())
         .score
         == 1.0
@@ -192,7 +194,9 @@ def test_parse_handles_fenced_json_and_prose() -> None:
 
 def test_missing_dimension_triggers_retry_then_uses_good_reply() -> None:
     provider = FakeProvider('{"format": 1.0, "factuality": 0.8}', _rubric_reply())
-    result = RubricJudge(provider).score(Observation(content="p"), Observation(content="a"), _ctx())
+    result = FidelityRubricJudge(provider).score(
+        Observation(content="p"), Observation(content="a"), _ctx()
+    )
     assert provider.calls == 2  # first reply invalid -> one retry
     assert result.valid is True
     assert result.score == 1.0
@@ -205,7 +209,9 @@ def test_missing_dimension_triggers_retry_then_uses_good_reply() -> None:
 
 def test_persistent_missing_dimensions_flag_invalid_not_zero_fidelity() -> None:
     provider = FakeProvider('{"format": 1.0, "factuality": 0.8}')
-    result = RubricJudge(provider).score(Observation(content="p"), Observation(content="a"), _ctx())
+    result = FidelityRubricJudge(provider).score(
+        Observation(content="p"), Observation(content="a"), _ctx()
+    )
     assert provider.calls == 2
     assert result.valid is False
     assert "missing" in result.critique
@@ -213,7 +219,9 @@ def test_persistent_missing_dimensions_flag_invalid_not_zero_fidelity() -> None:
 
 def test_unparseable_reply_retries_then_flags_invalid() -> None:
     provider = FakeProvider("the model rambled with no json at all")
-    result = RubricJudge(provider).score(Observation(content="p"), Observation(content="a"), _ctx())
+    result = FidelityRubricJudge(provider).score(
+        Observation(content="p"), Observation(content="a"), _ctx()
+    )
     assert provider.calls == 2
     assert result.valid is False
     assert result.score == 0.0
@@ -223,13 +231,15 @@ def test_unparseable_reply_retries_then_flags_invalid() -> None:
 def test_scale_confused_dimension_flags_invalid() -> None:
     # A judge answering on a 0-100 scale must not be clamped into a perfect 1.0.
     provider = FakeProvider(_rubric_reply(factuality=85))
-    result = RubricJudge(provider).score(Observation(content="p"), Observation(content="a"), _ctx())
+    result = FidelityRubricJudge(provider).score(
+        Observation(content="p"), Observation(content="a"), _ctx()
+    )
     assert result.valid is False
     assert "out of range" in result.critique
 
 
 def test_minor_float_slop_is_clamped_not_invalidated() -> None:
-    result = RubricJudge(FakeProvider(_rubric_reply(factuality=1.1))).score(
+    result = FidelityRubricJudge(FakeProvider(_rubric_reply(factuality=1.1))).score(
         Observation(content="p"), Observation(content="a"), _ctx()
     )
     assert result.valid is True

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from wmo.common.judging.checklist import ChecklistJudge
 from wmo.common.providers.base import Completion, Message, ProviderConfig, ProviderKind
-from wmo.simulation.scenarios.verification import ChecklistJudge
 
 
 class ScriptedProvider:

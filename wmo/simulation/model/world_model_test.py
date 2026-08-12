@@ -572,8 +572,8 @@ def test_load_named_model_uses_project_root_for_telemetry_opt_out(
 
 def test_score_session_meters_judge_separately_from_serve() -> None:
     """Reward-judge tokens land under Phase.JUDGE on the session tracker, not SERVE (D12 split)."""
+    from wmo.common.judging.episode import EpisodeScore
     from wmo.common.observability import Phase
-    from wmo.optimize.reward import EpisodeScore
 
     class JudgeReply:
         def __init__(self) -> None:

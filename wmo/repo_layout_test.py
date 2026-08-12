@@ -127,9 +127,6 @@ LEGACY_PATH_PREFIXES: Final[tuple[str, ...]] = (
 LEGACY_PATH_INVENTORY: Final[frozenset[str]] = frozenset(
     {
         "wmo/optimize/gepa.py",
-        "wmo/optimize/judge.py",
-        "wmo/optimize/judge_quality.py",
-        "wmo/optimize/reward.py",
         "wmo/runtime/evaluation/harbor/__init__.py",
         "wmo/runtime/evaluation/harbor/agent.py",
         "wmo/runtime/evaluation/harbor/agent_test.py",
@@ -207,8 +204,6 @@ LEGACY_PATH_INVENTORY: Final[frozenset[str]] = frozenset(
         "wmo/simulation/evaluation/base_test.py",
         "wmo/simulation/evaluation/closed_loop.py",
         "wmo/simulation/evaluation/closed_loop_test.py",
-        "wmo/simulation/evaluation/gold.py",
-        "wmo/simulation/evaluation/gold_test.py",
         "wmo/simulation/evaluation/open_loop.py",
         "wmo/simulation/evaluation/open_loop_test.py",
         "wmo/simulation/evaluation/tasks.py",
@@ -262,6 +257,9 @@ LEGACY_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
         "wmo/optimize/telemetry/conftest.py",
         "wmo/optimize/telemetry/hooks.py",
         "wmo/optimize/telemetry/hooks_test.py",
+        "wmo/optimize/judge.py",
+        "wmo/optimize/judge_quality.py",
+        "wmo/optimize/reward.py",
         "wmo/runtime/platform/__init__.py",
         "wmo/runtime/platform/auth.py",
         "wmo/runtime/platform/auth_test.py",
@@ -311,6 +309,8 @@ LEGACY_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
         "wmo/simulation/evaluation/grid_plot.py",
         "wmo/simulation/evaluation/grid_plot_test.py",
         "wmo/simulation/evaluation/grid_test.py",
+        "wmo/simulation/evaluation/gold.py",
+        "wmo/simulation/evaluation/gold_test.py",
     }
 )
 
