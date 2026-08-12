@@ -31,7 +31,7 @@ Re-run it to add another provider's models beside the ones already registered.
 wmo download bird-sql
 wmo list --root environment-capture-data/bird-sql
 export WMO_ROOT=environment-capture-data/bird-sql
-export WORLD_MODEL=<name-from-wmo-list>
+export WORLD_MODEL=your-model-name  # replace with a name printed by `wmo list`
 
 # Keep the TaskSet beside that model so sweep resolves both from the same local root.
 wmo build --file traces.jsonl --source otlp --project my-project --root "$WMO_ROOT"
