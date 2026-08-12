@@ -10,10 +10,40 @@ Managed with `uv`; lint/format with `ruff`; type-check with `ty`.
 
 ```bash
 uv sync --extra dev
-uv run ruff check . && uv run ruff format .
+uv run ruff check .
+uv run ruff format --check .
 uv run ty check
 uv run pytest -q
 ```
+
+## Repository guardrails
+
+- Every new or rewritten hand-authored source, test, configuration, and documentation file with a
+  covered suffix stays below 1,000 physical lines. The executable limit is 999 lines and counts
+  comments and blank lines. W1 freezes exact baseline counts for current oversized files. Active
+  entries may not grow and become tombstones when deleted or reduced to 999 lines or fewer.
+  Generated outputs are exempt only by exact path in the repository guardrail inventory. Generated
+  code belongs in an explicitly named `generated/` directory and is never edited by hand.
+- Full-repository Ruff check, Ruff format check, and ty check are required on every change. No
+  pre-existing lint or type failures are grandfathered.
+- Production imports follow the approved dependency direction: common may not import runtime,
+  simulation, optimize, or cli; runtime may not import simulation, optimize, or cli; simulation
+  may not import optimize or cli; optimize may not import simulation or cli. The AST gate records
+  current migration edges in an exact transition inventory. New edges fail immediately. Deletion
+  moves an entry to an append-only tombstone inventory.
+- Public Python modules, classes, protocols, functions, and methods use Google-style docstrings.
+  A trivial public function may use one clear summary line. Private helpers and test functions do
+  not need a docstring when their behavior is obvious.
+- The root CLI command set and current legacy paths are explicit transition inventories. A new
+  root command or a new path under an inventoried legacy root fails immediately. Deletion owners
+  remove an entry and retain its tombstone; reintroduction is rejected.
+- There is no 800-line warning and no numeric modules-per-directory gate.
+
+Current migration state: the checkout still contains current-main legacy surfaces and 30 active
+oversized-file inventory entries owned by the deletion and domain workstreams. The transition
+inventories name those paths and commands so they cannot grow while their owners remove or split
+them. The active size inventory is temporary migration state, not a permanent exemption, and must
+be empty by the final release audit.
 
 ## World models and trace lifecycle
 

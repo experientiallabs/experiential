@@ -138,8 +138,15 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ANN", "BLE", "T20"]
+extend-select = ["D100"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
+# Test modules are fixtures and assertions rather than public package APIs. Production modules
+# still require a module docstring, and new public APIs must use the Google convention above.
+"**/*_test.py" = ["D"]
 # The waterfall utility's adapter tests stub provider SDK clients, whose kwargs are genuinely
 # arbitrary — the fakes have to accept whatever the SDK signature accepts. Scoped to that one
 # module tree so the rest of `wmo/` keeps ANN401 in full force.
