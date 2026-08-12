@@ -22,11 +22,10 @@ optimize_app = typer.Typer(
 
 # `route` and `distill` load their real Typer app only on first use, so `wmo --help` never pays
 # for the optimize/engine/distill import chains those modules pull in. `model` is registered
-# directly because `wmo.cli.optimize_model_app` is itself light at import time (its own heavy
-# imports are local to its functions), which keeps `optimize model --help` at full fidelity
-# without needing a signature-forwarding stub.
+# directly from its command owner, whose heavy imports remain local to its functions, which keeps
+# `optimize model --help` at full fidelity without a compatibility import.
 from wmo.cli.defer import add_deferred_typer  # noqa: E402
-from wmo.cli.optimize_model_app import optimize_model  # noqa: E402
+from wmo.cli.optimize_model_cmd import optimize_model  # noqa: E402
 
 add_deferred_typer(
     optimize_app,
@@ -45,4 +44,6 @@ add_deferred_typer(
     "benchmark rollouts (harbor or tau2, config-selected), gated on held-out solve rates.",
     known_names=("run", "probe", "report"),
 )
-optimize_app.command("model")(optimize_model)
+optimize_app.command(
+    "model", help="Measure, fit, tune, and report a routing policy in one command."
+)(optimize_model)

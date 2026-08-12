@@ -34,7 +34,7 @@ scenarios_app = typer.Typer(
 _console = Console()
 
 
-@scenarios_app.command("build")
+@scenarios_app.command("build", help="Construct a representative scenario set from traces.")
 def scenarios_build(
     file: str = typer.Option(..., "--file", help="Path to exported traces (OTLP-JSON / JSONL)."),
     out: str = typer.Option("scenarios.json", "--out", help="Where to write the scenario set."),
@@ -70,9 +70,21 @@ def scenarios_build(
     the named clusters they came from, and the corpus-coverage number that justifies them.
 
     Args:
-        options: Inputs accepted by this callable.
+        file: Exported trace corpus to cluster.
+        out: Scenario-set JSON destination.
+        budget: Maximum number of representative scenarios.
+        k: Optional cluster count.
+        limit: Optional cap on ingested traces.
+        provider: Optional provider applied to all generation roles.
+        model: Optional model identifier applied to all generation roles.
+        region: Optional Bedrock region for those roles.
+        embed_provider: Provider used to embed trace facets.
+        embed_model: Optional embedding model identifier.
+        embed_dim: Embedding dimensionality.
+        seed: Clustering random seed.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The trace input or scenario construction configuration is invalid.
     """
     from wmo.simulation.scenarios import FacetExtractor, ScenarioBuildConfig, build_scenario_set
 
@@ -107,7 +119,9 @@ def scenarios_build(
     )
 
 
-@scenarios_app.command("verify")
+@scenarios_app.command(
+    "verify", help="Verify a scenario set against source traces and a world model."
+)
 def scenarios_verify(
     scenarios_file: str = typer.Argument(..., help="Scenario set JSON from `wmo scenarios build`."),
     file: str = typer.Option(..., "--file", help="Source trace corpus (for back-agreement)."),
@@ -126,7 +140,18 @@ def scenarios_verify(
     With `--drop`, unverified scenarios are removed from the set in place.
 
     Args:
-        options: Inputs accepted by this callable.
+        scenarios_file: Scenario-set JSON written by `wmo scenarios build`.
+        file: Source corpus used for back-agreement.
+        name: Optional world model to roll out.
+        root: Project artifact directory containing world models.
+        provider: Optional override for the serving provider.
+        model: Optional override for the serving model identifier.
+        region: Optional Bedrock region for overrides.
+        max_steps: Per-scenario rollout step budget.
+        drop: Whether to retain only scenarios that verify.
+
+    Raises:
+        typer.BadParameter: The scenario set, source corpus, or rollout configuration is invalid.
     """
     import wmo.common.providers as providers
     from wmo.common.providers.retry import wrap_provider_with_retries

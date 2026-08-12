@@ -1,7 +1,7 @@
 """Benchmark download and split-default tests."""
 
 # ruff: noqa: F403, F405
-from wmo.cli.app_fixtures_test import *
+from wmo.cli.cli_fixtures_test import *
 
 
 def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001

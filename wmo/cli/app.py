@@ -32,12 +32,27 @@ add_deferred_typer(
     help="Optimizers behind one switch.",
     known_names=("route", "distill", "model"),
 )
-app.command("build")(build)
-app.command("list")(list_models)
-app.command("download")(download)
-app.command("serve")(serve)
-app.command("eval")(eval_)
-app.command("knowledge")(knowledge_)
+app.command("build", help="Build a world model from an exported trace corpus.")(build)
+app.command("list", help="List locally available world-model artifacts.")(list_models)
+app.command("download", help="Download a published benchmark bundle.")(download)
+app.command(
+    "serve",
+    help=(
+        "Serve local world models over their step API and OpenAI-compatible "
+        "`/v1/chat/completions` endpoint. Use repeatable `--root` values such as `.wmo` "
+        "and `environment-capture-data/tau-bench`."
+    ),
+)(serve)
+app.command(
+    "eval",
+    help=(
+        r"Score open-loop reconstruction, closed-loop tasks, or agreement reports. "
+        r"`wmo eval <trace files...>` is open-loop; `--mode closed-loop` runs tasks against "
+        r"the world model, where `\[models.agent]` selects a distinct agent provider; "
+        r"`wmo eval agreement <a.json> <b.json>` compares reports."
+    ),
+)(eval_)
+app.command("knowledge", help="Inspect editable knowledge stored with a world model.")(knowledge_)
 
 
 def _register_ingest() -> None:

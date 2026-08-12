@@ -1,4 +1,4 @@
-"""Shared fixtures for the split optimize_model_app_test.py CLI tests."""
+"""Shared fixtures for staged model optimizer command tests."""
 
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def _local_model_uncached(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-optimize_module = importlib.import_module("wmo.cli.optimize_model_app")
+optimize_module = importlib.import_module("wmo.cli.optimize_model_cmd")
 
 
 route_module = importlib.import_module("wmo.cli.route_app")

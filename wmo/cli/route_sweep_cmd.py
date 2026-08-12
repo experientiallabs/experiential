@@ -203,9 +203,25 @@ def sweep(
     it, and the matrix is written either way.
 
     Args:
-        options: Inputs accepted by this callable.
+        model: Built world model to simulate while measuring candidates.
+        pool_file: Candidate pool TOML to measure.
+        traces_file: Optional source corpus for held-out scenarios.
+        scenarios: Maximum number of held-out scenarios to include.
+        episodes: Episode attempts per candidate and scenario.
+        max_steps: Per-episode agent step limit.
+        concurrency: Concurrent cells, which changes duration but not measured evidence.
+        history_chars: Observation history retained for each agent step.
+        assume_input_tokens: Input-token estimate used only for spend consent.
+        assume_output_tokens: Output-token estimate used only for spend consent.
+        out: Outcome matrix destination.
+        root: Project artifact directory containing the world model.
+        yes: Whether to consent to the projected spend without prompting.
+        allow_uneven_coverage: Whether to retain a matrix with unmatched scored evidence.
+        compressor: Optional compressor evaluated as part of the measured arm.
+        aggressiveness: Compressor-specific dial in the inclusive range from zero to one.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: Sweep inputs, selected candidates, or coverage settings are invalid.
     """
     from wmo.optimize.routing.compression import resolve_compression
     from wmo.optimize.routing.sweep import (
@@ -350,7 +366,8 @@ def print_deferred_risks(console: Console, deferred: tuple[DeferredRisk, ...]) -
     """Name what the request-free pre-flight could not close, per candidate that carries it.
 
     Args:
-        options: Inputs accepted by this callable.
+        console: Destination for the operator-facing preflight note.
+        deferred: Candidate risks that preflight could not verify without a request.
     """
     if not deferred:
         return
@@ -366,7 +383,8 @@ def print_tiny_corpus_note(console: Console, plan: SweepPlan) -> None:
     """Say when the corpus was too small to leave a held-out band to measure on.
 
     Args:
-        options: Inputs accepted by this callable.
+        console: Destination for the operator-facing note.
+        plan: Sweep plan whose corpus split is being described.
     """
     if not plan.tiny_corpus:
         return
@@ -399,7 +417,8 @@ def print_world_model_spend(console: Console, run: SweepRun) -> None:
     both would misprice both.
 
     Args:
-        options: Inputs accepted by this callable.
+        console: Destination for the metering summary.
+        run: Completed sweep whose evaluation-side usage is reported.
     """
     gap = run.metering_gap
     if run.episodes_metered == 0:
@@ -426,9 +445,11 @@ def cell_progress(console: Console, cells: int) -> Callable[[ScenarioOutcome], N
     """A per-cell progress line: which cell, what it scored, what it cost.
 
     Args:
-        options: Inputs accepted by this callable.
+        console: Destination for each completed cell's progress line.
+        cells: Total number of cells expected in the current invocation.
+
     Returns:
-        The value produced by this callable.
+        A callback that reports each completed scenario outcome.
     """
     done = itertools.count(1)
 
@@ -451,9 +472,10 @@ def uneven_warning(rows: list[CandidateCoverage]) -> str | None:
     Both bias a fit; naming which one happened is what makes the message actionable.
 
     Args:
-        options: Inputs accepted by this callable.
+        rows: Per-candidate scored-coverage measurements.
+
     Returns:
-        The value produced by this callable.
+        A warning explaining the bias, or None when coverage is comparable.
     """
     from wmo.optimize.routing.sweep import Unevenness, unevenness
 
@@ -490,7 +512,8 @@ def print_coverage(console: Console, rows: list[CandidateCoverage]) -> None:
     what a fitter weighs, so both are per candidate here rather than summed into Unscored.
 
     Args:
-        options: Inputs accepted by this callable.
+        console: Destination for the coverage table and diagnostics.
+        rows: Per-candidate scored-coverage measurements to render.
     """
     most: Counter[str] = Counter()
     for row in rows:
@@ -544,7 +567,9 @@ def print_cost_estimate(console: Console, plan: SweepPlan, *, already_measured: 
     under it says how much of that grid this run is actually paying for.
 
     Args:
-        options: Inputs accepted by this callable.
+        console: Destination for the spend table and assumptions.
+        plan: Sweep plan containing the priced candidate grid.
+        already_measured: Cells a resumed sweep will reuse without buying again.
     """
     table = Table(title="Route sweep cost estimate (ASSUMED tokens, not a measurement)")
     table.add_column("Candidate", no_wrap=True)
@@ -621,6 +646,8 @@ def register(app: typer.Typer) -> None:
     """Register the route sweep command on its parent Typer app.
 
     Args:
-        options: Inputs accepted by this callable.
+        app: Parent Typer application that owns the route command group.
     """
-    app.command("sweep")(sweep)
+    app.command("sweep", help="Measure routing candidates closed-loop into an outcome matrix.")(
+        sweep
+    )

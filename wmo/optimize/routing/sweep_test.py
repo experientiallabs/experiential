@@ -1,7 +1,7 @@
 """Tests for the sweep library: the scenario cut, the cost projection, and the coverage contract.
 
 The two CLI faces are covered end to end by `wmo/cli/route_app_test.py` and
-`wmo/cli/optimize_model_app_test.py`; these exercise the shared core directly, where the edge
+`wmo/cli/optimize_model_cmd_test.py`; these exercise the shared core directly, where the edge
 cases are cheaper to state than to stage through a command.
 """
 

@@ -1,7 +1,7 @@
 """Open-loop evaluation CLI tests."""
 
 # ruff: noqa: F403, F405
-from wmo.cli.app_fixtures_test import *
+from wmo.cli.cli_fixtures_test import *
 
 
 def test_eval_trace_file_command_still_scores(patched_provider, tmp_path) -> None:  # noqa: ANN001

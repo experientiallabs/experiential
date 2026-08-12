@@ -32,9 +32,12 @@ def convert_deepswe_cmd(
     """Convert published DeepSWE v1.1 trials into an OutcomeMatrix bundle.
 
     Args:
-        options: Inputs accepted by this callable.
+        source: Directory holding the published DeepSWE artifacts.
+        embedding_cache: Recorded task embeddings required for the offline bundle.
+        out: Destination directory for normalized outcomes and support artifacts.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The source data cannot be converted into valid outcomes.
     """
     from wmo.optimize.routing.deepswe import convert_deepswe, top_arm
     from wmo.optimize.routing.outcomes import OutcomeMatrix
@@ -60,6 +63,8 @@ def register(app: typer.Typer) -> None:
     """Register the DeepSWE conversion command on its parent Typer app.
 
     Args:
-        options: Inputs accepted by this callable.
+        app: Parent Typer application that owns the route command group.
     """
-    app.command("convert-deepswe")(convert_deepswe_cmd)
+    app.command("convert-deepswe", help="Convert published DeepSWE trials into an outcome matrix.")(
+        convert_deepswe_cmd
+    )

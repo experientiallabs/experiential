@@ -1,7 +1,7 @@
 """Build-input and model-catalog CLI tests."""
 
 # ruff: noqa: F403, F405
-from wmo.cli.app_fixtures_test import *
+from wmo.cli.cli_fixtures_test import *
 
 
 def test_build_then_list_shows_named_model(patched_provider, tmp_path) -> None:  # noqa: ANN001

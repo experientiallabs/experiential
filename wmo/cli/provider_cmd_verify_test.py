@@ -1,7 +1,7 @@
 """Provider verification CLI tests."""
 
 # ruff: noqa: F403, F405
-from wmo.cli.app_fixtures_test import *
+from wmo.cli.cli_fixtures_test import *
 
 
 def test_providers_verify_unknown_model_is_clean_error(tmp_path) -> None:  # noqa: ANN001

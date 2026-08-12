@@ -1,7 +1,7 @@
 """Staged model optimizer compression and embedder tests."""
 
 # ruff: noqa: F403, F405
-from wmo.cli.optimize_model_fixtures_test import *
+from wmo.cli.optimize_model_cmd_fixtures_test import *
 
 
 def test_a_compressed_run_shows_the_compact_row_and_charges_it_to_the_sweep(

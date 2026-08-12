@@ -1,11 +1,7 @@
-"""Composition and shared console for staged model optimization."""
+"""Compatibility facade for the staged model optimization command."""
 
 from __future__ import annotations
 
-from rich.console import Console
-
-_console = Console()
-
-from wmo.cli.optimize_model_cmd import optimize_model  # noqa: E402
+from wmo.cli.optimize_model_cmd import optimize_model
 
 __all__ = ("optimize_model",)

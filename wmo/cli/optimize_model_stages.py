@@ -10,7 +10,6 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 
-from wmo.cli import optimize_model_app as _app
 from wmo.cli.optimize_model_plan import (
     _compact_fingerprint,
     _fit_fingerprint,
@@ -37,6 +36,7 @@ if TYPE_CHECKING:
 def _run_stages(
     decisions: list[StageDecision],
     *,
+    console: Console,
     manifest: RunManifest,
     ledger: SpendLedger,
     paths: _RunPaths,
@@ -65,17 +65,18 @@ def _run_stages(
     # the time the gate can stop the run.
     for decision in decisions:
         if not decision.will_run:
-            _app._console.print(
+            console.print(
                 f"\n[bold]{decision.stage.value}[/bold] [dim]SKIP: {escape(decision.reason)}[/dim]"
             )
             continue
-        _app._console.print(
+        console.print(
             f"\n[bold]{decision.stage.value}[/bold] [dim]({escape(decision.reason)})[/dim]"
         )
         match decision.stage:
             case Stage.SWEEP:
                 ledger.check(Stage.SWEEP, projection.total_usd, basis=projection.basis)
                 record = _stage_sweep(
+                    console,
                     plan,
                     model_dir=model_dir,
                     pool_file=pool_file,
@@ -83,10 +84,11 @@ def _run_stages(
                 )
                 ledger.record(record.total_spend_usd)
             case Stage.COMPACT:
-                record = _stage_compact(compression)
+                record = _stage_compact(console, compression)
             case Stage.FIT:
-                _enforce_coverage(paths.matrix, allow_uneven=allow_uneven_coverage)
+                _enforce_coverage(console, paths.matrix, allow_uneven=allow_uneven_coverage)
                 record = _stage_fit(
+                    console,
                     paths,
                     embedder=embedder,
                     compression=compression,
@@ -94,9 +96,9 @@ def _run_stages(
                     allow_uneven=allow_uneven_coverage,
                 )
             case Stage.TUNE:
-                record = _stage_tune(paths, cost_quality=cost_quality)
+                record = _stage_tune(console, paths, cost_quality=cost_quality)
             case _:
-                record = _stage_report(paths, model_dir=model_dir, baseline=baseline)
+                record = _stage_report(console, paths, model_dir=model_dir, baseline=baseline)
         manifest = manifest.with_record(record)
         manifest.save(paths.manifest)
     return manifest
@@ -108,7 +110,12 @@ def _now() -> str:
 
 
 def _stage_sweep(
-    plan: SweepPlan, *, model_dir: Path, pool_file: Path, already_measured: int = 0
+    console: Console,
+    plan: SweepPlan,
+    *,
+    model_dir: Path,
+    pool_file: Path,
+    already_measured: int = 0,
 ) -> StageRecord:
     """Measure every candidate closed-loop and record what it cost.
 
@@ -134,18 +141,18 @@ def _stage_sweep(
         plan,
         world_model=world_model,
         env_factory=lambda: WorldModelEnv(world_model, score_on_close=True),
-        on_outcome=cell_progress(_app._console, plan.cells - already_measured),
+        on_outcome=cell_progress(console, plan.cells - already_measured),
     )
     matrix = run.matrix
     scored = sum(1 for outcome in matrix.outcomes if outcome.scored)
-    _app._console.print(
+    console.print(
         f"  [green]✓[/green] {len(matrix.outcomes)} cell(s), {scored} scored -> "
         f"{escape(str(plan.out_path))}\n"
         f"  measured candidate spend ${run.candidate_usd:.4f}{_compressor_note(run)} (the world "
         "model's own serve/judge cost is metered separately)",
         soft_wrap=True,
     )
-    print_world_model_spend(_app._console, run)
+    print_world_model_spend(console, run)
     record = StageRecord(
         stage=Stage.SWEEP,
         fingerprint={
@@ -165,7 +172,7 @@ def _stage_sweep(
     return record
 
 
-def _stage_compact(compression: CompressionConfig | None) -> StageRecord:
+def _stage_compact(console: Console, compression: CompressionConfig | None) -> StageRecord:
     """Record the D-COMPRESS arm this run configured into the sweep and the fit.
 
     The compaction slot as it actually turned out. The design reserved it as a step between sweep
@@ -183,7 +190,7 @@ def _stage_compact(compression: CompressionConfig | None) -> StageRecord:
     from wmo.optimize.routing.pipeline import Stage, StageRecord
 
     signature = compression_signature(compression)
-    _app._console.print(
+    console.print(
         f"  [green]✓[/green] configured {escape(signature)}\n"
         "  no separate step and no separate bill: this arm is what the sweep measures every "
         "candidate through and what the fit embeds its bank through, so the endpoint routes on "
@@ -197,7 +204,7 @@ def _stage_compact(compression: CompressionConfig | None) -> StageRecord:
     )
 
 
-def _enforce_coverage(matrix_path: Path, *, allow_uneven: bool) -> None:
+def _enforce_coverage(console: Console, matrix_path: Path, *, allow_uneven: bool) -> None:
     """Show what the fit would be weighed on, and withhold it when that is not a comparison.
 
     `route sweep`'s contract, applied at the point it actually protects something: the fit. Running
@@ -224,25 +231,26 @@ def _enforce_coverage(matrix_path: Path, *, allow_uneven: bool) -> None:
 
     matrix = OutcomeMatrix.load(matrix_path)
     rows = coverage(matrix)
-    print_coverage(_app._console, rows)
+    print_coverage(console, rows)
     if not any(outcome.scored for outcome in matrix.outcomes):
-        _app._console.print(NO_EVIDENCE_WARNING)
+        console.print(NO_EVIDENCE_WARNING)
         raise typer.Exit(1)
     warning = uneven_warning(rows)
     if warning is None:
         return
-    _app._console.print(warning)
+    console.print(warning)
     if not allow_uneven:
-        _app._console.print(
+        console.print(
             "  fix the lost cells and re-run, drop the candidate that lost them, or re-run "
             "with [bold]--allow-uneven-coverage[/bold] to fit on this matrix anyway (the "
             "matrix is on disk and recorded, so re-running will not buy these cells again)"
         )
         raise typer.Exit(1)
-    _app._console.print(BIAS_ACCEPTED_NOTE)
+    console.print(BIAS_ACCEPTED_NOTE)
 
 
 def _stage_fit(
+    console: Console,
     paths: _RunPaths,
     *,
     embedder: EmbedderSpec,
@@ -267,7 +275,7 @@ def _stage_fit(
     try:
         router_split = split_router_scenarios(matrix.scenario_ids())
     except ValueError as exc:
-        _app._console.print(f"[red]fit failed[/red] {escape(str(exc))}")
+        console.print(f"[red]fit failed[/red] {escape(str(exc))}")
         raise typer.Exit(1) from exc
     try:
         fitted = fit_knn_artifact(
@@ -282,10 +290,10 @@ def _stage_fit(
     except ValueError as exc:
         # Nothing is wrong with the flags: the matrix this run measured cannot be fitted. Exit 1
         # like the coverage gate, not 2 with a usage banner (`route_app.student` precedent).
-        _app._console.print(f"[red]fit failed[/red] {escape(str(exc))}")
+        console.print(f"[red]fit failed[/red] {escape(str(exc))}")
         raise typer.Exit(1) from exc
-    _rebaseline_dial_snapshot(paths.policy, fitted.policy)
-    _app._console.print(
+    _rebaseline_dial_snapshot(console, paths.policy, fitted.policy)
+    console.print(
         f"  [green]✓[/green] knn policy over {fitted.scenarios} scenario(s) -> "
         f"{escape(str(paths.policy))}\n"
         f"  bank {escape(str(fitted.bank_path))}, fallback {escape(fitted.policy.default_model)}\n"
@@ -308,7 +316,7 @@ def _stage_fit(
     )
 
 
-def _rebaseline_dial_snapshot(policy_path: Path, fitted: RoutingPolicy) -> None:
+def _rebaseline_dial_snapshot(console: Console, policy_path: Path, fitted: RoutingPolicy) -> None:
     """Retire an as-fitted snapshot that the fit just now superseded.
 
     `route tune` refuses to dial a policy whose `policy.base.json` describes a DIFFERENT fit,
@@ -335,14 +343,14 @@ def _rebaseline_dial_snapshot(policy_path: Path, fitted: RoutingPolicy) -> None:
     if not stale:
         return
     base_path.unlink()
-    _app._console.print(
+    console.print(
         f"  re-baselined the dial: {escape(base_path.name)} was the as-fitted snapshot of the "
         "fit this stage just replaced, so the next dial applies to the new fit",
         soft_wrap=True,
     )
 
 
-def _stage_tune(paths: _RunPaths, *, cost_quality: float) -> StageRecord:
+def _stage_tune(console: Console, paths: _RunPaths, *, cost_quality: float) -> StageRecord:
     """Set the endpoint's dial, preserving `route tune`'s as-fitted snapshot semantics."""
     from wmo.optimize.routing.knn import tune_policy_dial
     from wmo.optimize.routing.pipeline import Stage, StageRecord, file_sha256
@@ -351,10 +359,10 @@ def _stage_tune(paths: _RunPaths, *, cost_quality: float) -> StageRecord:
     try:
         dialed = tune_policy_dial(paths.policy, cost_quality)
     except ValueError as exc:
-        _app._console.print(f"[red]tune failed[/red] {escape(str(exc))}")
+        console.print(f"[red]tune failed[/red] {escape(str(exc))}")
         raise typer.Exit(1) from exc
     knobs = dialed.knobs
-    _app._console.print(
+    console.print(
         f"  [green]✓[/green] cost_quality={dialed.cost_quality:g} ({dialed.named_point})\n"
         f"  knobs: floor_q={knobs.floor_q:g}, cost knob lam={knobs.pick_lam:g}, "
         f"guard={knobs.guard_mode}, z={knobs.knn_z:g}\n"
@@ -370,7 +378,9 @@ def _stage_tune(paths: _RunPaths, *, cost_quality: float) -> StageRecord:
     )
 
 
-def _stage_report(paths: _RunPaths, *, model_dir: Path, baseline: str | None) -> StageRecord:
+def _stage_report(
+    console: Console, paths: _RunPaths, *, model_dir: Path, baseline: str | None
+) -> StageRecord:
     """Score the tuned policy against its anchor on the same held-out scenarios."""
     from wmo.optimize.routing.outcomes import OutcomeMatrix
     from wmo.optimize.routing.pareto import PARETO_FILENAME, held_out_curve
@@ -383,7 +393,7 @@ def _stage_report(paths: _RunPaths, *, model_dir: Path, baseline: str | None) ->
     try:
         report = build_endpoint_scorecard(matrix, policy, baseline=anchor, endpoint=model_dir.name)
     except (KeyError, ValueError) as exc:
-        _app._console.print(
+        console.print(
             f"[red]report failed[/red] cannot report against {escape(anchor)}: {escape(str(exc))}\n"
             "  name a pool model the sweep scored with --baseline, or re-run the sweep so the "
             "anchor has scored episodes"
@@ -391,7 +401,7 @@ def _stage_report(paths: _RunPaths, *, model_dir: Path, baseline: str | None) ->
         raise typer.Exit(1) from exc
     paths.report.parent.mkdir(parents=True, exist_ok=True)
     paths.report.write_text(report.model_dump_json(indent=2), encoding="utf-8")
-    _app._console.print(
+    console.print(
         f"  [green]✓[/green] report over {report.headline.scenarios_compared} commonly-scored "
         f"scenario(s) -> {escape(str(paths.report))}",
         soft_wrap=True,
@@ -404,14 +414,14 @@ def _stage_report(paths: _RunPaths, *, model_dir: Path, baseline: str | None) ->
         curve = held_out_curve(matrix, policy, judge="world-model verifier")
         pareto_path = model_dir / PARETO_FILENAME
         pareto_path.write_text(curve.model_dump_json(indent=2), encoding="utf-8")
-        _app._console.print(
+        console.print(
             f"  [green]✓[/green] pareto curve ({sum(1 for p in curve.points if p.on_frontier)} "
             f"frontier point(s), recommended {curve.recommended}) -> "
             f"{escape(str(pareto_path))}",
             soft_wrap=True,
         )
     except (ValueError, FileNotFoundError) as exc:
-        _app._console.print(
+        console.print(
             f"  [yellow]![/yellow] pareto curve skipped: {escape(str(exc))}", soft_wrap=True
         )
     return StageRecord(
@@ -442,9 +452,13 @@ def build_endpoint_scorecard(
     are.
 
     Args:
-        options: Inputs accepted by this callable.
+        matrix: Held-out candidate outcome matrix.
+        policy: Tuned routing policy to score.
+        baseline: Pool candidate used as the report's named anchor.
+        endpoint: World-model endpoint name attached to the report.
+
     Returns:
-        The value produced by this callable.
+        The paired held-out improvement report for the endpoint.
     """
     from wmo.optimize.routing.report import build_report
 

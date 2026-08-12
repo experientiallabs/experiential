@@ -1,7 +1,7 @@
 """Staged model optimizer resume and route-parity tests."""
 
 # ruff: noqa: F403, F405
-from wmo.cli.optimize_model_fixtures_test import *
+from wmo.cli.optimize_model_cmd_fixtures_test import *
 
 
 def test_one_command_lands_every_artifact_where_serving_reads_it(

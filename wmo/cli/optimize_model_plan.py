@@ -12,7 +12,6 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from wmo.cli import optimize_model_app as _app
 from wmo.cli.consent import require_spend_consent
 from wmo.common.config import WorldModelStore
 
@@ -642,9 +641,9 @@ def _print_plan(
     console.print(_world_model_forecast(projection, compressed=plan.compression is not None))
 
 
-def _print_budget_stop(name: str, exc: BudgetExceeded) -> None:
+def _print_budget_stop(console: Console, name: str, exc: BudgetExceeded) -> None:
     """Report a cap stop as a pause, not a failure: everything finished is on disk and recorded."""
-    _app._console.print(
+    console.print(
         f"\n[yellow]stopped at the spend cap[/yellow] {escape(str(exc))}\n"
         "  every finished stage is on disk and recorded, so nothing is lost. Resume with a "
         f"higher cap: [bold]wmo optimize model {escape(name)} --max-usd <more>[/bold]"
@@ -733,7 +732,9 @@ def _status_text(decision: StageDecision) -> str:
     return f"will run [dim]({escape(decision.reason)})[/dim]"
 
 
-def _confirm(decisions: list[StageDecision], plan: SweepPlan, *, yes: bool) -> bool:
+def _confirm(
+    decisions: list[StageDecision], plan: SweepPlan, *, console: Console, yes: bool
+) -> bool:
     """The run's single spend confirmation. One question, before the first paid call.
 
     Asked whenever the SWEEP will run, rather than whenever the candidate projection is nonzero.
@@ -758,7 +759,7 @@ def _confirm(decisions: list[StageDecision], plan: SweepPlan, *, yes: bool) -> b
     if yes or not _will_sweep(decisions):
         return True
     return require_spend_consent(
-        _app._console,
+        console,
         yes=yes,
         spend=f"~${_projected_total(decisions, plan):.2f} across {plan.cells} sweep cell(s)",
         command="wmo optimize model",

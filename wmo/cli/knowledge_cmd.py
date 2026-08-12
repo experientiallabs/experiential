@@ -39,7 +39,8 @@ def knowledge_(
     resolved across the default project and downloaded benchmark artifacts.
 
     Args:
-        options: Inputs accepted by this callable.
+        name: World model to inspect, or the only resolvable model.
+        root: Project artifact directory, with shipped examples available at the default root.
     """
     from wmo.simulation.model.knowledge import KnowledgeBase
 

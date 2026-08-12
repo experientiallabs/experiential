@@ -1,7 +1,7 @@
 """Scenario construction CLI tests."""
 
 # ruff: noqa: F403, F405
-from wmo.cli.app_fixtures_test import *
+from wmo.cli.cli_fixtures_test import *
 
 
 def test_scenarios_build_missing_file_is_clean_error(tmp_path) -> None:  # noqa: ANN001

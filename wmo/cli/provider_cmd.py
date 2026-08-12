@@ -40,7 +40,13 @@ _POOL_MODEL_OPTION = typer.Option(
 )
 
 
-@providers_app.command("set")
+@providers_app.command(
+    "set",
+    help=(
+        r"Choose the local worker provider, stored in `<root>/settings.toml` as "
+        r"`\[models.worker]`, and optionally register routing candidates in the pool."
+    ),
+)
 def providers_set(
     provider: str = typer.Option(None, "--provider", help="Provider for the local worker agent."),
     model: str = typer.Option(None, "--model", help="Canonical model type for the worker."),
@@ -93,9 +99,13 @@ def providers_set(
     for the endpoint URL and lists the server's own models.
 
     Args:
-        options: Inputs accepted by this callable.
+        provider: Worker provider kind to configure.
+        model: Canonical worker model type.
+        pool_model: Optional routing candidates to add without interaction.
+        root: Project artifact directory containing settings and the candidate pool.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: Provider, model, pricing, or pool configuration is invalid.
     """
     import wmo.cli.pool_registry as pool_registry
     from wmo.cli.ui import select_provider_and_model
@@ -227,7 +237,13 @@ def _register_pool_models(
     )
 
 
-@providers_app.command("verify")
+@providers_app.command(
+    "verify",
+    help=(
+        r"Ping configured completion and embedding providers, including the "
+        r"`\[models.<role>]` roles in `<root>/settings.toml` and built world models."
+    ),
+)
 def providers_verify(
     name: str = typer.Option(None, "--name", help="Verify one model's providers (default: all)."),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
@@ -245,9 +261,11 @@ def providers_verify(
     the whole report to that one world model.
 
     Args:
-        options: Inputs accepted by this callable.
+        name: Optional world model whose provider configuration is verified.
+        root: Project artifact directory containing settings and built models.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The selected model or its configuration cannot be read.
     """
     from wmo.common.providers import verify_all, verify_embedder
     from wmo.common.providers.base import EmbedderKind

@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import typer
+from rich.console import Console
 from rich.markup import escape
 
-from wmo.cli import optimize_model_app as _app
 from wmo.cli.optimize_model_plan import (
     _COST_QUALITY_BALANCED,
     _DEFAULT_POOL_PATH,
@@ -34,6 +34,9 @@ from wmo.common.config import ARTIFACT_DIR, WorldModelStore
 
 if TYPE_CHECKING:
     from wmo.optimize.routing.compression import CompressionConfig
+
+
+_console = Console()
 
 
 def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (see the help text)
@@ -202,9 +205,14 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     manifest under `<model>/optimize/`. Deleting that directory resets resume and breaks nothing.
 
     Args:
-        options: Inputs accepted by this callable.
+        world_model: Built world model to optimize, or the only model under `root`.
+        pool_file: Candidate roster measured by the sweep.
+        traces_file: Optional trace corpus used to construct held-out scenarios.
+        max_usd: Run-wide spend ceiling covering candidate and simulation costs.
+        dry_run: Whether to render the plan without writing artifacts or spending.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: A flag, model, pool entry, or planned stage is invalid.
     """
     from wmo.cli.route_sweep_cmd import print_deferred_risks, print_tiny_corpus_note
     from wmo.optimize.routing.compression import resolve_compression
@@ -266,7 +274,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     )
     read = load_manifest(paths.manifest, world_model=model_dir.name)
     if read.warning is not None:
-        _app._console.print(f"[yellow]note[/yellow] {escape(read.warning)}")
+        _console.print(f"[yellow]note[/yellow] {escape(read.warning)}")
     manifest = read.manifest
 
     # Preflight runs before the plan table by necessity: it is what proves the candidates are
@@ -275,7 +283,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     try:
         config = resolve_config(model_dir)
         preflight = run_preflight(Path(pool_file))
-        print_deferred_risks(_app._console, preflight.deferred)
+        print_deferred_risks(_console, preflight.deferred)
         plan = plan_sweep(
             model_dir=model_dir,
             config=config,
@@ -299,7 +307,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         split_router_scenarios([scenario_id(scenario) for scenario in plan.scenarios])
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    print_tiny_corpus_note(_app._console, plan)
+    print_tiny_corpus_note(_console, plan)
     # Both flags name a pool candidate, and the pool is loaded by the pre-flight above, so a typo
     # is knowable here for free: a boundary error rather than a surprise after the sweep has been
     # paid for and the fit written. --fallback used to survive this far and then be printed in the
@@ -325,7 +333,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     # Printed before the plan table, the way `route fit` prints it before the fit: the embedder
     # decides what the policy can route on, and an operator who meant to fit on semantic vectors
     # should see that it resolved to hashed features before authorizing any spend.
-    _app._console.print(resolution)
+    _console.print(resolution)
     # The world-model side of a sweep is not projectable from arithmetic, but once this model has
     # been swept once its OWN measured ratio is, and it is far too big to leave out of a cap
     # (7.0x the candidate side on a real tau corpus).
@@ -345,7 +353,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         redo=redo,
     )
     _print_plan(
-        _app._console,
+        _console,
         model_dir.name,
         pool_file=Path(pool_file),
         pool_size=len(plan.pool.models),
@@ -364,7 +372,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     # reading the table above without committing to anything, so it exits here even when the
     # budget check below would have refused the real run (the table already shows the numbers).
     if dry_run:
-        _app._console.print("\ndry run: nothing was run and nothing was spent")
+        _console.print("\ndry run: nothing was run and nothing was spent")
         raise typer.Exit(0)
 
     # One throwaway embedding before anything is bought, and only when a fit will actually happen:
@@ -387,15 +395,16 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         if _will_sweep(decisions):
             ledger.check(Stage.SWEEP, projection.total_usd, basis=projection.basis)
     except BudgetExceeded as exc:
-        _print_budget_stop(model_dir.name, exc)
+        _print_budget_stop(_console, model_dir.name, exc)
         raise typer.Exit(1) from exc
-    if not _confirm(decisions, plan, yes=yes):
-        _app._console.print("nothing was run and nothing was spent")
+    if not _confirm(decisions, plan, console=_console, yes=yes):
+        _console.print("nothing was run and nothing was spent")
         raise typer.Exit(0)
 
     try:
         manifest = _run_stages(
             decisions,
+            console=_console,
             manifest=manifest,
             ledger=ledger,
             paths=paths,
@@ -414,7 +423,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     except BudgetExceeded as exc:
         # The cap is a clean stop, not a failure: every stage that completed is recorded and the
         # next run resumes at the one that did not start.
-        _print_budget_stop(model_dir.name, exc)
+        _print_budget_stop(_console, model_dir.name, exc)
         raise typer.Exit(1) from exc
     except typer.Exit:
         # A stage refusal follows the command's ordinary exit path.
@@ -423,4 +432,4 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         raise
     # No save here: `_run_stages` persists after every stage it runs, which is what keeps a run
     # that dies mid-flight resumable.
-    _print_payoff(_app._console, model_dir.name, paths=paths, cost_quality=cost_quality)
+    _print_payoff(_console, model_dir.name, paths=paths, cost_quality=cost_quality)

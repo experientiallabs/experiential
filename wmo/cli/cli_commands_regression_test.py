@@ -1,7 +1,7 @@
 """Build, knowledge, and root CLI command tests."""
 
 # ruff: noqa: F403, F405
-from wmo.cli.app_fixtures_test import *
+from wmo.cli.cli_fixtures_test import *
 
 
 def test_build_uses_configured_worker_provider(patched_provider, tmp_path) -> None:  # noqa: ANN001

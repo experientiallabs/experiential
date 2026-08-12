@@ -1,7 +1,7 @@
 """Staged model optimizer budget and coverage tests."""
 
 # ruff: noqa: F403, F405
-from wmo.cli.optimize_model_fixtures_test import *
+from wmo.cli.optimize_model_cmd_fixtures_test import *
 
 
 def test_the_sweep_persists_the_world_models_own_spend_beside_the_build_records(

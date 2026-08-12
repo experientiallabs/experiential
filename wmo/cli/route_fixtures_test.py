@@ -1,4 +1,4 @@
-"""Shared fixtures for the split route_app_test.py CLI tests."""
+"""Shared fixtures for route command tests."""
 
 from __future__ import annotations
 

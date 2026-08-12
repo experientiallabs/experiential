@@ -95,9 +95,18 @@ def student(
     student and the rest of the roster, run `wmo optimize route fit` on a matrix that covers both.
 
     Args:
-        options: Inputs accepted by this callable.
+        card_dir: Distillation run or adapter directory containing `model_card.json`.
+        input_per_mtok: Prompt-token serving price in USD per million tokens.
+        output_per_mtok: Completion-token serving price in USD per million tokens.
+        name: Candidate-pool handle for the student.
+        pool: Candidate pool TOML to update.
+        endpoint: Optional OpenAI-compatible serving endpoint.
+        api_key_env: Optional environment variable holding that endpoint's credential.
+        chat_max_tokens_field: Output-token parameter accepted by the endpoint.
+        yes: Whether to replace an existing candidate without prompting.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The card, endpoint, pricing, or pool entry is invalid.
     """
     from wmo.common.core.locks import FileLockTimeout
     from wmo.common.providers.pool import upsert_pool_entry
@@ -263,9 +272,15 @@ def pin(
     choose per request.
 
     Args:
-        options: Inputs accepted by this callable.
+        world_model: Built world model whose endpoint receives the static policy.
+        model: Enabled pool entry selected for every request.
+        pool: Candidate pool TOML to snapshot into the policy.
+        root: Project artifact directory containing built models.
+        out: Optional policy destination, defaulting to the model directory.
+        yes: Whether to replace an installed policy without prompting.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The model, pool, or policy destination is invalid.
     """
     from wmo.common.providers.pool import load_pool
     from wmo.optimize.routing.policy import RoutingPolicy
@@ -354,7 +369,7 @@ def register(app: typer.Typer) -> None:
     """Register route pool-management commands on their parent Typer app.
 
     Args:
-        options: Inputs accepted by this callable.
+        app: Parent Typer application that owns the route command group.
     """
-    app.command("student")(student)
-    app.command("pin")(pin)
+    app.command("student", help="Add a distilled student to the routing candidate pool.")(student)
+    app.command("pin", help="Install a static policy that always uses one pool model.")(pin)

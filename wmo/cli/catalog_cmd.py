@@ -42,9 +42,10 @@ def list_models(root: str = typer.Option(ARTIFACT_DIR, help="Project dir to list
     `config.toml` costs you that one row instead of the whole listing.
 
     Args:
-        options: Inputs accepted by this callable.
+        root: Project artifact directory to inspect.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The requested project root is a file instead of a directory.
     """
     from wmo.cli.ui import models_table
 
@@ -83,9 +84,11 @@ def download(
     models available to the local server and closed-loop evaluation.
 
     Args:
-        options: Inputs accepted by this callable.
+        benchmarks: Named benchmark bundles, `all`, or no value for an interactive picker.
+        force: Whether an existing local bundle may be overwritten.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The Hub cannot provide the requested bundle or picker data.
     """
     from wmo.cli.ui import select_option
     from wmo.simulation.hub import corpus_path, published_corpora
@@ -257,9 +260,13 @@ def serve(
     `POST /v1/chat/completions` with `model="<name>"`, listed by `GET /v1/models`.
 
     Args:
-        options: Inputs accepted by this callable.
+        name: Optional repeatable set of world models to serve.
+        root: One or more project artifact directories containing models.
+        port: Local TCP port for the server.
+        max_fidelity: Whether to enable the model's measured online extras.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The selected model cannot be resolved or loaded.
     """
 
     import uvicorn

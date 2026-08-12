@@ -211,9 +211,13 @@ def fit(
     measure against the champion.
 
     Args:
-        options: Inputs accepted by this callable.
+        matrix_file: Measured candidate outcome matrix.
+        kind: Routing policy family to fit.
+        out: Policy artifact destination.
+        embedder: Feature embedder used to construct the policy's evidence bank.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The matrix, policy options, or embedder cannot form a valid fit.
     """
     from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
     from wmo.optimize.routing.compression import (
@@ -369,7 +373,10 @@ def print_knn_fit(console: Console, fitted: KnnFitOutcome, *, out: str, z: float
     """Report a written knn policy: where its evidence is, and what it scored in-sample.
 
     Args:
-        options: Inputs accepted by this callable.
+        console: Destination for the fit summary.
+        fitted: Measured kNN fitting result.
+        out: Path where the policy was written.
+        z: kNN distance threshold stored on the policy.
     """
     console.print(
         f"[green]✓[/green] fitted knn policy over {fitted.scenarios} scenarios -> {out}\n"
@@ -410,9 +417,11 @@ def tune(
     touching files at all: `PUT /v1/endpoints/{name}/config`.
 
     Args:
-        options: Inputs accepted by this callable.
+        policy_file: Existing fitted policy to update in place.
+        cost_quality: Measured frontier position from maximum quality to maximum savings.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The policy cannot be tuned with the requested dial value.
     """
     from wmo.optimize.routing.knn import tune_policy_dial
 
@@ -427,7 +436,8 @@ def print_dial(console: Console, dialed: DialResult) -> None:
     """Report an applied dial position against the frontier that was actually measured.
 
     Args:
-        options: Inputs accepted by this callable.
+        console: Destination for the dial summary.
+        dialed: Applied policy dial result.
     """
     from wmo.optimize.routing.knn import COST_QUALITY_ANCHORS
 
@@ -487,9 +497,13 @@ def report(
     """Build the improvement report for a fitted policy over a matrix.
 
     Args:
-        options: Inputs accepted by this callable.
+        matrix_file: Outcome matrix containing the held-out measurements.
+        policy_file: Fitted routing policy to evaluate.
+        baseline: Pool entry used as the report's named comparison anchor.
+        out: Destination for the JSON report and adjacent Pareto curve.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The matrix, policy, baseline, or provenance is invalid.
     """
     from wmo.optimize.routing.pareto import (
         PARETO_FILENAME,
@@ -609,8 +623,8 @@ def register(app: typer.Typer) -> None:
     """Register route fitting commands on their parent Typer app.
 
     Args:
-        options: Inputs accepted by this callable.
+        app: Parent Typer application that owns the route command group.
     """
-    app.command("fit")(fit)
-    app.command("tune")(tune)
-    app.command("report")(report)
+    app.command("fit", help="Fit a routing policy from a measured outcome matrix.")(fit)
+    app.command("tune", help="Set a fitted policy's cost and quality dial.")(tune)
+    app.command("report", help="Report a fitted policy against measured outcomes.")(report)

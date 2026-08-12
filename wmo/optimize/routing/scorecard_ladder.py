@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from wmo.optimize.routing import route_scenarios
+from wmo.optimize.routing.fit import route_scenarios
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmo.optimize.routing.scorecard import (
+from wmo.optimize.routing.scorecard_core import (
     DEFAULT_COMPLETION,
     Arm,
     CompletionRule,
@@ -58,7 +58,7 @@ def rows_for_policy(
         policy embeds its queries. Single-model arms via `rows_for_model` stay pure.
 
     Returns:
-        The value produced by this callable.
+        The selected outcome rows, including unscored placeholders for unmeasured choices.
     """
     wanted = list(ids) if ids is not None else matrix.scenario_ids()
     decisions = route_scenarios(policy, matrix, wanted, embedder=embedder)
@@ -110,9 +110,13 @@ def build_ladder(
             overwritten.
 
     Args:
-        options: Inputs accepted by this callable.
+        name: Stable name for the reported ablation sequence.
+        anchor: Untuned or baseline arm every rung is compared against.
+        arms: Ordered experimental arms to score as ladder rungs.
+        completion: Rule used to count completed tasks for effective cost.
+
     Returns:
-        The value produced by this callable.
+        An ablation ladder with scorecards measured on one common scenario set.
     """
     if not arms:
         raise ValueError(f"ladder '{name}' needs at least one arm besides the anchor")

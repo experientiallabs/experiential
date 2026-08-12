@@ -6,6 +6,7 @@ import ast
 import functools
 import importlib.util
 import subprocess
+import sys
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Final
@@ -14,6 +15,13 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASELINE_REVISION = "e7aad17b2f5041769ad8107ab25e77d4e88729ca"
+PR_BASE_REVISION = "origin/main"
+SPLIT_PUBLIC_MODULES: Final[frozenset[str]] = frozenset(
+    {
+        "wmo.cli.optimize_model_app",
+        "wmo.optimize.routing.scorecard",
+    }
+)
 
 FORBIDDEN_IMPORTS: Final[dict[str, frozenset[str]]] = {
     "common": frozenset({"runtime", "simulation", "optimize", "cli"}),
@@ -124,12 +132,54 @@ def _module_name(relative_path: str) -> str:
     return ".".join(parts)
 
 
+@functools.cache
+def _new_production_modules() -> tuple[str, ...]:
+    """Return PR-added modules plus the public facades changed by extracted modules.
+
+    `origin/main` is deliberate: this test is a PR regression rather than a comparison to the
+    frozen W1 migration baseline, and it also covers staged shepherd fixes before their commit.
+    Every listed module runs in its own interpreter below, so an import that succeeds only after
+    another module happened to initialize cannot pass.
+    """
+    paths = _git_output(["diff", "--name-only", "--diff-filter=A", PR_BASE_REVISION, "--", "wmo"])
+    modules = {
+        _module_name(relative_path)
+        for relative_path in paths.splitlines()
+        if relative_path.endswith(".py")
+        and not relative_path.endswith("_test.py")
+        and relative_path != "wmo/conftest.py"
+    }
+    # The command and scorecard facades predate this PR, but both now delegate to extracted
+    # owners. Exercise their direct imports alongside the new modules that form each split.
+    modules.update(SPLIT_PUBLIC_MODULES)
+    return tuple(sorted(modules))
+
+
 def _module_package(relative_path: str) -> str:
     """Return the package used to resolve relative imports from one source module."""
     module_name = _module_name(relative_path)
     if relative_path.endswith("/__init__.py"):
         return module_name
     return module_name.rpartition(".")[0]
+
+
+@pytest.mark.parametrize("module", _new_production_modules())
+def test_pr_added_and_split_production_modules_import_in_fresh_interpreters(module: str) -> None:
+    """Each PR-added or split production module imports without prior import state."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import importlib; importlib.import_module({module!r})",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"fresh import failed for {module}:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
 
 
 def _resolved_import_target(node: ast.ImportFrom, package: str) -> str:

@@ -17,7 +17,7 @@ def models_table(infos: list[ModelInfo]) -> Table:
         infos: The discovered model artifacts.
 
     Returns:
-        The value produced by this callable.
+        A table with one row for each discovered model artifact.
     """
     table = Table(title="world models")
     table.add_column("name", style="bold")

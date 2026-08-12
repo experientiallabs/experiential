@@ -21,7 +21,7 @@ config_app = typer.Typer(help="Manage project-local wmo settings.", no_args_is_h
 _console = Console()
 
 
-@config_app.command("telemetry")
+@config_app.command("telemetry", help="View or change project-local usage telemetry settings.")
 def config_telemetry(
     action: str = typer.Argument("status", help="status | enable | disable"),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding local settings."),
@@ -29,9 +29,11 @@ def config_telemetry(
     """View or change project-local usage telemetry settings.
 
     Args:
-        options: Inputs accepted by this callable.
+        action: `status`, `enable`, or `disable`.
+        root: Project artifact directory containing `settings.toml`.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: The action does not name a supported telemetry state.
     """
     normalized = action.lower()
     if normalized not in ("status", "enable", "disable"):

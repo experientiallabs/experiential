@@ -216,9 +216,13 @@ def build(
     pass `--no-interactive` (or any of those flags) to stay fully scriptable.
 
     Args:
-        options: Inputs accepted by this callable.
+        name: Artifact name, or a prompt to choose one in the interactive wizard.
+        source: Registered trace adapter used to normalize the corpus.
+        file: Exported trace file for a local build.
+        root: Project artifact directory where the model is written.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: Required inputs or provider settings are invalid.
     """
     # `--vendor <name>` is the deprecated alias for `--source <name> --pull`: it names the source
     # adapter and implies a live pull.

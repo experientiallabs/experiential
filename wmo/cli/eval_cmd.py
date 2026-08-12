@@ -167,9 +167,14 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     (bedrock/claude-opus-4-8 when no role is configured); `--provider`/`--model` override it.
 
     Args:
-        options: Inputs accepted by this callable.
+        ctx: Typer context used to distinguish explicitly supplied options.
+        tokens: Trace files, or the `agreement` report pair.
+        mode: Open-loop or closed-loop evaluation protocol.
+        root: Project artifact directory used to resolve named models.
+        out: Optional file for the evaluation result.
+
     Raises:
-        ValueError: If the requested operation cannot be completed.
+        typer.BadParameter: Evaluation inputs or selected protocol options are invalid.
     """
     from wmo.cli.eval_closed_loop import run_agreement, run_closed_loop
     from wmo.cli.ui import explicit_param as _explicit
