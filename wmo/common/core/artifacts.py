@@ -192,6 +192,8 @@ def canonical_json_bytes(value: BaseModel | JsonValue) -> bytes:
 
 def sha256_json(value: BaseModel | JsonValue) -> str:
     """Return the SHA-256 digest of `value`'s deterministic JSON serialization."""
+    # Content-addressed artifact identity, not password or credential storage.
+    # lgtm[py/weak-sensitive-data-hashing]
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
