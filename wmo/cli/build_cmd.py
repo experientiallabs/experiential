@@ -88,6 +88,7 @@ def build(
             created_at=datetime.now(UTC),
             code_revision=_current_revision(),
         )
+        _ensure_review_draft(store)
     except (ArtifactStoreError, ProjectStoreError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from None
     _capture_local_build_telemetry(
@@ -139,6 +140,17 @@ def _project_store(root: Path, project_id: str) -> ProjectStore:
     else:
         store.initialize(ProjectConfig(project_id=project_id))
     return store
+
+
+def _ensure_review_draft(store: ProjectStore) -> None:
+    """Create the shared mutable review root once without replacing an existing draft.
+
+    The optional local web review owns its namespaced state beneath this exact review.json file.
+    Creating an empty root here lets a later browser session resume the build's project without a
+    second store or artifact path.
+    """
+    if store.read_review() is None:
+        store.write_review({})
 
 
 def _current_revision() -> str:
