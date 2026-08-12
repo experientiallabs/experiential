@@ -21,9 +21,20 @@ from wmo.common.models import (
 )
 from wmo.runtime.models.credentials import ModelCredentialError
 from wmo.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
-from wmo.runtime.models.providers.tinker_sampling import TinkerSample, TinkerSampler
+from wmo.runtime.models.providers.tinker_sampling import (
+    TinkerOptionalDependencyError,
+    TinkerSample,
+    TinkerSampler,
+)
 from wmo.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
 from wmo.runtime.models.registry import ModelConnectionError, RuntimeModelCatalog
+
+_DEFAULT_CAPABILITIES = ModelCapabilities(
+    supports_tools=True,
+    supports_embeddings=True,
+    context_window_tokens=128_000,
+    maximum_output_tokens=16_000,
+)
 
 
 class _UnusedTransport(JsonHttpTransport):
@@ -54,7 +65,12 @@ class _FakeTinkerSampler:
         )
 
 
-def _catalog(*, provider: str = "openai", base_url: str | None = None) -> ModelCatalog:
+def _catalog(
+    *,
+    provider: str = "openai",
+    base_url: str | None = None,
+    capabilities: ModelCapabilities | None = _DEFAULT_CAPABILITIES,
+) -> ModelCatalog:
     """Build a minimum one-alias local catalog for deterministic resolution tests."""
     return ModelCatalog(
         connections={
@@ -64,7 +80,13 @@ def _catalog(*, provider: str = "openai", base_url: str | None = None) -> ModelC
                 api_key_env="FIXTURE_API_KEY",
             )
         },
-        models={"fixture-model": ModelRecord(connection="primary", model="fixture-model")},
+        models={
+            "fixture-model": ModelRecord(
+                connection="primary",
+                model="fixture-model",
+                capabilities=capabilities,
+            )
+        },
         roles=ModelRoles(candidates=("fixture-model",), incumbent="fixture-model"),
     )
 
@@ -80,14 +102,19 @@ def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
     snapshot, capabilities = catalog.snapshot("fixture-model")
 
     assert snapshot.model_id == "fixture-model"
-    assert capabilities == ModelCapabilities(supports_tools=True, supports_embeddings=True)
+    assert capabilities == ModelCapabilities(
+        supports_tools=True,
+        supports_embeddings=True,
+        context_window_tokens=128_000,
+        maximum_output_tokens=16_000,
+    )
     assert snapshot.capabilities_sha256 == sha256_json(capabilities)
 
 
 def test_preflight_rejects_capability_before_reading_missing_credentials() -> None:
     """A known unsupported requirement fails locally and cannot trigger a paid request."""
     catalog = RuntimeModelCatalog(
-        _catalog(provider="anthropic"),
+        _catalog(provider="anthropic", capabilities=ModelCapabilities()),
         environment={},
         transport_factory=_UnusedTransport,
     )
@@ -130,19 +157,74 @@ def test_resolution_rejects_unsupported_connection_and_incomplete_compatible_url
         compatible.resolve("fixture-model")
 
 
-def test_tinker_resolution_uses_only_an_explicit_completed_model_sampler_factory() -> None:
-    """Tinker construction never discovers, trains, or promotes a model handle."""
+def test_model_capability_snapshot_has_exact_limits_and_fails_closed_when_absent() -> None:
+    """Model records, not provider names, prove protocol support and W8 capacity boundaries."""
+    capabilities = ModelCapabilities(
+        supports_tools=True,
+        context_window_tokens=32_768,
+        maximum_output_tokens=16_000,
+    )
+    catalog = RuntimeModelCatalog(
+        _catalog(capabilities=capabilities),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=_UnusedTransport,
+    )
+
+    catalog.preflight(
+        "fixture-model",
+        CapabilityRequirement(
+            requires_tools=True,
+            minimum_context_window_tokens=32_768,
+            minimum_output_tokens=16_000,
+        ),
+    )
+    with pytest.raises(ModelCapabilityError, match="below required 16001"):
+        catalog.preflight(
+            "fixture-model",
+            CapabilityRequirement(minimum_output_tokens=16_001),
+        )
+    with pytest.raises(ModelCapabilityError, match="below required 32769"):
+        catalog.preflight(
+            "fixture-model",
+            CapabilityRequirement(minimum_context_window_tokens=32_769),
+        )
+
+    unknown = RuntimeModelCatalog(
+        _catalog(capabilities=None),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=_UnusedTransport,
+    )
+    assert unknown.snapshot("fixture-model")[1] == ModelCapabilities()
+    assert unknown.resolve("fixture-model").embedding_client is None
+    with pytest.raises(ModelCapabilityError, match="does not support tool calls"):
+        unknown.preflight("fixture-model", CapabilityRequirement(requires_tools=True))
+    with pytest.raises(ModelCapabilityError, match="does not report a context window"):
+        unknown.preflight(
+            "fixture-model",
+            CapabilityRequirement(minimum_context_window_tokens=1),
+        )
+
+
+def test_tinker_resolution_uses_runtime_owned_default_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cataloged Tinker handle resolves normally while tests can replace only its SDK seam."""
     constructed: list[tuple[str, str]] = []
 
-    def sampler_factory(model: ModelSnapshot, api_key: str) -> TinkerSampler:
+    def runtime_sampler(
+        model: ModelSnapshot,
+        api_key: str,
+        base_url: str | None,
+    ) -> TinkerSampler:
         constructed.append((model.model_id, api_key))
+        assert base_url is None
         return _FakeTinkerSampler()
 
+    monkeypatch.setattr("wmo.runtime.models.registry.create_tinker_sampler", runtime_sampler)
     catalog = RuntimeModelCatalog(
         _catalog(provider="tinker"),
         environment={"FIXTURE_API_KEY": "fixture-tinker-key"},
         transport_factory=_UnusedTransport,
-        tinker_sampler_factory=sampler_factory,
     )
 
     resolved = catalog.resolve("fixture-model")
@@ -155,3 +237,27 @@ def test_tinker_resolution_uses_only_an_explicit_completed_model_sampler_factory
         ).output.content
         == "sampled"
     )
+
+
+def test_tinker_resolution_reports_a_missing_optional_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normal catalog construction explains how to install the sampling-only dependency."""
+
+    def missing_tinker(
+        model: ModelSnapshot,
+        api_key: str,
+        base_url: str | None,
+    ) -> TinkerSampler:
+        del model, api_key, base_url
+        raise TinkerOptionalDependencyError("install with uv sync --extra distill")
+
+    monkeypatch.setattr("wmo.runtime.models.registry.create_tinker_sampler", missing_tinker)
+    catalog = RuntimeModelCatalog(
+        _catalog(provider="tinker"),
+        environment={"FIXTURE_API_KEY": "fixture-tinker-key"},
+        transport_factory=_UnusedTransport,
+    )
+
+    with pytest.raises(ModelConnectionError, match="uv sync --extra distill"):
+        catalog.resolve("fixture-model")

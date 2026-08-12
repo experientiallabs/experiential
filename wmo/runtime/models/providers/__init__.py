@@ -6,9 +6,13 @@ from wmo.runtime.models.providers.openai import OpenAIClient
 from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from wmo.runtime.models.providers.openrouter import OpenRouterClient
 from wmo.runtime.models.providers.tinker_sampling import (
+    TinkerOptionalDependencyError,
     TinkerSample,
     TinkerSampler,
     TinkerSamplingClient,
+    TinkerSamplingError,
+    TinkerSdkSampler,
+    create_tinker_sampler,
 )
 
 __all__ = [
@@ -17,7 +21,11 @@ __all__ = [
     "OpenAIClient",
     "OpenAICompatibleClient",
     "OpenRouterClient",
+    "TinkerOptionalDependencyError",
     "TinkerSample",
     "TinkerSampler",
+    "TinkerSamplingError",
     "TinkerSamplingClient",
+    "TinkerSdkSampler",
+    "create_tinker_sampler",
 ]

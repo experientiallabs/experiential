@@ -8,6 +8,7 @@ import pytest
 
 from wmo.common.models import (
     ConnectionConfig,
+    ModelCapabilities,
     ModelCatalog,
     ModelCatalogError,
     ModelRecord,
@@ -30,6 +31,11 @@ def _catalog() -> ModelCatalog:
             "candidate-economy": ModelRecord(
                 connection="openrouter",
                 model="deepseek/deepseek-v4-flash",
+                capabilities=ModelCapabilities(
+                    supports_tools=True,
+                    context_window_tokens=128_000,
+                    maximum_output_tokens=16_000,
+                ),
             )
         },
         roles=ModelRoles(candidates=("candidate-economy",), incumbent="candidate-economy"),
@@ -112,3 +118,23 @@ model = "sk-abcdefghijklmnopqrstuvwxyz123456"
         load_model_catalog(query_credential_path)
     with pytest.raises(ModelCatalogError, match="model identity"):
         load_model_catalog(model_credential_path)
+
+
+def test_openai_compatible_records_require_explicit_capabilities(tmp_path: Path) -> None:
+    """Private compatible endpoints cannot inherit unproven provider-wide capability claims."""
+    path = tmp_path / "compatible.toml"
+    path.write_text(
+        """
+[connections.private-world-model]
+provider = "openai-compatible"
+base_url = "https://models.example.com/v1"
+
+[models.world-model]
+connection = "private-world-model"
+model = "private-world-model"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ModelCatalogError, match="explicit capabilities"):
+        load_model_catalog(path)

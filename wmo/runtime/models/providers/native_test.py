@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Literal
 
+import pytest
+
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
@@ -29,6 +31,8 @@ from wmo.runtime.models.providers.tinker_sampling import (
     TinkerSample,
     TinkerSampler,
     TinkerSamplingClient,
+    TinkerSdkSampler,
+    create_tinker_sampler,
 )
 from wmo.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
 
@@ -116,6 +120,20 @@ def _request(
         temperature=0.2,
         maximum_output_tokens=128,
     )
+
+
+def test_default_tinker_factory_constructs_a_lazy_sdk_sampler_without_sampling() -> None:
+    """The runtime-owned factory uses the installed dependency but creates no provider session."""
+    pytest.importorskip("tinker")
+    pytest.importorskip("tinker_cookbook")
+
+    sampler = create_tinker_sampler(
+        model=_snapshot("tinker", "tinker://completed-handle-v2"),
+        api_key="fixture-tinker-key",
+        base_url="https://tinker.fixture",
+    )
+
+    assert isinstance(sampler, TinkerSdkSampler)
 
 
 def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity() -> None:

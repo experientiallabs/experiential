@@ -77,10 +77,10 @@ from wmo.optimize.routing.knn import COST_QUALITY_ANCHORS, apply_cost_quality
 from wmo.optimize.routing.policy import RoutingPolicy
 
 fitted = RoutingPolicy.load(Path("models/support/policy.json"))
-cheaper = apply_cost_quality(fitted, 0.6)   # a copy; `fitted` is untouched
+cheaper = apply_cost_quality(fitted, 0.6)  # a copy; `fitted` is untouched
 cheaper.save(Path("models/support/policy.json"))
 
-for anchor in COST_QUALITY_ANCHORS:         # the measured table above
+for anchor in COST_QUALITY_ANCHORS:  # the measured table above
     print(anchor.cost_quality, anchor.quality_delta_points, anchor.cost_delta_percent)
 ```
 

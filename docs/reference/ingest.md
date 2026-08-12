@@ -223,20 +223,30 @@ class MyProviderAdapter(BaseTraceAdapter):
         # you don't even need this method. Override it only when the export is a custom shape:
         spans: list[SpanRecord] = []
         for row in payload.get("events", []):
-            spans.append(SpanRecord(
-                trace_id=row["trace"], span_id=row["id"], start_nano=row["ts"],
-                attributes={                      # emit in GenAI vocab; the normalizer pairs them
-                    "gen_ai.operation.name": "chat",
-                    "gen_ai.tool.name": row["tool"],
-                    "gen_ai.tool.call.arguments": row["args"],   # JSON string or object
-                },
-            ))
-            spans.append(SpanRecord(
-                trace_id=row["trace"], span_id=row["id"] + "-r", start_nano=row["ts"] + 1,
-                status_error=bool(row.get("error")),
-                attributes={"gen_ai.operation.name": "execute_tool",
-                            "gen_ai.tool.message": row["result"]},
-            ))
+            spans.append(
+                SpanRecord(
+                    trace_id=row["trace"],
+                    span_id=row["id"],
+                    start_nano=row["ts"],
+                    attributes={  # emit in GenAI vocab; the normalizer pairs them
+                        "gen_ai.operation.name": "chat",
+                        "gen_ai.tool.name": row["tool"],
+                        "gen_ai.tool.call.arguments": row["args"],  # JSON string or object
+                    },
+                )
+            )
+            spans.append(
+                SpanRecord(
+                    trace_id=row["trace"],
+                    span_id=row["id"] + "-r",
+                    start_nano=row["ts"] + 1,
+                    status_error=bool(row.get("error")),
+                    attributes={
+                        "gen_ai.operation.name": "execute_tool",
+                        "gen_ai.tool.message": row["result"],
+                    },
+                )
+            )
         return spans
 
 
@@ -270,7 +280,7 @@ Phoenix has no stable file-export CLI, so dump spans with the Phoenix client aga
 ```python
 import phoenix as px
 
-df = px.Client().get_spans_dataframe()          # optionally filter / limit
+df = px.Client().get_spans_dataframe()  # optionally filter / limit
 df.reset_index().to_json("phoenix_export.json", orient="records")
 ```
 

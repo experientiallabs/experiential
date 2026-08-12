@@ -79,8 +79,9 @@ model_dir = WorldModelStore(".wmo").resolve("airline")
 wm, _provider = load_world_model(model_dir)
 
 session = wm.new_session(task="check out the cart")
-obs = wm.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="add_to_cart",
-                                 arguments={"sku": "A1"}))
+obs = wm.step(
+    session.id, Action(kind=ActionKind.TOOL_CALL, name="add_to_cart", arguments={"sku": "A1"})
+)
 print(obs.content)
 ```
 

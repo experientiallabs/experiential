@@ -22,17 +22,13 @@ from wmo.runtime.models.providers.gemini import GEMINI_BASE_URL, GeminiClient
 from wmo.runtime.models.providers.openai import OPENAI_BASE_URL, OpenAIClient
 from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from wmo.runtime.models.providers.openrouter import OPENROUTER_BASE_URL, OpenRouterClient
-from wmo.runtime.models.providers.tinker_sampling import TinkerSampler, TinkerSamplingClient
+from wmo.runtime.models.providers.tinker_sampling import (
+    TinkerOptionalDependencyError,
+    TinkerSampler,
+    TinkerSamplingClient,
+    create_tinker_sampler,
+)
 from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
-
-_PROVIDER_CAPABILITIES: Mapping[str, ModelCapabilities] = {
-    "openai": ModelCapabilities(supports_tools=True, supports_embeddings=True),
-    "openrouter": ModelCapabilities(supports_tools=True, supports_embeddings=True),
-    "openai-compatible": ModelCapabilities(supports_tools=True, supports_embeddings=True),
-    "anthropic": ModelCapabilities(supports_tools=True, supports_embeddings=False),
-    "gemini": ModelCapabilities(supports_tools=True, supports_embeddings=True),
-    "tinker": ModelCapabilities(supports_tools=True, supports_embeddings=False),
-}
 
 
 class ModelConnectionError(ValueError):
@@ -42,12 +38,18 @@ class ModelConnectionError(ValueError):
 class TinkerSamplerFactory(Protocol):
     """Builds a completed trained-model sampler from explicit local connection metadata."""
 
-    def __call__(self, model: ModelSnapshot, api_key: str) -> TinkerSampler:
+    def __call__(
+        self,
+        model: ModelSnapshot,
+        api_key: str,
+        base_url: str | None,
+    ) -> TinkerSampler:
         """Return a sampler for one completed trained-model handle.
 
         Args:
             model: Resolved model identity, including the trained handle model ID.
             api_key: Credential read from the connection's named environment variable.
+            base_url: Optional explicit Tinker API base URL for this connection.
 
         Returns:
             A completed-handle sampler with no training lifecycle behavior.
@@ -83,7 +85,8 @@ class RuntimeModelCatalog:
             catalog: Parsed `.wmo/models.toml` aliases and connections.
             environment: Credential mapping, injectable for deterministic tests.
             transport_factory: Explicit transport construction for HTTP-backed providers.
-            tinker_sampler_factory: Completed-handle sampler construction, supplied by Tinker code.
+            tinker_sampler_factory: Optional deterministic test override for completed-handle
+                sampling. Omit it to use the runtime-owned Tinker SDK construction seam.
         """
         self._catalog = catalog
         self._environment = os.environ if environment is None else environment
@@ -91,18 +94,29 @@ class RuntimeModelCatalog:
         self._tinker_sampler_factory = tinker_sampler_factory
 
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
-        """Resolve static identity and capabilities without reading credentials or a provider."""
+        """Resolve static identity and exact capability evidence without provider access.
+
+        Args:
+            alias: Stable local catalog alias.
+
+        Returns:
+            Immutable model identity and the alias-specific capability snapshot. Omitted catalog
+            capabilities become an all-unknown, fail-closed snapshot.
+
+        Raises:
+            ModelConnectionError: The alias is unknown or names an unsupported provider.
+        """
         record = self._catalog.models.get(alias)
         if record is None:
             raise ModelConnectionError(f"unknown model alias {alias!r}")
         connection = self._catalog.connections[record.connection]
-        capabilities = _PROVIDER_CAPABILITIES.get(connection.provider)
-        if capabilities is None:
-            supported = ", ".join(sorted(_PROVIDER_CAPABILITIES))
+        if connection.provider not in _SUPPORTED_PROVIDERS:
+            supported = ", ".join(sorted(_SUPPORTED_PROVIDERS))
             raise ModelConnectionError(
                 f"model alias {alias!r} uses unsupported provider {connection.provider!r}; "
                 f"choose one of: {supported}"
             )
+        capabilities = record.capabilities or ModelCapabilities()
         return (
             ModelSnapshot(
                 provider=connection.provider,
@@ -139,7 +153,13 @@ class RuntimeModelCatalog:
                 base_url=connection.base_url or OPENAI_BASE_URL,
                 transport=self._transport_factory(),
             )
-            return ResolvedModel(alias, snapshot, capabilities, client, client)
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capabilities,
+                client,
+                client if capabilities.supports_embeddings else None,
+            )
         if provider == "openrouter":
             client = OpenRouterClient(
                 model=snapshot,
@@ -147,7 +167,13 @@ class RuntimeModelCatalog:
                 base_url=connection.base_url or OPENROUTER_BASE_URL,
                 transport=self._transport_factory(),
             )
-            return ResolvedModel(alias, snapshot, capabilities, client, client)
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capabilities,
+                client,
+                client if capabilities.supports_embeddings else None,
+            )
         if provider == "openai-compatible":
             if connection.base_url is None:
                 raise ModelConnectionError(
@@ -159,7 +185,13 @@ class RuntimeModelCatalog:
                 base_url=connection.base_url,
                 transport=self._transport_factory(),
             )
-            return ResolvedModel(alias, snapshot, capabilities, client, client)
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capabilities,
+                client,
+                client if capabilities.supports_embeddings else None,
+            )
         if provider == "anthropic":
             client = AnthropicClient(
                 model=snapshot,
@@ -175,15 +207,24 @@ class RuntimeModelCatalog:
                 base_url=connection.base_url or GEMINI_BASE_URL,
                 transport=self._transport_factory(),
             )
-            return ResolvedModel(alias, snapshot, capabilities, client, client)
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capabilities,
+                client,
+                client if capabilities.supports_embeddings else None,
+            )
         if provider == "tinker":
-            if self._tinker_sampler_factory is None:
+            sampler_factory = self._tinker_sampler_factory or _runtime_tinker_sampler
+            try:
+                sampler = sampler_factory(snapshot, api_key, connection.base_url)
+            except TinkerOptionalDependencyError as exc:
                 raise ModelConnectionError(
-                    f"Tinker alias {alias!r} needs an explicit completed-model sampler factory"
-                )
+                    f"Tinker alias {alias!r} cannot be constructed: {exc}"
+                ) from exc
             client = TinkerSamplingClient(
                 model=snapshot,
-                sampler=self._tinker_sampler_factory(snapshot, api_key),
+                sampler=sampler,
             )
             return ResolvedModel(alias, snapshot, capabilities, client, None)
         raise ModelConnectionError(f"unsupported provider {provider!r}")
@@ -193,7 +234,19 @@ class RuntimeModelCatalog:
         alias: str,
         requirement: CapabilityRequirement | None = None,
     ) -> ResolvedModel:
-        """Construct and locally capability-check one alias before a paid provider call."""
+        """Construct and locally capability-check one alias before a paid provider call.
+
+        Args:
+            alias: Stable local catalog alias to validate and construct.
+            requirement: Optional required protocol features and capacity limits.
+
+        Returns:
+            The constructed focused client after its exact snapshot satisfies the requirement.
+
+        Raises:
+            ModelCapabilityError: The catalog cannot prove that the alias meets a requirement.
+            ModelConnectionError: The alias cannot be constructed through an approved provider.
+        """
         _, capabilities = self.snapshot(alias)
         preflight_capabilities(alias, capabilities, requirement or CapabilityRequirement())
         return self.resolve(alias)
@@ -213,3 +266,24 @@ class RuntimeModelCatalog:
             transport_factory=self._transport_factory,
             tinker_sampler_factory=self._tinker_sampler_factory,
         )
+
+
+_SUPPORTED_PROVIDERS = frozenset(
+    {
+        "anthropic",
+        "gemini",
+        "openai",
+        "openai-compatible",
+        "openrouter",
+        "tinker",
+    }
+)
+
+
+def _runtime_tinker_sampler(
+    model: ModelSnapshot,
+    api_key: str,
+    base_url: str | None,
+) -> TinkerSampler:
+    """Build the runtime-owned sampling seam for one cataloged Tinker handle."""
+    return create_tinker_sampler(model=model, api_key=api_key, base_url=base_url)

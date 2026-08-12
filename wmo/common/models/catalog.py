@@ -17,6 +17,7 @@ from wmo.common.core.artifacts import (
     validate_artifact_id,
 )
 from wmo.common.core.files import write_text_atomic
+from wmo.common.models.model import ModelCapabilities
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -63,11 +64,17 @@ class ConnectionConfig(ContractModel):
 
 
 class ModelRecord(ContractModel):
-    """A stable local model alias's connection and provider-side model name."""
+    """A stable local alias, exact capability snapshot, and provider-side model name.
+
+    An omitted capability declaration means the catalog cannot prove any optional protocol
+    feature or token limit. Callers may still resolve the alias for an unconstrained completion,
+    but capability preflight fails closed instead of inferring support from a provider name.
+    """
 
     connection: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=512)
     revision: str | None = Field(default=None, max_length=256)
+    capabilities: ModelCapabilities | None = None
 
     @model_validator(mode="after")
     def _require_secret_free_model_identity(self) -> ModelRecord:
@@ -77,6 +84,11 @@ class ModelRecord(ContractModel):
                     "connection": self.connection,
                     "model": self.model,
                     "revision": self.revision,
+                    "capabilities": (
+                        self.capabilities.model_dump(mode="json")
+                        if self.capabilities is not None
+                        else None
+                    ),
                 }
             )
         except SecretBoundaryError as exc:
@@ -137,6 +149,12 @@ class ModelCatalog(ContractModel):
             if record.connection not in self.connections:
                 raise ValueError(
                     f"model alias {alias!r} names unknown connection {record.connection!r}"
+                )
+            connection = self.connections[record.connection]
+            if connection.provider == "openai-compatible" and record.capabilities is None:
+                raise ValueError(
+                    f"OpenAI-compatible model alias {alias!r} needs an explicit capabilities "
+                    "declaration because its endpoint cannot be discovered safely"
                 )
         assigned_aliases = self.roles.candidates + tuple(
             alias

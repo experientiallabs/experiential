@@ -23,14 +23,29 @@ class ModelRole(StrEnum):
     TEACHER = "teacher"
 
 
-DEFAULT_BUILD_REQUIRED_ROLES: tuple[ModelRole, ...] = (
-    ModelRole.CANDIDATES,
-    ModelRole.WORLD_MODEL,
-    ModelRole.JUDGE,
-    ModelRole.RUBRIC_PROPOSER,
-    ModelRole.EMBEDDER,
-    ModelRole.TEACHER,
-)
+class ModelRoleWorkflow(StrEnum):
+    """Named workflows whose model roles must be configured before execution."""
+
+    ROUTER_BUILD = "router_build"
+    JUDGING = "judging"
+    RUBRIC_PROPOSAL = "rubric_proposal"
+    SFT = "sft"
+
+
+_WORKFLOW_REQUIRED_ROLES: Mapping[ModelRoleWorkflow, tuple[ModelRole, ...]] = {
+    ModelRoleWorkflow.ROUTER_BUILD: (
+        ModelRole.CANDIDATES,
+        ModelRole.WORLD_MODEL,
+        ModelRole.JUDGE,
+        ModelRole.EMBEDDER,
+    ),
+    ModelRoleWorkflow.JUDGING: (ModelRole.JUDGE,),
+    ModelRoleWorkflow.RUBRIC_PROPOSAL: (ModelRole.RUBRIC_PROPOSER,),
+    ModelRoleWorkflow.SFT: (ModelRole.TEACHER,),
+}
+
+DEFAULT_BUILD_WORKFLOW = ModelRoleWorkflow.ROUTER_BUILD
+DEFAULT_BUILD_REQUIRED_ROLES = _WORKFLOW_REQUIRED_ROLES[DEFAULT_BUILD_WORKFLOW]
 
 
 class MissingModelRolesError(ValueError):
@@ -53,7 +68,15 @@ class ModelRoleConfigurator(Protocol):
         catalog: ModelCatalog,
         missing_roles: tuple[ModelRole, ...],
     ) -> ModelCatalog:
-        """Return catalog metadata after collecting exactly the named missing roles."""
+        """Return catalog metadata after collecting exactly the named missing roles.
+
+        Args:
+            catalog: Current validated catalog before interactive updates.
+            missing_roles: Exact workflow-scoped assignments to collect from the local user.
+
+        Returns:
+            A validated catalog containing the requested role assignments.
+        """
 
 
 @dataclass(frozen=True)
@@ -66,11 +89,20 @@ class ModelRolePreflightResult:
 
 def missing_model_roles(
     catalog: ModelCatalog,
-    required_roles: Sequence[ModelRole] = DEFAULT_BUILD_REQUIRED_ROLES,
+    *,
+    workflow: ModelRoleWorkflow = DEFAULT_BUILD_WORKFLOW,
 ) -> tuple[ModelRole, ...]:
-    """Return required roles without an assigned alias in deterministic caller order."""
+    """Return the requested workflow's unassigned roles in deterministic order.
+
+    Args:
+        catalog: Catalog whose assignments are being checked.
+        workflow: Product workflow about to use model roles.
+
+    Returns:
+        Required roles that do not yet name a model alias.
+    """
     missing: list[ModelRole] = []
-    for role in required_roles:
+    for role in required_model_roles(workflow):
         if role is ModelRole.CANDIDATES:
             if not catalog.roles.candidates:
                 missing.append(role)
@@ -83,7 +115,7 @@ def preflight_model_roles(
     catalog: ModelCatalog,
     resolver: RuntimeModelCatalog,
     *,
-    required_roles: Sequence[ModelRole] = DEFAULT_BUILD_REQUIRED_ROLES,
+    workflow: ModelRoleWorkflow = DEFAULT_BUILD_WORKFLOW,
     requirements: Mapping[ModelRole, CapabilityRequirement] | None = None,
     non_interactive: bool = True,
     configurator: ModelRoleConfigurator | None = None,
@@ -93,7 +125,7 @@ def preflight_model_roles(
     Args:
         catalog: Initial local model catalog metadata.
         resolver: Explicit runtime catalog constructor for the same catalog state.
-        required_roles: Roles required by this caller's workflow.
+        workflow: Product workflow whose roles must be ready.
         requirements: Optional capability constraints by role.
         non_interactive: When true, report every missing role without guessing.
         configurator: Caller-owned interactive prompt implementation when interaction is allowed.
@@ -106,12 +138,13 @@ def preflight_model_roles(
         ValueError: Interactive mode has no caller-provided prompt implementation.
     """
     effective_catalog = catalog
-    missing = missing_model_roles(effective_catalog, required_roles)
+    required_roles = required_model_roles(workflow)
+    missing = missing_model_roles(effective_catalog, workflow=workflow)
     if missing and not non_interactive:
         if configurator is None:
             raise ValueError("interactive model-role preflight needs a ModelRoleConfigurator")
         effective_catalog = configurator.configure(effective_catalog, missing)
-        missing = missing_model_roles(effective_catalog, required_roles)
+        missing = missing_model_roles(effective_catalog, workflow=workflow)
     if missing:
         raise MissingModelRolesError(missing)
     if effective_catalog != catalog:
@@ -126,6 +159,18 @@ def preflight_model_roles(
         )
         resolved[role] = tuple(resolver.preflight(alias, requirement) for alias in aliases)
     return ModelRolePreflightResult(catalog=effective_catalog, models=resolved)
+
+
+def required_model_roles(workflow: ModelRoleWorkflow) -> tuple[ModelRole, ...]:
+    """Return the exact catalog roles that one product workflow consumes.
+
+    Args:
+        workflow: Product workflow about to use model roles.
+
+    Returns:
+        Ordered role assignments required before that workflow can run.
+    """
+    return _WORKFLOW_REQUIRED_ROLES[workflow]
 
 
 def _role_aliases(catalog: ModelCatalog, role: ModelRole) -> tuple[str, ...]:
