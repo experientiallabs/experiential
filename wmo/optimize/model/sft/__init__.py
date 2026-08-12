@@ -1,4 +1,4 @@
-"""Frozen, leakage-safe SFT dataset construction from accepted WMO evidence."""
+"""Frozen, leakage-safe SFT datasets and managed offline Tinker SFT behavior."""
 
 from wmo.optimize.model.sft.builder import (
     SFTBuildError,
@@ -32,6 +32,25 @@ from wmo.optimize.model.sft.rendering import (
     parse_rendered_turn,
     render_context_target,
 )
+from wmo.optimize.model.sft.tinker import (
+    TinkerSFTDatum,
+    TinkerSFTDependencyError,
+    TinkerTrainerBackend,
+    TinkerTrainerSession,
+    tinker_messages_from_example,
+)
+from wmo.optimize.model.sft.training import (
+    TinkerSFTBudgetExceeded,
+    TinkerSFTError,
+    TinkerSFTModelArtifact,
+    TinkerSFTOptimizer,
+    TinkerSFTResult,
+    TinkerSFTResumeError,
+    TinkerSFTRunManifest,
+    TinkerSFTSpec,
+    TrainerBackend,
+    train_tinker_sft,
+)
 
 __all__ = [
     "AssistantActionEvent",
@@ -52,12 +71,27 @@ __all__ = [
     "TeacherAcceptanceEvidence",
     "TeacherAcceptanceRule",
     "TeacherSFTSource",
+    "TinkerSFTBudgetExceeded",
+    "TinkerSFTDatum",
+    "TinkerSFTDependencyError",
+    "TinkerSFTError",
+    "TinkerSFTModelArtifact",
+    "TinkerSFTOptimizer",
+    "TinkerSFTResult",
+    "TinkerSFTRunManifest",
+    "TinkerSFTResumeError",
+    "TinkerSFTSpec",
+    "TinkerTrainerBackend",
+    "TinkerTrainerSession",
     "ToolEvent",
+    "TrainerBackend",
     "build_sft_dataset",
     "context_target_fingerprint",
     "ensure_no_cross_split_fingerprints",
     "load_sft_dataset",
     "parse_rendered_turn",
     "render_context_target",
+    "tinker_messages_from_example",
+    "train_tinker_sft",
     "write_sft_dataset",
 ]
