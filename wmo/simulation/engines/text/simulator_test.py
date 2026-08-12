@@ -69,6 +69,17 @@ class _ScriptedClient:
                 self.active_calls -= 1
 
 
+class _TimeoutClient:
+    """Provider seam that records dispatch and then fails without authoritative economics."""
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        raise TimeoutError("provider outcome is unknown")
+
+
 class _OneTurnAgent:
     def run(
         self,
@@ -204,7 +215,7 @@ def _persist_task_set(store: ArtifactStore, tasks: dict[str, TaskCase]) -> Artif
 
 def _resolved(
     alias: str,
-    client: _ScriptedClient,
+    client: ModelClient,
     *,
     context_window: int = 100_000,
 ) -> ResolvedModel:
@@ -252,8 +263,8 @@ def _simulator(
     plan: EvaluationPlan,
     plan_input: ArtifactInput,
     task_set_input: ArtifactInput,
-    candidate_client: _ScriptedClient,
-    world_client: _ScriptedClient,
+    candidate_client: ModelClient,
+    world_client: ModelClient,
     *,
     candidate_context_window: int = 100_000,
     agent_factory: Callable[[], AgentRuntime] = _OneTurnAgent,
@@ -479,6 +490,44 @@ def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
     assert second_rollout.stop_reason == StopReason.MAXIMUM_COST
     assert len(candidate_client.requests) == 1
     assert len(world_client.requests) == 1
+
+
+def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: Path) -> None:
+    """A dispatched timeout has unknown spend, so no second paid cell may be sent."""
+    cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(
+        store,
+        {"task-a": _task("task-a"), "task-b": _task("task-b")},
+    )
+    candidate_client = _TimeoutClient()
+    world_client = _ScriptedClient([])
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+    )
+
+    artifact_set = simulator.run(
+        _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=0.01)
+    )
+    first = simulator._load_rollout(artifact_set.artifact_ids[0])
+    second = simulator._load_rollout(artifact_set.artifact_ids[1])
+
+    assert len(candidate_client.requests) == 1
+    assert world_client.requests == []
+    assert first.stop_reason == StopReason.FAILURE
+    assert first.failure is not None
+    assert first.failure.details["provider_dispatch_unknown_spend"] is True
+    assert first.candidate_economics.cost_usd is None
+    assert second.stop_reason == StopReason.MAXIMUM_COST
+    assert second.failure is not None
+    assert second.failure.details["observed_spend_usd"] is None
 
 
 def test_text_simulation_enforces_configured_concurrency_bound(tmp_path: Path) -> None:

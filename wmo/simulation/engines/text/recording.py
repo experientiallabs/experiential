@@ -134,6 +134,7 @@ class RecordingCandidateClient:
         self._visible_transcript: tuple[ModelMessage, ...] = ()
         self._terminal = False
         self._failure: TextSimulationError | None = None
+        self._provider_dispatch_unknown_spend = False
 
     @property
     def terminal_error(self) -> TextSimulationError | None:
@@ -212,12 +213,15 @@ class RecordingCandidateClient:
             self._failure = self._failure or exc
             raise
         except Exception as exc:  # noqa: BLE001 - provider exceptions become durable episode evidence
+            details: dict[str, JsonValue] = {"phase": "candidate_or_world_model"}
+            if self._provider_dispatch_unknown_spend:
+                details["provider_dispatch_unknown_spend"] = True
             failure = StructuredFailure(
                 code=FailureCode.PROVIDER,
                 message=f"text simulation provider call failed with {type(exc).__name__}",
                 exception_type=type(exc).__name__,
                 attribution=FailureAttribution.MODEL,
-                details={"phase": "candidate_or_world_model"},
+                details=details,
             )
             text_error = TextSimulationError(StopReason.FAILURE, failure)
             self._failure = self._failure or text_error
@@ -253,7 +257,9 @@ class RecordingCandidateClient:
             self._token_counter,
         )
         candidate_started_at = _timestamp(self._clock)
+        self._provider_dispatch_unknown_spend = True
         candidate_response = self._candidate.client.complete(candidate_request)
+        self._provider_dispatch_unknown_spend = False
         candidate_ended_at = _timestamp(self._clock, not_before=candidate_started_at)
         self._candidate_responses.append(candidate_response)
         self._candidate_spans.append(
@@ -283,7 +289,9 @@ class RecordingCandidateClient:
             self._token_counter,
         )
         world_started_at = _timestamp(self._clock, not_before=candidate_ended_at)
+        self._provider_dispatch_unknown_spend = True
         world_response = self._world_model.client.complete(world_request)
+        self._provider_dispatch_unknown_spend = False
         world_ended_at = _timestamp(self._clock, not_before=world_started_at)
         self._world_model_responses.append(world_response)
         self._world_model_spans.append(

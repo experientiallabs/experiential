@@ -9,6 +9,7 @@ import pytest
 from wmo.common.core.locks import file_write_lock
 from wmo.common.project import ArtifactStore, ProjectPaths
 from wmo.simulation.engines.text.leases import (
+    TextCellLeaseError,
     TextCellLeaseState,
     TextCellLeaseStatus,
     TextCellLeaseStore,
@@ -338,3 +339,48 @@ def test_budget_contender_waits_for_active_claim_before_proven_over_budget_block
     assert blocked.state == TextCellLeaseState.BUDGET_BLOCKED
     assert blocked.observed_spend_usd == 1.1
     assert tuple((project.project_directory / "simulation-leases").glob("*.json")) == ()
+
+
+def test_stale_tombstone_rejects_symlink_swap_without_touching_victim(tmp_path: Path) -> None:
+    """A lease swapped after safe read cannot redirect tombstone bytes outside the lease dir."""
+    project = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
+    original = TextCellLeaseStore(project.project_directory, clock=lambda: _TIME)
+    original.acquire(
+        lease_id="lease-a",
+        resolution_id="resolution-a",
+        simulation_id="simulation-a",
+        rollout_id="rollout-a",
+        binding_sha256=_DIGEST,
+        maximum_cost_usd=1.0,
+        rollout_completed=lambda _rollout_id: False,
+        observed_spend_usd=lambda: 0.0,
+    )
+    lease_path = project.project_directory / "simulation-leases" / "lease-a.json"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not overwrite", encoding="utf-8")
+
+    def swap_to_symlink(_pid: int) -> bool:
+        lease_path.unlink()
+        lease_path.symlink_to(victim)
+        return False
+
+    recovery = TextCellLeaseStore(
+        project.project_directory,
+        clock=lambda: _TIME + timedelta(minutes=16),
+        owner_alive=swap_to_symlink,
+    )
+
+    with pytest.raises(TextCellLeaseError, match="cannot be mutated safely"):
+        recovery.acquire(
+            lease_id="lease-a",
+            resolution_id="resolution-a",
+            simulation_id="simulation-a",
+            rollout_id="rollout-a",
+            binding_sha256=_DIGEST,
+            maximum_cost_usd=1.0,
+            rollout_completed=lambda _rollout_id: False,
+            observed_spend_usd=lambda: 0.0,
+        )
+
+    assert victim.read_text(encoding="utf-8") == "do not overwrite"
+    assert lease_path.is_symlink()
