@@ -901,7 +901,7 @@ def _event_timestamp(
     if raw_timestamp is None:
         timestamp = _DETERMINISTIC_EVENT_EPOCH + timedelta(microseconds=line_number)
     elif isinstance(raw_timestamp, (int, float)) and not isinstance(raw_timestamp, bool):
-        if not math.isfinite(raw_timestamp):
+        if isinstance(raw_timestamp, float) and not math.isfinite(raw_timestamp):
             raise PiTranscriptError(f"Pi JSON event line {line_number} has an invalid timestamp")
         try:
             timestamp = _DETERMINISTIC_EVENT_EPOCH + timedelta(milliseconds=raw_timestamp)

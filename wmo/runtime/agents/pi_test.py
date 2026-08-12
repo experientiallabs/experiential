@@ -120,6 +120,26 @@ def test_installed_pi_parses_a_0731_numeric_millisecond_timestamp(tmp_path: Path
     assert episode.events[0].ended_at == expected_timestamp
 
 
+def test_pi_rejects_an_absurd_numeric_millisecond_timestamp() -> None:
+    """Unrepresentable integer timestamps are transcript errors, not leaked overflows."""
+    with pytest.raises(PiTranscriptError, match="invalid timestamp"):
+        _episode_from_pi_events(
+            _pi_events(
+                [
+                    {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "timestamp": 10**100,
+                            "content": [],
+                        },
+                    },
+                    {"type": "agent_end"},
+                ]
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("pi_stop_reason", "code", "attribution"),
     [
