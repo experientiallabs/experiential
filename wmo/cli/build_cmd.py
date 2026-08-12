@@ -51,11 +51,6 @@ def build(
         "--project",
         help="Local project ID below <root>/projects (default: default).",
     ),
-    name: str | None = typer.Option(
-        None,
-        "--name",
-        help="Compatibility spelling for --project while existing local scripts migrate.",
-    ),
     root: Path = _ROOT_OPTION,
 ) -> None:
     """Build an immutable representative task set from one local canonical trace export.
@@ -70,7 +65,6 @@ def build(
         file: Optional named local trace export path.
         source: Explicit canonical OTLP or PostHog local-export format.
         project: Destination project identifier for immutable local artifacts.
-        name: Compatibility spelling for the destination project identifier.
         root: Local `.wmo` artifact root.
 
     Raises:
@@ -79,7 +73,7 @@ def build(
     """
     started = time.monotonic()
     path = _resolve_trace_file(trace_file, file)
-    project_id = _resolve_project_id(project, name)
+    project_id = _resolve_project_id(project)
     normalized = _load_canonical_traces(path, source)
     if not normalized.traces:
         raise typer.BadParameter(
@@ -118,11 +112,9 @@ def _resolve_trace_file(trace_file: Path | None, file: Path | None) -> Path:
     return resolved
 
 
-def _resolve_project_id(project: str | None, name: str | None) -> str:
-    """Resolve the one local destination project while rejecting ambiguous legacy input."""
-    if project is not None and name is not None and project != name:
-        raise typer.BadParameter("--project and --name must match when both are supplied")
-    return project or name or _DEFAULT_PROJECT_ID
+def _resolve_project_id(project: str | None) -> str:
+    """Resolve the one local destination project with the default when omitted."""
+    return project or _DEFAULT_PROJECT_ID
 
 
 def _load_canonical_traces(path: Path, source: str) -> TraceNormalizationResult:

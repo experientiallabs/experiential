@@ -520,7 +520,7 @@ def _span_failure(raw: JsonObject, attributes: JsonObject) -> StructuredFailure 
 
 
 def _validate_tool_pairs(spans: Sequence[TraceSpan]) -> None:
-    """Reject explicit tool-call IDs whose call or result pair is absent or ambiguous."""
+    """Reject incomplete, ambiguous, or causally inconsistent explicit tool-call pairs."""
     calls: dict[str, TraceSpan] = {}
     results: dict[str, TraceSpan] = {}
     for span in spans:
@@ -543,6 +543,32 @@ def _validate_tool_pairs(spans: Sequence[TraceSpan]) -> None:
         if missing_calls:
             pieces.append(f"missing calls for {missing_calls[:3]}")
         raise OtlpTraceFormatError("unpaired explicit tool call IDs: " + ", ".join(pieces))
+    for call_id in sorted(calls):
+        _validate_tool_pair(call_id, calls[call_id], results[call_id])
+
+
+def _validate_tool_pair(call_id: str, call: TraceSpan, result: TraceSpan) -> None:
+    """Validate one explicit tool call and result as one causal, non-contradictory pair."""
+    call_name = _required_text(
+        call.attributes.get("gen_ai.tool.name"),
+        f"tool call {call_id!r} name",
+    )
+    result_name = _required_text(
+        result.attributes.get("gen_ai.tool.name"),
+        f"tool result {call_id!r} name",
+    )
+    if call_name != result_name:
+        raise OtlpTraceFormatError(
+            f"tool result {call_id!r} names {result_name!r}, not paired call name {call_name!r}"
+        )
+    if result.started_at < call.ended_at:
+        raise OtlpTraceFormatError(f"tool result {call_id!r} starts before paired call completes")
+    if call.parent_span_id == result.span_id:
+        raise OtlpTraceFormatError(f"tool call {call_id!r} cannot name its paired result as parent")
+    if result.parent_span_id is not None and result.parent_span_id != call.span_id:
+        raise OtlpTraceFormatError(
+            f"tool result {call_id!r} parent contradicts paired call span {call.span_id!r}"
+        )
 
 
 def _initial_request(

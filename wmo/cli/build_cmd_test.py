@@ -225,3 +225,13 @@ def test_build_rejects_unknown_source_and_missing_local_evidence(tmp_path: Path)
     assert "choose one of: otlp, posthog" in " ".join(unknown.output.replace("│", " ").split())
     assert missing.exit_code == 2
     assert "trace file not found" in missing.output
+
+
+def test_build_rejects_the_removed_name_compatibility_alias(tmp_path: Path) -> None:
+    """The direct task-set build accepts only --project for its local destination."""
+    source = _otlp_export(tmp_path, count=1)
+
+    result = _RUNNER.invoke(app, ["build", str(source), "--name", "support"])
+
+    assert result.exit_code == 2
+    assert "No such option: --name" in result.output

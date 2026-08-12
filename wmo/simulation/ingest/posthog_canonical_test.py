@@ -284,6 +284,28 @@ def test_posthog_rejects_unmatched_explicit_tool_results() -> None:
     )
 
 
+def test_posthog_rejects_provider_only_model_identity() -> None:
+    """A generation must not turn a partial provider identity into a model-less span."""
+    events = _posthog_events()
+    _event_properties(events[0]).pop("$ai_model")
+
+    result = normalize_posthog_payload(events, source=_source())
+
+    assert result.traces == ()
+    assert "provider but no model" in result.issues[0].message
+
+
+def test_posthog_rejects_model_only_model_identity() -> None:
+    """A generation must not turn a partial model identity into a model-less span."""
+    events = _posthog_events()
+    _event_properties(events[0]).pop("$ai_provider")
+
+    result = normalize_posthog_payload(events, source=_source())
+
+    assert result.traces == ()
+    assert "model but no provider" in result.issues[0].message
+
+
 def test_posthog_same_tool_multicall_without_result_ids_pairs_fifo() -> None:
     events = _posthog_events()
     generation_properties = _event_properties(events[0])

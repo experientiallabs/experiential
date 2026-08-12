@@ -113,6 +113,23 @@ def _payload_spans(payload: dict[str, object]) -> list[object]:
     return cast(list[object], scope_span["spans"])
 
 
+def _span(payload: dict[str, object], index: int) -> dict[str, object]:
+    """Return one mutable source span from an OTLP fixture."""
+    return cast(dict[str, object], _payload_spans(payload)[index])
+
+
+def _replace_attribute(
+    payload: dict[str, object], *, span_index: int, key: str, value: object
+) -> None:
+    """Replace one fixture attribute while retaining its OTLP AnyValue encoding."""
+    attributes = cast(list[dict[str, object]], _span(payload, span_index)["attributes"])
+    for attribute in attributes:
+        if attribute["key"] == key:
+            attribute["value"] = _attribute(key, value)["value"]
+            return
+    raise AssertionError(f"fixture has no attribute {key!r}")
+
+
 def _payload_with_late_request() -> dict[str, object]:
     """Return a fixture whose later span tries to alter request-visible evidence."""
     payload = _payload()
@@ -167,6 +184,57 @@ def test_normalizes_w3c_genai_trace_and_wmo_outcome_extensions() -> None:
     assert trace.spans[0].model is not None
     assert trace.spans[0].model.provider == "openai"
     assert trace.spans[1].parent_span_id == _CALL_SPAN_ID
+
+
+def test_otlp_accepts_a_causal_matching_tool_pair() -> None:
+    """A result that follows its matching call and names it as parent remains valid."""
+    result = normalize_otlp_payload(_payload(), source=_source())
+
+    assert result.issues == ()
+    call, tool_result = result.traces[0].spans
+    assert tool_result.started_at >= call.ended_at
+    assert tool_result.parent_span_id == call.span_id
+    assert tool_result.attributes["gen_ai.tool.name"] == call.attributes["gen_ai.tool.name"]
+
+
+def test_otlp_rejects_a_tool_result_that_precedes_its_call() -> None:
+    """An explicit result cannot begin before the corresponding model call completes."""
+    payload = _payload()
+    tool_result = _span(payload, 1)
+    tool_result["startTimeUnixNano"] = "1759999998000000000"
+    tool_result["endTimeUnixNano"] = "1759999999000000000"
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.traces == ()
+    assert "starts before paired call completes" in result.issues[0].message
+
+
+def test_otlp_rejects_mismatched_explicit_tool_pair_names() -> None:
+    """A tool result cannot reuse a call ID for a different named tool."""
+    payload = _payload()
+    _replace_attribute(
+        payload,
+        span_index=1,
+        key="gen_ai.tool.name",
+        value="delete_reservation",
+    )
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.traces == ()
+    assert "not paired call name" in result.issues[0].message
+
+
+def test_otlp_rejects_a_tool_result_with_a_contradictory_parent() -> None:
+    """A recorded tool-result parent must be the paired model call, when present."""
+    payload = _payload_with_late_request()
+    _span(payload, 1)["parentSpanId"] = _LATE_SPAN_ID
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.traces == ()
+    assert "parent contradicts paired call span" in result.issues[0].message
 
 
 def test_invalid_w3c_identity_excludes_the_trace_with_a_clear_issue() -> None:

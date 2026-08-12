@@ -814,8 +814,12 @@ def _model_snapshot(properties: JsonObject) -> ModelSnapshot | None:
     """Capture PostHog model identity only when both provider and model are present."""
     model_id = _first_property_text(properties, ("$ai_model", "$ai_model_id", "model"))
     provider = _first_property_text(properties, ("$ai_provider", "$ai_system", "provider"))
-    if model_id is None or provider is None:
+    if model_id is None and provider is None:
         return None
+    if model_id is None:
+        raise PostHogPullError("PostHog model identity has a provider but no model")
+    if provider is None:
+        raise PostHogPullError("PostHog model identity has a model but no provider")
     revision = _first_property_text(properties, ("$ai_model_revision", "model_revision"))
     digest = hashlib.sha256(f"{provider}\0{model_id}\0{revision or ''}".encode()).hexdigest()
     return ModelSnapshot(

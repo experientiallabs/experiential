@@ -27,7 +27,7 @@ Re-run it to add another provider's models beside the ones already registered.
 **2. Tune a router on your OTel traces.**
 
 ```bash
-wmo build --file traces.jsonl --name my-model
+wmo build --file traces.jsonl --source otlp --project my-project
 
 # Score every registered model on held-out tasks from your traces
 wmo optimize route sweep my-model --traces traces.otel.jsonl
