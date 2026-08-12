@@ -51,13 +51,8 @@ e2b = ["e2b==2.31.0"]
 # tracks its build behavior. Running harbor task environments ON E2B additionally needs
 # `wmo[harbor,e2b]` plus harbor's own e2b extra (`harbor[e2b]`, for dockerfile-parse).
 harbor = ["harbor==0.20.0"]
-# On-policy distillation (`wmo.optimize.model` + the tinker provider): trains a LoRA student on
-# Tinker from harbor rollouts. Imported lazily, same contract as the e2b extra. The cookbook
-# pin tracks the 0.4.x renderer surface this integration was verified against; Tinker's model
-# lineup churns, so base-model names live in run configs, never in code. The tinker pin tracks
-# the 0.23.x exception surface llm-waterfall's classification trusts by name (classify.py).
-# wandb is optional run tracking (lazy import, activated only via [wandb] enabled in the run config).
-distill = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5", "wandb>=0.17"]
+# Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
+sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
 # The in-process local embedder (`wmo.common.providers.local_embed`, EmbedderKind.LOCAL): Qwen3
 # embeddings with no embedding API in the loop. mlx-lm exists only on Apple silicon, hence the
 # marker; it is imported via importlib there (a static import would break the type gate
@@ -73,7 +68,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-optimizer[otel,e2b,harbor,distill,local]",
+    "world-model-optimizer[otel,e2b,harbor,sft,local]",
 ]
 
 [dependency-groups]
@@ -96,12 +91,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["wmo"]
-# Test-only code is named for pytest discovery (`*_test.py`), and these two are the exceptions
-# that the glob therefore misses: `fake_tinker` is the deterministic Tinker double the distill
-# tests run the whole loop against, and `wmo/conftest.py` is a pytest fixture module. Both are
-# imported only by tests, so neither belongs in the published wheel. `fake_tinker` stays where
-# it is rather than moving under a test path: five test modules import it by that name.
-exclude = ["**/*_test.py", "wmo/optimize/model/fake_tinker.py", "wmo/conftest.py"]
+# Test-only code is named for pytest discovery, and `wmo/conftest.py` is a pytest fixture module.
+exclude = ["**/*_test.py", "wmo/conftest.py"]
 # The vendored waterfall utility's MIT notice at wmo/common/vendor/waterfall/LICENSE needs no
 # force-include: `packages = ["wmo"]` already ships every non-Python file under wmo/.
 
@@ -166,7 +157,6 @@ convention = "google"
 "wmo/optimize/gepa.py" = ["D102"]
 "wmo/optimize/judge.py" = ["D102"]
 "wmo/optimize/judge_quality.py" = ["D102"]
-"wmo/optimize/model/store.py" = ["D102"]
 "wmo/optimize/numeric.py" = ["D102"]
 "wmo/optimize/research/ablation.py" = ["D102"]
 "wmo/optimize/research/concurrency_scaling.py" = ["D102"]

@@ -367,9 +367,8 @@ def load_pool(path: Path = DEFAULT_POOL_PATH) -> ModelPool:
     if not entries:
         raise ValueError(
             f"no [[model]] tables in {path}, so the candidate pool is empty; register a hosted "
-            "model with `wmo providers set <provider>`, add a distilled student with "
-            "`wmo optimize route student <run-dir> --input-per-mtok <p> --output-per-mtok <p>`, "
-            "or write one [[model]] table per candidate by hand"
+            "model with `wmo providers set <provider>`; the former `wmo optimize route student` "
+            "registration is unavailable, so write one [[model]] table per candidate by hand"
         )
     try:
         return ModelPool.model_validate({"models": entries})
@@ -424,7 +423,7 @@ class PoolWrite(NamedTuple):
 
     Two independent facts, because the CLI says a different thing for each and a bool cannot
     carry both. `replaced` answers "was an entry of this name already there", which is the
-    question `wmo optimize route student` prompts about BEFORE writing. `rewritten` answers
+    question an interactive caller prompts about before writing. `rewritten` answers
     "were the operator's comments dropped", which a replacement always does and an ADD can now
     also do, when the roster had to be normalized out of the legacy inline form.
     """
@@ -450,7 +449,7 @@ def upsert_pool_entry(
     key order, and spacing all survive byte for byte. REPLACING an entry has to remove the old
     table, which means re-rendering the file through `tomllib` -> `tomli_w`: that keeps every
     entry's fields but DROPS comments, because neither library round-trips them. Callers that can
-    prompt should say so before replacing (`wmo optimize route student` does).
+    prompt should say so before replacing.
 
     One kind of ADD re-renders too, and so also drops comments: a roster written as the inline
     array `model = [ {...} ]` rather than as `[[model]]` sections cannot be appended to (the

@@ -690,8 +690,7 @@ def test_template_ownership_and_local_concurrency_rules(tmp_path: Path) -> None:
 
 
 def test_custom_agent_import_path_and_extra_kwargs_thread_into_the_job(tmp_path: Path) -> None:
-    """The distill collector's route: a custom bridge plus its extra kwargs, with every
-    scorer-owned kwarg intact next to them."""
+    """A custom bridge retains its extra kwargs next to every scorer-owned setting."""
     scorer = HarborScorer(
         job_template=_job_template(tmp_path),
         tasks=_tasks(tmp_path, ("task-a",)),
@@ -699,15 +698,15 @@ def test_custom_agent_import_path_and_extra_kwargs_thread_into_the_job(tmp_path:
         harness_backend="e2b",
         e2b_template="pi-template",
         agent_concurrency=1,
-        agent_import_path="wmo.optimize.model.agents:WmoDistillHarborAgent",
-        extra_agent_kwargs={"token_sink_dir": "/runs/tokens/step-0000"},
+        agent_import_path="example.agents:CustomAgent",
+        extra_agent_kwargs={"trace_sink_dir": "/runs/traces"},
         runner=_Runner([]),
     )
     candidate = HarnessDoc.baseline()
     config = scorer._candidate_job(candidate)
     [agent] = config.agents
-    assert agent.import_path == "wmo.optimize.model.agents:WmoDistillHarborAgent"
-    assert agent.kwargs["token_sink_dir"] == "/runs/tokens/step-0000"
+    assert agent.import_path == "example.agents:CustomAgent"
+    assert agent.kwargs["trace_sink_dir"] == "/runs/traces"
     assert agent.kwargs["harness"] == candidate.model_dump(mode="json")
     assert agent.kwargs["harness_backend"] == "e2b"
     assert agent.kwargs["e2b_template"] == "pi-template"
@@ -716,9 +715,8 @@ def test_custom_agent_import_path_and_extra_kwargs_thread_into_the_job(tmp_path:
 def test_agent_model_name_overrides_the_provider_provenance_label(tmp_path: Path) -> None:
     """Harbor's terminus-2 reads AgentConfig.model_name as a REAL model identity.
 
-    It picks its renderer and tokenizer from it, so the distill collector sends the base model
-    there while the sampler path travels in the agent kwargs. The default (the WMO bridge, which
-    treats the field as provenance) is unchanged.
+    It picks its renderer and tokenizer from it. The default WMO bridge keeps the provider
+    identity as provenance.
     """
     default = HarborScorer(
         job_template=_job_template(tmp_path),
@@ -743,8 +741,7 @@ def test_agent_model_name_overrides_the_provider_provenance_label(tmp_path: Path
     )
     [agent] = overridden._candidate_job(HarnessDoc.baseline()).agents
     assert agent.model_name == "Qwen/Qwen3-8B"
-    # The provider identity is still recorded in the kwargs, which is what the collector's
-    # stale-policy check reads to spot a job dir from another session's sampler weights.
+    # Provider identity remains in the kwargs for provenance checks.
     assert agent.kwargs["provider_config"]["model"] == "worker-model"
 
     with pytest.raises(ValueError, match="agent_model_name must be a nonempty string"):
@@ -799,14 +796,14 @@ def test_create_threads_agent_import_path_and_extra_kwargs(
             harness_backend="e2b",
             e2b_template="pi-template",
             agent_concurrency=1,
-            agent_import_path="wmo.optimize.model.agents:WmoDistillHarborAgent",
-            extra_agent_kwargs={"token_sink_dir": "/runs/tokens/step-0001"},
+            agent_import_path="example.agents:CustomAgent",
+            extra_agent_kwargs={"trace_sink_dir": "/runs/traces"},
         )
     )
     config = scorer._candidate_job(HarnessDoc.baseline())
     [agent] = config.agents
-    assert agent.import_path == "wmo.optimize.model.agents:WmoDistillHarborAgent"
-    assert agent.kwargs["token_sink_dir"] == "/runs/tokens/step-0001"
+    assert agent.import_path == "example.agents:CustomAgent"
+    assert agent.kwargs["trace_sink_dir"] == "/runs/traces"
 
 
 def test_harbor_retries_thread_into_retry_config_with_default_exclusions(

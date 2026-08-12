@@ -2,7 +2,7 @@
 
 Each probe runs in a fresh subprocess so pytest collection of other CLI tests cannot pollute
 ``sys.modules``. Light paths must stay free of FastAPI, sklearn, scipy, uvicorn, and the heavy
-serving / distill / route bodies.
+serving / SFT / route bodies.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ assert not bad, f"heavy modules loaded for wmo --help: {bad}"
     )
 
 
-def test_list_and_config_do_not_load_serve_or_distill() -> None:
+def test_list_and_config_do_not_load_serve_or_sft() -> None:
     _run(
         """
 import sys

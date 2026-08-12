@@ -36,7 +36,7 @@ def _configured_project(tmp_path: Path, training: TinkerSFTSpec) -> _ConfiguredP
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"tinker": ConnectionConfig(provider="tinker")},
-            models={"base": ModelRecord(connection="tinker", model="base-model")},
+            models={"base": ModelRecord(connection="tinker", model="test-base-model")},
         ),
     )
     config = create_sft_model_optimization_config(
@@ -44,7 +44,9 @@ def _configured_project(tmp_path: Path, training: TinkerSFTSpec) -> _ConfiguredP
         dataset_id=fixture.artifact.dataset.dataset_id,
         model_alias="trained",
         tinker_connection="tinker",
+        base_model_alias="base",
         training=training,
+        allow_unbudgeted=True if training.maximum_cost_usd is None else None,
         created_at=_TIME,
         code_revision="w14m-test",
     )
@@ -59,6 +61,9 @@ def test_optimize_help_exposes_persisted_sft_and_not_the_deleted_distill_branch(
     assert result.exit_code == 0, result.output
     assert "model" in result.output
     assert "distill" not in result.output
+    route_help = CliRunner().invoke(app, ["optimize", "route", "--help"])
+    assert route_help.exit_code == 0, route_help.output
+    assert "student" not in route_help.output
 
 
 def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(

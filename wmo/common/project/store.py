@@ -16,6 +16,7 @@ from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
+    ArtifactInput,
     SecretBoundaryError,
     assert_secret_free,
     assert_text_secret_free,
@@ -24,7 +25,7 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
-from wmo.common.project.manifests import ArtifactFile, ArtifactManifest, file_digest
+from wmo.common.project.manifests import ArtifactFile, ArtifactManifest, artifact_input, file_digest
 from wmo.common.project.paths import ProjectPaths, validate_local_id
 from wmo.common.project.project import ProjectConfig, load_project_config, write_project_config
 
@@ -382,15 +383,18 @@ class ProjectStore:
         except ValueError as exc:
             raise ProjectStoreError(str(exc)) from exc
 
-    def set_model_optimization_config_id(self, config_id: str) -> ProjectConfig:
-        """Atomically bind one immutable SFT optimization config to this project.
+    def bind_model_optimization_config(
+        self, config: ArtifactInput, *, artifact_type: str
+    ) -> ProjectConfig:
+        """Atomically bind one verified immutable SFT config artifact to this project.
 
         The pointer is deliberately write-once.  The referenced config remains an immutable
         artifact, while this narrow project-level binding makes ``wmo optimize model <project>``
         unambiguous after the W12 dataset has been persisted.
 
         Args:
-            config_id: Persisted local config artifact ID to bind to the project.
+            config: Exact manifest input for the persisted local config artifact.
+            artifact_type: Expected domain-specific immutable artifact type.
 
         Returns:
             The existing or newly bound project configuration.
@@ -399,29 +403,51 @@ class ProjectStore:
             ProjectStoreError: The project is missing, invalid, or already names another config.
         """
         try:
-            validated_config_id = validate_local_id(config_id, label="model optimization config ID")
-        except ValueError as exc:
-            raise ProjectStoreError(str(exc)) from exc
+            validated_type = validate_local_id(
+                artifact_type, label="model optimization artifact type"
+            )
+            self._verify_model_optimization_config_input(config, artifact_type=validated_type)
+        except (ArtifactCorruptionError, ValueError) as exc:
+            raise ProjectStoreError(
+                f"model optimization config binding is not a verified immutable artifact: {exc}"
+            ) from exc
         with file_write_lock(self.paths.project_toml, what="model optimization configuration"):
+            try:
+                self._verify_model_optimization_config_input(config, artifact_type=validated_type)
+            except (ArtifactCorruptionError, ValueError) as exc:
+                raise ProjectStoreError(
+                    f"model optimization config binding changed before commit: {exc}"
+                ) from exc
             try:
                 existing = load_project_config(self.paths.project_toml)
             except ValueError as exc:
                 raise ProjectStoreError(str(exc)) from exc
-            current_config_id = existing.model_optimization_config_id
-            if current_config_id == validated_config_id:
+            current_config = existing.model_optimization_config
+            if current_config == config:
                 return existing
-            if current_config_id is not None:
+            if current_config is not None:
                 raise ProjectStoreError(
                     "project.toml already names a different immutable model optimization config"
                 )
-            updated = existing.model_copy(
-                update={"model_optimization_config_id": validated_config_id}
-            )
+            updated = existing.model_copy(update={"model_optimization_config": config})
             try:
                 write_project_config(self.paths.project_toml, updated)
             except ValueError as exc:
                 raise ProjectStoreError(str(exc)) from exc
             return updated
+
+    def _verify_model_optimization_config_input(
+        self, config: ArtifactInput, *, artifact_type: str
+    ) -> None:
+        """Require a project pointer to name this exact completed artifact manifest."""
+        stored = self.artifacts.read(config.artifact_id)
+        if stored.manifest.artifact_type != artifact_type:
+            raise ValueError(
+                f"artifact {config.artifact_id} is {stored.manifest.artifact_type!r}, "
+                f"not {artifact_type!r}"
+            )
+        if artifact_input(stored.manifest) != config:
+            raise ValueError("artifact manifest digest differs from the requested project binding")
 
     def write_review(self, review: BaseModel | JsonValue) -> None:
         """Lock and atomically replace the sole mutable local review draft.

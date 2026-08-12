@@ -194,14 +194,31 @@ def test_secret_boundary_review_draft_and_write_once_model_config_binding(tmp_pa
         store.initialize(
             ProjectConfig(project_id="support-project", redacted_field_names=("email",))
         )
-    assert store.set_model_optimization_config_id("sft-model-optimization-config-a") == (
+    manifest = store.artifacts.write_json(
+        artifact_id="sft-model-optimization-config-a",
+        artifact_type="sft-model-optimization-config",
+        envelope=_envelope(),
+        files={"config.json": {"config_id": "sft-model-optimization-config-a"}},
+    )
+    config_input = artifact_input(manifest)
+    assert store.bind_model_optimization_config(
+        config_input, artifact_type="sft-model-optimization-config"
+    ) == (
         ProjectConfig(
             project_id="support-project",
-            model_optimization_config_id="sft-model-optimization-config-a",
+            model_optimization_config=config_input,
         )
     )
-    assert store.set_model_optimization_config_id("sft-model-optimization-config-a").project_id == (
-        "support-project"
+    assert store.bind_model_optimization_config(
+        config_input, artifact_type="sft-model-optimization-config"
+    ).project_id == ("support-project")
+    different_manifest = store.artifacts.write_json(
+        artifact_id="sft-model-optimization-config-b",
+        artifact_type="sft-model-optimization-config",
+        envelope=_envelope(),
+        files={"config.json": {"config_id": "sft-model-optimization-config-b"}},
     )
     with pytest.raises(ProjectStoreError, match="different immutable model optimization config"):
-        store.set_model_optimization_config_id("sft-model-optimization-config-b")
+        store.bind_model_optimization_config(
+            artifact_input(different_manifest), artifact_type="sft-model-optimization-config"
+        )

@@ -185,8 +185,8 @@ def test_providers_verify_missing_optional_sdk_points_at_the_install(
 
     flat = _flat(result.output)
     # pip is the documented install path, so the extra must be reachable without a checkout,
-    # and the `[distill]` must survive rich markup rather than being read as a style tag.
-    assert "pip install 'world-model-optimizer[distill]'" in flat
+    # and the `[sft]` must survive rich markup rather than being read as a style tag.
+    assert "pip install 'world-model-optimizer[sft]'" in flat
     assert "credentials are set" not in flat
 
 

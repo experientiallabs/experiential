@@ -1,7 +1,7 @@
 """Atomic writes for the small files wmo owns: a reader sees the old file or the whole new one.
 
 Every file this covers is a registry or a config that a later command reads back: the candidate
-pool roster, a store's `aliases.toml`, `.wmo/config.toml`, `.wmo/settings.toml`, a distill run's
+pool roster, a store's `aliases.toml`, `.wmo/config.toml`, `.wmo/settings.toml`, an SFT run's
 resume state, a fitted policy, a paid sweep's outcome matrix. They share one failure mode, and it
 is not losing the file. It is leaving a TRUNCATED or EMPTY file behind an apparently successful
 write, so the next command fails to parse something nobody edited, and the recovery is hand-repair.
@@ -45,7 +45,7 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
     - **fsync on the payload and then on its parent directory.** Without both, a power loss can
       persist the rename while the data blocks are lost, leaving an empty file behind a write that
       reported success. These files are small and written rarely: measured at 0.08 ms per write,
-      about 0.1 s across a 200-step distill run whose steps are minutes of paid rollouts.
+      about 0.1 s across a 200-step SFT run whose steps are minutes of paid work.
     - **The destination's mode is carried over.** `replace` installs a NEW inode, so without this
       a file an operator or an installer had restricted comes back as 0644 on the first write.
     - **A symlinked destination is written THROUGH, not replaced.** See `resolve_write_target`.

@@ -12,7 +12,7 @@ tinker-cookbook `Renderer` so cookbook churn stays contained in this module.
 `build_renderer` resolves the cookbook renderer for a base model the same way
 the cookbook's own LiteLLM provider does (`get_recommended_renderer_name`).
 tinker-cookbook is an optional extra and is imported lazily
-(`uv sync --extra distill`), mirroring the e2b extra's contract.
+(`uv sync --extra sft`), mirroring the e2b extra's contract.
 """
 
 from __future__ import annotations
@@ -34,10 +34,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-MISSING_DISTILL_EXTRA = (
-    "the tinker-cookbook SDK is not installed; run `uv sync --extra distill` "
-    "(or `pip install 'world-model-optimizer[distill]'`) to use the Tinker "
-    "distillation provider"
+MISSING_TINKER_SFT_EXTRA = (
+    "the tinker-cookbook SDK is not installed; run `uv sync --extra sft` "
+    "(or `pip install 'world-model-optimizer[sft]'`) to use the Tinker provider"
 )
 
 
@@ -205,13 +204,13 @@ def renderer_messages_from_chat(messages: list[ChatMessage]) -> list[RendererMes
     plus assistant `tool_calls` are preserved.
 
     Raises:
-        ImportError: If tinker-cookbook is not installed (distill extra).
+        ImportError: If tinker-cookbook is not installed (sft extra).
         ValueError: If a message carries non-text content parts.
     """
     try:
         from tinker_cookbook.renderers.base import ToolCall
     except ImportError as exc:  # pragma: no cover - exercised via sys.modules patching
-        raise ImportError(MISSING_DISTILL_EXTRA) from exc
+        raise ImportError(MISSING_TINKER_SFT_EXTRA) from exc
 
     out: list[RendererMessage] = []
     for msg in messages:
@@ -345,8 +344,8 @@ class CookbookChatRendering:
         rendered OUTPUT chunks without its header, because the header is
         already the generation prompt's trailing suffix.
 
-        This is what lets a teacher's TEXT episode become training data under
-        the STUDENT's own template (`wmo.optimize.model.text_episodes`):
+        This is what lets a text transcript become supervised training data under
+        the target model's own template:
         prompt(index) + this turn's ids is exactly the prefix the next turn's
         prompt extends, which is the property `build_datums` merges on.
 
@@ -364,14 +363,14 @@ class CookbookChatRendering:
             The turn's token ids, framed as the sampled continuation.
 
         Raises:
-            ImportError: If tinker-cookbook is not installed (distill extra).
+            ImportError: If tinker-cookbook is not installed (sft extra).
             ValueError: If `index` is out of range, does not name an assistant
                 turn, or the turn renders to non-text chunks.
         """
         try:
             from tinker_cookbook.renderers.base import RenderContext
         except ImportError as exc:  # pragma: no cover - exercised via sys.modules patching
-            raise ImportError(MISSING_DISTILL_EXTRA) from exc
+            raise ImportError(MISSING_TINKER_SFT_EXTRA) from exc
 
         if not 0 <= index < len(messages):
             raise ValueError(f"index {index} is out of range for {len(messages)} message(s)")
@@ -445,14 +444,14 @@ class CookbookChatRendering:
             Token ids to append after the previous prompt plus sampled ids.
 
         Raises:
-            ImportError: If tinker-cookbook is not installed (distill extra).
+            ImportError: If tinker-cookbook is not installed (sft extra).
             ValueError: If `delta_start` is out of range or a delta message
                 renders to non-text chunks.
         """
         try:
             from tinker_cookbook.renderers.base import RenderContext
         except ImportError as exc:  # pragma: no cover - exercised via sys.modules patching
-            raise ImportError(MISSING_DISTILL_EXTRA) from exc
+            raise ImportError(MISSING_TINKER_SFT_EXTRA) from exc
 
         if not 1 <= delta_start <= len(messages):
             raise ValueError(
@@ -669,7 +668,7 @@ def build_renderer(base_model: str, tokenizer: RendererTokenizer) -> CookbookCha
         The cookbook-backed `ChatRendering` implementation.
 
     Raises:
-        ImportError: If tinker-cookbook is not installed (distill extra).
+        ImportError: If tinker-cookbook is not installed (sft extra).
         ValueError: If the cookbook has no renderer mapping for `base_model`.
     """
     try:
@@ -677,7 +676,7 @@ def build_renderer(base_model: str, tokenizer: RendererTokenizer) -> CookbookCha
         from tinker_cookbook.model_info import get_recommended_renderer_name
         from tinker_cookbook.renderers import get_renderer
     except ImportError as exc:  # pragma: no cover - exercised via sys.modules patching
-        raise ImportError(MISSING_DISTILL_EXTRA) from exc
+        raise ImportError(MISSING_TINKER_SFT_EXTRA) from exc
 
     try:
         renderer_name = get_recommended_renderer_name(base_model)
@@ -696,8 +695,8 @@ def build_offline_rendering(base_model: str) -> CookbookChatRendering:
     """Build a base model's rendering without any Tinker client.
 
     The rendering only needs a tokenizer, and the cookbook can load one from
-    Hugging Face directly, so text-to-datum work (`wmo.optimize.model.text_episodes`)
-    runs with no training client, no sampler, and no network once the tokenizer
+    Hugging Face directly, so offline datum rendering runs with no training client, no sampler,
+    and no network once the tokenizer
     is cached. The two production call sites pass a live client's tokenizer
     because they already hold one, not because a client is required.
 
@@ -709,13 +708,13 @@ def build_offline_rendering(base_model: str) -> CookbookChatRendering:
         The cookbook-backed `ChatRendering` for that model.
 
     Raises:
-        ImportError: If tinker-cookbook is not installed (distill extra).
+        ImportError: If tinker-cookbook is not installed (sft extra).
         ValueError: If the cookbook has no renderer mapping for `base_model`.
         OSError: If the tokenizer is neither cached nor downloadable.
     """
     try:
         from tinker_cookbook.tokenizer_utils import get_tokenizer
     except ImportError as exc:  # pragma: no cover - exercised via sys.modules patching
-        raise ImportError(MISSING_DISTILL_EXTRA) from exc
+        raise ImportError(MISSING_TINKER_SFT_EXTRA) from exc
 
     return build_renderer(base_model, cast("RendererTokenizer", get_tokenizer(base_model)))

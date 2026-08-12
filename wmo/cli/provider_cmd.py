@@ -355,7 +355,7 @@ def _print_verify_result(result: VerifyResult, sources: list[str], *, prefix: st
 
     `sources` names what asked for this provider (world model names, `models.<role>` settings
     roles) so a failure points at the thing to fix. The detail and the hint are escaped: they
-    carry raw provider error text and pip extras (`...[distill]`), and an unescaped `[...]` in
+    carry raw provider error text and pip extras (`...[sft]`), and an unescaped `[...]` in
     either would be read as rich markup and silently dropped from the report.
     """
     mark = "[green]ok[/green]" if result.ok else "[red]fail[/red]"

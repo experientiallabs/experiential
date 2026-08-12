@@ -1,6 +1,6 @@
-"""Tinker sampling provider: serves the pi agent from a Tinker LoRA student.
+"""Tinker sampling provider for a Tinker-hosted model.
 
-During distillation rollouts the student model lives on Tinker. This provider
+When a configured model lives on Tinker, this provider
 renders each structured chat request to token ids with the base model's
 cookbook renderer, samples from a Tinker sampling client, and parses the
 sampled tokens back into an OpenAI-style chat response for the pi bridge.
@@ -21,7 +21,7 @@ edit falls back to a full re-render and is counted on the recorder.
 `config.model_type` carries the base model name (renderer and tokenizer
 identity); `config.model` carries either a `tinker://` sampler-weights path or
 a base model name for an untrained student. The tinker SDK is an optional
-extra imported lazily (`uv sync --extra distill`), same contract as e2b.
+extra imported lazily (`uv sync --extra sft`), same contract as e2b.
 
 Every SDK call is deadline-bounded (`wmo.common.providers.tinker_deadlines`): a wedged
 session raises a retryable `TinkerDeadlineError` instead of hanging, and the
@@ -85,8 +85,8 @@ logger = logging.getLogger(__name__)
 TINKER_API_KEY_ENV = "TINKER_API_KEY"
 
 _MISSING_TINKER_EXTRA = (
-    "the tinker SDK is not installed; run `uv sync --extra distill` (or "
-    "`pip install 'world-model-optimizer[distill]'`) to use the tinker provider"
+    "the tinker SDK is not installed; run `uv sync --extra sft` (or "
+    "`pip install 'world-model-optimizer[sft]'`) to use the tinker provider"
 )
 """Both install forms, because `pip install world-model-optimizer` is the documented entry point
 and `uv sync` needs a checkout of this repo to have anything to sync."""
@@ -118,7 +118,7 @@ def check_tinker_prerequisites() -> None:
     of them that drifts. Nothing here touches the network.
 
     Raises:
-        ImportError: If the tinker SDK is not installed (the distill extra).
+        ImportError: If the tinker SDK is not installed (the sft extra).
         RuntimeError: If TINKER_API_KEY is missing from the environment.
     """
     try:
@@ -139,8 +139,7 @@ def shared_service_client() -> tinker.ServiceClient:
     its internal holder, so every constructed client lives (and pins one live
     server-side session) for the rest of the process. Constructing one per
     trial therefore leaks sessions until the service rejects new session
-    creation with capacity errors; every wmo consumer (the rollout provider,
-    the teacher scorer, the distill loop) shares this single client instead.
+    creation with capacity errors; every WMO consumer shares this single client instead.
 
     The API key is checked on every call, before the cache, so a missing key
     stays an actionable error rather than an SDK-internal auth failure.
@@ -149,7 +148,7 @@ def shared_service_client() -> tinker.ServiceClient:
         The shared service client.
 
     Raises:
-        ImportError: If the tinker SDK is not installed (the distill extra).
+        ImportError: If the tinker SDK is not installed (the sft extra).
         RuntimeError: If TINKER_API_KEY is missing from the environment.
         TinkerDeadlineError: If construction exceeds the connect deadline
             (nothing is cached, so the next call rebuilds).
@@ -215,7 +214,7 @@ def shared_sampling_client(model: str) -> tinker.SamplingClient:
         The cached (or newly built and cached) sampling client.
 
     Raises:
-        ImportError: If the tinker SDK is not installed (the distill extra).
+        ImportError: If the tinker SDK is not installed (the sft extra).
         RuntimeError: If TINKER_API_KEY is missing from the environment.
         TinkerDeadlineError: If client construction exceeds the connect
             deadline (nothing is cached, so the next call rebuilds).
@@ -257,7 +256,7 @@ def served_context_window(model: str) -> int | None:
         capability probe is unavailable).
 
     Raises:
-        ImportError: If the tinker SDK is not installed (the distill extra).
+        ImportError: If the tinker SDK is not installed (the sft extra).
         RuntimeError: If TINKER_API_KEY is missing from the environment.
     """
     global _served_context_windows
@@ -318,8 +317,7 @@ class TokenSpan(BaseModel):
     re-render the same conversation with its own chat template instead of
     guessing at the student template's framing. They are optional for
     backward compatibility: sinks recorded before they existed still load, and
-    `wmo.optimize.model.tokens.reconstruct_conversation` reports honestly (None) that
-    such a sink cannot be replayed.
+    such a sink cannot be replayed without the original conversation reconstruction contract.
     """
 
     call_index: int
@@ -333,17 +331,15 @@ class TokenSpan(BaseModel):
     logprobs_are_placeholders: bool = False
     """True when `sampled_logprobs` are stand-ins, not sampler-issued values.
 
-    Set only by the text bridge (`wmo.optimize.model.text_episodes`), which re-encodes
-    a teacher's recorded TEXT under the student's template: the token ids are
-    real training targets but no sampler ever scored them, so there are no
-    logprobs to record and the field carries zeros to satisfy alignment.
+    A text-derived record may re-encode targets under a different template. The token ids are
+    training targets but no sampler scored them, so the field carries zeros to satisfy alignment.
 
     Hard-target cross_entropy is the only sound consumer (its wire format sends
     target_tokens and weights, never logprobs). The advantage losses
     (`importance_sampling`, `ppo`) compute a teacher-minus-student gap FROM
     these values, so training on placeholders would optimize a fabricated
-    objective; `wmo.optimize.model.data.attach_advantages` refuses such spans rather
-    than trusting callers to remember. Default False, so every recorded sink
+    objective; consumers must reject such spans rather than trusting callers to remember.
+    Default False, so every recorded sink
     and every previously written manifest loads unchanged."""
 
     delta_start: int | None = None
@@ -459,8 +455,8 @@ class SampledSequenceLike(Protocol):
 class TinkerSampler(Protocol):
     """The sampling call the provider makes, in token-id terms.
 
-    `wmo.optimize.model.fake_tinker.FakeSamplingClient` satisfies this directly;
-    real `tinker.SamplingClient`s are adapted via `SdkSampler`.
+    Deterministic injected samplers satisfy this directly; real `tinker.SamplingClient`s are
+    adapted via `SdkSampler`.
     """
 
     def sample(
@@ -486,8 +482,7 @@ class SdkSampler:
     """Adapts a real `tinker.SamplingClient` to the `TinkerSampler` seam.
 
     The provider's lazy path builds this itself; callers that already hold a
-    sampling client (e.g. the distill loop refreshing student weights via
-    `save_weights_and_get_sampling_client`) wrap it in this before injecting.
+    sampling client wrap it in this before injecting.
     """
 
     def __init__(self, client: tinker.SamplingClient) -> None:
@@ -603,15 +598,14 @@ def _first_incompatible_index(
 
 
 class TinkerChatProvider:
-    """Serves completions from a Tinker-hosted LoRA student during distillation.
+    """Serves completions from a Tinker-hosted configured model.
 
     Args:
         config: Provider config; `model_type` is the base model name and
             `model` is the `tinker://` sampler-weights path (or a base model
             name for an untrained student).
-        sampling_client: Optional injected sampler (tests use the fakes in
-            `wmo.optimize.model.fake_tinker`; wrap a real `tinker.SamplingClient` in
-            `SdkSampler`). When None, a real client is fetched lazily from
+        sampling_client: Optional injected sampler. Wrap a real `tinker.SamplingClient` in
+            `SdkSampler`. When None, a real client is fetched lazily from
             the process-wide shared cache (`shared_sampling_client`, keyed by
             `config.model`; one client per model string serves every
             concurrent trial, and the SDK documents `SamplingClient` as
@@ -703,7 +697,7 @@ class TinkerChatProvider:
         being served, and the sampling client being constructible.
 
         Raises:
-            ImportError: If the tinker SDK is not installed (the distill extra).
+            ImportError: If the tinker SDK is not installed (the sft extra).
             RuntimeError: If TINKER_API_KEY is missing from the environment.
         """
         check_tinker_prerequisites()

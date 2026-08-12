@@ -11,7 +11,7 @@ from wmo.common.config import (
     PROVIDER_ENV_VARS,
 )
 
-_PROVIDER_EXTRAS: dict[str, str] = {"tinker": "distill"}
+_PROVIDER_EXTRAS: dict[str, str] = {"tinker": "sft"}
 """Providers whose SDK ships in an optional extra, keyed by kind value for the hint.
 
 Every other provider SDK is a core dependency. A missing module for one of those means the

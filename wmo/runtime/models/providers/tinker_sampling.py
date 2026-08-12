@@ -29,8 +29,8 @@ if TYPE_CHECKING:
 
 _JSON_OBJECT = TypeAdapter(JsonObject)
 _OPTIONAL_DEPENDENCY_GUIDANCE = (
-    "install the Tinker sampling dependencies with `uv sync --extra distill` or "
-    "`pip install 'world-model-optimizer[distill]'`"
+    "install the Tinker sampling dependencies with `uv sync --extra sft` or "
+    "`pip install 'world-model-optimizer[sft]'`"
 )
 
 

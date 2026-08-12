@@ -12,7 +12,7 @@ read whatever the redirect supplied, and a blank line was taken as approval.
 
 This lives in one place because the rule kept being re-implemented per command and a site kept
 being missed: `wmo optimize model` shipped proceed-and-note and spent a scripted caller's real
-money (#305), `route sweep`, `optimize distill run` and the harbor population search were fixed
+money (#305), `route sweep`, managed SFT execution, and the harbor population search were fixed
 next (#307), and the world-model mode of `wmo optimize harness` was still falling through with
 no prompt and no notice after both. Every gate now calls `require_spend_consent`, so there is
 one behaviour to read and one place a future spend surface has to reach for.

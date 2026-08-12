@@ -33,8 +33,8 @@ if TYPE_CHECKING:
     from tinker_cookbook.renderers import Message, Renderer
 
 _MISSING_TINKER_EXTRA = (
-    "Tinker SFT requires the optional distill dependencies; run `uv sync --extra distill` "
-    "or install `world-model-optimizer[distill]`"
+    "Tinker SFT requires the optional sft dependencies; run `uv sync --extra sft` "
+    "or install `world-model-optimizer[sft]`"
 )
 
 

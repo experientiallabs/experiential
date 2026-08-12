@@ -22,14 +22,16 @@ Examples:
             dataset_id=dataset.dataset.dataset_id,
             model_alias="support-sft",
             tinker_connection="tinker",
+            base_model_alias="base",
             training=training_spec,
+            allow_unbudgeted=True,
             created_at=created_at,
             code_revision=revision,
         )
         write_sft_model_optimization_config(store, config)
         result = run_sft_model_optimization(
             store,
-            config,
+            config.config_id,
             TinkerTrainerBackend(caller_owned_tinker_service),
             created_at=created_at,
             code_revision=revision,
@@ -56,7 +58,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Never
+from typing import Literal, Never
 
 from pydantic import model_validator
 
@@ -64,6 +66,7 @@ from wmo.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactId,
     ArtifactInput,
+    Sha256,
     sha256_json,
     stable_id,
 )
@@ -72,6 +75,9 @@ from wmo.common.models import (
     ModelCatalog,
     ModelCatalogError,
     ModelRecord,
+    ModelSnapshot,
+    NumericMeasurement,
+    SFTModelProvenance,
     load_model_catalog,
     write_model_catalog,
 )
@@ -94,6 +100,7 @@ from wmo.optimize.model.sft.training_contracts import (
     TinkerSFTSpec,
     TrainerBackend,
 )
+from wmo.optimize.model.sft.training_runtime import _expected_schedule
 
 _CONFIG_ARTIFACT_TYPE = "sft-model-optimization-config"
 _MODEL_FILE = "model.json"
@@ -116,21 +123,35 @@ class SFTModelOptimizationConfig(ArtifactEnvelope):
     dataset: ArtifactInput
     model_alias: ArtifactId
     tinker_connection: ArtifactId
+    base_model_alias: ArtifactId
+    base_model: ModelSnapshot
+    connection_config_sha256: Sha256
     training: TinkerSFTSpec
+    allow_unbudgeted: Literal[True] | None = None
 
     @model_validator(mode="after")
     def _require_exact_bindings(self) -> SFTModelOptimizationConfig:
         """Require content-addressed intent and exactly one frozen W12 input."""
         if self.inputs != (self.dataset,):
             raise ValueError("SFT model optimization configs must name exactly their W12 dataset")
-        expected_config_id = stable_id(
-            "sft-model-optimization-config",
-            {
-                "dataset": self.dataset.model_dump(mode="json"),
-                "model_alias": self.model_alias,
-                "tinker_connection": self.tinker_connection,
-                "training": self.training.model_dump(mode="json"),
-            },
+        if self.training.base_model != self.base_model.model_id:
+            raise ValueError("SFT training base_model must match the frozen base model snapshot")
+        if self.training.maximum_cost_usd is None and self.allow_unbudgeted is not True:
+            raise ValueError(
+                "an SFT model optimization config without maximum_cost_usd must explicitly "
+                "set allow_unbudgeted=true"
+            )
+        if self.training.maximum_cost_usd is not None and self.allow_unbudgeted is not None:
+            raise ValueError("allow_unbudgeted is only valid when maximum_cost_usd is absent")
+        expected_config_id = _config_id(
+            dataset=self.dataset,
+            model_alias=self.model_alias,
+            tinker_connection=self.tinker_connection,
+            base_model_alias=self.base_model_alias,
+            base_model=self.base_model,
+            connection_config_sha256=self.connection_config_sha256,
+            training=self.training,
+            allow_unbudgeted=self.allow_unbudgeted,
         )
         if self.config_id != expected_config_id:
             raise ValueError("SFT model optimization config ID is not content-addressed")
@@ -149,9 +170,12 @@ class SFTModelOptimizationPreflight:
     """
 
     config: SFTModelOptimizationConfig
+    config_input: ArtifactInput
     output_dir: Path
     completed_result: TinkerSFTResult | None
     completed_model: TinkerSFTModelArtifact | None
+    planned_batch_counts: tuple[int, ...]
+    conservative_schedule_cost_usd: NumericMeasurement | None
 
     def __post_init__(self) -> None:
         """Require terminal result and model artifacts to appear as one verified pair."""
@@ -202,7 +226,9 @@ def create_sft_model_optimization_config(
     dataset_id: ArtifactId,
     model_alias: ArtifactId,
     tinker_connection: ArtifactId,
+    base_model_alias: ArtifactId,
     training: TinkerSFTSpec,
+    allow_unbudgeted: bool | None = None,
     created_at: datetime,
     code_revision: str,
 ) -> SFTModelOptimizationConfig:
@@ -217,7 +243,9 @@ def create_sft_model_optimization_config(
         dataset_id: Persisted accepted W12 SFT dataset ID.
         model_alias: New local ``models.toml`` alias for the completed sampling handle.
         tinker_connection: Existing local connection name whose provider is ``tinker``.
+        base_model_alias: Existing catalog alias frozen as W13's exact base model.
         training: Frozen W13 Tinker SFT settings.
+        allow_unbudgeted: Must be ``True`` in immutable config when no cost cap is configured.
         created_at: Time the immutable config is created.
         code_revision: Exact revision that created the config.
 
@@ -228,16 +256,26 @@ def create_sft_model_optimization_config(
         SFTModelOptimizationError: The named dataset is not a verified accepted W12 artifact.
     """
     dataset_input = _verified_dataset_input(store, dataset_id)
-    config_id = stable_id(
-        "sft-model-optimization-config",
-        {
-            "dataset": dataset_input.model_dump(mode="json"),
-            "model_alias": model_alias,
-            "tinker_connection": tinker_connection,
-            "training": training.model_dump(mode="json"),
-        },
-    )
     try:
+        if allow_unbudgeted not in {None, True}:
+            raise ValueError("allow_unbudgeted must be true when it is specified")
+        immutable_unbudgeted: Literal[True] | None = True if allow_unbudgeted is True else None
+        resolved_base_model = _resolve_base_model(
+            _load_tinker_catalog(store, tinker_connection),
+            tinker_connection=tinker_connection,
+            base_model_alias=base_model_alias,
+            training=training,
+        )
+        config_id = _config_id(
+            dataset=dataset_input,
+            model_alias=model_alias,
+            tinker_connection=tinker_connection,
+            base_model_alias=base_model_alias,
+            base_model=resolved_base_model.snapshot,
+            connection_config_sha256=resolved_base_model.connection_config_sha256,
+            training=training,
+            allow_unbudgeted=immutable_unbudgeted,
+        )
         return SFTModelOptimizationConfig(
             schema_version=1,
             created_at=created_at,
@@ -247,9 +285,13 @@ def create_sft_model_optimization_config(
             dataset=dataset_input,
             model_alias=model_alias,
             tinker_connection=tinker_connection,
+            base_model_alias=base_model_alias,
+            base_model=resolved_base_model.snapshot,
+            connection_config_sha256=resolved_base_model.connection_config_sha256,
             training=training,
+            allow_unbudgeted=immutable_unbudgeted,
         )
-    except ValueError as exc:
+    except (SFTModelOptimizationPreflightError, ValueError) as exc:
         raise SFTModelOptimizationError(f"SFT model optimization config is invalid: {exc}") from exc
 
 
@@ -270,24 +312,27 @@ def write_sft_model_optimization_config(
             to another immutable config.
     """
     try:
-        store.artifacts.write_json(
+        config_manifest = store.artifacts.write_json(
             artifact_id=config.config_id,
             artifact_type=_CONFIG_ARTIFACT_TYPE,
             envelope=config,
             files={"config.json": config},
         )
     except ArtifactAlreadyExistsError:
-        existing = load_sft_model_optimization_config(store, config.config_id)
+        existing, stored = _load_sft_model_optimization_config_artifact(store, config.config_id)
         if existing != config:
             raise SFTModelOptimizationError(
                 "existing SFT model optimization config does not match its content-addressed ID"
             ) from None
+        config_manifest = stored.manifest
     except (ArtifactCorruptionError, ValueError) as exc:
         raise SFTModelOptimizationError(
             f"cannot persist SFT model optimization config {config.config_id}: {exc}"
         ) from exc
     try:
-        store.set_model_optimization_config_id(config.config_id)
+        store.bind_model_optimization_config(
+            artifact_input(config_manifest), artifact_type=_CONFIG_ARTIFACT_TYPE
+        )
     except ProjectStoreError as exc:
         raise SFTModelOptimizationError(
             f"cannot bind SFT model optimization config to the project: {exc}"
@@ -310,48 +355,45 @@ def load_sft_model_optimization_config(
     Raises:
         SFTModelOptimizationError: The artifact is missing, malformed, or mismatches its manifest.
     """
+    config, manifest = _load_sft_model_optimization_config_artifact(store, config_id)
     try:
-        stored = store.artifacts.read(config_id)
-    except (ArtifactCorruptionError, ValueError) as exc:
+        bound = store.load_project().model_optimization_config
+    except ProjectStoreError as exc:
         raise SFTModelOptimizationError(
-            f"SFT model optimization config {config_id} is not a verified artifact: {exc}"
+            f"cannot load project binding for SFT model optimization config {config_id}: {exc}"
         ) from exc
-    if stored.manifest.artifact_type != _CONFIG_ARTIFACT_TYPE:
+    if bound is None:
         raise SFTModelOptimizationError(
-            f"artifact {config_id} is {stored.manifest.artifact_type!r}, not an SFT model config"
+            "project has no immutable SFT model optimization config artifact binding"
         )
-    try:
-        config = SFTModelOptimizationConfig.model_validate_json(
-            store.artifacts.read_bytes(config_id, "config.json")
-        )
-    except (ArtifactCorruptionError, ValueError) as exc:
+    if bound.artifact_id != config_id:
         raise SFTModelOptimizationError(
-            f"SFT model optimization config {config_id} has an invalid config.json: {exc}"
-        ) from exc
-    _require_config_matches_manifest(config, stored)
-    if config.config_id != config_id:
-        raise SFTModelOptimizationError("SFT model optimization config ID differs from its path")
+            "requested SFT model optimization config is not the project-bound config artifact"
+        )
+    if bound != artifact_input(manifest.manifest):
+        raise SFTModelOptimizationError(
+            "project SFT model optimization binding does not match the config artifact manifest"
+        )
     return config
 
 
-def sft_model_optimization_output_dir(
-    store: ProjectStore, config: SFTModelOptimizationConfig
-) -> Path:
+def sft_model_optimization_output_dir(store: ProjectStore, config_id: ArtifactId) -> Path:
     """Return the stable append-only W13 run directory for one immutable config.
 
     Args:
         store: Project store that owns the local coordination directory.
-        config: Immutable W14M intent that fixes the directory name.
+        config_id: Project-bound immutable W14M config that fixes the directory name.
 
     Returns:
         Local path that W13 initializes only when execution begins.
     """
-    return store.artifacts.project_directory / _RUNS_DIRECTORY / config.config_id
+    load_sft_model_optimization_config(store, config_id)
+    return store.artifacts.project_directory / _RUNS_DIRECTORY / config_id
 
 
 def preflight_sft_model_optimization(
     store: ProjectStore,
-    config: SFTModelOptimizationConfig,
+    config_id: ArtifactId,
     backend: TrainerBackend,
     *,
     code_revision: str,
@@ -363,7 +405,7 @@ def preflight_sft_model_optimization(
 
     Args:
         store: Project store holding the W12 dataset and local model catalog.
-        config: Immutable W14M config selected by the project.
+        config_id: Project-bound immutable W14M config selected by the project.
         backend: Concrete Tinker adapter or deterministic injected fake.
         code_revision: Exact revision to require from an existing W13 run.
 
@@ -374,8 +416,10 @@ def preflight_sft_model_optimization(
         SFTModelOptimizationPreflightError: A validation, budget, catalog, or resume condition
             makes dispatch unsafe.
     """
+    config = load_sft_model_optimization_config(store, config_id)
+    config_input = _bound_config_input(store, config_id)
     dataset = _verified_dataset(store, config.dataset)
-    output_dir = sft_model_optimization_output_dir(store, config)
+    output_dir = sft_model_optimization_output_dir(store, config_id)
     completed = _verify_completed_run_if_present(
         store,
         config,
@@ -383,6 +427,7 @@ def preflight_sft_model_optimization(
         code_revision=code_revision,
     )
     catalog = _load_tinker_catalog(store, config.tinker_connection)
+    _require_frozen_base_model(catalog, config)
     existing = catalog.models.get(config.model_alias)
     if existing is not None:
         if completed is None:
@@ -390,39 +435,39 @@ def preflight_sft_model_optimization(
                 f"model alias {config.model_alias!r} already exists without a recursively verified "
                 "completed W13 result; refusing to risk a conflicting managed run"
             )
-        expected = _model_record(config, completed.model)
+        expected = _model_record(config, config_input, completed.result, completed.model)
         if existing != expected:
             raise SFTModelOptimizationPreflightError(
                 f"model alias {config.model_alias!r} already names a different model record"
             )
+    planned_batch_counts = _planned_batch_counts(dataset.rows, config.training)
+    conservative_schedule_cost: NumericMeasurement | None = None
     if config.training.maximum_cost_usd is not None and completed is None:
-        train_count = sum(row.partition == "train" for row in dataset.rows)
-        batch_example_count = min(config.training.batch_size, train_count)
-        try:
-            estimate = backend.conservative_step_cost(
-                config.training,
-                batch_example_count=batch_example_count,
-            )
-        except Exception as exc:
+        conservative_schedule_cost = _full_schedule_cost_upper_bound(
+            backend,
+            config.training,
+            planned_batch_counts,
+        )
+        if conservative_schedule_cost.value > config.training.maximum_cost_usd:
             raise SFTModelOptimizationPreflightError(
-                "cannot obtain a conservative Tinker SFT step cost before dispatch"
-            ) from exc
-        if estimate is None:
-            raise SFTModelOptimizationPreflightError(
-                "maximum_cost_usd is configured, but Tinker has no supported conservative cost "
-                "estimate. Remove maximum_cost_usd only if an unbudgeted managed run is intended."
+                "full Tinker SFT schedule conservative cost upper bound "
+                f"${conservative_schedule_cost.value:.2f} exceeds maximum_cost_usd "
+                f"${config.training.maximum_cost_usd:.2f}; no provider call was dispatched"
             )
     return SFTModelOptimizationPreflight(
         config=config,
+        config_input=config_input,
         output_dir=output_dir,
         completed_result=None if completed is None else completed.result,
         completed_model=None if completed is None else completed.model,
+        planned_batch_counts=planned_batch_counts,
+        conservative_schedule_cost_usd=conservative_schedule_cost,
     )
 
 
 def run_sft_model_optimization(
     store: ProjectStore,
-    config: SFTModelOptimizationConfig,
+    config_id: ArtifactId,
     backend: TrainerBackend,
     *,
     created_at: datetime,
@@ -433,11 +478,13 @@ def run_sft_model_optimization(
 
     Args:
         store: Project store holding all immutable inputs and ``models.toml``.
-        config: Immutable W14M configuration naming the existing W12 dataset.
+        config_id: Project-bound immutable W14M configuration naming the existing W12 dataset.
         backend: Concrete Tinker adapter or deterministic injected fake.
         created_at: Time W13 records if it initializes a new append-only run directory.
         code_revision: Exact revision W13 records or requires for a resumed directory.
-        preflight: Optional matching read-only preflight already performed by the CLI.
+        preflight: Optional matching pre-consent preflight. Execution always reruns the
+            authoritative preflight immediately before dispatch, so this object cannot bypass a
+            budget, resume, or drift gate.
 
     Returns:
         Completed W13 artifacts and the idempotent model-catalog registration result.
@@ -445,16 +492,21 @@ def run_sft_model_optimization(
     Raises:
         SFTModelOptimizationError: Preflight, W13, verification, or catalog registration failed.
     """
-    effective_preflight = preflight or preflight_sft_model_optimization(
+    config = load_sft_model_optimization_config(store, config_id)
+    config_input = _bound_config_input(store, config_id)
+    if preflight is not None:
+        if preflight.config != config or preflight.config_input != config_input:
+            raise SFTModelOptimizationError("supplied preflight belongs to a different SFT config")
+        if preflight.output_dir != sft_model_optimization_output_dir(store, config_id):
+            raise SFTModelOptimizationError(
+                "supplied preflight uses a different W13 output directory"
+            )
+    effective_preflight = preflight_sft_model_optimization(
         store,
-        config,
+        config_id,
         backend,
         code_revision=code_revision,
     )
-    if effective_preflight.config != config:
-        raise SFTModelOptimizationError("supplied preflight belongs to a different SFT config")
-    if effective_preflight.output_dir != sft_model_optimization_output_dir(store, config):
-        raise SFTModelOptimizationError("supplied preflight uses a different W13 output directory")
     if effective_preflight.completed_result is not None:
         verified = _verify_completed_run_if_present(
             store,
@@ -477,11 +529,13 @@ def run_sft_model_optimization(
         return _register_verified_model(
             store,
             config,
+            config_input,
             verified.result,
             verified.model,
             effective_preflight.output_dir,
         )
     try:
+        _require_frozen_base_model(_load_tinker_catalog(store, config.tinker_connection), config)
         result = TinkerSFTOptimizer(backend).optimize(
             store=store,
             dataset_id=config.dataset.artifact_id,
@@ -507,6 +561,7 @@ def run_sft_model_optimization(
     return _register_verified_model(
         store,
         config,
+        config_input,
         completed.result,
         completed.model,
         effective_preflight.output_dir,
@@ -585,6 +640,76 @@ def _require_config_matches_manifest(
         )
 
 
+def _load_sft_model_optimization_config_artifact(
+    store: ProjectStore, config_id: ArtifactId
+) -> tuple[SFTModelOptimizationConfig, StoredArtifact]:
+    """Load one immutable config artifact before checking the project binding."""
+    try:
+        stored = store.artifacts.read(config_id)
+    except (ArtifactCorruptionError, ValueError) as exc:
+        raise SFTModelOptimizationError(
+            f"SFT model optimization config {config_id} is not a verified artifact: {exc}"
+        ) from exc
+    if stored.manifest.artifact_type != _CONFIG_ARTIFACT_TYPE:
+        raise SFTModelOptimizationError(
+            f"artifact {config_id} is {stored.manifest.artifact_type!r}, not an SFT model config"
+        )
+    try:
+        config = SFTModelOptimizationConfig.model_validate_json(
+            store.artifacts.read_bytes(config_id, "config.json")
+        )
+    except (ArtifactCorruptionError, ValueError) as exc:
+        raise SFTModelOptimizationError(
+            f"SFT model optimization config {config_id} has an invalid config.json: {exc}"
+        ) from exc
+    _require_config_matches_manifest(config, stored)
+    if config.config_id != config_id:
+        raise SFTModelOptimizationError("SFT model optimization config ID differs from its path")
+    return config, stored
+
+
+def _bound_config_input(store: ProjectStore, config_id: ArtifactId) -> ArtifactInput:
+    """Return the exact manifest input after public loading verifies the project binding."""
+    load_sft_model_optimization_config(store, config_id)
+    _config, stored = _load_sft_model_optimization_config_artifact(store, config_id)
+    return artifact_input(stored.manifest)
+
+
+@dataclass(frozen=True)
+class _ResolvedBaseModel:
+    """Catalog facts frozen at configuration and checked again immediately before dispatch."""
+
+    snapshot: ModelSnapshot
+    connection_config_sha256: Sha256
+
+
+def _config_id(
+    *,
+    dataset: ArtifactInput,
+    model_alias: ArtifactId,
+    tinker_connection: ArtifactId,
+    base_model_alias: ArtifactId,
+    base_model: ModelSnapshot,
+    connection_config_sha256: Sha256,
+    training: TinkerSFTSpec,
+    allow_unbudgeted: Literal[True] | None,
+) -> ArtifactId:
+    """Compute the content ID for all immutable dispatch-relevant W14M bindings."""
+    return stable_id(
+        "sft-model-optimization-config",
+        {
+            "dataset": dataset.model_dump(mode="json"),
+            "model_alias": model_alias,
+            "tinker_connection": tinker_connection,
+            "base_model_alias": base_model_alias,
+            "base_model": base_model.model_dump(mode="json"),
+            "connection_config_sha256": connection_config_sha256,
+            "training": training.model_dump(mode="json"),
+            "allow_unbudgeted": allow_unbudgeted,
+        },
+    )
+
+
 def _load_tinker_catalog(store: ProjectStore, connection_name: ArtifactId) -> ModelCatalog:
     """Load a local catalog and require its configured connection to be native Tinker."""
     try:
@@ -606,6 +731,109 @@ def _load_tinker_catalog(store: ProjectStore, connection_name: ArtifactId) -> Mo
     return catalog
 
 
+def _resolve_base_model(
+    catalog: ModelCatalog,
+    *,
+    tinker_connection: ArtifactId,
+    base_model_alias: ArtifactId,
+    training: TinkerSFTSpec,
+) -> _ResolvedBaseModel:
+    """Resolve exactly the catalog target W13 will train from without reading credentials."""
+    connection = catalog.connections[tinker_connection]
+    record = catalog.models.get(base_model_alias)
+    if record is None:
+        raise SFTModelOptimizationPreflightError(
+            f"SFT model optimization config names unknown base model alias {base_model_alias!r}"
+        )
+    if record.connection != tinker_connection:
+        raise SFTModelOptimizationPreflightError(
+            f"base model alias {base_model_alias!r} does not use configured Tinker connection "
+            f"{tinker_connection!r}"
+        )
+    if record.model != training.base_model:
+        raise SFTModelOptimizationPreflightError(
+            f"base model alias {base_model_alias!r} resolves to {record.model!r}, not frozen "
+            f"W13 base_model {training.base_model!r}"
+        )
+    capabilities = (
+        record.capabilities.model_dump(mode="json") if record.capabilities is not None else None
+    )
+    return _ResolvedBaseModel(
+        snapshot=ModelSnapshot(
+            provider=connection.provider,
+            model_id=record.model,
+            revision=record.revision,
+            capabilities_sha256=sha256_json(capabilities),
+            connection_sha256=connection.identity_sha256(),
+        ),
+        connection_config_sha256=sha256_json(
+            {
+                "provider": connection.provider,
+                "base_url": connection.base_url,
+                "api_key_env": connection.api_key_env,
+            }
+        ),
+    )
+
+
+def _require_frozen_base_model(catalog: ModelCatalog, config: SFTModelOptimizationConfig) -> None:
+    """Fail closed when any base model, capability, endpoint, or key reference drifted."""
+    current = _resolve_base_model(
+        catalog,
+        tinker_connection=config.tinker_connection,
+        base_model_alias=config.base_model_alias,
+        training=config.training,
+    )
+    if current.snapshot != config.base_model:
+        raise SFTModelOptimizationPreflightError(
+            "configured Tinker base model snapshot drifted after immutable config creation"
+        )
+    if current.connection_config_sha256 != config.connection_config_sha256:
+        raise SFTModelOptimizationPreflightError(
+            "configured Tinker connection metadata drifted after immutable config creation"
+        )
+
+
+def _planned_batch_counts(
+    rows: tuple[PartitionedSFTExample, ...], spec: TinkerSFTSpec
+) -> tuple[int, ...]:
+    """Derive W13's exact frozen train schedule before asking for any cost estimate."""
+    try:
+        schedule = _expected_schedule(
+            tuple(row.example for row in rows if row.partition == "train"), spec
+        )
+    except TinkerSFTError as exc:
+        raise SFTModelOptimizationPreflightError(
+            f"cannot derive the exact W13 training schedule: {exc}"
+        ) from exc
+    return tuple(len(batch.example_ids) for batch in schedule)
+
+
+def _full_schedule_cost_upper_bound(
+    backend: TrainerBackend, spec: TinkerSFTSpec, batch_counts: tuple[int, ...]
+) -> NumericMeasurement:
+    """Require a finite conservative estimate for every exact W13 batch before dispatch."""
+    total = 0.0
+    for batch_number, batch_example_count in enumerate(batch_counts, start=1):
+        try:
+            estimate = backend.conservative_step_cost(spec, batch_example_count=batch_example_count)
+        except Exception as exc:
+            raise SFTModelOptimizationPreflightError(
+                f"cannot obtain conservative Tinker SFT cost for planned batch {batch_number}"
+            ) from exc
+        if estimate is None:
+            raise SFTModelOptimizationPreflightError(
+                "maximum_cost_usd is configured, but Tinker has no supported conservative cost "
+                "estimate for every planned batch; no provider call was dispatched"
+            )
+        if estimate.value < 0:
+            raise SFTModelOptimizationPreflightError(
+                f"conservative Tinker SFT cost for planned batch {batch_number} is negative"
+            )
+        total += estimate.value
+    return NumericMeasurement(value=total, provenance="estimated")
+
+
 def _verify_completed_run_if_present(
     store: ProjectStore,
     config: SFTModelOptimizationConfig,
@@ -615,7 +843,8 @@ def _verify_completed_run_if_present(
 ) -> _VerifiedCompletedRun | None:
     """Recursively verify a claimed W13 terminal result without allowing provider dispatch."""
     result_path = output_dir / _RESULT_FILE
-    if not result_path.exists():
+    model_path = output_dir / _MODEL_FILE
+    if not result_path.exists() and not model_path.exists():
         return None
     try:
         result = train_tinker_sft(
@@ -642,10 +871,31 @@ def _verify_completed_run_if_present(
     return _VerifiedCompletedRun(result=result, model=model)
 
 
-def _model_record(config: SFTModelOptimizationConfig, model: TinkerSFTModelArtifact) -> ModelRecord:
+def _model_record(
+    config: SFTModelOptimizationConfig,
+    config_input: ArtifactInput,
+    result: TinkerSFTResult,
+    model: TinkerSFTModelArtifact,
+) -> ModelRecord:
     """Build the only catalog record permitted for one verified opaque W13 handle."""
     try:
-        return ModelRecord(connection=config.tinker_connection, model=model.sampling_handle)
+        return ModelRecord(
+            connection=config.tinker_connection,
+            model=model.sampling_handle,
+            sft_provenance=SFTModelProvenance(
+                source_dataset=config.dataset,
+                optimization_config=config_input,
+                training_spec_sha256=sha256_json(config.training),
+                run_id=result.run_id,
+                model_id=model.model_id,
+                model_sha256=sha256_json(model),
+                result_id=result.result_id,
+                result_sha256=sha256_json(result),
+                base_model=config.base_model,
+                connection_config_sha256=config.connection_config_sha256,
+                sampling_handle_sha256=sha256_json({"sampling_handle": model.sampling_handle}),
+            ),
+        )
     except ValueError as exc:
         raise SFTModelOptimizationError(
             "verified W13 sampling handle cannot be represented in the local model catalog"
@@ -655,6 +905,7 @@ def _model_record(config: SFTModelOptimizationConfig, model: TinkerSFTModelArtif
 def _register_verified_model(
     store: ProjectStore,
     config: SFTModelOptimizationConfig,
+    config_input: ArtifactInput,
     result: TinkerSFTResult,
     model: TinkerSFTModelArtifact,
     output_dir: Path,
@@ -674,10 +925,11 @@ def _register_verified_model(
         raise SFTModelOptimizationError(
             "refusing to register a W13 result that does not match its model artifact"
         )
-    desired = _model_record(config, model)
+    desired = _model_record(config, config_input, result, model)
     try:
         with file_write_lock(store.model_catalog_path, what="the local model catalog"):
             catalog = _load_tinker_catalog(store, config.tinker_connection)
+            _require_frozen_base_model(catalog, config)
             existing = catalog.models.get(config.model_alias)
             if existing is not None:
                 if existing != desired:

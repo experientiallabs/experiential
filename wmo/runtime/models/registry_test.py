@@ -291,7 +291,7 @@ def test_tinker_resolution_reports_a_missing_optional_dependency(
         base_url: str | None,
     ) -> TinkerSampler:
         del model, api_key, base_url
-        raise TinkerOptionalDependencyError("install with uv sync --extra distill")
+        raise TinkerOptionalDependencyError("install with uv sync --extra sft")
 
     monkeypatch.setattr("wmo.runtime.models.registry.create_tinker_sampler", missing_tinker)
     catalog = RuntimeModelCatalog(
@@ -300,5 +300,5 @@ def test_tinker_resolution_reports_a_missing_optional_dependency(
         transport_factory=_UnusedTransport,
     )
 
-    with pytest.raises(ModelConnectionError, match="uv sync --extra distill"):
+    with pytest.raises(ModelConnectionError, match="uv sync --extra sft"):
         catalog.resolve("fixture-model")

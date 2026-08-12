@@ -14,8 +14,6 @@ from pathlib import Path
 
 import pytest
 
-from wmo.optimize.model.rollouts import rollout_stats
-from wmo.optimize.model.tokens import assemble_trial_records
 from wmo.runtime.evaluation.harbor.ctrf import read_trial_graded_tests
 from wmo.runtime.harness.scoring import GradedTests, ScoreCell
 
@@ -325,36 +323,38 @@ def _probe_cells(root: Path) -> list[ScoreCell]:
 
 
 def test_the_probe_graded_rate_reproduces_its_measured_values(tmp_path: Path) -> None:
-    """The regression pin: the probe's own 46 reports, end to end into `RolloutStats`.
+    """The regression pin: the probe's own 46 reports, read directly from score cells.
 
     If the parser ever collapses back to the binary reward, `graded_solve_rate` falls to 0.2174 and
     this fails.
     """
     cells = _probe_cells(tmp_path / "job")
-    records = assemble_trial_records(cells, tmp_path / "sinks")
+    gradeable = [cell for cell in cells if not cell.infra_failed]
+    graded = [cell for cell in gradeable if cell.graded_score is not None]
 
-    stats = rollout_stats(records, max_tokens=4096)
-
-    assert (stats.trials, stats.executed_trials, stats.infra_failed_trials) == (48, 46, 2)
+    assert (len(cells), len(gradeable), len(cells) - len(gradeable)) == (48, 46, 2)
     # The two ungradeable trials are out of the graded denominator too, not zeros inside it.
-    assert stats.graded_trials == 46
-    assert round(stats.solve_rate, 4) == 0.2174  # 10/46 binary
-    assert round(stats.graded_solve_rate, 4) == 0.3188
-    assert stats.graded_solve_rate > stats.solve_rate
+    assert len(graded) == 46
+    solve_rate = sum(cell.passed for cell in gradeable) / len(gradeable)
+    graded_scores = [cell.graded_score for cell in graded if cell.graded_score is not None]
+    graded_solve_rate = sum(graded_scores) / len(graded_scores)
+    assert round(solve_rate, 4) == 0.2174  # 10/46 binary
+    assert round(graded_solve_rate, 4) == 0.3188
+    assert graded_solve_rate > solve_rate
     # 9 of 46 gradeable trials (19.6%) scored reward 0 while passing at least one test: the entire
     # signal binary throws away on this task mix.
     hidden = [
-        record
-        for record in records
-        if not record.infra_failed
-        and record.reward == 0.0
-        and record.tests is not None
-        and record.tests.passed > 0
+        cell
+        for cell in cells
+        if not cell.infra_failed
+        and cell.reward == 0.0
+        and cell.tests is not None
+        and cell.tests.passed > 0
     ]
     assert len(hidden) == 9
-    assert round(len(hidden) / stats.graded_trials, 3) == 0.196
+    assert round(len(hidden) / len(graded), 3) == 0.196
     # Coarse by construction: 1 to 6 tests per trial, so most scores are 0, 1/2, or 1.
-    resolved = {record.tests.resolved for record in records if record.tests is not None}
+    resolved = {cell.tests.resolved for cell in cells if cell.tests is not None}
     assert (min(resolved), max(resolved)) == (1, 6)
 
 
@@ -365,15 +365,14 @@ def test_the_probe_graded_rate_moves_two_dead_tasks_off_zero(tmp_path: Path) -> 
     `filter-js-from-html` and `gcode-to-text` to 0.50, the most informative position there is.
     """
     cells = _probe_cells(tmp_path / "job")
-    records = assemble_trial_records(cells, tmp_path / "sinks")
-    gradeable = [record for record in records if not record.infra_failed]
+    gradeable = [cell for cell in cells if not cell.infra_failed]
 
     binary: dict[str, float] = {}
     graded: dict[str, float] = {}
     for task_id in _PROBE_TRIALS:
-        task_records = [record for record in gradeable if record.task_id == task_id]
-        binary[task_id] = sum(record.passed for record in task_records) / len(task_records)
-        scores = [record.graded_score for record in task_records if record.graded_score is not None]
+        task_records = [cell for cell in gradeable if cell.task_id == task_id]
+        binary[task_id] = sum(cell.passed for cell in task_records) / len(task_records)
+        scores = [cell.graded_score for cell in task_records if cell.graded_score is not None]
         graded[task_id] = sum(scores) / len(scores)
 
     assert (binary["filter-js-from-html"], graded["filter-js-from-html"]) == (0.0, 0.5)

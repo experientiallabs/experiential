@@ -6,6 +6,7 @@ from wmo.common.models.catalog import (
     ModelCatalogError,
     ModelRecord,
     ModelRoles,
+    SFTModelProvenance,
     load_model_catalog,
     write_model_catalog,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "OperationEconomics",
     "PricingSnapshot",
     "RoutedCandidateSnapshot",
+    "SFTModelProvenance",
     "ToolCall",
     "ToolChoice",
     "Usage",

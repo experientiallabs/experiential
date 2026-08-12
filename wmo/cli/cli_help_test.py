@@ -22,6 +22,7 @@ from wmo.cli.cli_fixtures_test import app, runner
         ["optimize", "router", "--help"],
         ["optimize", "router", "fit", "--help"],
         ["optimize", "router", "report", "--help"],
+        ["optimize", "model", "--help"],
     ],
     ids=[
         "root",
@@ -36,6 +37,7 @@ from wmo.cli.cli_fixtures_test import app, runner
         "router",
         "router-fit",
         "router-report",
+        "nested-model",
     ],
 )
 def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
@@ -50,7 +52,6 @@ def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
         "The value produced by this callable",
     ):
         assert marker not in result.output
-
 
 def test_removed_route_owner_is_not_callable() -> None:
     """The W10 clean break leaves no parallel legacy router CLI owner."""

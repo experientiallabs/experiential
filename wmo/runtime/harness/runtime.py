@@ -165,7 +165,7 @@ class StopReason(StrEnum):
     completely different events, all of them scored as clean submissions: a real `submit`, a
     prose-only turn, a turn truncated at the output-token cap, and a tool call the renderer could
     not parse. Anything other than `SUBMITTED` is a SCAFFOLD loss, not a measured task failure
-    (see `wmo.optimize.model.rollouts.RolloutStats.scaffold_loss_rate`).
+    (reported separately from measured task success).
     """
 
     SUBMITTED = "submitted"  # the agent called submit

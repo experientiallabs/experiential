@@ -10,6 +10,7 @@ from pydantic import Field
 
 from wmo.common.core.artifacts import (
     ArtifactId,
+    ArtifactInput,
     ContractModel,
     SecretBoundaryError,
     assert_secret_free,
@@ -33,7 +34,7 @@ class ProjectConfig(ContractModel):
     schema_version: int = Field(default=1, ge=1)
     project_id: ArtifactId
     agent: AgentConfiguration | None = None
-    model_optimization_config_id: ArtifactId | None = None
+    model_optimization_config: ArtifactInput | None = None
     redacted_field_names: tuple[str, ...] = ()
 
 

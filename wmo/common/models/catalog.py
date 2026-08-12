@@ -11,6 +11,7 @@ import tomli_w
 from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
+    ArtifactInput,
     ContractModel,
     JsonObject,
     SecretBoundaryError,
@@ -20,7 +21,7 @@ from wmo.common.core.artifacts import (
     validate_artifact_id,
 )
 from wmo.common.core.files import write_text_atomic
-from wmo.common.models.model import ModelCapabilities
+from wmo.common.models.model import ModelCapabilities, ModelSnapshot
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openrouter", "tinker"})
@@ -105,6 +106,22 @@ class ConnectionConfig(ContractModel):
         return sha256_json(identity)
 
 
+class SFTModelProvenance(ContractModel):
+    """Immutable W12, W13, and base-model bindings for one registered SFT sampling handle."""
+
+    source_dataset: ArtifactInput
+    optimization_config: ArtifactInput
+    training_spec_sha256: Sha256
+    run_id: str = Field(min_length=1, max_length=128)
+    model_id: str = Field(min_length=1, max_length=128)
+    model_sha256: Sha256
+    result_id: str = Field(min_length=1, max_length=128)
+    result_sha256: Sha256
+    base_model: ModelSnapshot
+    connection_config_sha256: Sha256
+    sampling_handle_sha256: Sha256
+
+
 class ModelRecord(ContractModel):
     """A stable local alias, exact capability snapshot, and provider-side model name.
 
@@ -114,12 +131,19 @@ class ModelRecord(ContractModel):
     """
 
     connection: str = Field(min_length=1, max_length=128)
-    model: str = Field(min_length=1, max_length=512)
+    model: str = Field(min_length=1, max_length=2_048)
     revision: str | None = Field(default=None, max_length=256)
     capabilities: ModelCapabilities | None = None
+    sft_provenance: SFTModelProvenance | None = None
 
     @model_validator(mode="after")
     def _require_secret_free_model_identity(self) -> ModelRecord:
+        if (
+            self.sft_provenance is not None
+            and self.sft_provenance.sampling_handle_sha256
+            != sha256_json({"sampling_handle": self.model})
+        ):
+            raise ValueError("SFT provenance does not bind this model sampling handle")
         try:
             assert_secret_free(
                 {
@@ -129,6 +153,11 @@ class ModelRecord(ContractModel):
                     "capabilities": (
                         self.capabilities.model_dump(mode="json")
                         if self.capabilities is not None
+                        else None
+                    ),
+                    "sft_provenance": (
+                        self.sft_provenance.model_dump(mode="json")
+                        if self.sft_provenance is not None
                         else None
                     ),
                 }

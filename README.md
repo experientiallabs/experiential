@@ -54,7 +54,8 @@ wmo optimize router report my-project --root "$WMO_ROOT" --config router-report.
 These offline commands accept explicit IDs for a pre-existing combined evaluation plan, completed
 rollouts and judgments, a plan-bound fidelity report, frozen embeddings, and pricing. They do not
 call providers. `fit` opens only fit and fidelity inputs; `report` opens held-out evidence only
-after the policy and bank are frozen. W14R owns the final public `wmo run` composition.
+after the policy and bank are frozen. Train from a project-bound persisted SFT dataset with
+`wmo optimize model PROJECT`. W14R owns the final public `wmo run` composition.
 
 ### E2B backend
 

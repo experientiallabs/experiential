@@ -103,48 +103,18 @@ state, not a permanent exemption, and must be empty by the final release audit.
 - Harness-search optimization (`wmo optimize harness`, world-model delta search, the harbor
   population search, live agent sessions) moved to the private `agent-optimization` repo
   (2026-08-03). `wmo/runtime/harness/` holds the episode runtime, `HarnessDoc`, scoring, the store,
-  and sandbox plumbing used by closed-loop evaluation and distillation. Do not grow search or
+  and sandbox plumbing used by closed-loop evaluation. Do not grow search or
   mutation machinery back into this repository or place runtime code under `wmo/optimize/`.
-- `wmo optimize model <world-model>` is the staged one-command path over the routing surface:
-  preflight, sweep, fit, tune, report, each stage calling the same library function its manual
-  `wmo optimize route` command calls, so consent, metering, and artifacts stay single-sourced. It
-  adds no artifact format of its own beyond a resume manifest at `<model_dir>/optimize/`, which is
-  disposable: every artifact lands where the manual command and `wmo serve` already read it. A
-  stage is skipped only when its recorded input fingerprints still match and its artifact is
-  unchanged on disk, and the reason prints either way. CLI face in
-  `wmo/cli/optimize_model_app.py`, stage engine in `wmo/optimize/routing/pipeline.py`, and shared
-  sweep core in `wmo/optimize/routing/sweep.py`.
-- `wmo optimize distill run` is the third optimization surface, named for the artifact it produces
-  (`adapter`, beside harness's `prompt` and route's `routing_policy`): instead of editing the
-  harness it trains the agent MODEL, a distillation of a Tinker LoRA student from real
-  benchmark rollouts. The rollout source is config-selected, exactly one of `[harbor]` (harbor's
-  OWN `terminus_2` agent on harbor tasks; measured: our pi scaffold needed
-  2-3x terminus-2's turns on the same TerminalBench-2 tasks and drove 39-59% harness loss, and
-  this command measures model quality, not scaffold quality) or `[tau2]` (real tau2-bench
-  episodes through a loopback proxy whose per-episode Tinker provider records the exact sampled
-  spans; see `docs/reference/distill.md`). The environment is implicit
-  and the harness is pinned, never edited: `--harness` (default `pi`) only selects the stored
-  document supplying the rollout params (`sampling.temperature`, `rollout.max_turns`,
-  `sampling.max_tokens`) and the hash that keys every harbor job. Terminus-2 samples
-  the student through `llm_backend="tinker"` with `collect_rollout_details=True`, and harbor
-  persists the per-turn token ids that become the training targets verbatim into each trial's
-  `result.json`. The loss is per-token reverse KL against the teacher's logprobs on the sampled
-  tokens (Tinker's `importance_sampling`, with an optional supervised warmup on the teacher's
-  passing trajectories), and promotion is gated on holdout solve rates: student-after must
-  reach `gate.min_teacher_fraction` of the teacher and not regress against student-before;
-  only then does the adapter version land in `AdapterStore` with the champion alias. Run
-  configuration is a per-run TOML passed via `--config` (student, teacher, one of
-  harbor/tau2, plus rollout, train, sampling, warmup, eval, gate, pricing, budget, tripwire,
-  wandb sections),
-  snapshotted into the run dir; `wmo optimize distill report --run-dir <dir>` reads a finished run
-  back. The CLI face lives in `wmo/cli/model_app.py` and the loop
-  in `wmo/optimize/model/`. Degeneration tripwires (`[tripwire]`,
-  `wmo/optimize/model/tripwire.py`) watch the student's own sampled tokens for the collapse a KL
-  curve hides; their thresholds are fractions of a baseline each run measures at its first
-  training step and persists in its run manifest, never absolute nats or token counts. See
-  `docs/reference/distill.md` for the user-facing how-to.
-- Changes to the execution seam require focused coverage in `store_test.py`, `scoring_test.py`,
-  and the closed-loop or distillation tests that consume it.
+- `wmo optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
+  It never builds a dataset, creates teacher rollouts, changes routing roles, or launches a
+  simulator. The config freezes the W12 manifest, native Tinker base-model snapshot, capability
+  digest, and credential-reference digest without persisting any secret. A finite cap requires a
+  conservative estimate for every exact scheduled batch before consent; `--yes` confirms only
+  after those checks. Completed W13 artifacts are recursively verified before an opaque sampling
+  handle is atomically registered in `models.toml`.
+- Changes to this composition seam require focused persisted-dataset, resume, budget, immutable
+  pointer, drift, and catalog-provenance coverage. Do not restore rollout, reverse-KL, cross-token
+  loss, promotion, adapter-store, or route-registration paths here.
 
 ## Python
 

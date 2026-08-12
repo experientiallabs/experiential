@@ -54,17 +54,18 @@ def optimize_model(
     try:
         store = ProjectStore(root, project)
         project_config = store.load_project()
-        config_id = project_config.model_optimization_config_id
-        if config_id is None:
+        config_input = project_config.model_optimization_config
+        if config_input is None:
             raise SFTModelOptimizationPreflightError(
-                "project has no model_optimization_config_id. Persist a verified W12 SFT dataset "
-                "and bind an immutable SFT model optimization config before running this command."
+                "project has no immutable SFT model optimization config artifact binding. "
+                "Persist a verified W12 SFT dataset and bind an immutable config first."
             )
+        config_id = config_input.artifact_id
         config = load_sft_model_optimization_config(store, config_id)
         backend = _compose_tinker_backend()
         preflight = preflight_sft_model_optimization(
             store,
-            config,
+            config_id,
             backend,
             code_revision=code_revision,
         )
@@ -77,13 +78,19 @@ def optimize_model(
         raise typer.BadParameter(str(exc)) from None
 
     if preflight.completed_result is None:
+        if config.training.maximum_cost_usd is None:
+            spend = "the explicitly unbudgeted managed Tinker SFT run selected in immutable config"
+        else:
+            assert preflight.conservative_schedule_cost_usd is not None
+            spend = (
+                "the managed Tinker SFT run bounded by immutable maximum_cost_usd "
+                f"${config.training.maximum_cost_usd:.2f} with a full-schedule conservative "
+                f"upper bound of ${preflight.conservative_schedule_cost_usd.value:.2f}"
+            )
         if not require_spend_consent(
             _console,
             yes=yes,
-            spend=(
-                "an unbudgeted managed Tinker SFT run because Tinker exposes no supported "
-                "dollar estimate"
-            ),
+            spend=spend,
             command="wmo optimize model",
         ):
             _console.print("Managed Tinker SFT was not started.")
@@ -91,7 +98,7 @@ def optimize_model(
     try:
         completed = run_sft_model_optimization(
             store,
-            config,
+            config_id,
             backend,
             created_at=datetime.now(UTC),
             code_revision=code_revision,
@@ -123,7 +130,7 @@ def _compose_tinker_backend() -> TrainerBackend:
         import tinker
     except ImportError as exc:
         raise SFTModelOptimizationPreflightError(
-            "Tinker SFT requires the optional distill dependencies; run `uv sync --extra distill`"
+            "Tinker SFT requires the optional sft dependencies; run `uv sync --extra sft`"
         ) from exc
     return TinkerTrainerBackend(tinker.ServiceClient())
 

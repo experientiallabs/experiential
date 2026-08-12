@@ -119,7 +119,7 @@ def test_configured_role_forwards_fields_and_defaults_the_azure_api_version(
 def test_tinker_role_forwards_model_type_for_weights_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A distilled student is a tinker:// weights path plus the base model identity in
+    # A trained Tinker model is a tinker:// weights path plus the base model identity in
     # model_type; without the pass-through, the tinker provider cannot resolve its
     # renderer and tokenizer from settings-configured roles.
     root = tmp_path / ".wmo"

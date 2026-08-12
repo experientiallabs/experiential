@@ -2,7 +2,7 @@
 
 Conversion-only logic is tested without the cookbook; everything that touches
 a real renderer is gated on the cookbook being importable (it is part of the
-distill extra), so the suite still passes in an environment without it.
+sft extra), so the suite still passes in an environment without it.
 """
 
 from __future__ import annotations
@@ -350,13 +350,13 @@ def test_build_renderer_unknown_model_is_actionable() -> None:
 def test_build_renderer_missing_extra_names_the_extra(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Simulate the distill extra being absent: None entries make every import
+    # Simulate the sft extra being absent: None entries make every import
     # of the package (and its already-imported submodules) raise ImportError.
     for name in list(sys.modules):
         if name == "tinker_cookbook" or name.startswith("tinker_cookbook."):
             monkeypatch.setitem(sys.modules, name, None)
     monkeypatch.setitem(sys.modules, "tinker_cookbook", None)
-    with pytest.raises(ImportError, match="uv sync --extra distill"):
+    with pytest.raises(ImportError, match="uv sync --extra sft"):
         build_renderer("Qwen/Qwen3-8B", _CharTokenizer())
 
 

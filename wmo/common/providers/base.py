@@ -20,7 +20,7 @@ class ProviderKind(StrEnum):
     OPENAI = "openai"  # GPT 5.5 direct
     OPENAI_RESPONSES = "openai_responses"  # GPT 5.x direct via the Responses API
     OPENROUTER = "openrouter"  # any OpenRouter-fronted model, on one OPENROUTER_API_KEY
-    TINKER = "tinker"  # Tinker LoRA sampling for distillation rollouts (lazy distill extra)
+    TINKER = "tinker"  # Tinker-hosted sampling (lazy sft extra)
 
 
 class EmbedderKind(StrEnum):
