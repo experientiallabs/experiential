@@ -34,14 +34,8 @@ IMPORT_TRANSITION_INVENTORY: Final[frozenset[tuple[str, str]]] = frozenset(
     {
         ("wmo/optimize/gepa.py", "wmo.simulation.retrieval"),
         ("wmo/optimize/gepa.py", "wmo.simulation.retrieval.leakfree"),
-        ("wmo/optimize/routing/evaluation.py", "wmo.simulation.scenarios.spec"),
         ("wmo/optimize/routing/policy.py", "wmo.simulation.retrieval.embedders"),
-        ("wmo/optimize/routing/sweep.py", "wmo.simulation.ingest"),
-        ("wmo/optimize/routing/sweep.py", "wmo.simulation.model"),
         ("wmo/optimize/routing/sweep.py", "wmo.simulation.model.world_model"),
-        ("wmo/optimize/routing/sweep.py", "wmo.simulation.scenarios.spec"),
-        ("wmo/optimize/routing/sweep.py", "wmo.simulation.serving.traces_source"),
-        ("wmo/simulation/model/build.py", "wmo.optimize"),
         ("wmo/simulation/model/replay.py", "wmo.optimize.gepa"),
         ("wmo/simulation/model/world_model.py", "wmo.optimize.gepa"),
         ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.compression"),
@@ -56,6 +50,11 @@ IMPORT_TRANSITION_INVENTORY: Final[frozenset[tuple[str, str]]] = frozenset(
 )
 IMPORT_TRANSITION_TOMBSTONES: Final[frozenset[tuple[str, str]]] = frozenset(
     {
+        ("wmo/optimize/routing/evaluation.py", "wmo.simulation.scenarios.spec"),
+        ("wmo/optimize/routing/sweep.py", "wmo.simulation.ingest"),
+        ("wmo/optimize/routing/sweep.py", "wmo.simulation.model"),
+        ("wmo/optimize/routing/sweep.py", "wmo.simulation.scenarios.spec"),
+        ("wmo/optimize/routing/sweep.py", "wmo.simulation.serving.traces_source"),
         ("wmo/optimize/research/concurrency_run.py", "wmo.simulation.retrieval.leakfree"),
         ("wmo/optimize/research/gepa_scaling.py", "wmo.simulation.model.replay"),
         ("wmo/optimize/research/gepa_scaling.py", "wmo.simulation.retrieval"),
@@ -76,6 +75,7 @@ IMPORT_TRANSITION_TOMBSTONES: Final[frozenset[tuple[str, str]]] = frozenset(
         ("wmo/simulation/evaluation/open_loop.py", "wmo.optimize.judge"),
         ("wmo/simulation/evaluation/grid.py", "wmo.optimize.judge"),
         ("wmo/simulation/model/autoconfig.py", "wmo.optimize.judge"),
+        ("wmo/simulation/model/build.py", "wmo.optimize"),
         ("wmo/simulation/model/replay.py", "wmo.optimize.judge"),
         ("wmo/simulation/model/world_model.py", "wmo.optimize.reward"),
         ("wmo/simulation/serving/server.py", "wmo.optimize.reward"),
