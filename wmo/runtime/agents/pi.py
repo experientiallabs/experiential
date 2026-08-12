@@ -3,79 +3,110 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import subprocess
+import threading
 from collections.abc import Callable
-from datetime import UTC, datetime
+from contextlib import AbstractContextManager
+from contextvars import copy_context
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from shutil import which
+from tempfile import TemporaryDirectory
+from typing import cast
+from urllib.parse import unquote, urlparse
 
 from pydantic import TypeAdapter, ValidationError
 
-from wmo.common.core.artifacts import JsonObject
-from wmo.common.models import AssistantAction, ToolCall
+from wmo.common.core.artifacts import (
+    ContractModel,
+    FailureAttribution,
+    FailureCode,
+    JsonObject,
+    StructuredFailure,
+)
+from wmo.common.models import AssistantAction, ModelMessage, ModelResponse, ToolCall
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
-from wmo.common.tasks import TaskCase
+from wmo.common.tasks import TaskCase, ToolSchema
 from wmo.runtime.agents.interface import AgentEpisode
-from wmo.runtime.environments import EnvironmentSession
-
-type PiTranscriptRunner = Callable[[TaskCase, object, EnvironmentSession], JsonObject]
-"""A deterministic test seam that returns a WMO-shaped Pi episode transcript."""
+from wmo.runtime.environments import EnvironmentSession, Observation
 
 _JSON_OBJECT = TypeAdapter(JsonObject)
-_PI_JSON_OPTIONS = (
-    "--mode",
-    "json",
-    "--no-session",
-    "--no-context-files",
-    "--no-extensions",
-    "--no-skills",
-    "--no-prompt-templates",
-    "--no-themes",
-    "--offline",
-    "--no-tools",
-)
+_DETERMINISTIC_EVENT_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_WMO_PI_PROVIDER = "wmo-injected"
+_WMO_PI_MODEL = "wmo-injected-model"
+_DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
 class PiRuntimePreflightError(RuntimeError):
-    """An installed Pi executable is unavailable or could not complete its local process run."""
+    """An installed Pi executable is unavailable or cannot complete its local process run."""
+
+
+class PiInvocationTimeoutError(TimeoutError):
+    """The bounded installed-Pi process did not finish before its episode deadline."""
 
 
 class PiTranscriptError(ValueError):
     """An installed Pi JSON event stream cannot be represented as an agent episode."""
 
 
-class PiAgentRuntime:
-    """Run installed Pi in its local JSON-event mode and return a WMO episode.
+class _PiModelRequest(ContractModel):
+    """Temporary private request mapping for the W3 ModelClient restack.
 
-    Pi's executable remains an external dependency. The default invokes its JSON-event mode with
-    sessions, context discovery, built-in tools, and Pi startup network activity disabled. A
-    supplied ``transcript_runner`` remains a deterministic test seam for WMO-shaped transcripts.
+    This is only the wire conversion required by the installed-Pi bridge while this worktree is
+    still based on W2. The W3 restack replaces it with common ``ModelRequest`` and the injected
+    ``ModelClient`` annotation, without changing Pi's process invocation or tool bridge.
+    """
+
+    messages: tuple[ModelMessage, ...]
+    tools: tuple[ToolSchema, ...]
+
+
+@dataclass(frozen=True)
+class _PiInvocation:
+    """The process arguments and environment for one installed-Pi execution."""
+
+    command: tuple[str, ...]
+    environment: dict[str, str]
+
+
+class PiAgentRuntime:
+    """Run installed Pi in local JSON-event mode through WMO's injected dependencies.
+
+    The adapter configures Pi with an ephemeral custom provider that sends every model request to
+    the model WMO supplied for this episode. Its explicit extension forwards task-visible tool
+    calls to the supplied execute-only environment. This configuration prevents ambient Pi model
+    selection, but it is not a sandbox or a security boundary for the installed Pi process.
 
     Args:
         executable: Name or path of the externally installed Pi executable.
-        transcript_runner: Deterministic test bridge returning a JSON-compatible WMO transcript.
+        timeout_seconds: Positive upper bound for the installed Pi subprocess.
     """
 
     def __init__(
         self,
         *,
         executable: str = "pi",
-        transcript_runner: PiTranscriptRunner | None = None,
+        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         if not executable:
             raise ValueError("Pi executable must be a non-empty command or path")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("Pi timeout_seconds must be a finite positive value")
         self._executable = executable
-        self._transcript_runner = transcript_runner
+        self._timeout_seconds = timeout_seconds
 
     def preflight(self) -> None:
         """Confirm that WMO can call the configured installed Pi executable.
 
-        The deterministic transcript seam is deliberately exempt because it invokes no process.
-
         Raises:
             PiRuntimePreflightError: The configured Pi executable cannot be found.
         """
-        if self._transcript_runner is None:
-            self._resolve_executable()
+        self._resolve_executable()
 
     def run(
         self,
@@ -96,13 +127,17 @@ class PiAgentRuntime:
 
         Raises:
             PiRuntimePreflightError: Pi cannot be found or its local process exits unsuccessfully.
+            PiInvocationTimeoutError: The installed Pi process exceeds its configured deadline.
             PiTranscriptError: Pi emitted an invalid or incomplete JSON event transcript.
         """
-        runner = self._transcript_runner
-        if runner is not None:
-            return _episode_from_wmo_transcript(runner(task, model, environment))
         executable = self._resolve_executable()
-        return _episode_from_pi_events(_invoke_installed_pi(executable, task))
+        with _PiBridge(task, model, environment) as bridge:
+            output = _invoke_installed_pi(
+                executable,
+                bridge.invocation(executable, task.instruction),
+                self._timeout_seconds,
+            )
+        return _episode_from_pi_events(output)
 
     def _resolve_executable(self) -> str:
         """Resolve the configured Pi command and raise an actionable local-install error."""
@@ -115,15 +150,326 @@ class PiAgentRuntime:
         return executable_path
 
 
-def _invoke_installed_pi(executable: str, task: TaskCase) -> str:
-    """Run one isolated installed-Pi JSON process without triggering Pi startup network work."""
+class _PiBridge(AbstractContextManager["_PiBridge"]):
+    """Bind one Pi process to one WMO model and execute-only environment session."""
+
+    def __init__(self, task: TaskCase, model: object, environment: EnvironmentSession) -> None:
+        self._task = task
+        self._model = model
+        self._environment = environment
+        self._tools_by_name = {tool.name: tool for tool in task.tools}
+        if len(self._tools_by_name) != len(task.tools):
+            raise ValueError("Pi bridge requires task-visible tool names to be unique")
+        self._model_context = copy_context()
+        self._model_lock = threading.Lock()
+        self._environment_context = copy_context()
+        self._tool_lock = threading.Lock()
+        self._temporary_directory: TemporaryDirectory[str] | None = None
+        self._server: _PiBridgeHttpServer | None = None
+        self._server_thread: threading.Thread | None = None
+
+    def __enter__(self) -> _PiBridge:
+        """Start the ephemeral local bridge and write Pi's per-invocation configuration."""
+        temporary_directory = TemporaryDirectory(prefix="wmo-pi-")
+        self._temporary_directory = temporary_directory
+        root = Path(temporary_directory.name)
+        config_directory = root / "agent"
+        config_directory.mkdir()
+        server = _PiBridgeHttpServer(("127.0.0.1", 0), self)
+        self._server = server
+        thread = threading.Thread(target=server.serve_forever, name="wmo-pi-bridge", daemon=True)
+        self._server_thread = thread
+        thread.start()
+        bridge_url = f"http://127.0.0.1:{server.server_port}"
+        (config_directory / "models.json").write_text(
+            json.dumps(_pi_models_config(bridge_url), separators=(",", ":")), encoding="utf-8"
+        )
+        (root / "tools.json").write_text(
+            json.dumps(_pi_tools_config(self._task.tools), separators=(",", ":")), encoding="utf-8"
+        )
+        (root / "wmo-pi-tools.mjs").write_text(_PI_EXTENSION_SOURCE, encoding="utf-8")
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: object | None,
+    ) -> bool:
+        """Stop the bridge before removing its ephemeral configuration files."""
+        server = self._server
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        thread = self._server_thread
+        if thread is not None:
+            thread.join()
+        temporary_directory = self._temporary_directory
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
+        self._server = None
+        self._server_thread = None
+        self._temporary_directory = None
+        return False
+
+    def invocation(self, executable: str, instruction: str) -> _PiInvocation:
+        """Build one Pi invocation that can use only this bridge's selected model and tools."""
+        temporary_directory = self._temporary_directory
+        server = self._server
+        if temporary_directory is None or server is None:
+            raise RuntimeError("Pi bridge invocation requested outside its active context")
+        root = Path(temporary_directory.name)
+        process_environment = os.environ.copy()
+        process_environment.update(
+            {
+                "PI_CODING_AGENT_DIR": str(root / "agent"),
+                "PI_OFFLINE": "1",
+                "PI_TELEMETRY": "0",
+                "PI_SKIP_VERSION_CHECK": "1",
+                "WMO_PI_BRIDGE_URL": f"http://127.0.0.1:{server.server_port}",
+                "WMO_PI_TOOLS_PATH": str(root / "tools.json"),
+            }
+        )
+        return _PiInvocation(
+            command=(
+                executable,
+                "--mode",
+                "json",
+                "--no-session",
+                "--no-context-files",
+                "--no-extensions",
+                "-e",
+                str(root / "wmo-pi-tools.mjs"),
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--offline",
+                "--no-builtin-tools",
+                "--provider",
+                _WMO_PI_PROVIDER,
+                "--model",
+                _WMO_PI_MODEL,
+                instruction,
+            ),
+            environment=process_environment,
+        )
+
+    def complete_model(self, payload: JsonObject) -> ModelResponse:
+        """Convert one Pi OpenAI-compatible request and call the WMO-injected model object."""
+        completion = getattr(self._model, "complete", None)
+        if not callable(completion):
+            raise _PiBridgeError(
+                "WMO's injected model must provide complete(request) for the installed Pi adapter"
+            )
+        request = _PiModelRequest(
+            messages=_model_messages_from_pi(payload),
+            tools=self._task.tools,
+        )
+        with self._model_lock:
+            response = self._model_context.run(
+                cast(Callable[[_PiModelRequest], object], completion), request
+            )
+        if not isinstance(response, ModelResponse):
+            raise _PiBridgeError(
+                "WMO's injected model returned an unsupported completion for the installed Pi "
+                "adapter"
+            )
+        return response
+
+    def execute_tool(self, tool_name: str, payload: JsonObject) -> Observation:
+        """Execute one Pi extension tool through WMO's supplied environment session."""
+        if tool_name not in self._tools_by_name:
+            raise _PiBridgeError(
+                f"Pi requested tool {tool_name!r}, which is not visible to this task"
+            )
+        call_id = payload.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            raise _PiBridgeError("Pi tool bridge request requires a non-empty call_id")
+        try:
+            arguments = _JSON_OBJECT.validate_python(payload.get("arguments", {}))
+        except ValidationError as exc:
+            raise _PiBridgeError("Pi tool bridge request has non-object arguments") from exc
+        with self._tool_lock:
+            return self._environment_context.run(
+                self._environment.execute,
+                ToolCall(call_id=call_id, name=tool_name, arguments=arguments),
+            )
+
+
+class _PiBridgeHttpServer(ThreadingHTTPServer):
+    """Threading HTTP server whose handler delegates only to one active Pi bridge."""
+
+    daemon_threads = True
+
+    def __init__(self, address: tuple[str, int], bridge: _PiBridge) -> None:
+        super().__init__(address, _PiBridgeRequestHandler)
+        self.bridge = bridge
+
+
+class _PiBridgeRequestHandler(BaseHTTPRequestHandler):
+    """Handle the two local HTTP endpoints that Pi's custom provider and extension require."""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler hook name
+        """Route one local Pi model or tool request without logging its contents."""
+        try:
+            payload = self._read_payload()
+            parsed_path = urlparse(self.path)
+            if parsed_path.path == "/v1/chat/completions":
+                self._write_completion(payload)
+                return
+            prefix = "/tools/"
+            if parsed_path.path.startswith(prefix):
+                self._write_tool_result(unquote(parsed_path.path.removeprefix(prefix)), payload)
+                return
+            self._write_json(HTTPStatus.NOT_FOUND, {"error": "unknown Pi bridge endpoint"})
+        except _PiBridgeError as exc:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception:  # noqa: BLE001 - bridge failures must not expose episode payloads
+            self._write_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Pi bridge execution failed"}
+            )
+
+    def log_message(self, format: str, *args: object) -> None:
+        """Suppress HTTP request logging because bridge payloads are episode-visible data."""
+
+    def _read_payload(self) -> JsonObject:
+        """Read a JSON object body with an explicit content-length requirement."""
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            raise _PiBridgeError("Pi bridge request requires Content-Length")
+        try:
+            length = int(raw_length)
+        except ValueError as exc:
+            raise _PiBridgeError("Pi bridge request has an invalid Content-Length") from exc
+        if length < 0:
+            raise _PiBridgeError("Pi bridge request has a negative Content-Length")
+        try:
+            return _JSON_OBJECT.validate_json(self.rfile.read(length))
+        except ValidationError as exc:
+            raise _PiBridgeError("Pi bridge request body must be a JSON object") from exc
+
+    def _write_completion(self, payload: JsonObject) -> None:
+        """Return a model response in the OpenAI-compatible shape Pi's custom provider uses."""
+        response = self._bridge.complete_model(payload)
+        if payload.get("stream") is True:
+            self._write_sse(_streaming_completion_events(response))
+            return
+        self._write_json(HTTPStatus.OK, _non_streaming_completion(response))
+
+    def _write_tool_result(self, tool_name: str, payload: JsonObject) -> None:
+        """Run an explicit task tool and return its canonical observation to Pi's extension."""
+        observation = self._bridge.execute_tool(tool_name, payload)
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "content": observation.content,
+                "is_error": observation.is_error,
+                "metadata": observation.metadata,
+            },
+        )
+
+    @property
+    def _bridge(self) -> _PiBridge:
+        """Return the bridge bound to this server's single active process invocation."""
+        return cast(_PiBridgeHttpServer, self.server).bridge
+
+    def _write_json(self, status: HTTPStatus, payload: JsonObject) -> None:
+        """Write one compact JSON response with no cacheable transport state."""
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _write_sse(self, events: tuple[JsonObject, ...]) -> None:
+        """Write the minimal chunk sequence required by Pi's streaming OpenAI provider."""
+        body = (
+            b"".join(
+                b"data: " + json.dumps(event, separators=(",", ":")).encode("utf-8") + b"\n\n"
+                for event in events
+            )
+            + b"data: [DONE]\n\n"
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _PiBridgeError(ValueError):
+    """A local conversion or execution request cannot cross the Pi bridge."""
+
+
+def _pi_models_config(bridge_url: str) -> JsonObject:
+    """Return Pi's ephemeral custom-provider configuration for one injected WMO model."""
+    return {
+        "providers": {
+            _WMO_PI_PROVIDER: {
+                "baseUrl": f"{bridge_url}/v1",
+                "api": "openai-completions",
+                "apiKey": "wmo-local-bridge",
+                "compat": {
+                    "maxTokensField": "max_tokens",
+                    "supportsDeveloperRole": False,
+                    "supportsReasoningEffort": False,
+                    "supportsUsageInStreaming": False,
+                },
+                "models": [
+                    {
+                        "id": _WMO_PI_MODEL,
+                        "name": _WMO_PI_MODEL,
+                        "reasoning": False,
+                        "input": ["text"],
+                        "contextWindow": 128000,
+                        "maxTokens": 16384,
+                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    }
+                ],
+            }
+        }
+    }
+
+
+def _pi_tools_config(tools: tuple[ToolSchema, ...]) -> JsonObject:
+    """Serialize exactly the task-visible tools for Pi's explicit bridge extension."""
+    return {
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            }
+            for tool in tools
+        ]
+    }
+
+
+def _invoke_installed_pi(
+    executable: str,
+    invocation: _PiInvocation,
+    timeout_seconds: float,
+) -> str:
+    """Run one bounded installed-Pi JSON process with its per-episode binding configuration."""
     try:
         result = subprocess.run(
-            (executable, *_PI_JSON_OPTIONS, task.instruction),
+            invocation.command,
             capture_output=True,
             check=False,
+            env=invocation.environment,
             text=True,
+            timeout=timeout_seconds,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise PiInvocationTimeoutError(
+            "PiAgentRuntime's installed Pi process exceeded its "
+            f"{timeout_seconds:g}-second deadline"
+        ) from exc
     except OSError as exc:
         raise PiRuntimePreflightError(
             f"PiAgentRuntime could not start installed Pi at {executable!r}: {type(exc).__name__}"
@@ -136,21 +482,210 @@ def _invoke_installed_pi(executable: str, task: TaskCase) -> str:
     return result.stdout
 
 
-def _episode_from_wmo_transcript(transcript: JsonObject) -> AgentEpisode:
-    """Validate a deterministic WMO-shaped test transcript returned by an injected bridge."""
+def _model_messages_from_pi(payload: JsonObject) -> tuple[ModelMessage, ...]:
+    """Map Pi's OpenAI-compatible request messages to WMO's temporary W2 bridge shape."""
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list) or not raw_messages:
+        raise _PiBridgeError("Pi model bridge request requires a non-empty messages list")
+    messages: list[ModelMessage] = []
+    for index, raw_message in enumerate(raw_messages):
+        try:
+            message = _JSON_OBJECT.validate_python(raw_message)
+        except ValidationError as exc:
+            raise _PiBridgeError(f"Pi model bridge message {index} must be an object") from exc
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in {"system", "user", "assistant", "tool"}:
+            raise _PiBridgeError(f"Pi model bridge message {index} has unsupported role {role!r}")
+        content = _pi_message_text(message.get("content"), index)
+        if role == "assistant":
+            action = _assistant_action_from_pi_message(message, content, index)
+            messages.append(
+                ModelMessage(role="assistant", content=content, assistant_action=action)
+            )
+            continue
+        if content is None:
+            raise _PiBridgeError(f"Pi model bridge message {index} has no text content")
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                raise _PiBridgeError(f"Pi model bridge tool message {index} has no tool_call_id")
+            messages.append(ModelMessage(role="tool", content=content, tool_call_id=tool_call_id))
+            continue
+        if role == "system":
+            messages.append(ModelMessage(role="system", content=content))
+        else:
+            messages.append(ModelMessage(role="user", content=content))
+    return tuple(messages)
+
+
+def _pi_message_text(value: object, index: int) -> str | None:
+    """Extract textual OpenAI-compatible content while rejecting unsupported multimodal blocks."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        raise _PiBridgeError(f"Pi model bridge message {index} has unsupported content")
+    parts: list[str] = []
+    for block in value:
+        try:
+            content_block = _JSON_OBJECT.validate_python(block)
+        except ValidationError as exc:
+            raise _PiBridgeError(
+                f"Pi model bridge message {index} has a non-object content block"
+            ) from exc
+        if content_block.get("type") != "text" or not isinstance(content_block.get("text"), str):
+            raise _PiBridgeError(f"Pi model bridge message {index} has unsupported content block")
+        parts.append(cast(str, content_block["text"]))
+    return "".join(parts)
+
+
+def _assistant_action_from_pi_message(
+    message: JsonObject,
+    content: str | None,
+    index: int,
+) -> AssistantAction:
+    """Map OpenAI-compatible assistant content and function calls into a WMO action."""
+    raw_tool_calls = message.get("tool_calls")
+    if raw_tool_calls is None:
+        if content is None:
+            raise _PiBridgeError(f"Pi model bridge assistant message {index} has no output")
+        return AssistantAction(content=content)
+    if not isinstance(raw_tool_calls, list):
+        raise _PiBridgeError(f"Pi model bridge assistant message {index} has invalid tool_calls")
+    tool_calls: list[ToolCall] = []
+    for tool_index, raw_tool_call in enumerate(raw_tool_calls):
+        try:
+            tool_call = _JSON_OBJECT.validate_python(raw_tool_call)
+        except ValidationError as exc:
+            raise _PiBridgeError(
+                "Pi model bridge assistant message "
+                f"{index} tool call {tool_index} must be an object"
+            ) from exc
+        tool_calls.append(_tool_call_from_openai(tool_call, index, tool_index))
+    return AssistantAction(content=content, tool_calls=tuple(tool_calls))
+
+
+def _tool_call_from_openai(
+    tool_call: JsonObject,
+    message_index: int,
+    tool_index: int,
+) -> ToolCall:
+    """Convert one OpenAI-compatible function call to WMO's canonical action contract."""
+    call_id = tool_call.get("id")
+    function = tool_call.get("function")
+    if not isinstance(call_id, str):
+        raise _PiBridgeError(
+            f"Pi model bridge assistant message {message_index} tool call {tool_index} has no id"
+        )
     try:
-        return AgentEpisode.model_validate(transcript)
+        function_object = _JSON_OBJECT.validate_python(function)
     except ValidationError as exc:
-        raise PiTranscriptError(
-            "Pi transcript does not satisfy the WMO AgentEpisode contract. "
-            "Update the deterministic Pi bridge to emit ordered events and terminal state."
+        raise _PiBridgeError(
+            "Pi model bridge assistant message "
+            f"{message_index} tool call {tool_index} has no function"
         ) from exc
+    name = function_object.get("name")
+    raw_arguments = function_object.get("arguments", "{}")
+    if not isinstance(name, str) or not isinstance(raw_arguments, str):
+        raise _PiBridgeError(
+            f"Pi model bridge assistant message {message_index} tool call {tool_index} is invalid"
+        )
+    try:
+        arguments = _JSON_OBJECT.validate_json(raw_arguments)
+    except ValidationError as exc:
+        raise _PiBridgeError(
+            "Pi model bridge assistant message "
+            f"{message_index} tool call {tool_index} has invalid arguments"
+        ) from exc
+    return ToolCall(call_id=call_id, name=name, arguments=arguments)
+
+
+def _non_streaming_completion(response: ModelResponse) -> JsonObject:
+    """Render one injected WMO model response as an OpenAI-compatible completed response."""
+    return {
+        "id": "wmo-pi-completion",
+        "object": "chat.completion",
+        "created": 0,
+        "model": _WMO_PI_MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": _openai_assistant_message(response.output),
+                "finish_reason": "tool_calls" if response.output.tool_calls else "stop",
+            }
+        ],
+    }
+
+
+def _streaming_completion_events(response: ModelResponse) -> tuple[JsonObject, ...]:
+    """Render one injected WMO model response as deterministic OpenAI-compatible SSE chunks."""
+    action = response.output
+    first_delta: JsonObject = {"role": "assistant"}
+    if action.content is not None:
+        first_delta["content"] = action.content
+    if action.tool_calls:
+        first_delta["tool_calls"] = [
+            {
+                "index": index,
+                "id": tool_call.call_id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.name,
+                    "arguments": json.dumps(tool_call.arguments, separators=(",", ":")),
+                },
+            }
+            for index, tool_call in enumerate(action.tool_calls)
+        ]
+    base: JsonObject = {
+        "id": "wmo-pi-completion",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": _WMO_PI_MODEL,
+    }
+    return (
+        {
+            **base,
+            "choices": [{"index": 0, "delta": first_delta, "finish_reason": None}],
+        },
+        {
+            **base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls" if action.tool_calls else "stop",
+                }
+            ],
+        },
+    )
+
+
+def _openai_assistant_message(action: AssistantAction) -> JsonObject:
+    """Render a WMO assistant action as the assistant message Pi's provider accepts."""
+    message: JsonObject = {"role": "assistant", "content": action.content}
+    if action.tool_calls:
+        message["tool_calls"] = [
+            {
+                "id": tool_call.call_id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.name,
+                    "arguments": json.dumps(tool_call.arguments, separators=(",", ":")),
+                },
+            }
+            for tool_call in action.tool_calls
+        ]
+    return message
 
 
 def _episode_from_pi_events(output: str) -> AgentEpisode:
     """Translate Pi JSON mode's ordered local events into the WMO episode representation."""
     spans: list[RolloutSpan] = []
     final_action: AssistantAction | None = None
+    failure: StructuredFailure | None = None
     last_event_time: datetime | None = None
     saw_agent_end = False
 
@@ -163,11 +698,13 @@ def _episode_from_pi_events(output: str) -> AgentEpisode:
             raise PiTranscriptError(f"Pi JSON event line {line_number} has no string type")
         if event_type == "message_end":
             message = _require_object(event, "message", line_number)
-            span, action = _message_span(message, line_number, last_event_time)
+            span, action, message_failure = _message_span(message, line_number, last_event_time)
             spans.append(span)
             last_event_time = span.ended_at
             if action is not None:
                 final_action = action
+            if message_failure is not None:
+                failure = message_failure
         elif event_type in {"tool_execution_start", "tool_execution_end"}:
             span = _tool_span(event, line_number, last_event_time)
             spans.append(span)
@@ -177,6 +714,13 @@ def _episode_from_pi_events(output: str) -> AgentEpisode:
 
     if not saw_agent_end:
         raise PiTranscriptError("Pi JSON transcript ended before an agent_end event")
+    if failure is not None:
+        return AgentEpisode(
+            events=tuple(spans),
+            final_action=final_action,
+            stop_reason=StopReason.FAILURE,
+            failure=failure,
+        )
     return AgentEpisode(
         events=tuple(spans),
         final_action=final_action,
@@ -207,8 +751,8 @@ def _message_span(
     message: JsonObject,
     line_number: int,
     previous_time: datetime | None,
-) -> tuple[RolloutSpan, AssistantAction | None]:
-    """Convert one completed Pi message to an ordered message span and possible final action."""
+) -> tuple[RolloutSpan, AssistantAction | None, StructuredFailure | None]:
+    """Convert one completed Pi message to an ordered message span and terminal evidence."""
     role = message.get("role")
     if not isinstance(role, str):
         raise PiTranscriptError(f"Pi JSON event line {line_number} message has no string role")
@@ -224,6 +768,9 @@ def _message_span(
     action = None
     if role == "assistant" and (text is not None or tool_calls):
         action = AssistantAction(content=text, tool_calls=tool_calls)
+    failure = _assistant_stop_failure(message, line_number) if role == "assistant" else None
+    if failure is not None:
+        payload["stop_reason"] = str(failure.details["pi_stop_reason"])
     return (
         RolloutSpan(
             span_id=f"pi-message-{line_number}",
@@ -231,9 +778,31 @@ def _message_span(
             started_at=timestamp,
             ended_at=timestamp,
             payload=payload,
+            failure=failure,
         ),
         action,
+        failure,
     )
+
+
+def _assistant_stop_failure(message: JsonObject, line_number: int) -> StructuredFailure | None:
+    """Map Pi's unsuccessful assistant stop reasons to explicit WMO terminal failures."""
+    stop_reason = message.get("stopReason")
+    if stop_reason == "error":
+        return StructuredFailure(
+            code=FailureCode.PROVIDER,
+            message=f"installed Pi assistant event line {line_number} stopped with error",
+            attribution=FailureAttribution.MODEL,
+            details={"pi_stop_reason": stop_reason},
+        )
+    if stop_reason == "aborted":
+        return StructuredFailure(
+            code=FailureCode.CANCELLED,
+            message=f"installed Pi assistant event line {line_number} was aborted",
+            attribution=FailureAttribution.AGENT,
+            details={"pi_stop_reason": stop_reason},
+        )
+    return None
 
 
 def _tool_span(
@@ -315,10 +884,15 @@ def _event_timestamp(
     line_number: int,
     previous_time: datetime | None,
 ) -> datetime:
-    """Return an ordered Pi timestamp, falling back to the local process clock."""
+    """Return an ordered event timestamp without manufacturing wall-clock provenance.
+
+    A supplied timezone-aware Pi timestamp is used unless it would move ordering backwards. A
+    missing timestamp becomes the Unix epoch plus its one-based JSONL line number in microseconds.
+    That explicit synthetic policy keeps all-missing transcripts deterministic and source-ordered.
+    """
     raw_timestamp = event.get("timestamp")
     if raw_timestamp is None:
-        timestamp = datetime.now(UTC)
+        timestamp = _DETERMINISTIC_EVENT_EPOCH + timedelta(microseconds=line_number)
     elif not isinstance(raw_timestamp, str):
         raise PiTranscriptError(f"Pi JSON event line {line_number} has a non-string timestamp")
     else:
@@ -333,3 +907,47 @@ def _event_timestamp(
                 f"Pi JSON event line {line_number} timestamp must include a timezone"
             )
     return max(timestamp, previous_time) if previous_time is not None else timestamp
+
+
+_PI_EXTENSION_SOURCE = r"""import { readFile } from "node:fs/promises";
+import { Type } from "typebox";
+
+const bridgeUrl = process.env.WMO_PI_BRIDGE_URL;
+const toolsPath = process.env.WMO_PI_TOOLS_PATH;
+
+async function request(path, body) {
+  if (!bridgeUrl) throw new Error("WMO_PI_BRIDGE_URL is required");
+  const response = await fetch(`${bridgeUrl}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error("WMO Pi bridge rejected the request");
+  return payload;
+}
+
+export default async function (pi) {
+  if (!toolsPath) throw new Error("WMO_PI_TOOLS_PATH is required");
+  const config = JSON.parse(await readFile(toolsPath, "utf8"));
+  for (const tool of config.tools) {
+    pi.registerTool({
+      name: tool.name,
+      label: tool.name,
+      description: tool.description,
+      parameters: Type.Unsafe(tool.input_schema),
+      async execute(toolCallId, params) {
+        const result = await request(`/tools/${encodeURIComponent(tool.name)}`, {
+          call_id: toolCallId,
+          arguments: params,
+        });
+        return {
+          content: [{ type: "text", text: result.content }],
+          details: result.metadata,
+          isError: result.is_error,
+        };
+      },
+    });
+  }
+}
+"""

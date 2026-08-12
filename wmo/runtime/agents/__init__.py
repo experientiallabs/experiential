@@ -7,13 +7,19 @@ from wmo.runtime.agents.interface import (
     preflight_agent_runtime,
 )
 from wmo.runtime.agents.lifecycle import execute_agent_episode
-from wmo.runtime.agents.pi import PiAgentRuntime, PiRuntimePreflightError, PiTranscriptError
+from wmo.runtime.agents.pi import (
+    PiAgentRuntime,
+    PiInvocationTimeoutError,
+    PiRuntimePreflightError,
+    PiTranscriptError,
+)
 
 __all__ = [
     "AgentAdapterPreflightError",
     "AgentEpisode",
     "AgentRuntime",
     "PiAgentRuntime",
+    "PiInvocationTimeoutError",
     "PiRuntimePreflightError",
     "PiTranscriptError",
     "execute_agent_episode",

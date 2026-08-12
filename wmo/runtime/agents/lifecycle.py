@@ -27,6 +27,7 @@ from wmo.runtime.environments import (
 
 _ExecuteAction = Callable[[ToolCall], Observation]
 _execute_action: ContextVar[_ExecuteAction | None] = ContextVar("wmo_execute_action", default=None)
+_LIFECYCLE_EVENT_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def execute_agent_episode(
@@ -43,7 +44,7 @@ def execute_agent_episode(
 
     Args:
         agent: Customer-owned whole-episode runtime.
-        environment_runtime: Simulator-owned source of isolated environment sessions.
+        environment_runtime: Simulator-owned source of per-episode environment sessions.
         task: Task whose already-open session the agent may execute against.
         model: Candidate model injected into the customer agent.
 
@@ -160,15 +161,17 @@ def _lifecycle_span(
     failure: StructuredFailure,
     prior_events: tuple[RolloutSpan, ...] = (),
 ) -> RolloutSpan:
-    """Create one ordered lifecycle span for a failure that prevented normal agent progress."""
-    now = datetime.now(UTC)
-    if prior_events:
-        now = max(now, prior_events[-1].ended_at)
+    """Create one ordered lifecycle span without inventing a wall-clock event time.
+
+    Failure spans follow the most recent event when one exists. A failure before any event uses a
+    fixed epoch, which records ordering without claiming a source timestamp that was not observed.
+    """
+    timestamp = prior_events[-1].ended_at if prior_events else _LIFECYCLE_EVENT_EPOCH
     return RolloutSpan(
         span_id=f"lifecycle-{uuid4().hex}",
         kind=RolloutEventKind.LIFECYCLE,
-        started_at=now,
-        ended_at=now,
+        started_at=timestamp,
+        ended_at=timestamp,
         payload={"phase": phase},
         failure=failure,
     )
@@ -179,8 +182,8 @@ def _execute_only_session(environment: EnvironmentSession) -> Iterator[Environme
     """Scope one raw session to a capability that exposes only execute.
 
     The capability itself retains no raw-session attribute. The lifecycle owns the context-local
-    executor for the duration of the customer call, so reset and close remain unavailable through
-    the object passed to the agent.
+    executor for the duration of the customer call, so reset and close are not attributes of the
+    object passed to the agent. This API restriction does not itself sandbox customer code.
     """
     token = _execute_action.set(environment.execute)
     try:

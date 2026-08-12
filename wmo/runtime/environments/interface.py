@@ -1,4 +1,4 @@
-"""The executable-environment boundary owned by a simulator."""
+"""The executable environment interface owned by a simulator."""
 
 from __future__ import annotations
 
@@ -41,13 +41,13 @@ class EnvironmentSession(Protocol):
 
 @runtime_checkable
 class EnvironmentRuntime(Protocol):
-    """Creates isolated environment sessions and owns their context-exit cleanup."""
+    """Creates per-episode environment sessions and owns their context-exit cleanup."""
 
     def open(self, task: TaskCase) -> AbstractContextManager[EnvironmentSession]:
         """Open a clean environment session for one task.
 
         Args:
-            task: The task whose executable state the session will isolate.
+            task: The task whose executable state the session serves.
 
         Returns:
             A context manager that releases the session when it exits.

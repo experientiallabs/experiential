@@ -17,6 +17,7 @@ from wmo.runtime.agents.lifecycle import execute_agent_episode
 from wmo.runtime.environments import EnvironmentResetError, EnvironmentSession, Observation
 
 _EVENT_TIME = datetime(2026, 8, 11, tzinfo=UTC)
+_LIFECYCLE_EVENT_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def test_complete_episode_injects_model_and_hides_environment_lifecycle() -> None:
@@ -128,6 +129,8 @@ def test_agent_exception_is_attributed_without_losing_the_episode() -> None:
     assert episode.failure is not None
     assert episode.failure.attribution == FailureAttribution.AGENT
     assert episode.events[0].payload == {"phase": "agent"}
+    assert episode.events[0].started_at == _LIFECYCLE_EVENT_EPOCH
+    assert episode.events[0].ended_at == _LIFECYCLE_EVENT_EPOCH
     assert runtime.close_calls == 1
 
 
@@ -185,7 +188,7 @@ def test_cleanup_failure_replaces_terminal_state_and_preserves_ordered_events() 
         episode.events[1].span_id,
     )
     assert episode.events[1].kind == RolloutEventKind.LIFECYCLE
-    assert episode.events[1].started_at >= episode.events[0].ended_at
+    assert episode.events[1].started_at == episode.events[0].ended_at
     assert runtime.close_calls == 1
 
 
