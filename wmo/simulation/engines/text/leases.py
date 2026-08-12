@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from typing import Self
 from uuid import uuid4
 
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, Sha256, canonical_json_bytes
 from wmo.common.core.locks import FileLockTimeout, file_write_lock
@@ -64,6 +65,7 @@ class TextCellLease(ContractModel):
     claimed_at: datetime
     expires_at: datetime
     status: TextCellLeaseStatus = TextCellLeaseStatus.ACTIVE
+    unknown_spend_blocks_budget: bool = False
 
     @field_validator("claimed_at", "expires_at")
     @classmethod
@@ -80,6 +82,21 @@ class TextCellLease(ContractModel):
         if value is not None and not value > 0:
             raise ValueError("text-cell lease reservation must be positive")
         return value
+
+    @model_validator(mode="after")
+    def _require_stale_budget_barrier(self) -> Self:
+        """Keep ambiguous finite-spend tombstones blocking until rollout evidence is durable."""
+        if self.status == TextCellLeaseStatus.ACTIVE:
+            if self.unknown_spend_blocks_budget:
+                raise ValueError("active text-cell leases cannot be unknown-spend tombstones")
+            return self
+        if self.maximum_cost_usd is None:
+            if self.unknown_spend_blocks_budget or self.reserved_cost_usd is not None:
+                raise ValueError("unbounded stale leases cannot retain a budget barrier")
+            return self
+        if not self.unknown_spend_blocks_budget or self.reserved_cost_usd != self.maximum_cost_usd:
+            raise ValueError("finite stale leases must retain the whole-ceiling budget barrier")
+        return self
 
 
 @dataclass(frozen=True)
@@ -361,9 +378,10 @@ class TextCellLeaseStore:
                 if rollout_completed(lease.rollout_id):
                     self._reap(path, lease)
                 elif lease.status == TextCellLeaseStatus.STALE:
-                    continue
+                    if lease.unknown_spend_blocks_budget:
+                        leases.append(lease)
                 elif self._is_stale(lease, now):
-                    self._tombstone(path, lease)
+                    leases.append(self._tombstone(path, lease))
                 else:
                     leases.append(lease)
         return tuple(leases)
@@ -375,7 +393,11 @@ class TextCellLeaseStore:
     def _tombstone(self, path: Path, lease: TextCellLease) -> TextCellLease:
         """Atomically retain non-replay evidence without retaining its budget reservation."""
         stale = lease.model_copy(
-            update={"status": TextCellLeaseStatus.STALE, "reserved_cost_usd": None}
+            update={
+                "status": TextCellLeaseStatus.STALE,
+                "reserved_cost_usd": lease.maximum_cost_usd,
+                "unknown_spend_blocks_budget": lease.maximum_cost_usd is not None,
+            }
         )
         self._replace_exact(path, expected=lease, replacement=stale)
         return stale

@@ -49,7 +49,16 @@ def test_expired_dead_paid_claim_is_recovered_as_stale_without_replay(tmp_path: 
         rollout_completed=lambda _rollout_id: False,
         observed_spend_usd=lambda: 0.0,
     )
-    allowed = recovery_store.acquire(
+    elapsed = [0.0]
+    blocked_store = TextCellLeaseStore(
+        project.project_directory,
+        clock=lambda: _TIME + timedelta(minutes=16),
+        owner_alive=lambda _pid: False,
+        sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+        monotonic=lambda: elapsed[0],
+        wait_timeout_seconds=0.05,
+    )
+    allowed = blocked_store.acquire(
         lease_id="lease-b",
         resolution_id="resolution-a",
         simulation_id="simulation-a",
@@ -64,10 +73,10 @@ def test_expired_dead_paid_claim_is_recovered_as_stale_without_replay(tmp_path: 
     assert recovered.state == TextCellLeaseState.STALE
     assert recovered.lease is not None
     assert recovered.lease.status == TextCellLeaseStatus.STALE
-    assert recovered.lease.reserved_cost_usd is None
-    assert allowed.state == TextCellLeaseState.OWNED
-    assert allowed.lease is not None
-    assert allowed.lease.reserved_cost_usd == pytest.approx(0.9)
+    assert recovered.lease.unknown_spend_blocks_budget
+    assert recovered.lease.reserved_cost_usd == 1.0
+    assert allowed.state == TextCellLeaseState.CONTENDED
+    assert allowed.retryable
 
 
 def test_live_paid_claim_returns_retryable_contention_at_finite_deadline(

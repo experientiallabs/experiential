@@ -28,7 +28,7 @@ from wmo.common.models import (
     Usage,
 )
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
-from wmo.common.rollouts import SimulationMode, StopReason
+from wmo.common.rollouts import RolloutArtifact, SimulationCellBinding, SimulationMode, StopReason
 from wmo.common.tasks import TaskCase, TaskSet, ToolSchema
 from wmo.runtime.agents import AgentEpisode, AgentRuntime
 from wmo.runtime.environments import EnvironmentSession
@@ -528,6 +528,112 @@ def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: P
     assert second.stop_reason == StopReason.MAXIMUM_COST
     assert second.failure is not None
     assert second.failure.details["observed_spend_usd"] is None
+
+
+def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_persists(
+    tmp_path: Path,
+) -> None:
+    """A stale tombstone is a budget barrier while its durable rollout is still pending."""
+    cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(
+        store,
+        {"task-a": _task("task-a"), "task-b": _task("task-b")},
+    )
+    candidate_client = _ScriptedClient([])
+    world_client = _ScriptedClient([])
+    recovery = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+    )
+    contender = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+    )
+    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
+    selected, world_model = recovery._validate_spec_and_bindings(spec)
+    spec_input = recovery._persist_specification(spec)
+    resolution, resolution_input, bindings = recovery._persist_resolution(
+        spec, spec_input, selected, world_model
+    )
+    first_binding = bindings["cell-a"]
+    holder = TextCellLeaseStore(store.project_directory, clock=lambda: _TIME)
+    holder.acquire(
+        lease_id=lease_id_for_binding(resolution, first_binding),
+        resolution_id=resolution.resolution_id,
+        simulation_id=spec.simulation_id,
+        rollout_id=rollout_id_for_binding(first_binding),
+        binding_sha256=binding_digest(first_binding),
+        maximum_cost_usd=1.0,
+        rollout_completed=lambda _rollout_id: False,
+        observed_spend_usd=lambda: 0.0,
+    )
+    recovery._leases = TextCellLeaseStore(
+        store.project_directory,
+        clock=lambda: _TIME.replace(hour=1),
+        owner_alive=lambda _pid: False,
+    )
+    elapsed = [0.0]
+    contender._leases = TextCellLeaseStore(
+        store.project_directory,
+        clock=lambda: _TIME.replace(hour=1),
+        owner_alive=lambda _pid: False,
+        sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+        monotonic=lambda: elapsed[0],
+        wait_timeout_seconds=0.05,
+    )
+    stale_persist_started = threading.Event()
+    allow_stale_persist = threading.Event()
+    persist = recovery._persist_rollout
+
+    def pause_stale_persist(
+        rollout: RolloutArtifact,
+        cell: EvaluationCell,
+        binding: SimulationCellBinding,
+        resolved_input: ArtifactInput,
+    ) -> RolloutArtifact:
+        if rollout.failure is not None and rollout.failure.details.get("phase") == (
+            "paid_cell_stale_lease"
+        ):
+            stale_persist_started.set()
+            assert allow_stale_persist.wait(timeout=5)
+        return persist(rollout, cell, binding, resolved_input)
+
+    recovery.__dict__["_persist_rollout"] = pause_stale_persist
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(recovery.run, spec)
+        try:
+            assert stale_persist_started.wait(timeout=5)
+            with pytest.raises(SimulationContentionError, match="contended; retry"):
+                contender._execute_and_persist_cell(
+                    spec,
+                    selected[1],
+                    world_model,
+                    spec_input,
+                    resolution,
+                    resolution_input,
+                    bindings,
+                )
+            assert candidate_client.requests == []
+            assert world_client.requests == []
+        finally:
+            allow_stale_persist.set()
+        artifact_set = future.result(timeout=5)
+
+    second = recovery._load_rollout(artifact_set.artifact_ids[1])
+    assert second.stop_reason == StopReason.MAXIMUM_COST
+    assert candidate_client.requests == []
+    assert world_client.requests == []
 
 
 def test_text_simulation_enforces_configured_concurrency_bound(tmp_path: Path) -> None:
