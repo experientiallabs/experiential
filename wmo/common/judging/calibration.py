@@ -7,15 +7,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
-from wmo.common.core.artifacts import (
-    ArtifactId,
-    ArtifactInput,
-    Sha256,
-    stable_id,
-)
+from wmo.common.core.artifacts import ArtifactId, ArtifactInput, Sha256, stable_id
+from wmo.common.judging.calibration_assembly import calibration_from_report
 from wmo.common.judging.calibration_contracts import (
     CalibrationReport,
     JudgeScoreObservation,
+    _same_calibration_identity,
+    _same_report_identity,
 )
 from wmo.common.judging.calibration_metrics import (
     CalibrationDatum,
@@ -35,6 +33,12 @@ from wmo.common.judging.provenance import (
     read_artifact_json,
     resolve_artifact,
     sorted_verified_inputs,
+)
+from wmo.common.judging.risk_acceptance import (
+    RiskAcceptanceError,
+    calibration_inputs,
+    require_calibration_risk_acceptance,
+    write_insufficient_calibration_risk_acceptance,
 )
 from wmo.common.judging.rubric import JudgeCalibration, Rubric
 from wmo.common.models import ModelSnapshot
@@ -221,7 +225,7 @@ class JudgeCalibrationService:
         )
         stored_report = self.write_report(store, report)
         stored_report, report_input = _require_persisted_report(store, stored_report)
-        calibration = _calibration_from_report(
+        calibration = calibration_from_report(
             stored_report,
             report_input=report_input,
             status="provisional",
@@ -232,13 +236,24 @@ class JudgeCalibrationService:
     def insufficient_calibration(
         self, store: ProjectStore, report: CalibrationReport
     ) -> JudgeCalibration:
-        """Create a persisted-report-bound calibration that remains visibly insufficient."""
+        """Create a persisted-report-bound calibration that remains visibly insufficient.
+
+        Args:
+            store: Project store that owns the exact completed calibration report.
+            report: Persisted insufficient report whose maps remain unavailable for final use.
+
+        Returns:
+            A report-bound calibration with its status left as ``insufficient``.
+
+        Raises:
+            CalibrationError: The report is absent, is not insufficient, or has no human labels.
+        """
         stored_report, report_input = _require_persisted_report(store, report)
         if stored_report.status != "insufficient" or stored_report.eligible_label_count == 0:
             raise CalibrationError(
                 "insufficient calibration requires a nonzero insufficient report"
             )
-        return _calibration_from_report(
+        return calibration_from_report(
             stored_report,
             report_input=report_input,
             status="insufficient",
@@ -280,11 +295,23 @@ class JudgeCalibrationService:
             raise CalibrationError(
                 "insufficient labels require explicit accept_insufficient_labels=True approval"
             )
-        return _calibration_from_report(
+        risk_acceptance: ArtifactInput | None = None
+        if stored_report.status == "insufficient":
+            try:
+                risk_acceptance = write_insufficient_calibration_risk_acceptance(
+                    store,
+                    report=stored_report,
+                    report_input=report_input,
+                    accepted_at=approved_at,
+                )
+            except RiskAcceptanceError as exc:
+                raise CalibrationError(str(exc)) from exc
+        return calibration_from_report(
             stored_report,
             report_input=report_input,
             status="human_calibrated",
             approved_at=approved_at,
+            risk_acceptance=risk_acceptance,
         )
 
     def write_report(self, store: ProjectStore, report: CalibrationReport) -> CalibrationReport:
@@ -338,7 +365,7 @@ class JudgeCalibrationService:
             CalibrationError: The report is unpersisted, corrupt, mismatched, or noncanonical.
         """
         stored_report, report_input = _require_persisted_report(store, report)
-        _require_calibration_report_binding(stored_report, calibration, report_input)
+        _require_calibration_report_binding(store, stored_report, calibration, report_input)
         try:
             store.artifacts.write_json(
                 artifact_id=calibration.calibration_id,
@@ -857,47 +884,8 @@ def _require_persisted_report(
     return stored, report_input
 
 
-def _calibration_from_report(
-    report: CalibrationReport,
-    *,
-    report_input: ArtifactInput,
-    status: Literal["provisional", "insufficient", "human_calibrated"],
-    approved_at: datetime | None,
-) -> JudgeCalibration:
-    """Build a calibration whose inputs include the report and every frozen report identity."""
-    inputs = sorted_verified_inputs((report_input, *report.inputs))
-    return JudgeCalibration(
-        schema_version=1,
-        created_at=report.created_at if approved_at is None else approved_at,
-        inputs=inputs,
-        code_revision=report.code_revision,
-        calibration_id=stable_id(
-            "judge-calibration",
-            {
-                "report": report_input.model_dump(mode="json"),
-                "inputs": [item.model_dump(mode="json") for item in inputs],
-                "status": status,
-                "approved_at": approved_at.isoformat() if approved_at is not None else None,
-            },
-        ),
-        rubric_id=report.rubric_id,
-        judge_model=report.judge_model,
-        judge_prompt_id=report.judge_prompt_id,
-        judge_prompt_sha256=report.judge_prompt_sha256,
-        label_set_id=report.label_set_id,
-        calibration_lineage_ids=report.eligible_lineage_ids,
-        excluded_router_held_out_lineage_ids=report.router_lineages.held_out_lineage_ids,
-        validation_method="grouped_k_fold",
-        out_of_fold_report_id=report.report_id,
-        out_of_fold_report_sha256=report_input.sha256,
-        score_maps=report.score_maps,
-        label_count=report.eligible_label_count,
-        status=status,
-        approved_at=approved_at,
-    )
-
-
 def _require_calibration_report_binding(
+    store: ProjectStore,
     report: CalibrationReport,
     calibration: JudgeCalibration,
     report_input: ArtifactInput,
@@ -932,7 +920,13 @@ def _require_calibration_report_binding(
         raise CalibrationError("judge calibration held-out lineages must match its report")
     if calibration.label_count != report.eligible_label_count:
         raise CalibrationError("judge calibration label denominator must match its report")
-    expected_inputs = sorted_verified_inputs((report_input, *report.inputs))
+    try:
+        require_calibration_risk_acceptance(
+            store, report=report, report_input=report_input, calibration=calibration
+        )
+    except RiskAcceptanceError as exc:
+        raise CalibrationError(str(exc)) from exc
+    expected_inputs = calibration_inputs(report_input, report.inputs, calibration.risk_acceptance)
     if calibration.inputs != expected_inputs:
         raise CalibrationError(
             "judge calibration inputs must be the report and all frozen report inputs"
@@ -945,26 +939,17 @@ def _require_calibration_report_binding(
         raise CalibrationError(
             "human calibration requires complete per-dimension grouped OOF evidence"
         )
-    expected = _calibration_from_report(
+    expected = calibration_from_report(
         report,
         report_input=report_input,
         status=calibration.status,
         approved_at=calibration.approved_at,
+        risk_acceptance=calibration.risk_acceptance,
     )
     if expected != calibration:
         raise CalibrationError(
             "judge calibration content is not derived from its exact persisted report"
         )
-
-
-def _same_report_identity(left: CalibrationReport, right: CalibrationReport) -> bool:
-    """Compare report evidence while permitting a safe retry with a later wall-clock time."""
-    return left.model_dump(exclude={"created_at"}) == right.model_dump(exclude={"created_at"})
-
-
-def _same_calibration_identity(left: JudgeCalibration, right: JudgeCalibration) -> bool:
-    """Compare frozen calibration content without retry-time artifact timestamps."""
-    return left.model_dump(exclude={"created_at"}) == right.model_dump(exclude={"created_at"})
 
 
 def _require_timezone(value: datetime) -> None:

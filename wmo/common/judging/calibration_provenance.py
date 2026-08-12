@@ -69,5 +69,5 @@ def _verify_persisted_calibration(
     if report_input not in calibration.inputs:
         raise CalibrationError("judge calibration does not hash its named report manifest")
     _verify_report_sources(store, report)
-    _require_calibration_report_binding(report, calibration, report_input)
+    _require_calibration_report_binding(store, report, calibration, report_input)
     return calibration, calibration_input

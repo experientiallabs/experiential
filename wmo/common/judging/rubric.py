@@ -8,7 +8,13 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel, Sha256
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactId,
+    ArtifactInput,
+    ContractModel,
+    Sha256,
+)
 from wmo.common.models import ModelSnapshot
 
 
@@ -147,6 +153,7 @@ class JudgeCalibration(ArtifactEnvelope):
     recommended_label_count: Literal[10] = 10
     status: Literal["provisional", "insufficient", "human_calibrated"] = "provisional"
     approved_at: datetime | None = None
+    risk_acceptance: ArtifactInput | None = None
 
     @field_validator("calibration_lineage_ids", "excluded_router_held_out_lineage_ids")
     @classmethod
@@ -177,6 +184,8 @@ class JudgeCalibration(ArtifactEnvelope):
             raise ValueError("human-calibrated judge calibrations require approved_at")
         if self.status != "human_calibrated" and self.approved_at is not None:
             raise ValueError("unapproved judge calibrations must not set approved_at")
+        if self.status != "human_calibrated" and self.risk_acceptance is not None:
+            raise ValueError("only human-calibrated judges can name risk acceptance evidence")
         if self.status == "provisional" and self.label_count != 0:
             raise ValueError("provisional judge calibrations require zero human labels")
         if self.status == "provisional" and any(

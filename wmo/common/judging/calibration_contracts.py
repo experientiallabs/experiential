@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -19,7 +20,7 @@ from wmo.common.judging.calibration_metrics import (
     WorstDisagreement,
 )
 from wmo.common.judging.lineage import RouterLineageSplit
-from wmo.common.judging.rubric import DimensionScoreMap
+from wmo.common.judging.rubric import DimensionScoreMap, JudgeCalibration
 from wmo.common.models import ModelSnapshot
 
 
@@ -40,6 +41,35 @@ class JudgeScoreObservation(ContractModel):
         if len(set(value)) != len(value):
             raise ValueError("calibration observation citations must not repeat")
         return value
+
+
+class InsufficientCalibrationRiskAcceptance(ArtifactEnvelope):
+    """Explicit human acceptance of the risk from fewer than ten eligible rollouts."""
+
+    acceptance_id: ArtifactId
+    report: ArtifactInput
+    eligible_label_count: int = Field(ge=1)
+    eligible_rollout_count: int = Field(ge=1, lt=10)
+    recommended_label_count: Literal[10] = 10
+    accepted_at: datetime
+    risk_accepted: Literal[True] = True
+
+    @field_validator("accepted_at")
+    @classmethod
+    def _require_timezone(cls, value: datetime) -> datetime:
+        """Require an auditable timezone-aware human acceptance timestamp."""
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("risk acceptance timestamps must include a timezone")
+        return value
+
+    @model_validator(mode="after")
+    def _require_report_bound_acceptance(self) -> InsufficientCalibrationRiskAcceptance:
+        """Require this durable decision to hash exactly its accepted report."""
+        if self.created_at != self.accepted_at:
+            raise ValueError("risk acceptance created_at must equal accepted_at")
+        if self.inputs != (self.report,):
+            raise ValueError("risk acceptances must hash exactly their calibration report")
+        return self
 
 
 class CalibrationReport(ArtifactEnvelope):
@@ -156,3 +186,13 @@ class CalibrationReport(ArtifactEnvelope):
             for metric in self.dimension_metrics
         ):
             raise ValueError("provisional calibration reports require zero metric denominators")
+
+
+def _same_report_identity(left: CalibrationReport, right: CalibrationReport) -> bool:
+    """Compare report evidence while permitting a safe retry with a later clock time."""
+    return left.model_dump(exclude={"created_at"}) == right.model_dump(exclude={"created_at"})
+
+
+def _same_calibration_identity(left: JudgeCalibration, right: JudgeCalibration) -> bool:
+    """Compare frozen calibration content without retry-time artifact timestamps."""
+    return left.model_dump(exclude={"created_at"}) == right.model_dump(exclude={"created_at"})

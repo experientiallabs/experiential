@@ -6,7 +6,11 @@ from wmo.common.judging.calibration import (
     JudgeCalibrationService,
     utc_now,
 )
-from wmo.common.judging.calibration_contracts import CalibrationReport, JudgeScoreObservation
+from wmo.common.judging.calibration_contracts import (
+    CalibrationReport,
+    InsufficientCalibrationRiskAcceptance,
+    JudgeScoreObservation,
+)
 from wmo.common.judging.calibration_metrics import (
     DimensionCalibrationMetrics,
     OutOfFoldPrediction,
@@ -57,6 +61,7 @@ __all__ = [
     "HumanScore",
     "HumanScoreHistory",
     "HumanScoreReview",
+    "InsufficientCalibrationRiskAcceptance",
     "Judge",
     "JudgeCalibration",
     "JudgeCalibrationService",

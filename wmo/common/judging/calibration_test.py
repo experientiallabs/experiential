@@ -588,6 +588,98 @@ def test_calibration_binds_every_report_input_to_verified_manifest_evidence(tmp_
         )
 
 
+def test_two_label_human_calibration_requires_persisted_risk_acceptance(tmp_path: Path) -> None:
+    """A low-sample approval hashes an explicit acceptance that consumers verify recursively."""
+    graph = _write_graph(tmp_path, _entries(2))
+    service = JudgeCalibrationService()
+    report = _build(graph)
+    assert report.status == "insufficient"
+    assert report.eligible_label_count == report.eligible_rollout_count == 2
+    service.write_report(graph.store, report)
+    with pytest.raises(CalibrationError, match="explicit accept_insufficient_labels"):
+        service.approve(graph.store, report, approved_at=_TIME)
+
+    calibration = service.approve(
+        graph.store,
+        report,
+        approved_at=_TIME,
+        accept_insufficient_labels=True,
+    )
+    assert calibration.risk_acceptance is not None
+    assert calibration.risk_acceptance in calibration.inputs
+    stored = service.write_calibration(graph.store, report=report, calibration=calibration)
+    verified, _verified_input = verify_persisted_calibration(graph.store, stored.calibration_id)
+    assert verified == stored
+
+    report_input = artifact_input(graph.store.artifacts.read(report.report_id).manifest)
+    forged = stored.model_copy(
+        update={
+            "calibration_id": "forged-two-label-human-calibration",
+            "inputs": _inputs(report_input, *report.inputs),
+            "risk_acceptance": None,
+        }
+    )
+    forged_input = artifact_input(
+        graph.store.artifacts.write_json(
+            artifact_id=forged.calibration_id,
+            artifact_type="judge-calibration",
+            envelope=forged,
+            files={"calibration.json": forged},
+        )
+    )
+    with pytest.raises(CalibrationError, match="risk acceptance"):
+        verify_persisted_calibration(graph.store, forged.calibration_id)
+
+    source_observation = graph.observations[0]
+    source_judgment = Judgment.model_validate_json(
+        graph.store.artifacts.read_bytes(source_observation.judgment.artifact_id, "judgment.json")
+    )
+    with pytest.raises(JudgmentError, match="verified persisted calibration"):
+        LMJudge(
+            _FakeJudgeClient(_model(), json.dumps({"dimensions": []})),
+            _prompt(),
+            code_revision="judging-revision",
+            clock=lambda: _TIME,
+        ).judge_and_write(
+            graph.store,
+            rollout_artifact_id=source_observation.source_rollout.artifact_id,
+            rubric_artifact_id=graph.rubric.rubric_id,
+            calibration_artifact_id=forged.calibration_id,
+        )
+    forged_judgment = source_judgment.model_copy(
+        update={
+            "judgment_id": "forged-two-label-source-judgment",
+            "calibration_id": forged.calibration_id,
+            "inputs": _inputs(
+                source_observation.source_rollout,
+                artifact_input(graph.store.artifacts.read(graph.rubric.rubric_id).manifest),
+                forged_input,
+            ),
+        }
+    )
+    forged_judgment_input = artifact_input(
+        graph.store.artifacts.write_json(
+            artifact_id=forged_judgment.judgment_id,
+            artifact_type="judgment",
+            envelope=forged_judgment,
+            files={"judgment.json": forged_judgment},
+        )
+    )
+    with pytest.raises(CalibrationError, match="verified calibration"):
+        service.build_report(
+            graph.store,
+            rubric_id=graph.rubric.rubric_id,
+            label_set_id=graph.label_set.label_set_id,
+            router_lineage_split_id=graph.split.split_id,
+            observations=(
+                source_observation.model_copy(update={"judgment": forged_judgment_input}),
+                *graph.observations[1:],
+            ),
+            created_at=_TIME,
+            code_revision="calibration-revision",
+        )
+
+
 def test_router_held_out_labels_are_reported_but_excluded_from_calibration_maps(
     tmp_path: Path,
 ) -> None:
