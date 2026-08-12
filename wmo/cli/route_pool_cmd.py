@@ -371,5 +371,11 @@ def register(app: typer.Typer) -> None:
     Args:
         app: Parent Typer application that owns the route command group.
     """
-    app.command("student", help="Add a distilled student to the routing candidate pool.")(student)
+    app.command(
+        "student",
+        help=(
+            "Add a distilled student to the routing candidate pool. "
+            "It writes a \\[\\[model]] table."
+        ),
+    )(student)
     app.command("pin", help="Install a static policy that always uses one pool model.")(pin)

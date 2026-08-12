@@ -66,3 +66,11 @@ def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
         "The value produced by this callable",
     ):
         assert marker not in result.output
+
+
+def test_route_student_help_preserves_literal_pool_table_name() -> None:
+    """Explicit route help preserves the literal TOML table name."""
+    result = runner.invoke(app, ["optimize", "route", "student", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "[[model]]" in result.output
