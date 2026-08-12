@@ -134,6 +134,33 @@ def test_human_score_review_persists_history_without_overwriting_other_review_st
     assert saved["other_review"] == {"status": "draft"}
 
 
+def test_human_score_review_upsert_is_idempotent_for_duplicate_delivery(tmp_path: Path) -> None:
+    """An identical retried score returns the active label without recording a correction."""
+    store = _store(tmp_path)
+    first = HumanScoreReview.open(store).upsert(
+        rubric_id="rubric-1",
+        rollout_id="rollout-1",
+        lineage_id="lineage-fit-1",
+        dimension_id="task-success",
+        score=3,
+        created_at=_TIME,
+    )
+    duplicate = HumanScoreReview.open(store).upsert(
+        rubric_id="rubric-1",
+        rollout_id="rollout-1",
+        lineage_id="lineage-fit-1",
+        dimension_id="task-success",
+        score=3,
+        created_at=_TIME + timedelta(seconds=1),
+    )
+
+    resumed = HumanScoreReview.open(store)
+
+    assert duplicate == first
+    assert resumed.history.scores == (first,)
+    assert resumed.history.active_scores() == (first,)
+
+
 def test_human_score_review_finalizes_an_idempotent_immutable_label_set(tmp_path: Path) -> None:
     """Finalized labels retain corrections and can safely resume without a second artifact."""
     store = _store(tmp_path)

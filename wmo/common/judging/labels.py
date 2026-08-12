@@ -236,7 +236,7 @@ class HumanScoreReview:
             created_at: Time at which the local human decision is recorded.
 
         Returns:
-            The newly persisted original score or immutable correction.
+            The stored original score, immutable correction, or existing identical score.
 
         Raises:
             ValueError: The supplied score timestamp has no timezone.
@@ -260,6 +260,9 @@ class HumanScoreReview:
                 ),
                 None,
             )
+            if existing is not None and existing.score == score:
+                result.append(existing)
+                return history
             label = HumanScore(
                 label_id=stable_id(
                     "human-score",
