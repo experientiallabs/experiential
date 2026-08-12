@@ -58,6 +58,9 @@ def build_world_model_request(
 
     Returns:
         A text-only provider request with the pinned prompt and no candidate hidden state.
+
+    Raises:
+        TextWorldModelProtocolError: The candidate response lacks visible text or includes tools.
     """
     if candidate_response.content is None or candidate_response.tool_calls:
         raise TextWorldModelProtocolError(

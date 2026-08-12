@@ -76,7 +76,14 @@ def internal_failure(phase: str, exception: Exception) -> StructuredFailure:
 
 
 def normalize_text_tool_failure(episode: AgentEpisode) -> StructuredFailure | None:
-    """Translate a tool attempt into the text mode's explicit unsupported-cell evidence."""
+    """Translate a tool attempt into the text mode's explicit unsupported-cell evidence.
+
+    Args:
+        episode: Customer-agent episode that may have ended at the text-only tool boundary.
+
+    Returns:
+        The original failure, a normalized unsupported failure, or ``None``.
+    """
     failure = episode.failure
     if failure is None or failure.exception_type != TextOnlyToolUseError.__name__:
         return failure
@@ -90,7 +97,14 @@ def normalize_text_tool_failure(episode: AgentEpisode) -> StructuredFailure | No
 
 
 def known_total_spend(rollouts: Sequence[RolloutArtifact]) -> float | None:
-    """Return total observed provider spend, or ``None`` if any completed episode is unpriced."""
+    """Return total observed provider spend, or ``None`` if any completed episode is unpriced.
+
+    Args:
+        rollouts: Completed text-simulation rollout artifacts to total.
+
+    Returns:
+        The known provider spend, or ``None`` when any billed call is not priced.
+    """
     values = tuple(rollout_spend(rollout) for rollout in rollouts)
     if any(value is None for value in values):
         return None
@@ -98,7 +112,14 @@ def known_total_spend(rollouts: Sequence[RolloutArtifact]) -> float | None:
 
 
 def rollout_spend(rollout: RolloutArtifact) -> float | None:
-    """Return observed provider cost, never interpreting an unpriced provider call as zero."""
+    """Return observed provider cost, never interpreting an unpriced provider call as zero.
+
+    Args:
+        rollout: Completed text-simulation rollout whose recorded calls are inspected.
+
+    Returns:
+        The recorded provider cost, or ``None`` when any paid call has unknown spend.
+    """
     if rollout.failure is not None and (
         rollout.failure.details.get("provider_dispatch_unknown_spend") is True
         or rollout.failure.details.get("phase") == "paid_cell_stale_lease"
@@ -132,7 +153,18 @@ def orchestration_economics(duration_seconds: float) -> OperationEconomics:
 
 
 def timestamp(clock: Callable[[], datetime], *, not_before: datetime | None = None) -> datetime:
-    """Return an aware timestamp and prevent a deterministic test clock from moving backwards."""
+    """Return an aware timestamp and prevent a deterministic test clock from moving backwards.
+
+    Args:
+        clock: Time source expected to return an aware UTC-comparable datetime.
+        not_before: Optional prior event time this timestamp may not precede.
+
+    Returns:
+        The current clock value, or ``not_before`` when the clock moved backwards.
+
+    Raises:
+        ValueError: The clock returns a naive datetime.
+    """
     value = clock()
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("text simulation clock must return timezone-aware datetimes")
@@ -147,7 +179,14 @@ def utc_now() -> datetime:
 
 
 def jsonl_bytes(records: Sequence[Mapping[str, object]]) -> bytes:
-    """Render a deterministic JSONL file from small internal artifact-index records."""
+    """Render a deterministic JSONL file from small internal artifact-index records.
+
+    Args:
+        records: JSON-safe records in their persisted artifact-index order.
+
+    Returns:
+        UTF-8 JSONL bytes, including a trailing newline when records are present.
+    """
     payload = b"\n".join(
         canonical_json_bytes(cast(dict[str, object], record)) for record in records
     )

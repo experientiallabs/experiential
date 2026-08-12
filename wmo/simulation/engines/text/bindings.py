@@ -80,6 +80,9 @@ def make_cell_binding(
 
     Returns:
         A complete identity record used for rollout IDs, persistence, and resume checks.
+
+    Raises:
+        ValueError: The specification does not retain world-model settings.
     """
     settings = spec.world_model
     if settings is None:  # pragma: no cover - concrete text callers validate the mode first

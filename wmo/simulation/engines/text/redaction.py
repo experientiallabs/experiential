@@ -91,6 +91,9 @@ def redact_failure(
 
     Returns:
         A redacted immutable failure copy, or ``None``.
+
+    Raises:
+        TypeError: Redaction does not retain a JSON object for structured failure details.
     """
     if failure is None:
         return None
@@ -111,6 +114,9 @@ def redact_span(span: RolloutSpan, field_names: frozenset[str]) -> RolloutSpan:
 
     Returns:
         A redacted immutable span copy.
+
+    Raises:
+        TypeError: Redaction does not retain a JSON object for the span payload.
     """
     payload = redact_json(span.payload, field_names)
     if not isinstance(payload, dict):  # pragma: no cover - JsonObject input always stays an object

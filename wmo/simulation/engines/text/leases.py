@@ -233,6 +233,9 @@ class TextCellLeaseStore:
 
         Args:
             lease: Exact claim obtained from ``acquire``.
+
+        Raises:
+            TextCellLeaseError: The durable claim changed before its owner could release it.
         """
         self._ensure_directory()
         path = self._path(lease.lease_id)

@@ -48,6 +48,7 @@ from wmo.common.rollouts import (
     RolloutArtifact,
     RolloutEventKind,
     RolloutSpan,
+    SimulationCellBinding,
     SimulationMode,
     StopReason,
     WorldModelSimulatorSnapshot,
@@ -331,12 +332,39 @@ def _rubric(task_set_input: ArtifactInput) -> Rubric:
     )
 
 
-def _rollout(tag: str, task_id: str) -> RolloutArtifact:
+def _rollout(
+    tag: str,
+    task: TaskCase,
+    task_set: TaskSet,
+    task_set_input: ArtifactInput,
+) -> RolloutArtifact:
     """Build one successful world-model rollout suitable for authoritative W6 judging."""
     model = _model("candidate-model")
+    plan_input = ArtifactInput(artifact_id=f"evaluation-plan-{tag}", sha256=_DIGEST)
+    spec_input = ArtifactInput(artifact_id=f"simulation-spec-{tag}", sha256=_DIGEST)
+    binding = SimulationCellBinding(
+        evaluation_plan_input=plan_input,
+        task_set_input=task_set_input,
+        task_set_tasks_sha256=task_set.tasks_sha256,
+        task_sha256=sha256_json(task),
+        candidate_alias="candidate-a",
+        candidate=model,
+        agent_id="customer-agent",
+        repeat=0,
+        world_model_alias="world-model-a",
+        world_model=model,
+        simulator_id="world-model-v1",
+        prompt_id="world-prompt-v1",
+        prompt_version="v1",
+        prompt_sha256=_DIGEST,
+        simulation_spec_input=spec_input,
+        simulation_spec_sha256=_DIGEST,
+        simulation_inputs_sha256=_DIGEST,
+    )
     return RolloutArtifact(
         schema_version=1,
         created_at=_TIME,
+        inputs=_inputs(plan_input, spec_input, task_set_input),
         code_revision="w12-test",
         artifact_id=f"rollout-artifact-{tag}",
         simulation_id=f"simulation-{tag}",
@@ -346,12 +374,14 @@ def _rollout(tag: str, task_id: str) -> RolloutArtifact:
         trace_id=f"teacher-trace-{tag}",
         evidence_source="world_model",
         source_run_id=f"run-{tag}",
-        task_id=task_id,
+        task_id=task.task_id,
         candidate=model,
         agent_id="customer-agent",
         simulator=WorldModelSimulatorSnapshot(
             simulator_id="world-model-v1",
             prompt_id="world-prompt-v1",
+            prompt_version="v1",
+            prompt_sha256=_DIGEST,
             world_model=model,
         ),
         world_model=model,
@@ -371,6 +401,7 @@ def _rollout(tag: str, task_id: str) -> RolloutArtifact:
         stop_reason=StopReason.COMPLETED,
         candidate_economics=OperationEconomics(),
         simulation_spec_sha256=_DIGEST,
+        simulation_binding=binding,
     )
 
 
@@ -388,7 +419,9 @@ def _write_teacher_source(
     )
     prompt = PromptDefinition.from_text("judge-prompt-v1", "Return structured judgment JSON.")
     model = _model()
-    rollouts = tuple(_rollout(f"calibration-{index}", task.task_id) for index in range(2))
+    rollouts = tuple(
+        _rollout(f"calibration-{index}", task, task_set, task_set_input) for index in range(2)
+    )
     rollout_inputs: list[ArtifactInput] = []
     for rollout in rollouts:
         rollout_inputs.append(
@@ -513,7 +546,7 @@ def _write_teacher_source(
         ),
     )
     calibration_input = artifact_input(store.artifacts.read(calibration.calibration_id).manifest)
-    final_rollout = _rollout("teacher", task.task_id)
+    final_rollout = _rollout("teacher", task, task_set, task_set_input)
     rollout_input = artifact_input(
         store.artifacts.write_json(
             artifact_id=final_rollout.artifact_id,
@@ -959,7 +992,6 @@ def test_frozen_dataset_round_trips_only_after_store_backed_build(tmp_path: Path
         ),
     )
     written = write_sft_dataset(store, artifact)
-
     assert load_sft_dataset(store, written.dataset.dataset_id) == written
     assert all(reference.source_artifact in written.dataset.inputs for reference in written.sources)
     assert all(

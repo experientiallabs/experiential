@@ -143,7 +143,11 @@ class RecordingCandidateClient:
 
     @property
     def last_candidate_action(self) -> AssistantAction | None:
-        """Return the final visible candidate output recorded before the episode stopped."""
+        """Return the final visible candidate output recorded before the episode stopped.
+
+        Returns:
+            The last recorded visible action, or ``None`` before the first candidate call.
+        """
         if not self._candidate_responses:
             return None
         return self._candidate_responses[-1].output
