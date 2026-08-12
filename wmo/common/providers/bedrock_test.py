@@ -23,6 +23,8 @@ from wmo.common.providers.base import (
     Message,
     ProviderConfig,
     ProviderKind,
+    StreamChunk,
+    TokenUsage,
 )
 from wmo.common.providers.bedrock import (
     AWS_DEFAULT_REGION_ENV,
@@ -35,6 +37,7 @@ from wmo.common.providers.bedrock import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
     from botocore.client import BaseClient
@@ -501,3 +504,58 @@ def test_live_titan_embed() -> None:  # pragma: no cover - network
     assert len(vectors) == 2
     assert all(len(vector) == 256 for vector in vectors)
     assert vectors[0] != vectors[1]  # distinct inputs, distinct embeddings
+
+
+# --- Native streaming ----------------------------------------------------------------------------
+# `stream()` must yield text deltas in order and exactly ONE terminal chunk carrying the call's
+# TokenUsage, because metering and the request log account for streamed traffic off that chunk
+# alone: a missing or duplicated terminal chunk is unbilled or double-billed traffic.
+
+
+def _collect(chunks: Iterator[StreamChunk]) -> tuple[str, StreamChunk]:
+    """Drain a stream into its concatenated text plus its single terminal chunk."""
+    parts: list[str] = []
+    final: StreamChunk | None = None
+    for chunk in chunks:
+        if chunk.done:
+            assert final is None, "stream yielded more than one terminal chunk"
+            final = chunk
+        else:
+            parts.append(chunk.delta)
+    assert final is not None, "stream never yielded a terminal chunk"
+    return "".join(parts), final
+
+
+_STREAM_MESSAGES = [Message(role="user", content="hi")]
+
+
+class _FakeStreamingBedrockClient:
+    def __init__(self, events: list[dict[str, object]]) -> None:
+        self._events = events
+        self.last_kwargs: dict[str, object] = {}
+
+    def converse_stream(self, **kwargs: object) -> dict[str, object]:
+        self.last_kwargs = kwargs
+        return {"stream": iter(self._events)}
+
+
+def test_stream_reads_usage_off_the_metadata_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[dict[str, object]] = [
+        {"contentBlockDelta": {"delta": {"text": "hel"}}},
+        {"contentBlockDelta": {"delta": {"text": "lo"}}},
+        {"metadata": {"usage": {"inputTokens": 9, "outputTokens": 5}}},
+    ]
+    fake = _FakeStreamingBedrockClient(events)
+    provider = BedrockProvider(
+        ProviderConfig(kind=ProviderKind.BEDROCK, model="us.anthropic.claude-opus-4-8")
+    )
+    monkeypatch.setattr(provider, "_get_client", lambda: fake)
+
+    text, final = _collect(provider.stream("sys", _STREAM_MESSAGES, max_tokens=64))
+
+    assert text == "hello"
+    assert final.usage == TokenUsage(input_tokens=9, output_tokens=5)
+    assert fake.last_kwargs["modelId"] == "us.anthropic.claude-opus-4-8"
+    # Claude via Converse: max tokens forwarded, temperature withheld (the catalog says the model
+    # rejects sampling params).
+    assert fake.last_kwargs["inferenceConfig"] == {"maxTokens": 64}

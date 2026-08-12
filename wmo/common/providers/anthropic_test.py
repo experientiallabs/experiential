@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
 
 from wmo.common.providers.anthropic import AnthropicProvider
-from wmo.common.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind
+from wmo.common.providers.base import (
+    ChatRequest,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+    StreamChunk,
+    TokenUsage,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
 
 class _FakeTextBlock:
@@ -218,3 +226,68 @@ def test_stream_forwards_the_configs_effort_dial(monkeypatch: pytest.MonkeyPatch
     assert fake.messages.last_kwargs["stream"] is True
     assert fake.messages.last_kwargs["thinking"] == {"type": "adaptive"}
     assert fake.messages.last_kwargs["output_config"] == {"effort": "max"}
+
+
+# --- Native streaming ----------------------------------------------------------------------------
+# `stream()` must yield text deltas in order and exactly ONE terminal chunk carrying the call's
+# TokenUsage, because metering and the request log account for streamed traffic off that chunk
+# alone: a missing or duplicated terminal chunk is unbilled or double-billed traffic.
+
+
+def _collect(chunks: Iterator[StreamChunk]) -> tuple[str, StreamChunk]:
+    """Drain a stream into its concatenated text plus its single terminal chunk."""
+    parts: list[str] = []
+    final: StreamChunk | None = None
+    for chunk in chunks:
+        if chunk.done:
+            assert final is None, "stream yielded more than one terminal chunk"
+            final = chunk
+        else:
+            parts.append(chunk.delta)
+    assert final is not None, "stream never yielded a terminal chunk"
+    return "".join(parts), final
+
+
+_STREAM_MESSAGES = [Message(role="user", content="hi")]
+
+
+class _FakeStreamMessages:
+    def __init__(self, events: list[object]) -> None:
+        self._events = events
+        self.last_kwargs: dict[str, object] = {}
+
+    def create(self, **kwargs: object) -> Iterator[object]:
+        self.last_kwargs = kwargs
+        return iter(self._events)
+
+
+def test_stream_yields_deltas_then_one_chunk_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Anthropic splits usage across two events: input tokens arrive with `message_start`, output
+    # tokens only with `message_delta`, so the terminal chunk has to accumulate both.
+    events: list[object] = [
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(usage=SimpleNamespace(input_tokens=9)),
+        ),
+        SimpleNamespace(
+            type="content_block_delta", delta=SimpleNamespace(type="text_delta", text="hel")
+        ),
+        SimpleNamespace(
+            type="content_block_delta", delta=SimpleNamespace(type="text_delta", text="lo")
+        ),
+        SimpleNamespace(type="message_delta", usage=SimpleNamespace(output_tokens=5)),
+        SimpleNamespace(type="message_stop"),
+    ]
+    fake_messages = _FakeStreamMessages(events)
+    provider = AnthropicProvider(
+        ProviderConfig(kind=ProviderKind.ANTHROPIC, model="claude-fable-5")
+    )
+    monkeypatch.setattr(provider, "_get_client", lambda: SimpleNamespace(messages=fake_messages))
+
+    text, final = _collect(provider.stream("be terse", _STREAM_MESSAGES, max_tokens=64))
+
+    assert text == "hello"
+    assert final.usage == TokenUsage(input_tokens=9, output_tokens=5)
+    assert fake_messages.last_kwargs["stream"] is True
+    assert fake_messages.last_kwargs["max_tokens"] == 64
+    assert "temperature" not in fake_messages.last_kwargs

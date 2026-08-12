@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Generator, Iterator
 
+import pytest
+
 from wmo.common.observability.metered import MeteredProvider, classify_build_call
 from wmo.common.observability.tracker import Phase, RunTracker
 from wmo.common.providers.base import (
@@ -253,4 +255,16 @@ def test_fully_consumed_stream_without_usage_records_nothing() -> None:
     chunks = list(provider.stream("sys", [Message(role="user", content="hi")]))
 
     assert chunks[-1].done
+    assert tracker.events == []
+
+
+def test_streaming_a_provider_without_stream_fails_before_any_traffic() -> None:
+    # `FakeProvider` has complete/embed/verify but no stream. Falling back to complete() here
+    # would silently turn a streamed request into a blocking one; the caller has to see it.
+    tracker = RunTracker(run_id="r", kind="test")
+    provider = MeteredProvider(FakeProvider(), tracker)
+
+    with pytest.raises(TypeError, match="stream"):
+        next(iter(provider.stream("sys", [Message(role="user", content="hi")])))
+
     assert tracker.events == []

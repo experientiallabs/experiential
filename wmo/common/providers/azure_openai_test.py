@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+
 import pytest
 
 from wmo.common.providers.azure_openai import AzureOpenAIProvider
-from wmo.common.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind
+from wmo.common.providers.base import (
+    ChatRequest,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+    StreamChunk,
+    TokenUsage,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 class _FakeMessage:
@@ -602,3 +615,89 @@ def test_live_verify() -> None:  # pragma: no cover - network
         )
     )
     assert provider.verify().ok is True
+
+
+# --- Native streaming ----------------------------------------------------------------------------
+# `stream()` must yield text deltas in order and exactly ONE terminal chunk carrying the call's
+# TokenUsage, because metering and the request log account for streamed traffic off that chunk
+# alone: a missing or duplicated terminal chunk is unbilled or double-billed traffic.
+
+
+def _collect(chunks: Iterator[StreamChunk]) -> tuple[str, StreamChunk]:
+    """Drain a stream into its concatenated text plus its single terminal chunk."""
+    parts: list[str] = []
+    final: StreamChunk | None = None
+    for chunk in chunks:
+        if chunk.done:
+            assert final is None, "stream yielded more than one terminal chunk"
+            final = chunk
+        else:
+            parts.append(chunk.delta)
+    assert final is not None, "stream never yielded a terminal chunk"
+    return "".join(parts), final
+
+
+_STREAM_MESSAGES = [Message(role="user", content="hi")]
+
+
+def _openai_stream_chunks() -> list[object]:
+    """The SDK's chunk sequence: content deltas, a contentless one, then usage with no choices."""
+    return [
+        SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(content="hel"))], usage=None
+        ),
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="lo"))], usage=None),
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None))], usage=None),
+        SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=9, completion_tokens=5)),
+    ]
+
+
+class _FakeStreamingChatCompletions:
+    def __init__(self, chunks: list[object]) -> None:
+        self._chunks = chunks
+        self.last_kwargs: dict[str, object] = {}
+
+    def create(self, **kwargs: object) -> Iterator[object]:
+        self.last_kwargs = kwargs
+        return iter(self._chunks)
+
+
+def _streaming_config() -> ProviderConfig:
+    return ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        deployment="gpt-5.5",
+        endpoint="https://example.openai.azure.com",
+        api_version="2024-10-21",
+    )
+
+
+def test_stream_routes_to_the_deployment_and_reports_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeStreamingChatCompletions(_openai_stream_chunks())
+    provider = AzureOpenAIProvider(_streaming_config(), api_key="sk-test")
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: SimpleNamespace(chat=SimpleNamespace(completions=fake)),
+    )
+
+    text, final = _collect(provider.stream("sys", _STREAM_MESSAGES))
+
+    assert text == "hello"
+    assert final.usage == TokenUsage(input_tokens=9, output_tokens=5)
+    # Azure addresses the DEPLOYMENT, not the base model id: a stream sent to the model name is a
+    # 404 from the customer's resource.
+    assert fake.last_kwargs["model"] == "gpt-5.5"
+
+
+def test_stream_refuses_a_reasoning_config_instead_of_dropping_the_effort() -> None:
+    # Azure chat completions has no reasoning_effort, and silently streaming without it would
+    # serve a cheaper model than the one the config asked for.
+    config = _streaming_config()
+    config.reasoning_effort = "high"
+    provider = AzureOpenAIProvider(config, api_key="sk-test")
+
+    with pytest.raises(NotImplementedError, match="reasoning_effort"):
+        next(iter(provider.stream("sys", _STREAM_MESSAGES)))

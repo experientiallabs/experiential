@@ -70,36 +70,21 @@ def test_top_level_directories_are_allowlisted() -> None:
 
 
 # AGENTS.md rule 2: a module needs no sibling suite when it has no behavior of its own to cover.
-# `__init__.py` is a re-export surface (its package tests it through `api_test.py`), `__main__.py`
-# is the `python -m` shim over an already-tested entry point, and `conftest.py` is pytest wiring
-# that every suite exercises by running at all.
+# `__init__.py` is a re-export surface (what it promises is asserted from the suite of whichever
+# module the package is mostly about), `__main__.py` is the `python -m` shim over an already-tested
+# entry point, and `conftest.py` is pytest wiring that every suite exercises by running at all.
 UNTESTED_MODULE_NAMES = {"__init__.py", "__main__.py", "conftest.py"}
 
-# AGENTS.md rule 2: the CLOSED set of suites that cover something other than one sibling module,
-# each mapped to what it does cover. One more is patterned rather than listed (a package's
-# `api_test.py` covers its `__init__.py` re-export surface). An agent may never extend this list: a
-# new test file either sits beside the module it covers, or it merges into the cross-cutting suite
-# that already owns its concern. Adding an entry requires a human to grant it for that exact path.
-CROSS_CUTTING_TESTS = {
-    "wmo/repo_layout_test.py": "the repo layout itself: this file",
-    "wmo/cli/startup_test.py": "the CLI's import graph: `wmo --help` must stay off heavy modules",
-    "wmo/common/providers/streaming_test.py": (
-        "one streaming contract held across every backend at once"
-    ),
-    "wmo/common/vendor/waterfall/import_hygiene_test.py": (
-        "the vendored package importing and constructing with zero provider SDKs installed"
-    ),
-    "wmo/simulation/model/integration_test.py": (
-        "convert -> build -> load -> step against a real Bedrock model (live, env-gated)"
-    ),
-    "wmo/simulation/serving/chat_openai_client_test.py": (
-        "wire compatibility proven with the real `openai` SDK against a booted server"
-    ),
-}
-
-#: The one suite name that pairs with a package rather than a module: a package's `api_test.py`
-#: covers the `__init__.py` re-export surface, which is the package's public API.
-_PACKAGE_SUITES = {"api_test.py": "__init__.py"}
+# AGENTS.md rule 2: the CLOSED set of suites that cover something other than one sibling module.
+# There is exactly ONE, and it is this file, which has no module to pair with by construction: the
+# repo layout is its subject. Everything else lives beside what it covers, including the seam suites
+# that used to sit here (a cross-backend contract is a section of each backend's own suite, a live
+# end-to-end path a section of the pipeline's, a package's public surface a section of the suite for
+# the module the package is about). An agent may never extend this list: a new test file either sits
+# beside the module it covers or merges into that module's suite. Adding an entry, and with it the
+# argument for why nothing beside a module could hold the test, requires a human to grant that exact
+# path in the same change that documents it in AGENTS.md rule 2.
+CROSS_CUTTING_TESTS = {"wmo/repo_layout_test.py": "the repo layout itself: this file"}
 
 
 def _tracked_python_files() -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -139,9 +124,7 @@ def test_every_test_covers_the_module_beside_it() -> None:
     orphans = sorted(
         p
         for p in tests
-        if p not in CROSS_CUTTING_TESTS
-        and str(Path(p).parent / _PACKAGE_SUITES.get(Path(p).name, "")) not in known
-        and p.removesuffix("_test.py") + ".py" not in known
+        if p not in CROSS_CUTTING_TESTS and p.removesuffix("_test.py") + ".py" not in known
     )
     assert not orphans, (
         f"test files with no module beside them: {orphans}; rename them to match the module they "

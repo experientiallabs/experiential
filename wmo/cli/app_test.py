@@ -7,6 +7,7 @@ import importlib.util
 import inspect
 import json
 import os
+import subprocess
 import sys
 import time
 from importlib.machinery import ModuleSpec
@@ -3485,3 +3486,110 @@ def test_build_defaults_to_the_free_fidelity_tier(patched_provider, tmp_path) ->
         (root / "models" / "defaulted" / "auto_fidelity.json").read_text(encoding="utf-8")
     )
     assert not auto.get("scores"), f"default build paid for a config search: {auto['scores']}"
+
+
+# --- Startup / import isolation (#344) -----------------------------------------------------------
+# `wmo --help` and the light commands must stay off FastAPI, sklearn, scipy, uvicorn, and the heavy
+# serving / distill / route bodies: the CLI is the first thing a user waits on, and every heavy
+# import on the light path is latency they pay on every invocation. Each probe runs in a FRESH
+# SUBPROCESS, because pytest's collection of the tests above has already imported half the product
+# into this process, and an in-process check would read that as the CLI's own import graph.
+
+
+def _run(code: str) -> None:
+    """Run a probe in a clean interpreter (this process's sys.modules proves nothing)."""
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
+
+
+def _run(code: str) -> None:
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
+
+
+def test_cli_import_stays_free_of_heavy_third_parties() -> None:
+    _run(
+        """
+import sys
+import wmo.cli
+banned = ("fastapi", "sklearn", "scipy", "uvicorn")
+roots = {k.split(".")[0] for k in sys.modules}
+bad = sorted(b for b in banned if b in roots)
+assert not bad, f"heavy packages loaded on import wmo.cli: {bad}"
+"""
+    )
+
+
+def test_cli_help_stays_free_of_heavy_product_modules() -> None:
+    _run(
+        """
+import sys
+from typer.testing import CliRunner
+from wmo.cli.app import app
+
+result = CliRunner().invoke(app, ["--help"])
+assert result.exit_code == 0, result.output
+banned = (
+    "fastapi",
+    "sklearn",
+    "scipy",
+    "uvicorn",
+    "wmo.simulation.serving.server",
+    "wmo.optimize.model",
+    "wmo.cli.route_app",
+    "wmo.simulation.evaluation.open_loop",
+)
+roots = {k.split(".")[0] for k in sys.modules}
+bad = []
+for name in banned:
+    if name in sys.modules:
+        bad.append(name)
+    elif "." not in name and name in roots:
+        bad.append(name)
+assert not bad, f"heavy modules loaded for wmo --help: {bad}"
+"""
+    )
+
+
+def test_list_and_config_do_not_load_serve_or_distill() -> None:
+    _run(
+        """
+import sys
+from typer.testing import CliRunner
+from wmo.cli.app import app
+
+runner = CliRunner()
+assert runner.invoke(app, ["list"]).exit_code == 0
+assert runner.invoke(app, ["config", "telemetry", "status"]).exit_code == 0
+banned = (
+    "wmo.simulation.serving.server",
+    "wmo.optimize.model",
+    "wmo.cli.route_app",
+    "fastapi",
+    "sklearn",
+    "uvicorn",
+)
+roots = {k.split(".")[0] for k in sys.modules}
+bad = []
+for name in banned:
+    if name in sys.modules:
+        bad.append(name)
+    elif "." not in name and name in roots:
+        bad.append(name)
+assert not bad, f"light commands pulled: {bad}"
+"""
+    )
+
+
+def test_serve_help_loads_uvicorn_path_when_handler_imports() -> None:
+    """Invoking the serve command body must be able to import the serve stack.
+
+    ``serve --help`` only needs the signature (still light). Importing the serve handler's
+    dependencies on demand is checked by importing create_app the same way ``serve`` does.
+    """
+    _run(
+        """
+import sys
+from wmo.simulation.serving.server import create_app
+assert callable(create_app)
+assert "fastapi" in {m.split(".")[0] for m in sys.modules}
+"""
+    )

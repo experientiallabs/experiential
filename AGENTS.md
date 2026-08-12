@@ -149,11 +149,12 @@ uv run pytest -q
    `wmo/repo_layout_test.py` enforces it, so a violation fails CI rather than landing quietly:
 
    - **Every module has a sibling suite.** The only exempt filenames are `__init__.py` (a
-     re-export surface, covered by its package's `api_test.py`), `__main__.py` (the `python -m`
-     shim over an already-tested entry point), and `conftest.py` (pytest wiring that every run
-     exercises). Coverage that lives in some other file does not satisfy the rule: the point of
-     the pairing is that a reader of `foo.py` can find its tests without searching, and that
-     nobody has to guess which suite would break if they changed it.
+     re-export surface: what it promises is asserted from the suite of whichever module the
+     package is mostly about, e.g. `wmo.__all__` from `wmo/common/core/types_test.py`),
+     `__main__.py` (the `python -m` shim over an already-tested entry point), and `conftest.py`
+     (pytest wiring that every run exercises). Coverage that lives in some other file does not
+     satisfy the rule: the point of the pairing is that a reader of `foo.py` can find its tests
+     without searching, and that nobody has to guess which suite would break if they changed it.
    - **Every suite has the module it names.** A `foo_test.py` whose `foo.py` was renamed away
      keeps passing while covering nothing, which is worse than no test at all: the gate reports
      green over code that is gone. Tests for a module go in that module's suite, never in a
@@ -168,21 +169,24 @@ uv run pytest -q
      and which suites cover the behavior of its implementers. A docstring-only `foo_test.py`
      satisfies the gate and is strictly preferred to a suite full of tautologies.
 
-   A handful of suites genuinely cover something other than one sibling module: a package's
-   `__init__.py` re-export surface (`api_test.py`), the layout and import direction of the whole
-   repo (`wmo/repo_layout_test.py`, the executable form of rules 2, 4, and 5, and the one home for
-   every structural assertion: the per-package `package_layout_test.py` files were folded into it,
-   so do not add another), the CLI's import graph (`wmo/cli/startup_test.py`), a contract held
-   identically across every backend (`wmo/common/providers/streaming_test.py`), the vendored
-   waterfall importing with no SDKs installed
-   (`wmo/common/vendor/waterfall/import_hygiene_test.py`), a live end-to-end path
-   (`wmo/simulation/model/integration_test.py`), and wire compatibility proven with a real
-   third-party SDK (`wmo/simulation/serving/chat_openai_client_test.py`). They exist because their
-   subject is a seam between modules, so splitting them per module would destroy what they check.
-   That set is CLOSED, listed as `CROSS_CUTTING_TESTS` in `wmo/repo_layout_test.py`, and **agents
-   may never extend it.** A new test file either sits beside the module it covers or merges into
-   the cross-cutting suite that already owns its concern. A new entry requires a human to grant
-   that exact path, and then it lands in the same change that documents it here.
+   Exactly ONE suite covers something other than a sibling module: `wmo/repo_layout_test.py`, the
+   executable form of rules 2, 4, and 5, which has nothing to pair with because the repo's own
+   layout is its subject. It is also the one home for every structural assertion, so do not add a
+   second layout or `package_layout` suite anywhere. That set is CLOSED, listed as
+   `CROSS_CUTTING_TESTS` in `wmo/repo_layout_test.py`, and **agents may never extend it.**
+
+   A cross-module concern is a SECTION of the suite for the module it is mostly about, not a file
+   of its own, and a section is cheap: a `# --- <concern> ---` banner and a comment saying what
+   would break. The ones that used to be separate files are where to look for the pattern: one
+   streaming contract held across every backend became a `Native streaming` section in each
+   backend's suite (`anthropic_test.py`, `openai_test.py`, and so on), the CLI's import-graph
+   probes became a section of `wmo/cli/app_test.py`, the vendored waterfall's zero-SDK import
+   became one of `waterfall_test.py`, the live Bedrock build-to-step path became an env-gated
+   section of `wmo/simulation/model/build_test.py`, real-`openai`-SDK wire compatibility became
+   one of `wmo/simulation/serving/chat_test.py`, and each package's public surface became one in
+   the suite for the module that package is about. A new test file either sits beside the module it
+   covers or merges into that module's suite. Granting a new exception requires a human plus the
+   argument for why no module's suite could hold it, in the same change that documents it here.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary

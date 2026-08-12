@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+
 import pytest
 
-from wmo.common.providers.base import DEFAULT_MAX_TOKENS, Message, ProviderConfig, ProviderKind
+from wmo.common.providers.base import (
+    DEFAULT_MAX_TOKENS,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+    StreamChunk,
+    TokenUsage,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 from wmo.common.providers.openai_responses import OpenAIResponsesProvider
 from wmo.common.vendor.waterfall import ChatRequest
 
@@ -293,3 +306,60 @@ def test_live_verify() -> None:  # pragma: no cover - network
         ProviderConfig(kind=ProviderKind.OPENAI_RESPONSES, model="gpt-5.4-mini")
     )
     assert provider.verify().ok is True
+
+
+# --- Native streaming ----------------------------------------------------------------------------
+# `stream()` must yield text deltas in order and exactly ONE terminal chunk carrying the call's
+# TokenUsage, because metering and the request log account for streamed traffic off that chunk
+# alone: a missing or duplicated terminal chunk is unbilled or double-billed traffic.
+
+
+def _collect(chunks: Iterator[StreamChunk]) -> tuple[str, StreamChunk]:
+    """Drain a stream into its concatenated text plus its single terminal chunk."""
+    parts: list[str] = []
+    final: StreamChunk | None = None
+    for chunk in chunks:
+        if chunk.done:
+            assert final is None, "stream yielded more than one terminal chunk"
+            final = chunk
+        else:
+            parts.append(chunk.delta)
+    assert final is not None, "stream never yielded a terminal chunk"
+    return "".join(parts), final
+
+
+_STREAM_MESSAGES = [Message(role="user", content="hi")]
+
+
+class _FakeStreamingResponses:
+    def __init__(self, events: list[object]) -> None:
+        self._events = events
+        self.last_kwargs: dict[str, object] = {}
+
+    def create(self, **kwargs: object) -> Iterator[object]:
+        self.last_kwargs = kwargs
+        return iter(self._events)
+
+
+def test_stream_reads_usage_off_the_completed_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[object] = [
+        SimpleNamespace(type="response.output_text.delta", delta="hel"),
+        SimpleNamespace(type="response.output_text.delta", delta="lo"),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(usage=SimpleNamespace(input_tokens=9, output_tokens=5)),
+        ),
+    ]
+    fake = _FakeStreamingResponses(events)
+    provider = OpenAIResponsesProvider(
+        ProviderConfig(kind=ProviderKind.OPENAI_RESPONSES, model="gpt-5.5")
+    )
+    monkeypatch.setattr(provider, "_get_client", lambda: SimpleNamespace(responses=fake))
+
+    text, final = _collect(provider.stream("sys", _STREAM_MESSAGES))
+
+    assert text == "hello"
+    assert final.usage == TokenUsage(input_tokens=9, output_tokens=5)
+    assert fake.last_kwargs["stream"] is True
+    # `store=False`: customer traffic must not be retained on OpenAI's side.
+    assert fake.last_kwargs["store"] is False

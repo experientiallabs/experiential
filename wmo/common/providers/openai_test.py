@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -12,6 +13,8 @@ from wmo.common.providers.base import (
     Message,
     ProviderConfig,
     ProviderKind,
+    StreamChunk,
+    TokenUsage,
 )
 from wmo.common.providers.openai import OpenAIProvider
 from wmo.common.vendor.waterfall import ChatMaxTokensField
@@ -581,3 +584,67 @@ def test_effort_dialed_stream_that_emits_text_is_left_alone(
 
     assert [c.delta for c in chunks if c.delta] == ["hi"]
     assert chunks[-1].done is True
+
+
+# --- Native streaming ----------------------------------------------------------------------------
+# `stream()` must yield text deltas in order and exactly ONE terminal chunk carrying the call's
+# TokenUsage, because metering and the request log account for streamed traffic off that chunk
+# alone: a missing or duplicated terminal chunk is unbilled or double-billed traffic.
+
+
+def _collect(chunks: Iterator[StreamChunk]) -> tuple[str, StreamChunk]:
+    """Drain a stream into its concatenated text plus its single terminal chunk."""
+    parts: list[str] = []
+    final: StreamChunk | None = None
+    for chunk in chunks:
+        if chunk.done:
+            assert final is None, "stream yielded more than one terminal chunk"
+            final = chunk
+        else:
+            parts.append(chunk.delta)
+    assert final is not None, "stream never yielded a terminal chunk"
+    return "".join(parts), final
+
+
+_STREAM_MESSAGES = [Message(role="user", content="hi")]
+
+
+def _openai_stream_chunks() -> list[object]:
+    """The SDK's chunk sequence: content deltas, a contentless one, then usage with no choices."""
+    return [
+        SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(content="hel"))], usage=None
+        ),
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="lo"))], usage=None),
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None))], usage=None),
+        SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=9, completion_tokens=5)),
+    ]
+
+
+class _FakeStreamingChatCompletions:
+    def __init__(self, chunks: list[object]) -> None:
+        self._chunks = chunks
+        self.last_kwargs: dict[str, object] = {}
+
+    def create(self, **kwargs: object) -> Iterator[object]:
+        self.last_kwargs = kwargs
+        return iter(self._chunks)
+
+
+def test_stream_asks_for_usage_and_reports_it_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Chat Completions omits usage from a stream unless `stream_options` asks for it, so without
+    # that flag every streamed call would meter as zero tokens.
+    fake = _FakeStreamingChatCompletions(_openai_stream_chunks())
+    provider = OpenAIProvider(ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5"))
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: SimpleNamespace(chat=SimpleNamespace(completions=fake)),
+    )
+
+    text, final = _collect(provider.stream("sys", _STREAM_MESSAGES))
+
+    assert text == "hello"
+    assert final.usage == TokenUsage(input_tokens=9, output_tokens=5)
+    assert fake.last_kwargs["stream"] is True
+    assert fake.last_kwargs["stream_options"] == {"include_usage": True}

@@ -1,9 +1,9 @@
 """Tests for deferred Typer sub-app loading: the root CLI must stay light until it must not.
 
 The lazy group is what keeps `wmo --help` off the optimize/serving import chains (the whole-CLI
-budget is checked in `startup_test.py`). Here the mechanism is exercised directly, against a
-sub-app registered under a module name that does not exist: any accidental import fails loudly
-instead of silently costing a second.
+budget is checked by the startup section of `app_test.py`). Here the mechanism is exercised
+directly, against a sub-app registered under a module name that does not exist: any accidental
+import fails loudly instead of silently costing a second.
 """
 
 from __future__ import annotations
