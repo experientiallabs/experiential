@@ -129,3 +129,19 @@ def test_stored_policy_rejects_a_pre_design_threshold_guard() -> None:
 
     with pytest.raises(ValidationError, match="minimum_paired_observations"):
         KnnRouterPolicy.model_validate(payload)
+
+
+@pytest.mark.parametrize("multiplier", [0, -0.5, float("inf"), float("nan")])
+def test_guard_and_stored_policy_reject_nonpositive_or_nonfinite_uncertainty(
+    multiplier: float,
+) -> None:
+    """New guards and persisted policy payloads cannot erase the uncertainty floor."""
+    guard_payload = _policy().guard.model_dump(mode="json")
+    guard_payload["uncertainty_multiplier"] = multiplier
+    with pytest.raises(ValidationError, match="uncertainty_multiplier|finite"):
+        KnnGuard.model_validate(guard_payload)
+
+    policy_payload = _policy().model_dump(mode="json")
+    policy_payload["guard"]["uncertainty_multiplier"] = multiplier
+    with pytest.raises(ValidationError, match="uncertainty_multiplier|finite"):
+        KnnRouterPolicy.model_validate(policy_payload)

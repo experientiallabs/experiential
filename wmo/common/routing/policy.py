@@ -17,7 +17,7 @@ class KnnGuard(ContractModel):
     maximum_neighbors: int = Field(gt=0)
     minimum_paired_observations: int = Field(ge=8)
     relative_similarity_threshold: float = Field(ge=0, le=1)
-    uncertainty_multiplier: float = Field(ge=0)
+    uncertainty_multiplier: float = Field(gt=0)
     quality_tolerance: float
 
     @field_validator("relative_similarity_threshold", "uncertainty_multiplier", "quality_tolerance")

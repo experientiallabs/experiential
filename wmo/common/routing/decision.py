@@ -172,6 +172,11 @@ def _require_policy_bank_match(
     bank: KnnEvidenceBank,
 ) -> None:
     """Fail before selection when any fit-time identity or sidecar axis drifted."""
+    if (
+        not math.isfinite(policy.guard.uncertainty_multiplier)
+        or policy.guard.uncertainty_multiplier <= 0
+    ):
+        raise RouterDecisionError("router uncertainty multiplier must be finite and positive")
     content_sha256 = hashlib.sha256(bank_bytes(bank)).hexdigest()
     if content_sha256 != policy.bank_sha256 or content_sha256 != manifest.bank_sha256:
         raise RouterDecisionError("router bank content has mutated from the frozen policy")

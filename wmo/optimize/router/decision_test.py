@@ -92,6 +92,17 @@ def test_guard_rejects_a_single_paired_observation() -> None:
             )
 
 
+def test_decision_defense_rejects_a_mutated_zero_uncertainty_multiplier() -> None:
+    """Selection fails closed even if an in-memory policy bypasses schema validation."""
+    scores = np.asarray(((0.5, 0.9, 0.0),) * 8, dtype=np.float32)
+    costs = np.asarray(((0.5, 0.1, 0.6),) * 8, dtype=np.float64)
+    policy, manifest, bank = _fixture(scores, costs)
+    object.__setattr__(policy.guard, "uncertainty_multiplier", 0.0)
+
+    with pytest.raises(RouterDecisionError, match="finite and positive"):
+        _select(policy, manifest, bank, np.asarray((1.0, 0.0)))
+
+
 def test_thin_identical_pairs_fall_back_and_design_threshold_can_route() -> None:
     """Identical favorable evidence cannot route below the eight-pair design threshold."""
     scores = np.asarray(
