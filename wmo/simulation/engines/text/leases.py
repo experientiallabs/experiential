@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import stat
 import time
@@ -16,7 +17,8 @@ from uuid import uuid4
 from pydantic import Field, ValidationError, field_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, Sha256, canonical_json_bytes
-from wmo.common.core.locks import file_write_lock
+from wmo.common.core.files import write_bytes_atomic
+from wmo.common.core.locks import FileLockTimeout, file_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,7 @@ _LEASE_DIRECTORY_NAME = "simulation-leases"
 _LEASE_SUFFIX = ".json"
 _DEFAULT_STALE_AFTER_SECONDS = 15 * 60
 _DEFAULT_POLL_INTERVAL_SECONDS = 0.02
+_DEFAULT_WAIT_TIMEOUT_SECONDS = 10.0
 
 
 class TextCellLeaseError(RuntimeError):
@@ -36,6 +39,14 @@ class TextCellLeaseState(StrEnum):
     OWNED = "owned"
     COMPLETED = "completed"
     BUDGET_BLOCKED = "budget_blocked"
+    CONTENDED = "contended"
+    STALE = "stale"
+
+
+class TextCellLeaseStatus(StrEnum):
+    """Durable status of a paid-cell claim or non-replayable tombstone."""
+
+    ACTIVE = "active"
     STALE = "stale"
 
 
@@ -53,6 +64,7 @@ class TextCellLease(ContractModel):
     owner_pid: int = Field(gt=0)
     claimed_at: datetime
     expires_at: datetime
+    status: TextCellLeaseStatus = TextCellLeaseStatus.ACTIVE
 
     @field_validator("claimed_at", "expires_at")
     @classmethod
@@ -79,14 +91,19 @@ class TextCellLeaseClaim:
     lease: TextCellLease | None
     observed_spend_usd: float | None
 
+    @property
+    def retryable(self) -> bool:
+        """Return whether the caller should retry after another live claim changes."""
+        return self.state == TextCellLeaseState.CONTENDED
+
 
 class TextCellLeaseStore:
     """Coordinate one local project's paid text-simulation cells across processes.
 
     A claim file is atomically created before a candidate or world-model provider call. A process
-    that sees a live claim waits for its immutable rollout. An expired claim with a dead owner is
-    intentionally not replayed: the earlier process may have paid a provider just before crashing,
-    so the caller writes a recovery failure rather than risking duplicate spend.
+    that sees a live claim waits for its immutable rollout up to a bounded deadline. An expired
+    claim with a dead owner becomes a durable non-reserving tombstone: the earlier process may have
+    paid a provider just before crashing, so the cell is not replayed.
     """
 
     def __init__(
@@ -96,8 +113,10 @@ class TextCellLeaseStore:
         clock: Callable[[], datetime],
         owner_alive: Callable[[int], bool] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
         stale_after_seconds: float = _DEFAULT_STALE_AFTER_SECONDS,
         poll_interval_seconds: float = _DEFAULT_POLL_INTERVAL_SECONDS,
+        wait_timeout_seconds: float = _DEFAULT_WAIT_TIMEOUT_SECONDS,
     ) -> None:
         """Create a project-local claim store without making a claim yet.
 
@@ -106,8 +125,10 @@ class TextCellLeaseStore:
             clock: Aware wall clock used for durable lease timestamps.
             owner_alive: Process-liveness probe, injectable for deterministic recovery tests.
             sleep: Short follower wait seam, injectable for deterministic tests.
+            monotonic: Deadline clock, injectable with ``sleep`` for deterministic tests.
             stale_after_seconds: Minimum retained duration before a dead claim is stale.
             poll_interval_seconds: Follower interval while another process owns a live claim.
+            wait_timeout_seconds: Maximum wait for active same-cell or budget contention.
 
         Raises:
             ValueError: A lease lifetime or follower interval is not positive.
@@ -116,12 +137,16 @@ class TextCellLeaseStore:
             raise ValueError("text-cell lease stale_after_seconds must be positive")
         if poll_interval_seconds <= 0:
             raise ValueError("text-cell lease poll_interval_seconds must be positive")
+        if not math.isfinite(wait_timeout_seconds) or wait_timeout_seconds <= 0:
+            raise ValueError("text-cell lease wait_timeout_seconds must be finite and positive")
         self._directory = project_directory / _LEASE_DIRECTORY_NAME
         self._clock = clock
         self._owner_alive = _owner_process_is_alive if owner_alive is None else owner_alive
         self._sleep = sleep
+        self._monotonic = monotonic
         self._stale_after = timedelta(seconds=stale_after_seconds)
         self._poll_interval_seconds = poll_interval_seconds
+        self._wait_timeout_seconds = wait_timeout_seconds
 
     def acquire(
         self,
@@ -132,8 +157,9 @@ class TextCellLeaseStore:
         rollout_id: ArtifactId,
         binding_sha256: Sha256,
         maximum_cost_usd: float | None,
-        rollout_completed: Callable[[], bool],
+        rollout_completed: Callable[[ArtifactId], bool],
         observed_spend_usd: Callable[[], float | None],
+        cancelled: Callable[[], bool] | None = None,
     ) -> TextCellLeaseClaim:
         """Atomically reserve one paid cell, or wait for its completed immutable artifact.
 
@@ -143,11 +169,11 @@ class TextCellLeaseStore:
             simulation_id: Parent simulation identity for budget coordination.
             rollout_id: Expected immutable rollout artifact identity.
             binding_sha256: Full cell binding digest, checked against any existing claim.
-            maximum_cost_usd: Optional run-wide ceiling. A finite run reserves all currently
-                uncommitted budget for this one cell, preventing parallel over-admission.
-            rollout_completed: Checks whether another owner has already persisted the rollout.
+            maximum_cost_usd: Optional run-wide ceiling shared by the selected cells.
+            rollout_completed: Checks a lease's expected immutable rollout by artifact identity.
             observed_spend_usd: Returns known spend for completed cells or ``None`` when it is
                 unpriced and later paid work must fail closed.
+            cancelled: Optional cooperative cancellation probe checked before and during waits.
 
         Returns:
             An owned claim, completed follower result, budget block, or stale recovery result.
@@ -157,20 +183,34 @@ class TextCellLeaseStore:
         """
         if maximum_cost_usd is not None and maximum_cost_usd <= 0:
             raise ValueError("text-cell maximum_cost_usd must be positive")
+        deadline = self._monotonic() + self._wait_timeout_seconds
+        is_cancelled = (lambda: False) if cancelled is None else cancelled
         while True:
-            decision = self._admit_once(
-                lease_id=lease_id,
-                resolution_id=resolution_id,
-                simulation_id=simulation_id,
-                rollout_id=rollout_id,
-                binding_sha256=binding_sha256,
-                maximum_cost_usd=maximum_cost_usd,
-                rollout_completed=rollout_completed,
-                observed_spend_usd=observed_spend_usd,
-            )
+            if is_cancelled():
+                return TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None)
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                return TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None)
+            try:
+                decision = self._admit_once(
+                    lease_id=lease_id,
+                    resolution_id=resolution_id,
+                    simulation_id=simulation_id,
+                    rollout_id=rollout_id,
+                    binding_sha256=binding_sha256,
+                    maximum_cost_usd=maximum_cost_usd,
+                    rollout_completed=rollout_completed,
+                    observed_spend_usd=observed_spend_usd,
+                    lock_timeout_seconds=min(self._poll_interval_seconds, remaining),
+                )
+            except FileLockTimeout:
+                decision = None
             if decision is not None:
                 return decision
-            self._sleep(self._poll_interval_seconds)
+            remaining = deadline - self._monotonic()
+            if remaining <= 0 or is_cancelled():
+                return TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None)
+            self._sleep(min(self._poll_interval_seconds, remaining))
 
     def release(self, lease: TextCellLease) -> None:
         """Remove this owner's claim after its immutable rollout is safely persisted.
@@ -207,14 +247,17 @@ class TextCellLeaseStore:
         rollout_id: ArtifactId,
         binding_sha256: Sha256,
         maximum_cost_usd: float | None,
-        rollout_completed: Callable[[], bool],
+        rollout_completed: Callable[[ArtifactId], bool],
         observed_spend_usd: Callable[[], float | None],
+        lock_timeout_seconds: float,
     ) -> TextCellLeaseClaim | None:
         """Make one lock-protected admission attempt, returning ``None`` for a live follower."""
         self._ensure_directory()
-        with file_write_lock(self._admission_path(), what="text simulation cell admission"):
-            if rollout_completed():
-                return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
+        with file_write_lock(
+            self._admission_path(),
+            what="text simulation cell admission",
+            timeout_s=lock_timeout_seconds,
+        ):
             path = self._path(lease_id)
             existing = self._read_optional(path)
             now = _aware_now(self._clock)
@@ -227,16 +270,31 @@ class TextCellLeaseStore:
                     binding_sha256=binding_sha256,
                     maximum_cost_usd=maximum_cost_usd,
                 )
-                if self._is_stale(existing, now):
+                if rollout_completed(existing.rollout_id):
+                    self._reap(path)
+                    return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
+                if existing.status == TextCellLeaseStatus.STALE:
                     return TextCellLeaseClaim(TextCellLeaseState.STALE, existing, None)
+                if self._is_stale(existing, now):
+                    stale = self._tombstone(path, existing)
+                    return TextCellLeaseClaim(TextCellLeaseState.STALE, stale, None)
                 return None
-            spend = observed_spend_usd()
-            reservation = self._reserve_budget(
+            if rollout_completed(rollout_id):
+                return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
+            active_leases = self._active_leases_for(
                 resolution_id=resolution_id,
                 simulation_id=simulation_id,
+                now=now,
+                rollout_completed=rollout_completed,
+            )
+            spend = observed_spend_usd()
+            reservation, contended = self._reserve_budget(
                 maximum_cost_usd=maximum_cost_usd,
                 observed_spend_usd=spend,
+                active_leases=active_leases,
             )
+            if contended:
+                return None
             if maximum_cost_usd is not None and reservation is None:
                 return TextCellLeaseClaim(TextCellLeaseState.BUDGET_BLOCKED, None, spend)
             lease = TextCellLease(
@@ -258,18 +316,14 @@ class TextCellLeaseStore:
     def _reserve_budget(
         self,
         *,
-        resolution_id: ArtifactId,
-        simulation_id: ArtifactId,
         maximum_cost_usd: float | None,
         observed_spend_usd: float | None,
-    ) -> float | None:
-        """Reserve all uncommitted finite budget so parallel cells cannot over-admit."""
+        active_leases: tuple[TextCellLease, ...],
+    ) -> tuple[float | None, bool]:
+        """Reserve all available budget, or wait until every live reservation resolves."""
         if maximum_cost_usd is None:
-            return None
-        if observed_spend_usd is None:
-            return None
-        active_reservations = 0.0
-        for lease in self._leases_for(resolution_id=resolution_id, simulation_id=simulation_id):
+            return None, False
+        for lease in active_leases:
             if lease.maximum_cost_usd != maximum_cost_usd:
                 raise TextCellLeaseError(
                     "text simulation has incompatible finite spend ceilings for one resolution"
@@ -278,19 +332,24 @@ class TextCellLeaseStore:
                 raise TextCellLeaseError(
                     "finite-budget text simulation has an unreserved active paid-cell claim"
                 )
-            active_reservations += lease.reserved_cost_usd
-        remaining = maximum_cost_usd - observed_spend_usd - active_reservations
-        if remaining <= 0:
-            return None
-        return remaining
+        if observed_spend_usd is None:
+            return None, False
+        if active_leases:
+            return None, True
+        remaining_ceiling = maximum_cost_usd - observed_spend_usd
+        if remaining_ceiling <= 0:
+            return None, False
+        return remaining_ceiling, False
 
-    def _leases_for(
+    def _active_leases_for(
         self,
         *,
         resolution_id: ArtifactId,
         simulation_id: ArtifactId,
+        now: datetime,
+        rollout_completed: Callable[[ArtifactId], bool],
     ) -> tuple[TextCellLease, ...]:
-        """Load every durable active reservation for one immutable simulation resolution."""
+        """Reap completed claims, tombstone dead claims, and return valid reservations."""
         leases = []
         for path in sorted(self._directory.glob(f"*{_LEASE_SUFFIX}")):
             lease = self._read_optional(path)
@@ -301,12 +360,32 @@ class TextCellLeaseStore:
                     raise TextCellLeaseError(
                         "text-cell lease mixes incompatible simulation and resolution identities"
                     )
-                leases.append(lease)
+                if rollout_completed(lease.rollout_id):
+                    self._reap(path)
+                elif lease.status == TextCellLeaseStatus.STALE:
+                    continue
+                elif self._is_stale(lease, now):
+                    self._tombstone(path, lease)
+                else:
+                    leases.append(lease)
         return tuple(leases)
 
     def _is_stale(self, lease: TextCellLease, now: datetime) -> bool:
         """Recognize only expired claims whose local owner process is no longer alive."""
         return now >= lease.expires_at and not self._owner_alive(lease.owner_pid)
+
+    def _tombstone(self, path: Path, lease: TextCellLease) -> TextCellLease:
+        """Atomically retain non-replay evidence without retaining its budget reservation."""
+        stale = lease.model_copy(
+            update={"status": TextCellLeaseStatus.STALE, "reserved_cost_usd": None}
+        )
+        write_bytes_atomic(path, canonical_json_bytes(stale))
+        return stale
+
+    def _reap(self, path: Path) -> None:
+        """Remove a claim whose immutable rollout now makes replay impossible."""
+        path.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
 
     def _require_same_claim(
         self,

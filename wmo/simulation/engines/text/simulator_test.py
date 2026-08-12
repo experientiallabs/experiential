@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import (
@@ -31,7 +33,13 @@ from wmo.common.tasks import TaskCase, TaskSet, ToolSchema
 from wmo.runtime.agents import AgentEpisode, AgentRuntime
 from wmo.runtime.environments import EnvironmentSession
 from wmo.runtime.models import ResolvedModel
-from wmo.simulation.engines.text.simulator import WorldModelSimulator
+from wmo.simulation.engines.text.bindings import (
+    binding_digest,
+    lease_id_for_binding,
+    rollout_id_for_binding,
+)
+from wmo.simulation.engines.text.leases import TextCellLeaseStore
+from wmo.simulation.engines.text.simulator import SimulationContentionError, WorldModelSimulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
@@ -594,3 +602,110 @@ def test_text_simulation_cross_runner_claim_prevents_duplicate_paid_calls(tmp_pa
     assert artifact_sets[0].artifact_ids == artifact_sets[1].artifact_ids
     assert len(candidate_client.requests) == 1
     assert len(world_client.requests) == 1
+
+
+def test_text_simulation_live_hung_claim_times_out_without_calls_or_result_artifact(
+    tmp_path: Path,
+) -> None:
+    """A live owner yields retryable contention without provider work or permanent cell output."""
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient([])
+    world_client = _ScriptedClient([])
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+    )
+    spec = _spec(plan_input, task_set_input, ("cell-a",), maximum_cost_usd=1.0)
+    cells, world_model = simulator._validate_spec_and_bindings(spec)
+    spec_input = simulator._persist_specification(spec)
+    resolution, resolution_input, bindings = simulator._persist_resolution(
+        spec, spec_input, cells, world_model
+    )
+    binding = bindings[cell.cell_id]
+    rollout_id = rollout_id_for_binding(binding)
+    holder = TextCellLeaseStore(store.project_directory, clock=lambda: _TIME)
+    holder.acquire(
+        lease_id=lease_id_for_binding(resolution, binding),
+        resolution_id=resolution.resolution_id,
+        simulation_id=spec.simulation_id,
+        rollout_id=rollout_id,
+        binding_sha256=binding_digest(binding),
+        maximum_cost_usd=spec.maximum_cost_usd,
+        rollout_completed=lambda _rollout_id: False,
+        observed_spend_usd=lambda: 0.0,
+    )
+    elapsed = [0.0]
+    simulator._leases = TextCellLeaseStore(
+        store.project_directory,
+        clock=lambda: _TIME,
+        sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+        monotonic=lambda: elapsed[0],
+        wait_timeout_seconds=0.05,
+    )
+    artifacts_before = store.list_ids()
+
+    with pytest.raises(SimulationContentionError, match="contended; retry"):
+        simulator.run(spec)
+
+    assert elapsed[0] == pytest.approx(0.05)
+    assert candidate_client.requests == []
+    assert world_client.requests == []
+    assert store.list_ids() == artifacts_before
+    assert rollout_id not in store.list_ids()
+
+
+def test_two_finite_budget_runners_complete_each_cell_exactly_once(tmp_path: Path) -> None:
+    """Cross-runner followers recompute spend and share both under-budget cell artifacts."""
+    cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(
+        store,
+        {"task-a": _task("task-a"), "task-b": _task("task-b")},
+    )
+    candidate_client = _ScriptedClient(
+        [
+            _response("answer a", snapshot=_snapshot("candidate-a"), cost=0.1),
+            _response("answer b", snapshot=_snapshot("candidate-a"), cost=0.1),
+        ],
+        delay_seconds=0.05,
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"done","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+                cost=0.1,
+            )
+            for _cell_index in range(2)
+        ]
+    )
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a", "cell-b"),
+        maximum_cost_usd=0.5,
+    )
+    runners = (
+        _simulator(store, plan, plan_input, task_set_input, candidate_client, world_client),
+        _simulator(store, plan, plan_input, task_set_input, candidate_client, world_client),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        artifact_sets = tuple(executor.map(lambda runner: runner.run(spec), runners))
+
+    assert artifact_sets[0].artifact_ids == artifact_sets[1].artifact_ids
+    assert len(artifact_sets[0].artifact_ids) == 2
+    assert len(candidate_client.requests) == 2
+    assert len(world_client.requests) == 2
+    rollouts = tuple(runners[0]._load_rollout(item) for item in artifact_sets[0].artifact_ids)
+    assert all(rollout.stop_reason == StopReason.COMPLETED for rollout in rollouts)

@@ -96,6 +96,10 @@ class SimulationResumeError(RuntimeError):
     """An immutable simulation artifact cannot safely be resumed or reused."""
 
 
+class SimulationContentionError(SimulationResumeError):
+    """Another live runner owns paid work, so this run may be retried without artifacts."""
+
+
 class WorldModelSimulator:
     """Execute a text-only customer agent against a remote world-model provider.
 
@@ -533,13 +537,15 @@ class WorldModelSimulator:
                 rollout_id=rollout_id,
                 binding_sha256=binding_digest(binding),
                 maximum_cost_usd=spec.maximum_cost_usd,
-                rollout_completed=lambda: self._load_optional_rollout(rollout_id) is not None,
+                rollout_completed=lambda item: self._load_optional_rollout(item) is not None,
                 observed_spend_usd=lambda: self._known_resolution_spend(bindings, resolution_input),
             )
         except TextCellLeaseError as exc:
             raise SimulationResumeError(
                 f"text simulation cell {cell.cell_id!r} cannot be admitted"
             ) from exc
+        if claim.retryable:
+            raise SimulationContentionError("text simulation cell is contended; retry the run")
         if claim.state == TextCellLeaseState.COMPLETED:
             completed = self._load_optional_rollout(rollout_id)
             if completed is None:  # pragma: no cover - artifact check and read share one store
