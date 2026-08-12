@@ -1,0 +1,104 @@
+"""Canonical normalized production-trace contracts."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import Field, field_validator, model_validator
+
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactId,
+    ContractModel,
+    JsonObject,
+    Sha256,
+    SourceIdentity,
+    StructuredFailure,
+)
+from wmo.common.models import ModelSnapshot, Usage
+from wmo.common.tasks import ToolSchema
+
+
+class TraceSource(ContractModel):
+    """Origin and semantic-convention version for a normalized production trace."""
+
+    identity: SourceIdentity
+    semantic_convention_version: str = Field(min_length=1, max_length=128)
+
+
+class TraceOutcome(ContractModel):
+    """Captured terminal outcome for one production trace."""
+
+    status: Literal["success", "failure", "abandoned", "unknown"]
+    outcome_name: str | None = Field(default=None, max_length=256)
+    failure: StructuredFailure | None = None
+
+    @model_validator(mode="after")
+    def _require_failure_for_failed_outcome(self) -> TraceOutcome:
+        if self.status == "failure" and self.failure is None:
+            raise ValueError("failed trace outcomes require a structured failure")
+        return self
+
+
+class TraceSpan(ContractModel):
+    """One ordered OpenTelemetry-style event in a normalized production trace."""
+
+    span_id: str = Field(min_length=1, max_length=256)
+    parent_span_id: str | None = Field(default=None, min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=256)
+    started_at: datetime
+    ended_at: datetime
+    attributes: JsonObject = Field(default_factory=dict)
+    model: ModelSnapshot | None = None
+    usage: Usage | None = None
+    failure: StructuredFailure | None = None
+
+    @model_validator(mode="after")
+    def _require_ordered_timestamps(self) -> TraceSpan:
+        if self.started_at.tzinfo is None or self.ended_at.tzinfo is None:
+            raise ValueError("trace span timestamps must include timezones")
+        if self.ended_at < self.started_at:
+            raise ValueError("trace span ended_at cannot be before started_at")
+        return self
+
+
+class Trace(ContractModel):
+    """One normalized customer agent trace with source provenance."""
+
+    trace_id: str = Field(min_length=1, max_length=512)
+    conversation_id: str | None = Field(default=None, max_length=512)
+    task: str = Field(min_length=1)
+    initial_context: JsonObject = Field(default_factory=dict)
+    tools: tuple[ToolSchema, ...] = ()
+    spans: tuple[TraceSpan, ...]
+    outcome: TraceOutcome | None = None
+    source: TraceSource
+
+    @field_validator("spans")
+    @classmethod
+    def _require_unique_span_ids(cls, value: tuple[TraceSpan, ...]) -> tuple[TraceSpan, ...]:
+        if not value:
+            raise ValueError("a trace must contain at least one span")
+        span_ids = tuple(span.span_id for span in value)
+        if len(set(span_ids)) != len(span_ids):
+            raise ValueError("trace span IDs must be unique")
+        return value
+
+
+class TraceDataset(ArtifactEnvelope):
+    """A frozen normalized trace-dataset manifest."""
+
+    dataset_id: ArtifactId
+    traces_path: str = Field(min_length=1)
+    traces_sha256: Sha256
+    trace_ids: tuple[str, ...]
+
+    @field_validator("trace_ids")
+    @classmethod
+    def _require_unique_trace_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value:
+            raise ValueError("a trace dataset must contain at least one trace")
+        if len(set(value)) != len(value):
+            raise ValueError("trace_ids must not contain duplicates")
+        return value
