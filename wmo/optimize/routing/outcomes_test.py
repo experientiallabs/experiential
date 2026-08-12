@@ -59,6 +59,58 @@ def test_matrix_accessors() -> None:
     assert [o.model for o in matrix.for_scenario("s1")] == ["fable-5", "haiku-4-5"]
 
 
+def test_w05_outcome_row_fixture_preserves_evaluation_evidence() -> None:
+    """Map current `OutcomeMatrix` and `ScenarioOutcome` to approved evaluation dataset rows.
+
+    The row preserves task, candidate, repeat, reward, usage, cost, latency, stop reason, and
+    replies. Current main has no evaluation protocol, judgment, or source-run identity fields.
+    """
+    row = ScenarioOutcome(
+        scenario_id="scenario-w05-refund",
+        task="Refund order A-42",
+        model="haiku-4-5",
+        episode=0,
+        reward=0.75,
+        success=True,
+        critique="The order was refunded.",
+        steps=1,
+        stop_reason="agent_done",
+        usage=TokenUsage(input_tokens=12, output_tokens=8),
+        cost_usd=0.0012,
+        call_seconds=[0.24],
+        replies=['{"status":"refunded"}'],
+    )
+    matrix = OutcomeMatrix(
+        pool=[
+            PoolEntry(name="fable-5", kind=ProviderKind.ANTHROPIC, model="claude-fable-5"),
+            PoolEntry(name="haiku-4-5", kind=ProviderKind.ANTHROPIC, model="claude-haiku-4-5"),
+        ],
+        outcomes=[row],
+    )
+
+    assert [(entry.name, entry.kind.value, entry.model) for entry in matrix.pool] == [
+        ("fable-5", "anthropic", "claude-fable-5"),
+        ("haiku-4-5", "anthropic", "claude-haiku-4-5"),
+    ]
+    assert row.scenario_id == "scenario-w05-refund"
+    assert row.task == "Refund order A-42"
+    assert row.model == "haiku-4-5"
+    assert row.episode == 0
+    assert row.reward == 0.75
+    assert row.success is True
+    assert row.critique == "The order was refunded."
+    assert row.steps == 1
+    assert row.stop_reason == "agent_done"
+    assert row.usage is not None
+    assert row.usage.input_tokens == 12
+    assert row.usage.output_tokens == 8
+    assert row.cost_usd == 0.0012
+    assert row.call_seconds == [0.24]
+    assert row.replies == ['{"status":"refunded"}']
+    assert row.error is None
+    assert OutcomeMatrix.model_validate_json(matrix.model_dump_json()) == matrix
+
+
 def test_router_split_is_deterministic_disjoint_and_order_preserving() -> None:
     ids = [f"scenario-{index}" for index in range(10)]
     split = split_router_scenarios(ids)

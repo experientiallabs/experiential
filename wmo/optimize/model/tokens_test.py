@@ -447,3 +447,60 @@ def test_assemble_harbor_trial_records_joins_rewards_with_harbor_spans(tmp_path:
     # A trial that left no evidence is kept with empty spans, never dropped.
     assert records[1].spans == []
     assert records[1].stop_reason is None
+
+
+def test_w05_tinker_training_record_fixture_preserves_tokens_and_provenance(
+    tmp_path: Path,
+) -> None:
+    """Map current `TrialRecord` and `TokenSpan` to approved Tinker training evidence.
+
+    The snapshot keeps exact prompt and sampled token IDs, sampler logprobs, verifier outcome,
+    stop reason, test counts, and artifact path. W2, W12, and W13 must reconcile this Harbor-owned
+    record with the approved source and SFT dataset contracts.
+    """
+    trial_dir = tmp_path / "harbor" / "refund-w05__attempt-1"
+    trial_dir.mkdir(parents=True)
+    span = TokenSpan(
+        call_index=0,
+        prompt_token_ids=[101, 102],
+        sampled_token_ids=[201, 202],
+        sampled_logprobs=[-0.25, -0.75],
+    )
+    recorder = TokenRecorder(jsonl_path=tmp_path / f"{trial_dir.name}.jsonl")
+    recorder.record(span)
+    cell = ScoreCell(
+        task_id="scenario-w05-refund",
+        attempt=1,
+        reward=1.0,
+        passed=True,
+        artifact_dir=str(trial_dir),
+        tests=GradedTests(passed=2, resolved=2),
+    )
+
+    records = assemble_trial_records(
+        [cell],
+        tmp_path,
+        read_stop_reason=lambda _artifact_dir: "submitted",
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert isinstance(record, TrialRecord)
+    assert record.task_id == "scenario-w05-refund"
+    assert record.attempt == 1
+    assert record.trial_name == "refund-w05__attempt-1"
+    assert record.reward == 1.0
+    assert record.passed is True
+    assert len(record.spans) == 1
+    recorded_span = record.spans[0]
+    assert recorded_span.call_index == 0
+    assert recorded_span.prompt_token_ids == [101, 102]
+    assert recorded_span.sampled_token_ids == [201, 202]
+    assert recorded_span.sampled_logprobs == [-0.25, -0.75]
+    assert record.stop_reason == "submitted"
+    assert record.infra_failed is False
+    assert record.tests is not None
+    assert record.tests.passed == 2
+    assert record.tests.resolved == 2
+    assert record.tests.unresolved == 0
+    assert record.artifact_dir == str(trial_dir)

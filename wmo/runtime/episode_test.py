@@ -160,3 +160,37 @@ def test_env_error_carries_traceback() -> None:
     result = run_episode(ScriptedEnv(fail_on_step=1), ScriptedAgent(), max_steps=5)
     assert result.error_traceback is not None
     assert "ConnectionError" in result.error_traceback
+
+
+def test_w05_episode_fixture_preserves_rollout_steps_and_stop_reason() -> None:
+    """Map current `run_episode` and `EpisodeResult` to the approved rollout artifact.
+
+    The snapshot keeps the task, state before the action, action, observation, and terminal reason.
+    The target rollout envelope and simulator provenance are intentionally not added here.
+    """
+    env = ScriptedEnv()
+    result = run_episode(
+        env,
+        ScriptedAgent(stop_after=1),
+        task="Refund order A-42",
+        seed_state=EnvState(structured={"account_id": "acct-demo"}, scratchpad="ready"),
+        max_steps=2,
+    )
+
+    assert result.task == "Refund order A-42"
+    assert len(result.steps) == 1
+    step = result.steps[0]
+    assert step.action.kind is ActionKind.TOOL_CALL
+    assert step.action.name == "poke"
+    assert step.action.arguments == {"turn": 0}
+    assert step.observation.content == "obs 1"
+    assert step.observation.is_error is False
+    assert step.state_before.structured == {"account_id": "acct-demo"}
+    assert step.state_before.scratchpad == "ready"
+    assert step.task == "Refund order A-42"
+    assert step.raw_span_ids == []
+    assert step.attribution is None
+    assert result.stop_reason is StopReason.AGENT_DONE
+    assert result.error is None
+    assert result.error_traceback is None
+    assert env.closed
