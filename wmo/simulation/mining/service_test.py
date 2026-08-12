@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -26,6 +27,20 @@ class IndexEmbedder:
         return tuple(
             tuple(1.0 if index == coordinate else 0.0 for coordinate in range(len(texts)))
             for index, _text in enumerate(texts)
+        )
+
+
+class ContentStableEmbedder:
+    """Embeds descriptor content with a deterministic hash rather than input position."""
+
+    def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
+        return tuple(
+            tuple(
+                1.0 if byte & (1 << bit) else -1.0
+                for byte in hashlib.sha256(text.encode("utf-8")).digest()
+                for bit in range(8)
+            )
+            for text in texts
         )
 
 
@@ -170,6 +185,42 @@ def test_default_100_trace_path_selects_50_fit_and_20_held_out_tasks() -> None:
     assert not set(result.partition.fit_lineage_group_ids).intersection(
         result.partition.held_out_lineage_group_ids
     )
+
+
+def test_over_70_lineage_core_selection_is_input_order_independent() -> None:
+    traces = tuple(
+        _trace(
+            index,
+            task=f"Resolve specialty customer workflow {index * index}",
+            conversation_id=f"lineage-{index}",
+            outcome="failure" if index % 11 == 0 else "success",
+            escalation=index % 13 == 0,
+            span_count=8 if index % 7 == 0 else 1,
+        )
+        for index in range(80)
+    )
+
+    result = mine_tasks(traces, embedder=ContentStableEmbedder())
+    reversed_result = mine_tasks(tuple(reversed(traces)), embedder=ContentStableEmbedder())
+
+    assert len(result.analysis.leakage_groups) == 80
+    assert len(result.tasks) == 70
+    assert tuple(task.task_id for task in result.tasks) == tuple(
+        task.task_id for task in reversed_result.tasks
+    )
+    assert {task.task_id: task.workload_weight for task in result.tasks} == {
+        task.task_id: task.workload_weight for task in reversed_result.tasks
+    }
+    assert result.partition.fit_lineage_group_ids == reversed_result.partition.fit_lineage_group_ids
+    assert (
+        result.partition.held_out_lineage_group_ids
+        == reversed_result.partition.held_out_lineage_group_ids
+    )
+    assert result.coverage.fit == reversed_result.coverage.fit
+    assert result.coverage.held_out == reversed_result.coverage.held_out
+    assert result.coverage.selections == reversed_result.coverage.selections
+    assert result.coverage.facets == reversed_result.coverage.facets
+    assert result.coverage.distances == reversed_result.coverage.distances
 
 
 def test_exact_70_lineages_keep_the_default_50_20_split_under_extreme_workload_skew() -> None:

@@ -49,6 +49,25 @@ class _PostHogEvent:
 
     event: JsonObject
     ordinal: int
+    source_order_key: str
+
+
+@dataclass(frozen=True)
+class _PendingToolCall:
+    """One emitted model tool call that awaits a matching PostHog tool result."""
+
+    call_id: str
+    parent_span_id: str
+
+
+@dataclass(frozen=True)
+class _SpanEmission:
+    """One canonical span before source and paired parent relationships are resolved."""
+
+    span: TraceSpan
+    source_span_id: str
+    source_parent_span_id: str | None
+    paired_parent_span_id: str | None = None
 
 
 def load_posthog_file(
@@ -201,7 +220,14 @@ def _events_from_payload(payload: JsonValue) -> tuple[_PostHogEvent, ...]:
         raise PostHogPullError("PostHog export has no event, events, or results shape")
 
     append(payload)
-    return tuple(_PostHogEvent(event=event, ordinal=index) for index, event in enumerate(events))
+    return tuple(
+        _PostHogEvent(
+            event=event,
+            ordinal=index,
+            source_order_key=_source_event_order_key(event, index),
+        )
+        for index, event in enumerate(events)
+    )
 
 
 def _normalize_trace_events(
@@ -213,7 +239,10 @@ def _normalize_trace_events(
 ) -> Trace:
     """Convert ordered PostHog root, generation, tool, and error events to one canonical trace."""
     trace_id = _w3c_trace_id(source_trace_id, kind="trace", namespace="trace")
-    ordered = sorted(events, key=lambda event: (_event_timestamp(event.event), event.ordinal))
+    ordered = sorted(
+        events,
+        key=lambda event: (_event_timestamp(event.event), event.source_order_key, event.ordinal),
+    )
     initial_request = _initial_request(ordered)
     if initial_request is None:
         raise PostHogPullError("PostHog trace has no initial user message or root task text")
@@ -225,8 +254,8 @@ def _normalize_trace_events(
         attributes_by_event, ("wmo.conversation.id", "gen_ai.conversation.id")
     )
     tools = _collect_tools((initial_extensions,))
-    spans: list[TraceSpan] = []
-    pending_calls: dict[str, deque[str]] = defaultdict(deque)
+    spans: list[_SpanEmission] = []
+    pending_calls: dict[str, deque[_PendingToolCall]] = defaultdict(deque)
     errors: list[StructuredFailure] = []
     for event in ordered:
         event_name = _event_name(event.event)
@@ -242,11 +271,13 @@ def _normalize_trace_events(
                 extensions,
             )
             spans.extend(generated)
-            errors.extend(span.failure for span in generated if span.failure is not None)
-            for tool_name, call_id in call_ids:
-                pending_calls[tool_name].append(call_id)
+            errors.extend(
+                emission.span.failure for emission in generated if emission.span.failure is not None
+            )
+            for tool_name, pending_call in call_ids:
+                pending_calls[tool_name].append(pending_call)
         elif event_name == "$ai_span":
-            span, call_id = _tool_span(
+            span = _tool_span(
                 source_trace_id,
                 event,
                 timestamp,
@@ -254,30 +285,24 @@ def _normalize_trace_events(
                 pending_calls,
             )
             spans.append(span)
-            if span.failure is not None:
-                errors.append(span.failure)
-            if call_id is not None:
-                _remove_pending_call(
-                    pending_calls,
-                    span.attributes.get("gen_ai.tool.name"),
-                    call_id,
-                )
+            if span.span.failure is not None:
+                errors.append(span.span.failure)
         elif event_name == "$ai_trace":
             span = _root_span(source_trace_id, event, timestamp, task, extensions)
             spans.append(span)
-            if span.failure is not None:
-                errors.append(span.failure)
+            if span.span.failure is not None:
+                errors.append(span.span.failure)
         elif _is_error(properties):
             span = _event_error_span(source_trace_id, event, timestamp, extensions)
             spans.append(span)
-            if span.failure is not None:
-                errors.append(span.failure)
+            if span.span.failure is not None:
+                errors.append(span.span.failure)
     if not spans:
         raise PostHogPullError("PostHog trace has no $ai_generation, $ai_span, or $ai_trace event")
     unmatched_calls = tuple(
-        f"{tool_name}:{call_id}"
+        f"{tool_name}:{pending_call.call_id}"
         for tool_name in sorted(pending_calls)
-        for call_id in pending_calls[tool_name]
+        for pending_call in pending_calls[tool_name]
     )
     if unmatched_calls:
         raise PostHogPullError(
@@ -290,7 +315,7 @@ def _normalize_trace_events(
         task=task,
         initial_context=initial_context,
         tools=tools,
-        spans=tuple(spans),
+        spans=_resolve_parent_links(spans),
         outcome=outcome,
         source=TraceSource(
             identity=source,
@@ -305,7 +330,7 @@ def _generation_spans(
     timestamp: datetime,
     task: str,
     extensions: JsonObject,
-) -> tuple[tuple[TraceSpan, ...], tuple[tuple[str, str], ...]]:
+) -> tuple[tuple[_SpanEmission, ...], tuple[tuple[str, _PendingToolCall], ...]]:
     """Map one PostHog generation and all of its tool calls to canonical model-call spans."""
     properties = _properties(event.event)
     choices = properties.get("$ai_output_choices")
@@ -317,8 +342,8 @@ def _generation_spans(
     input_messages = properties.get("$ai_input")
     if input_messages is not None:
         base_attributes["gen_ai.input.messages"] = input_messages
-    spans: list[TraceSpan] = []
-    call_ids: list[tuple[str, str]] = []
+    spans: list[_SpanEmission] = []
+    call_ids: list[tuple[str, _PendingToolCall]] = []
     if tool_calls:
         for call_index, call in enumerate(tool_calls):
             tool_name, arguments, raw_call_id = _tool_call_details(call)
@@ -331,18 +356,19 @@ def _generation_spans(
                     "gen_ai.tool.call.id": call_id,
                 }
             )
-            spans.append(
-                _span(
-                    source_trace_id,
-                    event,
-                    timestamp,
-                    name="agent.model_call",
-                    attributes=attributes,
-                    model=model,
-                    suffix=f"tool-{call_index}",
-                )
+            span = _span(
+                source_trace_id,
+                event,
+                timestamp,
+                name="agent.model_call",
+                attributes=attributes,
+                model=model,
+                suffix=f"tool-{call_index}",
             )
-            call_ids.append((tool_name, call_id))
+            spans.append(span)
+            call_ids.append(
+                (tool_name, _PendingToolCall(call_id=call_id, parent_span_id=span.span.span_id))
+            )
     else:
         attributes = dict(base_attributes)
         attributes["gen_ai.completion"] = _choices_text(choices)
@@ -365,8 +391,8 @@ def _tool_span(
     event: _PostHogEvent,
     timestamp: datetime,
     extensions: JsonObject,
-    pending_calls: dict[str, deque[str]],
-) -> tuple[TraceSpan, str | None]:
+    pending_calls: dict[str, deque[_PendingToolCall]],
+) -> _SpanEmission:
     """Map a PostHog tool event and pair it to an earlier generation call when possible."""
     properties = _properties(event.event)
     tool_name = _required_text(properties.get("$ai_span_name"), "PostHog $ai_span_name")
@@ -379,23 +405,26 @@ def _tool_span(
             "gen_ai.tool.message": _json_text(properties.get("$ai_output_state")),
         }
     )
-    raw_call_id = properties.get("$ai_tool_call_id") or properties.get("$ai_call_id")
-    call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id else None
-    if call_id is None and pending_calls[tool_name]:
-        call_id = pending_calls[tool_name][0]
-    if call_id is not None:
-        attributes["gen_ai.tool.call.id"] = call_id
-    return (
-        _span(
-            source_trace_id,
-            event,
-            timestamp,
-            name="agent.tool_call",
-            attributes=attributes,
-            model=None,
-            suffix="tool-result",
-        ),
-        call_id,
+    call_id = _explicit_tool_call_id(properties)
+    matched_call: _PendingToolCall | None = None
+    if call_id is None:
+        if pending_calls[tool_name]:
+            matched_call = pending_calls[tool_name].popleft()
+    else:
+        matched_call = _consume_pending_call(pending_calls[tool_name], call_id)
+        if matched_call is None:
+            raise PostHogPullError(f"unmatched explicit PostHog tool result: {tool_name}:{call_id}")
+    if matched_call is not None:
+        attributes["gen_ai.tool.call.id"] = matched_call.call_id
+    return _span(
+        source_trace_id,
+        event,
+        timestamp,
+        name="agent.tool_call",
+        attributes=attributes,
+        model=None,
+        suffix="tool-result",
+        paired_parent_span_id=None if matched_call is None else matched_call.parent_span_id,
     )
 
 
@@ -405,7 +434,7 @@ def _root_span(
     timestamp: datetime,
     task: str,
     extensions: JsonObject,
-) -> TraceSpan:
+) -> _SpanEmission:
     """Retain a PostHog trace-root event as canonical trace-level evidence."""
     attributes = dict(extensions)
     attributes["gen_ai.operation.name"] = "invoke_agent"
@@ -429,7 +458,7 @@ def _event_error_span(
     event: _PostHogEvent,
     timestamp: datetime,
     extensions: JsonObject,
-) -> TraceSpan:
+) -> _SpanEmission:
     """Retain an errored unrecognized PostHog AI event as structured failure evidence."""
     attributes = dict(extensions)
     attributes["gen_ai.operation.name"] = "invoke_agent"
@@ -453,24 +482,72 @@ def _span(
     attributes: JsonObject,
     model: ModelSnapshot | None,
     suffix: str,
-) -> TraceSpan:
+    paired_parent_span_id: str | None = None,
+) -> _SpanEmission:
     """Build one canonical span with deterministic W3C-shaped IDs and PostHog error mapping."""
     properties = _properties(event.event)
-    source_span_id = properties.get("$ai_span_id") or event.event.get("id") or event.ordinal
+    source_span_id = _source_span_id(event)
     span_id = _w3c_trace_id(
         f"{source_trace_id}\0{source_span_id}\0{suffix}", kind="span", namespace="span"
     )
     failure = _event_failure(properties)
-    return TraceSpan(
-        span_id=span_id,
-        parent_span_id=None,
-        name=name,
-        started_at=timestamp,
-        ended_at=timestamp,
-        attributes=attributes,
-        model=model,
-        failure=failure,
+    return _SpanEmission(
+        span=TraceSpan(
+            span_id=span_id,
+            parent_span_id=None,
+            name=name,
+            started_at=timestamp,
+            ended_at=timestamp,
+            attributes=attributes,
+            model=model,
+            failure=failure,
+        ),
+        source_span_id=source_span_id,
+        source_parent_span_id=_source_parent_span_id(properties),
+        paired_parent_span_id=paired_parent_span_id,
     )
+
+
+def _resolve_parent_links(emissions: Sequence[_SpanEmission]) -> tuple[TraceSpan, ...]:
+    """Resolve source and WMO-created parents only to canonical spans emitted in this trace."""
+    emitted_by_source_id: dict[str, list[str]] = defaultdict(list)
+    emitted_span_ids = {emission.span.span_id for emission in emissions}
+    for emission in emissions:
+        emitted_by_source_id[emission.source_span_id].append(emission.span.span_id)
+    resolved: list[TraceSpan] = []
+    for emission in emissions:
+        parent_span_id = _resolved_parent_span_id(
+            emission,
+            emitted_by_source_id,
+            emitted_span_ids,
+        )
+        resolved.append(emission.span.model_copy(update={"parent_span_id": parent_span_id}))
+    return tuple(resolved)
+
+
+def _resolved_parent_span_id(
+    emission: _SpanEmission,
+    emitted_by_source_id: dict[str, list[str]],
+    emitted_span_ids: set[str],
+) -> str | None:
+    """Prefer one unambiguous source parent, then a validated paired model-call parent."""
+    source_candidates = tuple(
+        span_id
+        for span_id in emitted_by_source_id.get(emission.source_parent_span_id or "", ())
+        if span_id != emission.span.span_id
+    )
+    if len(source_candidates) == 1:
+        return source_candidates[0]
+    if emission.paired_parent_span_id in source_candidates:
+        return emission.paired_parent_span_id
+    paired_parent_span_id = emission.paired_parent_span_id
+    if (
+        paired_parent_span_id is not None
+        and paired_parent_span_id != emission.span.span_id
+        and paired_parent_span_id in emitted_span_ids
+    ):
+        return paired_parent_span_id
+    return None
 
 
 def _initial_request(
@@ -549,6 +626,22 @@ def _tool_call_details(call: JsonObject) -> tuple[str, str, str | None]:
     arguments = _json_text(candidate.get("arguments"))
     raw_call_id = call.get("id")
     return name, arguments, raw_call_id if isinstance(raw_call_id, str) and raw_call_id else None
+
+
+def _explicit_tool_call_id(properties: JsonObject) -> str | None:
+    """Read one consistent explicit PostHog tool-result call identity when supplied."""
+    values = tuple(
+        _required_text(properties[key], f"PostHog {key}")
+        for key in ("$ai_tool_call_id", "$ai_call_id")
+        if key in properties
+    )
+    if not values:
+        return None
+    if len(set(values)) != 1:
+        raise PostHogPullError(
+            "PostHog $ai_tool_call_id and $ai_call_id must agree when both are supplied"
+        )
+    return values[0]
 
 
 def _choices_text(value: JsonValue | None) -> str:
@@ -741,20 +834,15 @@ def _event_failure(properties: JsonObject) -> StructuredFailure | None:
     )
 
 
-def _remove_pending_call(
-    pending_calls: dict[str, deque[str]], raw_tool_name: JsonValue | None, call_id: str
-) -> None:
-    """Remove a paired generated tool call once its PostHog tool result arrives."""
-    if not isinstance(raw_tool_name, str):
-        return
-    pending = pending_calls[raw_tool_name]
-    if pending and pending[0] == call_id:
-        pending.popleft()
-        return
-    try:
-        pending.remove(call_id)
-    except ValueError:
-        return
+def _consume_pending_call(
+    pending: deque[_PendingToolCall], call_id: str
+) -> _PendingToolCall | None:
+    """Remove and return one matching pending call without accepting a mismatched result."""
+    for candidate in pending:
+        if candidate.call_id == call_id:
+            pending.remove(candidate)
+            return candidate
+    return None
 
 
 def _source_trace_id(event: JsonObject) -> str:
@@ -769,6 +857,37 @@ def _source_trace_id(event: JsonObject) -> str:
         if isinstance(value, str) and value:
             return value
     raise PostHogPullError("PostHog AI event needs $ai_trace_id, $ai_span_id, id, or uuid")
+
+
+def _source_span_id(event: _PostHogEvent) -> str:
+    """Resolve one PostHog source span identity used for stable IDs and parent conversion."""
+    properties = _properties(event.event)
+    candidates = (
+        properties.get("$ai_span_id"),
+        event.event.get("uuid"),
+        event.event.get("id"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return f"ordinal:{event.ordinal}"
+
+
+def _source_parent_span_id(properties: JsonObject) -> str | None:
+    """Read the PostHog parent span identity when this source event supplies one."""
+    value = properties.get("$ai_parent_id")
+    if value is None:
+        return None
+    return _required_text(value, "PostHog $ai_parent_id")
+
+
+def _source_event_order_key(event: JsonObject, ordinal: int) -> str:
+    """Return a stable event identity for timestamp-tie ordering, or source ordinal fallback."""
+    for key in ("uuid", "id"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return f"{key}:{value}"
+    return f"ordinal:{ordinal:020d}"
 
 
 def _event_timestamp(event: JsonObject) -> datetime:

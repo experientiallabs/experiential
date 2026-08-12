@@ -140,8 +140,8 @@ def _hogql_body(request: PostHogPullRequest) -> JsonObject:
         timestamp = request.since.astimezone(UTC).isoformat().replace("+00:00", "Z")
         where += f" and timestamp >= toDateTime('{timestamp}')"
     query = (
-        "select event, properties, timestamp from events where "
-        f"{where} order by timestamp asc limit {request.limit}"
+        "select event, properties, timestamp, uuid from events where "
+        f"{where} order by timestamp asc, uuid asc limit {request.limit}"
     )
     return {"query": {"kind": "HogQLQuery", "query": query}}
 
@@ -158,8 +158,10 @@ def _hogql_events(payload: JsonValue) -> JsonValue:
         if isinstance(row, dict):
             events.append(row)
             continue
-        if not isinstance(row, list) or len(row) < 3:
-            raise PostHogPullError("PostHog HogQL rows must contain event, properties, timestamp")
+        if not isinstance(row, list) or len(row) < 4:
+            raise PostHogPullError(
+                "PostHog HogQL rows must contain event, properties, timestamp, and uuid"
+            )
         properties = row[1]
         if isinstance(properties, str):
             try:
@@ -170,7 +172,22 @@ def _hogql_events(payload: JsonValue) -> JsonValue:
             raise PostHogPullError("PostHog HogQL properties must decode to an object")
         event_name = row[0]
         timestamp = row[2]
-        if not isinstance(event_name, str) or not isinstance(timestamp, str):
-            raise PostHogPullError("PostHog HogQL event and timestamp values must be text")
-        events.append({"event": event_name, "properties": properties, "timestamp": timestamp})
+        event_uuid = row[3]
+        if (
+            not isinstance(event_name, str)
+            or not isinstance(timestamp, str)
+            or not isinstance(event_uuid, str)
+            or not event_uuid
+        ):
+            raise PostHogPullError(
+                "PostHog HogQL event, timestamp, and uuid values must be non-empty text"
+            )
+        events.append(
+            {
+                "event": event_name,
+                "properties": properties,
+                "timestamp": timestamp,
+                "uuid": event_uuid,
+            }
+        )
     return events
