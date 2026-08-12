@@ -62,7 +62,7 @@ def knowledge_(
         # back as if they were live.
         _console.print(
             f"[yellow]inert[/yellow]: {resolved!r} was built without a knowledge base, so "
-            "`wmo serve` never renders these files into the environment "
+            "the world-model runtime never renders these files into the environment "
             f"prompt. Activate them by rebuilding with {build_with_knowledge}, or by setting "
             f"`knowledge = true` in {escape(str(ArtifactPaths(model_dir).config))}."
         )

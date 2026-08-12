@@ -208,6 +208,10 @@ LEGACY_PATH_INVENTORY: Final[frozenset[str]] = frozenset(
         "wmo/simulation/evaluation/open_loop_test.py",
         "wmo/simulation/evaluation/tasks.py",
         "wmo/simulation/evaluation/tasks_test.py",
+    }
+)
+LEGACY_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
+    {
         "wmo/simulation/serving/__init__.py",
         "wmo/simulation/serving/chat.py",
         "wmo/simulation/serving/chat_openai_client_test.py",
@@ -222,10 +226,6 @@ LEGACY_PATH_INVENTORY: Final[frozenset[str]] = frozenset(
         "wmo/simulation/serving/server_test.py",
         "wmo/simulation/serving/traces_source.py",
         "wmo/simulation/serving/traces_source_test.py",
-    }
-)
-LEGACY_PATH_TOMBSTONES: Final[frozenset[str]] = frozenset(
-    {
         "wmo/optimize/research/__init__.py",
         "wmo/optimize/research/ablation.py",
         "wmo/optimize/research/ablation_test.py",
@@ -327,8 +327,6 @@ ROOT_CLI_COMMAND_INVENTORY: Final[frozenset[str]] = frozenset(
         "list",
         "optimize",
         "providers",
-        "run",
-        "serve",
     }
 )
 ROOT_CLI_COMMAND_TOMBSTONES: Final[frozenset[str]] = frozenset(
@@ -341,8 +339,10 @@ ROOT_CLI_COMMAND_TOMBSTONES: Final[frozenset[str]] = frozenset(
         "pull",
         "push",
         "research",
+        "run",
         "runs",
         "scenarios",
+        "serve",
         "status",
     }
 )

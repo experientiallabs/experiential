@@ -41,7 +41,7 @@ class RoutingDecision(ContractModel):
     policy_id: ArtifactId
     policy_sha256: Sha256
     request_sha256: Sha256
-    episode_id: str = Field(min_length=1, max_length=512)
+    episode_id_sha256: Sha256
     selected_alias: ModelAlias
     baseline_alias: ModelAlias
     neighbor_count: int = Field(ge=0)

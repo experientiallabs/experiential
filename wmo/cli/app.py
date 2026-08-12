@@ -7,13 +7,12 @@ import logging
 import typer
 
 from wmo.cli.build_cmd import build
-from wmo.cli.catalog_cmd import download, list_models, serve
+from wmo.cli.catalog_cmd import download, list_models
 from wmo.cli.config_cmd import config_app
 from wmo.cli.defer import add_deferred_typer
 from wmo.cli.eval_cmd import eval_
 from wmo.cli.knowledge_cmd import knowledge_
 from wmo.cli.provider_cmd import providers_app
-from wmo.cli.run_cmd import register as register_run_command
 from wmo.common.config import load_env_file
 
 app = typer.Typer(
@@ -34,14 +33,6 @@ app.command("build", help="Build an immutable task set from a local OTLP or Post
 app.command("list", help="List locally available world-model artifacts.")(list_models)
 app.command("download", help="Download a published benchmark bundle.")(download)
 app.command(
-    "serve",
-    help=(
-        "Serve local world models over their step API and OpenAI-compatible "
-        "`/v1/chat/completions` endpoint. Use repeatable `--root` values such as `.wmo` "
-        "and `environment-capture-data/tau-bench`."
-    ),
-)(serve)
-app.command(
     "eval",
     help=(
         r"Score open-loop reconstruction, closed-loop tasks, or agreement reports. "
@@ -51,7 +42,6 @@ app.command(
     ),
 )(eval_)
 app.command("knowledge", help="Inspect editable knowledge stored with a world model.")(knowledge_)
-register_run_command(app)
 
 
 def _quiet_http_logs() -> None:

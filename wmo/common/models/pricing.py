@@ -60,10 +60,10 @@ def load_pricing_snapshot(
         artifact_id: Pricing-snapshot artifact identity.
 
     Returns:
-        Parsed pricing snapshot and its exact manifest digest.
+        Parsed pricing snapshot and exact artifact-manifest digest.
 
     Raises:
-        ValueError: If the artifact type or embedded identity is inconsistent.
+        ValueError: The artifact type, payload, or bound identity is invalid.
     """
     stored = store.read(artifact_id)
     if stored.manifest.artifact_type != "pricing-snapshot":

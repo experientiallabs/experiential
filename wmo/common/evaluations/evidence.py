@@ -131,7 +131,7 @@ def read_fidelity_thresholds(
         artifact_id: Fidelity-threshold artifact identity.
 
     Returns:
-        Parsed thresholds plus the exact digest of their generic artifact manifest.
+        Parsed thresholds and their exact manifest-derived input.
     """
     value, input_record = _read_json(
         store,

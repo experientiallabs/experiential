@@ -233,56 +233,6 @@ def _fetch_with_progress(name: str, *, force: bool) -> Path:
         return fetch_corpus(name, force=force, on_progress=on_progress)
 
 
-def serve(
-    name: list[str] = typer.Option(  # noqa: B008 - typer reads option defaults at definition time
-        None, "--name", help="World model(s) to serve. Repeatable; default: all built ones."
-    ),
-    port: int = typer.Option(8000, help="Port for the local backend."),
-    root: list[str] = typer.Option(  # noqa: B008 - typer reads option defaults at definition time
-        [ARTIFACT_DIR],
-        "--root",
-        help="Project dir(s) to serve from. Repeatable; server-side builds land in the first.",
-    ),
-    max_fidelity: bool = typer.Option(
-        False,
-        "--max-fidelity",
-        help="Serve with the online extras on: the build-measured winning config when the "
-        "artifact has one, otherwise every extra it supports. Default: pure RAG.",
-    ),
-) -> None:
-    """Run the local FastAPI backend so agents can step against world models over HTTP.
-
-    Serves every built model by default, or just the `--name` ones, from one or more roots
-    (e.g. `--root .wmo --root environment-capture-data/tau-bench`). Two surfaces are
-    exposed: the world-model step API, namespaced `/world_models/{name}/sessions` and
-    `.../step`; and, for every served model whose dir carries a `policy.json` (written by
-    `wmo optimize route fit --out` or `wmo optimize model`), the OpenAI-compatible endpoint
-    `POST /v1/chat/completions` with `model="<name>"`, listed by `GET /v1/models`.
-
-    Args:
-        name: Optional repeatable set of world models to serve.
-        root: One or more project artifact directories containing models.
-        port: Local TCP port for the server.
-        max_fidelity: Whether to enable the model's measured online extras.
-
-    Raises:
-        typer.BadParameter: The selected model cannot be resolved or loaded.
-    """
-
-    import uvicorn
-
-    from wmo.simulation.serving.server import create_app
-
-    names = list(name) if name else None
-    # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
-    # not a traceback; load the models before uvicorn takes over the process.
-    try:
-        server_app = create_app(list(root), names=names, max_fidelity=max_fidelity)
-    except (ValueError, FileNotFoundError) as err:
-        raise typer.BadParameter(str(err)) from None
-    uvicorn.run(server_app, host="127.0.0.1", port=port)
-
-
 def _prepare_out_path(out: str | None) -> None:
     """Validate `--out` and create its parent directory BEFORE any (paid) eval work runs.
 

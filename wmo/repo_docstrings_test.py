@@ -65,6 +65,8 @@ _DOCSTRING_TOMBSTONE_ROWS: Final[tuple[str, ...]] = (
     'wmo/cli/app.py|scenarios_verify|function|missing-args-section',
     'wmo/cli/app.py|serve|function|missing-args-section',
     'wmo/cli/app.py|serve|function|missing-raises-section',
+    'wmo/cli/model_app.py|probe|function|missing-args-section',
+    'wmo/cli/model_app.py|probe|function|missing-raises-section',
     'wmo/cli/optimize_model_app.py|build_endpoint_scorecard|function|missing-args-section',
     'wmo/cli/optimize_model_app.py|build_endpoint_scorecard|function|missing-returns-section',
     'wmo/cli/optimize_model_app.py|optimize_model|function|missing-args-section',
@@ -114,16 +116,6 @@ _DOCSTRING_TOMBSTONE_ROWS: Final[tuple[str, ...]] = (
     'wmo/cli/route_app.py|tune|function|missing-raises-section',
     'wmo/cli/route_app.py|uneven_warning|function|missing-args-section',
     'wmo/cli/route_app.py|uneven_warning|function|missing-returns-section',
-    'wmo/cli/run_cmd.py|LocalPiRunRecorder.finish|method|missing-args-section',
-    'wmo/cli/run_cmd.py|LocalPiRunRecorder.finish|method|nontrivial-one-line-docstring',
-    'wmo/cli/run_cmd.py|LocalPiRunRecorder.flush|method|nontrivial-one-line-docstring',
-    'wmo/cli/run_cmd.py|LocalPiRunRecorder.record|method|missing-args-section',
-    'wmo/cli/run_cmd.py|LocalPiRunRecorder.record|method|nontrivial-one-line-docstring',
-    'wmo/cli/run_cmd.py|RemoteWorldModelDriver.run|method|missing-raises-section',
-    'wmo/cli/run_cmd.py|RemoteWorldModelDriver.run|method|nontrivial-one-line-docstring',
-    'wmo/cli/run_cmd.py|RunRecorder.finish|method|missing-docstring',
-    'wmo/cli/run_cmd.py|RunRecorder.flush|method|missing-docstring',
-    'wmo/cli/run_cmd.py|RunRecorder.record|method|missing-docstring',
     'wmo/cli/runs_app.py|backfill|function|missing-args-section',
     'wmo/cli/runs_app.py|list_runs|function|missing-args-section',
     'wmo/cli/runs_app.py|list_runs|function|missing-raises-section',
@@ -637,6 +629,24 @@ _DOCSTRING_TOMBSTONE_ROWS: Final[tuple[str, ...]] = (
 DOCSTRING_TOMBSTONES: frozenset[DocstringViolation] = frozenset(
     DocstringViolation(*row.split("|", maxsplit=3)) for row in _DOCSTRING_TOMBSTONE_ROWS
 )
+DELETED_OWNER_DOCSTRING_PATHS: Final[frozenset[str]] = frozenset(
+    """
+wmo/cli/run_cmd.py wmo/optimize/routing/__init__.py
+wmo/optimize/routing/cluster_labels.py wmo/optimize/routing/compression.py
+wmo/optimize/routing/deepswe.py wmo/optimize/routing/embedding_cache.py
+wmo/optimize/routing/evaluation.py wmo/optimize/routing/fit.py
+wmo/optimize/routing/knn.py wmo/optimize/routing/outcomes.py
+wmo/optimize/routing/pareto.py wmo/optimize/routing/pipeline.py
+wmo/optimize/routing/policy.py wmo/optimize/routing/report.py
+wmo/optimize/routing/scorecard.py wmo/optimize/routing/scorecard_core.py
+wmo/optimize/routing/scorecard_ladder.py wmo/optimize/routing/sweep.py
+wmo/optimize/routing/sweep_partial.py wmo/optimize/routing/teacher.py
+wmo/simulation/serving/__init__.py wmo/simulation/serving/chat.py
+wmo/simulation/serving/endpoint_config.py wmo/simulation/serving/query_embeddings.py
+wmo/simulation/serving/savings.py wmo/simulation/serving/server.py
+wmo/simulation/serving/traces_source.py
+""".split()
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -874,11 +884,15 @@ def test_public_docstring_transition_inventory_is_monotonic() -> None:
     """New violations fail and fixed baseline violations become permanent tombstones."""
     baseline = _baseline_docstring_violations()
     current = _docstring_violations(_tracked_files())
+    deletion_tombstones = frozenset(
+        violation for violation in baseline if violation.path in DELETED_OWNER_DOCSTRING_PATHS
+    )
+    tombstones = DOCSTRING_TOMBSTONES | deletion_tombstones
     new_violations = current - baseline
     fixed_violations = baseline - current
-    missing_tombstones = fixed_violations - DOCSTRING_TOMBSTONES
-    stale_tombstones = DOCSTRING_TOMBSTONES - fixed_violations
-    reintroduced = current & DOCSTRING_TOMBSTONES
+    missing_tombstones = fixed_violations - tombstones
+    stale_tombstones = tombstones - fixed_violations
+    reintroduced = current & tombstones
     assert not new_violations, f"new public-docstring violations: {sorted(new_violations)}"
     assert not missing_tombstones, (
         "fixed baseline public-docstring violations must be tombstoned: "

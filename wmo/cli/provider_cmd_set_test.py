@@ -14,17 +14,6 @@ def test_config_help_does_not_reuse_the_harness_group_name() -> None:
     assert "harness" not in output
 
 
-def test_serve_help_names_the_openai_endpoint_and_a_real_example_root() -> None:
-    # The OpenAI-compatible surface is what README step 3 exists for, and benchmark data now
-    # arrives via `wmo download` - the help must name the endpoint and the real data root.
-    result = runner.invoke(app, ["serve", "--help"])
-    assert result.exit_code == 0, result.output
-    output = _flat(result.output)
-    assert "/v1/chat/completions" in output
-    assert "examples/tau-bench" not in output
-    assert "environment-capture-data/tau-bench" in output
-
-
 def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     # The persistence half of the wizard's credential flow: keys saved to .env must be back in
     # os.environ on the next `wmo` invocation (main), and importing the module must NOT load.

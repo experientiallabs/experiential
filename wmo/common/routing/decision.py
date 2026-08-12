@@ -340,11 +340,12 @@ def _decision(
 ) -> RoutingDecision:
     """Create one content-addressed decision with its exact policy digest."""
     policy_sha256 = policy_content_sha256(policy)
+    episode_id_sha256 = hashlib.sha256(episode_id.encode("utf-8")).hexdigest()
     material = {
         "policy_id": policy.policy_id,
         "policy_sha256": policy_sha256,
         "request_sha256": request_sha256,
-        "episode_id": episode_id,
+        "episode_id_sha256": episode_id_sha256,
         "selected_alias": selected_alias,
         "baseline_alias": policy.baseline_alias,
         "neighbor_count": neighbor_count,
@@ -359,7 +360,7 @@ def _decision(
         policy_id=policy.policy_id,
         policy_sha256=policy_sha256,
         request_sha256=request_sha256,
-        episode_id=episode_id,
+        episode_id_sha256=episode_id_sha256,
         selected_alias=selected_alias,
         baseline_alias=policy.baseline_alias,
         neighbor_count=neighbor_count,

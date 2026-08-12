@@ -58,16 +58,16 @@ class FrozenEmbeddingClient(EmbeddingClient):
         }
 
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
-        """Return completed vectors for exact precomputed texts.
+        """Return completed vectors for exact precomputed feature texts.
 
         Args:
-            texts: Feature texts whose SHA-256 digests must exist in the frozen set.
+            texts: Canonical request-visible feature strings to resolve.
 
         Returns:
-            Embeddings in the same order as ``texts``.
+            Frozen embeddings in the caller's input order.
 
         Raises:
-            ValueError: If any requested text was not precomputed.
+            ValueError: A requested feature digest was not precomputed.
         """
         result = []
         for value in texts:
@@ -84,13 +84,13 @@ def load_frozen_embedding_set(store: ArtifactStore, artifact_id: ArtifactId) -> 
 
     Args:
         store: Project-local immutable artifact store.
-        artifact_id: Frozen embedding-set artifact identity.
+        artifact_id: Router-embedding artifact identity.
 
     Returns:
         Parsed frozen embedding set.
 
     Raises:
-        ValueError: If the artifact type or embedded identity is inconsistent.
+        ValueError: The artifact type, payload, or bound identity is invalid.
     """
     stored = store.read(artifact_id)
     if stored.manifest.artifact_type != "router-embeddings":

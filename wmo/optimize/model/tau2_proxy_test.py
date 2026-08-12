@@ -134,7 +134,7 @@ class TestServing:
         )
         assert status == 502
         # The class name crosses the wire; the detail stays in the collector log
-        # (CodeQL: stack-trace exposure), mirroring wmo.simulation.serving.chat's split.
+        # (CodeQL: stack-trace exposure), mirroring wmo.runtime.router.endpoint's split.
         assert "RuntimeError" in body["error"]["message"]
         assert "sampler wedged" not in body["error"]["message"]
 

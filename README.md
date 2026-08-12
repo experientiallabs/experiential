@@ -1,6 +1,8 @@
 # World Model Optimizer
 
-`wmo optimize` turns collected agent traces into smaller open-source models using the Tinker API, with optional closed-loop simulation training. `wmo serve` exposes an endpoint that routes requests between frontier and smaller models; on RouterBench, it maintains frontier quality at 27% lower cost. Rerun the pipeline as new traces arrive to continually improve a model you own.
+WMO builds immutable evaluation evidence and fits a conservative offline kNN policy across pinned
+model candidates. Runtime loads the frozen policy, evidence bank, catalog, pricing snapshot, and
+request-visible feature contract before selecting or calling a candidate.
 
 ![World model, runtime agent, and optimizer connected in a continuous improvement loop](assets/world-model-agent-loop.svg)
 
@@ -24,7 +26,7 @@ That verifies the provider and then offers to register its models as routing can
 catalog (OpenRouter's 338 published models included) and asks only for what that backend needs.
 Re-run it to add another provider's models beside the ones already registered.
 
-**2. Tune a router on your OTel traces.**
+**2. Build a task set from OTel traces.**
 
 ```bash
 # Download a published bundle containing prebuilt world models, then choose a name from the list.
@@ -36,35 +38,23 @@ export WORLD_MODEL=your-model-name  # replace with a name printed by `wmo list`
 # Keep the TaskSet beside that model so sweep resolves both from the same local root.
 wmo build --file traces.jsonl --source otlp --project my-project --root "$WMO_ROOT"
 
-# Score every registered candidate on the immutable held-out TaskSet from your traces.
-wmo optimize route sweep "$WORLD_MODEL" --project my-project --root "$WMO_ROOT"
-
-# Deterministically reserve 30% for reporting and fit on the other 70%
-wmo optimize route fit matrix.json --kind knn \
-  --out "$WMO_ROOT/models/$WORLD_MODEL/policy.json"
 ```
 
 `wmo build` writes trace and task artifacts, not a simulator. The downloaded bundle supplies the
 world model used above; a customer-specific world model can instead be placed under the same
 `<root>/models/<name>/` contract.
 
-**3. Serve it.**
+**3. Fit and report from completed artifacts.**
 
 ```bash
-wmo serve --root "$WMO_ROOT" --name "$WORLD_MODEL"
+wmo optimize router fit my-project --root "$WMO_ROOT" --config router-fit.json
+wmo optimize router report my-project --root "$WMO_ROOT" --config router-report.json
 ```
 
-See what it bought you against the model you were using before. The report automatically excludes
-the router-fit scenarios recorded in the policy:
-
-```bash
-wmo optimize route report matrix.json "$WMO_ROOT/models/$WORLD_MODEL/policy.json" \
-  --baseline gpt-5.6-sol
-```
-
-Distill your own small model into the pool with [`wmo optimize distill`](wmo/optimize/model/README.md),
-serve a single model with no routing via `wmo optimize route pin`, or build an optimized harness
-for your agent with `wmo optimize harness`.
+These offline commands accept explicit IDs for a pre-existing combined evaluation plan, completed
+rollouts and judgments, a plan-bound fidelity report, frozen embeddings, and pricing. They do not
+call providers. `fit` opens only fit and fidelity inputs; `report` opens held-out evidence only
+after the policy and bank are frozen. W14R owns the final public `wmo run` composition.
 
 ### E2B backend
 
@@ -94,9 +84,6 @@ obs = wm.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="add_to_cart",
                                  arguments={"sku": "A1"}))
 print(obs.content)
 ```
-
-Or over HTTP (same code path), namespaced by model name: `GET /world_models`, then `POST
-/world_models/{name}/sessions` and `POST /world_models/{name}/sessions/{id}/step`.
 
 ## Runtime agents and optimizers in E2B sandboxes
 

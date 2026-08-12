@@ -11,11 +11,9 @@ def test_cli_exposes_the_small_command_set() -> None:
     core = {
         "build",
         "list",
-        "serve",
         "eval",
         "download",
         "knowledge",
-        "run",
     }
     assert names == core
     # `optimize` is a GROUP (route, model, and distill; harness search moved out).
@@ -185,12 +183,6 @@ def test_bare_invocation_shows_help(args: list[str]) -> None:
     # Bare invocation keeps the usage-error exit code (click >=8.2), unlike explicit --help
     # which exits 0 - scripts can still tell "asked for help" from "forgot the command".
     assert result.exit_code == 2
-
-
-def test_serve_rejects_invalid_name_with_friendly_error(tmp_path) -> None:  # noqa: ANN001
-    result = runner.invoke(app, ["serve", "--name", "tau bench", "--root", str(tmp_path / ".wmo")])
-    assert result.exit_code == 2  # usage error, not a ValueError traceback
-    assert "invalid world model name" in result.output
 
 
 def test_examples_discovery_skips_unresolvable_names(tmp_path, monkeypatch) -> None:  # noqa: ANN001

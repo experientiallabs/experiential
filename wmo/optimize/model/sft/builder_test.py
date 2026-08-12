@@ -19,7 +19,6 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
     sha256_json,
 )
-from wmo.common.evaluations import FidelityReport
 from wmo.common.judging import (
     HumanScore,
     HumanScoreReview,
@@ -63,6 +62,7 @@ from wmo.optimize.model.sft.builder import (
     load_sft_dataset,
     write_sft_dataset,
 )
+from wmo.optimize.model.sft.builder_fidelity_fixture_test import approved_fidelity_report
 from wmo.optimize.model.sft.contracts import (
     AssistantActionEvent,
     HumanApproval,
@@ -574,30 +574,10 @@ def _write_teacher_source(
         calibration_artifact_id=calibration.calibration_id,
     )
     judgment_input = artifact_input(store.artifacts.read(final_judgment.judgment_id).manifest)
-    overlap_cell_ids = tuple(f"fidelity-cell-{index}" for index in range(8))
-    fidelity = FidelityReport(
-        schema_version=1,
-        created_at=_TIME,
+    fidelity = approved_fidelity_report(
         inputs=_inputs(task_set_input, fidelity_rollout_input),
-        code_revision="w12-test",
-        fidelity_report_id="fidelity-teacher",
-        evaluation_plan_id="evaluation-plan-teacher",
-        evaluation_plan_sha256=_DIGEST,
-        protocol_sha256=_DIGEST,
-        overlap_cell_ids=overlap_cell_ids,
-        planned_overlap_count=8,
-        usable_overlap_count=8,
-        failed_overlap_count=0,
-        score_mae=0.05,
-        pairs=usable_fidelity_pairs(
-            overlap_cell_ids,
-            final_rollout.artifact_id,
-            fidelity_rollout_input.artifact_id,
-        ),
-        gate_id="fidelity-gate-teacher",
-        gate_sha256=_DIGEST,
-        status="approved",
-        approved_at=_TIME,
+        created_at=_TIME,
+        digest=_DIGEST,
     )
     fidelity_input = artifact_input(
         store.artifacts.write_json(

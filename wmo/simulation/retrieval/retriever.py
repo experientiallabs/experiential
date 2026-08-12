@@ -127,7 +127,7 @@ class EmbeddingRetriever:
     def save(self, index_dir: str | Path) -> None:
         """Persist the buffer (embedding matrix + parallel steps) under `index_dir`.
 
-        `wmo build` writes this; `wmo serve` / `WorldModel.load` reloads it without re-embedding.
+        `wmo build` writes this; `WorldModel.load` reloads it without re-embedding.
         """
         path = Path(index_dir)
         path.mkdir(parents=True, exist_ok=True)

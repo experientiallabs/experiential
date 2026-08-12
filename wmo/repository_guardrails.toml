@@ -9,8 +9,8 @@ baseline_revision = "e7aad17b2f5041769ad8107ab25e77d4e88729ca"
 [oversized_file_inventory.entries]
 "wmo/cli/app.py" = { baseline_lines = 3716, status = "tombstoned" }
 "wmo/cli/app_test.py" = { baseline_lines = 3487, status = "tombstoned" }
-"wmo/cli/model_app.py" = { baseline_lines = 1316, status = "active" }
-"wmo/cli/model_app_test.py" = { baseline_lines = 1418, status = "active" }
+"wmo/cli/model_app.py" = { baseline_lines = 1316, status = "tombstoned" }
+"wmo/cli/model_app_test.py" = { baseline_lines = 1418, status = "tombstoned" }
 "wmo/cli/optimize_model_app.py" = { baseline_lines = 1720, status = "tombstoned" }
 "wmo/cli/optimize_model_app_test.py" = { baseline_lines = 1692, status = "tombstoned" }
 "wmo/cli/pool_registry_test.py" = { baseline_lines = 1184, status = "active" }
@@ -28,16 +28,16 @@ baseline_revision = "e7aad17b2f5041769ad8107ab25e77d4e88729ca"
 "wmo/optimize/model/loop_test.py" = { baseline_lines = 3700, status = "active" }
 "wmo/optimize/model/rollouts_test.py" = { baseline_lines = 1028, status = "active" }
 "wmo/optimize/model/store.py" = { baseline_lines = 1031, status = "active" }
-"wmo/optimize/routing/policy.py" = { baseline_lines = 1345, status = "active" }
-"wmo/optimize/routing/policy_test.py" = { baseline_lines = 1508, status = "active" }
+"wmo/optimize/routing/policy.py" = { baseline_lines = 1345, status = "tombstoned" }
+"wmo/optimize/routing/policy_test.py" = { baseline_lines = 1508, status = "tombstoned" }
 "wmo/optimize/routing/scorecard.py" = { baseline_lines = 1101, status = "tombstoned" }
 "wmo/optimize/telemetry/hooks.py" = { baseline_lines = 1111, status = "tombstoned" }
 "wmo/runtime/harness/pi_e2b.py" = { baseline_lines = 1711, status = "active" }
 "wmo/runtime/harness/pi_e2b_test.py" = { baseline_lines = 2440, status = "active" }
 "wmo/runtime/harness/vendor/pi-agent/src/harness/agent-harness.ts" = { baseline_lines = 1029, status = "active" }
 "wmo/runtime/harness/vendor/pi-agent/test/agent-loop.test.ts" = { baseline_lines = 1351, status = "active" }
-"wmo/simulation/serving/chat.py" = { baseline_lines = 1915, status = "active" }
-"wmo/simulation/serving/chat_test.py" = { baseline_lines = 3050, status = "active" }
+"wmo/simulation/serving/chat.py" = { baseline_lines = 1915, status = "tombstoned" }
+"wmo/simulation/serving/chat_test.py" = { baseline_lines = 3050, status = "tombstoned" }
 
 [generated_outputs]
 paths = ["uv.lock"]

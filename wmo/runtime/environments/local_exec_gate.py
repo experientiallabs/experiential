@@ -11,6 +11,7 @@ def main() -> None:
 
     Raises:
         SystemExit: The parent did not provide a command or declined to open the execution gate.
+        OSError: Reading the gate or replacing the process fails.
     """
     if len(sys.argv) < 3:
         raise SystemExit(64)

@@ -83,7 +83,7 @@ class RouterFeatureExtractor:
             Deterministic embedding text with no later action, outcome, or episode metadata.
 
         Raises:
-            ValueError: If the request has no initial user message.
+            ValueError: The request has no initial user message.
         """
         initial_user_intent = next(
             (

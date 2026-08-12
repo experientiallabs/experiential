@@ -1,6 +1,6 @@
 """Project config + the `.wmo/` artifact layout.
 
-`.wmo/` holds everything `wmo build` produces and `wmo serve` / `WorldModel.load` consume.
+`.wmo/` holds everything `wmo build` produces and `WorldModel.load` consumes.
 """
 
 from __future__ import annotations
@@ -158,7 +158,7 @@ missing kind silently degrades all three to "no credentials known"."""
 
 
 class HarnessConfig(BaseModel):
-    """Persisted to `.wmo/config.toml` and reloaded by `wmo serve` / `WorldModel.load`."""
+    """Persisted to `.wmo/config.toml` and reloaded by `WorldModel.load`."""
 
     providers: list[ProviderConfig] = Field(default_factory=list)
     serve_provider: ProviderKind = ProviderKind.ANTHROPIC  # serves the live world model

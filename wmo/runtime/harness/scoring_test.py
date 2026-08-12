@@ -62,32 +62,6 @@ def test_score_weights_tasks_equally_and_keeps_raw_rewards() -> None:
     assert report.by_task()["b"][0].artifact_dir == "/jobs/b__x1"
 
 
-def test_live_session_prompt_change_gets_a_distinct_score_identity() -> None:
-    """A score report cannot be reused after changing an input sent to the live runner."""
-    from wmo.cli.run_cmd import _assemble, _pi_node_baseline
-
-    doc = _pi_node_baseline()
-    changed = HarnessDoc(
-        name=doc.name,
-        surfaces=[
-            surface.model_copy(update={"content": surface.content + "\nBe concise."})
-            if surface.id == "prompt:core"
-            else surface
-            for surface in doc.surfaces
-        ],
-    )
-    report = ScoreReport(
-        doc_hash=doc.doc_hash,
-        request=ScoreRequest(task_ids=("a",), attempts=1),
-        reward_mode="raw",
-        cells=(_cell("a", 1, 1.0),),
-    )
-
-    assert _assemble(doc)[0] != _assemble(changed)[0]
-    assert report.doc_hash != changed.doc_hash
-    assert ScoreReport.model_validate_json(report.model_dump_json()).doc_hash == doc.doc_hash
-
-
 def test_report_rejects_missing_duplicate_and_extra_cells() -> None:
     with pytest.raises(ValidationError, match="missing"):
         _report((_cell("a", 1, 1.0),), tasks=("a", "b"), attempts=1)

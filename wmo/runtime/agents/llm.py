@@ -147,7 +147,7 @@ class LLMAgent:
         self._temperature = temperature
         self._history_chars = history_chars
         # Callers measuring per-call latency can set this to 0: each retry is one more timed
-        # provider call at the metering boundary (see `wmo.optimize.routing.report`).
+        # provider call at the metering boundary (see `wmo.common.evaluations.dataset`).
         self._empty_retries = empty_retries
         # Corpus-derived tool surface (names + argument keys observed in the traces). Without
         # it, capable models honestly refuse to invent tools while weaker ones hallucinate

@@ -140,7 +140,6 @@ convention = "google"
 # symbol-level transition test rejects new violations in these legacy files, requires tombstones
 # when a violation is fixed, and rejects a reintroduced tombstone. No directory is exempt.
 "wmo/cli/defer.py" = ["D102"]
-"wmo/cli/run_cmd.py" = ["D102"]
 "wmo/cli/ui.py" = ["D102"]
 "wmo/common/config/card.py" = ["D103"]
 "wmo/common/config/config.py" = ["D102"]
@@ -174,12 +173,6 @@ convention = "google"
 "wmo/optimize/research/gepa_scaling.py" = ["D102"]
 "wmo/optimize/research/seed_stability.py" = ["D102"]
 "wmo/optimize/research/trace_scaling.py" = ["D102"]
-"wmo/optimize/routing/compression.py" = ["D102"]
-"wmo/optimize/routing/embedding_cache.py" = ["D102"]
-"wmo/optimize/routing/evaluation.py" = ["D102"]
-"wmo/optimize/routing/outcomes.py" = ["D102"]
-"wmo/optimize/routing/policy.py" = ["D102"]
-"wmo/optimize/routing/sweep_partial.py" = ["D102"]
 "wmo/runtime/agents/llm.py" = ["D102"]
 "wmo/runtime/episode.py" = ["D102"]
 "wmo/runtime/evaluation/harbor/agent.py" = ["D102"]
@@ -223,10 +216,6 @@ convention = "google"
 "wmo/simulation/scenarios/synthesis/scenario_set.py" = ["D102"]
 "wmo/simulation/scenarios/verification/judge.py" = ["D102"]
 "wmo/simulation/scenarios/verification/verify.py" = ["D102"]
-"wmo/simulation/serving/builds.py" = ["D102"]
-"wmo/simulation/serving/chat.py" = ["D102"]
-"wmo/simulation/serving/query_embeddings.py" = ["D102"]
-"wmo/simulation/serving/traces_source.py" = ["D102"]
 # The waterfall utility's adapter tests stub provider SDK clients, whose kwargs are genuinely
 # arbitrary — the fakes have to accept whatever the SDK signature accepts. Scoped to that one
 # module tree so the rest of `wmo/` keeps ANN401 in full force.

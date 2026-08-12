@@ -9,9 +9,8 @@ What the loop runs with is a `HarnessDoc` - a typed document of identity-keyed s
 aliases (`wmo.runtime.harness.store`).
 
 The machinery that improves harnesses (delta search, mutation, population search) lives in the
-agent-optimization repo and imports this runtime seam. The live-session host stays here because it
-drives the retained local pi runner for `wmo run`. Closed-loop evaluation and model optimization
-use the same execution contracts.
+agent-optimization repo and imports this runtime seam. Closed-loop evaluation and model
+optimization use the same execution contracts. W14R owns any future CLI orchestration.
 """
 
 from wmo.runtime.harness.doc import HarnessDoc, Surface, SurfaceKind

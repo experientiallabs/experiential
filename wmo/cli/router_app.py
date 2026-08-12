@@ -88,8 +88,7 @@ def _load_config(path: Path, model_type: type[ContractModel]) -> ContractModel:
 
 
 @router_app.command(
-    "fit",
-    help="Materialize fit evidence and persist one frozen bank and policy.",
+    "fit", help="Materialize fit-only evidence and persist the frozen bank and policy."
 )
 def fit(
     project: str = typer.Argument(..., help="Canonical project ID."),
@@ -100,11 +99,11 @@ def fit(
 
     Args:
         project: Canonical project identifier.
-        config: Local JSON configuration containing immutable fit inputs.
-        root: Root directory for project artifacts.
+        config: Explicit fit command configuration path.
+        root: Project artifact-store root.
 
     Raises:
-        typer.BadParameter: If an input artifact is missing, inconsistent, or unapproved.
+        typer.BadParameter: Any configured artifact or partition binding is invalid.
     """
     value = _load_config(config, RouterFitCommandConfig)
     assert isinstance(value, RouterFitCommandConfig)
@@ -151,8 +150,7 @@ def fit(
 
 
 @router_app.command(
-    "report",
-    help="Open held-out evidence after policy lock and persist the router report.",
+    "report", help="Open held-out inputs after policy lock and persist the weighted router report."
 )
 def report(
     project: str = typer.Argument(..., help="Canonical project ID."),
@@ -163,11 +161,11 @@ def report(
 
     Args:
         project: Canonical project identifier.
-        config: Local JSON configuration containing held-out report inputs.
-        root: Root directory for project artifacts.
+        config: Explicit held-out report command configuration path.
+        root: Project artifact-store root.
 
     Raises:
-        typer.BadParameter: If policy-locked inputs drift or held-out evidence is invalid.
+        typer.BadParameter: Any configured artifact or frozen identity is invalid.
     """
     value = _load_config(config, RouterReportCommandConfig)
     assert isinstance(value, RouterReportCommandConfig)
@@ -262,10 +260,11 @@ def _verify_completed_inputs(
         if hashlib.sha256(index_payload).hexdigest() != artifact_set.artifacts_sha256:
             raise typer.BadParameter(f"rollout set {artifact_set_id} index digest has drifted")
         rollout_ids.update(artifact_set.artifact_ids)
+    simulated_cells = {cell.cell_id for cell in plan.cells if cell.execution == "simulate"}
     referenced = {
         item.rollout_artifact_id
         for item in value.cell_evidence
-        if item.rollout_artifact_id is not None
+        if item.cell_id in simulated_cells and item.rollout_artifact_id is not None
     }
     if not referenced.issubset(rollout_ids):
         missing = sorted(referenced - rollout_ids)

@@ -87,19 +87,3 @@ for name in banned:
 assert not bad, f"light commands pulled: {bad}"
 """
     )
-
-
-def test_serve_help_loads_uvicorn_path_when_handler_imports() -> None:
-    """Invoking the serve command body must be able to import the serve stack.
-
-    ``serve --help`` only needs the signature (still light). Importing the serve handler's
-    dependencies on demand is checked by importing create_app the same way ``serve`` does.
-    """
-    _run(
-        """
-import sys
-from wmo.simulation.serving.server import create_app
-assert callable(create_app)
-assert "fastapi" in {m.split(".")[0] for m in sys.modules}
-"""
-    )
