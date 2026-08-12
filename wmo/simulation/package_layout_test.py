@@ -7,13 +7,12 @@ WMO_DIR = SIMULATION_DIR.parent
 
 
 def test_simulation_domains_are_nested() -> None:
-    """World-model construction, serving, and evaluation stay under one package."""
+    """World-model construction and evaluation stay under one package."""
     expected_dirs = {
         "evaluation",
         "ingest",
         "model",
         "retrieval",
-        "serving",
     }
     missing_dirs = sorted(name for name in expected_dirs if not (SIMULATION_DIR / name).is_dir())
     assert not missing_dirs, f"simulation packages missing under wmo/simulation: {missing_dirs}"

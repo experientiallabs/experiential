@@ -77,7 +77,6 @@ from wmo.optimize.model.sft.contracts import (
     TeacherAcceptanceRule,
     TeacherSFTSource,
 )
-from wmo.optimize.model.sft.fidelity_support_test import usable_fidelity_pairs
 from wmo.simulation.ingest.dataset import persist_trace_dataset
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 

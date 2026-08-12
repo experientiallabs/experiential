@@ -29,22 +29,14 @@ IMPORT_TRANSITION_INVENTORY: Final[frozenset[tuple[str, str]]] = frozenset(
     {
         ("wmo/optimize/gepa.py", "wmo.simulation.retrieval"),
         ("wmo/optimize/gepa.py", "wmo.simulation.retrieval.leakfree"),
-        ("wmo/optimize/routing/policy.py", "wmo.simulation.retrieval.embedders"),
-        ("wmo/optimize/routing/sweep.py", "wmo.simulation.model.world_model"),
         ("wmo/simulation/model/replay.py", "wmo.optimize.gepa"),
         ("wmo/simulation/model/world_model.py", "wmo.optimize.gepa"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.compression"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.knn"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.pareto"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.policy"),
-        ("wmo/simulation/serving/savings.py", "wmo.optimize.routing.knn"),
-        ("wmo/simulation/serving/savings.py", "wmo.optimize.routing.policy"),
-        ("wmo/simulation/serving/server.py", "wmo.optimize.routing.pareto"),
-        ("wmo/simulation/serving/server.py", "wmo.optimize.routing.policy"),
     }
 )
 IMPORT_TRANSITION_TOMBSTONES: Final[frozenset[tuple[str, str]]] = frozenset(
     {
+        ("wmo/optimize/routing/policy.py", "wmo.simulation.retrieval.embedders"),
+        ("wmo/optimize/routing/sweep.py", "wmo.simulation.model.world_model"),
         ("wmo/optimize/routing/evaluation.py", "wmo.simulation.scenarios.spec"),
         ("wmo/optimize/routing/sweep.py", "wmo.simulation.ingest"),
         ("wmo/optimize/routing/sweep.py", "wmo.simulation.model"),
@@ -74,6 +66,14 @@ IMPORT_TRANSITION_TOMBSTONES: Final[frozenset[tuple[str, str]]] = frozenset(
         ("wmo/simulation/model/replay.py", "wmo.optimize.judge"),
         ("wmo/simulation/model/world_model.py", "wmo.optimize.reward"),
         ("wmo/simulation/serving/server.py", "wmo.optimize.reward"),
+        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.compression"),
+        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.knn"),
+        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.pareto"),
+        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.policy"),
+        ("wmo/simulation/serving/savings.py", "wmo.optimize.routing.knn"),
+        ("wmo/simulation/serving/savings.py", "wmo.optimize.routing.policy"),
+        ("wmo/simulation/serving/server.py", "wmo.optimize.routing.pareto"),
+        ("wmo/simulation/serving/server.py", "wmo.optimize.routing.policy"),
     }
 )
 

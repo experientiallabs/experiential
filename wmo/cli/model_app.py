@@ -1,9 +1,7 @@
 """`wmo optimize distill`: train the agent MODEL, leaving its harness pinned.
 
-The third member of the optimizer family, beside `wmo optimize harness`
-(prompt surfaces) and `wmo optimize route` (routing policy). Where those
-produce a `prompt` or a `routing_policy` artifact, this one produces an
-`adapter`: `run` drives one distillation of a Tinker LoRA student from real
+This command family produces an `adapter`: `run` drives one distillation of a
+Tinker LoRA student from real
 benchmark rollouts (the config selects the source: harbor's own terminus-2
 agent, or tau2-bench's own harness), and `report` reads a finished run dir
 back.
@@ -56,30 +54,16 @@ if TYPE_CHECKING:
     from wmo.optimize.model.cost import CostEstimate
     from wmo.optimize.model.loop import DistillProgress, DistillResult
     from wmo.optimize.model.store import AdapterStore, DistillRunStore
-    from wmo.optimize.routing.teacher import TeacherSearchVerdict
     from wmo.runtime.harness.doc import HarnessDoc
     from wmo.runtime.harness.e2b_reap import CapacityCheck
 
-# Literal mirrors of constants that otherwise live behind a heavy import (`wmo.optimize.model.loop`,
-# `wmo.optimize.routing.teacher`). Typer evaluates Option defaults at command-definition time,
-# so these have to be values, not names imported from those modules; the real constants are
-# re-imported inside the command bodies that need their behavior.
+# Literal mirror of the constant that otherwise lives behind the heavy
+# `wmo.optimize.model.loop` import. Typer evaluates Option defaults at command-definition time,
+# so this has to be a value, not a name imported from that module.
 _DEFAULT_DISTILL_HARNESS = "pi"
-_DEFAULT_MIN_GAP = 0.10
 
 DISTILL_RUN_RECORD = "distill-run.json"
 """The CLI-level pin file inside the run dir (see `DistillCliRunRecord`)."""
-
-PROBE_EXIT_NO_GAP = 3
-"""`probe` exit code: the matrix shows no teacher gap, so training is refused."""
-
-PROBE_EXIT_INSUFFICIENT = 4
-"""`probe` exit code: the matrix is too thin to decide either way.
-
-Distinct from `PROBE_EXIT_NO_GAP` because the two call for opposite actions (ship the cheap model
-against sweep more scenarios), and distinct from 1 and 2 so a script can tell a verdict from a
-crash or a usage error.
-"""
 
 _PI_NODE_RUNTIME = "pi-node"
 
@@ -226,137 +210,6 @@ def report(
     _print_trained_artifact(_console, store)
     _print_paired_delta(_console, store, gate)
     _print_training_summary(_console, store)
-
-
-@model_app.command("probe")
-def probe(
-    matrix_file: str = typer.Argument(
-        ...,
-        help="The outcome matrix to read: `<model>/optimize/matrix.json`, or wherever "
-        "`wmo optimize route sweep --out` put one.",
-    ),
-    student: str = typer.Option(
-        None,
-        "--student",
-        help="Pool model the distillation would train. Default: the cheapest measured model, "
-        "which is the one whose price makes distillation worth doing at all.",
-    ),
-    min_gap: float = typer.Option(
-        _DEFAULT_MIN_GAP,
-        "--min-gap",
-        min=0.0,
-        max=1.0,
-        help="Reward points (as a fraction of 1.0) a teacher must beat the student by. The "
-        "default 0.10 is 10 points.",
-    ),
-) -> None:
-    """Ask a measured matrix whether this workload has a teacher worth distilling from.
-
-    Free and read-only: the sweep already bought this evidence, so the gate is arithmetic over
-    the file.
-
-        wmo optimize distill probe .wmo/models/tau-bench/optimize/matrix.json
-
-    It prints every candidate's paired gain over the student, with a 95% interval and the price
-    it would teach at, then one verdict line to act on. Exit codes, so a script can branch
-    without parsing the text: 0 = distill (the gap is real; the named teacher is the cheapest
-    sufficient one), 3 = do not distill (no gap, so training has nothing to teach), 4 =
-    insufficient evidence (this matrix is too thin to say either way; sweep more scenarios).
-    Anything else is the usual usage or IO failure.
-    """
-    from wmo.optimize.routing.outcomes import OutcomeMatrix
-    from wmo.optimize.routing.teacher import select_teacher
-
-    path = Path(matrix_file)
-    if not path.is_file():
-        raise typer.BadParameter(
-            f"no outcome matrix at {path}; a sweep writes one to "
-            f"`<model>/optimize/matrix.json`, so run `wmo optimize model <world-model>` (or "
-            f"`wmo optimize route sweep`) before probing it"
-        )
-    try:
-        matrix = OutcomeMatrix.load(path)
-    except ValidationError as exc:
-        raise typer.BadParameter(f"{path} is not a readable outcome matrix: {exc}") from exc
-    try:
-        verdict = select_teacher(matrix, student=student, min_gap=min_gap)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-
-    _console.print(_teacher_gain_table(verdict, path))
-    color = "green" if verdict.should_distill else "yellow"
-    _console.print(f"[{color}]{verdict.decision}[/{color}] {escape(verdict.reason)}")
-    if verdict.unmeasured_models:
-        _console.print(
-            f"[dim]not compared (no scenario scored alongside '{escape(verdict.student)}'): "
-            f"{escape(', '.join(verdict.unmeasured_models))}[/dim]"
-        )
-    if verdict.decision == "do_not_distill":
-        raise typer.Exit(code=PROBE_EXIT_NO_GAP)
-    if verdict.decision == "insufficient_evidence":
-        raise typer.Exit(code=PROBE_EXIT_INSUFFICIENT)
-
-
-def _teacher_gain_table(verdict: TeacherSearchVerdict, matrix_file: Path) -> Table:
-    """Every candidate's paired gain over the student, best first.
-
-    Six columns, not nine: a gain and its interval belong in one cell (they are one measurement),
-    and the student's own reward is the same on every row, so it goes in the title. At an
-    80-column terminal the wider layout truncated every cell to an ellipsis, which is worse than
-    omitting the columns outright.
-
-    The price column carries its unit in its header, because the ladder is measured dollars per
-    completed task when the matrix recorded spend and list dollars per Mtok when it did not, and
-    a bare number would be read as the wrong one.
-    """
-    unit = "$/task" if verdict.price_basis == "measured" else "$/Mtok"
-    measured = verdict.price_basis == "measured"
-    unit_note = (
-        "this matrix's own cost per completed task"
-        if measured
-        else "list price per 1M tokens, input + output, which is the fallback whenever some "
-        "model has no measured cost per completed task (an unpriced entry, or a model that "
-        "completed nothing)"
-    )
-    table = Table(
-        title=f"Teacher search against '{verdict.student}' "
-        f"({verdict.n_scenarios} scored scenarios, {matrix_file})",
-        caption=f"n = scenarios shared with the student; gains are paired over those. "
-        f"{unit} is {unit_note}. Bar: {verdict.min_gap * 100:.1f} points over "
-        f"{verdict.min_scenarios}+ shared scenarios, interval excluding zero. "
-        f"A teacher (*) keeps {verdict.sufficiency * 100:.0f}% of the best gain.",
-        caption_justify="left",
-    )
-    table.add_column("Model", overflow="fold")
-    table.add_column("Tier")
-    table.add_column("n", justify="right")
-    table.add_column("Reward", justify="right")
-    table.add_column("Gain in points (95% CI)", justify="right")
-    table.add_column(unit, justify="right")
-    table.add_column("Gap?")
-    for row in verdict.gains:
-        interval = (
-            f"({row.ci_low * 100:+.1f} to {row.ci_high * 100:+.1f})"
-            if row.ci_low is not None and row.ci_high is not None
-            else "(no interval: one scenario)"
-        )
-        table.add_row(
-            f"{row.model} *" if row.model == verdict.teacher else row.model,
-            row.tier,
-            str(row.n_scenarios),
-            f"{row.mean_reward:.3f}",
-            f"{row.mean_gain * 100:+.1f} {interval}",
-            _probe_price(row.price, measured=measured),
-            "yes" if row.clears_gap else "no",
-        )
-    return table
-
-
-def _probe_price(price: float | None, *, measured: bool) -> str:
-    """A ladder key at the precision its unit deserves: fractions of a cent, or dollars a Mtok."""
-    if price is None:
-        return "unpriced"
-    return f"{price:.4f}" if measured else f"{price:.2f}"
 
 
 def _explicit(ctx: typer.Context, param: str) -> bool:

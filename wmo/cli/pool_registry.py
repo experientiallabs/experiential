@@ -1,12 +1,8 @@
 """The interactive model registry behind `wmo providers set`: filling `.wmo/pool.toml`.
 
-Two questions used to be unconnected. `wmo providers set` answered "which provider runs my local
-worker agent" and wrote `[models.worker]` into settings; the routing optimizer read a completely
-separate `pool.toml` that nothing wrote for an ordinary provider model, so a user who wanted five
-OpenRouter models and five Azure deployments had to hand-author TOML and get `kind`, `model`,
-prices, `deployment`, `api_version`, and `api_key_env` right unaided. This module makes the one
-command answer both: after a provider is picked and verified, it offers to register models from
-it (or from any other backend) as routing candidates.
+Two questions used to be unconnected. `wmo providers set` answered which provider runs the local
+worker agent, while the routing optimizer read a separate, hand-authored `pool.toml`. This module
+makes one command answer both by offering verified provider models as routing candidates.
 
 Design rules this module holds to:
 
@@ -65,6 +61,20 @@ _MAX_LISTED = 20
 """Rows one search shows. OpenRouter publishes 338 models, so an unfiltered dump is not a list."""
 
 _CHECK = "[green]✓[/green]"
+
+
+def endpoint_catalog(endpoint: str) -> ProviderCatalog:
+    """Load one endpoint catalog lazily while retaining the test injection seam.
+
+    Args:
+        endpoint: OpenAI-compatible endpoint whose model inventory should be read.
+
+    Returns:
+        Provider catalog reported by the endpoint.
+    """
+    from wmo.common.providers.catalog import endpoint_catalog as load_endpoint_catalog
+
+    return load_endpoint_catalog(endpoint)
 
 
 class EntryOptions(BaseModel):
@@ -219,7 +229,7 @@ def register_from_provider(
     operator-chosen deployment, so a first deployment that answers proves nothing about the
     second. `wmo providers verify` bills a call per model for the same reason.
     """
-    from wmo.common.providers.catalog import endpoint_catalog, list_provider_models
+    from wmo.common.providers.catalog import list_provider_models
 
     if kind is ProviderKind.OPENAI:
         # The one kind that can point at a self-hosted server (Ollama, vLLM, llama.cpp), so the
@@ -356,7 +366,7 @@ def register_model_ids(
             models for one. Non-interactively there is nobody to ask, so this fails loudly rather
             than writing a candidate that does not work.
     """
-    from wmo.common.providers.catalog import CatalogModel, endpoint_catalog, list_provider_models
+    from wmo.common.providers.catalog import CatalogModel, list_provider_models
     from wmo.common.providers.pool import is_local_endpoint, static_requirements
 
     _check_azure_deployment(kind, model_ids, options)

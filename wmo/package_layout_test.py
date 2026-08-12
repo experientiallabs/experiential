@@ -15,7 +15,7 @@ def test_wmo_package_root_is_a_closed_allowlist() -> None:
         f"wmo package directories are {sorted(actual_dirs)}, expected {sorted(expected_dirs)}"
     )
 
-    allowed_modules = {"__init__.py", "__main__.py", "conftest.py"}
+    allowed_modules = {"__init__.py", "__main__.py", "conftest.py", "review_server.py"}
     flat_modules = sorted(
         path.name
         for path in WMO_DIR.glob("*.py")

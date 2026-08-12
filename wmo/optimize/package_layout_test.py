@@ -25,8 +25,8 @@ ROUTING_MODULES = {
 
 
 def test_optimization_domains_are_nested() -> None:
-    """Routing, model optimization, and research ownership stays visible in the package tree."""
-    expected = {"routing", "model"}
+    """The retained offline model-optimization owner stays visible in the package tree."""
+    expected = {"model"}
     missing = sorted(name for name in expected if not (OPTIMIZE_DIR / name).is_dir())
     assert not missing, f"optimization domain packages missing under wmo/optimize: {missing}"
 
