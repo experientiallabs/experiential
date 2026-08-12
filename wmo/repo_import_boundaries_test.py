@@ -16,12 +16,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASELINE_REVISION = "e7aad17b2f5041769ad8107ab25e77d4e88729ca"
 PR_BASE_REVISION = "origin/main"
-SPLIT_PUBLIC_MODULES: Final[frozenset[str]] = frozenset(
-    {
-        "wmo.cli.optimize_model_app",
-        "wmo.optimize.routing.scorecard",
-    }
-)
+SPLIT_PUBLIC_MODULES: Final[frozenset[str]] = frozenset({})
 
 FORBIDDEN_IMPORTS: Final[dict[str, frozenset[str]]] = {
     "common": frozenset({"runtime", "simulation", "optimize", "cli"}),
@@ -34,22 +29,14 @@ IMPORT_TRANSITION_INVENTORY: Final[frozenset[tuple[str, str]]] = frozenset(
     {
         ("wmo/optimize/gepa.py", "wmo.simulation.retrieval"),
         ("wmo/optimize/gepa.py", "wmo.simulation.retrieval.leakfree"),
-        ("wmo/optimize/routing/policy.py", "wmo.simulation.retrieval.embedders"),
-        ("wmo/optimize/routing/sweep.py", "wmo.simulation.model.world_model"),
         ("wmo/simulation/model/replay.py", "wmo.optimize.gepa"),
         ("wmo/simulation/model/world_model.py", "wmo.optimize.gepa"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.compression"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.knn"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.pareto"),
-        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.policy"),
-        ("wmo/simulation/serving/savings.py", "wmo.optimize.routing.knn"),
-        ("wmo/simulation/serving/savings.py", "wmo.optimize.routing.policy"),
-        ("wmo/simulation/serving/server.py", "wmo.optimize.routing.pareto"),
-        ("wmo/simulation/serving/server.py", "wmo.optimize.routing.policy"),
     }
 )
 IMPORT_TRANSITION_TOMBSTONES: Final[frozenset[tuple[str, str]]] = frozenset(
     {
+        ("wmo/optimize/routing/policy.py", "wmo.simulation.retrieval.embedders"),
+        ("wmo/optimize/routing/sweep.py", "wmo.simulation.model.world_model"),
         ("wmo/optimize/routing/evaluation.py", "wmo.simulation.scenarios.spec"),
         ("wmo/optimize/routing/sweep.py", "wmo.simulation.ingest"),
         ("wmo/optimize/routing/sweep.py", "wmo.simulation.model"),
@@ -79,6 +66,14 @@ IMPORT_TRANSITION_TOMBSTONES: Final[frozenset[tuple[str, str]]] = frozenset(
         ("wmo/simulation/model/replay.py", "wmo.optimize.judge"),
         ("wmo/simulation/model/world_model.py", "wmo.optimize.reward"),
         ("wmo/simulation/serving/server.py", "wmo.optimize.reward"),
+        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.compression"),
+        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.knn"),
+        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.pareto"),
+        ("wmo/simulation/serving/chat.py", "wmo.optimize.routing.policy"),
+        ("wmo/simulation/serving/savings.py", "wmo.optimize.routing.knn"),
+        ("wmo/simulation/serving/savings.py", "wmo.optimize.routing.policy"),
+        ("wmo/simulation/serving/server.py", "wmo.optimize.routing.pareto"),
+        ("wmo/simulation/serving/server.py", "wmo.optimize.routing.policy"),
     }
 )
 

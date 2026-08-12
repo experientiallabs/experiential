@@ -28,7 +28,7 @@ add_deferred_typer(
     module="wmo.cli.optimize_app",
     attr="optimize_app",
     help="Optimizers behind one switch.",
-    known_names=("route", "distill", "model"),
+    known_names=("router", "distill"),
 )
 app.command("build", help="Build an immutable task set from a local OTLP or PostHog export.")(build)
 app.command("list", help="List locally available world-model artifacts.")(list_models)

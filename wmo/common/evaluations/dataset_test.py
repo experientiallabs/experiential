@@ -15,11 +15,31 @@ from wmo.common.evaluations import (
     EvaluationProtocol,
     EvaluationRow,
     FidelityFailure,
+    FidelityPair,
     FidelityReport,
 )
 from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
 
 _DIGEST = "a" * 64
+
+
+def _pairs(cell_ids: tuple[str, ...], usable: int) -> tuple[FidelityPair, ...]:
+    """Create complete overlap pair fixtures with explicit failures."""
+    failure = StructuredFailure(code=FailureCode.TIMEOUT, message="overlap failed")
+    return tuple(
+        FidelityPair(
+            fidelity_cell_id=cell_id,
+            observed_cell_id=f"observed-{cell_id}",
+            observed_rollout_id=f"observed-rollout-{index}",
+            simulated_rollout_id=f"simulated-rollout-{index}" if index < usable else None,
+            observed_score=0.8 if index < usable else None,
+            simulated_score=0.8 if index < usable else None,
+            absolute_error=0.0 if index < usable else None,
+            status="usable" if index < usable else "failed",
+            error=None if index < usable else failure,
+        )
+        for index, cell_id in enumerate(cell_ids)
+    )
 
 
 def _row() -> EvaluationRow:
@@ -71,6 +91,7 @@ def _manifest() -> EvaluationDatasetManifest:
         code_revision="e7aad17",
         evaluation_id="evaluation-1",
         evaluation_plan_id="plan-1",
+        evaluation_plan_sha256=_DIGEST,
         task_set_id="task-set-1",
         fit_task_ids=("task-1",),
         held_out_task_ids=("task-2",),
@@ -96,6 +117,8 @@ def _fidelity_report(
         created_at=datetime(2026, 8, 11, tzinfo=UTC),
         code_revision="e7aad17",
         fidelity_report_id="fidelity-report-1",
+        evaluation_plan_id="plan-1",
+        evaluation_plan_sha256=_DIGEST,
         protocol_sha256=_DIGEST,
         overlap_cell_ids=overlap_cell_ids,
         planned_overlap_count=len(overlap_cell_ids),
@@ -103,6 +126,7 @@ def _fidelity_report(
         failed_overlap_count=failed_overlap_count,
         score_mae=score_mae,
         failures=failures,
+        pairs=_pairs(overlap_cell_ids, usable_overlap_count),
         gate_id="fidelity-gate-v1",
         gate_sha256=_DIGEST,
         status=status,
@@ -119,6 +143,8 @@ def test_dataset_and_fidelity_report_round_trip() -> None:
         created_at=datetime(2026, 8, 11, tzinfo=UTC),
         code_revision="e7aad17",
         fidelity_report_id="fidelity-report-1",
+        evaluation_plan_id="plan-1",
+        evaluation_plan_sha256=_DIGEST,
         protocol_sha256=_DIGEST,
         overlap_cell_ids=tuple(f"cell-fidelity-{index}" for index in range(10)),
         planned_overlap_count=10,
@@ -135,6 +161,7 @@ def test_dataset_and_fidelity_report_round_trip() -> None:
                 failure=StructuredFailure(code=FailureCode.PROVIDER, message="provider failed"),
             ),
         ),
+        pairs=_pairs(tuple(f"cell-fidelity-{index}" for index in range(10)), 8),
         gate_id="fidelity-gate-v1",
         gate_sha256=_DIGEST,
         status="approved",
@@ -183,6 +210,8 @@ def test_rows_keep_failures_and_reject_duplicate_or_missing_evidence() -> None:
             created_at=datetime(2026, 8, 11, tzinfo=UTC),
             code_revision="e7aad17",
             fidelity_report_id="fidelity-report-2",
+            evaluation_plan_id="plan-1",
+            evaluation_plan_sha256=_DIGEST,
             protocol_sha256=_DIGEST,
             overlap_cell_ids=tuple(f"cell-fidelity-{index}" for index in range(10)),
             planned_overlap_count=10,
@@ -198,6 +227,7 @@ def test_rows_keep_failures_and_reject_duplicate_or_missing_evidence() -> None:
                 )
                 for index in range(7, 10)
             ),
+            pairs=_pairs(tuple(f"cell-fidelity-{index}" for index in range(10)), 7),
             gate_id="fidelity-gate-v1",
             gate_sha256=_DIGEST,
             status="approved",

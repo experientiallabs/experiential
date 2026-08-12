@@ -36,10 +36,26 @@ class EvaluationCell(ContractModel):
         return self
 
 
+class FidelityThresholds(ArtifactEnvelope):
+    """Reusable numerical thresholds with no authority over any evaluation plan."""
+
+    fidelity_thresholds_id: ArtifactId
+    planned_overlaps: Literal[10] = 10
+    minimum_usable_overlaps: Literal[8] = 8
+    maximum_score_mae: float = Field(default=0.10, ge=0)
+
+
 class FidelityGate(ArtifactEnvelope):
-    """Frozen default threshold for accepting world-model overlap evidence."""
+    """Plan-bound approval gate that cannot be replayed across evaluation scopes."""
 
     fidelity_gate_id: ArtifactId
+    fidelity_thresholds_id: ArtifactId
+    fidelity_thresholds_sha256: Sha256
+    evaluation_plan_id: ArtifactId
+    evaluation_plan_sha256: Sha256
+    protocol_sha256: Sha256
+    task_model_scope_sha256: Sha256
+    overlap_cell_ids: tuple[ArtifactId, ...]
     planned_overlaps: Literal[10] = 10
     minimum_usable_overlaps: Literal[8] = 8
     maximum_score_mae: float = Field(default=0.10, ge=0)
@@ -51,8 +67,9 @@ class EvaluationPlan(ArtifactEnvelope):
     plan_id: ArtifactId
     task_set_id: ArtifactId
     candidate_snapshots: tuple[RoutedCandidateSnapshot, ...]
-    fidelity_gate_id: ArtifactId
-    fidelity_gate_sha256: Sha256
+    fidelity_thresholds_id: ArtifactId
+    fidelity_thresholds_sha256: Sha256
+    fidelity_protocol_sha256: Sha256
     cells: tuple[EvaluationCell, ...]
 
     @field_validator("candidate_snapshots")

@@ -80,9 +80,8 @@ def test_sandbox_persists_each_rollout_and_resumes_without_reexecution(tmp_path:
     assert rollout.sandbox_binding is not None
     assert rollout.sandbox_binding.environment_sha256 == _ENVIRONMENT_DIGEST
     assert rollout.sandbox_binding.task_lineage_group_id == "lineage-task-a"
-    assert {span.kind for span in rollout.spans}.issuperset(
-        {RolloutEventKind.TOOL_CALL, RolloutEventKind.OBSERVATION}
-    )
+    kinds = {span.kind for span in rollout.spans}
+    assert kinds.issuperset({RolloutEventKind.TOOL_CALL, RolloutEventKind.OBSERVATION})
     assert rollout.candidate_economics.cost_usd is None
     assert rollout.sandbox_economics is not None
     assert rollout.sandbox_economics.cost_usd is None
@@ -587,8 +586,9 @@ def _persist_fixture(
         plan_id="plan-1",
         task_set_id=task_set.task_set_id,
         candidate_snapshots=(RoutedCandidateSnapshot(alias="candidate-a", model=_snapshot()),),
-        fidelity_gate_id="fidelity-gate-1",
-        fidelity_gate_sha256="f" * 64,
+        fidelity_thresholds_id="fidelity-thresholds-1",
+        fidelity_thresholds_sha256="f" * 64,
+        fidelity_protocol_sha256="e" * 64,
         cells=selected_cells,
     )
     plan_manifest = store.write_json(

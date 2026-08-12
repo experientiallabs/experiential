@@ -20,14 +20,9 @@ from wmo.cli.cli_fixtures_test import app, runner
         ["providers", "set", "--help"],
         ["providers", "verify", "--help"],
         ["config", "telemetry", "--help"],
-        ["optimize", "model", "--help"],
-        ["optimize", "route", "sweep", "--help"],
-        ["optimize", "route", "fit", "--help"],
-        ["optimize", "route", "tune", "--help"],
-        ["optimize", "route", "report", "--help"],
-        ["optimize", "route", "student", "--help"],
-        ["optimize", "route", "pin", "--help"],
-        ["optimize", "route", "convert-deepswe", "--help"],
+        ["optimize", "router", "--help"],
+        ["optimize", "router", "fit", "--help"],
+        ["optimize", "router", "report", "--help"],
     ],
     ids=[
         "root",
@@ -40,14 +35,9 @@ from wmo.cli.cli_fixtures_test import app, runner
         "provider-set",
         "provider-verify",
         "telemetry",
-        "nested-model",
-        "route-sweep",
-        "route-fit",
-        "route-tune",
-        "route-report",
-        "route-student",
-        "route-pin",
-        "route-deepswe",
+        "router",
+        "router-fit",
+        "router-report",
     ],
 )
 def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
@@ -64,30 +54,9 @@ def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
         assert marker not in result.output
 
 
-def test_route_student_help_preserves_literal_pool_table_name() -> None:
-    """Explicit route help preserves the literal TOML table name."""
-    result = runner.invoke(app, ["optimize", "route", "student", "--help"])
+def test_removed_route_owner_is_not_callable() -> None:
+    """The W10 clean break leaves no parallel legacy router CLI owner."""
+    result = runner.invoke(app, ["optimize", "route", "--help"])
 
-    assert result.exit_code == 0, result.output
-    assert "[[model]]" in result.output
-
-
-def test_readme_route_sweep_invocation_parses_without_a_provider() -> None:
-    """The documented downloaded-root task-set sweep requires no provider for help."""
-    result = runner.invoke(
-        app,
-        [
-            "optimize",
-            "route",
-            "sweep",
-            "my-model",
-            "--project",
-            "my-project",
-            "--root",
-            "environment-capture-data/bird-sql",
-            "--help",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "--project" in result.output and "--root" in result.output
+    assert result.exit_code == 2
+    assert "No such command 'route'" in result.output

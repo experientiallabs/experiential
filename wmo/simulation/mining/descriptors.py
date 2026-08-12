@@ -12,12 +12,17 @@ from typing import Protocol
 
 from pydantic import JsonValue
 
-from wmo.common.core.artifacts import JsonObject, canonical_json_bytes
+from wmo.common.core.artifacts import JsonObject
 from wmo.common.core.text import normalize_durable_text
+from wmo.common.routing.features import (
+    ROUTER_FEATURE_EXTRACTOR_ID,
+    RouterFeatureExtractor,
+    RouterFeatureRecord,
+)
 from wmo.common.tasks import ToolSchema
 from wmo.common.traces import Trace
 
-ROUTING_DESCRIPTOR_VERSION = "request-visible-v1"
+ROUTING_DESCRIPTOR_VERSION = ROUTER_FEATURE_EXTRACTOR_ID
 
 _TOKEN_PATTERN = re.compile(r"[\w]+", re.UNICODE)
 
@@ -64,13 +69,12 @@ class RoutingDescriptor:
         Returns:
             JSON-safe descriptor content with no outcome, later action, or trace-length fields.
         """
-        return {
-            "schema_version": ROUTING_DESCRIPTOR_VERSION,
-            "intent": self.intent,
-            "initial_context": self.initial_context,
-            "tools": [tool.model_dump(mode="json") for tool in self.tools],
-            "tags": list(self.tags),
-        }
+        return RouterFeatureRecord(
+            initial_user_intent=self.intent,
+            initial_context=self.initial_context,
+            tools=tuple(sorted(self.tools, key=lambda tool: tool.name)),
+            allowed_tags={"tags": list(self.tags)},
+        ).model_dump(mode="json")
 
     def embedding_text(self) -> str:
         """Return canonical UTF-8 text that an embedding client may consume.
@@ -78,11 +82,12 @@ class RoutingDescriptor:
         Returns:
             Stable serialized request-visible descriptor content.
         """
-        return canonical_json_bytes(self.canonical_payload()).decode("utf-8")
+        record = RouterFeatureRecord.model_validate(self.canonical_payload())
+        return RouterFeatureExtractor().render(record)
 
     def fingerprint(self) -> str:
         """Return the exact duplicate fingerprint of request-visible content."""
-        return hashlib.sha256(canonical_json_bytes(self.canonical_payload())).hexdigest()
+        return hashlib.sha256(self.embedding_text().encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)

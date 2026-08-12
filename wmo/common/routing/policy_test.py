@@ -33,6 +33,7 @@ def _policy() -> KnnRouterPolicy:
         policy_id="router-policy-v1",
         baseline_alias="candidate-incumbent",
         candidates=(_candidate("candidate-economy"), _candidate("candidate-incumbent")),
+        embedder_alias="embedder",
         embedder=ModelSnapshot(
             provider="openai",
             model_id="text-embedding-3-small",
@@ -42,6 +43,7 @@ def _policy() -> KnnRouterPolicy:
         feature_extractor_id="request-visible-v1",
         feature_schema_sha256=_DIGEST,
         pricing_snapshot_id="pricing-v1",
+        pricing_snapshot_sha256=_DIGEST,
         bank_artifact_id="bank-v1",
         bank_sha256=_DIGEST,
         guard=KnnGuard(

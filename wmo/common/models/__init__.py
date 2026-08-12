@@ -27,9 +27,11 @@ from wmo.common.models.model import (
     ToolChoice,
     Usage,
 )
+from wmo.common.models.pricing import CandidateTokenPrice, PricingSnapshot, load_pricing_snapshot
 
 __all__ = [
     "AssistantAction",
+    "CandidateTokenPrice",
     "ConnectionConfig",
     "Embedding",
     "EmbeddingClient",
@@ -47,10 +49,12 @@ __all__ = [
     "ModelSnapshot",
     "NumericMeasurement",
     "OperationEconomics",
+    "PricingSnapshot",
     "RoutedCandidateSnapshot",
     "ToolCall",
     "ToolChoice",
     "Usage",
     "load_model_catalog",
+    "load_pricing_snapshot",
     "write_model_catalog",
 ]

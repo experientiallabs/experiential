@@ -117,10 +117,38 @@ class FidelityFailure(ContractModel):
     failure: StructuredFailure
 
 
+class FidelityPair(ContractModel):
+    """One planned observed versus simulated overlap with exact rollout identities."""
+
+    fidelity_cell_id: ArtifactId
+    observed_cell_id: ArtifactId
+    observed_rollout_id: ArtifactId | None = None
+    simulated_rollout_id: ArtifactId | None = None
+    observed_score: float | None = Field(default=None, ge=0, le=1)
+    simulated_score: float | None = Field(default=None, ge=0, le=1)
+    absolute_error: float | None = Field(default=None, ge=0)
+    status: Literal["usable", "failed", "not_run"]
+    error: StructuredFailure | None = None
+
+    @model_validator(mode="after")
+    def _require_pair_status(self) -> FidelityPair:
+        metrics = (self.observed_score, self.simulated_score, self.absolute_error)
+        if self.status == "usable":
+            if self.observed_rollout_id is None or self.simulated_rollout_id is None:
+                raise ValueError("usable fidelity pairs require both rollout IDs")
+            if any(value is None for value in metrics) or self.error is not None:
+                raise ValueError("usable fidelity pairs require metrics and no error")
+        elif self.error is None or any(value is not None for value in metrics):
+            raise ValueError("unusable fidelity pairs require one error and no metrics")
+        return self
+
+
 class FidelityReport(ArtifactEnvelope):
     """Measured world-model agreement against precommitted observed overlap cells."""
 
     fidelity_report_id: ArtifactId
+    evaluation_plan_id: ArtifactId
+    evaluation_plan_sha256: Sha256
     protocol_sha256: Sha256
     overlap_cell_ids: tuple[ArtifactId, ...]
     planned_overlap_count: int = Field(ge=0)
@@ -128,6 +156,7 @@ class FidelityReport(ArtifactEnvelope):
     failed_overlap_count: int = Field(ge=0)
     score_mae: float | None = Field(default=None, ge=0)
     failures: tuple[FidelityFailure, ...] = ()
+    pairs: tuple[FidelityPair, ...]
     gate_id: ArtifactId
     gate_sha256: Sha256
     status: Literal["approved", "rejected", "insufficient"]
@@ -151,6 +180,12 @@ class FidelityReport(ArtifactEnvelope):
     def _require_consistent_fidelity_counts(self) -> FidelityReport:
         if len(self.overlap_cell_ids) != self.planned_overlap_count:
             raise ValueError("fidelity overlap cells must match the planned overlap count")
+        pair_cell_ids = tuple(pair.fidelity_cell_id for pair in self.pairs)
+        if pair_cell_ids != self.overlap_cell_ids or len(set(pair_cell_ids)) != len(pair_cell_ids):
+            raise ValueError("fidelity pairs must account for every planned overlap exactly once")
+        usable_pairs = sum(pair.status == "usable" for pair in self.pairs)
+        if usable_pairs != self.usable_overlap_count:
+            raise ValueError("usable fidelity pair records must match the usable count")
         if self.usable_overlap_count + self.failed_overlap_count != self.planned_overlap_count:
             raise ValueError(
                 "usable and failed overlap counts must match the planned overlap count"
@@ -192,6 +227,7 @@ class EvaluationDatasetManifest(ArtifactEnvelope):
 
     evaluation_id: ArtifactId
     evaluation_plan_id: ArtifactId
+    evaluation_plan_sha256: Sha256
     task_set_id: ArtifactId
     fit_task_ids: tuple[ArtifactId, ...]
     held_out_task_ids: tuple[ArtifactId, ...]
