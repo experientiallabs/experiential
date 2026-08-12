@@ -16,37 +16,29 @@ uv run ty check
 uv run pytest -q
 ```
 
-## Repository guardrails
+## Repository checks
 
 - Every new or rewritten hand-authored source, test, configuration, and documentation file with a
   covered suffix stays below 1,000 physical lines. The executable limit is 999 lines and counts
-  comments and blank lines. W1 freezes exact baseline counts for current oversized files. Active
-  entries may not grow and become tombstones when deleted or reduced to 999 lines or fewer.
-  Generated outputs are exempt only by exact path in the repository guardrail inventory. Generated
-  code belongs in an explicitly named `generated/` directory and is never edited by hand.
+  comments and blank lines. Generated lock files are excluded. Generated code belongs in an
+  explicitly named `generated/` directory and is never edited by hand.
 - Full-repository Ruff check, Ruff format check, and ty check are required on every change. No
   pre-existing lint or type failures are grandfathered.
 - Production imports follow the approved dependency direction: common may not import runtime,
   simulation, optimize, or cli; runtime may not import simulation, optimize, or cli; simulation
-  may not import optimize or cli; optimize may not import simulation or cli. The AST gate records
-  current migration edges in an exact transition inventory. New edges fail immediately. Deletion
-  moves an entry to an append-only tombstone inventory.
+  may not import optimize or cli; optimize may not import simulation or cli. The AST gate rejects
+  every current forbidden edge directly.
 - Public Python modules, classes, protocols, functions, and methods use Google-style docstrings.
   A trivial public function may use one clear summary line. Private helpers and test functions do
   not need a docstring when their behavior is obvious.
-- The root CLI command set and current legacy paths are explicit transition inventories. A new
-  root command or a new path under an inventoried legacy root fails immediately. Deletion owners
-  remove an entry and retain its tombstone; reintroduction is rejected.
+- The root CLI command set is exact: `build`, `config`, `optimize`, and `run`; package-layout and
+  release tests enforce the current module and distribution shape.
 - There is no 800-line warning and no numeric modules-per-directory gate.
-
-Current migration state: the oversized-file inventory has no active entries. All 31 frozen W1
-entries remain as permanent tombstones, and reintroducing one is rejected. Transition inventories
-for deleted paths and commands remain append-only history.
 
 ## Evidence, simulation, and routing lifecycle
 
 - `wmo/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
-  current engines, orchestration, artifact construction, comparisons, and bundle download. Keep
+  current engines, orchestration, artifact construction, and comparisons. Keep
   those responsibilities nested instead of returning production modules to flat `wmo/` paths.
 - `wmo build TRACE_FILE --source otlp|posthog --project PROJECT --root ROOT` is the only CLI path
   from local traces to immutable task evidence. It accepts 100 through 1000 normalized traces,
@@ -146,7 +138,7 @@ for deleted paths and commands remain append-only history.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
-   JSON use pydantic's `JsonValue` (see `wmo/common/core/types.py:JsonObject`), not `Any`.
+   JSON use `wmo.common.core.artifacts.JsonObject`, not `Any`.
 
 4. **Keep the structure coherent and the command surface intentional.** Agent execution is nested
    under `wmo/runtime/`; evidence construction, simulation, and orchestration are nested under
@@ -158,7 +150,7 @@ for deleted paths and commands remain append-only history.
    production modules to the flat `wmo/` namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
-   `docs/`, `assets/`, `web/`, `.claude/`, `.github/`. That list is closed.
+   `docs/`, `web/`, `.claude/`, `.github/`. That list is closed.
 
    `.agents/` is the one sanctioned scratchpad: a local, gitignored working directory for agent
    sessions (notes, probe scripts, run outputs). It is never tracked, never part of a PR, and
@@ -187,7 +179,7 @@ for deleted paths and commands remain append-only history.
      Reproduction lives in the report itself, quoted as public `wmo` API/CLI plus the exact
      parameter pins.
      Everything generated stays out of git: project evidence and model artifacts under the local
-     `.wmo/` root, distribution archives under ignored `dist/`, and downloaded benchmark bundles.
+     `.wmo/` root, distribution archives under ignored `dist/`, and external benchmark inputs.
      Never commit local settings files (`settings.toml` anywhere).
    - `wmo/` is the flagship package and the only importable code. Domain subpackages own their
      area under the rule 4 hierarchy. Provider-neutral model contracts live under
@@ -195,7 +187,6 @@ for deleted paths and commands remain append-only history.
      `wmo/runtime/models/providers/`.
    - `web/` is the local-only TypeScript review workbench. It proxies only to the loopback WMO
      review adapter and must not add provider, credential, tenant, or deployment integrations.
-   - `assets/` — media referenced by README/docs (demo GIFs, logos).
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
    - `.github/` — CI workflows.
@@ -205,11 +196,9 @@ for deleted paths and commands remain append-only history.
    under Research). When such work matures, promote its durable output into a real surface:
    writeup → `docs/research/`, verified how-to → `docs/reference/`, reusable code → `wmo/`.
 
-6. **Benchmark data is a dependency, not a directory.** Benchmark launch/capture/conversion logic
-   lives in the separately published `environment-capture` distribution. Give `wmo build` one
-   explicit local OTLP or PostHog export, then use only the locked `config`, `optimize`, and `run`
-   surfaces for persisted project artifacts. Do not vendor a benchmark's data, gold dirs, or
-   capture scripts back into this repo.
+6. **Benchmark data is external input, not a repository directory.** Give `wmo build` one explicit
+   local OTLP or PostHog export, then use only the locked `config`, `optimize`, and `run` surfaces
+   for persisted project artifacts. Do not vendor benchmark data, gold dirs, or capture scripts.
 
 7. **Give reusable workflows a clear owner.** Avoid parallel top-level scripts for harness actions.
    If a workflow is generally useful, implement it in `wmo/` and expose it through the CLI. When a
@@ -267,8 +256,7 @@ for deleted paths and commands remain append-only history.
 ## One package
 
 This repo publishes **one distribution**: `world-model-optimizer`, whose importable code is all of
-`wmo/` and nothing else. It was a uv workspace until `environment-capture` moved to PyPI and the
-legacy provider stack was retired. Rules of the road:
+`wmo/` and nothing else. Rules of the road:
 
 - **No workspace, no members**: there is no `[tool.uv.workspace]` and no `[tool.uv.sources]`. A
   dependency is either a normal PyPI requirement in `[project.dependencies]` or it is code under

@@ -9,14 +9,12 @@ The root surface is deliberately small:
 | `wmo run PROJECT --root ROOT` | Load a frozen policy and expose it on development-only loopback. | Local OpenAI-compatible endpoint requiring `X-WMO-Episode-ID`. |
 | `wmo config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.wmo/settings.toml`. |
 
-`build` makes zero model, provider, or judge paid calls. It preserves anonymous aggregate PostHog
-product telemetry, which may send unless disabled. `optimize router` does not make provider calls.
-`run` makes no provider call at startup. An HTTP completion or direct `RouterRuntime.complete` call
-is the explicit online model-call boundary. The router remains frozen for the process lifetime.
+`build` makes zero model, provider, or judge paid calls. Successful build, router, simulation, and
+SFT operations preserve anonymous aggregate PostHog product telemetry, which may send unless
+disabled. `optimize router` does not make provider calls. `run` makes no provider call at startup.
+An HTTP completion or direct `RouterRuntime.complete` call is the explicit online model-call
+boundary. The router remains frozen for the process lifetime.
 
 Build stops at review readiness. Simulation, judgment, fidelity, embedding, and pricing artifacts
 must be completed through a separately authorized workflow before creating the exact
 [`router-optimization.json`](reference/router_optimization_config.md) input.
-
-Removed commands and aliases include `providers`, `list`, `download`, `eval`, `knowledge`,
-`serve`, `optimize route`, and the separate router `fit` and `report` commands.

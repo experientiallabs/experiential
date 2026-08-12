@@ -121,6 +121,12 @@ def test_single_workflow_freezes_before_held_out_and_resumes_exactly(
 
     config_path = tmp_path / "router-config.json"
     config_path.write_text(config.model_dump_json(), encoding="utf-8")
+    captured = []
+
+    def capture(event, properties, *, root):  # noqa: ANN001, ANN202
+        captured.append((event, properties, root))
+
+    monkeypatch.setattr("wmo.cli.router_app.capture", capture)
     result = CliRunner().invoke(
         app,
         [
@@ -136,6 +142,13 @@ def test_single_workflow_freezes_before_held_out_and_resumes_exactly(
     assert result.exit_code == 0, result.output
     assert f"policy: {first.optimization.policy.policy_id}" in result.output
     assert "held-out evaluation:" in result.output
+    assert len(captured) == 1
+    event, properties, event_root = captured[0]
+    assert event == "wmo router completed"
+    assert event_root == tmp_path
+    assert properties["fit_cell_count"] == len(config.fit.cell_evidence)
+    assert properties["heldout_cell_count"] == len(config.held_out.cell_evidence)
+    assert properties["candidate_count"] == 1
 
 
 def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfig]:

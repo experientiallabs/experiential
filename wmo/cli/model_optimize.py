@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import typer
 from rich.console import Console
 
 from wmo.cli.consent import require_spend_consent
+from wmo.common.observability.telemetry import capture
 from wmo.common.project import ProjectStore, ProjectStoreError
 from wmo.optimize.model.sft import (
     SFTModelOptimizationError,
@@ -50,6 +52,7 @@ def optimize_model(
     Raises:
         typer.BadParameter: Local configuration, preflight, W13, or registration is unsafe.
     """
+    started = time.monotonic()
     code_revision = _current_revision()
     try:
         store = ProjectStore(root, project)
@@ -104,6 +107,14 @@ def optimize_model(
         )
     except SFTModelOptimizationError as exc:
         raise typer.BadParameter(str(exc)) from None
+    properties: dict[str, bool | int | float] = {
+        "success": True,
+        "training_step_count": completed.training_result.training_step_count,
+        "duration_seconds": max(time.monotonic() - started, 0.0),
+    }
+    if completed.training_result.total_cost_usd is not None:
+        properties["cost_usd"] = completed.training_result.total_cost_usd.value
+    capture("wmo sft completed", properties, root=root)
     if completed.catalog_updated:
         _console.print(
             f"Verified completed W13 SFT and registered model alias {config.model_alias!r}."

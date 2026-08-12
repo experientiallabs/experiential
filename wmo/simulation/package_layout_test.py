@@ -18,7 +18,7 @@ def test_simulation_domains_are_nested() -> None:
     missing_dirs = sorted(name for name in expected_dirs if not (SIMULATION_DIR / name).is_dir())
     assert not missing_dirs, f"simulation packages missing under wmo/simulation: {missing_dirs}"
 
-    expected_modules = {"build.py", "comparison.py", "hub.py"}
+    expected_modules = {"build.py", "comparison.py"}
     missing_modules = sorted(
         name for name in expected_modules if not (SIMULATION_DIR / name).is_file()
     )
@@ -48,4 +48,3 @@ def test_simulation_domains_are_nested() -> None:
         if (WMO_DIR / name).exists()
     )
     assert not legacy_dirs, f"simulation packages returned to the flat wmo namespace: {legacy_dirs}"
-    assert not (WMO_DIR / "hub.py").exists(), "simulation hub returned to the flat wmo namespace"

@@ -1,11 +1,6 @@
 name: gate
 
-# The whole-repo gate (AGENTS.md rule 1), run in CI so its promises are real.
-#
-# Deliberately NO `paths:` filter. This job carries the top-level allowlist check
-# (`wmo/repo_layout_test.py`, AGENTS.md rule 5), and that check exists to fail a change which
-# adds an unapproved top-level directory. A path filter would let exactly that change through
-# whenever it touched no Python: the allowlist is closed only if every pull request is checked.
+# Whole-repository quality, architecture, and non-live behavior gate.
 on:
   pull_request:
   push:
@@ -19,9 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          # W1 transition inventories read the immutable frozen baseline directly from Git.
-          fetch-depth: 0
       - uses: astral-sh/setup-uv@v6
       - name: Install the project and its dev extras
         run: uv sync --extra dev
@@ -31,17 +23,5 @@ jobs:
         run: uv run ruff format --check .
       - name: ty check
         run: uv run ty check
-      - name: W1 guardrail tests
-        # Scoped to the deterministic W1 guardrail suites, not the full run, so the gate is green and
-        # meaningful from its first day: the full suite carries ~94 pre-existing
-        # wmo/cli failures on Linux runners (Rich-rendered output and host state,
-        # proven against unmodified main in the since-closed probe PR #374; a
-        # macOS host reproduces 121, 73 of them on unmodified main). PR #306
-        # stabilizes that class; widen this to `uv run pytest -q` once it lands.
-        run: >-
-          uv run pytest -q
-          wmo/repo_layout_test.py
-          wmo/repo_structure_test.py
-          wmo/repo_docstrings_test.py
-          wmo/repo_import_boundaries_test.py
-          wmo/cli/repo_metrics_test.py
+      - name: non-live tests
+        run: uv run pytest -q -k "not live"

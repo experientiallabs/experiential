@@ -14,9 +14,6 @@ dependencies = [
     "uvicorn>=0.38",
     "pydantic>=2.6",
     "numpy>=1.26",
-    # The routing optimizer's clustering stack (KMeans + Normalizer), matching the Avengers
-    # reference implementation it replicates; serving only reads fitted centroids (numpy).
-    "scikit-learn>=1.4",
     "httpx>=0.27",
     "rich>=14.1",
     "tomli-w>=1.0",  # writing project and telemetry TOML; every `wmo build` needs it
@@ -24,25 +21,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-otel = ["opentelemetry-proto>=1.24"]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
 sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-optimizer[otel,sft]",
+    "world-model-optimizer[sft]",
 ]
-
-[dependency-groups]
-# environment-capture joins the dev environment (uv syncs the `dev` group by default) with its
-# heavy extras, so the root gate can exercise the tests that import it directly.
-#
-# A dependency GROUP is not published metadata, so nothing here reaches a `pip install
-# world-model-optimizer`. That is the whole point for environment-capture: it is a development
-# dependency only, and shipped `wmo/` imports nothing from it. The retained Hub helper owns its
-# small HTTP read core directly. The retired provider stack is not a dependency or vendored code.
-dev = ["environment-capture[bedrock,fetch]"]
 
 [project.scripts]
 wmo = "wmo.cli:main"
@@ -57,8 +43,7 @@ packages = ["wmo"]
 exclude = ["**/*_test.py", "wmo/conftest.py"]
 
 [tool.hatch.build.targets.sdist]
-# One flagship distribution: everything importable lives under /wmo. environment-capture is a
-# dev-only dependency, never a `Requires-Dist`.
+# One flagship distribution: everything importable lives under /wmo.
 include = [
     "/wmo",
     "/README.md",
@@ -85,32 +70,7 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 # Test modules are fixtures and assertions rather than public package APIs. Production modules
-# still require a module docstring, and new public APIs must use the Google convention above.
+# still require a module docstring and Google-style public API documentation.
 "**/*_test.py" = ["D"]
-# Exact public-docstring migration inventory frozen from W1's baseline. The corresponding
-# symbol-level transition test rejects new violations in these legacy files, requires tombstones
-# when a violation is fixed, and rejects a reintroduced tombstone. No directory is exempt.
-"wmo/cli/defer.py" = ["D102"]
-"wmo/common/config/settings.py" = ["D103"]
-"wmo/common/observability/telemetry.py" = ["D102", "D103"]
-"wmo/optimize/judge.py" = ["D102"]
-"wmo/optimize/judge_quality.py" = ["D102"]
-"wmo/optimize/numeric.py" = ["D102"]
-"wmo/optimize/research/ablation.py" = ["D102"]
-"wmo/optimize/research/concurrency_scaling.py" = ["D102"]
-"wmo/optimize/research/gepa_scaling.py" = ["D102"]
-"wmo/optimize/research/seed_stability.py" = ["D102"]
-"wmo/optimize/research/trace_scaling.py" = ["D102"]
-"wmo/runtime/platform/auth.py" = ["D102"]
-"wmo/runtime/platform/client.py" = ["D102"]
-"wmo/simulation/ingest/adapter.py" = ["D103"]
-"wmo/simulation/ingest/base.py" = ["D102"]
-"wmo/simulation/ingest/mastra.py" = ["D102"]
-"wmo/simulation/ingest/messages.py" = ["D102"]
-"wmo/simulation/ingest/normalize.py" = ["D103"]
-"wmo/simulation/ingest/posthog.py" = ["D102"]
-"wmo/simulation/scenarios/synthesis/scenario_set.py" = ["D102"]
-"wmo/simulation/scenarios/verification/judge.py" = ["D102"]
-"wmo/simulation/scenarios/verification/verify.py" = ["D102"]
 [tool.ty.environment]
 python-version = "3.12"

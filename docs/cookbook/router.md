@@ -28,6 +28,8 @@ reports, and returns `RouterRuntime`. A complete replay reuses those verified ar
 calling the simulator, judge, approval callback, or fit workflow again. The finite simulation
 ceiling is shared across both phases: held-out receives only the remainder after verified
 candidate plus simulator or environment spend, and unknown spend blocks the phase transition.
+After the workflow completes, one anonymous metadata-only simulation event may send unless
+telemetry is disabled.
 
 The setup supplier provides the application-owned facts WMO cannot invent: approved rubric and
 calibration, candidate snapshots, reviewed production overlap rollouts, exact protocols, frozen

@@ -30,11 +30,3 @@ def normalize_durable_text(value: str) -> str:
             normalized.append(value[index])
         index += 1
     return "".join(normalized)
-
-
-def validate_durable_text(value: str, *, field: str) -> None:
-    """Reject content-addressed text that canonicalization would change."""
-    if "\x00" in value:
-        raise ValueError(f"{field} contains an embedded NUL character")
-    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
-        raise ValueError(f"{field} contains an unpaired UTF-16 surrogate")

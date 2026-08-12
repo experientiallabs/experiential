@@ -12,5 +12,4 @@ results, and plans do not live here.
 | `reference/distill.md` | Existing model-distillation reference owned outside the W14R CLI slice. |
 | `reference/harness_delta.md` | Existing typed harness update contract owned outside the W14R CLI slice. |
 | `reference/ingest.md` | Current OTLP and PostHog local trace input contract. |
-| `reference/repository_guardrails.md` | Reproducible repository migration gates. |
 | `reference/router_optimization_config.md` | Exact completed-evidence configuration recipe for router optimization. |

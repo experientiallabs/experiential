@@ -1,21 +1,17 @@
 """The cross-process write lock for a file that is read, edited, and written back.
 
 Rename atomicity (`wmo.common.core.files`) stops a reader seeing half a file. It does not stop two
-writers reading the same file, each applying an edit, and the later write erasing
-the earlier one with both commands reporting success. A roster or an alias table needs this too.
+writers reading the same file, each applying an edit, and the later write erasing the earlier one
+with both commands reporting success. Mutable project state and resumable run manifests need this.
 
-Kept in its own module, separate from the atomic writers, because locking is what a file that is
-edited in place needs and most of the files wmo writes are not: `.wmo/config.toml`,
-`.wmo/settings.toml`, a model card, a fitted policy, an outcome matrix and an endpoint dial are all
-rendered whole from their source of truth, so they take `write_text_atomic` alone. Folding the two
-together put this module's dependency on the `wmo.common.config` import path, and therefore on
-almost every command.
+Kept in its own module because most files WMO writes are rendered whole from their source of truth
+and only need `write_text_atomic`; project configuration, review state, and run manifests need the
+stronger read-modify-write boundary. Keeping locking separate leaves its dependency off read-only
+paths.
 
 `filelock` rather than a direct `fcntl.flock`: it is the same advisory-lock semantics, but it
-selects `fcntl` on POSIX and `msvcrt` on Windows, so nothing here is the reason wmo cannot be
-imported on a non-POSIX platform. It is already in the resolved dependency graph (torch, datasets,
-huggingface-hub and harbor all require it) and is declared directly in `pyproject.toml` because
-this module imports it rather than inheriting it.
+selects `fcntl` on POSIX and `msvcrt` on Windows, so nothing here prevents WMO from importing on a
+non-POSIX platform. It is declared directly in `pyproject.toml` because this module imports it.
 """
 
 from __future__ import annotations
@@ -54,10 +50,9 @@ def file_write_lock(
     anything the moment the first writer landed.
 
     The sibling is chosen beside the file the write will actually LAND on, via
-    `resolve_write_target`, not beside `path` as given. A symlinked roster is written through to its
-    target, so two callers reaching one target through different links (a shared pool symlinked from
-    two project directories) would otherwise take one lock each, both succeed, and lose an update
-    apiece: exactly what this exists to prevent.
+    `resolve_write_target`, not beside `path` as given. Two callers reaching one target through
+    different links would otherwise take one lock each, both succeed, and lose an update apiece:
+    exactly what this exists to prevent.
 
     The lock is released by the OS when the holder exits, crashes, or is killed, so a leftover
     `.lock` FILE is never a held lock and can never wedge a later run. That is also why it is left
@@ -72,7 +67,7 @@ def file_write_lock(
 
     Args:
         path: The file being written. The lock file is created beside it.
-        what: The noun for the error message ("the model pool"), naming what is being written from
+        what: The noun for the error message ("project configuration"), naming what is written from
             the perspective of someone who ran a command, not the file's role in the code.
         timeout_s: Seconds to keep retrying the lock before raising.
 

@@ -453,6 +453,12 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         maximum_simulation_cost_usd=10.0,
         maximum_judgments=100,
     )
+    captured = []
+
+    def capture(event, properties, *, root):  # noqa: ANN001, ANN202
+        captured.append((event, properties, root))
+
+    monkeypatch.setattr("wmo.workflow.router.capture", capture)
 
     crash = True
 
@@ -524,6 +530,18 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     assert phases.index("fidelity_fit_started") < phases.index("policy_locked")
     assert phases.index("policy_locked") < phases.index("heldout_opened")
     assert phases.index("heldout_opened") < phases.index("report_complete")
+    assert len(captured) == 2
+    assert all(event == "wmo simulation completed" for event, _properties, _root in captured)
+    assert all(event_root == tmp_path for _event, _properties, event_root in captured)
+    assert all(
+        properties["rollout_count"]
+        == len(first.simulation_spec.cell_ids) + len(first.held_out_simulation_spec.cell_ids)
+        for _event, properties, _root in captured
+    )
+    assert all(
+        properties["cost_usd"] == pytest.approx(first.total_simulation_spend_usd)
+        for _event, properties, _root in captured
+    )
     purposes = {cell.cell_id: cell.purpose for cell in first.plan.cells}
     assert all(
         locked or all(purposes[cell_id] in {"fit", "fidelity"} for cell_id in cell_ids)

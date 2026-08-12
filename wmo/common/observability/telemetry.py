@@ -44,32 +44,37 @@ _ALLOWED_EVENT_PROPERTIES: dict[str, frozenset[str]] = {
             "cost_usd",
         }
     ),
-    "wmo eval completed": frozenset(
+    "wmo router completed": frozenset(
         {
             "success",
-            "eval_mode",
-            "file_count",
-            "scored_step_count",
-            "rag_enabled",
-            "train_split",
-            "top_k",
+            "fit_cell_count",
+            "heldout_cell_count",
+            "candidate_count",
+            "duration_seconds",
         }
     ),
-    "wmo generated trace started": frozenset({"generated_trace_count"}),
-    "wmo generated step failed": frozenset({"success", "duration_seconds"}),
-    "wmo generated step completed": frozenset(
+    "wmo simulation completed": frozenset(
         {
             "success",
-            "generated_step_count",
-            "session_step_count",
+            "rollout_count",
             "duration_seconds",
             "input_tokens",
             "output_tokens",
             "cost_usd",
         }
     ),
+    "wmo sft completed": frozenset(
+        {
+            "success",
+            "train_example_count",
+            "heldout_example_count",
+            "training_step_count",
+            "duration_seconds",
+            "cost_usd",
+        }
+    ),
 }
-_BOOLEAN_PROPERTIES = frozenset({"success", "rag_enabled"})
+_BOOLEAN_PROPERTIES = frozenset({"success"})
 _COUNT_PROPERTIES = frozenset(
     {
         "input_trace_count",
@@ -83,16 +88,16 @@ _COUNT_PROPERTIES = frozenset(
         "llm_call_count",
         "input_tokens",
         "output_tokens",
-        "file_count",
-        "scored_step_count",
-        "top_k",
-        "generated_trace_count",
-        "generated_step_count",
-        "session_step_count",
+        "fit_cell_count",
+        "heldout_cell_count",
+        "candidate_count",
+        "rollout_count",
+        "train_example_count",
+        "heldout_example_count",
+        "training_step_count",
     }
 )
 _NONNEGATIVE_MEASUREMENTS = frozenset({"duration_seconds", "cost_usd"})
-_EVAL_MODES = frozenset({"ad_hoc", "suite"})
 
 
 @dataclass
@@ -210,10 +215,6 @@ def _is_safe_property_value(name: str, value: TelemetryValue) -> bool:
         return type(value) is int and value >= 0
     if name in _NONNEGATIVE_MEASUREMENTS:
         return _is_nonnegative_finite_number(value)
-    if name == "train_split":
-        return _is_unit_interval_number(value)
-    if name == "eval_mode":
-        return isinstance(value, str) and value in _EVAL_MODES
     return False
 
 
@@ -225,47 +226,6 @@ def _is_nonnegative_finite_number(value: TelemetryValue) -> bool:
         and math.isfinite(value)
         and value >= 0
     )
-
-
-def _is_unit_interval_number(value: TelemetryValue) -> bool:
-    """Return whether a telemetry fraction is finite and falls from zero through one."""
-    return (
-        not isinstance(value, bool)
-        and isinstance(value, int | float)
-        and math.isfinite(value)
-        and 0 <= value <= 1
-    )
-
-
-def capture_eval_completed(
-    *,
-    mode: str,
-    file_count: int,
-    scored_step_count: int,
-    rag_enabled: bool,
-    sample_turns: str,
-    train_split: float,
-    top_k: int,
-    root: str | Path,
-) -> None:
-    capture(
-        "wmo eval completed",
-        {
-            "success": True,
-            "eval_mode": mode,
-            "file_count": file_count,
-            "scored_step_count": scored_step_count,
-            "rag_enabled": rag_enabled,
-            "train_split": train_split,
-            "top_k": top_k,
-        },
-        root=root,
-    )
-
-
-def settings_root_from_results_root(results_root: str) -> Path:
-    path = Path(results_root)
-    return path.parent if path.name == "evals" else Path(ARTIFACT_DIR)
 
 
 def _enabled(root: str | Path) -> bool:

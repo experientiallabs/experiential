@@ -1,18 +1,16 @@
 """Atomic writes for the small files wmo owns: a reader sees the old file or the whole new one.
 
-Every file this covers is a registry or a config that a later command reads back: the candidate
-pool roster, a store's `aliases.toml`, `.wmo/config.toml`, `.wmo/settings.toml`, an SFT run's
-resume state, a fitted policy, a paid sweep's outcome matrix. They share one failure mode, and it
-is not losing the file. It is leaving a TRUNCATED or EMPTY file behind an apparently successful
-write, so the next command fails to parse something nobody edited, and the recovery is hand-repair.
+Every file this covers is durable state that a later command reads back: project configuration,
+the model catalog, telemetry settings, review state, SFT run manifests, fitted policies, and paid
+simulation outcomes. They share one failure mode: a TRUNCATED or EMPTY file behind an apparently
+successful write, leaving the next command unable to parse state nobody edited.
 
 This is only half the problem. Rename atomicity means a reader never sees half a file, but two
 writers doing read-modify-write still overwrite each other with both reporting success. A file
-written whole from its source of truth (a config snapshot, a rendered document, a policy) needs
-`write_text_atomic` alone; a file that is read, edited, and written back (a roster, an alias table)
-needs `wmo.common.core.locks.file_write_lock` around the whole cycle too. That lock lives in a
-separate module because it needs Unix-only `fcntl`; keeping them together would put `fcntl` on
-the import path of `wmo.common.config`, which is the import path of almost everything.
+written whole from its source of truth (an artifact or rendered policy) needs
+`write_text_atomic` alone; a file that is read, edited, and written back (project configuration,
+review state, or a run manifest) needs `wmo.common.core.locks.file_write_lock` around the whole
+cycle too. The lock remains separate so read-only import paths do not load its dependency.
 
 Not covered here: credential writers such as `wmo.common.config.dotenv`. Those need 0600 from the
 moment of creation and refuse to follow a symlink, which is a different contract, not a stricter
@@ -36,9 +34,8 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
 
     - **Same-directory staging file plus `replace`.** A rename within a filesystem is atomic, so a
       crash or a full disk leaves the previous file intact instead of a truncated one. Writing in
-      place does not: a half-written `aliases.toml` loses the champion pointer that
-      `resolve_version` depends on, and a half-written `checkpoints.json` breaks resume exactly
-      when the crash that caused it made resume necessary.
+      place does not: a half-written `project.toml` loses durable configuration, and a
+      half-written run manifest breaks resume exactly when the crash made resume necessary.
     - **A staging name unique PER CALL.** A shared fixed `.tmp` lets two writers rename each
       other's half-written file into place, which turns a lost update into a corrupt file. The
       name is a uuid rather than the pid because two THREADS of one process collide on a pid.
@@ -86,14 +83,14 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
 def resolve_write_target(path: Path) -> Path:
     """The real file to write, following `path` if it is a symlink.
 
-    An in-place `write_text` follows a symlink: an operator who points `.wmo/config.toml` at a
+    An in-place `write_text` follows a symlink: an operator who points `project.toml` at a
     shared or version-controlled file gets their writes where they asked for them. `replace` does
     the opposite, and silently: it swaps the LINK for a regular file and leaves the target holding
     stale contents, with nothing raised and nothing to notice until something reads the target and
     gets an old answer.
 
     Resolving restores the behaviour those writers had before they became atomic, and extends it to
-    the ones that were always atomic (`pool.toml`, `.wmo/config.toml`, `.wmo/settings.toml`), where
+    the files that were always atomic (`project.toml`, `models.toml`, `settings.toml`), where
     the clobbering was longstanding rather than new. Following the link is what the operator asked
     for in every case; nothing wants a symlink quietly turned into a file.
 

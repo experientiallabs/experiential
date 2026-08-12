@@ -42,9 +42,8 @@ def _dead(_pid: int) -> bool:
 
 
 def test_ledger_dir_lives_under_the_explicit_state_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("WMO_HOME", "/ignored/global/state")
     state_directory = tmp_path / "explicit-state"
     assert ledger_dir(state_directory) == state_directory / "e2b-sandboxes"
 

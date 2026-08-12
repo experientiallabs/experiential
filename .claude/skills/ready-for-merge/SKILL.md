@@ -92,7 +92,7 @@ rule. In particular verify:
 - No `Any`, bare `dict`/`object`, or untyped `**kwargs` where a concrete type is practical.
 - NO new top-level directory or file, of any name, unless the PR description records that a
   human granted permission for that exact name (AGENTS.md rule 5). The tracked top level is
-  closed: `wmo/`, `docs/`, `assets/`, `.claude/`, `.github/`. Reusable code goes in `wmo/`
+  closed: `wmo/`, `docs/`, `web/`, `.claude/`, `.github/`. Reusable code goes in `wmo/`
   (shared contracts in `wmo/common/` and runtime adapters in `wmo/runtime/`), finished reports in
   `docs/`, and scratch work outside the repo entirely. Benchmark data is a dependency, never a
   directory.

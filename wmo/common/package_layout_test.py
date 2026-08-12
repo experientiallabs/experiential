@@ -60,15 +60,24 @@ def test_retired_provider_imports_do_not_return() -> None:
             "anthropic",
             "boto3",
             "botocore",
+            "environment_capture",
             "mlx",
             "mlx_lm",
             "openai",
+            "opentelemetry",
+            "sklearn",
             "transformers",
             "wmo.common.providers",
             "wmo.common.vendor",
         },
     )
     assert not violations, f"retired provider imports returned: {violations}"
+
+
+def test_retired_provider_packages_are_absent() -> None:
+    """The removed provider stack has no package directory to import accidentally."""
+    assert not (COMMON_DIR / "providers").exists()
+    assert not (COMMON_DIR / "vendor").exists()
 
 
 def _banned_imports(root: Path, banned: set[str]) -> list[str]:

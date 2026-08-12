@@ -79,6 +79,12 @@ def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(
     first_backend = _FakeBackend(conservative_cost_per_batch=0.10)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda: first_backend)
     monkeypatch.setattr(command, "_current_revision", lambda: "w14m-test")
+    captured = []
+
+    def capture(event, properties, *, root):  # noqa: ANN001, ANN202
+        captured.append((event, properties, root))
+
+    monkeypatch.setattr(command, "capture", capture)
     runner = CliRunner()
 
     first = runner.invoke(
@@ -114,6 +120,15 @@ def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(
     assert second.exit_code == 0, second.output
     assert "already registered" in second.output
     assert second_backend.open_resume_paths == []
+    assert len(captured) == 2
+    assert all(event == "wmo sft completed" for event, _properties, _root in captured)
+    assert all(
+        event_root == configured.store.paths.root for _event, _properties, event_root in captured
+    )
+    assert all(properties["training_step_count"] == 2 for _event, properties, _root in captured)
+    assert all(
+        properties["cost_usd"] == pytest.approx(0.2) for _event, properties, _root in captured
+    )
 
 
 def test_cli_yes_does_not_bypass_the_unsupported_budget_estimate_gate(

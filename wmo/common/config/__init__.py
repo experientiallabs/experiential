@@ -1,7 +1,7 @@
-"""Minimal environment, path, and product-telemetry configuration exports."""
+"""Minimal environment loading, artifact path, and product-telemetry settings exports."""
 
 from wmo.common.config.dotenv import load_env_file
-from wmo.common.config.paths import ARTIFACT_DIR, ENV_HOME, wmo_home
+from wmo.common.config.paths import ARTIFACT_DIR
 from wmo.common.config.settings import (
     ProjectSettings,
     TelemetrySettings,
@@ -14,7 +14,6 @@ from wmo.common.config.settings import (
 
 __all__ = [
     "ARTIFACT_DIR",
-    "ENV_HOME",
     "ProjectSettings",
     "TelemetrySettings",
     "ensure_telemetry_anonymous_id",
@@ -23,5 +22,4 @@ __all__ = [
     "save_settings",
     "set_telemetry_enabled",
     "settings_path",
-    "wmo_home",
 ]

@@ -9,7 +9,7 @@ import pytest
 
 import wmo.common.observability.telemetry as telemetry
 from wmo.common.config.settings import set_telemetry_enabled
-from wmo.common.observability.telemetry import capture, capture_eval_completed
+from wmo.common.observability.telemetry import capture
 
 
 class _FakePosthog:
@@ -50,11 +50,10 @@ def test_capture_posts_anonymous_metadata_event(
     monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
 
     assert capture(
-        "wmo generated step completed",
+        "wmo simulation completed",
         {
             "success": True,
-            "generated_step_count": 1,
-            "session_step_count": 1,
+            "rollout_count": 1,
             "duration_seconds": 0.25,
             "input_tokens": 4,
             "output_tokens": 2,
@@ -71,17 +70,16 @@ def test_capture_posts_anonymous_metadata_event(
     assert len(client.calls) == 1
     event, kwargs = client.calls[0]
     properties = cast(dict[str, object], kwargs["properties"])
-    assert event == "wmo generated step completed"
+    assert event == "wmo simulation completed"
     assert isinstance(kwargs["distinct_id"], str)
     assert properties["$process_person_profile"] is False
-    assert properties["generated_step_count"] == 1
+    assert properties["rollout_count"] == 1
     assert set(properties) == {
         "$process_person_profile",
         "wmo_version",
         "python_version",
         "success",
-        "generated_step_count",
-        "session_step_count",
+        "rollout_count",
         "duration_seconds",
         "input_tokens",
         "output_tokens",
@@ -98,8 +96,8 @@ def test_capture_honors_explicit_posthog_host_override(
     monkeypatch.setenv("WMO_POSTHOG_HOST", "https://eu.i.posthog.com/")
 
     assert capture(
-        "wmo generated trace started",
-        {"generated_trace_count": 1},
+        "wmo router completed",
+        {"success": True, "fit_cell_count": 1},
         root=tmp_path / ".wmo",
     )
 
@@ -116,32 +114,8 @@ def test_capture_respects_project_opt_out(monkeypatch: pytest.MonkeyPatch, tmp_p
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
 
-    assert capture("wmo generated trace started", root=root) is False
+    assert capture("wmo build completed", root=root) is False
     assert clients == []
-
-
-def test_eval_capture_omits_user_supplied_sample_turn_text(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    clients = _install_fake_posthog(monkeypatch)
-    monkeypatch.setenv("WMO_TELEMETRY", "1")
-    monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
-
-    capture_eval_completed(
-        mode="suite",
-        file_count=1,
-        scored_step_count=4,
-        rag_enabled=True,
-        sample_turns="customer-provided sample content",
-        train_split=0.8,
-        top_k=5,
-        root=tmp_path / ".wmo",
-    )
-
-    assert len(clients) == 1
-    _event, kwargs = clients[0].calls[0]
-    properties = cast(dict[str, object], kwargs["properties"])
-    assert "sample_turns" not in properties
 
 
 def test_capture_skips_when_settings_file_cannot_be_read(
@@ -157,7 +131,7 @@ def test_capture_skips_when_settings_file_cannot_be_read(
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
 
-    assert capture("wmo generated trace started", root=tmp_path / ".wmo") is False
+    assert capture("wmo build completed", root=tmp_path / ".wmo") is False
     assert clients == []
 
 
@@ -167,7 +141,7 @@ def test_do_not_track_wins_over_env_enable(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setenv("WMO_TELEMETRY", "1")
     monkeypatch.setenv("DO_NOT_TRACK", "1")
 
-    assert capture("wmo generated trace started", root=tmp_path / ".wmo") is False
+    assert capture("wmo build completed", root=tmp_path / ".wmo") is False
     assert clients == []
 
 
@@ -183,7 +157,7 @@ def test_capture_uses_unknown_version_when_distribution_metadata_is_missing(
     monkeypatch.setenv("WMO_TELEMETRY", "1")
     monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
 
-    assert capture("wmo generated trace started", root=tmp_path / ".wmo")
+    assert capture("wmo build completed", root=tmp_path / ".wmo")
 
     assert len(clients) == 1
     _event, kwargs = clients[0].calls[0]
@@ -217,7 +191,27 @@ def test_capture_rejects_unapproved_events_and_unsafe_properties(
         is False
     )
     assert capture("wmo arbitrary event", {"input_trace_count": 1}, root=tmp_path / ".wmo") is False
+    assert capture("wmo eval completed", {"success": True}, root=tmp_path / ".wmo") is False
+    assert (
+        capture("wmo generated step completed", {"success": True}, root=tmp_path / ".wmo") is False
+    )
     assert clients == []
+
+
+@pytest.mark.parametrize(
+    ("event", "properties"),
+    [
+        ("wmo build completed", {"success": True, "input_trace_count": 2}),
+        ("wmo router completed", {"success": True, "candidate_count": 2}),
+        ("wmo simulation completed", {"success": True, "rollout_count": 2}),
+        ("wmo sft completed", {"success": True, "training_step_count": 2}),
+    ],
+)
+def test_only_final_product_event_schemas_accept_metadata(
+    event: str, properties: dict[str, bool | int]
+) -> None:
+    """The final four product events accept only their aggregate metadata schemas."""
+    assert telemetry._sanitize_properties(event, properties) == properties
 
 
 def test_capture_isolates_posthog_delivery_failures(
@@ -230,8 +224,8 @@ def test_capture_isolates_posthog_delivery_failures(
 
     assert (
         capture(
-            "wmo generated trace started",
-            {"generated_trace_count": 1},
+            "wmo simulation completed",
+            {"success": False, "rollout_count": 0},
             root=tmp_path / ".wmo",
         )
         is False

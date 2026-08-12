@@ -1,15 +1,5 @@
-"""Shared user-level paths that do not belong to a product domain."""
+"""Canonical local artifact-root name shared by CLI and telemetry settings."""
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
-ENV_HOME = "WMO_HOME"
 ARTIFACT_DIR = ".wmo"
-
-
-def wmo_home() -> Path:
-    """Return the user-level WMO directory from ``$WMO_HOME`` or ``~/.wmo``."""
-    override = os.environ.get(ENV_HOME)
-    return Path(override) if override else Path.home() / ".wmo"

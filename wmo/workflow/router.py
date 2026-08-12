@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,6 +44,7 @@ from wmo.common.evaluations.evidence import (
 from wmo.common.evaluations.planning import plan_bound_fidelity_gate_id
 from wmo.common.judging import Judge, Judgment
 from wmo.common.models import RoutedCandidateSnapshot
+from wmo.common.observability.telemetry import capture
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from wmo.common.rollouts import (
     RolloutArtifact,
@@ -286,6 +288,7 @@ def compose_router(
     Raises:
         RouterCompositionError: A dependency, budget, artifact, or resume binding is invalid.
     """
+    started = time.monotonic()
     _preflight(project, services, budget, code_revision)
     normalized = (
         trace_source if isinstance(trace_source, TraceNormalizationResult) else trace_source.load()
@@ -445,6 +448,17 @@ def compose_router(
         policy_id=optimized.optimization.policy.policy_id,
         runtime_catalog=services.runtime_catalog,
     )
+    total_spend = math.fsum((phase_a_spend, held_out_spend))
+    capture(
+        "wmo simulation completed",
+        {
+            "success": True,
+            "rollout_count": len(phase_a_set.artifact_ids) + len(held_set.artifact_ids),
+            "duration_seconds": max(time.monotonic() - started, 0.0),
+            "cost_usd": total_spend,
+        },
+        root=project.paths.root,
+    )
     return RouterCompositionResult(
         build=built,
         review=review,
@@ -456,7 +470,7 @@ def compose_router(
         fidelity_report_id=fidelity.fidelity_report_id,
         phase_a_simulation_spend_usd=phase_a_spend,
         held_out_simulation_spend_usd=held_out_spend,
-        total_simulation_spend_usd=math.fsum((phase_a_spend, held_out_spend)),
+        total_simulation_spend_usd=total_spend,
         optimization=optimized,
         runtime=runtime,
     )

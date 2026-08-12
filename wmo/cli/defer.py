@@ -51,6 +51,7 @@ class DeferredTyperGroup(TyperGroup):
         return self._real
 
     def list_commands(self, ctx: _click.Context) -> list[str]:
+        """Return known command names without loading the deferred application."""
         if self._real is not None:
             return self._ensure().list_commands(ctx)
         if self._known_names:
@@ -58,6 +59,7 @@ class DeferredTyperGroup(TyperGroup):
         return self._ensure().list_commands(ctx)
 
     def get_command(self, ctx: _click.Context, cmd_name: str) -> _click.Command | None:
+        """Load the deferred application and resolve one command."""
         return self._ensure().get_command(ctx, cmd_name)
 
 
