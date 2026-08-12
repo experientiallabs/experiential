@@ -46,7 +46,7 @@ class ArtifactCorruptionError(ArtifactStoreError):
 
 
 class ProjectStoreError(RuntimeError):
-    """Project initialization or mutable review-draft persistence failed."""
+    """Project initialization or local configuration persistence failed."""
 
 
 @dataclass(frozen=True)
@@ -328,7 +328,7 @@ class ArtifactStore:
 
 
 class ProjectStore:
-    """Owns project configuration, the sole mutable review draft, and immutable artifacts."""
+    """Owns project configuration, a write-once SFT config binding, review draft, and artifacts."""
 
     def __init__(self, root: Path, project_id: str) -> None:
         """Create a project-local store without writing state until an explicit method is called."""
@@ -341,7 +341,7 @@ class ProjectStore:
         return self.paths.root / "models.toml"
 
     def initialize(self, config: ProjectConfig) -> None:
-        """Create an immutable project configuration, or verify the existing identical one.
+        """Create the initial project configuration, or verify the existing identical one.
 
         Args:
             config: Configuration whose project ID matches this store.
@@ -369,7 +369,7 @@ class ProjectStore:
                 raise ProjectStoreError(str(exc)) from exc
 
     def load_project(self) -> ProjectConfig:
-        """Load this store's typed immutable project configuration.
+        """Load this store's typed project configuration.
 
         Returns:
             The parsed project configuration.
@@ -381,6 +381,47 @@ class ProjectStore:
             return load_project_config(self.paths.project_toml)
         except ValueError as exc:
             raise ProjectStoreError(str(exc)) from exc
+
+    def set_model_optimization_config_id(self, config_id: str) -> ProjectConfig:
+        """Atomically bind one immutable SFT optimization config to this project.
+
+        The pointer is deliberately write-once.  The referenced config remains an immutable
+        artifact, while this narrow project-level binding makes ``wmo optimize model <project>``
+        unambiguous after the W12 dataset has been persisted.
+
+        Args:
+            config_id: Persisted local config artifact ID to bind to the project.
+
+        Returns:
+            The existing or newly bound project configuration.
+
+        Raises:
+            ProjectStoreError: The project is missing, invalid, or already names another config.
+        """
+        try:
+            validated_config_id = validate_local_id(config_id, label="model optimization config ID")
+        except ValueError as exc:
+            raise ProjectStoreError(str(exc)) from exc
+        with file_write_lock(self.paths.project_toml, what="model optimization configuration"):
+            try:
+                existing = load_project_config(self.paths.project_toml)
+            except ValueError as exc:
+                raise ProjectStoreError(str(exc)) from exc
+            current_config_id = existing.model_optimization_config_id
+            if current_config_id == validated_config_id:
+                return existing
+            if current_config_id is not None:
+                raise ProjectStoreError(
+                    "project.toml already names a different immutable model optimization config"
+                )
+            updated = existing.model_copy(
+                update={"model_optimization_config_id": validated_config_id}
+            )
+            try:
+                write_project_config(self.paths.project_toml, updated)
+            except ValueError as exc:
+                raise ProjectStoreError(str(exc)) from exc
+            return updated
 
     def write_review(self, review: BaseModel | JsonValue) -> None:
         """Lock and atomically replace the sole mutable local review draft.

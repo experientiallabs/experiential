@@ -54,7 +54,7 @@ class ProjectPaths:
 
     @property
     def project_toml(self) -> Path:
-        """Return the immutable project configuration file path."""
+        """Return the project configuration file path."""
         return self.project_directory / "project.toml"
 
     @property

@@ -5,7 +5,7 @@
 Extracted from the former `harness_app` module, which co-located the product's
 optimize switch with the harness-search CLI; the search program now lives in the
 agent-optimization repo, and this module owns only what the product ships:
-`router` (the single guarded offline kNN path) and `distill` (legacy model training).
+`router` (the guarded offline kNN path) and `model` (offline SFT from persisted artifacts).
 """
 
 from __future__ import annotations
@@ -13,12 +13,15 @@ from __future__ import annotations
 import typer
 
 optimize_app = typer.Typer(
-    help="Offline guarded router optimization and model distillation.",
+    help="Optimizers behind one switch. `router` fits routing policy; `model` runs offline SFT "
+    "from a persisted W12 dataset.",
     no_args_is_help=True,
 )
 
-# Commands load only on first use so root help remains provider-free.
+# `router` loads its real Typer app only on first use, so `wmo --help` never pays for the routing
+# optimizer import chain. `model` is registered directly from its narrow command owner.
 from wmo.cli.defer import add_deferred_typer  # noqa: E402
+from wmo.cli.model_optimize import optimize_model  # noqa: E402
 
 add_deferred_typer(
     optimize_app,
@@ -28,12 +31,6 @@ add_deferred_typer(
     help="Resume sparse evaluation and fit the single guarded offline kNN router.",
     known_names=("fit", "report"),
 )
-add_deferred_typer(
-    optimize_app,
-    name="distill",
-    module="wmo.cli.model_app",
-    attr="model_app",
-    help="Train the agent model itself: distillation of a Tinker LoRA student from real "
-    "benchmark rollouts (harbor or tau2, config-selected), gated on held-out solve rates.",
-    known_names=("run", "report"),
-)
+optimize_app.command(
+    "model", help="Run W13 Tinker SFT from an explicit persisted W12 dataset configuration."
+)(optimize_model)

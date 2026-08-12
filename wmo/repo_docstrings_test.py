@@ -67,6 +67,8 @@ _DOCSTRING_TOMBSTONE_ROWS: Final[tuple[str, ...]] = (
     'wmo/cli/app.py|serve|function|missing-raises-section',
     'wmo/cli/model_app.py|probe|function|missing-args-section',
     'wmo/cli/model_app.py|probe|function|missing-raises-section',
+    'wmo/cli/model_app.py|report|function|missing-args-section',
+    'wmo/cli/model_app.py|run|function|missing-args-section',
     'wmo/cli/optimize_model_app.py|build_endpoint_scorecard|function|missing-args-section',
     'wmo/cli/optimize_model_app.py|build_endpoint_scorecard|function|missing-returns-section',
     'wmo/cli/optimize_model_app.py|optimize_model|function|missing-args-section',

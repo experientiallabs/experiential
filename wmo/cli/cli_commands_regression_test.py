@@ -16,7 +16,7 @@ def test_cli_exposes_the_small_command_set() -> None:
         "knowledge",
     }
     assert names == core
-    # `optimize` is a GROUP (route, model, and distill; harness search moved out).
+    # `optimize` is a GROUP (route and persisted-dataset model SFT; harness search moved out).
     groups = {group.name for group in app.registered_groups}
     assert "optimize" in groups
 
