@@ -15,6 +15,7 @@ from wmo.common.core.artifacts import (
     ContractModel,
     Sha256,
     sha256_json,
+    stable_id,
 )
 from wmo.common.models import NumericMeasurement, Usage
 from wmo.optimize.model.sft.contracts import SFTExample
@@ -129,6 +130,7 @@ class TinkerSFTRunManifest(ArtifactEnvelope):
 
     run_id: ArtifactId
     dataset_id: ArtifactId
+    dataset_manifest_sha256: Sha256
     dataset_build_sha256: Sha256
     dataset_examples_sha256: Sha256
     spec: TinkerSFTSpec
@@ -137,12 +139,24 @@ class TinkerSFTRunManifest(ArtifactEnvelope):
     @model_validator(mode="after")
     def _require_exact_dataset_and_spec_bindings(self) -> TinkerSFTRunManifest:
         expected_inputs = (
-            ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_build_sha256),
+            ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_manifest_sha256),
         )
         if self.inputs != expected_inputs:
             raise ValueError("Tinker SFT manifests must name exactly their frozen dataset build")
         if self.spec_sha256 != sha256_json(self.spec):
             raise ValueError("Tinker SFT manifest spec digest does not match settings")
+        expected_run_id = stable_id(
+            "tinker-sft-run",
+            {
+                "dataset_id": self.dataset_id,
+                "dataset_manifest_sha256": self.dataset_manifest_sha256,
+                "dataset_build_sha256": self.dataset_build_sha256,
+                "dataset_examples_sha256": self.dataset_examples_sha256,
+                "spec_sha256": self.spec_sha256,
+            },
+        )
+        if self.run_id != expected_run_id:
+            raise ValueError("Tinker SFT manifest run ID is not content-addressed")
         return self
 
 
@@ -231,6 +245,7 @@ class TinkerSFTModelArtifact(ArtifactEnvelope):
     model_id: ArtifactId
     run_id: ArtifactId
     dataset_id: ArtifactId
+    dataset_manifest_sha256: Sha256
     dataset_build_sha256: Sha256
     events_sha256: Sha256
     final_checkpoint_id: ArtifactId
@@ -243,10 +258,20 @@ class TinkerSFTModelArtifact(ArtifactEnvelope):
     @model_validator(mode="after")
     def _require_exact_dataset_binding(self) -> TinkerSFTModelArtifact:
         expected_inputs = (
-            ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_build_sha256),
+            ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_manifest_sha256),
         )
         if self.inputs != expected_inputs:
             raise ValueError("Tinker SFT models must name exactly their frozen dataset build")
+        expected_model_id = stable_id(
+            "tinker-sft-model",
+            {
+                "run_id": self.run_id,
+                "checkpoint_id": self.final_checkpoint_id,
+                "sampling_handle": self.sampling_handle,
+            },
+        )
+        if self.model_id != expected_model_id:
+            raise ValueError("Tinker SFT model ID is not content-addressed")
         return self
 
 
@@ -256,6 +281,7 @@ class TinkerSFTResult(ArtifactEnvelope):
     result_id: ArtifactId
     run_id: ArtifactId
     dataset_id: ArtifactId
+    dataset_manifest_sha256: Sha256
     dataset_build_sha256: Sha256
     model_id: ArtifactId
     model_sha256: Sha256
@@ -271,7 +297,10 @@ class TinkerSFTResult(ArtifactEnvelope):
         expected_inputs = tuple(
             sorted(
                 (
-                    ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_build_sha256),
+                    ArtifactInput(
+                        artifact_id=self.dataset_id,
+                        sha256=self.dataset_manifest_sha256,
+                    ),
                     ArtifactInput(artifact_id=self.model_id, sha256=self.model_sha256),
                 ),
                 key=lambda item: item.artifact_id,
@@ -279,6 +308,12 @@ class TinkerSFTResult(ArtifactEnvelope):
         )
         if self.inputs != expected_inputs:
             raise ValueError("Tinker SFT results must name their dataset and terminal model")
+        expected_result_id = stable_id(
+            "tinker-sft-result",
+            {"run_id": self.run_id, "model_sha256": self.model_sha256},
+        )
+        if self.result_id != expected_result_id:
+            raise ValueError("Tinker SFT result ID is not content-addressed")
         return self
 
 

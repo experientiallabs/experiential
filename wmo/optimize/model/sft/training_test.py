@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -10,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from wmo.common.core.artifacts import canonical_json_bytes
+from wmo.common.core.artifacts import canonical_json_bytes, sha256_json, stable_id
 from wmo.common.models import NumericMeasurement
-from wmo.common.project import ProjectStore
+from wmo.common.project import ProjectStore, artifact_input
 from wmo.optimize.model.sft.builder import write_sft_dataset
 from wmo.optimize.model.sft.builder_test import (
     _build as _build_fixture_dataset,
@@ -36,10 +37,9 @@ from wmo.optimize.model.sft.training import (
     TinkerSFTResult,
     TinkerSFTResumeError,
     TinkerSFTSpec,
-    TrainerDatum,
     train_tinker_sft,
 )
-from wmo.optimize.model.sft.training_contracts import TrainerBatchResult
+from wmo.optimize.model.sft.training_contracts import TrainerBatchResult, TrainerDatum
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 
@@ -216,6 +216,13 @@ def test_fake_backend_consumes_only_train_rows_and_writes_terminal_provenance(
     terminal = json.loads((tmp_path / "run" / "result.json").read_text(encoding="utf-8"))
     metrics = (tmp_path / "run" / "events.jsonl").read_text(encoding="utf-8").splitlines()
     assert manifest["dataset_build_sha256"] == fixture.artifact.dataset.build_sha256
+    expected_dataset_input = artifact_input(
+        fixture.store.artifacts.read(fixture.artifact.dataset.dataset_id).manifest
+    )
+    assert manifest["dataset_manifest_sha256"] == expected_dataset_input.sha256
+    assert manifest["inputs"] == [expected_dataset_input.model_dump(mode="json")]
+    assert model["inputs"] == [expected_dataset_input.model_dump(mode="json")]
+    assert expected_dataset_input.model_dump(mode="json") in terminal["inputs"]
     assert manifest["dataset_examples_sha256"] == fixture.artifact.dataset.examples_sha256
     assert model["sampling_handle"].startswith("fake://model/")
     assert terminal["model_id"] == model["model_id"]
@@ -433,6 +440,103 @@ def test_completed_reuse_refuses_when_event_log_is_deleted(tmp_path: Path) -> No
 
     with pytest.raises(TinkerSFTResumeError):
         _run(fixture, output_dir, backend)
+
+
+def test_completed_reuse_rejects_coherent_result_dataset_build_input_edit(
+    tmp_path: Path,
+) -> None:
+    """A self-consistent mutable result cannot replace the canonical W12 manifest binding."""
+    fixture = _persisted_dataset(tmp_path)
+    backend = _FakeBackend()
+    output_dir = tmp_path / "run"
+    _run(fixture, output_dir, backend)
+    result_path = output_dir / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    forged_build = "0" * 64
+    result["dataset_build_sha256"] = forged_build
+    for input_item in result["inputs"]:
+        if input_item["artifact_id"] == fixture.artifact.dataset.dataset_id:
+            input_item["sha256"] = forged_build
+    result_path.write_bytes(canonical_json_bytes(result) + b"\n")
+
+    with pytest.raises(TinkerSFTResumeError):
+        _run(fixture, output_dir, backend)
+
+
+def test_completed_reuse_rejects_coherently_truncated_schedule(tmp_path: Path) -> None:
+    """A hash-consistent one-step terminal history cannot complete a frozen two-step run."""
+    fixture = _persisted_dataset(tmp_path)
+    backend = _FakeBackend()
+    output_dir = tmp_path / "run"
+    _run(fixture, output_dir, backend)
+
+    event_path = output_dir / "events.jsonl"
+    events = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+    first_events = [event for event in events if event.get("step") == 1]
+    first_checkpoint = next(event for event in first_events if event["record_type"] == "checkpoint")
+    first_metric = next(event for event in first_events if event["record_type"] == "metric")
+    event_payload = b"".join(canonical_json_bytes(event) + b"\n" for event in first_events)
+    event_path.write_bytes(event_payload)
+    events_sha256 = hashlib.sha256(event_payload).hexdigest()
+
+    for path in output_dir.glob("*step-2.step-intent.json"):
+        path.unlink()
+    second_checkpoint = next(
+        event for event in events if event["record_type"] == "checkpoint" and event["step"] == 2
+    )
+    (output_dir / f"{second_checkpoint['checkpoint_id']}.checkpoint-intent.json").unlink()
+    (output_dir / "model-intent.json").unlink()
+
+    model_path = output_dir / "model.json"
+    model = json.loads(model_path.read_text(encoding="utf-8"))
+    model.update(
+        {
+            "events_sha256": events_sha256,
+            "final_checkpoint_id": first_checkpoint["checkpoint_id"],
+            "final_checkpoint_state_path": first_checkpoint["state_path"],
+            "training_step_count": 1,
+            "training_metric_count": 1,
+            "total_cost_usd": first_metric["cumulative_cost_usd"],
+        }
+    )
+    model["model_id"] = stable_id(
+        "tinker-sft-model",
+        {
+            "run_id": model["run_id"],
+            "checkpoint_id": model["final_checkpoint_id"],
+            "sampling_handle": model["sampling_handle"],
+        },
+    )
+    model_path.write_bytes(canonical_json_bytes(model) + b"\n")
+    model_sha256 = sha256_json(model)
+
+    result_path = output_dir / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result.update(
+        {
+            "events_sha256": events_sha256,
+            "final_checkpoint_id": first_checkpoint["checkpoint_id"],
+            "model_id": model["model_id"],
+            "model_sha256": model_sha256,
+            "training_step_count": 1,
+            "training_metric_count": 1,
+            "checkpoint_count": 1,
+            "total_cost_usd": first_metric["cumulative_cost_usd"],
+        }
+    )
+    for input_item in result["inputs"]:
+        if input_item["artifact_id"] != fixture.artifact.dataset.dataset_id:
+            input_item.update({"artifact_id": model["model_id"], "sha256": model_sha256})
+    result["inputs"] = sorted(result["inputs"], key=lambda item: item["artifact_id"])
+    result["result_id"] = stable_id(
+        "tinker-sft-result",
+        {"run_id": result["run_id"], "model_sha256": model_sha256},
+    )
+    result_path.write_bytes(canonical_json_bytes(result) + b"\n")
+
+    with pytest.raises(TinkerSFTResumeError, match="frozen schedule"):
+        _run(fixture, output_dir, backend)
+    assert backend.open_resume_paths == [None]
 
 
 def test_provider_token_url_is_rejected_before_checkpoint_persistence(tmp_path: Path) -> None:

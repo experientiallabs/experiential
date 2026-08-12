@@ -7,7 +7,6 @@ import os
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
 
 from pydantic import BaseModel
 
@@ -22,9 +21,9 @@ from wmo.common.core.artifacts import (
 from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
 from wmo.common.models import NumericMeasurement
-from wmo.common.project import ProjectStore
+from wmo.common.project import ArtifactCorruptionError, ProjectStore, artifact_input
 from wmo.optimize.model.sft.builder import SFTBuildError, load_verified_sft_dataset
-from wmo.optimize.model.sft.contracts import SFTDatasetArtifact, SFTExample
+from wmo.optimize.model.sft.contracts import SFTDatasetArtifact
 from wmo.optimize.model.sft.provider_resources import validate_provider_resource_id
 from wmo.optimize.model.sft.rendering import partitioned_rows_sha256
 from wmo.optimize.model.sft.training_contracts import (
@@ -45,8 +44,19 @@ from wmo.optimize.model.sft.training_contracts import (
     TinkerSFTSpec,
     TinkerSFTStepIntent,
     TrainerBackend,
-    TrainerDatum,
     TrainerSession,
+)
+from wmo.optimize.model.sft.training_runtime import (
+    _add_cost,
+    _build_schedule,
+    _expected_schedule,
+    _ExpectedBatch,
+    _require_budget_can_continue,
+    _require_step_budget,
+    _schedule_batch_counts,
+    _total_cost,
+    _validate_event_schedule,
+    _validate_rendered_datums,
 )
 
 _MANIFEST_FILE = "manifest.json"
@@ -114,13 +124,15 @@ def train_tinker_sft(
     """
     try:
         dataset = load_verified_sft_dataset(store, dataset_id)
-    except SFTBuildError as exc:
+        dataset_input = artifact_input(store.artifacts.read(dataset_id).manifest)
+    except (ArtifactCorruptionError, SFTBuildError) as exc:
         raise TinkerSFTError(f"W12 dataset {dataset_id} is not safe for training: {exc}") from exc
     _validate_run_inputs(dataset, created_at=created_at, code_revision=code_revision)
     manifest_path = output_dir / _MANIFEST_FILE
     with file_write_lock(manifest_path, what="the Tinker SFT run"):
         return _train_locked(
             dataset=dataset,
+            dataset_input=dataset_input,
             spec=spec,
             output_dir=output_dir,
             backend=backend,
@@ -132,6 +144,7 @@ def train_tinker_sft(
 def _train_locked(
     *,
     dataset: SFTDatasetArtifact,
+    dataset_input: ArtifactInput,
     spec: TinkerSFTSpec,
     output_dir: Path,
     backend: TrainerBackend,
@@ -140,6 +153,7 @@ def _train_locked(
 ) -> TinkerSFTResult:
     manifest = _load_or_create_manifest(
         dataset=dataset,
+        dataset_input=dataset_input,
         spec=spec,
         output_dir=output_dir,
         created_at=created_at,
@@ -149,24 +163,44 @@ def _train_locked(
     _assert_no_ambiguous_step_intent(output_dir, manifest.run_id, events)
     _assert_no_ambiguous_checkpoint_intent(output_dir, manifest.run_id, events)
     _assert_no_uncheckpointed_completed_steps(events)
-    completed = _load_completed_result(output_dir, manifest, events)
+    train_examples = tuple(row.example for row in dataset.rows if row.partition == "train")
+    expected_schedule = _expected_schedule(train_examples, spec)
+    _validate_event_schedule(events, expected_schedule)
+    completed = _load_completed_result(
+        output_dir,
+        manifest,
+        events,
+        dataset=dataset,
+        dataset_input=dataset_input,
+        expected_schedule=expected_schedule,
+    )
     if completed is not None:
         return completed
     existing_model = _load_model(output_dir, manifest)
     if existing_model is not None:
-        _validate_model_lineage(output_dir, existing_model, events)
+        _validate_model_lineage(
+            output_dir,
+            existing_model,
+            events,
+            manifest=manifest,
+            dataset=dataset,
+            dataset_input=dataset_input,
+            expected_schedule=expected_schedule,
+        )
         return _write_terminal_result(
             output_dir=output_dir,
             manifest=manifest,
             model=existing_model,
             events=events,
+            dataset=dataset,
+            dataset_input=dataset_input,
+            expected_schedule=expected_schedule,
         )
     latest_checkpoint = _latest_checkpoint(events)
     durable_metrics = _metrics_at_checkpoint(events, latest_checkpoint)
     durable_cost = _total_cost(durable_metrics)
     _require_budget_can_continue(spec, durable_metrics, durable_cost)
 
-    train_examples = tuple(row.example for row in dataset.rows if row.partition == "train")
     schedule_counts = _schedule_batch_counts(len(train_examples), spec)
     start_step = latest_checkpoint.step if latest_checkpoint is not None else 0
     if start_step > len(schedule_counts):
@@ -270,12 +304,18 @@ def _train_locked(
         manifest=manifest,
         final_checkpoint=final_checkpoint,
         events=events,
+        dataset=dataset,
+        dataset_input=dataset_input,
+        expected_schedule=expected_schedule,
     )
     return _write_terminal_result(
         output_dir=output_dir,
         manifest=manifest,
         model=model,
         events=events,
+        dataset=dataset,
+        dataset_input=dataset_input,
+        expected_schedule=expected_schedule,
     )
 
 
@@ -307,6 +347,7 @@ def _validate_run_inputs(
 def _load_or_create_manifest(
     *,
     dataset: SFTDatasetArtifact,
+    dataset_input: ArtifactInput,
     spec: TinkerSFTSpec,
     output_dir: Path,
     created_at: datetime,
@@ -315,17 +356,22 @@ def _load_or_create_manifest(
     path = output_dir / _MANIFEST_FILE
     if path.exists():
         manifest = _read_model(path, TinkerSFTRunManifest, "Tinker SFT manifest")
-        _validate_manifest(manifest, dataset=dataset, spec=spec, code_revision=code_revision)
+        _validate_manifest(
+            manifest,
+            dataset=dataset,
+            dataset_input=dataset_input,
+            spec=spec,
+            code_revision=code_revision,
+        )
         return manifest
-    dataset_input = ArtifactInput(
-        artifact_id=dataset.dataset.dataset_id,
-        sha256=dataset.dataset.build_sha256,
-    )
+    if dataset_input.artifact_id != dataset.dataset.dataset_id:
+        raise TinkerSFTError("canonical W12 manifest names a different dataset")
     spec_sha256 = sha256_json(spec)
     run_id = stable_id(
         "tinker-sft-run",
         {
             "dataset_id": dataset.dataset.dataset_id,
+            "dataset_manifest_sha256": dataset_input.sha256,
             "dataset_build_sha256": dataset.dataset.build_sha256,
             "dataset_examples_sha256": dataset.dataset.examples_sha256,
             "spec_sha256": spec_sha256,
@@ -338,6 +384,7 @@ def _load_or_create_manifest(
         code_revision=code_revision,
         run_id=run_id,
         dataset_id=dataset.dataset.dataset_id,
+        dataset_manifest_sha256=dataset_input.sha256,
         dataset_build_sha256=dataset.dataset.build_sha256,
         dataset_examples_sha256=dataset.dataset.examples_sha256,
         spec=spec,
@@ -351,11 +398,20 @@ def _validate_manifest(
     manifest: TinkerSFTRunManifest,
     *,
     dataset: SFTDatasetArtifact,
+    dataset_input: ArtifactInput,
     spec: TinkerSFTSpec,
     code_revision: str,
 ) -> None:
     if manifest.dataset_id != dataset.dataset.dataset_id:
         raise TinkerSFTResumeError("existing Tinker SFT run belongs to a different W12 dataset")
+    if manifest.inputs != (dataset_input,):
+        raise TinkerSFTResumeError(
+            "existing Tinker SFT run does not name the canonical W12 artifact manifest"
+        )
+    if manifest.dataset_manifest_sha256 != dataset_input.sha256:
+        raise TinkerSFTResumeError(
+            "existing Tinker SFT run has a different W12 artifact manifest digest"
+        )
     if manifest.dataset_build_sha256 != dataset.dataset.build_sha256:
         raise TinkerSFTResumeError("existing Tinker SFT run has a different W12 dataset build")
     if manifest.dataset_examples_sha256 != dataset.dataset.examples_sha256:
@@ -485,139 +541,6 @@ def _next_attempt_id(events: Sequence[TinkerSFTEvent]) -> int:
     return max((event.attempt_id for event in events), default=0) + 1
 
 
-def _build_schedule(
-    datums: tuple[TrainerDatum, ...], spec: TinkerSFTSpec
-) -> tuple[_ScheduledBatch, ...]:
-    schedule_items: list[_ScheduledBatch] = []
-    for epoch in range(1, spec.epochs + 1):
-        shuffled = tuple(
-            sorted(
-                datums,
-                key=lambda datum: hashlib.sha256(
-                    f"{spec.seed}:{epoch}:{datum.example_id}".encode()
-                ).hexdigest(),
-            )
-        )
-        batches = tuple(
-            shuffled[index : index + spec.batch_size]
-            for index in range(0, len(shuffled), spec.batch_size)
-        )
-        schedule_items.extend(
-            _ScheduledBatch(epoch=epoch, batch_index=batch_index, datums=batch)
-            for batch_index, batch in enumerate(batches, start=1)
-        )
-    schedule = tuple(schedule_items)
-    if spec.maximum_steps is not None:
-        schedule = schedule[: spec.maximum_steps]
-    if not schedule:
-        raise TinkerSFTError("Tinker SFT schedule has no managed training batches")
-    return schedule
-
-
-def _schedule_batch_counts(example_count: int, spec: TinkerSFTSpec) -> tuple[int, ...]:
-    one_epoch = tuple(
-        min(spec.batch_size, example_count - index)
-        for index in range(0, example_count, spec.batch_size)
-    )
-    counts = one_epoch * spec.epochs
-    return counts[: spec.maximum_steps] if spec.maximum_steps is not None else counts
-
-
-class _ScheduledBatch:
-    def __init__(self, *, epoch: int, batch_index: int, datums: Sequence[TrainerDatum]) -> None:
-        self.epoch = epoch
-        self.batch_index = batch_index
-        self.datums = tuple(datums)
-
-
-def _validate_rendered_datums(
-    datums: tuple[TrainerDatum, ...], examples: Sequence[SFTExample]
-) -> None:
-    example_ids = tuple(example.example_id for example in examples)
-    datum_ids = tuple(datum.example_id for datum in datums)
-    if datum_ids != example_ids:
-        raise TinkerSFTError("Tinker SFT backend rendered a different ordered train-example set")
-    if any(datum.supervised_token_count <= 0 for datum in datums):
-        raise TinkerSFTError("Tinker SFT backend produced a datum without supervised target tokens")
-
-
-def _add_cost(
-    current: NumericMeasurement | None,
-    added: NumericMeasurement | None,
-    *,
-    has_prior_metrics: bool,
-) -> NumericMeasurement | None:
-    if added is None:
-        return None
-    if current is None:
-        if has_prior_metrics:
-            return None
-        return added
-    provenance: Literal["observed", "estimated"] = (
-        "observed"
-        if current.provenance == "observed" and added.provenance == "observed"
-        else "estimated"
-    )
-    return NumericMeasurement(value=current.value + added.value, provenance=provenance)
-
-
-def _total_cost(metrics: Sequence[TinkerSFTMetric]) -> NumericMeasurement | None:
-    if not metrics:
-        return None
-    total: NumericMeasurement | None = None
-    for index, metric in enumerate(metrics):
-        total = _add_cost(total, metric.cost_usd, has_prior_metrics=index > 0)
-        if total is None:
-            return None
-    return total
-
-
-def _require_budget_can_continue(
-    spec: TinkerSFTSpec,
-    metrics: Sequence[TinkerSFTMetric],
-    cost: NumericMeasurement | None,
-) -> None:
-    if spec.maximum_cost_usd is None:
-        return
-    if metrics and cost is None:
-        raise TinkerSFTBudgetExceeded(
-            "maximum_cost_usd cannot resume because a prior completed Tinker SFT batch lacked cost"
-        )
-    if cost is not None and cost.value >= spec.maximum_cost_usd:
-        raise TinkerSFTBudgetExceeded(
-            "observed Tinker SFT spend already reached maximum_cost_usd; no further provider call "
-            "was made"
-        )
-
-
-def _require_step_budget(
-    *,
-    backend: TrainerBackend,
-    spec: TinkerSFTSpec,
-    batch_example_count: int,
-    current_cost: NumericMeasurement | None,
-) -> NumericMeasurement | None:
-    upper_bound = backend.conservative_step_cost(
-        spec,
-        batch_example_count=batch_example_count,
-    )
-    if upper_bound is not None and upper_bound.value < 0:
-        raise TinkerSFTBudgetExceeded("backend cost upper bounds must be nonnegative")
-    if spec.maximum_cost_usd is None:
-        return upper_bound
-    if upper_bound is None:
-        raise TinkerSFTBudgetExceeded(
-            "maximum_cost_usd requires a backend-proven conservative step cost before dispatch"
-        )
-    spent = 0.0 if current_cost is None else current_cost.value
-    if spent + upper_bound.value > spec.maximum_cost_usd:
-        raise TinkerSFTBudgetExceeded(
-            "the next Tinker SFT step's conservative cost bound exceeds the remaining budget; "
-            "no optimizer call was dispatched"
-        )
-    return upper_bound
-
-
 def _save_checkpoint(
     *,
     session: TrainerSession,
@@ -666,9 +589,21 @@ def _save_or_load_terminal_model(
     manifest: TinkerSFTRunManifest,
     final_checkpoint: TinkerSFTCheckpoint,
     events: Sequence[TinkerSFTEvent],
+    dataset: SFTDatasetArtifact,
+    dataset_input: ArtifactInput,
+    expected_schedule: Sequence[_ExpectedBatch],
 ) -> TinkerSFTModelArtifact:
     existing_model = _load_model(output_dir, manifest)
     if existing_model is not None:
+        _validate_model_lineage(
+            output_dir,
+            existing_model,
+            events,
+            manifest=manifest,
+            dataset=dataset,
+            dataset_input=dataset_input,
+            expected_schedule=expected_schedule,
+        )
         return existing_model
     intent_path = output_dir / _MODEL_INTENT_FILE
     if intent_path.exists():
@@ -704,16 +639,12 @@ def _save_or_load_terminal_model(
     model = TinkerSFTModelArtifact(
         schema_version=1,
         created_at=manifest.created_at,
-        inputs=(
-            ArtifactInput(
-                artifact_id=manifest.dataset_id,
-                sha256=manifest.dataset_build_sha256,
-            ),
-        ),
+        inputs=(dataset_input,),
         code_revision=manifest.code_revision,
         model_id=model_id,
         run_id=manifest.run_id,
         dataset_id=manifest.dataset_id,
+        dataset_manifest_sha256=dataset_input.sha256,
         dataset_build_sha256=manifest.dataset_build_sha256,
         events_sha256=_events_sha256(output_dir),
         final_checkpoint_id=final_checkpoint.checkpoint_id,
@@ -733,8 +664,18 @@ def _write_terminal_result(
     manifest: TinkerSFTRunManifest,
     model: TinkerSFTModelArtifact,
     events: Sequence[TinkerSFTEvent],
+    dataset: SFTDatasetArtifact,
+    dataset_input: ArtifactInput,
+    expected_schedule: Sequence[_ExpectedBatch],
 ) -> TinkerSFTResult:
-    existing = _load_completed_result(output_dir, manifest, events)
+    existing = _load_completed_result(
+        output_dir,
+        manifest,
+        events,
+        dataset=dataset,
+        dataset_input=dataset_input,
+        expected_schedule=expected_schedule,
+    )
     if existing is not None:
         return existing
     final_checkpoint = _latest_checkpoint(events)
@@ -750,7 +691,7 @@ def _write_terminal_result(
                 (
                     ArtifactInput(
                         artifact_id=manifest.dataset_id,
-                        sha256=manifest.dataset_build_sha256,
+                        sha256=dataset_input.sha256,
                     ),
                     ArtifactInput(artifact_id=model.model_id, sha256=model_sha256),
                 ),
@@ -764,6 +705,7 @@ def _write_terminal_result(
         ),
         run_id=manifest.run_id,
         dataset_id=manifest.dataset_id,
+        dataset_manifest_sha256=dataset_input.sha256,
         dataset_build_sha256=manifest.dataset_build_sha256,
         model_id=model.model_id,
         model_sha256=model_sha256,
@@ -782,6 +724,10 @@ def _load_completed_result(
     output_dir: Path,
     manifest: TinkerSFTRunManifest,
     events: Sequence[TinkerSFTEvent],
+    *,
+    dataset: SFTDatasetArtifact,
+    dataset_input: ArtifactInput,
+    expected_schedule: Sequence[_ExpectedBatch],
 ) -> TinkerSFTResult | None:
     path = output_dir / _RESULT_FILE
     if not path.exists():
@@ -791,12 +737,30 @@ def _load_completed_result(
         raise TinkerSFTResumeError("Tinker SFT result names a different run")
     if result.dataset_id != manifest.dataset_id:
         raise TinkerSFTResumeError("Tinker SFT result names a different dataset")
+    _validate_dataset_lineage(
+        label="result",
+        dataset_id=result.dataset_id,
+        dataset_manifest_sha256=result.dataset_manifest_sha256,
+        dataset_build_sha256=result.dataset_build_sha256,
+        inputs=result.inputs,
+        manifest=manifest,
+        dataset=dataset,
+        dataset_input=dataset_input,
+    )
     model = _load_model(output_dir, manifest)
     if model is None:
         raise TinkerSFTResumeError("Tinker SFT result exists without its model artifact")
     if result.model_id != model.model_id or result.model_sha256 != sha256_json(model):
         raise TinkerSFTResumeError("Tinker SFT result does not match its model artifact")
-    _validate_model_lineage(output_dir, model, events)
+    _validate_model_lineage(
+        output_dir,
+        model,
+        events,
+        manifest=manifest,
+        dataset=dataset,
+        dataset_input=dataset_input,
+        expected_schedule=expected_schedule,
+    )
     final_checkpoint = _latest_checkpoint(events)
     if final_checkpoint is None or result.final_checkpoint_id != final_checkpoint.checkpoint_id:
         raise TinkerSFTResumeError("Tinker SFT result does not match its final checkpoint event")
@@ -813,6 +777,8 @@ def _load_completed_result(
         raise TinkerSFTResumeError("Tinker SFT result has the wrong durable cost facts")
     if result.checkpoint_count != sum(isinstance(event, TinkerSFTCheckpoint) for event in events):
         raise TinkerSFTResumeError("Tinker SFT result has the wrong checkpoint count")
+    if result.training_step_count != len(expected_schedule):
+        raise TinkerSFTResumeError("Tinker SFT result does not complete the frozen schedule")
     return result
 
 
@@ -835,11 +801,58 @@ def _load_model(output_dir: Path, manifest: TinkerSFTRunManifest) -> TinkerSFTMo
     return model
 
 
+def _validate_dataset_lineage(
+    *,
+    label: str,
+    dataset_id: ArtifactId,
+    dataset_manifest_sha256: str,
+    dataset_build_sha256: str,
+    inputs: Sequence[ArtifactInput],
+    manifest: TinkerSFTRunManifest,
+    dataset: SFTDatasetArtifact,
+    dataset_input: ArtifactInput,
+) -> None:
+    if dataset_id != dataset.dataset.dataset_id or dataset_id != manifest.dataset_id:
+        raise TinkerSFTResumeError(f"Tinker SFT {label} has a different canonical dataset ID")
+    if (
+        dataset_manifest_sha256 != dataset_input.sha256
+        or dataset_manifest_sha256 != manifest.dataset_manifest_sha256
+    ):
+        raise TinkerSFTResumeError(
+            f"Tinker SFT {label} has a different canonical dataset manifest digest"
+        )
+    if (
+        dataset_build_sha256 != dataset.dataset.build_sha256
+        or dataset_build_sha256 != manifest.dataset_build_sha256
+    ):
+        raise TinkerSFTResumeError(f"Tinker SFT {label} has a different dataset build digest")
+    matching_inputs = tuple(item for item in inputs if item.artifact_id == dataset_id)
+    if matching_inputs != (dataset_input,):
+        raise TinkerSFTResumeError(
+            f"Tinker SFT {label} does not input the canonical W12 artifact manifest"
+        )
+
+
 def _validate_model_lineage(
     output_dir: Path,
     model: TinkerSFTModelArtifact,
     events: Sequence[TinkerSFTEvent],
+    *,
+    manifest: TinkerSFTRunManifest,
+    dataset: SFTDatasetArtifact,
+    dataset_input: ArtifactInput,
+    expected_schedule: Sequence[_ExpectedBatch],
 ) -> None:
+    _validate_dataset_lineage(
+        label="model",
+        dataset_id=model.dataset_id,
+        dataset_manifest_sha256=model.dataset_manifest_sha256,
+        dataset_build_sha256=model.dataset_build_sha256,
+        inputs=model.inputs,
+        manifest=manifest,
+        dataset=dataset,
+        dataset_input=dataset_input,
+    )
     final_checkpoint = _latest_checkpoint(events)
     if final_checkpoint is None:
         raise TinkerSFTResumeError("Tinker SFT model artifact has no durable checkpoint event")
@@ -856,6 +869,13 @@ def _validate_model_lineage(
         raise TinkerSFTResumeError("Tinker SFT model artifact has inconsistent training counts")
     if model.total_cost_usd != _total_cost(metrics):
         raise TinkerSFTResumeError("Tinker SFT model artifact has inconsistent durable cost facts")
+    if final_checkpoint.step != len(expected_schedule) or len(metrics) != len(expected_schedule):
+        raise TinkerSFTResumeError("Tinker SFT model does not complete the frozen schedule")
+    all_metrics = tuple(event for event in events if isinstance(event, TinkerSFTMetric))
+    if len(all_metrics) != len(expected_schedule) or tuple(
+        sorted(metric.step for metric in all_metrics)
+    ) != tuple(range(1, len(expected_schedule) + 1)):
+        raise TinkerSFTResumeError("Tinker SFT event chain does not exactly complete the schedule")
 
 
 def _events_sha256(output_dir: Path) -> str:
