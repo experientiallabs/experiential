@@ -19,10 +19,10 @@ _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
 
 
-def test_paid_write_failure_tombstone_blocks_replay_until_rollout_is_durable(
+def test_dispatch_intent_blocks_replay_until_rollout_is_durable(
     tmp_path: Path,
 ) -> None:
-    """A possible paid dispatch remains non-replayable until its exact artifact can be read."""
+    """A durable dispatch intent keeps the live claim until exact rollout evidence exists."""
     project = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
     store = TextCellLeaseStore(project.project_directory, clock=lambda: _TIME)
     first = store.acquire(
@@ -37,9 +37,19 @@ def test_paid_write_failure_tombstone_blocks_replay_until_rollout_is_durable(
     )
     assert first.lease is not None
 
-    store.retain_non_replay_tombstone(first.lease)
-    store.retain_non_replay_tombstone(first.lease)
-    blocked = store.acquire(
+    intended = store.record_dispatch_intent(first.lease)
+    assert intended.dispatch_intent_recorded
+    assert intended.status == TextCellLeaseStatus.ACTIVE
+
+    elapsed = [0.0]
+    contender = TextCellLeaseStore(
+        project.project_directory,
+        clock=lambda: _TIME,
+        sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+        monotonic=lambda: elapsed[0],
+        wait_timeout_seconds=0.05,
+    )
+    blocked = contender.acquire(
         lease_id="lease-a",
         resolution_id="resolution-a",
         simulation_id="simulation-a",
@@ -60,7 +70,8 @@ def test_paid_write_failure_tombstone_blocks_replay_until_rollout_is_durable(
         observed_spend_usd=lambda: 0.0,
     )
 
-    assert blocked.state == TextCellLeaseState.STALE
+    assert blocked.state == TextCellLeaseState.CONTENDED
+    assert blocked.retryable
     assert completed.state == TextCellLeaseState.COMPLETED
     assert tuple((project.project_directory / "simulation-leases").glob("*.json")) == ()
 

@@ -155,6 +155,7 @@ def execute_bounded_sandbox_episode(
     remaining_cost_usd: float | None,
     maximum_call_cost_usd: float | None,
     cost_is_observable: bool,
+    record_dispatch_intent: Callable[[], None],
     clock: Callable[[], datetime] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[AgentEpisode, SandboxExecutionEvidence]:
@@ -173,6 +174,8 @@ def execute_bounded_sandbox_episode(
         remaining_cost_usd: Remaining run budget, or ``None`` for an unbounded run.
         maximum_call_cost_usd: Proven upper bound reserved before each candidate dispatch.
         cost_is_observable: Whether responses must report exact or estimated finite cost.
+        record_dispatch_intent: Fsync-backed callback invoked immediately before each external
+            candidate or environment dispatch may begin.
         clock: Aware event clock.
         monotonic: Monotonic deadline and latency clock.
 
@@ -213,12 +216,14 @@ def execute_bounded_sandbox_episode(
         maximum_call_cost_usd=maximum_call_cost_usd,
         clock=event_clock,
         monotonic=monotonic,
+        record_dispatch_intent=record_dispatch_intent,
     )
     environment = _RecordingEnvironmentRuntime(
         environment_runtime,
         deadline=deadline,
         clock=event_clock,
         monotonic=monotonic,
+        record_dispatch_intent=record_dispatch_intent,
     )
     with _hard_wall_timeout(deadline):
         agent = agent_factory()
@@ -267,6 +272,7 @@ class _RecordingCandidateClient:
         maximum_call_cost_usd: float | None,
         clock: Callable[[], datetime],
         monotonic: Callable[[], float],
+        record_dispatch_intent: Callable[[], None],
     ) -> None:
         self._client = client
         self._snapshot = snapshot
@@ -276,6 +282,7 @@ class _RecordingCandidateClient:
         self._maximum_call_cost_usd = maximum_call_cost_usd
         self._clock = clock
         self._monotonic = monotonic
+        self._record_dispatch_intent = record_dispatch_intent
         self._calls = 0
         self._spent = 0.0
         self.spans: list[RolloutSpan] = []
@@ -310,6 +317,7 @@ class _RecordingCandidateClient:
         self._calls += 1
         started_at = _timestamp(self._clock)
         started = self._monotonic()
+        self._record_dispatch_intent()
         try:
             response = self._client.complete(request)
         except Exception as exc:
@@ -404,11 +412,13 @@ class _RecordingEnvironmentRuntime:
         deadline: _Deadline,
         clock: Callable[[], datetime],
         monotonic: Callable[[], float],
+        record_dispatch_intent: Callable[[], None],
     ) -> None:
         self._runtime = runtime
         self._deadline = deadline
         self._clock = clock
         self._monotonic = monotonic
+        self._record_dispatch_intent = record_dispatch_intent
         self.spans: list[RolloutSpan] = []
         self.economics: list[OperationEconomics] = []
         self.limit_stop_reason: StopReason | None = None
@@ -417,6 +427,7 @@ class _RecordingEnvironmentRuntime:
     def open(self, task: TaskCase) -> AbstractContextManager[EnvironmentSession]:
         """Open the underlying session through one evidence-recording context."""
         self._deadline.remaining()
+        self._record_dispatch_intent()
         return _RecordingEnvironmentContext(self, self._runtime.open(task))
 
 
@@ -489,6 +500,7 @@ class _RecordingEnvironmentSession:
         self._index += 1
         started_at = _timestamp(self._owner._clock)
         started = self._owner._monotonic()
+        self._owner._record_dispatch_intent()
         try:
             observation = self._session.execute(action)
         except Exception as exc:

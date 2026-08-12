@@ -466,7 +466,14 @@ class SandboxSimulator:
             else max(0.0, spec.maximum_cost_usd - (claim.observed_spend_usd or 0.0))
         )
         environment_reservation = binding.environment_maximum_episode_cost_usd
-        dispatch_may_have_started = False
+        dispatch_intent_recorded = False
+
+        def record_dispatch_intent() -> None:
+            """Fsync the exact non-replay boundary before external sandbox work begins."""
+            nonlocal dispatch_intent_recorded, lease
+            lease = self._leases.record_dispatch_intent(lease)
+            dispatch_intent_recorded = True
+
         try:
             if (
                 remaining is not None
@@ -483,13 +490,17 @@ class SandboxSimulator:
                     spent=claim.observed_spend_usd,
                 )
             else:
-                dispatch_may_have_started = True
-                rollout = self._execute_cell(spec, cell, binding, resolution_input, remaining)
+                rollout = self._execute_cell(
+                    spec,
+                    cell,
+                    binding,
+                    resolution_input,
+                    remaining,
+                    record_dispatch_intent=record_dispatch_intent,
+                )
             persisted = self._persist_rollout(rollout, cell, binding, resolution_input)
         except BaseException:
-            if dispatch_may_have_started:
-                self._leases.retain_non_replay_tombstone(lease)
-            else:
+            if not dispatch_intent_recorded:
                 self._leases.release(lease)
             raise
         else:
@@ -523,6 +534,8 @@ class SandboxSimulator:
         binding: SandboxSimulationCellBinding,
         resolution_input: ArtifactInput,
         remaining_cost_usd: float | None,
+        *,
+        record_dispatch_intent: Callable[[], None],
     ) -> RolloutArtifact:
         """Execute one bounded customer episode and convert every normal failure into evidence."""
         started_at = _timestamp(self._clock)
@@ -545,6 +558,7 @@ class SandboxSimulator:
                 remaining_cost_usd=remaining_cost_usd,
                 maximum_call_cost_usd=candidate.maximum_call_cost_usd,
                 cost_is_observable=candidate.cost_is_observable,
+                record_dispatch_intent=record_dispatch_intent,
                 clock=self._clock,
                 monotonic=self._monotonic,
             )
