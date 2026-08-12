@@ -18,11 +18,12 @@ Build accepts 100 through 1000 valid normalized traces. It writes a manifest-bou
 PostHog product telemetry may use the network after artifact persistence unless telemetry is
 disabled. It never contains trace content.
 
-WMO stops at review readiness. Rubric review, simulation, judgment, fidelity validation, frozen
-embeddings, and pricing are required completed inputs to optimization. Produce them through an
-explicit external or provider-authorized workflow with its own consent and budget. Then create the
-single configuration using the exact typed recipe and field definitions in
-[Router optimization configuration](docs/reference/router_optimization_config.md).
+The provider-free CLI build stops at review readiness. For CLI optimization, produce approved
+rubric, calibration, simulation, judgment, fidelity, frozen embedding, and pricing artifacts under
+explicit consent and budget, then create the single config defined in
+[Router optimization configuration](docs/reference/router_optimization_config.md). Python callers
+can instead use `wmo.compose_router` below. It composes those WMO stages from explicit injected
+services and finite budgets, without hidden provider calls.
 
 After the combined fit, fidelity, and held-out evidence is complete, freeze and report one router:
 
@@ -60,50 +61,63 @@ cost bound before requesting consent for managed Tinker execution.
 
 ## Python composition
 
-The CLI calls the same domain services available to Python callers:
+Python callers can compose the full artifact chain with explicit dependencies. WMO never resolves
+a model, simulator, agent, judge, credential, consent, or budget implicitly:
 
 ```python
 from datetime import UTC, datetime
 from pathlib import Path
 
-from wmo import build_project, load_project_router, optimize_router
+from wmo import (
+    LocalTraceSource,
+    RouterCompositionBudget,
+    RouterWorkflowServices,
+    compose_router,
+)
 from wmo.common.models import ModelMessage, ModelRequest
 from wmo.common.project import ProjectConfig, ProjectStore
-from wmo.optimize.router import RouterOptimizationConfig
-from wmo.simulation.ingest.otlp import load_otlp_file
 
 root = Path(".wmo")
 project = ProjectStore(root, "support-agent")
 project.initialize(ProjectConfig(project_id="support-agent"))
 
-built = build_project(
-    load_otlp_file(Path("traces.otel.jsonl")),
+services = RouterWorkflowServices(
+    # Persists an approved Rubric and JudgeCalibration under application consent.
+    review_supplier=approved_review_supplier,
+    # Supplies reviewed production overlaps, candidates, embeddings, pricing, and guards.
+    setup_supplier=reviewed_evaluation_setup_supplier,
+    # Binds WorldModelSimulator to WMO's plan with explicit model clients and AgentRuntime.
+    simulator_factory=world_model_simulator_factory,
+    judge=judge_service,
+    fidelity_approval=fidelity_approval_service,
+    runtime_catalog=runtime_catalog,
+)
+result = compose_router(
     project,
+    LocalTraceSource(Path("traces.otel.jsonl"), source="otlp"),
+    services=services,
+    budget=RouterCompositionBudget(
+        maximum_simulation_cost_usd=25.0,
+        maximum_judgments=100,
+    ),
     created_at=datetime.now(UTC),
     code_revision="your-exact-revision",
 )
-assert built.review.status == "proposals_pending"
-
-# Stop here until an explicitly authorized external workflow has persisted the completed
-# evaluation plan, rollout sets, judgments, fidelity reports, frozen embeddings, and pricing.
-# Create this file from those typed outputs using docs/reference/router_optimization_config.md.
-router_config = RouterOptimizationConfig.model_validate_json(
-    Path("router-optimization.json").read_bytes()
-)
-optimized = optimize_router(project.artifacts, router_config)
 
 # This is the explicit online model-call boundary.
-runtime = load_project_router(
-    "support-agent",
-    root,
-    policy_id=optimized.optimization.policy.policy_id,
-)
-response = runtime.complete(
+response = result.runtime.complete(
     ModelRequest(messages=(ModelMessage(role="user", content="Help me"),)),
     episode_id="customer-conversation-42",
 )
 print(response.decision.selected_alias, response.response.output)
 ```
+
+`compose_router` creates the plan and finite-cost `SimulationSpec`, executes the injected
+simulator, invokes the injected judge only for missing judgments, builds and explicitly approves
+fidelity, freezes fit artifacts, opens held-out evidence only after policy lock, reports, and
+returns the verified W11 `RouterRuntime`. Exact replay does not repeat completed simulation or
+judgment calls. Callable contracts and `RouterEvaluationSetup` fields live in
+`wmo.workflow.router`.
 
 ## Telemetry
 

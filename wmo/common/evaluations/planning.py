@@ -17,6 +17,8 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.evaluations.evidence import (
     EvaluationEvidenceError,
+    read_evaluation_plan,
+    read_fidelity_gate,
     read_fidelity_thresholds,
     read_rollout,
     sorted_evaluation_inputs,
@@ -85,6 +87,15 @@ def persist_fidelity_thresholds(store: ArtifactStore, thresholds: FidelityThresh
         store: Project-local immutable artifact store.
         gate: Frozen fidelity thresholds to persist.
     """
+    destination = store.project_directory / "artifacts" / thresholds.fidelity_thresholds_id
+    if destination.exists():
+        existing, _input = read_fidelity_thresholds(store, thresholds.fidelity_thresholds_id)
+        replay = thresholds.model_copy(update={"created_at": existing.created_at})
+        if existing != replay:
+            raise EvaluationEvidenceError(
+                "existing fidelity thresholds differ from deterministic replay"
+            )
+        return
     store.write_json(
         artifact_id=thresholds.fidelity_thresholds_id,
         artifact_type="fidelity-thresholds",
@@ -224,12 +235,22 @@ def build_evaluation_plan(
         fidelity_protocol_sha256=fidelity_protocol_sha256,
         cells=cells,
     )
-    store.write_json(
-        artifact_id=plan.plan_id,
-        artifact_type="evaluation-plan",
-        envelope=plan,
-        files={"plan.json": plan},
-    )
+    plan_destination = store.project_directory / "artifacts" / plan.plan_id
+    if plan_destination.exists():
+        existing, _input = read_evaluation_plan(store, plan.plan_id)
+        replay = plan.model_copy(update={"created_at": existing.created_at})
+        if existing != replay:
+            raise EvaluationEvidenceError(
+                "existing evaluation plan differs from deterministic replay"
+            )
+        plan = existing
+    else:
+        store.write_json(
+            artifact_id=plan.plan_id,
+            artifact_type="evaluation-plan",
+            envelope=plan,
+            files={"evaluation-plan.json": plan, "plan.json": plan},
+        )
     plan_input = artifact_input(store.read(plan.plan_id).manifest)
     overlap_ids = tuple(cell.cell_id for cell in fidelity_cells)
     scope_sha256 = sha256_json(
@@ -257,12 +278,21 @@ def build_evaluation_plan(
         minimum_usable_overlaps=thresholds.minimum_usable_overlaps,
         maximum_score_mae=thresholds.maximum_score_mae,
     )
-    store.write_json(
-        artifact_id=gate_id,
-        artifact_type="fidelity-gate",
-        envelope=gate,
-        files={"gate.json": gate},
-    )
+    gate_destination = store.project_directory / "artifacts" / gate_id
+    if gate_destination.exists():
+        existing_gate, _input = read_fidelity_gate(store, gate_id)
+        replay_gate = gate.model_copy(update={"created_at": existing_gate.created_at})
+        if existing_gate != replay_gate:
+            raise EvaluationEvidenceError(
+                "existing fidelity gate differs from deterministic replay"
+            )
+    else:
+        store.write_json(
+            artifact_id=gate_id,
+            artifact_type="fidelity-gate",
+            envelope=gate,
+            files={"gate.json": gate},
+        )
     return plan
 
 

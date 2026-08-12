@@ -6,11 +6,11 @@ WMO_DIR = Path(__file__).resolve().parent
 
 
 def test_wmo_package_root_is_a_closed_allowlist() -> None:
-    """Only the three product domains, shared code, and CLI live directly under ``wmo``."""
+    """Only product domains, public workflow composition, shared code, and CLI live under wmo."""
     actual_dirs = {
         path.name for path in WMO_DIR.iterdir() if path.is_dir() and path.name != "__pycache__"
     }
-    expected_dirs = {"cli", "common", "optimize", "runtime", "simulation"}
+    expected_dirs = {"cli", "common", "optimize", "runtime", "simulation", "workflow"}
     assert actual_dirs == expected_dirs, (
         f"wmo package directories are {sorted(actual_dirs)}, expected {sorted(expected_dirs)}"
     )

@@ -18,10 +18,18 @@ reuses the exact artifact manifests and payloads.
 
 ## 2. Complete review and evaluation explicitly
 
-WMO does not generate the required simulation, judgment, or fidelity results in this production
-composition. Use an external or provider-authorized workflow with explicit consent and budget to
-persist a combined evaluation plan, completed rollout sets, judgments, fidelity reports, frozen
-embeddings, and a pricing snapshot. Review the results before optimization.
+The CLI keeps provider consent out of `build`, so its next input remains a reviewed completed
+evidence config. Python applications can use `wmo.compose_router` for actual WMO composition. They
+inject an approved-review supplier, reviewed setup supplier, plan-bound simulator factory, judge,
+runtime catalog, finite simulation-dollar ceiling, and finite judgment-call ceiling. WMO creates
+the plan and simulation spec, runs missing cells, persists judgments, approves fidelity, fits,
+opens held-out only after lock, reports, and returns `RouterRuntime`.
+
+The setup supplier provides the application-owned facts WMO cannot invent: approved rubric and
+calibration, candidate snapshots, reviewed production overlap rollouts, exact protocols, frozen
+embeddings, pricing, and guard thresholds. The simulator factory binds explicit candidate and
+world-model clients plus the customer `AgentRuntime` to WMO's frozen plan. See the executable
+public example in the root README and exact contracts in `wmo.workflow.router`.
 
 Create `router-optimization.json` from those exact typed outputs using
 [the configuration recipe](../reference/router_optimization_config.md). The recipe names and

@@ -27,6 +27,7 @@ from wmo.common.evaluations.evidence import (
     evaluation_protocol_digest,
     read_evaluation_plan,
     read_fidelity_gate,
+    read_fidelity_report,
     read_judgment,
     read_rollout,
     sorted_evaluation_inputs,
@@ -240,6 +241,15 @@ def build_fidelity_report(
         status=status,
         approved_at=approved_at if status == "approved" else None,
     )
+    destination = store.project_directory / "artifacts" / report.fidelity_report_id
+    if destination.exists():
+        existing, _input = read_fidelity_report(store, report.fidelity_report_id)
+        replay = report.model_copy(update={"created_at": existing.created_at})
+        if existing != replay:
+            raise EvaluationEvidenceError(
+                "existing fidelity report differs from deterministic replay"
+            )
+        return existing
     store.write_json(
         artifact_id=report.fidelity_report_id,
         artifact_type="fidelity-report",

@@ -1,8 +1,10 @@
 # Router optimization configuration
 
 `wmo build` stops with `proposals_pending`. It does not create simulation, judgment, fidelity,
-embedding, or pricing artifacts. Before optimization, an external or provider-authorized workflow
-must complete and persist all of these inputs with explicit user consent and budget:
+embedding, or pricing artifacts. The completed-evidence CLI path requires these inputs. A Python
+application may instead use `wmo.compose_router` with explicit suppliers, simulator, judge, runtime
+catalog, and finite budgets to have WMO create and verify the remaining artifact chain. Before
+either path, the application must provide these approved inputs with explicit user consent:
 
 - One combined evaluation plan containing fit, fidelity, and held-out cells.
 - Completed rollout sets and judgments for every referenced cell.

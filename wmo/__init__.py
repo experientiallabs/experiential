@@ -22,6 +22,21 @@ if TYPE_CHECKING:
     from wmo.simulation.build import TaskSetBuild as TaskSetBuild
     from wmo.simulation.build import build_project as build_project
     from wmo.simulation.build import build_task_set as build_task_set
+    from wmo.workflow.router import (
+        ApprovedRouterReview as ApprovedRouterReview,
+    )
+    from wmo.workflow.router import LocalTraceSource as LocalTraceSource
+    from wmo.workflow.router import (
+        RouterCompositionBudget as RouterCompositionBudget,
+    )
+    from wmo.workflow.router import (
+        RouterCompositionResult as RouterCompositionResult,
+    )
+    from wmo.workflow.router import (
+        RouterEvaluationSetup as RouterEvaluationSetup,
+    )
+    from wmo.workflow.router import RouterWorkflowServices as RouterWorkflowServices
+    from wmo.workflow.router import compose_router as compose_router
 
 _EXPORT_MODULES = {
     "BuildReviewReadiness": "wmo.simulation.build",
@@ -36,6 +51,13 @@ _EXPORT_MODULES = {
     "RouterRuntime": "wmo.runtime.router.runtime",
     "create_project_router_app": "wmo.runtime.router.application",
     "load_project_router": "wmo.runtime.router.application",
+    "ApprovedRouterReview": "wmo.workflow.router",
+    "LocalTraceSource": "wmo.workflow.router",
+    "RouterCompositionBudget": "wmo.workflow.router",
+    "RouterCompositionResult": "wmo.workflow.router",
+    "RouterEvaluationSetup": "wmo.workflow.router",
+    "RouterWorkflowServices": "wmo.workflow.router",
+    "compose_router": "wmo.workflow.router",
 }
 
 __all__ = list(_EXPORT_MODULES)
