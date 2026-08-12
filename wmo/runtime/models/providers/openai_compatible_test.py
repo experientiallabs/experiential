@@ -54,6 +54,7 @@ def _snapshot() -> ModelSnapshot:
         model_id="fake-model",
         revision="fake-revision",
         capabilities_sha256="a" * 64,
+        connection_sha256="a" * 64,
     )
 
 

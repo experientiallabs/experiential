@@ -29,7 +29,8 @@ class ModelRoleWorkflow(StrEnum):
     ROUTER_BUILD = "router_build"
     JUDGING = "judging"
     RUBRIC_PROPOSAL = "rubric_proposal"
-    SFT = "sft"
+    SFT_PRODUCTION_TRACES = "sft_production_traces"
+    SFT_TEACHER_ROLLOUTS = "sft_teacher_rollouts"
 
 
 _WORKFLOW_REQUIRED_ROLES: Mapping[ModelRoleWorkflow, tuple[ModelRole, ...]] = {
@@ -41,7 +42,8 @@ _WORKFLOW_REQUIRED_ROLES: Mapping[ModelRoleWorkflow, tuple[ModelRole, ...]] = {
     ),
     ModelRoleWorkflow.JUDGING: (ModelRole.JUDGE,),
     ModelRoleWorkflow.RUBRIC_PROPOSAL: (ModelRole.RUBRIC_PROPOSER,),
-    ModelRoleWorkflow.SFT: (ModelRole.TEACHER,),
+    ModelRoleWorkflow.SFT_PRODUCTION_TRACES: (),
+    ModelRoleWorkflow.SFT_TEACHER_ROLLOUTS: (ModelRole.TEACHER,),
 }
 
 DEFAULT_BUILD_WORKFLOW = ModelRoleWorkflow.ROUTER_BUILD

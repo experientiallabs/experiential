@@ -45,25 +45,23 @@ stop being the interface.
 
 ```python
 class SurfaceKind(StrEnum):
-    PROMPT = "prompt"  # a section of the system prompt (joined in id order)
-    SKILL = "skill"  # one skill: frontmatter (name, description) + body
+    PROMPT = "prompt"            # a section of the system prompt (joined in id order)
+    SKILL = "skill"              # one skill: frontmatter (name, description) + body
     TOOL_POLICY = "tool_policy"  # the tool list, one tool name per line
-    PARAM = "param"  # a scalar loop knob, serialized as its string form
-    CODE = "code"  # the agent loop itself: a module defining run(kit)
-
+    PARAM = "param"              # a scalar loop knob, serialized as its string form
+    CODE = "code"                # the agent loop itself: a module defining run(kit)
 
 class Surface(BaseModel):
-    id: str  # identity key: "prompt:core", "skill:count-words", "param:max-turns"
+    id: str                      # identity key: "prompt:core", "skill:count-words", "param:max-turns"
     kind: SurfaceKind
-    content: str  # the payload is deliberately unstructured
-    budget: int | None = None  # size budget (chars), validated at construction, not advisory
+    content: str                 # the payload — deliberately unstructured
+    budget: int | None = None    # size budget (chars), validated at construction, not advisory
     # content_hash: computed — blake2b(content)
-
 
 class HarnessDoc(BaseModel):
     name: str
-    version: int  # immutable, assigned by the store on save; 0 = unsaved
-    surfaces: list[Surface]  # unique ids; canonical order
+    version: int                 # immutable, assigned by the store on save; 0 = unsaved
+    surfaces: list[Surface]      # unique ids; canonical order
     # doc_hash: computed over sorted (id, content_hash) pairs. "The score of harness X" is
     # well-defined because X is this hash.
 ```
@@ -82,46 +80,41 @@ never to "whatever the harness currently is".
 ```python
 class FailureSignature(BaseModel):
     """Machine-clustered trigger: WHY this delta exists, queryably."""
-
-    mechanism: str  # e.g. the shared unmet assertion, or "none: all tasks pass"
-    task_ids: list[str]  # the cluster of failing tasks exhibiting it
+    mechanism: str               # e.g. the shared unmet assertion, or "none: all tasks pass"
+    task_ids: list[str]          # the cluster of failing tasks exhibiting it
     unmet_assertions: list[str]  # deduped gold assertions the mechanism explains
-
 
 class SurfaceOp(BaseModel):
     op: Literal["add", "replace", "remove"]
-    surface_id: str  # identity, never position or filename
-    kind: SurfaceKind | None  # required on add; must match the existing kind on replace
-    content: str | None  # the FULL new content (component rewrite, not a line diff)
-    budget: int | None  # on replace, None inherits the existing budget
-    rationale: str  # WHY THIS OP: bound to the op, not the delta (fixes blindness #5)
-
+    surface_id: str              # identity, never position or filename
+    kind: SurfaceKind | None     # required on add; must match the existing kind on replace
+    content: str | None          # the FULL new content (component rewrite, not a line diff)
+    budget: int | None           # on replace, None inherits the existing budget
+    rationale: str               # WHY THIS OP — bound to the op, not the delta (fixes blindness #5)
 
 class GateRecord(BaseModel):
     """Filled at evaluation time; the delta carries its own verdict."""
-
-    suite_delta: float  # regression suite: child − champion   (tier 1)
+    suite_delta: float           # regression suite: child − champion   (tier 1)
     suite_fraction_delta: float  # assertion credit when suite success ties
-    full_delta: float  # full split: child − best-seen        (tier 2)
-    full_fraction_delta: float  # assertion credit when full success ties
+    full_delta: float            # full split: child − best-seen        (tier 2)
+    full_fraction_delta: float   # assertion credit when full success ties
     holdout_delta: float | None  # held-out split: child − champion     (tier 3; None = no holdout)
     holdout_fraction_delta: float | None
     accepted: bool
-    reason: str  # accept/reject reasoning, incl. the expected-effect audit
-
+    reason: str                  # accept/reject reasoning, incl. the expected-effect audit
 
 class HarnessDelta(BaseModel):
-    delta_id: str  # content-addressed: blake2b(parent hash + ops)
-    parent_doc_hash: str  # lineage by content, not name
-    trigger: FailureSignature  # built by deterministic clustering, never free-typed
+    delta_id: str                  # content-addressed: blake2b(parent hash + ops)
+    parent_doc_hash: str           # lineage by content, not name
+    trigger: FailureSignature      # built by deterministic clustering, never free-typed
     preconditions: dict[str, str]  # surface_id -> expected content_hash of the PARENT surface the
-    # meta-agent actually read. ANY mismatch rejects the WHOLE delta
-    # atomically (fixes blindness #2). Every replace/remove target
-    # MUST have one.
-    ops: list[SurfaceOp]  # unknown surface_id on replace/remove = reject (fixes #4)
-    expected_effect: str  # falsifiable prediction: "tasks in the trigger cluster flip"
-    child_doc_hash: str | None  # recorded by application
-    verdict: GateRecord | None  # None until evaluated; the archive stores deltas, not snapshots
+                                   # meta-agent actually read. ANY mismatch rejects the WHOLE delta
+                                   # atomically (fixes blindness #2). Every replace/remove target
+                                   # MUST have one.
+    ops: list[SurfaceOp]           # unknown surface_id on replace/remove = reject (fixes #4)
+    expected_effect: str           # falsifiable prediction: "tasks in the trigger cluster flip"
+    child_doc_hash: str | None     # recorded by application
+    verdict: GateRecord | None     # None until evaluated; the archive stores deltas, not snapshots
 ```
 
 ### 2.3 Semantics

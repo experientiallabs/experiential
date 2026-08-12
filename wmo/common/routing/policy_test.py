@@ -20,6 +20,7 @@ def _candidate(alias: str) -> RoutedCandidateSnapshot:
             provider="openai",
             model_id=f"{alias}-model",
             capabilities_sha256=_DIGEST,
+            connection_sha256=_DIGEST,
         ),
     )
 
@@ -36,6 +37,7 @@ def _policy() -> KnnRouterPolicy:
             provider="openai",
             model_id="text-embedding-3-small",
             capabilities_sha256=_DIGEST,
+            connection_sha256=_DIGEST,
         ),
         feature_extractor_id="request-visible-v1",
         feature_schema_sha256=_DIGEST,

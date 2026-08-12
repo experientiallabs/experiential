@@ -46,6 +46,7 @@ def _manifest() -> EvaluationDatasetManifest:
             provider="openai",
             model_id="gpt-5.4-mini",
             capabilities_sha256=_DIGEST,
+            connection_sha256=_DIGEST,
         ),
     )
     protocol = EvaluationProtocol(
@@ -57,6 +58,7 @@ def _manifest() -> EvaluationDatasetManifest:
             provider="openai",
             model_id="gpt-5.4-mini",
             capabilities_sha256=_DIGEST,
+            connection_sha256=_DIGEST,
         ),
         simulator_prompt_id="world-model-prompt-v1",
         rubric_id="rubric-1",

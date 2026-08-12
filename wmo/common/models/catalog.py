@@ -5,21 +5,43 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
 from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ContractModel,
+    JsonObject,
     SecretBoundaryError,
+    Sha256,
     assert_secret_free,
+    sha256_json,
     validate_artifact_id,
 )
 from wmo.common.core.files import write_text_atomic
 from wmo.common.models.model import ModelCapabilities
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _normalize_base_url(value: str) -> str:
+    """Return the stable endpoint spelling used for connection identity."""
+    parsed = urlsplit(value)
+    hostname = parsed.hostname
+    if hostname is None:
+        raise ValueError("base_url must include a hostname")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("base_url must use a valid port") from exc
+    scheme = parsed.scheme.lower()
+    host = hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    default_port = 443 if scheme == "https" else 80
+    netloc = host if port in {None, default_port} else f"{host}:{port}"
+    return urlunsplit((scheme, netloc, parsed.path.rstrip("/"), "", ""))
 
 
 class ModelCatalogError(ValueError):
@@ -52,6 +74,7 @@ class ConnectionConfig(ContractModel):
             raise ValueError("base_url must not embed credentials")
         if parsed.query or parsed.fragment:
             raise ValueError("base_url must not include query parameters or fragments")
+        _normalize_base_url(value)
         return value
 
     @model_validator(mode="after")
@@ -61,6 +84,19 @@ class ConnectionConfig(ContractModel):
         except SecretBoundaryError as exc:
             raise ValueError("connection metadata must not contain credential values") from exc
         return self
+
+    def identity_sha256(self) -> Sha256:
+        """Return a deterministic digest of the secret-free provider endpoint identity.
+
+        Returns:
+            A SHA-256 digest over the provider and normalized base URL. Credential values and
+            credential-environment metadata are deliberately excluded.
+        """
+        identity: JsonObject = {
+            "provider": self.provider,
+            "base_url": None if self.base_url is None else _normalize_base_url(self.base_url),
+        }
+        return sha256_json(identity)
 
 
 class ModelRecord(ContractModel):

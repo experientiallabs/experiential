@@ -150,33 +150,53 @@ def test_router_build_does_not_require_optional_rubric_or_teacher_roles() -> Non
     assert ModelRole.TEACHER not in result.models
 
 
-def test_sft_and_judging_preflight_request_only_their_own_roles() -> None:
-    """SFT and judging retain exact independent role requirements after router setup narrows."""
-    sft_catalog = _catalog(ModelRoles(teacher="teacher"))
+def test_production_trace_sft_preflight_does_not_require_a_teacher() -> None:
+    """SFT over already-captured production traces resolves no teacher rollout client."""
+    catalog = _catalog(ModelRoles())
+    resolver = RuntimeModelCatalog(catalog, environment={})
+
+    result = preflight_model_roles(
+        catalog,
+        resolver,
+        workflow=ModelRoleWorkflow.SFT_PRODUCTION_TRACES,
+    )
+
+    assert tuple(result.models) == ()
+    assert required_model_roles(ModelRoleWorkflow.SFT_PRODUCTION_TRACES) == ()
+
+
+def test_teacher_rollout_sft_preflight_requires_a_teacher() -> None:
+    """Teacher-generated SFT traces fail before any client construction when unconfigured."""
+    catalog = _catalog(ModelRoles())
+    resolver = RuntimeModelCatalog(catalog, environment={})
+
+    with pytest.raises(MissingModelRolesError) as raised:
+        preflight_model_roles(
+            catalog,
+            resolver,
+            workflow=ModelRoleWorkflow.SFT_TEACHER_ROLLOUTS,
+        )
+
+    assert raised.value.missing_roles == (ModelRole.TEACHER,)
+    assert str(raised.value) == (
+        "missing model roles: teacher. Configure them in .wmo/models.toml or run "
+        "wmo build interactively."
+    )
+
+
+def test_judging_preflight_requests_only_its_own_role() -> None:
+    """Judging remains independent from the source-specific SFT workflows."""
     judging_catalog = _catalog(ModelRoles(judge="judge"))
-    sft_resolver = RuntimeModelCatalog(sft_catalog, environment={"FIXTURE_API_KEY": "fixture-key"})
     judging_resolver = RuntimeModelCatalog(
         judging_catalog,
         environment={"FIXTURE_API_KEY": "fixture-key"},
     )
 
-    sft = preflight_model_roles(
-        sft_catalog,
-        sft_resolver,
-        workflow=ModelRoleWorkflow.SFT,
-    )
     judging = preflight_model_roles(
         judging_catalog,
         judging_resolver,
         workflow=ModelRoleWorkflow.JUDGING,
     )
 
-    assert tuple(sft.models) == (ModelRole.TEACHER,)
     assert tuple(judging.models) == (ModelRole.JUDGE,)
     assert required_model_roles(ModelRoleWorkflow.RUBRIC_PROPOSAL) == (ModelRole.RUBRIC_PROPOSER,)
-    with pytest.raises(MissingModelRolesError, match="teacher"):
-        preflight_model_roles(
-            judging_catalog,
-            judging_resolver,
-            workflow=ModelRoleWorkflow.SFT,
-        )

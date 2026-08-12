@@ -14,12 +14,17 @@ ModelAlias = ArtifactId
 
 
 class ModelSnapshot(ContractModel):
-    """Resolved model identity captured at an immutable artifact boundary."""
+    """Resolved model identity captured at an immutable artifact boundary.
+
+    The connection digest identifies the normalized, secret-free provider endpoint used for the
+    model. It never carries a credential value or credential reference.
+    """
 
     provider: str = Field(min_length=1, max_length=128)
     model_id: str = Field(min_length=1, max_length=512)
     revision: str | None = Field(default=None, max_length=256)
     capabilities_sha256: Sha256
+    connection_sha256: Sha256
 
 
 class RoutedCandidateSnapshot(ContractModel):

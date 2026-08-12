@@ -28,6 +28,7 @@ class _FakeClient:
                 provider="fake",
                 model_id="fake-model",
                 capabilities_sha256="a" * 64,
+                connection_sha256="a" * 64,
             ),
             economics=OperationEconomics(),
         )

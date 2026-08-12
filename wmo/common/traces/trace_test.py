@@ -30,6 +30,7 @@ def _trace() -> Trace:
                     provider="openai",
                     model_id="gpt-5.4",
                     capabilities_sha256=_DIGEST,
+                    connection_sha256=_DIGEST,
                 ),
             ),
         ),

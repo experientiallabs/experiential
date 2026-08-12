@@ -111,6 +111,44 @@ def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
     assert snapshot.capabilities_sha256 == sha256_json(capabilities)
 
 
+def test_snapshot_connection_digest_is_normalized_and_endpoint_specific() -> None:
+    """Resolved identity changes for another endpoint but excludes credential metadata."""
+    first = RuntimeModelCatalog(
+        _catalog(base_url="HTTPS://Models.Example.test:443/v1/"),
+        environment={},
+        transport_factory=_UnusedTransport,
+    )
+    equivalent = RuntimeModelCatalog(
+        _catalog(base_url="https://models.example.test/v1"),
+        environment={},
+        transport_factory=_UnusedTransport,
+    )
+    distinct = RuntimeModelCatalog(
+        _catalog(base_url="https://models.example.test/v2"),
+        environment={},
+        transport_factory=_UnusedTransport,
+    )
+
+    first_snapshot, _ = first.snapshot("fixture-model")
+    equivalent_snapshot, _ = equivalent.snapshot("fixture-model")
+    distinct_snapshot, _ = distinct.snapshot("fixture-model")
+
+    assert first_snapshot == equivalent_snapshot
+    assert first_snapshot.connection_sha256 != distinct_snapshot.connection_sha256
+    assert first_snapshot != distinct_snapshot
+    assert (
+        first_snapshot.connection_sha256
+        == ConnectionConfig(
+            provider="openai",
+            base_url="https://models.example.test/v1",
+            api_key_env="ANOTHER_API_KEY",
+        ).identity_sha256()
+    )
+    serialized = first_snapshot.model_dump_json()
+    assert "models.example.test" not in serialized
+    assert "FIXTURE_API_KEY" not in serialized
+
+
 def test_preflight_rejects_capability_before_reading_missing_credentials() -> None:
     """A known unsupported requirement fails locally and cannot trigger a paid request."""
     catalog = RuntimeModelCatalog(

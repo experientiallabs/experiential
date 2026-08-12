@@ -123,6 +123,7 @@ class RuntimeModelCatalog:
                 model_id=record.model,
                 revision=record.revision,
                 capabilities_sha256=sha256_json(capabilities),
+                connection_sha256=connection.identity_sha256(),
             ),
             capabilities,
         )

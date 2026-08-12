@@ -83,6 +83,7 @@ def _snapshot(provider: str, model_id: str) -> ModelSnapshot:
         model_id=model_id,
         revision="fixture-revision",
         capabilities_sha256="a" * 64,
+        connection_sha256="a" * 64,
     )
 
 

@@ -30,6 +30,7 @@ def _snapshot() -> ModelSnapshot:
         model_id="gpt-5.4",
         revision="2026-08-11",
         capabilities_sha256=_CAPABILITIES_DIGEST,
+        connection_sha256=_CAPABILITIES_DIGEST,
     )
 
 
