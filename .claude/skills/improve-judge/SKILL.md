@@ -39,11 +39,11 @@ PY
 (an operator-local driver script does the same thing — use one if
 it's still around, but don't depend on it.)
 
-If the concern came from real eval runs, ALSO pull disagreements from the wild: read per-step
-scorecards from a recent `wmo eval` result (`.wmo/evals/**.json` carries `predicted`, `actual`,
-`score`, `dimensions`, `critique` per step), sample ~20 steps across the score range, and ask of
-each: "do I agree with this verdict?" Every disagreement becomes a labeled case (see step 5 of
-the playbook for band-writing rules). The dataset must grow from real data, not toy strings.
+If the concern came from a composed router workflow, also pull disagreements from the wild. Read
+the caller-persisted judgments produced by its approved setup and judge, sample about 20 cells
+across the score range, and ask of each: "do I agree with this verdict?" Every disagreement
+becomes a labeled case (see step 5 of the playbook for band-writing rules). The dataset must grow
+from real data, not toy strings.
 
 ## 2 — Identify the false positives and negatives
 

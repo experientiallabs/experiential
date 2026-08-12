@@ -1,8 +1,8 @@
 # Agent guide — world-model-optimizer
 
-WMO couples three first-class capabilities: a worker-agent runtime, world models learned from
-agent traces, and an optimizer that improves the worker's harness against those models. All
-importable code lives under `wmo/`; benchmark data arrives as a dependency (see rule 6).
+WMO builds immutable task evidence from agent traces, composes and fits frozen model routers,
+runs those routers on loopback, and executes bounded SFT from persisted datasets. All importable
+code lives under `wmo/`; benchmark data arrives as a dependency (see rule 6).
 
 ## Toolchain
 
@@ -46,65 +46,51 @@ them. An active oversized file changed after the frozen W1 baseline must reach 9
 and be tombstoned in that same pull request. The active size inventory is temporary migration
 state, not a permanent exemption, and must be empty by the final release audit.
 
-## World models and trace lifecycle
+## Evidence, simulation, and routing lifecycle
 
-- World-model code lives under `wmo/simulation/`: context collection, trace ingestion, the model
-  implementation, retrieval, scenario construction, evaluation, serving, and artifact download.
-  Keep these responsibilities nested here instead of returning domain packages to `wmo/`.
-- `wmo build --file <traces> --name <model>` is the canonical trace-to-model path. Route every
-  corpus through the registered `TraceAdapter` seam rather than adding parallel ingest or build
-  flows.
+- `wmo/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
+  current engines, orchestration, artifact construction, comparisons, and bundle download. Keep
+  those responsibilities nested instead of returning production modules to flat `wmo/` paths.
+- `wmo build TRACE_FILE --source otlp|posthog --project PROJECT --root ROOT` is the only CLI path
+  from local traces to immutable task evidence. It accepts 100 through 1000 normalized traces,
+  writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, and makes no
+  model, provider, or judge calls. Route each corpus through the registered `TraceAdapter` seam.
 - New trace sources belong in `wmo/simulation/ingest/`, normalize into the `Trace` and `Step`
   contracts in `wmo/common/core/types.py`, support file ingestion, and register from
   `wmo/simulation/ingest/__init__.py`.
-- Preserve the build's data boundary: deterministic train, validation, and test splits; a
-  full-corpus serving index; train-only prompt optimization and knowledge extraction; untouched
-  test data for final evaluation.
-- `--fidelity low|medium|high|max` controls measured search effort. Persist searched runtime
-  winners in `auto_fidelity.json` and activate them only through runtime `--max-fidelity`.
-- Keep evaluation protocols distinct. Open-loop eval is teacher-forced observation
-  reconstruction; closed-loop eval is agent task success against the simulation. Eval retrieval
-  uses `DemoRetriever`, and closed-loop runs stay frozen or use `enrich=False` so predictions
-  cannot become later demonstrations.
-- Knowledge is editable markdown seeded from training traces only. Automated serving writes may
-  touch only `learned.md` and `grounded.md`; seeded rules, entities, schemas, and human edits stay
-  intact.
-- `wmo scenarios build` must retain representative clustering, source back-agreement, normalized
-  weights, provenance, and coverage. `wmo serve`, the Python API, and CLI execution must expose
-  consistent stateful `WorldModel` session, step, score, usage, and knowledge behavior. Prefer
-  shared implementation where it prevents drift; separate adapters are acceptable when their
-  boundary is explicit and covered by tests.
+- Python applications use `wmo.compose_router` to complete review, plan-bound simulation,
+  judgment, fitting, held-out verification, reporting, and runtime loading. Callers inject the
+  approved review and setup suppliers, simulator factory, judge, runtime catalog, and finite
+  simulation-dollar and judgment-call ceilings. Preserve its phase boundary: held-out evidence
+  opens only after fit evidence, approval, policy locking, and remaining-budget checks pass.
+- `wmo optimize router PROJECT --config FILE --root ROOT` consumes only explicit completed
+  evidence. It verifies the plan and rollout membership, fits and locks the router, opens held-out
+  evidence, and writes the report without a model, simulator, judge, provider, or network client.
+- `wmo run PROJECT --root ROOT --port PORT` loads one frozen policy and exposes only the
+  development loopback adapter. Each request supplies `X-WMO-Episode-ID`; the first decision is
+  sticky for that episode, request-time embedding failure uses the frozen conservative baseline,
+  and neither path mutates policy or evidence.
 
 ## Worker-agent execution
 
-- Agent execution code lives under `wmo/runtime/`: built-in agents, the generic episode contract,
-  harness documents and execution, hosted platform transport, run transport, and real-agent
-  evaluation adapters. Optimization may depend on this package; runtime code must not depend on
-  optimization algorithms.
-- Keep `wmo run` as the primary supported execution surface. Bare runs use the built-in local pi
-  harness; platform world-model ids resolve to hosted sessions. Agent ids must fail clearly until
-  the platform exposes a hosted agent-session API again. Add another public entry point only for a
-  distinct user need, with consistent lifecycle and safety behavior.
-- `wmo providers set` owns the project-local worker model in `.wmo/settings.toml`. Local runs and
-  builds use that role unless explicit flags override it; credentials remain in the environment
-  or gitignored `.env`, never in settings.
-- Only bare runs execute harness code and bash on the user's machine. Preserve the explicit local
-  execution consent boundary and the `--dir` file-tool jail.
-- Do not reintroduce hosted-agent CLI flags against endpoints that do not exist. If hosted agent
-  sessions return, keep worker LLM calls, provider secrets, and world-model state host-side, and
-  require no local model or E2B credentials for that path.
-- For optimizer and eval E2B runs, sandbox the real pi process while the environment remains the
-  world-model simulation. Reuse warm sandboxes within score waves, isolate concurrent cells,
-  meter sandbox lifetime, retry uncertain transport only in a fresh sandbox, and fail closed when
-  cleanup cannot be proved.
+- Agent execution code lives under `wmo/runtime/`: agents, environments, harness documents and
+  execution, model clients, router runtime, and Harbor adapters. Runtime must not import
+  simulation or optimization algorithms.
+- Harness execution preserves the explicit local-execution consent boundary and file-tool jail.
+  E2B execution reuses warm sandboxes only within one score wave, isolates concurrent cells,
+  meters lifetime, retries uncertain transport in a fresh sandbox, and fails closed when cleanup
+  cannot be proved.
+- The root CLI is locked to `build`, `optimize`, `run`, and `config`. The optimize group is locked
+  to `router` and `model`; the config group is locked to `telemetry`. Do not restore removed root
+  commands, aliases, hosted-session flags, or separate fit and report commands.
 
 ## Optimization surfaces
 
-- Harness-search optimization (`wmo optimize harness`, world-model delta search, the harbor
-  population search, live agent sessions) moved to the private `agent-optimization` repo
-  (2026-08-03). `wmo/runtime/harness/` holds the episode runtime, `HarnessDoc`, scoring, the store,
-  and sandbox plumbing used by closed-loop evaluation. Do not grow search or
-  mutation machinery back into this repository or place runtime code under `wmo/optimize/`.
+- `wmo/optimize/router/` owns provider-free offline fit, policy locking, held-out reporting, and
+  their immutable artifacts. Online selection belongs to `wmo/runtime/router/`; customer workflow
+  composition belongs to `wmo/workflow/router.py`. Keep those three boundaries explicit.
+- Harness-search and mutation machinery lives outside this repository. Do not grow it back into
+  `wmo/optimize/` or place runtime code under optimization.
 - `wmo optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
   It never builds a dataset, creates teacher rollouts, changes routing roles, or launches a
   simulator. The config freezes the W12 manifest, native Tinker base-model snapshot, capability
@@ -143,22 +129,21 @@ state, not a permanent exemption, and must be empty by the final release audit.
    in scope or prevent meaningful validation.
 
 2. **Tests live inline next to the code.** A module `foo.py` is tested by `foo_test.py` in the same
-   directory (e.g. `wmo/simulation/model/world_model.py` maps to
-   `wmo/simulation/model/world_model_test.py`). There is no top-level `tests/` directory. Pytest is
-   configured (`python_files = ["*_test.py"]`) to discover these.
+   directory (for example, `wmo/workflow/router.py` maps to `wmo/workflow/router_test.py`). There
+   is no top-level `tests/` directory. Pytest is configured (`python_files = ["*_test.py"]`) to
+   discover these.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
    JSON use pydantic's `JsonValue` (see `wmo/common/core/types.py:JsonObject`), not `Any`.
 
 4. **Keep the structure coherent and the command surface intentional.** Agent execution is nested
-   under `wmo/runtime/`; world-model construction and execution are nested under
-   `wmo/simulation/`; routing, model optimization, and research harnesses are nested under
-   `wmo/optimize/`; shared contracts, config, providers, observability, and vendored utilities are
-   nested under `wmo/common/`. Common code must not import a product domain, and runtime code must
-   not import simulation or optimization. Add a CLI command when it represents a clear user
-   workflow; avoid unrelated command sprawl and hiding useful behavior behind internal APIs. Do
-   not return domain packages or production modules to the flat `wmo/` namespace.
+   under `wmo/runtime/`; evidence construction, simulation, and orchestration are nested under
+   `wmo/simulation/`; offline router fitting and SFT are nested under `wmo/optimize/`; public
+   workflow composition is under `wmo/workflow/`; shared contracts, config, providers,
+   observability, and vendored utilities are under `wmo/common/`. Common code must not import a
+   product domain, and runtime code must not import simulation or optimization. Keep the locked
+   CLI small and do not return production modules to the flat `wmo/` namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
    `docs/`, `assets/`, `web/`, `.claude/`, `.github/`. That list is closed.
@@ -189,9 +174,9 @@ state, not a permanent exemption, and must be empty by the final release audit.
      references and retaining durable evidence.
      Reproduction lives in the report itself, quoted as public `wmo` API/CLI plus the exact
      parameter pins.
-     Everything "generated" stays out of git: eval results under the local `.wmo/evals/`
-     artifact root, built models under `.wmo/models/`, and the benchmark data bundles
-     `wmo download` fetches. Never commit local settings files (`settings.toml` anywhere).
+     Everything generated stays out of git: project evidence and model artifacts under the local
+     `.wmo/` root, distribution archives under ignored `dist/`, and downloaded benchmark bundles.
+     Never commit local settings files (`settings.toml` anywhere).
    - `wmo/` is the flagship package and the only importable code. Domain subpackages own their
      area under the rule 4 hierarchy. `wmo/common/vendor/` holds self-contained building blocks
      with no import back into WMO product domains, including the waterfall chain and its MIT
@@ -226,28 +211,28 @@ state, not a permanent exemption, and must be empty by the final release audit.
    feature, write the call site first — the Python snippet or CLI invocation an outside developer
    would type — and judge it: is it obvious, minimal, and hard to misuse? Public surfaces (the
    `wmo` Python API, CLI commands, pydantic models) stay small, composable, and explicitly typed.
-   Extend via the existing seam for that concern (a new `TraceAdapter`, provider, retriever, eval
-   scorer) when that seam matches the new behavior. If it does not, introduce a focused abstraction
+   Extend via the existing seam for that concern (a new `TraceAdapter`, simulator, provider, or
+   router catalog) when that seam matches the new behavior. If it does not, introduce a focused abstraction
    and document why; do not force distinct semantics through an ill-fitting seam or accumulate
    special-case flags. Error messages are part of the interface: a failure a user can hit must say
    what went wrong *and* what to do about it.
 
-10. **Tests and evals protect behavior.** Add regression coverage for new harness behavior and
-    world-model changes. When practical, start with a failing test or eval. Bug fixes should capture
-    the repro before the fix; when that is unsafe or cannot be isolated, explain why and add the
-    strongest targeted regression check available. Treat failures as a coevolution loop: a failing
-    test means the test or the implementation may be wrong. If a test encodes an outdated
-    expectation, update or remove it with a stated reason. Never weaken a test merely to get green.
+10. **Tests protect behavior.** Add regression coverage for evidence, simulation, runtime, router,
+    and SFT changes. When practical, start with a failing test. Bug fixes should capture the repro
+    before the fix; when that is unsafe or cannot be isolated, explain why and add the strongest
+    targeted regression check available. Treat failures as a coevolution loop: a failing test
+    means the test or implementation may be wrong. If a test encodes an outdated expectation,
+    update or remove it with a stated reason. Never weaken a test merely to get green.
 
 11. **Verify end-to-end before claiming done.** Unit tests passing is necessary, not sufficient.
     For anything with a runtime surface, actually drive it — run the CLI command, hit the served
     endpoint, render the figure — and confirm the observed behavior, not just the exit code.
 
 12. **Improve automated components by inspecting their actual outputs.** Anything automated — an
-    LLM judge, a retriever, an optimizer, a scorer — is tuned against real data, not intuition.
+    LLM judge, a simulator, an optimizer, or a scorer — is tuned against real data, not intuition.
     Pull a sample of its actual inputs and outputs, read them, ask "do I agree with what it did
     here?", and tweak based on the disagreements. A judge prompt is validated by reading its
-    scores on real predictions; a retriever by reading what it retrieved. Never declare an
+    scores on real predictions; a simulator by reading its trajectories. Never declare an
     automated component improved without looking at concrete before/after examples.
 
 13. **Run `/ready-for-merge` before every PR merge.** No PR is merged until the
@@ -263,9 +248,8 @@ state, not a permanent exemption, and must be empty by the final release audit.
     - Ink (text/titles): `#0a0a0a` · Grid/hairlines: `#ececec` · Background: white
     - Accents, in order of use: `#0070f3` (primary blue), `#7928ca` purple, `#f5a623` amber,
       `#ee0000` red, `#50e3c2` teal
-    The published figures under `docs/` (e.g. `docs/research/figures/trace_scaling_law.png`) are the visual
-    reference. The palette above is the contract; the script that renders any given figure is
-    not, and does not belong in the repo (rule 5).
+    The palette above is the contract. Rendering scripts for one-off visuals do not belong in the
+    repository (rule 5).
 
 ## One package
 
