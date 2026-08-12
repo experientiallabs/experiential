@@ -45,6 +45,7 @@ _DETERMINISTIC_EVENT_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _WMO_PI_PROVIDER = "wmo-injected"
 _WMO_PI_MODEL = "wmo-injected-model"
 _DEFAULT_TIMEOUT_SECONDS = 300.0
+_UNIX_MILLISECOND_MAGNITUDE = 100_000_000_000
 
 
 class PiRuntimePreflightError(RuntimeError):
@@ -877,10 +878,11 @@ def _event_timestamp(
 ) -> datetime:
     """Return an ordered event timestamp without manufacturing wall-clock provenance.
 
-    A supplied timezone-aware Pi timestamp or finite Unix-millisecond value is used unless it
-    would move ordering backwards. A missing timestamp becomes the Unix epoch plus its one-based
-    JSONL line number in microseconds. That explicit synthetic policy keeps all-missing
-    transcripts deterministic and source-ordered.
+    A supplied timezone-aware Pi timestamp or finite Unix-seconds or Unix-milliseconds value is
+    used unless it would move ordering backwards. Numeric values with at least the magnitude of a
+    plausible modern millisecond timestamp use milliseconds; smaller values use seconds. A
+    missing timestamp becomes the Unix epoch plus its one-based JSONL line number in microseconds.
+    That explicit synthetic policy keeps all-missing transcripts deterministic and source-ordered.
     """
     raw_timestamp = event.get("timestamp")
     if raw_timestamp is None:
@@ -888,8 +890,9 @@ def _event_timestamp(
     elif isinstance(raw_timestamp, (int, float)) and not isinstance(raw_timestamp, bool):
         if isinstance(raw_timestamp, float) and not math.isfinite(raw_timestamp):
             raise PiTranscriptError(f"Pi JSON event line {line_number} has an invalid timestamp")
+        unit = "milliseconds" if abs(raw_timestamp) >= _UNIX_MILLISECOND_MAGNITUDE else "seconds"
         try:
-            timestamp = _DETERMINISTIC_EVENT_EPOCH + timedelta(milliseconds=raw_timestamp)
+            timestamp = _DETERMINISTIC_EVENT_EPOCH + timedelta(**{unit: raw_timestamp})
         except OverflowError as exc:
             raise PiTranscriptError(
                 f"Pi JSON event line {line_number} has an invalid timestamp"

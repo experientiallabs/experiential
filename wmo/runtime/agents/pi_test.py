@@ -119,6 +119,29 @@ def test_installed_pi_parses_a_0731_numeric_millisecond_timestamp(tmp_path: Path
     assert episode.events[0].ended_at == expected_timestamp
 
 
+def test_pi_distinguishes_numeric_second_timestamps_from_milliseconds() -> None:
+    """Unix seconds keep their wall-clock value instead of collapsing near the epoch."""
+    episode = _episode_from_pi_events(
+        _pi_events(
+            [
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "timestamp": 1_733_234_567.89,
+                        "content": [{"type": "text", "text": "Complete."}],
+                    },
+                },
+                {"type": "agent_end"},
+            ]
+        )
+    )
+
+    expected_timestamp = datetime(2024, 12, 3, 14, 2, 47, 890000, tzinfo=UTC)
+    assert episode.events[0].started_at == expected_timestamp
+    assert episode.events[0].ended_at == expected_timestamp
+
+
 def test_pi_rejects_an_absurd_numeric_millisecond_timestamp() -> None:
     """Unrepresentable integer timestamps are transcript errors, not leaked overflows."""
     with pytest.raises(PiTranscriptError, match="invalid timestamp"):
