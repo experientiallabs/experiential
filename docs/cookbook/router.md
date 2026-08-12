@@ -22,8 +22,10 @@ The CLI keeps provider consent out of `build`, so its next input remains a revie
 evidence config. Python applications can use `wmo.compose_router` for actual WMO composition. They
 inject an approved-review supplier, reviewed setup supplier, plan-bound simulator factory, judge,
 runtime catalog, finite simulation-dollar ceiling, and finite judgment-call ceiling. WMO creates
-the plan and simulation spec, runs missing cells, persists judgments, approves fidelity, fits,
-opens held-out only after lock, reports, and returns `RouterRuntime`.
+the plan and phase-scoped simulation specs, runs only fidelity and fit cells, persists judgments
+and an immutable approval receipt, fits and verifies the policy lock, then opens held-out cells,
+reports, and returns `RouterRuntime`. A complete replay reuses those verified artifacts without
+calling the simulator, judge, approval callback, or fit workflow again.
 
 The setup supplier provides the application-owned facts WMO cannot invent: approved rubric and
 calibration, candidate snapshots, reviewed production overlap rollouts, exact protocols, frozen

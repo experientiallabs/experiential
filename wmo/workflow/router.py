@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,25 +12,51 @@ from typing import Literal, Protocol
 
 from pydantic import Field, field_validator
 
-from wmo.common.core.artifacts import ArtifactId, ContractModel, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactId,
+    ArtifactInput,
+    ContractModel,
+    Sha256,
+    sha256_json,
+    stable_id,
+)
 from wmo.common.evaluations import (
+    EvaluationCell,
     EvaluationCellEvidence,
     EvaluationPlan,
     EvaluationProtocol,
+    FidelityReport,
     ObservedProductionCell,
     build_evaluation_plan,
     build_fidelity_report,
     default_fidelity_thresholds,
     persist_fidelity_thresholds,
 )
-from wmo.common.evaluations.evidence import read_judgment, read_rollout
+from wmo.common.evaluations.evidence import (
+    read_evaluation_plan,
+    read_fidelity_gate,
+    read_fidelity_report,
+    read_judgment,
+    read_rollout,
+)
+from wmo.common.evaluations.planning import plan_bound_fidelity_gate_id
 from wmo.common.judging import Judge, Judgment
 from wmo.common.models import RoutedCandidateSnapshot
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
-from wmo.common.rollouts import SimulationMode
-from wmo.common.routing import KnnGuard
-from wmo.optimize.router import EvaluationInputs, RouterOptimizationConfig, RouterWorkflowResult
-from wmo.optimize.router.workflow import optimize_router
+from wmo.common.rollouts import SimulationArtifactSet, SimulationMode
+from wmo.common.routing import KnnGuard, KnnRouterPolicy
+from wmo.common.routing.bank import KnnBankManifest
+from wmo.optimize.router import (
+    EvaluationInputs,
+    RouterFitConfig,
+    RouterFitWorkflowResult,
+    RouterReportConfig,
+    RouterWorkflowResult,
+    fit_router,
+    report_router,
+)
+from wmo.optimize.router.spec import RouterFitResult
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime
 from wmo.runtime.router.application import load_project_router
@@ -37,7 +64,7 @@ from wmo.simulation.build import ProjectBuild, build_project
 from wmo.simulation.ingest.otlp import TraceNormalizationResult, load_otlp_file
 from wmo.simulation.ingest.posthog import load_posthog_file
 from wmo.simulation.orchestration import Simulator
-from wmo.simulation.specs import SimulationSpec, WorldModelSettings
+from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
 
 
 class RouterCompositionError(ValueError):
@@ -146,8 +173,40 @@ class FidelityApproval(Protocol):
         plan: EvaluationPlan,
         evidence: tuple[EvaluationCellEvidence, ...],
         budget: RouterCompositionBudget,
-    ) -> datetime:
-        """Return the explicit timezone-aware approval time for reviewed fidelity evidence."""
+    ) -> FidelityApprovalDecision:
+        """Return explicit approval actor, evidence, and time for reviewed fidelity evidence."""
+
+
+class FidelityApprovalDecision(ContractModel):
+    """Non-secret actor evidence returned by one explicit fidelity approval callback."""
+
+    actor_id: str = Field(min_length=1, max_length=256)
+    evidence: str = Field(min_length=1, max_length=2_000)
+    approved_at: datetime
+
+
+class FidelityApprovalReceipt(ArtifactEnvelope):
+    """Immutable exact plan, gate, report, actor, and approval-evidence binding."""
+
+    approval_id: ArtifactId
+    plan: ArtifactInput
+    gate: ArtifactInput
+    report: ArtifactInput
+    protocol_sha256: Sha256
+    actor_id: str = Field(min_length=1, max_length=256)
+    evidence: str = Field(min_length=1, max_length=2_000)
+    approved_at: datetime
+
+
+class RouterPolicyLock(ArtifactEnvelope):
+    """Immutable proof that fit-only evaluation froze a verified bank and policy."""
+
+    lock_id: ArtifactId
+    plan: ArtifactInput
+    fit_evaluation: ArtifactInput
+    bank: ArtifactInput
+    policy: ArtifactInput
+    fit_config_sha256: Sha256
 
 
 @dataclass(frozen=True)
@@ -170,6 +229,9 @@ class RouterCompositionResult:
     review: ApprovedRouterReview
     plan: EvaluationPlan
     simulation_spec: SimulationSpec
+    held_out_simulation_spec: SimulationSpec
+    fidelity_approval_id: ArtifactId
+    policy_lock_id: ArtifactId
     fidelity_report_id: ArtifactId
     optimization: RouterWorkflowResult
     runtime: RouterRuntime
@@ -230,85 +292,56 @@ def compose_router(
         created_at=created_at,
         code_revision=code_revision,
     )
-    simulated_cells = tuple(
-        sorted(cell.cell_id for cell in plan.cells if cell.execution == "simulate")
-    )
     plan_input = artifact_input(project.artifacts.read(plan.plan_id).manifest)
     task_input = built.review.task_set
-    spec_binding = {
-        "plan": plan_input.model_dump(mode="json"),
-        "task_set": task_input.model_dump(mode="json"),
-        "cells": simulated_cells,
-        "settings": setup.world_model_settings.model_dump(mode="json"),
-        "agent_id": setup.agent_id,
-        "seed": setup.seed,
-        "maximum_steps": setup.maximum_steps,
-        "maximum_concurrency": setup.maximum_concurrency,
-        "maximum_cost_usd": budget.maximum_simulation_cost_usd,
-        "code_revision": code_revision,
-    }
-    spec = SimulationSpec(
-        schema_version=1,
-        created_at=created_at,
-        inputs=(plan_input, task_input),
-        code_revision=code_revision,
-        simulation_id=stable_id("simulation", spec_binding),
-        evaluation_plan_id=plan.plan_id,
-        cell_ids=simulated_cells,
-        agent_id=setup.agent_id,
-        mode=SimulationMode.WORLD_MODEL,
-        world_model=setup.world_model_settings,
-        seed=setup.seed,
-        maximum_steps=setup.maximum_steps,
-        maximum_concurrency=setup.maximum_concurrency,
-        maximum_cost_usd=budget.maximum_simulation_cost_usd,
-    )
-    _phase(phase_hook, "simulate")
-    artifact_set = services.simulator_factory(project, plan).run(spec)
-    evidence = _complete_cell_evidence(
-        project,
+    cells_by_id = {cell.cell_id: cell for cell in plan.cells}
+
+    _phase(phase_hook, "fidelity_fit_started")
+    phase_a_cells = tuple(cell for cell in plan.cells if cell.purpose in {"fit", "fidelity"})
+    spec = _simulation_spec(
         plan,
-        artifact_set.artifact_ids,
+        plan_input,
+        task_input,
+        setup,
+        budget,
+        created_at,
+        code_revision,
+        phase_a_cells,
+        phase="fidelity-fit",
+    )
+    phase_a_set = _run_or_load_simulation(project, plan, spec, services.simulator_factory)
+    phase_a_evidence, dispatched = _complete_cell_evidence(
+        project,
+        phase_a_cells,
+        phase_a_set.artifact_ids,
         setup,
         review,
         services.judge,
-        budget,
-        phase_hook,
+        budget.maximum_judgments,
     )
-    _phase(phase_hook, "fidelity")
-    approved_at = services.fidelity_approval(project, plan, evidence, budget)
-    fidelity = build_fidelity_report(
-        project.artifacts,
-        evaluation_plan_id=plan.plan_id,
-        protocol=setup.simulation_protocol,
-        cell_evidence=evidence,
-        created_at=created_at,
-        code_revision=code_revision,
-        approved_at=approved_at,
+    fidelity_evidence = tuple(
+        item for item in phase_a_evidence if cells_by_id[item.cell_id].purpose == "fidelity"
+    )
+    fidelity, approval = _approve_fidelity_once(
+        project,
+        plan,
+        setup.simulation_protocol,
+        phase_a_evidence,
+        fidelity_evidence,
+        services.fidelity_approval,
+        budget,
+        created_at,
+        code_revision,
     )
     approved_protocol = setup.simulation_protocol.model_copy(
         update={"fidelity_report_id": fidelity.fidelity_report_id}
     )
-    cells_by_id = {cell.cell_id: cell for cell in plan.cells}
-    fit_evidence = tuple(
-        item for item in evidence if cells_by_id[item.cell_id].purpose in {"fit", "fidelity"}
-    )
-    held_evidence = tuple(
-        item for item in evidence if cells_by_id[item.cell_id].purpose == "held_out"
-    )
-    config = RouterOptimizationConfig(
+    fit_config = RouterFitConfig(
         fit=EvaluationInputs(
             evaluation_plan_id=plan.plan_id,
-            rollout_set_ids=(artifact_set.artifact_set_id,),
+            rollout_set_ids=(phase_a_set.artifact_set_id,),
             protocols=(setup.production_protocol, approved_protocol),
-            cell_evidence=fit_evidence,
-            fidelity_report_ids=(fidelity.fidelity_report_id,),
-        ),
-        held_out=EvaluationInputs(
-            evaluation_plan_id=plan.plan_id,
-            rollout_set_ids=(artifact_set.artifact_set_id,),
-            protocols=(setup.production_protocol, approved_protocol),
-            cell_evidence=held_evidence,
+            cell_evidence=phase_a_evidence,
             fidelity_report_ids=(fidelity.fidelity_report_id,),
         ),
         embedding_set_id=setup.embedding_set_id,
@@ -319,9 +352,55 @@ def compose_router(
         created_at=created_at,
         code_revision=code_revision,
     )
-    _phase(phase_hook, "fit_then_heldout")
-    optimized = optimize_router(project.artifacts, config)
-    _phase(phase_hook, "runtime")
+    fit, policy_lock = _fit_and_lock_once(
+        project,
+        plan_input,
+        fit_config,
+        created_at,
+        code_revision,
+    )
+    _phase(phase_hook, "policy_locked")
+
+    _phase(phase_hook, "heldout_opened")
+    held_cells = tuple(cell for cell in plan.cells if cell.purpose == "held_out")
+    held_spec = _simulation_spec(
+        plan,
+        plan_input,
+        task_input,
+        setup,
+        budget,
+        created_at,
+        code_revision,
+        held_cells,
+        phase="heldout",
+    )
+    held_set = _run_or_load_simulation(project, plan, held_spec, services.simulator_factory)
+    held_evidence, _held_dispatched = _complete_cell_evidence(
+        project,
+        held_cells,
+        held_set.artifact_ids,
+        setup,
+        review,
+        services.judge,
+        budget.maximum_judgments - dispatched,
+    )
+    optimized = report_router(
+        project.artifacts,
+        fit,
+        RouterReportConfig(
+            held_out=EvaluationInputs(
+                evaluation_plan_id=plan.plan_id,
+                rollout_set_ids=(held_set.artifact_set_id,),
+                protocols=(setup.production_protocol, approved_protocol),
+                cell_evidence=held_evidence,
+                fidelity_report_ids=(fidelity.fidelity_report_id,),
+            ),
+            embedding_set_id=setup.embedding_set_id,
+            created_at=created_at,
+            code_revision=code_revision,
+        ),
+    )
+    _phase(phase_hook, "report_complete")
     runtime = load_project_router(
         project.paths.project_id,
         project.paths.root,
@@ -333,10 +412,270 @@ def compose_router(
         review=review,
         plan=plan,
         simulation_spec=spec,
+        held_out_simulation_spec=held_spec,
+        fidelity_approval_id=approval.approval_id,
+        policy_lock_id=policy_lock.lock_id,
         fidelity_report_id=fidelity.fidelity_report_id,
         optimization=optimized,
         runtime=runtime,
     )
+
+
+def _simulation_spec(
+    plan: EvaluationPlan,
+    plan_input: ArtifactInput,
+    task_input: ArtifactInput,
+    setup: RouterEvaluationSetup,
+    budget: RouterCompositionBudget,
+    created_at: datetime,
+    code_revision: str,
+    cells: tuple[EvaluationCell, ...],
+    *,
+    phase: Literal["fidelity-fit", "heldout"],
+) -> SimulationSpec:
+    """Create one phase-scoped sparse simulation spec without opening the other phase."""
+    cell_ids = tuple(
+        sorted(cell.cell_id for cell in cells if getattr(cell, "execution", None) == "simulate")
+    )
+    binding = {
+        "phase": phase,
+        "plan": plan_input.model_dump(mode="json"),
+        "task_set": task_input.model_dump(mode="json"),
+        "cells": cell_ids,
+        "settings": setup.world_model_settings.model_dump(mode="json"),
+        "agent_id": setup.agent_id,
+        "seed": setup.seed,
+        "maximum_steps": setup.maximum_steps,
+        "maximum_concurrency": setup.maximum_concurrency,
+        "maximum_cost_usd": budget.maximum_simulation_cost_usd,
+        "code_revision": code_revision,
+    }
+    return SimulationSpec(
+        schema_version=1,
+        created_at=created_at,
+        inputs=(plan_input, task_input),
+        code_revision=code_revision,
+        simulation_id=stable_id("simulation", binding),
+        evaluation_plan_id=plan.plan_id,
+        cell_ids=cell_ids,
+        agent_id=setup.agent_id,
+        mode=SimulationMode.WORLD_MODEL,
+        world_model=setup.world_model_settings,
+        seed=setup.seed,
+        maximum_steps=setup.maximum_steps,
+        maximum_concurrency=setup.maximum_concurrency,
+        maximum_cost_usd=budget.maximum_simulation_cost_usd,
+    )
+
+
+def _run_or_load_simulation(
+    project: ProjectStore,
+    plan: EvaluationPlan,
+    spec: SimulationSpec,
+    simulator_factory: SimulatorFactory,
+) -> SimulationArtifactSet:
+    """Load an exactly completed simulation set without invoking its simulator again."""
+    matches = []
+    for artifact_id in project.artifacts.list_ids():
+        stored = project.artifacts.read(artifact_id)
+        if stored.manifest.artifact_type != "simulation-artifact-set":
+            continue
+        artifact_set = SimulationArtifactSet.model_validate_json(
+            project.artifacts.read_bytes(artifact_id, "artifact-set.json")
+        )
+        if artifact_set.simulation_id != spec.simulation_id:
+            continue
+        index_payload = project.artifacts.read_bytes(artifact_id, artifact_set.artifacts_path)
+        if hashlib.sha256(index_payload).hexdigest() != artifact_set.artifacts_sha256:
+            raise RouterCompositionError("simulation artifact-set index digest has drifted")
+        rollouts = tuple(
+            read_rollout(project.artifacts, rollout_id)[0]
+            for rollout_id in artifact_set.artifact_ids
+        )
+        expected_digest = simulation_spec_digest(spec)
+        rollout_cell_ids = tuple(rollout.cell_id for rollout in rollouts)
+        if (
+            artifact_set.artifact_set_id != artifact_id
+            or any(cell_id is None for cell_id in rollout_cell_ids)
+            or tuple(sorted(cell_id for cell_id in rollout_cell_ids if cell_id is not None))
+            != spec.cell_ids
+            or any(
+                rollout.source_run_id != spec.simulation_id
+                or rollout.simulation_id != spec.simulation_id
+                or rollout.simulation_spec_sha256 != expected_digest
+                for rollout in rollouts
+            )
+        ):
+            raise RouterCompositionError(
+                "completed simulation artifact set differs from phase spec"
+            )
+        matches.append(artifact_set)
+    if len(matches) > 1:
+        raise RouterCompositionError("multiple completed artifact sets name one simulation phase")
+    if matches:
+        return matches[0]
+    return simulator_factory(project, plan).run(spec)
+
+
+def _approve_fidelity_once(
+    project: ProjectStore,
+    plan: EvaluationPlan,
+    protocol: EvaluationProtocol,
+    phase_a_evidence: tuple[EvaluationCellEvidence, ...],
+    fidelity_evidence: tuple[EvaluationCellEvidence, ...],
+    approval_service: FidelityApproval,
+    budget: RouterCompositionBudget,
+    created_at: datetime,
+    code_revision: str,
+) -> tuple[FidelityReport, FidelityApprovalReceipt]:
+    """Call approval exactly once, persist its exact receipt, and verify every replay."""
+    plan_value, plan_input = read_evaluation_plan(project.artifacts, plan.plan_id)
+    protocol_sha256 = _protocol_digest(protocol)
+    gate_id = plan_bound_fidelity_gate_id(plan_input.sha256, protocol_sha256)
+    _gate, gate_input = read_fidelity_gate(project.artifacts, gate_id)
+    approval_id = stable_id(
+        "fidelity-approval",
+        {
+            "plan": plan_input.model_dump(mode="json"),
+            "gate": gate_input.model_dump(mode="json"),
+            "protocol_sha256": protocol_sha256,
+        },
+    )
+    destination = project.artifacts.project_directory / "artifacts" / approval_id
+    if destination.exists():
+        if project.artifacts.read(approval_id).manifest.artifact_type != "fidelity-approval":
+            raise RouterCompositionError("fidelity approval identity has the wrong artifact type")
+        receipt = FidelityApprovalReceipt.model_validate_json(
+            project.artifacts.read_bytes(approval_id, "approval.json")
+        )
+        report, report_input = read_fidelity_report(project.artifacts, receipt.report.artifact_id)
+        if (
+            plan_value != plan
+            or receipt.plan != plan_input
+            or receipt.gate != gate_input
+            or receipt.report != report_input
+            or receipt.protocol_sha256 != protocol_sha256
+            or _sorted_artifact_inputs(*receipt.inputs)
+            != _sorted_artifact_inputs(plan_input, gate_input, report_input)
+        ):
+            raise RouterCompositionError("fidelity approval receipt binding has drifted")
+        replay = build_fidelity_report(
+            project.artifacts,
+            evaluation_plan_id=plan.plan_id,
+            protocol=protocol,
+            cell_evidence=phase_a_evidence,
+            created_at=created_at,
+            code_revision=code_revision,
+            approved_at=receipt.approved_at,
+        )
+        if replay != report:
+            raise RouterCompositionError("approved fidelity report differs from exact replay")
+        return report, receipt
+    decision = approval_service(project, plan, fidelity_evidence, budget)
+    report = build_fidelity_report(
+        project.artifacts,
+        evaluation_plan_id=plan.plan_id,
+        protocol=protocol,
+        cell_evidence=phase_a_evidence,
+        created_at=created_at,
+        code_revision=code_revision,
+        approved_at=decision.approved_at,
+    )
+    report_input = artifact_input(project.artifacts.read(report.fidelity_report_id).manifest)
+    receipt = FidelityApprovalReceipt(
+        schema_version=1,
+        created_at=created_at,
+        inputs=_sorted_artifact_inputs(plan_input, gate_input, report_input),
+        code_revision=code_revision,
+        approval_id=approval_id,
+        plan=plan_input,
+        gate=gate_input,
+        report=report_input,
+        protocol_sha256=protocol_sha256,
+        actor_id=decision.actor_id,
+        evidence=decision.evidence,
+        approved_at=decision.approved_at,
+    )
+    project.artifacts.write_json(
+        artifact_id=approval_id,
+        artifact_type="fidelity-approval",
+        envelope=receipt,
+        files={"approval.json": receipt},
+    )
+    return report, receipt
+
+
+def _fit_and_lock_once(
+    project: ProjectStore,
+    plan_input: ArtifactInput,
+    config: RouterFitConfig,
+    created_at: datetime,
+    code_revision: str,
+) -> tuple[RouterFitWorkflowResult, RouterPolicyLock]:
+    """Freeze fit once, persist an exact lock, and load it without refitting on replay."""
+    config_sha256 = sha256_json(config)
+    lock_id = stable_id(
+        "router-policy-lock",
+        {"plan": plan_input.model_dump(mode="json"), "fit_config_sha256": config_sha256},
+    )
+    destination = project.artifacts.project_directory / "artifacts" / lock_id
+    if destination.exists():
+        if project.artifacts.read(lock_id).manifest.artifact_type != "router-policy-lock":
+            raise RouterCompositionError("router policy lock identity has the wrong artifact type")
+        lock = RouterPolicyLock.model_validate_json(
+            project.artifacts.read_bytes(lock_id, "lock.json")
+        )
+        fit_input = artifact_input(project.artifacts.read(lock.fit_evaluation.artifact_id).manifest)
+        bank_input = artifact_input(project.artifacts.read(lock.bank.artifact_id).manifest)
+        policy_input = artifact_input(project.artifacts.read(lock.policy.artifact_id).manifest)
+        if (
+            lock.plan != plan_input
+            or lock.fit_config_sha256 != config_sha256
+            or (lock.fit_evaluation, lock.bank, lock.policy)
+            != (fit_input, bank_input, policy_input)
+            or _sorted_artifact_inputs(*lock.inputs)
+            != _sorted_artifact_inputs(plan_input, fit_input, bank_input, policy_input)
+        ):
+            raise RouterCompositionError("router policy lock binding has drifted")
+        policy = KnnRouterPolicy.model_validate_json(
+            project.artifacts.read_bytes(policy_input.artifact_id, "policy.json")
+        )
+        bank = KnnBankManifest.model_validate_json(
+            project.artifacts.read_bytes(bank_input.artifact_id, "bank.json")
+        )
+        if policy.bank_artifact_id != bank.bank_artifact_id:
+            raise RouterCompositionError("locked policy and bank identities differ")
+        return (
+            RouterFitWorkflowResult(
+                fit_evaluation_id=fit_input.artifact_id,
+                locked=RouterFitResult(policy=policy, bank=bank),
+            ),
+            lock,
+        )
+    fit = fit_router(project.artifacts, config)
+    fit_input = artifact_input(project.artifacts.read(fit.fit_evaluation_id).manifest)
+    bank_input = artifact_input(project.artifacts.read(fit.locked.bank.bank_artifact_id).manifest)
+    policy_input = artifact_input(project.artifacts.read(fit.locked.policy.policy_id).manifest)
+    inputs = _sorted_artifact_inputs(plan_input, fit_input, bank_input, policy_input)
+    lock = RouterPolicyLock(
+        schema_version=1,
+        created_at=created_at,
+        inputs=inputs,
+        code_revision=code_revision,
+        lock_id=lock_id,
+        plan=plan_input,
+        fit_evaluation=fit_input,
+        bank=bank_input,
+        policy=policy_input,
+        fit_config_sha256=config_sha256,
+    )
+    project.artifacts.write_json(
+        artifact_id=lock_id,
+        artifact_type="router-policy-lock",
+        envelope=lock,
+        files={"lock.json": lock},
+    )
+    return fit, lock
 
 
 def _preflight(
@@ -392,14 +731,13 @@ def _verify_setup(setup: RouterEvaluationSetup, review: ApprovedRouterReview) ->
 
 def _complete_cell_evidence(
     project: ProjectStore,
-    plan: EvaluationPlan,
+    cells: tuple[EvaluationCell, ...],
     simulated_rollout_ids: tuple[str, ...],
     setup: RouterEvaluationSetup,
     review: ApprovedRouterReview,
     judge: Judge,
-    budget: RouterCompositionBudget,
-    phase_hook: Callable[[str], None] | None,
-) -> tuple[EvaluationCellEvidence, ...]:
+    maximum_judgments: int,
+) -> tuple[tuple[EvaluationCellEvidence, ...], int]:
     """Verify rollout membership, resume judgments, and return evidence for every plan cell."""
     rollouts_by_cell = {}
     for rollout_id in simulated_rollout_ids:
@@ -413,8 +751,7 @@ def _complete_cell_evidence(
     }
     evidence = []
     dispatched = 0
-    _phase(phase_hook, "judge")
-    for cell in plan.cells:
+    for cell in cells:
         rollout_id = (
             cell.observed_rollout_id
             if cell.execution == "observed"
@@ -434,7 +771,7 @@ def _complete_cell_evidence(
         )
         judgment = _find_judgment(project, rollout_id, review)
         if judgment is None:
-            if dispatched >= budget.maximum_judgments:
+            if dispatched >= maximum_judgments:
                 raise RouterCompositionError("judgment dispatch budget exhausted")
             judgment = judge.judge_persisted(
                 project,
@@ -454,7 +791,7 @@ def _complete_cell_evidence(
                 source_run_id=rollout.source_run_id,
             )
         )
-    return tuple(evidence)
+    return tuple(evidence), dispatched
 
 
 def _find_judgment(
@@ -508,3 +845,9 @@ def _phase(hook: Callable[[str], None] | None, phase: str) -> None:
     """Emit one local ordering marker without changing workflow behavior."""
     if hook is not None:
         hook(phase)
+
+
+def _sorted_artifact_inputs(*values: object) -> tuple[ArtifactInput, ...]:
+    """Normalize Pydantic constructor unions to exact sorted artifact inputs."""
+    inputs = tuple(ArtifactInput.model_validate(value) for value in values)
+    return tuple(sorted(inputs, key=lambda item: item.artifact_id))

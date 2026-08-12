@@ -8,10 +8,15 @@ from wmo.optimize.router.spec import (
 )
 from wmo.optimize.router.workflow import (
     EvaluationInputs,
+    RouterFitConfig,
+    RouterFitWorkflowResult,
     RouterOptimizationConfig,
+    RouterReportConfig,
     RouterWorkflowError,
     RouterWorkflowResult,
+    fit_router,
     optimize_router,
+    report_router,
 )
 
 __all__ = [
@@ -21,8 +26,13 @@ __all__ = [
     "RouterOptimizationSpec",
     "RouterOptimizer",
     "EvaluationInputs",
+    "RouterFitConfig",
+    "RouterFitWorkflowResult",
     "RouterOptimizationConfig",
+    "RouterReportConfig",
     "RouterWorkflowError",
     "RouterWorkflowResult",
     "optimize_router",
+    "fit_router",
+    "report_router",
 ]

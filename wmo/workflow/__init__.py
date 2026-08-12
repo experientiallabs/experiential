@@ -2,6 +2,8 @@
 
 from wmo.workflow.router import (
     ApprovedRouterReview,
+    FidelityApprovalDecision,
+    FidelityApprovalReceipt,
     LocalTraceSource,
     RouterCompositionBudget,
     RouterCompositionResult,
@@ -12,6 +14,8 @@ from wmo.workflow.router import (
 
 __all__ = [
     "ApprovedRouterReview",
+    "FidelityApprovalDecision",
+    "FidelityApprovalReceipt",
     "LocalTraceSource",
     "RouterCompositionBudget",
     "RouterCompositionResult",

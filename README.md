@@ -114,9 +114,11 @@ print(response.decision.selected_alias, response.response.output)
 
 `compose_router` creates the plan and finite-cost `SimulationSpec`, executes the injected
 simulator, invokes the injected judge only for missing judgments, builds and explicitly approves
-fidelity, freezes fit artifacts, opens held-out evidence only after policy lock, reports, and
-returns the verified W11 `RouterRuntime`. Exact replay does not repeat completed simulation or
-judgment calls. Callable contracts and `RouterEvaluationSetup` fields live in
+fidelity, persists the plan-bound approval receipt, freezes fit artifacts and a policy lock, opens
+held-out evidence only after that lock verifies, reports, and returns the verified W11
+`RouterRuntime`. Exact replay verifies and reuses both phases without invoking the simulator,
+judge, approval callback, or fit workflow again. Callable contracts and `RouterEvaluationSetup`
+fields live in
 `wmo.workflow.router`.
 
 ## Telemetry

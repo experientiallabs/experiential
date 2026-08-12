@@ -9,7 +9,12 @@ from typing import cast
 import pytest
 
 from wmo.common.core.artifacts import stable_id
-from wmo.common.evaluations import EvaluationPlan, EvaluationProtocol, ObservedProductionCell
+from wmo.common.evaluations import (
+    EvaluationCellEvidence,
+    EvaluationPlan,
+    EvaluationProtocol,
+    ObservedProductionCell,
+)
 from wmo.common.evaluations.build_test import (
     _candidate,
     _persist_calibration,
@@ -26,6 +31,7 @@ from wmo.common.judging import (
 )
 from wmo.common.models import ModelClient, OperationEconomics
 from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
+from wmo.common.rollouts import SimulationArtifactSet
 from wmo.common.routing import KnnGuard
 from wmo.common.tasks import load_task_set
 from wmo.optimize.router.workflow_test import _persist_embeddings, _persist_pricing
@@ -41,9 +47,11 @@ from wmo.simulation.engines.text.simulator_test import (
     _ScriptedClient,
 )
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
-from wmo.simulation.specs import WorldModelSettings
+from wmo.simulation.orchestration import Simulator
+from wmo.simulation.specs import SimulationSpec, WorldModelSettings
 from wmo.workflow.router import (
     ApprovedRouterReview,
+    FidelityApprovalDecision,
     RouterCompositionBudget,
     RouterEvaluationSetup,
     RouterWorkflowServices,
@@ -77,9 +85,13 @@ class _ReviewSupplier:
                         dimension_id="dimension-a",
                         name="Task success",
                         description="Whether the task was completed.",
-                        anchors=tuple(
-                            ScoreAnchor(score=score, description=f"Score {score} outcome.")
-                            for score in range(6)
+                        anchors=(
+                            ScoreAnchor(score=0, description="Score 0 outcome."),
+                            ScoreAnchor(score=1, description="Score 1 outcome."),
+                            ScoreAnchor(score=2, description="Score 2 outcome."),
+                            ScoreAnchor(score=3, description="Score 3 outcome."),
+                            ScoreAnchor(score=4, description="Score 4 outcome."),
+                            ScoreAnchor(score=5, description="Score 5 outcome."),
                         ),
                     ),
                 ),
@@ -194,6 +206,7 @@ class _Judge:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.log: list[tuple[str, bool]] = []
 
     def judge_persisted(
         self,
@@ -204,6 +217,12 @@ class _Judge:
         calibration_artifact_id: str,
     ) -> Judgment:
         self.calls += 1
+        rollout_value = read_rollout(store.artifacts, rollout_artifact_id)[0]
+        locked = any(
+            store.artifacts.read(artifact_id).manifest.artifact_type == "router-policy-lock"
+            for artifact_id in store.artifacts.list_ids()
+        )
+        self.log.append((rollout_value.cell_id or "observed", locked))
         rollout = store.artifacts.read(rollout_artifact_id)
         rubric = store.artifacts.read(rubric_artifact_id)
         calibration = store.artifacts.read(calibration_artifact_id)
@@ -255,7 +274,7 @@ class _SimulatorFactory:
     """Bind the real text simulator to deterministic explicit fake model clients."""
 
     def __init__(self) -> None:
-        self.crash_once = True
+        self.log: list[tuple[tuple[str, ...], bool]] = []
         self.candidate = _ScriptedClient(
             [_response("Resolved.", snapshot=_snapshot("candidate-a"), cost=0.01)] * 80
         )
@@ -270,11 +289,8 @@ class _SimulatorFactory:
             * 80
         )
 
-    def __call__(self, project: ProjectStore, plan: EvaluationPlan) -> WorldModelSimulator:
-        if self.crash_once:
-            self.crash_once = False
-            raise RuntimeError("simulated crash after plan persistence")
-        return WorldModelSimulator(
+    def __call__(self, project: ProjectStore, plan: EvaluationPlan) -> Simulator:
+        simulator = WorldModelSimulator(
             store=project.artifacts,
             evaluation_plan=plan,
             evaluation_plan_input=artifact_input(project.artifacts.read(plan.plan_id).manifest),
@@ -289,9 +305,60 @@ class _SimulatorFactory:
             clock=lambda: _TIME,
             monotonic=lambda: 1.0,
         )
+        return _LoggingSimulator(project, simulator, self.log)
 
 
-def test_public_composition_runs_and_resumes_complete_frozen_router(tmp_path: Path) -> None:
+class _LoggingSimulator:
+    """Record phase cell IDs and lock state before delegating to the real simulator."""
+
+    def __init__(
+        self,
+        project: ProjectStore,
+        simulator: WorldModelSimulator,
+        log: list[tuple[tuple[str, ...], bool]],
+    ) -> None:
+        self.project = project
+        self.simulator = simulator
+        self.log = log
+
+    def run(self, spec: SimulationSpec) -> SimulationArtifactSet:
+        locked = any(
+            self.project.artifacts.read(artifact_id).manifest.artifact_type == "router-policy-lock"
+            for artifact_id in self.project.artifacts.list_ids()
+        )
+        self.log.append((spec.cell_ids, locked))
+        return self.simulator.run(spec)
+
+
+class _FidelityApproval:
+    """Assert the callback sees only fidelity cells and return auditable actor evidence."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(
+        self,
+        project: ProjectStore,
+        plan: EvaluationPlan,
+        evidence: tuple[EvaluationCellEvidence, ...],
+        budget: RouterCompositionBudget,
+    ) -> FidelityApprovalDecision:
+        del project, budget
+        self.calls += 1
+        cells = {cell.cell_id: cell for cell in plan.cells}
+        assert evidence
+        assert {cells[item.cell_id].purpose for item in evidence} == {"fidelity"}
+        return FidelityApprovalDecision(
+            actor_id="reviewer-fixture",
+            evidence="Reviewed all ten plan-bound fidelity pairs.",
+            approved_at=_TIME,
+        )
+
+
+def test_public_composition_runs_and_resumes_complete_frozen_router(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """One explicit workflow reaches sticky runtime without duplicate dispatch on resume."""
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
@@ -300,6 +367,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(tmp_path: Pa
     )
     simulator = _SimulatorFactory()
     judge = _Judge()
+    approval = _FidelityApproval()
     runtime_client = _Client()
     runtime_catalog = cast(
         RuntimeModelCatalog,
@@ -317,7 +385,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(tmp_path: Pa
         setup_supplier=_SetupSupplier(),
         simulator_factory=simulator,
         judge=judge,
-        fidelity_approval=lambda _project, _plan, _evidence, _budget: _TIME,
+        fidelity_approval=approval,
         runtime_catalog=runtime_catalog,
     )
     budget = RouterCompositionBudget(
@@ -325,7 +393,16 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(tmp_path: Pa
         maximum_judgments=100,
     )
 
-    with pytest.raises(RuntimeError, match="simulated crash"):
+    crash = True
+
+    def crash_after_lock(phase: str) -> None:
+        nonlocal crash
+        phases.append(phase)
+        if phase == "policy_locked" and crash:
+            crash = False
+            raise RuntimeError("simulated crash after policy lock")
+
+    with pytest.raises(RuntimeError, match="after policy lock"):
         compose_router(
             project,
             normalized,
@@ -333,7 +410,16 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(tmp_path: Pa
             budget=budget,
             created_at=_TIME,
             code_revision="test-revision",
+            phase_hook=crash_after_lock,
         )
+    assert approval.calls == 1
+    from wmo.workflow import router as workflow_module
+
+    monkeypatch.setattr(
+        workflow_module,
+        "fit_router",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("fit repeated")),
+    )
     first = compose_router(
         project,
         normalized,
@@ -341,9 +427,15 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(tmp_path: Pa
         budget=budget,
         created_at=_TIME,
         code_revision="test-revision",
-        phase_hook=phases.append,
+        phase_hook=crash_after_lock,
     )
-    dispatched = (len(simulator.candidate.requests), len(simulator.world.requests), judge.calls)
+    dispatched = (
+        len(simulator.log),
+        len(simulator.candidate.requests),
+        len(simulator.world.requests),
+        judge.calls,
+        approval.calls,
+    )
     second = compose_router(
         project,
         normalized,
@@ -355,11 +447,21 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(tmp_path: Pa
 
     assert second.optimization == first.optimization
     assert (
+        len(simulator.log),
         len(simulator.candidate.requests),
         len(simulator.world.requests),
         judge.calls,
+        approval.calls,
     ) == dispatched
-    assert phases.index("fit_then_heldout") < phases.index("runtime")
+    assert phases.index("fidelity_fit_started") < phases.index("policy_locked")
+    assert phases.index("policy_locked") < phases.index("heldout_opened")
+    assert phases.index("heldout_opened") < phases.index("report_complete")
+    purposes = {cell.cell_id: cell.purpose for cell in first.plan.cells}
+    assert all(
+        locked or all(purposes[cell_id] in {"fit", "fidelity"} for cell_id in cell_ids)
+        for cell_ids, locked in simulator.log
+    )
+    assert all(locked or purposes.get(cell_id) != "held_out" for cell_id, locked in judge.log)
     decision = first.runtime.select(_request(), episode_id="customer-episode")
     assert first.runtime.select(_request(), episode_id="customer-episode") == decision
     assert first.plan.cells

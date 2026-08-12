@@ -7,11 +7,18 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from wmo.optimize.router.workflow import EvaluationInputs as EvaluationInputs
+    from wmo.optimize.router.workflow import RouterFitConfig as RouterFitConfig
+    from wmo.optimize.router.workflow import (
+        RouterFitWorkflowResult as RouterFitWorkflowResult,
+    )
     from wmo.optimize.router.workflow import (
         RouterOptimizationConfig as RouterOptimizationConfig,
     )
+    from wmo.optimize.router.workflow import RouterReportConfig as RouterReportConfig
     from wmo.optimize.router.workflow import RouterWorkflowResult as RouterWorkflowResult
+    from wmo.optimize.router.workflow import fit_router as fit_router
     from wmo.optimize.router.workflow import optimize_router as optimize_router
+    from wmo.optimize.router.workflow import report_router as report_router
     from wmo.runtime.router.application import (
         create_project_router_app as create_project_router_app,
     )
@@ -25,6 +32,7 @@ if TYPE_CHECKING:
     from wmo.workflow.router import (
         ApprovedRouterReview as ApprovedRouterReview,
     )
+    from wmo.workflow.router import FidelityApprovalDecision as FidelityApprovalDecision
     from wmo.workflow.router import LocalTraceSource as LocalTraceSource
     from wmo.workflow.router import (
         RouterCompositionBudget as RouterCompositionBudget,
@@ -45,14 +53,20 @@ _EXPORT_MODULES = {
     "build_project": "wmo.simulation.build",
     "build_task_set": "wmo.simulation.build",
     "EvaluationInputs": "wmo.optimize.router.workflow",
+    "RouterFitConfig": "wmo.optimize.router.workflow",
+    "RouterFitWorkflowResult": "wmo.optimize.router.workflow",
     "RouterOptimizationConfig": "wmo.optimize.router.workflow",
+    "RouterReportConfig": "wmo.optimize.router.workflow",
     "RouterWorkflowResult": "wmo.optimize.router.workflow",
+    "fit_router": "wmo.optimize.router.workflow",
     "optimize_router": "wmo.optimize.router.workflow",
+    "report_router": "wmo.optimize.router.workflow",
     "RouterRuntime": "wmo.runtime.router.runtime",
     "create_project_router_app": "wmo.runtime.router.application",
     "load_project_router": "wmo.runtime.router.application",
     "ApprovedRouterReview": "wmo.workflow.router",
     "LocalTraceSource": "wmo.workflow.router",
+    "FidelityApprovalDecision": "wmo.workflow.router",
     "RouterCompositionBudget": "wmo.workflow.router",
     "RouterCompositionResult": "wmo.workflow.router",
     "RouterEvaluationSetup": "wmo.workflow.router",

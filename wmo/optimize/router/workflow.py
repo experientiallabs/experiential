@@ -23,7 +23,11 @@ from wmo.common.project import ArtifactStore, ArtifactStoreError
 from wmo.common.rollouts import SimulationArtifactSet
 from wmo.common.routing import FrozenEmbeddingClient, KnnGuard, load_frozen_embedding_set
 from wmo.optimize.router.optimizer import RouterOptimizer
-from wmo.optimize.router.spec import RouterOptimizationResult, RouterOptimizationSpec
+from wmo.optimize.router.spec import (
+    RouterFitResult,
+    RouterOptimizationResult,
+    RouterOptimizationSpec,
+)
 
 
 class RouterWorkflowError(ValueError):
@@ -60,6 +64,36 @@ class RouterOptimizationConfig(ContractModel):
         return self
 
 
+class RouterFitConfig(ContractModel):
+    """Fit-only configuration that contains no held-out evidence references."""
+
+    fit: EvaluationInputs
+    embedding_set_id: ArtifactId
+    incumbent_alias: ArtifactId | None = None
+    pricing_snapshot_id: ArtifactId
+    guard: KnnGuard
+    judgment_status: Literal["provisional", "human_calibrated"]
+    created_at: datetime
+    code_revision: str = Field(min_length=1, max_length=256)
+
+
+class RouterReportConfig(ContractModel):
+    """Post-lock held-out configuration for one already frozen policy."""
+
+    held_out: EvaluationInputs
+    embedding_set_id: ArtifactId
+    created_at: datetime
+    code_revision: str = Field(min_length=1, max_length=256)
+
+
+@dataclass(frozen=True)
+class RouterFitWorkflowResult:
+    """Fit evaluation and frozen W10 bank and policy."""
+
+    fit_evaluation_id: ArtifactId
+    locked: RouterFitResult
+
+
 @dataclass(frozen=True)
 class RouterWorkflowResult:
     """Customer-visible artifact identities from the completed offline workflow.
@@ -91,6 +125,33 @@ def optimize_router(
     Raises:
         RouterWorkflowError: Evidence, pricing, embedding, or split bindings are invalid.
     """
+    fit = fit_router(
+        store,
+        RouterFitConfig(
+            fit=config.fit,
+            embedding_set_id=config.embedding_set_id,
+            incumbent_alias=config.incumbent_alias,
+            pricing_snapshot_id=config.pricing_snapshot_id,
+            guard=config.guard,
+            judgment_status=config.judgment_status,
+            created_at=config.created_at,
+            code_revision=config.code_revision,
+        ),
+    )
+    return report_router(
+        store,
+        fit,
+        RouterReportConfig(
+            held_out=config.held_out,
+            embedding_set_id=config.embedding_set_id,
+            created_at=config.created_at,
+            code_revision=config.code_revision,
+        ),
+    )
+
+
+def fit_router(store: ArtifactStore, config: RouterFitConfig) -> RouterFitWorkflowResult:
+    """Materialize fit-only evaluation evidence and freeze the W10 bank and policy."""
     try:
         _verify_completed_inputs(store, config.fit, required_purpose="fit")
         pricing, pricing_sha256 = load_pricing_snapshot(store, config.pricing_snapshot_id)
@@ -128,11 +189,26 @@ def optimize_router(
             )
         )
 
-        # This boundary is deliberate. No held-out artifact is opened until fit returned a
-        # manifest-verified frozen policy and bank.
+    except RouterWorkflowError:
+        raise
+    except (ArtifactStoreError, KeyError, OSError, ValueError) as exc:
+        raise RouterWorkflowError(str(exc)) from exc
+    return RouterFitWorkflowResult(
+        fit_evaluation_id=fit_dataset.manifest.evaluation_id,
+        locked=locked,
+    )
+
+
+def report_router(
+    store: ArtifactStore,
+    fit: RouterFitWorkflowResult,
+    config: RouterReportConfig,
+) -> RouterWorkflowResult:
+    """Open held-out evidence after lock and report with the frozen W10 policy."""
+    try:
         _verify_completed_inputs(store, config.held_out, required_purpose="held_out")
         held_plan, held_plan_input = read_evaluation_plan(store, config.held_out.evaluation_plan_id)
-        reloaded_fit = load_evaluation_dataset(store, locked.policy.fit_evaluation_id)
+        reloaded_fit = load_evaluation_dataset(store, fit.locked.policy.fit_evaluation_id)
         if (
             reloaded_fit.manifest.evaluation_plan_id != held_plan.plan_id
             or reloaded_fit.manifest.evaluation_plan_sha256 != held_plan_input.sha256
@@ -151,8 +227,9 @@ def optimize_router(
             created_at=config.created_at,
             code_revision=config.code_revision,
         )
+        embeddings = load_frozen_embedding_set(store, config.embedding_set_id)
         result = RouterOptimizer(store, FrozenEmbeddingClient(embeddings)).report(
-            locked,
+            fit.locked,
             held_out_evaluation_id=held_out_dataset.manifest.evaluation_id,
             created_at=config.created_at,
             code_revision=config.code_revision,
@@ -162,7 +239,7 @@ def optimize_router(
     except (ArtifactStoreError, KeyError, OSError, ValueError) as exc:
         raise RouterWorkflowError(str(exc)) from exc
     return RouterWorkflowResult(
-        fit_evaluation_id=fit_dataset.manifest.evaluation_id,
+        fit_evaluation_id=fit.fit_evaluation_id,
         held_out_evaluation_id=held_out_dataset.manifest.evaluation_id,
         optimization=result,
     )
