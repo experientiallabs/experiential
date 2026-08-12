@@ -9,7 +9,6 @@ WMO_DIR = SIMULATION_DIR.parent
 def test_simulation_domains_are_nested() -> None:
     """World-model construction, serving, and evaluation stay under one package."""
     expected_dirs = {
-        "context",
         "evaluation",
         "ingest",
         "model",
