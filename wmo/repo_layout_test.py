@@ -1,11 +1,18 @@
-"""Executable form of AGENTS.md rules 2 and 5: test pairing, and the top level as an allowlist.
+"""Executable form of AGENTS.md rules 2, 4, and 5: the layout of this repo, in one file.
 
-Runs against `git ls-files` so it checks what is TRACKED, not what happens to be on disk.
-Skipped outside a git checkout (e.g. an installed sdist).
+Test pairing, the package tree and its import direction, and the top level as an allowlist. Most
+checks run against `git ls-files`, so they check what is TRACKED rather than what happens to be on
+disk, and are skipped outside a git checkout (e.g. an installed sdist).
+
+The per-package `package_layout_test.py` suites used to live one per domain. They are here now:
+five files asserted one property (the tree AGENTS.md rule 4 describes is the tree on disk), none of
+them paired with a module, and splitting them per package made each boundary BETWEEN two domains
+the property of whichever one happened to hold the assertion.
 """
 
 from __future__ import annotations
 
+import ast
 import functools
 import re
 import subprocess
@@ -15,6 +22,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+WMO_DIR = Path(__file__).resolve().parent
 
 # AGENTS.md rule 5: tracked top-level directories must be within this set, and the set is CLOSED.
 # An agent may never add to it. A new entry requires a human to name that exact directory and
@@ -68,11 +76,10 @@ def test_top_level_directories_are_allowlisted() -> None:
 UNTESTED_MODULE_NAMES = {"__init__.py", "__main__.py", "conftest.py"}
 
 # AGENTS.md rule 2: the CLOSED set of suites that cover something other than one sibling module,
-# each mapped to what it does cover. Two are patterned (a package's `api_test.py` covers its
-# `__init__.py` re-export surface, and `package_layout_test.py` covers a package's own boundary);
-# the rest are named outright. An agent may never extend this list: a new test file either sits
-# beside the module it covers, or it merges into the cross-cutting suite that already owns its
-# concern. Adding an entry requires a human to grant it for that exact path.
+# each mapped to what it does cover. One more is patterned rather than listed (a package's
+# `api_test.py` covers its `__init__.py` re-export surface). An agent may never extend this list: a
+# new test file either sits beside the module it covers, or it merges into the cross-cutting suite
+# that already owns its concern. Adding an entry requires a human to grant it for that exact path.
 CROSS_CUTTING_TESTS = {
     "wmo/repo_layout_test.py": "the repo layout itself: this file",
     "wmo/cli/startup_test.py": "the CLI's import graph: `wmo --help` must stay off heavy modules",
@@ -90,8 +97,9 @@ CROSS_CUTTING_TESTS = {
     ),
 }
 
-#: Suite names that pair with a package rather than a module, keyed by the file they cover.
-_PACKAGE_SUITES = {"api_test.py": "__init__.py", "package_layout_test.py": "__init__.py"}
+#: The one suite name that pairs with a package rather than a module: a package's `api_test.py`
+#: covers the `__init__.py` re-export surface, which is the package's public API.
+_PACKAGE_SUITES = {"api_test.py": "__init__.py"}
 
 
 def _tracked_python_files() -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -339,6 +347,132 @@ def test_top_level_files_are_allowlisted() -> None:
         f"top-level files {sorted(unexpected)} are not allowlisted; config belongs in "
         "pyproject.toml, tasks in the justfile, and everything else under an allowlisted dir"
     )
+
+
+#: AGENTS.md rule 4: the package tree, as one table. Every domain names the subpackages it owns, so
+#: a responsibility that quietly moves out of its domain (the `wmo/evals/harbor` and
+#: `wmo/optimize/harness` shapes this repo has already had and retired) fails here instead of in a
+#: reviewer's memory. A domain may grow a new subpackage without editing this table; only `wmo`
+#: itself is a closed set, because a package directly under it is a new product domain.
+PACKAGE_TREE = {
+    "wmo": {"cli", "common", "optimize", "runtime", "simulation"},
+    "wmo/common": {"config", "core", "observability", "providers", "vendor"},
+    "wmo/optimize": {"routing", "model", "research"},
+    "wmo/runtime": {"agents", "evaluation", "harness", "platform", "runs"},
+    "wmo/simulation": {
+        "context",
+        "evaluation",
+        "ingest",
+        "model",
+        "retrieval",
+        "scenarios",
+        "serving",
+    },
+}
+
+#: Modules that must stay at a domain's root: each is the domain's own contract, not a detail of
+#: one of its subpackages, so moving it down would hide the seam the domain is entered through.
+DOMAIN_ROOT_MODULES = {
+    "wmo/runtime": {"environment.py", "episode.py"},
+    "wmo/simulation": {"environment.py", "hub.py"},
+}
+
+
+def _subpackages(package: str) -> set[str]:
+    """The directory names directly under a package, ignoring bytecode caches."""
+    return {
+        path.name
+        for path in (REPO_ROOT / package).iterdir()
+        if path.is_dir() and path.name != "__pycache__"
+    }
+
+
+def test_every_domain_still_owns_the_subpackages_it_is_named_for() -> None:
+    """AGENTS.md rule 4: a responsibility never quietly leaves the domain that owns it."""
+    missing = {
+        package: sorted(expected - _subpackages(package))
+        for package, expected in PACKAGE_TREE.items()
+        if expected - _subpackages(package)
+    }
+    assert not missing, (
+        f"subpackages missing from the domain that owns them: {missing}; the tree in AGENTS.md "
+        "rule 4 changes with the rule 4 text, in the same change"
+    )
+
+
+def test_the_wmo_root_is_the_closed_set_of_product_domains() -> None:
+    """A directory directly under `wmo/` is a new product domain, so the set is closed (rule 4)."""
+    actual = _subpackages("wmo")
+    unexpected = actual - PACKAGE_TREE["wmo"]
+    assert not unexpected, (
+        f"new packages directly under wmo/: {sorted(unexpected)}; nest the work under the domain "
+        "that owns its concern (rule 4's four domains plus the CLI), and add a fifth domain only "
+        "with the rule 4 text in the same change"
+    )
+
+
+def test_each_domain_keeps_its_own_entry_modules_at_its_root() -> None:
+    """AGENTS.md rule 4: a domain's own contract stays at its root, not inside a subpackage."""
+    missing = {
+        package: sorted(name for name in expected if not (REPO_ROOT / package / name).is_file())
+        for package, expected in DOMAIN_ROOT_MODULES.items()
+    }
+    offenders = {package: names for package, names in missing.items() if names}
+    assert not offenders, f"domain entry modules missing from their package root: {offenders}"
+
+
+def test_no_production_module_sits_in_the_flat_wmo_namespace() -> None:
+    """AGENTS.md rule 4: `wmo/` holds the domains, not modules of its own.
+
+    Only the package shims live here: `__init__.py`, the `python -m` entry point, pytest wiring,
+    and this gate.
+    """
+    flat = sorted(
+        path.name
+        for path in WMO_DIR.glob("*.py")
+        if path.name not in UNTESTED_MODULE_NAMES and not path.name.endswith("_test.py")
+    )
+    assert not flat, (
+        f"production modules returned to the flat wmo namespace: {flat}; move each under the "
+        "domain that owns it (AGENTS.md rule 4)"
+    )
+
+
+def test_imports_point_inward_from_common_and_runtime() -> None:
+    """AGENTS.md rule 4: common is a leaf, and runtime does not know simulation or optimization.
+
+    This is the one rule the tree cannot show: the directories can be perfect while an import
+    inverts the dependency, and the cycle only surfaces later as an unimportable package.
+    """
+    violations = _banned_imports(
+        WMO_DIR / "common", {"wmo.cli", "wmo.optimize", "wmo.runtime", "wmo.simulation"}
+    ) + _banned_imports(WMO_DIR / "runtime", {"wmo.cli", "wmo.optimize", "wmo.simulation"})
+    assert not violations, (
+        f"imports point outward: {violations}; shared code belongs in wmo/common only if every "
+        "domain may depend on it, and runtime may not reach into simulation or optimization "
+        "(AGENTS.md rule 4)"
+    )
+
+
+def _banned_imports(root: Path, banned: set[str]) -> list[str]:
+    """Every `<path>:<line> imports <module>` under `root` that names a banned package."""
+    violations: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        if path.name == "conftest.py" or path.name.endswith("_test.py"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            modules: list[str] = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                modules = [node.module]
+            violations.extend(
+                f"{path.relative_to(WMO_DIR)}:{getattr(node, 'lineno', 0)} imports {module}"
+                for module in modules
+                if any(module == prefix or module.startswith(f"{prefix}.") for prefix in banned)
+            )
+    return violations
 
 
 def test_no_finder_duplicate_files_are_tracked() -> None:

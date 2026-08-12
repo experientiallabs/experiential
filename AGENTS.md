@@ -169,8 +169,10 @@ uv run pytest -q
      satisfies the gate and is strictly preferred to a suite full of tautologies.
 
    A handful of suites genuinely cover something other than one sibling module: a package's
-   `__init__.py` re-export surface (`api_test.py`), a package's own import boundary
-   (`package_layout_test.py`), the CLI's import graph (`wmo/cli/startup_test.py`), a contract held
+   `__init__.py` re-export surface (`api_test.py`), the layout and import direction of the whole
+   repo (`wmo/repo_layout_test.py`, the executable form of rules 2, 4, and 5, and the one home for
+   every structural assertion: the per-package `package_layout_test.py` files were folded into it,
+   so do not add another), the CLI's import graph (`wmo/cli/startup_test.py`), a contract held
    identically across every backend (`wmo/common/providers/streaming_test.py`), the vendored
    waterfall importing with no SDKs installed
    (`wmo/common/vendor/waterfall/import_hygiene_test.py`), a live end-to-end path
