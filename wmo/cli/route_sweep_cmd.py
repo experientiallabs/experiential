@@ -154,9 +154,10 @@ def sweep(
     Nothing measured is lost, and nothing measured is bought twice. Every cell lands in
     `<out>.partial.jsonl` the moment it completes, so a sweep killed at hour five keeps the cells
     it paid for; re-running the same command measures only what is missing and then writes the
-    matrix and removes the sidecar. Changing what the sweep measures (the pool, the scenario cut,
-    episodes, the step budget, the observation window, the compressor) makes those rows a
-    different arm, and the command says so and stops rather than merging two arms into one matrix.
+    matrix and removes the sidecar. Changing what the sweep measures (the pool, immutable TaskSet
+    payload or lineage, scenario cut, episodes, step budget, observation window, or compressor)
+    makes those rows a different arm, and the command says so and stops rather than merging two
+    arms into one matrix.
     `--concurrency N` runs N cells at once, which is the difference between a six-hour grid and a
     one-hour grid; it is not part of what the sweep measures, so a run interrupted at one value
     resumes at another.

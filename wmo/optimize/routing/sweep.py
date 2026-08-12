@@ -33,6 +33,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.common.config import ArtifactPaths
+from wmo.common.core.artifacts import ArtifactId, ArtifactInput, Sha256
 from wmo.common.core.types import Action, EnvState, Observation
 from wmo.common.judging.episode import EpisodeScore
 from wmo.common.observability import RunRecord, merge_run_records, save_run
@@ -134,7 +135,9 @@ class SweepPlan(BaseModel):
     model_dir: Path
     out_path: Path
     pool: ModelPool
-    task_set_id: str
+    task_set_id: ArtifactId
+    tasks_sha256: Sha256
+    task_set_inputs: tuple[ArtifactInput, ...]
     tasks: tuple[TaskCase, ...]
     episodes: int
     max_steps: int
@@ -171,13 +174,17 @@ class SweepPlan(BaseModel):
         """What this plan MEASURES, as the value a resumed run is checked against.
 
         Everything a matrix's rows depend on for comparability: which candidates at which prices,
-        which scenario cut, how many episodes of how many steps, how much of each observation the
-        agent saw, and which compression arm. Two plans that agree here produce rows that belong
-        in one matrix; two that disagree produce two arms, and merging them would be a fabricated
-        comparison. `identity.digest` is the short form for stamping into logs and artifacts.
+        which verified TaskSet payload and source lineage, which scenario cut, how many episodes
+        of how many steps, how much of each observation the agent saw, and which compression arm.
+        Two plans that agree here produce rows that belong in one matrix; two that disagree
+        produce two arms, and merging them would be a fabricated comparison. `identity.digest`
+        is the short form for stamping into logs and artifacts.
         """
         return PlanIdentity(
             pool=_pool_digest(self.pool),
+            task_set_id=self.task_set_id,
+            tasks_sha256=self.tasks_sha256,
+            task_set_inputs=self.task_set_inputs,
             scenarios=tuple(task_id(task) for task in self.tasks),
             episodes=self.episodes,
             max_steps=self.max_steps,
@@ -315,6 +322,8 @@ def plan_sweep(
         out_path=out_path,
         pool=pool,
         task_set_id=task_set.task_set.task_set_id,
+        tasks_sha256=task_set.task_set.tasks_sha256,
+        task_set_inputs=task_set.task_set.inputs,
         tasks=tuple(cut),
         episodes=episodes,
         max_steps=max_steps,

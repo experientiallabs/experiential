@@ -154,6 +154,9 @@ def test_route_sweep_refuses_a_sidecar_that_belongs_to_a_different_plan(
                 PartialHeader(
                     identity=PlanIdentity(
                         pool="stale",
+                        task_set_id="task-set-routing",
+                        tasks_sha256="0" * 64,
+                        task_set_inputs=(),
                         scenarios=tuple(_HELD_OUT_IDS[:3]),
                         episodes=1,
                         max_steps=20,

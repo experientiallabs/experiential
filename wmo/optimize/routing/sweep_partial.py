@@ -13,15 +13,16 @@ last line for a cell wins, which is what makes a re-measured cell (`remeasured=T
 earlier row without rewriting anything.
 
 Identity is checked, never assumed. Resuming a sidecar whose rows were measured under a different
-pool, a different scenario cut, a different episode count, step budget, history window, or
-compressor would silently mix two arms into one matrix, so a mismatch is refused with the field
-that differs named. That check is also the answer to a gap the tau-grid runner filed against the
-library: before this, nothing on disk recorded WHICH scenario cut a matrix came from.
+pool, immutable task-set payload or lineage, scenario cut, episode count, step budget, history
+window, or compressor would silently mix two arms into one matrix, so a mismatch is refused with
+the field that differs named. That check is also the answer to a gap the tau-grid runner filed
+against the library: before this, nothing on disk recorded WHICH scenario cut a matrix came from.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -29,6 +30,7 @@ from typing import TYPE_CHECKING, Self
 
 from pydantic import BaseModel, ConfigDict
 
+from wmo.common.core.artifacts import ArtifactId, ArtifactInput, Sha256
 from wmo.optimize.routing.outcomes import ScenarioOutcome
 
 if TYPE_CHECKING:
@@ -39,7 +41,7 @@ logger = logging.getLogger(__name__)
 PARTIAL_SUFFIX = ".partial.jsonl"
 """Appended to the matrix path: `matrix.json` -> `matrix.json.partial.jsonl`."""
 
-PARTIAL_FORMAT_VERSION = 1
+PARTIAL_FORMAT_VERSION = 2
 """Bumped only by a change that makes an older sidecar unreadable, so the refusal can say so."""
 
 IDENTITY_DIGEST_CHARS = 16
@@ -67,6 +69,9 @@ class PlanIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     pool: str  # digest of the candidate roster, prices included
+    task_set_id: ArtifactId  # immutable TaskSet artifact identity
+    tasks_sha256: Sha256  # digest of the verified canonical task records
+    task_set_inputs: tuple[ArtifactInput, ...]  # source artifact identities and digests
     scenarios: tuple[str, ...]  # the scenario cut, by id, in sweep order
     episodes: int
     max_steps: int
@@ -90,6 +95,14 @@ class PlanIdentity(BaseModel):
             return None
         if self.pool != other.pool:
             return "the candidate pool changed (different models, or different prices)"
+        if self.task_set_id != other.task_set_id:
+            return (
+                f"the immutable task set changed ({other.task_set_id} then, {self.task_set_id} now)"
+            )
+        if self.tasks_sha256 != other.tasks_sha256:
+            return "the task payload changed (different instructions, context, tools, or weights)"
+        if self.task_set_inputs != other.task_set_inputs:
+            return "the task set's immutable input artifacts changed"
         if self.scenarios != other.scenarios:
             return (
                 f"the scenario cut changed ({len(other.scenarios)} scenario(s) then, "
@@ -159,18 +172,26 @@ def read_partial(path: Path, identity: PlanIdentity) -> list[ScenarioOutcome]:
 def _parse_header(path: Path, line: str) -> PartialHeader:
     """Line 1, or a refusal naming what the file is instead."""
     try:
-        header = PartialHeader.model_validate_json(line)
+        raw_header = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise PartialSweepError(
+            f"{path} does not start with a partial-sweep header, so it was not written by this "
+            f"sweep and its contents are unknown: {exc}. Move or delete it, then re-run"
+        ) from exc
+    version = raw_header.get("version") if isinstance(raw_header, dict) else None
+    if isinstance(version, int) and version != PARTIAL_FORMAT_VERSION:
+        raise PartialSweepError(
+            f"{path} was written in partial-sweep format v{version}; this build reads "
+            f"v{PARTIAL_FORMAT_VERSION}. Finish that sweep with the build that started it, or "
+            "delete the file to measure this plan from scratch"
+        )
+    try:
+        header = PartialHeader.model_validate(raw_header)
     except ValueError as exc:
         raise PartialSweepError(
             f"{path} does not start with a partial-sweep header, so it was not written by this "
             f"sweep and its contents are unknown: {exc}. Move or delete it, then re-run"
         ) from exc
-    if header.version != PARTIAL_FORMAT_VERSION:
-        raise PartialSweepError(
-            f"{path} was written in partial-sweep format v{header.version}; this build reads "
-            f"v{PARTIAL_FORMAT_VERSION}. Finish that sweep with the build that started it, or "
-            "delete the file to measure this plan from scratch"
-        )
     return header
 
 

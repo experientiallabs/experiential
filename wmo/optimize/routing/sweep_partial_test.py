@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from wmo.common.core.artifacts import ArtifactInput
 from wmo.optimize.routing.outcomes import ScenarioOutcome
 from wmo.optimize.routing.sweep_partial import (
     PARTIAL_FORMAT_VERSION,
@@ -26,6 +27,9 @@ from wmo.optimize.routing.sweep_partial import (
 def _identity(**overrides: object) -> PlanIdentity:
     fields: dict[str, object] = {
         "pool": "poolsha",
+        "task_set_id": "task-set-one",
+        "tasks_sha256": "0" * 64,
+        "task_set_inputs": (ArtifactInput(artifact_id="trace-dataset-one", sha256="1" * 64),),
         "scenarios": ("s1", "s2"),
         "episodes": 1,
         "max_steps": 20,
@@ -107,10 +111,26 @@ def test_a_newer_format_says_which_build_can_finish_that_sweep(tmp_path: Path) -
         read_partial(path, _identity())
 
 
+def test_the_old_format_is_refused_before_its_missing_task_pins_are_parsed(tmp_path: Path) -> None:
+    path = partial_path(tmp_path / "matrix.json")
+    path.write_text(
+        '{"version":1,"identity":{"pool":"old","scenarios":["s1"]}}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(PartialSweepError, match="format v1"):
+        read_partial(path, _identity())
+
+
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
         ({"pool": "different"}, "candidate pool changed"),
+        ({"task_set_id": "task-set-two"}, "immutable task set changed"),
+        ({"tasks_sha256": "2" * 64}, "task payload changed"),
+        (
+            {"task_set_inputs": (ArtifactInput(artifact_id="trace-dataset-one", sha256="3" * 64),)},
+            "input artifacts changed",
+        ),
         ({"scenarios": ("s1",)}, "scenario cut changed"),
         ({"episodes": 3}, "episodes per cell changed"),
         ({"max_steps": 40}, "step budget changed"),
