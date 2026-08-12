@@ -115,9 +115,8 @@ def test_w05_episode_score_fixture_preserves_judgment_values() -> None:
 
     score = EpisodeRewardJudge(provider).score("Refund order A-42", [_step("refunded")])
 
-    assert score.model_dump(mode="json") == {
-        "reward": 0.75,
-        "success": True,
-        "critique": "The order was refunded and the final state confirms it.",
-        "step_rewards": [0.75],
-    }
+    assert isinstance(score, EpisodeScore)
+    assert score.reward == 0.75
+    assert score.success is True
+    assert score.critique == "The order was refunded and the final state confirms it."
+    assert score.step_rewards == [0.75]

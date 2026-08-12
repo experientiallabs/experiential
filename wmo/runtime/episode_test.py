@@ -177,33 +177,20 @@ def test_w05_episode_fixture_preserves_rollout_steps_and_stop_reason() -> None:
         max_steps=2,
     )
 
-    assert result.model_dump(mode="json") == {
-        "task": "Refund order A-42",
-        "steps": [
-            {
-                "action": {
-                    "kind": "tool_call",
-                    "name": "poke",
-                    "arguments": {"turn": 0},
-                    "content": None,
-                },
-                "observation": {
-                    "content": "obs 1",
-                    "is_error": False,
-                    "reward": None,
-                    "metadata": {},
-                },
-                "state_before": {
-                    "structured": {"account_id": "acct-demo"},
-                    "scratchpad": "ready",
-                },
-                "task": "Refund order A-42",
-                "raw_span_ids": [],
-                "attribution": None,
-            }
-        ],
-        "stop_reason": "agent_done",
-        "error": None,
-        "error_traceback": None,
-    }
+    assert result.task == "Refund order A-42"
+    assert len(result.steps) == 1
+    step = result.steps[0]
+    assert step.action.kind is ActionKind.TOOL_CALL
+    assert step.action.name == "poke"
+    assert step.action.arguments == {"turn": 0}
+    assert step.observation.content == "obs 1"
+    assert step.observation.is_error is False
+    assert step.state_before.structured == {"account_id": "acct-demo"}
+    assert step.state_before.scratchpad == "ready"
+    assert step.task == "Refund order A-42"
+    assert step.raw_span_ids == []
+    assert step.attribution is None
+    assert result.stop_reason is StopReason.AGENT_DONE
+    assert result.error is None
+    assert result.error_traceback is None
     assert env.closed

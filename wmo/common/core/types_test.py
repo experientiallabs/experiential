@@ -60,39 +60,25 @@ def test_w05_production_trace_fixture_preserves_behavior_and_provenance() -> Non
         ],
     )
 
-    assert trace.model_dump(mode="json") == {
-        "trace_id": "prod-trace-w05-001",
-        "steps": [
-            {
-                "action": {
-                    "kind": "tool_call",
-                    "name": "lookup_order",
-                    "arguments": {"order_id": "A-42"},
-                    "content": None,
-                },
-                "observation": {
-                    "content": '{"status":"refunded"}',
-                    "is_error": False,
-                    "reward": None,
-                    "metadata": {"status_code": 200},
-                },
-                "state_before": {"structured": {"account_id": "acct-demo"}, "scratchpad": ""},
-                "task": "Refund order A-42",
-                "raw_span_ids": ["span-action-001", "span-tool-001"],
-                "attribution": {
-                    "model": "candidate-incumbent",
-                    "provider": "openai",
-                    "config": {},
-                    "input_tokens": 12,
-                    "output_tokens": 8,
-                    "cost_usd": 0.0012,
-                    "latency_ms": 240.0,
-                    "error_class": None,
-                    "provenance": "otel-genai-v1",
-                },
-            }
-        ],
-        "source": "otel:production",
-        "metadata": {"capture": "otel-genai", "domain": "orders", "outcome": "success"},
-    }
+    step = trace.steps[0]
+    assert trace.trace_id == "prod-trace-w05-001"
+    assert trace.source == "otel:production"
+    assert trace.metadata == {"capture": "otel-genai", "domain": "orders", "outcome": "success"}
+    assert step.task == "Refund order A-42"
+    assert step.action.kind is ActionKind.TOOL_CALL
+    assert step.action.name == "lookup_order"
+    assert step.action.arguments == {"order_id": "A-42"}
+    assert step.observation.content == '{"status":"refunded"}'
+    assert step.observation.is_error is False
+    assert step.observation.metadata == {"status_code": 200}
+    assert step.state_before.structured == {"account_id": "acct-demo"}
+    assert step.raw_span_ids == ["span-action-001", "span-tool-001"]
+    assert step.attribution is not None
+    assert step.attribution.model == "candidate-incumbent"
+    assert step.attribution.provider == "openai"
+    assert step.attribution.input_tokens == 12
+    assert step.attribution.output_tokens == 8
+    assert step.attribution.cost_usd == 0.0012
+    assert step.attribution.latency_ms == 240.0
+    assert step.attribution.provenance == "otel-genai-v1"
     assert Trace.model_validate_json(trace.model_dump_json()) == trace

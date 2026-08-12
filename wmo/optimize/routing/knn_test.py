@@ -744,3 +744,21 @@ def test_w05_guarded_router_decision_fixture_preserves_evidence_and_fallback(
     assert decision.evidence.n_pairs == 1
     assert decision.evidence.gate == "passed"
     assert decision.evidence.propensity == "greedy"
+
+    fallback_policy = fit_knn_policy(
+        matrix,
+        bank_path=tmp_path / "fallback" / KNN_BANK_FILENAME,
+        fit_ids=["scenario-w05-refund"],
+        embedder=EmbedderSpec(dim=64),
+        guard_model="pricey",
+        rag_num=1,
+        min_pairs=2,
+        z=0.5,
+    )
+    fallback = knn_decision(fallback_policy, query)
+
+    assert fallback.model == "pricey"
+    assert fallback.evidence is not None
+    assert fallback.evidence.n_pairs == 1
+    assert fallback.evidence.gate == "reverted"
+    assert fallback.evidence.propensity == "fallback-forced"

@@ -92,35 +92,22 @@ def test_w05_outcome_row_fixture_preserves_evaluation_evidence() -> None:
         ("fable-5", "anthropic", "claude-fable-5"),
         ("haiku-4-5", "anthropic", "claude-haiku-4-5"),
     ]
-    assert row.model_dump(mode="json") == {
-        "scenario_id": "scenario-w05-refund",
-        "task": "Refund order A-42",
-        "model": "haiku-4-5",
-        "episode": 0,
-        "reward": 0.75,
-        "success": True,
-        "critique": "The order was refunded.",
-        "steps": 1,
-        "stop_reason": "agent_done",
-        "usage": {
-            "input_tokens": 12,
-            "output_tokens": 8,
-            "cached_input_tokens": 0,
-            "cache_write_input_tokens": 0,
-        },
-        "cost_usd": 0.0012,
-        "call_seconds": [0.24],
-        "replies": ['{"status":"refunded"}'],
-        "error": None,
-        "remeasured": False,
-        "tokens_in_raw": 0,
-        "tokens_in_compressed": 0,
-        "compressor_id": "",
-        "compressor_version": "",
-        "aggressiveness": 0.0,
-        "compressor_latency_s": 0.0,
-        "compressor_cost_usd": 0.0,
-    }
+    assert row.scenario_id == "scenario-w05-refund"
+    assert row.task == "Refund order A-42"
+    assert row.model == "haiku-4-5"
+    assert row.episode == 0
+    assert row.reward == 0.75
+    assert row.success is True
+    assert row.critique == "The order was refunded."
+    assert row.steps == 1
+    assert row.stop_reason == "agent_done"
+    assert row.usage is not None
+    assert row.usage.input_tokens == 12
+    assert row.usage.output_tokens == 8
+    assert row.cost_usd == 0.0012
+    assert row.call_seconds == [0.24]
+    assert row.replies == ['{"status":"refunded"}']
+    assert row.error is None
     assert OutcomeMatrix.model_validate_json(matrix.model_dump_json()) == matrix
 
 

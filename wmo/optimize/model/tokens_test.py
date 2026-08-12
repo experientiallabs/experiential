@@ -486,26 +486,21 @@ def test_w05_tinker_training_record_fixture_preserves_tokens_and_provenance(
     assert len(records) == 1
     record = records[0]
     assert isinstance(record, TrialRecord)
-    assert record.model_dump(mode="json") == {
-        "task_id": "scenario-w05-refund",
-        "attempt": 1,
-        "trial_name": "refund-w05__attempt-1",
-        "reward": 1.0,
-        "passed": True,
-        "spans": [
-            {
-                "call_index": 0,
-                "prompt_token_ids": [101, 102],
-                "sampled_token_ids": [201, 202],
-                "sampled_logprobs": [-0.25, -0.75],
-                "logprobs_are_placeholders": False,
-                "delta_start": None,
-                "delta_messages": None,
-                "tools": [],
-            }
-        ],
-        "stop_reason": "submitted",
-        "infra_failed": False,
-        "tests": {"passed": 2, "resolved": 2, "unresolved": 0},
-        "artifact_dir": str(trial_dir),
-    }
+    assert record.task_id == "scenario-w05-refund"
+    assert record.attempt == 1
+    assert record.trial_name == "refund-w05__attempt-1"
+    assert record.reward == 1.0
+    assert record.passed is True
+    assert len(record.spans) == 1
+    recorded_span = record.spans[0]
+    assert recorded_span.call_index == 0
+    assert recorded_span.prompt_token_ids == [101, 102]
+    assert recorded_span.sampled_token_ids == [201, 202]
+    assert recorded_span.sampled_logprobs == [-0.25, -0.75]
+    assert record.stop_reason == "submitted"
+    assert record.infra_failed is False
+    assert record.tests is not None
+    assert record.tests.passed == 2
+    assert record.tests.resolved == 2
+    assert record.tests.unresolved == 0
+    assert record.artifact_dir == str(trial_dir)

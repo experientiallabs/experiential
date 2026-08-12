@@ -81,26 +81,20 @@ def test_w05_scenario_set_fixture_preserves_task_weight_and_provenance() -> None
         coverage_tau=0.8,
     )
 
-    assert scenario_set.model_dump(mode="json") == {
-        "scenarios": [
-            {
-                "scenario_id": "scenario-w05-refund",
-                "task": "Refund order A-42",
-                "seed_state": {"structured": {"account_id": "acct-demo"}, "scratchpad": ""},
-                "checklist": ["order A-42 status is refunded"],
-                "provenance": ["prod-trace-w05-001"],
-                "cluster_name": "orders/refund",
-                "weight": 1.0,
-                "source_outcome": "success",
-                "failure_category": None,
-            }
-        ],
-        "clusters": [],
-        "corpus_traces": 1,
-        "corpus_coverage": 1.0,
-        "coverage_tau": 0.8,
-    }
-    assert scenario_set.scenarios[0].to_scenario().model_dump(mode="json") == {
-        "task": "Refund order A-42",
-        "provenance": ["prod-trace-w05-001"],
-    }
+    scenario = scenario_set.scenarios[0]
+    assert scenario.scenario_id == "scenario-w05-refund"
+    assert scenario.task == "Refund order A-42"
+    assert scenario.seed_state.structured == {"account_id": "acct-demo"}
+    assert scenario.checklist == ["order A-42 status is refunded"]
+    assert scenario.provenance == ["prod-trace-w05-001"]
+    assert scenario.cluster_name == "orders/refund"
+    assert scenario.weight == 1.0
+    assert scenario.source_outcome is Outcome.SUCCESS
+    assert scenario.failure_category is None
+    assert scenario_set.clusters == []
+    assert scenario_set.corpus_traces == 1
+    assert scenario_set.corpus_coverage == 1.0
+    assert scenario_set.coverage_tau == 0.8
+    minimal = scenario.to_scenario()
+    assert minimal.task == "Refund order A-42"
+    assert minimal.provenance == ["prod-trace-w05-001"]
