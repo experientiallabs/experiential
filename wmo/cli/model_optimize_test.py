@@ -65,6 +65,18 @@ def test_optimize_help_exposes_persisted_sft_and_not_the_deleted_distill_branch(
     assert "student" not in route_help.output
 
 
+def test_tau_bench_cookbook_keeps_model_sft_separate_from_route_workflow() -> None:
+    """The routing walk names the explicit route commands, never removed model flags."""
+    cookbook = Path(__file__).resolve().parents[2] / "docs" / "cookbook" / "tau-bench.md"
+    text = cookbook.read_text(encoding="utf-8")
+
+    assert "wmo optimize model tau-bench" not in text
+    assert "wmo optimize route sweep tau-bench" in text
+    assert "wmo optimize route fit .wmo/models/tau-bench/optimize/matrix.json" in text
+    assert "--force-from" not in text
+    assert "--traces" not in text
+
+
 def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
