@@ -541,7 +541,7 @@ def _materialization_fixture(
         ),
     )
     plan = EvaluationPlan(
-        schema_version=1,
+        schema_version=2,
         created_at=_TIME,
         inputs=tuple(sorted((pricing_input, task_input), key=lambda item: item.artifact_id)),
         code_revision="test-revision",

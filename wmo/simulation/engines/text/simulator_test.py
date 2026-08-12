@@ -154,7 +154,7 @@ def _task(task_id: str, *, tools: tuple[ToolSchema, ...] = ()) -> TaskCase:
 def _plan(cells: tuple[EvaluationCell, ...]) -> EvaluationPlan:
     candidate = RoutedCandidateSnapshot(alias="candidate-a", model=_snapshot("candidate-a"))
     return EvaluationPlan(
-        schema_version=1,
+        schema_version=2,
         created_at=_TIME,
         code_revision="test-revision",
         plan_id="evaluation-plan",

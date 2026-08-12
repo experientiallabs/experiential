@@ -580,7 +580,7 @@ def _persist_fixture(
         _cell(index, task_id, execution=execution) for index, task_id in enumerate(task_ids)
     )
     plan = EvaluationPlan(
-        schema_version=1,
+        schema_version=2,
         created_at=_TIME,
         code_revision="test-revision",
         plan_id="plan-1",

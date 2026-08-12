@@ -246,28 +246,43 @@ def test_fit_rejects_missing_wrong_type_invented_or_candidate_drifted_pricing(
 
 def test_canonical_builder_fit_lock_held_out_report_and_replay(tmp_path: Path) -> None:
     """Real canonical evidence composes through the public service and exact replay."""
-    fixture = _optimizer_fixture(tmp_path)
+    fixture = _optimizer_fixture(tmp_path, defer_held_out=True)
     fit_dataset = load_evaluation_dataset(fixture.store, fixture.spec.fit_evaluation_id)
     pricing_input = artifact_input(fixture.store.read(fixture.pricing_input.artifact_id).manifest)
     assert pricing_input in fit_dataset.manifest.inputs
 
     locked = fixture.optimizer.fit(fixture.spec)
+    held_evaluation_id = _persist_canonical_evaluation(
+        fixture.store,
+        fixture.held_out,
+        fixture.plan_input,
+        artifact_input(fixture.store.read("calibration-a").manifest),
+        purpose="held_out",
+    )
     result = fixture.optimizer.report(
         locked,
-        held_out_evaluation_id=fixture.held_evaluation_id,
+        held_out_evaluation_id=held_evaluation_id,
         created_at=_TIME,
         code_revision="test-revision",
+    )
+    replayed_held_evaluation_id = _persist_canonical_evaluation(
+        fixture.store,
+        fixture.held_out,
+        fixture.plan_input,
+        artifact_input(fixture.store.read("calibration-a").manifest),
+        purpose="held_out",
     )
     replayed_lock = fixture.optimizer.fit(fixture.spec)
     replayed_result = fixture.optimizer.report(
         replayed_lock,
-        held_out_evaluation_id=fixture.held_evaluation_id,
+        held_out_evaluation_id=replayed_held_evaluation_id,
         created_at=_TIME,
         code_revision="test-revision",
     )
 
     assert replayed_lock == locked
     assert replayed_result == result
+    assert replayed_held_evaluation_id == held_evaluation_id
     assert result.policy.pricing_snapshot_id == fixture.pricing_input.artifact_id
     assert result.policy.pricing_snapshot_sha256 == fixture.pricing_input.sha256
     assert fixture.embedder.call_sizes == [8, 2, 8, 2]
@@ -437,6 +452,7 @@ def _optimizer_fixture(
     tmp_path: Path,
     *,
     seal_leak: Literal["lineage", "request-visible"] | None = None,
+    defer_held_out: bool = False,
 ) -> _OptimizerFixture:
     """Create one valid direct-API fixture with exact stored plan, task, and pricing."""
     store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
@@ -472,8 +488,12 @@ def _optimizer_fixture(
         fit_evaluation_id = _persist_canonical_evaluation(
             store, fit, plan_input, calibration_input, purpose="fit"
         )
-        held_evaluation_id = _persist_canonical_evaluation(
-            store, held_out, plan_input, calibration_input, purpose="held_out"
+        held_evaluation_id = (
+            ""
+            if defer_held_out
+            else _persist_canonical_evaluation(
+                store, held_out, plan_input, calibration_input, purpose="held_out"
+            )
         )
     else:
         fit_evaluation_id = _persist_evaluation(
@@ -525,6 +545,7 @@ def _persist_canonical_evaluation(
     purpose: Literal["fit", "held_out"],
 ) -> str:
     """Materialize one partition through real persisted rollouts and judgments."""
+    existing_artifact_ids = set(store.list_ids())
     protocol = EvaluationProtocol(
         protocol_id="protocol-production",
         evidence_source="production",
@@ -576,12 +597,15 @@ def _persist_canonical_evaluation(
                 sandbox_economics=OperationEconomics(cost_usd=_money(20.0)),
                 orchestration_economics=OperationEconomics(cost_usd=_money(30.0)),
             )
-            rollout_manifest = store.write_json(
-                artifact_id=rollout_id,
-                artifact_type="rollout",
-                envelope=rollout,
-                files={"rollout.json": rollout},
-            )
+            if rollout_id not in existing_artifact_ids:
+                rollout_manifest = store.write_json(
+                    artifact_id=rollout_id,
+                    artifact_type="rollout",
+                    envelope=rollout,
+                    files={"rollout.json": rollout},
+                )
+            else:
+                rollout_manifest = store.read(rollout_id).manifest
             judgment = Judgment(
                 schema_version=1,
                 created_at=_TIME,
@@ -611,12 +635,13 @@ def _persist_canonical_evaluation(
                 overall_score=score,
                 judge_economics=OperationEconomics(cost_usd=_money(40.0)),
             )
-            store.write_json(
-                artifact_id=judgment_id,
-                artifact_type="judgment",
-                envelope=judgment,
-                files={"judgment.json": judgment},
-            )
+            if judgment_id not in existing_artifact_ids:
+                store.write_json(
+                    artifact_id=judgment_id,
+                    artifact_type="judgment",
+                    envelope=judgment,
+                    files={"judgment.json": judgment},
+                )
             evidence.append(
                 EvaluationCellEvidence(
                     cell_id=cell_id,
@@ -792,7 +817,7 @@ def _persist_plan(
         for alias in ("candidate-baseline", "candidate-cheap")
     )
     plan = EvaluationPlan(
-        schema_version=1,
+        schema_version=2,
         created_at=_TIME,
         inputs=tuple(sorted((pricing_input, task_input), key=lambda item: item.artifact_id)),
         code_revision="test-revision",

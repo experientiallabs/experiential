@@ -53,7 +53,7 @@ def test_sparse_plan_and_fidelity_gate_round_trip() -> None:
         comparison_observed_cell_id=observed.cell_id,
     )
     plan = EvaluationPlan(
-        schema_version=1,
+        schema_version=2,
         created_at=created_at,
         code_revision="e7aad17",
         plan_id="plan-v1",
@@ -111,7 +111,7 @@ def test_evaluation_cells_reject_implicit_or_inconsistent_evidence() -> None:
     )
     with pytest.raises(ValidationError, match="preserve the compared"):
         EvaluationPlan(
-            schema_version=1,
+            schema_version=2,
             created_at=datetime(2026, 8, 11, tzinfo=UTC),
             code_revision="e7aad17",
             plan_id="plan-v1",
@@ -126,7 +126,7 @@ def test_evaluation_cells_reject_implicit_or_inconsistent_evidence() -> None:
         )
     with pytest.raises(ValidationError, match="outside the plan snapshots"):
         EvaluationPlan(
-            schema_version=1,
+            schema_version=2,
             created_at=datetime(2026, 8, 11, tzinfo=UTC),
             code_revision="e7aad17",
             plan_id="plan-v1",

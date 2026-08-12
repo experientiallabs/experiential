@@ -405,7 +405,7 @@ def _persist_plan(
         for task, suffix in zip(tasks, ("a", "b"), strict=True)
     )
     plan = EvaluationPlan(
-        schema_version=1,
+        schema_version=2,
         created_at=_BEFORE_LOCK,
         inputs=(task_input,),
         code_revision="fixture-revision",
