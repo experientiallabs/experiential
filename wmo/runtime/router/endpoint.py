@@ -114,7 +114,11 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
         if runtime is None:
             return _error(404, f"no routed endpoint {request.model!r}")
         try:
-            routed = runtime.complete(_model_request(request), episode_id=episode_id)
+            model_request = _model_request(request)
+        except ValueError as exc:
+            return _error(400, f"invalid routed request ({exc})")
+        try:
+            routed = runtime.complete(model_request, episode_id=episode_id)
         except RouterEpisodeConflictError:
             return _error(409, "episode identity conflicts with an earlier request")
         except Exception as exc:  # noqa: BLE001
@@ -205,11 +209,17 @@ def _model_request(request: HttpChatRequest) -> ModelRequest:
         ),
         tool_choice=choice,
         temperature=request.temperature,
-        maximum_output_tokens=request.max_completion_tokens or request.max_tokens,
+        maximum_output_tokens=(
+            request.max_completion_tokens
+            if request.max_completion_tokens is not None
+            else request.max_tokens
+        ),
     )
 
 
 def _tool_choice(value: JsonValue) -> Literal["auto", "none", "required"] | ToolChoice | None:
+    if value is None:
+        return None
     if value == "auto":
         return "auto"
     if value == "none":
@@ -220,7 +230,7 @@ def _tool_choice(value: JsonValue) -> Literal["auto", "none", "required"] | Tool
         function = value.get("function")
         if isinstance(function, dict) and isinstance(function.get("name"), str):
             return ToolChoice(name=function["name"])
-    return None
+    raise ValueError("tool_choice must be auto, none, required, or a named function")
 
 
 def _error(status: int, message: str) -> Response:

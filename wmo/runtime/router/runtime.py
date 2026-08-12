@@ -58,7 +58,7 @@ class RouterRuntime:
         self._extractor = RouterFeatureExtractor()
         self._decision_sink = decision_sink
         self._episode_decisions: dict[str, RoutingDecision] = {}
-        self._consumed_decision_ids: set[ArtifactId] = set()
+        self._request_decisions: dict[tuple[Sha256, Sha256], RoutingDecision] = {}
         self._episode_lock = threading.Lock()
         self._resolved: dict[str, ResolvedModel] = {}
         self._expected_models = {
@@ -233,7 +233,6 @@ class RouterRuntime:
 
         Raises:
             ValueError: The episode identity is malformed.
-            RouterEpisodeConflictError: An episode identity is reused for another request.
             RouterRuntimeIntegrityError: The immutable evidence bank has mutated.
         """
         if episode_id is not None and (not episode_id.strip() or len(episode_id) > 512):
@@ -244,37 +243,40 @@ class RouterRuntime:
         request_sha256 = hashlib.sha256(feature.encode("utf-8")).hexdigest()
         with self._episode_lock:
             self._require_bank_integrity()
-            existing = self._episode_decisions.get(identity_sha256)
+            request_key = (identity_sha256, request_sha256)
+            existing = self._request_decisions.get(request_key)
             if existing is not None:
-                if existing.request_sha256 != request_sha256:
-                    raise RouterEpisodeConflictError(
-                        "episode ID was reused with a different request-visible hash"
-                    )
                 return existing
-            try:
-                embedded = self._embedder.embed((feature,))
-                if len(embedded) != 1:
-                    raise ValueError("embedder returned a non-singleton result")
-                vector = np.asarray(embedded[0].values, dtype=np.float64)
-                if (
-                    vector.shape != (self.manifest.embedding_dimension,)
-                    or not np.all(np.isfinite(vector))
-                    or float(np.linalg.norm(vector)) == 0
-                ):
-                    raise ValueError("embedder returned an invalid router vector")
-            except Exception:  # noqa: BLE001 - request-time embedding failures fall back
-                decision = self._fallback_decision(request_sha256, identity, "embedding_error")
+            episode_decision = self._episode_decisions.get(identity_sha256)
+            if episode_decision is not None:
+                decision = self._sticky_decision(episode_decision, request_sha256)
             else:
-                decision = select_from_bank(
-                    self.policy,
-                    self.manifest,
-                    self.bank,
-                    vector,
-                    request_sha256=request_sha256,
-                    episode_id=identity,
-                )
+                try:
+                    embedded = self._embedder.embed((feature,))
+                    if len(embedded) != 1:
+                        raise ValueError("embedder returned a non-singleton result")
+                    vector = np.asarray(embedded[0].values, dtype=np.float64)
+                    if (
+                        vector.shape != (self.manifest.embedding_dimension,)
+                        or not np.all(np.isfinite(vector))
+                        or float(np.linalg.norm(vector)) == 0
+                    ):
+                        raise ValueError("embedder returned an invalid router vector")
+                except Exception:  # noqa: BLE001 - request-time embedding failures fall back
+                    decision = self._fallback_decision(request_sha256, identity, "embedding_error")
+                else:
+                    decision = select_from_bank(
+                        self.policy,
+                        self.manifest,
+                        self.bank,
+                        vector,
+                        request_sha256=request_sha256,
+                        episode_id=identity,
+                    )
             self._record(decision)
-            self._episode_decisions[identity_sha256] = decision
+            if episode_decision is None:
+                self._episode_decisions[identity_sha256] = decision
+            self._request_decisions[request_key] = decision
             return decision
 
     def complete(
@@ -284,7 +286,7 @@ class RouterRuntime:
         episode_id: str | None = None,
         decision: RoutingDecision | None = None,
     ) -> RoutedModelResponse:
-        """Consume one validated decision exactly once and call its pinned model client.
+        """Validate one exact cached decision and call its pinned model client.
 
         Args:
             request: Provider-neutral request to route and complete.
@@ -296,7 +298,6 @@ class RouterRuntime:
 
         Raises:
             ValueError: A supplied decision does not bind this request, episode, or policy.
-            RouterEpisodeConflictError: An episode identity is reused for another request.
         """
         selected = decision or self.select(request, episode_id=episode_id)
         feature = self._extractor.from_request(request)
@@ -316,12 +317,9 @@ class RouterRuntime:
             raise ValueError("routing decision does not match this policy, request, or episode")
         self._require_bank_integrity()
         with self._episode_lock:
-            cached = self._episode_decisions.get(expected_episode_sha256)
+            cached = self._request_decisions.get((expected_episode_sha256, request_sha256))
             if cached != selected:
                 raise ValueError("routing decision is not the exact cached episode decision")
-            if selected.decision_id in self._consumed_decision_ids:
-                raise ValueError("routing decision has already been consumed")
-            self._consumed_decision_ids.add(selected.decision_id)
         response = self._resolve(selected.selected_alias).client.complete(request)
         return RoutedModelResponse(decision=selected, response=response)
 
@@ -450,6 +448,24 @@ class RouterRuntime:
             neighbor_count=0,
             paired_count=0,
             fallback_reason=reason,
+        )
+
+    def _sticky_decision(
+        self, episode_decision: RoutingDecision, request_sha256: Sha256
+    ) -> RoutingDecision:
+        """Bind a later episode turn to the original selected alias and evidence."""
+        material = {
+            "policy_id": episode_decision.policy_id,
+            "policy_sha256": episode_decision.policy_sha256,
+            "request_sha256": request_sha256,
+            "episode_id_sha256": episode_decision.episode_id_sha256,
+            "selected_alias": episode_decision.selected_alias,
+        }
+        return episode_decision.model_copy(
+            update={
+                "decision_id": stable_id("routing-decision", material),
+                "request_sha256": request_sha256,
+            }
         )
 
     def _record(self, decision: RoutingDecision) -> RoutingDecision:

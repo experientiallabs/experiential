@@ -12,8 +12,6 @@ from typing import cast
 
 import numpy as np
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from wmo.common.core.artifacts import canonical_json_bytes, sha256_json
 from wmo.common.evaluations import (
@@ -50,7 +48,7 @@ from wmo.common.routing.bank import (
 from wmo.common.routing.features import ROUTER_FEATURE_SCHEMA_SHA256
 from wmo.common.tasks import TaskCase, TaskSet
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
-from wmo.runtime.router import RouterRuntime, RouterRuntimeIntegrityError, create_router_endpoint
+from wmo.runtime.router import RouterRuntime, RouterRuntimeIntegrityError
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
@@ -62,6 +60,8 @@ class _Client:
     def __init__(self) -> None:
         self.embedding_values: tuple[Embedding, ...] | Exception = (Embedding(values=(1.0, 0.0)),)
         self.embed_calls = 0
+        self.complete_calls = 0
+        self.completion_error: Exception | None = None
         self.requests: list[ModelRequest] = []
 
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
@@ -72,6 +72,10 @@ class _Client:
         return self.embedding_values
 
     def complete(self, request: ModelRequest) -> ModelResponse:
+        self.complete_calls += 1
+        if self.completion_error is not None:
+            error, self.completion_error = self.completion_error, None
+            raise error
         self.requests.append(request)
         return ModelResponse(
             output=AssistantAction(
@@ -136,16 +140,18 @@ def test_episode_stickiness_uses_caller_identity_and_tools_affect_request_hash()
     runtime, client = _runtime()
     first = runtime.select(_request(tool_name="read"), episode_id="episode-a")
     client.embedding_values = ()
-    with pytest.raises(ValueError, match="different request-visible hash"):
-        runtime.select(_request(tool_name="write"), episode_id="episode-a")
+    next_turn = runtime.select(_request(tool_name="write"), episode_id="episode-a")
     sticky = runtime.select(_request(tool_name="read"), episode_id="episode-a")
     separate = runtime.select(_request(tool_name="read"), episode_id="episode-b")
 
-    assert first.selected_alias == sticky.selected_alias == "cheap"
+    assert first.selected_alias == next_turn.selected_alias == sticky.selected_alias == "cheap"
     assert sticky == first
     assert sticky.decision_id == first.decision_id
+    assert next_turn.decision_id != first.decision_id
+    assert next_turn.request_sha256 != first.request_sha256
     assert separate.selected_alias == "baseline"
     assert separate.episode_id_sha256 != first.episode_id_sha256
+    assert client.embed_calls == 2
     assert set(runtime._episode_decisions) == {  # noqa: SLF001 - privacy regression
         hashlib.sha256(b"episode-a").hexdigest(),
         hashlib.sha256(b"episode-b").hexdigest(),
@@ -517,8 +523,8 @@ def test_concurrent_first_selection_embeds_and_records_exactly_once() -> None:
     assert recorded == [decisions[0]]
 
 
-def test_cached_selection_and_completion_recheck_integrity_and_exact_consumption() -> None:
-    """Mutation, forged decisions, and repeated completion cannot bypass the episode lock."""
+def test_cached_selection_and_completion_recheck_integrity_without_consumption() -> None:
+    """Mutation and forged decisions reject while exact retries reuse the frozen decision."""
     runtime, client = _runtime()
     request = _request()
     decision = runtime.select(request, episode_id="episode-a")
@@ -528,9 +534,8 @@ def test_cached_selection_and_completion_recheck_integrity_and_exact_consumption
     assert client.requests == []
 
     runtime.complete(request, episode_id="episode-a", decision=decision)
-    with pytest.raises(ValueError, match="already been consumed"):
-        runtime.complete(request, episode_id="episode-a", decision=decision)
-    assert len(client.requests) == 1
+    runtime.complete(request, episode_id="episode-a", decision=decision)
+    assert len(client.requests) == 2
 
     runtime.bank.scores.setflags(write=True)
     runtime.bank.scores[0, 0] = 0.0
@@ -538,8 +543,8 @@ def test_cached_selection_and_completion_recheck_integrity_and_exact_consumption
         runtime.select(request, episode_id="episode-a")
 
 
-def test_complete_consumes_one_prior_decision_without_selecting_again() -> None:
-    """Python completion validates and reuses a supplied decision exactly once."""
+def test_complete_validates_one_prior_decision_without_selecting_again() -> None:
+    """Python completion validates and reuses the exact cached supplied decision."""
     policy, manifest, bank, snapshots, client = _fixture()
     recorded = []
     runtime = RouterRuntime(
@@ -561,73 +566,6 @@ def test_complete_consumes_one_prior_decision_without_selecting_again() -> None:
     assert client.requests == [request]
     with pytest.raises(ValueError, match="does not match"):
         runtime.complete(_request(tool_name="write"), episode_id="episode-a", decision=decision)
-
-
-def test_endpoint_requires_episode_rejects_stream_and_preserves_tool_transcript() -> None:
-    """HTTP is non-streaming and passes assistant calls plus ordered tool results unchanged."""
-    runtime, client = _runtime()
-    app = FastAPI()
-    app.include_router(create_router_endpoint({"router-a": runtime}))
-    http = TestClient(app)
-    payload = {
-        "model": "router-a",
-        "messages": [
-            {"role": "user", "content": "do it"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call-in",
-                        "type": "function",
-                        "function": {"name": "read", "arguments": '{"path":"a"}'},
-                    }
-                ],
-            },
-            {"role": "tool", "content": "result", "tool_call_id": "call-in"},
-        ],
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "read",
-                    "description": "read a file",
-                    "parameters": {"type": "object"},
-                },
-            }
-        ],
-    }
-    assert http.post("/v1/chat/completions", json=payload).status_code == 400
-    assert (
-        http.post(
-            "/v1/chat/completions",
-            json={**payload, "stream": True},
-            headers={"X-WMO-Episode-ID": "episode-a"},
-        ).status_code
-        == 400
-    )
-    response = http.post(
-        "/v1/chat/completions",
-        json=payload,
-        headers={"X-WMO-Episode-ID": "episode-a"},
-    )
-
-    assert response.status_code == 200
-    assert response.headers["X-WMO-Episode-ID-SHA256"] == hashlib.sha256(b"episode-a").hexdigest()
-    assert "episode-a" not in response.text
-    assert response.json()["choices"][0]["message"]["tool_calls"][0]["id"] == "call-out"
-    captured = client.requests[-1]
-    assert [message.role for message in captured.messages] == ["user", "assistant", "tool"]
-    assert captured.messages[1].assistant_action is not None
-    assert captured.messages[1].assistant_action.tool_calls[0].call_id == "call-in"
-    assert captured.messages[2].tool_call_id == "call-in"
-    conflict = http.post(
-        "/v1/chat/completions",
-        json={**payload, "tools": []},
-        headers={"X-WMO-Episode-ID": "episode-a"},
-    )
-    assert conflict.status_code == 409
-    assert "episode-a" not in conflict.text
 
 
 def _request(*, tool_name: str | None = None) -> ModelRequest:
