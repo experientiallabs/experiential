@@ -145,6 +145,8 @@ export function RubricReview({ busy, onMutation, snapshot }: RubricReviewProps) 
             {activeDimensions.map((dimension, index) => (
               <ActiveScaleCard
                 canEdit={!finalized && !busy}
+                canMoveDown={index < activeDimensions.length - 1}
+                canMoveUp={index > 0}
                 dimension={dimension}
                 index={index}
                 key={dimension.dimension_id}
@@ -408,12 +410,16 @@ function ProposalCard({
 
 function ActiveScaleCard({
   canEdit,
+  canMoveDown,
+  canMoveUp,
   dimension,
   index,
   onEdit,
   onMove
 }: {
   canEdit: boolean;
+  canMoveDown: boolean;
+  canMoveUp: boolean;
   dimension: RubricDimension;
   index: number;
   onEdit: () => void;
@@ -432,10 +438,22 @@ function ActiveScaleCard({
         </div>
         {canEdit ? (
           <div className="flex gap-2">
-            <Button aria-label={`Move ${dimension.name} up`} className="min-h-8 px-2" onClick={() => onMove(-1)} type="button">
+            <Button
+              aria-label={`Move ${dimension.name} up`}
+              className="min-h-8 px-2"
+              disabled={!canMoveUp}
+              onClick={() => onMove(-1)}
+              type="button"
+            >
               ↑
             </Button>
-            <Button aria-label={`Move ${dimension.name} down`} className="min-h-8 px-2" onClick={() => onMove(1)} type="button">
+            <Button
+              aria-label={`Move ${dimension.name} down`}
+              className="min-h-8 px-2"
+              disabled={!canMoveDown}
+              onClick={() => onMove(1)}
+              type="button"
+            >
               ↓
             </Button>
             <Button onClick={onEdit} type="button">

@@ -138,6 +138,86 @@ describe("ReviewWorkbench", () => {
     );
   });
 
+  it("blocks background proposal shortcuts while a modal is open", async () => {
+    const mutateRubric = vi.fn(async () => draftReviewSnapshot);
+    const api: ReviewApi = {
+      getSnapshot: vi.fn(async () => draftReviewSnapshot),
+      mutateRubric,
+      overrideScore: vi.fn(),
+      approveCalibration: vi.fn()
+    };
+
+    render(<ReviewWorkbench api={api} />);
+    await screen.findByText("Rollout evidence");
+    fireEvent.click(screen.getByRole("button", { name: "Rubric scales" }));
+    const proposal = screen.getByRole("article", { name: "Task success proposal" });
+    fireEvent.click(screen.getByRole("button", { name: "Design replacement set" }));
+    await screen.findByRole("dialog", { name: "Design the complete replacement set" });
+    fireEvent.keyDown(proposal, { key: "a" });
+
+    expect(mutateRubric).not.toHaveBeenCalled();
+  });
+
+  it("dismisses rubric finalization with Escape without finalizing", async () => {
+    const snapshot: ReviewSnapshot = {
+      ...draftReviewSnapshot,
+      rubric_review: {
+        ...draftReviewSnapshot.rubric_review,
+        dimensions: [taskSuccessDimension]
+      }
+    };
+    const mutateRubric = vi.fn(async () => snapshot);
+    const api: ReviewApi = {
+      getSnapshot: vi.fn(async () => snapshot),
+      mutateRubric,
+      overrideScore: vi.fn(),
+      approveCalibration: vi.fn()
+    };
+
+    render(<ReviewWorkbench api={api} />);
+    await screen.findByText("Rollout evidence");
+    fireEvent.click(screen.getByRole("button", { name: "Rubric scales" }));
+    const finalize = screen.getByRole("button", { name: "Finalize rubric" });
+    finalize.focus();
+    fireEvent.click(finalize);
+    fireEvent.keyDown(screen.getByRole("dialog", { name: "Finalize this rubric?" }), {
+      key: "Escape"
+    });
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(finalize).toHaveFocus();
+    expect(mutateRubric).not.toHaveBeenCalled();
+  });
+
+  it("disables reorder controls at the first and last boundaries", async () => {
+    const snapshot: ReviewSnapshot = {
+      ...draftReviewSnapshot,
+      rubric_review: {
+        ...draftReviewSnapshot.rubric_review,
+        dimensions: [taskSuccessDimension, clarityDimension]
+      }
+    };
+    const mutateRubric = vi.fn(async () => snapshot);
+    const api: ReviewApi = {
+      getSnapshot: vi.fn(async () => snapshot),
+      mutateRubric,
+      overrideScore: vi.fn(),
+      approveCalibration: vi.fn()
+    };
+
+    render(<ReviewWorkbench api={api} />);
+    await screen.findByText("Rollout evidence");
+    fireEvent.click(screen.getByRole("button", { name: "Rubric scales" }));
+
+    expect(screen.getByRole("button", { name: "Move Task success up" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Move Task success down" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Move Customer clarity up" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Move Customer clarity down" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Move Task success up" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move Customer clarity down" }));
+    expect(mutateRubric).not.toHaveBeenCalled();
+  });
+
   it("requires low-sample risk confirmation and renders the written calibration", async () => {
     const insufficientSnapshot: ReviewSnapshot = {
       ...finalizedReviewSnapshot,
@@ -186,6 +266,36 @@ describe("ReviewWorkbench", () => {
     );
     expect(await screen.findByText("Human-calibrated artifact")).toBeInTheDocument();
     expect(screen.getByText(/risk-fixture/)).toBeInTheDocument();
+  });
+
+  it("dismisses calibration approval with Escape without approving", async () => {
+    const insufficientSnapshot: ReviewSnapshot = {
+      ...finalizedReviewSnapshot,
+      calibration_reports: finalizedReviewSnapshot.calibration_reports.map((report) => ({
+        ...report,
+        status: "insufficient"
+      }))
+    };
+    const approveCalibration = vi.fn();
+    const api: ReviewApi = {
+      getSnapshot: vi.fn(async () => insufficientSnapshot),
+      mutateRubric: vi.fn(),
+      overrideScore: vi.fn(),
+      approveCalibration
+    };
+
+    render(<ReviewWorkbench api={api} />);
+    await screen.findByText("Rollout evidence");
+    fireEvent.click(screen.getByRole("button", { name: "Calibration" }));
+    const reviewApproval = screen.getByRole("button", { name: "Review low-sample approval" });
+    reviewApproval.focus();
+    fireEvent.click(reviewApproval);
+    const dialog = screen.getByRole("dialog", { name: "Approve this judge calibration?" });
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(reviewApproval).toHaveFocus();
+    expect(approveCalibration).not.toHaveBeenCalled();
   });
 });
 
