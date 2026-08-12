@@ -26,7 +26,9 @@ inline tests, `conftest.py`, test and fixture directories, test data, Vitest con
 named generated production exemptions. A physical final line without a newline counts as one line;
 a final newline does not add an extra blank line.
 
-For a pull request, the report compares the merge base of `--base` and `--head`. It records:
+For a pull request, the report resolves the merge base of `--base` and `--head` once. It uses that
+same immutable revision for the reported base snapshot, file and line deltas, and direct dependency
+comparison. It records:
 
 - Production files added, removed, and net.
 - Production diff lines added, removed, and net.

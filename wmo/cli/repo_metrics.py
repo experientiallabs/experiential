@@ -110,6 +110,11 @@ def _resolved_revision(revision: str) -> str:
     return _git_output(["rev-parse", revision]).strip()
 
 
+def _comparison_base(base: str, head: str) -> str:
+    """Resolve the one merge-base revision used for every pull-request report field."""
+    return _git_output(["merge-base", base, head]).strip()
+
+
 def production_snapshot(revision: str) -> ProductionSnapshot:
     """Count approved production files and physical LOC at one Git revision.
 
@@ -134,8 +139,8 @@ def production_snapshot(revision: str) -> ProductionSnapshot:
 
 
 def _changed_production_lines(base: str, head: str) -> tuple[int, int]:
-    """Return production lines added and removed by the merge-base pull-request comparison."""
-    output = _git_output(["diff", "--no-renames", "--numstat", f"{base}...{head}", "--", "wmo"])
+    """Return production lines added and removed between resolved comparison revisions."""
+    output = _git_output(["diff", "--no-renames", "--numstat", f"{base}..{head}", "--", "wmo"])
     added = 0
     removed = 0
     for line in output.splitlines():
@@ -204,9 +209,13 @@ def production_loc_report(base: str, head: str) -> ProductionLocReport:
     Returns:
         Production file and LOC deltas plus direct dependency additions and removals.
     """
-    base_snapshot = production_snapshot(base)
+    comparison_base = _comparison_base(base, head)
+    base_snapshot = production_snapshot(comparison_base)
     head_snapshot = production_snapshot(head)
-    lines_added, lines_removed = _changed_production_lines(base, head)
+    lines_added, lines_removed = _changed_production_lines(
+        base_snapshot.revision,
+        head_snapshot.revision,
+    )
     base_dependencies = _direct_dependencies(base_snapshot.revision)
     head_dependencies = _direct_dependencies(head_snapshot.revision)
     return ProductionLocReport(
