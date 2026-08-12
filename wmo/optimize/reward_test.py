@@ -94,3 +94,30 @@ def test_judge_never_sees_gold_trace() -> None:
     _system, user = provider.calls[0]
     assert "gold" not in user.lower()
     assert "reference" not in user.lower()
+
+
+def test_w05_episode_score_fixture_preserves_judgment_values() -> None:
+    """Map current `EpisodeRewardJudge` and `EpisodeScore` to the approved judgment concept.
+
+    The score is linked to the supplied task and rollout by this test, but current main has no
+    judgment ID, rubric ID, calibration ID, or source hash. W2 and W6 must add that provenance.
+    """
+    provider = FakeProvider(
+        json.dumps(
+            {
+                "success": True,
+                "reward": 0.75,
+                "step_rewards": [0.75],
+                "critique": "The order was refunded and the final state confirms it.",
+            }
+        )
+    )
+
+    score = EpisodeRewardJudge(provider).score("Refund order A-42", [_step("refunded")])
+
+    assert score.model_dump(mode="json") == {
+        "reward": 0.75,
+        "success": True,
+        "critique": "The order was refunded and the final state confirms it.",
+        "step_rewards": [0.75],
+    }

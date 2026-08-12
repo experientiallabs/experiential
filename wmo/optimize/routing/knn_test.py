@@ -684,3 +684,63 @@ def test_an_all_free_pool_refuses_the_cost_knob_loudly(tmp_path: Path) -> None:
     assert apply_cost_quality(policy, COST_QUALITY_BALANCED).pick_lam == 0.0
     with pytest.raises(ValueError, match="cost_scale"):
         apply_cost_quality(policy, 1.0)
+
+
+def test_w05_guarded_router_decision_fixture_preserves_evidence_and_fallback(
+    tmp_path: Path,
+) -> None:
+    """Map current `knn_decision` and `RoutingDecision` to the approved guarded router decision.
+
+    The fixture exercises one paired candidate and baseline row, freezes the evidence gate, and
+    leaves private cached vectors and the future policy/request identity envelope out of scope.
+    """
+    task = "Refund order A-42"
+    matrix = OutcomeMatrix(
+        pool=_pool(),
+        outcomes=[
+            ScenarioOutcome(
+                scenario_id="scenario-w05-refund",
+                task=task,
+                model="cheap",
+                reward=1.0,
+                success=True,
+                steps=1,
+                stop_reason="agent_done",
+                cost_usd=0.001,
+            ),
+            ScenarioOutcome(
+                scenario_id="scenario-w05-refund",
+                task=task,
+                model="pricey",
+                reward=0.0,
+                success=False,
+                steps=1,
+                stop_reason="agent_done",
+                cost_usd=0.01,
+            ),
+        ],
+    )
+    policy = fit_knn_policy(
+        matrix,
+        bank_path=tmp_path / KNN_BANK_FILENAME,
+        fit_ids=["scenario-w05-refund"],
+        embedder=EmbedderSpec(dim=64),
+        guard_model="pricey",
+        rag_num=1,
+        min_pairs=1,
+        z=0.5,
+    )
+    query = np.asarray(HashingEmbedder(dim=64).embed([task])[0], dtype=np.float32)
+
+    decision = knn_decision(policy, query)
+
+    assert decision.model == "cheap"
+    assert decision.cluster_id is None
+    assert decision.cluster_label == ""
+    assert decision.reason == "knn: 1 neighbors, delta=+1.000 > 0.5xSE=0.250"
+    assert decision.evidence is not None
+    assert decision.evidence.mean_diff == pytest.approx(1.0)
+    assert decision.evidence.se == pytest.approx(0.5)
+    assert decision.evidence.n_pairs == 1
+    assert decision.evidence.gate == "passed"
+    assert decision.evidence.propensity == "greedy"

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from wmo.common.core.types import EnvState
+from wmo.simulation.scenarios.mining.facets import Outcome
 from wmo.simulation.scenarios.synthesis import EvalScenario, ScenarioSet
 
 
@@ -53,3 +55,52 @@ def test_scenario_set_save_load_roundtrip(tmp_path: Path) -> None:
     scenario_set.save(path)
     loaded = ScenarioSet.load(path)
     assert loaded == scenario_set
+
+
+def test_w05_scenario_set_fixture_preserves_task_weight_and_provenance() -> None:
+    """Map current `ScenarioSet` and `EvalScenario` to approved `TaskSet` and `TaskCase`.
+
+    The fixture retains the task, checklist, source trace, outcome, corpus coverage, and workload
+    weight. It freezes the current owner without adding a canonical W2 task schema.
+    """
+    scenario_set = ScenarioSet(
+        scenarios=[
+            EvalScenario(
+                scenario_id="scenario-w05-refund",
+                task="Refund order A-42",
+                seed_state=EnvState(structured={"account_id": "acct-demo"}),
+                checklist=["order A-42 status is refunded"],
+                provenance=["prod-trace-w05-001"],
+                cluster_name="orders/refund",
+                weight=1.0,
+                source_outcome=Outcome.SUCCESS,
+            )
+        ],
+        corpus_traces=1,
+        corpus_coverage=1.0,
+        coverage_tau=0.8,
+    )
+
+    assert scenario_set.model_dump(mode="json") == {
+        "scenarios": [
+            {
+                "scenario_id": "scenario-w05-refund",
+                "task": "Refund order A-42",
+                "seed_state": {"structured": {"account_id": "acct-demo"}, "scratchpad": ""},
+                "checklist": ["order A-42 status is refunded"],
+                "provenance": ["prod-trace-w05-001"],
+                "cluster_name": "orders/refund",
+                "weight": 1.0,
+                "source_outcome": "success",
+                "failure_category": None,
+            }
+        ],
+        "clusters": [],
+        "corpus_traces": 1,
+        "corpus_coverage": 1.0,
+        "coverage_tau": 0.8,
+    }
+    assert scenario_set.scenarios[0].to_scenario().model_dump(mode="json") == {
+        "task": "Refund order A-42",
+        "provenance": ["prod-trace-w05-001"],
+    }
