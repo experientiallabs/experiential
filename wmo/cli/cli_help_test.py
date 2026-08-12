@@ -70,3 +70,14 @@ def test_route_student_help_preserves_literal_pool_table_name() -> None:
 
     assert result.exit_code == 0, result.output
     assert "[[model]]" in result.output
+
+
+def test_readme_route_sweep_invocation_parses_without_a_provider() -> None:
+    """The documented project-owned task-set route sweep requires no provider for help."""
+    result = runner.invoke(
+        app,
+        ["optimize", "route", "sweep", "my-model", "--project", "my-project", "--help"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "--project" in result.output

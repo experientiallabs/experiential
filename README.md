@@ -29,8 +29,8 @@ Re-run it to add another provider's models beside the ones already registered.
 ```bash
 wmo build --file traces.jsonl --source otlp --project my-project
 
-# Score every registered model on held-out tasks from your traces
-wmo optimize route sweep my-model --traces traces.otel.jsonl
+# Score every registered model on the immutable held-out TaskSet from your traces
+wmo optimize route sweep my-model --project my-project
 
 # Deterministically reserve 30% for reporting and fit on the other 70%
 wmo optimize route fit matrix.json --kind knn \
