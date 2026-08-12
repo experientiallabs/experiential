@@ -12,25 +12,18 @@ from __future__ import annotations
 
 import typer
 
+from wmo.cli.model_optimize import optimize_model
+from wmo.cli.router_app import router
+
 optimize_app = typer.Typer(
-    help="Optimizers behind one switch. `router` fits routing policy; `model` runs offline SFT "
-    "from a persisted W12 dataset.",
+    help="Offline optimization of frozen project artifacts.",
     no_args_is_help=True,
 )
 
-# `router` loads its real Typer app only on first use, so `wmo --help` never pays for the routing
-# optimizer import chain. `model` is registered directly from its narrow command owner.
-from wmo.cli.defer import add_deferred_typer  # noqa: E402
-from wmo.cli.model_optimize import optimize_model  # noqa: E402
-
-add_deferred_typer(
-    optimize_app,
-    name="router",
-    module="wmo.cli.router_app",
-    attr="router_app",
-    help="Resume sparse evaluation and fit the single guarded offline kNN router.",
-    known_names=("fit", "report"),
-)
+optimize_app.command(
+    "router",
+    help="Fit, freeze, and report one guarded router from completed evidence.",
+)(router)
 optimize_app.command(
     "model", help="Run W13 Tinker SFT from an explicit persisted W12 dataset configuration."
 )(optimize_model)

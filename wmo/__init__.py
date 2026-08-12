@@ -1,9 +1,4 @@
-"""World Model Optimizer public API with lazy package-root exports.
-
-Importing a focused subpackage must not initialize the simulation or offline
-optimizer graphs. Package-root attributes remain available for supported
-Python callers and are imported only when accessed.
-"""
+"""World Model Optimizer public customer services with lazy package-root exports."""
 
 from __future__ import annotations
 
@@ -11,77 +6,49 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from wmo.common.core.types import (
-        Action as Action,
+    from wmo.optimize.router.workflow import EvaluationInputs as EvaluationInputs
+    from wmo.optimize.router.workflow import (
+        RouterOptimizationConfig as RouterOptimizationConfig,
     )
-    from wmo.common.core.types import (
-        ActionKind as ActionKind,
+    from wmo.optimize.router.workflow import RouterWorkflowResult as RouterWorkflowResult
+    from wmo.optimize.router.workflow import optimize_router as optimize_router
+    from wmo.runtime.router.application import (
+        create_project_router_app as create_project_router_app,
     )
-    from wmo.common.core.types import (
-        EnvState as EnvState,
-    )
-    from wmo.common.core.types import (
-        Observation as Observation,
-    )
-    from wmo.common.core.types import (
-        Session as Session,
-    )
-    from wmo.common.core.types import (
-        Step as Step,
-    )
-    from wmo.common.core.types import (
-        Trace as Trace,
-    )
-    from wmo.runtime import (
-        DONE_SIGNAL as DONE_SIGNAL,
-    )
-    from wmo.runtime import (
-        Agent as Agent,
-    )
-    from wmo.runtime import (
-        Env as Env,
-    )
-    from wmo.runtime import (
-        EpisodeResult as EpisodeResult,
-    )
-    from wmo.runtime import (
-        StopReason as StopReason,
-    )
-    from wmo.runtime import (
-        run_episode as run_episode,
-    )
-    from wmo.simulation.environment import WorldModelEnv as WorldModelEnv
-    from wmo.simulation.model.world_model import WorldModel as WorldModel
+    from wmo.runtime.router.application import load_project_router as load_project_router
+    from wmo.runtime.router.runtime import RouterRuntime as RouterRuntime
+    from wmo.simulation.build import BuildReviewReadiness as BuildReviewReadiness
+    from wmo.simulation.build import ProjectBuild as ProjectBuild
+    from wmo.simulation.build import TaskSetBuild as TaskSetBuild
+    from wmo.simulation.build import build_project as build_project
+    from wmo.simulation.build import build_task_set as build_task_set
 
 _EXPORT_MODULES = {
-    "Action": "wmo.common.core.types",
-    "ActionKind": "wmo.common.core.types",
-    "EnvState": "wmo.common.core.types",
-    "Observation": "wmo.common.core.types",
-    "Session": "wmo.common.core.types",
-    "Step": "wmo.common.core.types",
-    "Trace": "wmo.common.core.types",
-    "DONE_SIGNAL": "wmo.runtime",
-    "Agent": "wmo.runtime",
-    "Env": "wmo.runtime",
-    "EpisodeResult": "wmo.runtime",
-    "StopReason": "wmo.runtime",
-    "run_episode": "wmo.runtime",
-    "WorldModelEnv": "wmo.simulation.environment",
-    "WorldModel": "wmo.simulation.model.world_model",
+    "BuildReviewReadiness": "wmo.simulation.build",
+    "ProjectBuild": "wmo.simulation.build",
+    "TaskSetBuild": "wmo.simulation.build",
+    "build_project": "wmo.simulation.build",
+    "build_task_set": "wmo.simulation.build",
+    "EvaluationInputs": "wmo.optimize.router.workflow",
+    "RouterOptimizationConfig": "wmo.optimize.router.workflow",
+    "RouterWorkflowResult": "wmo.optimize.router.workflow",
+    "optimize_router": "wmo.optimize.router.workflow",
+    "RouterRuntime": "wmo.runtime.router.runtime",
+    "create_project_router_app": "wmo.runtime.router.application",
+    "load_project_router": "wmo.runtime.router.application",
 }
 
 __all__ = list(_EXPORT_MODULES)
 
 
 def __getattr__(name: str) -> object:
-    """Resolve one supported package-root export on first access.
+    """Resolve one supported package-root service on first access.
 
     Args:
         name: Package attribute requested by Python.
 
     Returns:
-        The supported public object loaded from its owning module.
+        The supported public object loaded from its owning domain module.
 
     Raises:
         AttributeError: The name is not part of the supported public API.

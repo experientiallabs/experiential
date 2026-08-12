@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import typer
 from rich.console import Console
 
-from wmo.cli.model_roles import load_settings_or_abort
 from wmo.common.config import (
     ARTIFACT_DIR,
+    load_settings,
     set_telemetry_enabled,
     settings_path,
 )
-
-if TYPE_CHECKING:
-    pass
 
 config_app = typer.Typer(help="Manage project-local wmo settings.", no_args_is_help=True)
 _console = Console()
@@ -41,7 +36,10 @@ def config_telemetry(
     # Read through the guarded loader first: `set_telemetry_enabled` reads the same file to
     # preserve the rest of it, so a corrupt settings.toml must fail here as a usage error naming
     # the file rather than as a tomllib traceback from inside the write.
-    settings = load_settings_or_abort(root)
+    try:
+        settings = load_settings(root)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
     if normalized != "status":
         settings = set_telemetry_enabled(normalized == "enable", root)
     state = "enabled" if settings.telemetry.enabled else "disabled"

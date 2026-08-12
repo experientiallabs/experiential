@@ -14,7 +14,7 @@ from wmo.common.config import ARTIFACT_DIR
 from wmo.common.observability import RunRecord
 from wmo.common.observability.telemetry import BuildTelemetryStats, capture_build_completed
 from wmo.common.project import ArtifactStoreError, ProjectConfig, ProjectStore, ProjectStoreError
-from wmo.simulation.build import TaskSetBuild, build_task_set
+from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project
 from wmo.simulation.ingest.otlp import (
     OtlpTraceFormatError,
     TraceNormalizationResult,
@@ -23,33 +23,26 @@ from wmo.simulation.ingest.otlp import (
 from wmo.simulation.ingest.posthog import PostHogPullError, load_posthog_file
 
 _console = Console()
-_DEFAULT_PROJECT_ID = "default"
 _CANONICAL_SOURCES = ("otlp", "posthog")
 _TRACE_FILE_ARGUMENT = typer.Argument(
-    None,
+    ...,
     metavar="TRACE_FILE",
     help="OTLP JSON or JSONL, or a PostHog LLM-observability export.",
-)
-_TRACE_FILE_OPTION = typer.Option(
-    None,
-    "--file",
-    help="Named form of TRACE_FILE for scripts that prefer an option.",
 )
 _ROOT_OPTION = typer.Option(Path(ARTIFACT_DIR), "--root", help="Local .wmo artifact root.")
 
 
 def build(
-    trace_file: Path | None = _TRACE_FILE_ARGUMENT,
-    file: Path | None = _TRACE_FILE_OPTION,
+    trace_file: Path = _TRACE_FILE_ARGUMENT,
     source: str = typer.Option(
         "otlp",
         "--source",
         help="Canonical source format: otlp (default) or posthog.",
     ),
-    project: str | None = typer.Option(
-        None,
+    project: str = typer.Option(
+        ...,
         "--project",
-        help="Local project ID below <root>/projects (default: default).",
+        help="Local project ID below <root>/projects.",
     ),
     root: Path = _ROOT_OPTION,
 ) -> None:
@@ -62,7 +55,6 @@ def build(
 
     Args:
         trace_file: Positional local trace export path.
-        file: Optional named local trace export path.
         source: Explicit canonical OTLP or PostHog local-export format.
         project: Destination project identifier for immutable local artifacts.
         root: Local `.wmo` artifact root.
@@ -72,8 +64,8 @@ def build(
             fails.
     """
     started = time.monotonic()
-    path = _resolve_trace_file(trace_file, file)
-    project_id = _resolve_project_id(project)
+    path = _resolve_trace_file(trace_file)
+    project_id = project
     normalized = _load_canonical_traces(path, source)
     if not normalized.traces:
         raise typer.BadParameter(
@@ -82,9 +74,9 @@ def build(
         )
     try:
         store = _project_store(root, project_id)
-        completed = build_task_set(
+        completed = build_project(
             normalized,
-            store.artifacts,
+            store,
             created_at=datetime.now(UTC),
             code_revision=_current_revision(),
         )
@@ -92,30 +84,22 @@ def build(
     except (ArtifactStoreError, ProjectStoreError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from None
     _capture_local_build_telemetry(
-        completed,
+        completed.artifacts,
         root=root,
         duration_seconds=time.monotonic() - started,
     )
     _render_completed_build(completed)
 
 
-def _resolve_trace_file(trace_file: Path | None, file: Path | None) -> Path:
+def _resolve_trace_file(trace_file: Path) -> Path:
     """Validate one explicit local trace-file selection without opening its content."""
-    if trace_file is not None and file is not None:
-        raise typer.BadParameter("pass either TRACE_FILE or --file, not both")
-    resolved = trace_file or file
-    if resolved is None:
-        raise typer.BadParameter("provide TRACE_FILE or --file <export>")
-    if not resolved.exists():
-        raise typer.BadParameter(f"trace file not found: {resolved}")
-    if not resolved.is_file():
-        raise typer.BadParameter(f"--file must be a trace export, not a directory: {resolved}")
-    return resolved
-
-
-def _resolve_project_id(project: str | None) -> str:
-    """Resolve the one local destination project with the default when omitted."""
-    return project or _DEFAULT_PROJECT_ID
+    if not trace_file.exists():
+        raise typer.BadParameter(f"trace file not found: {trace_file}")
+    if not trace_file.is_file():
+        raise typer.BadParameter(
+            f"TRACE_FILE must be a trace export, not a directory: {trace_file}"
+        )
+    return trace_file
 
 
 def _load_canonical_traces(path: Path, source: str) -> TraceNormalizationResult:
@@ -197,16 +181,20 @@ def _capture_local_build_telemetry(
     )
 
 
-def _render_completed_build(completed: TaskSetBuild) -> None:
+def _render_completed_build(completed: ProjectBuild) -> None:
     """Present immutable artifact identities without reading or invoking external systems."""
-    dataset = completed.trace_dataset.dataset
-    task_set = completed.task_set
+    dataset = completed.artifacts.trace_dataset.dataset
+    task_set = completed.artifacts.task_set
     _console.print(
         f"[green]built[/green] TraceDataset {dataset.dataset_id} "
         f"({len(dataset.trace_ids)} valid, {dataset.invalid_trace_count} excluded)"
     )
     _console.print(
         f"[green]mined[/green] TaskSet {task_set.task_set_id} "
-        f"({sum(task.partition == 'fit' for task in completed.mining.tasks)} fit, "
-        f"{sum(task.partition == 'held_out' for task in completed.mining.tasks)} held_out)"
+        f"({sum(task.partition == 'fit' for task in completed.artifacts.mining.tasks)} fit, "
+        f"{sum(task.partition == 'held_out' for task in completed.artifacts.mining.tasks)} "
+        "held_out)"
+    )
+    _console.print(
+        "[yellow]review ready[/yellow] rubric proposals pending; no model or judge call was made"
     )

@@ -6,10 +6,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from wmo.common.core.artifacts import SourceIdentity
-from wmo.common.project import ArtifactStore, artifact_input
+from wmo.common.project import ArtifactStore, ProjectConfig, ProjectStore, artifact_input
 from wmo.common.project.paths import ProjectPaths
 from wmo.common.traces import Trace, TraceSource, TraceSpan
-from wmo.simulation.build import build_task_set
+from wmo.simulation.build import build_project, build_task_set
 from wmo.simulation.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
 from wmo.simulation.mining.service import MiningSpec
 
@@ -64,3 +64,30 @@ def test_build_task_set_uses_only_the_persisted_trace_dataset_as_task_set_input(
     assert built.trace_dataset.traces == (_trace(1), _trace(2))
     assert built.task_set.task_ids
     assert store.read(built.task_set.task_set_id).manifest.inputs == (dataset_input,)
+
+
+def test_build_project_resumes_and_records_provider_free_review_readiness(tmp_path: Path) -> None:
+    """A repeated local build reuses immutable IDs and never invents rubric proposals."""
+    store = ProjectStore(tmp_path, "project-a")
+    store.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(traces=(_trace(1), _trace(2)), issues=())
+    first = build_project(
+        normalized,
+        store,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="test-revision",
+        mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
+    )
+    replay = build_project(
+        normalized,
+        store,
+        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+        code_revision="test-revision",
+        mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
+    )
+
+    assert replay == first
+    assert replay.review.status == "proposals_pending"
+    assert replay.review.paid_calls_made == 0
+    assert store.read_review() == {"build_review": replay.review.model_dump(mode="json")}
+    assert len(store.artifacts.list_ids()) == 2

@@ -16,8 +16,8 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
     stable_id,
 )
-from wmo.common.project import ArtifactStore
-from wmo.common.tasks import TaskCase, TaskSet
+from wmo.common.project import ArtifactAlreadyExistsError, ArtifactStore
+from wmo.common.tasks import TaskCase, TaskSet, load_task_set
 from wmo.common.traces import Trace
 from wmo.simulation.mining.cleanup import (
     InstructionCleanupModel,
@@ -230,6 +230,9 @@ def persist_task_set(
 
     Returns:
         The canonical ``TaskSet`` manifest stored with ``tasks.jsonl`` and ``coverage.json``.
+
+    Raises:
+        ValueError: An existing artifact differs from the deterministic replay.
     """
     task_payload = _jsonl_bytes(result.tasks)
     coverage_payload = canonical_json_bytes(result.coverage)
@@ -246,16 +249,36 @@ def persist_task_set(
         coverage_path="coverage.json",
         coverage_sha256=hashlib.sha256(coverage_payload).hexdigest(),
     )
-    store.write(
-        artifact_id=task_set_id,
-        artifact_type="task-set",
-        envelope=task_set,
-        files={
-            "tasks.jsonl": task_payload,
-            "coverage.json": coverage_payload,
-            "task-set.json": canonical_json_bytes(task_set),
-        },
-    )
+    destination = store.project_directory / "artifacts" / task_set_id
+    if destination.exists():
+        loaded = load_task_set(store, task_set_id)
+        replay = task_set.model_copy(update={"created_at": loaded.task_set.created_at})
+        if loaded.task_set != replay or loaded.tasks != result.tasks:
+            raise ValueError("existing task set differs from replayed mining evidence")
+        if store.read_bytes(task_set_id, "coverage.json") != coverage_payload:
+            raise ValueError("existing task-set coverage differs from replayed mining evidence")
+        return loaded.task_set
+    try:
+        store.write(
+            artifact_id=task_set_id,
+            artifact_type="task-set",
+            envelope=task_set,
+            files={
+                "tasks.jsonl": task_payload,
+                "coverage.json": coverage_payload,
+                "task-set.json": canonical_json_bytes(task_set),
+            },
+        )
+    except ArtifactAlreadyExistsError:
+        loaded = load_task_set(store, task_set_id)
+        replay = task_set.model_copy(update={"created_at": loaded.task_set.created_at})
+        if loaded.task_set != replay or loaded.tasks != result.tasks:
+            raise ValueError("existing task set differs from replayed mining evidence") from None
+        if store.read_bytes(task_set_id, "coverage.json") != coverage_payload:
+            raise ValueError(
+                "existing task-set coverage differs from replayed mining evidence"
+            ) from None
+        return loaded.task_set
     return task_set
 
 

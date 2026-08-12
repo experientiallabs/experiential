@@ -1,132 +1,121 @@
 # World Model Optimizer
 
-WMO builds immutable evaluation evidence and fits a conservative offline kNN policy across pinned
-model candidates. Runtime loads the frozen policy, evidence bank, catalog, pricing snapshot, and
-request-visible feature contract before selecting or calling a candidate.
+WMO turns local OpenTelemetry or PostHog trace exports into immutable task evidence, fits one
+conservative offline router from completed evaluations, and runs the frozen router locally.
 
-![World model, runtime agent, and optimizer connected in a continuous improvement loop](assets/world-model-agent-loop.svg)
+## Customer workflow
 
-<p align="center">
-  🌐 <a href="https://platform.experientiallabs.ai">Platform</a> |
-  📚 <a href="https://github.com/experientiallabs/world-model-optimizer/tree/main/docs">Docs</a> |
-  <a href="https://discord.gg/B6sM8xTVwU"><img src="https://cdn.simpleicons.org/discord/5865F2" alt="" width="16" height="16"> Discord</a>
-</p>
-
-## Getting started
-
-**1. Register your providers.**
+Install the package, then build a project from one explicit local export:
 
 ```bash
 pip install world-model-optimizer
-wmo providers set
+wmo build traces.otel.jsonl --source otlp --project support-agent --root .wmo
 ```
 
-That verifies the provider and then offers to register its models as routing candidates in
-`.wmo/pool.toml`, the roster everything below chooses from. It searches the provider's own
-catalog (OpenRouter's 338 published models included) and asks only for what that backend needs.
-Re-run it to add another provider's models beside the ones already registered.
+Build writes a normalized `TraceDataset`, a deterministic `TaskSet`, and a local review handoff
+whose status is `proposals_pending`. It does not call a model, judge, provider, or network service.
+Rubric proposal, simulation, and judgment are separate explicit operations with their own consent
+and budget boundaries.
 
-**2. Build a task set from OTel traces.**
+After the combined fit, fidelity, and held-out evidence is complete, freeze and report one router:
 
 ```bash
-# Download a published bundle containing prebuilt world models, then choose a name from the list.
-wmo download bird-sql
-wmo list --root environment-capture-data/bird-sql
-export WMO_ROOT=environment-capture-data/bird-sql
-export WORLD_MODEL=your-model-name  # replace with a name printed by `wmo list`
-
-# Keep the TaskSet beside that model so sweep resolves both from the same local root.
-wmo build --file traces.jsonl --source otlp --project my-project --root "$WMO_ROOT"
-
+wmo optimize router support-agent --config router-optimization.json --root .wmo
 ```
 
-`wmo build` writes trace and task artifacts, not a simulator. The downloaded bundle supplies the
-world model used above; a customer-specific world model can instead be placed under the same
-`<root>/models/<name>/` contract.
+The single JSON config names completed evidence, a frozen embedding set, pricing, guard settings,
+and an exact timestamp and code revision. The workflow materializes fit-only evidence and freezes
+the bank and policy before it opens held-out evidence. Repeating the command with the same config
+verifies and reuses the same immutable artifacts. It never calls a provider.
 
-**3. Fit and report from completed artifacts.**
+Run the frozen router through the development-only loopback adapter:
 
 ```bash
-wmo optimize router fit my-project --root "$WMO_ROOT" --config router-fit.json
-wmo optimize router report my-project --root "$WMO_ROOT" --config router-report.json
+wmo run support-agent --root .wmo --port 8000
 ```
 
-These offline commands accept explicit IDs for a pre-existing combined evaluation plan, completed
-rollouts and judgments, a plan-bound fidelity report, frozen embeddings, and pricing. They do not
-call providers. `fit` opens only fit and fidelity inputs; `report` opens held-out evidence only
-after the policy and bank are frozen. Train from a project-bound persisted SFT dataset with
-`wmo optimize model PROJECT`. W14R owns the final public `wmo run` composition.
-
-### E2B backend
-
-To evaluate a local optimization in E2B, install the extra and provide an E2B key:
+The command can bind only to `127.0.0.1`. Every completion request must provide a caller-owned
+`X-WMO-Episode-ID`, which keeps the selected candidate sticky for that episode. Startup loads and
+verifies the policy, bank, pricing, feature contract, model aliases, and connection identities.
+Selection happens online, but the policy never learns online.
 
 ```bash
-pip install "world-model-optimizer[e2b]"
-export E2B_API_KEY=...
-wmo optimize harness my-agent my-environment --tasks tasks.jsonl --backend e2b
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-WMO-Episode-ID: customer-conversation-42' \
+  -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
 ```
 
-## Use a world model as an API
+To train a model from an already persisted, project-bound SFT dataset, use
+`wmo optimize model PROJECT`. The command validates the complete local artifact graph and a finite
+cost bound before requesting consent for managed Tinker execution.
 
-`world-model-optimizer` includes world models that can be used to simulate your agent environment
-for testing and optimization.
+## Python composition
+
+The CLI calls the same domain services available to Python callers:
 
 ```python
-from wmo import Action, ActionKind
-from wmo.common.config.store import WorldModelStore
-from wmo.simulation.model.loader import load_world_model
+from datetime import UTC, datetime
+from pathlib import Path
 
-model_dir = WorldModelStore(".wmo").resolve("airline")
-wm, _provider = load_world_model(model_dir)
+from wmo import build_project, load_project_router, optimize_router
+from wmo.common.models import ModelMessage, ModelRequest
+from wmo.common.project import ProjectConfig, ProjectStore
+from wmo.optimize.router import RouterOptimizationConfig
+from wmo.simulation.ingest.otlp import load_otlp_file
 
-session = wm.new_session(task="check out the cart")
-obs = wm.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="add_to_cart",
-                                 arguments={"sku": "A1"}))
-print(obs.content)
+root = Path(".wmo")
+project = ProjectStore(root, "support-agent")
+project.initialize(ProjectConfig(project_id="support-agent"))
+
+built = build_project(
+    load_otlp_file(Path("traces.otel.jsonl")),
+    project,
+    created_at=datetime.now(UTC),
+    code_revision="your-exact-revision",
+)
+assert built.review.status == "proposals_pending"
+
+# Explicit simulation and judgment services produce the completed artifact IDs in this file.
+router_config = RouterOptimizationConfig.model_validate_json(
+    Path("router-optimization.json").read_bytes()
+)
+optimized = optimize_router(project.artifacts, router_config)
+
+# This is the explicit online model-call boundary.
+runtime = load_project_router(
+    "support-agent",
+    root,
+    policy_id=optimized.optimization.policy.policy_id,
+)
+response = runtime.complete(
+    ModelRequest(messages=(ModelMessage(role="user", content="Help me"),)),
+    episode_id="customer-conversation-42",
+)
+print(response.decision.selected_alias, response.response.output)
 ```
 
-## Runtime agents and optimizers in E2B sandboxes
+## Telemetry
 
-WMO can run the real [pi](https://github.com/earendil-works/pi) worker inside isolated
-[E2B](https://e2b.dev) sandboxes while the world model supplies the environment. Optimization and
-evaluation rollouts run in parallel, and model credentials stay outside the sandbox.
+Anonymous aggregate PostHog product telemetry is enabled by default. It never includes prompts,
+traces, actions, observations, paths, model names, credentials, or raw customer content.
 
 ```bash
-wmo optimize harness my-agent my-environment --tasks tasks.jsonl --backend e2b
-wmo eval tasks.jsonl --mode closed-loop --harness my-agent --harness-backend e2b
+wmo config telemetry status
+wmo config telemetry disable
+wmo config telemetry enable
 ```
 
-The optimizer can change prompts, tools, policies, skills, and runtime code. Every candidate is
-measured against the same simulated tasks, and only changes that pass the evaluation gates become
-the new versioned champion harness.
+The preference is stored locally in `.wmo/settings.toml`.
 
 ## Development
 
-Managed with [uv](https://docs.astral.sh/uv/); linting/formatting with [ruff](https://docs.astral.sh/ruff/); type checking with [ty](https://github.com/astral-sh/ty); tasks run through [just](https://github.com/casey/just) (`brew install just` / `cargo install just`). Conventions live in [AGENTS.md](./AGENTS.md).
-
 ```bash
-just setup               # first time: .env from the template + uv sync
-uv sync --extra dev      # env + dev tools
-uv run ruff check .      # lint
-uv run ruff format .     # format
-uv run ty check          # type check
-uv run pytest -q         # tests
+uv sync --extra dev
+uv run ruff format --check .
+uv run ruff check .
+uv run ty check
+uv run pytest -q
 ```
 
-## Usage telemetry
-
-`wmo` uses anonymous usage telemetry to track the volume of usage.
-Telemetry is strictly metadata. It never includes prompts, traces, actions, observations, file
-paths,
-model names, provider credentials, or raw user content.
-
-Telemetry is enabled by default. To opt out for a project:
-
-```bash
-uv run wmo config telemetry disable
-```
-
-This writes `.wmo/settings.toml`. You can re-enable it with `uv run wmo config telemetry enable`,
-check the current setting with `uv run wmo config telemetry status`, or disable it for a process
-with `DO_NOT_TRACK=1` or `WMO_TELEMETRY=0`.
+Repository and documentation conventions live in [AGENTS.md](./AGENTS.md).

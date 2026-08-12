@@ -134,7 +134,6 @@ def test_build_reads_the_raw_otlp_file_once_and_persists_the_immutable_boundary(
         app,
         [
             "build",
-            "--file",
             str(source),
             "--source",
             "otlp",
@@ -219,8 +218,14 @@ def test_build_rejects_unknown_source_and_missing_local_evidence(tmp_path: Path)
     """The direct build surface names only its two canonical input formats and local file need."""
     source = _otlp_export(tmp_path, count=1)
 
-    unknown = _RUNNER.invoke(app, ["build", str(source), "--source", "langsmith"])
-    missing = _RUNNER.invoke(app, ["build", "--file", str(tmp_path / "missing.json")])
+    unknown = _RUNNER.invoke(
+        app,
+        ["build", str(source), "--source", "langsmith", "--project", "support"],
+    )
+    missing = _RUNNER.invoke(
+        app,
+        ["build", str(tmp_path / "missing.json"), "--project", "support"],
+    )
 
     assert unknown.exit_code == 2
     assert "choose one of: otlp, posthog" in " ".join(unknown.output.replace("│", " ").split())
@@ -236,3 +241,16 @@ def test_build_rejects_the_removed_name_compatibility_alias(tmp_path: Path) -> N
 
     assert result.exit_code == 2
     assert "No such option: --name" in result.output
+
+
+def test_build_rejects_removed_file_alias_and_requires_project(tmp_path: Path) -> None:
+    """The locked build surface has one positional trace and one explicit project."""
+    source = _otlp_export(tmp_path, count=1)
+
+    alias = _RUNNER.invoke(app, ["build", "--file", str(source), "--project", "support"])
+    missing_project = _RUNNER.invoke(app, ["build", str(source)])
+
+    assert alias.exit_code == 2
+    assert "No such option: --file" in alias.output
+    assert missing_project.exit_code == 2
+    assert "--project" in missing_project.output

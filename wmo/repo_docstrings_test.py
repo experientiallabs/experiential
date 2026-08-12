@@ -628,7 +628,8 @@ DOCSTRING_TOMBSTONES: frozenset[DocstringViolation] = frozenset(
     DocstringViolation(*row.split("|", maxsplit=3)) for row in _DOCSTRING_TOMBSTONE_ROWS
 )
 DELETED_OWNER_DOCSTRING_PATHS: Final[frozenset[str]] = frozenset(
-    """wmo/cli/model_app.py wmo/cli/optimize_model_app.py wmo/cli/run_cmd.py
+    """wmo/cli/eval_closed_loop.py wmo/cli/model_app.py wmo/cli/optimize_model_app.py
+wmo/cli/pool_registry.py wmo/cli/run_cmd.py wmo/cli/ui.py
 wmo/optimize/routing/__init__.py
 wmo/optimize/routing/cluster_labels.py wmo/optimize/routing/compression.py
 wmo/optimize/routing/deepswe.py wmo/optimize/routing/embedding_cache.py
@@ -903,7 +904,6 @@ def test_public_docstring_transition_inventory_is_monotonic() -> None:
 def test_google_docstrings_accept_trivial_and_nontrivial_public_apis() -> None:
     """One-line trivial APIs and full Google sections are both direct passing fixtures."""
     source = '''"""Fixture module."""
-
 from typing import Protocol
 
 class CustomerProtocol(Protocol):

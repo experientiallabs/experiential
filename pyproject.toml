@@ -131,7 +131,6 @@ convention = "google"
 # symbol-level transition test rejects new violations in these legacy files, requires tombstones
 # when a violation is fixed, and rejects a reintroduced tombstone. No directory is exempt.
 "wmo/cli/defer.py" = ["D102"]
-"wmo/cli/ui.py" = ["D102"]
 "wmo/common/config/card.py" = ["D103"]
 "wmo/common/config/config.py" = ["D102"]
 "wmo/common/config/settings.py" = ["D103"]

@@ -95,11 +95,13 @@ def settings_path(root: str | Path = ARTIFACT_DIR) -> Path:
     return Path(root) / SETTINGS_FILENAME
 
 
-_SETTINGS_REPAIR = "fix the file, or delete it and re-run `wmo providers set` to write a fresh one"
+_SETTINGS_REPAIR = (
+    "fix the file, or delete it and rerun `wmo config telemetry status` to use defaults"
+)
 """How to recover a settings file this loader refuses. Every raise below names it.
 
-`wmo providers set` reads the file before it rewrites it, so "just re-run it" is only true once
-the broken file is out of the way, hence "delete it and re-run", not "re-run".
+Telemetry commands read the file before changing it, so a malformed file must be repaired or
+removed before the local default can be used.
 """
 
 

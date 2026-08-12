@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from wmo.common.core.artifacts import SourceIdentity, canonical_json_bytes, stable_id
-from wmo.common.project import ArtifactManifest, ArtifactStore
+from wmo.common.project import ArtifactAlreadyExistsError, ArtifactManifest, ArtifactStore
 from wmo.common.traces import Trace, TraceDataset, TraceSource
 from wmo.simulation.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
 
@@ -87,17 +87,75 @@ def persist_trace_dataset(
         invalid_trace_count=result.invalid_trace_count,
         trace_ids=tuple(trace.trace_id for trace in traces),
     )
-    manifest = store.write(
-        artifact_id=dataset.dataset_id,
-        artifact_type=_TRACE_DATASET_ARTIFACT_TYPE,
-        envelope=dataset,
-        files={
-            _TRACES_PATH: traces_payload,
-            _ISSUES_PATH: issues_payload,
-            _TRACE_DATASET_PATH: canonical_json_bytes(dataset),
-        },
-    )
+    destination = store.project_directory / "artifacts" / dataset.dataset_id
+    if destination.exists():
+        return _load_exact_replay(
+            store,
+            dataset,
+            traces,
+            traces_payload=traces_payload,
+            issues_payload=issues_payload,
+        )
+    try:
+        manifest = store.write(
+            artifact_id=dataset.dataset_id,
+            artifact_type=_TRACE_DATASET_ARTIFACT_TYPE,
+            envelope=dataset,
+            files={
+                _TRACES_PATH: traces_payload,
+                _ISSUES_PATH: issues_payload,
+                _TRACE_DATASET_PATH: canonical_json_bytes(dataset),
+            },
+        )
+    except ArtifactAlreadyExistsError:
+        return _load_exact_replay(
+            store,
+            dataset,
+            traces,
+            traces_payload=traces_payload,
+            issues_payload=issues_payload,
+        )
     return PersistedTraceDataset(dataset=dataset, manifest=manifest, traces=traces)
+
+
+def _load_exact_replay(
+    store: ArtifactStore,
+    expected: TraceDataset,
+    traces: tuple[Trace, ...],
+    *,
+    traces_payload: bytes,
+    issues_payload: bytes,
+) -> PersistedTraceDataset:
+    """Return an existing content-identical dataset for a safe build resume."""
+    stored = store.read(expected.dataset_id)
+    if stored.manifest.artifact_type != _TRACE_DATASET_ARTIFACT_TYPE:
+        raise ValueError(f"existing artifact {expected.dataset_id} is not a trace dataset")
+    existing = TraceDataset.model_validate_json(
+        store.read_bytes(expected.dataset_id, _TRACE_DATASET_PATH)
+    )
+    replay = expected.model_copy(update={"created_at": existing.created_at})
+    if existing != replay:
+        raise ValueError("existing trace dataset differs from replayed normalized evidence")
+    if store.read_bytes(expected.dataset_id, _TRACES_PATH) != traces_payload:
+        raise ValueError("existing trace dataset records differ from replayed evidence")
+    if store.read_bytes(expected.dataset_id, _ISSUES_PATH) != issues_payload:
+        raise ValueError("existing trace dataset issues differ from replayed evidence")
+    manifest = stored.manifest
+    if (
+        manifest.schema_version,
+        manifest.created_at,
+        manifest.inputs,
+        manifest.code_revision,
+        manifest.source,
+    ) != (
+        existing.schema_version,
+        existing.created_at,
+        existing.inputs,
+        existing.code_revision,
+        existing.source,
+    ):
+        raise ValueError("existing trace dataset envelope differs from its manifest")
+    return PersistedTraceDataset(dataset=existing, manifest=manifest, traces=traces)
 
 
 def _ordered_traces(traces: Sequence[Trace]) -> tuple[Trace, ...]:

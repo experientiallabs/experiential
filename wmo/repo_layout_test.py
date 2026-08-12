@@ -321,25 +321,25 @@ ROOT_CLI_COMMAND_INVENTORY: Final[frozenset[str]] = frozenset(
     {
         "build",
         "config",
-        "download",
-        "eval",
-        "knowledge",
-        "list",
         "optimize",
-        "providers",
+        "run",
     }
 )
 ROOT_CLI_COMMAND_TOMBSTONES: Final[frozenset[str]] = frozenset(
     {
         "demo",
+        "download",
+        "eval",
         "ingest",
+        "knowledge",
+        "list",
         "login",
         "logout",
         "play",
+        "providers",
         "pull",
         "push",
         "research",
-        "run",
         "runs",
         "scenarios",
         "serve",

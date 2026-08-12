@@ -59,7 +59,7 @@ assert not bad, f"heavy modules loaded for wmo --help: {bad}"
     )
 
 
-def test_list_and_config_do_not_load_serve_or_sft() -> None:
+def test_config_does_not_load_router_runtime_or_optimizer() -> None:
     _run(
         """
 import sys
@@ -67,12 +67,10 @@ from typer.testing import CliRunner
 from wmo.cli.app import app
 
 runner = CliRunner()
-assert runner.invoke(app, ["list"]).exit_code == 0
 assert runner.invoke(app, ["config", "telemetry", "status"]).exit_code == 0
 banned = (
-    "wmo.simulation.serving.server",
-    "wmo.optimize.model",
-    "wmo.cli.route_app",
+    "wmo.runtime.router",
+    "wmo.optimize.router",
     "fastapi",
     "sklearn",
     "uvicorn",
