@@ -7,7 +7,7 @@ from pathlib import Path
 
 import typer
 
-from wmo.common.observability.telemetry import capture
+from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.project import ArtifactStore, ProjectPaths
 from wmo.optimize.router.workflow import RouterOptimizationConfig, optimize_router
 
@@ -42,8 +42,9 @@ def router(
         result = optimize_router(ArtifactStore(ProjectPaths(root=root, project_id=project)), value)
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from None
-    capture(
+    capture_completion_once(
         "wmo router completed",
+        result.optimization.report.report_id,
         {
             "success": True,
             "fit_cell_count": len(value.fit.cell_evidence),

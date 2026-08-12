@@ -10,6 +10,7 @@ from typing import cast
 import pytest
 from typer.testing import CliRunner
 
+from wmo.cli import router_app
 from wmo.cli.app import app
 from wmo.common.core.artifacts import ArtifactInput, FailureCode, StructuredFailure
 from wmo.common.evaluations import (
@@ -38,6 +39,7 @@ from wmo.common.models import (
     PricingSnapshot,
     RoutedCandidateSnapshot,
 )
+from wmo.common.observability import telemetry
 from wmo.common.project import ProjectConfig, ProjectStore
 from wmo.common.routing import (
     FrozenEmbedding,
@@ -121,34 +123,110 @@ def test_single_workflow_freezes_before_held_out_and_resumes_exactly(
 
     config_path = tmp_path / "router-config.json"
     config_path.write_text(config.model_dump_json(), encoding="utf-8")
-    captured = []
+    capture_calls = []
+    deliveries = []
+    actual_capture = router_app.capture_completion_once
 
-    def capture(event, properties, *, root):  # noqa: ANN001, ANN202
-        captured.append((event, properties, root))
+    def capture(event, completion_id, properties, *, root):  # noqa: ANN001, ANN202
+        capture_calls.append((event, completion_id, properties, root))
+        return actual_capture(event, completion_id, properties, root=root)
 
-    monkeypatch.setattr("wmo.cli.router_app.capture", capture)
-    result = CliRunner().invoke(
-        app,
-        [
-            "optimize",
-            "router",
-            "project-a",
-            "--config",
-            str(config_path),
-            "--root",
-            str(tmp_path),
-        ],
-    )
+    def deliver(event, properties, *, root, event_uuid=None):  # noqa: ANN001, ANN202
+        deliveries.append((event, properties, root, event_uuid))
+        return True
+
+    monkeypatch.setenv("WMO_TELEMETRY", "1")
+    monkeypatch.setattr(router_app, "capture_completion_once", capture)
+    monkeypatch.setattr(telemetry, "_capture_sanitized", deliver)
+    arguments = [
+        "optimize",
+        "router",
+        "project-a",
+        "--config",
+        str(config_path),
+        "--root",
+        str(tmp_path),
+    ]
+    runner = CliRunner()
+
+    result = runner.invoke(app, arguments)
+    replay = runner.invoke(app, arguments)
+
     assert result.exit_code == 0, result.output
+    assert replay.exit_code == 0, replay.output
     assert f"policy: {first.optimization.policy.policy_id}" in result.output
     assert "held-out evaluation:" in result.output
-    assert len(captured) == 1
-    event, properties, event_root = captured[0]
+    assert result.output == replay.output
+    assert len(capture_calls) == 2
+    assert len(deliveries) == 1
+    event, completion_id, properties, event_root = capture_calls[0]
     assert event == "wmo router completed"
+    assert completion_id == first.optimization.report.report_id
+    assert all(call[1] == completion_id for call in capture_calls)
     assert event_root == tmp_path
     assert properties["fit_cell_count"] == len(config.fit.cell_evidence)
     assert properties["heldout_cell_count"] == len(config.held_out.cell_evidence)
     assert properties["candidate_count"] == 1
+    receipts = tuple((tmp_path / "telemetry-receipts").glob("*.json"))
+    assert len(receipts) == 1
+    assert completion_id.encode() in receipts[0].read_bytes()
+
+
+def test_router_cli_crash_after_telemetry_receipt_replays_without_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A final CLI crash keeps its durable report and never redelivers its telemetry event."""
+    store, config = _workflow_fixture(tmp_path)
+    config_path = tmp_path / "router-config.json"
+    config_path.write_text(config.model_dump_json(), encoding="utf-8")
+    capture_calls = []
+    deliveries = []
+    actual_capture = router_app.capture_completion_once
+
+    def capture(event, completion_id, properties, *, root):  # noqa: ANN001, ANN202
+        capture_calls.append((event, completion_id, properties, root))
+        return actual_capture(event, completion_id, properties, root=root)
+
+    def crash_after_receipt(event, properties, *, root, event_uuid=None):  # noqa: ANN001, ANN202
+        deliveries.append((event, properties, root, event_uuid))
+        raise RuntimeError("simulated process crash after router telemetry receipt")
+
+    monkeypatch.setenv("WMO_TELEMETRY", "1")
+    monkeypatch.setattr(router_app, "capture_completion_once", capture)
+    monkeypatch.setattr(telemetry, "_capture_sanitized", crash_after_receipt)
+    arguments = [
+        "optimize",
+        "router",
+        "project-a",
+        "--config",
+        str(config_path),
+        "--root",
+        str(tmp_path),
+    ]
+    runner = CliRunner()
+
+    crashed = runner.invoke(app, arguments)
+    assert crashed.exit_code == 1
+    assert isinstance(crashed.exception, RuntimeError)
+    assert "after router telemetry receipt" in str(crashed.exception)
+    report_ids = tuple(
+        artifact_id
+        for artifact_id in store.artifacts.list_ids()
+        if store.artifacts.read(artifact_id).manifest.artifact_type == "router-report"
+    )
+    assert len(report_ids) == 1
+
+    replay = runner.invoke(app, arguments)
+
+    assert replay.exit_code == 0, replay.output
+    assert f"report: {report_ids[0]}" in replay.output
+    assert len(capture_calls) == 2
+    assert all(call[1] == report_ids[0] for call in capture_calls)
+    assert len(deliveries) == 1
+    receipts = tuple((tmp_path / "telemetry-receipts").glob("*.json"))
+    assert len(receipts) == 1
+    assert report_ids[0].encode() in receipts[0].read_bytes()
 
 
 def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfig]:
