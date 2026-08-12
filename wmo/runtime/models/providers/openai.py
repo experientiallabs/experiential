@@ -94,7 +94,19 @@ def openai_responses_response(
     configured_model: ModelSnapshot,
     latency_seconds: float,
 ) -> ModelResponse:
-    """Convert one completed native Responses response into a shared WMO response."""
+    """Convert one completed native Responses response into a shared WMO response.
+
+    Args:
+        payload: Decoded completed OpenAI Responses payload.
+        configured_model: Resolved catalog identity used for the request.
+        latency_seconds: Observed duration of the successful request sequence.
+
+    Returns:
+        The typed assistant action, served model identity, and observed economics.
+
+    Raises:
+        ProviderResponseError: The response status, output, tools, or usage is malformed.
+    """
     status = payload.get("status")
     if status not in {None, "completed"}:
         raise ProviderResponseError(f"OpenAI response ended with status {status!r}")
@@ -161,7 +173,14 @@ class OpenAIClient:
         self._timeout_seconds = timeout_seconds
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Complete one request through the native non-streaming Responses endpoint."""
+        """Complete one request through the native non-streaming Responses endpoint.
+
+        Args:
+            request: Visible messages, tool schemas, and sampling controls to send.
+
+        Returns:
+            The typed non-streaming model response with observed request economics.
+        """
         started_at = time.monotonic()
         response = post_json(
             self._transport,
@@ -178,7 +197,14 @@ class OpenAIClient:
         )
 
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
-        """Embed texts through OpenAI's native embeddings endpoint."""
+        """Embed texts through OpenAI's native embeddings endpoint.
+
+        Args:
+            texts: Ordered visible text values to embed.
+
+        Returns:
+            Unit-normalized embeddings in the input order.
+        """
         if not texts:
             return ()
         response = post_json(

@@ -204,7 +204,14 @@ class OpenAICompatibleClient:
         self._extra_headers = dict(extra_headers or {})
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Complete one non-streaming request through Chat Completions."""
+        """Complete one non-streaming request through Chat Completions.
+
+        Args:
+            request: Visible messages, tool schemas, and sampling controls to send.
+
+        Returns:
+            The typed non-streaming model response with observed request economics.
+        """
         started_at = time.monotonic()
         response = post_json(
             self._transport,
@@ -221,7 +228,14 @@ class OpenAICompatibleClient:
         )
 
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
-        """Embed ordered text through the configured model without making empty requests."""
+        """Embed ordered text through the configured model without making empty requests.
+
+        Args:
+            texts: Ordered visible text values to embed.
+
+        Returns:
+            Unit-normalized embeddings in the input order, or an empty tuple for no texts.
+        """
         if not texts:
             return ()
         response = post_json(
@@ -332,7 +346,17 @@ def _usage(payload: JsonObject) -> Usage | None:
 
 
 def normalize_embedding_vector(values: Sequence[JsonValue]) -> tuple[float, ...]:
-    """Return one finite, non-zero unit vector from a provider response."""
+    """Return one finite, non-zero unit vector from a provider response.
+
+    Args:
+        values: Numeric values in one provider-returned embedding vector.
+
+    Returns:
+        The same vector normalized to unit length.
+
+    Raises:
+        OpenAICompatibleResponseError: A value is nonnumeric, nonfinite, or the vector is zero.
+    """
     vector: list[float] = []
     for index, value in enumerate(values):
         if isinstance(value, bool) or not isinstance(value, (int, float)):

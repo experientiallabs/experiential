@@ -68,7 +68,20 @@ class HttpxJsonTransport(JsonHttpTransport):
         payload: JsonObject,
         timeout_seconds: float,
     ) -> JsonHttpResponse:
-        """Send one bounded JSON request without logging content or credentials."""
+        """Send one bounded JSON request without logging content or credentials.
+
+        Args:
+            url: Absolute provider endpoint URL.
+            headers: Provider request headers, including the resolved credential.
+            payload: Complete JSON request body.
+            timeout_seconds: Per-attempt request timeout.
+
+        Returns:
+            The HTTP status and decoded JSON response object.
+
+        Raises:
+            ProviderTransportError: The request fails or the response is not a JSON object.
+        """
         try:
             response = self._client.post(
                 url,

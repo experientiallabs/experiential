@@ -37,7 +37,18 @@ DEFAULT_MAXIMUM_OUTPUT_TOKENS = 4096
 
 
 def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
-    """Convert a WMO request into Gemini's native generateContent payload."""
+    """Convert a WMO request into Gemini's native generateContent payload.
+
+    Args:
+        model_id: Gemini model identifier selected by the catalog.
+        request: Typed visible messages, tools, and sampling parameters.
+
+    Returns:
+        A non-streaming native payload for the generateContent endpoint.
+
+    Raises:
+        ValueError: A visible request message cannot preserve its tool linkage on Gemini's wire.
+    """
     system_parts: list[JsonObject] = []
     contents: list[JsonObject] = []
     tool_names: dict[str, str] = {}
@@ -83,7 +94,19 @@ def gemini_generate_response(
     configured_model: ModelSnapshot,
     latency_seconds: float,
 ) -> ModelResponse:
-    """Convert native Gemini candidate parts into WMO text and tool calls."""
+    """Convert native Gemini candidate parts into WMO text and tool calls.
+
+    Args:
+        payload: Decoded completed Gemini response.
+        configured_model: Resolved catalog identity used for the request.
+        latency_seconds: Observed duration of the successful request sequence.
+
+    Returns:
+        The typed assistant action, served model identity, and observed economics.
+
+    Raises:
+        ProviderResponseError: The response omits a usable candidate or has malformed content.
+    """
     candidates = _array(payload.get("candidates"), "candidates")
     if not candidates:
         raise ProviderResponseError("Gemini response has no candidates")
@@ -148,7 +171,14 @@ class GeminiClient:
         self._timeout_seconds = timeout_seconds
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Complete one native Gemini generateContent request."""
+        """Complete one native Gemini generateContent request.
+
+        Args:
+            request: Visible messages, tool schemas, and sampling controls to send.
+
+        Returns:
+            The typed non-streaming model response with observed request economics.
+        """
         started_at = time.monotonic()
         response = post_json(
             self._transport,
@@ -165,7 +195,17 @@ class GeminiClient:
         )
 
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
-        """Batch-embed texts through Gemini and normalize every returned vector."""
+        """Batch-embed texts through Gemini and normalize every returned vector.
+
+        Args:
+            texts: Ordered visible text values to embed.
+
+        Returns:
+            Unit-normalized embeddings in the input order.
+
+        Raises:
+            ProviderResponseError: Gemini returns a missing, malformed, or mismatched vector.
+        """
         if not texts:
             return ()
         model_name = f"models/{_path_model_id(self._model.model_id)}"

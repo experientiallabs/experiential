@@ -43,6 +43,9 @@ def anthropic_messages_request(model_id: str, request: ModelRequest) -> JsonObje
 
     Returns:
         Native Messages payload preserving tool-use and tool-result blocks.
+
+    Raises:
+        ValueError: A visible request message cannot be represented by the native protocol.
     """
     system_parts: list[str] = []
     messages: list[JsonObject] = []
@@ -83,7 +86,19 @@ def anthropic_messages_response(
     configured_model: ModelSnapshot,
     latency_seconds: float,
 ) -> ModelResponse:
-    """Convert native Anthropic content blocks without OpenAI-wire intermediates."""
+    """Convert native Anthropic content blocks without OpenAI-wire intermediates.
+
+    Args:
+        payload: Decoded completed Anthropic response.
+        configured_model: Resolved catalog identity used for the request.
+        latency_seconds: Observed duration of the successful request sequence.
+
+    Returns:
+        The typed assistant action, served model identity, and observed economics.
+
+    Raises:
+        ProviderResponseError: The completed response has malformed or unsupported content.
+    """
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
     for index, value in enumerate(_array(payload.get("content"), "content")):
@@ -147,7 +162,14 @@ class AnthropicClient:
         self._timeout_seconds = timeout_seconds
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Complete one native Messages request without OpenAI conversion."""
+        """Complete one native Messages request without OpenAI conversion.
+
+        Args:
+            request: Visible messages, tool schemas, and sampling controls to send.
+
+        Returns:
+            The typed non-streaming model response with observed request economics.
+        """
         started_at = time.monotonic()
         response = post_json(
             self._transport,
