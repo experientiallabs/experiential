@@ -439,6 +439,8 @@ def _verify_teacher_decision(
         )
     if fidelity.status != "approved" or fidelity.approved_at is None:
         raise SFTSourceVerificationError("teacher rollout requires an approved fidelity report")
+    if rollout_input not in fidelity.inputs:
+        raise SFTSourceVerificationError("teacher fidelity report does not bind the stored rollout")
     if judgment.rollout_id != rollout.rollout_id:
         raise SFTSourceVerificationError("teacher judgment does not belong to the stored rollout")
     if judgment.calibration_id != calibration.calibration_id:

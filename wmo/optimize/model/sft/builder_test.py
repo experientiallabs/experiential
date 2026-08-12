@@ -374,7 +374,9 @@ def _rollout(tag: str, task_id: str) -> RolloutArtifact:
     )
 
 
-def _write_teacher_source(store: ProjectStore) -> _TeacherFixture:
+def _write_teacher_source(
+    store: ProjectStore, *, bind_fidelity_to_teacher_rollout: bool = True
+) -> _TeacherFixture:
     """Persist a complete W5, W6, rollout, fidelity, and acceptance chain for one teacher row."""
     task, task_set, task_set_input = _task_set(store)
     rubric = _rubric(task_set_input)
@@ -520,6 +522,9 @@ def _write_teacher_source(store: ProjectStore) -> _TeacherFixture:
             files={"rollout.json": final_rollout},
         )
     )
+    fidelity_rollout_input = (
+        rollout_input if bind_fidelity_to_teacher_rollout else rollout_inputs[0]
+    )
     final_judgment = LMJudge(
         _FakeJudgeClient(
             model,
@@ -549,7 +554,7 @@ def _write_teacher_source(store: ProjectStore) -> _TeacherFixture:
     fidelity = FidelityReport(
         schema_version=1,
         created_at=_TIME,
-        inputs=(task_set_input,),
+        inputs=_inputs(task_set_input, fidelity_rollout_input),
         code_revision="w12-test",
         fidelity_report_id="fidelity-teacher",
         protocol_sha256=_DIGEST,
@@ -835,6 +840,15 @@ def test_teacher_rejects_forged_score_and_recursively_unverifiable_calibration(
                 ),
             ),
         )
+
+
+def test_teacher_rejects_fidelity_report_bound_to_another_rollout(tmp_path: Path) -> None:
+    """Teacher evidence cannot reuse an approved fidelity report from another rollout."""
+    store = _store(tmp_path)
+    fixture = _write_teacher_source(store, bind_fidelity_to_teacher_rollout=False)
+
+    with pytest.raises(SFTBuildError, match="fidelity report does not bind the stored rollout"):
+        _build(store, teacher=(fixture.source,))
 
 
 def test_teacher_rejects_corrupt_full_task_case_and_preserves_task_set_lineage(
