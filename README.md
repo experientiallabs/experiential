@@ -29,25 +29,26 @@ Re-run it to add another provider's models beside the ones already registered.
 ```bash
 wmo build --file traces.jsonl --source otlp --project my-project
 
-# Score every registered model on the immutable held-out TaskSet from your traces
-wmo optimize route sweep my-model --project my-project
+# Choose an already available world model, then score every registered model on the immutable
+# held-out TaskSet from your traces. Build writes trace and task artifacts, not a simulator.
+wmo optimize route sweep existing-world-model --project my-project
 
 # Deterministically reserve 30% for reporting and fit on the other 70%
 wmo optimize route fit matrix.json --kind knn \
-  --out .wmo/models/my-model/policy.json
+  --out .wmo/models/existing-world-model/policy.json
 ```
 
 **3. Serve it.**
 
 ```bash
-wmo serve --name my-model
+wmo serve --name existing-world-model
 ```
 
 See what it bought you against the model you were using before. The report automatically excludes
 the router-fit scenarios recorded in the policy:
 
 ```bash
-wmo optimize route report matrix.json .wmo/models/my-model/policy.json \
+wmo optimize route report matrix.json .wmo/models/existing-world-model/policy.json \
   --baseline gpt-5.6-sol
 ```
 
