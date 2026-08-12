@@ -754,7 +754,7 @@ def _mean_valset_score(
     Raises on a total judge outage rather than returning 0.0: the acceptance re-check compares
     two of these means, and an all-invalid pass (raw zeros, nothing to impute) would silently
     revert a good winner or wave through a bad one on a number that says nothing about fidelity.
-    Same contract as `wmo.optimize.research.pipeline.score_prompt`.
+    Same contract as the archived research prompt-scoring seam.
 
     Raises:
         RuntimeError: if steps were scored but every judgement was invalid (judge outage).

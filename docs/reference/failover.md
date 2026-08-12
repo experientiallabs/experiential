@@ -3,7 +3,7 @@
 Long GEPA/eval runs die (or silently degrade) when the primary model throttles. The harness
 fails over **world-model calls** across a chain of backends instead: create a gitignored
 `.wmo/fallback.toml` and every CLI entry point that predicts observations (`wmo build`,
-`wmo eval`, `wmo serve` / `demo` / `play`) rides the chain automatically. No file → plain
+`wmo eval`, `wmo serve`) rides the chain automatically. No file means plain
 single-backend behavior.
 
 ```toml

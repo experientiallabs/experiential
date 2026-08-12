@@ -55,7 +55,6 @@ if TYPE_CHECKING:
     from wmo.optimize.routing.report import ImprovementReport
     from wmo.optimize.routing.sweep import SweepPlan
     from wmo.optimize.routing.teacher import TeacherSearchVerdict
-    from wmo.optimize.telemetry.hooks import PipelineEmitter
 
 _console = Console()
 
@@ -220,13 +219,6 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         help="Print the plan table (what would run, what it is projected to cost) and exit "
         "without spending anything or touching any artifact.",
     ),
-    no_emit: bool = typer.Option(
-        False,
-        "--no-emit",
-        help="Do not report this run to the platform's runs panel. Reporting is on whenever a "
-        "platform credential with an organization resolves (`wmo login`); it is buffered, cannot "
-        "fail the run, and changes nothing about what the stages do.",
-    ),
 ) -> None:
     """Measure, fit, tune, and report a routing policy for a world model, in one command.
 
@@ -280,8 +272,6 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     from wmo.optimize.routing.policy import POLICY_FILENAME, probe_embedder
     from wmo.optimize.routing.sweep import SweepError, plan_sweep, resolve_config, resumable_cells
     from wmo.optimize.routing.sweep import preflight_pool as run_preflight
-    from wmo.optimize.telemetry.hooks import PipelineEmitter
-    from wmo.runtime.runs.schema import RunStatus
 
     if distill is not None:
         raise typer.BadParameter(_distill_reserved_message(world_model=world_model, root=root))
@@ -450,23 +440,6 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         _console.print("nothing was run and nothing was spent")
         raise typer.Exit(0)
 
-    # Created after consent, so a dry run and a declined cost question leave no platform run
-    # behind, and before the first stage, so the panel has the run before it has any spend.
-    emitter = PipelineEmitter.create(world_model=model_dir.name, requested=not no_emit)
-    emitter.start(
-        world_model=model_dir.name,
-        config={
-            "stages": [decision.stage.value for decision in decisions],
-            "scenarios": len(plan.scenarios),
-            "episodes": plan.episodes,
-            "cells": plan.cells,
-            "pool": [entry.name for entry in plan.pool.models],
-            "cost_quality": cost_quality,
-            "compressor": compression.compressor_id if compression is not None else None,
-            "embedder": embedder_spec.kind,
-            "max_usd": max_usd,
-        },
-    )
     try:
         manifest = _run_stages(
             decisions,
@@ -484,24 +457,17 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             cost_quality=cost_quality,
             allow_uneven_coverage=allow_uneven_coverage,
             already_measured=already_measured,
-            emitter=emitter,
         )
     except BudgetExceeded as exc:
         # The cap is a clean stop, not a failure: every stage that completed is recorded and the
         # next run resumes at the one that did not start.
-        emitter.finished(RunStatus.STOPPED, error=str(exc))
         _print_budget_stop(model_dir.name, exc)
         raise typer.Exit(1) from exc
-    except typer.Exit as exc:
-        # A stage refused (the coverage gate, a failed fit): the command's own exit path, which is
-        # a failed optimization from the panel's point of view.
-        emitter.finished(RunStatus.FAILED if exc.exit_code else RunStatus.COMPLETED)
+    except typer.Exit:
+        # A stage refusal follows the command's ordinary exit path.
         raise
-    except Exception as exc:
-        emitter.finished(RunStatus.FAILED, error=f"{type(exc).__name__}: {exc}")
+    except Exception:
         raise
-    emitter.finished(RunStatus.COMPLETED)
-    emitter.close()
     # No save here: `_run_stages` persists after every stage it runs, which is what keeps a run
     # that dies mid-flight resumable.
     _print_payoff(_console, model_dir.name, paths=paths, cost_quality=cost_quality)
@@ -1245,7 +1211,6 @@ def _run_stages(
     baseline: str | None,
     cost_quality: float,
     allow_uneven_coverage: bool,
-    emitter: PipelineEmitter,
     already_measured: int = 0,
 ) -> RunManifest:
     """Walk the plan, running what it said would run and recording each stage as it completes.
@@ -1253,9 +1218,6 @@ def _run_stages(
     The manifest is saved after EVERY stage, not once at the end: a run that dies on the fit has
     still paid for its sweep, and the next run must know that.
 
-    `emitter` mirrors each verdict to the platform's runs panel. It is reported AFTER the manifest
-    is saved, so what the panel shows is a fact already on disk rather than a claim about a stage
-    whose record could still be lost.
     """
     from wmo.optimize.routing.pipeline import Stage
 
@@ -1267,12 +1229,10 @@ def _run_stages(
             _console.print(
                 f"\n[bold]{decision.stage.value}[/bold] [dim]SKIP: {escape(decision.reason)}[/dim]"
             )
-            emitter.stage_skipped(decision.stage, reason=decision.reason)
             continue
         _console.print(
             f"\n[bold]{decision.stage.value}[/bold] [dim]({escape(decision.reason)})[/dim]"
         )
-        emitter.stage_running(decision.stage)
         match decision.stage:
             case Stage.SWEEP:
                 ledger.check(Stage.SWEEP, projection.total_usd, basis=projection.basis)
@@ -1300,12 +1260,6 @@ def _run_stages(
                 record = _stage_report(paths, model_dir=model_dir, baseline=baseline)
         manifest = manifest.with_record(record)
         manifest.save(paths.manifest)
-        lifetime_candidate_usd, lifetime_wm_usd = manifest.lifetime_split
-        emitter.stage_completed(
-            record,
-            lifetime_candidate_usd=lifetime_candidate_usd,
-            lifetime_wm_usd=lifetime_wm_usd,
-        )
     return manifest
 
 

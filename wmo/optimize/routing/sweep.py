@@ -834,8 +834,7 @@ def _corpus_traces(model_dir: Path, adapter_name: str, explicit: Path | None) ->
 
     A build does NOT persist the corpus it read (it keeps prompts, metrics and the retrieval
     index), so `local_traces_path` finds a file only for a Hub-downloaded model or a shipped
-    example. `--traces` is the same escape hatch `wmo demo` carries for exactly this reason, and
-    the failure names it.
+    example. `--traces` supplies the corpus when no local copy exists, and the failure names it.
     """
     if explicit is not None:
         if not explicit.is_file():

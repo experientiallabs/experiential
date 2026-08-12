@@ -14,10 +14,9 @@ needs `wmo.common.core.locks.file_write_lock` around the whole cycle too. That l
 separate module because it needs Unix-only `fcntl`; keeping them together would put `fcntl` on
 the import path of `wmo.common.config`, which is the import path of almost everything.
 
-Not covered here: the credential and session writers (`wmo.common.config.dotenv`,
-`wmo.runtime.platform.credentials`, `wmo.simulation.context.credentials`, `wmo.cli.session_state`,
-`wmo.cli.workspace_sync`). Those need 0600 from the moment of creation and refuse to follow a
-symlink, which is a different contract, not a stricter setting of this one.
+Not covered here: credential writers such as `wmo.common.config.dotenv`. Those need 0600 from the
+moment of creation and refuse to follow a symlink, which is a different contract, not a stricter
+setting of this one.
 """
 
 from __future__ import annotations

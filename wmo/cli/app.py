@@ -1,32 +1,28 @@
-"""`wmo` CLI — ingestion UI and operator console for the harness.
+"""`wmo` CLI: ingestion UI and operator console for the harness.
 
 Deliberately small. The lifecycle is:
-    providers verify -> build -> list -> serve / demo / play
+    providers verify -> build -> list -> serve
 `build` creates the project artifact directory itself, so there is no separate init step. World
 models are named (`--name`), stored under `<root>/models/<name>/`, and listed with `wmo list`.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import logging
-import random
 import time
 import urllib.error
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn, cast
-from uuid import uuid4
+from typing import TYPE_CHECKING, cast
 
 import typer
 from pydantic import ValidationError
 from rich.console import Console
 from rich.filesize import decimal
 from rich.markup import escape
-from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Table
 
@@ -54,15 +50,12 @@ from wmo.common.config import (
 
 if TYPE_CHECKING:
     import wmo.cli.pool_registry as pool_registry
-    from wmo.common.core.types import JsonObject, Trace
+    from wmo.common.core.types import Trace
     from wmo.common.providers import ProviderConfig, ProviderKind, VerifyResult
     from wmo.common.providers.base import Embedder, Provider
     from wmo.common.providers.models import ProviderModel
     from wmo.common.providers.pool import Tier
-    from wmo.simulation.evaluation.grid import ModelSpec
     from wmo.simulation.evaluation.open_loop import EvalReport
-    from wmo.simulation.model.eval_suites import EvalSuite
-    from wmo.simulation.model.world_model import WorldModel
     from wmo.simulation.scenarios import ScenarioSet
 
 
@@ -75,16 +68,12 @@ app = typer.Typer(
 providers_app = typer.Typer(help="Manage and verify LLM providers.", no_args_is_help=True)
 # "harness" here would collide with the `wmo harness` group, which manages a different object.
 config_app = typer.Typer(help="Manage project-local wmo settings.", no_args_is_help=True)
-research_app = typer.Typer(
-    help="Research experiments over the harness (scaling laws, ablations).", no_args_is_help=True
-)
 scenarios_app = typer.Typer(
     help="Construct and verify representative eval scenario sets from traces.",
     no_args_is_help=True,
 )
 app.add_typer(providers_app, name="providers")
 app.add_typer(config_app, name="config")
-app.add_typer(research_app, name="research")
 app.add_typer(scenarios_app, name="scenarios")
 add_deferred_typer(
     app,
@@ -98,14 +87,6 @@ add_deferred_typer(
     ),
     known_names=("route", "distill", "model"),
 )
-add_deferred_typer(
-    app,
-    name="runs",
-    module="wmo.cli.runs_app",
-    attr="runs_app",
-    help="See and steer optimization runs: list, show, tail, stop, retry, backfill.",
-    known_names=("list", "show", "tail", "stop", "retry", "backfill"),
-)
 
 
 def _register_ingest() -> None:
@@ -115,9 +96,6 @@ def _register_ingest() -> None:
 
 
 def _register_side_commands() -> None:
-    from wmo.cli.platform_cmds import register as register_platform_commands
-
-    register_platform_commands(app)
     register_run_command(app)
 
 
@@ -126,39 +104,11 @@ _register_side_commands()
 _console = Console()
 _CHECK = "[green]✓[/green]"
 
-# Module-level singleton: a typer.Argument call can't be a default inline (ruff B008).
-# Every dispatched flow is listed: the `grid*` family owns six of this command's options
-# (--val-frac, --models, --gepa-prompts, --dataset-label, --limit-traces, --judge-model), so
-# leaving its tokens out of the help made those flags reference an undiscoverable subcommand.
+# Module-level singleton: a typer.Argument call cannot be a default inline (ruff B008).
 _EVAL_TOKENS = typer.Argument(
     None,
-    help="Trace files to score, or eval flow: list | run <suite> | results optional-suite | "
-    "grid <suite> | grid-plot <result.json>... | grid-heatmap <result.json>... | "
-    "agreement <a.json> <b.json>.",
+    help="Trace files to score, or `agreement <a.json> <b.json>`.",
 )
-# Repeatable option default hoisted out of the signature (ruff B008 forbids the call inline).
-_RESEARCH_REAL_ARG = typer.Option(
-    None, "--real-arg", help="Extra arg forwarded to the real sandbox run.sh; repeat for several."
-)
-_RESEARCH_PLOT_REPORT = typer.Argument(..., help="ConcurrencyScalingReport JSON file to plot.")
-_RESEARCH_PLOT_COMBINED = typer.Argument(
-    ..., help="ConcurrencyScalingReport JSONs to overlay (one per benchmark)."
-)
-# Flags each real runner needs so concurrent scenarios stay COLD/FRESH (as if on separate machines)
-# and measure the TRUE standup cost. swe-bench: `--mode build` forces the honest from-source standup
-# (base image + conda/pip env install + repo clone/checkout/install, minutes/env) instead of pulling
-# SWE-bench's prebuilt image (~16s, which under-counts the real environment cost ~15-30x); plus
-# `--no-family-purge` keeps each instance's own build cold without deleting sibling runs' images.
-# terminal-tasks needs nothing — it already builds a per-run unique image tag under concurrency.
-# tau-bench's real side is in-process (no docker), so it is always isolated.
-_CONCURRENCY_ISOLATION_FLAGS: dict[str, tuple[str, ...]] = {
-    # --cache-shared: build the shared base+env images once, but cold-build the per-instance image
-    # at every level (the marginal per-scenario standup). Correct for this fixed-N sweep, where the
-    # same scenarios repeat across levels — plain --no-family-purge would rebuild the 660MB base for
-    # every scenario and let concurrent workers clobber each other's base image. (--cache-shared
-    # implies no family purge.)
-    "swe-bench": ("--mode", "build", "--cache-shared"),
-}
 
 _DOWNLOAD_BENCHMARKS = typer.Argument(
     None, help="Benchmark bundles to download, or 'all'. Omit for a picker."
@@ -993,8 +943,7 @@ def build(
             provenance = "signature estimate — no search"
         _console.print(
             f"[bold]max-fidelity config[/bold]: [bold]{auto['winner_label']}[/bold] "
-            f"({provenance}) — activate with `wmo serve --max-fidelity` / "
-            f"`wmo play --max-fidelity`"
+            f"({provenance}) - activate with `wmo serve --max-fidelity`"
         )
     _console.print(
         f"[bold]run[/bold] {record.run_id[:8]}: {record.duration_seconds:.1f}s, "
@@ -1127,7 +1076,7 @@ def download(
     benchmarks: list[str] = _DOWNLOAD_BENCHMARKS,
     force: bool = typer.Option(False, "--force", help="Overwrite existing local files."),
 ) -> None:
-    """Download benchmark data bundles (traces, task data, prebuilt model, evals) from the Hub.
+    """Download benchmark data bundles (traces, task data, prebuilt models) from the Hub.
 
     With no arguments, lists the org's published datasets (live, via the Hub API) and offers a
     picker. Bundles land in `environment-capture-data/<benchmark>/` under the current directory;
@@ -1135,8 +1084,7 @@ def download(
     `--force`.
 
     A bundle arrives ready to use, not just ready to build from: its `models/` are prebuilt world
-    models `wmo play`/`demo`/`eval --mode closed-loop` resolve by name, and its `evals/` are the
-    named suites `wmo eval list` discovers.
+    models available to the local server and closed-loop evaluation.
     """
     from wmo.cli.ui import select_option
     from wmo.simulation.hub import corpus_path, published_corpora
@@ -1323,30 +1271,12 @@ def serve(
     uvicorn.run(server_app, host="127.0.0.1", port=port)
 
 
-# Charting deps ship in the optional `viz` extra, so `wmo.simulation.evaluation.grid_plot` /
-# `wmo.optimize.research.concurrency_plot` import them lazily. Every chart-writing flow probes for
-# them up front: `wmo eval grid` otherwise spent the whole paid grid and only then died on
-# `import matplotlib` with a raw traceback that never named the extra.
-_VIZ_MODULES = ("matplotlib", "seaborn")
-
-
-def _require_viz_extra() -> None:
-    """Usage error naming the `viz` extra when the charting deps are not installed."""
-    missing = [name for name in _VIZ_MODULES if importlib.util.find_spec(name) is None]
-    if missing:
-        raise typer.BadParameter(
-            f"charts need the `viz` extra ({', '.join(missing)} not installed); run "
-            "`uv sync --extra viz` (or `pip install 'world-model-optimizer[viz]'`) and retry"
-        )
-
-
 def _prepare_out_path(out: str | None) -> None:
     """Validate `--out` and create its parent directory BEFORE any (paid) eval work runs.
 
     Reports are written last, so a `--out` under a missing directory used to surface as a raw
-    FileNotFoundError that discarded a finished run. `_eval_run_suite`/`_eval_run_grid` already
-    created the parent at write time; doing it here makes every eval flow behave the same and
-    fail before it spends anything.
+    FileNotFoundError that discarded a finished run. Creating the parent here makes every eval
+    flow behave the same and fail before it spends anything.
     """
     if out is None:
         return
@@ -1359,20 +1289,6 @@ def _prepare_out_path(out: str | None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as err:
         raise typer.BadParameter(f"cannot create --out directory {path.parent}: {err}") from None
-
-
-def _resolve_eval_suite_or_usage(selector: str, examples_roots: list[str]) -> EvalSuite:
-    """Resolve a suite name, turning the unknown/ambiguous `ValueError` into a usage error.
-
-    Same contract as `_resolve_example`: a typo prints a clean box listing the available suites,
-    never a traceback.
-    """
-    from wmo.simulation.model.eval_suites import resolve_eval_suite
-
-    try:
-        return resolve_eval_suite(selector, examples_roots)
-    except ValueError as err:
-        raise typer.BadParameter(str(err)) from None
 
 
 # Options only the closed-loop mode reads. In open-loop they used to be accepted and silently
@@ -1420,23 +1336,17 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     ),
     train_split: float | None = typer.Option(
         None,
-        help="Train/holdout ratio per file (default: 0.8, or suite config). "
+        help="Train/holdout ratio per file (default: 0.8). "
         "Must match the ratio the model was built with, or the holdout contains train traces.",
     ),
-    val_frac: float | None = typer.Option(
-        None,
-        "--val-frac",
-        help="`wmo eval grid`: validation fraction reserved for GEPA in a 3-way split so cells "
-        "score only the leak-free test band (default: (1 - train_split)/2, matching build).",
-    ),
     embed_dim: int | None = typer.Option(
-        None, help="phi dimensionality for the offline embedder (default: 512, or suite config)."
+        None, help="phi dimensionality for the offline embedder (default: 512)."
     ),
     rag: bool | None = typer.Option(
         None, "--rag/--no-rag", help="Enable retrieval, or disable it for zero-shot replay."
     ),
     sample_turns: str | None = typer.Option(
-        None, help="Turns scored per trace: all | sampled (5). Default: all, or suite config."
+        None, help="Turns scored per trace: all | sampled (5). Default: all."
     ),
     seed: int | None = typer.Option(None, help="Seed for reproducible turn sampling."),
     top_k: int | None = typer.Option(
@@ -1453,32 +1363,6 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         help="Deliberate-then-answer output contract (explicit reasoning pass).",
     ),
     out: str | None = typer.Option(None, help="Optional path to write the full JSON report."),
-    examples_root: str | None = typer.Option(
-        None,
-        help="Directory containing eval suites. Default: the downloaded benchmark data root "
-        "(environment-capture-data/, where the shipped suites live).",
-    ),
-    results_root: str = typer.Option(
-        f"{ARTIFACT_DIR}/evals", help="Local directory for named eval result JSON."
-    ),
-    limit: int = typer.Option(20, help="Rows to show for `wmo eval results`."),
-    models: str | None = typer.Option(
-        None,
-        help="`wmo eval grid`: comma-separated Label:provider:model cells "
-        "(e.g. 'Opus 4.8:bedrock:us.anthropic.claude-opus-4-8,GPT-5.5:openai:gpt-5.5').",
-    ),
-    gepa_prompts: str | None = typer.Option(
-        None, help="`wmo eval grid`: dir of <label>.txt evolved prompts (enables +GEPA cells)."
-    ),
-    dataset_label: str | None = typer.Option(
-        None, help="`wmo eval grid`: dataset name for the chart subtitle (default: suite id)."
-    ),
-    limit_traces: int | None = typer.Option(
-        None, help="`wmo eval grid`: cap test traces (dry-run). Default: all."
-    ),
-    judge_model: str = typer.Option(
-        "us.anthropic.claude-opus-4-8", help="`wmo eval grid`: pinned judge model (Bedrock)."
-    ),
     name: str | None = typer.Option(
         None, "--name", help="World model for --mode closed-loop (default: the only built one)."
     ),
@@ -1520,27 +1404,18 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         "first use).",
     ),
 ) -> None:
-    """Score reconstruction fidelity, or run named example-local eval suites.
+    """Score reconstruction fidelity or compare two closed-loop reports.
 
     Flows:
-    - `wmo eval <trace files...>`: ad hoc replay scoring (open-loop, teacher-forced — the
+    - `wmo eval <trace files...>`: ad hoc replay scoring (open-loop, teacher-forced, the
       default mode).
     - `wmo eval <tasks.jsonl> --mode closed-loop`: a live agent runs tasks WITH the world model
       as its environment. `\\[models.agent]` selects a distinct agent provider when configured;
       otherwise the agent shares the world model's provider. `--harness-backend e2b` moves the
       pi-node harness process into pooled E2B sandboxes while the environment stays the world
       model. Score task success against gold assertions (see docs/reference/closed_loop.md).
-    - `wmo eval list`: list named suites under `environment-capture-data/<task>/evals/`.
-    - `wmo eval run <suite>`: run a suite and save a local JSON result.
-    - `wmo eval results optional-suite`: summarize local suite results.
-    - `wmo eval grid <suite>`: run the model x condition grid for a suite and chart it (needs the
-      `viz` extra; consumes --models/--gepa-prompts/--dataset-label/--limit-traces/--judge-model
-      and --val-frac).
-    - `wmo eval grid-plot <result.json>...`: re-chart saved grid results, merged (`viz` extra).
-    - `wmo eval grid-heatmap <result.json>...`: chart saved grid results as one cross-benchmark
-      heatmap (`viz` extra).
     - `wmo eval agreement <a.json> <b.json>`: compare two closed-loop reports task-by-task
-      (e.g. world-model vs real environment) — the outcome-agreement validity check.
+      (for example, world-model versus real environment), the outcome-agreement validity check.
 
     Open-loop scoring runs on the worker role `wmo providers set` writes to `.wmo/settings.toml`
     (bedrock/claude-opus-4-8 when no role is configured); `--provider`/`--model` override it.
@@ -1550,9 +1425,6 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     from wmo.common.observability.telemetry import capture_eval_completed
 
     args = tokens or []
-    suite_roots = (
-        [str(root) for root in _benchmark_roots()] if examples_root is None else [examples_root]
-    )
     if mode not in ("open-loop", "closed-loop"):
         raise typer.BadParameter(f"unknown --mode {mode!r}; choose open-loop or closed-loop")
     # Reject flags this flow will never read, before anything runs: a silently dropped
@@ -1571,7 +1443,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     # --out is written last (after the paid work); make sure it is writable first.
     _prepare_out_path(out)
     if mode == "closed-loop":
-        if len(args) != 1 or args[0] in ("list", "run", "results", "agreement"):
+        if len(args) != 1 or args[0] == "agreement":
             raise typer.BadParameter("usage: wmo eval <tasks.jsonl> --mode closed-loop")
         run_closed_loop(
             _console,
@@ -1592,76 +1464,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             raise typer.BadParameter("usage: wmo eval agreement <report_a.json> <report_b.json>")
         run_agreement(_console, report_a=args[1], report_b=args[2], threshold=threshold)
         return
-    if args and args[0] == "list":
-        if len(args) != 1:
-            raise typer.BadParameter("usage: wmo eval list")
-        _eval_list(suite_roots)
-        return
-    if args and args[0] == "results":
-        if len(args) > 2:
-            raise typer.BadParameter("usage: wmo eval results [suite]")
-        suite_filter = args[1] if len(args) == 2 else None
-        _eval_results(results_root, suite_roots, suite_filter, limit=limit)
-        return
-    if args and args[0] == "grid":
-        if len(args) != 2:
-            raise typer.BadParameter("usage: wmo eval grid <suite>")
-        _eval_run_grid(
-            args[1],
-            examples_roots=suite_roots,
-            results_root=results_root,
-            models=models,
-            gepa_prompts=gepa_prompts,
-            dataset_label=dataset_label,
-            limit_traces=limit_traces,
-            judge_model=judge_model,
-            region=region,
-            train_split=train_split,
-            seed=seed,
-            top_k=top_k,
-            embed_dim=embed_dim,
-            sample_turns=sample_turns,
-            val_frac=val_frac,
-            out=out,
-        )
-        return
-    if args and args[0] == "grid-plot":
-        if len(args) < 2:
-            raise typer.BadParameter("usage: wmo eval grid-plot <result.json> [<result.json>...]")
-        _eval_grid_plot(args[1:], out=out, dataset_label=dataset_label)
-        return
-    if args and args[0] == "grid-heatmap":
-        if len(args) < 2:
-            raise typer.BadParameter(
-                "usage: wmo eval grid-heatmap <result.json> [<result.json>...]"
-            )
-        _eval_grid_heatmap(args[1:], out=out)
-        return
-    if args and args[0] == "run":
-        if len(args) != 2:
-            raise typer.BadParameter("usage: wmo eval run <suite>")
-        _eval_run_suite(
-            args[1],
-            examples_roots=suite_roots,
-            results_root=results_root,
-            prompt_file=prompt_file,
-            provider_config=_worker_role_provider_config(provider, model, region),
-            train_split=train_split,
-            embed_dim=embed_dim,
-            rag=rag,
-            sample_turns=sample_turns,
-            seed=seed,
-            top_k=top_k,
-            knowledge=knowledge,
-            reasoning=reasoning,
-            out=out,
-        )
-        return
     if not args:
         raise typer.BadParameter(
-            "provide trace files, or use `wmo eval list`, `wmo eval run <suite>`, "
-            "`wmo eval results`, `wmo eval grid <suite>`, `wmo eval grid-plot <result.json>`, "
-            "`wmo eval grid-heatmap <result.json>`, or `wmo eval agreement <a.json> <b.json>`"
+            "provide trace files, or use `wmo eval agreement <a.json> <b.json>`"
         )
 
     options = _eval_options(
@@ -1702,348 +1507,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     )
 
 
-def _eval_list(examples_roots: list[str]) -> None:
-    from wmo.simulation.model.eval_suites import discover_eval_suites
-
-    suites = discover_eval_suites(examples_roots)
-    if not suites:
-        _console.print("[yellow]no eval suites found[/yellow]")
-        return
-    table = Table(title="Eval suites")
-    table.add_column("Suite", no_wrap=True)
-    table.add_column("Files")
-    table.add_column("Split")
-    table.add_column("Description")
-    for suite in suites:
-        table.add_row(
-            suite.id,
-            ", ".join(suite.config.files),
-            f"{suite.config.train_split:.2f}",
-            suite.config.description or "",
-        )
-    _console.print(table)
-
-
-def _eval_results(
-    results_root: str,
-    examples_roots: list[str],
-    suite_filter: str | None,
-    *,
-    limit: int,
-) -> None:
-    from wmo.simulation.model.eval_suites import list_eval_results, resolve_eval_suite
-
-    resolved_suite = suite_filter
-    if suite_filter is not None:
-        try:
-            resolved_suite = resolve_eval_suite(suite_filter, examples_roots).id
-        except ValueError:
-            resolved_suite = suite_filter
-    summaries = list_eval_results(results_root, resolved_suite, limit=limit)
-    if not summaries:
-        _console.print("[yellow]no eval results found[/yellow]")
-        return
-    table = Table(title="Eval results")
-    table.add_column("Suite", no_wrap=True)
-    table.add_column("Run")
-    table.add_column("Started")
-    table.add_column("Model")
-    table.add_column("Fidelity", justify="right")
-    table.add_column("Steps", justify="right")
-    table.add_column("Path")
-    for summary in summaries:
-        steps = str(summary.total_steps)
-        if summary.total_invalid:
-            steps += f" ({summary.total_invalid} inv)"
-        table.add_row(
-            summary.suite,
-            summary.run_id[:8],
-            summary.started_at,
-            summary.model,
-            f"{summary.overall_fidelity:.3f}±{summary.overall_std:.3f}",
-            steps,
-            str(summary.path),
-        )
-    _console.print(table)
-
-
 # Default grid: one bar family per serving model. Qwen-AgentWorld is self-hosted (openai-compatible
 # vLLM via OPENAI_BASE_URL); the rest are frontier models the registry builds directly.
-_DEFAULT_GRID_MODELS = (
-    "Opus 4.8:bedrock:us.anthropic.claude-opus-4-8",
-    "Haiku 4.5:bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "GPT-5.5:openai:gpt-5.5",
-    "GPT-5.4 Mini:openai:gpt-5.4-mini",
-    "Qwen-AgentWorld:openai:Qwen/Qwen-AgentWorld-35B-A3B",
-)
-
-
-def _parse_model_specs(models: str | None) -> list[ModelSpec]:
-    """Parse "Label:provider:model[,...]" into ModelSpecs (default set when None).
-
-    The provider is validated and the model resolved through the shared catalog
-    (`resolve_provider_model`), so a friendly model type resolves to its canonical wire id while an
-    unknown (self-hosted) id passes through unchanged, and a bad provider fails at parse time.
-    """
-    from wmo.common.providers import ProviderKind
-    from wmo.common.providers.models import resolve_provider_model
-    from wmo.simulation.evaluation.grid import ModelSpec
-
-    raw = models.split(",") if models else list(_DEFAULT_GRID_MODELS)
-    specs: list[ModelSpec] = []
-    for entry in raw:
-        parts = entry.split(":", 2)
-        if len(parts) != 3 or not all(p.strip() for p in parts):
-            raise typer.BadParameter(f"bad --models entry {entry!r}; want 'Label:provider:model'")
-        label, provider_str, model_str = (p.strip() for p in parts)
-        try:
-            kind = ProviderKind(provider_str)
-        except ValueError:
-            kinds = ", ".join(k.value for k in ProviderKind)
-            raise typer.BadParameter(
-                f"unknown provider {provider_str!r} in --models {entry!r}; want one of {kinds}"
-            ) from None
-        specs.append(ModelSpec(label, kind.value, resolve_provider_model(kind, model_str).model_id))
-    return specs
-
-
-def _grid_output_paths(out: str | None, default_json: Path) -> tuple[Path, Path]:
-    """Result-JSON and chart-PNG destinations for a grid run.
-
-    With `--out`, the JSON and PNG share the stem but ALWAYS take distinct suffixes, so passing
-    `--out foo.json` can never make the PNG write clobber the result JSON at the same path (and
-    `--out foo.png` still lands the JSON next to it). Without `--out`, use the default JSON dest and
-    its `.png` sibling.
-    """
-    if out is None:
-        return default_json, default_json.with_suffix(".png")
-    base = Path(out)
-    return base.with_suffix(".json"), base.with_suffix(".png")
-
-
-def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each maps to one flag
-    selector: str,
-    *,
-    examples_roots: list[str],
-    results_root: str,
-    models: str | None,
-    gepa_prompts: str | None,
-    dataset_label: str | None,
-    limit_traces: int | None,
-    judge_model: str,
-    region: str | None,
-    train_split: float | None,
-    seed: int | None,
-    top_k: int | None,
-    embed_dim: int | None,
-    sample_turns: str | None,
-    val_frac: float | None,
-    out: str | None,
-) -> None:
-    """Run the model x condition grid for a suite, write result JSON + a fidelity bar chart PNG."""
-    from wmo.simulation.evaluation.grid import run_grid
-    from wmo.simulation.evaluation.grid_plot import plot_grid
-    from wmo.simulation.model.prompts import BASE_ENV_PROMPT
-
-    suite = _resolve_eval_suite_or_usage(selector, examples_roots)
-    # The chart is the last thing written, so probe its deps before the grid spends anything.
-    _require_viz_extra()
-    specs = _parse_model_specs(models)
-    prompt_dir = Path(gepa_prompts) if gepa_prompts else None
-    prompt_map: dict[str, str] | None = None
-    if prompt_dir is not None:
-        prompt_map = {
-            s.label: str(prompt_dir / f"{s.label}.txt")
-            for s in specs
-            if (prompt_dir / f"{s.label}.txt").exists()
-        }
-    cfg = suite.config
-    result = run_grid(
-        suite_name=suite.id,
-        files=[str(p) for p in suite.resolve_files()],
-        models=specs,
-        gepa_prompts=prompt_map,
-        base_prompt=BASE_ENV_PROMPT,
-        judge_provider="bedrock",
-        judge_model=judge_model,
-        judge_region=region,
-        train_split=train_split if train_split is not None else cfg.train_split,
-        val_frac=val_frac,
-        top_k=top_k if top_k is not None else cfg.top_k,
-        seed=seed if seed is not None else cfg.seed,
-        sample_turns=sample_turns or cfg.sample_turns,
-        embed_dim=embed_dim if embed_dim is not None else cfg.embed_dim,
-        max_holdout_traces=limit_traces,
-    )
-    for cell in result.cells:
-        cost = f" ${cell.cost_usd:.2f}" if cell.cost_usd else ""
-        _console.print(
-            f"  {cell.model_label:16} {cell.condition_label:14} "
-            f"fidelity={cell.fidelity:.3f} err_flag={cell.error_flag_acc:.3f} "
-            f"n={cell.n_steps}{cost}"
-        )
-    run_id = uuid4().hex
-    default_dest = Path(results_root) / "grid" / f"{suite.name}-{run_id}.json"
-    dest, png = _grid_output_paths(out, default_dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(result.model_dump_json(indent=2), encoding="utf-8")
-    _console.print(f"wrote grid result -> {dest}")
-    png.parent.mkdir(parents=True, exist_ok=True)
-    plot_grid(
-        result,
-        png,
-        dataset_label=dataset_label or suite.id,
-        n_test_traces=result.total_test_traces,
-    )
-    _console.print(f"wrote grid chart  -> {png}")
-
-
-def _eval_grid_plot(paths: list[str], *, out: str | None, dataset_label: str | None) -> None:
-    """Merge one or more grid result JSONs and render a single combined fidelity chart.
-
-    Lets a self-hosted model's grid (run in its own process, since its OpenAI base URL is
-    process-global) be combined with the API-model grid into one chart - and re-plots any saved
-    result without re-running the eval.
-    """
-    from wmo.simulation.evaluation.grid import GridResult, merge_results
-    from wmo.simulation.evaluation.grid_plot import plot_grid
-
-    _require_viz_extra()
-    results = [GridResult.model_validate_json(Path(p).read_text(encoding="utf-8")) for p in paths]
-    merged = merge_results(results)
-    for cell in merged.cells:
-        cost = f" ${cell.cost_usd:.2f}" if cell.cost_usd else ""
-        _console.print(
-            f"  {cell.model_label:16} {cell.condition_label:14} "
-            f"fidelity={cell.fidelity:.3f} err_flag={cell.error_flag_acc:.3f} "
-            f"n={cell.n_steps}{cost}"
-        )
-    # Force a .png suffix so `--out foo.json` writes a real PNG file, never a PNG mislabeled .json.
-    png = Path(out).with_suffix(".png") if out else Path(paths[0]).with_suffix(".merged.png")
-    plot_grid(
-        merged,
-        png,
-        dataset_label=dataset_label or merged.suite,
-        n_test_traces=merged.total_test_traces,
-    )
-    _console.print(f"wrote merged grid chart -> {png}")
-
-
-def _eval_grid_heatmap(paths: list[str], *, out: str | None) -> None:
-    """Render the whole grid as one heatmap from result JSONs (merged per suite).
-
-    Accepts any mix of API/Qwen result JSONs; same-suite results are merged into one 5-model row
-    set, then all suites become the heatmap's columns (rows = model x condition).
-    """
-    from wmo.simulation.evaluation.grid import GridResult, merge_results
-    from wmo.simulation.evaluation.grid_plot import plot_grid_heatmap
-
-    _require_viz_extra()
-    by_suite: dict[str, list[GridResult]] = {}
-    for p in paths:
-        res = GridResult.model_validate_json(Path(p).read_text(encoding="utf-8"))
-        by_suite.setdefault(res.suite, []).append(res)
-    merged = {suite: merge_results(rs) for suite, rs in by_suite.items()}
-    png = Path(out).with_suffix(".png") if out else Path("grid-heatmap.png")
-    plot_grid_heatmap(merged, png)
-    _console.print(f"wrote grid heatmap -> {png} ({len(merged)} benchmarks)")
-
-
-def _eval_run_suite(
-    selector: str,
-    *,
-    examples_roots: list[str],
-    results_root: str,
-    prompt_file: str | None,
-    provider_config: ProviderConfig,
-    train_split: float | None,
-    embed_dim: int | None,
-    rag: bool | None,
-    sample_turns: str | None,
-    seed: int | None,
-    top_k: int | None,
-    knowledge: bool | None,
-    reasoning: bool | None,
-    out: str | None,
-) -> None:
-    from wmo.common.observability.telemetry import (
-        capture_eval_completed,
-        settings_root_from_results_root,
-    )
-    from wmo.simulation.model.eval_suites import result_path
-
-    suite = _resolve_eval_suite_or_usage(selector, examples_roots)
-    suite_prompt = suite.resolve_prompt()
-    options = _eval_options(
-        prompt_file=prompt_file or (str(suite_prompt) if suite_prompt is not None else None),
-        train_split=train_split if train_split is not None else suite.config.train_split,
-        embed_dim=embed_dim if embed_dim is not None else suite.config.embed_dim,
-        rag=rag if rag is not None else not suite.config.no_rag,
-        sample_turns=sample_turns or suite.config.sample_turns,
-        seed=seed if seed is not None else suite.config.seed,
-        top_k=top_k if top_k is not None else suite.config.top_k,
-        knowledge=knowledge if knowledge is not None else suite.config.knowledge,
-        reasoning=reasoning if reasoning is not None else suite.config.reasoning,
-    )
-    files = suite.resolve_files()
-    if not files:
-        raise typer.BadParameter(
-            f"eval suite {suite.id} lists no trace files; set `files` in {suite.path}"
-        )
-    report = _run_eval_files(files, options, provider_config=provider_config)
-    # A suite run is saved under --results-root and resurfaces in `wmo eval results`, so a
-    # zero-step scorecard must fail here rather than persist as a real 0.000 measurement.
-    _require_scorable_steps(
-        report,
-        [str(path) for path in files],
-        next_step=f"check the corpus `files` in {suite.path} with `wmo ingest --file {files[0]}`",
-    )
-    _print_eval_report(report)
-
-    run_id = uuid4().hex
-    started_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    destination = Path(out) if out else result_path(results_root, suite, run_id)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "run_id": run_id,
-        "started_at": started_at,
-        "suite": suite.id,
-        "suite_path": str(suite.path),
-        "suite_config": suite.config.model_dump(mode="json"),
-        # The RESOLVED backend, not the raw flags: with the flags omitted these come from the
-        # configured worker role, and a result JSON that recorded `null` could not say which
-        # model produced the fidelity number.
-        "config": {
-            "provider": provider_config.kind.value,
-            "model": provider_config.model_type or provider_config.model,
-            "region": provider_config.region,
-            "prompt": options.prompt_file,
-            "files": [str(path) for path in files],
-            "train_split": options.train_split,
-            "top_k": options.top_k,
-            "sample_turns": options.sample_turns,
-            "seed": options.seed,
-            "rag": options.use_rag,
-            "embed_dim": options.embed_dim,
-            "knowledge": options.knowledge,
-            "reasoning": options.reasoning,
-        },
-        "report": _eval_report_payload(report),
-    }
-    destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    _console.print(f"wrote eval result -> {destination}")
-    capture_eval_completed(
-        mode="suite",
-        file_count=len(files),
-        scored_step_count=report.total_valid,
-        rag_enabled=options.use_rag,
-        sample_turns=options.sample_turns,
-        train_split=options.train_split,
-        top_k=options.top_k,
-        root=settings_root_from_results_root(results_root),
-    )
-
-
 def _eval_options(
     *,
     prompt_file: str | None,
@@ -2151,9 +1616,8 @@ def _require_scorable_steps(report: EvalReport, paths: list[str], *, next_step: 
 
     `evaluate_files` skips a file that yields no OTel GenAI traces, so a wrong file type, a
     tasks.jsonl missing `--mode closed-loop`, or a train_split that leaves no holdout all used to
-    render as a plausible `OVERALL fidelity=0.000 over 0 held-out steps` at exit 0. `wmo eval run
-    <suite>` additionally saved that scorecard as a durable result, so it resurfaced later in
-    `wmo eval results`; both flows now stop here instead.
+    render as a plausible `OVERALL fidelity=0.000 over 0 held-out steps` at exit 0. The command
+    now stops before it can print or persist that misleading scorecard.
 
     `next_step` is the caller's flow-specific remedy, since the ad-hoc path can suggest
     `--mode closed-loop` for a tasks file and the suite path cannot.
@@ -2187,19 +1651,6 @@ def _write_ad_hoc_eval_report(path: Path, report: EvalReport) -> None:
     _console.print(f"wrote full report -> {path}")
 
 
-def _eval_report_payload(report: EvalReport) -> JsonObject:
-    from wmo.optimize.judge import JUDGE_VERSION
-
-    return {
-        "judge_version": JUDGE_VERSION,
-        "overall_fidelity": report.overall_fidelity,
-        "overall_std": report.overall_std,
-        "total_steps": report.total_steps,
-        "total_invalid": report.total_invalid,
-        "per_file": {name: rep.model_dump(mode="json") for name, rep in report.per_file.items()},
-    }
-
-
 @app.command("knowledge")
 def knowledge_(
     name: str = typer.Option(None, "--name", help="World model (default: the only one)."),
@@ -2214,7 +1665,7 @@ def knowledge_(
     The printed directory IS the editing interface, open it in any editor. `rules.md`/
     `entities.md`/`schemas.md` are seeded at build (with knowledge enabled); `learned.md` collects
     the env's own cross-session notes; `grounded.md` caches web-search groundings. Models are
-    resolved exactly as `wmo demo`/`wmo play` resolve them, so a shipped example needs no `--root`.
+    resolved across the default project and downloaded benchmark artifacts.
     """
     from wmo.simulation.model.knowledge import KnowledgeBase
 
@@ -2236,7 +1687,7 @@ def knowledge_(
         # back as if they were live.
         _console.print(
             f"[yellow]inert[/yellow]: {resolved!r} was built without a knowledge base, so "
-            "`wmo demo` / `wmo play` / `wmo serve` never render these files into the env "
+            "`wmo serve` never renders these files into the environment "
             f"prompt. Activate them by rebuilding with {build_with_knowledge}, or by setting "
             f"`knowledge = true` in {escape(str(ArtifactPaths(model_dir).config))}."
         )
@@ -2676,240 +2127,6 @@ def _resolve_scenario_embedder(
     )
 
 
-@app.command("demo")
-def demo(
-    name: str = typer.Option(None, "--name", help="World model to demo (default: pick one)."),
-    root: str = typer.Option(
-        ARTIFACT_DIR,
-        help="Project dir. Shipped example models are found too while this is the default "
-        "project dir; point it elsewhere to search that root alone.",
-    ),
-    steps: int = typer.Option(5, min=1, help="Max scenario steps to replay."),
-    traces: str = typer.Option(
-        None,
-        "--traces",
-        help="Trace file to sample the scenario from. Default: the model's own "
-        "traces.otel.jsonl, which only a Hub-downloaded model or a shipped example has, since a "
-        "build keeps no copy of the corpus it read.",
-    ),
-    seed: int = typer.Option(None, help="Seed for the scenario sample (default: random)."),
-    show_prompt: bool = typer.Option(
-        True,
-        "--show-prompt/--no-prompt",
-        help="Print the exact env prompt the world model sees for the first step.",
-    ),
-    max_fidelity: bool = typer.Option(
-        False, "--max-fidelity", help="Run with the online extras on (default: pure RAG)."
-    ),
-) -> None:
-    """Replay a randomly sampled recorded scenario against the world model, open loop."""
-
-    import wmo.common.providers as providers
-    from wmo.cli.ui import select_provider_and_model
-    from wmo.common.providers import verify_all
-    from wmo.common.providers.retry import wrap_provider_with_retries
-    from wmo.common.vendor.waterfall import is_capacity_error
-    from wmo.simulation.model.build import ingest
-    from wmo.simulation.model.demo import run_demo
-    from wmo.simulation.model.world_model import WorldModel
-
-    wm, resolved_name, _provider, model_root = _load_model_any(
-        name, root, max_fidelity=max_fidelity
-    )
-    model_dir = WorldModelStore(str(model_root)).resolve(resolved_name)
-    traces_file = _demo_traces(model_dir, resolved_name, traces)
-    config = load_config(model_dir)  # the model dir holds its own HarnessConfig
-    candidates = [t for t in ingest(config, file=str(traces_file)) if t.steps]
-    if not candidates:
-        raise typer.BadParameter(f"{traces_file} contains no replayable traces")
-    trace = random.Random(seed).choice(candidates)
-
-    total = min(steps, len(trace.steps))
-    _console.print(
-        f"replaying scenario [bold]{trace.trace_id}[/bold] against [bold]{resolved_name}[/bold] "
-        f"(open loop, {total} of {len(trace.steps)} steps)…"
-    )
-    if trace.steps[0].task:
-        _console.print(f"[dim]task: {escape(trace.steps[0].task)}[/dim]")
-    if show_prompt:
-        _console.print(
-            Panel(
-                escape(_first_prompt(wm, trace)),
-                title="[dim]env prompt (step 1) — what the world model sees[/dim]",
-                border_style="bright_black",
-            )
-        )
-
-    done: list = []  # DemoStep results stream in as each prediction lands
-
-    def _print_result(i: int, n: int, demo_step) -> None:  # noqa: ANN001 - engine DemoStep
-        done.append(demo_step)
-        action = demo_step.action
-        call = (
-            f"{action.name} {json.dumps(action.arguments)}"
-            if action.name
-            else (action.content or "")[:120]
-        )
-        verdict = (
-            "[green]exact match[/green]" if demo_step.exact_match else "[yellow]differs[/yellow]"
-        )
-        _console.print(f"\n[bold]step {i}/{n}[/bold]  [cyan]{escape(call)}[/cyan]  {verdict}")
-        _console.print(f"  [green]predicted[/green]: {escape(demo_step.predicted.content)}")
-        _console.print(f"  [dim]actual[/dim]:    {escape(demo_step.actual.content)}")
-        note = demo_step.predicted.metadata.get("state_note")
-        if isinstance(note, str) and note.strip():
-            _console.print(f"  [dim]model note: {escape(note.strip())}[/dim]")
-
-    while True:
-        try:
-            busy = "[dim]world model predicting…[/dim]"
-            with _console.status(busy, spinner="dots") as status:
-                _NARRATOR.attach(status, busy)
-
-                def _on_step(i: int, n: int) -> None:
-                    text = f"[dim]world model predicting step {i}/{n}…[/dim]"
-                    _NARRATOR.busy = text
-                    status.update(text)
-
-                try:
-                    run_demo(
-                        wm,
-                        trace,
-                        max_steps=steps,
-                        on_step=_on_step,
-                        on_result=_print_result,
-                        skip=len(done),
-                    )
-                finally:
-                    _NARRATOR.detach()
-            break
-        except Exception as exc:  # noqa: BLE001 - classified below
-            out_of_capacity = is_capacity_error(exc)
-            if not out_of_capacity or not _console.is_terminal:
-                # A backend that refused the request (missing/expired credentials, a model id it
-                # does not serve) is a user-fixable setup error, not a wmo bug: render it with the
-                # same hint `wmo providers verify` prints. Anything else keeps its traceback.
-                if not _is_provider_sdk_error(exc):
-                    raise
-                _exit_serve_provider_failure(
-                    resolved_name,
-                    config.serve_provider_config(),
-                    exc,
-                    out_of_capacity=out_of_capacity,
-                    retry=f"`wmo demo --name {resolved_name}`",
-                )
-            # Retries are exhausted and the backend is still down: offer to re-point the model
-            # at a different provider (same picker as the build wizard) and RESUME from the
-            # failed step — completed steps stay done.
-            _console.print(f"\n[red]serve provider is still failing[/red]: {_short_error(exc)}")
-            _console.print("[yellow]pick a different provider to continue the demo[/yellow]")
-            provider_name, model_type, region = select_provider_and_model(
-                _console,
-                lambda text: _console.input(text),
-                lambda text: _console.input(text, password=True),
-                default_provider=None,
-                default_model=None,
-                default_region=None,
-                interactive=True,
-                check=lambda cfg: verify_all([cfg])[0],
-            )
-            switched = _provider_config(provider_name, model_type, region)
-            provider = wrap_provider_with_retries(
-                providers.get_provider(switched), on_retry=_NARRATOR.on_retry, sleep=_NARRATOR.sleep
-            )
-            wm = WorldModel.load(str(model_dir), provider, telemetry_root=str(model_root))
-            _console.print(
-                f"[dim]resuming from step {len(done) + 1} with "
-                f"{provider_name} ({model_type})…[/dim]"
-            )
-    matches = sum(1 for d in done if d.exact_match)
-    _console.print(f"\n{matches}/{len(done)} exact matches (run `wmo eval` for judged fidelity)")
-
-
-def _first_prompt(wm: WorldModel, trace) -> str:  # noqa: ANN001 - core Trace
-    """Render the first step's env prompt on a throwaway session (display only)."""
-    probe = wm.new_session(task=trace.steps[0].task)
-    try:
-        return wm.render_step_prompt(probe.id, trace.steps[0].action)
-    finally:
-        wm.end_session(probe.id)
-
-
-@app.command("play")
-def play(
-    name: str = typer.Option(None, "--name", help="World model to play (default: pick one)."),
-    task: str = typer.Option(None, "--task", help="Task to seed the session with."),
-    root: str = typer.Option(
-        ARTIFACT_DIR,
-        help="Project dir. Shipped example models are found too while this is the default "
-        "project dir; point it elsewhere to search that root alone.",
-    ),
-    max_fidelity: bool = typer.Option(
-        False, "--max-fidelity", help="Run with the online extras on (default: pure RAG)."
-    ),
-) -> None:
-    """Step into the environment yourself: type actions, the world model returns observations."""
-    from wmo.cli.ui import run_play_repl
-
-    wm, resolved_name, _provider, _model_root = _load_model_any(
-        name, root, max_fidelity=max_fidelity
-    )
-    suggestions = _action_suggestions(wm)
-    run_play_repl(_console, wm, resolved_name, task, suggestions=suggestions)
-
-
-def _demo_traces(model_dir: Path, resolved_name: str, explicit: str | None) -> Path:
-    """The corpus `wmo demo` samples its scenario from: explicit `--traces`, else the model's own.
-
-    Default resolution is `local_traces_path`, the same one `wmo serve` and `wmo optimize route
-    sweep` use: a Hub-downloaded copy inside the artifact, else the sibling corpus of the shipped
-    example layout. A build keeps NO copy of the corpus it read, so a plain `wmo build` leaves
-    neither, and the failure has to name the file to pass rather than the directory it searched.
-    """
-    from wmo.simulation.serving.traces_source import TRACES_FILENAME, local_traces_path
-
-    if explicit is not None:
-        path = Path(explicit)
-        if not path.is_file():
-            raise typer.BadParameter(f"no trace file at {path} (--traces)")
-        return path
-    found = local_traces_path(model_dir)
-    if found is not None:
-        return found
-    raise typer.BadParameter(
-        f"no trace corpus for world model {resolved_name!r}: looked for "
-        f"{model_dir / TRACES_FILENAME} and {model_dir.parent.parent / TRACES_FILENAME}. "
-        "A build keeps no copy of the corpus it read, so pass the file `wmo build --file` was "
-        f"given: `wmo demo --name {resolved_name} --traces <that file>`"
-    )
-
-
-def _action_suggestions(wm: WorldModel, n: int = 3) -> list[str]:
-    """Real action lines sampled from the model's corpus, to seed the play prompt."""
-    suggestions: list[str] = []
-    for step in wm.sample_steps(8):
-        action = step.action
-        if action.name:
-            args = json.dumps(action.arguments) if action.arguments else ""
-            line = f"{action.name} {args}".strip()
-        elif action.content:
-            line = f"say {action.content[:60]}"
-        else:
-            continue
-        if line not in suggestions:
-            suggestions.append(line)
-        if len(suggestions) >= n:
-            break
-    return suggestions
-
-
-def _load_model_any(name: str | None, root: str, *, max_fidelity: bool = False):  # noqa: ANN202
-    """Resolve a model across the project dir AND shipped examples, then load it."""
-    store_root, resolved = _resolve_model_any(name, root)
-    wm, resolved, provider = _load_model(resolved, str(store_root), max_fidelity=max_fidelity)
-    return wm, resolved, provider, store_root
-
-
 def _model_candidates(root: str) -> list[tuple[str, Path, str]]:
     """Every reachable artifact as `(label, store_root, name)`, local builds first.
 
@@ -2940,9 +2157,7 @@ def _resolve_model_any(name: str | None, root: str) -> tuple[Path, str]:
     """Which artifact a read command should open, as `(store_root, resolved_name)`.
 
     A `--root` pointing somewhere other than the default project dir keeps single-root behavior.
-    Otherwise the search spans `<root>/models/*` plus the downloaded `<data root>/*/models/*`,
-    so `demo`, `play` and `knowledge` all agree on
-    which models exist.
+    Otherwise the search spans `<root>/models/*` plus the downloaded `<data root>/*/models/*`.
     """
     if not _is_default_project_dir(root):
         return Path(root), _resolve_name(WorldModelStore(root), name)
@@ -3080,442 +2295,6 @@ def _is_safe_example_name(name: str) -> bool:
     return True
 
 
-def _resolve_example(name: str) -> Path:
-    # An unsafe segment (spaces, path separators, ...) is simply not an example name; fall
-    # through to the same "unknown example" usage error instead of a ValueError traceback.
-    try:
-        safe = validate_name(name)
-    except ValueError:
-        safe = None
-    if safe is not None:
-        matches = [root / safe for root in _benchmark_roots() if (root / safe).is_dir()]
-        if len(matches) > 1:
-            found = ", ".join(str(path) for path in matches)
-            raise typer.BadParameter(f"example {name!r} exists in multiple roots: {found}")
-        if matches:
-            return matches[0]
-    available = ", ".join(path.name for path in _discover_examples())
-    hint = f" (available: {available})" if available else ""
-    raise typer.BadParameter(f"unknown example {name!r}{hint}")
-
-
-@research_app.command("concurrency")
-def research_concurrency(
-    suite: str = typer.Argument(
-        ..., help="Eval suite / example name (e.g. tau-bench) — its corpus + config are reused."
-    ),
-    scenarios: int = typer.Option(16, "--scenarios", help="Batch size N held fixed across levels."),
-    levels: str = typer.Option(
-        "1,2,4,8,16", "--levels", help="Comma-separated concurrency levels (baseline first)."
-    ),
-    trials: int = typer.Option(1, "--trials", help="Timed repeats per level (for error bars)."),
-    select: str = typer.Option(
-        "random",
-        "--select",
-        help="Which held-out scenarios to draw: random (default — a representative sample) | "
-        "simplest (fewest steps) | longest. simplest/longest order by step count to check whether "
-        "a result is robust to the trace sample; the biased draws must not be the default.",
-    ),
-    select_seed: int = typer.Option(0, "--select-seed", help="Seed for --select random."),
-    side: str = typer.Option(
-        "both", "--side", help="both = differential | world = WM-only | real = sandbox-only."
-    ),
-    provider: str | None = typer.Option(
-        None,
-        "--provider",
-        help="Provider running the model. Default: the worker role `wmo providers set` wrote to "
-        "`.wmo/settings.toml`, else bedrock.",
-    ),
-    model: str | None = typer.Option(
-        None,
-        help="Model id (environment LLM). Default: the configured worker role's model, else the "
-        "flagship of whichever provider is in play (bedrock/claude-opus-4-8).",
-    ),
-    region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
-    deployment: str | None = typer.Option(None, help="Azure OpenAI deployment name."),
-    api_version: str | None = typer.Option(None, help="Azure OpenAI API version."),
-    endpoint: str | None = typer.Option(None, help="Azure OpenAI / custom base URL."),
-    real_arg: list[str] | None = _RESEARCH_REAL_ARG,
-    real_timeout: float | None = typer.Option(
-        None, "--real-timeout", help="Abort a real sandbox run after N seconds."
-    ),
-    out: str | None = typer.Option(None, help="Path to write the ConcurrencyScalingReport JSON."),
-    examples_root: str | None = typer.Option(
-        None, help="Examples dir. Default: the downloaded benchmark data root."
-    ),
-) -> None:
-    """Measure the concurrency scaling law: batch wall-clock vs. how many scenarios run at once.
-
-    Reconstructs a fixed batch of N held-out scenarios from `suite`'s corpus at each concurrency
-    level, timing the world-model batch and (with `--side both`) the matching real-sandbox batch,
-    to give the time differential T_real(W)/T_world(W). Reuses the suite's corpus + config
-    (train_split, top_k, prompt) and the example's `run.sh`. See
-    `wmo.optimize.research.concurrency_run`.
-    """
-    import wmo.common.providers as providers
-    from wmo.optimize.research import Side, run_concurrency_scaling
-    from wmo.optimize.research.concurrency_run import build_real_runner, build_world_runner
-    from wmo.optimize.research.concurrency_scaling import ConcurrencyPoint
-    from wmo.simulation.ingest import get_adapter
-    from wmo.simulation.model.build import split_traces
-    from wmo.simulation.model.eval_suites import resolve_eval_suite
-    from wmo.simulation.model.prompts import BASE_ENV_PROMPT
-    from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
-    from wmo.simulation.retrieval.leakfree import DemoRetriever
-
-    if scenarios < 1:
-        raise typer.BadParameter("--scenarios must be at least 1")
-    try:
-        which = Side(side)
-    except ValueError:
-        allowed = ", ".join(s.value for s in Side)
-        raise typer.BadParameter(f"--side must be one of: {allowed}") from None
-    # Resolve (and so validate) the environment LLM up front, not lazily inside a worker thread
-    # mid-sweep. Omitted flags come from the configured worker role.
-    # `--deployment` goes IN rather than on top: on Azure it is what a `--model` swap needs to
-    # know, and layering it afterwards would reject a run the user had already answered for.
-    env_config = _worker_role_provider_config(provider, model, region, deployment=deployment)
-    connection = {
-        field: value
-        for field, value in (("api_version", api_version), ("endpoint", endpoint))
-        if value is not None
-    }
-    if connection:
-        env_config = env_config.model_copy(update=connection)
-    if select not in ("simplest", "longest", "random"):
-        raise typer.BadParameter("--select must be one of: simplest, longest, random")
-    try:
-        level_list = [int(x) for x in levels.split(",") if x.strip()]
-    except ValueError:
-        raise typer.BadParameter(
-            f"--levels must be a comma-separated list of integers, got {levels!r}"
-        ) from None
-    if not level_list:
-        raise typer.BadParameter("--levels must list at least one concurrency level")
-    if any(level < 1 for level in level_list):
-        raise typer.BadParameter("--levels must be positive concurrency counts")
-    # Every level runs the same N scenarios, so a level above N would silently cap its effective
-    # concurrency at N and just duplicate the N-worker point — a misleading flat tail.
-    if max(level_list) > scenarios:
-        raise typer.BadParameter(
-            f"--levels goes up to {max(level_list)} but only --scenarios {scenarios} run at each "
-            f"level, so W>{scenarios} would just duplicate W={scenarios}. Raise --scenarios to "
-            f"{max(level_list)} or drop levels above {scenarios}."
-        )
-
-    suite_roots = (
-        [str(root) for root in _benchmark_roots()] if examples_root is None else [examples_root]
-    )
-    # An unresolvable suite is a bad argument, like every other input validated above; the
-    # ValueError carries the available names, so only the next command has to be added. A direct
-    # `.toml` selector that exists resolves past name lookup and fails on its own contents, so
-    # listing the discoverable suites there would point away from the file that needs repairing.
-    try:
-        resolved = resolve_eval_suite(suite, suite_roots)
-    except ValueError as exc:
-        direct = Path(suite)
-        resolved_by_name = not (direct.suffix == ".toml" and direct.exists())
-        hint = "; `wmo eval list` prints the suites" if resolved_by_name else ""
-        raise typer.BadParameter(f"{exc}{hint}") from exc
-    files = resolved.resolve_files()
-    missing = [f for f in files if not f.exists()]
-    if not files or missing:
-        raise typer.BadParameter(f"suite {suite!r} has no trace corpus at {missing or files}")
-    adapter = get_adapter("otel-genai")
-    traces = [t for f in files for t in adapter.from_file(str(f))]
-    if not traces:
-        raise typer.BadParameter(f"suite {suite!r} ingested no traces")
-
-    # Draw N held-out scenarios, so both sides replay the SAME held-out traces by index — keep N
-    # within the held-out pool so the split stays aligned. `--select` picks the drawing rule:
-    # `random` (default — a representative sample) or `simplest`/`longest`, which order by step
-    # count to check a result is robust to the trace sample rather than an artifact of it.
-    train, holdout = split_traces(traces, resolved.config.train_split)
-    pool = holdout or traces
-    need = scenarios
-    if need > len(pool):
-        raise typer.BadParameter(
-            f"need {need} scenario(s) but suite {suite!r} has only {len(pool)} held-out trace(s); "
-            "lower --scenarios/--levels or grow the corpus"
-        )
-    indexed = list(enumerate(pool))
-    if select == "random":
-        random.Random(select_seed).shuffle(indexed)
-    else:  # simplest | longest — order by step count, ascending or descending
-        indexed.sort(key=lambda item: len(item[1].steps), reverse=(select == "longest"))
-    selected = indexed[:need]
-
-    # Prompt + retrieval mirror the suite's eval config, so the timed reconstruction is the same
-    # work `wmo eval run <suite>` scores.
-    suite_prompt = resolved.resolve_prompt()
-    prompt = (
-        suite_prompt.read_text(encoding="utf-8") if suite_prompt is not None else BASE_ENV_PROMPT
-    )
-    use_rag = not resolved.config.no_rag
-    embedder = HashingEmbedder(dim=resolved.config.embed_dim) if use_rag else None
-    demos = DemoRetriever(
-        EmbeddingRetriever(embedder) if embedder is not None else None,
-        train if use_rag else [],
-        top_k=resolved.config.top_k,
-    )
-
-    def provider_factory() -> Provider:
-        return providers.get_provider(env_config)
-
-    world_runner = build_world_runner(provider_factory, prompt, demos, selected)
-    real_runner = None
-    if which in (Side.BOTH, Side.REAL):
-        example_dir = _resolve_example(resolved.example)
-        real_extra = list(real_arg or [])
-        # Force each runner's cold-standup + isolation flags so the real side pays its TRUE from-
-        # source standup and concurrent sandboxes don't clobber each other's docker state (see
-        # _CONCURRENCY_ISOLATION_FLAGS). Skipped if the caller passed their own real-runner args.
-        # Prepend the forced cold-standup/isolation flags; any user `--real-arg` comes AFTER so it
-        # can still override (argparse takes the last value), but the forced flags are never dropped
-        # just because the user passed an unrelated arg.
-        forced = _CONCURRENCY_ISOLATION_FLAGS.get(resolved.example, ())
-        if forced:
-            real_extra = list(forced) + real_extra
-            _console.print(
-                f"[yellow]{resolved.example}: real runner uses {' '.join(forced)} "
-                "(true from-source cold standup, isolated per concurrent scenario)[/yellow]"
-            )
-        real_runner = build_real_runner(
-            example_dir,
-            selected,
-            train_split=resolved.config.train_split,
-            extra_args=real_extra,
-            timeout=real_timeout,
-        )
-
-    batch_desc = f"batch of {len(selected)}"
-    _console.print(
-        f"\n[bold]concurrency scaling[/bold] {suite}: {batch_desc} held-out "
-        f"scenario(s), levels={level_list}, side={which.value}, trials={trials}\n"
-    )
-
-    def _progress(point: ConcurrencyPoint) -> None:
-        _console.print(f"  {point.summary()}")
-
-    report = run_concurrency_scaling(
-        world_runner,
-        real_runner,
-        levels=level_list,
-        scenarios=len(selected),
-        trials=trials,
-        side=which,
-        on_point=_progress,
-    )
-    report.benchmark = resolved.example
-
-    # Speedup vs. W=1 is a like-for-like ratio because every level runs the same fixed-N batch.
-    best = report.best_speedup()
-    if best is not None and best.speedup:
-        _console.print(
-            f"\n[bold]best world-model speedup[/bold]: {best.speedup:.2f}x at concurrency "
-            f"{best.level} (efficiency {best.efficiency:.0%})"
-        )
-    if out:
-        Path(out).write_text(report.model_dump_json(indent=2), encoding="utf-8")
-        _console.print(f"wrote report -> {out}")
-
-
-@research_app.command("plot-concurrency")
-def research_plot_concurrency(
-    report: str = _RESEARCH_PLOT_REPORT,
-    out: str = typer.Option("concurrency_scaling.png", "--out", help="Output image path."),
-    title: str = typer.Option("Concurrency scaling law", "--title", help="Figure title."),
-) -> None:
-    """Render a concurrency scaling-law report JSON to a figure (needs the `viz` extra).
-
-    Draws batch wall-clock vs. concurrency (log-log, mean±std), the world-model speedup vs.
-    ideal-linear, and the T_real/T_world differential when the report has both sides.
-
-    `concurrency_plot` is imported here (not at module scope) because it pulls in matplotlib/pandas
-    from the optional `viz` extra, and the harness runtime must not require them.
-    `_require_viz_extra`
-    turns a missing extra into a usage error naming `uv sync --extra viz`, so the import itself
-    never surfaces a raw ModuleNotFoundError traceback.
-    """
-    _require_viz_extra()
-    from wmo.optimize.research.concurrency_plot import render_report
-
-    try:
-        written = render_report(report, out, title=title)
-    except (ValueError, FileNotFoundError) as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    _console.print(f"wrote figure -> {written}")
-
-
-@research_app.command("plot-concurrency-combined")
-def research_plot_concurrency_combined(
-    reports: list[str] = _RESEARCH_PLOT_COMBINED,
-    out_speedup: str = typer.Option(
-        "concurrency_speedup.png", "--out-speedup", help="Output path for the speed-up figure."
-    ),
-    out_cost: str = typer.Option(
-        "concurrency_cost.png", "--out-cost", help="Output path for the cost figure."
-    ),
-) -> None:
-    """Render the cross-benchmark comparison as two standalone figures (needs the `viz` extra).
-
-    Overlays several benchmarks so their RELATIVE differences read at a glance, split into two
-    self-contained images: the speed-up figure (how many times faster the world model is than the
-    real environment, per benchmark) and the cost figure (the reconstruction-vs-real-setup cost that
-    explains it). Pass the per-benchmark report JSONs (`wmo research concurrency <suite> --out ...`)
-    in the order you want them coloured.
-
-    Imported lazily for the same reason as `plot-concurrency` (the optional matplotlib viz extra),
-    and guarded by the same `_require_viz_extra` pre-flight.
-    """
-    _require_viz_extra()
-    from wmo.optimize.research.concurrency_plot import render_cost, render_speedup
-
-    try:
-        speedup_path = render_speedup(reports, out_speedup)
-        cost_path = render_cost(reports, out_cost)
-    except (ValueError, FileNotFoundError) as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    _console.print(f"wrote figures -> {speedup_path}, {cost_path}")
-
-
-# The pre-split coding-router lab's own numbers on this matrix, quoted beside the wmo protocol's
-# so a reader sees the decision-rule difference instead of hunting for it: its router picked the
-# CHEAPEST arm whose predicted solve odds cleared a threshold (cost first, quality as the
-# constraint), measured over 6 seeded 80/20 repo splits.
-_DEEPSWE_LAB_REFERENCE = "cost ratio median 3.18x (range 0.90-5.25), graded delta median -0.015"
-
-
-@research_app.command("deepswe-holdout")
-def research_deepswe_holdout(
-    bundle: str = typer.Argument(
-        ...,
-        help="Converted DeepSWE bundle dir: matrix.json + task_embeddings.npy + "
-        "scenario_groups.json (written by `wmo optimize route convert-deepswe`).",
-    ),
-    fallback: str = typer.Option(
-        "claude-opus-5@high",
-        "--fallback",
-        help="Baseline pool arm the guard pins (the matrix's strongest single arm).",
-    ),
-    splits: int = typer.Option(
-        6,
-        "--splits",
-        min=1,
-        help="Independent repo-grouped fit/report splits (deterministic, salted 0..n-1); the "
-        "median over them is the headline, since one 30% holdout of ~90 repos can be lucky.",
-    ),
-    cost_quality: float = typer.Option(
-        0.25,
-        "--cost-quality",
-        min=0.0,
-        max=1.0,
-        help="Dial position to evaluate (0.25 = the shipped default; 1.0 = max savings). The "
-        "champion optimizes quality first, so cost movement lives on this dial.",
-    ),
-) -> None:
-    """Repo-grouped router holdout on the converted DeepSWE matrix, offline and credential-free.
-
-    The honesty protocol this benchmark needs: DeepSWE tasks from one repository share code, so
-    fit and report sides split by REPOSITORY (`split_router_scenarios_grouped`), never by row.
-    Per split: fit wmo's champion kNN on the fit repos (recorded local-model vectors, guard
-    pinned to `--fallback`), set the dial, and report the held-out paired headline against
-    always-`--fallback`. Prints per-split rows, the medians, and the pre-split lab's reference
-    numbers for the same matrix under its different (cheapest-arm-above-threshold) decision
-    rule; a gap against that reference is a finding about the rules, not noise.
-    """
-    import tempfile
-    from datetime import UTC, datetime
-    from statistics import median
-
-    from rich.table import Table
-
-    from wmo.optimize.routing.embedding_cache import CachedTaskEmbedder
-    from wmo.optimize.routing.knn import apply_cost_quality, fit_knn_artifact
-    from wmo.optimize.routing.outcomes import OutcomeMatrix, split_router_scenarios_grouped
-    from wmo.optimize.routing.policy import EmbedderSpec
-    from wmo.optimize.routing.report import build_report
-
-    root = Path(bundle)
-    for name in ("matrix.json", "task_embeddings.npy", "scenario_groups.json"):
-        if not (root / name).is_file():
-            raise typer.BadParameter(
-                f"{root / name} is missing; point at a bundle written by "
-                "`wmo optimize route convert-deepswe` (or the downloaded published bundle)"
-            )
-    matrix = OutcomeMatrix.load(root / "matrix.json")
-    groups: dict[str, str] = json.loads((root / "scenario_groups.json").read_text(encoding="utf-8"))
-    built = CachedTaskEmbedder(matrix, root / "task_embeddings.npy")
-    spec = EmbedderSpec(kind="local", dim=built.dim)
-
-    table = Table(show_header=True, title=f"DeepSWE repo-grouped holdout (dial {cost_quality:g})")
-    for column in ("split", "fit/report tasks", "repos", "base", "routed", "delta", "x cheaper"):
-        table.add_column(column, justify="right")
-    ratios: list[float] = []
-    deltas: list[float] = []
-    for index in range(splits):
-        salt = "" if index == 0 else str(index)
-        try:
-            split = split_router_scenarios_grouped(matrix.scenario_ids(), groups, salt=salt)
-        except ValueError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-        with tempfile.TemporaryDirectory(prefix="deepswe-holdout-") as scratch:
-            try:
-                fitted = fit_knn_artifact(
-                    matrix,
-                    out_path=Path(scratch) / "policy.json",
-                    matrix_source=str(root / "matrix.json"),
-                    embedder=spec,
-                    fit_ids=list(split.fit_ids),
-                    fallback=fallback,
-                    built=built,
-                )
-            except ValueError as exc:
-                raise typer.BadParameter(str(exc)) from exc
-            policy = apply_cost_quality(fitted.policy, cost_quality)
-            report = build_report(
-                matrix,
-                policy,
-                baseline=fallback,
-                endpoint="research-deepswe-holdout",
-                generated_at=datetime.now(UTC).isoformat(),
-                scenario_label="on held-out DeepSWE tasks from repositories the fit never saw",
-                built=built,
-            )
-        headline = report.headline
-        ratio = (
-            headline.baseline_cost_per_run_usd / headline.cost_per_run_usd
-            if headline.cost_per_run_usd > 0.0
-            else float("inf")
-        )
-        delta = headline.accuracy - headline.baseline_accuracy
-        ratios.append(ratio)
-        deltas.append(delta)
-        fit_repos = len({groups[sid] for sid in split.fit_ids})
-        report_repos = len({groups[sid] for sid in split.report_ids})
-        table.add_row(
-            salt or "0",
-            f"{len(split.fit_ids)}/{len(split.report_ids)}",
-            f"{fit_repos}/{report_repos}",
-            f"{headline.baseline_accuracy:.3f}",
-            f"{headline.accuracy:.3f}",
-            f"{delta:+.3f}",
-            f"{ratio:.2f}",
-        )
-    _console.print(table)
-    _console.print(
-        f"[bold]median over {splits} grouped splits[/bold]: cost ratio "
-        f"{median(ratios):.2f}x (range {min(ratios):.2f}-{max(ratios):.2f}), "
-        f"graded delta {median(deltas):+.3f}"
-    )
-    _console.print(
-        f"[dim]pre-split lab reference on this matrix, its cheapest-arm-above-threshold rule, "
-        f"6 seeded 80/20 repo splits: {_DEEPSWE_LAB_REFERENCE}. wmo's guarded champion leaves "
-        "the baseline only on paired quality evidence, so at low dial it buys parity rather "
-        "than savings; slide --cost-quality toward 1.0 for the savings end.[/dim]"
-    )
-
-
 def _short_error(exc: Exception) -> str:
     """The error's code + service message, without transport chatter.
 
@@ -3633,63 +2412,6 @@ def _prepare_serve_provider_or_exit(provider: Provider, config: ProviderConfig) 
         _console.print(f"  [yellow]{escape(_credential_hint(config.kind, str(exc)))}[/yellow]")
         _console.print("  [yellow]then re-check with `wmo providers verify`[/yellow]")
         raise typer.Exit(1) from exc
-
-
-def _exit_serve_provider_failure(
-    resolved_name: str,
-    config: ProviderConfig,
-    exc: Exception,
-    *,
-    out_of_capacity: bool,
-    retry: str,
-) -> NoReturn:
-    """Render a serve-provider failure as the setup error or the outage it actually is, then exit.
-
-    The two need opposite next steps, and printing the wrong one costs the user the debugging
-    session: a 429/503/timeout has already survived `RetryingProvider`'s backoff, so the
-    credentials it took to get that far are demonstrably fine and `wmo providers verify` will
-    just report the same outage. Only a refusal (bad key, unserved model id) earns the
-    credential hint.
-    """
-    verb = "is out of capacity" if out_of_capacity else "failed"
-    _console.print(
-        f"\n[red]✗ the serve provider for {resolved_name!r} "
-        f"({config.kind.value}, {config.model}) {verb}[/red]: {escape(_short_error(exc))}"
-    )
-    if out_of_capacity:
-        _console.print(
-            "  [yellow]retries are exhausted and the backend is still refusing; this is an "
-            "outage or a rate limit, not a credentials problem[/yellow]"
-        )
-        _console.print(
-            f"  [yellow]re-run {retry} once it recovers, or run it on a terminal to switch "
-            "provider and resume from the failed step[/yellow]"
-        )
-    else:
-        _console.print(f"  [yellow]{escape(_credential_hint(config.kind, str(exc)))}[/yellow]")
-        _console.print("  [yellow]then re-check with `wmo providers verify`[/yellow]")
-    raise typer.Exit(1) from exc
-
-
-# Top-level modules whose exceptions mean "the backend refused", not "wmo has a bug": the provider
-# SDKs plus the HTTP transports they raise through. waterfall gates its capacity/client
-# classification on the same set; this one answers a different question (is a credential hint the
-# right thing to print?), so it stays a local literal rather than importing a private name.
-_PROVIDER_SDK_MODULES = frozenset(
-    {"anthropic", "boto3", "botocore", "httpcore", "httpx", "openai", "tinker"}
-)
-
-
-def _is_provider_sdk_error(exc: Exception) -> bool:
-    """Whether `exc` was DEFINED by a provider SDK (bad creds, bad model id, refused request).
-
-    Deliberately narrow: wmo's own bugs must keep their traceback, so only exceptions whose class
-    (or a base of it) comes from a backend SDK are re-rendered as a setup error.
-    """
-    return any(
-        (getattr(klass, "__module__", "") or "").split(".")[0] in _PROVIDER_SDK_MODULES
-        for klass in type(exc).__mro__
-    )
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@
   fidelity (the default `wmo eval` mode).
 - `closed_loop`: a live agent runs tasks with the world model as its environment, gold-judged for
   end-to-end task success over k=3 passes (`wmo eval --mode closed-loop`).
-- `agreement`: compare two closed-loop reports task-by-task (e.g. simulated vs real), the
-  outcome-agreement validity check.
+- `agreement`: compare two closed-loop reports task-by-task (for example, simulated versus real).
+  This is the outcome-agreement validity check.
 - `gold` / `tasks`: the gold-assertion judge and the task specs closed-loop eval scores against.
 """
 
@@ -22,7 +22,6 @@ from wmo.simulation.evaluation.closed_loop import (
     evaluate_with_env,
 )
 from wmo.simulation.evaluation.gold import GoldJudge, GoldVerdict
-from wmo.simulation.evaluation.grid import GridCell, GridResult, ModelSpec, merge_results, run_grid
 from wmo.simulation.evaluation.open_loop import EvalReport, OpenLoopEval, evaluate_files
 from wmo.simulation.evaluation.tasks import TaskSpec, load_tasks
 
@@ -35,9 +34,6 @@ __all__ = [
     "Evaluation",
     "GoldJudge",
     "GoldVerdict",
-    "GridCell",
-    "GridResult",
-    "ModelSpec",
     "OpenLoopEval",
     "TaskOutcome",
     "TaskSpec",
@@ -47,6 +43,4 @@ __all__ = [
     "evaluate_files",
     "evaluate_with_env",
     "load_tasks",
-    "merge_results",
-    "run_grid",
 ]

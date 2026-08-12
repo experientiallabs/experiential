@@ -8,7 +8,7 @@ WMO_DIR = RUNTIME_DIR.parent
 
 def test_runtime_domains_are_nested() -> None:
     """Agent execution ownership stays visible in the package tree."""
-    expected_dirs = {"agents", "evaluation", "harness", "platform", "runs"}
+    expected_dirs = {"agents", "evaluation", "harness"}
     missing_dirs = sorted(name for name in expected_dirs if not (RUNTIME_DIR / name).is_dir())
     assert not missing_dirs, f"runtime packages missing under wmo/runtime: {missing_dirs}"
 

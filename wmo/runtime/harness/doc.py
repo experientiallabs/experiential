@@ -247,8 +247,8 @@ class HarnessDoc(BaseModel):
     def legacy_doc_hash(self) -> str:
         """The pre-path-inclusion document identity (surface id + content hash only).
 
-        Exists ONLY so `wmo pull` can integrity-check harness versions the platform recorded
-        before `doc_hash` covered materialized paths. Never use it anywhere else: not for new
+        Exists only for legacy artifact integrity checks from before `doc_hash` covered
+        materialized paths. Never use it anywhere else: not for new
         records, dedupe, or caching.
         """
         joined = "\n".join(f"{s.id}\x00{s.content_hash}" for s in self.surfaces)

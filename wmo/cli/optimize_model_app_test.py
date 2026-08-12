@@ -10,7 +10,7 @@ from __future__ import annotations
 import importlib
 import json
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
@@ -27,7 +27,6 @@ from wmo.common.core.types import (
     Action,
     ActionKind,
     EnvState,
-    JsonObject,
     Observation,
     Session,
     Step,
@@ -65,8 +64,6 @@ from wmo.optimize.routing.policy import (
 from wmo.optimize.routing.report import ImprovementReport
 from wmo.optimize.routing.sweep import SweepPlan, plan_sweep, resolve_config
 from wmo.optimize.routing.sweep_partial import PartialHeader
-from wmo.optimize.telemetry import hooks as hooks_module
-from wmo.runtime.runs.client import RunsSink
 from wmo.simulation.ingest.otel_writer import write_traces_jsonl
 from wmo.simulation.model.world_model import WorldModel
 from wmo.simulation.serving.traces_source import TRACES_FILENAME
@@ -1594,99 +1591,3 @@ def test_the_fit_fingerprint_moves_with_the_embedder_and_with_the_arm(tmp_path: 
     assert fingerprint(embedder=EmbedderSpec(), compression=arm) != fingerprint(
         embedder=EmbedderSpec(), compression=keener
     )
-
-
-def test_the_run_reports_its_stages_to_the_platform(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With a credential resolvable, the staged run tells the panel what it did, stage by stage.
-
-    Driven through the CLI rather than against `PipelineEmitter` directly, because the thing worth
-    protecting is the WIRING: which seams of the stage loop report, in which order, and that the
-    values handed over are the ones the manifest recorded.
-    """
-    pushed: list[JsonObject] = []
-
-    class Transport:
-        def push_run_events(
-            self,
-            org_id: str,
-            external_id: str,
-            *,
-            emitter_id: str,
-            events: Sequence[JsonObject],
-        ) -> JsonObject:
-            pushed.extend(dict(event) for event in events)
-            seqs = [int(str(event["seq"])) for event in events]
-            return {"accepted": len(events), "last_seq": max(seqs), "control": []}
-
-        def ack_run_control(
-            self,
-            org_id: str,
-            external_id: str,
-            control_id: str,
-            *,
-            status: str,
-            note: str | None = None,
-        ) -> JsonObject:
-            return {}
-
-        def close(self) -> None:
-            """No-op: this double owns no connection pool."""
-
-    monkeypatch.setattr(
-        hooks_module, "runs_sink", lambda: RunsSink(Transport(), org_id="org-1", emitter_id="test")
-    )
-    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9})
-    root = _project(tmp_path)
-
-    result = _run(tmp_path, root, "--yes")
-
-    assert result.exit_code == 0, result.output
-    meta = [event for event in pushed if event["type"] == "run.meta"]
-    assert len(meta) == 1
-    stages = [event for event in pushed if event["type"] == "stage.upsert"]
-    completed = [
-        str(_payload(event)["stage"])
-        for event in stages
-        if _payload(event)["status"] == "completed"
-    ]
-    assert completed == ["sweep", "fit", "tune", "report"]
-    assert [str(event["type"]) for event in pushed][-1] == "run.status"
-    assert _payload(pushed[-1])["status"] == "completed"
-    # The sweep is the only paid stage, and what the panel is told it cost is what the manifest
-    # recorded: no second accounting path.
-    manifest = RunManifest.model_validate_json(_paths(root)[3].read_text(encoding="utf-8"))
-    sweep_record = manifest.record_for(Stage.SWEEP)
-    assert sweep_record is not None
-    sweep_event = next(
-        event
-        for event in stages
-        if _payload(event)["stage"] == "sweep" and _payload(event)["status"] == "completed"
-    )
-    spend = _payload(sweep_event)["spend"]
-    assert isinstance(spend, dict)
-    assert spend["candidate_usd"] == sweep_record.spend_usd
-    assert spend["wm_usd"] == sweep_record.world_model_spend_usd
-
-
-def test_no_emit_reports_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """`--no-emit` never builds a transport, let alone reaches one."""
-
-    def refuse() -> RunsSink | None:
-        raise AssertionError("--no-emit must not resolve a platform sink")
-
-    monkeypatch.setattr(hooks_module, "runs_sink", refuse)
-    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9})
-    root = _project(tmp_path)
-
-    result = _run(tmp_path, root, "--yes", "--no-emit")
-
-    assert result.exit_code == 0, result.output
-
-
-def _payload(event: JsonObject) -> JsonObject:
-    """One pushed event's payload, typed."""
-    payload = event["payload"]
-    assert isinstance(payload, dict)
-    return payload

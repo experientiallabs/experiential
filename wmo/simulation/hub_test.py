@@ -178,14 +178,13 @@ _PREBUILT = {
     "models/tau-bench/metrics.json": b"{}",
     "models/tau-bench/prompts/base.txt": b"you are a backend\n",
     "models/tau-bench/index/embeddings.npy": b"\x93NUMPY-ish",
-    "evals/default.toml": b'title = "Tau Bench default replay"\nfiles = ["../traces.otel.jsonl"]\n',
 }
 
 
-def test_fetch_downloads_the_prebuilt_model_and_eval_suites(
+def test_fetch_downloads_the_prebuilt_model(
     data_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A bundle is not just traces: the world model built from them and its suites ride along.
+    """A bundle is not just traces: its world model artifact rides along.
 
     tau-bench declares no ``data_dirs``, which is the point: the artifact dirs are a property of
     every bundle, not of a corpus spec, so a benchmark with no upstream payload still gets them.
@@ -204,23 +203,17 @@ def test_fetch_places_artifacts_where_existing_discovery_looks(
 ) -> None:
     """The remote layout mirrors the local one, so nothing downstream needs a Hub special case.
 
-    This asserts against the REAL resolvers rather than restating paths: the store that every
-    read command walks (`<data root>/<benchmark>/models/<name>/`) and the suite glob
-    (`<root>/*/evals/*.toml`). Renaming either layout on the Hub breaks here instead of at a
-    user's first `wmo eval`.
+    This asserts against the real resolver rather than restating paths: the store that every
+    read command walks (`<data root>/<benchmark>/models/<name>/`). Renaming that layout on the
+    Hub breaks here instead of at a user's first `wmo serve`.
     """
     from wmo.common.config.store import WorldModelStore
-    from wmo.simulation.model.eval_suites import discover_eval_suites
 
     _fake_hub(monkeypatch, _PREBUILT)
 
     fetch_corpus("tau-bench")
 
     assert WorldModelStore(data_root / "tau-bench").list_names() == ["tau-bench"]
-    suites = discover_eval_suites(data_root)
-    assert [suite.id for suite in suites] == ["tau-bench/default"]
-    # The suite's relative `files` resolve because corpus and suites land in one benchmark dir.
-    assert suites[0].resolve_files() == [data_root / "tau-bench" / "traces.otel.jsonl"]
 
 
 def test_fetch_keeps_a_local_artifact_unless_forced(

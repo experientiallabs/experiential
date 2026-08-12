@@ -238,7 +238,7 @@ class WorldModel:
         return tracker.record_summary()
 
     def sample_steps(self, n: int) -> list[Step]:
-        """Return up to `n` steps from the replay buffer (used to seed `wmo play` suggestions)."""
+        """Return up to `n` steps from the replay buffer."""
         return self._retriever.sample(n)
 
     def score_session(self, session_id: str) -> EpisodeScore:
@@ -285,7 +285,7 @@ class WorldModel:
     def render_step_prompt(self, session_id: str, action: Action) -> str:
         """Assemble the exact (system + user) env prompt `step` would send, without calling the LLM.
 
-        Used by `wmo demo` to display what the world model sees. Read-only: no session mutation.
+        Read-only: no session mutation.
         """
         session = self._sessions[session_id]
         demos = self._retriever.topk(session.state, action, self._top_k)
@@ -350,8 +350,7 @@ class WorldModel:
         """Predict like `step`, but advance the session with the RECORDED observation.
 
         Teacher-forced replay: the prediction is returned for display/scoring while the session
-        continues from ground truth, so later predictions are conditioned on the real trajectory
-        (the open-loop protocol used by `wmo demo` and the replay eval).
+        continues from ground truth, so later predictions are conditioned on the real trajectory.
         """
         session = self._sessions[session_id]
         demos = self._retriever.topk(session.state, action, self._top_k)

@@ -34,13 +34,11 @@ Three optimizers, named for the artifact each produces.
 `wmo optimize model` is the staged path over the four `route` commands and calls the same library
 functions they do, so you can drop to any stage and the next run resumes around it.
 
-## Inspecting and driving a world model
+## Inspecting and evaluating a world model
 
 | Command | Purpose | Artifact |
 |---|---|---|
-| `wmo play` | Step into the environment yourself: type actions, get observations back. | nothing (a session) |
-| `wmo demo` | Replay a randomly sampled recorded scenario against the world model, open loop. Needs the corpus (`--traces`) unless the model ships one, since a build keeps no copy of what it read. | nothing (prints) |
-| `wmo eval` | Score reconstruction fidelity (open-loop, teacher-forced) or run a live agent against the model (`--mode closed-loop`), or run a named example-local suite. | results under `.wmo/evals/` |
+| `wmo eval` | Score reconstruction fidelity (open-loop, teacher-forced), run a live agent against the model (`--mode closed-loop`), or compare closed-loop reports with `agreement`. | optional JSON report passed to `--out` |
 | `wmo knowledge` | Print the model's knowledge base directory: editable markdown that is the env's canonical facts. Says so when the model was built without `--knowledge`, which makes those files inert. | nothing (the directory it names is the editing interface) |
 | `wmo list` | List every world model built under the project dir. | nothing (prints) |
 
@@ -49,7 +47,7 @@ functions they do, so you can drop to any stage and the next run resumes around 
 | Command | Purpose | Artifact |
 |---|---|---|
 | `wmo ingest` | Normalize traces from a file, a vendor API, or a Postgres table into OTel JSONL. No model is built. | an OTel GenAI JSONL corpus, ready for `wmo build --file` |
-| `wmo download` | Fetch published benchmark data bundles from the Hub: trace corpus, task data, the prebuilt world model(s) built from that corpus, and its named eval suites. | `environment-capture-data/<benchmark>/` (`traces.otel.jsonl`, `models/<name>/`, `evals/*.toml`) |
+| `wmo download` | Fetch published benchmark data bundles from the Hub: trace corpus, task data, and prebuilt world model(s) built from that corpus. | `environment-capture-data/<benchmark>/` (`traces.otel.jsonl`, `models/<name>/`) |
 | `wmo scenarios build` | Distill a trace corpus into a weighted, representative scenario set (facets, cluster, select). | a `ScenarioSet` |
 | `wmo scenarios verify` | Closed-loop verification of a scenario set: back-agreement on source traces plus solvability rollouts. | a verification report |
 
@@ -63,30 +61,9 @@ JSONL. The two formats are not interchangeable.
 | `wmo providers verify` | Ping every configured provider on the completion and embedding paths (deduped by kind and model): the `[models.<role>]` roles in `.wmo/settings.toml` **and** the providers each built world model recorded. Run it before `wmo build` — with nothing built yet it still checks the roles, and just skips the embed half. | nothing (prints a row per provider) |
 | `wmo config telemetry` | View or change project-local usage telemetry settings. | `.wmo/settings.toml` |
 
-## Running agents, and the platform
+## Running agents
 
 | Command | Purpose | Artifact |
 |---|---|---|
-| `wmo run [world-model-id]` | With no target, run the built-in pi agent against a selected local directory. With a hosted world-model ID, open its interactive simulation session. Hosted agent IDs are currently unsupported. | nothing locally; logged-in local runs leave a platform usage record |
-| `wmo login` / `logout` / `status` | Connect this machine to a platform account, disconnect, or show the current account and organizations. | a saved credential |
-| `wmo push` / `pull` | Publish a local world model to the platform registry, or fetch a model or endpoint state from it. | a registry entry, or a local artifact dir |
+| `wmo run` | Run the built-in pi agent locally, with an explicit local-execution consent prompt and a file-tool jail selected by `--dir`. | local changes inside the selected directory |
 | `reproduce list` / `run <benchmark>` (moved to the [research repo](https://github.com/experientiallabs/research)) | Reproduce a published benchmark result from its shipped manifest: download the pinned data, replay the pinned protocol, and compare every published number field by field. `matrix` manifests run offline and bit-exact; `commands` manifests replay live CLI steps, state their estimated spend, and refuse without `--yes`. Exit 0 is REPRODUCED, 4 is DIVERGED. | `verdict.json` plus the run's own artifacts |
-| `wmo runs list` / `show` / `tail` | See the runs this organization is feeding: progress, spend, stages, per-candidate cells, and the live event log. `--json` on the first two; `--org` (id or slug) to read another organization the credential can see, which otherwise comes from the login or `WMO_PLATFORM_ORG`. | nothing (prints) |
-| `wmo runs stop` / `retry` | Ask the process feeding a run to stop at its next safe boundary, or to re-measure its unscored cells. Pull-based: it takes effect when that process next reports in, and a runner that owns its own retry policy may refuse with a reason. | a queued command |
-| `wmo runs backfill <path>` | Replay a finished or interrupted run from its own artifacts (a grid directory, or a world model's `optimize/`), so a run nobody watched still has its history. The run's name comes from where the artifacts live; `--name` supplies it for artifacts that have moved. `--dry-run` writes the events as JSONL instead. | run history on the platform |
-
-A long run reports itself while it works, and only when a platform credential with an organization
-resolves; `wmo optimize model --no-emit` turns it off. Reporting never changes what a run measures
-and can never fail it: every call is buffered and guarded, and none of them can raise. It is not
-free, though. Pushes ride the run's own callbacks rather than a background thread, so an unreachable
-platform costs at most a few bounded seconds at stage boundaries while its requests time out.
-Re-running a backfill is free: events are keyed by the emitter's sequence number, and the platform
-discards ones it already holds.
-
-## Research
-
-`wmo research` holds the experiment drivers behind the published studies (`concurrency`,
-`plot-concurrency`, `deepswe-holdout`, and the rest). They write report JSONs and figures (or
-print comparison tables) rather than serving artifacts; `wmo research --help` lists what is
-currently wired. `deepswe-holdout` runs the repo-grouped router holdout on a converted DeepSWE
-bundle and prints the per-split table, the medians, and the pre-split lab's reference numbers.

@@ -1,15 +1,13 @@
-"""Tests for the CLI: command surface + build/list/play driven via CliRunner (fake provider)."""
+"""Tests for the CLI command surface plus build and list flows with a fake provider."""
 
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import inspect
 import json
 import os
 import sys
 import time
-from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -20,7 +18,6 @@ from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from wmo.cli import app, pool_registry
-from wmo.cli.app import _CONCURRENCY_ISOLATION_FLAGS
 from wmo.cli.pool_registry import read_pool_entries
 from wmo.common.config import (
     FIDELITY_TIERS,
@@ -51,7 +48,6 @@ from wmo.common.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatal
 from wmo.common.providers.tinker import _MISSING_TINKER_EXTRA
 from wmo.simulation.ingest import VendorPull
 from wmo.simulation.model.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
-from wmo.simulation.model.eval_suites import EvalSuiteConfig
 
 # `wmo.cli`'s `app` attribute (the Typer object) shadows the `wmo.cli.app` submodule on
 # plain `import wmo.cli.app as ...`; go through importlib to monkeypatch module globals.
@@ -63,6 +59,11 @@ runner = CliRunner()
 def _flat(text: str) -> str:
     """Collapse rich wrapping (and typer's error-box borders) for substring asserts."""
     return " ".join(text.replace("│", " ").split())
+
+
+def _framed(output: str) -> str:
+    """Collapse a rich-framed message into one line for assertions."""
+    return " ".join(output.replace("│", " ").split())
 
 
 class FakeProvider:
@@ -332,16 +333,12 @@ def test_cli_exposes_the_small_command_set() -> None:
         "ingest",
         "list",
         "serve",
-        "demo",
         "eval",
-        "play",
         "download",
         "knowledge",
+        "run",
     }
-    # `run` owns local pi execution and hosted world-model sessions. Platform
-    # commands also cover the model registry round-trip and login lifecycle.
-    platform = {"login", "logout", "status", "push", "pull", "run"}
-    assert names == core | platform
+    assert names == core
     # `optimize` is a GROUP (route, model, and distill; harness search moved out).
     groups = {group.name for group in app.registered_groups}
     assert "optimize" in groups
@@ -442,8 +439,8 @@ def test_knowledge_command_stays_quiet_when_the_kb_is_live(tmp_path) -> None:  #
     assert "inert" not in result.output
 
 
-def test_knowledge_resolves_a_shipped_example_like_demo_and_play(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    """`wmo knowledge` must see the same models `wmo demo`/`wmo play` resolve, examples included."""
+def test_knowledge_resolves_a_shipped_example(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """`wmo knowledge` resolves a shipped example model when it is available."""
     from wmo.common.config import save_config
     from wmo.common.config.config import HarnessConfig
     from wmo.simulation.model.knowledge import KnowledgeBase
@@ -574,312 +571,6 @@ def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(cli_app_module, "app", lambda: None)
     cli_app_module.main()
     assert os.environ["WMO_TEST_MAIN_VAR"] == "loaded"
-
-
-def test_demo_replays_a_sampled_scenario_open_loop(patched_provider, tmp_path) -> None:  # noqa: ANN001
-    root = tmp_path / ".wmo"
-    _build(root, "demo-model", tmp_path)
-    result = runner.invoke(
-        app,
-        [
-            "demo",
-            "--name",
-            "demo-model",
-            "--root",
-            str(root),
-            "--traces",
-            _traces_file(tmp_path),
-            "--seed",
-            "0",
-            "--steps",
-            "3",
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    assert "replaying scenario" in result.output
-    assert "predicted" in result.output
-    assert "actual" in result.output
-    assert "exact matches" in result.output
-
-
-@pytest.mark.parametrize("steps", ["0", "-1"])
-def test_demo_rejects_a_non_positive_step_budget(patched_provider, tmp_path, steps) -> None:  # noqa: ANN001
-    # `--steps 0` used to slice the trace to [] and index [-1] on it: an IndexError traceback.
-    root = tmp_path / ".wmo"
-    _build(root, "demo-model", tmp_path)
-    result = runner.invoke(
-        app,
-        [
-            "demo",
-            "--name",
-            "demo-model",
-            "--root",
-            str(root),
-            "--traces",
-            _traces_file(tmp_path),
-            "--steps",
-            steps,
-            "--no-prompt",
-        ],
-    )
-    assert result.exit_code == 2, result.output
-    assert not isinstance(result.exception, IndexError)
-    assert "--steps" in result.output
-
-
-def test_demo_missing_explicit_traces_names_the_path_given(patched_provider, tmp_path) -> None:  # noqa: ANN001
-    # The old message blamed the model's default location and told you to pass the flag you just
-    # passed; an explicit path that does not exist must name that path.
-    root = tmp_path / ".wmo"
-    _build(root, "demo-model", tmp_path)
-    typo = tmp_path / "does-not-exist.jsonl"
-    result = runner.invoke(
-        app, ["demo", "--name", "demo-model", "--root", str(root), "--traces", str(typo)]
-    )
-    assert result.exit_code == 2, result.output
-    assert _squashed(str(typo)) in _squashed(result.output)
-
-
-def test_demo_without_a_corpus_names_the_file_to_pass(patched_provider, tmp_path) -> None:  # noqa: ANN001
-    """A build keeps no copy of its corpus, so the default can never resolve after `wmo build`."""
-    root = tmp_path / ".wmo"
-    _build(root, "demo-model", tmp_path)
-    result = runner.invoke(app, ["demo", "--name", "demo-model", "--root", str(root)])
-    assert result.exit_code == 2, result.output
-    flat = _squashed(result.output)
-    assert _squashed("keeps no copy of the corpus it read") in flat
-    assert _squashed("--traces <that file>") in flat
-    assert _squashed(str(root / "models" / "demo-model" / "traces.otel.jsonl")) in flat
-
-
-def test_demo_finds_a_corpus_stored_beside_the_artifact(patched_provider, tmp_path) -> None:  # noqa: ANN001
-    """serve and `optimize route sweep` read <model_dir>/traces.otel.jsonl; demo must too."""
-    root = tmp_path / ".wmo"
-    _build(root, "demo-model", tmp_path)
-    corpus = Path(_traces_file(tmp_path)).read_text(encoding="utf-8")
-    (root / "models" / "demo-model" / "traces.otel.jsonl").write_text(corpus, encoding="utf-8")
-
-    result = runner.invoke(
-        app, ["demo", "--name", "demo-model", "--root", str(root), "--seed", "0", "--steps", "1"]
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "replaying scenario" in result.output
-
-
-def test_demo_provider_failure_is_a_clean_error_not_a_traceback(
-    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The likeliest first-run failure: the serve provider has no credentials."""
-    import openai
-
-    import wmo.common.providers as providers_pkg
-
-    root = tmp_path / ".wmo"
-    _build(root, "demo-model", tmp_path)
-
-    class _NoCredentials(FakeProvider):
-        def complete(self, system, messages, *, temperature=0.7, max_tokens=8192):  # noqa: ANN001, ANN202
-            raise openai.OpenAIError("Missing credentials. Please pass an `api_key`")
-
-    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: _NoCredentials())
-
-    result = runner.invoke(
-        app,
-        [
-            "demo",
-            "--name",
-            "demo-model",
-            "--root",
-            str(root),
-            "--traces",
-            _traces_file(tmp_path),
-            "--steps",
-            "1",
-            "--no-prompt",
-        ],
-    )
-
-    assert result.exit_code == 1, result.output
-    assert not isinstance(result.exception, openai.OpenAIError)
-    flat = _squashed(result.output)
-    assert _squashed("Missing credentials") in flat
-    assert _squashed("wmo providers verify") in flat
-
-
-def test_demo_off_a_terminal_calls_an_outage_an_outage(
-    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A 429 that outlived the retries is not a credentials problem, and must not claim to be.
-
-    CliRunner is never a terminal, so this is exactly the CI/redirected path: the interactive
-    branch (offer a different provider) is unreachable and the capacity error falls through to
-    the setup-error renderer, which used to print `check ... your credentials`.
-    """
-    import httpx
-    import openai
-
-    import wmo.common.providers as providers_pkg
-
-    root = tmp_path / ".wmo"
-    _build(root, "demo-model", tmp_path)
-    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
-
-    class _RateLimited(FakeProvider):
-        def complete(self, system, messages, *, temperature=0.7, max_tokens=8192):  # noqa: ANN001, ANN202
-            raise openai.RateLimitError(
-                "Rate limit reached for gpt-4o",
-                response=httpx.Response(429, request=request),
-                body=None,
-            )
-
-    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: _RateLimited())
-
-    result = runner.invoke(
-        app,
-        [
-            "demo",
-            "--name",
-            "demo-model",
-            "--root",
-            str(root),
-            "--traces",
-            _traces_file(tmp_path),
-            "--steps",
-            "1",
-            "--no-prompt",
-        ],
-    )
-
-    assert result.exit_code == 1, result.output
-    assert not isinstance(result.exception, openai.RateLimitError)  # still no traceback
-    flat = _squashed(result.output)
-    assert _squashed("is out of capacity") in flat
-    assert _squashed("not a credentials problem") in flat
-    assert _squashed("re-run `wmo demo --name demo-model`") in flat  # the exact next command
-    assert "credentialsareset" not in flat  # the setup hint, squashed; wrong diagnosis here
-    assert "wmoprovidersverify" not in flat  # it would only re-report the same outage
-
-
-def test_demo_keeps_the_traceback_for_a_wmo_bug(patched_provider, tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    """Only backend SDK failures are re-rendered; our own bugs must not be dressed up as setup."""
-    root = tmp_path / ".wmo"
-    _build(root, "demo-model", tmp_path)
-    monkeypatch.setattr(
-        "wmo.simulation.model.demo.run_demo",
-        lambda *a, **kw: (_ for _ in ()).throw(KeyError("internal")),
-    )
-
-    result = runner.invoke(
-        app,
-        [
-            "demo",
-            "--name",
-            "demo-model",
-            "--root",
-            str(root),
-            "--traces",
-            _traces_file(tmp_path),
-            "--steps",
-            "1",
-            "--no-prompt",
-        ],
-    )
-
-    assert isinstance(result.exception, KeyError)
-
-
-def test_play_refuses_a_serve_provider_it_cannot_prepare(
-    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`prepare()` is free and offline, so a missing credential fails before the first step."""
-    import wmo.common.providers as providers_pkg
-
-    root = tmp_path / ".wmo"
-    _build(root, "demo-model", tmp_path)
-
-    class _Unpreparable(FakeProvider):
-        def prepare(self) -> None:
-            raise RuntimeError("Missing credentials. Set OPENAI_API_KEY")
-
-    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: _Unpreparable())
-
-    result = runner.invoke(app, ["play", "--name", "demo-model", "--root", str(root)])
-
-    assert result.exit_code == 1, result.output
-    flat = _squashed(result.output)
-    assert _squashed("Missing credentials") in flat
-    assert _squashed("wmo providers verify") in flat
-
-
-def _example_model(root: Path, example: str, name: str) -> Path:
-    """A shipped-example artifact: <root>/<example>/models/<name>/ plus the example's corpus."""
-    from wmo.common.config import save_config
-    from wmo.common.config.config import HarnessConfig
-
-    example_dir = root / example
-    (example_dir / "traces.otel.jsonl").parent.mkdir(parents=True, exist_ok=True)
-    (example_dir / "traces.otel.jsonl").write_text("", encoding="utf-8")
-    model_dir = example_dir / "models" / name
-    save_config(HarnessConfig(), root=model_dir)
-    return model_dir
-
-
-def test_demo_root_spelling_does_not_change_what_is_discovered(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    # Discovery used to be gated on `root != ".wmo"` string equality, so `./.wmo` (or the `.wmo/`
-    # shell tab-completion types) silently searched a different set than the identical `.wmo`.
-    _example_model(tmp_path, "airline-bench", "airline")
-    project = tmp_path / "project"
-    project.mkdir()
-    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
-    monkeypatch.chdir(project)
-
-    outputs = [
-        _squashed(runner.invoke(app, ["demo", "--name", "ghost", "--root", spelling]).output)
-        for spelling in (".wmo", "./.wmo", ".wmo/")
-    ]
-
-    assert all(_squashed("airline (airline-bench example)") in out for out in outputs), outputs
-
-
-def test_demo_lists_a_shadowed_example_distinguishably(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    # A local build of the same name used to appear twice in the list, and --name could not say
-    # which one was meant.
-    from wmo.common.config import save_config
-    from wmo.common.config.config import HarnessConfig
-
-    _example_model(tmp_path, "airline-bench", "airline")
-    project = tmp_path / "project"
-    save_config(HarnessConfig(), root=project / ".wmo" / "models" / "airline")
-    _example_model(tmp_path, "retail-bench", "retail")
-    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
-    monkeypatch.chdir(project)
-
-    result = runner.invoke(app, ["demo"])
-
-    assert result.exit_code == 2, result.output
-    flat = _squashed(result.output)
-    assert _squashed("airline (local)") in flat
-    assert _squashed("airline (airline-bench example)") in flat
-    assert _squashed(f"--root {tmp_path / 'airline-bench'}") in flat
-
-
-def test_demo_with_nothing_built_points_at_a_command_that_exists(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    # The old hint named `examples/tau-bench`, a path that ships in neither the wheel nor the repo.
-    empty_root = tmp_path / "no-examples"
-    empty_root.mkdir()
-    project = tmp_path / "project"
-    project.mkdir()
-    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (empty_root,))
-    monkeypatch.chdir(project)
-
-    result = runner.invoke(app, ["demo"])
-
-    assert result.exit_code == 2, result.output
-    flat = _squashed(result.output)
-    assert "examples/tau-bench" not in flat
-    assert "wmodownload" in flat
-    assert _squashed("wmo build --file <traces> --name <name>") in flat
 
 
 def test_retry_narrator_dedupes_identical_failures_and_counts_down(monkeypatch) -> None:  # noqa: ANN001
@@ -1472,108 +1163,6 @@ def test_eval_provider_flag_overrides_the_configured_worker(
     assert {config.model for config in seen} == {"us.anthropic.claude-opus-4-8"}
 
 
-def test_eval_suite_run_records_the_resolved_worker_model(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    # The result JSON must name the model that produced the number, which with no flags is the
-    # configured role rather than anything on the command line.
-    examples_root = tmp_path / "examples"
-    evals_dir = examples_root / "tiny-task" / "evals"
-    evals_dir.mkdir(parents=True)
-    (examples_root / "tiny-task" / "traces.otel.jsonl").write_text(
-        Path(_traces_file(tmp_path)).read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    (evals_dir / "default.toml").write_text(
-        'files = ["../traces.otel.jsonl"]\ntrain_split = 0.5\n', encoding="utf-8"
-    )
-    _write_worker_role(tmp_path / ".wmo", "openai", "gpt-5.4-mini")
-    monkeypatch.chdir(tmp_path)
-    seen = _record_eval_providers(monkeypatch)
-    results_root = tmp_path / ".wmo" / "evals"
-
-    ran = runner.invoke(
-        app,
-        [
-            "eval",
-            "run",
-            "tiny-task",
-            "--examples-root",
-            str(examples_root),
-            "--results-root",
-            str(results_root),
-        ],
-    )
-
-    assert ran.exit_code == 0, ran.output
-    assert {config.kind for config in seen} == {ProviderKind.OPENAI}
-    payload = json.loads(next(iter(results_root.glob("tiny-task/default/*.json"))).read_text())
-    assert payload["config"]["provider"] == "openai"
-    assert payload["config"]["model"] == "gpt-5.4-mini"
-
-
-def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  # noqa: ANN001
-    examples_root = tmp_path / "examples"
-    task_dir = examples_root / "tiny-task"
-    evals_dir = task_dir / "evals"
-    evals_dir.mkdir(parents=True)
-    trace_path = task_dir / "traces.otel.jsonl"
-    trace_path.write_text(
-        Path(_traces_file(tmp_path)).read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    (evals_dir / "default.toml").write_text(
-        "\n".join(
-            [
-                'description = "Tiny deterministic suite"',
-                'files = ["../traces.otel.jsonl"]',
-                "train_split = 0.5",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    listed = runner.invoke(app, ["eval", "list", "--examples-root", str(examples_root)])
-    assert listed.exit_code == 0, listed.output
-    assert "tiny-task/default" in listed.output
-
-    results_root = tmp_path / ".wmo" / "evals"
-    ran = runner.invoke(
-        app,
-        [
-            "eval",
-            "run",
-            "tiny-task",
-            "--examples-root",
-            str(examples_root),
-            "--results-root",
-            str(results_root),
-        ],
-    )
-    assert ran.exit_code == 0, ran.output
-    assert "wrote eval result" in ran.output
-    result_files = list(results_root.glob("tiny-task/default/*.json"))
-    assert len(result_files) == 1
-    payload = json.loads(result_files[0].read_text(encoding="utf-8"))
-    assert payload["suite"] == "tiny-task/default"
-    assert payload["report"]["overall_fidelity"] == 0.5
-    assert set(payload["report"]["per_file"]) == {"tiny-task"}
-
-    summarized = runner.invoke(
-        app,
-        [
-            "eval",
-            "results",
-            "tiny-task",
-            "--examples-root",
-            str(examples_root),
-            "--results-root",
-            str(results_root),
-        ],
-    )
-    assert summarized.exit_code == 0, summarized.output
-    assert "tiny-task/default" in summarized.output
-    assert "0.500" in summarized.output
-
-
 def test_eval_out_parent_is_created_before_the_eval_runs(patched_provider, tmp_path) -> None:  # noqa: ANN001
     # The report is written last; a missing parent used to blow up with FileNotFoundError AFTER
     # the (paid) eval had finished, discarding it.
@@ -1625,60 +1214,6 @@ def test_eval_file_with_no_traces_fails_instead_of_scoring_zero(tmp_path) -> Non
     assert "OVERALL" not in flat
 
 
-def test_eval_run_suite_with_no_traces_fails_instead_of_persisting_zero(tmp_path) -> None:  # noqa: ANN001
-    # A suite result is durable: a zero-step run used to be saved and then resurface in
-    # `wmo eval results` as a real 0.000 measurement.
-    evals_dir = tmp_path / "examples" / "tiny-task" / "evals"
-    evals_dir.mkdir(parents=True)
-    (evals_dir.parent / "traces.otel.jsonl").write_text(
-        '{"task_id": "t1", "instruction": "do it"}\n', encoding="utf-8"
-    )
-    (evals_dir / "default.toml").write_text('files = ["../traces.otel.jsonl"]\n', encoding="utf-8")
-    results_root = tmp_path / ".wmo" / "evals"
-
-    result = runner.invoke(
-        app,
-        [
-            "eval",
-            "run",
-            "tiny-task",
-            "--examples-root",
-            str(tmp_path / "examples"),
-            "--results-root",
-            str(results_root),
-        ],
-    )
-
-    assert result.exit_code == 2, result.output
-    flat = _flat(result.output)
-    assert "no OTel GenAI traces" in flat
-    assert "OVERALL" not in flat
-    assert not list(results_root.rglob("*.json"))  # nothing persisted
-
-
-def test_eval_run_suite_listing_no_files_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
-    evals_dir = tmp_path / "examples" / "tiny-task" / "evals"
-    evals_dir.mkdir(parents=True)
-    (evals_dir / "default.toml").write_text("files = []\n", encoding="utf-8")
-
-    result = runner.invoke(
-        app, ["eval", "run", "tiny-task", "--examples-root", str(tmp_path / "examples")]
-    )
-
-    assert result.exit_code == 2, result.output
-    assert "lists no trace files" in _flat(result.output)
-
-
-def test_eval_run_unknown_suite_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
-    examples_root = tmp_path / "examples"
-    examples_root.mkdir()
-
-    for tokens in (["run", "nosuite"], ["grid", "nosuite"]):
-        result = runner.invoke(app, ["eval", *tokens, "--examples-root", str(examples_root)])
-        assert result.exit_code == 2, result.output  # usage error, not a ValueError traceback
-        assert "unknown eval suite 'nosuite'" in _flat(result.output)
-
-
 def test_eval_unknown_chain_is_a_usage_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     monkeypatch.chdir(tmp_path)  # no .wmo/fallback.toml here
 
@@ -1718,53 +1253,13 @@ def test_eval_threshold_belongs_to_the_agreement_flow(tmp_path) -> None:  # noqa
     assert "wmo eval agreement" in _flat(result.output)
 
 
-def _hide_viz_extra(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make only matplotlib/seaborn look uninstalled, as on a core `pip install`."""
-    real_find_spec = importlib.util.find_spec
-
-    def find_spec(name: str, package: str | None = None) -> ModuleSpec | None:
-        if name in cli_app_module._VIZ_MODULES:
-            return None
-        return real_find_spec(name, package)
-
-    monkeypatch.setattr(cli_app_module.importlib.util, "find_spec", find_spec)
-
-
-def test_eval_grid_flows_name_the_viz_extra_when_it_is_missing(monkeypatch, tmp_path) -> None:  # noqa: ANN001
-    # matplotlib/seaborn ship in the optional [viz] extra; the plotting import used to escape as a
-    # raw ModuleNotFoundError that never named it (for `eval grid`, after the whole paid grid).
-    _hide_viz_extra(monkeypatch)
-    result_json = tmp_path / "grid.json"
-    result_json.write_text("{}", encoding="utf-8")
-
-    for tokens in (["grid-plot", str(result_json)], ["grid-heatmap", str(result_json)]):
-        result = runner.invoke(app, ["eval", *tokens])
-        assert result.exit_code == 2, result.output
-        assert "uv sync --extra viz" in _flat(result.output)
-
-
-def test_research_plot_commands_name_the_viz_extra_when_it_is_missing(monkeypatch) -> None:  # noqa: ANN001
-    _hide_viz_extra(monkeypatch)
-
-    for argv in (
-        ["research", "plot-concurrency", "missing.json"],
-        ["research", "plot-concurrency-combined", "a.json", "b.json"],
-    ):
-        result = runner.invoke(app, argv)
-        assert result.exit_code == 2, result.output
-        assert "uv sync --extra viz" in _flat(result.output)
-
-
 def test_eval_help_lists_every_dispatched_flow() -> None:
     result = runner.invoke(app, ["eval", "--help"])
 
     assert result.exit_code == 0, result.output
     flat = _flat(result.output)
-    # The grid family owns six of this command's options, so its tokens must be discoverable.
-    for token in ("grid <suite>", "grid-plot", "grid-heatmap", "agreement"):
+    for token in ("open-loop", "closed-loop", "agreement"):
         assert token in flat
-    # Suites live beside the downloaded corpus; the help must not send readers to a repo dir.
-    assert "environment-capture-data" in flat
 
 
 def test_build_then_list_shows_named_model(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -1856,20 +1351,6 @@ def test_the_model_picker_reports_when_nothing_is_readable(
 
     with pytest.raises(typer.BadParameter, match="no readable world model"):
         cli_app_module._resolve_name(WorldModelStore(root), None)
-
-
-def test_play_repl_steps_and_quits(patched_provider, tmp_path) -> None:  # noqa: ANN001
-    root = tmp_path / ".wmo"
-    _build(root, "default", tmp_path)
-
-    # Feed one tool call then quit; the world model's canned observation should surface.
-    result = runner.invoke(
-        app,
-        ["play", "--root", str(root), "--task", "look up users"],
-        input='get_user {"id": "u1"}\n:quit\n',
-    )
-    assert result.exit_code == 0, result.output
-    assert "user u1 found" in result.output
 
 
 def test_build_interactive_wizard_creates_model(
@@ -2315,23 +1796,6 @@ def test_build_aborts_when_provider_sdk_missing(monkeypatch, tmp_path) -> None: 
     assert not (root / "models" / "x" / "config.toml").exists()
 
 
-def test_play_unknown_model_errors(tmp_path) -> None:  # noqa: ANN001
-    result = runner.invoke(app, ["play", "--name", "nope", "--root", str(tmp_path / ".wmo")])
-    assert result.exit_code != 0
-    # A clean usage error, not an uncaught FileNotFoundError traceback.
-    assert not isinstance(result.exception, FileNotFoundError)
-    assert "nope" in result.output
-
-
-def test_demo_unknown_model_is_clean_error(patched_provider, tmp_path) -> None:  # noqa: ANN001
-    root = tmp_path / ".wmo"
-    _build(root, "airline", tmp_path)
-    result = runner.invoke(app, ["demo", "--name", "ghost", "--root", str(root)])
-    assert result.exit_code != 0
-    # Resolved through _load_model -> _resolve_name; must surface as a usage error, not a traceback.
-    assert not isinstance(result.exception, (FileNotFoundError, ValueError))
-
-
 def test_providers_verify_unknown_model_is_clean_error(tmp_path) -> None:  # noqa: ANN001
     result = runner.invoke(
         app, ["providers", "verify", "--name", "ghost", "--root", str(tmp_path / ".wmo")]
@@ -2700,133 +2164,6 @@ def test_providers_verify_name_scopes_the_report_to_one_world_model(
     assert "models.worker" not in result.output
 
 
-def test_research_concurrency_uses_the_configured_worker_provider(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    # The environment LLM is the same worker-role call every other command makes; it used to be
-    # pinned to bedrock/claude-opus-4-8 whatever the project configured.
-    examples_root = tmp_path / "examples"
-    evals_dir = examples_root / "tiny-task" / "evals"
-    evals_dir.mkdir(parents=True)
-    (examples_root / "tiny-task" / "traces.otel.jsonl").write_text(
-        Path(_traces_file(tmp_path)).read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    (evals_dir / "default.toml").write_text(
-        'files = ["../traces.otel.jsonl"]\ntrain_split = 0.5\n', encoding="utf-8"
-    )
-    _write_worker_role(tmp_path / ".wmo", "openai", "gpt-5.4-mini")
-    monkeypatch.chdir(tmp_path)
-    # get_provider is the identity here, so calling the runner's factory yields its config.
-    built: list[ProviderConfig] = []
-    monkeypatch.setattr("wmo.common.providers.get_provider", lambda config: config)
-    monkeypatch.setattr(
-        "wmo.optimize.research.concurrency_run.build_world_runner",
-        lambda factory, prompt, demos, selected: built.append(factory()),
-    )
-    monkeypatch.setattr(
-        "wmo.optimize.research.run_concurrency_scaling",
-        lambda *a, **kw: SimpleNamespace(benchmark="", best_speedup=lambda: None),
-    )
-
-    result = runner.invoke(
-        app,
-        [
-            "research",
-            "concurrency",
-            "tiny-task",
-            "--examples-root",
-            str(examples_root),
-            "--side",
-            "world",
-            "--scenarios",
-            "1",
-            "--levels",
-            "1",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert built[0].kind is ProviderKind.OPENAI
-    assert built[0].model == "gpt-5.4-mini"
-
-
-def test_research_concurrency_rejects_level_above_scenarios_fixed_n() -> None:
-    # Fixed-N: a level above --scenarios would silently cap concurrency at N and duplicate the
-    # N-worker point, so it must fail fast (guard fires before any suite/corpus resolution).
-    result = runner.invoke(
-        app,
-        ["research", "concurrency", "any-suite", "--scenarios", "4", "--levels", "1,2,4,8"],
-    )
-    assert result.exit_code != 0
-    assert "levels goes up to 8" in result.output
-
-
-def test_research_concurrency_allows_levels_up_to_scenarios() -> None:
-    # levels == scenarios is fine; the guard must not fire (a later stage may still fail).
-    result = runner.invoke(
-        app,
-        ["research", "concurrency", "any-suite", "--scenarios", "8", "--levels", "1,2,4,8"],
-    )
-    assert "levels goes up to" not in result.output
-
-
-def test_swe_bench_concurrency_forces_cache_shared() -> None:
-    # swe-bench's fixed-N sweep must force --cache-shared (build shared base+env once, cold-build
-    # the per-instance image each level) — NOT --no-family-purge, which would rebuild the base per
-    # scenario and let concurrent workers clobber each other's shared images.
-    forced = _CONCURRENCY_ISOLATION_FLAGS["swe-bench"]
-    assert "--cache-shared" in forced
-    assert "--no-family-purge" not in forced
-
-
-def test_research_concurrency_rejects_non_integer_levels() -> None:
-    # A typo in --levels must produce a friendly BadParameter, not a raw int() traceback.
-    result = runner.invoke(
-        app,
-        ["research", "concurrency", "any-suite", "--scenarios", "8", "--levels", "1,2,foo,8"],
-    )
-    assert result.exit_code != 0
-    assert "--levels must be a comma-separated list of integers" in result.output
-
-
-def test_research_concurrency_rejects_bad_select() -> None:
-    result = runner.invoke(
-        app,
-        [
-            "research",
-            "concurrency",
-            "any-suite",
-            "--select",
-            "bogus",
-            "--scenarios",
-            "4",
-            "--levels",
-            "1,2,4",
-        ],
-    )
-    assert result.exit_code != 0
-    assert "--select must be one of" in result.output
-
-
-def _framed(output: str) -> str:
-    """One flat line of a rich-framed message: the box wraps and pads what it renders."""
-    return " ".join(output.replace("│", " ").split())
-
-
-def test_research_concurrency_unknown_suite_is_clean_error(tmp_path) -> None:  # noqa: ANN001
-    # The suite argument must fail like every other argument on this command: a framed usage
-    # error naming the next command, not the raw ValueError traceback out of resolve_eval_suite.
-    result = runner.invoke(
-        app,
-        ["research", "concurrency", "nosuchsuite", "--examples-root", str(tmp_path)],
-    )
-    assert result.exit_code != 0
-    assert not isinstance(result.exception, ValueError)
-    flat = _framed(result.output)
-    assert "unknown eval suite 'nosuchsuite'" in flat
-    assert "`wmo eval list` prints the suites" in flat
-
-
 def test_scenarios_build_missing_file_is_clean_error(tmp_path) -> None:  # noqa: ANN001
     # A typo in --file is the likeliest first-run mistake; it must not be a FileNotFoundError.
     result = runner.invoke(app, ["scenarios", "build", "--file", str(tmp_path / "nope.jsonl")])
@@ -2936,19 +2273,6 @@ def test_scenarios_build_unreadable_corpus_is_clean_error(tmp_path) -> None:  # 
     flat = _framed(result.output)
     assert "could not be read" in flat
     assert "shows its owner and mode" in flat
-
-
-def test_research_concurrency_malformed_suite_file_omits_the_listing_hint(tmp_path) -> None:  # noqa: ANN001
-    # Regression (Greptile P2): a direct `.toml` selector that exists resolves past name lookup
-    # and fails on its own contents, so `wmo eval list` would point away from the broken file.
-    suite_file = tmp_path / "broken.toml"
-    suite_file.write_text("this is not = toml [[[\n", encoding="utf-8")
-    result = runner.invoke(app, ["research", "concurrency", str(suite_file)])
-    assert result.exit_code != 0
-    assert not isinstance(result.exception, ValueError)
-    flat = _framed(result.output)
-    assert "is not valid TOML" in flat
-    assert "wmo eval list" not in flat
 
 
 def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa: ANN001
@@ -3364,42 +2688,6 @@ def test_download_picker_lists_published_and_fetches_choice(
     assert "not downloaded" in result.output  # picker showed local status
 
 
-def test_grid_output_paths_never_collide() -> None:
-    # Regression: `--out foo.json` must NOT make the chart PNG overwrite the just-written result
-    # JSON. The JSON and PNG always get distinct suffixes off the same stem.
-    from wmo.cli.app import _grid_output_paths
-
-    default = Path("/tmp/grid/suite-run.json")
-    for out in ("foo.json", "foo.png", "foo", "dir/bar.json"):
-        json_path, png_path = _grid_output_paths(out, default)
-        assert json_path.suffix == ".json"
-        assert png_path.suffix == ".png"
-        assert json_path != png_path  # the bug: these were equal for `--out foo.json`
-        assert json_path.stem == png_path.stem == Path(out).stem
-    # No --out: fall back to the default JSON dest + its .png sibling.
-    json_path, png_path = _grid_output_paths(None, default)
-    assert json_path == default
-    assert png_path == default.with_suffix(".png")
-
-
-def test_parse_model_specs_validates_provider_and_resolves_model() -> None:
-    from wmo.cli.app import _parse_model_specs
-
-    specs = _parse_model_specs(
-        "Opus 4.8:bedrock:us.anthropic.claude-opus-4-8,Qwen:openai:qwen-agentworld-35b-a3b"
-    )
-    assert [(s.label, s.provider, s.model) for s in specs] == [
-        ("Opus 4.8", "bedrock", "us.anthropic.claude-opus-4-8"),  # exact wire id preserved
-        ("Qwen", "openai", "qwen-agentworld-35b-a3b"),  # self-hosted id passes through unchanged
-    ]
-    # A bad provider fails at parse time with a clear message, not deep inside run_grid.
-    with pytest.raises(typer.BadParameter, match="unknown provider"):
-        _parse_model_specs("X:notaprovider:m")
-    # Malformed entry (wrong arity) still rejected.
-    with pytest.raises(typer.BadParameter, match="bad --models entry"):
-        _parse_model_specs("Opus:bedrock")
-
-
 def _build_cli_train_split_default() -> float:
     """The `--train-split` default `wmo build` registers, read off the Typer option itself."""
     option = inspect.signature(cli_app_module.build).parameters["train_split"].default
@@ -3431,8 +2719,6 @@ def test_build_and_eval_share_one_default_train_split() -> None:
     assert _eval_cli_train_split_default() == DEFAULT_TRAIN_SPLIT
     # Pinned to each other too, so a future edit to one alone is a failure and not a silent leak.
     assert _build_cli_train_split_default() == _eval_cli_train_split_default()
-    # Suites and the Python-API config default sit on the same line and must agree as well.
-    assert EvalSuiteConfig().train_split == DEFAULT_TRAIN_SPLIT
     assert HarnessConfig().train_split == DEFAULT_TRAIN_SPLIT
 
 

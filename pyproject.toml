@@ -38,9 +38,6 @@ dependencies = [
 
 [project.optional-dependencies]
 otel = ["opentelemetry-proto>=1.24"]
-# Plotting/figures for research runs (wmo research plot-concurrency); kept out of the core install.
-# pandas backs the concurrency-scaling plot's tidy DataFrame.
-viz = ["seaborn>=0.13", "matplotlib>=3.8", "pandas>=2.0"]
 # The e2b harness backend (`--harness-backend e2b`): the pi-node harness PROCESS executes in
 # pooled E2B microVMs while the environment stays the world model. Only those runs need it —
 # local runs stay sandbox-free — so it is an optional extra imported lazily
@@ -55,10 +52,6 @@ e2b = ["e2b==2.31.0"]
 # tracks its build behavior. Running harbor task environments ON E2B additionally needs
 # `wmo[harbor,e2b]` plus harbor's own e2b extra (`harbor[e2b]`, for dockerfile-parse).
 harbor = ["harbor==0.20.0"]
-# Context connectors (`wmo.simulation.context`): the MCP client SDK backs the Notion connector's
-# remote-MCP OAuth/pull path. Only that path needs it, so it is an optional extra imported
-# lazily (wmo.simulation.context.notion), same contract as the e2b extra above.
-connectors = ["mcp>=1.27"]
 # The Postgres trace source (`wmo ingest --source postgres`): the driver is imported lazily
 # inside the adapter's pull path, same contract as the vendor-SDK extras.
 postgres = ["psycopg[binary]>=3.1"]
@@ -84,7 +77,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-optimizer[otel,viz,e2b,connectors,harbor,postgres,distill,local]",
+    "world-model-optimizer[otel,e2b,harbor,postgres,distill,local]",
 ]
 
 [dependency-groups]

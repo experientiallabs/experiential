@@ -1,9 +1,8 @@
 """A minimal LLM agent for rollouts: one tool call (or DONE) per turn, JSON-formatted.
 
-This is the reusable counterpart of the throwaway agent inside `wmo demo`: it implements the
-`Agent` protocol so scenario verification and research runs can roll real episodes against a
-world model without every caller re-writing the same prompt-and-parse loop. It is deliberately
-simple — no planning scaffold — because its role is "a competent baseline agent", not SOTA.
+This implementation of the `Agent` protocol lets scenario verification roll real episodes
+against a world model without every caller re-writing the same prompt-and-parse loop. It is
+deliberately simple, with no planning scaffold, because its role is a competent baseline agent.
 """
 
 from __future__ import annotations

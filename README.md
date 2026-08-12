@@ -55,25 +55,9 @@ Distill your own small model into the pool with [`wmo optimize distill`](wmo/opt
 serve a single model with no routing via `wmo optimize route pin`, or build an optimized harness
 for your agent with `wmo optimize harness`.
 
-### Hosted platform
-
-Create an account at [platform.experientiallabs.ai](https://platform.experientiallabs.ai), then
-authenticate the CLI:
-
-```bash
-wmo login
-```
-
-Copy a world-model ID from the platform and open an interactive session:
-
-```bash
-wmo run <world-model-id>
-```
-
 ### E2B backend
 
-Hosted agents already run in platform-managed E2B sandboxes. To evaluate a local optimization in
-E2B, install the extra and provide an E2B key:
+To evaluate a local optimization in E2B, install the extra and provide an E2B key:
 
 ```bash
 pip install "world-model-optimizer[e2b]"
@@ -102,16 +86,6 @@ print(obs.content)
 
 Or over HTTP (same code path), namespaced by model name: `GET /world_models`, then `POST
 /world_models/{name}/sessions` and `POST /world_models/{name}/sessions/{id}/step`.
-
-## Run a world model from the platform
-
-After `wmo login`, `wmo run` resolves a platform target ID and opens a hosted world-model session.
-The platform manages model credentials, so this path needs no local API key.
-
-```bash
-wmo login
-wmo run <world-model-id> --task "check out the cart"
-```
 
 ## Runtime agents and optimizers in E2B sandboxes
 

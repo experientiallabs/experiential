@@ -91,7 +91,7 @@ def test_resolve_unknown_name_lists_available(tmp_path) -> None:  # noqa: ANN001
 
 
 def test_one_unreadable_artifact_does_not_hide_the_healthy_ones(tmp_path) -> None:  # noqa: ANN001
-    # A model dir arrives from `wmo pull` or a hand copy, so a config.toml this CLI cannot parse
+    # A model dir arrives from a hand copy, so a config.toml this CLI cannot parse
     # is an ordinary state. It must cost its own row, not the whole listing.
     store = WorldModelStore(tmp_path / ".wmo")
     _build_fake_model(store, "alpha-healthy")

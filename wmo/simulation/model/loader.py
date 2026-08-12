@@ -23,8 +23,8 @@ def load_world_model(
 ) -> tuple[WorldModel, Provider]:
     """Load the world model under `model_dir`, returning it with the serve provider it was built on.
 
-    The provider is returned alongside so callers that also need it (e.g. `wmo demo`, which runs an
-    LLM agent against the same provider) don't re-read the config or reconstruct it.
+    The provider is returned alongside so callers that also need it do not re-read the config or
+    reconstruct it.
     `max_fidelity` turns on the online extras (the build-measured winner when the artifact has
     one); a plain load runs pure RAG.
     """

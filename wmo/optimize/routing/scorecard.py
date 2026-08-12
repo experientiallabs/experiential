@@ -32,8 +32,7 @@ Discipline inherited from the surrounding code, and where this module deliberate
   episode-level (each episode is a task attempt that cost money), but a mean reward over
   episodes silently reweights the comparison when two arms ran different episode counts on the
   same scenario, which is the scenario-level version of the bug the common set exists to stop.
-- Comparability invariants fail loudly rather than merge, as in
-  `wmo.simulation.evaluation.grid.merge_results`.
+- Comparability invariants fail loudly rather than merge.
   A `wm_simulated` arm never silently scores against a `real_episode` anchor, and two arms whose
   condition labels collide are rejected: the GEPA program lost runs to colliding labels, so a
   `ConditionLabel` here is structured and must name every experimental axis.
@@ -980,8 +979,8 @@ def _anchor_dominates(card: Scorecard, latency: LatencyObjective) -> bool:
 def _require_comparable(arm: Arm, anchor: Arm) -> None:
     """Fail loudly on any axis that must match for the two sides to be one comparison.
 
-    Follows `wmo.simulation.evaluation.grid.merge_results`: an invariant that would produce a
-    plausible but meaningless number is checked, not documented. `base_model`, `optimizer`, and
+    An invariant that would produce a plausible but meaningless number is checked, not documented.
+    `base_model`, `optimizer`, and
     `seed` may differ because differing on them is what an ablation is.
     """
     if arm.name == anchor.name:

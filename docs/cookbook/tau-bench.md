@@ -143,17 +143,6 @@ serving index covers the full corpus, so the simulator can retrieve a held-out t
 recorded steps as demonstrations when it simulates that scenario, and bands are cut per trace id
 rather than per task text, so a task repeated across traces can land on both sides.
 
-Look at the thing before optimizing it:
-
-```bash
-uv run wmo play --name tau-bench      # step in yourself
-uv run wmo demo --name tau-bench \
-  --traces environment-capture-data/tau-bench/traces.otel.jsonl   # replay one, open loop
-```
-
-`wmo demo` needs the corpus because a build keeps no copy of the traces it read, only the prompts,
-the metrics and the retrieval index. Pass the same file step 1's `wmo build --file` was given.
-
 ## Step 2: register the routing candidates
 
 The router picks between the models in a pool file. Write it with:

@@ -14,7 +14,7 @@ holding the rest fixed, each layer's result motivating the next:
 | 6 | economics | concurrency scaling law (#41) | a world model saves wall-clock iff real standup cost exceeds reconstruction cost |
 
 Cross-cutting instruments: the judge overhaul (#83) and the cross-model benchmark grid (#98,
-how-to in [`../reference/eval_grid.md`](../reference/eval_grid.md)). The work merged to `main`
+archived as historical research evidence). The work merged to `main`
 as one six-PR train (#41, #72, #97, #55, #120, #98); the six layers map to five study PRs, with
 #72 carrying layers 1 and 2 and #98 serving as instrumentation.
 
@@ -25,9 +25,8 @@ as one six-PR train (#41, #72, #97, #55, #120, #98); the six layers map to five 
   terminal-tasks 280 / 685, swe-bench 255 / 1868 (swe scored on the healthy,
   degenerate-dropped corpus where noted).
 - **Split discipline**: deterministic by hash of `trace_id` into a fixed test band (the y-axis
-  never changes as the corpus grows), a fixed valid band, and a train pool
-  (`wmo.optimize.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`). Selection (GEPA, config
-  search) uses valid; the reported number is always the untouched test slice.
+  never changes as the corpus grows), a fixed valid band, and a train pool. Selection (GEPA,
+  config search) uses valid; the reported number is always the untouched test slice.
 - **Metric**: open-loop reconstruction fidelity. The world model replays recorded steps
   teacher-forced (`predict_observation`); a pinned `RubricJudge` scores each predicted
   observation against the recorded one.
@@ -380,9 +379,8 @@ wall-clock, is the portable quantity.
 
 ## Cross-model generality: the benchmark grid (#98)
 
-The layers above pin one serving model per study. `wmo eval grid` (reference:
-[`../reference/eval_grid.md`](../reference/eval_grid.md)) re-asks the base/+RAG/+GEPA/+GEPA+RAG
-question across five serving models × four benchmarks under one pinned judge, with
+The layers above pin one serving model per study. The archived cross-model grid re-asked the
+base/+RAG/+GEPA/+GEPA+RAG question across five serving models × four benchmarks under one pinned judge, with
 `JUDGE_VERSION` stamped into every result and merges refusing mixed-version or mixed-split
 reports. The archived reference run is rubric-v1 and reference-only; re-run before comparing
 against anything current.
@@ -464,14 +462,15 @@ machine; treat any number without that pinning as unfalsifiable.
 
 ## Reproduce
 
-All six layers are driven by the public `wmo` API; any thin driver reproduces them. Corpora:
+The archived research runners produced these results. Corpora:
 `environment-capture-data/<suite>/traces.otel.jsonl` via `wmo.simulation.ingest` (adapter
 `otel-genai`, degenerate traces dropped for swe-healthy). Splits via
-`wmo.optimize.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`. Figures: matplotlib over the
-result JSONs, brand palette per AGENTS.md rule 15.
+the fixed 20% test and 15% validation hash partition. Figures: matplotlib over the result JSONs,
+brand palette per AGENTS.md rule 15. The research-only runners and grid tool are no longer a
+product command surface.
 
 ```text
-Layer 1  wmo.optimize.research.TraceScalingAblation + run_ablation
+Layer 1  archived trace-scaling ablation runner
          counts=1,4,16,64,256,648 (auto-caps at each pool), modes=base, seeds=0,1,
          sample_turns=sampled, test_cap=40, concurrency=8, top_k=5
          serve + judge us.anthropic.claude-opus-4-8 (Bedrock, AWS_PROFILE=default us-east-1),
@@ -484,7 +483,7 @@ Layer 2  same ablation, counts=1,16,<pool>, test_cap=15,
          retrieval_key="state_action"; unoptimized: top_k=5, no cap
          semantic arm: Azure ada-002 embedder; command-only key arm: retrieval_key="action"
 
-Layer 3  wmo.optimize.research.GepaScalingAblation + run_ablation
+Layer 3  archived GEPA-scaling ablation runner
          common: sample_turns=sampled, test_cap=40, concurrency=8, gepa_val_steps=30
          budget axis: budgets {0,1,2,4,8,16} at counts=64, seeds 0,1
          trace axis: counts {1,4,16,pool} at budgets=8, seed 0
@@ -505,9 +504,9 @@ Layer 5  layer-1 ablation with composable modes base+conf, reason+conf, reason+c
          (confidence, judge-score) joins the calibration analysis needs);
          counts: tau 200 / terminal 160 / swe 24, seeds 0,1, test caps 40/40/20
 
-Layer 6  wmo research concurrency <suite> --side both --scenarios 16 --levels 1,2,4,8,16
-         --select random --select-seed 1 (trials: tau 3 / terminal 2 / swe 1; swe auto-forces
-         --cache-shared); figures via wmo research plot-concurrency-combined
+Layer 6  archived concurrency runner, side both, scenarios 16, levels 1,2,4,8,16,
+         random selection with seed 1 (trials: tau 3 / terminal 2 / swe 1; swe used a
+         cache-shared setup); figures rendered from archived reports
 
 GEV      one shell command per scorecard; the runners (run_gen.sh / run_verify.sh /
          run_exec.sh) ship with #254 alongside the scorecards, per-episode rows, and

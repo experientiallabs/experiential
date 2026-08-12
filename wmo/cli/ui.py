@@ -1,5 +1,6 @@
-"""Terminal UX for the `wmo` CLI: guided creation/selection flows, an animated build pipeline, and
-the interactive play REPL.
+"""Terminal UX for the `wmo` CLI.
+
+Provides guided creation and selection flows plus an animated build pipeline.
 
 Everything that talks to `rich` lives here so the engine stays headless. Responsibilities:
 
@@ -11,8 +12,6 @@ Everything that talks to `rich` lives here so the engine stays headless. Respons
   events into a guided, animated pipeline (stage lines + a live GEPA rollout progress bar) on a
   TTY, and into
   plain one-line-per-event output when piped (non-TTY), so logs stay legible.
-- `run_play_repl` drives the human-in-the-loop demo: the user types actions, the world model
-  answers, and the evolving session state (scratchpad + history) is rendered each turn.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ import os
 import sys
 from collections import deque
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import click
 import typer
@@ -52,11 +50,6 @@ from wmo.common.config import (
     validate_name,
 )
 from wmo.common.providers.base import ProviderConfig, ProviderKind, VerifyResult
-
-if TYPE_CHECKING:
-    from wmo.common.core.types import Action, Session
-    from wmo.simulation.model.play import PlayTurn
-    from wmo.simulation.model.world_model import WorldModel
 
 # A reader takes a fully-rendered prompt string and returns the user's typed line.
 PromptReader = Callable[[str], str]
@@ -253,8 +246,7 @@ def select_provider_and_model(
 
     Providers with credentials present are annotated and the first becomes the suggested default
     (none otherwise); a failed live ping loops back to the picker with the failed pick as the
-    retry default. Also reused by `wmo demo`'s switch-provider flow. Returns
-    (provider, model, region).
+    retry default. Returns (provider, model, region).
     """
     from wmo.common.providers.models import resolve_provider_model
 
@@ -986,7 +978,7 @@ def build_summary_panel(info: ModelInfo, root: str) -> Panel:
     return Panel(
         table,
         title=f"[bold green]world model ready: {info.name}[/bold green]",
-        subtitle="serve it with `wmo serve` or step into it with `wmo play`",
+        subtitle="serve it with `wmo serve`",
         border_style="green",
     )
 
@@ -1015,126 +1007,6 @@ def models_table(infos: list[ModelInfo]) -> Table:
             "-" if info.frontier_size is None else str(info.frontier_size),
         )
     return table
-
-
-# --- interactive play REPL -----------------------------------------------------------------------
-
-_PLAY_HELP = (
-    "[bold]You are the agent.[/bold] Type an action and the world model answers:\n"
-    '  [cyan]get_user {"id": "u1"}[/cyan]   a tool call with JSON arguments\n'
-    "  [cyan]list_flights[/cyan]            a tool call with no arguments\n"
-    "  [cyan]say I am stuck[/cyan]          a free-text message to the environment\n"
-    "Commands: [cyan]:state[/cyan] show session state  ·  [cyan]:help[/cyan]  ·  "
-    "[cyan]:quit[/cyan] (or Ctrl-D) to exit"
-)
-
-
-_AGENT_PROMPT = "[bold]agent>[/bold] "
-
-
-def run_play_repl(
-    console: Console,
-    world_model: WorldModel,
-    model_name: str,
-    task: str | None,
-    reader: PromptReader | None = None,
-    suggestions: list[str] | None = None,
-) -> None:
-    """Run the human-in-the-loop demo against `world_model`.
-
-    `reader` is an optional `PromptReader` (`(prompt_text) -> line`) used to source input — injected
-    in tests, defaults to the console's prompt. The loop ends on `:quit`, EOF, or KeyboardInterrupt.
-    """
-    ask = reader if reader is not None else console.input
-    session = world_model.new_session(task=task)
-    body = _PLAY_HELP
-    if suggestions:
-        sampled = "\n".join(f"  [cyan]{escape(line)}[/cyan]" for line in suggestions)
-        body = (
-            "You are the agent. Type an action and the world model answers.\n"
-            "Real actions from this model's traces to try:\n"
-            f"{sampled}\n"
-            "Commands: :state show session state  \u00b7  :help  \u00b7  :quit (or Ctrl-D) to exit"
-        )
-    console.print(
-        Panel(
-            body,
-            title=f"[bold]playing[/bold] {model_name}",
-            subtitle=f"task: {task}" if task else "no task set",
-            border_style="cyan",
-        )
-    )
-
-    while True:
-        try:
-            line = ask(_AGENT_PROMPT)
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[dim]bye[/dim]")
-            return
-        line = line.strip()
-        if not line:
-            continue
-        if line in {":quit", ":q", ":exit"}:
-            console.print("[dim]bye[/dim]")
-            return
-        if line in {":help", ":h"}:
-            console.print(_PLAY_HELP)
-            continue
-        if line == ":state":
-            _render_state(console, world_model.get_session(session.id))
-            continue
-        _handle_action(console, world_model, session.id, line)
-
-
-def _handle_action(console: Console, world_model: WorldModel, session_id: str, line: str) -> None:
-    """Parse + step one typed action, rendering the observation (or a friendly error).
-
-    A failed step (e.g. a provider/network error) is reported and swallowed so the REPL keeps the
-    session alive instead of crashing the whole interactive run.
-    """
-    from wmo.simulation.model.play import parse_action, play_turn
-
-    try:
-        action = parse_action(line)
-    except ValueError as exc:
-        console.print(f"[red]parse error[/red]: {exc}")
-        return
-    try:
-        with console.status("[dim]world model thinking…[/dim]", spinner="dots"):
-            turn = play_turn(world_model, session_id, action)
-    except Exception as exc:  # noqa: BLE001 - keep the REPL alive; surface the failure to the user
-        console.print(f"[red]step failed[/red]: {exc}")
-        return
-    _render_turn(console, turn)
-
-
-def _render_turn(console: Console, turn: PlayTurn) -> None:
-    console.print(f"[bold cyan]→ you[/bold cyan]: {_action_text(turn.action)}")
-    style = "red" if turn.observation.is_error else "green"
-    label = "error" if turn.observation.is_error else "observation"
-    console.print(
-        Panel(
-            turn.observation.content or "[dim](empty)[/dim]",
-            title=f"[bold]{label}[/bold]",
-            border_style=style,
-        )
-    )
-
-
-def _render_state(console: Console, session: Session) -> None:
-    scratchpad = session.state.scratchpad or "[dim](empty)[/dim]"
-    body = f"[bold]task[/bold]: {session.task or '(none)'}\n"
-    body += f"[bold]turns[/bold]: {len(session.history)}\n\n"
-    body += f"[bold]scratchpad[/bold]:\n{scratchpad}"
-    console.print(Panel(body, title="session state", border_style="blue"))
-
-
-def _action_text(action: Action) -> str:
-    from wmo.common.core.types import ActionKind
-
-    if action.kind == ActionKind.TOOL_CALL:
-        return f"{action.name}({action.arguments})"
-    return f'message: "{action.content}"'
 
 
 def explicit_param(ctx: typer.Context, param: str) -> bool:

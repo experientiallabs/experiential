@@ -1,8 +1,8 @@
 """Fetch and list trace-corpus data bundles from the Hugging Face Hub (stdlib-only).
 
 Every publishable benchmark's bundle lives in a dataset repo under the org: the trace corpus, its
-task data / gold / evidence dirs, and the prebuilt world model and eval suites built from that
-corpus (see ``_ARTIFACT_DIRS``). This is the READ core behind `wmo download`, plus
+task data / gold / evidence dirs, and the prebuilt world model built from that corpus (see
+``_ARTIFACT_DIRS``). This is the READ core behind `wmo download`, plus
 the "is it local, and where" resolver (`corpus_path`) that decides whether to fetch or serve
 from disk. Plain HTTP against the Hub's public REST API, so it needs no extra dependency and no
 token for public repos (pass ``token`` for private ones).
@@ -59,17 +59,14 @@ _REPO_SUFFIX = "-traces"
 _MISSING_REPO_CODES = frozenset({401, 403, 404})
 
 # Prebuilt artifact dirs published in the same dataset repo as the corpus, fetched for every
-# benchmark. Unlike `CorpusSpec.data_dirs` these are not upstream data but `wmo`'s own outputs (the
-# benchmark's prebuilt world model and its named eval suites), and the set is identical everywhere,
-# so it is a constant rather than a per-corpus field.
+# benchmark. Unlike `CorpusSpec.data_dirs` these are not upstream data but `wmo`'s own outputs,
+# and the set is identical everywhere, so it is a constant rather than a per-corpus field.
 #
 # The remote paths mirror the local layout EXACTLY: `models/<name>/` holding
-# `{card.json,config.toml,metrics.json,prompts/,index/}`, and `evals/*.toml`, landing under
-# `<data root>/<benchmark>/`. That is what `WorldModelStore` walks and what suite discovery globs
-# as `<root>/*/evals/*.toml`, so a downloaded bundle is found by the same code as a locally
-# captured one, with no special case for "came from the Hub". A suite names its corpus relatively
-# (`../traces.otel.jsonl`), which resolves because both land in one benchmark dir.
-_ARTIFACT_DIRS = ("models", "evals")
+# `{card.json,config.toml,metrics.json,prompts/,index/}`, landing under
+# `<data root>/<benchmark>/`. That is what `WorldModelStore` walks, so a downloaded bundle is
+# found by the same code as a locally captured one, with no special case for "came from the Hub".
+_ARTIFACT_DIRS = ("models",)
 
 # on_progress(files_done, files_total, bytes_total): called after every streamed chunk, across ALL
 # files in the fetch (front-ends render one bar for the whole bundle). Progress is weighted by

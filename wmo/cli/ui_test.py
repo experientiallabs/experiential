@@ -1,4 +1,4 @@
-"""Tests for the terminal UX: the non-TTY build reporter and the play REPL (injected I/O)."""
+"""Tests for the terminal UX and non-TTY build reporter."""
 
 from __future__ import annotations
 
@@ -17,20 +17,10 @@ from wmo.cli.ui import (
     _step_selection,
     models_table,
     run_build_wizard,
-    run_play_repl,
     select_model,
 )
 from wmo.common.config import PROVIDER_ENV_VARS, ModelInfo
-from wmo.common.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.common.providers.base import (
-    Completion,
-    Message,
-    ProviderConfig,
-    ProviderKind,
-    VerifyResult,
-)
-from wmo.simulation.model.world_model import WorldModel
-from wmo.simulation.retrieval import EmbeddingRetriever, HashingEmbedder
+from wmo.common.providers.base import ProviderConfig, ProviderKind, VerifyResult
 
 ui_module = importlib.import_module("wmo.cli.ui")
 
@@ -53,47 +43,6 @@ def _scripted_reader(answers: list[str]):  # noqa: ANN202 - returns a PromptRead
     """A PromptReader that returns successive `answers`, ignoring the rendered prompt text."""
     it = iter(answers)
     return lambda _prompt: next(it)
-
-
-class FakeProvider:
-    def __init__(self) -> None:
-        self.config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")
-
-    def complete(
-        self,
-        system: str,
-        messages: list[Message],
-        *,
-        temperature: float = 0.7,
-        max_tokens: int = 8192,
-    ) -> Completion:
-        return Completion(
-            text='{"output": "found u1", "is_error": false, "state_note": "looked up u1"}'
-        )
-
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        return [[0.0] for _ in texts]
-
-    def verify(self):  # noqa: ANN201
-        raise NotImplementedError
-
-
-def _world_model() -> WorldModel:
-    retriever = EmbeddingRetriever(HashingEmbedder(dim=32))
-    retriever.index(
-        [
-            Trace(
-                trace_id="t",
-                steps=[
-                    Step(
-                        action=Action(kind=ActionKind.TOOL_CALL, name="get_user", arguments={}),
-                        observation=Observation(content="found u0"),
-                    )
-                ],
-            )
-        ]
-    )
-    return WorldModel(FakeProvider(), retriever, top_k=3)
 
 
 def test_reporter_degrades_to_plain_lines_when_not_a_tty() -> None:
@@ -133,36 +82,6 @@ def test_models_table_renders_names() -> None:
     with console.capture() as cap:
         console.print(table)
     assert "airline" in cap.get()
-
-
-def test_play_repl_renders_observation_and_state_then_quits() -> None:
-    console = Console(force_terminal=False, no_color=True, width=100)
-    reader = _scripted_reader(['get_user {"id": "u1"}', ":state", ":quit"])
-    with console.capture() as cap:
-        run_play_repl(console, _world_model(), "airline", task="look up users", reader=reader)
-    out = cap.get()
-    assert "found u1" in out  # observation rendered
-    assert "looked up u1" in out  # scratchpad updated and shown by :state
-    assert "bye" in out
-
-
-def test_play_repl_reports_parse_errors_without_crashing() -> None:
-    console = Console(force_terminal=False, no_color=True, width=100)
-    reader = _scripted_reader(['get_user ["bad"]', ":quit"])
-    with console.capture() as cap:
-        run_play_repl(console, _world_model(), "airline", task=None, reader=reader)
-    assert "parse error" in cap.get()
-
-
-def test_play_repl_exits_cleanly_on_eof() -> None:
-    console = Console(force_terminal=False, no_color=True, width=100)
-
-    def eof(_prompt: str) -> str:
-        raise EOFError
-
-    with console.capture() as cap:
-        run_play_repl(console, _world_model(), "airline", task=None, reader=eof)
-    assert "bye" in cap.get()
 
 
 # --- creation wizard -----------------------------------------------------------------------------
@@ -651,22 +570,6 @@ def test_select_model_picks_by_number() -> None:
         ModelInfo(name="retail", serve_provider="bedrock", serve_model="opus"),
     ]
     assert select_model(console, infos, reader=_scripted_reader(["2"])) == "retail"
-
-
-def test_play_repl_shows_sampled_action_suggestions() -> None:
-    console = Console(force_terminal=False, no_color=True, width=100)
-    with console.capture() as cap:
-        run_play_repl(
-            console,
-            _world_model(),
-            "airline",
-            task=None,
-            reader=_scripted_reader([":quit"]),
-            suggestions=['get_user {"id": "u1"}', "list_flights"],
-        )
-    out = cap.get()
-    assert "Real actions from this model's traces" in out
-    assert 'get_user {"id": "u1"}' in out
 
 
 def test_select_model_reprompts_then_accepts_name() -> None:
