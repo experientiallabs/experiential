@@ -89,6 +89,17 @@ class FailureCode(StrEnum):
     INTERNAL = "internal"
 
 
+class FailureAttribution(StrEnum):
+    """The runtime boundary that owns an operation failure."""
+
+    AGENT = "agent"
+    MODEL = "model"
+    TOOL = "tool"
+    ENVIRONMENT = "environment"
+    RESET = "reset"
+    CLEANUP = "cleanup"
+
+
 class StructuredFailure(ContractModel):
     """A non-secret, machine-readable description of one failed operation."""
 
@@ -96,6 +107,7 @@ class StructuredFailure(ContractModel):
     message: str = Field(min_length=1)
     retryable: bool = False
     exception_type: str | None = None
+    attribution: FailureAttribution | None = None
     details: JsonObject = Field(default_factory=dict)
 
 

@@ -10,8 +10,11 @@ from pydantic import ValidationError
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
+    FailureAttribution,
+    FailureCode,
     SecretBoundaryError,
     SourceIdentity,
+    StructuredFailure,
     assert_secret_free,
     canonical_json_bytes,
     sha256_json,
@@ -91,3 +94,14 @@ def test_artifact_file_paths_reject_nonportable_components() -> None:
     for path in ("../outside.json", "nested\\outside.json", "C:/outside.json"):
         with pytest.raises(ValueError, match="relative POSIX"):
             validate_artifact_file_path(path)
+
+
+def test_structured_failures_preserve_runtime_attribution() -> None:
+    """A failure distinguishes model and environment lifecycle ownership."""
+    failure = StructuredFailure(
+        code=FailureCode.INTERNAL,
+        message="environment cleanup failed",
+        attribution=FailureAttribution.CLEANUP,
+    )
+
+    assert StructuredFailure.model_validate_json(failure.model_dump_json()) == failure

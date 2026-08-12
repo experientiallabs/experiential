@@ -1,11 +1,21 @@
-"""Built-in agent definitions.
+"""Whole-episode customer-agent runtime contracts and the built-in Pi adapter."""
 
-The optimizer, meta, and project agents moved to the agent-optimization repo with
-the harness-search program; what ships here is the default agent the playground
-and distillation seed from.
-"""
+from wmo.runtime.agents.interface import (
+    AgentAdapterPreflightError,
+    AgentEpisode,
+    AgentRuntime,
+    preflight_agent_runtime,
+)
+from wmo.runtime.agents.lifecycle import execute_agent_episode
+from wmo.runtime.agents.pi import PiAgentRuntime, PiRuntimePreflightError, PiTranscriptError
 
-from wmo.runtime.agents.default import default_agent
-from wmo.runtime.agents.llm import LLMAgent
-
-__all__ = ["LLMAgent", "default_agent"]
+__all__ = [
+    "AgentAdapterPreflightError",
+    "AgentEpisode",
+    "AgentRuntime",
+    "PiAgentRuntime",
+    "PiRuntimePreflightError",
+    "PiTranscriptError",
+    "execute_agent_episode",
+    "preflight_agent_runtime",
+]

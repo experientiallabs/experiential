@@ -20,6 +20,7 @@ class RolloutEventKind(StrEnum):
     TOOL_CALL = "tool_call"
     OBSERVATION = "observation"
     MESSAGE = "message"
+    LIFECYCLE = "lifecycle"
 
 
 class RolloutSpan(ContractModel):
