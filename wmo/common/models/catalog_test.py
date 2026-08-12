@@ -78,8 +78,37 @@ model = "private-world-model"
 """.strip(),
         encoding="utf-8",
     )
+    query_credential_path = tmp_path / "query-credential.toml"
+    query_credential_path.write_text(
+        """
+[connections.private-world-model]
+provider = "openai-compatible"
+base_url = "https://models.example.com/v1?api_key=sk-abcdefghijklmnopqrstuvwxyz123456"
+
+[models.world-model]
+connection = "private-world-model"
+model = "private-world-model"
+""".strip(),
+        encoding="utf-8",
+    )
+    model_credential_path = tmp_path / "model-credential.toml"
+    model_credential_path.write_text(
+        """
+[connections.openrouter]
+provider = "openrouter"
+
+[models.candidate-economy]
+connection = "openrouter"
+model = "sk-abcdefghijklmnopqrstuvwxyz123456"
+""".strip(),
+        encoding="utf-8",
+    )
 
     with pytest.raises(ModelCatalogError, match="api_key"):
         load_model_catalog(raw_key_path)
     with pytest.raises(ModelCatalogError, match="embed credentials"):
         load_model_catalog(embedded_credential_path)
+    with pytest.raises(ModelCatalogError, match="query parameters"):
+        load_model_catalog(query_credential_path)
+    with pytest.raises(ModelCatalogError, match="model identity"):
+        load_model_catalog(model_credential_path)

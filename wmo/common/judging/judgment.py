@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel
 from wmo.common.models import OperationEconomics
@@ -19,6 +19,17 @@ class DimensionJudgment(ContractModel):
     calibrated_score: float = Field(ge=0, le=5)
     evidence_span_ids: tuple[str, ...]
     feedback: str = Field(min_length=1)
+
+    @field_validator("evidence_span_ids")
+    @classmethod
+    def _require_unique_evidence_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value:
+            raise ValueError("dimension judgments require at least one cited evidence span")
+        if any(not span_id for span_id in value):
+            raise ValueError("dimension judgment evidence span IDs must be non-empty")
+        if len(set(value)) != len(value):
+            raise ValueError("dimension judgment evidence span IDs must not repeat")
+        return value
 
     @field_validator("calibrated_score")
     @classmethod
@@ -57,3 +68,12 @@ class Judgment(ArtifactEnvelope):
         if not math.isfinite(value):
             raise ValueError("overall_score must be finite")
         return value
+
+    @model_validator(mode="after")
+    def _require_equal_weight_overall_score(self) -> Judgment:
+        expected_score = sum(dimension.calibrated_score / 5 for dimension in self.dimensions) / len(
+            self.dimensions
+        )
+        if not math.isclose(self.overall_score, expected_score, rel_tol=1e-12, abs_tol=1e-12):
+            raise ValueError("overall_score must equal the equal-weight calibrated dimension mean")
+        return self

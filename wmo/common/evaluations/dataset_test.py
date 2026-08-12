@@ -13,6 +13,7 @@ from wmo.common.evaluations import (
     EvaluationDatasetManifest,
     EvaluationProtocol,
     EvaluationRow,
+    FidelityFailure,
     FidelityReport,
 )
 from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
@@ -27,6 +28,7 @@ def _row() -> EvaluationRow:
         candidate_alias="candidate-economy",
         repeat=0,
         protocol_id="protocol-1",
+        source_run_id="run-1",
         purpose="fit",
         status="completed",
         rollout_id="rollout-1",
@@ -50,6 +52,12 @@ def _manifest() -> EvaluationDatasetManifest:
         evidence_source="world_model",
         agent_id="customer-agent",
         simulator_id="world-model-v1",
+        world_model=ModelSnapshot(
+            provider="openai",
+            model_id="gpt-5.4-mini",
+            capabilities_sha256=_DIGEST,
+        ),
+        simulator_prompt_id="world-model-prompt-v1",
         rubric_id="rubric-1",
         judge_calibration_id="calibration-1",
         pricing_snapshot_id="pricing-1",
@@ -80,11 +88,21 @@ def test_dataset_and_fidelity_report_round_trip() -> None:
         code_revision="e7aad17",
         fidelity_report_id="fidelity-report-1",
         protocol_sha256=_DIGEST,
-        overlap_cell_ids=("cell-fidelity-1",),
+        overlap_cell_ids=tuple(f"cell-fidelity-{index}" for index in range(10)),
         planned_overlap_count=10,
         usable_overlap_count=8,
         failed_overlap_count=2,
         score_mae=0.08,
+        failures=(
+            FidelityFailure(
+                cell_id="cell-fidelity-8",
+                failure=StructuredFailure(code=FailureCode.TIMEOUT, message="simulator timed out"),
+            ),
+            FidelityFailure(
+                cell_id="cell-fidelity-9",
+                failure=StructuredFailure(code=FailureCode.PROVIDER, message="provider failed"),
+            ),
+        ),
         gate_id="fidelity-gate-v1",
         gate_sha256=_DIGEST,
         status="approved",
@@ -103,6 +121,7 @@ def test_rows_keep_failures_and_reject_duplicate_or_missing_evidence() -> None:
         candidate_alias="candidate-economy",
         repeat=0,
         protocol_id="protocol-1",
+        source_run_id="run-1",
         purpose="fit",
         status="failed",
         error=StructuredFailure(
@@ -124,3 +143,22 @@ def test_rows_keep_failures_and_reject_duplicate_or_missing_evidence() -> None:
         )
     with pytest.raises(ValidationError, match="repeat a cell ID"):
         EvaluationDataset(manifest=_manifest(), rows=(_row(), _row()))
+    with pytest.raises(ValidationError, match="started evaluation rows require a source_run_id"):
+        EvaluationRow.model_validate({**_row().model_dump(), "source_run_id": None})
+    with pytest.raises(ValidationError, match="frozen 8-pair"):
+        FidelityReport(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            code_revision="e7aad17",
+            fidelity_report_id="fidelity-report-2",
+            protocol_sha256=_DIGEST,
+            overlap_cell_ids=tuple(f"cell-fidelity-{index}" for index in range(10)),
+            planned_overlap_count=10,
+            usable_overlap_count=7,
+            failed_overlap_count=0,
+            score_mae=0.08,
+            gate_id="fidelity-gate-v1",
+            gate_sha256=_DIGEST,
+            status="approved",
+            approved_at=datetime(2026, 8, 11, tzinfo=UTC),
+        )

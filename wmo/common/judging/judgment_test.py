@@ -59,3 +59,23 @@ def test_judgment_rejects_duplicate_dimensions_and_nonfinite_scores() -> None:
             evidence_span_ids=("span-1",),
             feedback="Invalid score.",
         )
+    with pytest.raises(ValidationError, match="equal-weight"):
+        Judgment(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            code_revision="e7aad17",
+            judgment_id="judgment-1",
+            rollout_id="rollout-1",
+            rubric_id="support-rubric-v1",
+            calibration_id="judge-calibration-v1",
+            dimensions=(_dimension_judgment(),),
+            overall_score=0.75,
+        )
+    with pytest.raises(ValidationError, match="at least one cited"):
+        DimensionJudgment(
+            dimension_id="task-success",
+            raw_score=4,
+            calibrated_score=3.8,
+            evidence_span_ids=(),
+            feedback="The refund request includes the order and reason.",
+        )

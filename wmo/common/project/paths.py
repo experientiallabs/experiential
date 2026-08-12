@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
-from wmo.common.core.artifacts import validate_artifact_id
+from wmo.common.core.artifacts import validate_artifact_file_path, validate_artifact_id
 
 
 class ProjectPathError(ValueError):
@@ -29,24 +29,6 @@ def validate_local_id(value: str, *, label: str) -> str:
         return validate_artifact_id(value)
     except ValueError as exc:
         raise ProjectPathError(f"invalid {label} {value!r}: use a lowercase stable ID") from exc
-
-
-def validate_artifact_file_path(value: str) -> PurePosixPath:
-    """Validate a relative POSIX data-file path inside one artifact directory.
-
-    Args:
-        value: Proposed artifact data-file path.
-
-    Returns:
-        A safe, non-empty relative POSIX path.
-
-    Raises:
-        ProjectPathError: The path could escape an artifact directory.
-    """
-    path = PurePosixPath(value)
-    if not value or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        raise ProjectPathError("artifact file paths must be non-empty relative paths without '..'")
-    return path
 
 
 @dataclass(frozen=True)
@@ -107,7 +89,10 @@ class ProjectPaths:
             A checked descendant path.
         """
         directory = self.artifact_directory(artifact_id)
-        relative = validate_artifact_file_path(relative_path)
+        try:
+            relative = validate_artifact_file_path(relative_path)
+        except ValueError as exc:
+            raise ProjectPathError(str(exc)) from exc
         candidate = directory.joinpath(*relative.parts)
         _assert_descendant(candidate, directory)
         return candidate

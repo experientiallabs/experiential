@@ -5,10 +5,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
-from wmo.common.routing import KnnGuard, KnnRouterPolicy, RoutingDecision
+from wmo.common.routing import KnnGuard, KnnRouterPolicy, RouterPolicy, RoutingDecision
 
 _DIGEST = "a" * 64
 
@@ -74,6 +74,7 @@ def test_policy_and_decision_round_trip() -> None:
 
     assert KnnRouterPolicy.model_validate_json(policy.model_dump_json()) == policy
     assert RoutingDecision.model_validate_json(decision.model_dump_json()) == decision
+    assert TypeAdapter(RouterPolicy).validate_json(policy.model_dump_json()) == policy
 
 
 def test_policy_rejects_unpinned_baseline_and_nonfinite_guard_values() -> None:
@@ -89,4 +90,24 @@ def test_policy_rejects_unpinned_baseline_and_nonfinite_guard_values() -> None:
             relative_similarity_threshold=0.95,
             uncertainty_multiplier=float("inf"),
             quality_tolerance=0,
+        )
+    with pytest.raises(ValidationError, match="cannot exceed maximum"):
+        KnnGuard(
+            maximum_neighbors=7,
+            minimum_paired_observations=8,
+            relative_similarity_threshold=0.95,
+            uncertainty_multiplier=0.5,
+            quality_tolerance=0,
+        )
+    with pytest.raises(ValidationError, match="more paired observations"):
+        RoutingDecision(
+            decision_id="decision-1",
+            policy_id="router-policy-v1",
+            policy_sha256=_DIGEST,
+            request_sha256=_DIGEST,
+            episode_id="episode-1",
+            selected_alias="candidate-economy",
+            baseline_alias="candidate-incumbent",
+            neighbor_count=2,
+            paired_count=3,
         )

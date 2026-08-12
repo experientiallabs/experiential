@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -13,6 +13,7 @@ from wmo.common.core.artifacts import (
     ContractModel,
     JsonObject,
     Sha256,
+    validate_artifact_file_path,
 )
 
 
@@ -34,7 +35,7 @@ class TaskCase(ContractModel):
     initial_context: JsonObject = Field(default_factory=dict)
     tools: tuple[ToolSchema, ...] = ()
     workload_weight: float = Field(gt=0)
-    source_trace_ids: tuple[str, ...] = ()
+    source_trace_ids: tuple[str, ...] = Field(min_length=1)
 
     @field_validator("workload_weight")
     @classmethod
@@ -61,6 +62,18 @@ class TaskSet(ArtifactEnvelope):
     coverage_path: str | None = None
     coverage_sha256: Sha256 | None = None
 
+    @field_validator("tasks_path")
+    @classmethod
+    def _require_safe_tasks_path(cls, value: str) -> str:
+        return validate_artifact_file_path(value).as_posix()
+
+    @field_validator("coverage_path")
+    @classmethod
+    def _require_safe_coverage_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return validate_artifact_file_path(value).as_posix()
+
     @field_validator("task_ids")
     @classmethod
     def _require_unique_task_ids(cls, value: tuple[ArtifactId, ...]) -> tuple[ArtifactId, ...]:
@@ -69,3 +82,9 @@ class TaskSet(ArtifactEnvelope):
         if len(set(value)) != len(value):
             raise ValueError("task_ids must not contain duplicates")
         return value
+
+    @model_validator(mode="after")
+    def _require_complete_coverage_reference(self) -> TaskSet:
+        if (self.coverage_path is None) != (self.coverage_sha256 is None):
+            raise ValueError("task-set coverage path and digest must be set together")
+        return self

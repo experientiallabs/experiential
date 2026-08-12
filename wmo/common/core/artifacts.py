@@ -11,6 +11,7 @@ import json
 import re
 from datetime import datetime
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
@@ -49,6 +50,10 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE),
+)
+_SECRET_ENVIRONMENT_NAME_PATTERN = re.compile(
+    r"\b(?:[A-Z][A-Z0-9]*_)*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|REFRESH_TOKEN|SECRET|"
+    r"CREDENTIAL)(?:_[A-Z0-9]+)*\b"
 )
 _SECRET_REFERENCE_PATTERN = re.compile(
     r"\b(?:"
@@ -215,6 +220,33 @@ def validate_artifact_id(value: str) -> str:
     return value
 
 
+def validate_artifact_file_path(value: str) -> PurePosixPath:
+    """Validate one portable relative data-file path inside an artifact directory.
+
+    Args:
+        value: Proposed POSIX relative path stored in an immutable manifest.
+
+    Returns:
+        A normalized relative POSIX path safe to join below an artifact directory.
+
+    Raises:
+        ValueError: The path is empty, absolute, or contains a non-portable component.
+    """
+    path = PurePosixPath(value)
+    components = value.split("/")
+    if (
+        not value
+        or path.is_absolute()
+        or "\x00" in value
+        or "\\" in value
+        or any(component in {"", ".", ".."} or ":" in component for component in components)
+    ):
+        raise ValueError(
+            "artifact file paths must be non-empty relative POSIX paths with ordinary components"
+        )
+    return path
+
+
 def assert_secret_free(value: BaseModel | JsonValue) -> None:
     """Reject secret values and credential references at immutable artifact boundaries.
 
@@ -241,7 +273,7 @@ def assert_text_secret_free(value: str) -> None:
     Raises:
         SecretBoundaryError: The text includes a credential reference or secret-like value.
     """
-    if _SECRET_REFERENCE_PATTERN.search(value):
+    if _SECRET_REFERENCE_PATTERN.search(value) or _SECRET_ENVIRONMENT_NAME_PATTERN.search(value):
         raise SecretBoundaryError("immutable artifacts cannot contain credential references")
     if any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS):
         raise SecretBoundaryError("immutable artifacts cannot contain secret-like values")
@@ -261,7 +293,12 @@ def _assert_json_value_secret_free(value: JsonValue, *, path: str) -> None:
         for index, nested_value in enumerate(value):
             _assert_json_value_secret_free(nested_value, path=f"{path}[{index}]")
         return
-    if isinstance(value, str) and any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS):
-        raise SecretBoundaryError(
-            f"immutable artifacts cannot contain a secret-like value at {path}"
-        )
+    if isinstance(value, str):
+        if any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS):
+            raise SecretBoundaryError(
+                f"immutable artifacts cannot contain a secret-like value at {path}"
+            )
+        if _SECRET_ENVIRONMENT_NAME_PATTERN.search(value):
+            raise SecretBoundaryError(
+                f"immutable artifacts cannot contain a credential environment name at {path}"
+            )

@@ -15,6 +15,7 @@ from wmo.common.core.artifacts import (
     Sha256,
     SourceIdentity,
     StructuredFailure,
+    validate_artifact_file_path,
 )
 from wmo.common.models import ModelSnapshot, Usage
 from wmo.common.tasks import ToolSchema
@@ -93,6 +94,11 @@ class TraceDataset(ArtifactEnvelope):
     traces_path: str = Field(min_length=1)
     traces_sha256: Sha256
     trace_ids: tuple[str, ...]
+
+    @field_validator("traces_path")
+    @classmethod
+    def _require_safe_traces_path(cls, value: str) -> str:
+        return validate_artifact_file_path(value).as_posix()
 
     @field_validator("trace_ids")
     @classmethod

@@ -19,11 +19,12 @@ from wmo.common.core.artifacts import (
     assert_secret_free,
     assert_text_secret_free,
     canonical_json_bytes,
+    validate_artifact_file_path,
 )
 from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
 from wmo.common.project.manifests import ArtifactManifest, file_digest
-from wmo.common.project.paths import ProjectPaths, validate_artifact_file_path, validate_local_id
+from wmo.common.project.paths import ProjectPaths, validate_local_id
 from wmo.common.project.project import ProjectConfig, load_project_config, write_project_config
 
 logger = logging.getLogger(__name__)
@@ -93,7 +94,10 @@ class ArtifactStore:
         seen_paths: set[str] = set()
         manifest_files = []
         for relative_path, payload in sorted(files.items()):
-            validated_path = validate_artifact_file_path(relative_path).as_posix()
+            try:
+                validated_path = validate_artifact_file_path(relative_path).as_posix()
+            except ValueError as exc:
+                raise ArtifactStoreError(str(exc)) from exc
             if validated_path == "manifest.json":
                 raise ArtifactStoreError("artifact data files cannot replace manifest.json")
             if validated_path in seen_paths:

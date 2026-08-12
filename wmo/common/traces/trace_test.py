@@ -86,3 +86,13 @@ def test_trace_requires_ordered_unique_spans_and_structured_failure() -> None:
         ).failure
         is not None
     )
+    with pytest.raises(ValidationError, match="relative POSIX"):
+        TraceDataset(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            code_revision="e7aad17",
+            dataset_id="traces-20260811",
+            traces_path="../traces.jsonl",
+            traces_sha256=_DIGEST,
+            trace_ids=(trace.trace_id,),
+        )

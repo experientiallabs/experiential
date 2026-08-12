@@ -16,6 +16,7 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
     sha256_json,
     stable_id,
+    validate_artifact_file_path,
 )
 
 _DIGEST_A = "a" * 64
@@ -80,3 +81,13 @@ def test_source_identity_and_secret_boundary_round_trip() -> None:
         assert_secret_free({"api_key_env": "OPENAI_API_KEY"})
     with pytest.raises(SecretBoundaryError, match="secret-like"):
         assert_secret_free({"note": "sk-abcdefghijklmnopqrstuvwxyz123456"})
+    with pytest.raises(SecretBoundaryError, match="environment name"):
+        assert_secret_free({"connection_hint": "OPENAI_API_KEY"})
+
+
+def test_artifact_file_paths_reject_nonportable_components() -> None:
+    """Portable artifact paths cannot escape or change meaning on Windows."""
+    assert validate_artifact_file_path("nested/data.json").as_posix() == "nested/data.json"
+    for path in ("../outside.json", "nested\\outside.json", "C:/outside.json"):
+        with pytest.raises(ValueError, match="relative POSIX"):
+            validate_artifact_file_path(path)

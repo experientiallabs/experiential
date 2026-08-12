@@ -7,9 +7,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from wmo.common.core.artifacts import FailureCode, StructuredFailure
+from wmo.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
 from wmo.common.models import ModelSnapshot, OperationEconomics
 from wmo.common.rollouts import (
+    ProductionSimulatorSnapshot,
     RolloutArtifact,
     RolloutEventKind,
     RolloutSpan,
@@ -102,6 +103,10 @@ def test_rollout_rejects_missing_simulation_digest_and_failure_details() -> None
             **rollout.model_dump(),
             "evidence_source": "production",
             "simulation_spec_sha256": None,
+            "world_model": None,
+            "simulator": ProductionSimulatorSnapshot(
+                source=SourceIdentity(kind="production", source_id="trace-1", sha256=_DIGEST)
+            ).model_dump(),
             "failure": StructuredFailure(
                 code=FailureCode.PROVIDER,
                 message="captured failure",
@@ -110,3 +115,14 @@ def test_rollout_rejects_missing_simulation_digest_and_failure_details() -> None
     )
 
     assert production.evidence_source == "production"
+    assert rollout.world_model is not None
+    with pytest.raises(ValidationError, match="identity must match"):
+        RolloutArtifact.model_validate(
+            {
+                **rollout.model_dump(),
+                "world_model": {
+                    **rollout.world_model.model_dump(),
+                    "model_id": "different-world-model",
+                },
+            }
+        )

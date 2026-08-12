@@ -66,6 +66,10 @@ class Rubric(ArtifactEnvelope):
             raise ValueError("human-approved rubrics require approved_at")
         if self.status == "provisional" and self.approved_at is not None:
             raise ValueError("provisional rubrics must not set approved_at")
+        if self.approved_at is not None and (
+            self.approved_at.tzinfo is None or self.approved_at.utcoffset() is None
+        ):
+            raise ValueError("rubric approval times must include a timezone")
         return self
 
 
@@ -104,6 +108,13 @@ class JudgeCalibration(ArtifactEnvelope):
     score_maps: tuple[DimensionScoreMap, ...]
     approved_at: datetime | None = None
 
+    @field_validator("calibration_lineage_ids", "excluded_router_held_out_lineage_ids")
+    @classmethod
+    def _require_unique_lineage_ids(cls, value: tuple[ArtifactId, ...]) -> tuple[ArtifactId, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("judge calibration lineage IDs must not repeat")
+        return value
+
     @field_validator("score_maps")
     @classmethod
     def _require_unique_score_maps(
@@ -115,3 +126,15 @@ class JudgeCalibration(ArtifactEnvelope):
         if len(set(dimension_ids)) != len(dimension_ids):
             raise ValueError("judge calibration score maps must not repeat a dimension")
         return value
+
+    @model_validator(mode="after")
+    def _require_sealed_calibration_lineages(self) -> JudgeCalibration:
+        if set(self.calibration_lineage_ids).intersection(
+            self.excluded_router_held_out_lineage_ids
+        ):
+            raise ValueError("calibration lineages must exclude router-held-out lineages")
+        if self.approved_at is not None and (
+            self.approved_at.tzinfo is None or self.approved_at.utcoffset() is None
+        ):
+            raise ValueError("judge calibration approval times must include a timezone")
+        return self

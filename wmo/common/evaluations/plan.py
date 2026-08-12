@@ -76,3 +76,36 @@ class EvaluationPlan(ArtifactEnvelope):
         if len(set(cell_ids)) != len(cell_ids):
             raise ValueError("evaluation plan cell IDs must be unique")
         return value
+
+    @model_validator(mode="after")
+    def _require_consistent_cell_references(self) -> EvaluationPlan:
+        candidate_aliases = {candidate.alias for candidate in self.candidate_snapshots}
+        cells_by_id = {cell.cell_id: cell for cell in self.cells}
+        planned_cell_keys: set[tuple[ArtifactId, ModelAlias, int, str]] = set()
+        for cell in self.cells:
+            if cell.candidate_alias not in candidate_aliases:
+                raise ValueError(
+                    f"evaluation cell {cell.cell_id} names a candidate outside the plan snapshots"
+                )
+            cell_key = (cell.task_id, cell.candidate_alias, cell.repeat, cell.purpose)
+            if cell_key in planned_cell_keys:
+                raise ValueError(
+                    "evaluation plan must not repeat a task, candidate, repeat, and purpose cell"
+                )
+            planned_cell_keys.add(cell_key)
+            if cell.purpose != "fidelity":
+                continue
+            comparison = cells_by_id.get(cell.comparison_observed_cell_id)
+            if comparison is None or comparison.execution != "observed":
+                raise ValueError("fidelity cells must reference an observed cell in the same plan")
+            if comparison.purpose != "fit":
+                raise ValueError("fidelity cells must compare against observed fit evidence")
+            if (comparison.task_id, comparison.candidate_alias, comparison.repeat) != (
+                cell.task_id,
+                cell.candidate_alias,
+                cell.repeat,
+            ):
+                raise ValueError(
+                    "fidelity cells must preserve the compared task, candidate, and repeat"
+                )
+        return self

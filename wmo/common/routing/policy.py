@@ -27,6 +27,12 @@ class KnnGuard(ContractModel):
             raise ValueError("kNN guard values must be finite")
         return value
 
+    @model_validator(mode="after")
+    def _require_reachable_minimum_pairs(self) -> KnnGuard:
+        if self.minimum_paired_observations > self.maximum_neighbors:
+            raise ValueError("minimum paired observations cannot exceed maximum neighbors")
+        return self
+
 
 class RoutingDecision(ContractModel):
     """One persisted explanation of a single frozen-policy model selection."""
@@ -51,6 +57,14 @@ class RoutingDecision(ContractModel):
         if value is not None and not math.isfinite(value):
             raise ValueError("routing decision metrics must be finite")
         return value
+
+    @model_validator(mode="after")
+    def _require_paired_count_within_neighbors(self) -> RoutingDecision:
+        if self.paired_count > self.neighbor_count:
+            raise ValueError(
+                "routing decisions cannot have more paired observations than neighbors"
+            )
+        return self
 
 
 class KnnRouterPolicy(ArtifactEnvelope):

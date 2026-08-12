@@ -7,9 +7,21 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, Sha256, StructuredFailure
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactId,
+    Sha256,
+    StructuredFailure,
+    validate_artifact_file_path,
+)
 from wmo.common.models import AssistantAction, ModelSnapshot, OperationEconomics
-from wmo.common.rollouts.otel import RolloutSpan, SimulatorSnapshot
+from wmo.common.rollouts.otel import (
+    ProductionSimulatorSnapshot,
+    RolloutSpan,
+    SandboxSimulatorSnapshot,
+    SimulatorSnapshot,
+    WorldModelSimulatorSnapshot,
+)
 
 
 class SimulationMode(StrEnum):
@@ -85,6 +97,25 @@ class RolloutArtifact(SimulationArtifact):
             raise ValueError("simulated rollouts require a simulation specification digest")
         if self.stop_reason == StopReason.FAILURE and self.failure is None:
             raise ValueError("failed rollouts require a structured failure")
+        if self.evidence_source == "production":
+            if not isinstance(self.simulator, ProductionSimulatorSnapshot):
+                raise ValueError("production rollouts require a production simulator snapshot")
+            if self.world_model is not None:
+                raise ValueError("production rollouts must not name a world model")
+        elif self.evidence_source == "world_model":
+            if self.mode != SimulationMode.WORLD_MODEL:
+                raise ValueError("world-model rollouts require world_model mode")
+            if not isinstance(self.simulator, WorldModelSimulatorSnapshot):
+                raise ValueError("world-model rollouts require a world-model simulator snapshot")
+            if self.world_model != self.simulator.world_model:
+                raise ValueError("world-model rollout identity must match its simulator snapshot")
+        elif self.evidence_source == "sandbox":
+            if self.mode != SimulationMode.SANDBOX:
+                raise ValueError("sandbox rollouts require sandbox mode")
+            if not isinstance(self.simulator, SandboxSimulatorSnapshot):
+                raise ValueError("sandbox rollouts require a sandbox simulator snapshot")
+            if self.world_model is not None:
+                raise ValueError("sandbox rollouts must not name a world model")
         return self
 
 
@@ -96,6 +127,11 @@ class SimulationArtifactSet(ArtifactEnvelope):
     artifact_ids: tuple[ArtifactId, ...]
     artifacts_path: str = Field(min_length=1)
     artifacts_sha256: Sha256
+
+    @field_validator("artifacts_path")
+    @classmethod
+    def _require_safe_artifacts_path(cls, value: str) -> str:
+        return validate_artifact_file_path(value).as_posix()
 
     @field_validator("artifact_ids")
     @classmethod

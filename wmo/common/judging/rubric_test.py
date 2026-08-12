@@ -97,3 +97,28 @@ def test_rubric_requires_ordered_complete_anchors_and_approval_time() -> None:
             source_task_set_id="task-set-v1",
             status="human_approved",
         )
+    with pytest.raises(ValidationError, match="exclude router-held-out"):
+        JudgeCalibration(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            code_revision="e7aad17",
+            calibration_id="judge-calibration-v1",
+            rubric_id="support-rubric-v1",
+            judge_model=ModelSnapshot(
+                provider="openai",
+                model_id="gpt-5.4-mini",
+                capabilities_sha256=_DIGEST,
+            ),
+            judge_prompt_id="judge-prompt-v1",
+            label_set_id="label-set-v1",
+            calibration_lineage_ids=("lineage-1",),
+            excluded_router_held_out_lineage_ids=("lineage-1",),
+            validation_method="grouped_k_fold",
+            out_of_fold_report_id="judge-report-v1",
+            score_maps=(
+                DimensionScoreMap(
+                    dimension_id="task-success",
+                    calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
+                ),
+            ),
+        )

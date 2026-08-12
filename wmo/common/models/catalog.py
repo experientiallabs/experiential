@@ -10,7 +10,12 @@ from urllib.parse import urlsplit
 import tomli_w
 from pydantic import Field, field_validator, model_validator
 
-from wmo.common.core.artifacts import ContractModel, validate_artifact_id
+from wmo.common.core.artifacts import (
+    ContractModel,
+    SecretBoundaryError,
+    assert_secret_free,
+    validate_artifact_id,
+)
 from wmo.common.core.files import write_text_atomic
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -44,7 +49,17 @@ class ConnectionConfig(ContractModel):
             raise ValueError("base_url must be an absolute HTTP(S) URL")
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("base_url must not embed credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("base_url must not include query parameters or fragments")
         return value
+
+    @model_validator(mode="after")
+    def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        try:
+            assert_secret_free({"provider": self.provider, "base_url": self.base_url})
+        except SecretBoundaryError as exc:
+            raise ValueError("connection metadata must not contain credential values") from exc
+        return self
 
 
 class ModelRecord(ContractModel):
@@ -53,6 +68,20 @@ class ModelRecord(ContractModel):
     connection: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=512)
     revision: str | None = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def _require_secret_free_model_identity(self) -> ModelRecord:
+        try:
+            assert_secret_free(
+                {
+                    "connection": self.connection,
+                    "model": self.model,
+                    "revision": self.revision,
+                }
+            )
+        except SecretBoundaryError as exc:
+            raise ValueError("model identity must not contain credential values") from exc
+        return self
 
 
 class ModelRoles(ContractModel):

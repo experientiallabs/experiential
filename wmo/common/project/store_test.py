@@ -111,6 +111,20 @@ def test_secret_boundary_and_only_mutable_review_file(tmp_path: Path) -> None:
             envelope=_envelope(),
             files={"tasks.json": {"api_key_env": "OPENAI_API_KEY"}},
         )
+    with pytest.raises(ArtifactStoreError, match="credential environment name"):
+        store.artifacts.write_json(
+            artifact_id="unsafe-variable-v1",
+            artifact_type="task-set",
+            envelope=_envelope(),
+            files={"tasks.json": {"connection_hint": "OPENAI_API_KEY"}},
+        )
+    with pytest.raises(ArtifactStoreError, match="relative POSIX"):
+        store.artifacts.write_json(
+            artifact_id="unsafe-path-v1",
+            artifact_type="task-set",
+            envelope=_envelope(),
+            files={"../tasks.json": {"task_ids": ["task-1"]}},
+        )
     with pytest.raises(ArtifactStoreError, match="secret boundary"):
         store.artifacts.write(
             artifact_id="unsafe-text-v1",

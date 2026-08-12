@@ -13,8 +13,8 @@ from wmo.common.core.artifacts import (
     ContractModel,
     Sha256,
     sha256_json,
+    validate_artifact_file_path,
 )
-from wmo.common.project.paths import validate_artifact_file_path
 
 
 class ArtifactFile(ContractModel):
