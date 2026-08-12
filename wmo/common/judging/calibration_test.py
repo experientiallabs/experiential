@@ -29,6 +29,8 @@ from wmo.common.judging import (
     Rubric,
     RubricDimension,
     ScoreAnchor,
+    VerifiedJudgeCalibration,
+    verify_authoritative_calibration,
     verify_persisted_calibration,
     write_router_lineage_split,
 )
@@ -596,6 +598,26 @@ def test_two_label_human_calibration_requires_persisted_risk_acceptance(tmp_path
     assert report.status == "insufficient"
     assert report.eligible_label_count == report.eligible_rollout_count == 2
     service.write_report(graph.store, report)
+    insufficient = service.write_calibration(
+        graph.store,
+        report=report,
+        calibration=service.insufficient_calibration(graph.store, report),
+    )
+    source_observation = graph.observations[0]
+    with pytest.raises(CalibrationError, match="insufficient judge calibrations"):
+        verify_authoritative_calibration(graph.store, insufficient.calibration_id)
+    with pytest.raises(JudgmentError, match="verified persisted calibration"):
+        LMJudge(
+            _FakeJudgeClient(_model(), json.dumps({"dimensions": []})),
+            _prompt(),
+            code_revision="judging-revision",
+            clock=lambda: _TIME,
+        ).judge_and_write(
+            graph.store,
+            rollout_artifact_id=source_observation.source_rollout.artifact_id,
+            rubric_artifact_id=graph.rubric.rubric_id,
+            calibration_artifact_id=insufficient.calibration_id,
+        )
     with pytest.raises(CalibrationError, match="explicit accept_insufficient_labels"):
         service.approve(graph.store, report, approved_at=_TIME)
 
@@ -610,6 +632,41 @@ def test_two_label_human_calibration_requires_persisted_risk_acceptance(tmp_path
     stored = service.write_calibration(graph.store, report=report, calibration=calibration)
     verified, _verified_input = verify_persisted_calibration(graph.store, stored.calibration_id)
     assert verified == stored
+
+    authorized = verify_authoritative_calibration(graph.store, stored.calibration_id)
+    rollout = RolloutArtifact.model_validate_json(
+        graph.store.artifacts.read_bytes(
+            source_observation.source_rollout.artifact_id,
+            "rollout.json",
+        )
+    )
+    output = json.dumps(
+        {
+            "dimensions": [
+                {
+                    "dimension_id": "task-success",
+                    "raw_score": 4,
+                    "evidence_span_ids": [rollout.spans[0].span_id],
+                    "feedback": "The rollout has sufficient evidence.",
+                }
+            ]
+        }
+    )
+    direct_judge = LMJudge(
+        _FakeJudgeClient(_model(), output),
+        _prompt(),
+        code_revision="judging-revision",
+        clock=lambda: _TIME,
+    )
+    direct = direct_judge.judge(rollout, graph.rubric, authorized)
+    assert direct.calibration_id == stored.calibration_id
+    persisted = direct_judge.judge_and_write(
+        graph.store,
+        rollout_artifact_id=source_observation.source_rollout.artifact_id,
+        rubric_artifact_id=graph.rubric.rubric_id,
+        calibration_artifact_id=stored.calibration_id,
+    )
+    assert persisted.calibration_id == stored.calibration_id
 
     report_input = artifact_input(graph.store.artifacts.read(report.report_id).manifest)
     forged = stored.model_copy(
@@ -629,8 +686,15 @@ def test_two_label_human_calibration_requires_persisted_risk_acceptance(tmp_path
     )
     with pytest.raises(CalibrationError, match="risk acceptance"):
         verify_persisted_calibration(graph.store, forged.calibration_id)
+    with pytest.raises(CalibrationError, match="risk acceptance"):
+        verify_authoritative_calibration(graph.store, forged.calibration_id)
+    with pytest.raises(JudgmentError, match="recursively verified calibration"):
+        direct_judge.judge(
+            rollout,
+            graph.rubric,
+            cast(VerifiedJudgeCalibration, forged),
+        )
 
-    source_observation = graph.observations[0]
     source_judgment = Judgment.model_validate_json(
         graph.store.artifacts.read_bytes(source_observation.judgment.artifact_id, "judgment.json")
     )

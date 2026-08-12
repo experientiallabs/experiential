@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -23,6 +24,8 @@ from wmo.common.judging import (
     Rubric,
     RubricDimension,
     ScoreAnchor,
+    VerifiedJudgeCalibration,
+    verify_authoritative_calibration,
     write_router_lineage_split,
 )
 from wmo.common.models import (
@@ -263,9 +266,12 @@ def _write_bootstrap_sources(
     return rollout, rubric, calibration, prompt
 
 
-def test_lm_judge_requires_exact_identity_and_cited_rollout_evidence() -> None:
-    """Structured output receives a calibration map only when its model and evidence match."""
-    prompt = PromptDefinition.from_text("judge-prompt-v1", "Return only structured scores.")
+def test_lm_judge_requires_verified_calibration_and_cited_rollout_evidence(
+    tmp_path: Path,
+) -> None:
+    """Only recursively verified provisional evidence can authorize direct judging."""
+    store = _store(tmp_path)
+    rollout, rubric, calibration, prompt = _write_bootstrap_sources(store)
     client = _FakeJudgeClient(_valid_output())
     judge = LMJudge(
         client,
@@ -274,7 +280,15 @@ def test_lm_judge_requires_exact_identity_and_cited_rollout_evidence() -> None:
         clock=lambda: _TIME,
     )
 
-    judgment = judge.judge(_rollout(), _rubric(), _calibration(prompt))
+    with pytest.raises(JudgmentError, match="recursively verified calibration"):
+        judge.judge(
+            rollout,
+            rubric,
+            cast(VerifiedJudgeCalibration, _calibration(prompt)),
+        )
+
+    verified = verify_authoritative_calibration(store, calibration.calibration_id)
+    judgment = judge.judge(rollout, rubric, verified)
 
     assert isinstance(client, ModelClient)
     assert isinstance(judge, Judge)
@@ -287,11 +301,13 @@ def test_lm_judge_requires_exact_identity_and_cited_rollout_evidence() -> None:
     assert "span-1" in request_content
 
 
-def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs() -> None:
+def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs(
+    tmp_path: Path,
+) -> None:
     """Malformed JSON, tool outputs, and invented span citations are actionable errors."""
-    prompt = PromptDefinition.from_text("judge-prompt-v1", "Return only structured scores.")
-    calibration = _calibration(prompt)
-    rollout = _rollout()
+    store = _store(tmp_path)
+    rollout, rubric, calibration, prompt = _write_bootstrap_sources(store)
+    verified = verify_authoritative_calibration(store, calibration.calibration_id)
 
     with pytest.raises(JudgmentError, match="malformed"):
         LMJudge(
@@ -299,7 +315,7 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs() -
             prompt,
             code_revision="judging-revision",
             clock=lambda: _TIME,
-        ).judge(rollout, _rubric(), calibration)
+        ).judge(rollout, rubric, verified)
     with pytest.raises(JudgmentError, match="tool calls"):
         LMJudge(
             _FakeJudgeClient(
@@ -309,14 +325,14 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs() -
             prompt,
             code_revision="judging-revision",
             clock=lambda: _TIME,
-        ).judge(rollout, _rubric(), calibration)
+        ).judge(rollout, rubric, verified)
     with pytest.raises(JudgmentError, match="do not exist"):
         LMJudge(
             _FakeJudgeClient(_valid_output("invented-span")),
             prompt,
             code_revision="judging-revision",
             clock=lambda: _TIME,
-        ).judge(rollout, _rubric(), calibration)
+        ).judge(rollout, rubric, verified)
     wrong_model = ModelSnapshot(
         provider="fake",
         model_id="other-judge",
@@ -328,7 +344,7 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs() -
             prompt,
             code_revision="judging-revision",
             clock=lambda: _TIME,
-        ).judge(rollout, _rubric(), calibration)
+        ).judge(rollout, rubric, verified)
     changed_prompt = PromptDefinition.from_text(
         "judge-prompt-v1", "Return only structured scores with revised wording."
     )
@@ -338,7 +354,7 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs() -
             changed_prompt,
             code_revision="judging-revision",
             clock=lambda: _TIME,
-        ).judge(rollout, _rubric(), calibration)
+        ).judge(rollout, rubric, verified)
 
 
 def test_persisted_bootstrap_creates_final_judgment_with_verified_artifact_inputs(

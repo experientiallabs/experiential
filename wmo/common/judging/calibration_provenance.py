@@ -19,6 +19,44 @@ _VERIFICATION_STACK: ContextVar[tuple[ArtifactId, ...]] = ContextVar(
     "judge_calibration_verification_stack",
     default=(),
 )
+_AUTHORITATIVE_CALIBRATION_TOKEN = object()
+
+
+class VerifiedJudgeCalibration:
+    """Opaque authorization returned only after recursive calibration verification.
+
+    A raw ``JudgeCalibration`` is immutable data, not authority to ask an LM for an
+    authoritative score. Consumers receive this capability only from
+    ``verify_authoritative_calibration`` after the calibration, its report, and any
+    low-sample risk acceptance have been re-verified from the project store.
+    """
+
+    __slots__ = ("calibration", "artifact_input", "_authorization")
+
+    calibration: JudgeCalibration
+    artifact_input: ArtifactInput
+    _authorization: object
+
+    def __init__(self) -> None:
+        """Prevent callers from minting calibration authorization directly."""
+        raise TypeError(
+            "verified judge calibrations must come from verify_authoritative_calibration"
+        )
+
+    @classmethod
+    def _from_persisted(
+        cls, calibration: JudgeCalibration, artifact_input: ArtifactInput
+    ) -> VerifiedJudgeCalibration:
+        """Mint one internal capability from already-verified persisted evidence."""
+        value = object.__new__(cls)
+        value.calibration = calibration
+        value.artifact_input = artifact_input
+        value._authorization = _AUTHORITATIVE_CALIBRATION_TOKEN
+        return value
+
+    def is_authoritative(self) -> bool:
+        """Return whether this token was minted by the recursive verifier."""
+        return self._authorization is _AUTHORITATIVE_CALIBRATION_TOKEN
 
 
 def verify_persisted_calibration(
@@ -45,6 +83,32 @@ def verify_persisted_calibration(
         return _verify_persisted_calibration(store, calibration_artifact_id)
     finally:
         _VERIFICATION_STACK.reset(token)
+
+
+def verify_authoritative_calibration(
+    store: ProjectStore, calibration_artifact_id: ArtifactId
+) -> VerifiedJudgeCalibration:
+    """Return a capability eligible to authorize authoritative LM judgments.
+
+    Args:
+        store: Project store that owns immutable calibration evidence.
+        calibration_artifact_id: Completed judge-calibration artifact to authorize.
+
+    Returns:
+        An opaque calibration capability for ``LMJudge.judge``.
+
+    Raises:
+        CalibrationError: The calibration cannot be recursively verified or remains
+            insufficient for authoritative use.
+    """
+    calibration, calibration_input = verify_persisted_calibration(store, calibration_artifact_id)
+    if calibration.status == "insufficient":
+        raise CalibrationError(
+            "insufficient judge calibrations cannot authorize authoritative LM judgments"
+        )
+    if calibration.status not in {"provisional", "human_calibrated"}:
+        raise CalibrationError("judge calibration has an unsupported authorization status")
+    return VerifiedJudgeCalibration._from_persisted(calibration, calibration_input)
 
 
 def _verify_persisted_calibration(

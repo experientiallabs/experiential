@@ -16,7 +16,11 @@ from wmo.common.judging.calibration_metrics import (
     OutOfFoldPrediction,
     WorstDisagreement,
 )
-from wmo.common.judging.calibration_provenance import verify_persisted_calibration
+from wmo.common.judging.calibration_provenance import (
+    VerifiedJudgeCalibration,
+    verify_authoritative_calibration,
+    verify_persisted_calibration,
+)
 from wmo.common.judging.interface import Judge
 from wmo.common.judging.judgment import DimensionJudgment, Judgment
 from wmo.common.judging.labels import HumanLabelSet, HumanScore, HumanScoreHistory, HumanScoreReview
@@ -87,6 +91,8 @@ __all__ = [
     "RouterLineageAssignment",
     "ScoreAnchor",
     "WorstDisagreement",
+    "VerifiedJudgeCalibration",
+    "verify_authoritative_calibration",
     "write_router_lineage_split",
     "write_rubric_proposal_evidence",
     "verify_persisted_calibration",

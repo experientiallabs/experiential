@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from wmo.common.judging.calibration_provenance import VerifiedJudgeCalibration
 from wmo.common.judging.judgment import Judgment
-from wmo.common.judging.rubric import JudgeCalibration, Rubric
+from wmo.common.judging.rubric import Rubric
 from wmo.common.rollouts import RolloutArtifact
 
 
@@ -17,6 +18,15 @@ class Judge(Protocol):
         self,
         rollout: RolloutArtifact,
         rubric: Rubric,
-        calibration: JudgeCalibration,
+        calibration: VerifiedJudgeCalibration,
     ) -> Judgment:
-        """Return a structured evidence-cited judgment without rerunning the rollout."""
+        """Return a structured evidence-cited judgment without rerunning the rollout.
+
+        Args:
+            rollout: Existing immutable rollout evidence to score.
+            rubric: Immutable customer rubric that defines score dimensions.
+            calibration: Recursively verified calibration authorization to apply.
+
+        Returns:
+            The structured judgment over the supplied rollout.
+        """

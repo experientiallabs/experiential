@@ -63,6 +63,11 @@ def require_calibration_risk_acceptance(
             the report did not require that exception.
     """
     if report.status == "insufficient" and calibration.status == "human_calibrated":
+        if report.eligible_rollout_count >= report.recommended_label_count:
+            raise RiskAcceptanceError(
+                "insufficient human calibration risk acceptance is limited to fewer than ten "
+                "eligible rollouts"
+            )
         if calibration.risk_acceptance is None:
             raise RiskAcceptanceError(
                 "human calibration of insufficient labels requires risk acceptance"

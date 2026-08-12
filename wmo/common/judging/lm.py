@@ -11,7 +11,10 @@ from pydantic import Field, field_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, stable_id
 from wmo.common.judging.calibration import CalibrationError
-from wmo.common.judging.calibration_provenance import verify_persisted_calibration
+from wmo.common.judging.calibration_provenance import (
+    VerifiedJudgeCalibration,
+    verify_authoritative_calibration,
+)
 from wmo.common.judging.judgment import DimensionJudgment, Judgment
 from wmo.common.judging.prompts import PromptDefinition
 from wmo.common.judging.provenance import (
@@ -78,14 +81,14 @@ class LMJudge:
         self,
         rollout: RolloutArtifact,
         rubric: Rubric,
-        calibration: JudgeCalibration,
+        calibration: VerifiedJudgeCalibration,
     ) -> Judgment:
-        """Score an existing rollout against exactly one rubric and calibration binding.
+        """Score an existing rollout against one verified rubric and calibration binding.
 
         Args:
             rollout: Completed rollout evidence to score without rerunning simulation.
             rubric: Immutable zero-to-five rubric for the score dimensions.
-            calibration: Frozen model, prompt, and score-map identity to apply.
+            calibration: Recursively verified calibration authorization to apply.
 
         Returns:
             An immutable judgment with validated cited rollout spans and equal-weight overall score.
@@ -93,7 +96,8 @@ class LMJudge:
         Raises:
             JudgmentError: Model, prompt, calibration, score, or citation identity is invalid.
         """
-        _validate_bindings(rubric, calibration, self._prompt)
+        verified_calibration = _require_authoritative_calibration(calibration)
+        _validate_bindings(rubric, verified_calibration, self._prompt)
         response = self._model.complete(
             ModelRequest(
                 messages=(
@@ -104,12 +108,12 @@ class LMJudge:
                 maximum_output_tokens=4_096,
             )
         )
-        if response.model != calibration.judge_model:
+        if response.model != verified_calibration.judge_model:
             raise JudgmentError(
                 "judge response model identity does not match the frozen calibration"
             )
         raw = _parse_response(response.output.content, response.output.tool_calls)
-        dimensions = _build_dimensions(raw, rollout, rubric, calibration)
+        dimensions = _build_dimensions(raw, rollout, rubric, verified_calibration)
         created_at = self._clock()
         if created_at.tzinfo is None or created_at.utcoffset() is None:
             raise JudgmentError("judge clock must return a timezone-aware time")
@@ -123,7 +127,7 @@ class LMJudge:
                 {
                     "rollout_id": rollout.rollout_id,
                     "rubric_id": rubric.rubric_id,
-                    "calibration_id": calibration.calibration_id,
+                    "calibration_id": verified_calibration.calibration_id,
                     "dimensions": [item.model_dump(mode="json") for item in dimensions],
                     "judge_model": response.model.model_dump(mode="json"),
                     "judge_prompt_sha256": self._prompt.sha256,
@@ -132,7 +136,7 @@ class LMJudge:
             ),
             rollout_id=rollout.rollout_id,
             rubric_id=rubric.rubric_id,
-            calibration_id=calibration.calibration_id,
+            calibration_id=verified_calibration.calibration_id,
             judge_model=response.model,
             judge_prompt_id=self._prompt.prompt_id,
             judge_prompt_sha256=self._prompt.sha256,
@@ -186,9 +190,7 @@ class LMJudge:
                 "final judgment requires completed immutable source artifacts"
             ) from exc
         try:
-            calibration, calibration_input = verify_persisted_calibration(
-                store, calibration_artifact_id
-            )
+            calibration = verify_authoritative_calibration(store, calibration_artifact_id)
         except CalibrationError as exc:
             raise JudgmentError(
                 "final judgment requires a verified persisted calibration and report"
@@ -197,10 +199,10 @@ class LMJudge:
             raise JudgmentError("stored rollout record does not match its artifact identity")
         if rubric.rubric_id != rubric_artifact_id:
             raise JudgmentError("stored rubric record does not match its artifact identity")
-        if calibration.calibration_id != calibration_artifact_id:
+        if calibration.calibration.calibration_id != calibration_artifact_id:
             raise JudgmentError("stored calibration record does not match its artifact identity")
         draft = self.judge(rollout, rubric, calibration)
-        inputs = sorted_verified_inputs((rollout_input, rubric_input, calibration_input))
+        inputs = sorted_verified_inputs((rollout_input, rubric_input, calibration.artifact_input))
         judgment = draft.model_copy(
             update={
                 "inputs": inputs,
@@ -209,7 +211,7 @@ class LMJudge:
                     {
                         "rollout_id": rollout.rollout_id,
                         "rubric_id": rubric.rubric_id,
-                        "calibration_id": calibration.calibration_id,
+                        "calibration_id": calibration.calibration.calibration_id,
                         "dimensions": [item.model_dump(mode="json") for item in draft.dimensions],
                         "judge_model": draft.judge_model.model_dump(mode="json"),
                         "judge_prompt_sha256": draft.judge_prompt_sha256,
@@ -243,6 +245,15 @@ class LMJudge:
                 ) from None
             return stored
         return judgment
+
+
+def _require_authoritative_calibration(
+    value: VerifiedJudgeCalibration,
+) -> JudgeCalibration:
+    """Reject raw or caller-minted calibration values before invoking the LM."""
+    if not isinstance(value, VerifiedJudgeCalibration) or not value.is_authoritative():
+        raise JudgmentError("LM judging requires a recursively verified calibration authorization")
+    return value.calibration
 
 
 def _validate_bindings(
