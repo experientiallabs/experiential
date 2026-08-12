@@ -76,6 +76,7 @@ class SandboxSimulatorSnapshot(ContractModel):
     kind: Literal["sandbox"] = "sandbox"
     simulator_id: str = Field(min_length=1, max_length=256)
     environment_id: str = Field(min_length=1, max_length=256)
+    environment_sha256: Sha256
 
 
 SimulatorSnapshot = Annotated[

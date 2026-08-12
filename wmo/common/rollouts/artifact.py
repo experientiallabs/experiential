@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from enum import StrEnum
 from typing import Literal
 
@@ -40,6 +41,7 @@ class StopReason(StrEnum):
     COMPLETED = "completed"
     AGENT_STOP = "agent_stop"
     MAXIMUM_STEPS = "maximum_steps"
+    MAXIMUM_TIME = "maximum_time"
     MAXIMUM_COST = "maximum_cost"
     CONTEXT_OVERFLOW = "context_overflow"
     LENGTH = "length"
@@ -84,6 +86,44 @@ class SimulationCellBinding(ContractModel):
     simulation_inputs_sha256: Sha256
 
 
+class SandboxSimulationCellBinding(ContractModel):
+    """Exact task, model, environment, and artifact identity for one sandbox cell."""
+
+    cell_id: ArtifactId
+    task_id: ArtifactId
+    purpose: Literal["fit", "held_out", "fidelity"]
+    evaluation_plan_input: ArtifactInput
+    task_set_input: ArtifactInput
+    task_set_tasks_sha256: Sha256
+    task_sha256: Sha256
+    task_lineage_group_id: ArtifactId
+    candidate_alias: ModelAlias
+    candidate: ModelSnapshot
+    candidate_maximum_call_cost_usd: float | None = Field(default=None, gt=0)
+    candidate_cost_is_observable: bool = False
+    environment_maximum_episode_cost_usd: float | None = Field(default=None, ge=0)
+    environment_cost_is_observable: bool = False
+    agent_id: str = Field(min_length=1, max_length=256)
+    repeat: int = Field(ge=0)
+    simulator_id: str = Field(min_length=1, max_length=256)
+    environment_id: ArtifactId
+    environment_sha256: Sha256
+    simulation_spec_input: ArtifactInput
+    simulation_spec_sha256: Sha256
+    simulation_inputs_sha256: Sha256
+
+    @field_validator(
+        "candidate_maximum_call_cost_usd",
+        "environment_maximum_episode_cost_usd",
+    )
+    @classmethod
+    def _require_finite_call_cost(cls, value: float | None) -> float | None:
+        """Reject a reservation that cannot enforce a finite spend boundary."""
+        if value is not None and not math.isfinite(value):
+            raise ValueError("sandbox cost reservations must be finite")
+        return value
+
+
 class RolloutArtifact(SimulationArtifact):
     """The v1 simulation artifact subtype that preserves one full agent episode."""
 
@@ -109,6 +149,7 @@ class RolloutArtifact(SimulationArtifact):
     orchestration_economics: OperationEconomics | None = None
     simulation_spec_sha256: Sha256 | None = None
     simulation_binding: SimulationCellBinding | None = None
+    sandbox_binding: SandboxSimulationCellBinding | None = None
 
     @field_validator("spans")
     @classmethod
@@ -133,6 +174,8 @@ class RolloutArtifact(SimulationArtifact):
                 raise ValueError("production rollouts require a production simulator snapshot")
             if self.world_model is not None:
                 raise ValueError("production rollouts must not name a world model")
+            if self.sandbox_binding is not None:
+                raise ValueError("production rollouts must not contain a sandbox binding")
         elif self.evidence_source == "world_model":
             if self.mode != SimulationMode.WORLD_MODEL:
                 raise ValueError("world-model rollouts require world_model mode")
@@ -140,6 +183,8 @@ class RolloutArtifact(SimulationArtifact):
                 raise ValueError("world-model rollouts require a world-model simulator snapshot")
             if self.world_model != self.simulator.world_model:
                 raise ValueError("world-model rollout identity must match its simulator snapshot")
+            if self.sandbox_binding is not None:
+                raise ValueError("world-model rollouts must not contain a sandbox binding")
             _require_world_model_binding(self)
         elif self.evidence_source == "sandbox":
             if self.mode != SimulationMode.SANDBOX:
@@ -148,6 +193,9 @@ class RolloutArtifact(SimulationArtifact):
                 raise ValueError("sandbox rollouts require a sandbox simulator snapshot")
             if self.world_model is not None:
                 raise ValueError("sandbox rollouts must not name a world model")
+            if self.simulation_binding is not None:
+                raise ValueError("sandbox rollouts must not contain a world-model binding")
+            _require_sandbox_binding(self)
         return self
 
 
@@ -186,6 +234,40 @@ def _require_world_model_binding(rollout: RolloutArtifact) -> None:
     }
     if not required_inputs.issubset(set(rollout.inputs)):
         raise ValueError("world-model rollout inputs must retain every bound simulation input")
+
+
+def _require_sandbox_binding(rollout: RolloutArtifact) -> None:
+    """Verify an executable rollout agrees with its complete sandbox cell binding."""
+    binding = rollout.sandbox_binding
+    simulator = rollout.simulator
+    if binding is None:
+        raise ValueError("sandbox rollouts require a complete sandbox cell binding")
+    if not isinstance(simulator, SandboxSimulatorSnapshot):
+        raise ValueError("sandbox rollouts require a sandbox simulator snapshot")
+    if binding.simulation_spec_sha256 != rollout.simulation_spec_sha256:
+        raise ValueError("sandbox binding must match the rollout simulation specification")
+    if binding.cell_id != rollout.cell_id or binding.task_id != rollout.task_id:
+        raise ValueError("sandbox binding cell and task must match the rollout")
+    if binding.task_set_input.artifact_id == binding.evaluation_plan_input.artifact_id:
+        raise ValueError("sandbox binding task-set and evaluation-plan inputs must differ")
+    if binding.candidate != rollout.candidate:
+        raise ValueError("sandbox binding candidate must match the rollout candidate")
+    if binding.agent_id != rollout.agent_id or binding.repeat != rollout.repeat:
+        raise ValueError("sandbox binding agent and repeat must match the rollout")
+    if binding.simulator_id != simulator.simulator_id:
+        raise ValueError("sandbox binding simulator must match the rollout simulator")
+    if (
+        binding.environment_id != simulator.environment_id
+        or binding.environment_sha256 != simulator.environment_sha256
+    ):
+        raise ValueError("sandbox binding environment must match the rollout simulator")
+    required_inputs = {
+        binding.evaluation_plan_input,
+        binding.task_set_input,
+        binding.simulation_spec_input,
+    }
+    if not required_inputs.issubset(set(rollout.inputs)):
+        raise ValueError("sandbox rollout inputs must retain every bound simulation input")
 
 
 class SimulationArtifactSet(ArtifactEnvelope):

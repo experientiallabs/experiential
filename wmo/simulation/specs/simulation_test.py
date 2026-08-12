@@ -62,7 +62,15 @@ def test_spec_preserves_only_the_selected_mode_settings_and_is_digest_stable() -
         ({"cell_ids": ("cell-a", "cell-a")}, "must not repeat"),
         ({"cell_ids": ()}, "at least one"),
         ({"world_model": None}, "missing settings"),
-        ({"sandbox": SandboxSettings(environment_id="sandbox-a")}, "inactive"),
+        (
+            {
+                "sandbox": SandboxSettings(
+                    environment_id="sandbox-a",
+                    environment_sha256="b" * 64,
+                )
+            },
+            "inactive",
+        ),
     ],
 )
 def test_spec_rejects_ambiguous_sparse_or_inactive_settings(
@@ -85,3 +93,15 @@ def test_mixed_reality_shape_is_persistable_but_reserved_for_a_later_simulator()
     assert spec.mixed_reality == MixedRealitySettings(policy_id="policy-a")
     with pytest.raises(SimulationModeUnsupportedError, match="not implemented"):
         require_implemented_mode(spec, SimulationMode.WORLD_MODEL)
+
+
+def test_sandbox_limits_and_run_cost_ceiling_must_be_finite() -> None:
+    """Non-finite limits fail before an environment or provider can be opened."""
+    with pytest.raises(ValidationError, match="maximum_time_seconds must be finite"):
+        SandboxSettings(
+            environment_id="sandbox-a",
+            environment_sha256="b" * 64,
+            maximum_time_seconds=float("inf"),
+        )
+    with pytest.raises(ValidationError, match="maximum_cost_usd must be finite"):
+        _spec(maximum_cost_usd=float("inf"))

@@ -2,6 +2,7 @@
 
 from wmo.common.rollouts.artifact import (
     RolloutArtifact,
+    SandboxSimulationCellBinding,
     SimulationArtifact,
     SimulationArtifactSet,
     SimulationCellBinding,
@@ -23,6 +24,7 @@ __all__ = [
     "RolloutEventKind",
     "RolloutSpan",
     "SandboxSimulatorSnapshot",
+    "SandboxSimulationCellBinding",
     "SimulationArtifact",
     "SimulationArtifactSet",
     "SimulationCellBinding",

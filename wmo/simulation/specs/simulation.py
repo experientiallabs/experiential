@@ -6,6 +6,7 @@ mode.  A concrete simulator validates the settings it consumes before it starts 
 
 from __future__ import annotations
 
+import math
 from typing import Literal, Self
 
 from pydantic import Field, field_validator, model_validator
@@ -34,9 +35,19 @@ class WorldModelSettings(ContractModel):
 
 
 class SandboxSettings(ContractModel):
-    """Reserved executable-environment settings owned by the sandbox simulator workstream."""
+    """Versioned executable-environment identity and per-episode wall-clock limit."""
 
     environment_id: ArtifactId
+    environment_sha256: Sha256
+    maximum_time_seconds: float = Field(default=300.0, gt=0)
+
+    @field_validator("maximum_time_seconds")
+    @classmethod
+    def _require_finite_time_limit(cls, value: float) -> float:
+        """Reject a wall-clock limit that cannot stop an executable episode."""
+        if not math.isfinite(value):
+            raise ValueError("sandbox maximum_time_seconds must be finite")
+        return value
 
 
 class MixedRealitySettings(ContractModel):
@@ -75,6 +86,14 @@ class SimulationSpec(ArtifactEnvelope):
     maximum_steps: int = Field(ge=1)
     maximum_concurrency: int = Field(default=1, ge=1)
     maximum_cost_usd: float | None = Field(default=None, gt=0)
+
+    @field_validator("maximum_cost_usd")
+    @classmethod
+    def _require_finite_cost_limit(cls, value: float | None) -> float | None:
+        """Reject a spend ceiling that cannot provide a finite admission boundary."""
+        if value is not None and not math.isfinite(value):
+            raise ValueError("simulation maximum_cost_usd must be finite")
+        return value
 
     @field_validator("cell_ids")
     @classmethod
