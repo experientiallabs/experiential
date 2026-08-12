@@ -53,6 +53,7 @@ from wmo.simulation.engines.sandbox_recording import (
     SandboxTimeLimitError,
     execute_bounded_sandbox_episode,
     merge_sandbox_spans,
+    require_hard_wall_timeout_support,
 )
 from wmo.simulation.engines.text.leases import (
     TextCellLeaseError,
@@ -161,6 +162,12 @@ class SandboxSimulator:
         """
         require_implemented_mode(spec, SimulationMode.SANDBOX)
         cells = self._validate_spec_and_bindings(spec)
+        try:
+            require_hard_wall_timeout_support()
+        except SandboxTimeLimitError as exc:
+            raise SandboxSimulationError(
+                "sandbox simulation cannot start without enforceable hard wall-time limits"
+            ) from exc
         spec_input = self._persist_specification(spec)
         resolution, resolution_input, bindings = self._persist_resolution(
             spec,
@@ -452,33 +459,33 @@ class SandboxSimulator:
             return self._persist_rollout(rollout, cell, binding, resolution_input)
         if claim.lease is None:
             raise SandboxResumeError("owned sandbox admission omitted its durable lease")
+        lease = claim.lease
         remaining = (
             None
             if spec.maximum_cost_usd is None
             else max(0.0, spec.maximum_cost_usd - (claim.observed_spend_usd or 0.0))
         )
         environment_reservation = binding.environment_maximum_episode_cost_usd
-        if (
-            remaining is not None
-            and environment_reservation is not None
-            and environment_reservation > remaining
-        ):
-            rollout = self._admission_failure_rollout(
-                spec,
-                cell,
-                binding,
-                resolution_input,
-                phase="environment_cost_admission",
-                message="sandbox environment reservation exceeds the remaining run ceiling",
-                spent=claim.observed_spend_usd,
-            )
-            persisted = self._persist_rollout(rollout, cell, binding, resolution_input)
-            self._leases.release(claim.lease)
-            return persisted
-        rollout = self._execute_cell(spec, cell, binding, resolution_input, remaining)
-        persisted = self._persist_rollout(rollout, cell, binding, resolution_input)
-        self._leases.release(claim.lease)
-        return persisted
+        try:
+            if (
+                remaining is not None
+                and environment_reservation is not None
+                and environment_reservation > remaining
+            ):
+                rollout = self._admission_failure_rollout(
+                    spec,
+                    cell,
+                    binding,
+                    resolution_input,
+                    phase="environment_cost_admission",
+                    message="sandbox environment reservation exceeds the remaining run ceiling",
+                    spent=claim.observed_spend_usd,
+                )
+            else:
+                rollout = self._execute_cell(spec, cell, binding, resolution_input, remaining)
+            return self._persist_rollout(rollout, cell, binding, resolution_input)
+        finally:
+            self._leases.release(lease)
 
     def _known_resolution_spend(
         self,

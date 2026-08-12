@@ -519,9 +519,15 @@ class _RecordingEnvironmentSession:
         return observation
 
 
-@contextmanager
-def _hard_wall_timeout(deadline: _Deadline) -> Iterator[None]:
-    """Install a POSIX main-thread timer so a silent hung agent cannot evade its limit."""
+def require_hard_wall_timeout_support() -> tuple[float, float]:
+    """Verify that this thread can install the timer required for sandbox execution.
+
+    Returns:
+        The inactive prior timer settings that the caller must restore after execution.
+
+    Raises:
+        SandboxTimeLimitError: Hard wall-time enforcement is unavailable or already claimed.
+    """
     if os.name != "posix" or threading.current_thread() is not threading.main_thread():
         raise SandboxTimeLimitError(
             "hard sandbox wall-time enforcement requires the POSIX main thread"
@@ -531,6 +537,13 @@ def _hard_wall_timeout(deadline: _Deadline) -> Iterator[None]:
     previous_delay, previous_interval = signal.getitimer(signal.ITIMER_REAL)
     if previous_delay > 0 or previous_interval > 0:
         raise SandboxTimeLimitError("another wall timer is already active")
+    return previous_delay, previous_interval
+
+
+@contextmanager
+def _hard_wall_timeout(deadline: _Deadline) -> Iterator[None]:
+    """Install a POSIX main-thread timer so a silent hung agent cannot evade its limit."""
+    previous_delay, previous_interval = require_hard_wall_timeout_support()
     previous_handler = signal.getsignal(signal.SIGALRM)
 
     def raise_timeout(_signum: int, _frame: object) -> None:
