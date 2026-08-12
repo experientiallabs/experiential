@@ -10,7 +10,9 @@ import numpy as np
 from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
+    Sha256,
     canonical_json_bytes,
+    sha256_json,
     stable_id,
 )
 from wmo.common.evaluations import (
@@ -23,11 +25,17 @@ from wmo.common.evaluations import (
 from wmo.common.evaluations.evidence import (
     EvaluationEvidenceError,
     read_calibration,
+    read_evaluation_plan,
     read_fidelity_report,
     sorted_evaluation_inputs,
 )
-from wmo.common.models import EmbeddingClient, ModelAlias
-from wmo.common.project import ArtifactStore, artifact_input
+from wmo.common.models import (
+    EmbeddingClient,
+    ModelAlias,
+    RoutedCandidateSnapshot,
+    load_pricing_snapshot,
+)
+from wmo.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
 from wmo.common.routing import KnnRouterPolicy, RouterFeatureExtractor
 from wmo.common.routing.bank import (
     KnnBankManifest,
@@ -86,7 +94,7 @@ class RouterOptimizer:
         """
         try:
             return self._fit(spec)
-        except (EvaluationEvidenceError, KeyError, ValueError) as exc:
+        except (ArtifactCorruptionError, EvaluationEvidenceError, KeyError, ValueError) as exc:
             if isinstance(exc, RouterOptimizationError):
                 raise
             raise RouterOptimizationError(
@@ -99,13 +107,33 @@ class RouterOptimizer:
         dataset = load_evaluation_dataset(self._store, spec.fit_evaluation_id)
         evaluation_input = artifact_input(self._store.read(spec.fit_evaluation_id).manifest)
         _require_fit_only_dataset(dataset)
+        plan, plan_input = read_evaluation_plan(self._store, dataset.manifest.evaluation_plan_id)
         loaded_tasks = load_task_set(self._store, dataset.manifest.task_set_id)
         task_input = artifact_input(self._store.read(dataset.manifest.task_set_id).manifest)
+        _require_plan_scope(
+            dataset,
+            plan.plan_id,
+            plan_input,
+            plan.task_set_id,
+            task_input,
+            plan.inputs,
+            plan.candidate_snapshots,
+        )
         if task_input not in dataset.manifest.inputs:
             raise RouterOptimizationError(
                 "evaluation manifest does not retain its verified task-set input"
             )
         _require_dataset_tasks(dataset, loaded_tasks.tasks)
+        pricing, pricing_sha256 = load_pricing_snapshot(self._store, spec.pricing_snapshot_id)
+        pricing_input = artifact_input(self._store.read(spec.pricing_snapshot_id).manifest)
+        _require_pricing_scope(
+            dataset,
+            pricing_snapshot_id=spec.pricing_snapshot_id,
+            expected_sha256=spec.pricing_snapshot_sha256,
+            actual_sha256=pricing_sha256,
+            pricing_input=pricing_input,
+            pricing_aliases=tuple(item.candidate_alias for item in pricing.candidate_prices),
+        )
         reports, report_inputs = _load_reports(self._store, dataset)
         _require_protocol_compatibility(
             self._store,
@@ -129,7 +157,9 @@ class RouterOptimizer:
             spec,
             dataset,
             evaluation_input,
+            plan_input,
             task_input,
+            pricing_input,
             report_inputs,
             bank,
         )
@@ -166,28 +196,101 @@ class RouterOptimizer:
         Raises:
             RouterOptimizationError: If evidence is incompatible, incomplete, or drifted.
         """
+        try:
+            return self._report(
+                locked,
+                held_out_evaluation_id=held_out_evaluation_id,
+                created_at=created_at,
+                code_revision=code_revision,
+            )
+        except (ArtifactCorruptionError, EvaluationEvidenceError, KeyError, ValueError) as exc:
+            if isinstance(exc, RouterOptimizationError):
+                raise
+            raise RouterOptimizationError(
+                f"router reporting refused incompatible or insufficient evidence: {exc}"
+            ) from exc
+
+    def _report(
+        self,
+        locked: RouterFitResult,
+        *,
+        held_out_evaluation_id: ArtifactId,
+        created_at: object,
+        code_revision: str,
+    ) -> RouterOptimizationResult:
+        """Execute report construction only after all fit and held-out pins verify."""
         from datetime import datetime
 
         if not isinstance(created_at, datetime):
             raise RouterOptimizationError("held-out report time must be a datetime")
-        dataset = load_evaluation_dataset(self._store, held_out_evaluation_id)
-        _require_held_out_only_dataset(dataset)
-        evaluation_input = artifact_input(self._store.read(held_out_evaluation_id).manifest)
-        loaded_tasks = load_task_set(self._store, dataset.manifest.task_set_id)
-        reports, _report_inputs = _load_reports(self._store, dataset)
+        policy = _load_locked_policy(self._store, locked.policy)
         bank_manifest, bank = load_knn_bank(
             self._store,
             locked.bank.bank_artifact_id,
-            expected_sha256=locked.policy.bank_sha256,
+            expected_sha256=policy.bank_sha256,
         )
-        policy_input = artifact_input(self._store.read(locked.policy.policy_id).manifest)
+        if bank_manifest != locked.bank:
+            raise RouterOptimizationError("supplied router bank differs from its stored artifact")
+        fit_dataset = load_evaluation_dataset(self._store, policy.fit_evaluation_id)
+        _require_fit_only_dataset(fit_dataset)
+        fit_plan, fit_plan_input = read_evaluation_plan(
+            self._store, fit_dataset.manifest.evaluation_plan_id
+        )
+        fit_tasks = load_task_set(self._store, fit_dataset.manifest.task_set_id)
+        fit_task_input = artifact_input(self._store.read(fit_dataset.manifest.task_set_id).manifest)
+        _require_plan_scope(
+            fit_dataset,
+            fit_plan.plan_id,
+            fit_plan_input,
+            fit_plan.task_set_id,
+            fit_task_input,
+            fit_plan.inputs,
+            fit_plan.candidate_snapshots,
+        )
+        _require_fit_lock(fit_dataset, policy, bank_manifest)
+        if fit_task_input.sha256 != policy.task_set_sha256:
+            raise RouterOptimizationError("fit task-set digest has drifted from the locked policy")
+        _require_dataset_tasks(fit_dataset, fit_tasks.tasks)
+        pricing, pricing_sha256 = load_pricing_snapshot(self._store, policy.pricing_snapshot_id)
+        pricing_input = artifact_input(self._store.read(policy.pricing_snapshot_id).manifest)
+        _require_pricing_scope(
+            fit_dataset,
+            pricing_snapshot_id=policy.pricing_snapshot_id,
+            expected_sha256=policy.pricing_snapshot_sha256,
+            actual_sha256=pricing_sha256,
+            pricing_input=pricing_input,
+            pricing_aliases=tuple(item.candidate_alias for item in pricing.candidate_prices),
+        )
+        dataset = load_evaluation_dataset(self._store, held_out_evaluation_id)
+        _require_held_out_only_dataset(dataset)
+        plan, plan_input = read_evaluation_plan(self._store, dataset.manifest.evaluation_plan_id)
+        loaded_tasks = load_task_set(self._store, dataset.manifest.task_set_id)
+        task_input = artifact_input(self._store.read(dataset.manifest.task_set_id).manifest)
+        _require_plan_scope(
+            dataset,
+            plan.plan_id,
+            plan_input,
+            plan.task_set_id,
+            task_input,
+            plan.inputs,
+            plan.candidate_snapshots,
+        )
+        _require_held_out_lock(dataset, policy)
+        evaluation_input = artifact_input(self._store.read(held_out_evaluation_id).manifest)
+        if task_input.sha256 != policy.task_set_sha256:
+            raise RouterOptimizationError(
+                "held-out task-set digest differs from the locked fit scope"
+            )
+        _require_dataset_tasks(dataset, loaded_tasks.tasks)
+        reports, _report_inputs = _load_reports(self._store, dataset)
+        policy_input = artifact_input(self._store.read(policy.policy_id).manifest)
         report = build_held_out_report(
             self._store,
             dataset=dataset,
             evaluation_input=evaluation_input,
             tasks=loaded_tasks.tasks,
             reports=reports,
-            policy=locked.policy,
+            policy=policy,
             policy_input=policy_input,
             bank_manifest=bank_manifest,
             bank=bank,
@@ -196,7 +299,7 @@ class RouterOptimizer:
             created_at=created_at,
             code_revision=code_revision,
         )
-        return RouterOptimizationResult(policy=locked.policy, bank=bank_manifest, report=report)
+        return RouterOptimizationResult(policy=policy, bank=bank_manifest, report=report)
 
     def _require_feature_identity(self, spec: RouterOptimizationSpec) -> None:
         """Ensure fit uses exactly the extractor implementation represented by the spec."""
@@ -207,6 +310,143 @@ class RouterOptimizer:
             raise RouterOptimizationError(
                 "router feature implementation differs from the optimization spec"
             )
+
+
+def _protocol_scope_sha256(dataset: EvaluationDataset) -> Sha256:
+    """Digest the exact ordered protocol and fidelity-report scope."""
+    return sha256_json(
+        {
+            "protocols": [item.model_dump(mode="json") for item in dataset.manifest.protocols],
+            "fidelity_report_ids": list(dataset.manifest.fidelity_report_ids),
+        }
+    )
+
+
+def _require_plan_scope(
+    dataset: EvaluationDataset,
+    plan_id: ArtifactId,
+    plan_input: ArtifactInput,
+    task_set_id: ArtifactId,
+    task_input: ArtifactInput,
+    plan_inputs: Sequence[ArtifactInput],
+    candidates: Sequence[RoutedCandidateSnapshot],
+) -> None:
+    """Require an evaluation to match its stored plan, task set, and candidates exactly."""
+    manifest = dataset.manifest
+    if (
+        manifest.evaluation_plan_id != plan_id
+        or manifest.evaluation_plan_sha256 != plan_input.sha256
+    ):
+        raise RouterOptimizationError(
+            "evaluation plan identity or digest differs from its artifact"
+        )
+    if manifest.task_set_id != task_set_id:
+        raise RouterOptimizationError("evaluation task set differs from its stored plan")
+    if task_input not in plan_inputs:
+        raise RouterOptimizationError("evaluation plan does not retain its task-set input")
+    if manifest.candidate_snapshots != tuple(candidates):
+        raise RouterOptimizationError("evaluation candidates differ from its stored plan")
+    if plan_input not in manifest.inputs:
+        raise RouterOptimizationError("evaluation manifest does not retain its plan input")
+
+
+def _require_pricing_scope(
+    dataset: EvaluationDataset,
+    *,
+    pricing_snapshot_id: ArtifactId,
+    expected_sha256: Sha256,
+    actual_sha256: Sha256,
+    pricing_input: ArtifactInput,
+    pricing_aliases: tuple[ModelAlias, ...],
+) -> None:
+    """Require one real pricing artifact to cover the exact evaluation candidates."""
+    if expected_sha256 != actual_sha256:
+        raise RouterOptimizationError("router pricing snapshot digest differs from its artifact")
+    if pricing_input not in dataset.manifest.inputs:
+        raise RouterOptimizationError(
+            "evaluation manifest does not retain its pricing-snapshot input"
+        )
+    aliases = tuple(item.alias for item in dataset.manifest.candidate_snapshots)
+    if pricing_aliases != aliases:
+        raise RouterOptimizationError(
+            "pricing snapshot candidates differ from evaluation candidates"
+        )
+    if any(item.pricing_snapshot_id != pricing_snapshot_id for item in dataset.manifest.protocols):
+        raise RouterOptimizationError(
+            "evaluation protocol pricing differs from the locked snapshot"
+        )
+
+
+def _load_locked_policy(store: ArtifactStore, supplied: KnnRouterPolicy) -> KnnRouterPolicy:
+    """Reload a persisted policy and reject a caller-supplied mutation."""
+    stored = store.read(supplied.policy_id)
+    if stored.manifest.artifact_type != "router-policy":
+        raise RouterOptimizationError("locked policy artifact has the wrong type")
+    policy = KnnRouterPolicy.model_validate_json(
+        store.read_bytes(supplied.policy_id, "policy.json")
+    )
+    if policy != supplied or policy.policy_id != supplied.policy_id:
+        raise RouterOptimizationError("supplied router policy differs from its stored artifact")
+    return policy
+
+
+def _require_fit_lock(
+    dataset: EvaluationDataset,
+    policy: KnnRouterPolicy,
+    bank: KnnBankManifest,
+) -> None:
+    """Verify every persisted fit-scope pin before held-out evidence is opened."""
+    manifest = dataset.manifest
+    checks = (
+        (manifest.evaluation_id, policy.fit_evaluation_id, "fit evaluation"),
+        (manifest.evaluation_id, bank.fit_evaluation_id, "bank fit evaluation"),
+        (manifest.evaluation_plan_id, policy.evaluation_plan_id, "evaluation plan"),
+        (manifest.evaluation_plan_id, bank.evaluation_plan_id, "bank evaluation plan"),
+        (manifest.evaluation_plan_sha256, policy.evaluation_plan_sha256, "evaluation plan digest"),
+        (manifest.evaluation_plan_sha256, bank.evaluation_plan_sha256, "bank plan digest"),
+        (manifest.task_set_id, policy.task_set_id, "task set"),
+        (manifest.task_set_id, bank.task_set_id, "bank task set"),
+        (_protocol_scope_sha256(dataset), policy.evaluation_protocols_sha256, "protocol scope"),
+        (_protocol_scope_sha256(dataset), bank.evaluation_protocols_sha256, "bank protocol scope"),
+        (manifest.fidelity_report_ids, policy.fidelity_report_ids, "fidelity scope"),
+        (manifest.fidelity_report_ids, bank.fidelity_report_ids, "bank fidelity scope"),
+        (
+            tuple(item.alias for item in manifest.candidate_snapshots),
+            bank.candidate_aliases,
+            "bank candidates",
+        ),
+        (manifest.candidate_snapshots, policy.candidates, "policy candidates"),
+        (policy.task_set_sha256, bank.task_set_sha256, "task-set digest"),
+        (policy.pricing_snapshot_id, bank.pricing_snapshot_id, "pricing snapshot"),
+        (policy.pricing_snapshot_sha256, bank.pricing_snapshot_sha256, "pricing digest"),
+    )
+    for actual, expected, label in checks:
+        if actual != expected:
+            raise RouterOptimizationError(f"{label} differs from the persisted fit lock")
+
+
+def _require_held_out_lock(dataset: EvaluationDataset, policy: KnnRouterPolicy) -> None:
+    """Reject held-out evidence outside the exact plan and fit-time identity scope."""
+    manifest = dataset.manifest
+    checks = (
+        (manifest.evaluation_plan_id, policy.evaluation_plan_id, "held-out evaluation plan"),
+        (
+            manifest.evaluation_plan_sha256,
+            policy.evaluation_plan_sha256,
+            "held-out evaluation plan digest",
+        ),
+        (manifest.task_set_id, policy.task_set_id, "held-out task set"),
+        (manifest.candidate_snapshots, policy.candidates, "held-out candidates"),
+        (
+            _protocol_scope_sha256(dataset),
+            policy.evaluation_protocols_sha256,
+            "held-out protocol scope",
+        ),
+        (manifest.fidelity_report_ids, policy.fidelity_report_ids, "held-out fidelity scope"),
+    )
+    for actual, expected, label in checks:
+        if actual != expected:
+            raise RouterOptimizationError(f"{label} differs from the persisted fit lock")
 
 
 def choose_baseline(
@@ -403,22 +643,33 @@ def _persist_bank(
     spec: RouterOptimizationSpec,
     dataset: EvaluationDataset,
     evaluation_input: ArtifactInput,
+    plan_input: ArtifactInput,
     task_input: ArtifactInput,
+    pricing_input: ArtifactInput,
     report_inputs: Sequence[ArtifactInput],
     bank: KnnEvidenceBank,
 ) -> tuple[KnnBankManifest, ArtifactInput]:
     """Persist byte-stable numeric evidence with exact fit and identity pins."""
     payload = bank_bytes(bank)
     digest = hashlib.sha256(payload).hexdigest()
-    inputs = sorted_evaluation_inputs((evaluation_input, task_input, *report_inputs))
+    inputs = sorted_evaluation_inputs(
+        (evaluation_input, plan_input, task_input, pricing_input, *report_inputs)
+    )
+    protocol_scope = _protocol_scope_sha256(dataset)
     bank_id = stable_id(
         "knn-bank",
         {
             "version": "guarded-knn-bank-v1",
             "fit_evaluation_id": dataset.manifest.evaluation_id,
+            "evaluation_plan_id": dataset.manifest.evaluation_plan_id,
+            "evaluation_plan_sha256": dataset.manifest.evaluation_plan_sha256,
             "inputs": [item.model_dump(mode="json") for item in inputs],
+            "task_set_id": dataset.manifest.task_set_id,
+            "task_set_sha256": task_input.sha256,
             "task_ids": list(bank.task_ids),
             "candidate_aliases": list(bank.candidate_aliases),
+            "evaluation_protocols_sha256": protocol_scope,
+            "fidelity_report_ids": list(dataset.manifest.fidelity_report_ids),
             "embedder": spec.embedder.model_dump(mode="json"),
             "embedder_alias": spec.embedder_alias,
             "feature_extractor_id": spec.feature_extractor_id,
@@ -435,9 +686,14 @@ def _persist_bank(
         code_revision=spec.code_revision,
         bank_artifact_id=bank_id,
         fit_evaluation_id=dataset.manifest.evaluation_id,
+        evaluation_plan_id=dataset.manifest.evaluation_plan_id,
+        evaluation_plan_sha256=dataset.manifest.evaluation_plan_sha256,
         task_set_id=dataset.manifest.task_set_id,
+        task_set_sha256=task_input.sha256,
         task_ids=bank.task_ids,
         candidate_aliases=bank.candidate_aliases,
+        evaluation_protocols_sha256=protocol_scope,
+        fidelity_report_ids=dataset.manifest.fidelity_report_ids,
         embedder_alias=spec.embedder_alias,
         embedder=spec.embedder,
         feature_extractor_id=spec.feature_extractor_id,
@@ -487,6 +743,12 @@ def _persist_policy(
         "bank_sha256": bank.bank_sha256,
         "guard": spec.guard.model_dump(mode="json"),
         "fit_evaluation_id": dataset.manifest.evaluation_id,
+        "evaluation_plan_id": dataset.manifest.evaluation_plan_id,
+        "evaluation_plan_sha256": dataset.manifest.evaluation_plan_sha256,
+        "task_set_id": dataset.manifest.task_set_id,
+        "task_set_sha256": bank.task_set_sha256,
+        "evaluation_protocols_sha256": bank.evaluation_protocols_sha256,
+        "fidelity_report_ids": list(bank.fidelity_report_ids),
         "judgment_status": spec.judgment_status,
     }
     policy = KnnRouterPolicy(
@@ -507,6 +769,12 @@ def _persist_policy(
         bank_sha256=bank.bank_sha256,
         guard=spec.guard,
         fit_evaluation_id=dataset.manifest.evaluation_id,
+        evaluation_plan_id=dataset.manifest.evaluation_plan_id,
+        evaluation_plan_sha256=dataset.manifest.evaluation_plan_sha256,
+        task_set_id=dataset.manifest.task_set_id,
+        task_set_sha256=bank.task_set_sha256,
+        evaluation_protocols_sha256=bank.evaluation_protocols_sha256,
+        fidelity_report_ids=bank.fidelity_report_ids,
         judgment_status=spec.judgment_status,
     )
     policy_record = write_or_verify_exact(

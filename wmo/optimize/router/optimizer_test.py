@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -12,22 +13,26 @@ import pytest
 
 from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes, stable_id
 from wmo.common.evaluations import (
+    EvaluationCell,
     EvaluationDatasetManifest,
+    EvaluationPlan,
     EvaluationProtocol,
     EvaluationRow,
 )
 from wmo.common.judging import DimensionScoreMap, JudgeCalibration
 from wmo.common.models import (
+    CandidateTokenPrice,
     Embedding,
     ModelSnapshot,
     NumericMeasurement,
+    PricingSnapshot,
     RoutedCandidateSnapshot,
 )
-from wmo.common.project import ArtifactCorruptionError, ArtifactStore, ProjectPaths, artifact_input
+from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
 from wmo.common.routing import KnnGuard
 from wmo.common.routing.bank import load_knn_bank
 from wmo.common.tasks import TaskCase, TaskSet
-from wmo.optimize.router import RouterOptimizationSpec, RouterOptimizer
+from wmo.optimize.router import RouterOptimizationError, RouterOptimizationSpec, RouterOptimizer
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
@@ -52,6 +57,23 @@ class _LockCheckingEmbedder:
         return tuple(Embedding(values=(1.0, 0.0)) for _text in texts)
 
 
+@dataclass(frozen=True)
+class _OptimizerFixture:
+    """Typed direct-API fixture with every persisted identity exposed."""
+
+    store: ArtifactStore
+    fit: tuple[TaskCase, ...]
+    held_out: tuple[TaskCase, ...]
+    task_input: ArtifactInput
+    plan_input: ArtifactInput
+    pricing_input: ArtifactInput
+    evaluation_inputs: tuple[ArtifactInput, ...]
+    held_evaluation_id: str
+    embedder: _LockCheckingEmbedder
+    optimizer: RouterOptimizer
+    spec: RouterOptimizationSpec
+
+
 def test_optimizer_locks_fit_policy_then_reports_held_out_with_separate_spend(
     tmp_path: Path,
 ) -> None:
@@ -59,20 +81,30 @@ def test_optimizer_locks_fit_policy_then_reports_held_out_with_separate_spend(
     store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
     fit = tuple(_task(f"task-fit-{index:02d}", "fit") for index in range(8))
     held_out = tuple(_task(f"task-held-{index:02d}", "held_out") for index in range(2))
-    fit_task_input = _persist_task_set(store, fit, task_set_id="task-set-fit")
-    held_task_input = _persist_task_set(store, held_out, task_set_id="task-set-held")
+    all_tasks = (*fit, *held_out)
+    task_input = _persist_task_set(store, all_tasks, task_set_id="task-set-a")
+    plan_input = _persist_plan(store, all_tasks, task_input)
+    pricing_input = _persist_pricing(store)
     calibration_input = _persist_calibration(store, fit, held_out)
+    evaluation_inputs = tuple(
+        sorted(
+            (calibration_input, plan_input, pricing_input, task_input),
+            key=lambda item: item.artifact_id,
+        )
+    )
     fit_evaluation_id = _persist_evaluation(
         store,
         fit,
-        "task-set-fit",
-        tuple(sorted((fit_task_input, calibration_input), key=lambda item: item.artifact_id)),
+        "task-set-a",
+        plan_input,
+        evaluation_inputs,
     )
     held_evaluation_id = _persist_evaluation(
         store,
         held_out,
-        "task-set-held",
-        tuple(sorted((held_task_input, calibration_input), key=lambda item: item.artifact_id)),
+        "task-set-a",
+        plan_input,
+        evaluation_inputs,
     )
     embedder = _LockCheckingEmbedder(store, fit_count=len(fit))
     spec = RouterOptimizationSpec(
@@ -81,7 +113,7 @@ def test_optimizer_locks_fit_policy_then_reports_held_out_with_separate_spend(
         embedder_alias="embedder",
         embedder=_snapshot("embedder"),
         pricing_snapshot_id="pricing-a",
-        pricing_snapshot_sha256=_DIGEST,
+        pricing_snapshot_sha256=pricing_input.sha256,
         guard=KnnGuard(
             maximum_neighbors=8,
             minimum_paired_observations=8,
@@ -144,7 +176,7 @@ def test_optimizer_locks_fit_policy_then_reports_held_out_with_separate_spend(
 
     report_path = store.read(result.report.report_id).directory / "report.json"
     report_path.write_bytes(report_path.read_bytes() + b"corruption")
-    with pytest.raises(ArtifactCorruptionError):
+    with pytest.raises(RouterOptimizationError, match="digest mismatch"):
         optimizer.report(
             locked,
             held_out_evaluation_id=held_evaluation_id,
@@ -153,11 +185,192 @@ def test_optimizer_locks_fit_policy_then_reports_held_out_with_separate_spend(
         )
 
 
+def test_fit_rejects_missing_wrong_type_invented_or_candidate_drifted_pricing(
+    tmp_path: Path,
+) -> None:
+    """The public API accepts only a real exact pricing artifact for every candidate."""
+    fixture = _optimizer_fixture(tmp_path)
+    optimizer = fixture.optimizer
+    spec = fixture.spec
+    embedder = fixture.embedder
+    task_input = fixture.task_input
+    drifted_pricing = _persist_pricing(
+        fixture.store,
+        pricing_snapshot_id="pricing-b",
+        candidate_aliases=("candidate-baseline",),
+    )
+
+    invalid_specs = (
+        spec.model_copy(update={"pricing_snapshot_id": "pricing-missing"}),
+        spec.model_copy(
+            update={
+                "pricing_snapshot_id": task_input.artifact_id,
+                "pricing_snapshot_sha256": task_input.sha256,
+            }
+        ),
+        spec.model_copy(update={"pricing_snapshot_sha256": "b" * 64}),
+        spec.model_copy(
+            update={
+                "pricing_snapshot_id": drifted_pricing.artifact_id,
+                "pricing_snapshot_sha256": drifted_pricing.sha256,
+            }
+        ),
+    )
+    for invalid in invalid_specs:
+        with pytest.raises(RouterOptimizationError):
+            optimizer.fit(invalid)
+    assert embedder.call_sizes == []
+
+
+def test_report_rejects_mutated_lock_and_all_held_out_identity_drift_before_embedding(
+    tmp_path: Path,
+) -> None:
+    """Plan, tasks, candidates, protocols, pricing, and stored lock all fail closed."""
+    fixture = _optimizer_fixture(tmp_path)
+    optimizer = fixture.optimizer
+    spec = fixture.spec
+    embedder = fixture.embedder
+    store = fixture.store
+    held_out = fixture.held_out
+    plan_input = fixture.plan_input
+    evaluation_inputs = fixture.evaluation_inputs
+
+    locked = optimizer.fit(spec)
+    assert embedder.call_sizes == [8]
+    mutated_policy = locked.policy.model_copy(update={"pricing_snapshot_id": "pricing-invented"})
+    with pytest.raises(RouterOptimizationError, match="supplied router policy"):
+        optimizer.report(
+            replace(locked, policy=mutated_policy),
+            held_out_evaluation_id=fixture.held_evaluation_id,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+
+    invalid_held_out_ids = (
+        _persist_evaluation(
+            store,
+            held_out,
+            "task-set-a",
+            plan_input,
+            evaluation_inputs,
+            evaluation_salt="missing-plan",
+            evaluation_plan_id="plan-missing",
+        ),
+        _persist_evaluation(
+            store,
+            held_out,
+            "task-set-a",
+            plan_input,
+            evaluation_inputs,
+            evaluation_salt="invented-plan-digest",
+            evaluation_plan_sha256="b" * 64,
+        ),
+        _persist_evaluation(
+            store,
+            held_out,
+            "task-set-changed",
+            plan_input,
+            evaluation_inputs,
+            evaluation_salt="changed-task-set",
+        ),
+        _persist_evaluation(
+            store,
+            held_out,
+            "task-set-a",
+            plan_input,
+            evaluation_inputs,
+            evaluation_salt="changed-candidates",
+            candidates=(
+                _candidate("candidate-baseline"),
+                _candidate("candidate-other"),
+            ),
+        ),
+        _persist_evaluation(
+            store,
+            held_out,
+            "task-set-a",
+            plan_input,
+            evaluation_inputs,
+            evaluation_salt="changed-pricing-protocol",
+            protocol_pricing_id="pricing-b",
+        ),
+    )
+    for held_out_id in invalid_held_out_ids:
+        with pytest.raises(RouterOptimizationError):
+            optimizer.report(
+                locked,
+                held_out_evaluation_id=held_out_id,
+                created_at=_TIME,
+                code_revision="test-revision",
+            )
+    assert embedder.call_sizes == [8]
+
+
+def _optimizer_fixture(tmp_path: Path) -> _OptimizerFixture:
+    """Create one valid direct-API fixture with exact stored plan, task, and pricing."""
+    store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
+    fit = tuple(_task(f"task-fit-{index:02d}", "fit") for index in range(8))
+    held_out = tuple(_task(f"task-held-{index:02d}", "held_out") for index in range(2))
+    task_input = _persist_task_set(store, (*fit, *held_out), task_set_id="task-set-a")
+    plan_input = _persist_plan(store, (*fit, *held_out), task_input)
+    pricing_input = _persist_pricing(store)
+    calibration_input = _persist_calibration(store, fit, held_out)
+    evaluation_inputs = tuple(
+        sorted(
+            (calibration_input, plan_input, pricing_input, task_input),
+            key=lambda item: item.artifact_id,
+        )
+    )
+    fit_evaluation_id = _persist_evaluation(store, fit, "task-set-a", plan_input, evaluation_inputs)
+    held_evaluation_id = _persist_evaluation(
+        store, held_out, "task-set-a", plan_input, evaluation_inputs
+    )
+    embedder = _LockCheckingEmbedder(store, fit_count=len(fit))
+    spec = RouterOptimizationSpec(
+        fit_evaluation_id=fit_evaluation_id,
+        incumbent_alias="candidate-baseline",
+        embedder_alias="embedder",
+        embedder=_snapshot("embedder"),
+        pricing_snapshot_id=pricing_input.artifact_id,
+        pricing_snapshot_sha256=pricing_input.sha256,
+        guard=KnnGuard(
+            maximum_neighbors=8,
+            minimum_paired_observations=8,
+            relative_similarity_threshold=0.95,
+            uncertainty_multiplier=0.5,
+            quality_tolerance=0.0,
+        ),
+        judgment_status="provisional",
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+    return _OptimizerFixture(
+        store=store,
+        fit=fit,
+        held_out=held_out,
+        task_input=task_input,
+        plan_input=plan_input,
+        pricing_input=pricing_input,
+        evaluation_inputs=evaluation_inputs,
+        held_evaluation_id=held_evaluation_id,
+        embedder=embedder,
+        optimizer=RouterOptimizer(store, embedder),
+        spec=spec,
+    )
+
+
 def _persist_evaluation(
     store: ArtifactStore,
     tasks: tuple[TaskCase, ...],
     task_set_id: str,
+    plan_input: ArtifactInput,
     inputs: tuple[ArtifactInput, ...],
+    *,
+    evaluation_salt: str = "",
+    evaluation_plan_id: str = "plan-a",
+    evaluation_plan_sha256: str | None = None,
+    protocol_pricing_id: str = "pricing-a",
+    candidates: tuple[RoutedCandidateSnapshot, ...] | None = None,
 ) -> str:
     """Persist a complete observed matrix with candidate and run costs kept separate."""
     protocol = EvaluationProtocol(
@@ -167,7 +380,7 @@ def _persist_evaluation(
         simulator_id="production-import-v1",
         rubric_id="rubric-a",
         judge_calibration_id="calibration-a",
-        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_id=protocol_pricing_id,
     )
     rows = tuple(
         _row(task, alias, protocol)
@@ -178,7 +391,19 @@ def _persist_evaluation(
     rows_sha256 = hashlib.sha256(rows_payload).hexdigest()
     evaluation_id = stable_id(
         "evaluation",
-        {"rows_sha256": rows_sha256, "task_set_id": task_set_id},
+        {
+            "rows_sha256": rows_sha256,
+            "task_set_id": task_set_id,
+            "plan_id": evaluation_plan_id,
+            "plan_sha256": evaluation_plan_sha256 or plan_input.sha256,
+            "pricing_snapshot_id": protocol_pricing_id,
+            "candidate_aliases": [
+                item.alias
+                for item in candidates
+                or (_candidate("candidate-baseline"), _candidate("candidate-cheap"))
+            ],
+            "salt": evaluation_salt,
+        },
     )
     manifest = EvaluationDatasetManifest(
         schema_version=1,
@@ -186,15 +411,13 @@ def _persist_evaluation(
         inputs=inputs,
         code_revision="test-revision",
         evaluation_id=evaluation_id,
-        evaluation_plan_id="plan-a",
-        evaluation_plan_sha256=_DIGEST,
+        evaluation_plan_id=evaluation_plan_id,
+        evaluation_plan_sha256=evaluation_plan_sha256 or plan_input.sha256,
         task_set_id=task_set_id,
         fit_task_ids=tuple(task.task_id for task in tasks if task.partition == "fit"),
         held_out_task_ids=tuple(task.task_id for task in tasks if task.partition == "held_out"),
-        candidate_snapshots=(
-            _candidate("candidate-baseline"),
-            _candidate("candidate-cheap"),
-        ),
+        candidate_snapshots=candidates
+        or (_candidate("candidate-baseline"), _candidate("candidate-cheap")),
         protocols=(protocol,),
         rows_path="rows.jsonl",
         rows_sha256=rows_sha256,
@@ -261,6 +484,80 @@ def _persist_task_set(
         artifact_type="task-set",
         envelope=task_set,
         files={"task-set.json": canonical_json_bytes(task_set), "tasks.jsonl": payload},
+    )
+    return artifact_input(manifest)
+
+
+def _persist_plan(
+    store: ArtifactStore,
+    tasks: tuple[TaskCase, ...],
+    task_input: ArtifactInput,
+) -> ArtifactInput:
+    """Persist the one exact plan shared by sealed fit and held-out evaluations."""
+    cells = tuple(
+        EvaluationCell(
+            cell_id=f"cell-{task.task_id}-{alias}",
+            task_id=task.task_id,
+            candidate_alias=alias,
+            repeat=0,
+            purpose=task.partition,
+            execution="observed",
+            observed_rollout_id=f"rollout-{task.task_id}-{alias}",
+        )
+        for task in tasks
+        for alias in ("candidate-baseline", "candidate-cheap")
+    )
+    plan = EvaluationPlan(
+        schema_version=1,
+        created_at=_TIME,
+        inputs=(task_input,),
+        code_revision="test-revision",
+        plan_id="plan-a",
+        task_set_id="task-set-a",
+        candidate_snapshots=(
+            _candidate("candidate-baseline"),
+            _candidate("candidate-cheap"),
+        ),
+        fidelity_thresholds_id="fidelity-thresholds-a",
+        fidelity_thresholds_sha256=_DIGEST,
+        fidelity_protocol_sha256=_DIGEST,
+        cells=cells,
+    )
+    manifest = store.write_json(
+        artifact_id=plan.plan_id,
+        artifact_type="evaluation-plan",
+        envelope=plan,
+        files={"plan.json": plan},
+    )
+    return artifact_input(manifest)
+
+
+def _persist_pricing(
+    store: ArtifactStore,
+    *,
+    pricing_snapshot_id: str = "pricing-a",
+    candidate_aliases: tuple[str, ...] = ("candidate-baseline", "candidate-cheap"),
+) -> ArtifactInput:
+    """Persist pricing for exactly the candidates in the frozen evaluation plan."""
+    pricing = PricingSnapshot(
+        schema_version=1,
+        created_at=_TIME,
+        code_revision="test-revision",
+        pricing_snapshot_id=pricing_snapshot_id,
+        candidate_prices=tuple(
+            CandidateTokenPrice(
+                candidate_alias=alias,
+                input_usd_per_million_tokens=1.0,
+                output_usd_per_million_tokens=2.0,
+            )
+            for alias in candidate_aliases
+        ),
+    )
+    manifest = store.write_json(
+        artifact_id=pricing.pricing_snapshot_id,
+        artifact_type="pricing-snapshot",
+        envelope=pricing,
+        files={"pricing.json": pricing},
     )
     return artifact_input(manifest)
 

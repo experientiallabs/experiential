@@ -40,9 +40,14 @@ class KnnBankManifest(ArtifactEnvelope):
 
     bank_artifact_id: ArtifactId
     fit_evaluation_id: ArtifactId
+    evaluation_plan_id: ArtifactId
+    evaluation_plan_sha256: Sha256
     task_set_id: ArtifactId
+    task_set_sha256: Sha256
     task_ids: tuple[ArtifactId, ...]
     candidate_aliases: tuple[ModelAlias, ...]
+    evaluation_protocols_sha256: Sha256
+    fidelity_report_ids: tuple[ArtifactId, ...] = ()
     embedder_alias: ModelAlias
     embedder: ModelSnapshot
     feature_extractor_id: ArtifactId

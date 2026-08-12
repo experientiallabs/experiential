@@ -54,6 +54,11 @@ def _policy() -> KnnRouterPolicy:
             quality_tolerance=0,
         ),
         fit_evaluation_id="evaluation-v1",
+        evaluation_plan_id="plan-v1",
+        evaluation_plan_sha256=_DIGEST,
+        task_set_id="task-set-v1",
+        task_set_sha256=_DIGEST,
+        evaluation_protocols_sha256=_DIGEST,
         judgment_status="provisional",
     )
 
