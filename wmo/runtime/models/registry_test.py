@@ -114,17 +114,20 @@ def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
 def test_snapshot_connection_digest_is_normalized_and_endpoint_specific() -> None:
     """Resolved identity changes for another endpoint but excludes credential metadata."""
     first = RuntimeModelCatalog(
-        _catalog(base_url="HTTPS://Models.Example.test:443/v1/"),
+        _catalog(
+            provider="openai-compatible",
+            base_url="HTTPS://Models.Example.test:443/v1/",
+        ),
         environment={},
         transport_factory=_UnusedTransport,
     )
     equivalent = RuntimeModelCatalog(
-        _catalog(base_url="https://models.example.test/v1"),
+        _catalog(provider="openai-compatible", base_url="https://models.example.test/v1"),
         environment={},
         transport_factory=_UnusedTransport,
     )
     distinct = RuntimeModelCatalog(
-        _catalog(base_url="https://models.example.test/v2"),
+        _catalog(provider="openai-compatible", base_url="https://models.example.test/v2"),
         environment={},
         transport_factory=_UnusedTransport,
     )
@@ -139,7 +142,7 @@ def test_snapshot_connection_digest_is_normalized_and_endpoint_specific() -> Non
     assert (
         first_snapshot.connection_sha256
         == ConnectionConfig(
-            provider="openai",
+            provider="openai-compatible",
             base_url="https://models.example.test/v1",
             api_key_env="ANOTHER_API_KEY",
         ).identity_sha256()

@@ -203,6 +203,9 @@ def test_openai_compatible_client_retries_only_the_same_endpoint() -> None:
         "https://example.test/v1/chat/completions",
         "https://example.test/v1/chat/completions",
     ]
+    idempotency_keys = [request[1]["Idempotency-Key"] for request in transport.requests]
+    assert idempotency_keys[0].startswith("wmo-")
+    assert idempotency_keys[0] == idempotency_keys[1]
 
 
 def test_openai_compatible_embedding_response_is_ordered_and_normalized() -> None:

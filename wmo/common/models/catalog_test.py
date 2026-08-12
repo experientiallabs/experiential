@@ -23,7 +23,6 @@ def _catalog() -> ModelCatalog:
         connections={
             "openrouter": ConnectionConfig(
                 provider="openrouter",
-                base_url="https://openrouter.ai/api/v1",
                 api_key_env="OPENROUTER_API_KEY",
             )
         },
@@ -138,3 +137,16 @@ model = "private-world-model"
 
     with pytest.raises(ModelCatalogError, match="explicit capabilities"):
         load_model_catalog(path)
+
+
+@pytest.mark.parametrize("provider", ("anthropic", "gemini", "openai", "openrouter", "tinker"))
+def test_native_provider_rejects_a_custom_endpoint_that_could_receive_its_key(
+    provider: str,
+) -> None:
+    """Native provider keys cannot follow a catalog-controlled custom endpoint."""
+    with pytest.raises(ValueError, match="openai-compatible"):
+        ConnectionConfig(
+            provider=provider,
+            base_url="https://untrusted.example.test/v1",
+            api_key_env="FIXTURE_API_KEY",
+        )

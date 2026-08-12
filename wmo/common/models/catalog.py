@@ -23,6 +23,7 @@ from wmo.common.core.files import write_text_atomic
 from wmo.common.models.model import ModelCapabilities
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openrouter", "tinker"})
 
 
 def _normalize_base_url(value: str) -> str:
@@ -79,6 +80,11 @@ class ConnectionConfig(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        if self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
+            raise ValueError(
+                f"native provider {self.provider!r} uses its built-in official endpoint; "
+                "use provider='openai-compatible' for a trusted custom endpoint"
+            )
         try:
             assert_secret_free({"provider": self.provider, "base_url": self.base_url})
         except SecretBoundaryError as exc:

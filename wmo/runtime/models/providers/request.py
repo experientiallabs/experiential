@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from uuid import uuid4
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.runtime.models.providers.retry import RetryPolicy, run_with_retry
@@ -34,11 +35,15 @@ def post_json(
     Raises:
         ProviderTransportError: The endpoint failed or returned a non-success status.
     """
+    request_headers = {
+        name: value for name, value in headers.items() if name.lower() != "idempotency-key"
+    }
+    request_headers["Idempotency-Key"] = f"wmo-{uuid4().hex}"
 
     def send() -> JsonObject:
         response = transport.post(
             url,
-            headers=headers,
+            headers=request_headers,
             payload=payload,
             timeout_seconds=timeout_seconds,
         )
