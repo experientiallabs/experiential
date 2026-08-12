@@ -120,3 +120,12 @@ def test_policy_rejects_unpinned_baseline_and_nonfinite_guard_values() -> None:
             neighbor_count=2,
             paired_count=3,
         )
+
+
+def test_stored_policy_rejects_a_pre_design_threshold_guard() -> None:
+    """Loading an older policy cannot bypass the enforced eight-pair design threshold."""
+    payload = _policy().model_dump(mode="json")
+    payload["guard"]["minimum_paired_observations"] = 2
+
+    with pytest.raises(ValidationError, match="minimum_paired_observations"):
+        KnnRouterPolicy.model_validate(payload)

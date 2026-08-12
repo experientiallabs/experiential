@@ -39,8 +39,8 @@ def test_cheapest_safe_candidate_wins_deterministic_quality_and_alias_ties() -> 
 
     assert decision.selected_alias == "candidate-a"
     assert decision.baseline_alias == "candidate-baseline"
-    assert decision.neighbor_count == 3
-    assert decision.paired_count == 3
+    assert decision.neighbor_count == 8
+    assert decision.paired_count == 8
     assert decision.estimated_quality_difference == pytest.approx(0.1)
     assert decision.fallback_reason is None
 
@@ -79,51 +79,49 @@ def test_bank_owns_read_only_copies_and_rejects_forced_mutation() -> None:
 
 
 def test_guard_rejects_a_single_paired_observation() -> None:
-    """A one-sample estimate cannot represent measurable routing uncertainty."""
-    with pytest.raises(ValidationError, match="minimum_paired_observations"):
-        KnnGuard(
-            maximum_neighbors=3,
-            minimum_paired_observations=1,
-            relative_similarity_threshold=0.95,
-            uncertainty_multiplier=0.5,
-            quality_tolerance=0.0,
-        )
+    """Every new or loaded policy enforces the eight-pair design threshold."""
+    for paired_count in (1, 2, 7):
+        with pytest.raises(ValidationError, match="minimum_paired_observations"):
+            KnnGuard(
+                maximum_neighbors=8,
+                minimum_paired_observations=paired_count,
+                relative_similarity_threshold=0.95,
+                uncertainty_multiplier=0.5,
+                quality_tolerance=0.0,
+            )
 
 
-def test_one_pair_falls_back_but_two_consistent_pairs_can_route() -> None:
-    """The minimum valid guard measures variance and never routes from one comparison."""
+def test_thin_identical_pairs_fall_back_and_design_threshold_can_route() -> None:
+    """Identical favorable evidence cannot route below the eight-pair design threshold."""
     scores = np.asarray(
-        (
-            (0.5, 0.9, 0.0),
-            (0.5, float("nan"), 0.0),
-            (0.5, float("nan"), 0.0),
-        ),
+        tuple((0.5, 0.9 if index < 2 else float("nan"), 0.0) for index in range(8)),
         dtype=np.float32,
     )
-    costs = np.asarray(((0.5, 0.1, 0.6),) * 3, dtype=np.float64)
+    costs = np.asarray(((0.5, 0.1, 0.6),) * 8, dtype=np.float64)
     policy, manifest, bank = _fixture(scores, costs)
-    guard = policy.guard.model_copy(update={"minimum_paired_observations": 2})
-    policy = policy.model_copy(update={"guard": guard})
+    thin = _select(policy, manifest, bank, np.asarray((1.0, 0.0)))
 
-    one_pair = _select(policy, manifest, bank, np.asarray((1.0, 0.0)))
+    assert thin.selected_alias == policy.baseline_alias
+    assert thin.paired_count == 2
+    assert thin.fallback_reason == "insufficient_pairs"
 
-    assert one_pair.selected_alias == policy.baseline_alias
-    assert one_pair.paired_count == 1
-    assert one_pair.fallback_reason == "insufficient_pairs"
-
-    two_scores = scores.copy()
-    two_scores[1, 1] = 0.9
-    two_bank = _fixture(two_scores, costs)[2]
-    two_manifest = manifest.model_copy(
-        update={"bank_sha256": hashlib.sha256(bank_bytes(two_bank)).hexdigest()}
+    threshold_scores = scores.copy()
+    threshold_scores[:, 1] = 0.9
+    threshold_bank = _fixture(threshold_scores, costs)[2]
+    threshold_manifest = manifest.model_copy(
+        update={"bank_sha256": hashlib.sha256(bank_bytes(threshold_bank)).hexdigest()}
     )
-    two_policy = policy.model_copy(update={"bank_sha256": two_manifest.bank_sha256})
+    threshold_policy = policy.model_copy(update={"bank_sha256": threshold_manifest.bank_sha256})
 
-    two_pairs = _select(two_policy, two_manifest, two_bank, np.asarray((1.0, 0.0)))
+    threshold = _select(
+        threshold_policy,
+        threshold_manifest,
+        threshold_bank,
+        np.asarray((1.0, 0.0)),
+    )
 
-    assert two_pairs.selected_alias == "candidate-b"
-    assert two_pairs.paired_count == 2
-    assert two_pairs.uncertainty == pytest.approx(0.0)
+    assert threshold.selected_alias == "candidate-b"
+    assert threshold.paired_count == 8
 
 
 @pytest.mark.parametrize(
@@ -155,17 +153,21 @@ def _fixture(
     scores: np.ndarray,
     costs: np.ndarray,
 ) -> tuple[KnnRouterPolicy, KnnBankManifest, KnnEvidenceBank]:
-    """Create one aligned three-task, three-candidate policy and bank."""
+    """Create one aligned policy and bank at the eight-pair design threshold."""
+    if scores.shape[0] < 8:
+        scores = np.concatenate((scores, np.repeat(scores[-1:, :], 8 - scores.shape[0], axis=0)))
+        costs = np.concatenate((costs, np.repeat(costs[-1:, :], 8 - costs.shape[0], axis=0)))
     aliases = ("candidate-baseline", "candidate-b", "candidate-a")
+    task_ids = tuple(f"task-{index:02d}" for index in range(scores.shape[0]))
     bank = KnnEvidenceBank(
-        task_ids=("task-a", "task-b", "task-c"),
+        task_ids=task_ids,
         candidate_aliases=aliases,
-        embeddings=np.asarray(((1.0, 0.0),) * 3, dtype=np.float32),
+        embeddings=np.asarray(((1.0, 0.0),) * len(task_ids), dtype=np.float32),
         scores=scores,
         candidate_costs=costs,
         score_counts=(~np.isnan(scores)).astype(np.int32),
         cost_counts=(~np.isnan(costs)).astype(np.int32),
-        workload_weights=np.ones(3, dtype=np.float64),
+        workload_weights=np.ones(len(task_ids), dtype=np.float64),
         novelty_floor=0.5,
     )
     bank.validate()
@@ -217,8 +219,8 @@ def _fixture(
         bank_artifact_id=manifest.bank_artifact_id,
         bank_sha256=manifest.bank_sha256,
         guard=KnnGuard(
-            maximum_neighbors=3,
-            minimum_paired_observations=3,
+            maximum_neighbors=len(task_ids),
+            minimum_paired_observations=8,
             relative_similarity_threshold=0.95,
             uncertainty_multiplier=0.5,
             quality_tolerance=0.0,

@@ -289,7 +289,7 @@ def _estimate_candidate(
     conservative = mean_difference - uncertainty
     threshold = -policy.guard.quality_tolerance
     rejection = None
-    if paired_count < policy.guard.minimum_paired_observations:
+    if paired_count < max(8, policy.guard.minimum_paired_observations):
         rejection = "insufficient_pairs"
     elif bool(np.any(differences < threshold) and np.any(differences > threshold)):
         rejection = "neighbor_disagreement"
