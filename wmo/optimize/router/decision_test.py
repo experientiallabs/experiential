@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
 from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
 from wmo.common.routing import KnnGuard, KnnRouterPolicy, RoutingDecision
@@ -75,6 +76,54 @@ def test_bank_owns_read_only_copies_and_rejects_forced_mutation() -> None:
     bank.scores[0, 0] = 0.0
     with pytest.raises(RouterDecisionError, match="content has mutated"):
         _select(policy, manifest, bank, np.asarray((1.0, 0.0)))
+
+
+def test_guard_rejects_a_single_paired_observation() -> None:
+    """A one-sample estimate cannot represent measurable routing uncertainty."""
+    with pytest.raises(ValidationError, match="minimum_paired_observations"):
+        KnnGuard(
+            maximum_neighbors=3,
+            minimum_paired_observations=1,
+            relative_similarity_threshold=0.95,
+            uncertainty_multiplier=0.5,
+            quality_tolerance=0.0,
+        )
+
+
+def test_one_pair_falls_back_but_two_consistent_pairs_can_route() -> None:
+    """The minimum valid guard measures variance and never routes from one comparison."""
+    scores = np.asarray(
+        (
+            (0.5, 0.9, 0.0),
+            (0.5, float("nan"), 0.0),
+            (0.5, float("nan"), 0.0),
+        ),
+        dtype=np.float32,
+    )
+    costs = np.asarray(((0.5, 0.1, 0.6),) * 3, dtype=np.float64)
+    policy, manifest, bank = _fixture(scores, costs)
+    guard = policy.guard.model_copy(update={"minimum_paired_observations": 2})
+    policy = policy.model_copy(update={"guard": guard})
+
+    one_pair = _select(policy, manifest, bank, np.asarray((1.0, 0.0)))
+
+    assert one_pair.selected_alias == policy.baseline_alias
+    assert one_pair.paired_count == 1
+    assert one_pair.fallback_reason == "insufficient_pairs"
+
+    two_scores = scores.copy()
+    two_scores[1, 1] = 0.9
+    two_bank = _fixture(two_scores, costs)[2]
+    two_manifest = manifest.model_copy(
+        update={"bank_sha256": hashlib.sha256(bank_bytes(two_bank)).hexdigest()}
+    )
+    two_policy = policy.model_copy(update={"bank_sha256": two_manifest.bank_sha256})
+
+    two_pairs = _select(two_policy, two_manifest, two_bank, np.asarray((1.0, 0.0)))
+
+    assert two_pairs.selected_alias == "candidate-b"
+    assert two_pairs.paired_count == 2
+    assert two_pairs.uncertainty == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize(

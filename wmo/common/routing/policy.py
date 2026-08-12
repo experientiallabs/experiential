@@ -15,7 +15,7 @@ class KnnGuard(ContractModel):
     """Conservative evidence thresholds used by the offline guarded kNN policy."""
 
     maximum_neighbors: int = Field(gt=0)
-    minimum_paired_observations: int = Field(gt=0)
+    minimum_paired_observations: int = Field(ge=2)
     relative_similarity_threshold: float = Field(ge=0, le=1)
     uncertainty_multiplier: float = Field(ge=0)
     quality_tolerance: float
