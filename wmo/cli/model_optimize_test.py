@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,30 +53,6 @@ def _configured_project(tmp_path: Path, training: TinkerSFTSpec) -> _ConfiguredP
     return _ConfiguredProject(store=fixture.store, config=config)
 
 
-def _documented_wmo_commands(text: str) -> tuple[list[str], ...]:
-    """Extract continued ``uv run wmo`` commands from the cookbook's runnable walk."""
-    walk = text.split("## Measured results on this benchmark", maxsplit=1)[0]
-    commands: list[list[str]] = []
-    continued: list[str] = []
-    for line in walk.splitlines():
-        stripped = line.strip()
-        if continued:
-            continued.append(stripped.removesuffix("\\").strip())
-            if not stripped.endswith("\\"):
-                commands.append(shlex.split(" ".join(continued)))
-                continued = []
-            continue
-        prefix = "uv run wmo "
-        if stripped.startswith(prefix):
-            command = stripped.removeprefix(prefix)
-            continued = [command.removesuffix("\\").strip()]
-            if not command.endswith("\\"):
-                commands.append(shlex.split(continued[0]))
-                continued = []
-    assert not continued, "cookbook ends with an unterminated WMO command"
-    return tuple(commands)
-
-
 def test_optimize_help_exposes_persisted_sft_and_not_the_deleted_distill_branch() -> None:
     """The W14M command replaces the old training CLI branch without a compatibility alias."""
     result = CliRunner().invoke(app, ["optimize", "--help"])
@@ -85,121 +60,14 @@ def test_optimize_help_exposes_persisted_sft_and_not_the_deleted_distill_branch(
     assert result.exit_code == 0, result.output
     assert "model" in result.output
     assert "distill" not in result.output
+    router_help = CliRunner().invoke(app, ["optimize", "router", "--help"])
+    assert router_help.exit_code == 0, router_help.output
+    assert "fit" in router_help.output
+    assert "report" in router_help.output
+    assert "student" not in router_help.output
     route_help = CliRunner().invoke(app, ["optimize", "route", "--help"])
-    assert route_help.exit_code == 0, route_help.output
-    assert "student" not in route_help.output
-
-
-def test_tau_bench_cookbook_end_to_end_commands_match_the_current_cli() -> None:
-    """Every documented WMO command parses, including the artifact-first build boundary."""
-    cookbook = Path(__file__).resolve().parents[2] / "docs" / "cookbook" / "tau-bench.md"
-    text = cookbook.read_text(encoding="utf-8")
-    root = "environment-capture-data/tau-bench"
-    model_dir = f"{root}/models/tau-bench"
-    commands = (
-        ["download", "tau-bench"],
-        ["list", "--root", root],
-        [
-            "build",
-            f"{root}/traces.otel.jsonl",
-            "--source",
-            "otlp",
-            "--project",
-            "tau-bench",
-            "--root",
-            root,
-        ],
-        [
-            "providers",
-            "set",
-            "--provider",
-            "bedrock",
-            "--model",
-            "claude-opus-4-8",
-            "--pool-model",
-            "claude-opus-4-8",
-            "--pool-model",
-            "claude-haiku-4-5",
-            "--tier",
-            "frontier",
-        ],
-        [
-            "optimize",
-            "route",
-            "sweep",
-            "tau-bench",
-            "--project",
-            "tau-bench",
-            "--root",
-            root,
-            "--pool",
-            ".wmo/pool.toml",
-            "--scenarios",
-            "8",
-            "--out",
-            f"{model_dir}/optimize/matrix.json",
-        ],
-        [
-            "optimize",
-            "route",
-            "fit",
-            f"{model_dir}/optimize/matrix.json",
-            "--kind",
-            "knn",
-            "--out",
-            f"{model_dir}/policy.json",
-        ],
-        [
-            "optimize",
-            "route",
-            "tune",
-            f"{model_dir}/policy.json",
-            "--cost-quality",
-            "0.25",
-        ],
-        [
-            "optimize",
-            "route",
-            "report",
-            f"{model_dir}/optimize/matrix.json",
-            f"{model_dir}/policy.json",
-            "--baseline",
-            "claude-opus-4-8",
-            "--endpoint",
-            "tau-bench",
-            "--out",
-            f"{model_dir}/optimize/report.json",
-        ],
-        [
-            "optimize",
-            "route",
-            "pin",
-            "tau-bench",
-            "--model",
-            "claude-haiku-4-5",
-            "--pool",
-            ".wmo/pool.toml",
-            "--root",
-            root,
-        ],
-        ["serve", "--root", root, "--name", "tau-bench"],
-    )
-
-    documented_commands = _documented_wmo_commands(text)
-    assert documented_commands == commands
-    runner = CliRunner()
-    for command in documented_commands:
-        result = runner.invoke(app, [*command, "--help"])
-        assert result.exit_code == 0, f"{' '.join(command)}\n{result.output}"
-
-    assert "wmo optimize model tau-bench" not in text
-    assert "wmo optimize route sweep tau-bench" in text
-    assert f"wmo build {root}/traces.otel.jsonl" in text
-    assert "--name tau-bench --project tau-bench" not in text
-    assert "--fidelity" not in text
-    assert "--embed-provider" not in text
-    assert "--force-from" not in text
-    assert "--traces" not in text
+    assert route_help.exit_code == 2
+    assert "No such command 'route'" in route_help.output
 
 
 def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(

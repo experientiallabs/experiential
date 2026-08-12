@@ -65,14 +65,6 @@ _DOCSTRING_TOMBSTONE_ROWS: Final[tuple[str, ...]] = (
     'wmo/cli/app.py|scenarios_verify|function|missing-args-section',
     'wmo/cli/app.py|serve|function|missing-args-section',
     'wmo/cli/app.py|serve|function|missing-raises-section',
-    'wmo/cli/model_app.py|probe|function|missing-args-section',
-    'wmo/cli/model_app.py|probe|function|missing-raises-section',
-    'wmo/cli/model_app.py|report|function|missing-args-section',
-    'wmo/cli/model_app.py|run|function|missing-args-section',
-    'wmo/cli/optimize_model_app.py|build_endpoint_scorecard|function|missing-args-section',
-    'wmo/cli/optimize_model_app.py|build_endpoint_scorecard|function|missing-returns-section',
-    'wmo/cli/optimize_model_app.py|optimize_model|function|missing-args-section',
-    'wmo/cli/optimize_model_app.py|optimize_model|function|missing-raises-section',
     'wmo/cli/platform_cmds.py|login|function|missing-args-section',
     'wmo/cli/platform_cmds.py|login|function|missing-raises-section',
     'wmo/cli/platform_cmds.py|login|function|nontrivial-one-line-docstring',
@@ -636,8 +628,8 @@ DOCSTRING_TOMBSTONES: frozenset[DocstringViolation] = frozenset(
     DocstringViolation(*row.split("|", maxsplit=3)) for row in _DOCSTRING_TOMBSTONE_ROWS
 )
 DELETED_OWNER_DOCSTRING_PATHS: Final[frozenset[str]] = frozenset(
-    """
-wmo/cli/run_cmd.py wmo/optimize/routing/__init__.py
+    """wmo/cli/model_app.py wmo/cli/optimize_model_app.py wmo/cli/run_cmd.py
+wmo/optimize/routing/__init__.py
 wmo/optimize/routing/cluster_labels.py wmo/optimize/routing/compression.py
 wmo/optimize/routing/deepswe.py wmo/optimize/routing/embedding_cache.py
 wmo/optimize/routing/evaluation.py wmo/optimize/routing/fit.py

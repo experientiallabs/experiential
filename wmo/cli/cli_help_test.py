@@ -53,6 +53,7 @@ def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
     ):
         assert marker not in result.output
 
+
 def test_removed_route_owner_is_not_callable() -> None:
     """The W10 clean break leaves no parallel legacy router CLI owner."""
     result = runner.invoke(app, ["optimize", "route", "--help"])
