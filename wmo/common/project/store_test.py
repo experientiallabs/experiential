@@ -101,6 +101,59 @@ def test_corruption_and_crash_do_not_create_valid_partial_artifacts(
     assert not tuple(store.paths.artifacts_directory.glob(".task-set-v2.*.partial"))
 
 
+def test_read_bytes_rechecks_the_exact_file_snapshot_after_full_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement after `read` cannot make `read_bytes` return unchecked data."""
+    store = _store(tmp_path)
+    store.artifacts.write_json(
+        artifact_id="task-set-v1",
+        artifact_type="task-set",
+        envelope=_envelope(),
+        files={"tasks.json": {"task_ids": ["task-1"]}},
+    )
+    target = store.paths.artifact_file("task-set-v1", "tasks.json")
+    verified_read = store.artifacts.read
+
+    def replace_after_verification(artifact_id: str) -> project_store_module.StoredArtifact:
+        stored = verified_read(artifact_id)
+        target.write_bytes(b'{"task_ids":["task-replaced"]}')
+        return stored
+
+    monkeypatch.setattr(store.artifacts, "read", replace_after_verification)
+
+    with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
+        store.artifacts.read_bytes("task-set-v1", "tasks.json")
+
+
+def test_read_bytes_rejects_a_symlink_swapped_after_full_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement symlink cannot escape an artifact after `read` verified it."""
+    store = _store(tmp_path)
+    store.artifacts.write_json(
+        artifact_id="task-set-v1",
+        artifact_type="task-set",
+        envelope=_envelope(),
+        files={"tasks.json": {"task_ids": ["task-1"]}},
+    )
+    target = store.paths.artifact_file("task-set-v1", "tasks.json")
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b'{"task_ids":["outside"]}')
+    verified_read = store.artifacts.read
+
+    def replace_after_verification(artifact_id: str) -> project_store_module.StoredArtifact:
+        stored = verified_read(artifact_id)
+        target.unlink()
+        target.symlink_to(outside)
+        return stored
+
+    monkeypatch.setattr(store.artifacts, "read", replace_after_verification)
+
+    with pytest.raises(ArtifactCorruptionError, match="unsafe or unreadable"):
+        store.artifacts.read_bytes("task-set-v1", "tasks.json")
+
+
 def test_secret_boundary_and_only_mutable_review_file(tmp_path: Path) -> None:
     """Artifacts reject credentials while review JSON may be atomically replaced as a draft."""
     store = _store(tmp_path)

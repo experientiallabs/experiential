@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from atexit import register
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -20,11 +22,79 @@ POSTHOG_PROJECT_API_KEY = "phc_rPFfCufWpxyctR7duEZTTXovP4k5kbHqSqzd4Z4MQJdL"
 POSTHOG_HOST = "https://us.i.posthog.com"
 
 TelemetryValue = str | int | float | bool | None
-TelemetryProperties = dict[str, TelemetryValue]
+TelemetryProperties = Mapping[str, TelemetryValue]
 
 _FALSE_VALUES = {"0", "false", "off", "no"}
 _TRUE_VALUES = {"1", "true", "on", "yes"}
 _CLIENTS: dict[tuple[str, str], Posthog] = {}
+_ALLOWED_EVENT_PROPERTIES: dict[str, frozenset[str]] = {
+    "wmo build completed": frozenset(
+        {
+            "success",
+            "input_trace_count",
+            "input_step_count",
+            "train_trace_count",
+            "val_trace_count",
+            "heldout_trace_count",
+            "indexed_step_count",
+            "rollouts_used",
+            "frontier_size",
+            "duration_seconds",
+            "llm_call_count",
+            "input_tokens",
+            "output_tokens",
+            "cost_usd",
+        }
+    ),
+    "wmo eval completed": frozenset(
+        {
+            "success",
+            "eval_mode",
+            "file_count",
+            "scored_step_count",
+            "rag_enabled",
+            "train_split",
+            "top_k",
+        }
+    ),
+    "wmo generated trace started": frozenset({"generated_trace_count"}),
+    "wmo generated step failed": frozenset({"success", "duration_seconds"}),
+    "wmo generated step completed": frozenset(
+        {
+            "success",
+            "generated_step_count",
+            "session_step_count",
+            "duration_seconds",
+            "input_tokens",
+            "output_tokens",
+            "cost_usd",
+        }
+    ),
+}
+_BOOLEAN_PROPERTIES = frozenset({"success", "rag_enabled"})
+_COUNT_PROPERTIES = frozenset(
+    {
+        "input_trace_count",
+        "input_step_count",
+        "train_trace_count",
+        "val_trace_count",
+        "heldout_trace_count",
+        "indexed_step_count",
+        "rollouts_used",
+        "frontier_size",
+        "llm_call_count",
+        "input_tokens",
+        "output_tokens",
+        "file_count",
+        "scored_step_count",
+        "top_k",
+        "generated_trace_count",
+        "generated_step_count",
+        "session_step_count",
+    }
+)
+_NONNEGATIVE_MEASUREMENTS = frozenset({"duration_seconds", "cost_usd"})
+_EVAL_MODES = frozenset({"ad_hoc", "suite"})
 
 
 @dataclass
@@ -81,6 +151,9 @@ def capture(
     root: str | Path = ARTIFACT_DIR,
 ) -> bool:
     """Send one anonymous metadata-only event. Returns False when skipped or failed."""
+    safe_properties = _sanitize_properties(event, properties)
+    if safe_properties is None:
+        return False
     if not _enabled(root):
         return False
     api_key = os.getenv("WMO_POSTHOG_PROJECT_API_KEY", POSTHOG_PROJECT_API_KEY).strip()
@@ -89,20 +162,19 @@ def capture(
     host = os.getenv("WMO_POSTHOG_HOST", POSTHOG_HOST).rstrip("/")
     try:
         distinct_id = ensure_telemetry_anonymous_id(root)
-        event_properties: TelemetryProperties = {
+        event_properties = {
             "$process_person_profile": False,
             "wmo_version": _wmo_version(),
             "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
-            **(properties or {}),
         }
-        # Never log prompts, traces, actions, observations, paths, models, credentials, or text.
+        event_properties.update(safe_properties)
         message_id = _posthog_client(api_key, host).capture(
             event,
             distinct_id=distinct_id,
             properties=event_properties,
         )
         return message_id is not None
-    except (OSError, ValueError):
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -125,7 +197,6 @@ def capture_build_completed(
             "val_trace_count": stats.val_trace_count,
             "heldout_trace_count": stats.heldout_trace_count,
             "indexed_step_count": stats.indexed_step_count,
-            "gepa_budget": gepa_budget,
             "rollouts_used": rollouts_used,
             "frontier_size": frontier_size,
             "duration_seconds": round(record.duration_seconds, 3),
@@ -135,6 +206,62 @@ def capture_build_completed(
             "cost_usd": round(record.total.cost_usd, 6),
         },
         root=root,
+    )
+
+
+def _sanitize_properties(
+    event: str,
+    properties: TelemetryProperties | None,
+) -> dict[str, TelemetryValue] | None:
+    """Return validated aggregate metadata, rejecting arbitrary telemetry egress."""
+    allowed_properties = _ALLOWED_EVENT_PROPERTIES.get(event)
+    if allowed_properties is None:
+        return None
+    supplied_properties: TelemetryProperties = {} if properties is None else properties
+    if not set(supplied_properties).issubset(allowed_properties):
+        return None
+    safe_properties: dict[str, TelemetryValue] = {}
+    for name, value in supplied_properties.items():
+        if value is None:
+            continue
+        if not _is_safe_property_value(name, value):
+            return None
+        safe_properties[name] = value
+    return safe_properties
+
+
+def _is_safe_property_value(name: str, value: TelemetryValue) -> bool:
+    """Validate one explicitly permitted aggregate property value."""
+    if name in _BOOLEAN_PROPERTIES:
+        return isinstance(value, bool)
+    if name in _COUNT_PROPERTIES:
+        return type(value) is int and value >= 0
+    if name in _NONNEGATIVE_MEASUREMENTS:
+        return _is_nonnegative_finite_number(value)
+    if name == "train_split":
+        return _is_unit_interval_number(value)
+    if name == "eval_mode":
+        return isinstance(value, str) and value in _EVAL_MODES
+    return False
+
+
+def _is_nonnegative_finite_number(value: TelemetryValue) -> bool:
+    """Return whether a telemetry measurement is finite and nonnegative."""
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int | float)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def _is_unit_interval_number(value: TelemetryValue) -> bool:
+    """Return whether a telemetry fraction is finite and falls from zero through one."""
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int | float)
+        and math.isfinite(value)
+        and 0 <= value <= 1
     )
 
 
@@ -157,7 +284,6 @@ def capture_eval_completed(
             "file_count": file_count,
             "scored_step_count": scored_step_count,
             "rag_enabled": rag_enabled,
-            "sample_turns": sample_turns,
             "train_split": train_split,
             "top_k": top_k,
         },

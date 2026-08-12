@@ -151,8 +151,10 @@ class FidelityReport(ArtifactEnvelope):
     def _require_consistent_fidelity_counts(self) -> FidelityReport:
         if len(self.overlap_cell_ids) != self.planned_overlap_count:
             raise ValueError("fidelity overlap cells must match the planned overlap count")
-        if self.usable_overlap_count + self.failed_overlap_count > self.planned_overlap_count:
-            raise ValueError("usable and failed overlap counts exceed the planned overlap count")
+        if self.usable_overlap_count + self.failed_overlap_count != self.planned_overlap_count:
+            raise ValueError(
+                "usable and failed overlap counts must match the planned overlap count"
+            )
         failure_cell_ids = tuple(failure.cell_id for failure in self.failures)
         if len(set(failure_cell_ids)) != len(failure_cell_ids):
             raise ValueError("fidelity failures must not repeat an overlap cell")

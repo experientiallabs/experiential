@@ -6,9 +6,10 @@ import hashlib
 import logging
 import os
 import shutil
+import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
@@ -23,7 +24,7 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
-from wmo.common.project.manifests import ArtifactManifest, file_digest
+from wmo.common.project.manifests import ArtifactFile, ArtifactManifest, file_digest
 from wmo.common.project.paths import ProjectPaths, validate_local_id
 from wmo.common.project.project import ProjectConfig, load_project_config, write_project_config
 
@@ -268,20 +269,8 @@ class ArtifactStore:
             raise ArtifactCorruptionError(
                 f"artifact {artifact_id} data files do not match its manifest"
             )
-        for relative_path, entry in expected_files.items():
-            payload = (directory / relative_path).read_bytes()
-            actual_digest = hashlib.sha256(payload).hexdigest()
-            if len(payload) != entry.size_bytes or actual_digest != entry.sha256:
-                raise ArtifactCorruptionError(
-                    f"artifact {artifact_id} data file digest mismatch: {relative_path}"
-                )
-            try:
-                _assert_payload_secret_free(relative_path, payload)
-            except ArtifactStoreError as exc:
-                raise ArtifactCorruptionError(
-                    f"artifact {artifact_id} data file violates the secret boundary: "
-                    f"{relative_path}"
-                ) from exc
+        for entry in expected_files.values():
+            _read_verified_artifact_file(directory, artifact_id, entry)
         return StoredArtifact(directory=directory, manifest=manifest)
 
     def read_bytes(self, artifact_id: str, relative_path: str) -> bytes:
@@ -300,11 +289,13 @@ class ArtifactStore:
         """
         stored = self.read(artifact_id)
         validated_path = validate_artifact_file_path(relative_path).as_posix()
-        if validated_path not in {entry.path for entry in stored.manifest.files}:
+        expected_files = {entry.path: entry for entry in stored.manifest.files}
+        entry = expected_files.get(validated_path)
+        if entry is None:
             raise ArtifactCorruptionError(
                 f"artifact {artifact_id} does not own data file {validated_path}"
             )
-        return (stored.directory / validated_path).read_bytes()
+        return _read_verified_artifact_file(stored.directory, artifact_id, entry)
 
     def list_ids(self) -> tuple[str, ...]:
         """Return completed artifact IDs, excluding partial directories and lock files.
@@ -433,6 +424,71 @@ def _assert_payload_secret_free(relative_path: str, payload: bytes) -> None:
         raise ArtifactStoreError(
             f"artifact data file {relative_path} violates the secret boundary"
         ) from exc
+
+
+def _read_verified_artifact_file(
+    directory: Path,
+    artifact_id: str,
+    entry: ArtifactFile,
+) -> bytes:
+    """Read one artifact file from a stable descriptor and verify those exact bytes."""
+    try:
+        payload = _read_artifact_file_snapshot(directory, entry.path)
+    except OSError as exc:
+        raise ArtifactCorruptionError(
+            f"artifact {artifact_id} has an unsafe or unreadable data file: {entry.path}"
+        ) from exc
+    actual_digest = hashlib.sha256(payload).hexdigest()
+    if len(payload) != entry.size_bytes or actual_digest != entry.sha256:
+        raise ArtifactCorruptionError(
+            f"artifact {artifact_id} data file digest mismatch: {entry.path}"
+        )
+    try:
+        _assert_payload_secret_free(entry.path, payload)
+    except ArtifactStoreError as exc:
+        raise ArtifactCorruptionError(
+            f"artifact {artifact_id} data file violates the secret boundary: {entry.path}"
+        ) from exc
+    return payload
+
+
+def _read_artifact_file_snapshot(directory: Path, relative_path: str) -> bytes:
+    """Read a regular descendant without following a replaced path component."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("secure artifact reads require O_NOFOLLOW")
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW)
+    current_fd = directory_fd
+    try:
+        if not stat.S_ISDIR(os.fstat(current_fd).st_mode):
+            raise OSError("artifact directory is not a directory")
+        parts = PurePosixPath(relative_path).parts
+        for component in parts[:-1]:
+            next_fd = os.open(component, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
+            try:
+                if not stat.S_ISDIR(os.fstat(next_fd).st_mode):
+                    raise OSError("artifact data path has a non-directory component")
+            except OSError:
+                os.close(next_fd)
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+        file_descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+                raise OSError("artifact data path is not a regular file")
+            return _read_file_descriptor(file_descriptor)
+        finally:
+            os.close(file_descriptor)
+    finally:
+        os.close(current_fd)
+
+
+def _read_file_descriptor(file_descriptor: int) -> bytes:
+    """Read all available bytes from one already-open regular file descriptor."""
+    chunks: list[bytes] = []
+    while chunk := os.read(file_descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _artifact_data_files(directory: Path) -> tuple[str, ...]:
