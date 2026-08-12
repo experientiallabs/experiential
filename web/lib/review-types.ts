@@ -198,6 +198,7 @@ export type ScoreOverride = {
   lineage_id: string;
   dimension_id: string;
   score: Score;
+  submission_id: string;
 };
 
 export type CalibrationApproval = {

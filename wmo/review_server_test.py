@@ -647,6 +647,7 @@ def test_review_api_keeps_human_score_corrections_and_never_requires_provider_wo
             "lineage_id": first_task["lineage_group_id"],
             "dimension_id": "task-success",
             "score": 2,
+            "submission_id": "00000000-0000-4000-8000-000000000001",
         },
     )
     second = client.post(
@@ -656,13 +657,25 @@ def test_review_api_keeps_human_score_corrections_and_never_requires_provider_wo
             "lineage_id": first_task["lineage_group_id"],
             "dimension_id": "task-success",
             "score": 4,
+            "submission_id": "00000000-0000-4000-8000-000000000002",
+        },
+    )
+    delayed = client.post(
+        "/api/review/score",
+        json={
+            "rollout_id": "rollout-1",
+            "lineage_id": first_task["lineage_group_id"],
+            "dimension_id": "task-success",
+            "score": 2,
+            "submission_id": "00000000-0000-4000-8000-000000000001",
         },
     )
 
     assert first.status_code == 200
     assert "Score saved locally" in first.json()["notice"]
     assert second.status_code == 200
-    history = second.json()["snapshot"]["human_score_history"]["scores"]
+    assert delayed.status_code == 200
+    history = delayed.json()["snapshot"]["human_score_history"]["scores"]
     assert [score["score"] for score in history] == [2, 4]
     assert history[1]["supersedes_label_id"] == history[0]["label_id"]
 
@@ -693,6 +706,7 @@ def test_review_api_refreshes_w6_calibration_after_a_human_score_correction(
             "lineage_id": lineage_id,
             "dimension_id": "task-success",
             "score": 2,
+            "submission_id": "00000000-0000-4000-8000-000000000011",
         },
     )
     corrected = client.post(
@@ -702,6 +716,7 @@ def test_review_api_refreshes_w6_calibration_after_a_human_score_correction(
             "lineage_id": lineage_id,
             "dimension_id": "task-success",
             "score": 4,
+            "submission_id": "00000000-0000-4000-8000-000000000012",
         },
     )
 
@@ -760,6 +775,7 @@ def test_review_api_requires_explicit_calibration_confirmation_and_writes_artifa
                 "lineage_id": task_lineages[index % 2],
                 "dimension_id": "task-success",
                 "score": 2 + (index % 3),
+                "submission_id": f"00000000-0000-4000-8000-{index + 100:012d}",
             },
         )
         assert response.status_code == 200, response.text

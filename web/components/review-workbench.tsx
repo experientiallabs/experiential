@@ -164,7 +164,8 @@ export function ReviewWorkbench({ api = localReviewApi }: { api?: ReviewApi }) {
                 dimension_id: dimensionId,
                 lineage_id: lineageId,
                 rollout_id: rolloutId,
-                score
+                score,
+                submission_id: crypto.randomUUID()
               })
             }
             onSelectTask={setSelectedTaskId}

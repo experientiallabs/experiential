@@ -73,7 +73,8 @@ describe("ReviewWorkbench", () => {
         rollout_id: "rollout-refund",
         lineage_id: "lineage-refund",
         dimension_id: "task-success",
-        score: 4
+        score: 4,
+        submission_id: expect.any(String)
       })
     );
     expect(await screen.findByText("Score saved locally.")).toBeInTheDocument();

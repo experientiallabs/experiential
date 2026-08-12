@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 from urllib.parse import SplitResult, urlsplit
+from uuid import UUID
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -96,6 +97,7 @@ class ScoreOverride(BaseModel):
     lineage_id: ArtifactId
     dimension_id: ArtifactId
     score: ScoreValue
+    submission_id: UUID
 
 
 class CalibrationApproval(BaseModel):
@@ -295,6 +297,7 @@ class ReviewApplication:
             lineage_id=override.lineage_id,
             dimension_id=override.dimension_id,
             score=override.score,
+            submission_id=str(override.submission_id),
             created_at=self._now(),
         )
         notice = self._refresh_calibration(rubric_id=rubric.rubric_id, score_review=score_review)
