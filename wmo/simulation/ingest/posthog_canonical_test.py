@@ -261,7 +261,18 @@ def test_posthog_rejects_unmatched_explicit_tool_results() -> None:
     events = _posthog_events()
     generation_properties = _event_properties(events[0])
     generation_properties["$ai_output_choices"] = [
-        {"role": "assistant", "content": "I will check that for you."}
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "other-call",
+                    "function": {
+                        "name": "cancel_reservation",
+                        "arguments": {"reservation_id": "R-17"},
+                    },
+                }
+            ],
+        }
     ]
 
     result = normalize_posthog_payload(events, source=_source())
@@ -299,6 +310,7 @@ def test_posthog_same_tool_multicall_without_result_ids_pairs_fifo() -> None:
     ]
     first_result_properties = _event_properties(events[1])
     first_result_properties.pop("$ai_tool_call_id")
+    first_result_properties.pop("$ai_parent_id")
     events.insert(
         2,
         {
@@ -307,7 +319,6 @@ def test_posthog_same_tool_multicall_without_result_ids_pairs_fifo() -> None:
             "properties": {
                 "$ai_trace_id": _TRACE_ID,
                 "$ai_span_id": "tool-2",
-                "$ai_parent_id": "generation-1",
                 "$ai_span_name": "cancel_reservation",
                 "$ai_input_state": {"reservation_id": "R-18"},
                 "$ai_output_state": "Reservation cancelled",
