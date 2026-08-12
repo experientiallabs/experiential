@@ -87,8 +87,8 @@ UNTESTED_MODULE_NAMES = {"__init__.py", "__main__.py", "conftest.py"}
 CROSS_CUTTING_TESTS = {"wmo/repo_layout_test.py": "the repo layout itself: this file"}
 
 # The vendored trees, listed rather than matched on the name `vendor`: they are verbatim upstream
-# copies, so their own `test/` layout is theirs and not ours, and that exemption must not extend to a
-# product package that merely happens to be called `vendor`. A new vendored tree is added here in
+# copies, so their own `test/` layout is theirs and not ours, and that exemption must not extend to
+# a product package that merely happens to be called `vendor`. A new vendored tree is added here in
 # the change that vendors it.
 VENDORED_TREES = ("wmo/common/vendor/", "wmo/runtime/harness/vendor/")
 
