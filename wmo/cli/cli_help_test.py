@@ -73,11 +73,21 @@ def test_route_student_help_preserves_literal_pool_table_name() -> None:
 
 
 def test_readme_route_sweep_invocation_parses_without_a_provider() -> None:
-    """The documented project-owned task-set route sweep requires no provider for help."""
+    """The documented downloaded-root task-set sweep requires no provider for help."""
     result = runner.invoke(
         app,
-        ["optimize", "route", "sweep", "my-model", "--project", "my-project", "--help"],
+        [
+            "optimize",
+            "route",
+            "sweep",
+            "my-model",
+            "--project",
+            "my-project",
+            "--root",
+            "environment-capture-data/bird-sql",
+            "--help",
+        ],
     )
 
     assert result.exit_code == 0, result.output
-    assert "--project" in result.output
+    assert "--project" in result.output and "--root" in result.output

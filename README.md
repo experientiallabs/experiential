@@ -27,28 +27,38 @@ Re-run it to add another provider's models beside the ones already registered.
 **2. Tune a router on your OTel traces.**
 
 ```bash
-wmo build --file traces.jsonl --source otlp --project my-project
+# Download a published bundle containing prebuilt world models, then choose a name from the list.
+wmo download bird-sql
+wmo list --root environment-capture-data/bird-sql
+export WMO_ROOT=environment-capture-data/bird-sql
+export WORLD_MODEL=<name-from-wmo-list>
 
-# Choose an already available world model, then score every registered model on the immutable
-# held-out TaskSet from your traces. Build writes trace and task artifacts, not a simulator.
-wmo optimize route sweep existing-world-model --project my-project
+# Keep the TaskSet beside that model so sweep resolves both from the same local root.
+wmo build --file traces.jsonl --source otlp --project my-project --root "$WMO_ROOT"
+
+# Score every registered candidate on the immutable held-out TaskSet from your traces.
+wmo optimize route sweep "$WORLD_MODEL" --project my-project --root "$WMO_ROOT"
 
 # Deterministically reserve 30% for reporting and fit on the other 70%
 wmo optimize route fit matrix.json --kind knn \
-  --out .wmo/models/existing-world-model/policy.json
+  --out "$WMO_ROOT/models/$WORLD_MODEL/policy.json"
 ```
+
+`wmo build` writes trace and task artifacts, not a simulator. The downloaded bundle supplies the
+world model used above; a customer-specific world model can instead be placed under the same
+`<root>/models/<name>/` contract.
 
 **3. Serve it.**
 
 ```bash
-wmo serve --name existing-world-model
+wmo serve --root "$WMO_ROOT" --name "$WORLD_MODEL"
 ```
 
 See what it bought you against the model you were using before. The report automatically excludes
 the router-fit scenarios recorded in the policy:
 
 ```bash
-wmo optimize route report matrix.json .wmo/models/existing-world-model/policy.json \
+wmo optimize route report matrix.json "$WMO_ROOT/models/$WORLD_MODEL/policy.json" \
   --baseline gpt-5.6-sol
 ```
 
