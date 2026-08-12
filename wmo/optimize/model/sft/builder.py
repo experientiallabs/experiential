@@ -9,12 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, ValidationError
+from pydantic import ValidationError
 
 from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
-    ContractModel,
     Sha256,
     canonical_json_bytes,
     sha256_json,
@@ -30,6 +29,7 @@ from wmo.optimize.model.sft.contracts import (
     InfrastructureFailureEvent,
     PartitionedSFTExample,
     ProductionSFTSource,
+    SFTBuildSpec,
     SFTContextEvent,
     SFTDataset,
     SFTDatasetArtifact,
@@ -59,14 +59,6 @@ from wmo.optimize.model.sft.sources import (
 
 class SFTBuildError(ValueError):
     """Raised when SFT input provenance, partitioning, or artifact integrity is invalid."""
-
-
-class SFTBuildSpec(ContractModel):
-    """Deterministic controls for one frozen SFT dataset build."""
-
-    held_out_fraction: float = Field(default=0.20, gt=0, lt=1)
-    representative_sample_count: int = Field(default=3, ge=0)
-    split_salt: str = Field(default="wmo-sft-split-v1", min_length=1, max_length=256)
 
 
 @dataclass(frozen=True)
@@ -247,6 +239,7 @@ def build_sft_dataset(
         ),
     )
     return SFTDatasetArtifact(
+        build_spec=spec,
         dataset=dataset,
         sources=tuple(source_references),
         partitions=partitions,
@@ -346,6 +339,7 @@ def load_sft_dataset(
     except (ArtifactCorruptionError, ValidationError, ValueError) as exc:
         raise SFTBuildError(f"frozen SFT dataset {dataset_id} has invalid data files") from exc
     artifact = SFTDatasetArtifact(
+        build_spec=metadata.build_spec,
         dataset=metadata.dataset,
         sources=metadata.sources,
         partitions=metadata.partitions,
@@ -361,6 +355,53 @@ def load_sft_dataset(
             f"SFT dataset {dataset_id} is insufficient and cannot be consumed for training"
         )
     return artifact
+
+
+def load_verified_sft_dataset(store: ProjectStore, dataset_id: ArtifactId) -> SFTDatasetArtifact:
+    """Reload and rebuild one accepted dataset from its persisted W12 evidence chain.
+
+    Args:
+        store: Project-local store owning the dataset and every transitive source artifact.
+        dataset_id: Stable ID of the previously persisted W12 dataset.
+
+    Returns:
+        The canonical dataset only when its stored bytes equal a fresh deterministic rebuild.
+
+    Raises:
+        SFTBuildError: Any dataset, source, evidence, input, partition, build, or fingerprint
+            invariant cannot be reproduced from the immutable project store.
+    """
+    loaded = load_sft_dataset(store, dataset_id)
+    production_sources = tuple(
+        ProductionSFTSource(acceptance_evidence_id=source.acceptance_evidence.artifact_id)
+        for source in loaded.sources
+        if source.kind == "production_trace"
+    )
+    teacher_sources = tuple(
+        TeacherSFTSource(acceptance_evidence_id=source.acceptance_evidence.artifact_id)
+        for source in loaded.sources
+        if source.kind == "teacher_rollout"
+    )
+    try:
+        rebuilt = build_sft_dataset(
+            store=store,
+            production_sources=production_sources,
+            teacher_sources=teacher_sources,
+            spec=loaded.build_spec,
+            created_at=loaded.dataset.created_at,
+            code_revision=loaded.dataset.code_revision,
+        )
+    except SFTBuildError:
+        raise
+    except ValueError as exc:
+        raise SFTBuildError(
+            f"frozen SFT dataset {dataset_id} cannot reproduce its evidence chain"
+        ) from exc
+    if rebuilt != loaded:
+        raise SFTBuildError(
+            f"frozen SFT dataset {dataset_id} does not equal its canonical evidence rebuild"
+        )
+    return loaded
 
 
 def _scan_source_actions(

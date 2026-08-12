@@ -24,7 +24,7 @@ from wmo.optimize.model.sft.tinker import (
     TinkerTrainerSession,
     tinker_messages_from_example,
 )
-from wmo.optimize.model.sft.training import TinkerSFTSpec
+from wmo.optimize.model.sft.training import TinkerSFTError, TinkerSFTSpec
 
 if TYPE_CHECKING:
     import tinker
@@ -257,9 +257,11 @@ class _Service:
     client: _ResumeClient
     calls: list[str]
 
-    def create_lora_training_client(self, base_model: str, rank: int) -> _ResumeClient:
+    def create_lora_training_client(
+        self, base_model: str, rank: int, seed: int | None = None
+    ) -> _ResumeClient:
         """Return the injected local client without constructing a Tinker service."""
-        self.calls.append(f"create:{base_model}:{rank}")
+        self.calls.append(f"create:{base_model}:{rank}:{seed}")
         return self.client
 
 
@@ -291,7 +293,37 @@ def test_backend_restores_before_renderer_setup_with_an_injected_local_service(
 
     assert isinstance(session, TinkerTrainerSession)
     assert calls == [
-        "create:Qwen/Qwen3-8B:8",
+        "create:Qwen/Qwen3-8B:8:0",
         "load:fake://state/checkpoint",
         "tokenizer",
     ]
+
+
+def test_context_truncation_retains_the_complete_two_token_target() -> None:
+    """A tight datum limit removes prompt context without dropping either target token."""
+    renderer = _DatumRenderer()
+    session = TinkerTrainerSession(
+        client=cast("tinker.TrainingClient", _TrainingClient()),
+        renderer=cast("Renderer", renderer),
+        spec=_spec().model_copy(update={"maximum_datum_tokens": 3}),
+    )
+
+    (datum,) = session.render_examples((_example(),))
+
+    assert isinstance(datum, TinkerSFTDatum)
+    assert datum.supervised_token_count == 2
+    assert datum.datum.model_input.to_ints() == [11, 12]
+    assert datum.datum.loss_fn_inputs["target_tokens"].data == [12, 13]
+    assert datum.datum.loss_fn_inputs["weights"].data == [1.0, 1.0]
+
+
+def test_datum_limit_rejects_instead_of_truncating_the_two_token_target() -> None:
+    """A limit too small for the complete target fails before any training dispatch."""
+    session = TinkerTrainerSession(
+        client=cast("tinker.TrainingClient", _TrainingClient()),
+        renderer=cast("Renderer", _DatumRenderer()),
+        spec=_spec().model_copy(update={"maximum_datum_tokens": 2}),
+    )
+
+    with pytest.raises(TinkerSFTError, match="complete supervised target"):
+        session.render_examples((_example(),))

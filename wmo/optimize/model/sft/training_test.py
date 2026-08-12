@@ -2,42 +2,46 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
 
 import pytest
 
-from wmo.common.core.artifacts import ArtifactInput
-from wmo.common.models import AssistantAction, NumericMeasurement
-from wmo.optimize.model.sft.contracts import (
-    AssistantActionEvent,
-    PartitionedSFTExample,
-    SFTDataset,
-    SFTDatasetArtifact,
-    SFTExample,
-    SFTInspectionReport,
-    SFTMessage,
-    TraceExampleSource,
+from wmo.common.core.artifacts import canonical_json_bytes
+from wmo.common.models import NumericMeasurement
+from wmo.common.project import ProjectStore
+from wmo.optimize.model.sft.builder import write_sft_dataset
+from wmo.optimize.model.sft.builder_test import (
+    _build as _build_fixture_dataset,
 )
-from wmo.optimize.model.sft.rendering import partitioned_rows_sha256
+from wmo.optimize.model.sft.builder_test import (
+    _store as _fixture_store,
+)
+from wmo.optimize.model.sft.builder_test import (
+    _write_production_source,
+)
+from wmo.optimize.model.sft.contracts import SFTDatasetArtifact, SFTExample
+from wmo.optimize.model.sft.rendering import (
+    canonical_partitioned_rows_jsonl,
+    partitioned_rows_sha256,
+)
 from wmo.optimize.model.sft.training import (
+    TinkerSFTAmbiguousStepError,
     TinkerSFTBudgetExceeded,
+    TinkerSFTError,
     TinkerSFTOptimizer,
     TinkerSFTResult,
     TinkerSFTResumeError,
     TinkerSFTSpec,
-    TrainerBatchResult,
     TrainerDatum,
     train_tinker_sft,
 )
+from wmo.optimize.model.sft.training_contracts import TrainerBatchResult
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
-_DIGEST = "d" * 64
 
 
 @dataclass(frozen=True)
@@ -68,7 +72,7 @@ class _FakeSession:
         if self._backend.fail_on_train_call == self._backend.train_calls:
             raise RuntimeError("injected training failure")
         self._backend.trained_example_ids.extend(datum.example_id for datum in datums)
-        return TrainerBatchResult(
+        result = TrainerBatchResult(
             loss=1.0 / self._backend.train_calls,
             gradient_norm=0.5,
             cost_usd=NumericMeasurement(
@@ -76,10 +80,13 @@ class _FakeSession:
                 provenance="observed",
             ),
         )
+        if self._backend.fail_after_train_call == self._backend.train_calls:
+            raise RuntimeError("injected failure after optimizer dispatch")
+        return result
 
     def save_state(self, checkpoint_name: str) -> str:
         self._backend.saved_state_names.append(checkpoint_name)
-        return f"fake://state/{checkpoint_name}"
+        return self._backend.state_resource or f"fake://state/{checkpoint_name}"
 
     def save_sampling_handle(self, model_name: str) -> str:
         self._backend.saved_model_names.append(model_name)
@@ -93,99 +100,62 @@ class _FakeBackend:
         self,
         *,
         cost_per_batch: float = 0.10,
+        conservative_cost_per_batch: float | None = 0.10,
         fail_on_train_call: int | None = None,
+        fail_after_train_call: int | None = None,
+        fail_on_cost_call: int | None = None,
+        state_resource: str | None = None,
     ) -> None:
         self.cost_per_batch = cost_per_batch
+        self.conservative_cost_per_batch = conservative_cost_per_batch
         self.fail_on_train_call = fail_on_train_call
+        self.fail_after_train_call = fail_after_train_call
+        self.fail_on_cost_call = fail_on_cost_call
+        self.state_resource = state_resource
         self.open_resume_paths: list[str | None] = []
         self.rendered_example_ids: list[str] = []
         self.trained_example_ids: list[str] = []
         self.saved_state_names: list[str] = []
         self.saved_model_names: list[str] = []
         self.train_calls = 0
+        self.cost_calls = 0
+
+    def conservative_step_cost(
+        self, spec: TinkerSFTSpec, *, batch_example_count: int
+    ) -> NumericMeasurement | None:
+        self.cost_calls += 1
+        if self.fail_on_cost_call == self.cost_calls:
+            raise RuntimeError("injected pre-dispatch planning failure")
+        if self.conservative_cost_per_batch is None:
+            return None
+        return NumericMeasurement(
+            value=self.conservative_cost_per_batch,
+            provenance="estimated",
+        )
 
     def open(self, spec: TinkerSFTSpec, resume_state_path: str | None) -> _FakeSession:
         self.open_resume_paths.append(resume_state_path)
         return _FakeSession(self)
 
 
-def _example(name: str, partition: Literal["train", "held_out"]) -> PartitionedSFTExample:
-    """Build one immutable W12-shaped SFT row for a deterministic training test."""
-    return PartitionedSFTExample(
-        partition=partition,
-        fingerprint=hashlib.sha256(name.encode("utf-8")).hexdigest(),
-        example=SFTExample(
-            example_id=f"example-{name}",
-            leakage_group_id=f"lineage-{name}",
-            task=f"Resolve request {name}.",
-            history=(
-                SFTMessage(role="system", content="Follow the support policy."),
-                SFTMessage(role="user", content=f"Customer request {name}."),
-                AssistantActionEvent(action=AssistantAction(content="I will investigate.")),
-            ),
-            target=AssistantAction(content=f"Resolved {name}."),
-            source=TraceExampleSource(
-                trace_id=f"trace-{name}",
-                acceptance_evidence=ArtifactInput(
-                    artifact_id="acceptance-evidence", sha256=_DIGEST
-                ),
-            ),
-            source_step_index=1,
-        ),
-    )
+@dataclass(frozen=True)
+class _PersistedDataset:
+    """Canonical persisted W12 fixture used through the public W13 entry boundary."""
+
+    store: ProjectStore
+    artifact: SFTDatasetArtifact
 
 
-def _dataset() -> SFTDatasetArtifact:
-    """Build one accepted frozen dataset with two train rows and one held-out row."""
-    rows = (
-        _example("train-a", "train"),
-        _example("train-b", "train"),
-        _example("held-out", "held_out"),
+def _persisted_dataset(tmp_path: Path) -> _PersistedDataset:
+    """Build and persist two verified production lineages through W12 services."""
+    store = _fixture_store(tmp_path / "project")
+    sources = (
+        _write_production_source(store, "train-source-a"),
+        _write_production_source(store, "train-source-b"),
     )
-    train_rows = tuple(row for row in rows if row.partition == "train")
-    held_out_rows = tuple(row for row in rows if row.partition == "held_out")
-    dataset = SFTDataset(
-        schema_version=1,
-        created_at=_TIME,
-        inputs=(ArtifactInput(artifact_id="acceptance-evidence", sha256=_DIGEST),),
-        code_revision="w12-fixture",
-        dataset_id="sft-dataset-fixture",
-        build_sha256="b" * 64,
-        status="accepted",
-        acceptance_rule_ids=("acceptance-rule",),
-        acceptance_evidence_ids=("acceptance-evidence",),
-        train_leakage_group_ids=tuple(sorted(row.example.leakage_group_id for row in train_rows)),
-        held_out_leakage_group_ids=tuple(
-            sorted(row.example.leakage_group_id for row in held_out_rows)
-        ),
-        train_example_ids=tuple(sorted(row.example.example_id for row in train_rows)),
-        held_out_example_ids=tuple(sorted(row.example.example_id for row in held_out_rows)),
-        examples_path="examples.jsonl",
-        examples_sha256=partitioned_rows_sha256(rows),
-    )
-    inspection = SFTInspectionReport(
-        report_id="sft-inspection-fixture",
-        dataset_id=dataset.dataset_id,
-        build_sha256=dataset.build_sha256,
-        source_count=1,
-        accepted_source_count=1,
-        eligible_action_count=len(rows),
-        fingerprint_count=len(rows),
-        connected_component_count=len(rows),
-        train_example_count=len(train_rows),
-        held_out_example_count=len(held_out_rows),
-        exclusions=(),
-        representative_train_example_ids=tuple(row.example.example_id for row in train_rows),
-        representative_held_out_example_ids=tuple(row.example.example_id for row in held_out_rows),
-    )
-    return SFTDatasetArtifact(
-        dataset=dataset,
-        sources=(),
-        partitions=(),
-        inspection=inspection,
-        representative_samples=rows,
-        rows=rows,
-    )
+    artifact = _build_fixture_dataset(store, production=sources)
+    write_sft_dataset(store, artifact)
+    return _PersistedDataset(store=store, artifact=artifact)
 
 
 def _spec(**overrides: int | float | str | None) -> TinkerSFTSpec:
@@ -205,6 +175,7 @@ def _spec(**overrides: int | float | str | None) -> TinkerSFTSpec:
 
 
 def _run(
+    fixture: _PersistedDataset,
     output_dir: Path,
     backend: _FakeBackend,
     *,
@@ -212,7 +183,8 @@ def _run(
 ) -> TinkerSFTResult:
     """Run the public operation with immutable test provenance."""
     return train_tinker_sft(
-        _dataset(),
+        fixture.store,
+        fixture.artifact.dataset.dataset_id,
         spec or _spec(),
         output_dir,
         backend=backend,
@@ -225,22 +197,26 @@ def test_fake_backend_consumes_only_train_rows_and_writes_terminal_provenance(
     tmp_path: Path,
 ) -> None:
     """The injected fake completes without a service client, credentials, or network call."""
+    fixture = _persisted_dataset(tmp_path)
     backend = _FakeBackend()
+    train_ids = tuple(
+        row.example.example_id for row in fixture.artifact.rows if row.partition == "train"
+    )
 
-    result = _run(tmp_path / "run", backend)
+    result = _run(fixture, tmp_path / "run", backend)
 
     assert backend.open_resume_paths == [None]
-    assert backend.rendered_example_ids == ["example-train-a", "example-train-b"]
-    assert backend.trained_example_ids == ["example-train-a", "example-train-b"]
-    assert result.dataset_id == "sft-dataset-fixture"
+    assert backend.rendered_example_ids == list(train_ids)
+    assert sorted(backend.trained_example_ids) == sorted(train_ids)
+    assert result.dataset_id == fixture.artifact.dataset.dataset_id
     assert result.training_step_count == 2
     assert result.total_cost_usd == NumericMeasurement(value=0.20, provenance="observed")
     manifest = json.loads((tmp_path / "run" / "manifest.json").read_text(encoding="utf-8"))
     model = json.loads((tmp_path / "run" / "model.json").read_text(encoding="utf-8"))
     terminal = json.loads((tmp_path / "run" / "result.json").read_text(encoding="utf-8"))
     metrics = (tmp_path / "run" / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    assert manifest["dataset_build_sha256"] == "b" * 64
-    assert manifest["dataset_examples_sha256"] == _dataset().dataset.examples_sha256
+    assert manifest["dataset_build_sha256"] == fixture.artifact.dataset.build_sha256
+    assert manifest["dataset_examples_sha256"] == fixture.artifact.dataset.examples_sha256
     assert model["sampling_handle"].startswith("fake://model/")
     assert terminal["model_id"] == model["model_id"]
     assert [json.loads(line)["record_type"] for line in metrics] == [
@@ -256,18 +232,20 @@ def test_resume_uses_last_durable_checkpoint_without_replaying_completed_batch(
     tmp_path: Path,
 ) -> None:
     """A retry restores the recorded state before training only the remaining batch."""
-    backend = _FakeBackend(fail_on_train_call=2)
+    fixture = _persisted_dataset(tmp_path)
+    backend = _FakeBackend(fail_on_cost_call=3)
     output_dir = tmp_path / "run"
 
-    with pytest.raises(RuntimeError, match="injected training failure"):
-        _run(output_dir, backend)
+    with pytest.raises(RuntimeError, match="planning failure"):
+        _run(fixture, output_dir, backend)
 
     saved_state = f"fake://state/{backend.saved_state_names[-1]}"
-    backend.fail_on_train_call = None
-    result = _run(output_dir, backend)
+    backend.fail_on_cost_call = None
+    result = _run(fixture, output_dir, backend)
 
     assert backend.open_resume_paths == [None, saved_state]
-    assert backend.trained_example_ids == ["example-train-a", "example-train-b"]
+    assert len(backend.trained_example_ids) == 2
+    assert len(set(backend.trained_example_ids)) == 2
     assert result.training_step_count == 2
     records = [
         json.loads(line)
@@ -282,90 +260,86 @@ def test_resume_uses_last_durable_checkpoint_without_replaying_completed_batch(
     ]
 
 
-def test_retry_after_an_uncheckpointed_metric_starts_a_new_base_attempt(tmp_path: Path) -> None:
-    """Abandoned pre-checkpoint metrics never become a later checkpoint's durable lineage."""
-    backend = _FakeBackend(fail_on_train_call=2)
+def test_crash_after_optimizer_dispatch_never_replays_and_reports_unknown_spend(
+    tmp_path: Path,
+) -> None:
+    """An unmatched pre-dispatch intent is an honest terminal ambiguity, never a retry cue."""
+    fixture = _persisted_dataset(tmp_path)
+    backend = _FakeBackend(fail_after_train_call=1)
     output_dir = tmp_path / "run"
-    spec = _spec(checkpoint_every_steps=2)
 
-    with pytest.raises(RuntimeError, match="injected training failure"):
-        _run(output_dir, backend, spec=spec)
+    with pytest.raises(RuntimeError, match="after optimizer dispatch"):
+        _run(fixture, output_dir, backend)
 
+    assert backend.train_calls == 1
     assert backend.saved_state_names == []
-    backend.fail_on_train_call = None
-    result = _run(output_dir, backend, spec=spec)
-
-    assert backend.open_resume_paths == [None, None]
-    assert backend.trained_example_ids == [
-        "example-train-a",
-        "example-train-a",
-        "example-train-b",
-    ]
-    records = [
-        json.loads(line)
-        for line in (output_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    assert [(record["record_type"], record["attempt_id"]) for record in records] == [
-        ("metric", 1),
-        ("metric", 2),
-        ("metric", 2),
-        ("checkpoint", 2),
-    ]
-    assert result.training_metric_count == 2
-    assert result.total_cost_usd == NumericMeasurement(value=0.20, provenance="observed")
+    backend.fail_after_train_call = None
+    with pytest.raises(TinkerSFTAmbiguousStepError, match="spend are unknown"):
+        _run(fixture, output_dir, backend)
+    assert backend.train_calls == 1
+    assert backend.open_resume_paths == [None]
 
 
 def test_completed_run_is_idempotent_and_does_not_open_another_trainer(tmp_path: Path) -> None:
     """A completed terminal result is returned from local provenance before backend composition."""
+    fixture = _persisted_dataset(tmp_path)
     backend = _FakeBackend()
     output_dir = tmp_path / "run"
 
-    first = _run(output_dir, backend)
-    second = _run(output_dir, backend)
+    first = _run(fixture, output_dir, backend)
+    second = _run(fixture, output_dir, backend)
 
     assert second == first
     assert backend.open_resume_paths == [None]
 
 
-def test_budget_exhaustion_persists_a_checkpoint_and_refuses_further_spend(
+def test_budget_refuses_a_step_whose_upper_bound_exceeds_remaining_spend(
     tmp_path: Path,
 ) -> None:
-    """Observed spend over the cap leaves a resumable checkpoint but no terminal model."""
-    backend = _FakeBackend(cost_per_batch=0.20)
+    """A $0.10 cap against a $0.20 bound dispatches no trainer or optimizer call."""
+    fixture = _persisted_dataset(tmp_path)
+    backend = _FakeBackend(cost_per_batch=0.20, conservative_cost_per_batch=0.20)
     output_dir = tmp_path / "run"
 
-    with pytest.raises(TinkerSFTBudgetExceeded, match="maximum_cost_usd"):
-        _run(output_dir, backend, spec=_spec(maximum_cost_usd=0.30, checkpoint_every_steps=10))
+    with pytest.raises(TinkerSFTBudgetExceeded, match="remaining budget"):
+        _run(fixture, output_dir, backend, spec=_spec(maximum_cost_usd=0.10))
 
-    records = [
-        json.loads(line)
-        for line in (output_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    assert [record["record_type"] for record in records] == ["metric", "metric", "checkpoint"]
-    assert not (output_dir / "model.json").exists()
-    opens_before_retry = list(backend.open_resume_paths)
-    with pytest.raises(TinkerSFTBudgetExceeded, match="already reached"):
-        _run(output_dir, backend, spec=_spec(maximum_cost_usd=0.30, checkpoint_every_steps=10))
-    assert backend.open_resume_paths == opens_before_retry
+    assert backend.open_resume_paths == []
+    assert backend.train_calls == 0
+
+
+def test_unknown_cost_refuses_before_open_or_optimizer_dispatch(tmp_path: Path) -> None:
+    """A budgeted concrete-style backend with no supported bound performs zero remote work."""
+    fixture = _persisted_dataset(tmp_path)
+    backend = _FakeBackend(conservative_cost_per_batch=None)
+
+    with pytest.raises(TinkerSFTBudgetExceeded, match="backend-proven"):
+        _run(fixture, tmp_path / "run", backend, spec=_spec(maximum_cost_usd=1.0))
+
+    assert backend.open_resume_paths == []
+    assert backend.train_calls == 0
 
 
 def test_changed_spec_cannot_reuse_an_append_only_run_directory(tmp_path: Path) -> None:
     """A run directory remains tied to its original frozen dataset and optimization settings."""
+    fixture = _persisted_dataset(tmp_path)
     backend = _FakeBackend()
     output_dir = tmp_path / "run"
-    _run(output_dir, backend)
+    _run(fixture, output_dir, backend)
 
     with pytest.raises(TinkerSFTResumeError, match="training spec"):
-        _run(output_dir, backend, spec=_spec(learning_rate=0.02))
+        _run(fixture, output_dir, backend, spec=_spec(learning_rate=0.02))
 
 
 def test_optimizer_delegates_to_the_same_injected_backend(tmp_path: Path) -> None:
     """The narrow optimizer seam adds no registry or alternate training implementation."""
+    fixture = _persisted_dataset(tmp_path)
     backend = _FakeBackend()
     optimizer = TinkerSFTOptimizer(backend)
 
     result = optimizer.optimize(
-        dataset=_dataset(),
+        store=fixture.store,
+        dataset_id=fixture.artifact.dataset.dataset_id,
         spec=_spec(),
         output_dir=tmp_path / "run",
         created_at=_TIME,
@@ -374,3 +348,99 @@ def test_optimizer_delegates_to_the_same_injected_backend(tmp_path: Path) -> Non
 
     assert result.training_step_count == 2
     assert backend.open_resume_paths == [None]
+
+
+def test_seed_deterministically_controls_schedule_order(tmp_path: Path) -> None:
+    """The same seed repeats exact batch order while a selected alternate seed changes it."""
+    fixture = _persisted_dataset(tmp_path)
+    first = _FakeBackend()
+    repeat = _FakeBackend()
+    alternate = _FakeBackend()
+
+    _run(fixture, tmp_path / "first", first, spec=_spec(seed=7))
+    _run(fixture, tmp_path / "repeat", repeat, spec=_spec(seed=7))
+    _run(fixture, tmp_path / "alternate", alternate, spec=_spec(seed=11))
+
+    assert first.trained_example_ids == repeat.trained_example_ids
+    assert first.trained_example_ids != alternate.trained_example_ids
+
+
+def test_forged_cross_split_persisted_input_never_opens_training(tmp_path: Path) -> None:
+    """Even manifest-digested forged rows fail W12 invariants before backend composition."""
+    fixture = _persisted_dataset(tmp_path)
+    original = fixture.artifact
+    held_out = next(row for row in original.rows if row.partition == "held_out")
+    forged_row = held_out.model_copy(
+        update={
+            "partition": "train",
+            "example": held_out.example.model_copy(update={"example_id": "forged-example"}),
+        }
+    )
+    rows = (*original.rows, forged_row)
+    dataset = original.dataset.model_copy(
+        update={
+            "dataset_id": "forged-cross-split",
+            "build_sha256": "f" * 64,
+            "train_example_ids": tuple(
+                sorted((*original.dataset.train_example_ids, forged_row.example.example_id))
+            ),
+            "examples_sha256": partitioned_rows_sha256(rows),
+        }
+    )
+    inspection = original.inspection.model_copy(
+        update={
+            "dataset_id": dataset.dataset_id,
+            "build_sha256": dataset.build_sha256,
+            "train_example_count": original.inspection.train_example_count + 1,
+        }
+    )
+    forged = original.model_copy(
+        update={"dataset": dataset, "inspection": inspection, "rows": rows}
+    )
+    fixture.store.artifacts.write(
+        artifact_id=dataset.dataset_id,
+        artifact_type="sft-dataset",
+        envelope=dataset,
+        files={
+            "dataset.json": canonical_json_bytes(forged.metadata()),
+            "examples.jsonl": canonical_partitioned_rows_jsonl(rows),
+        },
+    )
+    backend = _FakeBackend()
+
+    with pytest.raises(TinkerSFTError, match="not safe for training"):
+        train_tinker_sft(
+            fixture.store,
+            dataset.dataset_id,
+            _spec(),
+            tmp_path / "forged-run",
+            backend=backend,
+            created_at=_TIME,
+            code_revision="w13-test",
+        )
+
+    assert backend.open_resume_paths == []
+    assert backend.train_calls == 0
+
+
+def test_completed_reuse_refuses_when_event_log_is_deleted(tmp_path: Path) -> None:
+    """A terminal result is not trusted without its hash-bound checkpoint event lineage."""
+    fixture = _persisted_dataset(tmp_path)
+    backend = _FakeBackend()
+    output_dir = tmp_path / "run"
+    _run(fixture, output_dir, backend)
+    (output_dir / "events.jsonl").unlink()
+
+    with pytest.raises(TinkerSFTResumeError):
+        _run(fixture, output_dir, backend)
+
+
+def test_provider_token_url_is_rejected_before_checkpoint_persistence(tmp_path: Path) -> None:
+    """Provider resource strings with token query material never enter local artifacts."""
+    fixture = _persisted_dataset(tmp_path)
+    backend = _FakeBackend(state_resource="https://provider.test/state?token=secret-value")
+
+    with pytest.raises(TinkerSFTError, match="opaque provider resource ID"):
+        _run(fixture, tmp_path / "run", backend)
+
+    assert not (tmp_path / "run" / "result.json").exists()

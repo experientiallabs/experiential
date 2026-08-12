@@ -356,6 +356,14 @@ class SFTPartition(ContractModel):
         return value
 
 
+class SFTBuildSpec(ContractModel):
+    """Deterministic controls persisted with one frozen SFT dataset build."""
+
+    held_out_fraction: float = Field(default=0.20, gt=0, lt=1)
+    representative_sample_count: int = Field(default=3, ge=0)
+    split_salt: str = Field(default="wmo-sft-split-v1", min_length=1, max_length=256)
+
+
 class SFTSourceReference(ContractModel):
     """An auditable source and acceptance-evidence reference in a frozen dataset manifest."""
 
@@ -467,6 +475,7 @@ class SFTInspectionReport(ContractModel):
 class SFTDatasetMetadata(ContractModel):
     """All non-row frozen manifest data persisted beside canonical SFT JSONL examples."""
 
+    build_spec: SFTBuildSpec
     dataset: SFTDataset
     sources: tuple[SFTSourceReference, ...]
     partitions: tuple[SFTPartition, ...]
@@ -477,6 +486,7 @@ class SFTDatasetMetadata(ContractModel):
 class SFTDatasetArtifact(ContractModel):
     """Materialized dataset rows plus the immutable metadata required to reload and inspect them."""
 
+    build_spec: SFTBuildSpec
     dataset: SFTDataset
     sources: tuple[SFTSourceReference, ...]
     partitions: tuple[SFTPartition, ...]
@@ -487,6 +497,7 @@ class SFTDatasetArtifact(ContractModel):
     def metadata(self) -> SFTDatasetMetadata:
         """Return the immutable metadata file stored beside the canonical JSONL rows."""
         return SFTDatasetMetadata(
+            build_spec=self.build_spec,
             dataset=self.dataset,
             sources=self.sources,
             partitions=self.partitions,

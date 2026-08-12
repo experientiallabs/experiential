@@ -20,7 +20,7 @@ from wmo.optimize.model.sft.contracts import (
     SFTMessage,
     ToolEvent,
 )
-from wmo.optimize.model.sft.training import (
+from wmo.optimize.model.sft.training_contracts import (
     TinkerSFTError,
     TinkerSFTSpec,
     TrainerBatchResult,
@@ -92,6 +92,18 @@ class TinkerTrainerBackend:
         """
         self._service = service
 
+    def conservative_step_cost(self, spec: TinkerSFTSpec, *, batch_example_count: int) -> None:
+        """Return no cost bound because the pinned SDK exposes no supported estimator.
+
+        Args:
+            spec: Frozen training settings, unused because no SDK estimate exists.
+            batch_example_count: Planned row count, also insufficient for an SDK-backed bound.
+
+        Returns:
+            None. A run with ``maximum_cost_usd`` therefore fails before opening this backend.
+        """
+        return None
+
     def open(self, spec: TinkerSFTSpec, resume_state_path: str | None) -> TrainerSession:
         """Create a managed LoRA client and restore a durable state before rendering any datum.
 
@@ -109,7 +121,11 @@ class TinkerTrainerBackend:
         from tinker_cookbook.model_info import get_recommended_renderer_name
         from tinker_cookbook.renderers import get_renderer
 
-        client = self._service.create_lora_training_client(spec.base_model, rank=spec.lora_rank)
+        client = self._service.create_lora_training_client(
+            spec.base_model,
+            rank=spec.lora_rank,
+            seed=spec.seed,
+        )
         if resume_state_path is not None:
             # Tinker requires restore before a weight-affecting call.  In particular, renderer
             # creation waits until this returns, so a resumed optimizer state is never replaced.
@@ -155,6 +171,10 @@ class TinkerTrainerSession:
 
         Returns:
             One labeled Tinker datum per input example, in exactly the same order.
+
+        Raises:
+            TinkerSFTError: Rendering omitted cross-entropy inputs, removed the complete target,
+                or left the target with no supervised tokens.
         """
         _require_tinker_dependencies()
         from tinker_cookbook.renderers import TrainOnWhat
@@ -165,9 +185,14 @@ class TinkerTrainerSession:
             datum = conversation_to_datum(
                 cast("list[Message]", tinker_messages_from_example(example)),
                 self._renderer,
-                max_length=self._spec.maximum_datum_tokens,
+                max_length=None,
                 train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
                 reduction="none",
+            )
+            datum = _truncate_context_only(
+                datum,
+                maximum_datum_tokens=self._spec.maximum_datum_tokens,
+                example_id=example.example_id,
             )
             weights = datum.loss_fn_inputs.get("weights")
             targets = datum.loss_fn_inputs.get("target_tokens")
@@ -223,12 +248,26 @@ class TinkerTrainerSession:
         )
 
     def save_state(self, checkpoint_name: str) -> str:
-        """Persist one non-overwriting managed state and return Tinker's resume handle."""
+        """Persist one non-overwriting managed optimizer state.
+
+        Args:
+            checkpoint_name: Unique immutable checkpoint name for the current run step.
+
+        Returns:
+            Tinker's opaque resume resource identifier.
+        """
         response = self._client.save_state(checkpoint_name).result()
         return response.path
 
     def save_sampling_handle(self, model_name: str) -> str:
-        """Persist one completed sampler handle without deployment, serving, or catalog mutation."""
+        """Persist one completed sampler handle without deploying or serving it.
+
+        Args:
+            model_name: Unique immutable resource name for the completed run.
+
+        Returns:
+            Tinker's opaque sampling resource identifier.
+        """
         response = self._client.save_weights_for_sampler(model_name).result()
         return response.path
 
@@ -245,6 +284,9 @@ def tinker_messages_from_example(example: SFTExample) -> list[TinkerConversation
 
     Returns:
         Ordered messages whose final assistant message is the only supervised target.
+
+    Raises:
+        TinkerSFTError: The frozen context contains an unsupported event type.
     """
     messages: list[TinkerConversationMessage] = [
         {"role": "system", "content": f"Task:\n{example.task}"}
@@ -301,6 +343,51 @@ def _named_metric(metrics: Mapping[str, float] | None, names: Sequence[str]) -> 
                 raise TinkerSFTError(f"Tinker reported a non-finite metric for {key}")
             return numeric_value
     return None
+
+
+def _truncate_context_only(
+    datum: tinker.Datum,
+    *,
+    maximum_datum_tokens: int | None,
+    example_id: str,
+) -> tinker.Datum:
+    """Trim only unsupervised prompt tokens while retaining the complete target suffix."""
+    if maximum_datum_tokens is None:
+        return datum
+    import tinker
+
+    model_tokens = datum.model_input.to_ints()
+    maximum_model_tokens = maximum_datum_tokens - 1
+    if len(model_tokens) <= maximum_model_tokens:
+        return datum
+    weights = datum.loss_fn_inputs["weights"].data
+    targets = datum.loss_fn_inputs["target_tokens"].data
+    weight_tensor = datum.loss_fn_inputs["weights"]
+    target_tensor = datum.loss_fn_inputs["target_tokens"]
+    first_supervised = next(
+        (index for index, weight in enumerate(weights) if weight != 0.0),
+        len(weights),
+    )
+    trim_count = len(model_tokens) - maximum_model_tokens
+    if trim_count > first_supervised:
+        raise TinkerSFTError(
+            f"maximum_datum_tokens cannot retain the complete supervised target for {example_id}"
+        )
+    return tinker.Datum(
+        model_input=tinker.ModelInput.from_ints(model_tokens[trim_count:]),
+        loss_fn_inputs={
+            "target_tokens": tinker.TensorData(
+                data=targets[trim_count:],
+                dtype=target_tensor.dtype,
+                shape=[len(targets) - trim_count],
+            ),
+            "weights": tinker.TensorData(
+                data=weights[trim_count:],
+                dtype=weight_tensor.dtype,
+                shape=[len(weights) - trim_count],
+            ),
+        },
+    )
 
 
 def _require_tinker_dependencies() -> None:

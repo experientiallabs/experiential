@@ -2,21 +2,18 @@
 
 from __future__ import annotations
 
-import math
+import hashlib
 import os
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Literal, Protocol
+from typing import Literal
 
-from pydantic import BaseModel, Field, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel
 
 from wmo.common.core.artifacts import (
-    ArtifactEnvelope,
     ArtifactId,
     ArtifactInput,
-    ContractModel,
-    Sha256,
     assert_secret_free,
     canonical_json_bytes,
     sha256_json,
@@ -24,257 +21,39 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
-from wmo.common.models import NumericMeasurement, Usage
+from wmo.common.models import NumericMeasurement
+from wmo.common.project import ProjectStore
+from wmo.optimize.model.sft.builder import SFTBuildError, load_verified_sft_dataset
 from wmo.optimize.model.sft.contracts import SFTDatasetArtifact, SFTExample
+from wmo.optimize.model.sft.provider_resources import validate_provider_resource_id
 from wmo.optimize.model.sft.rendering import partitioned_rows_sha256
+from wmo.optimize.model.sft.training_contracts import (
+    TINKER_SFT_EVENT_ADAPTER,
+    TinkerSFTAmbiguousStepError,
+    TinkerSFTBudgetExceeded,
+    TinkerSFTCheckpoint,
+    TinkerSFTCheckpointIntent,
+    TinkerSFTError,
+    TinkerSFTEvent,
+    TinkerSFTMetric,
+    TinkerSFTModelArtifact,
+    TinkerSFTModelIntent,
+    TinkerSFTResult,
+    TinkerSFTResumeError,
+    TinkerSFTResumeEvent,
+    TinkerSFTRunManifest,
+    TinkerSFTSpec,
+    TinkerSFTStepIntent,
+    TrainerBackend,
+    TrainerDatum,
+    TrainerSession,
+)
 
 _MANIFEST_FILE = "manifest.json"
 _EVENTS_FILE = "events.jsonl"
 _MODEL_FILE = "model.json"
 _MODEL_INTENT_FILE = "model-intent.json"
 _RESULT_FILE = "result.json"
-
-
-class TinkerSFTError(RuntimeError):
-    """The frozen dataset or append-only local SFT run cannot proceed safely."""
-
-
-class TinkerSFTResumeError(TinkerSFTError):
-    """An existing run directory cannot be resumed without mixing immutable state."""
-
-
-class TinkerSFTBudgetExceeded(TinkerSFTError):
-    """Observed or required spend accounting prevents another managed training step."""
-
-
-class TinkerSFTSpec(ContractModel):
-    """Frozen base-model, LoRA, batch, checkpoint, and managed-spend settings."""
-
-    base_model: str = Field(min_length=1, max_length=512)
-    lora_rank: int = Field(default=32, gt=0, le=4096)
-    learning_rate: float = Field(gt=0)
-    batch_size: int = Field(gt=0)
-    epochs: int = Field(gt=0)
-    checkpoint_every_steps: int = Field(gt=0)
-    maximum_steps: int | None = Field(default=None, gt=0)
-    maximum_datum_tokens: int | None = Field(default=None, gt=0)
-    maximum_cost_usd: float | None = Field(default=None, gt=0)
-
-    @field_validator("learning_rate", "maximum_cost_usd")
-    @classmethod
-    def _require_finite_float(cls, value: float | None) -> float | None:
-        if value is not None and not math.isfinite(value):
-            raise ValueError("Tinker SFT numeric settings must be finite")
-        return value
-
-
-class TrainerBatchResult(ContractModel):
-    """Metrics returned by one backend-managed cross-entropy update, without fabrication."""
-
-    loss: float | None = None
-    gradient_norm: float | None = None
-    usage: Usage | None = None
-    cost_usd: NumericMeasurement | None = None
-
-    @field_validator("loss", "gradient_norm")
-    @classmethod
-    def _require_finite_metric(cls, value: float | None) -> float | None:
-        if value is not None and not math.isfinite(value):
-            raise ValueError("Tinker SFT backend metrics must be finite")
-        return value
-
-
-class TrainerDatum(Protocol):
-    """The tiny datum identity slice retained after a backend renders frozen examples."""
-
-    @property
-    def example_id(self) -> str:
-        """Return the exact frozen W12 example identifier rendered into this datum."""
-        ...
-
-    @property
-    def supervised_token_count(self) -> int:
-        """Return the non-zero cross-entropy token count after renderer truncation."""
-        ...
-
-
-class TrainerSession(Protocol):
-    """One managed training client already created or restored by its backend."""
-
-    def render_examples(self, examples: Sequence[SFTExample]) -> tuple[TrainerDatum, ...]:
-        """Render complete frozen assistant-action targets into cross-entropy datums."""
-        ...
-
-    def train_batch(
-        self, datums: Sequence[TrainerDatum], *, learning_rate: float
-    ) -> TrainerBatchResult:
-        """Accumulate and apply one managed cross-entropy batch."""
-        ...
-
-    def save_state(self, checkpoint_name: str) -> str:
-        """Persist a resumable managed state and return its non-secret provider handle."""
-        ...
-
-    def save_sampling_handle(self, model_name: str) -> str:
-        """Persist completed weights for later sampling and return the non-secret handle."""
-        ...
-
-
-class TrainerBackend(Protocol):
-    """The injection boundary for the concrete Tinker SDK adapter or a test fake."""
-
-    def open(self, spec: TinkerSFTSpec, resume_state_path: str | None) -> TrainerSession:
-        """Create an uninitialized session, restoring state before renderer work when set."""
-        ...
-
-
-class TinkerSFTRunManifest(ArtifactEnvelope):
-    """Immutable local identity for one append-only run directory."""
-
-    run_id: ArtifactId
-    dataset_id: ArtifactId
-    dataset_build_sha256: Sha256
-    dataset_examples_sha256: Sha256
-    spec: TinkerSFTSpec
-    spec_sha256: Sha256
-
-    @model_validator(mode="after")
-    def _require_exact_dataset_and_spec_bindings(self) -> TinkerSFTRunManifest:
-        expected_inputs = (
-            ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_build_sha256),
-        )
-        if self.inputs != expected_inputs:
-            raise ValueError("Tinker SFT manifests must name exactly their frozen dataset build")
-        if self.spec_sha256 != sha256_json(self.spec):
-            raise ValueError("Tinker SFT manifest spec digest does not match settings")
-        return self
-
-
-class TinkerSFTMetric(ContractModel):
-    """One observed managed training batch, without a task-behavior or quality claim."""
-
-    record_type: Literal["metric"] = "metric"
-    run_id: ArtifactId
-    attempt_id: int = Field(ge=1)
-    step: int = Field(ge=1)
-    epoch: int = Field(ge=1)
-    batch_index: int = Field(ge=1)
-    batch_example_count: int = Field(gt=0)
-    supervised_token_count: int = Field(gt=0)
-    loss: float | None = None
-    gradient_norm: float | None = None
-    usage: Usage | None = None
-    cost_usd: NumericMeasurement | None = None
-    cumulative_cost_usd: NumericMeasurement | None = None
-
-    @field_validator("loss", "gradient_norm")
-    @classmethod
-    def _require_finite_metric(cls, value: float | None) -> float | None:
-        if value is not None and not math.isfinite(value):
-            raise ValueError("Tinker SFT metrics must be finite")
-        return value
-
-
-class TinkerSFTCheckpoint(ContractModel):
-    """One durable provider state tied to a completed prefix of frozen training batches."""
-
-    record_type: Literal["checkpoint"] = "checkpoint"
-    checkpoint_id: ArtifactId
-    run_id: ArtifactId
-    attempt_id: int = Field(ge=1)
-    step: int = Field(ge=1)
-    state_path: str = Field(min_length=1, max_length=2048)
-    metric_count: int = Field(gt=0)
-    cumulative_cost_usd: NumericMeasurement | None = None
-
-
-class TinkerSFTResumeEvent(ContractModel):
-    """An append-only record that a new attempt starts from a durable earlier checkpoint."""
-
-    record_type: Literal["resume"] = "resume"
-    run_id: ArtifactId
-    attempt_id: int = Field(ge=2)
-    checkpoint_id: ArtifactId
-    resumed_from_step: int = Field(ge=1)
-
-
-class TinkerSFTCheckpointIntent(ContractModel):
-    """A durable pre-call marker that prevents an ambiguous checkpoint save from being repeated."""
-
-    run_id: ArtifactId
-    checkpoint_id: ArtifactId
-    attempt_id: int = Field(ge=1)
-    step: int = Field(ge=1)
-    checkpoint_name: str = Field(min_length=1, max_length=512)
-
-
-class TinkerSFTModelIntent(ContractModel):
-    """A durable pre-call marker for the non-idempotent terminal sampling-handle save."""
-
-    run_id: ArtifactId
-    model_name: str = Field(min_length=1, max_length=512)
-    checkpoint_id: ArtifactId
-
-
-class TinkerSFTModelArtifact(ArtifactEnvelope):
-    """Completed sampling handle plus the frozen dataset and durable checkpoint that produced it."""
-
-    model_id: ArtifactId
-    run_id: ArtifactId
-    dataset_id: ArtifactId
-    dataset_build_sha256: Sha256
-    final_checkpoint_id: ArtifactId
-    final_checkpoint_state_path: str = Field(min_length=1, max_length=2048)
-    sampling_handle: str = Field(min_length=1, max_length=2048)
-    training_step_count: int = Field(gt=0)
-    training_metric_count: int = Field(gt=0)
-    total_cost_usd: NumericMeasurement | None = None
-
-    @model_validator(mode="after")
-    def _require_exact_dataset_binding(self) -> TinkerSFTModelArtifact:
-        expected_inputs = (
-            ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_build_sha256),
-        )
-        if self.inputs != expected_inputs:
-            raise ValueError("Tinker SFT models must name exactly their frozen dataset build")
-        return self
-
-
-class TinkerSFTResult(ArtifactEnvelope):
-    """Terminal local result that names the completed handle artifact and training facts."""
-
-    result_id: ArtifactId
-    run_id: ArtifactId
-    dataset_id: ArtifactId
-    dataset_build_sha256: Sha256
-    model_id: ArtifactId
-    model_sha256: Sha256
-    training_step_count: int = Field(gt=0)
-    training_metric_count: int = Field(gt=0)
-    checkpoint_count: int = Field(gt=0)
-    total_cost_usd: NumericMeasurement | None = None
-
-    @model_validator(mode="after")
-    def _require_exact_terminal_inputs(self) -> TinkerSFTResult:
-        expected_inputs = tuple(
-            sorted(
-                (
-                    ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_build_sha256),
-                    ArtifactInput(artifact_id=self.model_id, sha256=self.model_sha256),
-                ),
-                key=lambda item: item.artifact_id,
-            )
-        )
-        if self.inputs != expected_inputs:
-            raise ValueError("Tinker SFT results must name their dataset and terminal model")
-        return self
-
-
-type TinkerSFTEvent = Annotated[
-    TinkerSFTMetric | TinkerSFTCheckpoint | TinkerSFTResumeEvent,
-    Field(discriminator="record_type"),
-]
-_EVENT_ADAPTER = TypeAdapter(TinkerSFTEvent)
 
 
 class TinkerSFTOptimizer:
@@ -287,15 +66,17 @@ class TinkerSFTOptimizer:
     def optimize(
         self,
         *,
-        dataset: SFTDatasetArtifact,
+        store: ProjectStore,
+        dataset_id: ArtifactId,
         spec: TinkerSFTSpec,
         output_dir: Path,
         created_at: datetime,
         code_revision: str,
     ) -> TinkerSFTResult:
-        """Train from one frozen dataset without changing router, catalog, or serving state."""
+        """Train from one persisted dataset without changing catalog, router, or serving state."""
         return train_tinker_sft(
-            dataset,
+            store,
+            dataset_id,
             spec,
             output_dir,
             backend=self._backend,
@@ -305,7 +86,8 @@ class TinkerSFTOptimizer:
 
 
 def train_tinker_sft(
-    dataset: SFTDatasetArtifact,
+    store: ProjectStore,
+    dataset_id: ArtifactId,
     spec: TinkerSFTSpec,
     output_dir: Path,
     *,
@@ -316,7 +98,8 @@ def train_tinker_sft(
     """Train a managed LoRA from frozen W12 examples with append-only local provenance.
 
     Args:
-        dataset: W12 immutable artifact with accepted train and held-out example rows.
+        store: Project store owning the dataset and every transitive acceptance artifact.
+        dataset_id: Persisted W12 dataset ID. Caller-constructed rows are never authoritative.
         spec: Base model, LoRA, optimization, budget, and checkpoint settings.
         output_dir: Append-only local run directory.
         backend: Concrete Tinker SDK adapter or a deterministic injected fake.
@@ -329,6 +112,10 @@ def train_tinker_sft(
     Raises:
         TinkerSFTError: Dataset, budget, or append-only resume state is unsafe to continue.
     """
+    try:
+        dataset = load_verified_sft_dataset(store, dataset_id)
+    except SFTBuildError as exc:
+        raise TinkerSFTError(f"W12 dataset {dataset_id} is not safe for training: {exc}") from exc
     _validate_run_inputs(dataset, created_at=created_at, code_revision=code_revision)
     manifest_path = output_dir / _MANIFEST_FILE
     with file_write_lock(manifest_path, what="the Tinker SFT run"):
@@ -358,13 +145,16 @@ def _train_locked(
         created_at=created_at,
         code_revision=code_revision,
     )
-    completed = _load_completed_result(output_dir, manifest)
+    events = _read_events(output_dir, manifest.run_id)
+    _assert_no_ambiguous_step_intent(output_dir, manifest.run_id, events)
+    _assert_no_ambiguous_checkpoint_intent(output_dir, manifest.run_id, events)
+    _assert_no_uncheckpointed_completed_steps(events)
+    completed = _load_completed_result(output_dir, manifest, events)
     if completed is not None:
         return completed
-    events = _read_events(output_dir, manifest.run_id)
-    _assert_no_ambiguous_checkpoint_intent(output_dir, manifest.run_id, events)
     existing_model = _load_model(output_dir, manifest)
     if existing_model is not None:
+        _validate_model_lineage(output_dir, existing_model, events)
         return _write_terminal_result(
             output_dir=output_dir,
             manifest=manifest,
@@ -377,6 +167,19 @@ def _train_locked(
     _require_budget_can_continue(spec, durable_metrics, durable_cost)
 
     train_examples = tuple(row.example for row in dataset.rows if row.partition == "train")
+    schedule_counts = _schedule_batch_counts(len(train_examples), spec)
+    start_step = latest_checkpoint.step if latest_checkpoint is not None else 0
+    if start_step > len(schedule_counts):
+        raise TinkerSFTResumeError(
+            "the latest Tinker SFT checkpoint is beyond this frozen training schedule"
+        )
+    if start_step < len(schedule_counts):
+        _require_step_budget(
+            backend=backend,
+            spec=spec,
+            batch_example_count=schedule_counts[start_step],
+            current_cost=durable_cost,
+        )
     session = backend.open(
         spec,
         latest_checkpoint.state_path if latest_checkpoint is not None else None,
@@ -396,13 +199,27 @@ def _train_locked(
     datums = session.render_examples(train_examples)
     _validate_rendered_datums(datums, train_examples)
     schedule = _build_schedule(datums, spec)
-    start_step = latest_checkpoint.step if latest_checkpoint is not None else 0
-    if start_step > len(schedule):
-        raise TinkerSFTResumeError(
-            "the latest Tinker SFT checkpoint is beyond this frozen training schedule"
-        )
     current_cost = durable_cost
     for step, batch in enumerate(schedule[start_step:], start=start_step + 1):
+        upper_bound = _require_step_budget(
+            backend=backend,
+            spec=spec,
+            batch_example_count=len(batch.datums),
+            current_cost=current_cost,
+        )
+        _write_new_json(
+            _step_intent_path(output_dir, attempt_id, step),
+            TinkerSFTStepIntent(
+                run_id=manifest.run_id,
+                attempt_id=attempt_id,
+                step=step,
+                epoch=batch.epoch,
+                batch_index=batch.batch_index,
+                example_ids=tuple(datum.example_id for datum in batch.datums),
+                conservative_cost_upper_bound_usd=upper_bound,
+            ),
+            "Tinker SFT optimizer-step intent",
+        )
         batch_result = session.train_batch(batch.datums, learning_rate=spec.learning_rate)
         current_cost = _add_cost(current_cost, batch_result.cost_usd, has_prior_metrics=step > 1)
         metric = TinkerSFTMetric(
@@ -412,6 +229,7 @@ def _train_locked(
             epoch=batch.epoch,
             batch_index=batch.batch_index,
             batch_example_count=len(batch.datums),
+            example_ids=tuple(datum.example_id for datum in batch.datums),
             supervised_token_count=sum(datum.supervised_token_count for datum in batch.datums),
             loss=batch_result.loss,
             gradient_norm=batch_result.gradient_norm,
@@ -421,37 +239,17 @@ def _train_locked(
         )
         _append_event(output_dir, metric)
         events = (*events, metric)
+        if upper_bound is not None and batch_result.cost_usd is not None:
+            if batch_result.cost_usd.value > upper_bound.value:
+                raise TinkerSFTBudgetExceeded(
+                    "backend-reported step cost exceeded its conservative pre-dispatch bound; "
+                    "the completed step is not replayable and requires manual review"
+                )
         must_checkpoint = step % spec.checkpoint_every_steps == 0 or step == len(schedule)
-        if spec.maximum_cost_usd is not None:
-            if current_cost is None:
-                checkpoint = _save_checkpoint(
-                    session=session,
-                    output_dir=output_dir,
-                    manifest=manifest,
-                    events=events,
-                    attempt_id=attempt_id,
-                    step=step,
-                    cumulative_cost_usd=current_cost,
-                )
-                events = (*events, checkpoint)
-                raise TinkerSFTBudgetExceeded(
-                    "maximum_cost_usd requires every completed Tinker SFT batch to report cost"
-                )
-            if current_cost.value >= spec.maximum_cost_usd:
-                checkpoint = _save_checkpoint(
-                    session=session,
-                    output_dir=output_dir,
-                    manifest=manifest,
-                    events=events,
-                    attempt_id=attempt_id,
-                    step=step,
-                    cumulative_cost_usd=current_cost,
-                )
-                events = (*events, checkpoint)
-                raise TinkerSFTBudgetExceeded(
-                    "observed Tinker SFT spend reached maximum_cost_usd; resume requires a larger "
-                    "explicit budget"
-                )
+        if spec.maximum_cost_usd is not None and current_cost is None:
+            raise TinkerSFTBudgetExceeded(
+                "a completed Tinker SFT step did not report exact cost; no later step may dispatch"
+            )
         if must_checkpoint:
             checkpoint = _save_checkpoint(
                 session=session,
@@ -581,13 +379,20 @@ def _read_events(output_dir: Path, run_id: ArtifactId) -> tuple[TinkerSFTEvent, 
         if not line:
             raise TinkerSFTResumeError(f"Tinker SFT event log has an empty line at {number}")
         try:
-            event = _EVENT_ADAPTER.validate_json(line)
+            event = TINKER_SFT_EVENT_ADAPTER.validate_json(line)
         except ValueError as exc:
             raise TinkerSFTResumeError(
                 f"Tinker SFT event log has an invalid record at line {number}: {exc}"
             ) from exc
         if event.run_id != run_id:
             raise TinkerSFTResumeError("Tinker SFT event log names a different run")
+        if isinstance(event, TinkerSFTCheckpoint):
+            try:
+                validate_provider_resource_id(event.state_path, label="checkpoint state")
+            except TinkerSFTError as exc:
+                raise TinkerSFTResumeError(
+                    "Tinker SFT checkpoint has an unsafe resource ID"
+                ) from exc
         events.append(event)
     _validate_event_history(tuple(events))
     return tuple(events)
@@ -595,6 +400,7 @@ def _read_events(output_dir: Path, run_id: ArtifactId) -> tuple[TinkerSFTEvent, 
 
 def _validate_event_history(events: tuple[TinkerSFTEvent, ...]) -> None:
     checkpoints: dict[str, TinkerSFTCheckpoint] = {}
+    metric_keys: set[tuple[int, int]] = set()
     seen_attempts: set[int] = set()
     for event in events:
         if isinstance(event, TinkerSFTCheckpoint):
@@ -612,12 +418,28 @@ def _validate_event_history(events: tuple[TinkerSFTEvent, ...]) -> None:
                 raise TinkerSFTResumeError("Tinker SFT event log reuses an attempt identifier")
             seen_attempts.add(event.attempt_id)
         else:
+            metric_key = (event.attempt_id, event.step)
+            if metric_key in metric_keys:
+                raise TinkerSFTResumeError("Tinker SFT event log repeats a completed step")
+            if event.batch_example_count != len(event.example_ids):
+                raise TinkerSFTResumeError("Tinker SFT metric has an inconsistent batch size")
+            metric_keys.add(metric_key)
             seen_attempts.add(event.attempt_id)
 
 
 def _latest_checkpoint(events: Sequence[TinkerSFTEvent]) -> TinkerSFTCheckpoint | None:
     checkpoints = [event for event in events if isinstance(event, TinkerSFTCheckpoint)]
     return checkpoints[-1] if checkpoints else None
+
+
+def _assert_no_uncheckpointed_completed_steps(events: Sequence[TinkerSFTEvent]) -> None:
+    checkpoint = _latest_checkpoint(events)
+    durable_step = 0 if checkpoint is None else checkpoint.step
+    if any(isinstance(event, TinkerSFTMetric) and event.step > durable_step for event in events):
+        raise TinkerSFTAmbiguousStepError(
+            "a completed optimizer step has no durable checkpoint state; replay would duplicate "
+            "remote work and spend, so manual recovery or a new run is required"
+        )
 
 
 def _metrics_at_checkpoint(
@@ -666,19 +488,39 @@ def _next_attempt_id(events: Sequence[TinkerSFTEvent]) -> int:
 def _build_schedule(
     datums: tuple[TrainerDatum, ...], spec: TinkerSFTSpec
 ) -> tuple[_ScheduledBatch, ...]:
-    one_epoch = tuple(
-        datums[index : index + spec.batch_size] for index in range(0, len(datums), spec.batch_size)
-    )
-    schedule = tuple(
-        _ScheduledBatch(epoch=epoch, batch_index=batch_index, datums=batch)
-        for epoch in range(1, spec.epochs + 1)
-        for batch_index, batch in enumerate(one_epoch, start=1)
-    )
+    schedule_items: list[_ScheduledBatch] = []
+    for epoch in range(1, spec.epochs + 1):
+        shuffled = tuple(
+            sorted(
+                datums,
+                key=lambda datum: hashlib.sha256(
+                    f"{spec.seed}:{epoch}:{datum.example_id}".encode()
+                ).hexdigest(),
+            )
+        )
+        batches = tuple(
+            shuffled[index : index + spec.batch_size]
+            for index in range(0, len(shuffled), spec.batch_size)
+        )
+        schedule_items.extend(
+            _ScheduledBatch(epoch=epoch, batch_index=batch_index, datums=batch)
+            for batch_index, batch in enumerate(batches, start=1)
+        )
+    schedule = tuple(schedule_items)
     if spec.maximum_steps is not None:
         schedule = schedule[: spec.maximum_steps]
     if not schedule:
         raise TinkerSFTError("Tinker SFT schedule has no managed training batches")
     return schedule
+
+
+def _schedule_batch_counts(example_count: int, spec: TinkerSFTSpec) -> tuple[int, ...]:
+    one_epoch = tuple(
+        min(spec.batch_size, example_count - index)
+        for index in range(0, example_count, spec.batch_size)
+    )
+    counts = one_epoch * spec.epochs
+    return counts[: spec.maximum_steps] if spec.maximum_steps is not None else counts
 
 
 class _ScheduledBatch:
@@ -748,6 +590,34 @@ def _require_budget_can_continue(
         )
 
 
+def _require_step_budget(
+    *,
+    backend: TrainerBackend,
+    spec: TinkerSFTSpec,
+    batch_example_count: int,
+    current_cost: NumericMeasurement | None,
+) -> NumericMeasurement | None:
+    upper_bound = backend.conservative_step_cost(
+        spec,
+        batch_example_count=batch_example_count,
+    )
+    if upper_bound is not None and upper_bound.value < 0:
+        raise TinkerSFTBudgetExceeded("backend cost upper bounds must be nonnegative")
+    if spec.maximum_cost_usd is None:
+        return upper_bound
+    if upper_bound is None:
+        raise TinkerSFTBudgetExceeded(
+            "maximum_cost_usd requires a backend-proven conservative step cost before dispatch"
+        )
+    spent = 0.0 if current_cost is None else current_cost.value
+    if spent + upper_bound.value > spec.maximum_cost_usd:
+        raise TinkerSFTBudgetExceeded(
+            "the next Tinker SFT step's conservative cost bound exceeds the remaining budget; "
+            "no optimizer call was dispatched"
+        )
+    return upper_bound
+
+
 def _save_checkpoint(
     *,
     session: TrainerSession,
@@ -773,7 +643,9 @@ def _save_checkpoint(
     _write_new_json(
         _checkpoint_intent_path(output_dir, checkpoint_id), intent, "Tinker SFT checkpoint intent"
     )
-    state_path = session.save_state(checkpoint_name)
+    state_path = validate_provider_resource_id(
+        session.save_state(checkpoint_name), label="checkpoint state"
+    )
     checkpoint = TinkerSFTCheckpoint(
         checkpoint_id=checkpoint_id,
         run_id=manifest.run_id,
@@ -817,7 +689,9 @@ def _save_or_load_terminal_model(
         ),
         "Tinker SFT model intent",
     )
-    sampling_handle = session.save_sampling_handle(model_name)
+    sampling_handle = validate_provider_resource_id(
+        session.save_sampling_handle(model_name), label="sampling handle"
+    )
     effective_metrics = _metrics_at_checkpoint(events, final_checkpoint)
     model_id = stable_id(
         "tinker-sft-model",
@@ -841,6 +715,7 @@ def _save_or_load_terminal_model(
         run_id=manifest.run_id,
         dataset_id=manifest.dataset_id,
         dataset_build_sha256=manifest.dataset_build_sha256,
+        events_sha256=_events_sha256(output_dir),
         final_checkpoint_id=final_checkpoint.checkpoint_id,
         final_checkpoint_state_path=final_checkpoint.state_path,
         sampling_handle=sampling_handle,
@@ -859,7 +734,7 @@ def _write_terminal_result(
     model: TinkerSFTModelArtifact,
     events: Sequence[TinkerSFTEvent],
 ) -> TinkerSFTResult:
-    existing = _load_completed_result(output_dir, manifest)
+    existing = _load_completed_result(output_dir, manifest, events)
     if existing is not None:
         return existing
     final_checkpoint = _latest_checkpoint(events)
@@ -892,6 +767,8 @@ def _write_terminal_result(
         dataset_build_sha256=manifest.dataset_build_sha256,
         model_id=model.model_id,
         model_sha256=model_sha256,
+        events_sha256=_events_sha256(output_dir),
+        final_checkpoint_id=final_checkpoint.checkpoint_id,
         training_step_count=final_checkpoint.step,
         training_metric_count=len(effective_metrics),
         checkpoint_count=sum(isinstance(event, TinkerSFTCheckpoint) for event in events),
@@ -902,7 +779,9 @@ def _write_terminal_result(
 
 
 def _load_completed_result(
-    output_dir: Path, manifest: TinkerSFTRunManifest
+    output_dir: Path,
+    manifest: TinkerSFTRunManifest,
+    events: Sequence[TinkerSFTEvent],
 ) -> TinkerSFTResult | None:
     path = output_dir / _RESULT_FILE
     if not path.exists():
@@ -917,6 +796,23 @@ def _load_completed_result(
         raise TinkerSFTResumeError("Tinker SFT result exists without its model artifact")
     if result.model_id != model.model_id or result.model_sha256 != sha256_json(model):
         raise TinkerSFTResumeError("Tinker SFT result does not match its model artifact")
+    _validate_model_lineage(output_dir, model, events)
+    final_checkpoint = _latest_checkpoint(events)
+    if final_checkpoint is None or result.final_checkpoint_id != final_checkpoint.checkpoint_id:
+        raise TinkerSFTResumeError("Tinker SFT result does not match its final checkpoint event")
+    effective_metrics = _metrics_at_checkpoint(events, final_checkpoint)
+    if result.events_sha256 != _events_sha256(output_dir):
+        raise TinkerSFTResumeError("Tinker SFT result does not hash the current event log")
+    if result.events_sha256 != model.events_sha256:
+        raise TinkerSFTResumeError("Tinker SFT result and model name different event logs")
+    if result.training_step_count != final_checkpoint.step:
+        raise TinkerSFTResumeError("Tinker SFT result has the wrong durable step count")
+    if result.training_metric_count != len(effective_metrics):
+        raise TinkerSFTResumeError("Tinker SFT result has the wrong durable metric count")
+    if result.total_cost_usd != _total_cost(effective_metrics):
+        raise TinkerSFTResumeError("Tinker SFT result has the wrong durable cost facts")
+    if result.checkpoint_count != sum(isinstance(event, TinkerSFTCheckpoint) for event in events):
+        raise TinkerSFTResumeError("Tinker SFT result has the wrong checkpoint count")
     return result
 
 
@@ -931,7 +827,46 @@ def _load_model(output_dir: Path, manifest: TinkerSFTRunManifest) -> TinkerSFTMo
         raise TinkerSFTResumeError("Tinker SFT model artifact names a different dataset")
     if model.dataset_build_sha256 != manifest.dataset_build_sha256:
         raise TinkerSFTResumeError("Tinker SFT model artifact has a different dataset build")
+    try:
+        validate_provider_resource_id(model.sampling_handle, label="sampling handle")
+        validate_provider_resource_id(model.final_checkpoint_state_path, label="checkpoint state")
+    except TinkerSFTError as exc:
+        raise TinkerSFTResumeError("Tinker SFT model artifact has an unsafe resource ID") from exc
     return model
+
+
+def _validate_model_lineage(
+    output_dir: Path,
+    model: TinkerSFTModelArtifact,
+    events: Sequence[TinkerSFTEvent],
+) -> None:
+    final_checkpoint = _latest_checkpoint(events)
+    if final_checkpoint is None:
+        raise TinkerSFTResumeError("Tinker SFT model artifact has no durable checkpoint event")
+    if model.events_sha256 != _events_sha256(output_dir):
+        raise TinkerSFTResumeError("Tinker SFT model artifact does not hash the current event log")
+    if model.final_checkpoint_id != final_checkpoint.checkpoint_id:
+        raise TinkerSFTResumeError("Tinker SFT model artifact names a different final checkpoint")
+    if model.final_checkpoint_state_path != final_checkpoint.state_path:
+        raise TinkerSFTResumeError("Tinker SFT model artifact has a different checkpoint resource")
+    metrics = _metrics_at_checkpoint(events, final_checkpoint)
+    if model.training_step_count != final_checkpoint.step or model.training_metric_count != len(
+        metrics
+    ):
+        raise TinkerSFTResumeError("Tinker SFT model artifact has inconsistent training counts")
+    if model.total_cost_usd != _total_cost(metrics):
+        raise TinkerSFTResumeError("Tinker SFT model artifact has inconsistent durable cost facts")
+
+
+def _events_sha256(output_dir: Path) -> str:
+    path = output_dir / _EVENTS_FILE
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise TinkerSFTResumeError(f"Tinker SFT event log is required at {path}: {exc}") from exc
+    if not payload:
+        raise TinkerSFTResumeError("Tinker SFT event log is empty")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _assert_no_ambiguous_checkpoint_intent(
@@ -940,6 +875,7 @@ def _assert_no_ambiguous_checkpoint_intent(
     checkpoint_ids = {
         event.checkpoint_id for event in events if isinstance(event, TinkerSFTCheckpoint)
     }
+    intent_ids: set[ArtifactId] = set()
     for path in output_dir.glob("*.checkpoint-intent.json"):
         intent = _read_model(path, TinkerSFTCheckpointIntent, "Tinker SFT checkpoint intent")
         if intent.run_id != run_id:
@@ -949,6 +885,42 @@ def _assert_no_ambiguous_checkpoint_intent(
                 "a prior Tinker checkpoint save may have completed without an event record; "
                 "inspect the provider before retrying"
             )
+        intent_ids.add(intent.checkpoint_id)
+    if checkpoint_ids != intent_ids:
+        raise TinkerSFTResumeError("Tinker SFT checkpoint event is missing its pre-call intent")
+
+
+def _assert_no_ambiguous_step_intent(
+    output_dir: Path, run_id: ArtifactId, events: Sequence[TinkerSFTEvent]
+) -> None:
+    metrics = {
+        (event.attempt_id, event.step): event
+        for event in events
+        if isinstance(event, TinkerSFTMetric)
+    }
+    intent_keys: set[tuple[int, int]] = set()
+    for path in output_dir.glob("*.step-intent.json"):
+        intent = _read_model(path, TinkerSFTStepIntent, "Tinker SFT optimizer-step intent")
+        if intent.run_id != run_id:
+            raise TinkerSFTResumeError("Tinker SFT optimizer-step intent names a different run")
+        metric = metrics.get((intent.attempt_id, intent.step))
+        if metric is None:
+            raise TinkerSFTAmbiguousStepError(
+                "a prior Tinker optimizer step was durably marked before dispatch but has no "
+                "completion event; remote completion and spend are unknown, so the step will "
+                "not be replayed. Manual provider inspection or a new run is required"
+            )
+        if metric.example_ids != intent.example_ids:
+            raise TinkerSFTResumeError(
+                "Tinker SFT optimizer-step intent does not match its completed metric batch"
+            )
+        intent_keys.add((intent.attempt_id, intent.step))
+    if set(metrics) != intent_keys:
+        raise TinkerSFTResumeError("Tinker SFT completed metric is missing its pre-dispatch intent")
+
+
+def _step_intent_path(output_dir: Path, attempt_id: int, step: int) -> Path:
+    return output_dir / f"attempt-{attempt_id}-step-{step}.step-intent.json"
 
 
 def _checkpoint_intent_path(output_dir: Path, checkpoint_id: ArtifactId) -> Path:
