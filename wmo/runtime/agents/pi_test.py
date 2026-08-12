@@ -70,6 +70,45 @@ def test_default_pi_runtime_binds_the_injected_model_and_environment(
     }
 
 
+@pytest.mark.parametrize("instruction", ("@candidate", "--candidate"))
+def test_installed_pi_keeps_special_task_text_out_of_argv(
+    tmp_path: Path,
+    instruction: str,
+) -> None:
+    """Literal task text reaches the injected model through stdin rather than Pi argv."""
+    model = _Model()
+    task = _task(instruction)
+    runtime = PiAgentRuntime(executable=str(_write_pi_binding_fixture(tmp_path)))
+
+    episode = execute_agent_episode(runtime, _EnvironmentRuntime(), task, model)
+
+    assert episode.stop_reason == StopReason.COMPLETED
+    assert [message.content for message in model.requests[0].messages] == [instruction]
+
+
+def test_installed_pi_uses_private_cwd_without_caller_pi_system_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caller project Pi prompts cannot affect an isolated installed-Pi invocation."""
+    caller_cwd = tmp_path / "caller"
+    pi_directory = caller_cwd / ".pi"
+    pi_directory.mkdir(parents=True)
+    (pi_directory / "SYSTEM.md").write_text("hostile system prompt", encoding="utf-8")
+    (pi_directory / "APPEND_SYSTEM.md").write_text("hostile appended prompt", encoding="utf-8")
+    monkeypatch.chdir(caller_cwd)
+    monkeypatch.setenv("WMO_TEST_CALLER_CWD", str(caller_cwd))
+    model = _Model()
+    task = _task()
+    runtime = PiAgentRuntime(executable=str(_write_pi_binding_fixture(tmp_path)))
+
+    episode = execute_agent_episode(runtime, _EnvironmentRuntime(), task, model)
+
+    assert episode.stop_reason == StopReason.COMPLETED
+    assert Path.cwd() == caller_cwd
+    assert [message.content for message in model.requests[0].messages] == [task.instruction]
+
+
 def test_installed_pi_parses_a_0731_numeric_millisecond_timestamp(tmp_path: Path) -> None:
     """Pi 0.73.1 JSON mode preserves numeric assistant message timestamps through WMO."""
     runtime = PiAgentRuntime(executable=str(_write_pi_0731_timestamp_fixture(tmp_path)))
@@ -301,13 +340,13 @@ class _EnvironmentContext(AbstractContextManager[EnvironmentSession]):
         return False
 
 
-def _task() -> TaskCase:
+def _task(instruction: str = "Complete the deterministic Pi fixture.") -> TaskCase:
     """Return one task whose explicit tool schema the local binding fixture verifies."""
     return TaskCase(
         task_id="task-1",
         lineage_group_id="lineage-1",
         partition="held_out",
-        instruction="Complete the deterministic Pi fixture.",
+        instruction=instruction,
         tools=(
             ToolSchema(
                 name="lookup",
@@ -340,7 +379,7 @@ import sys
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-instruction = {_task().instruction!r}
+instruction = sys.stdin.read()
 arguments = sys.argv[1:]
 if "--no-tools" in arguments:
     raise SystemExit(10)
@@ -358,9 +397,19 @@ if (
     or "WMO_PI_BRIDGE_URL" not in extension_source
 ):
     raise SystemExit(14)
-if arguments[-1] != instruction:
+if instruction in arguments:
     raise SystemExit(15)
+if "@candidate" in arguments:
+    raise SystemExit(21)
+if "--candidate" in arguments:
+    raise SystemExit(22)
 agent_dir = Path(os.environ["PI_CODING_AGENT_DIR"])
+caller_cwd = os.environ.get("WMO_TEST_CALLER_CWD")
+if caller_cwd is not None and (
+    Path.cwd().resolve() != agent_dir.parent.resolve()
+    or Path.cwd().resolve() == Path(caller_cwd).resolve()
+):
+    raise SystemExit(23)
 model_config = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
 provider = model_config["providers"]["wmo-injected"]
 if provider["models"][0]["id"] != "wmo-injected-model":
@@ -369,6 +418,13 @@ tools = json.loads(Path(os.environ["WMO_PI_TOOLS_PATH"]).read_text(encoding="utf
 if tools["tools"][0]["name"] != "lookup":
     raise SystemExit(17)
 bridge_url = os.environ["WMO_PI_BRIDGE_URL"]
+system_messages = []
+for system_filename in ("SYSTEM.md", "APPEND_SYSTEM.md"):
+    system_path = Path(".pi") / system_filename
+    if system_path.exists():
+        system_messages.append(
+            {{"role": "system", "content": system_path.read_text(encoding="utf-8")}}
+        )
 def post(path, payload):
     request = Request(
         bridge_url + path,
@@ -379,7 +435,7 @@ def post(path, payload):
     with urlopen(request) as response:
         return response.read()
 completion = post("/v1/chat/completions", {{
-    "messages": [{{"role": "user", "content": instruction}}],
+    "messages": [*system_messages, {{"role": "user", "content": instruction}}],
     "stream": True,
 }})
 if b"Injected model output." not in completion or b'"name":"lookup"' not in completion:

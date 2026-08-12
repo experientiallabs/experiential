@@ -68,10 +68,12 @@ class _PiModelRequest(ContractModel):
 
 @dataclass(frozen=True)
 class _PiInvocation:
-    """The process arguments and environment for one installed-Pi execution."""
+    """The process arguments, input, environment, and root for one installed-Pi execution."""
 
     command: tuple[str, ...]
     environment: dict[str, str]
+    input_text: str
+    cwd: Path
 
 
 class PiAgentRuntime:
@@ -80,7 +82,8 @@ class PiAgentRuntime:
     The adapter configures Pi with an ephemeral custom provider that sends every model request to
     the model WMO supplied for this episode. Its explicit extension forwards task-visible tool
     calls to the supplied execute-only environment. This configuration prevents ambient Pi model
-    selection, but it is not a sandbox or a security boundary for the installed Pi process.
+    selection. Its private working directory isolates evaluator inputs from caller project Pi
+    settings and prompts. It is not a security sandbox for the installed Pi process.
 
     Args:
         executable: Name or path of the externally installed Pi executable.
@@ -249,9 +252,10 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
                 _WMO_PI_PROVIDER,
                 "--model",
                 _WMO_PI_MODEL,
-                instruction,
             ),
             environment=process_environment,
+            input_text=instruction,
+            cwd=root,
         )
 
     def complete_model(self, payload: JsonObject) -> ModelResponse:
@@ -461,7 +465,9 @@ def _invoke_installed_pi(
             invocation.command,
             capture_output=True,
             check=False,
+            cwd=invocation.cwd,
             env=invocation.environment,
+            input=invocation.input_text,
             text=True,
             timeout=timeout_seconds,
         )
