@@ -9,11 +9,10 @@ from typing import Literal
 
 from pydantic import Field, field_validator
 
-from wmo.common.core.artifacts import ArtifactId, ContractModel, stable_id
+from wmo.common.core.artifacts import ArtifactId, ArtifactInput, ContractModel, stable_id
 from wmo.common.judging.calibration import CalibrationError
 from wmo.common.judging.calibration_provenance import (
-    VerifiedJudgeCalibration,
-    verify_authoritative_calibration,
+    _load_authoritative_persisted_calibration,
 )
 from wmo.common.judging.judgment import DimensionJudgment, Judgment
 from wmo.common.judging.prompts import PromptDefinition
@@ -77,27 +76,44 @@ class LMJudge:
         self._code_revision = code_revision
         self._clock = _utc_now if clock is None else clock
 
-    def judge(
+    def judge_persisted(
         self,
-        rollout: RolloutArtifact,
-        rubric: Rubric,
-        calibration: VerifiedJudgeCalibration,
+        store: ProjectStore,
+        *,
+        rollout_artifact_id: ArtifactId,
+        rubric_artifact_id: ArtifactId,
+        calibration_artifact_id: ArtifactId,
     ) -> Judgment:
-        """Score an existing rollout against one verified rubric and calibration binding.
+        """Score persisted evidence after recursively verifying every authoritative input.
 
         Args:
-            rollout: Completed rollout evidence to score without rerunning simulation.
-            rubric: Immutable zero-to-five rubric for the score dimensions.
-            calibration: Recursively verified calibration authorization to apply.
+            store: Project store that owns completed immutable judging inputs.
+            rollout_artifact_id: Completed source rollout artifact directory to score.
+            rubric_artifact_id: Completed rubric artifact directory used to score the rollout.
+            calibration_artifact_id: Completed calibration artifact that must be eligible for
+                authoritative judging.
 
         Returns:
-            An immutable judgment with validated cited rollout spans and equal-weight overall score.
+            An unwritten judgment with manifest-verified inputs and cited rollout spans.
 
         Raises:
-            JudgmentError: Model, prompt, calibration, score, or citation identity is invalid.
+            JudgmentError: A source is absent, calibration is ineligible, or model output is
+                invalid.
         """
-        verified_calibration = _require_authoritative_calibration(calibration)
-        _validate_bindings(rubric, verified_calibration, self._prompt)
+        (
+            rollout,
+            rollout_input,
+            rubric,
+            rubric_input,
+            calibration,
+            calibration_input,
+        ) = _load_authoritative_judging_inputs(
+            store,
+            rollout_artifact_id=rollout_artifact_id,
+            rubric_artifact_id=rubric_artifact_id,
+            calibration_artifact_id=calibration_artifact_id,
+        )
+        _validate_bindings(rubric, calibration, self._prompt)
         response = self._model.complete(
             ModelRequest(
                 messages=(
@@ -108,35 +124,38 @@ class LMJudge:
                 maximum_output_tokens=4_096,
             )
         )
-        if response.model != verified_calibration.judge_model:
+        if response.model != calibration.judge_model:
             raise JudgmentError(
                 "judge response model identity does not match the frozen calibration"
             )
         raw = _parse_response(response.output.content, response.output.tool_calls)
-        dimensions = _build_dimensions(raw, rollout, rubric, verified_calibration)
+        dimensions = _build_dimensions(raw, rollout, rubric, calibration)
         created_at = self._clock()
         if created_at.tzinfo is None or created_at.utcoffset() is None:
             raise JudgmentError("judge clock must return a timezone-aware time")
         overall_score = sum(item.calibrated_score / 5 for item in dimensions) / len(dimensions)
+        inputs = sorted_verified_inputs((rollout_input, rubric_input, calibration_input))
         return Judgment(
             schema_version=1,
             created_at=created_at,
+            inputs=inputs,
             code_revision=self._code_revision,
             judgment_id=stable_id(
                 "judgment",
                 {
                     "rollout_id": rollout.rollout_id,
                     "rubric_id": rubric.rubric_id,
-                    "calibration_id": verified_calibration.calibration_id,
+                    "calibration_id": calibration.calibration_id,
                     "dimensions": [item.model_dump(mode="json") for item in dimensions],
                     "judge_model": response.model.model_dump(mode="json"),
                     "judge_prompt_sha256": self._prompt.sha256,
                     "judging_code_revision": self._code_revision,
+                    "inputs": [item.model_dump(mode="json") for item in inputs],
                 },
             ),
             rollout_id=rollout.rollout_id,
             rubric_id=rubric.rubric_id,
-            calibration_id=verified_calibration.calibration_id,
+            calibration_id=calibration.calibration_id,
             judge_model=response.model,
             judge_prompt_id=self._prompt.prompt_id,
             judge_prompt_sha256=self._prompt.sha256,
@@ -170,56 +189,11 @@ class LMJudge:
             JudgmentError: A required source is absent, wrong-typed, inconsistent, or
                 conflicts on retry.
         """
-        try:
-            rollout, rollout_input = read_artifact_json(
-                store,
-                artifact_id=rollout_artifact_id,
-                expected_artifact_type="rollout",
-                relative_path="rollout.json",
-                model_type=RolloutArtifact,
-            )
-            rubric, rubric_input = read_artifact_json(
-                store,
-                artifact_id=rubric_artifact_id,
-                expected_artifact_type="rubric",
-                relative_path="rubric.json",
-                model_type=Rubric,
-            )
-        except JudgingProvenanceError as exc:
-            raise JudgmentError(
-                "final judgment requires completed immutable source artifacts"
-            ) from exc
-        try:
-            calibration = verify_authoritative_calibration(store, calibration_artifact_id)
-        except CalibrationError as exc:
-            raise JudgmentError(
-                "final judgment requires a verified persisted calibration and report"
-            ) from exc
-        if rollout.artifact_id != rollout_artifact_id:
-            raise JudgmentError("stored rollout record does not match its artifact identity")
-        if rubric.rubric_id != rubric_artifact_id:
-            raise JudgmentError("stored rubric record does not match its artifact identity")
-        if calibration.calibration.calibration_id != calibration_artifact_id:
-            raise JudgmentError("stored calibration record does not match its artifact identity")
-        draft = self.judge(rollout, rubric, calibration)
-        inputs = sorted_verified_inputs((rollout_input, rubric_input, calibration.artifact_input))
-        judgment = draft.model_copy(
-            update={
-                "inputs": inputs,
-                "judgment_id": stable_id(
-                    "judgment",
-                    {
-                        "rollout_id": rollout.rollout_id,
-                        "rubric_id": rubric.rubric_id,
-                        "calibration_id": calibration.calibration.calibration_id,
-                        "dimensions": [item.model_dump(mode="json") for item in draft.dimensions],
-                        "judge_model": draft.judge_model.model_dump(mode="json"),
-                        "judge_prompt_sha256": draft.judge_prompt_sha256,
-                        "judging_code_revision": self._code_revision,
-                        "inputs": [item.model_dump(mode="json") for item in inputs],
-                    },
-                ),
-            }
+        judgment = self.judge_persisted(
+            store,
+            rollout_artifact_id=rollout_artifact_id,
+            rubric_artifact_id=rubric_artifact_id,
+            calibration_artifact_id=calibration_artifact_id,
         )
         try:
             store.artifacts.write_json(
@@ -247,13 +221,68 @@ class LMJudge:
         return judgment
 
 
-def _require_authoritative_calibration(
-    value: VerifiedJudgeCalibration,
-) -> JudgeCalibration:
-    """Reject raw or caller-minted calibration values before invoking the LM."""
-    if not isinstance(value, VerifiedJudgeCalibration) or not value.is_authoritative():
-        raise JudgmentError("LM judging requires a recursively verified calibration authorization")
-    return value.calibration
+def _load_authoritative_judging_inputs(
+    store: ProjectStore,
+    *,
+    rollout_artifact_id: ArtifactId,
+    rubric_artifact_id: ArtifactId,
+    calibration_artifact_id: ArtifactId,
+) -> tuple[
+    RolloutArtifact,
+    ArtifactInput,
+    Rubric,
+    ArtifactInput,
+    JudgeCalibration,
+    ArtifactInput,
+]:
+    """Resolve all immutable inputs and eligibility immediately before an LM invocation.
+
+    Args:
+        store: Project store that owns immutable judging artifacts.
+        rollout_artifact_id: Completed rollout artifact to load.
+        rubric_artifact_id: Completed rubric artifact to load.
+        calibration_artifact_id: Completed calibration artifact to verify recursively.
+
+    Returns:
+        The typed rollout, rubric, eligible calibration, and their manifest-derived inputs.
+
+    Raises:
+        JudgmentError: A source is unavailable, mismatched, or not eligible for judging.
+    """
+    try:
+        rollout, rollout_input = read_artifact_json(
+            store,
+            artifact_id=rollout_artifact_id,
+            expected_artifact_type="rollout",
+            relative_path="rollout.json",
+            model_type=RolloutArtifact,
+        )
+        rubric, rubric_input = read_artifact_json(
+            store,
+            artifact_id=rubric_artifact_id,
+            expected_artifact_type="rubric",
+            relative_path="rubric.json",
+            model_type=Rubric,
+        )
+    except JudgingProvenanceError as exc:
+        raise JudgmentError(
+            "authoritative judgment requires completed immutable source artifacts"
+        ) from exc
+    try:
+        calibration, calibration_input = _load_authoritative_persisted_calibration(
+            store, calibration_artifact_id
+        )
+    except CalibrationError as exc:
+        raise JudgmentError(
+            "authoritative judgment requires an eligible persisted calibration and report"
+        ) from exc
+    if rollout.artifact_id != rollout_artifact_id:
+        raise JudgmentError("stored rollout record does not match its artifact identity")
+    if rubric.rubric_id != rubric_artifact_id:
+        raise JudgmentError("stored rubric record does not match its artifact identity")
+    if calibration.calibration_id != calibration_artifact_id:
+        raise JudgmentError("stored calibration record does not match its artifact identity")
+    return rollout, rollout_input, rubric, rubric_input, calibration, calibration_input
 
 
 def _validate_bindings(

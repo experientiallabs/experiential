@@ -604,16 +604,20 @@ def _require_final_judgment_provenance(
     rollout_input: ArtifactInput,
     rubric_input: ArtifactInput,
 ) -> None:
-    """Require a source judgment to already hash its rollout, rubric, and calibration inputs."""
+    """Require a source judgment to use an eligible persisted calibration and exact inputs."""
     # The verifier rebuilds reports through this module, so importing it above would cycle.
-    from wmo.common.judging.calibration_provenance import verify_persisted_calibration
+    from wmo.common.judging.calibration_provenance import (
+        _load_authoritative_persisted_calibration,
+    )
 
     try:
-        calibration, calibration_input = verify_persisted_calibration(
+        calibration, calibration_input = _load_authoritative_persisted_calibration(
             store, judgment.calibration_id
         )
     except CalibrationError as exc:
-        raise CalibrationError("uncalibrated judgment has no verified calibration input") from exc
+        raise CalibrationError(
+            "source judgment has no eligible persisted calibration input"
+        ) from exc
     if (
         calibration.rubric_id != judgment.rubric_id
         or calibration.judge_model != judgment.judge_model

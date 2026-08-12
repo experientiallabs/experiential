@@ -17,8 +17,6 @@ from wmo.common.judging.calibration_metrics import (
     WorstDisagreement,
 )
 from wmo.common.judging.calibration_provenance import (
-    VerifiedJudgeCalibration,
-    verify_authoritative_calibration,
     verify_persisted_calibration,
 )
 from wmo.common.judging.interface import Judge
@@ -91,8 +89,6 @@ __all__ = [
     "RouterLineageAssignment",
     "ScoreAnchor",
     "WorstDisagreement",
-    "VerifiedJudgeCalibration",
-    "verify_authoritative_calibration",
     "write_router_lineage_split",
     "write_rubric_proposal_evidence",
     "verify_persisted_calibration",

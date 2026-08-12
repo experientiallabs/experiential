@@ -29,8 +29,6 @@ from wmo.common.judging import (
     Rubric,
     RubricDimension,
     ScoreAnchor,
-    VerifiedJudgeCalibration,
-    verify_authoritative_calibration,
     verify_persisted_calibration,
     write_router_lineage_split,
 )
@@ -62,9 +60,10 @@ class _FakeJudgeClient:
     def __init__(self, model: ModelSnapshot, content: str) -> None:
         self._model = model
         self._content = content
+        self.requests: list[ModelRequest] = []
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        del request
+        self.requests.append(request)
         return ModelResponse(
             output=AssistantAction(content=self._content),
             model=self._model,
@@ -505,7 +504,7 @@ def test_forged_calibration_report_pair_is_rejected_by_judging_and_observation_b
     source_judgment = Judgment.model_validate_json(
         graph.store.artifacts.read_bytes(source_observation.judgment.artifact_id, "judgment.json")
     )
-    with pytest.raises(JudgmentError, match="verified persisted calibration"):
+    with pytest.raises(JudgmentError, match="eligible persisted calibration"):
         LMJudge(
             _FakeJudgeClient(_model(), json.dumps({"dimensions": []})),
             _prompt(),
@@ -536,7 +535,7 @@ def test_forged_calibration_report_pair_is_rejected_by_judging_and_observation_b
             files={"judgment.json": forged_judgment},
         )
     )
-    with pytest.raises(CalibrationError, match="verified calibration"):
+    with pytest.raises(CalibrationError, match="eligible persisted calibration"):
         JudgeCalibrationService().build_report(
             graph.store,
             rubric_id=graph.rubric.rubric_id,
@@ -604,19 +603,58 @@ def test_two_label_human_calibration_requires_persisted_risk_acceptance(tmp_path
         calibration=service.insufficient_calibration(graph.store, report),
     )
     source_observation = graph.observations[0]
-    with pytest.raises(CalibrationError, match="insufficient judge calibrations"):
-        verify_authoritative_calibration(graph.store, insufficient.calibration_id)
-    with pytest.raises(JudgmentError, match="verified persisted calibration"):
+    rejected_client = _FakeJudgeClient(_model(), json.dumps({"dimensions": []}))
+    with pytest.raises(JudgmentError, match="eligible persisted calibration"):
         LMJudge(
-            _FakeJudgeClient(_model(), json.dumps({"dimensions": []})),
+            rejected_client,
             _prompt(),
             code_revision="judging-revision",
             clock=lambda: _TIME,
-        ).judge_and_write(
+        ).judge_persisted(
             graph.store,
             rollout_artifact_id=source_observation.source_rollout.artifact_id,
             rubric_artifact_id=graph.rubric.rubric_id,
             calibration_artifact_id=insufficient.calibration_id,
+        )
+    assert rejected_client.requests == []
+
+    source_judgment = Judgment.model_validate_json(
+        graph.store.artifacts.read_bytes(source_observation.judgment.artifact_id, "judgment.json")
+    )
+    insufficient_input = artifact_input(
+        graph.store.artifacts.read(insufficient.calibration_id).manifest
+    )
+    insufficient_source_judgment = source_judgment.model_copy(
+        update={
+            "judgment_id": "insufficient-source-judgment",
+            "calibration_id": insufficient.calibration_id,
+            "inputs": _inputs(
+                source_observation.source_rollout,
+                artifact_input(graph.store.artifacts.read(graph.rubric.rubric_id).manifest),
+                insufficient_input,
+            ),
+        }
+    )
+    insufficient_source_input = artifact_input(
+        graph.store.artifacts.write_json(
+            artifact_id=insufficient_source_judgment.judgment_id,
+            artifact_type="judgment",
+            envelope=insufficient_source_judgment,
+            files={"judgment.json": insufficient_source_judgment},
+        )
+    )
+    with pytest.raises(CalibrationError, match="eligible persisted calibration"):
+        service.build_report(
+            graph.store,
+            rubric_id=graph.rubric.rubric_id,
+            label_set_id=graph.label_set.label_set_id,
+            router_lineage_split_id=graph.split.split_id,
+            observations=(
+                source_observation.model_copy(update={"judgment": insufficient_source_input}),
+                *graph.observations[1:],
+            ),
+            created_at=_TIME,
+            code_revision="calibration-revision",
         )
     with pytest.raises(CalibrationError, match="explicit accept_insufficient_labels"):
         service.approve(graph.store, report, approved_at=_TIME)
@@ -633,7 +671,6 @@ def test_two_label_human_calibration_requires_persisted_risk_acceptance(tmp_path
     verified, _verified_input = verify_persisted_calibration(graph.store, stored.calibration_id)
     assert verified == stored
 
-    authorized = verify_authoritative_calibration(graph.store, stored.calibration_id)
     rollout = RolloutArtifact.model_validate_json(
         graph.store.artifacts.read_bytes(
             source_observation.source_rollout.artifact_id,
@@ -658,7 +695,12 @@ def test_two_label_human_calibration_requires_persisted_risk_acceptance(tmp_path
         code_revision="judging-revision",
         clock=lambda: _TIME,
     )
-    direct = direct_judge.judge(rollout, graph.rubric, authorized)
+    direct = direct_judge.judge_persisted(
+        graph.store,
+        rollout_artifact_id=source_observation.source_rollout.artifact_id,
+        rubric_artifact_id=graph.rubric.rubric_id,
+        calibration_artifact_id=stored.calibration_id,
+    )
     assert direct.calibration_id == stored.calibration_id
     persisted = direct_judge.judge_and_write(
         graph.store,
@@ -686,19 +728,7 @@ def test_two_label_human_calibration_requires_persisted_risk_acceptance(tmp_path
     )
     with pytest.raises(CalibrationError, match="risk acceptance"):
         verify_persisted_calibration(graph.store, forged.calibration_id)
-    with pytest.raises(CalibrationError, match="risk acceptance"):
-        verify_authoritative_calibration(graph.store, forged.calibration_id)
-    with pytest.raises(JudgmentError, match="recursively verified calibration"):
-        direct_judge.judge(
-            rollout,
-            graph.rubric,
-            cast(VerifiedJudgeCalibration, forged),
-        )
-
-    source_judgment = Judgment.model_validate_json(
-        graph.store.artifacts.read_bytes(source_observation.judgment.artifact_id, "judgment.json")
-    )
-    with pytest.raises(JudgmentError, match="verified persisted calibration"):
+    with pytest.raises(JudgmentError, match="eligible persisted calibration"):
         LMJudge(
             _FakeJudgeClient(_model(), json.dumps({"dimensions": []})),
             _prompt(),
@@ -729,7 +759,7 @@ def test_two_label_human_calibration_requires_persisted_risk_acceptance(tmp_path
             files={"judgment.json": forged_judgment},
         )
     )
-    with pytest.raises(CalibrationError, match="verified calibration"):
+    with pytest.raises(CalibrationError, match="eligible persisted calibration"):
         service.build_report(
             graph.store,
             rubric_id=graph.rubric.rubric_id,

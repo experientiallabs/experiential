@@ -4,29 +4,32 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from wmo.common.judging.calibration_provenance import VerifiedJudgeCalibration
+from wmo.common.core.artifacts import ArtifactId
 from wmo.common.judging.judgment import Judgment
-from wmo.common.judging.rubric import Rubric
-from wmo.common.rollouts import RolloutArtifact
+from wmo.common.project import ProjectStore
 
 
 @runtime_checkable
 class Judge(Protocol):
-    """Scores one existing rollout against a frozen rubric and calibration."""
+    """Scores persisted rollout evidence against persisted rubric and calibration artifacts."""
 
-    def judge(
+    def judge_persisted(
         self,
-        rollout: RolloutArtifact,
-        rubric: Rubric,
-        calibration: VerifiedJudgeCalibration,
+        store: ProjectStore,
+        *,
+        rollout_artifact_id: ArtifactId,
+        rubric_artifact_id: ArtifactId,
+        calibration_artifact_id: ArtifactId,
     ) -> Judgment:
-        """Return a structured evidence-cited judgment without rerunning the rollout.
+        """Return a structured judgment from recursively verified persisted evidence.
 
         Args:
-            rollout: Existing immutable rollout evidence to score.
-            rubric: Immutable customer rubric that defines score dimensions.
-            calibration: Recursively verified calibration authorization to apply.
+            store: Project store that owns immutable judging inputs.
+            rollout_artifact_id: Completed rollout artifact to score.
+            rubric_artifact_id: Completed rubric artifact that defines score dimensions.
+            calibration_artifact_id: Completed calibration artifact to verify before the model
+                call.
 
         Returns:
-            The structured judgment over the supplied rollout.
+            The structured judgment over the persisted rollout.
         """

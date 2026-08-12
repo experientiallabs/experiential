@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from inspect import signature
 from pathlib import Path
-from typing import cast
 
 import pytest
 
 from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactInput, SourceIdentity
 from wmo.common.judging import (
-    DimensionScoreMap,
     HumanScoreReview,
     Judge,
     JudgeCalibration,
@@ -24,8 +23,7 @@ from wmo.common.judging import (
     Rubric,
     RubricDimension,
     ScoreAnchor,
-    VerifiedJudgeCalibration,
-    verify_authoritative_calibration,
+    calibration_provenance,
     write_router_lineage_split,
 )
 from wmo.common.models import (
@@ -112,32 +110,6 @@ def _rubric(*, task_set_input: ArtifactInput | None = None) -> Rubric:
         source_task_set_id="task-set-1",
         status="human_approved",
         approved_at=_TIME,
-    )
-
-
-def _calibration(prompt: PromptDefinition) -> JudgeCalibration:
-    return JudgeCalibration(
-        schema_version=1,
-        created_at=_TIME,
-        code_revision="w6-test",
-        calibration_id="calibration-1",
-        rubric_id="rubric-1",
-        judge_model=_model(),
-        judge_prompt_id=prompt.prompt_id,
-        judge_prompt_sha256=prompt.sha256,
-        label_set_id="labels-none",
-        calibration_lineage_ids=(),
-        excluded_router_held_out_lineage_ids=("lineage-held-out",),
-        validation_method="grouped_k_fold",
-        out_of_fold_report_id="report-1",
-        out_of_fold_report_sha256=_DIGEST,
-        score_maps=(
-            DimensionScoreMap(
-                dimension_id="task-success",
-                calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
-            ),
-        ),
-        status="provisional",
     )
 
 
@@ -266,10 +238,10 @@ def _write_bootstrap_sources(
     return rollout, rubric, calibration, prompt
 
 
-def test_lm_judge_requires_verified_calibration_and_cited_rollout_evidence(
+def test_lm_judge_requires_store_backed_persisted_inputs_and_cited_rollout_evidence(
     tmp_path: Path,
 ) -> None:
-    """Only recursively verified provisional evidence can authorize direct judging."""
+    """Only a store-backed provisional calibration can invoke the LM judge."""
     store = _store(tmp_path)
     rollout, rubric, calibration, prompt = _write_bootstrap_sources(store)
     client = _FakeJudgeClient(_valid_output())
@@ -280,15 +252,12 @@ def test_lm_judge_requires_verified_calibration_and_cited_rollout_evidence(
         clock=lambda: _TIME,
     )
 
-    with pytest.raises(JudgmentError, match="recursively verified calibration"):
-        judge.judge(
-            rollout,
-            rubric,
-            cast(VerifiedJudgeCalibration, _calibration(prompt)),
-        )
-
-    verified = verify_authoritative_calibration(store, calibration.calibration_id)
-    judgment = judge.judge(rollout, rubric, verified)
+    judgment = judge.judge_persisted(
+        store,
+        rollout_artifact_id=rollout.artifact_id,
+        rubric_artifact_id=rubric.rubric_id,
+        calibration_artifact_id=calibration.calibration_id,
+    )
 
     assert isinstance(client, ModelClient)
     assert isinstance(judge, Judge)
@@ -301,13 +270,27 @@ def test_lm_judge_requires_verified_calibration_and_cited_rollout_evidence(
     assert "span-1" in request_content
 
 
+def test_lm_judge_has_no_caller_mintable_or_mutable_calibration_entry_point() -> None:
+    """Raw calibration data cannot mint authority or reach the LM judge call surface."""
+    assert not hasattr(calibration_provenance, "VerifiedJudgeCalibration")
+    assert not hasattr(calibration_provenance, "verify_authoritative_calibration")
+    assert not hasattr(LMJudge, "judge")
+    parameters = signature(LMJudge.judge_persisted).parameters
+    assert "calibration" not in parameters
+    assert "calibration_artifact_id" in parameters
+
+
 def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs(
     tmp_path: Path,
 ) -> None:
     """Malformed JSON, tool outputs, and invented span citations are actionable errors."""
     store = _store(tmp_path)
     rollout, rubric, calibration, prompt = _write_bootstrap_sources(store)
-    verified = verify_authoritative_calibration(store, calibration.calibration_id)
+    source_ids = {
+        "rollout_artifact_id": rollout.artifact_id,
+        "rubric_artifact_id": rubric.rubric_id,
+        "calibration_artifact_id": calibration.calibration_id,
+    }
 
     with pytest.raises(JudgmentError, match="malformed"):
         LMJudge(
@@ -315,7 +298,7 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs(
             prompt,
             code_revision="judging-revision",
             clock=lambda: _TIME,
-        ).judge(rollout, rubric, verified)
+        ).judge_persisted(store, **source_ids)
     with pytest.raises(JudgmentError, match="tool calls"):
         LMJudge(
             _FakeJudgeClient(
@@ -325,14 +308,14 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs(
             prompt,
             code_revision="judging-revision",
             clock=lambda: _TIME,
-        ).judge(rollout, rubric, verified)
+        ).judge_persisted(store, **source_ids)
     with pytest.raises(JudgmentError, match="do not exist"):
         LMJudge(
             _FakeJudgeClient(_valid_output("invented-span")),
             prompt,
             code_revision="judging-revision",
             clock=lambda: _TIME,
-        ).judge(rollout, rubric, verified)
+        ).judge_persisted(store, **source_ids)
     wrong_model = ModelSnapshot(
         provider="fake",
         model_id="other-judge",
@@ -344,7 +327,7 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs(
             prompt,
             code_revision="judging-revision",
             clock=lambda: _TIME,
-        ).judge(rollout, rubric, verified)
+        ).judge_persisted(store, **source_ids)
     changed_prompt = PromptDefinition.from_text(
         "judge-prompt-v1", "Return only structured scores with revised wording."
     )
@@ -354,7 +337,7 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs(
             changed_prompt,
             code_revision="judging-revision",
             clock=lambda: _TIME,
-        ).judge(rollout, rubric, verified)
+        ).judge_persisted(store, **source_ids)
 
 
 def test_persisted_bootstrap_creates_final_judgment_with_verified_artifact_inputs(
