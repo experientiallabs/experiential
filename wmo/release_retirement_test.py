@@ -25,6 +25,7 @@ FORBIDDEN_DOC_PATTERNS: Final[dict[str, re.Pattern[str]]] = {
     "deleted root command": re.compile(
         r"\bwmo (?:download|list|eval|knowledge|providers|scenarios|serve)\b"
     ),
+    "deleted optimize judge command": re.compile(r"\bwmo optimize judge(?=\s|`|$)"),
     "deleted WorldModel API": re.compile(r"\bWorldModel\b"),
 }
 
@@ -56,6 +57,16 @@ def _tracked_document_paths() -> tuple[Path, ...]:
     )
     paths = (REPO_ROOT / relative_path for relative_path in result.stdout.splitlines())
     return tuple(path for path in paths if path.is_file())
+
+
+def _retired_document_findings(documents: Iterable[tuple[str, str]]) -> tuple[str, ...]:
+    findings: list[str] = []
+    for relative_path, text in documents:
+        for label, pattern in FORBIDDEN_DOC_PATTERNS.items():
+            for match in pattern.finditer(text):
+                line = text.count("\n", 0, match.start()) + 1
+                findings.append(f"{relative_path}:{line}: {label}: {match.group(0)}")
+    return tuple(findings)
 
 
 def _normalized_archive_path(member_name: str) -> str:
@@ -94,15 +105,22 @@ def _sdist_metadata(archive: tarfile.TarFile) -> str:
 
 
 def test_tracked_docs_do_not_publish_retired_w8_workflows() -> None:
-    findings: list[str] = []
-    for path in _tracked_document_paths():
-        text = path.read_text(encoding="utf-8")
-        relative_path = path.relative_to(REPO_ROOT).as_posix()
-        for label, pattern in FORBIDDEN_DOC_PATTERNS.items():
-            for match in pattern.finditer(text):
-                line = text.count("\n", 0, match.start()) + 1
-                findings.append(f"{relative_path}:{line}: {label}: {match.group(0)}")
+    documents = (
+        (path.relative_to(REPO_ROOT).as_posix(), path.read_text(encoding="utf-8"))
+        for path in _tracked_document_paths()
+    )
+    findings = _retired_document_findings(documents)
     assert not findings, "retired W8 documentation returned:\n" + "\n".join(findings)
+
+
+def test_tracked_document_scanner_rejects_hidden_optimize_judge_instruction() -> None:
+    """A synthetic hidden skill proves the tracked-document scanner catches the nested command."""
+    findings = _retired_document_findings(
+        ((".claude/skills/example/SKILL.md", "First run `wmo optimize judge sample`."),)
+    )
+    assert findings == (
+        ".claude/skills/example/SKILL.md:1: deleted optimize judge command: wmo optimize judge",
+    )
 
 
 def test_built_archives_exclude_retired_w8_content() -> None:
@@ -144,6 +162,7 @@ def test_archive_scanner_rejects_retired_module_descendants() -> None:
         ("deleted root command", "run `wmo providers set` first"),
         ("deleted root command", "run `wmo scenarios build` first"),
         ("deleted root command", "run `wmo serve` next"),
+        ("deleted optimize judge command", "run `wmo optimize judge sample` first"),
     ],
 )
 def test_document_scanner_rejects_retired_judges_and_root_commands(label: str, text: str) -> None:
