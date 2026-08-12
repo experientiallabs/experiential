@@ -12,10 +12,17 @@ pip install world-model-optimizer
 wmo build traces.otel.jsonl --source otlp --project support-agent --root .wmo
 ```
 
-Build writes a normalized `TraceDataset`, a deterministic `TaskSet`, and a local review handoff
-whose status is `proposals_pending`. It does not call a model, judge, provider, or network service.
-Rubric proposal, simulation, and judgment are separate explicit operations with their own consent
-and budget boundaries.
+Build accepts 100 through 1000 valid normalized traces. It writes a manifest-bound
+`TraceDataset`, deterministic `TaskSet`, and local review handoff whose status is
+`proposals_pending`. Build makes zero model, provider, or judge paid calls. Anonymous aggregate
+PostHog product telemetry may use the network after artifact persistence unless telemetry is
+disabled. It never contains trace content.
+
+WMO stops at review readiness. Rubric review, simulation, judgment, fidelity validation, frozen
+embeddings, and pricing are required completed inputs to optimization. Produce them through an
+explicit external or provider-authorized workflow with its own consent and budget. Then create the
+single configuration using the exact typed recipe and field definitions in
+[Router optimization configuration](docs/reference/router_optimization_config.md).
 
 After the combined fit, fidelity, and held-out evidence is complete, freeze and report one router:
 
@@ -23,10 +30,11 @@ After the combined fit, fidelity, and held-out evidence is complete, freeze and 
 wmo optimize router support-agent --config router-optimization.json --root .wmo
 ```
 
-The single JSON config names completed evidence, a frozen embedding set, pricing, guard settings,
-and an exact timestamp and code revision. The workflow materializes fit-only evidence and freezes
-the bank and policy before it opens held-out evidence. Repeating the command with the same config
-verifies and reuses the same immutable artifacts. It never calls a provider.
+The single JSON config names completed simulation, judgment, and fidelity evidence, a frozen
+embedding set, pricing, guard settings, and an exact timestamp and code revision. The workflow
+materializes fit-only evidence and freezes the bank and policy before it opens held-out evidence.
+Repeating the command with the same config verifies and reuses the same immutable artifacts. It
+never calls a provider.
 
 Run the frozen router through the development-only loopback adapter:
 
@@ -76,7 +84,9 @@ built = build_project(
 )
 assert built.review.status == "proposals_pending"
 
-# Explicit simulation and judgment services produce the completed artifact IDs in this file.
+# Stop here until an explicitly authorized external workflow has persisted the completed
+# evaluation plan, rollout sets, judgments, fidelity reports, frozen embeddings, and pricing.
+# Create this file from those typed outputs using docs/reference/router_optimization_config.md.
 router_config = RouterOptimizationConfig.model_validate_json(
     Path("router-optimization.json").read_bytes()
 )

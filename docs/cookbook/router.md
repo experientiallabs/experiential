@@ -9,17 +9,25 @@ online request.
 wmo build traces.otel.jsonl --source otlp --project support-agent --root .wmo
 ```
 
-The command reads the raw file once. It persists normalized traces and representative fit and
-held-out tasks, then records that rubric proposals are pending. It makes zero paid calls. Repeating
-the command with identical source content and code revision reuses the same artifact identities.
+The command requires 100 through 1000 valid normalized traces. It reads the raw file once,
+persists normalized traces and representative fit and held-out tasks, then records a
+manifest-bound readiness state with rubric proposals pending. It makes zero model, provider, or
+judge paid calls. Anonymous aggregate PostHog product telemetry may send after persistence unless
+disabled. Repeating the command with identical source content and code revision verifies and
+reuses the exact artifact manifests and payloads.
 
 ## 2. Complete review and evaluation explicitly
 
-Use the rubric, simulation, judgment, and evaluation services to produce a combined plan and its
-completed evidence. Provider-backed work must have explicit consent and a budget outside `build`.
-Freeze the resulting IDs in one `router-optimization.json` file. That file contains separate fit
-plus fidelity evidence and held-out evidence under one plan, along with the frozen embedding and
-pricing IDs, guard, judgment status, timestamp, and code revision.
+WMO does not generate the required simulation, judgment, or fidelity results in this production
+composition. Use an external or provider-authorized workflow with explicit consent and budget to
+persist a combined evaluation plan, completed rollout sets, judgments, fidelity reports, frozen
+embeddings, and a pricing snapshot. Review the results before optimization.
+
+Create `router-optimization.json` from those exact typed outputs using
+[the configuration recipe](../reference/router_optimization_config.md). The recipe names and
+explains every field. The file separates fit plus fidelity evidence from held-out evidence under
+one plan. It also fixes the embedding and pricing IDs, guard, judgment status, timestamp, and code
+revision.
 
 ## 3. Freeze and report
 

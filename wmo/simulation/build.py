@@ -6,8 +6,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from wmo.common.core.artifacts import ArtifactId, ArtifactInput, ContractModel, stable_id
-from wmo.common.project import ArtifactStore, ProjectStore, artifact_input
+from pydantic import Field, model_validator
+
+from wmo.common.core.artifacts import (
+    ArtifactId,
+    ArtifactInput,
+    ContractModel,
+    SourceIdentity,
+    stable_id,
+)
+from wmo.common.project import ArtifactStore, ProjectConfig, ProjectStore, artifact_input
 from wmo.common.tasks import TaskSet
 from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
@@ -31,13 +39,28 @@ class TaskSetBuild:
 
 
 class BuildReviewReadiness(ContractModel):
-    """Provider-free handoff from deterministic task mining to rubric review."""
+    """Manifest-bound provider-free handoff from deterministic mining to rubric review."""
 
     schema_version: int = 1
+    readiness_id: ArtifactId
     status: Literal["proposals_pending"] = "proposals_pending"
-    trace_dataset_id: ArtifactId
-    task_set_id: ArtifactId
+    trace_dataset: ArtifactInput
+    task_set: ArtifactInput
+    project_config: ProjectConfig
+    source: SourceIdentity
+    mining_spec: MiningSpec
+    descriptor_embedder: Literal["hashing-descriptor-v1"] = "hashing-descriptor-v1"
+    descriptor_dimensions: int = Field(ge=8)
+    code_revision: str = Field(min_length=1, max_length=256)
     paid_calls_made: Literal[0] = 0
+
+    @model_validator(mode="after")
+    def _require_content_identity(self) -> BuildReviewReadiness:
+        """Reject readiness state whose ID does not bind its complete deterministic content."""
+        expected = _build_review_id(self.model_dump(mode="json", exclude={"readiness_id"}))
+        if self.readiness_id != expected:
+            raise ValueError("build review readiness ID differs from its complete binding")
+        return self
 
 
 @dataclass(frozen=True)
@@ -131,17 +154,61 @@ def build_project(
     Raises:
         ValueError: Existing review state binds a different deterministic build.
     """
+    trace_count = len(normalized.traces)
+    if trace_count < 100 or trace_count > 1_000:
+        raise ValueError(
+            "wmo build requires 100 to 1000 valid normalized traces after validation and "
+            f"deduplication; received {trace_count}"
+        )
+    resolved_spec = mining_spec or MiningSpec()
+    resolved_embedder = embedder or HashingDescriptorEmbedder()
+    if not isinstance(resolved_embedder, HashingDescriptorEmbedder):
+        raise ValueError(
+            "the provider-free build workflow requires HashingDescriptorEmbedder; use the "
+            "lower-level build_task_set API for an explicitly configured external embedder"
+        )
     artifacts = build_task_set(
         normalized,
         store.artifacts,
         created_at=created_at,
         code_revision=code_revision,
-        mining_spec=mining_spec,
-        embedder=embedder,
+        mining_spec=resolved_spec,
+        embedder=resolved_embedder,
     )
+    trace_stored = store.artifacts.read(artifacts.trace_dataset.dataset.dataset_id)
+    task_stored = store.artifacts.read(artifacts.task_set.task_set_id)
+    if trace_stored.manifest != artifacts.trace_dataset.manifest:
+        raise ValueError("loaded trace dataset manifest differs from the completed build")
+    trace_input = artifact_input(trace_stored.manifest)
+    task_input = artifact_input(task_stored.manifest)
+    if artifacts.task_set.inputs != (trace_input,):
+        raise ValueError("loaded task set does not bind the exact trace dataset manifest")
+    project_config = store.load_project()
+    source = artifacts.trace_dataset.dataset.source
+    if source is None:
+        raise ValueError("completed trace dataset has no immutable source identity")
+    review_binding = {
+        "schema_version": 1,
+        "status": "proposals_pending",
+        "trace_dataset": trace_input.model_dump(mode="json"),
+        "task_set": task_input.model_dump(mode="json"),
+        "project_config": project_config.model_dump(mode="json"),
+        "source": source.model_dump(mode="json"),
+        "mining_spec": resolved_spec.model_dump(mode="json"),
+        "descriptor_embedder": "hashing-descriptor-v1",
+        "descriptor_dimensions": resolved_embedder.dimensions,
+        "code_revision": code_revision,
+        "paid_calls_made": 0,
+    }
     review = BuildReviewReadiness(
-        trace_dataset_id=artifacts.trace_dataset.dataset.dataset_id,
-        task_set_id=artifacts.task_set.task_set_id,
+        readiness_id=_build_review_id(review_binding),
+        trace_dataset=trace_input,
+        task_set=task_input,
+        project_config=project_config,
+        source=source,
+        mining_spec=resolved_spec,
+        descriptor_dimensions=resolved_embedder.dimensions,
+        code_revision=code_revision,
     )
     current = store.read_review()
     if current is None:
@@ -152,8 +219,13 @@ def build_project(
         raise ValueError("review.json must be an object before build readiness can be recorded")
     prior = root_review.get("build_review")
     serialized = review.model_dump(mode="json")
-    if prior is not None and prior != serialized:
-        raise ValueError("review.json already binds a different completed build")
+    if prior is not None:
+        try:
+            existing = BuildReviewReadiness.model_validate(prior)
+        except ValueError as exc:
+            raise ValueError("review.json contains invalid build readiness") from exc
+        if existing != review:
+            raise ValueError("review.json already binds a different completed build")
     root_review["build_review"] = serialized
     store.write_review(root_review)
     return ProjectBuild(artifacts=artifacts, review=review)
@@ -169,3 +241,8 @@ def _task_set_id(dataset_input: ArtifactInput, mining: TaskMiningResult) -> str:
             "coverage": mining.coverage.model_dump(mode="json"),
         },
     )
+
+
+def _build_review_id(binding: dict[str, object]) -> str:
+    """Return the content ID for one complete manifest-bound build review handoff."""
+    return stable_id("build-review", binding)

@@ -61,28 +61,36 @@ def _otlp_export(tmp_path: Path, count: int = 100) -> Path:
     return path
 
 
-def _posthog_export(tmp_path: Path) -> Path:
-    """Write one local PostHog LLM-observability export without an HTTP call."""
+def _posthog_export(tmp_path: Path, count: int = 100) -> Path:
+    """Write distinct local PostHog generation traces without an HTTP call."""
     path = tmp_path / "posthog.json"
     path.write_text(
         json.dumps(
-            {
-                "event": "$ai_generation",
-                "timestamp": "2026-08-11T00:00:00Z",
-                "properties": {
-                    "$ai_trace_id": "a" * 32,
-                    "$ai_span_id": "generation-1",
-                    "$ai_provider": "openai",
-                    "$ai_model": "gpt-test",
-                    "$ai_input": [{"role": "user", "content": "Reset my password"}],
-                    "$ai_output_choices": [
-                        {"role": "assistant", "content": "I sent reset instructions."}
-                    ],
-                    "wmo.customer.id": "customer-1",
-                    "wmo.conversation.id": "conversation-1",
-                    "wmo.outcome.status": "success",
-                },
-            }
+            [
+                {
+                    "event": "$ai_generation",
+                    "timestamp": f"2026-08-11T00:{index // 60:02d}:{index % 60:02d}Z",
+                    "properties": {
+                        "$ai_trace_id": f"{index + 1:032x}",
+                        "$ai_span_id": f"generation-{index}",
+                        "$ai_provider": "openai",
+                        "$ai_model": "gpt-test",
+                        "$ai_input": [
+                            {
+                                "role": "user",
+                                "content": f"Resolve distinct support request {index}",
+                            }
+                        ],
+                        "$ai_output_choices": [
+                            {"role": "assistant", "content": "I sent reset instructions."}
+                        ],
+                        "wmo.customer.id": f"customer-{index}",
+                        "wmo.conversation.id": f"conversation-{index}",
+                        "wmo.outcome.status": "success",
+                    },
+                }
+                for index in range(count)
+            ]
         ),
         encoding="utf-8",
     )
@@ -210,8 +218,54 @@ def test_build_accepts_a_local_posthog_export_without_using_the_hogql_transport(
     assert trace_dataset.source is not None
     assert trace_dataset.source.kind == "file"
     assert trace_dataset.invalid_trace_count == 0
-    assert len(task_set.task_ids) == 1
+    assert len(trace_dataset.trace_ids) == 100
+    assert task_set.task_ids
     assert reads == 1
+
+
+@pytest.mark.parametrize("source_kind", ["otlp", "posthog"])
+@pytest.mark.parametrize(
+    ("trace_count", "accepted"),
+    [(99, False), (100, True), (1_000, True), (1_001, False)],
+)
+def test_build_enforces_normalized_trace_operating_range_for_each_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_kind: str,
+    trace_count: int,
+    accepted: bool,
+) -> None:
+    """Both canonical loaders enforce the exact 100 through 1000 trace build range."""
+    monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
+    source = (
+        _otlp_export(tmp_path, trace_count)
+        if source_kind == "otlp"
+        else _posthog_export(tmp_path, trace_count)
+    )
+    root = tmp_path / ".wmo"
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            str(source),
+            "--source",
+            source_kind,
+            "--project",
+            "boundary",
+            "--root",
+            str(root),
+        ],
+    )
+
+    if accepted:
+        assert result.exit_code == 0, result.output
+        trace_dataset, _task_set = _task_set_for(root, "boundary")
+        assert len(trace_dataset.trace_ids) == trace_count
+    else:
+        assert result.exit_code == 2
+        assert "requires 100 to 1000 valid normalized traces" in result.output
+        assert ProjectStore(root, "boundary").artifacts.list_ids() == ()
 
 
 def test_build_rejects_unknown_source_and_missing_local_evidence(tmp_path: Path) -> None:

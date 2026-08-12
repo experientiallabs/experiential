@@ -11,7 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
-from wmo.common.core.artifacts import FailureCode, StructuredFailure
+from wmo.common.core.artifacts import ArtifactInput, FailureCode, StructuredFailure
 from wmo.common.evaluations import (
     EvaluationProtocol,
     ObservedProductionCell,
@@ -53,6 +53,11 @@ from wmo.runtime.router.runtime_test import _Catalog, _Client, _request
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
+
+
+def _artifact_input(value: object) -> ArtifactInput:
+    """Normalize helper-return unions to the exact persisted input contract."""
+    return ArtifactInput.model_validate(value)
 
 
 def test_single_workflow_freezes_before_held_out_and_resumes_exactly(
@@ -160,8 +165,9 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
         judgment = Judgment(
             schema_version=1,
             created_at=_TIME,
-            inputs=tuple(
-                sorted((rollout_input, calibration_input), key=lambda item: item.artifact_id)
+            inputs=(
+                _artifact_input(calibration_input),
+                _artifact_input(rollout_input),
             ),
             code_revision="test-revision",
             judgment_id=f"judgment-{task.task_id}",

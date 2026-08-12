@@ -5,8 +5,16 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from wmo.common.core.artifacts import SourceIdentity
-from wmo.common.project import ArtifactStore, ProjectConfig, ProjectStore, artifact_input
+from wmo.common.project import (
+    ArtifactCorruptionError,
+    ArtifactStore,
+    ProjectConfig,
+    ProjectStore,
+    artifact_input,
+)
 from wmo.common.project.paths import ProjectPaths
 from wmo.common.traces import Trace, TraceSource, TraceSpan
 from wmo.simulation.build import build_project, build_task_set
@@ -70,7 +78,9 @@ def test_build_project_resumes_and_records_provider_free_review_readiness(tmp_pa
     """A repeated local build reuses immutable IDs and never invents rubric proposals."""
     store = ProjectStore(tmp_path, "project-a")
     store.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(traces=(_trace(1), _trace(2)), issues=())
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
     first = build_project(
         normalized,
         store,
@@ -89,5 +99,60 @@ def test_build_project_resumes_and_records_provider_free_review_readiness(tmp_pa
     assert replay == first
     assert replay.review.status == "proposals_pending"
     assert replay.review.paid_calls_made == 0
+    assert replay.review.trace_dataset == artifact_input(replay.artifacts.trace_dataset.manifest)
+    task_manifest = store.artifacts.read(replay.artifacts.task_set.task_set_id).manifest
+    assert replay.review.task_set == artifact_input(task_manifest)
+    assert replay.review.project_config == ProjectConfig(project_id="project-a")
+    assert replay.review.source == _trace(0).source.identity
+    assert replay.review.mining_spec == MiningSpec(fit_task_budget=1, held_out_task_budget=1)
+    assert replay.review.code_revision == "test-revision"
     assert store.read_review() == {"build_review": replay.review.model_dump(mode="json")}
     assert len(store.artifacts.list_ids()) == 2
+
+    corrupt_review = replay.review.model_dump(mode="json")
+    corrupt_review["readiness_id"] = "build-review-00000000000000000000"
+    store.write_review({"build_review": corrupt_review})
+    with pytest.raises(ValueError, match="invalid build readiness"):
+        build_project(
+            normalized,
+            store,
+            created_at=datetime(2026, 8, 12, tzinfo=UTC),
+            code_revision="test-revision",
+            mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
+        )
+
+
+def test_build_project_refuses_changed_revision_and_corrupt_replay_payload(tmp_path: Path) -> None:
+    """Resume verifies the exact artifact envelope and bytes before returning readiness."""
+    store = ProjectStore(tmp_path, "project-a")
+    store.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
+    first = build_project(
+        normalized,
+        store,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="test-revision",
+        mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
+    )
+
+    with pytest.raises(ValueError, match="differs from replayed normalized evidence"):
+        build_project(
+            normalized,
+            store,
+            created_at=datetime(2026, 8, 12, tzinfo=UTC),
+            code_revision="changed-revision",
+            mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
+        )
+
+    trace_directory = store.artifacts.read(first.review.trace_dataset.artifact_id).directory
+    (trace_directory / "traces.jsonl").write_text("corrupt\n", encoding="utf-8")
+    with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
+        build_project(
+            normalized,
+            store,
+            created_at=datetime(2026, 8, 12, tzinfo=UTC),
+            code_revision="test-revision",
+            mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
+        )

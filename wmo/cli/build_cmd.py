@@ -50,8 +50,9 @@ def build(
 
     The command performs exactly one raw-source read inside the selected OTLP or PostHog loader.
     It persists that normalized evidence as a ``TraceDataset`` and mines a dependent immutable
-    ``TaskSet`` with the approved 50-fit and 20-held-out defaults. It performs no provider,
-    model, or network operation.
+    ``TaskSet`` with the approved 50-fit and 20-held-out defaults. Build performs no model,
+    provider, or judge paid call. After persistence, anonymous aggregate PostHog product telemetry
+    may use the network unless disabled.
 
     Args:
         trace_file: Positional local trace export path.

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from wmo.common.core.artifacts import SourceIdentity
-from wmo.common.project import ArtifactAlreadyExistsError, ArtifactStore, artifact_input
+from wmo.common.project import ArtifactStore, artifact_input
 from wmo.common.project.paths import ProjectPaths
 from wmo.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
 from wmo.simulation.ingest.dataset import persist_trace_dataset
@@ -111,8 +111,10 @@ def test_persist_trace_dataset_is_content_addressed_despite_input_order(tmp_path
     assert first_persisted.manifest == second_persisted.manifest
 
 
-def test_persist_trace_dataset_refuses_to_overwrite_completed_evidence(tmp_path: Path) -> None:
-    """A completed trace dataset cannot be rewritten under its stable content identity."""
+def test_persist_trace_dataset_returns_exact_replay_and_refuses_changed_envelope(
+    tmp_path: Path,
+) -> None:
+    """A completed dataset resumes exactly but rejects changed provenance under the same ID."""
     result = TraceNormalizationResult(traces=(_trace(1),), issues=())
     store = _store(tmp_path, "project-a")
     first = persist_trace_dataset(
@@ -122,12 +124,20 @@ def test_persist_trace_dataset_refuses_to_overwrite_completed_evidence(tmp_path:
         code_revision="test-revision",
     )
 
-    with pytest.raises(ArtifactAlreadyExistsError, match="immutable"):
+    replay = persist_trace_dataset(
+        result,
+        store,
+        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+        code_revision="test-revision",
+    )
+    assert replay == first
+
+    with pytest.raises(ValueError, match="differs from replayed normalized evidence"):
         persist_trace_dataset(
             result,
             store,
-            created_at=datetime(2026, 8, 11, tzinfo=UTC),
-            code_revision="test-revision",
+            created_at=datetime(2026, 8, 12, tzinfo=UTC),
+            code_revision="changed-revision",
         )
 
     assert store.read(first.dataset.dataset_id).manifest == first.manifest
