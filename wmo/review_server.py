@@ -305,7 +305,18 @@ class ReviewApplication:
         report_id: ArtifactId,
         approval: CalibrationApproval,
     ) -> ReviewMutationResponse:
-        """Approve one exact visible W6 report only after explicit human confirmation."""
+        """Approve one exact visible W6 report only after explicit human confirmation.
+
+        Args:
+            report_id: Visible persisted calibration report selected for approval.
+            approval: Explicit confirmation and low-sample risk-acceptance fields.
+
+        Returns:
+            The refreshed local review state and immutable approval notice.
+
+        Raises:
+            ReviewServerError: Confirmation, finalization, report, or risk requirements fail.
+        """
         if not approval.confirmed:
             raise ReviewServerError("calibration approval requires explicit confirmation")
         review = self._rubric_review(self._loaded_task_set())
@@ -452,6 +463,9 @@ def create_review_app(
 
     Returns:
         A FastAPI application with no auth, tenant, provider, or deployment integration.
+
+    Raises:
+        ReviewServerError: The requested local loopback port is outside the valid range.
     """
     if not 1 <= port <= 65535:
         raise ReviewServerError("review port must be between 1 and 65535")

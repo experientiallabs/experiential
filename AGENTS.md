@@ -191,7 +191,7 @@ state, not a permanent exemption, and must be empty by the final release audit.
    not return domain packages or production modules to the flat `wmo/` namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
-   `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.
+   `docs/`, `assets/`, `web/`, `.claude/`, `.github/`. That list is closed.
 
    `.agents/` is the one sanctioned scratchpad: a local, gitignored working directory for agent
    sessions (notes, probe scripts, run outputs). It is never tracked, never part of a PR, and
@@ -226,6 +226,8 @@ state, not a permanent exemption, and must be empty by the final release audit.
      area under the rule 4 hierarchy. `wmo/common/vendor/` holds self-contained building blocks
      with no import back into WMO product domains, including the waterfall chain and its MIT
      `LICENSE`.
+   - `web/` is the local-only TypeScript review workbench. It proxies only to the loopback WMO
+     review adapter and must not add provider, credential, tenant, or deployment integrations.
    - `assets/` — media referenced by README/docs (demo GIFs, logos).
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.

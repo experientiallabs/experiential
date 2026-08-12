@@ -225,7 +225,22 @@ class HumanScoreReview:
         score: Literal[0, 1, 2, 3, 4, 5],
         created_at: datetime,
     ) -> HumanScore:
-        """Append or correct one score after reloading its active predecessor under the lock."""
+        """Append or correct one score after reloading its active predecessor under the lock.
+
+        Args:
+            rubric_id: Immutable finalized rubric that owns the score.
+            rollout_id: Persisted rollout receiving the score.
+            lineage_id: Frozen task lineage retained for calibration.
+            dimension_id: Rubric dimension receiving the zero-to-five score.
+            score: Human score on the finalized dimension scale.
+            created_at: Time at which the local human decision is recorded.
+
+        Returns:
+            The newly persisted original score or immutable correction.
+
+        Raises:
+            ValueError: The supplied score timestamp has no timezone.
+        """
         if created_at.tzinfo is None or created_at.utcoffset() is None:
             raise ValueError("human score timestamps must include a timezone")
         result: list[HumanScore] = []
@@ -278,7 +293,16 @@ class HumanScoreReview:
         code_revision: str,
         created_at: datetime,
     ) -> HumanLabelSet:
-        """Freeze the latest locked score history as an immutable calibration input."""
+        """Freeze the latest locked score history as an immutable calibration input.
+
+        Args:
+            rubric_id: Immutable finalized rubric whose labels are being frozen.
+            code_revision: Exact code revision producing the label-set artifact.
+            created_at: Time at which the frozen label set is materialized.
+
+        Returns:
+            The immutable label set containing the complete correction history.
+        """
         result: list[HumanLabelSet] = []
 
         def transition(history: HumanScoreHistory) -> HumanScoreHistory:

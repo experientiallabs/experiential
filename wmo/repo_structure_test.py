@@ -20,6 +20,7 @@ ALLOWED_TOP_DIRS = {
     "wmo",
     "docs",
     "assets",
+    "web",
     ".claude",
     ".github",
 }
@@ -37,7 +38,7 @@ ALLOWED_TOP_FILES = {
     "uv.lock",
 }
 
-RETIRED_TOP_DIRS = (".agents/", "deploy/", "examples/", "packages/", "web/")
+RETIRED_TOP_DIRS = (".agents/", "deploy/", "examples/", "packages/")
 _RETIRED_PATTERNS = tuple(
     (retired, re.compile(rf"(?<![\w./-]){re.escape(retired)}")) for retired in RETIRED_TOP_DIRS
 )

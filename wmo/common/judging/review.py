@@ -179,7 +179,11 @@ class RubricReview:
         return self._draft
 
     def accept(self, dimension_id: ArtifactId) -> None:
-        """Accept one proposed rubric card in a locked review transaction."""
+        """Accept one proposed rubric card in a locked review transaction.
+
+        Args:
+            dimension_id: Proposed rubric card to add to the human-owned draft.
+        """
         self._mutate(lambda review: review._accept(dimension_id))
 
     def _accept(self, dimension_id: ArtifactId) -> None:
@@ -205,7 +209,11 @@ class RubricReview:
         )
 
     def reject(self, dimension_id: ArtifactId) -> None:
-        """Reject one proposed rubric card in a locked review transaction."""
+        """Reject one proposed rubric card in a locked review transaction.
+
+        Args:
+            dimension_id: Proposed rubric card to remove from the editable draft.
+        """
         self._mutate(lambda review: review._reject(dimension_id))
 
     def _reject(self, dimension_id: ArtifactId) -> None:
@@ -241,7 +249,14 @@ class RubricReview:
         description: str | None = None,
         anchors: tuple[ScoreAnchor, ...] | None = None,
     ) -> None:
-        """Edit one rubric card in a locked review transaction."""
+        """Edit one rubric card in a locked review transaction.
+
+        Args:
+            dimension_id: Active or proposed rubric card to change.
+            name: Optional replacement display name.
+            description: Optional replacement customer-facing definition.
+            anchors: Optional complete ordered zero-to-five anchor replacement.
+        """
         self._mutate(
             lambda review: review._edit(
                 dimension_id,
@@ -301,7 +316,11 @@ class RubricReview:
         )
 
     def add(self, dimension: RubricDimension) -> None:
-        """Add one human-authored scale in a locked review transaction."""
+        """Add one human-authored scale in a locked review transaction.
+
+        Args:
+            dimension: Complete zero-to-five rubric dimension to append.
+        """
         self._mutate(lambda review: review._add(dimension))
 
     def _add(self, dimension: RubricDimension) -> None:
@@ -323,7 +342,11 @@ class RubricReview:
         )
 
     def replace_all(self, dimensions: Sequence[RubricDimension]) -> None:
-        """Replace every active scale in a locked review transaction."""
+        """Replace every active scale in a locked review transaction.
+
+        Args:
+            dimensions: Complete ordered non-empty set of replacement scales.
+        """
         replacement = tuple(dimensions)
         self._mutate(lambda review: review._replace_all(replacement))
 
@@ -349,7 +372,11 @@ class RubricReview:
         )
 
     def order(self, dimension_ids: Sequence[ArtifactId]) -> None:
-        """Reorder every active scale in a locked review transaction."""
+        """Reorder every active scale in a locked review transaction.
+
+        Args:
+            dimension_ids: Every active dimension ID once, in the desired output order.
+        """
         requested = tuple(dimension_ids)
         self._mutate(lambda review: review._order(requested))
 
@@ -374,7 +401,11 @@ class RubricReview:
         )
 
     def finalize(self) -> Rubric:
-        """Finalize the current draft inside one locked review transaction."""
+        """Finalize the current draft inside one locked review transaction.
+
+        Returns:
+            The immutable approved rubric produced from the locked review draft.
+        """
         finalized: list[Rubric] = []
 
         def transition(review: RubricReview) -> None:

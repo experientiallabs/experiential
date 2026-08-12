@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from wmo.common.core.artifacts import ArtifactEnvelope, SourceIdentity
+from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactInput, SourceIdentity
 from wmo.common.judging import (
     DimensionJudgment,
     HumanScoreReview,
@@ -39,6 +39,7 @@ from wmo.common.rollouts import (
     RolloutArtifact,
     RolloutEventKind,
     RolloutSpan,
+    SimulationCellBinding,
     SimulationMode,
     StopReason,
     WorldModelSimulatorSnapshot,
@@ -90,6 +91,46 @@ def _model(model_id: str) -> ModelSnapshot:
         capabilities_sha256=_DIGEST,
         connection_sha256=_DIGEST,
     )
+
+
+def _world_model_rollout_provenance(
+    candidate: ModelSnapshot,
+    world_model: ModelSnapshot,
+    *,
+    agent_id: str,
+    repeat: int,
+) -> tuple[tuple[ArtifactInput, ...], WorldModelSimulatorSnapshot, SimulationCellBinding]:
+    """Return the complete W8 binding required by a local world-model fixture."""
+    plan_input = ArtifactInput(artifact_id="evaluation-plan", sha256=_DIGEST)
+    specification_input = ArtifactInput(artifact_id="simulation-spec", sha256=_DIGEST)
+    task_set_input = ArtifactInput(artifact_id="task-set-1", sha256=_DIGEST)
+    simulator = WorldModelSimulatorSnapshot(
+        simulator_id="world-model-v1",
+        prompt_id="world-prompt-v1",
+        prompt_version="v1",
+        prompt_sha256=_DIGEST,
+        world_model=world_model,
+    )
+    binding = SimulationCellBinding(
+        evaluation_plan_input=plan_input,
+        task_set_input=task_set_input,
+        task_set_tasks_sha256=_DIGEST,
+        task_sha256=_DIGEST,
+        candidate_alias="candidate",
+        candidate=candidate,
+        agent_id=agent_id,
+        repeat=repeat,
+        world_model_alias="world-model",
+        world_model=world_model,
+        simulator_id=simulator.simulator_id,
+        prompt_id=simulator.prompt_id,
+        prompt_version=simulator.prompt_version,
+        prompt_sha256=simulator.prompt_sha256,
+        simulation_spec_input=specification_input,
+        simulation_spec_sha256=_DIGEST,
+        simulation_inputs_sha256=_DIGEST,
+    )
+    return (plan_input, specification_input, task_set_input), simulator, binding
 
 
 def _trace(index: int) -> Trace:
@@ -216,9 +257,17 @@ def _write_rollout_and_judgment(
 ) -> None:
     """Persist one viewed rollout and one canonical W6 score for override coverage."""
     candidate = _model("candidate")
+    world_model = _model("world-model")
+    inputs, simulator, binding = _world_model_rollout_provenance(
+        candidate,
+        world_model,
+        agent_id="customer-agent",
+        repeat=0,
+    )
     rollout = RolloutArtifact(
         schema_version=1,
         created_at=_TIME,
+        inputs=inputs,
         code_revision="review-test",
         artifact_id="rollout-1",
         simulation_id="simulation-1",
@@ -231,12 +280,8 @@ def _write_rollout_and_judgment(
         task_id=task_id,
         candidate=candidate,
         agent_id="customer-agent",
-        simulator=WorldModelSimulatorSnapshot(
-            simulator_id="world-model-v1",
-            prompt_id="world-prompt-v1",
-            world_model=_model("world-model"),
-        ),
-        world_model=_model("world-model"),
+        simulator=simulator,
+        world_model=world_model,
         seed=7,
         repeat=0,
         spans=(
@@ -252,6 +297,7 @@ def _write_rollout_and_judgment(
         stop_reason=StopReason.COMPLETED,
         candidate_economics=OperationEconomics(),
         simulation_spec_sha256=_DIGEST,
+        simulation_binding=binding,
     )
     store.artifacts.write_json(
         artifact_id=rollout.artifact_id,
@@ -298,9 +344,17 @@ def _write_calibratable_judgment(
 ) -> None:
     """Persist a W6-provenance-valid local rollout and provisional judgment fixture."""
     candidate = _model("candidate")
+    world_model = _model("world-model")
+    inputs, simulator, binding = _world_model_rollout_provenance(
+        candidate,
+        world_model,
+        agent_id="customer-agent",
+        repeat=0,
+    )
     rollout = RolloutArtifact(
         schema_version=1,
         created_at=_TIME,
+        inputs=inputs,
         code_revision="review-test",
         artifact_id="rollout-calibration-1",
         simulation_id="simulation-calibration-1",
@@ -313,12 +367,8 @@ def _write_calibratable_judgment(
         task_id=task_id,
         candidate=candidate,
         agent_id="customer-agent",
-        simulator=WorldModelSimulatorSnapshot(
-            simulator_id="world-model-v1",
-            prompt_id="world-prompt-v1",
-            world_model=_model("world-model"),
-        ),
-        world_model=_model("world-model"),
+        simulator=simulator,
+        world_model=world_model,
         seed=17,
         repeat=0,
         spans=(
@@ -334,6 +384,7 @@ def _write_calibratable_judgment(
         stop_reason=StopReason.COMPLETED,
         candidate_economics=OperationEconomics(),
         simulation_spec_sha256=_DIGEST,
+        simulation_binding=binding,
     )
     store.artifacts.write_json(
         artifact_id=rollout.artifact_id,
@@ -400,6 +451,7 @@ def _write_calibration_batch(
 ) -> tuple[str, ...]:
     """Persist a complete two-lineage calibration fixture with deterministic labels."""
     candidate = _model("candidate")
+    world_model = _model("world-model")
     judge_model = _model("judge")
     prompt = PromptDefinition.from_text("judge-prompt-v1", "Return structured scores.")
     rollout_ids = tuple(f"rollout-calibration-{index}" for index in range(label_count))
@@ -407,9 +459,16 @@ def _write_calibration_batch(
     for index, rollout_id in enumerate(rollout_ids):
         lineage_id = task_lineages[index % 2]
         span_id = f"span-calibration-{index}"
+        inputs, simulator, binding = _world_model_rollout_provenance(
+            candidate,
+            world_model,
+            agent_id="customer-agent",
+            repeat=0,
+        )
         rollout = RolloutArtifact(
             schema_version=1,
             created_at=_TIME,
+            inputs=inputs,
             code_revision="fixture-source",
             artifact_id=rollout_id,
             simulation_id=f"simulation-calibration-{index}",
@@ -422,12 +481,8 @@ def _write_calibration_batch(
             task_id=task_ids[index % 2],
             candidate=candidate,
             agent_id="customer-agent",
-            simulator=WorldModelSimulatorSnapshot(
-                simulator_id="world-model-v1",
-                prompt_id="world-prompt-v1",
-                world_model=_model("world-model"),
-            ),
-            world_model=_model("world-model"),
+            simulator=simulator,
+            world_model=world_model,
             seed=index,
             repeat=0,
             spans=(
@@ -443,6 +498,7 @@ def _write_calibration_batch(
             stop_reason=StopReason.COMPLETED,
             candidate_economics=OperationEconomics(),
             simulation_spec_sha256=_DIGEST,
+            simulation_binding=binding,
         )
         store.artifacts.write_json(
             artifact_id=rollout.artifact_id,
