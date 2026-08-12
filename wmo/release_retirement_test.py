@@ -18,11 +18,13 @@ BUILT_DIST_ENV: Final[str] = "WMO_BUILT_DIST_DIR"
 
 FORBIDDEN_DOC_PATTERNS: Final[dict[str, re.Pattern[str]]] = {
     "deleted optimizer module": re.compile(r"wmo[/\.]optimize[/\.](?:base|gepa)(?:\.py)?"),
+    "deleted judge module": re.compile(r"wmo[/\.]optimize[/\.](?:judge|judge_quality)(?:\.py)?"),
     "deleted simulation owner": re.compile(
         r"wmo[/\.]simulation[/\.](?:environment(?:\.py)?|model|evaluation|retrieval)"
     ),
-    "deleted scenarios command": re.compile(r"\bwmo scenarios build\b"),
-    "deleted serve or eval command": re.compile(r"\bwmo (?:serve|eval)\b"),
+    "deleted root command": re.compile(
+        r"\bwmo (?:download|list|eval|knowledge|providers|scenarios|serve)\b"
+    ),
     "deleted WorldModel API": re.compile(r"\bWorldModel\b"),
 }
 
@@ -128,3 +130,22 @@ def test_archive_scanner_rejects_retired_module_descendants() -> None:
         "wmo/runtime/router/runtime.py",
     )
     assert frozenset(_retired_archive_members(members)) == frozenset(members[:2])
+
+
+@pytest.mark.parametrize(
+    ("label", "text"),
+    [
+        ("deleted judge module", "from wmo.optimize.judge import LegacyJudge"),
+        ("deleted judge module", "see wmo/optimize/judge_quality.py"),
+        ("deleted root command", "run `wmo download sample` first"),
+        ("deleted root command", "run `wmo list` first"),
+        ("deleted root command", "run `wmo eval sample` first"),
+        ("deleted root command", "run `wmo knowledge sample` first"),
+        ("deleted root command", "run `wmo providers set` first"),
+        ("deleted root command", "run `wmo scenarios build` first"),
+        ("deleted root command", "run `wmo serve` next"),
+    ],
+)
+def test_document_scanner_rejects_retired_judges_and_root_commands(label: str, text: str) -> None:
+    """Hidden instructions cannot evade the retired workflow documentation scanner."""
+    assert FORBIDDEN_DOC_PATTERNS[label].search(text) is not None

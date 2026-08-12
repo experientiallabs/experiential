@@ -194,9 +194,10 @@ state, not a permanent exemption, and must be empty by the final release audit.
    writeup → `docs/research/`, verified how-to → `docs/reference/`, reusable code → `wmo/`.
 
 6. **Benchmark data is a dependency, not a directory.** Benchmark launch/capture/conversion logic
-   lives in the separately published `environment-capture` distribution, and its trace corpora and
-   task data are Hub-hosted bundles fetched with `wmo download` (`wmo/simulation/hub.py`). Do not
-   vendor a benchmark's data, gold dirs, or capture scripts back into this repo.
+   lives in the separately published `environment-capture` distribution. Give `wmo build` one
+   explicit local OTLP or PostHog export, then use only the locked `config`, `optimize`, and `run`
+   surfaces for persisted project artifacts. Do not vendor a benchmark's data, gold dirs, or
+   capture scripts back into this repo.
 
 7. **Give reusable workflows a clear owner.** Avoid parallel top-level scripts for harness actions.
    If a workflow is generally useful, implement it in `wmo/` and expose it through the CLI. When a
@@ -263,9 +264,9 @@ This repo publishes **one distribution**: `world-model-optimizer`, whose importa
 - **Vendor or depend, decide once**: a shared building block goes to PyPI and is depended on
   (`environment-capture`), or it is vendored under `wmo/common/vendor/` with its upstream
   `LICENSE` (`wmo/common/vendor/waterfall/`). Vendoring is for code we alone consume; keep it
-  free of imports back into `wmo` so it stays independently testable. The data-bundle read core
-  behind `wmo download` is vendored the same way at `wmo/simulation/hub.py`, which names its origin in the
-  module docstring: a `wmo` release must never wait on an `environment-capture` release.
+  free of imports back into `wmo` so it stays independently testable. The current model catalog,
+  role configuration, and immutable model snapshots live under `wmo/common/models/`; releases do
+  not depend on an unpublished workspace member.
 - **Gate scoping**: the root gate is `uv run ruff check .`, `uv run ty check`, `uv run pytest -q`,
   all over the single `testpaths = ["wmo"]`. Tests are inline `*_test.py` beside the module they
   cover. There is exactly one ruff config and one ty config, at the root.
