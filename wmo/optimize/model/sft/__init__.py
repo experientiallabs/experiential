@@ -1,0 +1,63 @@
+"""Frozen, leakage-safe SFT dataset construction from accepted WMO evidence."""
+
+from wmo.optimize.model.sft.builder import (
+    SFTBuildError,
+    SFTBuildSpec,
+    build_sft_dataset,
+    ensure_no_cross_split_fingerprints,
+    load_sft_dataset,
+    write_sft_dataset,
+)
+from wmo.optimize.model.sft.contracts import (
+    AssistantActionEvent,
+    HumanApproval,
+    InfrastructureFailureEvent,
+    PartitionedSFTExample,
+    ProductionAcceptanceEvidence,
+    ProductionAcceptanceRule,
+    ProductionSFTSource,
+    SFTDataset,
+    SFTDatasetArtifact,
+    SFTExample,
+    SFTMessage,
+    SFTTranscript,
+    TeacherAcceptanceEvidence,
+    TeacherAcceptanceRule,
+    TeacherSFTSource,
+    ToolEvent,
+)
+from wmo.optimize.model.sft.rendering import (
+    CanonicalSFTTurn,
+    context_target_fingerprint,
+    parse_rendered_turn,
+    render_context_target,
+)
+
+__all__ = [
+    "AssistantActionEvent",
+    "CanonicalSFTTurn",
+    "HumanApproval",
+    "InfrastructureFailureEvent",
+    "PartitionedSFTExample",
+    "ProductionAcceptanceEvidence",
+    "ProductionAcceptanceRule",
+    "ProductionSFTSource",
+    "SFTBuildError",
+    "SFTBuildSpec",
+    "SFTDataset",
+    "SFTDatasetArtifact",
+    "SFTExample",
+    "SFTMessage",
+    "SFTTranscript",
+    "TeacherAcceptanceEvidence",
+    "TeacherAcceptanceRule",
+    "TeacherSFTSource",
+    "ToolEvent",
+    "build_sft_dataset",
+    "context_target_fingerprint",
+    "ensure_no_cross_split_fingerprints",
+    "load_sft_dataset",
+    "parse_rendered_turn",
+    "render_context_target",
+    "write_sft_dataset",
+]
