@@ -466,6 +466,7 @@ class SandboxSimulator:
             else max(0.0, spec.maximum_cost_usd - (claim.observed_spend_usd or 0.0))
         )
         environment_reservation = binding.environment_maximum_episode_cost_usd
+        dispatch_may_have_started = False
         try:
             if (
                 remaining is not None
@@ -482,10 +483,18 @@ class SandboxSimulator:
                     spent=claim.observed_spend_usd,
                 )
             else:
+                dispatch_may_have_started = True
                 rollout = self._execute_cell(spec, cell, binding, resolution_input, remaining)
-            return self._persist_rollout(rollout, cell, binding, resolution_input)
-        finally:
+            persisted = self._persist_rollout(rollout, cell, binding, resolution_input)
+        except BaseException:
+            if dispatch_may_have_started:
+                self._leases.retain_non_replay_tombstone(lease)
+            else:
+                self._leases.release(lease)
+            raise
+        else:
             self._leases.release(lease)
+            return persisted
 
     def _known_resolution_spend(
         self,

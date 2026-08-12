@@ -256,6 +256,39 @@ class TextCellLeaseStore:
                 exc,
             )
 
+    def retain_non_replay_tombstone(self, lease: TextCellLease) -> None:
+        """Retain a durable unknown-spend barrier after possibly paid work lacks a rollout.
+
+        Args:
+            lease: Exact active claim whose dispatch may have completed before persistence failed.
+
+        Raises:
+            TextCellLeaseError: The claim is absent or changed before the safety barrier is durable.
+        """
+        self._ensure_directory()
+        path = self._path(lease.lease_id)
+        with file_write_lock(self._admission_path(), what="text simulation cell admission"):
+            existing = self._read_optional(path)
+            if existing is None:
+                raise TextCellLeaseError(
+                    f"text-cell lease {lease.lease_id!r} disappeared before non-replay retention"
+                )
+            if existing == lease:
+                self._tombstone(path, existing)
+                return
+            restored_active = existing.model_copy(
+                update={
+                    "status": TextCellLeaseStatus.ACTIVE,
+                    "reserved_cost_usd": lease.reserved_cost_usd,
+                    "unknown_spend_blocks_budget": False,
+                }
+            )
+            if existing.status == TextCellLeaseStatus.STALE and restored_active == lease:
+                return
+            raise TextCellLeaseError(
+                f"text-cell lease {lease.lease_id!r} changed before non-replay retention"
+            )
+
     def _admit_once(
         self,
         *,

@@ -19,6 +19,52 @@ _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
 
 
+def test_paid_write_failure_tombstone_blocks_replay_until_rollout_is_durable(
+    tmp_path: Path,
+) -> None:
+    """A possible paid dispatch remains non-replayable until its exact artifact can be read."""
+    project = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
+    store = TextCellLeaseStore(project.project_directory, clock=lambda: _TIME)
+    first = store.acquire(
+        lease_id="lease-a",
+        resolution_id="resolution-a",
+        simulation_id="simulation-a",
+        rollout_id="rollout-a",
+        binding_sha256=_DIGEST,
+        maximum_cost_usd=1.0,
+        rollout_completed=lambda _rollout_id: False,
+        observed_spend_usd=lambda: 0.0,
+    )
+    assert first.lease is not None
+
+    store.retain_non_replay_tombstone(first.lease)
+    store.retain_non_replay_tombstone(first.lease)
+    blocked = store.acquire(
+        lease_id="lease-a",
+        resolution_id="resolution-a",
+        simulation_id="simulation-a",
+        rollout_id="rollout-a",
+        binding_sha256=_DIGEST,
+        maximum_cost_usd=1.0,
+        rollout_completed=lambda _rollout_id: False,
+        observed_spend_usd=lambda: 0.0,
+    )
+    completed = store.acquire(
+        lease_id="lease-a",
+        resolution_id="resolution-a",
+        simulation_id="simulation-a",
+        rollout_id="rollout-a",
+        binding_sha256=_DIGEST,
+        maximum_cost_usd=1.0,
+        rollout_completed=lambda rollout_id: rollout_id == "rollout-a",
+        observed_spend_usd=lambda: 0.0,
+    )
+
+    assert blocked.state == TextCellLeaseState.STALE
+    assert completed.state == TextCellLeaseState.COMPLETED
+    assert tuple((project.project_directory / "simulation-leases").glob("*.json")) == ()
+
+
 def test_expired_dead_paid_claim_is_recovered_as_stale_without_replay(tmp_path: Path) -> None:
     """A crash after claim creation is never silently replayed as a second paid provider call."""
     project = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
