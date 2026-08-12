@@ -52,6 +52,22 @@ from wmo.simulation.ingest.normalize import (
     iso_to_ordinal,
     openai_call_name_args,
 )
+from wmo.simulation.ingest.posthog_canonical import (
+    load_posthog_file,
+    normalize_posthog_payload,
+)
+from wmo.simulation.ingest.posthog_pull import (
+    PostHogPullRequest,
+    pull_posthog_traces,
+)
+
+__all__ = [
+    "PostHogAdapter",
+    "PostHogPullRequest",
+    "load_posthog_file",
+    "normalize_posthog_payload",
+    "pull_posthog_traces",
+]
 
 # PostHog API. `$AI_*` events are queried via HogQL over the `events` table. Host is region-specific
 # (US: us.posthog.com, EU: eu.posthog.com), so it is configurable.

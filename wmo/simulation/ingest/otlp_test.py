@@ -1,0 +1,220 @@
+"""Behavior tests for strict OpenTelemetry GenAI canonical normalization."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import cast
+
+from wmo.common.core.artifacts import SourceIdentity
+from wmo.simulation.ingest.otlp import load_otlp_file, normalize_otlp_payload
+from wmo.simulation.mining.descriptors import routing_descriptor
+
+_TRACE_ID = "1" * 32
+_CALL_SPAN_ID = "2" * 16
+_TOOL_SPAN_ID = "3" * 16
+_LATE_SPAN_ID = "4" * 16
+
+
+def _attribute(key: str, value: object) -> dict[str, object]:
+    if isinstance(value, bool):
+        encoded: dict[str, object] = {"boolValue": value}
+    elif isinstance(value, int):
+        encoded = {"intValue": str(value)}
+    else:
+        encoded = {"stringValue": value}
+    return {"key": key, "value": encoded}
+
+
+def _payload(trace_id: str = _TRACE_ID) -> dict[str, object]:
+    return {
+        "resourceSpans": [
+            {
+                "resource": {"attributes": [_attribute("service.name", "support-agent")]},
+                "scopeSpans": [
+                    {
+                        "spans": [
+                            {
+                                "traceId": trace_id,
+                                "spanId": _CALL_SPAN_ID,
+                                "name": "agent.model_call",
+                                "startTimeUnixNano": "1760000000000000000",
+                                "endTimeUnixNano": "1760000001000000000",
+                                "attributes": [
+                                    _attribute("gen_ai.operation.name", "chat"),
+                                    _attribute("gen_ai.provider.name", "openai"),
+                                    _attribute("gen_ai.request.model", "gpt-test"),
+                                    _attribute(
+                                        "gen_ai.input.messages",
+                                        json.dumps(
+                                            [
+                                                {
+                                                    "role": "user",
+                                                    "content": "Cancel reservation R-17",
+                                                }
+                                            ]
+                                        ),
+                                    ),
+                                    _attribute("gen_ai.tool.name", "cancel_reservation"),
+                                    _attribute("gen_ai.tool.call.id", "call-1"),
+                                    _attribute(
+                                        "gen_ai.tool.definitions",
+                                        json.dumps(
+                                            [
+                                                {
+                                                    "name": "cancel_reservation",
+                                                    "description": "Cancel one reservation.",
+                                                    "input_schema": {"type": "object"},
+                                                }
+                                            ]
+                                        ),
+                                    ),
+                                    _attribute("wmo.request.context", json.dumps({"tier": "gold"})),
+                                    _attribute("wmo.request.tags", json.dumps(["domain:travel"])),
+                                    _attribute("wmo.customer.id", "customer-7"),
+                                    _attribute("wmo.conversation.id", "conversation-9"),
+                                    _attribute("wmo.outcome.status", "success"),
+                                    _attribute("wmo.outcome.name", "reservation_cancelled"),
+                                ],
+                            },
+                            {
+                                "traceId": trace_id,
+                                "spanId": _TOOL_SPAN_ID,
+                                "parentSpanId": _CALL_SPAN_ID,
+                                "name": "agent.tool_call",
+                                "startTimeUnixNano": "1760000001000000000",
+                                "endTimeUnixNano": "1760000002000000000",
+                                "attributes": [
+                                    _attribute("gen_ai.operation.name", "execute_tool"),
+                                    _attribute("gen_ai.tool.name", "cancel_reservation"),
+                                    _attribute("gen_ai.tool.call.id", "call-1"),
+                                    _attribute("gen_ai.tool.message", "Reservation cancelled"),
+                                ],
+                            },
+                        ]
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def _source() -> SourceIdentity:
+    return SourceIdentity(kind="otlp", source_id="fixture", sha256="a" * 64)
+
+
+def _payload_spans(payload: dict[str, object]) -> list[object]:
+    """Return the mutable OTLP fixture span list with concrete test-side casts."""
+    resource_spans = cast(list[object], payload["resourceSpans"])
+    resource_span = cast(dict[str, object], resource_spans[0])
+    scope_spans = cast(list[object], resource_span["scopeSpans"])
+    scope_span = cast(dict[str, object], scope_spans[0])
+    return cast(list[object], scope_span["spans"])
+
+
+def _payload_with_late_request() -> dict[str, object]:
+    """Return a fixture whose later span tries to alter request-visible evidence."""
+    payload = _payload()
+    spans = _payload_spans(payload)
+    spans.append(
+        {
+            "traceId": _TRACE_ID,
+            "spanId": _LATE_SPAN_ID,
+            "name": "agent.later_model_call",
+            "startTimeUnixNano": "1760000003000000000",
+            "endTimeUnixNano": "1760000004000000000",
+            "attributes": [
+                _attribute("gen_ai.operation.name", "chat"),
+                _attribute("gen_ai.provider.name", "openai"),
+                _attribute("gen_ai.request.model", "gpt-test"),
+                _attribute(
+                    "gen_ai.input.messages",
+                    json.dumps([{"role": "user", "content": "Later secret task"}]),
+                ),
+                _attribute("wmo.request.context", json.dumps({"tier": "secret"})),
+                _attribute("wmo.request.tags", json.dumps(["domain:secret"])),
+                _attribute(
+                    "gen_ai.tool.definitions",
+                    json.dumps(
+                        [
+                            {
+                                "name": "delete_reservation",
+                                "description": "Delete one reservation.",
+                                "input_schema": {"type": "object"},
+                            }
+                        ]
+                    ),
+                ),
+            ],
+        }
+    )
+    return payload
+
+
+def test_normalizes_w3c_genai_trace_and_wmo_outcome_extensions() -> None:
+    result = normalize_otlp_payload(_payload(), source=_source())
+
+    assert result.issues == ()
+    assert len(result.traces) == 1
+    trace = result.traces[0]
+    assert trace.trace_id == _TRACE_ID
+    assert trace.conversation_id == "conversation-9"
+    assert trace.task == "Cancel reservation R-17"
+    assert trace.initial_context == {"tier": "gold"}
+    assert trace.tools[0].name == "cancel_reservation"
+    assert trace.outcome is not None and trace.outcome.status == "success"
+    assert trace.spans[0].model is not None
+    assert trace.spans[0].model.provider == "openai"
+    assert trace.spans[1].parent_span_id == _CALL_SPAN_ID
+
+
+def test_invalid_w3c_identity_excludes_the_trace_with_a_clear_issue() -> None:
+    result = normalize_otlp_payload(_payload(trace_id="not-a-w3c-trace"), source=_source())
+
+    assert result.traces == ()
+    assert len(result.issues) == 1
+    assert "W3C ID" in result.issues[0].message
+
+
+def test_jsonl_preserves_a_malformed_line_as_an_explicit_exclusion(tmp_path: Path) -> None:
+    payload = _payload()
+    path = tmp_path / "traces.jsonl"
+    path.write_text(json.dumps(payload) + "\n{bad-json\n", encoding="utf-8")
+
+    result = load_otlp_file(path)
+
+    assert len(result.traces) == 1
+    assert result.invalid_trace_count == 1
+    assert result.traces[0].source.identity.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_otlp_sorts_unordered_export_before_selecting_the_initial_task() -> None:
+    payload = _payload_with_late_request()
+    _payload_spans(payload).reverse()
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.issues == ()
+    assert result.traces[0].task == "Cancel reservation R-17"
+
+
+def test_otlp_ignores_late_request_context() -> None:
+    result = normalize_otlp_payload(_payload_with_late_request(), source=_source())
+
+    assert result.issues == ()
+    assert result.traces[0].initial_context == {"tier": "gold"}
+
+
+def test_otlp_ignores_late_tool_definitions() -> None:
+    result = normalize_otlp_payload(_payload_with_late_request(), source=_source())
+
+    assert result.issues == ()
+    assert tuple(tool.name for tool in result.traces[0].tools) == ("cancel_reservation",)
+
+
+def test_otlp_routing_tags_ignore_late_request_tags() -> None:
+    result = normalize_otlp_payload(_payload_with_late_request(), source=_source())
+
+    assert result.issues == ()
+    assert routing_descriptor(result.traces[0]).tags == ("domain:travel",)
