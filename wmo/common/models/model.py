@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
+from wmo.common.tasks import ToolSchema
 
 ModelAlias = ArtifactId
 
@@ -93,6 +94,10 @@ class ModelMessage(ContractModel):
             raise ValueError("a model message needs text or an assistant action")
         if self.role != "tool" and self.tool_call_id is not None:
             raise ValueError("tool_call_id is valid only for tool messages")
+        if self.role != "assistant" and self.assistant_action is not None:
+            raise ValueError("assistant_action is valid only for assistant messages")
+        if self.role == "tool" and self.tool_call_id is None:
+            raise ValueError("tool messages require tool_call_id")
         return self
 
 
@@ -102,3 +107,70 @@ class ModelResponse(ContractModel):
     output: AssistantAction
     model: ModelSnapshot
     economics: OperationEconomics
+
+
+class ModelCapabilities(ContractModel):
+    """Static capabilities known before a model request is sent.
+
+    The runtime records a digest of this object in every resolved model identity. The fields
+    describe protocol support, not a claim that a provider accepts every possible prompt.
+    """
+
+    supports_tools: bool = False
+    supports_embeddings: bool = False
+    context_window_tokens: int | None = Field(default=None, gt=0)
+    maximum_output_tokens: int | None = Field(default=None, gt=0)
+
+
+class ToolChoice(ContractModel):
+    """A request to require one named tool when the provider supports forced tools."""
+
+    name: str = Field(min_length=1, max_length=256)
+
+
+class ModelRequest(ContractModel):
+    """A complete non-streaming model request independent of provider wire format.
+
+    Args:
+        messages: Ordered visible conversation messages.
+        tools: Tool schemas available for this turn.
+        tool_choice: Optional automatic, disabled, required, or named-tool selection.
+        temperature: Optional sampling temperature.
+        maximum_output_tokens: Optional upper bound for generated tokens.
+    """
+
+    messages: tuple[ModelMessage, ...] = Field(min_length=1)
+    tools: tuple[ToolSchema, ...] = ()
+    tool_choice: Literal["auto", "none", "required"] | ToolChoice | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    maximum_output_tokens: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _require_coherent_tools_and_messages(self) -> ModelRequest:
+        tool_names = tuple(tool.name for tool in self.tools)
+        if len(set(tool_names)) != len(tool_names):
+            raise ValueError("model request tool names must be unique")
+        if isinstance(self.tool_choice, ToolChoice) and self.tool_choice.name not in tool_names:
+            raise ValueError("named tool_choice must name a request tool")
+        if self.tool_choice == "required" and not self.tools:
+            raise ValueError("required tool_choice needs at least one request tool")
+        for message in self.messages:
+            if message.role == "tool" and message.assistant_action is not None:
+                raise ValueError("tool messages cannot carry assistant actions")
+        return self
+
+
+class Embedding(ContractModel):
+    """One normalized vector returned for a request-visible text input."""
+
+    values: tuple[float, ...] = Field(min_length=1)
+
+    @field_validator("values")
+    @classmethod
+    def _require_finite_values(cls, value: tuple[float, ...]) -> tuple[float, ...]:
+        if not all(math.isfinite(item) for item in value):
+            raise ValueError("embedding values must be finite")
+        norm = math.sqrt(sum(item * item for item in value))
+        if not math.isclose(norm, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+            raise ValueError("embedding values must have unit norm")
+        return value
