@@ -44,7 +44,12 @@ from wmo.common.evaluations.planning import plan_bound_fidelity_gate_id
 from wmo.common.judging import Judge, Judgment
 from wmo.common.models import RoutedCandidateSnapshot
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
-from wmo.common.rollouts import SimulationArtifactSet, SimulationMode
+from wmo.common.rollouts import (
+    RolloutArtifact,
+    RolloutEventKind,
+    SimulationArtifactSet,
+    SimulationMode,
+)
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import KnnBankManifest
 from wmo.optimize.router import (
@@ -233,6 +238,9 @@ class RouterCompositionResult:
     fidelity_approval_id: ArtifactId
     policy_lock_id: ArtifactId
     fidelity_report_id: ArtifactId
+    phase_a_simulation_spend_usd: float
+    held_out_simulation_spend_usd: float
+    total_simulation_spend_usd: float
     optimization: RouterWorkflowResult
     runtime: RouterRuntime
 
@@ -303,13 +311,23 @@ def compose_router(
         plan_input,
         task_input,
         setup,
-        budget,
+        budget.maximum_simulation_cost_usd,
         created_at,
         code_revision,
         phase_a_cells,
         phase="fidelity-fit",
     )
     phase_a_set = _run_or_load_simulation(project, plan, spec, services.simulator_factory)
+    phase_a_spend = _verified_simulation_spend(project, phase_a_set)
+    if phase_a_spend > budget.maximum_simulation_cost_usd:
+        raise RouterCompositionError("verified Phase A simulation spend exceeds the total budget")
+    remaining_cost_usd = max(0.0, budget.maximum_simulation_cost_usd - phase_a_spend)
+    if remaining_cost_usd <= 0 and any(
+        cell.purpose == "held_out" and cell.execution == "simulate" for cell in plan.cells
+    ):
+        raise RouterCompositionError(
+            "Phase A consumed the total simulation budget; held-out dispatch is blocked"
+        )
     phase_a_evidence, dispatched = _complete_cell_evidence(
         project,
         phase_a_cells,
@@ -361,20 +379,23 @@ def compose_router(
     )
     _phase(phase_hook, "policy_locked")
 
-    _phase(phase_hook, "heldout_opened")
     held_cells = tuple(cell for cell in plan.cells if cell.purpose == "held_out")
+    _phase(phase_hook, "heldout_opened")
     held_spec = _simulation_spec(
         plan,
         plan_input,
         task_input,
         setup,
-        budget,
+        remaining_cost_usd,
         created_at,
         code_revision,
         held_cells,
         phase="heldout",
     )
     held_set = _run_or_load_simulation(project, plan, held_spec, services.simulator_factory)
+    held_out_spend = _verified_simulation_spend(project, held_set)
+    if math.fsum((phase_a_spend, held_out_spend)) > budget.maximum_simulation_cost_usd:
+        raise RouterCompositionError("verified composed simulation spend exceeds the total budget")
     held_evidence, _held_dispatched = _complete_cell_evidence(
         project,
         held_cells,
@@ -416,6 +437,9 @@ def compose_router(
         fidelity_approval_id=approval.approval_id,
         policy_lock_id=policy_lock.lock_id,
         fidelity_report_id=fidelity.fidelity_report_id,
+        phase_a_simulation_spend_usd=phase_a_spend,
+        held_out_simulation_spend_usd=held_out_spend,
+        total_simulation_spend_usd=math.fsum((phase_a_spend, held_out_spend)),
         optimization=optimized,
         runtime=runtime,
     )
@@ -426,7 +450,7 @@ def _simulation_spec(
     plan_input: ArtifactInput,
     task_input: ArtifactInput,
     setup: RouterEvaluationSetup,
-    budget: RouterCompositionBudget,
+    maximum_cost_usd: float,
     created_at: datetime,
     code_revision: str,
     cells: tuple[EvaluationCell, ...],
@@ -447,7 +471,7 @@ def _simulation_spec(
         "seed": setup.seed,
         "maximum_steps": setup.maximum_steps,
         "maximum_concurrency": setup.maximum_concurrency,
-        "maximum_cost_usd": budget.maximum_simulation_cost_usd,
+        "maximum_cost_usd": maximum_cost_usd,
         "code_revision": code_revision,
     }
     return SimulationSpec(
@@ -464,7 +488,7 @@ def _simulation_spec(
         seed=setup.seed,
         maximum_steps=setup.maximum_steps,
         maximum_concurrency=setup.maximum_concurrency,
-        maximum_cost_usd=budget.maximum_simulation_cost_usd,
+        maximum_cost_usd=maximum_cost_usd,
     )
 
 
@@ -515,6 +539,66 @@ def _run_or_load_simulation(
     if matches:
         return matches[0]
     return simulator_factory(project, plan).run(spec)
+
+
+def _verified_simulation_spend(
+    project: ProjectStore,
+    expected: SimulationArtifactSet,
+) -> float:
+    """Recompute one phase's observed dispatch spend from verified immutable rollouts."""
+    stored = project.artifacts.read(expected.artifact_set_id)
+    if stored.manifest.artifact_type != "simulation-artifact-set":
+        raise RouterCompositionError("simulation spend source has the wrong artifact type")
+    artifact_set = SimulationArtifactSet.model_validate_json(
+        project.artifacts.read_bytes(expected.artifact_set_id, "artifact-set.json")
+    )
+    if artifact_set != expected:
+        raise RouterCompositionError("simulation spend source differs from its completed set")
+    index_payload = project.artifacts.read_bytes(
+        expected.artifact_set_id, artifact_set.artifacts_path
+    )
+    if hashlib.sha256(index_payload).hexdigest() != artifact_set.artifacts_sha256:
+        raise RouterCompositionError("simulation spend index digest has drifted")
+    values = tuple(
+        _observed_rollout_spend(read_rollout(project.artifacts, rollout_id)[0])
+        for rollout_id in artifact_set.artifact_ids
+    )
+    return math.fsum(values)
+
+
+def _observed_rollout_spend(rollout: RolloutArtifact) -> float:
+    """Total observed paid candidate plus simulator or environment spend for one rollout."""
+    if rollout.failure is not None and (
+        rollout.failure.details.get("provider_dispatch_unknown_spend") is True
+        or rollout.failure.details.get("environment_dispatch_unknown_spend") is True
+        or rollout.failure.details.get("phase") == "paid_cell_stale_lease"
+    ):
+        raise RouterCompositionError("simulation rollout has unknown dispatched spend")
+    economics = []
+    if any(span.kind == RolloutEventKind.AGENT_MODEL_CALL for span in rollout.spans):
+        economics.append(rollout.candidate_economics)
+    if rollout.evidence_source == "world_model":
+        if any(span.kind == RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL for span in rollout.spans):
+            economics.append(rollout.world_model_economics)
+    elif rollout.evidence_source == "sandbox":
+        binding = rollout.sandbox_binding
+        if binding is None:
+            raise RouterCompositionError("sandbox rollout lacks its environment cost binding")
+        if binding.environment_maximum_episode_cost_usd != 0:
+            economics.append(rollout.sandbox_economics)
+    else:
+        raise RouterCompositionError("production evidence cannot count as simulation spend")
+    if rollout.orchestration_economics is not None:
+        orchestration_cost = rollout.orchestration_economics.cost_usd
+        if orchestration_cost is not None:
+            economics.append(rollout.orchestration_economics)
+    costs = []
+    for operation in economics:
+        cost = operation.cost_usd if operation is not None else None
+        if cost is None or cost.provenance != "observed" or cost.value < 0:
+            raise RouterCompositionError("simulation rollout spend is not fully observed")
+        costs.append(cost.value)
+    return math.fsum(costs)
 
 
 def _approve_fidelity_once(

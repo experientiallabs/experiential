@@ -53,6 +53,7 @@ from wmo.workflow.router import (
     ApprovedRouterReview,
     FidelityApprovalDecision,
     RouterCompositionBudget,
+    RouterCompositionError,
     RouterEvaluationSetup,
     RouterWorkflowServices,
     compose_router,
@@ -446,6 +447,13 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     )
 
     assert second.optimization == first.optimization
+    assert first.held_out_simulation_spec.maximum_cost_usd == pytest.approx(
+        budget.maximum_simulation_cost_usd - first.phase_a_simulation_spend_usd
+    )
+    assert first.total_simulation_spend_usd == pytest.approx(
+        first.phase_a_simulation_spend_usd + first.held_out_simulation_spend_usd
+    )
+    assert first.total_simulation_spend_usd <= budget.maximum_simulation_cost_usd
     assert (
         len(simulator.log),
         len(simulator.candidate.requests),
@@ -462,6 +470,58 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         for cell_ids, locked in simulator.log
     )
     assert all(locked or purposes.get(cell_id) != "held_out" for cell_id, locked in judge.log)
+
+    near_cap_simulator = _SimulatorFactory()
+    near_cap_services = RouterWorkflowServices(
+        review_supplier=services.review_supplier,
+        setup_supplier=services.setup_supplier,
+        simulator_factory=near_cap_simulator,
+        judge=judge,
+        fidelity_approval=approval,
+        runtime_catalog=runtime_catalog,
+    )
+    calls_before_near_cap = judge.calls
+
+    def exact_cap_spend(
+        phase_project: ProjectStore,
+        artifact_set: SimulationArtifactSet,
+    ) -> float:
+        del phase_project, artifact_set
+        return 1.0
+
+    monkeypatch.setattr(workflow_module, "_verified_simulation_spend", exact_cap_spend)
+    with pytest.raises(RouterCompositionError, match="consumed the total simulation budget"):
+        compose_router(
+            project,
+            normalized,
+            services=near_cap_services,
+            budget=RouterCompositionBudget(
+                maximum_simulation_cost_usd=1.0,
+                maximum_judgments=100,
+            ),
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+    assert len(near_cap_simulator.log) == 1
+    assert judge.calls == calls_before_near_cap
+    assert approval.calls == 1
+
+    phase_a_set = next(
+        SimulationArtifactSet.model_validate_json(
+            project.artifacts.read_bytes(artifact_id, "artifact-set.json")
+        )
+        for artifact_id in project.artifacts.list_ids()
+        if project.artifacts.read(artifact_id).manifest.artifact_type == "simulation-artifact-set"
+        and SimulationArtifactSet.model_validate_json(
+            project.artifacts.read_bytes(artifact_id, "artifact-set.json")
+        ).simulation_id
+        == first.simulation_spec.simulation_id
+    )
+    rollout = read_rollout(project.artifacts, phase_a_set.artifact_ids[0])[0]
+    unknown = rollout.model_copy(update={"candidate_economics": OperationEconomics()})
+    with pytest.raises(RouterCompositionError, match="not fully observed"):
+        workflow_module._observed_rollout_spend(unknown)
+
     decision = first.runtime.select(_request(), episode_id="customer-episode")
     assert first.runtime.select(_request(), episode_id="customer-episode") == decision
     assert first.plan.cells

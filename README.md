@@ -118,8 +118,9 @@ fidelity, persists the plan-bound approval receipt, freezes fit artifacts and a 
 held-out evidence only after that lock verifies, reports, and returns the verified W11
 `RouterRuntime`. Exact replay verifies and reuses both phases without invoking the simulator,
 judge, approval callback, or fit workflow again. Callable contracts and `RouterEvaluationSetup`
-fields live in
-`wmo.workflow.router`.
+fields live in `wmo.workflow.router`. The simulation ceiling covers both phases together. WMO
+recomputes observed candidate plus world-model or environment spend from persisted Phase A
+rollouts, fails closed on unknown spend, and gives held-out only the verified remainder.
 
 ## Telemetry
 
