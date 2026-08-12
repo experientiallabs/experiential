@@ -158,6 +158,15 @@ uv run pytest -q
      keeps passing while covering nothing, which is worse than no test at all: the gate reports
      green over code that is gone. Tests for a module go in that module's suite, never in a
      neighbour's.
+   - **Never satisfy the pairing with vacuous tests.** The rule exists to make behavior findable,
+     not to manufacture green assertions. An assertion that restates the source (a protocol
+     declares the members it declares, a dataclass defaults to the defaults it defaults to,
+     `hasattr` for a method that is right there) or that only exercises a double defined in the
+     test file proves nothing and costs a reader real time deciding whether it matters. For a
+     module with no behavior of its own (a bare `Protocol`, a constants table), the correct suite
+     is an EMPTY one: a docstring saying what there is to test, why there is nothing to assert,
+     and which suites cover the behavior of its implementers. A docstring-only `foo_test.py`
+     satisfies the gate and is strictly preferred to a suite full of tautologies.
 
    A handful of suites genuinely cover something other than one sibling module: a package's
    `__init__.py` re-export surface (`api_test.py`), a package's own import boundary

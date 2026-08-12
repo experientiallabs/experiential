@@ -1,77 +1,16 @@
-"""Tests for the Env protocol the episode runner steps against."""
+"""No tests: `environment.py` declares the `Env` protocol and nothing else.
 
-from __future__ import annotations
+There is nothing here a test could hold. Asserting the protocol lists `reset`, `step`, and
+`close` restates the declaration, and exercising a double defined in this file would test the
+double. No production code does `isinstance(x, Env)` either, so even the runtime-checkable
+behavior is unused: `ty` is what binds implementers to this contract.
 
-from wmo.common.core.types import Action, ActionKind, EnvState, Observation
-from wmo.runtime.environment import Env
+The behavior the contract describes is covered where it is implemented, against real state:
+`wmo/simulation/evaluation/closed_loop_test.py` for the world-model environment, and
+`wmo/runtime/episode_test.py` for the loop that drives reset/step/close in order and snapshots the
+live state view.
 
-
-class _MinimalEnv:
-    """The smallest thing that is an Env: a live state view, a step, and an idempotent close."""
-
-    def __init__(self) -> None:
-        self.closes = 0
-        self._state = EnvState()
-
-    def reset(self, task: str | None = None, seed_state: EnvState | None = None) -> EnvState:
-        self._state = seed_state.model_copy(deep=True) if seed_state else EnvState()
-        return self._state
-
-    def step(self, action: Action) -> Observation:
-        self._state.scratchpad += f"ran {action.name}\n"  # the live view mutates in place
-        return Observation(content="ok")
-
-    def close(self) -> None:
-        self.closes += 1
-
-
-def test_the_protocol_is_reset_step_close() -> None:
-    declared = sorted(name for name in vars(Env) if not name.startswith("_"))
-
-    assert declared == ["close", "reset", "step"]
-
-
-def test_a_structural_env_satisfies_the_protocol_without_inheriting_it() -> None:
-    # Backends implement this by shape (the world-model env, sandbox envs, test doubles); nothing
-    # subclasses `Env`, so the runtime check is the only conformance signal callers get.
-    assert isinstance(_MinimalEnv(), Env)
-
-
-def test_an_incomplete_env_is_not_an_env() -> None:
-    class _NoClose:
-        def reset(self, task: str | None = None, seed_state: EnvState | None = None) -> EnvState:
-            return EnvState()
-
-        def step(self, action: Action) -> Observation:
-            return Observation(content="ok")
-
-    assert not isinstance(_NoClose(), Env)
-
-
-def test_reset_returns_a_live_view_that_step_updates_in_place() -> None:
-    # The documented contract `run_episode` depends on: the object reset handed back keeps
-    # reflecting the episode, which is why recorded steps snapshot it.
-    env: Env = _MinimalEnv()
-    state = env.reset("do the thing")
-
-    env.step(Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"cmd": "ls"}))
-
-    assert state.scratchpad == "ran bash\n"
-
-
-def test_reset_seeds_from_a_supplied_state() -> None:
-    env: Env = _MinimalEnv()
-
-    state = env.reset(seed_state=EnvState(structured={"cwd": "/tmp"}, scratchpad="seeded\n"))
-
-    assert state.structured == {"cwd": "/tmp"}
-    assert state.scratchpad == "seeded\n"
-
-
-def test_close_is_idempotent() -> None:
-    env = _MinimalEnv()
-
-    env.close()
-    env.close()
-
-    assert env.closes == 2  # calling twice is allowed; the env, not the caller, guards resources
+This file exists because AGENTS.md rule 2 pairs every module with a suite. An empty suite is the
+honest answer when a module has no behavior of its own: it says "nothing to assert here, and here
+is where the behavior is proven" instead of parking green assertions over a bare declaration.
+"""

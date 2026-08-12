@@ -1,4 +1,10 @@
-"""Tests for the TraceAdapter seam: the protocol, the registry, and the vendor-pull params."""
+"""Tests for the TraceAdapter registry: what `--source` resolves to, and what it says when wrong.
+
+The `TraceAdapter` protocol gets no test of its own, and neither does `VendorPull`: listing the
+members one declares, or the all-optional fields of the other, only restates the declaration. What
+bites is registry behavior (a bundled source silently not registering, a typo'd `--source` failing
+without naming the real choices), so that is what is exercised here, against the real registry.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +16,6 @@ import wmo.simulation.ingest.adapter as adapter_module
 from wmo.simulation.ingest import list_adapters as list_bundled_adapters
 from wmo.simulation.ingest.adapter import (
     SourceCredentialError,
-    TraceAdapter,
     VendorPull,
     get_adapter,
     list_adapters,
@@ -43,17 +48,6 @@ def isolated_registry() -> Iterator[None]:
     yield
     adapter_module._ADAPTERS.clear()
     adapter_module._ADAPTERS.update(saved)
-
-
-def test_the_protocol_is_a_name_plus_both_transports() -> None:
-    declared = sorted(
-        member
-        for member in (*vars(TraceAdapter), *TraceAdapter.__annotations__)
-        if not member.startswith("_")
-    )
-
-    assert declared == ["from_file", "from_vendor", "name"]
-    assert isinstance(_StubAdapter("stub"), TraceAdapter)
 
 
 def test_register_then_get_returns_the_same_adapter(isolated_registry: None) -> None:
@@ -99,20 +93,10 @@ def test_importing_the_package_registers_the_bundled_adapters() -> None:
     assert {"otel-genai", "chat-json", "postgres"} <= set(list_bundled_adapters())
 
 
-def test_vendor_pull_defaults_to_env_and_source_defaults() -> None:
-    # Every field is optional: a bare `VendorPull()` means "use the vendor env var and the
-    # adapter's own column/table defaults", which is what the CLI passes when given no flags.
-    pull = VendorPull()
-
-    assert pull.api_key is None
-    assert pull.project is None
-    assert pull.since is None
-    assert pull.limit is None
-    assert pull.dsn is None
-    assert pull.table is None
-    assert pull.trace_id_column is None
-    assert pull.payload_column is None
-    assert pull.order_column is None
+def test_a_bare_vendor_pull_asks_every_adapter_for_its_own_defaults() -> None:
+    # This is what the CLI passes when the user gives no pull flags, so nothing here may carry a
+    # value of its own: a default table or column set here would silently override the adapter's.
+    assert not VendorPull().model_dump(exclude_none=True)
 
 
 def test_source_credential_error_is_a_permission_error() -> None:

@@ -17,15 +17,3 @@ def test_constructing_the_stub_fails_and_names_the_workaround() -> None:
     message = str(excinfo.value)
     assert "'bedrock' backend" in message
     assert "aws_mantle.py" in message
-
-
-def test_the_stub_still_declares_the_whole_adapter_protocol() -> None:
-    # Keeping the surface complete is what makes finishing the adapter a body-only change. The
-    # protocol's own membership is pinned in base_test.py.
-    missing = [
-        name
-        for name in ("complete", "complete_chat", "embed", "embed_model_id")
-        if not hasattr(AwsMantleAdapter, name)
-    ]
-    assert not missing, f"AwsMantleAdapter is missing {missing}"
-    assert "backend" in AwsMantleAdapter.__annotations__

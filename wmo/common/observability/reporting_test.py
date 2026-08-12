@@ -1,8 +1,10 @@
-"""Tests for the build-progress reporting seam and its no-op default.
+"""Tests for `NullReporter`, the default sink the headless build pipeline calls into.
 
-`BuildReporter` is the only thing the headless build pipeline knows about its UI, so what matters
-is that the shipped implementations cover the whole protocol: a missing method surfaces as an
-`AttributeError` mid-build, after the expensive stages have already run.
+The `BuildReporter` protocol gets no test of its own: asserting which methods it declares restates
+the declaration. What can actually break is the default implementation drifting from it, because
+the pipeline calls these by name with keywords, so a missing or renamed parameter surfaces as a
+`TypeError` mid-build, after the expensive stages have already run. The one real implementation is
+covered beside itself in `wmo/cli/ui_test.py`.
 """
 
 from __future__ import annotations
@@ -11,44 +13,20 @@ import inspect
 
 from wmo.common.observability.reporting import BuildReporter, NullReporter
 
-#: Every event the build pipeline emits, in the order the lifecycle reaches them.
-_PROTOCOL_METHODS = (
-    "ingest_done",
-    "split_done",
-    "index_done",
-    "optimize_start",
-    "rollout",
-    "activity",
-    "optimize_done",
-)
+#: Read off the protocol rather than hand-copied, so a new event is checked the moment it is added.
+_EVENTS = tuple(name for name in vars(BuildReporter) if not name.startswith("_"))
 
 
-def test_the_protocol_is_exactly_the_build_lifecycle() -> None:
-    # Pinned against the declaration itself: a new event added to the protocol without a stub for
-    # it here would otherwise leave the NullReporter/RichBuildReporter checks below silently
-    # narrower than the contract.
-    declared = sorted(name for name in vars(BuildReporter) if not name.startswith("_"))
-
-    assert declared == sorted(_PROTOCOL_METHODS)
-
-
-def test_null_reporter_implements_every_protocol_method_with_a_matching_signature() -> None:
-    for name in _PROTOCOL_METHODS:
+def test_the_default_reporter_accepts_every_event_exactly_as_declared() -> None:
+    for name in _EVENTS:
         implementation = getattr(NullReporter, name, None)
         assert implementation is not None, f"NullReporter is missing {name}"
         assert inspect.signature(implementation) == inspect.signature(getattr(BuildReporter, name))
 
 
-def test_rich_build_reporter_implements_every_protocol_method() -> None:
-    # The CLI's reporter is the one real implementation; the pipeline calls these by name, so a
-    # protocol method it forgot would only fail during an actual build.
-    from wmo.cli.ui import RichBuildReporter
-
-    missing = [name for name in _PROTOCOL_METHODS if not hasattr(RichBuildReporter, name)]
-    assert not missing, f"RichBuildReporter is missing {missing}"
-
-
-def test_null_reporter_swallows_every_event() -> None:
+def test_a_whole_build_lifecycle_through_the_default_reporter_does_nothing() -> None:
+    # A library caller passes no reporter, so every event lands here. Swallowing them must be
+    # total: one event that raised would fail a build that asked for no progress output at all.
     reporter: BuildReporter = NullReporter()
 
     reporter.ingest_done(traces=2, steps=9)
