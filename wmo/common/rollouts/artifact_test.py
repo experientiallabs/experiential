@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from wmo.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
+from wmo.common.core.artifacts import ArtifactInput, FailureCode, SourceIdentity, StructuredFailure
 from wmo.common.models import ModelSnapshot, OperationEconomics
 from wmo.common.rollouts import (
     ProductionSimulatorSnapshot,
@@ -15,6 +15,7 @@ from wmo.common.rollouts import (
     RolloutEventKind,
     RolloutSpan,
     SimulationArtifactSet,
+    SimulationCellBinding,
     SimulationMode,
     StopReason,
     WorldModelSimulatorSnapshot,
@@ -34,9 +35,32 @@ def _model() -> ModelSnapshot:
 
 def _rollout() -> RolloutArtifact:
     started_at = datetime(2026, 8, 11, tzinfo=UTC)
+    plan_input = ArtifactInput(artifact_id="evaluation-plan", sha256=_DIGEST)
+    spec_input = ArtifactInput(artifact_id="simulation-spec", sha256=_DIGEST)
+    task_set_input = ArtifactInput(artifact_id="task-set", sha256=_DIGEST)
+    binding = SimulationCellBinding(
+        evaluation_plan_input=plan_input,
+        task_set_input=task_set_input,
+        task_set_tasks_sha256=_DIGEST,
+        task_sha256=_DIGEST,
+        candidate_alias="candidate-a",
+        candidate=_model(),
+        agent_id="customer-agent",
+        repeat=0,
+        world_model_alias="world-model-a",
+        world_model=_model(),
+        simulator_id="world-model-v1",
+        prompt_id="world-prompt-v1",
+        prompt_version="v1",
+        prompt_sha256=_DIGEST,
+        simulation_spec_input=spec_input,
+        simulation_spec_sha256=_DIGEST,
+        simulation_inputs_sha256=_DIGEST,
+    )
     return RolloutArtifact(
         schema_version=1,
         created_at=started_at,
+        inputs=(plan_input, spec_input, task_set_input),
         code_revision="e7aad17",
         artifact_id="rollout-artifact-1",
         simulation_id="simulation-1",
@@ -52,6 +76,8 @@ def _rollout() -> RolloutArtifact:
         simulator=WorldModelSimulatorSnapshot(
             simulator_id="world-model-v1",
             prompt_id="world-prompt-v1",
+            prompt_version="v1",
+            prompt_sha256=_DIGEST,
             world_model=_model(),
         ),
         world_model=_model(),
@@ -69,6 +95,7 @@ def _rollout() -> RolloutArtifact:
         stop_reason=StopReason.COMPLETED,
         candidate_economics=OperationEconomics(),
         simulation_spec_sha256=_DIGEST,
+        simulation_binding=binding,
     )
 
 

@@ -131,7 +131,7 @@ class RecordingCandidateClient:
         self._candidate_responses: list[ModelResponse] = []
         self._world_model_responses: list[ModelResponse] = []
         self._transitions: list[TextWorldModelTransition] = []
-        self._pending_messages: tuple[ModelMessage, ...] = ()
+        self._visible_transcript: tuple[ModelMessage, ...] = ()
         self._terminal = False
         self._failure: TextSimulationError | None = None
 
@@ -146,6 +146,37 @@ class RecordingCandidateClient:
         if not self._candidate_responses:
             return None
         return self._candidate_responses[-1].output
+
+    @property
+    def world_model_terminal(self) -> bool:
+        """Return whether the world model has explicitly ended the visible scenario."""
+        return self._terminal
+
+    @property
+    def candidate_turn_count(self) -> int:
+        """Return the number of paid candidate turns recorded in this simulation cell."""
+        return len(self._candidate_responses)
+
+    @property
+    def visible_transcript(self) -> tuple[ModelMessage, ...]:
+        """Return only assistant-visible candidate and simulated-user transcript turns."""
+        return self._visible_transcript
+
+    def terminal_limit_error(self) -> TextSimulationError | None:
+        """Return a no-call maximum-step failure when a nonterminal world turn exhausted v1.
+
+        Returns:
+            A structured terminal error after the final permitted nonterminal world transition,
+            or ``None`` when another candidate turn remains or the world model ended the scenario.
+        """
+        if self._terminal or len(self._candidate_responses) < self._maximum_steps:
+            return None
+        return _text_failure(
+            StopReason.MAXIMUM_STEPS,
+            FailureCode.BUDGET,
+            f"text simulation reached its maximum of {self._maximum_steps} candidate turns",
+            phase="candidate_turn_limit",
+        )
 
     @property
     def recorded(self) -> RecordedTextCalls:
@@ -212,7 +243,7 @@ class RecordingCandidateClient:
         _require_text_only_candidate_request(request)
         candidate_request = _bounded_candidate_request(
             request,
-            pending_messages=self._pending_messages,
+            visible_transcript=self._visible_transcript,
             maximum_output_tokens=self._maximum_output_tokens,
         )
         _preflight_context(
@@ -236,6 +267,7 @@ class RecordingCandidateClient:
                 redacted_field_names=self._redacted_field_names,
             )
         )
+        _require_response_identity(candidate_response, self._candidate, role="candidate")
         _require_complete_response(candidate_response, role="candidate")
         _require_text_only_action(candidate_response.output, role="candidate")
         world_request = build_world_model_request(
@@ -265,6 +297,7 @@ class RecordingCandidateClient:
                 redacted_field_names=self._redacted_field_names,
             )
         )
+        _require_response_identity(world_response, self._world_model, role="world model")
         _require_complete_response(world_response, role="world model")
         try:
             transition = parse_world_model_transition(world_response.output)
@@ -277,7 +310,11 @@ class RecordingCandidateClient:
                 exception_type=type(exc).__name__,
             ) from exc
         self._transitions.append(transition)
-        self._pending_messages = (transition.visible_message,)
+        self._visible_transcript = (
+            *self._visible_transcript,
+            ModelMessage(role="assistant", assistant_action=candidate_response.output),
+            transition.visible_message,
+        )
         self._terminal = transition.terminal
         return candidate_response
 
@@ -313,10 +350,10 @@ def text_prompt_digest() -> str:
 def _bounded_candidate_request(
     request: ModelRequest,
     *,
-    pending_messages: tuple[ModelMessage, ...],
+    visible_transcript: tuple[ModelMessage, ...],
     maximum_output_tokens: int,
 ) -> ModelRequest:
-    """Inject the prior visible world turn and enforce a caller-visible output budget."""
+    """Inject the visible transcript and enforce a caller-visible output budget."""
     requested_budget = request.maximum_output_tokens
     if requested_budget is not None and requested_budget > maximum_output_tokens:
         raise _text_failure(
@@ -327,11 +364,25 @@ def _bounded_candidate_request(
         )
     return request.model_copy(
         update={
-            "messages": (*request.messages, *pending_messages),
+            "messages": _messages_with_visible_transcript(request.messages, visible_transcript),
             "maximum_output_tokens": requested_budget or maximum_output_tokens,
             "tool_choice": "none",
         }
     )
+
+
+def _messages_with_visible_transcript(
+    messages: tuple[ModelMessage, ...],
+    visible_transcript: tuple[ModelMessage, ...],
+) -> tuple[ModelMessage, ...]:
+    """Append retained visible turns unless a stateful agent already supplied that suffix."""
+    if not visible_transcript:
+        return messages
+    if len(messages) >= len(visible_transcript) and messages[-len(visible_transcript) :] == (
+        visible_transcript
+    ):
+        return messages
+    return (*messages, *visible_transcript)
 
 
 def _require_text_only_candidate_request(request: ModelRequest) -> None:
@@ -354,6 +405,39 @@ def _require_text_only_action(action: AssistantAction, *, role: str) -> None:
             f"{role} emitted tool calls or no visible text; use sandbox mode for tools",
             phase=f"{role.replace(' ', '_')}_tools",
         )
+
+
+def _require_response_identity(
+    response: ModelResponse,
+    resolved: ResolvedModel,
+    *,
+    role: str,
+) -> None:
+    """Reject a provider response that was not served by the pinned resolved identity.
+
+    A provider may expose a separately configured served model ID, for example when a cataloged
+    routing alias resolves to one pinned dated model. That exception remains explicit and retains
+    the configured provider, revision, capability, and connection digests.
+    """
+    expected = resolved.snapshot
+    if response.model == expected:
+        return
+    served_model_id = resolved.served_model_id
+    if (
+        served_model_id is not None
+        and response.model.model_id == served_model_id
+        and response.model.provider == expected.provider
+        and response.model.revision == expected.revision
+        and response.model.capabilities_sha256 == expected.capabilities_sha256
+        and response.model.connection_sha256 == expected.connection_sha256
+    ):
+        return
+    raise _text_failure(
+        StopReason.FAILURE,
+        FailureCode.VALIDATION,
+        f"{role} response identity does not match its pinned resolved model",
+        phase=f"{role.replace(' ', '_')}_identity",
+    )
 
 
 def _require_complete_response(response: ModelResponse, *, role: str) -> None:

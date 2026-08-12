@@ -6,8 +6,7 @@ import hashlib
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
-from typing import cast
+from datetime import datetime
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -20,7 +19,7 @@ from wmo.common.core.artifacts import (
     stable_id,
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
-from wmo.common.models import AssistantAction, NumericMeasurement, OperationEconomics
+from wmo.common.models import AssistantAction, OperationEconomics
 from wmo.common.project import (
     ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
@@ -29,19 +28,29 @@ from wmo.common.project import (
 )
 from wmo.common.rollouts import (
     RolloutArtifact,
-    RolloutEventKind,
     RolloutSpan,
     SimulationArtifactSet,
+    SimulationCellBinding,
     SimulationMode,
     StopReason,
     WorldModelSimulatorSnapshot,
 )
-from wmo.common.tasks import TaskCase
-from wmo.runtime.agents import AgentEpisode, AgentRuntime, execute_agent_episode
+from wmo.common.tasks import LoadedTaskSet, load_task_set
+from wmo.runtime.agents import AgentRuntime
 from wmo.runtime.models import ResolvedModel
-from wmo.simulation.engines.text.environment import (
-    TextOnlyEnvironmentRuntime,
-    TextOnlyToolUseError,
+from wmo.simulation.engines.text.bindings import (
+    SimulationResolution,
+    binding_digest,
+    lease_id_for_binding,
+    make_cell_binding,
+    make_resolution,
+    rollout_id_for_binding,
+)
+from wmo.simulation.engines.text.episode_loop import execute_text_episode_loop
+from wmo.simulation.engines.text.leases import (
+    TextCellLeaseError,
+    TextCellLeaseState,
+    TextCellLeaseStore,
 )
 from wmo.simulation.engines.text.prompt import (
     WORLD_MODEL_TEXT_PROMPT_ID,
@@ -55,11 +64,22 @@ from wmo.simulation.engines.text.recording import (
 from wmo.simulation.engines.text.redaction import (
     redact_action,
     redact_failure,
-    redact_span,
     redacted_field_set,
 )
+from wmo.simulation.engines.text.rollout_support import (
+    combine_spans,
+    elapsed_seconds,
+    failure_span,
+    internal_failure,
+    jsonl_bytes,
+    known_total_spend,
+    normalize_text_tool_failure,
+    orchestration_economics,
+    timestamp,
+    utc_now,
+)
 from wmo.simulation.orchestration import require_implemented_mode
-from wmo.simulation.specs import SimulationSpec, simulation_spec_digest
+from wmo.simulation.specs import SimulationSpec
 
 _SIMULATOR_ID = "text-world-model-v1"
 _SPEC_FILE = "simulation-spec.json"
@@ -89,7 +109,7 @@ class WorldModelSimulator:
         store: Immutable local artifact store receiving specifications and rollout artifacts.
         evaluation_plan: Frozen plan whose explicit simulated cells may be selected.
         evaluation_plan_input: Verified persisted-plan manifest reference.
-        tasks: Canonical tasks keyed by task ID.
+        task_set_input: Verified full immutable task-set manifest reference.
         candidate_models: Independently resolved candidate models keyed by plan alias.
         world_models: Independently resolved world-model providers keyed by local alias.
         agent_factory: Creates an isolated customer-agent runtime for each episode worker.
@@ -105,7 +125,7 @@ class WorldModelSimulator:
         store: ArtifactStore,
         evaluation_plan: EvaluationPlan,
         evaluation_plan_input: ArtifactInput,
-        tasks: Mapping[str, TaskCase],
+        task_set_input: ArtifactInput,
         candidate_models: Mapping[str, ResolvedModel],
         world_models: Mapping[str, ResolvedModel],
         agent_factory: Callable[[], AgentRuntime],
@@ -120,7 +140,7 @@ class WorldModelSimulator:
             store: Immutable store scoped to one `.wmo` project.
             evaluation_plan: Exact plan selected by later simulation specifications.
             evaluation_plan_input: Manifest identity for ``evaluation_plan``.
-            tasks: Canonical task records available to selected plan cells.
+            task_set_input: Verified full immutable task-set manifest reference.
             candidate_models: Candidate aliases resolved through the canonical runtime package.
             world_models: Remote world-model aliases resolved through the canonical runtime package.
             agent_factory: Per-episode customer-agent construction seam.
@@ -139,14 +159,68 @@ class WorldModelSimulator:
         self._store = store
         self._plan = evaluation_plan
         self._plan_input = evaluation_plan_input
-        self._tasks = dict(tasks)
+        self._task_set_input = task_set_input
+        loaded_task_set = self._load_and_verify_task_set(task_set_input)
+        self._task_set = loaded_task_set.task_set
+        self._tasks = {task.task_id: task for task in loaded_task_set.tasks}
         self._candidate_models = dict(candidate_models)
         self._world_models = dict(world_models)
         self._agent_factory = agent_factory
         self._redacted_field_names = redacted_field_set(redacted_field_names)
-        self._clock = clock or _utc_now
+        self._clock = clock or utc_now
         self._monotonic = monotonic
         self._token_counter = token_counter or Utf8UpperBoundTokenCounter()
+        self._leases = TextCellLeaseStore(store.project_directory, clock=self._clock)
+        self._verify_persisted_evaluation_plan()
+
+    def _load_and_verify_task_set(self, task_set_input: ArtifactInput) -> LoadedTaskSet:
+        """Load the exact task-set manifest and reject an ID paired with a different digest."""
+        try:
+            stored = self._store.read(task_set_input.artifact_id)
+        except ArtifactCorruptionError as exc:
+            raise SimulationConfigurationError(
+                f"simulation task set {task_set_input.artifact_id!r} cannot be read safely"
+            ) from exc
+        if (
+            stored.manifest.artifact_type != "task-set"
+            or artifact_input(stored.manifest) != task_set_input
+        ):
+            raise SimulationConfigurationError(
+                "simulation task_set_input must name the exact persisted task-set manifest"
+            )
+        try:
+            return load_task_set(self._store, task_set_input.artifact_id)
+        except ArtifactCorruptionError as exc:
+            raise SimulationConfigurationError(
+                f"simulation task set {task_set_input.artifact_id!r} has invalid task content"
+            ) from exc
+
+    def _verify_persisted_evaluation_plan(self) -> None:
+        """Reject a caller-provided plan object that differs from its immutable manifest input."""
+        try:
+            stored = self._store.read(self._plan_input.artifact_id)
+            persisted = EvaluationPlan.model_validate_json(
+                self._store.read_bytes(self._plan_input.artifact_id, "evaluation-plan.json")
+            )
+        except (ArtifactCorruptionError, ValueError) as exc:
+            raise SimulationConfigurationError(
+                f"simulation evaluation plan {self._plan_input.artifact_id!r} cannot be read safely"
+            ) from exc
+        if (
+            stored.manifest.artifact_type != "evaluation-plan"
+            or artifact_input(stored.manifest) != self._plan_input
+        ):
+            raise SimulationConfigurationError(
+                "evaluation_plan_input must name the exact persisted evaluation-plan manifest"
+            )
+        if persisted != self._plan:
+            raise SimulationConfigurationError(
+                "supplied evaluation plan differs from its immutable persisted manifest"
+            )
+        if self._plan.task_set_id != self._task_set.task_set_id:
+            raise SimulationConfigurationError(
+                "evaluation plan task_set_id does not match the supplied immutable task set"
+            )
 
     def run(self, spec: SimulationSpec) -> SimulationArtifactSet:
         """Run or resume exactly the sparse simulated cells selected by ``spec``.
@@ -169,8 +243,13 @@ class WorldModelSimulator:
         require_implemented_mode(spec, SimulationMode.WORLD_MODEL)
         cells, world_model = self._validate_spec_and_bindings(spec)
         spec_input = self._persist_specification(spec)
-        spec_digest = simulation_spec_digest(spec)
-        completed = self._load_completed_rollouts(spec, cells, spec_digest)
+        resolution, resolution_input, bindings = self._persist_resolution(
+            spec,
+            spec_input,
+            cells,
+            world_model,
+        )
+        completed = self._load_completed_rollouts(cells, bindings, resolution_input)
         pending = tuple(cell for cell in cells if cell.cell_id not in completed)
 
         if pending:
@@ -181,7 +260,9 @@ class WorldModelSimulator:
                         pending,
                         world_model,
                         spec_input,
-                        spec_digest,
+                        resolution,
+                        resolution_input,
+                        bindings,
                     )
                 )
             else:
@@ -191,12 +272,13 @@ class WorldModelSimulator:
                         pending,
                         world_model,
                         spec_input,
-                        spec_digest,
-                        tuple(completed.values()),
+                        resolution,
+                        resolution_input,
+                        bindings,
                     )
                 )
         ordered_rollouts = tuple(completed[cell.cell_id] for cell in cells)
-        return self._persist_artifact_set(spec, spec_input, ordered_rollouts)
+        return self._persist_artifact_set(spec, spec_input, resolution_input, ordered_rollouts)
 
     def _validate_spec_and_bindings(
         self,
@@ -210,6 +292,10 @@ class WorldModelSimulator:
         if self._plan_input not in spec.inputs:
             raise SimulationConfigurationError(
                 "simulation spec inputs must include the exact evaluation-plan manifest reference"
+            )
+        if self._task_set_input not in spec.inputs:
+            raise SimulationConfigurationError(
+                "simulation spec inputs must include the exact task-set manifest reference"
             )
         settings = spec.world_model
         if settings is None:  # pragma: no cover - selected settings are validated by SimulationSpec
@@ -292,21 +378,79 @@ class WorldModelSimulator:
                 ) from exc
             return artifact_input(stored.manifest)
 
-    def _load_completed_rollouts(
+    def _persist_resolution(
         self,
         spec: SimulationSpec,
+        spec_input: ArtifactInput,
         cells: Sequence[EvaluationCell],
-        spec_digest: str,
+        world_model: ResolvedModel,
+    ) -> tuple[SimulationResolution, ArtifactInput, dict[ArtifactId, SimulationCellBinding]]:
+        """Persist or verify aliases, tasks, prompt content, and inputs before provider work."""
+        bindings = {
+            cell.cell_id: make_cell_binding(
+                spec=spec,
+                simulation_spec_input=spec_input,
+                evaluation_plan_input=self._plan_input,
+                task_set_input=self._task_set_input,
+                task_set=self._task_set,
+                cell=cell,
+                task=self._tasks[cell.task_id],
+                candidate=self._candidate_models[cell.candidate_alias],
+                world_model=world_model,
+            )
+            for cell in cells
+        }
+        resolution = make_resolution(
+            spec=spec,
+            simulation_spec_input=spec_input,
+            evaluation_plan_input=self._plan_input,
+            task_set_input=self._task_set_input,
+            bindings=tuple(bindings[cell.cell_id] for cell in cells),
+            created_at=timestamp(self._clock),
+        )
+        try:
+            manifest = self._store.write_json(
+                artifact_id=resolution.resolution_id,
+                artifact_type="simulation-resolution",
+                envelope=resolution,
+                files={"simulation-resolution.json": resolution},
+            )
+            return resolution, artifact_input(manifest), bindings
+        except ArtifactAlreadyExistsError as exc:
+            stored = self._store.read(resolution.resolution_id)
+            if stored.manifest.artifact_type != "simulation-resolution":
+                raise SimulationResumeError(
+                    f"resolution {resolution.resolution_id!r} has an incompatible artifact type"
+                ) from exc
+            try:
+                existing = SimulationResolution.model_validate_json(
+                    self._store.read_bytes(resolution.resolution_id, "simulation-resolution.json")
+                )
+            except (ArtifactCorruptionError, ValueError) as error:
+                raise SimulationResumeError(
+                    f"simulation resolution {resolution.resolution_id!r} cannot be read safely"
+                ) from error
+            if existing.model_copy(update={"created_at": resolution.created_at}) != resolution:
+                raise SimulationResumeError(
+                    "simulation aliases, prompt, task content, or immutable inputs changed after "
+                    "this simulation specification was first resolved"
+                ) from exc
+            return existing, artifact_input(stored.manifest), bindings
+
+    def _load_completed_rollouts(
+        self,
+        cells: Sequence[EvaluationCell],
+        bindings: Mapping[ArtifactId, SimulationCellBinding],
+        resolution_input: ArtifactInput,
     ) -> dict[ArtifactId, RolloutArtifact]:
-        """Load valid completed episodes, leaving missing cells available for atomic resume."""
+        """Load only completed rollout artifacts whose full immutable bindings still match."""
         completed: dict[ArtifactId, RolloutArtifact] = {}
         for cell in cells:
-            rollout_id = _rollout_id(spec_digest, cell.cell_id)
-            rollout = self._load_optional_rollout(rollout_id)
-            if rollout is None:
-                continue
-            self._validate_resume_rollout(rollout, spec, cell, spec_digest)
-            completed[cell.cell_id] = rollout
+            binding = bindings[cell.cell_id]
+            rollout = self._load_optional_rollout(rollout_id_for_binding(binding))
+            if rollout is not None:
+                self._validate_resume_rollout(rollout, cell, binding, resolution_input)
+                completed[cell.cell_id] = rollout
         return completed
 
     def _run_without_spend_limit(
@@ -315,17 +459,15 @@ class WorldModelSimulator:
         cells: Sequence[EvaluationCell],
         world_model: ResolvedModel,
         spec_input: ArtifactInput,
-        spec_digest: str,
+        resolution: SimulationResolution,
+        resolution_input: ArtifactInput,
+        bindings: Mapping[ArtifactId, SimulationCellBinding],
     ) -> dict[ArtifactId, RolloutArtifact]:
-        """Run pending cells with the configured bounded worker concurrency."""
+        """Run unbounded-cost cells with local worker and cross-process claim limits."""
         if spec.maximum_concurrency == 1:
             return {
                 cell.cell_id: self._execute_and_persist_cell(
-                    spec,
-                    cell,
-                    world_model,
-                    spec_input,
-                    spec_digest,
+                    spec, cell, world_model, spec_input, resolution, resolution_input, bindings
                 )
                 for cell in cells
             }
@@ -340,7 +482,9 @@ class WorldModelSimulator:
                     cell,
                     world_model,
                     spec_input,
-                    spec_digest,
+                    resolution,
+                    resolution_input,
+                    bindings,
                 )
                 for cell in cells
             }
@@ -352,38 +496,17 @@ class WorldModelSimulator:
         cells: Sequence[EvaluationCell],
         world_model: ResolvedModel,
         spec_input: ArtifactInput,
-        spec_digest: str,
-        completed: Sequence[RolloutArtifact],
+        resolution: SimulationResolution,
+        resolution_input: ArtifactInput,
+        bindings: Mapping[ArtifactId, SimulationCellBinding],
     ) -> dict[ArtifactId, RolloutArtifact]:
-        """Admit sequential episodes until observed total provider spend reaches the ceiling."""
-        ceiling = spec.maximum_cost_usd
-        if ceiling is None:  # pragma: no cover - caller branches on this exact value
-            raise ValueError("a spend-limited simulation needs a finite maximum_cost_usd")
-        spent = _known_total_spend(completed)
-        results: dict[ArtifactId, RolloutArtifact] = {}
-        for cell in cells:
-            if spent is None or spent >= ceiling:
-                rollout = self._budget_failure_rollout(
-                    spec,
-                    cell,
-                    world_model,
-                    spec_input,
-                    spec_digest,
-                    spent,
-                )
-                results[cell.cell_id] = self._persist_rollout(rollout)
-                continue
-            rollout = self._execute_and_persist_cell(
-                spec,
-                cell,
-                world_model,
-                spec_input,
-                spec_digest,
+        """Run finite-budget cells serially while durable claims reserve all remaining budget."""
+        return {
+            cell.cell_id: self._execute_and_persist_cell(
+                spec, cell, world_model, spec_input, resolution, resolution_input, bindings
             )
-            results[cell.cell_id] = rollout
-            episode_spend = _rollout_spend(rollout)
-            spent = None if spent is None or episode_spend is None else spent + episode_spend
-        return results
+            for cell in cells
+        }
 
     def _execute_and_persist_cell(
         self,
@@ -391,24 +514,89 @@ class WorldModelSimulator:
         cell: EvaluationCell,
         world_model: ResolvedModel,
         spec_input: ArtifactInput,
-        spec_digest: str,
+        resolution: SimulationResolution,
+        resolution_input: ArtifactInput,
+        bindings: Mapping[ArtifactId, SimulationCellBinding],
     ) -> RolloutArtifact:
-        """Run one selected cell and atomically persist its terminal evidence."""
-        rollout = self._execute_cell(spec, cell, world_model, spec_input, spec_digest)
-        return self._persist_rollout(rollout)
+        """Acquire a durable paid-work claim, execute one cell, and persist before release."""
+        binding = bindings[cell.cell_id]
+        rollout_id = rollout_id_for_binding(binding)
+        existing = self._load_optional_rollout(rollout_id)
+        if existing is not None:
+            self._validate_resume_rollout(existing, cell, binding, resolution_input)
+            return existing
+        try:
+            claim = self._leases.acquire(
+                lease_id=lease_id_for_binding(resolution, binding),
+                resolution_id=resolution.resolution_id,
+                simulation_id=spec.simulation_id,
+                rollout_id=rollout_id,
+                binding_sha256=binding_digest(binding),
+                maximum_cost_usd=spec.maximum_cost_usd,
+                rollout_completed=lambda: self._load_optional_rollout(rollout_id) is not None,
+                observed_spend_usd=lambda: self._known_resolution_spend(bindings, resolution_input),
+            )
+        except TextCellLeaseError as exc:
+            raise SimulationResumeError(
+                f"text simulation cell {cell.cell_id!r} cannot be admitted"
+            ) from exc
+        if claim.state == TextCellLeaseState.COMPLETED:
+            completed = self._load_optional_rollout(rollout_id)
+            if completed is None:  # pragma: no cover - artifact check and read share one store
+                raise SimulationResumeError("completed text-cell claim has no readable rollout")
+            self._validate_resume_rollout(completed, cell, binding, resolution_input)
+            return completed
+        if claim.state == TextCellLeaseState.STALE:
+            stale = claim.lease
+            if stale is None:  # pragma: no cover - stale state always retains its durable record
+                raise SimulationResumeError("stale text-cell claim omitted its recovery evidence")
+            rollout = self._lease_failure_rollout(
+                spec, cell, world_model, binding, resolution_input, stale.lease_id
+            )
+            return self._persist_rollout(rollout, cell, binding, resolution_input)
+        if claim.state == TextCellLeaseState.BUDGET_BLOCKED:
+            rollout = self._budget_failure_rollout(
+                spec, cell, world_model, binding, resolution_input, claim.observed_spend_usd
+            )
+            return self._persist_rollout(rollout, cell, binding, resolution_input)
+        if claim.lease is None:  # pragma: no cover - owned state always creates an exact lease
+            raise SimulationResumeError("owned text-cell admission omitted its durable lease")
+        try:
+            rollout = self._execute_cell(spec, cell, world_model, binding, resolution_input)
+            persisted = self._persist_rollout(rollout, cell, binding, resolution_input)
+        except BaseException:
+            raise
+        self._leases.release(claim.lease)
+        return persisted
+
+    def _known_resolution_spend(
+        self,
+        bindings: Mapping[ArtifactId, SimulationCellBinding],
+        resolution_input: ArtifactInput,
+    ) -> float | None:
+        """Return completed provider spend or unknown when one bound cell is unpriced."""
+        rollouts = []
+        for cell_id, binding in bindings.items():
+            rollout = self._load_optional_rollout(rollout_id_for_binding(binding))
+            if rollout is None:
+                continue
+            cell = next(item for item in self._plan.cells if item.cell_id == cell_id)
+            self._validate_resume_rollout(rollout, cell, binding, resolution_input)
+            rollouts.append(rollout)
+        return known_total_spend(rollouts)
 
     def _execute_cell(
         self,
         spec: SimulationSpec,
         cell: EvaluationCell,
         world_model: ResolvedModel,
-        spec_input: ArtifactInput,
-        spec_digest: str,
+        binding: SimulationCellBinding,
+        resolution_input: ArtifactInput,
     ) -> RolloutArtifact:
         """Execute one no-tools episode, converting every boundary issue into a rollout artifact."""
         task = self._tasks[cell.task_id]
         candidate = self._candidate_models[cell.candidate_alias]
-        started_at = _timestamp(self._clock)
+        started_at = timestamp(self._clock)
         started_monotonic = self._monotonic()
         if task.tools:
             return self._failure_rollout(
@@ -416,8 +604,8 @@ class WorldModelSimulator:
                 cell,
                 candidate,
                 world_model,
-                spec_input,
-                spec_digest,
+                binding,
+                resolution_input,
                 started_at,
                 StopReason.FAILURE,
                 StructuredFailure(
@@ -426,7 +614,7 @@ class WorldModelSimulator:
                     attribution=FailureAttribution.TOOL,
                     details={"phase": "task_tools", "tool_count": len(task.tools)},
                 ),
-                duration_seconds=_elapsed_seconds(started_monotonic, self._monotonic()),
+                duration_seconds=elapsed_seconds(started_monotonic, self._monotonic()),
             )
         settings = spec.world_model
         if settings is None:  # pragma: no cover - validated before this execution path
@@ -442,58 +630,49 @@ class WorldModelSimulator:
             token_counter=self._token_counter,
         )
         try:
-            agent = self._agent_factory()
-            episode = execute_agent_episode(
-                agent,
-                TextOnlyEnvironmentRuntime(),
-                task,
-                recorder,
+            outcome = execute_text_episode_loop(
+                agent_factory=self._agent_factory,
+                task=task,
+                recorder=recorder,
             )
-        except Exception as exc:  # noqa: BLE001 - a construction fault belongs in the selected cell
+        except Exception as exc:  # noqa: BLE001 - construction faults remain cell evidence
             return self._failure_rollout(
                 spec,
                 cell,
                 candidate,
                 world_model,
-                spec_input,
-                spec_digest,
+                binding,
+                resolution_input,
                 started_at,
                 StopReason.FAILURE,
-                _internal_failure("agent construction or lifecycle", exc),
-                duration_seconds=_elapsed_seconds(started_monotonic, self._monotonic()),
+                internal_failure("agent construction or lifecycle", exc),
+                duration_seconds=elapsed_seconds(started_monotonic, self._monotonic()),
                 recorder=recorder,
             )
-        ended_at = _timestamp(self._clock, not_before=started_at)
-        duration_seconds = _elapsed_seconds(started_monotonic, self._monotonic())
-        text_error = recorder.terminal_error
-        if text_error is not None:
-            stop_reason = text_error.stop_reason
-            failure = None if stop_reason == StopReason.COMPLETED else text_error.failure
-        else:
-            stop_reason = episode.stop_reason
-            failure = _normalize_text_tool_failure(episode)
-        final_output = episode.final_action or recorder.last_candidate_action
+        failure = outcome.failure
+        if outcome.episodes and failure == outcome.episodes[-1].failure:
+            failure = normalize_text_tool_failure(outcome.episodes[-1])
         return self._make_rollout(
             spec,
             cell,
             candidate,
             world_model,
-            spec_input,
-            spec_digest,
+            binding,
+            resolution_input,
             started_at,
-            ended_at,
-            stop_reason,
+            timestamp(self._clock, not_before=started_at),
+            outcome.stop_reason,
             failure,
-            final_output,
-            _combine_spans(
-                episode.events,
+            outcome.final_output,
+            combine_spans(
+                tuple(event for episode in outcome.episodes for event in episode.events),
                 recorder.recorded.candidate_spans,
                 recorder.recorded.world_model_spans,
                 self._redacted_field_names,
             ),
             recorder.recorded.candidate_economics,
             recorder.recorded.world_model_economics,
-            _orchestration_economics(duration_seconds),
+            orchestration_economics(elapsed_seconds(started_monotonic, self._monotonic())),
         )
 
     def _failure_rollout(
@@ -502,8 +681,8 @@ class WorldModelSimulator:
         cell: EvaluationCell,
         candidate: ResolvedModel,
         world_model: ResolvedModel,
-        spec_input: ArtifactInput,
-        spec_digest: str,
+        binding: SimulationCellBinding,
+        resolution_input: ArtifactInput,
         started_at: datetime,
         stop_reason: StopReason,
         failure: StructuredFailure,
@@ -512,23 +691,23 @@ class WorldModelSimulator:
         recorder: RecordingCandidateClient | None = None,
     ) -> RolloutArtifact:
         """Build an artifact-safe failed cell, retaining calls recorded before the failure."""
-        ended_at = _timestamp(self._clock, not_before=started_at)
+        ended_at = timestamp(self._clock, not_before=started_at)
         recorded = recorder.recorded if recorder is not None else None
-        spans = _combine_spans(
+        spans = combine_spans(
             (),
             recorded.candidate_spans if recorded is not None else (),
             recorded.world_model_spans if recorded is not None else (),
             self._redacted_field_names,
         )
         if not spans:
-            spans = (_failure_span(started_at, ended_at, failure),)
+            spans = (failure_span(started_at, ended_at, failure),)
         return self._make_rollout(
             spec,
             cell,
             candidate,
             world_model,
-            spec_input,
-            spec_digest,
+            binding,
+            resolution_input,
             started_at,
             ended_at,
             stop_reason,
@@ -537,7 +716,7 @@ class WorldModelSimulator:
             spans,
             recorded.candidate_economics if recorded is not None else OperationEconomics(),
             recorded.world_model_economics if recorded is not None else OperationEconomics(),
-            _orchestration_economics(duration_seconds),
+            orchestration_economics(duration_seconds),
         )
 
     def _budget_failure_rollout(
@@ -545,30 +724,56 @@ class WorldModelSimulator:
         spec: SimulationSpec,
         cell: EvaluationCell,
         world_model: ResolvedModel,
-        spec_input: ArtifactInput,
-        spec_digest: str,
+        binding: SimulationCellBinding,
+        resolution_input: ArtifactInput,
         spent: float | None,
     ) -> RolloutArtifact:
-        """Represent a not-admitted selected cell as immutable structured budget evidence."""
-        timestamp = _timestamp(self._clock)
-        candidate = self._candidate_models[cell.candidate_alias]
+        """Represent a cell rejected by the durable finite-spend admission reservation."""
         failure = StructuredFailure(
             code=FailureCode.BUDGET,
-            message=(
-                "simulation spend is unknown or the spend ceiling was reached before this "
-                "selected cell was admitted"
-            ),
+            message="simulation spend is unknown or its durable reservation exhausted the ceiling",
             attribution=FailureAttribution.MODEL,
-            details={"phase": "episode_admission", "observed_spend_usd": spent},
+            details={"phase": "paid_cell_admission", "observed_spend_usd": spent},
         )
         return self._failure_rollout(
             spec,
             cell,
-            candidate,
+            self._candidate_models[cell.candidate_alias],
             world_model,
-            spec_input,
-            spec_digest,
-            timestamp,
+            binding,
+            resolution_input,
+            timestamp(self._clock),
+            StopReason.MAXIMUM_COST,
+            failure,
+            duration_seconds=0.0,
+        )
+
+    def _lease_failure_rollout(
+        self,
+        spec: SimulationSpec,
+        cell: EvaluationCell,
+        world_model: ResolvedModel,
+        binding: SimulationCellBinding,
+        resolution_input: ArtifactInput,
+        lease_id: ArtifactId,
+    ) -> RolloutArtifact:
+        """Record a non-replayed crash recovery outcome for an ambiguous expired paid-cell claim."""
+        failure = StructuredFailure(
+            code=FailureCode.BUDGET,
+            message=(
+                "a prior paid-cell claim expired after its owner exited; WMO will not replay it"
+            ),
+            attribution=FailureAttribution.MODEL,
+            details={"phase": "paid_cell_stale_lease", "lease_id": lease_id},
+        )
+        return self._failure_rollout(
+            spec,
+            cell,
+            self._candidate_models[cell.candidate_alias],
+            world_model,
+            binding,
+            resolution_input,
+            timestamp(self._clock),
             StopReason.MAXIMUM_COST,
             failure,
             duration_seconds=0.0,
@@ -580,8 +785,8 @@ class WorldModelSimulator:
         cell: EvaluationCell,
         candidate: ResolvedModel,
         world_model: ResolvedModel,
-        spec_input: ArtifactInput,
-        spec_digest: str,
+        binding: SimulationCellBinding,
+        resolution_input: ArtifactInput,
         started_at: datetime,
         ended_at: datetime,
         stop_reason: StopReason,
@@ -594,18 +799,23 @@ class WorldModelSimulator:
     ) -> RolloutArtifact:
         """Compose one canonical ``RolloutArtifact`` from completed or failed evidence."""
         del started_at, ended_at
-        rollout_id = _rollout_id(spec_digest, cell.cell_id)
+        rollout_id = rollout_id_for_binding(binding)
         return RolloutArtifact(
             schema_version=1,
-            created_at=_timestamp(self._clock),
-            inputs=_sorted_inputs(self._plan_input, spec_input),
+            created_at=timestamp(self._clock),
+            inputs=_sorted_inputs(
+                self._plan_input,
+                self._task_set_input,
+                binding.simulation_spec_input,
+                resolution_input,
+            ),
             code_revision=spec.code_revision,
             artifact_id=rollout_id,
             simulation_id=spec.simulation_id,
             cell_id=cell.cell_id,
             mode=SimulationMode.WORLD_MODEL,
             rollout_id=rollout_id,
-            trace_id=sha256_json({"simulation": spec.simulation_id, "cell": cell.cell_id}),
+            trace_id=sha256_json({"binding": binding.model_dump(mode="json")}),
             evidence_source="world_model",
             source_run_id=spec.simulation_id,
             task_id=cell.task_id,
@@ -614,6 +824,8 @@ class WorldModelSimulator:
             simulator=WorldModelSimulatorSnapshot(
                 simulator_id=_SIMULATOR_ID,
                 prompt_id=WORLD_MODEL_TEXT_PROMPT_ID,
+                prompt_version=WORLD_MODEL_TEXT_PROMPT_VERSION,
+                prompt_sha256=binding.prompt_sha256,
                 world_model=world_model.snapshot,
             ),
             world_model=world_model.snapshot,
@@ -626,11 +838,18 @@ class WorldModelSimulator:
             candidate_economics=candidate_economics,
             world_model_economics=world_model_economics,
             orchestration_economics=orchestration_economics,
-            simulation_spec_sha256=spec_digest,
+            simulation_spec_sha256=binding.simulation_spec_sha256,
+            simulation_binding=binding,
         )
 
-    def _persist_rollout(self, rollout: RolloutArtifact) -> RolloutArtifact:
-        """Atomically store one rollout or return its already completed resume counterpart."""
+    def _persist_rollout(
+        self,
+        rollout: RolloutArtifact,
+        cell: EvaluationCell,
+        binding: SimulationCellBinding,
+        resolution_input: ArtifactInput,
+    ) -> RolloutArtifact:
+        """Atomically store a rollout, accepting only an exactly bound completed counterpart."""
         try:
             self._store.write_json(
                 artifact_id=rollout.artifact_id,
@@ -639,16 +858,14 @@ class WorldModelSimulator:
                 files={_ROLLOUT_FILE: rollout},
             )
             return rollout
-        except ArtifactAlreadyExistsError as exc:
+        except ArtifactAlreadyExistsError:
             existing = self._load_rollout(rollout.artifact_id)
-            if (
-                existing.simulation_id != rollout.simulation_id
-                or existing.cell_id != rollout.cell_id
-                or existing.simulation_spec_sha256 != rollout.simulation_spec_sha256
-            ):
+            try:
+                self._validate_resume_rollout(existing, cell, binding, resolution_input)
+            except SimulationResumeError as error:
                 raise SimulationResumeError(
                     f"rollout ID {rollout.artifact_id!r} is already bound to incompatible evidence"
-                ) from exc
+                ) from error
             return existing
 
     def _load_rollout(self, rollout_id: ArtifactId) -> RolloutArtifact:
@@ -674,17 +891,24 @@ class WorldModelSimulator:
     def _validate_resume_rollout(
         self,
         rollout: RolloutArtifact,
-        spec: SimulationSpec,
         cell: EvaluationCell,
-        spec_digest: str,
+        binding: SimulationCellBinding,
+        resolution_input: ArtifactInput,
     ) -> None:
-        """Ensure a stable rollout ID has not been reused for unrelated immutable data."""
+        """Ensure a completed cell retains every exact binding, input, and stable rollout ID."""
+        expected_inputs = _sorted_inputs(
+            self._plan_input,
+            self._task_set_input,
+            binding.simulation_spec_input,
+            resolution_input,
+        )
         if (
-            rollout.simulation_id != spec.simulation_id
-            or rollout.cell_id != cell.cell_id
+            rollout.cell_id != cell.cell_id
+            or rollout.task_id != cell.task_id
             or rollout.mode != SimulationMode.WORLD_MODEL
-            or rollout.simulation_spec_sha256 != spec_digest
-            or rollout.rollout_id != _rollout_id(spec_digest, cell.cell_id)
+            or rollout.rollout_id != rollout_id_for_binding(binding)
+            or rollout.simulation_binding != binding
+            or rollout.inputs != expected_inputs
         ):
             raise SimulationResumeError(
                 f"stored rollout {rollout.artifact_id!r} does not match the requested "
@@ -695,20 +919,26 @@ class WorldModelSimulator:
         self,
         spec: SimulationSpec,
         spec_input: ArtifactInput,
+        resolution_input: ArtifactInput,
         rollouts: Sequence[RolloutArtifact],
     ) -> SimulationArtifactSet:
         """Write or verify the immutable terminal index after every selected cell has evidence."""
         artifact_ids = tuple(rollout.artifact_id for rollout in rollouts)
         records = tuple({"artifact_id": artifact_id} for artifact_id in artifact_ids)
-        index_payload = _jsonl_bytes(records)
+        index_payload = jsonl_bytes(records)
         artifact_set_id = stable_id(
             "simulation-artifact-set",
             {"simulation_id": spec.simulation_id, "artifact_ids": artifact_ids},
         )
         artifact_set = SimulationArtifactSet(
             schema_version=1,
-            created_at=_timestamp(self._clock),
-            inputs=_sorted_inputs(self._plan_input, spec_input),
+            created_at=timestamp(self._clock),
+            inputs=_sorted_inputs(
+                self._plan_input,
+                self._task_set_input,
+                spec_input,
+                resolution_input,
+            ),
             code_revision=spec.code_revision,
             artifact_set_id=artifact_set_id,
             simulation_id=spec.simulation_id,
@@ -755,148 +985,9 @@ class WorldModelSimulator:
             return existing
 
 
-def _utc_now() -> datetime:
-    """Return a timezone-aware default timestamp without importing provider or runtime state."""
-    return datetime.now(UTC)
-
-
-def _rollout_id(spec_digest: str, cell_id: ArtifactId) -> ArtifactId:
-    """Build a deterministic per-cell artifact ID tied to one immutable simulation recipe."""
-    return stable_id("rollout", {"spec": spec_digest, "cell_id": cell_id})
-
-
 def _sorted_inputs(*inputs: ArtifactInput) -> tuple[ArtifactInput, ...]:
     """Return exactly one immutable input per ID in the artifact envelope's required order."""
     by_id = {item.artifact_id: item for item in inputs}
     if len(by_id) != len(inputs):
         raise SimulationConfigurationError("simulation artifact inputs must have distinct IDs")
     return tuple(by_id[artifact_id] for artifact_id in sorted(by_id))
-
-
-def _combine_spans(
-    agent_events: Sequence[RolloutSpan],
-    candidate_spans: Sequence[RolloutSpan],
-    world_model_spans: Sequence[RolloutSpan],
-    redacted_field_names: frozenset[str],
-) -> tuple[RolloutSpan, ...]:
-    """Merge redacted evidence while keeping recorder-owned candidate calls canonical."""
-    agent_id_map = {event.span_id: f"agent-{event.span_id}" for event in agent_events}
-    copied_agent_events = []
-    for event in agent_events:
-        if event.kind == RolloutEventKind.AGENT_MODEL_CALL:
-            continue
-        copied = redact_span(event, redacted_field_names)
-        copied_agent_events.append(
-            copied.model_copy(
-                update={
-                    "span_id": agent_id_map[event.span_id],
-                    "parent_span_id": agent_id_map.get(
-                        copied.parent_span_id,
-                        copied.parent_span_id,
-                    ),
-                }
-            )
-        )
-    combined = (*copied_agent_events, *candidate_spans, *world_model_spans)
-    return tuple(
-        sorted(
-            combined,
-            key=lambda span: (span.started_at, span.ended_at, span.span_id),
-        )
-    )
-
-
-def _failure_span(
-    started_at: datetime,
-    ended_at: datetime,
-    failure: StructuredFailure,
-) -> RolloutSpan:
-    """Build a minimum lifecycle span for a failure that preceded any model call."""
-    return RolloutSpan(
-        span_id="lifecycle-failure",
-        kind=RolloutEventKind.LIFECYCLE,
-        started_at=started_at,
-        ended_at=ended_at,
-        payload={"phase": failure.details.get("phase", "simulation")},
-        failure=failure,
-    )
-
-
-def _internal_failure(phase: str, exception: Exception) -> StructuredFailure:
-    """Normalize a local orchestration exception without retaining arbitrary exception text."""
-    return StructuredFailure(
-        code=FailureCode.INTERNAL,
-        message=f"{phase} failed with {type(exception).__name__}",
-        exception_type=type(exception).__name__,
-        attribution=FailureAttribution.AGENT,
-        details={"phase": phase},
-    )
-
-
-def _normalize_text_tool_failure(episode: AgentEpisode) -> StructuredFailure | None:
-    """Translate a tool attempt into the text mode's explicit unsupported-cell evidence."""
-    failure = episode.failure
-    if failure is None or failure.exception_type != TextOnlyToolUseError.__name__:
-        return failure
-    return StructuredFailure(
-        code=FailureCode.UNSUPPORTED,
-        message="text world-model simulation cannot execute a customer-agent tool call",
-        exception_type=failure.exception_type,
-        attribution=FailureAttribution.TOOL,
-        details={"phase": "agent_tool_call"},
-    )
-
-
-def _orchestration_economics(duration_seconds: float) -> OperationEconomics:
-    """Record simulator-owned elapsed time without attributing it to the candidate model."""
-    return OperationEconomics(
-        latency_seconds=NumericMeasurement(value=duration_seconds, provenance="observed")
-    )
-
-
-def _known_total_spend(rollouts: Sequence[RolloutArtifact]) -> float | None:
-    """Return total observed provider spend, or ``None`` if any completed episode is unpriced."""
-    values = tuple(_rollout_spend(rollout) for rollout in rollouts)
-    if any(value is None for value in values):
-        return None
-    return sum(cast(float, value) for value in values)
-
-
-def _rollout_spend(rollout: RolloutArtifact) -> float | None:
-    """Return observed provider cost, never interpreting an unpriced provider call as zero."""
-    roles = (
-        (rollout.candidate_economics, RolloutEventKind.AGENT_MODEL_CALL),
-        (rollout.world_model_economics, RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL),
-    )
-    total = 0.0
-    for economics, span_kind in roles:
-        made_call = any(span.kind == span_kind for span in rollout.spans)
-        if not made_call:
-            continue
-        if economics is None or economics.cost_usd is None:
-            return None
-        total += economics.cost_usd.value
-    return total
-
-
-def _elapsed_seconds(started_at: float, ended_at: float) -> float:
-    """Return a nonnegative orchestration duration from an injected monotonic clock."""
-    return max(0.0, ended_at - started_at)
-
-
-def _timestamp(clock: Callable[[], datetime], *, not_before: datetime | None = None) -> datetime:
-    """Return an aware timestamp and prevent a deterministic test clock from moving backwards."""
-    value = clock()
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise SimulationConfigurationError("simulation clock must return timezone-aware datetimes")
-    if not_before is not None and value < not_before:
-        return not_before
-    return value
-
-
-def _jsonl_bytes(records: Sequence[Mapping[str, object]]) -> bytes:
-    """Render a deterministic JSONL file from small internal artifact-index records."""
-    payload = b"\n".join(
-        canonical_json_bytes(cast(dict[str, object], record)) for record in records
-    )
-    return payload + (b"\n" if payload else b"")

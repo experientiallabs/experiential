@@ -4,6 +4,7 @@ from wmo.common.rollouts.artifact import (
     RolloutArtifact,
     SimulationArtifact,
     SimulationArtifactSet,
+    SimulationCellBinding,
     SimulationMode,
     StopReason,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "SandboxSimulatorSnapshot",
     "SimulationArtifact",
     "SimulationArtifactSet",
+    "SimulationCellBinding",
     "SimulationMode",
     "SimulatorSnapshot",
     "StopReason",

@@ -1,5 +1,6 @@
 """Tests for text-only candidate recording and preflight boundaries."""
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -98,14 +99,18 @@ def _recorder(
     world_client: _ScriptedClient,
     *,
     candidate_context_window: int = 100_000,
+    candidate_served_model_id: str | None = None,
 ) -> RecordingCandidateClient:
+    candidate = _resolved(
+        "candidate-a",
+        candidate_client,
+        context_window_tokens=candidate_context_window,
+    )
+    if candidate_served_model_id is not None:
+        candidate = replace(candidate, served_model_id=candidate_served_model_id)
     return RecordingCandidateClient(
         task=_task(),
-        candidate=_resolved(
-            "candidate-a",
-            candidate_client,
-            context_window_tokens=candidate_context_window,
-        ),
+        candidate=candidate,
         world_model=_resolved("world-model-a", world_client),
         maximum_steps=2,
         maximum_output_tokens=16_000,
@@ -206,3 +211,35 @@ def test_recorder_fails_context_preflight_and_explicit_length_stops_without_trun
         "output": {"content": "unfinished response", "tool_calls": []},
         "finish_reason": "length",
     }
+
+
+def test_recorder_fails_closed_on_rebound_response_identity_but_allows_explicit_served_id() -> None:
+    """A provider alias cannot silently change identity after resolution."""
+    wrong = _recorder(
+        _ScriptedClient([_response("wrong", model=_snapshot("candidate-rebound"))]),
+        _ScriptedClient([]),
+    )
+
+    with pytest.raises(TextSimulationError, match="identity") as error:
+        wrong.complete(ModelRequest(messages=(ModelMessage(role="user", content="short"),)))
+
+    assert error.value.failure.details["phase"] == "candidate_identity"
+    accepted = _recorder(
+        _ScriptedClient([_response("served", model=_snapshot("candidate-served"))]),
+        _ScriptedClient(
+            [
+                _response(
+                    '{"message":"done","terminal":true}',
+                    model=_snapshot("world-model-a"),
+                )
+            ]
+        ),
+        candidate_served_model_id="candidate-served",
+    )
+
+    assert (
+        accepted.complete(
+            ModelRequest(messages=(ModelMessage(role="user", content="short"),))
+        ).output.content
+        == "served"
+    )

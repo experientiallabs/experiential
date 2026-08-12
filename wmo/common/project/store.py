@@ -64,6 +64,16 @@ class ArtifactStore:
         """Create a store rooted at one project's canonical artifact directory."""
         self._paths = paths
 
+    @property
+    def project_directory(self) -> Path:
+        """Return the project-owned local state directory for durable coordination records.
+
+        Immutable artifacts remain under ``artifacts``. Callers that need a mutable, local-only
+        coordination record, such as an in-flight paid-work lease, use this project directory so
+        independent processes addressing the same project contend on one durable location.
+        """
+        return self._paths.project_directory
+
     def write(
         self,
         *,

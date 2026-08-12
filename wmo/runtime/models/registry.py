@@ -66,6 +66,7 @@ class ResolvedModel:
     capabilities: ModelCapabilities
     client: ModelClient
     embedding_client: EmbeddingClient | None
+    served_model_id: str | None = None
 
 
 class RuntimeModelCatalog:

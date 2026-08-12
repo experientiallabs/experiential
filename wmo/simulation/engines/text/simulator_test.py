@@ -1,12 +1,14 @@
 """Deterministic end-to-end tests for atomic text world-model simulation."""
 
+import hashlib
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
-from wmo.common.core.artifacts import ArtifactInput
+from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import (
     AssistantAction,
@@ -25,7 +27,7 @@ from wmo.common.models import (
 )
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
 from wmo.common.rollouts import SimulationMode, StopReason
-from wmo.common.tasks import TaskCase, ToolSchema
+from wmo.common.tasks import TaskCase, TaskSet, ToolSchema
 from wmo.runtime.agents import AgentEpisode, AgentRuntime
 from wmo.runtime.environments import EnvironmentSession
 from wmo.runtime.models import ResolvedModel
@@ -170,6 +172,28 @@ def _persist_plan(store: ArtifactStore, plan: EvaluationPlan) -> ArtifactInput:
     return artifact_input(manifest)
 
 
+def _persist_task_set(store: ArtifactStore, tasks: dict[str, TaskCase]) -> ArtifactInput:
+    """Persist the immutable full task set required by text simulation identity checks."""
+    ordered = tuple(tasks[task_id] for task_id in sorted(tasks))
+    payload = b"\n".join(canonical_json_bytes(task) for task in ordered) + b"\n"
+    task_set = TaskSet(
+        schema_version=1,
+        created_at=_TIME,
+        code_revision="test-revision",
+        task_set_id="task-set",
+        task_ids=tuple(task.task_id for task in ordered),
+        tasks_path="tasks.jsonl",
+        tasks_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    manifest = store.write(
+        artifact_id=task_set.task_set_id,
+        artifact_type="task-set",
+        envelope=task_set,
+        files={"task-set.json": canonical_json_bytes(task_set), "tasks.jsonl": payload},
+    )
+    return artifact_input(manifest)
+
+
 def _resolved(
     alias: str,
     client: _ScriptedClient,
@@ -188,11 +212,16 @@ def _resolved(
     )
 
 
-def _spec(plan_input: ArtifactInput, cells: tuple[str, ...], **updates: object) -> SimulationSpec:
+def _spec(
+    plan_input: ArtifactInput,
+    task_set_input: ArtifactInput,
+    cells: tuple[str, ...],
+    **updates: object,
+) -> SimulationSpec:
     values: dict[str, object] = {
         "schema_version": 1,
         "created_at": _TIME,
-        "inputs": (plan_input,),
+        "inputs": (plan_input, task_set_input),
         "code_revision": "test-revision",
         "simulation_id": "simulation-a",
         "evaluation_plan_id": "evaluation-plan",
@@ -214,7 +243,7 @@ def _simulator(
     store: ArtifactStore,
     plan: EvaluationPlan,
     plan_input: ArtifactInput,
-    tasks: dict[str, TaskCase],
+    task_set_input: ArtifactInput,
     candidate_client: _ScriptedClient,
     world_client: _ScriptedClient,
     *,
@@ -225,7 +254,7 @@ def _simulator(
         store=store,
         evaluation_plan=plan,
         evaluation_plan_input=plan_input,
-        tasks=tasks,
+        task_set_input=task_set_input,
         candidate_models={
             "candidate-a": _resolved(
                 "candidate-a",
@@ -248,6 +277,8 @@ def test_text_simulation_persists_separate_economics_and_resumes_without_duplica
     plan = _plan((cell,))
     store = _store(tmp_path)
     plan_input = _persist_plan(store, plan)
+    tasks = {"task-a": _task("task-a")}
+    task_set_input = _persist_task_set(store, tasks)
     candidate_client = _ScriptedClient(
         [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.2)]
     )
@@ -264,11 +295,11 @@ def test_text_simulation_persists_separate_economics_and_resumes_without_duplica
         store,
         plan,
         plan_input,
-        {"task-a": _task("task-a")},
+        task_set_input,
         candidate_client,
         world_client,
     )
-    spec = _spec(plan_input, ("cell-a",))
+    spec = _spec(plan_input, task_set_input, ("cell-a",))
 
     artifact_set = simulator.run(spec)
     rollout_id = artifact_set.artifact_ids[0]
@@ -304,18 +335,20 @@ def test_text_simulation_records_tool_tasks_and_context_overflow_as_failed_cells
     plan = _plan(cells)
     store = _store(tmp_path)
     plan_input = _persist_plan(store, plan)
+    tasks = {"task-a": _task("task-a", tools=(tool,)), "task-b": _task("task-b")}
+    task_set_input = _persist_task_set(store, tasks)
     candidate_client = _ScriptedClient([])
     world_client = _ScriptedClient([])
     simulator = _simulator(
         store,
         plan,
         plan_input,
-        {"task-a": _task("task-a", tools=(tool,)), "task-b": _task("task-b")},
+        task_set_input,
         candidate_client,
         world_client,
         candidate_context_window=16_000,
     )
-    spec = _spec(plan_input, ("cell-a", "cell-b"))
+    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"))
 
     artifact_set = simulator.run(spec)
     tool_rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
@@ -338,17 +371,19 @@ def test_text_simulation_normalizes_agent_tool_attempts_to_unsupported_cells(
     plan = _plan((cell,))
     store = _store(tmp_path)
     plan_input = _persist_plan(store, plan)
+    tasks = {"task-a": _task("task-a")}
+    task_set_input = _persist_task_set(store, tasks)
     simulator = _simulator(
         store,
         plan,
         plan_input,
-        {"task-a": _task("task-a")},
+        task_set_input,
         _ScriptedClient([]),
         _ScriptedClient([]),
         agent_factory=_ToolAttemptAgent,
     )
 
-    artifact_set = simulator.run(_spec(plan_input, ("cell-a",)))
+    artifact_set = simulator.run(_spec(plan_input, task_set_input, ("cell-a",)))
     rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
 
     assert rollout.failure is not None
@@ -363,6 +398,8 @@ def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path
     plan = _plan(cells)
     store = _store(tmp_path)
     plan_input = _persist_plan(store, plan)
+    tasks = {"task-a": _task("task-a"), "task-b": _task("task-b")}
+    task_set_input = _persist_task_set(store, tasks)
     candidate_client = _ScriptedClient(
         [
             _response(
@@ -378,11 +415,11 @@ def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path
         store,
         plan,
         plan_input,
-        {"task-a": _task("task-a"), "task-b": _task("task-b")},
+        task_set_input,
         candidate_client,
         world_client,
     )
-    spec = _spec(plan_input, ("cell-a", "cell-b"), maximum_cost_usd=0.5)
+    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=0.5)
 
     artifact_set = simulator.run(spec)
     length_rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
@@ -404,6 +441,8 @@ def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
     plan = _plan(cells)
     store = _store(tmp_path)
     plan_input = _persist_plan(store, plan)
+    tasks = {"task-a": _task("task-a"), "task-b": _task("task-b")}
+    task_set_input = _persist_task_set(store, tasks)
     candidate_client = _ScriptedClient(
         [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)]
     )
@@ -420,11 +459,11 @@ def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
         store,
         plan,
         plan_input,
-        {"task-a": _task("task-a"), "task-b": _task("task-b")},
+        task_set_input,
         candidate_client,
         world_client,
     )
-    spec = _spec(plan_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
+    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
 
     artifact_set = simulator.run(spec)
     second_rollout = simulator._load_rollout(artifact_set.artifact_ids[1])
@@ -440,6 +479,11 @@ def test_text_simulation_enforces_configured_concurrency_bound(tmp_path: Path) -
     plan = _plan(cells)
     store = _store(tmp_path)
     plan_input = _persist_plan(store, plan)
+    tasks = {
+        task.task_id: task
+        for task in (_task("task-a"), _task("task-b"), _task("task-c"), _task("task-d"))
+    }
+    task_set_input = _persist_task_set(store, tasks)
     candidate_client = _ScriptedClient(
         [_response(f"candidate {index}", snapshot=_snapshot("candidate-a")) for index in range(4)],
         delay_seconds=0.03,
@@ -457,22 +501,96 @@ def test_text_simulation_enforces_configured_concurrency_bound(tmp_path: Path) -
         store,
         plan,
         plan_input,
-        {
-            task.task_id: task
-            for task in (
-                _task("task-a"),
-                _task("task-b"),
-                _task("task-c"),
-                _task("task-d"),
-            )
-        },
+        task_set_input,
         candidate_client,
         world_client,
     )
-    spec = _spec(plan_input, tuple(cell.cell_id for cell in cells), maximum_concurrency=2)
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        tuple(cell.cell_id for cell in cells),
+        maximum_concurrency=2,
+    )
 
     artifact_set = simulator.run(spec)
 
     assert len(artifact_set.artifact_ids) == 4
     assert candidate_client.maximum_active_calls == 2
     assert world_client.maximum_active_calls <= 2
+
+
+def test_text_simulation_continues_after_agent_completion_until_world_terminal(
+    tmp_path: Path,
+) -> None:
+    """A one-turn agent cannot turn a nonterminal world response into a completed rollout."""
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient(
+        [
+            _response("first answer", snapshot=_snapshot("candidate-a")),
+            _response("second answer", snapshot=_snapshot("candidate-a")),
+        ]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Please continue.","terminal":false}',
+                snapshot=_snapshot("world-model-a"),
+            ),
+            _response(
+                '{"message":"done","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+            ),
+        ]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+    )
+
+    artifact_set = simulator.run(_spec(plan_input, task_set_input, ("cell-a",)))
+    rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
+
+    assert rollout.stop_reason == StopReason.COMPLETED
+    assert len(candidate_client.requests) == 2
+    assert len(world_client.requests) == 2
+    assert candidate_client.requests[1].messages[-2].assistant_action is not None
+    assert candidate_client.requests[1].messages[-2].assistant_action.content == "first answer"
+    assert candidate_client.requests[1].messages[-1].content == "Please continue."
+
+
+def test_text_simulation_cross_runner_claim_prevents_duplicate_paid_calls(tmp_path: Path) -> None:
+    """Two concurrent same-spec runners share one durable paid-cell claim and rollout."""
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient(
+        [_response("answer", snapshot=_snapshot("candidate-a"))], delay_seconds=0.08
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"done","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+            )
+        ]
+    )
+    spec = _spec(plan_input, task_set_input, ("cell-a",))
+    first = _simulator(store, plan, plan_input, task_set_input, candidate_client, world_client)
+    second = _simulator(store, plan, plan_input, task_set_input, candidate_client, world_client)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        artifact_sets = tuple(executor.map(lambda simulator: simulator.run(spec), (first, second)))
+
+    assert artifact_sets[0].artifact_ids == artifact_sets[1].artifact_ids
+    assert len(candidate_client.requests) == 1
+    assert len(world_client.requests) == 1

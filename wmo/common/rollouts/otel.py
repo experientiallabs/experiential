@@ -8,7 +8,13 @@ from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 
-from wmo.common.core.artifacts import ContractModel, JsonObject, SourceIdentity, StructuredFailure
+from wmo.common.core.artifacts import (
+    ContractModel,
+    JsonObject,
+    Sha256,
+    SourceIdentity,
+    StructuredFailure,
+)
 from wmo.common.models import ModelSnapshot, Usage
 
 
@@ -59,6 +65,8 @@ class WorldModelSimulatorSnapshot(ContractModel):
     kind: Literal["world_model"] = "world_model"
     simulator_id: str = Field(min_length=1, max_length=256)
     prompt_id: str = Field(min_length=1, max_length=256)
+    prompt_version: str = Field(min_length=1, max_length=256)
+    prompt_sha256: Sha256
     world_model: ModelSnapshot
 
 

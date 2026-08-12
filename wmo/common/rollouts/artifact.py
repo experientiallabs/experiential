@@ -10,11 +10,13 @@ from pydantic import Field, field_validator, model_validator
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactId,
+    ArtifactInput,
+    ContractModel,
     Sha256,
     StructuredFailure,
     validate_artifact_file_path,
 )
-from wmo.common.models import AssistantAction, ModelSnapshot, OperationEconomics
+from wmo.common.models import AssistantAction, ModelAlias, ModelSnapshot, OperationEconomics
 from wmo.common.rollouts.otel import (
     ProductionSimulatorSnapshot,
     RolloutSpan,
@@ -54,6 +56,34 @@ class SimulationArtifact(ArtifactEnvelope):
     mode: SimulationMode
 
 
+class SimulationCellBinding(ContractModel):
+    """Immutable identity needed to safely resume one simulated evaluation cell.
+
+    A simulation specification names aliases and artifact inputs. This binding resolves those
+    references once before provider work starts, then carries the exact task, model, prompt, and
+    input identities into the persisted rollout. It prevents an alias or a same-ID local artifact
+    from being silently rebound during a later resume.
+    """
+
+    evaluation_plan_input: ArtifactInput
+    task_set_input: ArtifactInput
+    task_set_tasks_sha256: Sha256
+    task_sha256: Sha256
+    candidate_alias: ModelAlias
+    candidate: ModelSnapshot
+    agent_id: str = Field(min_length=1, max_length=256)
+    repeat: int = Field(ge=0)
+    world_model_alias: ModelAlias
+    world_model: ModelSnapshot
+    simulator_id: str = Field(min_length=1, max_length=256)
+    prompt_id: str = Field(min_length=1, max_length=256)
+    prompt_version: str = Field(min_length=1, max_length=256)
+    prompt_sha256: Sha256
+    simulation_spec_input: ArtifactInput
+    simulation_spec_sha256: Sha256
+    simulation_inputs_sha256: Sha256
+
+
 class RolloutArtifact(SimulationArtifact):
     """The v1 simulation artifact subtype that preserves one full agent episode."""
 
@@ -78,6 +108,7 @@ class RolloutArtifact(SimulationArtifact):
     sandbox_economics: OperationEconomics | None = None
     orchestration_economics: OperationEconomics | None = None
     simulation_spec_sha256: Sha256 | None = None
+    simulation_binding: SimulationCellBinding | None = None
 
     @field_validator("spans")
     @classmethod
@@ -109,6 +140,7 @@ class RolloutArtifact(SimulationArtifact):
                 raise ValueError("world-model rollouts require a world-model simulator snapshot")
             if self.world_model != self.simulator.world_model:
                 raise ValueError("world-model rollout identity must match its simulator snapshot")
+            _require_world_model_binding(self)
         elif self.evidence_source == "sandbox":
             if self.mode != SimulationMode.SANDBOX:
                 raise ValueError("sandbox rollouts require sandbox mode")
@@ -117,6 +149,43 @@ class RolloutArtifact(SimulationArtifact):
             if self.world_model is not None:
                 raise ValueError("sandbox rollouts must not name a world model")
         return self
+
+
+def _require_world_model_binding(rollout: RolloutArtifact) -> None:
+    """Verify the text-simulation binding agrees with the persisted rollout envelope."""
+    binding = rollout.simulation_binding
+    simulator = rollout.simulator
+    if binding is None:
+        raise ValueError("world-model rollouts require a complete simulation cell binding")
+    if not isinstance(simulator, WorldModelSimulatorSnapshot):
+        raise ValueError("world-model rollouts require a world-model simulator snapshot")
+    if binding.simulation_spec_sha256 != rollout.simulation_spec_sha256:
+        raise ValueError("world-model binding must match the rollout simulation specification")
+    if binding.task_set_input.artifact_id == binding.evaluation_plan_input.artifact_id:
+        raise ValueError("world-model binding task-set and evaluation-plan inputs must differ")
+    if binding.candidate != rollout.candidate:
+        raise ValueError("world-model binding candidate must match the rollout candidate")
+    if binding.agent_id != rollout.agent_id:
+        raise ValueError("world-model binding agent must match the rollout agent")
+    if binding.repeat != rollout.repeat:
+        raise ValueError("world-model binding repeat must match the rollout repeat")
+    if binding.world_model != rollout.world_model:
+        raise ValueError("world-model binding must match the rollout world model")
+    if binding.simulator_id != simulator.simulator_id:
+        raise ValueError("world-model binding simulator must match the rollout simulator")
+    if binding.prompt_id != simulator.prompt_id:
+        raise ValueError("world-model binding prompt must match the rollout simulator")
+    if binding.prompt_version != simulator.prompt_version:
+        raise ValueError("world-model binding prompt version must match the rollout simulator")
+    if binding.prompt_sha256 != simulator.prompt_sha256:
+        raise ValueError("world-model binding prompt digest must match the rollout simulator")
+    required_inputs = {
+        binding.evaluation_plan_input,
+        binding.task_set_input,
+        binding.simulation_spec_input,
+    }
+    if not required_inputs.issubset(set(rollout.inputs)):
+        raise ValueError("world-model rollout inputs must retain every bound simulation input")
 
 
 class SimulationArtifactSet(ArtifactEnvelope):
