@@ -12,6 +12,7 @@ from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     Embedding,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -108,8 +109,16 @@ def openai_responses_response(
         ProviderResponseError: The response status, output, tools, or usage is malformed.
     """
     status = payload.get("status")
-    if status not in {None, "completed"}:
+    if status not in {None, "completed", "incomplete"}:
         raise ProviderResponseError(f"OpenAI response ended with status {status!r}")
+    incomplete_details = payload.get("incomplete_details")
+    incomplete_reason = (
+        incomplete_details.get("reason") if isinstance(incomplete_details, dict) else None
+    )
+    if status == "incomplete" and incomplete_reason not in {"max_output_tokens", "max_tokens"}:
+        raise ProviderResponseError(
+            f"OpenAI response ended incompletely for unsupported reason {incomplete_reason!r}"
+        )
     output = _array(payload.get("output"), "output")
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
@@ -143,6 +152,9 @@ def openai_responses_response(
         economics=OperationEconomics(
             usage=_responses_usage(payload),
             latency_seconds=NumericMeasurement(value=latency_seconds, provenance="observed"),
+        ),
+        finish_reason=(
+            ModelFinishReason.LENGTH if status == "incomplete" else ModelFinishReason.COMPLETED
         ),
     )
 

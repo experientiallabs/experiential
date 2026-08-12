@@ -12,6 +12,7 @@ from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     Embedding,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -141,6 +142,11 @@ def gemini_generate_response(
         economics=OperationEconomics(
             usage=_gemini_usage(payload),
             latency_seconds=NumericMeasurement(value=latency_seconds, provenance="observed"),
+        ),
+        finish_reason=(
+            ModelFinishReason.LENGTH
+            if candidate.get("finishReason") == "MAX_TOKENS"
+            else ModelFinishReason.COMPLETED
         ),
     )
 

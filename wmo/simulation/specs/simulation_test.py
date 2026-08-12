@@ -1,0 +1,87 @@
+"""Tests for sparse cross-mode simulation specification validation."""
+
+from datetime import UTC, datetime
+
+import pytest
+from pydantic import ValidationError
+
+from wmo.common.core.artifacts import ArtifactInput
+from wmo.common.rollouts import SimulationMode
+from wmo.simulation.orchestration import SimulationModeUnsupportedError, require_implemented_mode
+from wmo.simulation.specs import (
+    MixedRealitySettings,
+    SandboxSettings,
+    SimulationSpec,
+    WorldModelSettings,
+    simulation_spec_digest,
+)
+
+_TIME = datetime(2026, 8, 12, tzinfo=UTC)
+_PLAN_INPUT = ArtifactInput(artifact_id="evaluation-plan", sha256="a" * 64)
+
+
+def _spec(**updates: object) -> SimulationSpec:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "created_at": _TIME,
+        "inputs": (_PLAN_INPUT,),
+        "code_revision": "test-revision",
+        "simulation_id": "simulation-a",
+        "evaluation_plan_id": "evaluation-plan",
+        "cell_ids": ("cell-a", "cell-b"),
+        "agent_id": "agent-a",
+        "mode": SimulationMode.WORLD_MODEL,
+        "world_model": WorldModelSettings(
+            world_model_alias="world-model-a",
+            prompt_version="text-world-model-v1",
+        ),
+        "seed": 7,
+        "maximum_steps": 3,
+    }
+    values.update(updates)
+    return SimulationSpec.model_validate(values)
+
+
+def test_spec_preserves_only_the_selected_mode_settings_and_is_digest_stable() -> None:
+    """One stable explicit cell selection produces one stable specification digest."""
+    first = _spec()
+    second = _spec()
+
+    assert first.world_model is not None
+    assert first.world_model.maximum_output_tokens == 16_000
+    assert first.world_model.allow_tools is False
+    assert first.sandbox is None
+    assert first.mixed_reality is None
+    assert simulation_spec_digest(first) == simulation_spec_digest(second)
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"cell_ids": ("cell-b", "cell-a")}, "must be sorted"),
+        ({"cell_ids": ("cell-a", "cell-a")}, "must not repeat"),
+        ({"cell_ids": ()}, "at least one"),
+        ({"world_model": None}, "missing settings"),
+        ({"sandbox": SandboxSettings(environment_id="sandbox-a")}, "inactive"),
+    ],
+)
+def test_spec_rejects_ambiguous_sparse_or_inactive_settings(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    """Invalid mode cells and config combinations fail before a simulator can run."""
+    with pytest.raises(ValidationError, match=message):
+        _spec(**updates)
+
+
+def test_mixed_reality_shape_is_persistable_but_reserved_for_a_later_simulator() -> None:
+    """The shared schema holds future mode configuration without implementing that mode."""
+    spec = _spec(
+        mode=SimulationMode.MIXED_REALITY,
+        world_model=None,
+        mixed_reality=MixedRealitySettings(policy_id="policy-a"),
+    )
+
+    assert spec.mixed_reality == MixedRealitySettings(policy_id="policy-a")
+    with pytest.raises(SimulationModeUnsupportedError, match="not implemented"):
+        require_implemented_mode(spec, SimulationMode.WORLD_MODEL)

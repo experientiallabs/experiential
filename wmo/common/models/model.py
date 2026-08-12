@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -106,12 +107,20 @@ class ModelMessage(ContractModel):
         return self
 
 
+class ModelFinishReason(StrEnum):
+    """Terminal condition reported by a non-streaming provider completion."""
+
+    COMPLETED = "completed"
+    LENGTH = "length"
+
+
 class ModelResponse(ContractModel):
     """A completed model response with resolved identity and operation accounting."""
 
     output: AssistantAction
     model: ModelSnapshot
     economics: OperationEconomics
+    finish_reason: ModelFinishReason = ModelFinishReason.COMPLETED
 
 
 class ModelCapabilities(ContractModel):

@@ -14,6 +14,7 @@ from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     Embedding,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -127,6 +128,11 @@ def openai_compatible_response(
         economics=OperationEconomics(
             usage=_usage(payload),
             latency_seconds=NumericMeasurement(value=latency_seconds, provenance="observed"),
+        ),
+        finish_reason=(
+            ModelFinishReason.LENGTH
+            if choice.get("finish_reason") == "length"
+            else ModelFinishReason.COMPLETED
         ),
     )
 

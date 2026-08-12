@@ -1,0 +1,478 @@
+"""Deterministic end-to-end tests for atomic text world-model simulation."""
+
+import threading
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+
+from wmo.common.core.artifacts import ArtifactInput
+from wmo.common.evaluations import EvaluationCell, EvaluationPlan
+from wmo.common.models import (
+    AssistantAction,
+    ModelCapabilities,
+    ModelClient,
+    ModelFinishReason,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+    NumericMeasurement,
+    OperationEconomics,
+    RoutedCandidateSnapshot,
+    ToolCall,
+    Usage,
+)
+from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
+from wmo.common.rollouts import SimulationMode, StopReason
+from wmo.common.tasks import TaskCase, ToolSchema
+from wmo.runtime.agents import AgentEpisode, AgentRuntime
+from wmo.runtime.environments import EnvironmentSession
+from wmo.runtime.models import ResolvedModel
+from wmo.simulation.engines.text.simulator import WorldModelSimulator
+from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
+
+_TIME = datetime(2026, 8, 12, tzinfo=UTC)
+
+
+class _ScriptedClient:
+    def __init__(self, responses: list[ModelResponse], *, delay_seconds: float = 0.0) -> None:
+        self._responses = list(responses)
+        self._delay_seconds = delay_seconds
+        self._lock = threading.Lock()
+        self.requests: list[ModelRequest] = []
+        self.active_calls = 0
+        self.maximum_active_calls = 0
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        with self._lock:
+            self.requests.append(request)
+            self.active_calls += 1
+            self.maximum_active_calls = max(self.maximum_active_calls, self.active_calls)
+        try:
+            if self._delay_seconds:
+                time.sleep(self._delay_seconds)
+            with self._lock:
+                return self._responses.pop(0)
+        finally:
+            with self._lock:
+                self.active_calls -= 1
+
+
+class _OneTurnAgent:
+    def run(
+        self,
+        task: TaskCase,
+        *,
+        model: ModelClient,
+        environment: EnvironmentSession,
+    ) -> AgentEpisode:
+        del environment
+        response = model.complete(
+            ModelRequest(messages=(ModelMessage(role="user", content=task.instruction),))
+        )
+        return AgentEpisode(stop_reason=StopReason.COMPLETED, final_action=response.output)
+
+
+class _ToolAttemptAgent:
+    def run(
+        self,
+        task: TaskCase,
+        *,
+        model: ModelClient,
+        environment: EnvironmentSession,
+    ) -> AgentEpisode:
+        del task, model
+        environment.execute(ToolCall(call_id="call-a", name="unexpected_tool", arguments={}))
+        raise AssertionError("text-only environment must reject the attempted tool call")
+
+
+def _snapshot(alias: str) -> ModelSnapshot:
+    return ModelSnapshot(
+        provider="test",
+        model_id=alias,
+        revision="fixture",
+        capabilities_sha256="a" * 64,
+        connection_sha256="b" * 64,
+    )
+
+
+def _response(
+    content: str,
+    *,
+    snapshot: ModelSnapshot,
+    cost: float | None = 0.10,
+    finish_reason: ModelFinishReason = ModelFinishReason.COMPLETED,
+) -> ModelResponse:
+    return ModelResponse(
+        output=AssistantAction(content=content),
+        model=snapshot,
+        economics=OperationEconomics(
+            usage=Usage(input_tokens=8, output_tokens=4),
+            cost_usd=(
+                NumericMeasurement(value=cost, provenance="observed") if cost is not None else None
+            ),
+        ),
+        finish_reason=finish_reason,
+    )
+
+
+def _task(task_id: str, *, tools: tuple[ToolSchema, ...] = ()) -> TaskCase:
+    return TaskCase(
+        task_id=task_id,
+        lineage_group_id=f"lineage-{task_id}",
+        partition="fit",
+        instruction=f"Resolve {task_id} politely.",
+        initial_context={"customer": "Ada"},
+        tools=tools,
+        workload_weight=1.0,
+        source_trace_ids=(f"trace-{task_id}",),
+    )
+
+
+def _plan(cells: tuple[EvaluationCell, ...]) -> EvaluationPlan:
+    candidate = RoutedCandidateSnapshot(alias="candidate-a", model=_snapshot("candidate-a"))
+    return EvaluationPlan(
+        schema_version=1,
+        created_at=_TIME,
+        code_revision="test-revision",
+        plan_id="evaluation-plan",
+        task_set_id="task-set",
+        candidate_snapshots=(candidate,),
+        fidelity_gate_id="fidelity-gate",
+        fidelity_gate_sha256="c" * 64,
+        cells=cells,
+    )
+
+
+def _cell(cell_id: str, task_id: str) -> EvaluationCell:
+    return EvaluationCell(
+        cell_id=cell_id,
+        task_id=task_id,
+        candidate_alias="candidate-a",
+        repeat=0,
+        purpose="fit",
+        execution="simulate",
+    )
+
+
+def _store(tmp_path: Path) -> ArtifactStore:
+    return ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
+
+
+def _persist_plan(store: ArtifactStore, plan: EvaluationPlan) -> ArtifactInput:
+    manifest = store.write_json(
+        artifact_id=plan.plan_id,
+        artifact_type="evaluation-plan",
+        envelope=plan,
+        files={"evaluation-plan.json": plan},
+    )
+    return artifact_input(manifest)
+
+
+def _resolved(
+    alias: str,
+    client: _ScriptedClient,
+    *,
+    context_window: int = 100_000,
+) -> ResolvedModel:
+    return ResolvedModel(
+        alias=alias,
+        snapshot=_snapshot(alias),
+        capabilities=ModelCapabilities(
+            context_window_tokens=context_window,
+            maximum_output_tokens=16_000,
+        ),
+        client=client,
+        embedding_client=None,
+    )
+
+
+def _spec(plan_input: ArtifactInput, cells: tuple[str, ...], **updates: object) -> SimulationSpec:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "created_at": _TIME,
+        "inputs": (plan_input,),
+        "code_revision": "test-revision",
+        "simulation_id": "simulation-a",
+        "evaluation_plan_id": "evaluation-plan",
+        "cell_ids": cells,
+        "agent_id": "agent-a",
+        "mode": SimulationMode.WORLD_MODEL,
+        "world_model": WorldModelSettings(
+            world_model_alias="world-model-a",
+            prompt_version="text-world-model-v1",
+        ),
+        "seed": 11,
+        "maximum_steps": 2,
+    }
+    values.update(updates)
+    return SimulationSpec.model_validate(values)
+
+
+def _simulator(
+    store: ArtifactStore,
+    plan: EvaluationPlan,
+    plan_input: ArtifactInput,
+    tasks: dict[str, TaskCase],
+    candidate_client: _ScriptedClient,
+    world_client: _ScriptedClient,
+    *,
+    candidate_context_window: int = 100_000,
+    agent_factory: Callable[[], AgentRuntime] = _OneTurnAgent,
+) -> WorldModelSimulator:
+    return WorldModelSimulator(
+        store=store,
+        evaluation_plan=plan,
+        evaluation_plan_input=plan_input,
+        tasks=tasks,
+        candidate_models={
+            "candidate-a": _resolved(
+                "candidate-a",
+                candidate_client,
+                context_window=candidate_context_window,
+            )
+        },
+        world_models={"world-model-a": _resolved("world-model-a", world_client)},
+        agent_factory=agent_factory,
+        clock=lambda: _TIME,
+        monotonic=lambda: 1.0,
+    )
+
+
+def test_text_simulation_persists_separate_economics_and_resumes_without_duplicate_calls(
+    tmp_path: Path,
+) -> None:
+    """The candidate cost is distinct from world-model cost and an immutable rollout resumes."""
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    candidate_client = _ScriptedClient(
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.2)]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Thanks.","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+                cost=0.8,
+            )
+        ]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        {"task-a": _task("task-a")},
+        candidate_client,
+        world_client,
+    )
+    spec = _spec(plan_input, ("cell-a",))
+
+    artifact_set = simulator.run(spec)
+    rollout_id = artifact_set.artifact_ids[0]
+    rollout = simulator._load_rollout(rollout_id)
+    resumed = simulator.run(spec)
+
+    assert rollout.candidate_economics.cost_usd == NumericMeasurement(
+        value=0.2,
+        provenance="observed",
+    )
+    assert rollout.world_model_economics is not None
+    assert rollout.world_model_economics.cost_usd == NumericMeasurement(
+        value=0.8,
+        provenance="observed",
+    )
+    assert rollout.simulation_spec_sha256 == simulation_spec_digest(spec)
+    assert len(rollout.spans) == 2
+    assert len(candidate_client.requests) == 1
+    assert len(world_client.requests) == 1
+    assert resumed.artifact_ids == artifact_set.artifact_ids
+
+
+def test_text_simulation_records_tool_tasks_and_context_overflow_as_failed_cells(
+    tmp_path: Path,
+) -> None:
+    """Neither a declared tool nor an overflowing request reaches a remote provider silently."""
+    tool = ToolSchema(
+        name="lookup",
+        description="Lookup an account.",
+        input_schema={"type": "object"},
+    )
+    cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    candidate_client = _ScriptedClient([])
+    world_client = _ScriptedClient([])
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        {"task-a": _task("task-a", tools=(tool,)), "task-b": _task("task-b")},
+        candidate_client,
+        world_client,
+        candidate_context_window=16_000,
+    )
+    spec = _spec(plan_input, ("cell-a", "cell-b"))
+
+    artifact_set = simulator.run(spec)
+    tool_rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
+    overflow_rollout = simulator._load_rollout(artifact_set.artifact_ids[1])
+
+    assert tool_rollout.failure is not None
+    assert tool_rollout.failure.code.value == "unsupported"
+    assert overflow_rollout.stop_reason == StopReason.CONTEXT_OVERFLOW
+    assert overflow_rollout.failure is not None
+    assert overflow_rollout.failure.code.value == "context_overflow"
+    assert candidate_client.requests == []
+    assert world_client.requests == []
+
+
+def test_text_simulation_normalizes_agent_tool_attempts_to_unsupported_cells(
+    tmp_path: Path,
+) -> None:
+    """An agent cannot bypass task tool declarations to get execution in a text-only episode."""
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        {"task-a": _task("task-a")},
+        _ScriptedClient([]),
+        _ScriptedClient([]),
+        agent_factory=_ToolAttemptAgent,
+    )
+
+    artifact_set = simulator.run(_spec(plan_input, ("cell-a",)))
+    rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
+
+    assert rollout.failure is not None
+    assert rollout.failure.code.value == "unsupported"
+    assert rollout.failure.attribution is not None
+    assert rollout.failure.attribution.value == "tool"
+
+
+def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path: Path) -> None:
+    """A length finish is durable evidence, then later selected cells become budget failures."""
+    cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    candidate_client = _ScriptedClient(
+        [
+            _response(
+                "unfinished",
+                snapshot=_snapshot("candidate-a"),
+                cost=0.6,
+                finish_reason=ModelFinishReason.LENGTH,
+            )
+        ]
+    )
+    world_client = _ScriptedClient([])
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        {"task-a": _task("task-a"), "task-b": _task("task-b")},
+        candidate_client,
+        world_client,
+    )
+    spec = _spec(plan_input, ("cell-a", "cell-b"), maximum_cost_usd=0.5)
+
+    artifact_set = simulator.run(spec)
+    length_rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
+    budget_rollout = simulator._load_rollout(artifact_set.artifact_ids[1])
+
+    assert length_rollout.stop_reason == StopReason.LENGTH
+    assert budget_rollout.stop_reason == StopReason.MAXIMUM_COST
+    assert budget_rollout.failure is not None
+    assert budget_rollout.failure.code.value == "budget"
+    assert len(candidate_client.requests) == 1
+    assert world_client.requests == []
+
+
+def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
+    tmp_path: Path,
+) -> None:
+    """A finite budget cannot admit later cells after a completed provider call has unknown cost."""
+    cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    candidate_client = _ScriptedClient(
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"done","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+                cost=0.1,
+            )
+        ]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        {"task-a": _task("task-a"), "task-b": _task("task-b")},
+        candidate_client,
+        world_client,
+    )
+    spec = _spec(plan_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
+
+    artifact_set = simulator.run(spec)
+    second_rollout = simulator._load_rollout(artifact_set.artifact_ids[1])
+
+    assert second_rollout.stop_reason == StopReason.MAXIMUM_COST
+    assert len(candidate_client.requests) == 1
+    assert len(world_client.requests) == 1
+
+
+def test_text_simulation_enforces_configured_concurrency_bound(tmp_path: Path) -> None:
+    """A no-spend-limit batch uses at most the pinned number of independent episode workers."""
+    cells = tuple(_cell(f"cell-{letter}", f"task-{letter}") for letter in "abcd")
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    candidate_client = _ScriptedClient(
+        [_response(f"candidate {index}", snapshot=_snapshot("candidate-a")) for index in range(4)],
+        delay_seconds=0.03,
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"done","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+            )
+            for _ in range(4)
+        ]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        {
+            task.task_id: task
+            for task in (
+                _task("task-a"),
+                _task("task-b"),
+                _task("task-c"),
+                _task("task-d"),
+            )
+        },
+        candidate_client,
+        world_client,
+    )
+    spec = _spec(plan_input, tuple(cell.cell_id for cell in cells), maximum_concurrency=2)
+
+    artifact_set = simulator.run(spec)
+
+    assert len(artifact_set.artifact_ids) == 4
+    assert candidate_client.maximum_active_calls == 2
+    assert world_client.maximum_active_calls <= 2

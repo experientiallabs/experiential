@@ -10,6 +10,7 @@ from pydantic import JsonValue
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -132,6 +133,11 @@ def anthropic_messages_response(
         economics=OperationEconomics(
             usage=_anthropic_usage(payload),
             latency_seconds=NumericMeasurement(value=latency_seconds, provenance="observed"),
+        ),
+        finish_reason=(
+            ModelFinishReason.LENGTH
+            if payload.get("stop_reason") == "max_tokens"
+            else ModelFinishReason.COMPLETED
         ),
     )
 
