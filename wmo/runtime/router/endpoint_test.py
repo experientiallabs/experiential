@@ -249,6 +249,18 @@ def test_idempotency_key_rejects_a_different_request(path: str) -> None:
             "/v1/responses",
             {"model": "router-a", "input": "next", "previous_response_id": "missing"},
         ),
+        (
+            "/v1/chat/completions",
+            {
+                "model": "router-a",
+                "messages": [{"role": "user", "content": "unsupported"}],
+                "logprobs": True,
+            },
+        ),
+        (
+            "/v1/responses",
+            {"model": "router-a", "input": "unsupported", "background": True},
+        ),
     ],
 )
 def test_invalid_official_request_never_reaches_provider(

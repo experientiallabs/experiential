@@ -15,13 +15,15 @@ from typing import Literal, cast
 from fastapi import APIRouter, Header, Response
 from fastapi.responses import StreamingResponse
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
+from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses import (
     ResponseCompletedEvent,
     ResponseCreatedEvent,
     ResponseTextDeltaEvent,
 )
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from openai.types.responses.response_create_params import ResponseCreateParams
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, model_validator
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
@@ -38,6 +40,33 @@ from wmo.runtime.router.runtime import RouterEpisodeConflictError, RouterRuntime
 _AFFINITY_CAPACITY = 4096
 _IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 logger = logging.getLogger(__name__)
+_CHAT_REQUEST_ADAPTER = TypeAdapter(CompletionCreateParams)
+_RESPONSE_REQUEST_ADAPTER = TypeAdapter(ResponseCreateParams)
+_CHAT_FIELDS = frozenset(
+    {
+        "model",
+        "messages",
+        "tools",
+        "tool_choice",
+        "temperature",
+        "max_tokens",
+        "max_completion_tokens",
+        "stream",
+    }
+)
+_RESPONSE_FIELDS = frozenset(
+    {
+        "model",
+        "input",
+        "instructions",
+        "previous_response_id",
+        "tools",
+        "tool_choice",
+        "temperature",
+        "max_output_tokens",
+        "stream",
+    }
+)
 
 
 class OpenAIRequestConflictError(ValueError):
@@ -105,7 +134,7 @@ class HttpTool(BaseModel):
 class HttpChatRequest(BaseModel):
     """Supported OpenAI Chat Completions request."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     model: str
     messages: tuple[HttpMessage, ...] = Field(min_length=1)
@@ -115,6 +144,14 @@ class HttpChatRequest(BaseModel):
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
     stream: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _official_openai_shape(cls, value: object) -> object:
+        """Validate the official request type before narrowing to routed capabilities."""
+        _CHAT_REQUEST_ADAPTER.validate_python(value)
+        _reject_unsupported_fields(value, _CHAT_FIELDS, "Chat Completions")
+        return value
 
 
 class HttpResponseTool(BaseModel):
@@ -146,7 +183,7 @@ class HttpResponseFunctionOutput(BaseModel):
 class HttpResponseRequest(BaseModel):
     """Supported OpenAI Responses request."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     model: str
     input: str | tuple[HttpMessage | HttpResponseFunctionCall | HttpResponseFunctionOutput, ...]
@@ -157,6 +194,14 @@ class HttpResponseRequest(BaseModel):
     temperature: float | None = None
     max_output_tokens: int | None = None
     stream: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _official_openai_shape(cls, value: object) -> object:
+        """Validate the official request type before narrowing to routed capabilities."""
+        _RESPONSE_REQUEST_ADAPTER.validate_python(value)
+        _reject_unsupported_fields(value, _RESPONSE_FIELDS, "Responses")
+        return value
 
 
 class _ResponseState(BaseModel):
@@ -675,6 +720,18 @@ def _request_sha256(request: BaseModel) -> str:
     payload = request.model_dump(mode="json")
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _reject_unsupported_fields(value: object, supported: frozenset[str], api_name: str) -> None:
+    """Reject official fields that the routed provider-neutral seam cannot preserve."""
+    if not isinstance(value, dict):
+        return
+    unsupported = sorted(str(key) for key in value if key not in supported)
+    if unsupported:
+        raise ValueError(
+            f"{api_name} fields are not supported by this routed endpoint: "
+            + ", ".join(unsupported)
+        )
 
 
 def _tool_choice(value: JsonValue) -> Literal["auto", "none", "required"] | ToolChoice | None:
