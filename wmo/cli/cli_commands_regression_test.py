@@ -16,9 +16,10 @@ def test_root_command_surface_is_locked() -> None:
     assert group_names == {"config", "optimize"}
 
 
-def test_config_requires_only_the_telemetry_subtree() -> None:
-    """The retained config command is the thin local telemetry preference service."""
-    result = CliRunner().invoke(app, ["config", "telemetry", "status"])
+def test_config_exposes_telemetry_and_provider_setup() -> None:
+    """Config contains only local telemetry and model-provider state."""
+    result = CliRunner().invoke(app, ["config", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert "telemetry enabled" in result.output
+    assert "telemetry" in result.output
+    assert "providers" in result.output

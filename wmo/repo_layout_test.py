@@ -113,7 +113,10 @@ def test_root_cli_and_subgroups_are_exact() -> None:
     root_context = Context(root)
     assert set(root.list_commands(root_context)) == {"build", "config", "optimize", "run"}
 
-    expected_subcommands = {"config": {"telemetry"}, "optimize": {"model", "router"}}
+    expected_subcommands = {
+        "config": {"providers", "telemetry"},
+        "optimize": {"model", "router"},
+    }
     for name, expected in expected_subcommands.items():
         command = root.get_command(root_context, name)
         assert isinstance(command, TyperGroup)

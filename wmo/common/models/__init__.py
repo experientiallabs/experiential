@@ -29,6 +29,13 @@ from wmo.common.models.model import (
     Usage,
 )
 from wmo.common.models.pricing import CandidateTokenPrice, PricingSnapshot, load_pricing_snapshot
+from wmo.common.models.setup import (
+    ProviderConnection,
+    ProviderModelSelection,
+    ProviderSetup,
+    ProviderSetupError,
+    configure_provider_catalog,
+)
 
 __all__ = [
     "AssistantAction",
@@ -51,6 +58,10 @@ __all__ = [
     "NumericMeasurement",
     "OperationEconomics",
     "PricingSnapshot",
+    "ProviderConnection",
+    "ProviderModelSelection",
+    "ProviderSetup",
+    "ProviderSetupError",
     "RoutedCandidateSnapshot",
     "SFTModelProvenance",
     "ToolCall",
@@ -58,5 +69,6 @@ __all__ = [
     "Usage",
     "load_model_catalog",
     "load_pricing_snapshot",
+    "configure_provider_catalog",
     "write_model_catalog",
 ]
