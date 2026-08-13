@@ -1,8 +1,6 @@
-"""Read-only retrieval from a loaded immutable observed-transition index.
+"""Read-only cosine retrieval from a loaded immutable observed-transition index.
 
-The ``retrieve`` behavior adapts top-k cosine ranking from
-``e7aad17b:wmo/simulation/retrieval/retriever.py::EmbeddingRetriever.topk``. Unlike that historical
-class, this retriever has no index or add method. Its corpus and vectors are frozen before load.
+The corpus and vectors are frozen before load and expose no mutation surface.
 """
 
 from __future__ import annotations

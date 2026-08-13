@@ -1,9 +1,7 @@
-"""Build immutable RAG artifacts from verified real traces.
+"""Build digest-verified immutable RAG artifacts from real traces only.
 
-This restores the useful offline index, save, and reload behavior from
-``e7aad17b:wmo/simulation/retrieval/retriever.py::EmbeddingRetriever`` while replacing its mutable
-buffer with digest-verified artifacts. It deliberately does not restore ``Retriever.add``, so
-world-model predictions can never become retrieval demonstrations.
+The artifact has no mutation surface, so generated world-model predictions cannot become
+retrieval demonstrations.
 """
 
 from __future__ import annotations
