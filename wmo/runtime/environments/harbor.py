@@ -18,7 +18,8 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import TracebackType
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, cast, runtime_checkable
+from uuid import uuid4
 
 from wmo.common.core.artifacts import ContractModel, JsonObject
 from wmo.common.models import OperationEconomics, ToolCall
@@ -235,15 +236,53 @@ class _HarborSessionContext(AbstractContextManager[EnvironmentSession]):
 
     def __enter__(self) -> EnvironmentSession:
         """Open, identity-record, validate, and adapt one task-local Harbor session."""
+        quarantine_occurrence_id = uuid4().hex
         session = self._runtime._factory.open(
             self._task,
             template_name=self._runtime.template_name,
         )
-        sandbox_id = _validate_sandbox_id(session.sandbox_id)
+        raw_sandbox_id = session.sandbox_id
+        if not isinstance(raw_sandbox_id, str):
+            entry_error = ValueError(
+                "Harbor executable sessions must expose a valid nonempty sandbox ID"
+            )
+            quarantine_id = _quarantined_sandbox_identity(
+                raw_sandbox_id,
+                occurrence_id=quarantine_occurrence_id,
+            )
+            self._runtime._ledger.record_created(sandbox_id=quarantine_id)
+            try:
+                result = session.close(
+                    sandbox_id=cast(str, raw_sandbox_id),
+                    timeout_seconds=self._runtime._cleanup_timeout_seconds,
+                )
+            except BaseException as cleanup_error:
+                raise cleanup_error from entry_error
+            if not isinstance(result, HarborCleanupResult):
+                raise TypeError("Harbor close must return HarborCleanupResult") from entry_error
+            if result.sandbox_id is not raw_sandbox_id:
+                raise HarborCleanupUnprovenError(
+                    "Harbor cleanup result did not match the captured malformed sandbox identity"
+                ) from entry_error
+            if result.released and result.timed_out:
+                raise HarborCleanupUnprovenError(
+                    "Harbor cleanup result cannot be both released and timed out"
+                ) from entry_error
+            if result.timed_out:
+                raise HarborCleanupTimeoutError(
+                    "Harbor cleanup timed out for a malformed sandbox identity"
+                ) from entry_error
+            if not result.released:
+                raise HarborCleanupUnprovenError(
+                    "Harbor cleanup returned without proof for a malformed sandbox identity"
+                ) from entry_error
+            self._runtime._ledger.record_released(quarantine_id)
+            raise entry_error
         self._session = session
-        self._sandbox_id = sandbox_id
-        self._runtime._ledger.record_created(sandbox_id=sandbox_id)
+        self._sandbox_id = raw_sandbox_id
+        self._runtime._ledger.record_created(sandbox_id=raw_sandbox_id)
         try:
+            _validate_sandbox_id(raw_sandbox_id)
             template_id = session.template_id
             if not isinstance(template_id, str) or not template_id.strip():
                 raise ValueError("Harbor executable sessions must expose a nonempty template ID")
@@ -317,6 +356,30 @@ def _validate_sandbox_id(value: object) -> str:
     if not isinstance(value, str) or _SANDBOX_ID_PATTERN.fullmatch(value) is None:
         raise ValueError("Harbor executable sessions must expose a valid nonempty sandbox ID")
     return value
+
+
+def _quarantined_sandbox_identity(value: object, *, occurrence_id: str) -> str:
+    """Address one invalid resource occurrence without invoking value or class protocols."""
+    value_type = type(value)
+    if value is None:
+        type_tag = "none"
+    elif value_type is bool:
+        type_tag = "bool"
+    elif value_type is int:
+        type_tag = "int"
+    elif value_type is float:
+        type_tag = "float"
+    elif value_type is bytes:
+        type_tag = "bytes"
+    elif value_type is list:
+        type_tag = "list"
+    elif value_type is dict:
+        type_tag = "dict"
+    else:
+        type_tag = "object"
+    if re.fullmatch(r"[0-9a-f]{32}", occurrence_id) is None:
+        raise ValueError("invalid sandbox quarantine occurrence ID")
+    return f"invalid-sandbox-id:{type_tag}:{occurrence_id}"
 
 
 class _HarborEnvironmentSession:
