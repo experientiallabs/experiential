@@ -78,3 +78,33 @@ def test_interactive_judge_rejection_cancels_without_writing(tmp_path: Path) -> 
 
     assert result.exit_code == 1
     assert not (root / "models.toml").exists()
+
+
+def test_anthropic_noninteractive_setup_reports_separate_embedder_flags(tmp_path: Path) -> None:
+    """A provider without runtime embeddings gives actionable noninteractive remediation."""
+    result = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--non-interactive",
+            "--provider",
+            "anthropic",
+            "--connection",
+            "anthropic-main",
+            "--api-key-env",
+            "ANTHROPIC_API_KEY",
+            "--world-model",
+            "world-id",
+            "--judge",
+            "judge-id",
+            "--embedder",
+            "embed-id",
+        ],
+    )
+
+    assert result.exit_code == 2
+    for flag in ("--embedder-provider", "--embedder-connection", "--embedder-api-key-env"):
+        assert flag in result.output

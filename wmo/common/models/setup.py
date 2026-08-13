@@ -106,7 +106,8 @@ class ProviderSetup(ContractModel):
         if providers[self.embedder.connection] == "anthropic":
             raise ValueError(
                 "anthropic does not expose embeddings through the current runtime; "
-                "select an OpenAI, OpenRouter, Gemini, or OpenAI-compatible embedder connection"
+                "select an OpenAI, OpenRouter, Gemini, or OpenAI-compatible embedder connection "
+                "with --embedder-provider, --embedder-connection, and --embedder-api-key-env"
             )
         return self
 

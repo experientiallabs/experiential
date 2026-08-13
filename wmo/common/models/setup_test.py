@@ -148,6 +148,31 @@ def test_anthropic_primary_can_use_a_separate_gemini_embedder(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("openai", None),
+        ("openrouter", None),
+        ("anthropic", None),
+        ("gemini", None),
+        ("openai-compatible", "https://models.example.test/v1"),
+    ],
+)
+def test_setup_accepts_each_supported_provider_connection(
+    provider: str, base_url: str | None
+) -> None:
+    """The setup contract covers every current provider without choosing one."""
+    connection = ProviderConnection(
+        name="selected-provider",
+        provider=provider,
+        api_key_env="SELECTED_PROVIDER_API_KEY",
+        base_url=base_url,
+    )
+
+    assert connection.provider == provider
+    assert connection.base_url == base_url
+
+
+@pytest.mark.parametrize(
     ("connection", "message"),
     [
         (
