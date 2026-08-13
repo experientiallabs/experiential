@@ -20,20 +20,23 @@ from wmo.common.evaluations import (
     persist_fidelity_thresholds,
 )
 from wmo.common.evaluations.build_test import (
-    _candidate,
     _persist_calibration,
     _persist_rollout,
     _persist_task_set,
     _production_rollout,
-    _snapshot,
     _task,
 )
-from wmo.common.evaluations.evidence import EvaluationCellEvidence, evaluation_protocol_digest
+from wmo.common.evaluations.evidence import (
+    EvaluationCellEvidence,
+    evaluation_protocol_digest,
+    read_calibration,
+)
 from wmo.common.judging import DimensionJudgment, Judgment
 from wmo.common.models import (
     CandidateTokenPrice,
     OperationEconomics,
     PricingSnapshot,
+    RoutedCandidateSnapshot,
 )
 from wmo.common.project import ProjectConfig, ProjectStore
 from wmo.common.routing import (
@@ -49,7 +52,7 @@ from wmo.optimize.router.workflow import (
 )
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.application import load_project_router
-from wmo.runtime.router.runtime_test import _Catalog, _Client, _request
+from wmo.runtime.router.runtime_test import _Catalog, _Client, _request, _snapshot
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
@@ -149,7 +152,8 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
         fit_lineages=tuple(task.lineage_group_id for task in fit),
         held_out_lineages=tuple(task.lineage_group_id for task in held_out),
     )
-    candidate = _candidate("candidate-a")
+    calibration = read_calibration(store, "calibration-a")[0]
+    candidate = RoutedCandidateSnapshot(alias="candidate-a", model=_snapshot("candidate-a"))
     observed = []
     evidence_by_task: dict[str, EvaluationCellEvidence] = {}
     for task in tasks:
@@ -174,9 +178,9 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
             rollout_id=rollout.rollout_id,
             rubric_id="rubric-a",
             calibration_id="calibration-a",
-            judge_model=_snapshot("judge-model"),
-            judge_prompt_id="judge-prompt-v1",
-            judge_prompt_sha256=_DIGEST,
+            judge_model=calibration.judge_model,
+            judge_prompt_id=calibration.judge_prompt_id,
+            judge_prompt_sha256=calibration.judge_prompt_sha256,
             dimensions=(
                 DimensionJudgment(
                     dimension_id="dimension-a",
@@ -223,10 +227,12 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
         judge_calibration_id="calibration-a",
         pricing_snapshot_id="pricing-a",
     )
+    _persist_pricing(store)
     plan = build_evaluation_plan(
         store,
         task_set_id="task-set-workflow",
         candidate_snapshots=(candidate,),
+        pricing_snapshot_id="pricing-a",
         observed_cells=observed,
         fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
         fidelity_protocol_sha256=evaluation_protocol_digest(world_protocol),
@@ -260,7 +266,6 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
         for cell in plan.cells
         if cell.purpose == "fidelity"
     )
-    _persist_pricing(store)
     _persist_embeddings(store, tasks)
     protocols = (production_protocol, world_protocol)
     return project, RouterOptimizationConfig(
@@ -289,9 +294,9 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
         pricing_snapshot_id="pricing-a",
         guard=KnnGuard(
             maximum_neighbors=10,
-            minimum_paired_observations=1,
+            minimum_paired_observations=8,
             relative_similarity_threshold=0.0,
-            uncertainty_multiplier=0.0,
+            uncertainty_multiplier=0.5,
             quality_tolerance=0.0,
         ),
         judgment_status="provisional",

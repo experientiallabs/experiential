@@ -151,7 +151,18 @@ def optimize_router(
 
 
 def fit_router(store: ArtifactStore, config: RouterFitConfig) -> RouterFitWorkflowResult:
-    """Materialize fit-only evaluation evidence and freeze the W10 bank and policy."""
+    """Materialize fit-only evaluation evidence and freeze the W10 bank and policy.
+
+    Args:
+        store: Project-local immutable artifact store.
+        config: Fit-only evidence and frozen router configuration.
+
+    Returns:
+        Fit evaluation plus the locked bank and policy.
+
+    Raises:
+        RouterWorkflowError: Evidence, pricing, embedding, or split bindings are invalid.
+    """
     try:
         _verify_completed_inputs(store, config.fit, required_purpose="fit")
         pricing, pricing_sha256 = load_pricing_snapshot(store, config.pricing_snapshot_id)
@@ -164,6 +175,7 @@ def fit_router(store: ArtifactStore, config: RouterFitConfig) -> RouterFitWorkfl
         fit_dataset = build_evaluation_dataset(
             store,
             evaluation_plan_id=config.fit.evaluation_plan_id,
+            pricing_snapshot_id=config.pricing_snapshot_id,
             protocols=config.fit.protocols,
             cell_evidence=tuple(
                 item for item in config.fit.cell_evidence if item.cell_id in fit_cells
@@ -204,7 +216,19 @@ def report_router(
     fit: RouterFitWorkflowResult,
     config: RouterReportConfig,
 ) -> RouterWorkflowResult:
-    """Open held-out evidence after lock and report with the frozen W10 policy."""
+    """Open held-out evidence after lock and report with the frozen W10 policy.
+
+    Args:
+        store: Project-local immutable artifact store.
+        fit: Already locked fit result whose identities constrain held-out reporting.
+        config: Held-out evidence configuration.
+
+    Returns:
+        Complete fit, held-out, bank, policy, and report identities.
+
+    Raises:
+        RouterWorkflowError: Held-out evidence or frozen identities are invalid.
+    """
     try:
         _verify_completed_inputs(store, config.held_out, required_purpose="held_out")
         held_plan, held_plan_input = read_evaluation_plan(store, config.held_out.evaluation_plan_id)
@@ -218,6 +242,7 @@ def report_router(
         held_out_dataset = build_evaluation_dataset(
             store,
             evaluation_plan_id=config.held_out.evaluation_plan_id,
+            pricing_snapshot_id=fit.locked.policy.pricing_snapshot_id,
             protocols=config.held_out.protocols,
             cell_evidence=tuple(
                 item for item in config.held_out.cell_evidence if item.cell_id in held_out_cells

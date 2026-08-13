@@ -8,7 +8,7 @@ from typing import cast
 
 import pytest
 
-from wmo.common.core.artifacts import stable_id
+from wmo.common.core.artifacts import sha256_json, stable_id
 from wmo.common.evaluations import (
     EvaluationCellEvidence,
     EvaluationPlan,
@@ -16,12 +16,11 @@ from wmo.common.evaluations import (
     ObservedProductionCell,
 )
 from wmo.common.evaluations.build_test import (
-    _candidate,
     _persist_calibration,
     _persist_rollout,
     _production_rollout,
-    _snapshot,
 )
+from wmo.common.evaluations.evidence import read_calibration
 from wmo.common.judging import (
     DimensionJudgment,
     Judgment,
@@ -29,20 +28,25 @@ from wmo.common.judging import (
     RubricDimension,
     ScoreAnchor,
 )
-from wmo.common.models import ModelClient, OperationEconomics
+from wmo.common.models import (
+    ModelCapabilities,
+    ModelClient,
+    ModelSnapshot,
+    OperationEconomics,
+    RoutedCandidateSnapshot,
+)
 from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
 from wmo.common.rollouts import SimulationArtifactSet
 from wmo.common.routing import KnnGuard
 from wmo.common.tasks import load_task_set
 from wmo.optimize.router.workflow_test import _persist_embeddings, _persist_pricing
-from wmo.runtime.models import RuntimeModelCatalog
-from wmo.runtime.router.runtime_test import _Catalog, _Client, _request
+from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.router.runtime_test import _Client, _request
 from wmo.simulation.build import ProjectBuild
 from wmo.simulation.build_test import _trace
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
     _OneTurnAgent,
-    _resolved,
     _response,
     _ScriptedClient,
 )
@@ -61,6 +65,57 @@ from wmo.workflow.router import (
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
+
+
+def _capabilities(alias: str) -> ModelCapabilities:
+    """Return the exact frozen capabilities used by each focused model."""
+    if alias == "embedder":
+        return ModelCapabilities(supports_embeddings=True)
+    return ModelCapabilities(context_window_tokens=100_000, maximum_output_tokens=16_000)
+
+
+def _snapshot(alias: str) -> ModelSnapshot:
+    """Freeze one model identity over the capabilities needed by text simulation."""
+    return ModelSnapshot(
+        provider="test",
+        model_id=alias,
+        revision="fixture",
+        capabilities_sha256=sha256_json(_capabilities(alias)),
+        connection_sha256="b" * 64,
+    )
+
+
+def _resolved(alias: str, client: ModelClient) -> ResolvedModel:
+    """Resolve one fake client with the same capabilities pinned by the test snapshot."""
+    capabilities = _capabilities(alias)
+    return ResolvedModel(
+        alias=alias,
+        snapshot=_snapshot(alias),
+        capabilities=capabilities,
+        client=client,
+        embedding_client=None,
+    )
+
+
+class _Catalog:
+    """Resolve the exact simulation-capable identities frozen by this composition test."""
+
+    def __init__(self, snapshots: dict[str, ModelSnapshot], client: _Client) -> None:
+        self.snapshots = snapshots
+        self.client = client
+
+    def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+        return self.snapshots[alias], _capabilities(alias)
+
+    def resolve(self, alias: str) -> ResolvedModel:
+        snapshot, capabilities = self.snapshot(alias)
+        return ResolvedModel(
+            alias=alias,
+            snapshot=snapshot,
+            capabilities=capabilities,
+            client=self.client,
+            embedding_client=self.client if capabilities.supports_embeddings else None,
+        )
 
 
 class _ReviewSupplier:
@@ -131,7 +186,7 @@ class _SetupSupplier:
     ) -> RouterEvaluationSetup:
         del review, budget
         tasks = load_task_set(project.artifacts, build.artifacts.task_set.task_set_id).tasks
-        candidate = _candidate("candidate-a")
+        candidate = RoutedCandidateSnapshot(alias="candidate-a", model=_snapshot("candidate-a"))
         observed = []
         fit = tuple(task for task in tasks if task.partition == "fit")
         for index, task in enumerate(fit[:10]):
@@ -185,9 +240,9 @@ class _SetupSupplier:
             incumbent_alias="candidate-a",
             guard=KnnGuard(
                 maximum_neighbors=10,
-                minimum_paired_observations=1,
+                minimum_paired_observations=8,
                 relative_similarity_threshold=0.0,
-                uncertainty_multiplier=0.0,
+                uncertainty_multiplier=0.5,
                 quality_tolerance=0.0,
             ),
             judgment_status="provisional",
@@ -227,6 +282,7 @@ class _Judge:
         rollout = store.artifacts.read(rollout_artifact_id)
         rubric = store.artifacts.read(rubric_artifact_id)
         calibration = store.artifacts.read(calibration_artifact_id)
+        calibration_value = read_calibration(store.artifacts, calibration_artifact_id)[0]
         inputs = tuple(
             sorted(
                 map(artifact_input, (rollout.manifest, rubric.manifest, calibration.manifest)),
@@ -245,9 +301,9 @@ class _Judge:
             rollout_id=rollout_artifact_id,
             rubric_id=rubric_artifact_id,
             calibration_id=calibration_artifact_id,
-            judge_model=_snapshot("judge-model"),
-            judge_prompt_id="judge-prompt-v1",
-            judge_prompt_sha256=_DIGEST,
+            judge_model=calibration_value.judge_model,
+            judge_prompt_id=calibration_value.judge_prompt_id,
+            judge_prompt_sha256=calibration_value.judge_prompt_sha256,
             dimensions=(
                 DimensionJudgment(
                     dimension_id="dimension-a",

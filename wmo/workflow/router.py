@@ -120,7 +120,11 @@ class TraceSource(Protocol):
     """Loads one explicit local source into canonical normalized traces."""
 
     def load(self) -> TraceNormalizationResult:
-        """Return canonical normalized traces after one explicit source read."""
+        """Return canonical normalized traces after one explicit source read.
+
+        Returns:
+            Canonical normalized traces and any rejected-source issues.
+        """
 
 
 @dataclass(frozen=True)
@@ -131,7 +135,11 @@ class LocalTraceSource:
     source: Literal["otlp", "posthog"] = "otlp"
 
     def load(self) -> TraceNormalizationResult:
-        """Read and normalize this local file through its selected canonical loader."""
+        """Read and normalize this local file through its selected canonical loader.
+
+        Returns:
+            Canonical normalized traces and any rejected-source issues.
+        """
         if self.source == "otlp":
             return load_otlp_file(self.path)
         return load_posthog_file(self.path)
@@ -294,6 +302,7 @@ def compose_router(
         project.artifacts,
         task_set_id=built.artifacts.task_set.task_set_id,
         candidate_snapshots=setup.candidates,
+        pricing_snapshot_id=setup.pricing_snapshot_id,
         observed_cells=setup.observed_cells,
         fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
         fidelity_protocol_sha256=_protocol_digest(setup.simulation_protocol),

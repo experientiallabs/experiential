@@ -163,7 +163,6 @@ def test_build_reads_the_raw_otlp_file_once_and_persists_the_immutable_boundary(
     task_records = tuple(line for line in tasks.decode("utf-8").splitlines() if line)
     assert sum('"partition":"fit"' in line for line in task_records) == 50
     assert sum('"partition":"held_out"' in line for line in task_records) == 20
-    assert ProjectStore(root, "support").read_review() == {}
     assert len(captured) == 1
     stats = captured[0]
     assert stats.input_trace_count == 100

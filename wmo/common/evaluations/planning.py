@@ -85,7 +85,10 @@ def persist_fidelity_thresholds(store: ArtifactStore, thresholds: FidelityThresh
 
     Args:
         store: Project-local immutable artifact store.
-        gate: Frozen fidelity thresholds to persist.
+        thresholds: Frozen fidelity thresholds to persist.
+
+    Raises:
+        EvaluationEvidenceError: An existing artifact differs from deterministic replay.
     """
     destination = store.project_directory / "artifacts" / thresholds.fidelity_thresholds_id
     if destination.exists():
