@@ -82,7 +82,7 @@ def create_project_router_app(project: str, runtime: RouterRuntime) -> FastAPI:
         runtime: Already verified frozen router runtime.
 
     Returns:
-        FastAPI application requiring ``X-WMO-Episode-ID`` on every completion.
+        FastAPI application exposing OpenAI Chat Completions and Responses routes.
     """
     application = FastAPI(
         title="WMO local router",

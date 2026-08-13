@@ -18,6 +18,8 @@ dependencies = [
     "rich>=14.1",
     "tomli-w>=1.0",  # writing project and telemetry TOML; every `wmo build` needs it
     "posthog>=7.0",
+    # Public router request and response types follow the official OpenAI-generated schemas.
+    "openai>=3.0,<4",
 ]
 
 [project.optional-dependencies]

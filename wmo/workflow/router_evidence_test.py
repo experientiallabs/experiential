@@ -473,11 +473,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_sticky(
         "model": "w16-router",
         "messages": [{"role": "user", "content": "Resolve customer case 17"}],
     }
-    first_http = http.post(
-        "/v1/chat/completions",
-        json=payload,
-        headers={"X-WMO-Episode-ID": "w16-customer-episode"},
-    )
+    first_http = http.post("/v1/chat/completions", json=payload)
     second_http = http.post(
         "/v1/chat/completions",
         json={
@@ -487,17 +483,13 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_sticky(
                 {"role": "user", "content": "Continue with the same customer case"},
             ],
         },
-        headers={"X-WMO-Episode-ID": "w16-customer-episode"},
     )
     assert first_http.status_code == second_http.status_code == 200
     assert first_http.headers["X-WMO-Routed-Model"] == second_http.headers["X-WMO-Routed-Model"]
-    assert (
-        first_http.json()["routing_decision"]["episode_id_sha256"]
-        == second_http.json()["routing_decision"]["episode_id_sha256"]
-    )
+    assert first_http.json()["object"] == second_http.json()["object"] == "chat.completion"
     assert runtime_catalog.clients["embedder"].embed_calls == 1
     assert sum(client.complete_calls for client in runtime_catalog.clients.values()) == 2
-    assert "w16-customer-episode" not in first_http.text
+    assert "routing_decision" not in first_http.text
     provenance = verify_release_evidence(
         project.artifacts,
         expected_revision=revision,

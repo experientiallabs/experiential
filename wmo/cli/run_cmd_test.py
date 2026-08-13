@@ -43,7 +43,6 @@ def test_run_loads_once_and_can_only_bind_loopback(monkeypatch: pytest.MonkeyPat
     assert result.exit_code == 0, result.output
     assert loaded == [("project-a", Path("/tmp/local-wmo"), "policy-a")]
     assert served == [(application, "127.0.0.1", 8123)]
-    assert "development-only" in result.output
     assert "provisional judgment" in result.output
-    assert "X-WMO-Episode-ID is required" in result.output
+    assert "OpenAI API router at http://127.0.0.1:8123/v1" in result.output
     assert "--host" not in CliRunner().invoke(app, ["run", "--help"]).output

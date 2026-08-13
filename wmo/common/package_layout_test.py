@@ -67,7 +67,6 @@ def test_retired_provider_imports_do_not_return() -> None:
             "environment_capture",
             "mlx",
             "mlx_lm",
-            "openai",
             "opentelemetry",
             "sklearn",
             "transformers",

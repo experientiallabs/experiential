@@ -55,10 +55,12 @@ uv run pytest -q
 - `wmo optimize router PROJECT --config FILE --root ROOT` consumes only explicit completed
   evidence. It verifies the plan and rollout membership, fits and locks the router, opens held-out
   evidence, and writes the report without a model, simulator, judge, provider, or network client.
-- `wmo run PROJECT --root ROOT --port PORT` loads one frozen policy and exposes only the
-  development loopback adapter. Each request supplies `X-WMO-Episode-ID`; the first decision is
-  sticky for that episode, request-time embedding failure uses the frozen conservative baseline,
-  and neither path mutates policy or evidence.
+- `wmo run PROJECT --root ROOT --port PORT` loads one frozen policy and exposes OpenAI Chat
+  Completions, Responses, and Models routes on loopback. Public request and response types come
+  from the official OpenAI SDK. Chat transcript prefixes and Responses `previous_response_id`
+  provide internal routing affinity without WMO-specific request fields or headers. Request-time
+  embedding failure uses the frozen conservative baseline, and neither path mutates policy or
+  evidence.
 
 ## Worker-agent execution
 

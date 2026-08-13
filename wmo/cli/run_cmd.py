@@ -24,9 +24,9 @@ def run(
 ) -> None:
     """Start a development-only loopback adapter over one frozen router.
 
-    Every completion request must provide a caller-owned ``X-WMO-Episode-ID``. The command
-    cannot bind remotely and performs no online learning, deployment, or provider call at
-    startup.
+    The server exposes OpenAI Chat Completions and Responses routes. Transcript and response-ID
+    affinity remain internal, so callers need no WMO-specific request fields or headers. The
+    command cannot bind remotely and performs no provider call at startup.
 
     Args:
         project: Canonical project identifier and endpoint model name.
@@ -48,7 +48,5 @@ def run(
     typer.echo(
         f"loaded policy {runtime.policy.policy_id} with {runtime.policy.judgment_status} judgment"
     )
-    typer.echo(
-        f"development-only router at http://{_LOOPBACK_HOST}:{port}; X-WMO-Episode-ID is required"
-    )
+    typer.echo(f"OpenAI API router at http://{_LOOPBACK_HOST}:{port}/v1")
     uvicorn.run(create_project_router_app(project, runtime), host=_LOOPBACK_HOST, port=port)
