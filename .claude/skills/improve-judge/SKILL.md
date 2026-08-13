@@ -76,5 +76,5 @@ inputs or failover behavior differ.
   on the same frozen evidence.
 
 Stop when a fresh reviewed sample produces no disagreement worth encoding. Keep the canonical
-artifact chain intact and do not add compatibility aliases, parallel judge modules, or new CLI
-commands.
+artifact chain intact and do not add compatibility aliases, parallel judge modules, or product
+commands outside the approved `wmo config judge` surface.
