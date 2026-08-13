@@ -74,7 +74,7 @@ def test_refused_settings_name_the_path_and_the_repair(
     message = str(excinfo.value)
     assert expected in message
     assert str(settings_path(root)) in message
-    assert "delete it and re-run `wmo providers set`" in message
+    assert "delete it and rerun `wmo config telemetry status`" in message
 
 
 def test_non_utf8_settings_name_the_path_and_the_repair(tmp_path: Path) -> None:
@@ -89,7 +89,7 @@ def test_non_utf8_settings_name_the_path_and_the_repair(tmp_path: Path) -> None:
     message = str(excinfo.value)
     assert "not valid TOML" in message
     assert str(settings_path(root)) in message
-    assert "delete it and re-run `wmo providers set`" in message
+    assert "delete it and rerun `wmo config telemetry status`" in message
 
 
 def test_model_roles_round_trip_through_toml(tmp_path: Path) -> None:
