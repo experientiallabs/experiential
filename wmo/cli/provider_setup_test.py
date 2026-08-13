@@ -108,3 +108,51 @@ def test_anthropic_noninteractive_setup_reports_separate_embedder_flags(tmp_path
     assert result.exit_code == 2
     for flag in ("--embedder-provider", "--embedder-connection", "--embedder-api-key-env"):
         assert flag in result.output
+
+
+def test_interactive_supplied_unknown_provider_is_an_actionable_error(tmp_path: Path) -> None:
+    """A flag value cannot bypass the interactive provider choice validation."""
+    result = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--provider",
+            "unknown-provider",
+        ],
+        input="\n",
+    )
+
+    assert result.exit_code == 2
+    assert "Primary provider must be one of" in result.output
+    assert not (tmp_path / ".wmo" / "models.toml").exists()
+
+
+def test_interactive_supplied_nonembedding_provider_is_an_actionable_error(
+    tmp_path: Path,
+) -> None:
+    """A supplied embedder provider must satisfy the narrower provider choices."""
+    result = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--provider",
+            "openai",
+            "--connection",
+            "openai-main",
+            "--api-key-env",
+            "OPENAI_API_KEY",
+            "--embedder-provider",
+            "anthropic",
+        ],
+        input="n\n",
+    )
+
+    assert result.exit_code == 2
+    assert "Embedder provider must be one of" in result.output
+    assert not (tmp_path / ".wmo" / "models.toml").exists()

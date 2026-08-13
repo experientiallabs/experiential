@@ -122,6 +122,32 @@ def test_replace_does_not_mutate_a_connection_used_by_router_candidates(tmp_path
     assert load_model_catalog(path) == existing
 
 
+def test_replace_cannot_drift_connection_behind_an_identical_preserved_alias(
+    tmp_path: Path,
+) -> None:
+    """Connection changes are blocked even when a preserved fixed-alias record stays equal."""
+    path = tmp_path / "models.toml"
+    existing = ModelCatalog(
+        connections={
+            "openai-main": ConnectionConfig(provider="openrouter", api_key_env="OPENROUTER_API_KEY")
+        },
+        models={
+            "judge": ModelRecord(
+                connection="openai-main",
+                model="judge-id",
+                capabilities=ModelCapabilities(),
+            )
+        },
+        roles=ModelRoles(candidates=("judge",), incumbent="judge", judge="judge"),
+    )
+    write_model_catalog(path, existing)
+
+    with pytest.raises(ProviderSetupError, match="use a new connection name"):
+        configure_provider_catalog(path, _openai_setup(), replace=True)
+
+    assert load_model_catalog(path) == existing
+
+
 def test_anthropic_primary_can_use_a_separate_gemini_embedder(tmp_path: Path) -> None:
     """Provider setup represents roles on separate current-runtime connections."""
     setup = ProviderSetup(

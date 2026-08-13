@@ -19,6 +19,7 @@ from wmo.common.models.catalog import (
 from wmo.common.models.model import ModelCapabilities
 
 SETUP_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openai-compatible", "openrouter"})
+_BUILD_ROLE_ALIASES = frozenset({"world-model", "judge", "embedder"})
 
 
 class ProviderSetupError(ValueError):
@@ -153,6 +154,16 @@ def _merge_provider_setup(
     connections = dict(existing.connections) if existing is not None else {}
     models = dict(existing.models) if existing is not None else {}
     roles = existing.roles if existing is not None else ModelRoles()
+    preserved_role_aliases = set(roles.candidates)
+    preserved_role_aliases.update(
+        role_alias
+        for role_alias in (
+            roles.incumbent,
+            roles.rubric_proposer,
+            roles.teacher,
+        )
+        if role_alias is not None
+    )
 
     for selected in setup.connections:
         proposed = selected.catalog_config()
@@ -165,7 +176,7 @@ def _merge_provider_setup(
             alias
             for alias, record in models.items()
             if record.connection == selected.name
-            and alias not in {"world-model", "judge", "embedder"}
+            and (alias not in _BUILD_ROLE_ALIASES or alias in preserved_role_aliases)
         )
         if current is not None and current != proposed and preserved_aliases:
             raise ProviderSetupError(
@@ -188,16 +199,6 @@ def _merge_provider_setup(
         current = models.get(alias)
         if current is not None and current != proposed and not replace:
             raise ProviderSetupError(f"model alias {alias!r} already differs; rerun with --replace")
-        preserved_role_aliases = set(roles.candidates)
-        preserved_role_aliases.update(
-            role_alias
-            for role_alias in (
-                roles.incumbent,
-                roles.rubric_proposer,
-                roles.teacher,
-            )
-            if role_alias is not None
-        )
         if current is not None and current != proposed and alias in preserved_role_aliases:
             raise ProviderSetupError(
                 f"model alias {alias!r} is assigned to a preserved router or training role; "

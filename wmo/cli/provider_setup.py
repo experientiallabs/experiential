@@ -228,6 +228,8 @@ def _prompt_connection(
     selected_provider = provider or Prompt.ask(
         f"{label} provider", choices=list(providers), console=console
     )
+    if selected_provider not in providers:
+        raise typer.BadParameter(f"{label} provider must be one of: {', '.join(providers)}")
     selected_name = (
         name
         or Prompt.ask(
