@@ -10,7 +10,7 @@ from collections.abc import Callable
 import numpy as np
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, Sha256, sha256_json, stable_id
-from wmo.common.models import ModelAlias, ModelRequest, ModelResponse
+from wmo.common.models import IdempotentModelClient, ModelAlias, ModelRequest, ModelResponse
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore
 from wmo.common.routing import KnnRouterPolicy, RouterFeatureExtractor, RoutingDecision
 from wmo.common.routing.bank import KnnBankManifest, KnnEvidenceBank, bank_bytes, load_knn_bank
@@ -289,6 +289,7 @@ class RouterRuntime:
         *,
         episode_id: str | None = None,
         decision: RoutingDecision | None = None,
+        provider_idempotency_key: str | None = None,
     ) -> RoutedModelResponse:
         """Validate one exact cached decision and call its pinned model client.
 
@@ -296,6 +297,8 @@ class RouterRuntime:
             request: Provider-neutral request to route and complete.
             episode_id: Optional caller-owned identity for sticky routing.
             decision: Optional prior decision to validate and consume without reselection.
+            provider_idempotency_key: Optional validated key forwarded only when the selected
+                client implements the explicit idempotency capability.
 
         Returns:
             Exact routing decision beside the selected model response.
@@ -319,9 +322,27 @@ class RouterRuntime:
             or selected.selected_alias not in {item.alias for item in self.policy.candidates}
         ):
             raise ValueError("routing decision does not match this policy, request, or episode")
+        if provider_idempotency_key is not None:
+            _validate_idempotency_key(provider_idempotency_key)
         self._require_bank_integrity()
         with self._episode_lock:
-            cached = self._request_decisions.get((expected_episode_sha256, request_sha256))
+            request_key = (expected_episode_sha256, request_sha256)
+            cached = self._request_decisions.get(request_key)
+            episode_decision = self._episode_decisions.get(expected_episode_sha256)
+            if cached is None and decision is not None:
+                if selected.decision_id != _decision_content_id(selected):
+                    raise ValueError(
+                        "routing decision does not match this policy, request, or episode"
+                    )
+                if (
+                    episode_decision is not None
+                    and episode_decision.selected_alias != selected.selected_alias
+                ):
+                    raise ValueError("routing decision conflicts with the cached episode model")
+                if episode_decision is None:
+                    self._episode_decisions[expected_episode_sha256] = selected
+                self._request_decisions[request_key] = selected
+                cached = selected
             if cached != selected:
                 raise ValueError("routing decision is not the exact cached episode decision")
         resolved = self._resolve(selected.selected_alias)
@@ -337,7 +358,11 @@ class RouterRuntime:
                 f"routed model alias {selected.selected_alias!r} cannot prove the requested "
                 "output-token capacity"
             )
-        response = resolved.client.complete(request)
+        client = resolved.client
+        if provider_idempotency_key is not None and isinstance(client, IdempotentModelClient):
+            response = client.complete_idempotent(request, idempotency_key=provider_idempotency_key)
+        else:
+            response = client.complete(request)
         return RoutedModelResponse(decision=selected, response=response)
 
     def _require_activation_identity(
@@ -447,15 +472,8 @@ class RouterRuntime:
     ) -> RoutingDecision:
         alias = selected_alias or self.policy.baseline_alias
         episode_id_sha256 = hashlib.sha256(episode_id.encode("utf-8")).hexdigest()
-        material = {
-            "policy_id": self.policy.policy_id,
-            "request_sha256": request_sha256,
-            "episode_id_sha256": episode_id_sha256,
-            "selected_alias": alias,
-            "fallback_reason": reason,
-        }
-        return RoutingDecision(
-            decision_id=stable_id("routing-decision", material),
+        provisional = RoutingDecision(
+            decision_id="routing-decision-provisional",
             policy_id=self.policy.policy_id,
             policy_sha256=policy_content_sha256(self.policy),
             request_sha256=request_sha256,
@@ -466,6 +484,7 @@ class RouterRuntime:
             paired_count=0,
             fallback_reason=reason,
         )
+        return provisional.model_copy(update={"decision_id": _decision_content_id(provisional)})
 
     def _sticky_decision(
         self, episode_decision: RoutingDecision, request_sha256: Sha256
@@ -495,3 +514,18 @@ def _requires_tool_protocol(request: ModelRequest) -> bool:
             for message in request.messages
         )
     )
+
+
+def _decision_content_id(decision: RoutingDecision) -> str:
+    """Return the canonical content identity for a routing decision."""
+    material = decision.model_dump(mode="json")
+    del material["decision_id"]
+    return stable_id("routing-decision", material)
+
+
+def _validate_idempotency_key(value: str) -> None:
+    """Reject keys that cannot safely cross an HTTP provider boundary."""
+    if not value or len(value) > 512 or value.strip() != value:
+        raise ValueError("idempotency key must be 1 to 512 non-blank characters")
+    if any(ord(character) < 33 or ord(character) > 126 for character in value):
+        raise ValueError("idempotency key must contain only visible ASCII characters")

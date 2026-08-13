@@ -63,6 +63,16 @@ class ProjectPaths:
         return self.project_directory / "review.json"
 
     @property
+    def runtime_directory(self) -> Path:
+        """Return the mutable runtime-state directory outside immutable artifacts."""
+        return self.project_directory / "runtime"
+
+    @property
+    def runtime_journal(self) -> Path:
+        """Return the append-only routed-interaction journal path."""
+        return self.runtime_directory / "interactions.jsonl"
+
+    @property
     def artifacts_directory(self) -> Path:
         """Return the directory that contains completed immutable artifacts."""
         return self.project_directory / "artifacts"

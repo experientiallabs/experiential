@@ -32,3 +32,12 @@ def test_project_paths_reject_a_symlink_escape(tmp_path: Path) -> None:
 
     with pytest.raises(ProjectPathError, match="escapes"):
         paths.artifact_file("artifact-1", "link/data.json")
+
+
+def test_project_paths_keep_runtime_state_outside_immutable_artifacts(tmp_path: Path) -> None:
+    """The mutable journal has one project-local path that cannot overlap artifacts."""
+    paths = ProjectPaths(root=tmp_path / ".wmo", project_id="support-project")
+
+    assert paths.runtime_directory == tmp_path / ".wmo/projects/support-project/runtime"
+    assert paths.runtime_journal == paths.runtime_directory / "interactions.jsonl"
+    assert not paths.runtime_journal.is_relative_to(paths.artifacts_directory)

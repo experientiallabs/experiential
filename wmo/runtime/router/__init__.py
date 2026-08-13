@@ -7,6 +7,18 @@ from wmo.runtime.router.application import (
     load_router,
 )
 from wmo.runtime.router.endpoint import create_router_endpoint
+from wmo.runtime.router.journal import (
+    JournaledRouterRuntime,
+    RuntimeAcceptedEvent,
+    RuntimeAttemptFailedEvent,
+    RuntimeCompletedEvent,
+    RuntimeIdempotencyConflictError,
+    RuntimeInteractionFailedError,
+    RuntimeInteractionInProgressError,
+    RuntimeInteractionJournal,
+    RuntimeJournalError,
+    RuntimeJournalEvent,
+)
 from wmo.runtime.router.runtime import (
     RoutedModelResponse,
     RouterEpisodeConflictError,
@@ -17,6 +29,16 @@ from wmo.runtime.router.runtime import (
 
 __all__ = [
     "RoutedModelResponse",
+    "JournaledRouterRuntime",
+    "RuntimeAcceptedEvent",
+    "RuntimeAttemptFailedEvent",
+    "RuntimeCompletedEvent",
+    "RuntimeIdempotencyConflictError",
+    "RuntimeInteractionFailedError",
+    "RuntimeInteractionInProgressError",
+    "RuntimeInteractionJournal",
+    "RuntimeJournalError",
+    "RuntimeJournalEvent",
     "RouterEpisodeConflictError",
     "RouterModelCapabilityError",
     "RouterRuntime",

@@ -10,7 +10,7 @@ from wmo.common.models.catalog import (
     load_model_catalog,
     write_model_catalog,
 )
-from wmo.common.models.client import EmbeddingClient, ModelClient
+from wmo.common.models.client import EmbeddingClient, IdempotentModelClient, ModelClient
 from wmo.common.models.model import (
     AssistantAction,
     Embedding,
@@ -43,6 +43,7 @@ __all__ = [
     "ConnectionConfig",
     "Embedding",
     "EmbeddingClient",
+    "IdempotentModelClient",
     "ModelCatalog",
     "ModelCatalogError",
     "ModelAlias",
