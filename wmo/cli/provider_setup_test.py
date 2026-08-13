@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
@@ -59,11 +60,13 @@ def test_noninteractive_setup_reports_all_missing_required_flags(tmp_path: Path)
             "--provider",
             "openai",
         ],
+        color=True,
     )
 
     assert result.exit_code == 2
+    output = unstyle(result.output)
     for flag in ("--connection", "--api-key-env", "--world-model", "--judge", "--embedder"):
-        assert flag in result.output
+        assert flag in output
     assert not (tmp_path / ".wmo" / "models.toml").exists()
 
 
@@ -103,11 +106,13 @@ def test_anthropic_noninteractive_setup_reports_separate_embedder_flags(tmp_path
             "--embedder",
             "embed-id",
         ],
+        color=True,
     )
 
     assert result.exit_code == 2
+    output = unstyle(result.output)
     for flag in ("--embedder-provider", "--embedder-connection", "--embedder-api-key-env"):
-        assert flag in result.output
+        assert flag in output
 
 
 def test_interactive_supplied_unknown_provider_is_an_actionable_error(tmp_path: Path) -> None:
