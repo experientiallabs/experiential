@@ -33,7 +33,7 @@ from wmo.common.core.artifacts import (
 from wmo.common.core.locks import file_write_lock
 from wmo.common.models import ModelRequest, ModelResponse, ModelSnapshot
 from wmo.common.project import ProjectPaths
-from wmo.common.routing import RouterFeatureExtractor, RoutingDecision
+from wmo.common.routing import RoutingDecision
 from wmo.runtime.models.providers.transport import ProviderTransportError
 from wmo.runtime.router.runtime import (
     RoutedModelResponse,
@@ -134,6 +134,8 @@ class RuntimeAcceptedEvent(ContractModel):
     def _require_matching_pins(self) -> RuntimeAcceptedEvent:
         if self.request_sha256 != sha256_json(self.request):
             raise ValueError("accepted request digest differs from canonical request")
+        if self.attempt_started_at < self.received_at:
+            raise ValueError("accepted attempt start precedes request receipt")
         RuntimeAcceptance(
             decision=self.decision,
             selected_alias=self.selected_alias,
@@ -346,8 +348,6 @@ class RuntimeInteractionJournal:
     ) -> RuntimeCompletedEvent:
         """Append a response only while the named attempt is still live."""
         _require_timezone(completed_at)
-        if response.model != accepted.selected_model:
-            raise RuntimeJournalError("completed response model differs from the accepted target")
         with file_write_lock(self.path, what="the routed-interaction journal"):
             events = list(self._read_unlocked())
             state = _validate_events(events).get(accepted.interaction_id)
@@ -665,12 +665,6 @@ def _validate_events(
             ).hexdigest()
             if event.decision.episode_id_sha256 != expected_episode_sha256:
                 raise RuntimeJournalError("routing decision differs from accepted lineage")
-            feature = RouterFeatureExtractor().from_request(event.request)
-            feature_sha256 = hashlib.sha256(
-                feature.encode("utf-8"), usedforsecurity=False
-            ).hexdigest()
-            if event.decision.request_sha256 != feature_sha256:
-                raise RuntimeJournalError("routing decision differs from accepted request")
             if event.decision.decision_id != _routing_decision_content_id(event.decision):
                 raise RuntimeJournalError("routing decision ID differs from its canonical content")
             key = (event.project_id, event.idempotency_key_sha256)
@@ -700,8 +694,8 @@ def _validate_events(
         if isinstance(event, RuntimeAttemptFailedEvent):
             if event.attempt_started_at != state.accepted.attempt_started_at:
                 raise RuntimeJournalError("failure start time differs from accepted attempt")
-        elif event.response.model != state.accepted.selected_model:
-            raise RuntimeJournalError("completed response model differs from accepted target")
+        elif event.completed_at < state.accepted.attempt_started_at:
+            raise RuntimeJournalError("completion precedes its accepted attempt")
         states[event.interaction_id] = _InteractionState(state.accepted, event)
     return states
 
