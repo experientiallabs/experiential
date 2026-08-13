@@ -13,6 +13,7 @@ def test_simulation_domains_are_nested() -> None:
         "engines",
         "mining",
         "orchestration",
+        "retrieval",
         "specs",
     }
     actual_dirs = {
@@ -34,7 +35,7 @@ def test_simulation_domains_are_nested() -> None:
 
     retired = sorted(
         name
-        for name in ("evaluation", "model", "retrieval", "environment.py")
+        for name in ("evaluation", "model", "environment.py")
         if (SIMULATION_DIR / name).is_file() or any((SIMULATION_DIR / name).rglob("*.py"))
     )
     assert not retired, f"retired simulation owners returned: {retired}"
