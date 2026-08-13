@@ -53,6 +53,7 @@ from wmo.simulation.engines.text.simulator_test import (
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings
+from wmo.workflow.judgment_budget import JudgmentDispatchReceipt
 from wmo.workflow.router import (
     ApprovedRouterReview,
     FidelityApprovalDecision,
@@ -263,6 +264,7 @@ class _Judge:
     def __init__(self) -> None:
         self.calls = 0
         self.log: list[tuple[str, bool]] = []
+        self.fail_on_call: int | None = None
 
     def judge_persisted(
         self,
@@ -273,6 +275,8 @@ class _Judge:
         calibration_artifact_id: str,
     ) -> Judgment:
         self.calls += 1
+        if self.calls == self.fail_on_call:
+            raise RuntimeError("simulated judgment dispatch interruption")
         rollout_value = read_rollout(store.artifacts, rollout_artifact_id)[0]
         locked = any(
             store.artifacts.read(artifact_id).manifest.artifact_type == "router-policy-lock"
@@ -526,6 +530,15 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         for cell_ids, locked in simulator.log
     )
     assert all(locked or purposes.get(cell_id) != "held_out" for cell_id, locked in judge.log)
+    dispatches = tuple(
+        JudgmentDispatchReceipt.model_validate_json(
+            project.artifacts.read_bytes(artifact_id, "dispatch.json")
+        )
+        for artifact_id in project.artifacts.list_ids()
+        if project.artifacts.read(artifact_id).manifest.artifact_type == "judgment-dispatch"
+    )
+    assert len(dispatches) == judge.calls <= budget.maximum_judgments
+    assert {purposes[item.cell_id] for item in dispatches} >= {"fit", "held_out"}
 
     near_cap_simulator = _SimulatorFactory()
     near_cap_services = RouterWorkflowServices(
@@ -581,3 +594,98 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     decision = first.runtime.select(_request(), episode_id="customer-episode")
     assert first.runtime.select(_request(), episode_id="customer-episode") == decision
     assert first.plan.cells
+
+
+def test_judgment_budget_reservation_blocks_partial_retry_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A failed paid-call boundary consumes its durable slot and cannot dispatch again."""
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
+    judge = _Judge()
+    judge.fail_on_call = 3
+    runtime_client = _Client()
+    services = RouterWorkflowServices(
+        review_supplier=_ReviewSupplier(),
+        setup_supplier=_SetupSupplier(),
+        simulator_factory=_SimulatorFactory(),
+        judge=judge,
+        fidelity_approval=_FidelityApproval(),
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _Catalog(
+                {
+                    "candidate-a": _snapshot("candidate-a"),
+                    "embedder": _snapshot("embedder"),
+                },
+                runtime_client,
+            ),
+        ),
+    )
+    budget = RouterCompositionBudget(
+        maximum_simulation_cost_usd=10.0,
+        maximum_judgments=3,
+    )
+
+    with pytest.raises(RuntimeError, match="judgment dispatch interruption"):
+        compose_router(
+            project,
+            normalized,
+            services=services,
+            budget=budget,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+    assert judge.calls == 3
+    assert (
+        sum(
+            project.artifacts.read(artifact_id).manifest.artifact_type == "judgment-dispatch"
+            for artifact_id in project.artifacts.list_ids()
+        )
+        == budget.maximum_judgments
+    )
+
+    with pytest.raises(RouterCompositionError, match="reserved judgment dispatch"):
+        compose_router(
+            project,
+            normalized,
+            services=services,
+            budget=budget,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+    assert judge.calls == 3
+
+    first_judgment_id = next(
+        artifact_id
+        for artifact_id in project.artifacts.list_ids()
+        if project.artifacts.read(artifact_id).manifest.artifact_type == "judgment"
+    )
+    first_judgment = Judgment.model_validate_json(
+        project.artifacts.read_bytes(first_judgment_id, "judgment.json")
+    )
+    forged = first_judgment.model_copy(
+        update={
+            "judgment_id": "judgment-forged-cross-plan",
+            "judge_prompt_sha256": "f" * 64,
+        }
+    )
+    project.artifacts.write_json(
+        artifact_id=forged.judgment_id,
+        artifact_type="judgment",
+        envelope=forged,
+        files={"judgment.json": forged},
+    )
+    with pytest.raises(RouterCompositionError, match="exact plan review pins"):
+        compose_router(
+            project,
+            normalized,
+            services=services,
+            budget=budget,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+    assert judge.calls == 3

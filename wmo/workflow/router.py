@@ -70,6 +70,12 @@ from wmo.simulation.ingest.otlp import TraceNormalizationResult, load_otlp_file
 from wmo.simulation.ingest.posthog import load_posthog_file
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
+from wmo.workflow.judgment_budget import (
+    JudgmentBudgetError,
+    find_verified_judgment,
+    persist_dispatch_reservation,
+    read_dispatch_reservation,
+)
 
 
 class RouterCompositionError(ValueError):
@@ -337,8 +343,9 @@ def compose_router(
         raise RouterCompositionError(
             "Phase A consumed the total simulation budget; held-out dispatch is blocked"
         )
-    phase_a_evidence, dispatched = _complete_cell_evidence(
+    phase_a_evidence, phase_a_consumed = _complete_cell_evidence(
         project,
+        plan_input,
         phase_a_cells,
         phase_a_set.artifact_ids,
         setup,
@@ -407,12 +414,13 @@ def compose_router(
         raise RouterCompositionError("verified composed simulation spend exceeds the total budget")
     held_evidence, _held_dispatched = _complete_cell_evidence(
         project,
+        plan_input,
         held_cells,
         held_set.artifact_ids,
         setup,
         review,
         services.judge,
-        budget.maximum_judgments - dispatched,
+        budget.maximum_judgments - phase_a_consumed,
     )
     optimized = report_router(
         project.artifacts,
@@ -824,6 +832,7 @@ def _verify_setup(setup: RouterEvaluationSetup, review: ApprovedRouterReview) ->
 
 def _complete_cell_evidence(
     project: ProjectStore,
+    plan_input: ArtifactInput,
     cells: tuple[EvaluationCell, ...],
     simulated_rollout_ids: tuple[str, ...],
     setup: RouterEvaluationSetup,
@@ -831,7 +840,7 @@ def _complete_cell_evidence(
     judge: Judge,
     maximum_judgments: int,
 ) -> tuple[tuple[EvaluationCellEvidence, ...], int]:
-    """Verify rollout membership, resume judgments, and return evidence for every plan cell."""
+    """Verify evidence and reserve each bounded judgment dispatch durably before calling it."""
     rollouts_by_cell = {}
     for rollout_id in simulated_rollout_ids:
         rollout, _input = read_rollout(project.artifacts, rollout_id)
@@ -843,7 +852,7 @@ def _complete_cell_evidence(
         for item in setup.observed_cells
     }
     evidence = []
-    dispatched = 0
+    consumed = 0
     for cell in cells:
         rollout_id = (
             cell.observed_rollout_id
@@ -862,17 +871,55 @@ def _complete_cell_evidence(
         protocol = (
             setup.production_protocol if cell.execution == "observed" else setup.simulation_protocol
         )
-        judgment = _find_judgment(project, rollout_id, review)
+        try:
+            judgment = find_verified_judgment(
+                project,
+                rollout_id,
+                review.rubric_id,
+                review.calibration_id,
+                protocol,
+            )
+            receipt = read_dispatch_reservation(
+                project,
+                plan_input,
+                cell,
+                rollout_id,
+                review.rubric_id,
+                review.calibration_id,
+                protocol,
+            )
+        except JudgmentBudgetError as exc:
+            raise RouterCompositionError(str(exc)) from exc
+        if judgment is not None or receipt is not None:
+            consumed += 1
+        if consumed > maximum_judgments:
+            raise RouterCompositionError("judgment dispatch budget exhausted")
         if judgment is None:
-            if dispatched >= maximum_judgments:
+            if receipt is not None:
+                raise RouterCompositionError(
+                    "reserved judgment dispatch has no completed judgment; retry is blocked"
+                )
+            if consumed >= maximum_judgments:
                 raise RouterCompositionError("judgment dispatch budget exhausted")
+            try:
+                persist_dispatch_reservation(
+                    project,
+                    plan_input,
+                    cell,
+                    rollout_id,
+                    review.rubric_id,
+                    review.calibration_id,
+                    protocol,
+                )
+            except JudgmentBudgetError as exc:
+                raise RouterCompositionError(str(exc)) from exc
+            consumed += 1
             judgment = judge.judge_persisted(
                 project,
                 rollout_artifact_id=rollout_id,
                 rubric_artifact_id=review.rubric_id,
                 calibration_artifact_id=review.calibration_id,
             )
-            dispatched += 1
             _persist_judgment(project, judgment)
         rollout, _input = read_rollout(project.artifacts, rollout_id)
         evidence.append(
@@ -884,30 +931,7 @@ def _complete_cell_evidence(
                 source_run_id=rollout.source_run_id,
             )
         )
-    return tuple(evidence), dispatched
-
-
-def _find_judgment(
-    project: ProjectStore,
-    rollout_id: str,
-    review: ApprovedRouterReview,
-) -> Judgment | None:
-    """Find one exact completed judgment so resume never repeats a paid judge call."""
-    matches = []
-    for artifact_id in project.artifacts.list_ids():
-        stored = project.artifacts.read(artifact_id)
-        if stored.manifest.artifact_type != "judgment":
-            continue
-        judgment, _input = read_judgment(project.artifacts, artifact_id)
-        if (
-            judgment.rollout_id == rollout_id
-            and judgment.rubric_id == review.rubric_id
-            and judgment.calibration_id == review.calibration_id
-        ):
-            matches.append(judgment)
-    if len(matches) > 1:
-        raise RouterCompositionError("multiple judgments bind the same rollout and review")
-    return matches[0] if matches else None
+    return tuple(evidence), consumed
 
 
 def _persist_judgment(project: ProjectStore, judgment: Judgment) -> None:
