@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from openai import OpenAI
 
@@ -90,6 +92,24 @@ def create_project_router_app(project: str, runtime: RouterRuntime) -> FastAPI:
         title="WMO local router",
         description="Development-only loopback adapter over one frozen RouterRuntime.",
     )
+
+    @application.exception_handler(RequestValidationError)
+    async def openai_validation_error(
+        _request: Request, _error: RequestValidationError
+    ) -> JSONResponse:
+        """Return the OpenAI error envelope for public request validation failures."""
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "Invalid OpenAI request",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "invalid_request",
+                }
+            },
+        )
+
     application.include_router(create_router_endpoint({project: runtime}))
     return application
 

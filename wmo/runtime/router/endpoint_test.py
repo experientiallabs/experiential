@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from openai import OpenAI
 from openai.types.chat import (
@@ -14,15 +13,14 @@ from openai.types.chat import (
 )
 from openai.types.responses import Response, ResponseStreamEvent
 
-from wmo.runtime.router import create_router_endpoint
+from wmo.runtime.router.application import create_project_router_app
 from wmo.runtime.router.runtime import RouterRuntime
 from wmo.runtime.router.runtime_test import _Client, _runtime
 
 
 def _clients(*, candidate_tools: bool = True) -> tuple[OpenAI, TestClient, RouterRuntime, _Client]:
     runtime, model_client = _runtime(candidate_tools=candidate_tools)
-    app = FastAPI()
-    app.include_router(create_router_endpoint({"router-a": runtime}))
+    app = create_project_router_app("router-a", runtime)
     http = TestClient(app)
     openai = OpenAI(api_key="local-test", base_url="http://testserver/v1", http_client=http)
     return openai, http, runtime, model_client
@@ -189,6 +187,28 @@ def test_openai_text_content_parts_are_preserved() -> None:
 
     assert model_client.requests[-2].messages[0].content == "first second"
     assert model_client.requests[-1].messages[0].content == "third fourth"
+
+
+def test_request_validation_uses_an_openai_error_envelope() -> None:
+    """Public schema failures do not leak FastAPI's proprietary detail body."""
+    _openai, http, _runtime_value, model_client = _clients()
+
+    response = http.post(
+        "/v1/chat/completions",
+        json={"model": "router-a", "messages": [{"role": "invalid", "content": "x"}]},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "message": "Invalid OpenAI request",
+            "type": "invalid_request_error",
+            "param": None,
+            "code": "invalid_request",
+        }
+    }
+    assert model_client.embed_calls == 0
+    assert model_client.complete_calls == 0
 
 
 def test_official_clients_parse_buffered_streams() -> None:

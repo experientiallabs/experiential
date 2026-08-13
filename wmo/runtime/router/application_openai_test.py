@@ -1,7 +1,5 @@
 """Public official OpenAI Python client over a loaded project router."""
 
-from pathlib import Path
-
 import pytest
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
@@ -21,7 +19,7 @@ def test_load_router_exposes_official_chat_and_responses_resources(
         lambda project, root, **kwargs: runtime,
     )
 
-    with load_router("support-agent", Path(".wmo")) as router:
+    with load_router("support-agent") as router:
         assert isinstance(router, OpenAI)
         chat = router.chat.completions.create(
             model="support-agent",
