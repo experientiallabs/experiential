@@ -211,7 +211,7 @@ class _ResponseState(BaseModel):
     messages: tuple[HttpMessage, ...]
 
 
-class _TranscriptAffinity:
+class _OpenAIRequestState:
     """Bounded standard request and response identity without a proprietary caller header.
 
     This retains bounded standard request and response identities without restoring the unsafe
@@ -284,7 +284,10 @@ class _TranscriptAffinity:
                 return existing[1]
             if len(self._idempotency) >= _AFFINITY_CAPACITY:
                 raise OpenAIRequestConflictError("live idempotency-key capacity is exhausted")
-            episode_id = existing_episode or f"idempotency-{key_sha256}"
+            # An expired key starts a new logical request. Its episode must not be
+            # derived from the key, because RouterRuntime intentionally retains
+            # prior episode decisions longer than this bounded transport cache.
+            episode_id = existing_episode or f"idempotency-{uuid.uuid4().hex}"
             self._idempotency[key_sha256] = (
                 request_sha256,
                 episode_id,
@@ -303,7 +306,7 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
         Loopback-hostable OpenAI API router.
     """
     router = APIRouter()
-    affinity = _TranscriptAffinity()
+    affinity = _OpenAIRequestState()
 
     @router.get("/v1/models")
     def models() -> dict[str, object]:

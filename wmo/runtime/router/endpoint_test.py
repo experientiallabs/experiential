@@ -218,6 +218,34 @@ def test_idempotency_key_rejects_a_different_request(path: str) -> None:
     assert model_client.complete_calls == 1
 
 
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses"))
+def test_expired_idempotency_key_starts_a_fresh_episode(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An expired transport key cannot reconnect to retained router state."""
+    now = [100.0]
+    monkeypatch.setattr("wmo.runtime.router.endpoint.time.monotonic", lambda: now[0])
+    _openai, http, runtime, model_client = _clients()
+    headers = {"Idempotency-Key": "reusable-after-retention"}
+    if path.endswith("responses"):
+        first = {"model": "router-a", "input": "first"}
+        changed = {"model": "router-a", "input": "changed"}
+    else:
+        first = {"model": "router-a", "messages": [{"role": "user", "content": "first"}]}
+        changed = {
+            "model": "router-a",
+            "messages": [{"role": "user", "content": "changed"}],
+        }
+
+    assert http.post(path, json=first, headers=headers).status_code == 200
+    now[0] += 24 * 60 * 60 + 1
+    assert http.post(path, json=changed, headers=headers).status_code == 200
+
+    assert model_client.embed_calls == 2
+    assert model_client.complete_calls == 2
+    assert len(runtime._episode_decisions) == 2  # noqa: SLF001
+
+
 @pytest.mark.parametrize(
     "path,payload",
     [
