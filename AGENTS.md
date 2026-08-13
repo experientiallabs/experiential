@@ -57,10 +57,10 @@ uv run pytest -q
   evidence, and writes the report without a model, simulator, judge, provider, or network client.
 - `wmo run PROJECT --root ROOT --port PORT` loads one frozen policy and exposes OpenAI Chat
   Completions, Responses, and Models routes on loopback. Public request and response types come
-  from the official OpenAI SDK. Chat transcript prefixes and Responses `previous_response_id`
-  provide internal routing affinity without WMO-specific request fields or headers. Request-time
-  embedding failure uses the frozen conservative baseline, and neither path mutates policy or
-  evidence.
+  from the official OpenAI SDK. Chat retries use the standard `Idempotency-Key`; Responses
+  continuations use `previous_response_id`. WMO never joins unrelated Chat callers by transcript
+  prefix and requires no proprietary request fields or headers. Request-time embedding failure
+  uses the frozen conservative baseline, and neither path mutates policy or evidence.
 
 ## Worker-agent execution
 

@@ -28,8 +28,8 @@ def _clients() -> tuple[OpenAI, TestClient, RouterRuntime, _Client]:
     return openai, http, runtime, model_client
 
 
-def test_official_chat_client_preserves_tools_and_transcript_affinity() -> None:
-    """Official SDK chat calls need no WMO header and retain one transcript decision."""
+def test_official_chat_client_preserves_tools_without_cross_caller_affinity() -> None:
+    """Official SDK chat calls need no WMO header and do not join equal transcripts."""
     openai, _http, _runtime_value, model_client = _clients()
     messages: list[ChatCompletionMessageParam] = [
         {"role": "user", "content": "do it"},
@@ -92,8 +92,11 @@ def test_official_chat_client_preserves_tools_and_transcript_affinity() -> None:
     )
 
     assert next_turn.model == "router-a"
-    assert model_client.embed_calls == 1
+    assert model_client.embed_calls == 2
     assert len(model_client.requests[-1].messages) == 6
+
+    openai.chat.completions.create(model="router-a", messages=messages, tools=tools)
+    assert model_client.embed_calls == 3
 
 
 def test_official_responses_client_continues_with_previous_response_id() -> None:

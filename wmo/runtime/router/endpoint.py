@@ -160,40 +160,23 @@ class _ResponseState(BaseModel):
 
 
 class _TranscriptAffinity:
-    """Bounded process-local transcript affinity without a proprietary caller header.
+    """Bounded standard request and response identity without a proprietary caller header.
 
-    This restores the useful prefix behavior from
-    ``e7aad17b:wmo/simulation/serving/chat.py`` while keeping the public wire format OpenAI-native.
+    This retains bounded standard request and response identities without restoring the unsafe
+    global transcript-prefix map from ``e7aad17b:wmo/simulation/serving/chat.py``. Two unrelated
+    callers can send the same transcript, so a transcript alone cannot be a conversation identity.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._transcripts: OrderedDict[str, str] = OrderedDict()
         self._responses: OrderedDict[str, _ResponseState] = OrderedDict()
 
     def chat_episode(self, messages: tuple[HttpMessage, ...], idempotency_key: str | None) -> str:
-        """Return a stable internal episode for a transcript or idempotent retry."""
-        with self._lock:
-            for length in range(len(messages), 0, -1):
-                fingerprint = _messages_sha256(messages[:length])
-                known = self._transcripts.get(fingerprint)
-                if known is not None:
-                    self._transcripts.move_to_end(fingerprint)
-                    return known
+        """Return a stable internal episode only for a standard idempotent retry."""
+        del messages
         if idempotency_key is not None:
             return "idempotency-" + hashlib.sha256(idempotency_key.encode()).hexdigest()
         return f"openai-{uuid.uuid4().hex}"
-
-    def remember_chat(
-        self,
-        request_messages: tuple[HttpMessage, ...],
-        assistant: HttpMessage,
-        episode_id: str,
-    ) -> None:
-        """Remember exact request and completed transcript fingerprints."""
-        with self._lock:
-            self._remember_transcript(_messages_sha256(request_messages), episode_id)
-            self._remember_transcript(_messages_sha256((*request_messages, assistant)), episode_id)
 
     def response_context(
         self, previous_response_id: str | None, idempotency_key: str | None
@@ -220,12 +203,6 @@ class _TranscriptAffinity:
             self._responses.move_to_end(response_id)
             while len(self._responses) > _AFFINITY_CAPACITY:
                 self._responses.popitem(last=False)
-
-    def _remember_transcript(self, fingerprint: str, episode_id: str) -> None:
-        self._transcripts[fingerprint] = episode_id
-        self._transcripts.move_to_end(fingerprint)
-        while len(self._transcripts) > _AFFINITY_CAPACITY:
-            self._transcripts.popitem(last=False)
 
 
 def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
@@ -268,8 +245,6 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
             return _error(409, "request transcript conflicts with an earlier routed turn")
         except Exception as exc:  # noqa: BLE001
             return _error(502, f"routed model call failed ({type(exc).__name__})")
-        assistant = _assistant_message(routed.response.output)
-        affinity.remember_chat(request.messages, assistant, episode_id)
         completion = _chat_completion(request.model, routed.response.output, routed.response)
         headers = {"X-WMO-Routed-Model": routed.decision.selected_alias}
         if request.stream:
@@ -642,12 +617,6 @@ def _responses_stream(response: OpenAIResponse) -> Iterator[str]:
 
 def _response_event(name: str, data: str) -> str:
     return f"event: {name}\ndata: {data}\n\n"
-
-
-def _messages_sha256(messages: tuple[HttpMessage, ...]) -> str:
-    payload = [message.model_dump(mode="json") for message in messages]
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _tool_choice(value: JsonValue) -> Literal["auto", "none", "required"] | ToolChoice | None:

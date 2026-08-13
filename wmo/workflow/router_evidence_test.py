@@ -326,7 +326,7 @@ class _RuntimeCatalog:
         )
 
 
-def test_w16_public_router_evidence_is_complete_replay_safe_and_sticky(
+def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -487,7 +487,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_sticky(
     assert first_http.status_code == second_http.status_code == 200
     assert first_http.headers["X-WMO-Routed-Model"] == second_http.headers["X-WMO-Routed-Model"]
     assert first_http.json()["object"] == second_http.json()["object"] == "chat.completion"
-    assert runtime_catalog.clients["embedder"].embed_calls == 1
+    assert runtime_catalog.clients["embedder"].embed_calls == 2
     assert sum(client.complete_calls for client in runtime_catalog.clients.values()) == 2
     assert "routing_decision" not in first_http.text
     provenance = verify_release_evidence(
