@@ -192,6 +192,30 @@ def test_idempotency_key_reuses_decision_after_provider_failure() -> None:
     assert model_client.complete_calls == 2
 
 
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses"))
+def test_idempotency_key_rejects_a_different_request(path: str) -> None:
+    """One standard idempotency key cannot merge two divergent OpenAI requests."""
+    _openai, http, _runtime_value, model_client = _clients()
+    headers = {"Idempotency-Key": "one-logical-request"}
+    if path.endswith("responses"):
+        first = {"model": "router-a", "input": "first"}
+        changed = {"model": "router-a", "input": "changed"}
+    else:
+        first = {"model": "router-a", "messages": [{"role": "user", "content": "first"}]}
+        changed = {
+            "model": "router-a",
+            "messages": [{"role": "user", "content": "changed"}],
+        }
+
+    assert http.post(path, json=first, headers=headers).status_code == 200
+    conflict = http.post(path, json=changed, headers=headers)
+
+    assert conflict.status_code == 409
+    assert "different request" in conflict.json()["error"]["message"]
+    assert model_client.embed_calls == 1
+    assert model_client.complete_calls == 1
+
+
 @pytest.mark.parametrize(
     "path,payload",
     [

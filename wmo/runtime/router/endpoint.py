@@ -35,6 +35,7 @@ from wmo.common.tasks import ToolSchema
 from wmo.runtime.router.runtime import RouterEpisodeConflictError, RouterRuntime
 
 _AFFINITY_CAPACITY = 4096
+_IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 
 
 class HttpFunctionCall(BaseModel):
@@ -168,18 +169,19 @@ class _TranscriptAffinity:
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._idempotency: OrderedDict[str, tuple[str, str, float]] = OrderedDict()
         self._responses: OrderedDict[str, _ResponseState] = OrderedDict()
 
-    def chat_episode(self, messages: tuple[HttpMessage, ...], idempotency_key: str | None) -> str:
+    def chat_episode(self, request_sha256: str, idempotency_key: str | None) -> str:
         """Return a stable internal episode only for a standard idempotent retry."""
-        del messages
-        if idempotency_key is not None:
-            return "idempotency-" + hashlib.sha256(idempotency_key.encode()).hexdigest()
-        return f"openai-{uuid.uuid4().hex}"
+        return self._idempotent_episode(request_sha256, idempotency_key, existing_episode=None)
 
     def response_context(
-        self, previous_response_id: str | None, idempotency_key: str | None
+        self,
+        previous_response_id: str | None,
+        request_sha256: str,
+        idempotency_key: str | None,
     ) -> _ResponseState:
         """Resolve prior Responses state or start a new internal conversation."""
         with self._lock:
@@ -188,12 +190,11 @@ class _TranscriptAffinity:
                 if state is None:
                     raise ValueError("previous_response_id does not name a local response")
                 self._responses.move_to_end(previous_response_id)
-                return state
-        identity = (
-            "idempotency-" + hashlib.sha256(idempotency_key.encode()).hexdigest()
-            if idempotency_key is not None
-            else f"openai-{uuid.uuid4().hex}"
-        )
+                identity = self._idempotent_episode(
+                    request_sha256, idempotency_key, existing_episode=state.episode_id
+                )
+                return _ResponseState(episode_id=identity, messages=state.messages)
+        identity = self._idempotent_episode(request_sha256, idempotency_key, existing_episode=None)
         return _ResponseState(episode_id=identity, messages=())
 
     def remember_response(self, response_id: str, state: _ResponseState) -> None:
@@ -203,6 +204,42 @@ class _TranscriptAffinity:
             self._responses.move_to_end(response_id)
             while len(self._responses) > _AFFINITY_CAPACITY:
                 self._responses.popitem(last=False)
+
+    def _idempotent_episode(
+        self,
+        request_sha256: str,
+        idempotency_key: str | None,
+        *,
+        existing_episode: str | None,
+    ) -> str:
+        """Bind a standard key to one exact request and internal episode."""
+        if idempotency_key is None:
+            return existing_episode or f"openai-{uuid.uuid4().hex}"
+        key_sha256 = hashlib.sha256(idempotency_key.encode()).hexdigest()
+        with self._lock:
+            now = time.monotonic()
+            expired = tuple(
+                key for key, (_, _, deadline) in self._idempotency.items() if deadline <= now
+            )
+            for key in expired:
+                del self._idempotency[key]
+            existing = self._idempotency.get(key_sha256)
+            if existing is not None:
+                if existing[0] != request_sha256:
+                    raise RouterEpisodeConflictError(
+                        "Idempotency-Key is already bound to a different request"
+                    )
+                self._idempotency.move_to_end(key_sha256)
+                return existing[1]
+            if len(self._idempotency) >= _AFFINITY_CAPACITY:
+                raise RouterEpisodeConflictError("live idempotency-key capacity is exhausted")
+            episode_id = existing_episode or f"idempotency-{key_sha256}"
+            self._idempotency[key_sha256] = (
+                request_sha256,
+                episode_id,
+                now + _IDEMPOTENCY_TTL_SECONDS,
+            )
+            return episode_id
 
 
 def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
@@ -237,12 +274,12 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
             return _error(404, f"no routed endpoint {request.model!r}")
         try:
             model_request = _chat_model_request(request)
-            episode_id = affinity.chat_episode(request.messages, idempotency_key)
+            episode_id = affinity.chat_episode(_request_sha256(request), idempotency_key)
             routed = runtime.complete(model_request, episode_id=episode_id)
+        except RouterEpisodeConflictError as exc:
+            return _error(409, str(exc))
         except (ValueError, json.JSONDecodeError) as exc:
             return _error(400, f"invalid routed request ({exc})")
-        except RouterEpisodeConflictError:
-            return _error(409, "request transcript conflicts with an earlier routed turn")
         except Exception as exc:  # noqa: BLE001
             return _error(502, f"routed model call failed ({type(exc).__name__})")
         completion = _chat_completion(request.model, routed.response.output, routed.response)
@@ -266,15 +303,17 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
         if runtime is None:
             return _error(404, f"no routed endpoint {request.model!r}")
         try:
-            prior = affinity.response_context(request.previous_response_id, idempotency_key)
+            prior = affinity.response_context(
+                request.previous_response_id, _request_sha256(request), idempotency_key
+            )
             visible = _response_messages(request)
             all_messages = (*prior.messages, *visible)
             model_request = _responses_model_request(request, all_messages)
             routed = runtime.complete(model_request, episode_id=prior.episode_id)
+        except RouterEpisodeConflictError as exc:
+            return _error(409, str(exc))
         except (ValueError, json.JSONDecodeError) as exc:
             return _error(400, f"invalid routed request ({exc})")
-        except RouterEpisodeConflictError:
-            return _error(409, "response continuation conflicts with an earlier routed turn")
         except Exception as exc:  # noqa: BLE001
             return _error(502, f"routed model call failed ({type(exc).__name__})")
         response = _openai_response(
@@ -617,6 +656,13 @@ def _responses_stream(response: OpenAIResponse) -> Iterator[str]:
 
 def _response_event(name: str, data: str) -> str:
     return f"event: {name}\ndata: {data}\n\n"
+
+
+def _request_sha256(request: BaseModel) -> str:
+    """Return the complete canonical OpenAI request digest for idempotency binding."""
+    payload = request.model_dump(mode="json")
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _tool_choice(value: JsonValue) -> Literal["auto", "none", "required"] | ToolChoice | None:
