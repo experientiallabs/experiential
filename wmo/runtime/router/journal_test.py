@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import multiprocessing
 import os
+import stat
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -15,7 +16,13 @@ from typing import cast
 
 import pytest
 
-from wmo.common.core.artifacts import ArtifactInput, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactInput,
+    FailureAttribution,
+    FailureCode,
+    StructuredFailure,
+    stable_id,
+)
 from wmo.common.models import (
     AssistantAction,
     ModelMessage,
@@ -36,6 +43,7 @@ from wmo.runtime.router.journal import (
     RuntimeInteractionInProgressError,
     RuntimeInteractionJournal,
     RuntimeJournalError,
+    _completed_event,
     _interaction_identity,
 )
 from wmo.runtime.router.runtime import RoutedModelResponse, RouterRuntime
@@ -410,6 +418,78 @@ def test_original_provider_success_wins_after_concurrent_stale_takeover(tmp_path
     ]
 
 
+def test_replacement_permanent_failure_wins_over_late_original_success(tmp_path: Path) -> None:
+    """A replacement's permanent failure remains canonical after a late original success."""
+    journal = RuntimeInteractionJournal(
+        ProjectPaths(root=tmp_path / ".wmo", project_id="support-agent")
+    )
+    request = _request()
+    identity = _interaction_identity("support-agent", "permanent-key", request, None)
+    decision = _decision(identity.lineage_id)
+    acceptance = RuntimeAcceptance(
+        decision=decision,
+        selected_alias=decision.selected_alias,
+        selected_model=_snapshot(),
+        policy_input=ArtifactInput(artifact_id=decision.policy_id, sha256=decision.policy_sha256),
+    )
+    original = journal.claim(
+        identity,
+        acceptance,
+        now=_TIME,
+        stale_after=timedelta(seconds=1),
+    )
+    replacement = journal.claim(
+        identity,
+        None,
+        now=_TIME + timedelta(seconds=2),
+        stale_after=timedelta(seconds=1),
+    )
+    assert original.accepted is not None
+    assert replacement.accepted is not None
+    permanent = StructuredFailure(
+        code=FailureCode.PROVIDER,
+        message="routed model provider attempt failed permanently",
+        retryable=False,
+        attribution=FailureAttribution.MODEL,
+    )
+    terminal = journal.record_failure(
+        replacement.accepted,
+        permanent,
+        failed_at=_TIME + timedelta(seconds=3),
+    )
+
+    observed = journal.record_completed(
+        original.accepted,
+        _response(),
+        completed_at=_TIME + timedelta(seconds=4),
+    )
+
+    assert observed == terminal
+    failed_claim = journal.claim(
+        identity,
+        None,
+        now=_TIME + timedelta(seconds=5),
+        stale_after=timedelta(seconds=1),
+    )
+    assert failed_claim.status == "failed"
+    assert [event.event for event in journal.read_events()] == [
+        "accepted",
+        "attempt_failed",
+        "accepted",
+        "attempt_failed",
+    ]
+
+    corrupted_completion = _completed_event(
+        original.accepted,
+        _response(),
+        ordinal=5,
+        completed_at=_TIME + timedelta(seconds=4),
+    )
+    journal._append_unlocked(corrupted_completion)
+    with pytest.raises(RuntimeJournalError, match="permanent interaction failure"):
+        journal.read_events()
+
+
 def test_live_attempt_wait_is_bounded_and_retryable(tmp_path: Path) -> None:
     """A live attempt produces a bounded retryable conflict instead of hanging."""
     journal = RuntimeInteractionJournal(
@@ -496,3 +576,58 @@ def test_first_append_fsyncs_file_and_new_directory_entries(
     assert {"runtime", "support-agent", "projects", ".wmo"}.issubset(
         {path.name for path in directory_opens}
     )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory fsync is POSIX-only")
+def test_append_retries_directory_fsync_after_first_creation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later append repairs directory durability after first creation fsync fails."""
+    journal = RuntimeInteractionJournal(
+        ProjectPaths(root=tmp_path / ".wmo", project_id="support-agent")
+    )
+    request = _request()
+    identity = _interaction_identity("support-agent", "fsync-retry-key", request, None)
+    decision = _decision(identity.lineage_id)
+    acceptance = RuntimeAcceptance(
+        decision=decision,
+        selected_alias=decision.selected_alias,
+        selected_model=_snapshot(),
+        policy_input=ArtifactInput(artifact_id=decision.policy_id, sha256=decision.policy_sha256),
+    )
+    directory_failures = 0
+    successful_directory_fsyncs = 0
+    real_fsync = os.fsync
+
+    def fail_first_directory_fsync(descriptor: int) -> None:
+        nonlocal directory_failures, successful_directory_fsyncs
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            if directory_failures == 0:
+                directory_failures += 1
+                raise OSError("simulated directory fsync failure")
+            successful_directory_fsyncs += 1
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_first_directory_fsync)
+    with pytest.raises(RuntimeJournalError, match="cannot persist runtime journal directory"):
+        journal.claim(
+            identity,
+            acceptance,
+            now=_TIME,
+            stale_after=timedelta(seconds=1),
+        )
+
+    retry = journal.claim(
+        identity,
+        None,
+        now=_TIME + timedelta(seconds=2),
+        stale_after=timedelta(seconds=1),
+    )
+
+    assert retry.status == "dispatch"
+    assert successful_directory_fsyncs >= 8
+    assert [event.event for event in journal.read_events()] == [
+        "accepted",
+        "attempt_failed",
+        "accepted",
+    ]

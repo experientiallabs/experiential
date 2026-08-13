@@ -364,8 +364,8 @@ class RuntimeInteractionJournal:
         response: ModelResponse,
         *,
         completed_at: datetime,
-    ) -> RuntimeCompletedEvent:
-        """Commit the first response, including one returned after a stale takeover."""
+    ) -> RuntimeAttemptFailedEvent | RuntimeCompletedEvent:
+        """Commit the first response or observe an earlier permanent failure."""
         _require_timezone(completed_at)
         with file_write_lock(self.path, what="the routed-interaction journal"):
             events = list(self._read_unlocked())
@@ -375,6 +375,11 @@ class RuntimeInteractionJournal:
                     "cannot complete an interaction attempt that was not accepted"
                 )
             if isinstance(state.terminal, RuntimeCompletedEvent):
+                return state.terminal
+            if (
+                isinstance(state.terminal, RuntimeAttemptFailedEvent)
+                and not state.terminal.retryable
+            ):
                 return state.terminal
             if state.accepted != accepted:
                 prior = _attempt_failure(events, accepted)
@@ -421,7 +426,6 @@ class RuntimeInteractionJournal:
             raise RuntimeJournalError("runtime event ID differs from its canonical content")
         _prepare_runtime_directory(self.path)
         _truncate_torn_tail(self.path)
-        created = not self.path.exists()
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -432,8 +436,7 @@ class RuntimeInteractionJournal:
                 handle.write(canonical_json_bytes(event) + b"\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            if created:
-                _fsync_directories(self._durability_directories)
+            _fsync_directories(self._durability_directories)
         except OSError as exc:
             raise RuntimeJournalError(f"cannot append runtime journal {self.path}") from exc
 
@@ -566,6 +569,8 @@ class JournaledRouterRuntime:
             routed.response,
             completed_at=self._clock(),
         )
+        if isinstance(completed, RuntimeAttemptFailedEvent):
+            raise RuntimeInteractionFailedError(completed.failure)
         return RoutedModelResponse(
             decision=accepted.decision,
             response=completed.response,
@@ -748,7 +753,14 @@ def _validate_events(
             raise RuntimeJournalError("completion precedes its accepted attempt")
         elif isinstance(state.terminal, RuntimeCompletedEvent):
             raise RuntimeJournalError("interaction has more than one completed response")
+        elif isinstance(state.terminal, RuntimeAttemptFailedEvent) and accepted == state.accepted:
+            raise RuntimeJournalError("runtime attempt has more than one terminal event")
         elif accepted != state.accepted:
+            if (
+                isinstance(state.terminal, RuntimeAttemptFailedEvent)
+                and not state.terminal.retryable
+            ):
+                raise RuntimeJournalError("completion follows a permanent interaction failure")
             prior = failed_attempts.get((event.interaction_id, event.attempt_ordinal))
             if prior is None or not prior.retryable:
                 raise RuntimeJournalError("superseded completion lacks a retryable durable failure")
@@ -873,7 +885,7 @@ def _attempt_failure(
 
 
 def _fsync_directories(directories: tuple[Path, ...]) -> None:
-    """Persist a newly created journal and every project directory entry that names it."""
+    """Persist the journal and every project directory entry that names it."""
     if os.name == "nt":
         return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
