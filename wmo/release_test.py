@@ -34,7 +34,11 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
 REQUIRED_WHEEL_MODULES = frozenset(
     {
         "wmo/common/models/model.py",
+        "wmo/runtime/environments/local.py",
         "wmo/runtime/models/registry.py",
+        "wmo/runtime/router/application.py",
+        "wmo/simulation/comparison.py",
+        "wmo/simulation/engines/sandbox.py",
         "wmo/workflow/router.py",
     }
 )
@@ -195,6 +199,21 @@ def test_requirement_scanner_rejects_removed_dependencies() -> None:
         "transformers",
     ):
         assert RETIRED_REQUIREMENT.search(f"Requires-Dist: {dependency}>=1\n") is not None
+
+
+def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
+    """W16 customer and comparison workflows resolve without test-only API owners."""
+    import wmo
+    from wmo.runtime.environments import LocalProcessEnvironmentRuntime
+    from wmo.simulation import compare_text_and_sandbox
+    from wmo.simulation.engines import SandboxSimulator
+
+    assert callable(wmo.compose_router)
+    assert callable(wmo.load_project_router)
+    assert callable(wmo.create_project_router_app)
+    assert callable(compare_text_and_sandbox)
+    assert SandboxSimulator.__module__ == "wmo.simulation.engines.sandbox"
+    assert LocalProcessEnvironmentRuntime.__module__ == "wmo.runtime.environments.local"
 
 
 @pytest.mark.parametrize(
