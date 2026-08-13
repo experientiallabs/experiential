@@ -92,13 +92,23 @@ class _Client:
 class _Catalog:
     """Exact static identity catalog with no environment or provider access."""
 
-    def __init__(self, snapshots: dict[str, ModelSnapshot], client: _Client) -> None:
+    def __init__(
+        self,
+        snapshots: dict[str, ModelSnapshot],
+        client: _Client,
+        *,
+        candidate_tools: bool = True,
+    ) -> None:
         self.snapshots = snapshots
         self.client = client
+        self.candidate_tools = candidate_tools
         self.resolve_calls: list[str] = []
 
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
-        return self.snapshots[alias], ModelCapabilities(supports_embeddings=alias == "embedder")
+        return self.snapshots[alias], ModelCapabilities(
+            supports_tools=self.candidate_tools and alias != "embedder",
+            supports_embeddings=alias == "embedder",
+        )
 
     def resolve(self, alias: str) -> ResolvedModel:
         self.resolve_calls.append(alias)
@@ -413,7 +423,7 @@ def test_embedder_candidate_alias_overlap_requires_the_same_frozen_identity() ->
         )
     assert client.embed_calls == 0
 
-    embedding_capabilities = ModelCapabilities(supports_embeddings=True)
+    embedding_capabilities = ModelCapabilities(supports_tools=True, supports_embeddings=True)
     overlapping_snapshot = snapshots["baseline"].model_copy(
         update={"capabilities_sha256": sha256_json(embedding_capabilities)}
     )
@@ -440,7 +450,10 @@ def test_embedder_candidate_alias_overlap_requires_the_same_frozen_identity() ->
     class _OverlapCatalog(_Catalog):
         def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
             snapshot = self.snapshots[alias]
-            return snapshot, ModelCapabilities(supports_embeddings=alias == "baseline")
+            return snapshot, ModelCapabilities(
+                supports_tools=alias in {"baseline", "cheap"},
+                supports_embeddings=alias == "baseline",
+            )
 
     runtime = RouterRuntime(
         same,
@@ -601,14 +614,17 @@ def _request(*, tool_name: str | None = None) -> ModelRequest:
     return ModelRequest(messages=(ModelMessage(role="user", content="route me"),), tools=tools)
 
 
-def _runtime() -> tuple[RouterRuntime, _Client]:
-    policy, manifest, bank, snapshots, client = _fixture()
+def _runtime(*, candidate_tools: bool = True) -> tuple[RouterRuntime, _Client]:
+    policy, manifest, bank, snapshots, client = _fixture(candidate_tools=candidate_tools)
     return (
         RouterRuntime(
             policy,
             manifest,
             bank,
-            cast(RuntimeModelCatalog, _Catalog(snapshots, client)),
+            cast(
+                RuntimeModelCatalog,
+                _Catalog(snapshots, client, candidate_tools=candidate_tools),
+            ),
             pricing_snapshot_id="pricing-a",
             pricing_snapshot_sha256=_DIGEST,
             pricing_candidate_aliases=bank.candidate_aliases,
@@ -617,14 +633,19 @@ def _runtime() -> tuple[RouterRuntime, _Client]:
     )
 
 
-def _fixture() -> tuple[
+def _fixture(
+    *, candidate_tools: bool = True
+) -> tuple[
     KnnRouterPolicy,
     KnnBankManifest,
     KnnEvidenceBank,
     dict[str, ModelSnapshot],
     _Client,
 ]:
-    snapshots = {alias: _snapshot(alias) for alias in ("baseline", "cheap", "embedder")}
+    snapshots = {
+        alias: _snapshot(alias, candidate_tools=candidate_tools)
+        for alias in ("baseline", "cheap", "embedder")
+    }
     client = _Client()
     bank = KnnEvidenceBank(
         task_ids=tuple(f"task-{index}" for index in range(8)),
@@ -701,8 +722,11 @@ def _fixture() -> tuple[
     return policy, manifest, bank, snapshots, client
 
 
-def _snapshot(alias: str) -> ModelSnapshot:
-    capabilities = ModelCapabilities(supports_embeddings=alias == "embedder")
+def _snapshot(alias: str, *, candidate_tools: bool = True) -> ModelSnapshot:
+    capabilities = ModelCapabilities(
+        supports_tools=candidate_tools and alias != "embedder",
+        supports_embeddings=alias == "embedder",
+    )
     return ModelSnapshot(
         provider="test",
         model_id=alias,

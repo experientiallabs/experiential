@@ -26,6 +26,10 @@ class RouterEpisodeConflictError(ValueError):
     """A caller reused an episode identity with different request-visible inputs."""
 
 
+class RouterModelCapabilityError(ValueError):
+    """The selected frozen model cannot preserve the requested OpenAI capability."""
+
+
 class RoutedModelResponse(ContractModel):
     """One exact routing decision and the response produced by its selected model."""
 
@@ -320,7 +324,20 @@ class RouterRuntime:
             cached = self._request_decisions.get((expected_episode_sha256, request_sha256))
             if cached != selected:
                 raise ValueError("routing decision is not the exact cached episode decision")
-        response = self._resolve(selected.selected_alias).client.complete(request)
+        resolved = self._resolve(selected.selected_alias)
+        if _requires_tool_protocol(request) and not resolved.capabilities.supports_tools:
+            raise RouterModelCapabilityError(
+                f"routed model alias {selected.selected_alias!r} does not support tool calls"
+            )
+        if request.maximum_output_tokens is not None and (
+            resolved.capabilities.maximum_output_tokens is None
+            or request.maximum_output_tokens > resolved.capabilities.maximum_output_tokens
+        ):
+            raise RouterModelCapabilityError(
+                f"routed model alias {selected.selected_alias!r} cannot prove the requested "
+                "output-token capacity"
+            )
+        response = resolved.client.complete(request)
         return RoutedModelResponse(decision=selected, response=response)
 
     def _require_activation_identity(
@@ -465,3 +482,16 @@ class RouterRuntime:
         if self._decision_sink is not None:
             self._decision_sink(decision)
         return decision
+
+
+def _requires_tool_protocol(request: ModelRequest) -> bool:
+    """Return whether preserving this request requires structured tool support."""
+    return bool(
+        request.tools
+        or request.tool_choice is not None
+        or any(
+            message.role == "tool"
+            or (message.assistant_action is not None and bool(message.assistant_action.tool_calls))
+            for message in request.messages
+        )
+    )

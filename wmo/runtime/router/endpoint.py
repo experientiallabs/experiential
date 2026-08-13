@@ -35,7 +35,11 @@ from wmo.common.models import (
     ToolChoice,
 )
 from wmo.common.tasks import ToolSchema
-from wmo.runtime.router.runtime import RouterEpisodeConflictError, RouterRuntime
+from wmo.runtime.router.runtime import (
+    RouterEpisodeConflictError,
+    RouterModelCapabilityError,
+    RouterRuntime,
+)
 
 _AFFINITY_CAPACITY = 4096
 _IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
@@ -334,6 +338,8 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
             return _error(409, "Idempotency-Key conflicts with live request state")
         except RouterEpisodeConflictError:
             return _error(409, "request conflicts with an earlier routed turn")
+        except RouterModelCapabilityError as exc:
+            return _error(501, str(exc), code="tool_calling_unsupported")
         except (ValueError, json.JSONDecodeError) as exc:
             return _error(400, f"invalid routed request ({exc})")
         except Exception:  # noqa: BLE001
@@ -371,6 +377,8 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
             return _error(409, "Idempotency-Key conflicts with live request state")
         except RouterEpisodeConflictError:
             return _error(409, "response continuation conflicts with an earlier routed turn")
+        except RouterModelCapabilityError as exc:
+            return _error(501, str(exc), code="tool_calling_unsupported")
         except (ValueError, json.JSONDecodeError) as exc:
             return _error(400, f"invalid routed request ({exc})")
         except Exception:  # noqa: BLE001
@@ -472,7 +480,9 @@ def _model_request(
         tools=tuple(
             ToolSchema(
                 name=tool.function.name,
-                description=tool.function.description,
+                # OpenAI makes function descriptions optional while WMO's stable
+                # internal task schema requires a non-empty rendering label.
+                description=tool.function.description or tool.function.name,
                 input_schema=tool.function.parameters,
             )
             for tool in tools
@@ -755,7 +765,7 @@ def _tool_choice(value: JsonValue) -> Literal["auto", "none", "required"] | Tool
     raise ValueError("tool_choice must be auto, none, required, or a named function")
 
 
-def _error(status: int, message: str) -> Response:
+def _error(status: int, message: str, *, code: str = "routing_error") -> Response:
     return Response(
         content=json.dumps(
             {
@@ -763,7 +773,7 @@ def _error(status: int, message: str) -> Response:
                     "message": message,
                     "type": "invalid_request_error" if status < 500 else "api_error",
                     "param": None,
-                    "code": "routing_error",
+                    "code": code,
                 }
             }
         ),

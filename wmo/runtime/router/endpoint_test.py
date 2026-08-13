@@ -19,8 +19,8 @@ from wmo.runtime.router.runtime import RouterRuntime
 from wmo.runtime.router.runtime_test import _Client, _runtime
 
 
-def _clients() -> tuple[OpenAI, TestClient, RouterRuntime, _Client]:
-    runtime, model_client = _runtime()
+def _clients(*, candidate_tools: bool = True) -> tuple[OpenAI, TestClient, RouterRuntime, _Client]:
+    runtime, model_client = _runtime(candidate_tools=candidate_tools)
     app = FastAPI()
     app.include_router(create_router_endpoint({"router-a": runtime}))
     http = TestClient(app)
@@ -97,6 +97,45 @@ def test_official_chat_client_preserves_tools_without_cross_caller_affinity() ->
 
     openai.chat.completions.create(model="router-a", messages=messages, tools=tools)
     assert model_client.embed_calls == 3
+
+
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses"))
+def test_tool_request_rejects_an_incapable_selected_model(path: str) -> None:
+    """OpenAI tool requests fail explicitly before an incapable provider call."""
+    _openai, http, _runtime_value, model_client = _clients(candidate_tools=False)
+    payload = (
+        {
+            "model": "router-a",
+            "input": "read",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        }
+        if path.endswith("responses")
+        else {
+            "model": "router-a",
+            "messages": [{"role": "user", "content": "read"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+    )
+
+    response = http.post(path, json=payload)
+
+    assert response.status_code == 501
+    assert response.json()["error"]["code"] == "tool_calling_unsupported"
+    assert model_client.complete_calls == 0
 
 
 def test_official_responses_client_continues_with_previous_response_id() -> None:

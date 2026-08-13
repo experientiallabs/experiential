@@ -9,6 +9,7 @@ from wmo.runtime.router.endpoint import create_router_endpoint
 from wmo.runtime.router.runtime import (
     RoutedModelResponse,
     RouterEpisodeConflictError,
+    RouterModelCapabilityError,
     RouterRuntime,
     RouterRuntimeIntegrityError,
 )
@@ -16,6 +17,7 @@ from wmo.runtime.router.runtime import (
 __all__ = [
     "RoutedModelResponse",
     "RouterEpisodeConflictError",
+    "RouterModelCapabilityError",
     "RouterRuntime",
     "RouterRuntimeIntegrityError",
     "create_router_endpoint",
