@@ -389,11 +389,13 @@ class RuntimeInteractionJournal:
         if event.event_id != _event_content_id(event):
             raise RuntimeJournalError("runtime event ID differs from its canonical content")
         _prepare_runtime_directory(self.path)
+        _truncate_torn_tail(self.path)
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
             descriptor = os.open(self.path, flags, 0o600)
+            os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "ab", closefd=True) as handle:
                 handle.write(canonical_json_bytes(event) + b"\n")
                 handle.flush()
@@ -800,9 +802,26 @@ def _prepare_runtime_directory(path: Path) -> None:
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     if directory.is_symlink() or not directory.is_dir():
         raise RuntimeJournalError("runtime journal directory must be a real directory")
-    directory.chmod(0o700)
     if path.is_symlink():
         raise RuntimeJournalError("runtime journal path cannot be a symbolic link")
+
+
+def _truncate_torn_tail(path: Path) -> None:
+    """Remove only a non-newline-terminated final record before the next append."""
+    try:
+        with path.open("r+b") as handle:
+            payload = handle.read()
+            if not payload or payload.endswith(b"\n"):
+                return
+            last_newline = payload.rfind(b"\n")
+            handle.seek(last_newline + 1)
+            handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeJournalError(f"cannot repair torn runtime journal {path}") from exc
 
 
 def _validate_external_id(value: str, *, label: str, visible_ascii: bool) -> None:

@@ -290,8 +290,11 @@ def test_torn_tail_is_ignored_but_interior_corruption_fails_closed(tmp_path: Pat
     path.write_bytes(clean + b'{"event":"accepted"')
 
     assert len(service.journal.read_events()) == 2
+    service.complete(_request(), idempotency_key="after-torn-key")
+    assert len(service.journal.read_events()) == 4
 
-    path.write_bytes(clean.splitlines(keepends=True)[0] + b"not-json\n" + clean)
+    repaired = path.read_bytes()
+    path.write_bytes(repaired.splitlines(keepends=True)[0] + b"not-json\n" + repaired)
     with pytest.raises(RuntimeJournalError, match="invalid interior line"):
         service.journal.read_events()
 
