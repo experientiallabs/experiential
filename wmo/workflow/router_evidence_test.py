@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -12,7 +13,14 @@ from fastapi.testclient import TestClient
 import wmo
 from wmo.common.evaluations import EvaluationPlan, EvaluationProtocol, ObservedProductionCell
 from wmo.common.evaluations.build_test import _persist_rollout, _production_rollout
-from wmo.common.judging import Judgment
+from wmo.common.judging import (
+    DimensionScoreMap,
+    JudgeCalibration,
+    Judgment,
+    Rubric,
+    RubricDimension,
+    ScoreAnchor,
+)
 from wmo.common.models import (
     AssistantAction,
     CandidateTokenPrice,
@@ -28,9 +36,9 @@ from wmo.common.models import (
     Usage,
 )
 from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
-from wmo.common.routing import KnnGuard
+from wmo.common.routing import FrozenEmbedding, FrozenEmbeddingSet, KnnGuard, RouterFeatureExtractor
 from wmo.common.tasks import load_task_set
-from wmo.optimize.router.workflow_test import _persist_embeddings
+from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.application import create_project_router_app
 from wmo.simulation.build_test import _trace
@@ -55,16 +63,17 @@ from wmo.workflow.router_test import (
     _FidelityApproval,
     _Judge,
     _resolved,
-    _ReviewSupplier,
     _snapshot,
 )
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
-_REVISION = "w16-deterministic-evidence-v1"
 
 
 class _EvidenceSetupSupplier:
     """Persist two measured candidates, reviewed overlaps, embeddings, and pricing."""
+
+    def __init__(self, revision: str) -> None:
+        self.revision = revision
 
     def __call__(
         self,
@@ -89,7 +98,9 @@ class _EvidenceSetupSupplier:
                     cell_id=f"w16-import-{index}",
                     task=task,
                     candidate=candidates[0].model,
-                ).model_copy(update={"trace_id": task.source_trace_ids[0]})
+                ).model_copy(
+                    update={"trace_id": task.source_trace_ids[0], "code_revision": self.revision}
+                )
                 _persist_rollout(project.artifacts, rollout)
             observed.append(
                 ObservedProductionCell(
@@ -103,7 +114,7 @@ class _EvidenceSetupSupplier:
             pricing = PricingSnapshot(
                 schema_version=1,
                 created_at=_TIME,
-                code_revision=_REVISION,
+                code_revision=self.revision,
                 pricing_snapshot_id="w16-pricing",
                 candidate_prices=(
                     CandidateTokenPrice(
@@ -124,7 +135,7 @@ class _EvidenceSetupSupplier:
                 envelope=pricing,
                 files={"pricing.json": pricing},
             )
-            _persist_embeddings(project.artifacts, tasks)
+            _persist_release_embeddings(project, tasks, self.revision)
         production = EvaluationProtocol(
             protocol_id="w16-production-protocol",
             evidence_source="production",
@@ -231,7 +242,11 @@ class _EvidenceSimulatorFactory:
 
 
 class _EvidenceJudge(_Judge):
-    """Persist the deterministic judgment with an explicit observed zero-dollar cost."""
+    """Persist the deterministic judgment with exact revision and observed zero-dollar cost."""
+
+    def __init__(self, revision: str) -> None:
+        super().__init__()
+        self.revision = revision
 
     def judge_persisted(
         self,
@@ -249,9 +264,10 @@ class _EvidenceJudge(_Judge):
         )
         return judgment.model_copy(
             update={
+                "code_revision": self.revision,
                 "judge_economics": OperationEconomics(
                     cost_usd=NumericMeasurement(value=0.0, provenance="observed")
-                )
+                ),
             }
         )
 
@@ -315,6 +331,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_sticky(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One 100-trace public workflow proves phase locks, replay, budgets, and HTTP stickiness."""
+    revision = exact_checkout_revision()
     project = ProjectStore(tmp_path, "w16-project")
     project.initialize(ProjectConfig(project_id="w16-project"))
     normalized = TraceNormalizationResult(
@@ -322,12 +339,12 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_sticky(
         issues=(),
     )
     simulator = _EvidenceSimulatorFactory()
-    judge = _EvidenceJudge()
+    judge = _EvidenceJudge(revision)
     approval = _FidelityApproval()
     runtime_catalog = _RuntimeCatalog()
     services = RouterWorkflowServices(
-        review_supplier=_ReviewSupplier(),
-        setup_supplier=_EvidenceSetupSupplier(),
+        review_supplier=_EvidenceReviewSupplier(revision),
+        setup_supplier=_EvidenceSetupSupplier(revision),
         simulator_factory=simulator,
         judge=judge,
         fidelity_approval=approval,
@@ -368,7 +385,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_sticky(
             services=services,
             budget=budget,
             created_at=_TIME,
-            code_revision=_REVISION,
+            code_revision=revision,
             phase_hook=checkpoint,
         )
     dispatches_after_crash = _dispatch_counts(simulator, judge, approval)
@@ -379,7 +396,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_sticky(
             services=services,
             budget=budget,
             created_at=_TIME,
-            code_revision=_REVISION,
+            code_revision=revision,
             phase_hook=checkpoint,
         )
     result = wmo.compose_router(
@@ -388,7 +405,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_sticky(
         services=services,
         budget=budget,
         created_at=_TIME,
-        code_revision=_REVISION,
+        code_revision=revision,
         phase_hook=checkpoint,
     )
     dispatches_after_completion = _dispatch_counts(simulator, judge, approval)
@@ -398,7 +415,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_sticky(
         services=services,
         budget=budget,
         created_at=_TIME,
-        code_revision=_REVISION,
+        code_revision=revision,
     )
 
     tasks = load_task_set(project.artifacts, result.plan.task_set_id).tasks
@@ -481,6 +498,129 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_sticky(
     assert runtime_catalog.clients["embedder"].embed_calls == 1
     assert sum(client.complete_calls for client in runtime_catalog.clients.values()) == 2
     assert "w16-customer-episode" not in first_http.text
+    provenance = verify_release_evidence(
+        project.artifacts,
+        expected_revision=revision,
+        report_name="w16-router",
+        claims={
+            "normalized_trace_count": 100,
+            "fit_task_count": 50,
+            "held_out_task_count": 20,
+            "planned_cell_count": 150,
+            "simulated_cell_count": 140,
+            "judgment_count": 150,
+            "maximum_judgments": 200,
+            "maximum_simulation_cost_usd": 2.0,
+            "observed_spend_usd": 0.0,
+            "hosted_call_count": 0,
+        },
+    )
+    assert provenance["code_revision"] == revision
+
+
+class _EvidenceReviewSupplier:
+    """Persist one exact-revision approved rubric and sealed calibration."""
+
+    def __init__(self, revision: str) -> None:
+        self.revision = revision
+
+    def __call__(
+        self,
+        project: ProjectStore,
+        build: wmo.ProjectBuild,
+        budget: RouterCompositionBudget,
+    ) -> ApprovedRouterReview:
+        del budget
+        if "rubric-a" not in project.artifacts.list_ids():
+            task_input = build.review.task_set
+            rubric = Rubric(
+                schema_version=1,
+                created_at=_TIME,
+                inputs=(task_input,),
+                code_revision=self.revision,
+                rubric_id="rubric-a",
+                dimensions=(
+                    RubricDimension(
+                        dimension_id="dimension-a",
+                        name="Task success",
+                        description="Whether the task was completed.",
+                        anchors=tuple(
+                            ScoreAnchor(score=score, description=f"Score {score} outcome.")
+                            for score in (0, 1, 2, 3, 4, 5)
+                        ),
+                    ),
+                ),
+                source_task_set_id=task_input.artifact_id,
+                status="human_approved",
+                approved_at=_TIME,
+            )
+            project.artifacts.write_json(
+                artifact_id=rubric.rubric_id,
+                artifact_type="rubric",
+                envelope=rubric,
+                files={"rubric.json": rubric},
+            )
+            tasks = load_task_set(project.artifacts, task_input.artifact_id).tasks
+            calibration = JudgeCalibration(
+                schema_version=1,
+                created_at=_TIME,
+                code_revision=self.revision,
+                calibration_id="calibration-a",
+                rubric_id="rubric-a",
+                judge_model=_snapshot("judge-model"),
+                judge_prompt_id="judge-prompt-v1",
+                judge_prompt_sha256="a" * 64,
+                label_set_id="label-set-a",
+                calibration_lineage_ids=tuple(
+                    task.lineage_group_id for task in tasks if task.partition == "fit"
+                ),
+                excluded_router_held_out_lineage_ids=tuple(
+                    task.lineage_group_id for task in tasks if task.partition == "held_out"
+                ),
+                validation_method="grouped_k_fold",
+                out_of_fold_report_id="calibration-report-a",
+                out_of_fold_report_sha256="a" * 64,
+                score_maps=(
+                    DimensionScoreMap(
+                        dimension_id="dimension-a",
+                        calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
+                    ),
+                ),
+                status="provisional",
+            )
+            project.artifacts.write_json(
+                artifact_id=calibration.calibration_id,
+                artifact_type="judge-calibration",
+                envelope=calibration,
+                files={"calibration.json": calibration},
+            )
+        return ApprovedRouterReview(rubric_id="rubric-a", calibration_id="calibration-a")
+
+
+def _persist_release_embeddings(project: ProjectStore, tasks, revision: str) -> None:  # noqa: ANN001
+    """Persist exact local vectors with release-checkout provenance."""
+    extractor = RouterFeatureExtractor()
+    embeddings = FrozenEmbeddingSet(
+        schema_version=1,
+        created_at=_TIME,
+        code_revision=revision,
+        embedding_set_id="embeddings-a",
+        embedder_alias="embedder",
+        embedder=_snapshot("embedder"),
+        embeddings=tuple(
+            FrozenEmbedding(
+                text_sha256=hashlib.sha256(extractor.from_task(task).encode()).hexdigest(),
+                values=(1.0, 0.0),
+            )
+            for task in tasks
+        ),
+    )
+    project.artifacts.write_json(
+        artifact_id=embeddings.embedding_set_id,
+        artifact_type="router-embeddings",
+        envelope=embeddings,
+        files={"embeddings.json": embeddings},
+    )
 
 
 def _dispatch_counts(

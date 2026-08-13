@@ -53,9 +53,7 @@ def test_yes_consents_without_asking_even_at_a_terminal(monkeypatch: pytest.Monk
     monkeypatch.setattr(consent_module, "Confirm", answer)
     console, buffer = _console(terminal=True)
 
-    assert require_spend_consent(
-        console, yes=True, spend="~$12.00", command="wmo optimize route sweep"
-    )
+    assert require_spend_consent(console, yes=True, spend="~$12.00", command="wmo optimize model")
     assert answer.asked == []
     assert buffer.getvalue() == ""
 
@@ -68,7 +66,7 @@ def test_a_terminal_is_asked_and_a_no_declines(
     console, _buffer = _console(terminal=True)
 
     assert not require_spend_consent(
-        console, yes=False, spend="~$12.00", command="wmo optimize route sweep"
+        console, yes=False, spend="~$12.00", command="wmo optimize model"
     )
     assert len(answer.asked) == 1
 
@@ -80,9 +78,7 @@ def test_a_terminal_is_asked_and_a_yes_consents(
     monkeypatch.setattr(consent_module, "Confirm", answer)
     console, _buffer = _console(terminal=True)
 
-    assert require_spend_consent(
-        console, yes=False, spend="~$12.00", command="wmo optimize route sweep"
-    )
+    assert require_spend_consent(console, yes=False, spend="~$12.00", command="wmo optimize model")
     assert len(answer.asked) == 1
 
 
@@ -103,14 +99,14 @@ def test_no_terminal_and_no_yes_refuses_naming_the_spend_and_the_flag(
             console,
             yes=False,
             spend="~$12.00 across 240 cell(s)",
-            command="wmo optimize route sweep",
+            command="wmo optimize model",
         )
 
     assert caught.value.exit_code == NO_CONSENT_EXIT_CODE
     assert answer.asked == []  # nothing was asked, because there was nobody to ask
     flat = _flat(buffer)
     assert "cannot ask for spend consent" in flat
-    assert "wmo optimize route sweep would spend ~$12.00 across 240 cell(s) here" in flat
+    assert "wmo optimize model would spend ~$12.00 across 240 cell(s) here" in flat
     assert "Re-run the same command with --yes to consent explicitly." in flat
 
 
@@ -131,7 +127,7 @@ def test_the_refusal_names_a_second_way_out_when_the_command_has_one() -> None:
 
 # -- the input stream is half of "interactive" --------------------------------------------------
 # Checking only the console asked the wrong stream: the console reports on stdout while the
-# prompt reads stdin, so `wmo optimize route sweep < /dev/null` at a terminal passed the gate
+# prompt reads stdin, so `wmo optimize model < /dev/null` at a terminal passed the gate
 # and then had a redirect answer the money question for the absent human.
 
 
@@ -148,9 +144,7 @@ def test_a_terminal_stdout_with_redirected_stdin_refuses(
     console, buffer = _console(terminal=True)
 
     with pytest.raises(typer.Exit) as caught:
-        require_spend_consent(
-            console, yes=False, spend="~$12.00", command="wmo optimize route sweep"
-        )
+        require_spend_consent(console, yes=False, spend="~$12.00", command="wmo optimize model")
 
     assert caught.value.exit_code == NO_CONSENT_EXIT_CODE
     assert answer.asked == []  # never offered, so a redirect could not answer it
@@ -196,7 +190,7 @@ def test_a_blank_answer_refuses_instead_of_authorizing_the_spend(
     console, _buffer = _console(terminal=True)
 
     assert not require_spend_consent(
-        console, yes=False, spend="~$12.00", command="wmo optimize route sweep"
+        console, yes=False, spend="~$12.00", command="wmo optimize model"
     )
 
 
@@ -212,13 +206,13 @@ def test_eof_at_the_prompt_is_the_documented_refusal_not_a_traceback(
             console,
             yes=False,
             spend="~$12.00 across 240 cell(s)",
-            command="wmo optimize route sweep",
+            command="wmo optimize model",
         )
 
     assert caught.value.exit_code == NO_CONSENT_EXIT_CODE
     flat = _flat(buffer)
     assert "cannot ask for spend consent" in flat
-    assert "wmo optimize route sweep would spend ~$12.00 across 240 cell(s) here" in flat
+    assert "wmo optimize model would spend ~$12.00 across 240 cell(s) here" in flat
     assert "Re-run the same command with --yes to consent explicitly." in flat
 
 
@@ -230,6 +224,6 @@ def test_the_prompt_defaults_to_refusing(
     monkeypatch.setattr(consent_module, "Confirm", answer)
     console, _buffer = _console(terminal=True)
 
-    require_spend_consent(console, yes=False, spend="~$12.00", command="wmo optimize route sweep")
+    require_spend_consent(console, yes=False, spend="~$12.00", command="wmo optimize model")
 
     assert answer.defaults == [False]

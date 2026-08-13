@@ -12,10 +12,9 @@ read whatever the redirect supplied, and a blank line was taken as approval.
 
 This lives in one place because the rule kept being re-implemented per command and a site kept
 being missed: `wmo optimize model` shipped proceed-and-note and spent a scripted caller's real
-money (#305), `route sweep`, managed SFT execution, and the harbor population search were fixed
-next (#307), and the world-model mode of `wmo optimize harness` was still falling through with
-no prompt and no notice after both. Every gate now calls `require_spend_consent`, so there is
-one behaviour to read and one place a future spend surface has to reach for.
+money (#305). Later router-composition and managed SFT spend surfaces exposed the same class of
+failure. Every retained gate now calls `require_spend_consent`, so there is one behaviour to read
+and one place a future spend surface has to reach for.
 """
 
 from __future__ import annotations
@@ -97,7 +96,7 @@ def require_spend_consent(
             projected dollar figure, or the rollout/episode counts when the work is unpriced).
             Printed in the refusal, so a scripted caller learns the size of what it just
             declined to authorize instead of only that something was skipped.
-        command: The command being run, e.g. `wmo optimize route sweep`, named in the refusal
+        command: The command being run, e.g. `wmo optimize model`, named in the refusal
             so the message says what to re-run.
         alternative: An optional second way out, phrased as a flag plus what it does, e.g.
             "--dry-run to see the plan without spending".

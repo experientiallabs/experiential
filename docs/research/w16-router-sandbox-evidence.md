@@ -4,6 +4,10 @@ W16 verifies the current public router workflow and the text-versus-sandbox comp
 deterministic injected clients. The evidence invokes no hosted provider, E2B, Tinker, credential,
 or paid service. It does not claim provider quality or cloud-environment parity.
 
+The exact-checkout gate resolves and validates the full 40-hex Git revision, writes it into every
+persisted W16 artifact, recursively verifies manifest inputs and nested artifact envelopes, and
+uploads machine-readable JSON plus JUnit output. Symbolic or mismatched revision labels fail closed.
+
 ## Router workflow
 
 `wmo/workflow/router_evidence_test.py` drives `wmo.compose_router` from 100 normalized traces.

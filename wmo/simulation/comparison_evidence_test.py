@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
@@ -11,14 +12,20 @@ from typing import cast
 
 import pytest
 
-from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactInput, sha256_json
-from wmo.common.evaluations import EvaluationPlan
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactInput,
+    canonical_json_bytes,
+    sha256_json,
+)
+from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import (
     ModelCapabilities,
     ModelClient,
     ModelMessage,
     ModelRequest,
     ModelSnapshot,
+    RoutedCandidateSnapshot,
     ToolCall,
 )
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
@@ -30,7 +37,8 @@ from wmo.common.rollouts import (
     StopReason,
     WorldModelSimulatorSnapshot,
 )
-from wmo.common.tasks import TaskCase
+from wmo.common.tasks import TaskCase, TaskSet
+from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
 from wmo.runtime.agents import AgentEpisode
 from wmo.runtime.environments import (
     EnvironmentSession,
@@ -47,7 +55,7 @@ from wmo.simulation import (
     persist_comparison,
     persist_comparison_spec,
 )
-from wmo.simulation.comparison_test import _inputs, _persist_plan, _persist_tasks
+from wmo.simulation.comparison_test import _inputs
 from wmo.simulation.engines import CandidateBinding, SandboxSimulator
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import _response, _ScriptedClient
@@ -114,18 +122,20 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
     tmp_path: Path,
 ) -> None:
     """Two actual modes replay exactly while one process failure remains in the denominator."""
+    revision = exact_checkout_revision()
     store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="w16-comparison"))
-    lock_input = _persist_policy_lock(store)
+    lock_input = _persist_policy_lock(store, revision)
     tasks = (_task("task-a"), _task("task-b"))
-    task_set, task_input = _persist_tasks(store, tasks)
-    text_plan, text_plan_input = _persist_plan(store, tasks, task_input, "text")
-    sandbox_plan, sandbox_plan_input = _persist_plan(store, tasks, task_input, "sandbox")
-    text_spec = _spec(text_plan, text_plan_input, task_input, SimulationMode.WORLD_MODEL)
+    task_set, task_input = _persist_tasks(store, tasks, revision)
+    text_plan, text_plan_input = _persist_plan(store, tasks, task_input, "text", revision)
+    sandbox_plan, sandbox_plan_input = _persist_plan(store, tasks, task_input, "sandbox", revision)
+    text_spec = _spec(text_plan, text_plan_input, task_input, SimulationMode.WORLD_MODEL, revision)
     sandbox_spec = _spec(
         sandbox_plan,
         sandbox_plan_input,
         task_input,
         SimulationMode.SANDBOX,
+        revision,
     )
     candidate_snapshot = text_plan.candidate_snapshots[0].model
     candidate_text = _ScriptedClient(
@@ -214,13 +224,14 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
         text_set,
         sandbox_set,
         tasks,
+        revision,
     )
     persist_comparison_spec(comparison, store)
     report = compare_text_and_sandbox(
         comparison,
         store=store,
         created_at=_REPORT_AT,
-        code_revision="w16-comparison-v1",
+        code_revision=revision,
     )
     persist_comparison(report, store)
 
@@ -239,7 +250,7 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
         comparison,
         store=store,
         created_at=_REPORT_AT,
-        code_revision="w16-comparison-v1",
+        code_revision=revision,
     )
     assert replay == report
     assert (
@@ -249,6 +260,24 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
         process_runtime.open_calls,
     ) == dispatches
     assert list(tmp_path.glob("wmo-sandbox-*")) == []
+    provenance = verify_release_evidence(
+        store,
+        expected_revision=revision,
+        report_name="w16-sandbox-comparison",
+        claims={
+            "expected_pair_count": 2,
+            "paired_rollout_count": 2,
+            "usable_pair_count": 1,
+            "missing_text_count": 0,
+            "missing_sandbox_count": 0,
+            "failed_text_count": 0,
+            "failed_sandbox_count": 1,
+            "observed_spend_usd": 0.0,
+            "hosted_call_count": 0,
+            "comparison_scope": "structural-only",
+        },
+    )
+    assert provenance["code_revision"] == revision
 
 
 def _comparison_spec(
@@ -264,6 +293,7 @@ def _comparison_spec(
     text_set: SimulationArtifactSet,
     sandbox_set: SimulationArtifactSet,
     tasks: Sequence[TaskCase],
+    revision: str,
 ) -> SimulationComparisonSpec:
     """Freeze one post-lock comparison from actual simulator outputs."""
     text_spec_input = artifact_input(store.read(text_spec.simulation_id).manifest)
@@ -307,7 +337,7 @@ def _comparison_spec(
         schema_version=1,
         created_at=_COMPARISON_AT,
         inputs=inputs,
-        code_revision="w16-comparison-v1",
+        code_revision=revision,
         comparison_id="w16-text-sandbox-comparison",
         policy_lock_input=lock_input,
         task_set_input=task_input,
@@ -321,12 +351,12 @@ def _comparison_spec(
     )
 
 
-def _persist_policy_lock(store: ArtifactStore) -> ArtifactInput:
+def _persist_policy_lock(store: ArtifactStore, revision: str) -> ArtifactInput:
     """Persist the immutable policy barrier required before comparison evidence."""
     envelope = ArtifactEnvelope(
         schema_version=1,
         created_at=_LOCK_AT,
-        code_revision="w16-lock-v1",
+        code_revision=revision,
     )
     manifest = store.write_json(
         artifact_id="w16-policy-lock",
@@ -342,13 +372,14 @@ def _spec(
     plan_input: ArtifactInput,
     task_input: ArtifactInput,
     mode: SimulationMode,
+    revision: str,
 ) -> SimulationSpec:
     """Return one exact executable specification without pre-persisting its outputs."""
     return SimulationSpec(
         schema_version=1,
         created_at=_EVIDENCE_AT,
         inputs=_inputs(plan_input, task_input),
-        code_revision="w16-comparison-v1",
+        code_revision=revision,
         simulation_id=f"w16-{mode.value}-simulation",
         evaluation_plan_id=plan.plan_id,
         cell_ids=tuple(cell.cell_id for cell in plan.cells),
@@ -373,6 +404,87 @@ def _spec(
         ),
         seed=16,
         maximum_steps=2,
+    )
+
+
+def _persist_tasks(
+    store: ArtifactStore,
+    tasks: tuple[TaskCase, ...],
+    revision: str,
+) -> tuple[TaskSet, ArtifactInput]:
+    """Persist exact release-bound tasks for both comparison modes."""
+    payload = b"\n".join(canonical_json_bytes(task) for task in tasks) + b"\n"
+    task_set = TaskSet(
+        schema_version=1,
+        created_at=_PLAN_AT,
+        code_revision=revision,
+        task_set_id="task-set-1",
+        task_ids=tuple(task.task_id for task in tasks),
+        tasks_path="tasks.jsonl",
+        tasks_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    manifest = store.write(
+        artifact_id=task_set.task_set_id,
+        artifact_type="task-set",
+        envelope=task_set,
+        files={"task-set.json": canonical_json_bytes(task_set), "tasks.jsonl": payload},
+    )
+    return task_set, artifact_input(manifest)
+
+
+def _persist_plan(
+    store: ArtifactStore,
+    tasks: tuple[TaskCase, ...],
+    task_input: ArtifactInput,
+    label: str,
+    revision: str,
+) -> tuple[EvaluationPlan, ArtifactInput]:
+    """Persist one release-bound mode-specific plan over the same tasks."""
+    cells = tuple(
+        EvaluationCell(
+            cell_id=f"{label}-cell-{suffix}",
+            task_id=task.task_id,
+            candidate_alias="candidate-a",
+            repeat=0,
+            purpose="held_out",
+            execution="simulate",
+        )
+        for task, suffix in zip(tasks, ("a", "b"), strict=True)
+    )
+    plan = EvaluationPlan(
+        schema_version=2,
+        created_at=_PLAN_AT,
+        inputs=(task_input,),
+        code_revision=revision,
+        plan_id=f"{label}-plan-1",
+        task_set_id="task-set-1",
+        candidate_snapshots=(
+            RoutedCandidateSnapshot(alias="candidate-a", model=_candidate_snapshot()),
+        ),
+        pricing_snapshot_id="pricing-1",
+        pricing_snapshot_sha256="d" * 64,
+        fidelity_thresholds_id="fidelity-thresholds-1",
+        fidelity_thresholds_sha256="f" * 64,
+        fidelity_protocol_sha256="e" * 64,
+        cells=cells,
+    )
+    manifest = store.write_json(
+        artifact_id=plan.plan_id,
+        artifact_type="evaluation-plan",
+        envelope=plan,
+        files={"evaluation-plan.json": plan},
+    )
+    return plan, artifact_input(manifest)
+
+
+def _candidate_snapshot() -> ModelSnapshot:
+    """Return the one frozen candidate used by both comparison modes."""
+    return ModelSnapshot(
+        provider="test",
+        model_id="candidate-a",
+        revision="fixture",
+        capabilities_sha256="c" * 64,
+        connection_sha256="d" * 64,
     )
 
 

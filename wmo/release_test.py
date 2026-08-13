@@ -216,6 +216,34 @@ def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
     assert LocalProcessEnvironmentRuntime.__module__ == "wmo.runtime.environments.local"
 
 
+def test_documentation_index_commands_and_release_scope_are_current() -> None:
+    """Every indexed doc exists and release docs name current commands and explicit exclusions."""
+    repository = Path(__file__).resolve().parent.parent
+    docs = repository / "docs"
+    index = (docs / "README.md").read_text(encoding="utf-8")
+    indexed_paths = re.findall(r"\| `([^`]+\.md)` \|", index)
+    assert indexed_paths
+    assert not [path for path in indexed_paths if not (docs / path).is_file()]
+
+    usage = (docs / "usage.md").read_text(encoding="utf-8")
+    assert "wmo optimize router" in usage
+    assert "wmo optimize model" in usage
+    assert "wmo optimize route" not in usage.replace("wmo optimize router", "")
+
+    scope = (docs / "release-scope.md").read_text(encoding="utf-8")
+    for exclusion in (
+        "No paid E2B or Harbor cloud smoke ran",
+        "No real Tinker training ran",
+        "No trained-versus-base behavioral comparison ran",
+        "exactly $0.00 observed service spend",
+    ):
+        assert exclusion in scope
+
+    ingest = (docs / "reference" / "ingest.md").read_text(encoding="utf-8")
+    assert "PostHogPullRequest" in ingest
+    assert "pull_posthog_traces" in ingest
+
+
 @pytest.mark.parametrize(
     "stale_member",
     [
