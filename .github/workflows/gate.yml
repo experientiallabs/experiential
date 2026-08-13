@@ -25,3 +25,24 @@ jobs:
         run: uv run ty check
       - name: non-live tests
         run: uv run pytest -q -k "not live"
+
+  w16-darwin-evidence:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
+      - name: W16 router and bounded local-process evidence
+        run: >-
+          uv run pytest -q
+          --junitxml=w16-darwin-evidence.xml
+          wmo/workflow/router_evidence_test.py
+          wmo/simulation/comparison_evidence_test.py
+      - name: Upload W16 Darwin evidence result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: w16-darwin-evidence
+          path: w16-darwin-evidence.xml

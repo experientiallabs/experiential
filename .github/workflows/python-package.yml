@@ -56,7 +56,29 @@ jobs:
         run: |
           uv venv /tmp/wmo-wheel-smoke
           uv pip install --python /tmp/wmo-wheel-smoke/bin/python dist/*.whl
-          /tmp/wmo-wheel-smoke/bin/python -c "import wmo, wmo.common.models, wmo.runtime.models"
+          cd /tmp
+          /tmp/wmo-wheel-smoke/bin/python - <<'PY'
+          import wmo
+          import wmo.common.models
+          import wmo.runtime.models
+          from wmo.runtime.environments import LocalProcessEnvironmentRuntime
+          from wmo.runtime.router import RouterRuntime, create_project_router_app
+          from wmo.simulation import compare_text_and_sandbox
+          from wmo.simulation.engines import SandboxSimulator
+          from wmo.workflow import RouterCompositionResult
+          from wmo.simulation import SimulationSpec
+
+          assert callable(wmo.compose_router)
+          assert callable(wmo.load_project_router)
+          assert callable(wmo.create_project_router_app)
+          assert wmo.RouterRuntime is RouterRuntime
+          assert wmo.RouterCompositionResult is RouterCompositionResult
+          assert wmo.create_project_router_app is create_project_router_app
+          assert callable(compare_text_and_sandbox)
+          assert SimulationSpec.__module__ == "wmo.simulation.specs.simulation"
+          assert SandboxSimulator.__module__ == "wmo.simulation.engines.sandbox"
+          assert LocalProcessEnvironmentRuntime.__module__ == "wmo.runtime.environments.local"
+          PY
           /tmp/wmo-wheel-smoke/bin/wmo --help
       - uses: actions/upload-artifact@v4
         with:
