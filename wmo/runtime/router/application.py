@@ -21,6 +21,7 @@ from wmo.common.project import (
 )
 from wmo.common.routing import KnnRouterPolicy
 from wmo.runtime.models import RuntimeModelCatalog
+from wmo.runtime.router.completion import RouterCompletionService
 from wmo.runtime.router.endpoint import create_router_endpoint
 from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
 
@@ -78,12 +79,18 @@ def load_project_router(
         raise RouterApplicationError(str(exc)) from exc
 
 
-def create_project_router_app(project: str, runtime: RouterRuntime) -> FastAPI:
+def create_project_router_app(
+    project: str,
+    runtime: RouterRuntime,
+    *,
+    completion_service: RouterCompletionService | None = None,
+) -> FastAPI:
     """Create the dev-only loopback HTTP adapter for one loaded project router.
 
     Args:
         project: Public local model name accepted by the endpoint.
         runtime: Already verified frozen router runtime.
+        completion_service: Optional durable service for standard idempotent requests.
 
     Returns:
         FastAPI application exposing OpenAI Chat Completions and Responses routes.
@@ -110,7 +117,10 @@ def create_project_router_app(project: str, runtime: RouterRuntime) -> FastAPI:
             },
         )
 
-    application.include_router(create_router_endpoint({project: runtime}))
+    services = {project: completion_service} if completion_service is not None else None
+    application.include_router(
+        create_router_endpoint({project: runtime}, completion_services=services)
+    )
     return application
 
 

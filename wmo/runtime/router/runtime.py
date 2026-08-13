@@ -277,6 +277,7 @@ class RouterRuntime:
                         request_sha256=request_sha256,
                         episode_id=identity,
                     )
+            decision = self._eligible_decision(request, decision, request_sha256, identity)
             self._record(decision)
             if episode_decision is None:
                 self._episode_decisions[identity_sha256] = decision
@@ -462,6 +463,42 @@ class RouterRuntime:
             self._resolved[alias] = resolved
         return resolved
 
+    def _eligible_decision(
+        self,
+        request: ModelRequest,
+        decision: RoutingDecision,
+        request_sha256: Sha256,
+        episode_id: str,
+    ) -> RoutingDecision:
+        """Use a frozen eligible candidate when the original selection cannot serve the request."""
+        if _supports_request(self._resolve(decision.selected_alias), request):
+            return decision
+        eligible = tuple(
+            candidate.alias
+            for candidate in self.policy.candidates
+            if _supports_request(self._resolve(candidate.alias), request)
+        )
+        if not eligible:
+            return decision
+        alias = (
+            self.policy.baseline_alias
+            if self.policy.baseline_alias in eligible
+            else min(
+                eligible,
+                key=lambda item: (
+                    self.bank.complete_weighted_cost(item) is None,
+                    self.bank.complete_weighted_cost(item) or 0.0,
+                    item,
+                ),
+            )
+        )
+        return self._fallback_decision(
+            request_sha256,
+            episode_id,
+            "capability_eligibility",
+            selected_alias=alias,
+        )
+
     def _fallback_decision(
         self,
         request_sha256: str,
@@ -529,3 +566,12 @@ def _validate_idempotency_key(value: str) -> None:
         raise ValueError("idempotency key must be 1 to 512 non-blank characters")
     if any(ord(character) < 33 or ord(character) > 126 for character in value):
         raise ValueError("idempotency key must contain only visible ASCII characters")
+
+
+def _supports_request(resolved: ResolvedModel, request: ModelRequest) -> bool:
+    """Return whether one frozen resolved model proves every requested protocol capability."""
+    if _requires_tool_protocol(request) and not resolved.capabilities.supports_tools:
+        return False
+    requested = request.maximum_output_tokens
+    available = resolved.capabilities.maximum_output_tokens
+    return requested is None or (available is not None and requested <= available)

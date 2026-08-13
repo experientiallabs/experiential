@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 from openai import OpenAI
@@ -12,15 +14,60 @@ from openai.types.chat import (
     ChatCompletionToolUnionParam,
 )
 from openai.types.responses import Response, ResponseStreamEvent
+from openai.types.responses.function_tool_param import FunctionToolParam
 
+from wmo.common.models import (
+    AssistantAction,
+    ModelFinishReason,
+    ModelRequest,
+    ModelResponse,
+    OperationEconomics,
+)
 from wmo.runtime.router.application import create_project_router_app
-from wmo.runtime.router.runtime import RouterRuntime
-from wmo.runtime.router.runtime_test import _Client, _runtime
+from wmo.runtime.router.completion import RouterCompletionConflictError
+from wmo.runtime.router.endpoint import (
+    HttpResponseRequest,
+    _chat_completion,
+    _openai_response,
+)
+from wmo.runtime.router.runtime import RoutedModelResponse, RouterRuntime
+from wmo.runtime.router.runtime_test import _Client, _runtime, _snapshot
 
 
-def _clients(*, candidate_tools: bool = True) -> tuple[OpenAI, TestClient, RouterRuntime, _Client]:
+class _ReplayService:
+    """Thread-safe test double for the durable journal completion contract."""
+
+    def __init__(self, runtime: RouterRuntime) -> None:
+        self.runtime = runtime
+        self._lock = threading.Lock()
+        self._completed: dict[str, tuple[ModelRequest, RoutedModelResponse]] = {}
+
+    def complete(
+        self,
+        request: ModelRequest,
+        *,
+        idempotency_key: str,
+        conversation_id: str | None = None,
+    ) -> RoutedModelResponse:
+        if not idempotency_key:
+            return self.runtime.complete(request, episode_id=conversation_id)
+        with self._lock:
+            existing = self._completed.get(idempotency_key)
+            if existing is not None:
+                if existing[0] != request:
+                    raise RouterCompletionConflictError("key reused for another request")
+                return existing[1]
+            result = self.runtime.complete(request, episode_id=conversation_id or idempotency_key)
+            self._completed[idempotency_key] = (request, result)
+            return result
+
+
+def _clients(
+    *, candidate_tools: bool = True, durable: bool = False
+) -> tuple[OpenAI, TestClient, RouterRuntime, _Client]:
     runtime, model_client = _runtime(candidate_tools=candidate_tools)
-    app = create_project_router_app("router-a", runtime)
+    service = _ReplayService(runtime) if durable else None
+    app = create_project_router_app("router-a", runtime, completion_service=service)
     http = TestClient(app)
     openai = OpenAI(api_key="local-test", base_url="http://testserver/v1", http_client=http)
     return openai, http, runtime, model_client
@@ -156,6 +203,26 @@ def test_official_responses_client_continues_with_previous_response_id() -> None
     ]
 
 
+def test_responses_continuation_does_not_carry_prior_instructions() -> None:
+    """Each Responses instructions field is scoped only to its own provider call."""
+    openai, _http, _runtime_value, model_client = _clients()
+
+    first = openai.responses.create(model="router-a", input="one", instructions="FIRST")
+    openai.responses.create(
+        model="router-a",
+        input="two",
+        instructions="SECOND",
+        previous_response_id=first.id,
+    )
+
+    assert [(item.role, item.content) for item in model_client.requests[-1].messages] == [
+        ("user", "one"),
+        ("assistant", None),
+        ("system", "SECOND"),
+        ("user", "two"),
+    ]
+
+
 def test_openai_text_content_parts_are_preserved() -> None:
     """Chat and Responses text parts reach the routed model as complete visible text."""
     openai, _http, _runtime_value, model_client = _clients()
@@ -230,31 +297,176 @@ def test_official_clients_parse_buffered_streams() -> None:
     assert response_events[-1].type == "response.completed"
 
 
-def test_idempotency_key_reuses_decision_after_provider_failure() -> None:
-    """A standard idempotency key pins the retry decision without a WMO episode header."""
-    openai, http, runtime, model_client = _clients()
-    model_client.completion_error = RuntimeError("provider unavailable")
-    payload = {"model": "router-a", "messages": [{"role": "user", "content": "retry"}]}
-    headers = {"Idempotency-Key": "interaction-a"}
+def test_responses_tool_stream_emits_the_official_item_and_argument_events() -> None:
+    """Official SDK tool loops observe the complete Responses streaming lifecycle."""
+    openai, _http, _runtime_value, _model_client = _clients()
 
-    assert http.post("/v1/chat/completions", json=payload, headers=headers).status_code == 502
-    cached = next(iter(runtime._request_decisions.values()))  # noqa: SLF001
-    response = openai.chat.completions.create(
-        model="router-a",
-        messages=[{"role": "user", "content": "retry"}],
-        extra_headers=headers,
+    events = list(
+        openai.responses.create(
+            model="router-a",
+            input="write",
+            tools=[
+                FunctionToolParam(
+                    type="function",
+                    name="write",
+                    parameters={"type": "object"},
+                    strict=None,
+                )
+            ],
+            stream=True,
+        )
     )
 
-    assert response.id.startswith("chatcmpl-")
-    assert next(iter(runtime._request_decisions.values())) == cached  # noqa: SLF001
-    assert model_client.embed_calls == 1
-    assert model_client.complete_calls == 2
+    assert [event.type for event in events] == [
+        "response.created",
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+
+
+def test_nested_unsupported_official_fields_fail_before_dispatch() -> None:
+    """Official nested fields are never silently discarded by the provider-neutral seam."""
+    _openai, http, _runtime_value, model_client = _clients()
+
+    response = http.post(
+        "/v1/chat/completions",
+        json={
+            "model": "router-a",
+            "messages": [{"role": "user", "content": "read", "name": "customer"}],
+        },
+    )
+    strict = http.post(
+        "/v1/responses",
+        json={
+            "model": "router-a",
+            "input": "read",
+            "tools": [{"type": "function", "name": "read", "parameters": {}, "strict": True}],
+        },
+    )
+
+    assert response.status_code == strict.status_code == 400
+    assert model_client.embed_calls == model_client.complete_calls == 0
+
+
+def test_length_and_responses_request_metadata_are_preserved() -> None:
+    """Truncation and supported Responses request metadata survive public adaptation."""
+    model_response = ModelResponse(
+        output=AssistantAction(content="partial"),
+        model=_snapshot("cheap"),
+        economics=OperationEconomics(),
+        finish_reason=ModelFinishReason.LENGTH,
+    )
+    request = HttpResponseRequest.model_validate(
+        {
+            "model": "router-a",
+            "input": "write",
+            "instructions": "be brief",
+            "temperature": 0.2,
+            "max_output_tokens": 10,
+            "parallel_tool_calls": True,
+            "tool_choice": {"type": "function", "name": "write"},
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "write",
+                    "parameters": {"type": "object"},
+                    "strict": None,
+                }
+            ],
+        }
+    )
+
+    chat = _chat_completion("router-a", model_response.output, model_response)
+    response = _openai_response(
+        "router-a",
+        model_response.output,
+        model_response,
+        request=request,
+        idempotency_key=None,
+        previous_response_id=None,
+    )
+
+    assert chat.choices[0].finish_reason == "length"
+    assert response.status == "incomplete"
+    assert response.incomplete_details is not None
+    assert response.incomplete_details.reason == "max_output_tokens"
+    assert response.instructions == "be brief"
+    assert response.temperature == 0.2
+    assert response.max_output_tokens == 10
+    assert response.parallel_tool_calls is True
+    assert not isinstance(response.tool_choice, str)
+    assert response.tool_choice.type == "function"
+    assert response.tools[0].type == "function"
+
+
+def test_idempotency_key_fails_closed_without_a_durable_service() -> None:
+    """A raw runtime rejects claimed idempotency before selection or provider dispatch."""
+    _openai, http, runtime, model_client = _clients()
+
+    response = http.post(
+        "/v1/chat/completions",
+        json={"model": "router-a", "messages": [{"role": "user", "content": "retry"}]},
+        headers={"Idempotency-Key": "interaction-a"},
+    )
+
+    assert response.status_code == 409
+    assert model_client.embed_calls == model_client.complete_calls == 0
+    assert not runtime._request_decisions  # noqa: SLF001
+
+
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses"))
+def test_empty_idempotency_key_is_rejected_before_dispatch(path: str) -> None:
+    """An empty standard idempotency key cannot become an unkeyed provider call."""
+    _openai, http, runtime, model_client = _clients(durable=True)
+    payload = (
+        {"model": "router-a", "input": "retry"}
+        if path.endswith("responses")
+        else {"model": "router-a", "messages": [{"role": "user", "content": "retry"}]}
+    )
+
+    response = http.post(path, json=payload, headers={"Idempotency-Key": " "})
+
+    assert response.status_code == 400
+    assert model_client.embed_calls == model_client.complete_calls == 0
+    assert not runtime._request_decisions  # noqa: SLF001
+
+
+def test_durable_service_replays_the_same_public_completion() -> None:
+    """A durable completion service prevents duplicate dispatch and public-envelope drift."""
+    _openai, http, _runtime_value, model_client = _clients(durable=True)
+    payload = {"model": "router-a", "messages": [{"role": "user", "content": "same"}]}
+    headers = {"Idempotency-Key": "interaction-a"}
+
+    first = http.post("/v1/chat/completions", json=payload, headers=headers)
+    second = http.post("/v1/chat/completions", json=payload, headers=headers)
+
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content
+    assert first.json()["id"].startswith("chatcmpl-")
+    assert model_client.embed_calls == model_client.complete_calls == 1
+
+
+def test_durable_service_replays_the_same_public_response() -> None:
+    """Responses replay preserves nested output identities without another provider call."""
+    _openai, http, _runtime_value, model_client = _clients(durable=True)
+    payload = {"model": "router-a", "input": "same"}
+    headers = {"Idempotency-Key": "interaction-response"}
+
+    first = http.post("/v1/responses", json=payload, headers=headers)
+    second = http.post("/v1/responses", json=payload, headers=headers)
+
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content
+    assert model_client.embed_calls == model_client.complete_calls == 1
 
 
 @pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses"))
 def test_idempotency_key_rejects_a_different_request(path: str) -> None:
     """One standard idempotency key cannot merge two divergent OpenAI requests."""
-    _openai, http, _runtime_value, model_client = _clients()
+    _openai, http, _runtime_value, model_client = _clients(durable=True)
     headers = {"Idempotency-Key": "one-logical-request"}
     if path.endswith("responses"):
         first = {"model": "router-a", "input": "first"}
@@ -271,38 +483,11 @@ def test_idempotency_key_rejects_a_different_request(path: str) -> None:
 
     assert conflict.status_code == 409
     assert (
-        conflict.json()["error"]["message"] == "Idempotency-Key conflicts with live request state"
+        conflict.json()["error"]["message"]
+        == "Idempotency-Key conflicts with durable request state"
     )
     assert model_client.embed_calls == 1
     assert model_client.complete_calls == 1
-
-
-@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses"))
-def test_expired_idempotency_key_starts_a_fresh_episode(
-    path: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An expired transport key cannot reconnect to retained router state."""
-    now = [100.0]
-    monkeypatch.setattr("wmo.runtime.router.endpoint.time.monotonic", lambda: now[0])
-    _openai, http, runtime, model_client = _clients()
-    headers = {"Idempotency-Key": "reusable-after-retention"}
-    if path.endswith("responses"):
-        first = {"model": "router-a", "input": "first"}
-        changed = {"model": "router-a", "input": "changed"}
-    else:
-        first = {"model": "router-a", "messages": [{"role": "user", "content": "first"}]}
-        changed = {
-            "model": "router-a",
-            "messages": [{"role": "user", "content": "changed"}],
-        }
-
-    assert http.post(path, json=first, headers=headers).status_code == 200
-    now[0] += 24 * 60 * 60 + 1
-    assert http.post(path, json=changed, headers=headers).status_code == 200
-
-    assert model_client.embed_calls == 2
-    assert model_client.complete_calls == 2
-    assert len(runtime._episode_decisions) == 2  # noqa: SLF001
 
 
 @pytest.mark.parametrize(
