@@ -54,7 +54,8 @@ class TraceRAGRetriever:
         """Return top cosine matches after excluding query-related lineages.
 
         Args:
-            query: Request-visible task, initial context, action, lineage exclusions, and limit.
+            query: Request-visible task, initial context, action, lineage exclusions, and optional
+                limit. An omitted limit uses the immutable index default.
 
         Returns:
             Up to ``top_k`` fit-side real transitions. Equal scores use transition ID order.
@@ -83,4 +84,5 @@ class TraceRAGRetriever:
             )
             candidates.append(RAGMatch(transition=transition, score=score))
         candidates.sort(key=lambda match: (-match.score, match.transition.transition_id))
-        return tuple(candidates[: query.top_k])
+        limit = self._index.default_top_k if query.top_k is None else query.top_k
+        return tuple(candidates[:limit])

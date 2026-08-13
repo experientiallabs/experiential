@@ -204,6 +204,68 @@ def test_equal_scores_use_transition_id_order(tmp_path: Path) -> None:
     )
 
 
+def test_omitted_query_limit_uses_index_default_and_explicit_limit_overrides(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path, "persisted-top-k")
+    source_input, traces = _persist_traces(store, count=3)
+    embedder = _constant_binding()
+    persisted = persist_trace_rag(
+        store,
+        (source_input,),
+        _bindings(traces),
+        created_at=_CREATED_AT,
+        code_revision="revision-a",
+        embedder=embedder,
+        default_top_k=1,
+    )
+    retriever = TraceRAGRetriever(load_rag_index(store, persisted.index.rag_id), embedder=embedder)
+    action = RAGAction(kind="message", content="anything")
+
+    inherited = retriever.retrieve(RAGQuery(task="anything", action=action))
+    overridden = retriever.retrieve(RAGQuery(task="anything", action=action, top_k=2))
+
+    assert len(inherited) == 1
+    assert len(overridden) == 2
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [("default_top_k", 1), ("code_revision", "revision-b")],
+)
+def test_replay_sensitive_fields_produce_distinct_artifact_ids(
+    tmp_path: Path,
+    changed_field: str,
+    changed_value: str | int,
+) -> None:
+    store = _store(tmp_path, f"identity-{changed_field}")
+    source_input, traces = _persist_traces(store, count=2)
+    kwargs: dict[str, str | int] = {
+        "code_revision": "revision-a",
+        "default_top_k": 5,
+    }
+    kwargs[changed_field] = changed_value
+    original = persist_trace_rag(
+        store,
+        (source_input,),
+        _bindings(traces),
+        created_at=_CREATED_AT,
+        code_revision="revision-a",
+        default_top_k=5,
+    )
+    changed = persist_trace_rag(
+        store,
+        (source_input,),
+        _bindings(traces),
+        created_at=_CREATED_AT,
+        code_revision=str(kwargs["code_revision"]),
+        default_top_k=int(kwargs["default_top_k"]),
+    )
+
+    assert changed.index.rag_id != original.index.rag_id
+    assert load_rag_index(store, changed.index.rag_id).index == changed.index
+
+
 @pytest.mark.parametrize("artifact_type", ["simulation", "teacher-rollout", "judgment"])
 def test_non_trace_artifact_sources_are_forbidden(tmp_path: Path, artifact_type: str) -> None:
     store = _store(tmp_path, "forbidden-artifact")

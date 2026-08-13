@@ -177,7 +177,7 @@ class RAGQuery(ContractModel):
     initial_context: JsonObject = Field(default_factory=dict)
     action: RAGAction
     excluded_lineage_ids: tuple[ArtifactId, ...] = ()
-    top_k: int = Field(default=5, gt=0)
+    top_k: int | None = Field(default=None, gt=0)
 
     @field_validator("excluded_lineage_ids")
     @classmethod

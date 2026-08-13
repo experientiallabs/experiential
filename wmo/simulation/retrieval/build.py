@@ -115,11 +115,19 @@ def persist_trace_rag(
     if not fit_lineages:
         raise ValueError("RAG construction needs at least one fit lineage")
     content = {
+        "code_revision": code_revision,
+        "default_top_k": default_top_k,
         "embedder": binding.snapshot.model_dump(mode="json"),
+        "embedding_dimension": dimensions,
         "fit_lineage_ids": list(fit_lineages),
         "key_schema_version": RAG_KEY_SCHEMA_VERSION,
+        "schema_version": 1,
         "sources": [source.model_dump(mode="json") for source in sources],
+        "transition_count": len(transitions),
+        "transition_ids": [item.transition_id for item in transitions],
+        "transitions_path": RAG_TRANSITIONS_PATH,
         "transitions_sha256": hashlib.sha256(transitions_payload).hexdigest(),
+        "vectors_path": RAG_VECTORS_PATH,
         "vectors_sha256": hashlib.sha256(vectors_payload).hexdigest(),
     }
     resolved_id = rag_id or stable_id("trace-rag", content)
