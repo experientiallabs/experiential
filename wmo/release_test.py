@@ -34,6 +34,9 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
 )
 REQUIRED_WHEEL_MODULES = frozenset(
     {
+        "wmo/common/judging/calibration.py",
+        "wmo/common/judging/labels.py",
+        "wmo/common/judging/review.py",
         "wmo/common/models/model.py",
         "wmo/runtime/environments/local.py",
         "wmo/runtime/models/registry.py",
@@ -46,6 +49,7 @@ REQUIRED_WHEEL_MODULES = frozenset(
 REQUIRED_SDIST_MEMBERS = frozenset({"README.md", "pyproject.toml", "wmo/workflow/router.py"})
 FORBIDDEN_ARCHIVE_PREFIXES = (
     "assets/",
+    "web/",
     "wmo/common/providers/",
     "wmo/common/vendor/",
     "wmo/optimize/research/",
@@ -53,6 +57,8 @@ FORBIDDEN_ARCHIVE_PREFIXES = (
 FORBIDDEN_ARCHIVE_MEMBERS = frozenset(
     {
         "docs/reference/repository_guardrails.md",
+        "wmo/cli/review_server.py",
+        "wmo/cli/review_server_test.py",
         "wmo/cli/repo_metrics.py",
         "wmo/common/core/parsing.py",
         "wmo/common/core/render.py",
@@ -204,6 +210,7 @@ def test_requirement_scanner_rejects_removed_dependencies() -> None:
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
     """W16 customer and comparison workflows resolve without test-only API owners."""
     import wmo
+    from wmo.common.judging import HumanScoreReview, JudgeCalibrationService, RubricReview
     from wmo.runtime.environments import LocalProcessEnvironmentRuntime
     from wmo.simulation import compare_text_and_sandbox
     from wmo.simulation.engines import SandboxSimulator
@@ -212,6 +219,9 @@ def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
     assert callable(wmo.load_project_router)
     assert callable(wmo.load_router)
     assert callable(wmo.create_project_router_app)
+    assert callable(HumanScoreReview.open)
+    assert callable(JudgeCalibrationService)
+    assert callable(RubricReview.open)
     assert callable(compare_text_and_sandbox)
     assert SandboxSimulator.__module__ == "wmo.simulation.engines.sandbox"
     assert LocalProcessEnvironmentRuntime.__module__ == "wmo.runtime.environments.local"
@@ -249,6 +259,10 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     "stale_member",
     [
         "assets/world-model-agent-loop.svg",
+        "web/package.json",
+        "web/app/page.tsx",
+        "wmo/cli/review_server.py",
+        "wmo/cli/review_server_test.py",
         "wmo/common/providers/openai.py",
         "wmo/common/vendor/sdk.py",
         "wmo/optimize/research/runner.py",

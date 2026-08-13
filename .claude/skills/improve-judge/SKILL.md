@@ -5,8 +5,8 @@ description: Improve a canonical common-owned judge from reviewed rollout eviden
 
 # Improve the Judge
 
-Use the common-owned judging contracts and the W7 local review flow. Every change starts from a
-reviewed disagreement in persisted rollout evidence and ends with a regression that would catch
+Use the common-owned judging contracts and persisted local review state. Every change starts from
+a reviewed disagreement in persisted rollout evidence and ends with a regression that would catch
 the same failure. Never tune a judge from intuition or from unverified caller data.
 
 ## 1. Resolve the canonical evidence
@@ -15,8 +15,10 @@ the same failure. Never tune a judge from intuition or from unverified caller da
   calibration artifacts.
 - Use `wmo.common.judging.Judge` as the scoring boundary. A judge receives recursively verified
   artifact IDs through `judge_persisted` and returns a structured `Judgment`.
-- Use the W7 loopback review application in `wmo/cli/review_server.py` to inspect judgments, record
-  human score corrections, refresh calibration reports, and explicitly approve calibration.
+- Use `RubricReview`, `HumanScoreReview`, and `JudgeCalibrationService` to inspect judgments,
+  record human score corrections, refresh calibration reports, and explicitly approve
+  calibration. CLI and Platform workflows must call these same services rather than create a
+  second artifact path.
 - Keep raw review and run output under the local project root or `/tmp`. Do not commit customer
   evidence or operator-local outputs.
 
@@ -55,9 +57,8 @@ identity whenever scoring semantics change.
 ## 4. Encode the expectation first
 
 Add the smallest failing regression beside the common judging owner. Prefer focused tests for the
-rubric, LM judge, calibration metrics, provenance, review, or risk-acceptance layer. For W7 review
-behavior, add coverage beside `wmo/cli/review_server_test.py`. For workflow behavior, add coverage
-beside `wmo/workflow/router_test.py`.
+rubric, LM judge, calibration metrics, provenance, review, or risk-acceptance layer. For workflow
+behavior, add coverage beside `wmo/workflow/router_test.py`.
 
 Use a counter-control for every change that could overcorrect. Model comparisons use the same
 frozen rollout, rubric, human labels, prompt identity, and lineage split. Never compare runs whose
@@ -66,7 +67,7 @@ inputs or failover behavior differ.
 ## 5. Prove and re-anchor
 
 - Run the focused owner tests twice when model behavior is stochastic.
-- Run the common judging, W7 review, and composed-router regressions.
+- Run the common judging and composed-router regressions.
 - Confirm controls are stable and that calibration uses fit lineages only. Held-out router
   evidence must remain unopened until the policy is locked.
 - Inspect the worst stored disagreements in the new `CalibrationReport`; a green aggregate alone

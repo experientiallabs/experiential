@@ -157,13 +157,13 @@ def test_exact_checkout_revision_rejects_symbolic_or_mismatched_ci_pin(
         exact_checkout_revision()
 
 
-@pytest.mark.parametrize("relative_path", ["release-shadow.py", "web/release-shadow.ts"])
+@pytest.mark.parametrize("relative_path", ["release-shadow.py", "wmo/release-shadow.py"])
 def test_exact_checkout_revision_rejects_untracked_checkout_inputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     relative_path: str,
 ) -> None:
-    """Root and web untracked inputs cannot hide outside the exact-checkout proof."""
+    """Root and package untracked inputs cannot hide outside the exact-checkout proof."""
     repository = tmp_path / "repo"
     repository.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=repository, check=True)

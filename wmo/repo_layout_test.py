@@ -26,7 +26,7 @@ HAND_AUTHORED_SUFFIXES = {
     ".yaml",
     ".yml",
 }
-ALLOWED_TOP_DIRS = {".claude", ".github", "docs", "web", "wmo"}
+ALLOWED_TOP_DIRS = {".claude", ".github", "docs", "wmo"}
 ALLOWED_TOP_FILES = {
     ".env.example",
     ".gitignore",
@@ -87,6 +87,13 @@ def test_top_level_paths_are_allowlisted() -> None:
     actual_files = {path for path in tracked if "/" not in path}
     assert actual_dirs == ALLOWED_TOP_DIRS
     assert actual_files == ALLOWED_TOP_FILES
+
+
+def test_browser_review_surface_is_retired() -> None:
+    """The removed browser workbench and loopback review adapter cannot return."""
+    assert not (REPO_ROOT / "web").exists()
+    assert not (REPO_ROOT / "wmo" / "cli" / "review_server.py").exists()
+    assert not (REPO_ROOT / "wmo" / "cli" / "review_server_test.py").exists()
 
 
 def test_no_local_state_or_cache_is_tracked() -> None:

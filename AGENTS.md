@@ -152,7 +152,7 @@ uv run pytest -q
    production modules to the flat `wmo/` namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
-   `docs/`, `web/`, `.claude/`, `.github/`. That list is closed.
+   `docs/`, `.claude/`, `.github/`. That list is closed.
 
    `.agents/` is the one sanctioned scratchpad: a local, gitignored working directory for agent
    sessions (notes, probe scripts, run outputs). It is never tracked, never part of a PR, and
@@ -187,8 +187,6 @@ uv run pytest -q
      area under the rule 4 hierarchy. Provider-neutral model contracts live under
      `wmo/common/models/`, and explicit HTTP-backed clients live under
      `wmo/runtime/models/providers/`.
-   - `web/` is the local-only TypeScript review workbench. It proxies only to the loopback WMO
-     review adapter and must not add provider, credential, tenant, or deployment integrations.
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
    - `.github/` — CI workflows.
