@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -270,7 +271,7 @@ def test_completion_capture_persists_receipt_before_exactly_one_delivery(
 def test_completion_receipt_closes_delivery_crash_window(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A delivery exception after receipt persistence is never retried into a duplicate event."""
+    """A pending delivery retries with its stable UUID and then becomes delivered."""
     clients = _install_fake_posthog(monkeypatch)
     _FakePosthog.raise_on_capture = True
     monkeypatch.setenv("WMO_TELEMETRY", "1")
@@ -285,7 +286,7 @@ def test_completion_receipt_closes_delivery_crash_window(
         root=root,
     )
     _FakePosthog.raise_on_capture = False
-    assert not capture_completion_once(
+    assert capture_completion_once(
         "wmo sft completed",
         "tinker-sft-result-abc123",
         properties,
@@ -293,7 +294,66 @@ def test_completion_receipt_closes_delivery_crash_window(
     )
 
     assert len(tuple((root / "telemetry-receipts").glob("*.json"))) == 1
+    assert len(clients[0].calls) == 2
+    assert clients[0].calls[0][1]["uuid"] == clients[0].calls[1][1]["uuid"]
+    receipt = next((root / "telemetry-receipts").glob("*.json"))
+    assert b'"delivery_status":"delivered"' in receipt.read_bytes()
+
+
+def test_concurrent_completion_capture_delivers_one_deterministic_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The receipt lock serializes concurrent callers around one delivery transition."""
+    clients = _install_fake_posthog(monkeypatch)
+    monkeypatch.setenv("WMO_TELEMETRY", "1")
+    monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
+    root = tmp_path / ".wmo"
+
+    def send() -> bool:
+        return capture_completion_once(
+            "wmo router completed",
+            "router-report-concurrent123",
+            {"success": True, "candidate_count": 2},
+            root=root,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(lambda _index: send(), range(2)))
+
+    assert sorted(results) == [False, True]
+    assert len(clients) == 1
     assert len(clients[0].calls) == 1
+
+
+def test_synchronous_completion_keeps_pending_state_on_refused_http_then_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Queue acceptance is insufficient; refused bounded HTTP delivery remains retryable."""
+    telemetry._CLIENTS.clear()
+    monkeypatch.setenv("WMO_TELEMETRY", "1")
+    monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
+    monkeypatch.setenv("WMO_POSTHOG_HOST", "http://127.0.0.1:1")
+    root = tmp_path / ".wmo"
+    properties = {"success": True, "training_step_count": 2}
+
+    assert not capture_completion_once(
+        "wmo sft completed",
+        "tinker-sft-result-refused123",
+        properties,
+        root=root,
+    )
+    receipt = next((root / "telemetry-receipts").glob("*.json"))
+    assert b'"delivery_status":"pending"' in receipt.read_bytes()
+
+    clients = _install_fake_posthog(monkeypatch)
+    assert capture_completion_once(
+        "wmo sft completed",
+        "tinker-sft-result-refused123",
+        properties,
+        root=root,
+    )
+    assert clients[0].kwargs["sync_mode"] is True
+    assert b'"delivery_status":"delivered"' in receipt.read_bytes()
 
 
 def test_completion_capture_honors_opt_out_without_persisting_a_receipt(

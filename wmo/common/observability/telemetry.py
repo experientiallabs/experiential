@@ -30,7 +30,7 @@ TelemetryProperties = Mapping[str, TelemetryValue]
 
 _FALSE_VALUES = {"0", "false", "off", "no"}
 _TRUE_VALUES = {"1", "true", "on", "yes"}
-_CLIENTS: dict[tuple[str, str], Posthog] = {}
+_CLIENTS: dict[tuple[str, str, bool], Posthog] = {}
 _COMPLETION_RECEIPT_DIRECTORY = "telemetry-receipts"
 _ALLOWED_EVENT_PROPERTIES: dict[str, frozenset[str]] = {
     "wmo build completed": frozenset(
@@ -108,14 +108,15 @@ _NONNEGATIVE_MEASUREMENTS = frozenset({"duration_seconds", "cost_usd"})
 
 
 class _CompletionTelemetryReceipt(BaseModel):
-    """Immutable local proof that one durable completion was handled for telemetry."""
+    """Durable local delivery state for one content-addressed completion event."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     event: str
     completion_id: str
     properties: dict[str, TelemetryValue]
+    delivery_status: Literal["pending", "delivered"]
 
 
 @dataclass
@@ -157,11 +158,11 @@ def capture_completion_once(
     *,
     root: str | Path = ARTIFACT_DIR,
 ) -> bool:
-    """Persist one metadata-only completion receipt and make at most one delivery attempt.
+    """Retry one metadata-only completion until its deterministic event is delivered.
 
-    The caller invokes this only when its current operation created the named durable completion.
-    A receipt is written before PostHog delivery, so a crash after delivery cannot make replay send
-    the event again. The deterministic PostHog UUID provides a second ingestion deduplication key.
+    Pending state is written before egress and delivered state afterwards. A crash in between is
+    retried with the same PostHog UUID, so ingestion deduplicates the ambiguous delivery attempt.
+    Callers must invoke this on every successful replay of the named durable completion.
 
     Args:
         event: One allowlisted completion event.
@@ -170,7 +171,7 @@ def capture_completion_once(
         root: Project root that owns telemetry settings and receipts.
 
     Returns:
-        True only when this call created the receipt and PostHog accepted the delivery attempt.
+        True only when this call advanced the receipt to delivered.
     """
     safe_properties = _sanitize_properties(event, properties)
     if safe_properties is None or not _enabled(root):
@@ -179,26 +180,44 @@ def capture_completion_once(
         validated_completion_id = validate_artifact_id(completion_id)
         if len(validated_completion_id) > 128:
             return False
-        receipt = _CompletionTelemetryReceipt(
+        pending = _CompletionTelemetryReceipt(
             event=event,
             completion_id=validated_completion_id,
             properties=dict(safe_properties),
+            delivery_status="pending",
         )
-        receipt_bytes = canonical_json_bytes(receipt) + b"\n"
         receipt_path = _completion_receipt_path(root, event, validated_completion_id)
         with file_write_lock(receipt_path, what="anonymous completion telemetry receipt"):
             if receipt_path.exists():
-                _verify_completion_receipt(receipt_path, event, validated_completion_id)
+                pending = _read_completion_receipt(
+                    receipt_path,
+                    event,
+                    validated_completion_id,
+                )
+                if pending.delivery_status == "delivered":
+                    return False
+                if _stable_completion_properties(pending.properties) != (
+                    _stable_completion_properties(safe_properties)
+                ):
+                    return False
+            else:
+                write_bytes_atomic(receipt_path, canonical_json_bytes(pending) + b"\n")
+            delivered = _capture_sanitized(
+                event,
+                pending.properties,
+                root=root,
+                event_uuid=_completion_event_uuid(event, validated_completion_id),
+            )
+            if not delivered:
                 return False
-            write_bytes_atomic(receipt_path, receipt_bytes)
+            write_bytes_atomic(
+                receipt_path,
+                canonical_json_bytes(pending.model_copy(update={"delivery_status": "delivered"}))
+                + b"\n",
+            )
+            return True
     except (OSError, RuntimeError, ValueError):
         return False
-    return _capture_sanitized(
-        event,
-        safe_properties,
-        root=root,
-        event_uuid=_completion_event_uuid(event, validated_completion_id),
-    )
 
 
 def _capture_sanitized(
@@ -223,7 +242,7 @@ def _capture_sanitized(
             "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
         }
         event_properties.update(safe_properties)
-        client = _posthog_client(api_key, host)
+        client = _posthog_client(api_key, host, synchronous=event_uuid is not None)
         if event_uuid is None:
             message_id = client.capture(
                 event,
@@ -244,17 +263,20 @@ def _capture_sanitized(
 
 def capture_build_completed(
     *,
+    completion_id: str,
     stats: BuildTelemetryStats,
     root: str | Path,
 ) -> None:
     """Capture one metadata-only aggregate for a completed local build.
 
     Args:
+        completion_id: Immutable task-set artifact ID produced by the build.
         stats: Aggregate build measurements without prompt or response content.
         root: Project root that owns telemetry preferences and identity.
     """
-    capture(
+    capture_completion_once(
         "wmo build completed",
+        completion_id,
         {
             "success": True,
             "input_trace_count": stats.input_trace_count,
@@ -286,8 +308,12 @@ def _completion_event_uuid(event: str, completion_id: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"world-model-optimizer:{event}:{completion_id}")
 
 
-def _verify_completion_receipt(path: Path, event: str, completion_id: str) -> None:
-    """Fail closed unless one stored receipt is canonical and matches its addressed completion."""
+def _read_completion_receipt(
+    path: Path,
+    event: str,
+    completion_id: str,
+) -> _CompletionTelemetryReceipt:
+    """Load canonical delivery state matching its content-addressed completion."""
     try:
         payload = path.read_bytes()
         receipt = _CompletionTelemetryReceipt.model_validate_json(payload)
@@ -300,6 +326,14 @@ def _verify_completion_receipt(path: Path, event: str, completion_id: str) -> No
         or _sanitize_properties(receipt.event, receipt.properties) != receipt.properties
     ):
         raise ValueError("completion telemetry receipt does not match its durable completion")
+    return receipt
+
+
+def _stable_completion_properties(
+    properties: Mapping[str, TelemetryValue],
+) -> dict[str, TelemetryValue]:
+    """Exclude invocation-local duration while comparing immutable replay aggregates."""
+    return {name: value for name, value in properties.items() if name != "duration_seconds"}
 
 
 def _sanitize_properties(
@@ -375,8 +409,9 @@ def _wmo_version() -> str:
         return "unknown"
 
 
-def _posthog_client(api_key: str, host: str) -> Posthog:
-    key = (api_key, host)
+def _posthog_client(api_key: str, host: str, *, synchronous: bool = False) -> Posthog:
+    """Return one bounded official PostHog client for async or confirmed delivery."""
+    key = (api_key, host, synchronous)
     client = _CLIENTS.get(key)
     if client is None:
         client = Posthog(
@@ -384,6 +419,7 @@ def _posthog_client(api_key: str, host: str) -> Posthog:
             host=host,
             flush_interval=1.0,
             max_retries=1,
+            sync_mode=synchronous,
             timeout=0.5,
         )
         _CLIENTS[key] = client

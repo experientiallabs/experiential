@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
@@ -281,7 +282,9 @@ def test_build_rejects_unknown_source_and_missing_local_evidence(tmp_path: Path)
     )
 
     assert unknown.exit_code == 2
-    assert "choose one of: otlp, posthog" in " ".join(unknown.output.replace("│", " ").split())
+    assert "choose one of: otlp, posthog" in " ".join(
+        unstyle(unknown.output).replace("│", " ").split()
+    )
     assert missing.exit_code == 2
     assert "trace file not found" in missing.output
 
@@ -293,7 +296,7 @@ def test_build_rejects_the_removed_name_compatibility_alias(tmp_path: Path) -> N
     result = _RUNNER.invoke(app, ["build", str(source), "--name", "support"])
 
     assert result.exit_code == 2
-    assert "No such option: --name" in result.output
+    assert "No such option: --name" in unstyle(result.output)
 
 
 def test_build_rejects_removed_file_alias_and_requires_project(tmp_path: Path) -> None:
@@ -304,6 +307,6 @@ def test_build_rejects_removed_file_alias_and_requires_project(tmp_path: Path) -
     missing_project = _RUNNER.invoke(app, ["build", str(source)])
 
     assert alias.exit_code == 2
-    assert "No such option: --file" in alias.output
+    assert "No such option: --file" in unstyle(alias.output)
     assert missing_project.exit_code == 2
-    assert "--project" in missing_project.output
+    assert "--project" in unstyle(missing_project.output)

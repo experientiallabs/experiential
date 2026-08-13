@@ -114,13 +114,12 @@ def optimize_model(
     }
     if completed.training_result.total_cost_usd is not None:
         properties["cost_usd"] = completed.training_result.total_cost_usd.value
-    if completed.catalog_updated:
-        capture_completion_once(
-            "wmo sft completed",
-            completed.training_result.result_id,
-            properties,
-            root=root,
-        )
+    capture_completion_once(
+        "wmo sft completed",
+        completed.training_result.result_id,
+        properties,
+        root=root,
+    )
     if completed.catalog_updated:
         _console.print(
             f"Verified completed W13 SFT and registered model alias {config.model_alias!r}."

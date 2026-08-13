@@ -161,6 +161,7 @@ def _capture_local_build_telemetry(
     """
     tasks = completed.mining.tasks
     capture_build_completed(
+        completion_id=completed.task_set.task_set_id,
         stats=BuildTelemetryStats(
             input_trace_count=len(completed.trace_dataset.traces),
             input_step_count=sum(len(trace.spans) for trace in completed.trace_dataset.traces),

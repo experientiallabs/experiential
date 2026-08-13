@@ -11,7 +11,7 @@ const adapterArguments = [
   "run",
   "python",
   "-m",
-  "wmo.review_server",
+  "wmo.cli.review_server",
   "--root",
   options.root,
   "--project",

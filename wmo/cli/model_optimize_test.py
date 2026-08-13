@@ -128,7 +128,7 @@ def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(
     assert second.exit_code == 0, second.output
     assert "already registered" in second.output
     assert second_backend.open_resume_paths == []
-    assert len(attempts) == 1
+    assert len(attempts) == 2
     assert len(emitted) == 1
     assert attempts[0][0] == "wmo sft completed"
     assert len({completion_id for _event, completion_id, _properties, _root in attempts}) == 1
@@ -192,7 +192,7 @@ def test_cli_crash_after_sft_receipt_replays_without_duplicate_event_or_dispatch
     assert replay.exit_code == 0, replay.output
     assert "already registered" in replay.output
     assert replay_backend.open_resume_paths == []
-    assert len(attempts) == 1
+    assert len(attempts) == 2
     assert len(emitted) == 1
 
 

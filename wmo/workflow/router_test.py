@@ -553,7 +553,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     assert phases.index("fidelity_fit_started") < phases.index("policy_locked")
     assert phases.index("policy_locked") < phases.index("heldout_opened")
     assert phases.index("heldout_opened") < phases.index("report_complete")
-    assert len(attempts) == 1
+    assert len(attempts) == 3
     assert len(emitted) == 1
     assert attempts[0][0] == "wmo simulation completed"
     assert all(

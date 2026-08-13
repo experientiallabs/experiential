@@ -884,7 +884,7 @@ def _current_revision() -> str:
     """Return the repository revision that will produce new local review artifacts."""
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
-        cwd=Path(__file__).resolve().parents[1],
+        cwd=Path(__file__).resolve().parents[2],
         capture_output=True,
         text=True,
         check=False,

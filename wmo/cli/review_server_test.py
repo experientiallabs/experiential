@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from wmo.cli.review_server import _loopback_host, create_review_app
 from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactInput, SourceIdentity
 from wmo.common.judging import (
     DimensionJudgment,
@@ -45,7 +46,6 @@ from wmo.common.rollouts import (
     WorldModelSimulatorSnapshot,
 )
 from wmo.common.traces import Trace, TraceSource, TraceSpan
-from wmo.review_server import _loopback_host, create_review_app
 from wmo.simulation.mining.descriptors import HashingDescriptorEmbedder
 from wmo.simulation.mining.service import MiningSpec, mine_tasks, persist_task_set
 

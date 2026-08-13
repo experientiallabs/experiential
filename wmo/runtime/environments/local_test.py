@@ -26,7 +26,13 @@ from wmo.runtime.environments.local import (
     _signal_exact_identity,
 )
 
+_DARWIN_ONLY = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="process-containment integration requires Darwin kqueue fork notifications",
+)
 
+
+@_DARWIN_ONLY
 def test_local_process_environment_executes_in_an_ephemeral_workspace(tmp_path: Path) -> None:
     """Each episode gets a private workspace that disappears after simulator-owned cleanup."""
     runtime = _runtime(tmp_path)
@@ -41,6 +47,7 @@ def test_local_process_environment_executes_in_an_ephemeral_workspace(tmp_path: 
     assert list(tmp_path.glob("wmo-sandbox-*")) == []
 
 
+@_DARWIN_ONLY
 def test_local_process_environment_times_out_and_cleans_up(tmp_path: Path) -> None:
     """A blocked tool response reaches the configured bound instead of hanging a rollout."""
     runtime = _runtime(
@@ -59,6 +66,7 @@ def test_local_process_environment_times_out_and_cleans_up(tmp_path: Path) -> No
     assert list(tmp_path.glob("wmo-sandbox-*")) == []
 
 
+@_DARWIN_ONLY
 def test_local_process_environment_records_a_child_crash_without_stderr_leakage(
     tmp_path: Path,
 ) -> None:
@@ -72,6 +80,7 @@ def test_local_process_environment_records_a_child_crash_without_stderr_leakage(
     assert list(tmp_path.glob("wmo-sandbox-*")) == []
 
 
+@_DARWIN_ONLY
 def test_local_process_environment_rejects_an_oversized_or_unframed_response(
     tmp_path: Path,
 ) -> None:
@@ -93,6 +102,7 @@ def test_local_process_environment_rejects_an_oversized_or_unframed_response(
     assert list(tmp_path.glob("wmo-sandbox-*")) == []
 
 
+@_DARWIN_ONLY
 def test_local_process_environment_rejects_malformed_json_and_cleans_up(tmp_path: Path) -> None:
     """Malformed child output remains protocol failure evidence and leaves no workspace."""
     runtime = _runtime(tmp_path)
@@ -104,6 +114,7 @@ def test_local_process_environment_rejects_malformed_json_and_cleans_up(tmp_path
     assert list(tmp_path.glob("wmo-sandbox-*")) == []
 
 
+@_DARWIN_ONLY
 def test_local_process_child_receives_only_the_documented_environment_allowlist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -131,6 +142,7 @@ def test_local_process_child_receives_only_the_documented_environment_allowlist(
     assert "OPENAI_API_KEY" not in keys
 
 
+@_DARWIN_ONLY
 def test_local_process_cleanup_kills_orphaned_grandchild_after_leader_exit(
     tmp_path: Path,
 ) -> None:
@@ -154,6 +166,7 @@ def test_local_process_cleanup_kills_orphaned_grandchild_after_leader_exit(
     assert list(tmp_path.glob("wmo-sandbox-*")) == []
 
 
+@_DARWIN_ONLY
 def test_cleanup_kills_setsid_descendant_without_touching_unrelated_process(
     tmp_path: Path,
 ) -> None:
@@ -215,15 +228,18 @@ def test_reused_pid_identity_is_never_signaled(monkeypatch: pytest.MonkeyPatch) 
     assert signals == []
 
 
-def test_local_process_rejects_unsafe_environment_keys_and_symlinked_parent(
-    tmp_path: Path,
-) -> None:
-    """Configuration cannot reintroduce credentials or redirect workspaces through a symlink."""
+def test_local_process_rejects_unsafe_environment_keys() -> None:
+    """Configuration cannot reintroduce credentials on any platform."""
     with pytest.raises(ValueError, match="outside the safe allowlist"):
         LocalProcessEnvironmentRuntime(
             (sys.executable, "fixture.py"),
             environment={"API_KEY": "secret"},
         )
+
+
+@_DARWIN_ONLY
+def test_local_process_rejects_symlinked_workspace_parent(tmp_path: Path) -> None:
+    """Darwin execution cannot redirect its ephemeral workspace through a symlink."""
     real_parent = tmp_path / "real"
     real_parent.mkdir()
     linked_parent = tmp_path / "linked"
@@ -281,6 +297,7 @@ def test_darwin_without_kqueue_binding_fails_closed(monkeypatch: pytest.MonkeyPa
         local_module._require_containment_support()
 
 
+@_DARWIN_ONLY
 def test_snapshot_failure_after_gated_spawn_is_cleaned_without_masking(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

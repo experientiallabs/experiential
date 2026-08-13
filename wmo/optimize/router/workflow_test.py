@@ -176,7 +176,7 @@ def test_router_cli_crash_after_telemetry_receipt_replays_without_duplicate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A final CLI crash keeps its durable report and never redelivers its telemetry event."""
+    """A failed delivery stays pending and replay retries the same deterministic event."""
     store, config = _workflow_fixture(tmp_path)
     config_path = tmp_path / "router-config.json"
     config_path.write_text(config.model_dump_json(), encoding="utf-8")
@@ -188,13 +188,13 @@ def test_router_cli_crash_after_telemetry_receipt_replays_without_duplicate(
         capture_calls.append((event, completion_id, properties, root))
         return actual_capture(event, completion_id, properties, root=root)
 
-    def crash_after_receipt(event, properties, *, root, event_uuid=None):  # noqa: ANN001, ANN202
+    def deliver_after_retry(event, properties, *, root, event_uuid=None):  # noqa: ANN001, ANN202
         deliveries.append((event, properties, root, event_uuid))
-        raise RuntimeError("simulated process crash after router telemetry receipt")
+        return len(deliveries) > 1
 
     monkeypatch.setenv("WMO_TELEMETRY", "1")
     monkeypatch.setattr(router_app, "capture_completion_once", capture)
-    monkeypatch.setattr(telemetry, "_capture_sanitized", crash_after_receipt)
+    monkeypatch.setattr(telemetry, "_capture_sanitized", deliver_after_retry)
     arguments = [
         "optimize",
         "router",
@@ -206,10 +206,8 @@ def test_router_cli_crash_after_telemetry_receipt_replays_without_duplicate(
     ]
     runner = CliRunner()
 
-    crashed = runner.invoke(app, arguments)
-    assert crashed.exit_code == 1
-    assert isinstance(crashed.exception, RuntimeError)
-    assert "after router telemetry receipt" in str(crashed.exception)
+    first = runner.invoke(app, arguments)
+    assert first.exit_code == 0, first.output
     report_ids = tuple(
         artifact_id
         for artifact_id in store.artifacts.list_ids()
@@ -223,7 +221,8 @@ def test_router_cli_crash_after_telemetry_receipt_replays_without_duplicate(
     assert f"report: {report_ids[0]}" in replay.output
     assert len(capture_calls) == 2
     assert all(call[1] == report_ids[0] for call in capture_calls)
-    assert len(deliveries) == 1
+    assert len(deliveries) == 2
+    assert deliveries[0][3] == deliveries[1][3]
     receipts = tuple((tmp_path / "telemetry-receipts").glob("*.json"))
     assert len(receipts) == 1
     assert report_ids[0].encode() in receipts[0].read_bytes()

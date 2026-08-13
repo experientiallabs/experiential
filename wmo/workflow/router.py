@@ -289,7 +289,6 @@ def compose_router(
         RouterCompositionError: A dependency, budget, artifact, or resume binding is invalid.
     """
     started = time.monotonic()
-    artifact_ids_at_start = frozenset(project.artifacts.list_ids())
     _preflight(project, services, budget, code_revision)
     normalized = (
         trace_source if isinstance(trace_source, TraceNormalizationResult) else trace_source.load()
@@ -444,18 +443,17 @@ def compose_router(
     )
     total_spend = math.fsum((phase_a_spend, held_out_spend))
     completion_id = optimized.optimization.report.report_id
-    if completion_id not in artifact_ids_at_start:
-        capture_completion_once(
-            "wmo simulation completed",
-            completion_id,
-            {
-                "success": True,
-                "rollout_count": len(phase_a_set.artifact_ids) + len(held_set.artifact_ids),
-                "duration_seconds": max(time.monotonic() - started, 0.0),
-                "cost_usd": total_spend,
-            },
-            root=project.paths.root,
-        )
+    capture_completion_once(
+        "wmo simulation completed",
+        completion_id,
+        {
+            "success": True,
+            "rollout_count": len(phase_a_set.artifact_ids) + len(held_set.artifact_ids),
+            "duration_seconds": max(time.monotonic() - started, 0.0),
+            "cost_usd": total_spend,
+        },
+        root=project.paths.root,
+    )
     _phase(phase_hook, "report_complete")
     runtime = load_project_router(
         project.paths.project_id,
