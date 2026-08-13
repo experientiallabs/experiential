@@ -42,7 +42,21 @@ def find_verified_judgment(
     calibration_id: str,
     protocol: EvaluationProtocol,
 ) -> Judgment | None:
-    """Find one fully verified judgment so a resume never repeats its dispatch."""
+    """Find one fully verified judgment so a resume never repeats its dispatch.
+
+    Args:
+        project: Project whose immutable evidence is being resumed.
+        rollout_id: Exact plan-bound rollout whose judgment is required.
+        rubric_id: Approved rubric identity for the workflow.
+        calibration_id: Approved calibration identity for the workflow.
+        protocol: Frozen evaluation protocol governing the rollout.
+
+    Returns:
+        The unique exact judgment, or ``None`` when no matching evidence exists.
+
+    Raises:
+        JudgmentBudgetError: Matching evidence is duplicated or differs from frozen pins.
+    """
     matches = []
     for artifact_id in project.artifacts.list_ids():
         stored = project.artifacts.read(artifact_id)
@@ -67,7 +81,23 @@ def read_dispatch_reservation(
     calibration_id: str,
     protocol: EvaluationProtocol,
 ) -> JudgmentDispatchReceipt | None:
-    """Load and verify an existing exact dispatch reservation, if present."""
+    """Load and verify an existing exact dispatch reservation, if present.
+
+    Args:
+        project: Project containing the immutable dispatch ledger.
+        plan_input: Exact evaluation-plan artifact input.
+        cell: Plan cell whose judgment dispatch is being resumed.
+        rollout_id: Exact rollout assigned to the cell.
+        rubric_id: Approved rubric identity for the workflow.
+        calibration_id: Approved calibration identity for the workflow.
+        protocol: Frozen evaluation protocol governing the cell.
+
+    Returns:
+        The verified reservation, or ``None`` before the first dispatch attempt.
+
+    Raises:
+        JudgmentBudgetError: Stored reservation type or bindings have drifted.
+    """
     material = _dispatch_material(
         project, plan_input, cell, rollout_id, rubric_id, calibration_id, protocol
     )
@@ -105,7 +135,20 @@ def persist_dispatch_reservation(
     calibration_id: str,
     protocol: EvaluationProtocol,
 ) -> JudgmentDispatchReceipt:
-    """Reserve one plan-cell dispatch immutably before calling the injected judge."""
+    """Reserve one plan-cell dispatch immutably before calling the injected judge.
+
+    Args:
+        project: Project receiving the immutable dispatch reservation.
+        plan_input: Exact evaluation-plan artifact input.
+        cell: Plan cell whose judgment dispatch is being reserved.
+        rollout_id: Exact rollout assigned to the cell.
+        rubric_id: Approved rubric identity for the workflow.
+        calibration_id: Approved calibration identity for the workflow.
+        protocol: Frozen evaluation protocol governing the cell.
+
+    Returns:
+        The newly persisted exact dispatch reservation.
+    """
     material = _dispatch_material(
         project, plan_input, cell, rollout_id, rubric_id, calibration_id, protocol
     )
