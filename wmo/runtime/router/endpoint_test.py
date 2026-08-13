@@ -211,7 +211,9 @@ def test_idempotency_key_rejects_a_different_request(path: str) -> None:
     conflict = http.post(path, json=changed, headers=headers)
 
     assert conflict.status_code == 409
-    assert "different request" in conflict.json()["error"]["message"]
+    assert (
+        conflict.json()["error"]["message"] == "Idempotency-Key conflicts with live request state"
+    )
     assert model_client.embed_calls == 1
     assert model_client.complete_calls == 1
 

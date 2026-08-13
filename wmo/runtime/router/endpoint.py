@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 import time
 import uuid
@@ -36,6 +37,11 @@ from wmo.runtime.router.runtime import RouterEpisodeConflictError, RouterRuntime
 
 _AFFINITY_CAPACITY = 4096
 _IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
+logger = logging.getLogger(__name__)
+
+
+class OpenAIRequestConflictError(ValueError):
+    """A standard OpenAI request identity conflicts with prior local state."""
 
 
 class HttpFunctionCall(BaseModel):
@@ -226,13 +232,13 @@ class _TranscriptAffinity:
             existing = self._idempotency.get(key_sha256)
             if existing is not None:
                 if existing[0] != request_sha256:
-                    raise RouterEpisodeConflictError(
+                    raise OpenAIRequestConflictError(
                         "Idempotency-Key is already bound to a different request"
                     )
                 self._idempotency.move_to_end(key_sha256)
                 return existing[1]
             if len(self._idempotency) >= _AFFINITY_CAPACITY:
-                raise RouterEpisodeConflictError("live idempotency-key capacity is exhausted")
+                raise OpenAIRequestConflictError("live idempotency-key capacity is exhausted")
             episode_id = existing_episode or f"idempotency-{key_sha256}"
             self._idempotency[key_sha256] = (
                 request_sha256,
@@ -276,12 +282,15 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
             model_request = _chat_model_request(request)
             episode_id = affinity.chat_episode(_request_sha256(request), idempotency_key)
             routed = runtime.complete(model_request, episode_id=episode_id)
-        except RouterEpisodeConflictError as exc:
-            return _error(409, str(exc))
+        except OpenAIRequestConflictError:
+            return _error(409, "Idempotency-Key conflicts with live request state")
+        except RouterEpisodeConflictError:
+            return _error(409, "request conflicts with an earlier routed turn")
         except (ValueError, json.JSONDecodeError) as exc:
             return _error(400, f"invalid routed request ({exc})")
-        except Exception as exc:  # noqa: BLE001
-            return _error(502, f"routed model call failed ({type(exc).__name__})")
+        except Exception:  # noqa: BLE001
+            logger.exception("routed Chat Completions call failed")
+            return _error(502, "routed model call failed")
         completion = _chat_completion(request.model, routed.response.output, routed.response)
         headers = {"X-WMO-Routed-Model": routed.decision.selected_alias}
         if request.stream:
@@ -310,12 +319,15 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
             all_messages = (*prior.messages, *visible)
             model_request = _responses_model_request(request, all_messages)
             routed = runtime.complete(model_request, episode_id=prior.episode_id)
-        except RouterEpisodeConflictError as exc:
-            return _error(409, str(exc))
+        except OpenAIRequestConflictError:
+            return _error(409, "Idempotency-Key conflicts with live request state")
+        except RouterEpisodeConflictError:
+            return _error(409, "response continuation conflicts with an earlier routed turn")
         except (ValueError, json.JSONDecodeError) as exc:
             return _error(400, f"invalid routed request ({exc})")
-        except Exception as exc:  # noqa: BLE001
-            return _error(502, f"routed model call failed ({type(exc).__name__})")
+        except Exception:  # noqa: BLE001
+            logger.exception("routed Responses call failed")
+            return _error(502, "routed model call failed")
         response = _openai_response(
             request.model,
             routed.response.output,
