@@ -4,6 +4,7 @@ from wmo.runtime.router.application import (
     RouterApplicationError,
     create_project_router_app,
     load_project_router,
+    load_router,
 )
 from wmo.runtime.router.endpoint import create_router_endpoint
 from wmo.runtime.router.runtime import (
@@ -23,5 +24,6 @@ __all__ = [
     "create_router_endpoint",
     "RouterApplicationError",
     "create_project_router_app",
+    "load_router",
     "load_project_router",
 ]

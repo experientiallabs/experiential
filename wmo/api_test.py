@@ -7,7 +7,11 @@ import sys
 
 import wmo
 from wmo.optimize.router.workflow import fit_router, optimize_router, report_router
-from wmo.runtime.router.application import create_project_router_app, load_project_router
+from wmo.runtime.router.application import (
+    create_project_router_app,
+    load_project_router,
+    load_router,
+)
 from wmo.runtime.router.runtime import RouterRuntime
 from wmo.simulation.build import build_project
 from wmo.workflow.router import compose_router
@@ -22,6 +26,7 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.RouterRuntime is RouterRuntime
     assert wmo.compose_router is compose_router
     assert wmo.load_project_router is load_project_router
+    assert wmo.load_router is load_router
     assert wmo.create_project_router_app is create_project_router_app
     assert "ActionKind" not in wmo.__all__
 

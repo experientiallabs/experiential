@@ -210,6 +210,7 @@ def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
 
     assert callable(wmo.compose_router)
     assert callable(wmo.load_project_router)
+    assert callable(wmo.load_router)
     assert callable(wmo.create_project_router_app)
     assert callable(compare_text_and_sandbox)
     assert SandboxSimulator.__module__ == "wmo.simulation.engines.sandbox"

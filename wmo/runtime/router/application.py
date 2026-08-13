@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from openai import OpenAI
 
 from wmo.common.core.artifacts import ArtifactId
 from wmo.common.models import load_model_catalog
@@ -90,6 +92,46 @@ def create_project_router_app(project: str, runtime: RouterRuntime) -> FastAPI:
     )
     application.include_router(create_router_endpoint({project: runtime}))
     return application
+
+
+def load_router(
+    project: str,
+    root: Path = Path(".wmo"),
+    *,
+    policy_id: ArtifactId | None = None,
+    environment: Mapping[str, str] | None = None,
+    runtime_catalog: RuntimeModelCatalog | None = None,
+    decision_sink: DecisionSink | None = None,
+) -> OpenAI:
+    """Load one local project as an official synchronous OpenAI client.
+
+    Args:
+        project: Canonical project identifier and public OpenAI model name.
+        root: Local ``.wmo`` root. Defaults to the happy-path project location.
+        policy_id: Optional exact policy identity when the project contains several.
+        environment: Optional credential mapping for runtime client construction.
+        runtime_catalog: Optional explicit catalog for deterministic applications and tests.
+        decision_sink: Optional aggregate-safe routing-decision recorder.
+
+    Returns:
+        Official OpenAI client whose Chat Completions and Responses resources call the local
+        verified router in process. Close it or use it as a context manager when finished.
+    """
+    runtime = load_project_router(
+        project,
+        root,
+        policy_id=policy_id,
+        environment=environment,
+        runtime_catalog=runtime_catalog,
+        decision_sink=decision_sink,
+    )
+    application = create_project_router_app(project, runtime)
+    transport = TestClient(application, raise_server_exceptions=False)
+    return OpenAI(
+        api_key="wmo-local-runtime",
+        base_url="http://wmo.local/v1",
+        http_client=transport,
+    )
 
 
 def _only_policy(store: ArtifactStore) -> ArtifactId:

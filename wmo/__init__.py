@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         create_project_router_app as create_project_router_app,
     )
     from wmo.runtime.router.application import load_project_router as load_project_router
+    from wmo.runtime.router.application import load_router as load_router
     from wmo.runtime.router.runtime import RouterRuntime as RouterRuntime
     from wmo.simulation.build import BuildReviewReadiness as BuildReviewReadiness
     from wmo.simulation.build import ProjectBuild as ProjectBuild
@@ -64,6 +65,7 @@ _EXPORT_MODULES = {
     "RouterRuntime": "wmo.runtime.router.runtime",
     "create_project_router_app": "wmo.runtime.router.application",
     "load_project_router": "wmo.runtime.router.application",
+    "load_router": "wmo.runtime.router.application",
     "ApprovedRouterReview": "wmo.workflow.router",
     "LocalTraceSource": "wmo.workflow.router",
     "FidelityApprovalDecision": "wmo.workflow.router",
