@@ -232,6 +232,12 @@ class RuntimeInteractionJournal:
         """Bind the journal to one project's canonical mutable runtime path."""
         self.path = paths.runtime_journal
         self.project_id = paths.project_id
+        self._durability_directories = (
+            paths.runtime_directory,
+            paths.project_directory,
+            paths.projects_directory,
+            paths.root,
+        )
 
     def read_events(self) -> tuple[RuntimeJournalEvent, ...]:
         """Read and fully validate all durable records, ignoring only a torn final line."""
@@ -322,14 +328,27 @@ class RuntimeInteractionJournal:
         failure: StructuredFailure,
         *,
         failed_at: datetime,
-    ) -> RuntimeAttemptFailedEvent:
-        """Append a failure only while the named attempt is still live."""
+    ) -> RuntimeAttemptFailedEvent | RuntimeCompletedEvent:
+        """Append a live failure or reconcile with a concurrent winning outcome."""
         _require_timezone(failed_at)
         with file_write_lock(self.path, what="the routed-interaction journal"):
             events = list(self._read_unlocked())
             state = _validate_events(events).get(accepted.interaction_id)
-            if state is None or state.accepted != accepted or state.terminal is not None:
-                raise RuntimeJournalError("cannot fail an interaction attempt that is not live")
+            if state is None or accepted not in events:
+                raise RuntimeJournalError(
+                    "cannot fail an interaction attempt that was not accepted"
+                )
+            if isinstance(state.terminal, RuntimeCompletedEvent):
+                return state.terminal
+            if state.accepted != accepted:
+                prior = _attempt_failure(events, accepted)
+                if prior is None:
+                    raise RuntimeJournalError("superseded attempt has no durable failure")
+                return prior
+            if state.terminal is not None:
+                if isinstance(state.terminal, RuntimeAttemptFailedEvent):
+                    return state.terminal
+                raise RuntimeJournalError("cannot fail an interaction after completion")
             event = _failed_event(
                 accepted,
                 failure,
@@ -346,13 +365,25 @@ class RuntimeInteractionJournal:
         *,
         completed_at: datetime,
     ) -> RuntimeCompletedEvent:
-        """Append a response only while the named attempt is still live."""
+        """Commit the first response, including one returned after a stale takeover."""
         _require_timezone(completed_at)
         with file_write_lock(self.path, what="the routed-interaction journal"):
             events = list(self._read_unlocked())
             state = _validate_events(events).get(accepted.interaction_id)
-            if state is None or state.accepted != accepted or state.terminal is not None:
-                raise RuntimeJournalError("cannot complete an interaction attempt that is not live")
+            if state is None or accepted not in events:
+                raise RuntimeJournalError(
+                    "cannot complete an interaction attempt that was not accepted"
+                )
+            if isinstance(state.terminal, RuntimeCompletedEvent):
+                return state.terminal
+            if state.accepted != accepted:
+                prior = _attempt_failure(events, accepted)
+                if prior is None or not prior.retryable:
+                    raise RuntimeJournalError(
+                        "superseded attempt lacks a retryable durable failure"
+                    )
+            elif state.terminal is not None:
+                raise RuntimeJournalError("cannot complete a terminal interaction attempt")
             event = _completed_event(
                 accepted,
                 response,
@@ -390,6 +421,7 @@ class RuntimeInteractionJournal:
             raise RuntimeJournalError("runtime event ID differs from its canonical content")
         _prepare_runtime_directory(self.path)
         _truncate_torn_tail(self.path)
+        created = not self.path.exists()
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -400,6 +432,8 @@ class RuntimeInteractionJournal:
                 handle.write(canonical_json_bytes(event) + b"\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+            if created:
+                _fsync_directories(self._durability_directories)
         except OSError as exc:
             raise RuntimeJournalError(f"cannot append runtime journal {self.path}") from exc
 
@@ -520,14 +554,22 @@ class JournaledRouterRuntime:
             )
         except Exception as exc:
             failure = _structured_provider_failure(exc)
-            self.journal.record_failure(accepted, failure, failed_at=self._clock())
+            terminal = self.journal.record_failure(accepted, failure, failed_at=self._clock())
+            if isinstance(terminal, RuntimeCompletedEvent):
+                return RoutedModelResponse(
+                    decision=accepted.decision,
+                    response=terminal.response,
+                )
             raise
-        self.journal.record_completed(
+        completed = self.journal.record_completed(
             accepted,
             routed.response,
             completed_at=self._clock(),
         )
-        return routed
+        return RoutedModelResponse(
+            decision=accepted.decision,
+            response=completed.response,
+        )
 
 
 def _interaction_identity(
@@ -639,6 +681,8 @@ def _validate_events(
 ) -> dict[str, _InteractionState]:
     """Validate global order, content digests, and every interaction transition."""
     states: dict[str, _InteractionState] = {}
+    accepted_attempts: dict[tuple[str, int], RuntimeAcceptedEvent] = {}
+    failed_attempts: dict[tuple[str, int], RuntimeAttemptFailedEvent] = {}
     key_owners: dict[tuple[str, str], str] = {}
     seen_event_ids: set[str] = set()
     for expected_ordinal, event in enumerate(events, start=1):
@@ -684,19 +728,33 @@ def _validate_events(
                 if _acceptance_pins(event) != _acceptance_pins(state.accepted):
                     raise RuntimeJournalError("retry drifted from the original accepted pins")
             states[event.interaction_id] = _InteractionState(event, None)
+            accepted_attempts[(event.interaction_id, event.attempt_ordinal)] = event
             continue
         if state is None:
             raise RuntimeJournalError("terminal runtime event has no accepted attempt")
-        if state.terminal is not None:
-            raise RuntimeJournalError("runtime attempt has more than one terminal event")
-        if event.attempt_ordinal != state.accepted.attempt_ordinal:
-            raise RuntimeJournalError("terminal event names a different attempt ordinal")
+        accepted = accepted_attempts.get((event.interaction_id, event.attempt_ordinal))
+        if accepted is None:
+            raise RuntimeJournalError("terminal event names an unaccepted attempt ordinal")
         if isinstance(event, RuntimeAttemptFailedEvent):
-            if event.attempt_started_at != state.accepted.attempt_started_at:
+            if state.terminal is not None:
+                raise RuntimeJournalError("runtime attempt has more than one terminal event")
+            if accepted != state.accepted:
+                raise RuntimeJournalError("failure event names a superseded attempt")
+            if event.attempt_started_at != accepted.attempt_started_at:
                 raise RuntimeJournalError("failure start time differs from accepted attempt")
-        elif event.completed_at < state.accepted.attempt_started_at:
+            failed_attempts[(event.interaction_id, event.attempt_ordinal)] = event
+            states[event.interaction_id] = _InteractionState(state.accepted, event)
+        elif event.completed_at < accepted.attempt_started_at:
             raise RuntimeJournalError("completion precedes its accepted attempt")
-        states[event.interaction_id] = _InteractionState(state.accepted, event)
+        elif isinstance(state.terminal, RuntimeCompletedEvent):
+            raise RuntimeJournalError("interaction has more than one completed response")
+        elif accepted != state.accepted:
+            prior = failed_attempts.get((event.interaction_id, event.attempt_ordinal))
+            if prior is None or not prior.retryable:
+                raise RuntimeJournalError("superseded completion lacks a retryable durable failure")
+            states[event.interaction_id] = _InteractionState(state.accepted, event)
+        else:
+            states[event.interaction_id] = _InteractionState(accepted, event)
     return states
 
 
@@ -798,6 +856,38 @@ def _prepare_runtime_directory(path: Path) -> None:
         raise RuntimeJournalError("runtime journal directory must be a real directory")
     if path.is_symlink():
         raise RuntimeJournalError("runtime journal path cannot be a symbolic link")
+
+
+def _attempt_failure(
+    events: list[RuntimeJournalEvent], accepted: RuntimeAcceptedEvent
+) -> RuntimeAttemptFailedEvent | None:
+    """Return the durable failure that closed one accepted attempt, if present."""
+    for event in events:
+        if (
+            isinstance(event, RuntimeAttemptFailedEvent)
+            and event.interaction_id == accepted.interaction_id
+            and event.attempt_ordinal == accepted.attempt_ordinal
+        ):
+            return event
+    return None
+
+
+def _fsync_directories(directories: tuple[Path, ...]) -> None:
+    """Persist a newly created journal and every project directory entry that names it."""
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    for directory in directories:
+        try:
+            descriptor = os.open(directory, flags)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as exc:
+            raise RuntimeJournalError(
+                f"cannot persist runtime journal directory {directory}"
+            ) from exc
 
 
 def _truncate_torn_tail(path: Path) -> None:

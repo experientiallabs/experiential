@@ -353,6 +353,63 @@ def test_stale_attempt_gets_failure_then_retry_with_original_route(tmp_path: Pat
     ]
 
 
+def test_original_provider_success_wins_after_concurrent_stale_takeover(tmp_path: Path) -> None:
+    """A late original success commits once and prevents a replacement response."""
+    journal = RuntimeInteractionJournal(
+        ProjectPaths(root=tmp_path / ".wmo", project_id="support-agent")
+    )
+    request = _request()
+    identity = _interaction_identity("support-agent", "takeover-key", request, None)
+    decision = _decision(identity.lineage_id)
+    acceptance = RuntimeAcceptance(
+        decision=decision,
+        selected_alias=decision.selected_alias,
+        selected_model=_snapshot(),
+        policy_input=ArtifactInput(artifact_id=decision.policy_id, sha256=decision.policy_sha256),
+    )
+    original = journal.claim(
+        identity,
+        acceptance,
+        now=_TIME,
+        stale_after=timedelta(seconds=1),
+    )
+    replacement = journal.claim(
+        identity,
+        None,
+        now=_TIME + timedelta(seconds=2),
+        stale_after=timedelta(seconds=1),
+    )
+    assert original.accepted is not None
+    assert replacement.accepted is not None
+
+    winning = journal.record_completed(
+        original.accepted,
+        _response(),
+        completed_at=_TIME + timedelta(seconds=3),
+    )
+    replay = journal.claim(
+        identity,
+        None,
+        now=_TIME + timedelta(seconds=4),
+        stale_after=timedelta(seconds=1),
+    )
+
+    assert replay.status == "completed"
+    assert replay.completed == winning
+    replacement_observed = journal.record_completed(
+        replacement.accepted,
+        _response().model_copy(update={"output": AssistantAction(content="replacement")}),
+        completed_at=_TIME + timedelta(seconds=5),
+    )
+    assert replacement_observed == winning
+    assert [event.event for event in journal.read_events()] == [
+        "accepted",
+        "attempt_failed",
+        "accepted",
+        "completed",
+    ]
+
+
 def test_live_attempt_wait_is_bounded_and_retryable(tmp_path: Path) -> None:
     """A live attempt produces a bounded retryable conflict instead of hanging."""
     journal = RuntimeInteractionJournal(
@@ -403,4 +460,39 @@ def test_append_flushes_and_fsyncs_before_return(
     service = _service(tmp_path / ".wmo", _FakeRuntime())
     service.complete(_request(), idempotency_key="fsync-key")
 
-    assert len(calls) == 2
+    assert len(calls) >= 2
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory fsync is POSIX-only")
+def test_first_append_fsyncs_file_and_new_directory_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first accepted claim persists the file and each newly named parent entry."""
+    fsync_calls = 0
+    directory_opens: list[Path] = []
+    real_fsync = os.fsync
+    real_open = os.open
+
+    def record_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        real_fsync(descriptor)
+
+    def record_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        if flags & getattr(os, "O_DIRECTORY", 0):
+            directory_opens.append(Path(os.fsdecode(path)))
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "open", record_open)
+    service = _service(tmp_path / ".wmo", _FakeRuntime())
+    service.complete(_request(), idempotency_key="directory-fsync-key")
+
+    assert fsync_calls >= 6
+    assert {"runtime", "support-agent", "projects", ".wmo"}.issubset(
+        {path.name for path in directory_opens}
+    )
