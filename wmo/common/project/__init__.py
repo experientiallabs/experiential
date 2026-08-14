@@ -4,8 +4,12 @@ from wmo.common.project.manifests import ArtifactFile, ArtifactManifest, artifac
 from wmo.common.project.paths import ProjectPathError, ProjectPaths
 from wmo.common.project.project import (
     AgentConfiguration,
+    ProjectBudgetConfiguration,
+    ProjectBuildArtifacts,
     ProjectConfig,
     ProjectConfigError,
+    ProjectModelConfiguration,
+    ProjectRetrievalConfiguration,
     load_project_config,
     write_project_config,
 )
@@ -29,6 +33,10 @@ __all__ = [
     "ArtifactStoreError",
     "ProjectConfig",
     "ProjectConfigError",
+    "ProjectBuildArtifacts",
+    "ProjectBudgetConfiguration",
+    "ProjectModelConfiguration",
+    "ProjectRetrievalConfiguration",
     "ProjectPathError",
     "ProjectPaths",
     "ProjectStore",

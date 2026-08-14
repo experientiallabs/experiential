@@ -127,10 +127,10 @@ def _verify_records(
         raise ArtifactCorruptionError("RAG records do not match ordered transition IDs")
     if len(transitions) != index.transition_count or len(vectors) != index.transition_count:
         raise ArtifactCorruptionError("RAG record counts do not match the envelope")
-    fit_lineages = set(index.fit_lineage_ids)
+    included_lineages = set(index.included_lineage_ids or index.fit_lineage_ids)
     for transition, vector in zip(transitions, vectors, strict=True):
-        if transition.lineage_id not in fit_lineages:
-            raise ArtifactCorruptionError("RAG transition is outside the frozen fit lineages")
+        if transition.lineage_id not in included_lineages:
+            raise ArtifactCorruptionError("RAG transition is outside the frozen included lineages")
         key_text = render_rag_key(
             task=transition.task,
             initial_context=transition.initial_context,

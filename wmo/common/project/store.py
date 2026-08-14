@@ -27,7 +27,12 @@ from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
 from wmo.common.project.manifests import ArtifactFile, ArtifactManifest, artifact_input, file_digest
 from wmo.common.project.paths import ProjectPaths, validate_local_id
-from wmo.common.project.project import ProjectConfig, load_project_config, write_project_config
+from wmo.common.project.project import (
+    ProjectBuildArtifacts,
+    ProjectConfig,
+    load_project_config,
+    write_project_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -382,6 +387,44 @@ class ProjectStore:
             return load_project_config(self.paths.project_toml)
         except ValueError as exc:
             raise ProjectStoreError(str(exc)) from exc
+
+    def bind_completed_build(self, build: ProjectBuildArtifacts) -> ProjectConfig:
+        """Atomically select a fully verified immutable build for future project workflows.
+
+        Args:
+            build: Exact trace, task, RAG, and world-model artifact manifest references.
+
+        Returns:
+            Updated project configuration naming the completed build.
+
+        Raises:
+            ProjectStoreError: A pointer is stale, has the wrong type, or configuration is invalid.
+        """
+        expected_types = {
+            "trace_dataset": "trace-dataset",
+            "task_set": "task-set",
+            "serving_rag": "trace-rag-index",
+            "fit_rag": "trace-rag-index",
+            "world_model": "grounded-world-model",
+        }
+        with file_write_lock(self.paths.project_toml, what="completed project build"):
+            try:
+                for field_name, artifact_type in expected_types.items():
+                    pointer = getattr(build, field_name)
+                    stored = self.artifacts.read(pointer.artifact_id)
+                    if stored.manifest.artifact_type != artifact_type:
+                        raise ValueError(
+                            f"{field_name} artifact is {stored.manifest.artifact_type!r}, "
+                            f"not {artifact_type!r}"
+                        )
+                    if artifact_input(stored.manifest) != pointer:
+                        raise ValueError(f"{field_name} artifact manifest digest changed")
+                existing = load_project_config(self.paths.project_toml)
+                updated = existing.model_copy(update={"build": build})
+                write_project_config(self.paths.project_toml, updated)
+            except (ArtifactCorruptionError, ValueError) as exc:
+                raise ProjectStoreError(f"cannot bind completed build: {exc}") from exc
+            return updated
 
     def bind_model_optimization_config(
         self, config: ArtifactInput, *, artifact_type: str

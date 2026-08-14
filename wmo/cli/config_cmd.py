@@ -19,6 +19,16 @@ from wmo.common.core.locks import FileLockTimeout
 config_app = typer.Typer(help="Manage project-local wmo settings.", no_args_is_help=True)
 _console = Console()
 _PROVIDER_ROOT_OPTION = typer.Option(Path(ARTIFACT_DIR), "--root", help="Local .wmo root.")
+_CONNECTION_JSON_OPTION = typer.Option(
+    None,
+    "--connection-json",
+    help="Repeatable JSON provider connection with name, provider, and api_key_env.",
+)
+_MODEL_JSON_OPTION = typer.Option(
+    None,
+    "--model-json",
+    help="Repeatable JSON model alias with connection, model ID, and capabilities.",
+)
 
 
 @config_app.command("telemetry", help="View or change project-local usage telemetry settings.")
@@ -54,48 +64,14 @@ def config_telemetry(
 @config_app.command("providers", help="Configure model providers and build-time model roles.")
 def config_providers(
     root: Path = _PROVIDER_ROOT_OPTION,
-    provider: str | None = typer.Option(None, "--provider", help="Primary provider kind."),
-    connection: str | None = typer.Option(
-        None, "--connection", help="Stable primary connection name."
-    ),
-    api_key_env: str | None = typer.Option(
-        None, "--api-key-env", help="Credential environment variable name."
-    ),
-    base_url: str | None = typer.Option(
-        None, "--base-url", help="Base URL for an OpenAI-compatible provider only."
-    ),
+    connection_json: list[str] | None = _CONNECTION_JSON_OPTION,
+    model_json: list[str] | None = _MODEL_JSON_OPTION,
     world_model: str | None = typer.Option(
-        None, "--world-model", help="Exact provider-side world model ID."
+        None, "--world-model", help="Configured alias for grounded world-model calls."
     ),
-    judge: str | None = typer.Option(None, "--judge", help="Exact provider-side judge model ID."),
+    judge: str | None = typer.Option(None, "--judge", help="Configured judge alias."),
     embedder: str | None = typer.Option(
-        None, "--embedder", help="Exact provider-side embedding model ID."
-    ),
-    embedder_provider: str | None = typer.Option(
-        None, "--embedder-provider", help="Provider for a separate embedding connection."
-    ),
-    embedder_connection: str | None = typer.Option(
-        None, "--embedder-connection", help="Stable separate embedding connection name."
-    ),
-    embedder_api_key_env: str | None = typer.Option(
-        None,
-        "--embedder-api-key-env",
-        help="Credential environment variable for a separate embedding connection.",
-    ),
-    embedder_base_url: str | None = typer.Option(
-        None,
-        "--embedder-base-url",
-        help="Base URL for a separate OpenAI-compatible embedding provider only.",
-    ),
-    world_model_tools: bool = typer.Option(
-        False,
-        "--world-model-tools/--no-world-model-tools",
-        help="Record explicit tool support for the world model.",
-    ),
-    judge_tools: bool = typer.Option(
-        False,
-        "--judge-tools/--no-judge-tools",
-        help="Record explicit tool support for the judge.",
+        None, "--embedder", help="Configured embedding-capable alias."
     ),
     non_interactive: bool = typer.Option(
         False,
@@ -114,19 +90,11 @@ def config_providers(
     written. Router candidates remain untouched until ``wmo optimize router``.
     """
     options = ProviderSetupOptions(
-        provider=provider,
-        connection=connection,
-        api_key_env=api_key_env,
-        base_url=base_url,
+        connection_json=tuple(connection_json or ()),
+        model_json=tuple(model_json or ()),
         world_model=world_model,
         judge=judge,
         embedder=embedder,
-        embedder_provider=embedder_provider,
-        embedder_connection=embedder_connection,
-        embedder_api_key_env=embedder_api_key_env,
-        embedder_base_url=embedder_base_url,
-        world_model_tools=world_model_tools,
-        judge_tools=judge_tools,
     )
     try:
         catalog = run_provider_setup(

@@ -132,8 +132,10 @@ class ModelCapabilities(ContractModel):
 
     supports_tools: bool = False
     supports_embeddings: bool = False
+    supports_structured_output: bool = False
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
+    input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
 
 
 class ToolChoice(ContractModel):

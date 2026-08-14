@@ -39,6 +39,29 @@ def extract_fit_transitions(
     Raises:
         ValueError: Trace identities and lineage bindings differ or repeat.
     """
+    return extract_real_transitions(
+        traces,
+        lineage_bindings,
+        included_partitions=frozenset({"fit"}),
+    )
+
+
+def extract_real_transitions(
+    traces: Sequence[Trace],
+    lineage_bindings: Sequence[RAGLineageBinding],
+    *,
+    included_partitions: frozenset[str],
+) -> tuple[RAGTransition, ...]:
+    """Extract deterministic observed transitions from selected frozen real partitions.
+
+    Args:
+        traces: Verified real traces.
+        lineage_bindings: Complete trace-to-lineage partition assignments.
+        included_partitions: Fit, held-out, or both partitions to include.
+
+    Returns:
+        Sorted immutable real transitions from only the selected partitions.
+    """
     trace_ids = tuple(trace.trace_id for trace in traces)
     if len(set(trace_ids)) != len(trace_ids):
         raise ValueError("RAG source datasets repeat a trace ID")
@@ -47,10 +70,10 @@ def extract_fit_transitions(
         raise ValueError("RAG lineage bindings repeat a trace ID")
     if set(binding_by_trace) != set(trace_ids):
         raise ValueError("RAG lineage bindings must cover exactly the verified source traces")
-    transitions: list[RAGTransition] = []
+    transitions = []
     for trace in traces:
         binding = binding_by_trace[trace.trace_id]
-        if binding.partition != "fit":
+        if binding.partition not in included_partitions:
             continue
         transitions.extend(_trace_transitions(trace, binding.lineage_id))
     ordered = tuple(sorted(transitions, key=lambda item: item.transition_id))
@@ -198,7 +221,7 @@ def _message_observation(
 
 
 def _assistant_text(attributes: Mapping[str, JsonValue]) -> str | None:
-    """Read visible assistant output from standard or legacy GenAI attributes."""
+    """Read visible assistant output from supported GenAI semantic-convention attributes."""
     messages = _json_value(attributes.get("gen_ai.output.messages"))
     text = _last_role_message(messages, frozenset({"assistant", "model"}))
     if text is not None:

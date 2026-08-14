@@ -2,20 +2,53 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
-from wmo.common.models import load_model_catalog
+from wmo.common.models import (
+    ConnectionConfig,
+    ModelCatalog,
+    ModelRecord,
+    ModelRoles,
+    load_model_catalog,
+    write_model_catalog,
+)
+
+_RUNNER = CliRunner()
 
 
-def test_noninteractive_provider_setup_writes_exact_roles(tmp_path: Path) -> None:
-    """Automation can configure all build-time roles without a prompt."""
+def _connection_json(name: str, provider: str, env: str) -> str:
+    """Return one concise structured connection flag value."""
+    return json.dumps({"name": name, "provider": provider, "api_key_env": env})
+
+
+def _model_json(
+    alias: str,
+    connection: str,
+    model: str,
+    *,
+    embeddings: bool = False,
+) -> str:
+    """Return one concise structured model flag value."""
+    return json.dumps(
+        {
+            "alias": alias,
+            "connection": connection,
+            "model": model,
+            "supports_embeddings": embeddings,
+            "input_cost_per_million_tokens_usd": 0.1 if embeddings else None,
+        }
+    )
+
+
+def test_noninteractive_setup_collects_many_connections_models_and_roles(tmp_path: Path) -> None:
+    """Automation supplies repeatable collections before independent role aliases."""
     root = tmp_path / ".wmo"
-
-    result = CliRunner().invoke(
+    result = _RUNNER.invoke(
         app,
         [
             "config",
@@ -23,33 +56,109 @@ def test_noninteractive_provider_setup_writes_exact_roles(tmp_path: Path) -> Non
             "--root",
             str(root),
             "--non-interactive",
-            "--provider",
-            "openai",
-            "--connection",
-            "openai-main",
-            "--api-key-env",
-            "OPENAI_API_KEY",
+            "--connection-json",
+            _connection_json("openai", "openai", "OPENAI_API_KEY"),
+            "--connection-json",
+            _connection_json("gemini", "gemini", "GEMINI_API_KEY"),
+            "--model-json",
+            _model_json("world", "openai", "world-id"),
+            "--model-json",
+            _model_json("judge", "openai", "judge-id"),
+            "--model-json",
+            _model_json("embed", "gemini", "embed-id", embeddings=True),
             "--world-model",
-            "world-id",
+            "world",
             "--judge",
-            "judge-id",
+            "judge",
             "--embedder",
-            "embed-id",
+            "embed",
         ],
     )
 
     assert result.exit_code == 0, result.output
-    assert "configured providers" in result.output
     catalog = load_model_catalog(root / "models.toml")
-    assert catalog.models["world-model"].model == "world-id"
-    assert catalog.models["judge"].model == "judge-id"
-    assert catalog.models["embedder"].model == "embed-id"
-    assert catalog.roles.candidates == ()
+    assert tuple(sorted(catalog.connections)) == ("gemini", "openai")
+    assert tuple(sorted(catalog.models)) == ("embed", "judge", "world")
+    assert catalog.roles == ModelRoles(world_model="world", judge="judge", embedder="embed")
 
 
-def test_noninteractive_setup_reports_all_missing_required_flags(tmp_path: Path) -> None:
-    """Automation failures explain how to complete setup."""
-    result = CliRunner().invoke(
+def test_noninteractive_setup_reports_every_missing_collection_and_role(tmp_path: Path) -> None:
+    """One failure lists the complete remediation instead of serial missing prompts."""
+    result = _RUNNER.invoke(
+        app,
+        ["config", "providers", "--root", str(tmp_path / ".wmo"), "--non-interactive"],
+        color=True,
+    )
+
+    assert result.exit_code == 2
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    for value in (
+        "at least one --connection-json",
+        "at least one --model-json",
+        "--world-model",
+        "--judge",
+        "--embedder",
+    ):
+        assert value in output
+    assert not (tmp_path / ".wmo" / "models.toml").exists()
+
+
+def test_setup_preserves_router_candidates_and_unrelated_entries(tmp_path: Path) -> None:
+    """Editing build roles does not consume or mutate router candidate selection."""
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    write_model_catalog(
+        root / "models.toml",
+        ModelCatalog(
+            connections={
+                "router": ConnectionConfig(provider="openrouter", api_key_env="OPENROUTER_API_KEY")
+            },
+            models={"candidate": ModelRecord(connection="router", model="vendor/candidate")},
+            roles=ModelRoles(candidates=("candidate",), incumbent="candidate"),
+        ),
+    )
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(root),
+            "--non-interactive",
+            "--connection-json",
+            _connection_json("openai", "openai", "OPENAI_API_KEY"),
+            "--model-json",
+            _model_json("all", "openai", "all-id", embeddings=True),
+            "--world-model",
+            "all",
+            "--judge",
+            "all",
+            "--embedder",
+            "all",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    catalog = load_model_catalog(root / "models.toml")
+    assert catalog.roles.candidates == ("candidate",)
+    assert catalog.roles.incumbent == "candidate"
+    assert catalog.models["candidate"].model == "vendor/candidate"
+
+
+def test_structured_input_rejects_openai_compatible_without_capabilities(tmp_path: Path) -> None:
+    """Private compatible endpoints cannot acquire provider-wide capability guesses."""
+    connection = json.dumps(
+        {
+            "name": "private",
+            "provider": "openai-compatible",
+            "api_key_env": "PRIVATE_API_KEY",
+            "base_url": "https://models.example.test/v1",
+        }
+    )
+    model = json.dumps({"alias": "private", "connection": "private", "model": "private-model"})
+
+    result = _RUNNER.invoke(
         app,
         [
             "config",
@@ -57,107 +166,35 @@ def test_noninteractive_setup_reports_all_missing_required_flags(tmp_path: Path)
             "--root",
             str(tmp_path / ".wmo"),
             "--non-interactive",
-            "--provider",
-            "openai",
+            "--connection-json",
+            connection,
+            "--model-json",
+            model,
+            "--world-model",
+            "private",
+            "--judge",
+            "private",
+            "--embedder",
+            "private",
         ],
-        color=True,
     )
 
     assert result.exit_code == 2
-    output = unstyle(result.output)
-    for flag in ("--connection", "--api-key-env", "--world-model", "--judge", "--embedder"):
-        assert flag in output
+    assert "must declare embedding support" in result.output
     assert not (tmp_path / ".wmo" / "models.toml").exists()
 
 
-def test_interactive_judge_rejection_cancels_without_writing(tmp_path: Path) -> None:
-    """The interactive collector finishes before the atomic service is invoked."""
+def test_interactive_final_rejection_writes_no_catalog(tmp_path: Path) -> None:
+    """All answers remain in memory until the user confirms the complete summary."""
     root = tmp_path / ".wmo"
-    result = CliRunner().invoke(
+    result = _RUNNER.invoke(
         app,
         ["config", "providers", "--root", str(root)],
-        input="openai\n\n\ny\nworld-id\njudge-id\nn\n",
+        input=(
+            "y\n\n\nn\nn\nn\nn\nn\nopenai\nall\nmodel-id\nn\ny\ny\nn\nn\nn\nn\nall\ny\nall\nn\n"
+        ),
     )
 
     assert result.exit_code == 1
+    assert "Configuration summary" in result.output
     assert not (root / "models.toml").exists()
-
-
-def test_anthropic_noninteractive_setup_reports_separate_embedder_flags(tmp_path: Path) -> None:
-    """A provider without runtime embeddings gives actionable noninteractive remediation."""
-    result = CliRunner().invoke(
-        app,
-        [
-            "config",
-            "providers",
-            "--root",
-            str(tmp_path / ".wmo"),
-            "--non-interactive",
-            "--provider",
-            "anthropic",
-            "--connection",
-            "anthropic-main",
-            "--api-key-env",
-            "ANTHROPIC_API_KEY",
-            "--world-model",
-            "world-id",
-            "--judge",
-            "judge-id",
-            "--embedder",
-            "embed-id",
-        ],
-        color=True,
-    )
-
-    assert result.exit_code == 2
-    output = unstyle(result.output)
-    for flag in ("--embedder-provider", "--embedder-connection", "--embedder-api-key-env"):
-        assert flag in output
-
-
-def test_interactive_supplied_unknown_provider_is_an_actionable_error(tmp_path: Path) -> None:
-    """A flag value cannot bypass the interactive provider choice validation."""
-    result = CliRunner().invoke(
-        app,
-        [
-            "config",
-            "providers",
-            "--root",
-            str(tmp_path / ".wmo"),
-            "--provider",
-            "unknown-provider",
-        ],
-        input="\n",
-    )
-
-    assert result.exit_code == 2
-    assert "Primary provider must be one of" in result.output
-    assert not (tmp_path / ".wmo" / "models.toml").exists()
-
-
-def test_interactive_supplied_nonembedding_provider_is_an_actionable_error(
-    tmp_path: Path,
-) -> None:
-    """A supplied embedder provider must satisfy the narrower provider choices."""
-    result = CliRunner().invoke(
-        app,
-        [
-            "config",
-            "providers",
-            "--root",
-            str(tmp_path / ".wmo"),
-            "--provider",
-            "openai",
-            "--connection",
-            "openai-main",
-            "--api-key-env",
-            "OPENAI_API_KEY",
-            "--embedder-provider",
-            "anthropic",
-        ],
-        input="n\n",
-    )
-
-    assert result.exit_code == 2
-    assert "Embedder provider must be one of" in result.output
-    assert not (tmp_path / ".wmo" / "models.toml").exists()

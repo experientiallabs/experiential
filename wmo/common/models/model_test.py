@@ -45,8 +45,10 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
     assert ModelCapabilities(supports_tools=True).model_dump(mode="json") == {
         "supports_tools": True,
         "supports_embeddings": False,
+        "supports_structured_output": False,
         "context_window_tokens": None,
         "maximum_output_tokens": None,
+        "input_cost_per_million_tokens_usd": None,
     }
     with pytest.raises(ValidationError, match="named tool_choice"):
         ModelRequest(

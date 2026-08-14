@@ -10,6 +10,7 @@ import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -39,7 +40,7 @@ from wmo.simulation.retrieval.embedding import (
     embed_rag_texts,
 )
 from wmo.simulation.retrieval.store import load_rag_index
-from wmo.simulation.retrieval.transitions import extract_fit_transitions
+from wmo.simulation.retrieval.transitions import extract_real_transitions
 
 _REAL_SOURCE_KINDS = frozenset({"file", "otlp", "production"})
 
@@ -64,6 +65,7 @@ def persist_trace_rag(
     embedder: RAGEmbedderBinding | None = None,
     rag_id: str | None = None,
     default_top_k: int = 5,
+    included_partitions: frozenset[Literal["fit", "held_out"]] = frozenset({"fit"}),
 ) -> PersistedRAGIndex:
     """Build a read-only fit-side index from any positive number of real imported traces.
 
@@ -80,6 +82,8 @@ def persist_trace_rag(
             embedder is used when omitted.
         rag_id: Optional explicit artifact ID. Content addressing is used when omitted.
         default_top_k: Default number of matches returned by the loaded retriever.
+        included_partitions: Frozen lineage partitions eligible for this index. Fit-only indexes
+            use ``{"fit"}``; serving indexes use both real-evidence partitions.
 
     Returns:
         The immutable envelope, manifest, observed transitions, and persisted vectors.
@@ -93,10 +97,17 @@ def persist_trace_rag(
     if default_top_k <= 0:
         raise ValueError("RAG default top_k must be positive")
     sources, traces = _load_real_sources(store, source_inputs)
-    transitions = extract_fit_transitions(traces, lineage_bindings)
+    invalid_partitions = included_partitions.difference({"fit", "held_out"})
+    if not included_partitions or invalid_partitions:
+        raise ValueError("RAG included_partitions must contain fit, held_out, or both")
+    transitions = extract_real_transitions(
+        traces,
+        lineage_bindings,
+        included_partitions=included_partitions,
+    )
     if not transitions:
         raise ValueError(
-            "verified fit traces contain no real action-to-subsequent-observation transitions"
+            "verified included traces contain no real action-to-subsequent-observation transitions"
         )
     binding = embedder or default_rag_embedder()
     embedded = embed_rag_texts(binding, tuple(item.key_text for item in transitions))
@@ -110,14 +121,25 @@ def persist_trace_rag(
     fit_lineages = tuple(
         sorted({binding.lineage_id for binding in lineage_bindings if binding.partition == "fit"})
     )
-    if not fit_lineages:
-        raise ValueError("RAG construction needs at least one fit lineage")
+    included_lineages = tuple(
+        sorted(
+            {
+                binding.lineage_id
+                for binding in lineage_bindings
+                if binding.partition in included_partitions
+            }
+        )
+    )
+    if not fit_lineages or not included_lineages:
+        raise ValueError("RAG construction needs at least one included lineage")
     content = {
         "code_revision": code_revision,
         "default_top_k": default_top_k,
         "embedder": binding.snapshot.model_dump(mode="json"),
         "embedding_dimension": dimensions,
         "fit_lineage_ids": list(fit_lineages),
+        "included_lineage_ids": list(included_lineages),
+        "included_partitions": sorted(included_partitions),
         "key_schema_version": RAG_KEY_SCHEMA_VERSION,
         "schema_version": 1,
         "sources": [source.model_dump(mode="json") for source in sources],
@@ -142,6 +164,8 @@ def persist_trace_rag(
         vectors_sha256=hashlib.sha256(vectors_payload).hexdigest(),
         transition_ids=tuple(item.transition_id for item in transitions),
         fit_lineage_ids=fit_lineages,
+        included_lineage_ids=included_lineages,
+        included_partitions=tuple(sorted(included_partitions)),
         embedding_dimension=dimensions,
         transition_count=len(transitions),
         default_top_k=default_top_k,
