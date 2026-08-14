@@ -21,8 +21,12 @@ from wmo.common.project import (
 )
 from wmo.common.routing import KnnRouterPolicy
 from wmo.runtime.models import RuntimeModelCatalog
-from wmo.runtime.router.completion import RouterCompletionService
+from wmo.runtime.router.completion import (
+    JournaledRouterCompletionService,
+    RouterCompletionService,
+)
 from wmo.runtime.router.endpoint import create_router_endpoint
+from wmo.runtime.router.journal import JournaledRouterRuntime, RuntimeInteractionJournal
 from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
 
 
@@ -122,6 +126,37 @@ def create_project_router_app(
         create_router_endpoint({project: runtime}, completion_services=services)
     )
     return application
+
+
+def create_project_completion_service(
+    store: ProjectStore,
+    runtime: RouterRuntime,
+) -> RouterCompletionService:
+    """Compose one project's durable completion boundary without provider dispatch.
+
+    Args:
+        store: Initialized project whose canonical runtime journal receives interactions.
+        runtime: Loaded frozen router wrapped by the durable journal service.
+
+    Returns:
+        Neutral completion service shared by every endpoint request in one application.
+
+    Raises:
+        RouterApplicationError: The store does not own the runtime's exact verified policy.
+    """
+    try:
+        stored_policy = _load_policy(store.artifacts, runtime.policy.policy_id)
+    except (ArtifactStoreError, OSError, ValueError) as exc:
+        raise RouterApplicationError(
+            "project cannot bind runtime journaling without its verified router policy"
+        ) from exc
+    if stored_policy != runtime.policy:
+        raise RouterApplicationError(
+            "project router policy content differs from the runtime selected for journaling"
+        )
+    return JournaledRouterCompletionService(
+        JournaledRouterRuntime(runtime, RuntimeInteractionJournal(store.paths))
+    )
 
 
 def load_router(

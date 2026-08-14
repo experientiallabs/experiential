@@ -35,9 +35,9 @@ from wmo.runtime.router.completion import (
     RouterCompletionFailedError,
     RouterCompletionInProgressError,
     RouterCompletionService,
+    complete_router_request,
 )
 from wmo.runtime.router.runtime import (
-    RoutedModelResponse,
     RouterEpisodeConflictError,
     RouterModelCapabilityError,
     RouterRuntime,
@@ -77,32 +77,6 @@ _RESPONSE_FIELDS = frozenset(
         "stream",
     }
 )
-
-
-class _UnsupportedIdempotencyService:
-    """Fail closed when no durable service owns caller-keyed interactions."""
-
-    def complete(
-        self,
-        request: ModelRequest,
-        *,
-        idempotency_key: str,
-        conversation_id: str | None = None,
-    ) -> RoutedModelResponse:
-        """Reject a keyed interaction before routing or provider dispatch.
-
-        Args:
-            request: Request that cannot be completed durably.
-            idempotency_key: Caller key with no durable owner.
-            conversation_id: Optional conversation identity supplied by the endpoint.
-
-        Raises:
-            RouterCompletionConflictError: Always, because no durable service is configured.
-        """
-        del request, idempotency_key, conversation_id
-        raise RouterCompletionConflictError(
-            "this router has no durable idempotency service; retry without Idempotency-Key"
-        )
 
 
 class HttpFunctionCall(BaseModel):
@@ -312,11 +286,14 @@ class _OpenAIRequestState:
     def response_context(
         self,
         previous_response_id: str | None,
+        *,
+        new_episode_id: str | None = None,
     ) -> _ResponseState:
         """Resolve prior Responses state or start a new internal conversation.
 
         Args:
             previous_response_id: Optional opaque response identity to continue.
+            new_episode_id: Optional deterministic identity for a new keyed request.
 
         Returns:
             Retained state for the named response, or empty state for a new conversation.
@@ -333,7 +310,7 @@ class _OpenAIRequestState:
                 self._responses.move_to_end(previous_response_id)
                 return state
         return _ResponseState(
-            episode_id=f"openai-{uuid.uuid4().hex}",
+            episode_id=new_episode_id or f"openai-{uuid.uuid4().hex}",
             messages=(),
             expires_at=time.monotonic() + _RESPONSE_TTL_SECONDS,
             size_bytes=0,
@@ -384,10 +361,7 @@ def create_router_endpoint(
     """
     router = APIRouter()
     affinity = _OpenAIRequestState()
-    services: dict[str, RouterCompletionService] = {
-        name: _UnsupportedIdempotencyService() for name in endpoints
-    }
-    services.update(completion_services or {})
+    services = completion_services or {}
 
     @router.get("/v1/models")
     def models() -> dict[str, object]:
@@ -425,13 +399,11 @@ def create_router_endpoint(
             return _error(404, f"no routed endpoint {request.model!r}")
         try:
             model_request = _chat_model_request(request)
-            routed = (
-                runtime.complete(model_request)
-                if idempotency_key is None
-                else services[request.model].complete(
-                    model_request,
-                    idempotency_key=idempotency_key,
-                )
+            routed = complete_router_request(
+                runtime,
+                services.get(request.model),
+                model_request,
+                idempotency_key=idempotency_key,
             )
         except RouterCompletionConflictError:
             return _error(409, "Idempotency-Key conflicts with durable request state")
@@ -487,18 +459,19 @@ def create_router_endpoint(
         if runtime is None:
             return _error(404, f"no routed endpoint {request.model!r}")
         try:
-            prior = affinity.response_context(request.previous_response_id)
+            prior = affinity.response_context(
+                request.previous_response_id,
+                new_episode_id=_new_response_episode_id(idempotency_key),
+            )
             visible = _response_messages(request)
             all_messages = (*prior.messages, *visible)
             model_request = _responses_model_request(request, all_messages)
-            routed = (
-                runtime.complete(model_request, episode_id=prior.episode_id)
-                if idempotency_key is None
-                else services[request.model].complete(
-                    model_request,
-                    idempotency_key=idempotency_key,
-                    conversation_id=prior.episode_id,
-                )
+            routed = complete_router_request(
+                runtime,
+                services.get(request.model),
+                model_request,
+                idempotency_key=idempotency_key,
+                conversation_id=prior.episode_id,
             )
         except RouterCompletionConflictError:
             return _error(409, "Idempotency-Key conflicts with durable request state")
@@ -545,6 +518,21 @@ def create_router_endpoint(
         )
 
     return router
+
+
+def _new_response_episode_id(idempotency_key: str | None) -> str | None:
+    """Derive stable new-conversation routing identity for a keyed Responses request.
+
+    Args:
+        idempotency_key: Optional standard caller replay key.
+
+    Returns:
+        A stable non-secret conversation identity for keyed requests, otherwise ``None``.
+    """
+    if idempotency_key is None:
+        return None
+    digest = hashlib.sha256(idempotency_key.encode(), usedforsecurity=False).hexdigest()
+    return f"openai-keyed-{digest[:32]}"
 
 
 def _chat_model_request(request: HttpChatRequest) -> ModelRequest:

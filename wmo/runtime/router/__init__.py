@@ -2,11 +2,13 @@
 
 from wmo.runtime.router.application import (
     RouterApplicationError,
+    create_project_completion_service,
     create_project_router_app,
     load_project_router,
     load_router,
 )
 from wmo.runtime.router.completion import (
+    JournaledRouterCompletionService,
     RouterCompletionConflictError,
     RouterCompletionFailedError,
     RouterCompletionInProgressError,
@@ -46,6 +48,7 @@ from wmo.runtime.router.snapshot import (
 __all__ = [
     "RoutedModelResponse",
     "JournaledRouterRuntime",
+    "JournaledRouterCompletionService",
     "RuntimeAcceptedEvent",
     "RuntimeAttemptFailedEvent",
     "RuntimeCompletedEvent",
@@ -73,6 +76,7 @@ __all__ = [
     "seal_runtime_trace_snapshot",
     "create_router_endpoint",
     "RouterApplicationError",
+    "create_project_completion_service",
     "create_project_router_app",
     "load_router",
     "load_project_router",

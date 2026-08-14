@@ -39,14 +39,29 @@ def run(
     """
     import uvicorn
 
-    from wmo.runtime.router.application import create_project_router_app, load_project_router
+    from wmo.common.project import ProjectStore
+    from wmo.runtime.router.application import (
+        create_project_completion_service,
+        create_project_router_app,
+        load_project_router,
+    )
 
     try:
         runtime = load_project_router(project, root, policy_id=policy)
+        project_store = ProjectStore(root, project)
+        completion_service = create_project_completion_service(project_store, runtime)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     typer.echo(
         f"loaded policy {runtime.policy.policy_id} with {runtime.policy.judgment_status} judgment"
     )
     typer.echo(f"OpenAI API router at http://{_LOOPBACK_HOST}:{port}/v1")
-    uvicorn.run(create_project_router_app(project, runtime), host=_LOOPBACK_HOST, port=port)
+    uvicorn.run(
+        create_project_router_app(
+            project,
+            runtime,
+            completion_service=completion_service,
+        ),
+        host=_LOOPBACK_HOST,
+        port=port,
+    )
