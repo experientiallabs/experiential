@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -205,6 +206,7 @@ RuntimeJournalEvent = Annotated[
     Field(discriminator="event"),
 ]
 _EVENT_ADAPTER: TypeAdapter[RuntimeJournalEvent] = TypeAdapter(RuntimeJournalEvent)
+_SELECTION_LOCKS = tuple(threading.RLock() for _ in range(64))
 
 
 @dataclass(frozen=True)
@@ -504,26 +506,46 @@ class JournaledRouterRuntime:
             conversation_id,
         )
         deadline = self._monotonic() + self._wait_timeout_seconds
-        acceptance: RuntimeAcceptance | None = None
         while True:
             claim = self.journal.claim(
                 identity,
-                acceptance,
+                None,
                 now=self._clock(),
                 stale_after=self._stale_after,
             )
             if claim.status == "needs_selection":
-                decision = self.runtime.select(request, episode_id=identity.lineage_id)
-                acceptance = RuntimeAcceptance(
-                    decision=decision,
-                    selected_alias=decision.selected_alias,
-                    selected_model=_selected_model(self.runtime, decision.selected_alias),
-                    policy_input=ArtifactInput(
-                        artifact_id=decision.policy_id,
-                        sha256=decision.policy_sha256,
-                    ),
-                )
-                continue
+                selection_lock = _selection_lock(identity.interaction_id)
+                remaining = deadline - self._monotonic()
+                if remaining <= 0 or not selection_lock.acquire(timeout=remaining):
+                    raise RuntimeInteractionInProgressError(
+                        "another local request is selecting an idempotent interaction; retry"
+                    )
+                try:
+                    claim = self.journal.claim(
+                        identity,
+                        None,
+                        now=self._clock(),
+                        stale_after=self._stale_after,
+                    )
+                    if claim.status == "needs_selection":
+                        decision = self.runtime.select(request, episode_id=identity.lineage_id)
+                        acceptance = RuntimeAcceptance(
+                            decision=decision,
+                            selected_alias=decision.selected_alias,
+                            selected_model=_selected_model(self.runtime, decision.selected_alias),
+                            policy_input=ArtifactInput(
+                                artifact_id=decision.policy_id,
+                                sha256=decision.policy_sha256,
+                            ),
+                        )
+                        claim = self.journal.claim(
+                            identity,
+                            acceptance,
+                            now=self._clock(),
+                            stale_after=self._stale_after,
+                        )
+                finally:
+                    selection_lock.release()
             if claim.status == "completed":
                 if claim.accepted is None or claim.completed is None:
                     raise RuntimeJournalError("completed journal claim omitted its records")
@@ -542,7 +564,6 @@ class JournaledRouterRuntime:
                         "another process is completing this idempotent interaction; retry"
                     )
                 self._sleep(min(0.05, remaining))
-                acceptance = None
                 continue
             if claim.accepted is None:
                 raise RuntimeJournalError("dispatch journal claim omitted its accepted record")
@@ -575,6 +596,19 @@ class JournaledRouterRuntime:
             decision=accepted.decision,
             response=completed.response,
         )
+
+
+def _selection_lock(interaction_id: str) -> threading.RLock:
+    """Return a bounded process-wide lock for one interaction selection handshake.
+
+    Args:
+        interaction_id: Canonical content-derived runtime interaction identity.
+
+    Returns:
+        Stable lock stripe shared by every local runtime instance.
+    """
+    digest = int(interaction_id.rsplit("-", maxsplit=1)[-1], 16)
+    return _SELECTION_LOCKS[digest % len(_SELECTION_LOCKS)]
 
 
 def _interaction_identity(

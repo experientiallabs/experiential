@@ -8,6 +8,7 @@ import os
 import stat
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from multiprocessing.sharedctypes import Synchronized
 from pathlib import Path
@@ -106,22 +107,48 @@ class _FakeRuntime:
         *,
         counter: Synchronized | None = None,
         delay: float = 0.0,
+        selection_delay: float = 0.0,
+        selection_hook: Callable[[], None] | None = None,
         fail_once: bool = False,
     ) -> None:
+        """Configure deterministic selection, completion, delay, and failure behavior.
+
+        Args:
+            counter: Optional process-shareable completion counter.
+            delay: Seconds to pause each target completion.
+            selection_delay: Seconds to pause each routing selection.
+            selection_hook: Optional synchronous callback invoked during selection.
+            fail_once: Whether the first target completion raises a timeout.
+        """
         self.policy = SimpleNamespace(
             candidates=(RoutedCandidateSnapshot(alias="candidate-a", model=_snapshot()),)
         )
         self.counter = counter
         self.delay = delay
+        self.selection_delay = selection_delay
+        self.selection_hook = selection_hook
         self.fail_once = fail_once
         self.select_calls = 0
         self.complete_calls = 0
         self.decisions: list[RoutingDecision] = []
 
     def select(self, request: ModelRequest, *, episode_id: str | None = None) -> RoutingDecision:
+        """Return a deterministic decision after the configured selection delay.
+
+        Args:
+            request: Canonical request accepted by the runtime seam.
+            episode_id: Required journal-derived routing lineage.
+
+        Returns:
+            Deterministic routing decision for the requested lineage.
+        """
         del request
         assert episode_id is not None
         self.select_calls += 1
+        if self.selection_delay:
+            time.sleep(self.selection_delay)
+        if self.selection_hook is not None:
+            self.selection_hook()
         decision = _decision(episode_id)
         self.decisions.append(decision)
         return decision
@@ -165,6 +192,44 @@ def _service(
     )
 
 
+def _find_colliding_key(
+    reference_key: str,
+    reference_request: ModelRequest,
+    candidate_request: ModelRequest,
+) -> str:
+    """Find a distinct key mapped to the same bounded selection-lock stripe.
+
+    Args:
+        reference_key: Key whose process-local lock stripe must be matched.
+        reference_request: Request paired with the reference key.
+        candidate_request: Request paired with generated candidate keys.
+
+    Returns:
+        Deterministic candidate key using the same selection-lock stripe.
+
+    Raises:
+        AssertionError: No collision is found within the bounded search.
+    """
+    reference_identity = _interaction_identity(
+        "support-agent", reference_key, reference_request, None
+    )
+    reference_stripe = int(reference_identity.interaction_id.rsplit("-", maxsplit=1)[-1], 16) % 64
+    for index in range(1_000):
+        candidate = f"colliding-key-{index}"
+        candidate_identity = _interaction_identity(
+            "support-agent",
+            candidate,
+            candidate_request,
+            None,
+        )
+        candidate_stripe = (
+            int(candidate_identity.interaction_id.rsplit("-", maxsplit=1)[-1], 16) % 64
+        )
+        if candidate_stripe == reference_stripe:
+            return candidate
+    raise AssertionError("bounded key search did not find a selection-lock collision")
+
+
 def test_completed_interaction_replays_after_restart_without_provider_or_selection(
     tmp_path: Path,
 ) -> None:
@@ -187,6 +252,133 @@ def test_completed_interaction_replays_after_restart_without_provider_or_selecti
         "accepted",
         "completed",
     ]
+
+
+def test_concurrent_runtime_instances_select_and_dispatch_once(tmp_path: Path) -> None:
+    """Serialize initial route selection across services sharing one project journal.
+
+    Args:
+        tmp_path: Pytest-owned local project root.
+    """
+    first_runtime = _FakeRuntime(selection_delay=0.05, delay=0.05)
+    second_runtime = _FakeRuntime(selection_delay=0.05, delay=0.05)
+    services = (
+        _service(tmp_path / ".wmo", first_runtime),
+        _service(tmp_path / ".wmo", second_runtime),
+    )
+    barrier = threading.Barrier(3)
+    responses: list[RoutedModelResponse] = []
+    errors: list[Exception] = []
+
+    def complete(service: JournaledRouterRuntime) -> None:
+        """Start together and capture one shared-key completion result.
+
+        Args:
+            service: Independently composed runtime over the shared journal.
+        """
+        try:
+            barrier.wait()
+            responses.append(service.complete(_request(), idempotency_key="shared-key"))
+        except Exception as exc:  # noqa: BLE001 - capture thread failures for the main assertion
+            errors.append(exc)
+
+    threads = tuple(threading.Thread(target=complete, args=(service,)) for service in services)
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads), "shared-key handshake deadlocked"
+    assert errors == []
+    assert len(responses) == 2 and responses[0] == responses[1]
+    assert first_runtime.select_calls + second_runtime.select_calls == 1
+    assert first_runtime.complete_calls + second_runtime.complete_calls == 1
+    assert [event.event for event in services[0].journal.read_events()] == [
+        "accepted",
+        "completed",
+    ]
+
+
+def test_colliding_selection_stripe_allows_nested_independent_runtime(tmp_path: Path) -> None:
+    """Allow same-thread selection reentry for an unrelated colliding interaction.
+
+    Args:
+        tmp_path: Pytest-owned local project root.
+    """
+    root = tmp_path / ".wmo"
+    outer_key = "outer-key"
+    nested_key = _find_colliding_key(outer_key, _request(), _request("Nested"))
+    nested_runtime = _FakeRuntime()
+    nested_service = _service(root, nested_runtime)
+
+    def complete_nested() -> None:
+        """Complete one unrelated interaction through the second local service."""
+        nested_service.complete(_request("Nested"), idempotency_key=nested_key)
+
+    outer_runtime = _FakeRuntime(selection_hook=complete_nested)
+    outer_service = _service(root, outer_runtime)
+    errors: list[Exception] = []
+
+    def complete_outer() -> None:
+        """Capture a nested-selection failure without blocking the test process."""
+        try:
+            outer_service.complete(_request(), idempotency_key=outer_key)
+        except Exception as exc:  # noqa: BLE001 - capture thread failures for the main assertion
+            errors.append(exc)
+
+    thread = threading.Thread(target=complete_outer, daemon=True)
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive(), "colliding selection stripe deadlocked on same-thread reentry"
+    assert errors == []
+    assert outer_runtime.select_calls == outer_runtime.complete_calls == 1
+    assert nested_runtime.select_calls == nested_runtime.complete_calls == 1
+
+
+def test_colliding_selection_stripe_obeys_bounded_wait(tmp_path: Path) -> None:
+    """Bound another thread's wait for a busy selection-lock stripe.
+
+    Args:
+        tmp_path: Pytest-owned local project root.
+    """
+    root = tmp_path / ".wmo"
+    held_key = "held-key"
+    waiting_key = _find_colliding_key(held_key, _request("Held"), _request("Waiting"))
+    selection_started = threading.Event()
+    release_selection = threading.Event()
+
+    def hold_selection() -> None:
+        """Signal lock ownership and wait until the bounded-wait assertion finishes."""
+        selection_started.set()
+        assert release_selection.wait(timeout=2.0)
+
+    held_runtime = _FakeRuntime(selection_hook=hold_selection)
+    held_service = _service(root, held_runtime)
+    waiting_service = _service(root, _FakeRuntime(), wait_timeout_seconds=0.05)
+    errors: list[Exception] = []
+
+    def complete_held() -> None:
+        """Run the selector that temporarily owns the shared lock stripe."""
+        try:
+            held_service.complete(_request("Held"), idempotency_key=held_key)
+        except Exception as exc:  # noqa: BLE001 - capture thread failures for the main assertion
+            errors.append(exc)
+
+    thread = threading.Thread(target=complete_held, daemon=True)
+    thread.start()
+    assert selection_started.wait(timeout=1.0)
+    started_at = time.monotonic()
+    with pytest.raises(RuntimeInteractionInProgressError, match="selecting"):
+        waiting_service.complete(_request("Waiting"), idempotency_key=waiting_key)
+    elapsed = time.monotonic() - started_at
+    release_selection.set()
+    thread.join(timeout=1.0)
+
+    assert elapsed < 0.5
+    assert not thread.is_alive()
+    assert errors == []
 
 
 def test_same_key_with_different_request_or_lineage_conflicts(tmp_path: Path) -> None:
