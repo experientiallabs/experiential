@@ -29,12 +29,8 @@ uv run pytest -q
   simulation, optimize, or cli; runtime may not import simulation, optimize, or cli; simulation
   may not import optimize or cli; optimize may not import simulation or cli. The AST gate rejects
   every current forbidden edge directly.
-- Every Python function and method uses a Google-style docstring. An absolutely trivial function
-  or method may use one clear summary line. This rule includes private helpers, nested functions,
-  and test helpers so each callable states its current contract locally.
 - The root CLI command set is exact: `build`, `config`, `optimize`, and `run`;
   `wmo/cli/app_test.py` and the release tests enforce the current command and distribution shape.
-- There is no 800-line warning and no numeric modules-per-directory gate.
 
 ## Evidence, simulation, and routing lifecycle
 
@@ -85,18 +81,19 @@ uv run pytest -q
 
 ## Optimization surfaces
 
-- Harness-search optimization, world-model delta search, Harbor benchmark scoring, and live agent
-  sessions moved to the private `agent-optimization` repo on 2026-08-03. Customer agent execution
-  lives only in `wmo/runtime/agents/`, executable environments live only in
+- This repository owns no harness search, world-model delta search, Harbor benchmark scoring, or
+  live agent session surface; that work belongs to the private `agent-optimization` repo. Customer
+  agent execution lives only in `wmo/runtime/agents/`, executable environments live only in
   `wmo/runtime/environments/`, and sandbox simulation lives only in
-  `wmo/simulation/engines/sandbox.py`. Do not grow harness documents, benchmark ownership, or
-  mutation machinery back into this repository.
+  `wmo/simulation/engines/sandbox.py`. Keep harness documents, benchmark ownership, and mutation
+  machinery out of this repository.
 - `wmo/optimize/router/` owns provider-free offline fit, policy locking, held-out reporting, and
   their immutable artifacts. Online selection belongs to `wmo/runtime/router/`; customer workflow
   composition belongs to `wmo/workflow/router.py`. Keep those three boundaries explicit.
 - The root CLI is locked to `build`, `optimize`, `run`, and `config`. The optimize group is locked
-  to `router` and `model`; the config group is locked to `telemetry`. Do not restore removed root
-  commands, aliases, hosted-session flags, or separate fit and report commands.
+  to `router` and `model`; the config group is locked to `telemetry` and `providers`. Adding a root
+  command, an alias, a hosted-session flag, or separate fit and report commands requires widening
+  that locked surface deliberately.
 - `wmo optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
   It never builds a dataset, creates teacher rollouts, changes routing roles, or launches a
   simulator. The config freezes the W12 manifest, native Tinker base-model snapshot, capability
@@ -105,14 +102,15 @@ uv run pytest -q
   after those checks. Completed W13 artifacts are recursively verified before an opaque sampling
   handle is atomically registered in `models.toml`.
 - Changes to this composition seam require focused persisted-dataset, resume, budget, immutable
-  pointer, drift, and catalog-provenance coverage. Do not restore rollout, reverse-KL, cross-token
-  loss, promotion, adapter-store, or route-registration paths here.
+  pointer, drift, and catalog-provenance coverage. Rollout, reverse-KL, cross-token loss,
+  promotion, adapter-store, and route-registration paths do not belong on this seam.
 
 ## Python
 
 - Every Python file must have a module docstring.
-- Write Google-style docstrings for all classes and functions. Use plain one-line docstrings only
-  for absolutely trivial classes and functions.
+- Every class, function, and method uses a Google-style docstring, including private helpers,
+  nested functions, and test helpers, so each callable states its contract locally. An absolutely
+  trivial callable may use one clear summary line.
 - **Never `print`.** All diagnostic/progress output goes through a module logger
   (`logging.getLogger(__name__)`), never the `print` builtin — enforced by ruff's `T20` rules.
   The one exception is deliberate user-facing CLI presentation, which goes through a local rich
@@ -183,8 +181,9 @@ uv run pytest -q
      and their rendered figures under `docs/research/figures/`), `docs/reference/` (how-to
      references verified against main), and `docs/cookbook/` (end-to-end walks through the whole
      pipeline on one benchmark, each step one real CLI command plus the artifact it creates),
-     plus the single root page `docs/usage.md` (the terse map of the CLI surface: one line of
-     purpose and one artifact per command). Nothing else: raw result JSONs, vector sources, design
+     plus two root pages: `docs/usage.md` (the terse map of the CLI surface: one line of purpose
+     and one artifact per command) and `docs/release-scope.md` (the supported and explicitly
+     excluded claims of the current release, checked by `wmo/release_test.py`). Nothing else: raw result JSONs, vector sources, design
      notes, and drafts do not belong in the repo at all. `docs/README.md` indexes every
      doc and records its purpose. Update or remove superseded material only after checking
      references and retaining durable evidence.
