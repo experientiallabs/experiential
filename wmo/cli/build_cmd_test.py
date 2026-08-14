@@ -348,3 +348,13 @@ def test_build_rejects_old_project_option_shape(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "No such option: --project" in unstyle(result.output)
+
+
+def test_build_help_describes_the_completed_grounded_artifact() -> None:
+    """CLI guidance names the reusable output of the build happy path."""
+    result = _RUNNER.invoke(app, ["build", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "Build a reusable grounded world model from local trace evidence." in unstyle(
+        result.output
+    )

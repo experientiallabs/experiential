@@ -13,7 +13,7 @@ from wmo.cli.run_cmd import run
 from wmo.common.config import load_env_file
 
 app = typer.Typer(
-    help="Build local evidence, optimize a frozen router, and run it on loopback.",
+    help="Build grounded simulations, optimize model use, and serve routers locally.",
     no_args_is_help=True,
 )
 app.add_typer(config_app, name="config")
@@ -25,7 +25,7 @@ add_deferred_typer(
     help="Optimize supported frozen project artifacts.",
     known_names=("router", "model"),
 )
-app.command("build", help="Build an immutable task set from a local OTLP or PostHog export.")(build)
+app.command("build", help="Build a reusable grounded world model from local trace evidence.")(build)
 app.command("run", help="Run one frozen project router on a development-only loopback endpoint.")(
     run
 )
