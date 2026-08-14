@@ -283,6 +283,12 @@ class RouterRuntime:
                 episode_decision is None
                 or decision.selected_alias != episode_decision.selected_alias
             ):
+                if episode_decision is not None:
+                    stale_request_keys = tuple(
+                        key for key in self._request_decisions if key[0] == identity_sha256
+                    )
+                    for stale_key in stale_request_keys:
+                        del self._request_decisions[stale_key]
                 self._episode_decisions[identity_sha256] = decision
             self._request_decisions[request_key] = decision
             return decision

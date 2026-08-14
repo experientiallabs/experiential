@@ -89,7 +89,16 @@ class _UnsupportedIdempotencyService:
         idempotency_key: str,
         conversation_id: str | None = None,
     ) -> RoutedModelResponse:
-        """Reject a keyed interaction before routing or provider dispatch."""
+        """Reject a keyed interaction before routing or provider dispatch.
+
+        Args:
+            request: Request that cannot be completed durably.
+            idempotency_key: Caller key with no durable owner.
+            conversation_id: Optional conversation identity supplied by the endpoint.
+
+        Raises:
+            RouterCompletionConflictError: Always, because no durable service is configured.
+        """
         del request, idempotency_key, conversation_id
         raise RouterCompletionConflictError(
             "this router has no durable idempotency service; retry without Idempotency-Key"
@@ -382,7 +391,11 @@ def create_router_endpoint(
 
     @router.get("/v1/models")
     def models() -> dict[str, object]:
-        """List the routed model names exposed by this endpoint."""
+        """List the routed model names exposed by this endpoint.
+
+        Returns:
+            OpenAI-compatible model-list envelope in deterministic name order.
+        """
         return {
             "object": "list",
             "data": [

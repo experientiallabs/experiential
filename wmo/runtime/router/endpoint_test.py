@@ -50,7 +50,19 @@ class _ReplayService:
         idempotency_key: str,
         conversation_id: str | None = None,
     ) -> RoutedModelResponse:
-        """Complete a request once per key and replay the durable result."""
+        """Complete a request once per key and replay the durable result.
+
+        Args:
+            request: Provider-neutral request to route.
+            idempotency_key: Caller key that owns the replay entry.
+            conversation_id: Optional stable conversation identity.
+
+        Returns:
+            Newly completed or previously retained routed response.
+
+        Raises:
+            RouterCompletionConflictError: The key is reused for another request.
+        """
         if not idempotency_key:
             return self.runtime.complete(request, episode_id=conversation_id)
         with self._lock:
@@ -67,7 +79,15 @@ class _ReplayService:
 def _clients(
     *, candidate_tools: bool = True, durable: bool = False
 ) -> tuple[OpenAI, TestClient, RouterRuntime, _Client]:
-    """Build official and loopback clients over one test router runtime."""
+    """Build official and loopback clients over one test router runtime.
+
+    Args:
+        candidate_tools: Whether the routed candidate declares tool support.
+        durable: Whether to inject the replaying durable completion service.
+
+    Returns:
+        Official OpenAI client, loopback HTTP client, router runtime, and model client.
+    """
     runtime, model_client = _runtime(candidate_tools=candidate_tools)
     service = _ReplayService(runtime) if durable else None
     app = create_project_router_app("router-a", runtime, completion_service=service)
@@ -207,7 +227,11 @@ def test_official_responses_client_continues_with_previous_response_id() -> None
 
 
 def test_responses_continuation_does_not_carry_prior_instructions() -> None:
-    """Each Responses instructions field is scoped only to its own provider call."""
+    """Prove Responses instructions remain scoped to their provider call.
+
+    A continued request retains visible conversation content while excluding the earlier
+    request-scoped instruction from the next provider transcript.
+    """
     openai, _http, _runtime_value, model_client = _clients()
 
     first = openai.responses.create(model="router-a", input="one", instructions="FIRST")
@@ -301,7 +325,11 @@ def test_official_clients_parse_buffered_streams() -> None:
 
 
 def test_responses_tool_stream_emits_the_official_item_and_argument_events() -> None:
-    """Official SDK tool loops observe the complete Responses streaming lifecycle."""
+    """Prove tool streams expose the complete official Responses lifecycle.
+
+    The official SDK observes item creation, argument delta and completion, item completion, and
+    the final response event in protocol order.
+    """
     openai, _http, _runtime_value, _model_client = _clients()
 
     events = list(
@@ -331,7 +359,11 @@ def test_responses_tool_stream_emits_the_official_item_and_argument_events() -> 
 
 
 def test_nested_unsupported_official_fields_fail_before_dispatch() -> None:
-    """Official nested fields are never silently discarded by the provider-neutral seam."""
+    """Prove unsupported official nested fields fail before provider dispatch.
+
+    Strict tool schemas and serial tool-call requirements are rejected at validation, and neither
+    request reaches the model client.
+    """
     _openai, http, _runtime_value, model_client = _clients()
 
     response = http.post(
@@ -355,7 +387,11 @@ def test_nested_unsupported_official_fields_fail_before_dispatch() -> None:
 
 
 def test_length_and_responses_request_metadata_are_preserved() -> None:
-    """Truncation and supported Responses request metadata survive public adaptation."""
+    """Prove truncation and supported request metadata survive public adaptation.
+
+    The response preserves instructions, tool settings, temperature, token limits, usage, and the
+    incomplete terminal state produced by length termination.
+    """
     model_response = ModelResponse(
         output=AssistantAction(content="partial"),
         model=_snapshot("cheap"),
@@ -406,7 +442,11 @@ def test_length_and_responses_request_metadata_are_preserved() -> None:
 
 
 def test_idempotency_key_fails_closed_without_a_durable_service() -> None:
-    """A raw runtime rejects claimed idempotency before selection or provider dispatch."""
+    """Prove a keyed request fails closed without a durable completion service.
+
+    The endpoint rejects the claim before router selection or provider dispatch can create state
+    that cannot be replayed durably.
+    """
     _openai, http, runtime, model_client = _clients()
 
     response = http.post(
@@ -422,7 +462,11 @@ def test_idempotency_key_fails_closed_without_a_durable_service() -> None:
 
 @pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses"))
 def test_empty_idempotency_key_is_rejected_before_dispatch(path: str) -> None:
-    """An empty standard idempotency key cannot become an unkeyed provider call."""
+    """Prove an empty standard idempotency key never becomes an unkeyed call.
+
+    Args:
+        path: OpenAI endpoint path exercised by the parameterized regression.
+    """
     _openai, http, runtime, model_client = _clients(durable=True)
     payload = (
         {"model": "router-a", "input": "retry"}
@@ -438,7 +482,11 @@ def test_empty_idempotency_key_is_rejected_before_dispatch(path: str) -> None:
 
 
 def test_durable_service_replays_the_same_public_completion() -> None:
-    """A durable completion service prevents duplicate dispatch and public-envelope drift."""
+    """Prove durable Chat Completion replay avoids dispatch and envelope drift.
+
+    Two calls with the same key return identical public JSON while producing only one model client
+    completion.
+    """
     _openai, http, _runtime_value, model_client = _clients(durable=True)
     payload = {"model": "router-a", "messages": [{"role": "user", "content": "same"}]}
     headers = {"Idempotency-Key": "interaction-a"}
@@ -453,7 +501,11 @@ def test_durable_service_replays_the_same_public_completion() -> None:
 
 
 def test_durable_service_replays_the_same_public_response() -> None:
-    """Responses replay preserves nested output identities without another provider call."""
+    """Prove durable Responses replay preserves nested public identities.
+
+    Reusing a caller key returns identical response and child-item IDs without another provider
+    invocation.
+    """
     _openai, http, _runtime_value, model_client = _clients(durable=True)
     payload = {"model": "router-a", "input": "same"}
     headers = {"Idempotency-Key": "interaction-response"}
@@ -468,7 +520,11 @@ def test_durable_service_replays_the_same_public_response() -> None:
 
 @pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses"))
 def test_idempotency_key_rejects_a_different_request(path: str) -> None:
-    """One standard idempotency key cannot merge two divergent OpenAI requests."""
+    """Prove one idempotency key cannot merge divergent OpenAI requests.
+
+    Args:
+        path: OpenAI endpoint path exercised by the parameterized conflict regression.
+    """
     _openai, http, _runtime_value, model_client = _clients(durable=True)
     headers = {"Idempotency-Key": "one-logical-request"}
     if path.endswith("responses"):

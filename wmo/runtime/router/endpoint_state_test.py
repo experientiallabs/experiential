@@ -6,7 +6,15 @@ from wmo.runtime.router.endpoint import HttpMessage, _OpenAIRequestState, _Respo
 
 
 def _state(*, expires_at: float, size_bytes: int) -> _ResponseState:
-    """Build retained response state with controlled expiry and size."""
+    """Build retained response state with controlled expiry and size.
+
+    Args:
+        expires_at: Monotonic deadline for the test state.
+        size_bytes: Serialized size charged to the continuation capacity.
+
+    Returns:
+        Deterministic response state for continuation-boundary tests.
+    """
     return _ResponseState(
         episode_id="episode-a",
         messages=(HttpMessage(role="user", content="x"),),
@@ -18,7 +26,11 @@ def _state(*, expires_at: float, size_bytes: int) -> _ResponseState:
 def test_response_state_expires_before_continuation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Expired response identities cannot recover retained transcript content."""
+    """Prove expired response identities cannot recover retained transcript content.
+
+    The test advances the monotonic clock beyond the stored deadline and verifies both lookup
+    rejection and byte-accounting cleanup.
+    """
     now = [10.0]
     monkeypatch.setattr("wmo.runtime.router.endpoint.time.monotonic", lambda: now[0])
     state = _OpenAIRequestState()
@@ -32,7 +44,11 @@ def test_response_state_expires_before_continuation(
 
 
 def test_response_state_evicts_to_the_byte_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Large histories are evicted even when the item-count ceiling is not reached."""
+    """Prove byte pressure evicts history before the item-count ceiling.
+
+    The test stores two individually valid histories whose combined serialized size exceeds the
+    configured capacity, then verifies the oldest identity is unavailable.
+    """
     monkeypatch.setattr("wmo.runtime.router.endpoint._RESPONSE_CAPACITY_BYTES", 15)
     state = _OpenAIRequestState()
 

@@ -12,7 +12,11 @@ from wmo.runtime.router.streaming import chat_stream, responses_stream
 
 
 def test_text_stream_emits_every_official_lifecycle_event() -> None:
-    """Buffered text includes item, part, delta, done, and terminal events in order."""
+    """Prove buffered text emits every official lifecycle event in order.
+
+    The stream includes response creation, item and content-part boundaries, text delta and done,
+    item completion, and the terminal response event with monotonic sequence numbers.
+    """
     response = ModelResponse(
         output=AssistantAction(content="hello"),
         model=_snapshot("cheap"),
@@ -43,7 +47,11 @@ def test_text_stream_emits_every_official_lifecycle_event() -> None:
 
 
 def test_length_streams_use_incomplete_terminals() -> None:
-    """Truncated Chat and Responses streams never report successful completion."""
+    """Prove truncated Chat and Responses streams use incomplete terminals.
+
+    Chat reports a length finish reason while Responses emits an incomplete event rather than a
+    successful completion event.
+    """
     response = ModelResponse(
         output=AssistantAction(content="partial"),
         model=_snapshot("cheap"),

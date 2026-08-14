@@ -67,7 +67,11 @@ def test_replayed_tool_history_requires_tool_capability() -> None:
 
 
 def test_selection_uses_an_eligible_frozen_candidate_before_dispatch() -> None:
-    """An incapable preferred alias does not mask another eligible frozen candidate."""
+    """Prove an incapable preferred alias cannot mask an eligible frozen candidate.
+
+    The runtime evaluates request-time capabilities before dispatch and selects the frozen
+    baseline that supports the requested tool protocol.
+    """
     policy, manifest, bank, snapshots, client = _fixture()
     capabilities = {
         "cheap": ModelCapabilities(),
@@ -94,7 +98,14 @@ def test_selection_uses_an_eligible_frozen_candidate_before_dispatch() -> None:
             return snapshots[alias], capabilities[alias]
 
         def resolve(self, alias: str) -> ResolvedModel:
-            """Resolve an alias to the shared test client and frozen metadata."""
+            """Resolve an alias to the shared test client and frozen metadata.
+
+            Args:
+                alias: Frozen candidate alias to resolve.
+
+            Returns:
+                Resolved model with capability-appropriate embedding support.
+            """
             snapshot, capability = self.snapshot(alias)
             return ResolvedModel(
                 alias,
@@ -122,7 +133,11 @@ def test_selection_uses_an_eligible_frozen_candidate_before_dispatch() -> None:
 
 
 def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
-    """A later capability fallback remains sticky for subsequent ordinary turns."""
+    """Prove a capability fallback replaces the episode's sticky model.
+
+    An ordinary turn first selects the cheap model, a tool turn falls back to the eligible model,
+    and both a later turn and an exact replay of the first request remain on that replacement.
+    """
     policy, manifest, bank, snapshots, client = _fixture()
     capabilities = {
         "cheap": ModelCapabilities(),
@@ -149,7 +164,14 @@ def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
             return snapshots[alias], capabilities[alias]
 
         def resolve(self, alias: str) -> ResolvedModel:
-            """Resolve an alias to the shared test client and frozen metadata."""
+            """Resolve an alias to the shared test client and frozen metadata.
+
+            Args:
+                alias: Frozen candidate alias to resolve.
+
+            Returns:
+                Resolved model with capability-appropriate embedding support.
+            """
             snapshot, capability = self.snapshot(alias)
             return ResolvedModel(
                 alias,
@@ -175,8 +197,10 @@ def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
         ModelRequest(messages=(ModelMessage(role="user", content="ordinary later turn"),)),
         episode_id="eligible-sticky",
     )
+    replayed_first = runtime.select(_request(), episode_id="eligible-sticky")
 
     assert first.selected_alias == "cheap"
     assert fallback.selected_alias == "baseline"
     assert fallback.fallback_reason == "capability_eligibility"
     assert later.selected_alias == "baseline"
+    assert replayed_first.selected_alias == "baseline"
