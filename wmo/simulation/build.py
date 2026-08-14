@@ -32,6 +32,13 @@ from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.mining.descriptors import DescriptorEmbedder, HashingDescriptorEmbedder
 from wmo.simulation.mining.service import MiningSpec, TaskMiningResult, mine_tasks, persist_task_set
 
+_BUILD_SCOPED_REVIEW_KEYS = (
+    "manual_judge",
+    "rubric_review",
+    "human_score_history",
+    "human_score_submissions",
+)
+
 
 @dataclass(frozen=True)
 class TaskSetBuild:
@@ -331,16 +338,7 @@ def select_build_review(store: ProjectStore, review: BuildReviewReadiness) -> No
             )
         except ValueError as exc:
             raise ValueError("review.json contains invalid build readiness") from exc
-        if prior != review:
-            for key in (
-                "manual_judge",
-                "rubric_review",
-                "human_score_history",
-                "human_score_submissions",
-            ):
-                root_review.pop(key, None)
-        root_review["build_review"] = review.model_dump(mode="json")
-        return root_review
+        return _advance_build_review(root_review, prior=prior, review=review)
 
     store.update_review(update)
 
@@ -371,20 +369,45 @@ def _prepare_build_review(store: ProjectStore, review: BuildReviewReadiness) -> 
         root_review = _review_object(current)
         prior = root_review.get("build_review")
         if prior is None:
-            root_review["build_review"] = review.model_dump(mode="json")
-            return root_review
+            return _advance_build_review(root_review, prior=None, review=review)
         try:
             existing = BuildReviewReadiness.model_validate(prior)
         except ValueError as exc:
             raise ValueError("review.json contains invalid build readiness") from exc
-        if existing == review or _completed_build_matches_review(store, review):
-            root_review["build_review"] = review.model_dump(mode="json")
+        if existing == review:
             return root_review
+        if _completed_build_matches_review(store, review):
+            return _advance_build_review(root_review, prior=existing, review=review)
         if _completed_build_matches_review(store, existing):
             return root_review
         raise ValueError("review.json already binds a different completed build")
 
-    store.update_review(update)
+    with _build_review_coordination(store):
+        store.update_review(update)
+
+
+def _advance_build_review(
+    root_review: JsonObject,
+    *,
+    prior: BuildReviewReadiness | None,
+    review: BuildReviewReadiness,
+) -> JsonObject:
+    """Advance the build binding and remove only namespaces owned by replaced evidence.
+
+    Args:
+        root_review: Mutable complete project review object.
+        prior: Previous build binding, or None before the first build.
+        review: Selected build binding that will replace it.
+
+    Returns:
+        Review state with the selected build binding, unrelated members preserved, and judge
+        namespaces removed only when their prior build binding was replaced.
+    """
+    if prior != review:
+        for key in _BUILD_SCOPED_REVIEW_KEYS:
+            root_review.pop(key, None)
+    root_review["build_review"] = review.model_dump(mode="json")
+    return root_review
 
 
 def _review_object(current: JsonValue | None) -> JsonObject:

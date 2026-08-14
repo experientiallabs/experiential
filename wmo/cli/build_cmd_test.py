@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from click import unstyle
+from pydantic import JsonValue
 from typer.testing import CliRunner
 
 import wmo.cli.build_cmd as build_command
@@ -543,6 +544,28 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     first_build = store.load_project().build
     first_review = store.read_review()
     assert first_build is not None
+    assert isinstance(first_review, dict)
+
+    def add_build_scoped_review_state(current: JsonValue | None) -> JsonValue:
+        """Attach graph-A judge namespaces and unrelated review state.
+
+        Args:
+            current: Current project review value.
+
+        Returns:
+            Review state with stale build-scoped fixtures and an unrelated marker.
+        """
+        assert isinstance(current, dict)
+        return {
+            **current,
+            "manual_judge": {"build": "a"},
+            "rubric_review": {"build": "a"},
+            "human_score_history": [{"build": "a"}],
+            "human_score_submissions": [{"build": "a"}],
+            "unrelated_review_state": {"preserve": True},
+        }
+
+    first_review = store.update_review(add_build_scoped_review_state)
     original_select_review = simulation_build.select_build_review
 
     def fail_review_selection(*_args: object, **_kwargs: object) -> None:
@@ -590,6 +613,11 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     assert recovered_review["build_review"]["trace_dataset"] == (
         selected_build.trace_dataset.model_dump(mode="json")
     )
+    assert "manual_judge" not in recovered_review
+    assert "rubric_review" not in recovered_review
+    assert "human_score_history" not in recovered_review
+    assert "human_score_submissions" not in recovered_review
+    assert recovered_review["unrelated_review_state"] == {"preserve": True}
 
 
 @pytest.mark.parametrize("count", [2, 100, 1_001])
