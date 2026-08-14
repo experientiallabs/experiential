@@ -117,3 +117,62 @@ def test_selection_uses_an_eligible_frozen_candidate_before_dispatch() -> None:
     assert result.decision.selected_alias == "baseline"
     assert result.decision.fallback_reason == "capability_eligibility"
     assert client.complete_calls == 1
+
+
+def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
+    """A later capability fallback remains sticky for subsequent ordinary turns."""
+    policy, manifest, bank, snapshots, client = _fixture()
+    capabilities = {
+        "cheap": ModelCapabilities(),
+        "baseline": ModelCapabilities(supports_tools=True),
+        "embedder": ModelCapabilities(supports_embeddings=True),
+    }
+    snapshots = {
+        alias: snapshot.model_copy(update={"capabilities_sha256": sha256_json(capabilities[alias])})
+        for alias, snapshot in snapshots.items()
+    }
+    policy = policy.model_copy(
+        update={
+            "candidates": tuple(
+                RoutedCandidateSnapshot(alias=item.alias, model=snapshots[item.alias])
+                for item in policy.candidates
+            ),
+            "embedder": snapshots[policy.embedder_alias],
+        }
+    )
+
+    class _MixedCatalog(_Catalog):
+        def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+            return snapshots[alias], capabilities[alias]
+
+        def resolve(self, alias: str) -> ResolvedModel:
+            snapshot, capability = self.snapshot(alias)
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capability,
+                client,
+                client if capability.supports_embeddings else None,
+            )
+
+    runtime = RouterRuntime(
+        policy,
+        manifest,
+        bank,
+        cast(RuntimeModelCatalog, _MixedCatalog(snapshots, client)),
+        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_sha256="a" * 64,
+        pricing_candidate_aliases=bank.candidate_aliases,
+    )
+
+    first = runtime.select(_request(), episode_id="eligible-sticky")
+    fallback = runtime.select(_request(tool_name="read"), episode_id="eligible-sticky")
+    later = runtime.select(
+        ModelRequest(messages=(ModelMessage(role="user", content="ordinary later turn"),)),
+        episode_id="eligible-sticky",
+    )
+
+    assert first.selected_alias == "cheap"
+    assert fallback.selected_alias == "baseline"
+    assert fallback.fallback_reason == "capability_eligibility"
+    assert later.selected_alias == "baseline"

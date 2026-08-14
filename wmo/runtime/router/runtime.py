@@ -279,7 +279,10 @@ class RouterRuntime:
                     )
             decision = self._eligible_decision(request, decision, request_sha256, identity)
             self._record(decision)
-            if episode_decision is None:
+            if (
+                episode_decision is None
+                or decision.selected_alias != episode_decision.selected_alias
+            ):
                 self._episode_decisions[identity_sha256] = decision
             self._request_decisions[request_key] = decision
             return decision
