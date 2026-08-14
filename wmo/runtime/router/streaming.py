@@ -26,7 +26,14 @@ from wmo.common.core.artifacts import JsonObject
 
 
 def chat_stream(completion: ChatCompletion) -> Iterator[str]:
-    """Reframe one buffered Chat Completion as official SDK-readable chunks."""
+    """Reframe one buffered Chat Completion as official SDK-readable chunks.
+
+    Args:
+        completion: Completed OpenAI Chat Completion to stream.
+
+    Yields:
+        Server-sent event data frames followed by the standard done sentinel.
+    """
     choice = completion.choices[0]
     message = choice.message
     delta: JsonObject = {"role": "assistant"}
@@ -71,7 +78,14 @@ def chat_stream(completion: ChatCompletion) -> Iterator[str]:
 
 
 def responses_stream(response: OpenAIResponse) -> Iterator[str]:
-    """Emit the complete official lifecycle for buffered text and function-call output."""
+    """Emit the official lifecycle for buffered text and function-call output.
+
+    Args:
+        response: Completed OpenAI Response to stream.
+
+    Yields:
+        Named server-sent events in monotonically increasing sequence order.
+    """
     created = ResponseCreatedEvent(response=response, sequence_number=0, type="response.created")
     yield _event(created.type, created.model_dump_json(exclude_none=True))
     sequence = 1
@@ -116,7 +130,19 @@ def responses_stream(response: OpenAIResponse) -> Iterator[str]:
 def _text_events(
     item: ResponseOutputMessage, output_index: int, sequence: int
 ) -> Generator[str, None, int]:
-    """Yield the official content-part and text lifecycle for one output message."""
+    """Emit the content-part and text lifecycle for one output message.
+
+    Args:
+        item: Completed Responses output message.
+        output_index: Position of the message in the response output.
+        sequence: Sequence number for the first emitted event.
+
+    Yields:
+        Named content-part and text server-sent events.
+
+    Returns:
+        Next unused response event sequence number.
+    """
     for content_index, content in enumerate(item.content):
         if content.type != "output_text":
             continue
@@ -166,7 +192,22 @@ def _text_events(
 def _function_events(
     item: ResponseFunctionToolCall, output_index: int, sequence: int
 ) -> Generator[str, None, int]:
-    """Yield the official argument lifecycle for one function-call item."""
+    """Emit the argument lifecycle for one function-call item.
+
+    Args:
+        item: Completed Responses function-call output.
+        output_index: Position of the call in the response output.
+        sequence: Sequence number for the first emitted event.
+
+    Yields:
+        Named function-argument delta and completion server-sent events.
+
+    Returns:
+        Next unused response event sequence number.
+
+    Raises:
+        ValueError: The function-call output has no item identity.
+    """
     if item.id is None:
         raise ValueError("Responses function-call output omitted its item ID")
     events = (

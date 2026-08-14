@@ -304,7 +304,17 @@ class _OpenAIRequestState:
         self,
         previous_response_id: str | None,
     ) -> _ResponseState:
-        """Resolve prior Responses state or start a new internal conversation."""
+        """Resolve prior Responses state or start a new internal conversation.
+
+        Args:
+            previous_response_id: Optional opaque response identity to continue.
+
+        Returns:
+            Retained state for the named response, or empty state for a new conversation.
+
+        Raises:
+            ValueError: The response identity is unknown or expired.
+        """
         with self._lock:
             self._expire_responses(time.monotonic())
             if previous_response_id is not None:
@@ -321,7 +331,12 @@ class _OpenAIRequestState:
         )
 
     def remember_response(self, response_id: str, state: _ResponseState) -> None:
-        """Remember one count-, time-, and byte-bounded Responses continuation."""
+        """Remember one count-, time-, and byte-bounded Responses continuation.
+
+        Args:
+            response_id: Opaque public identity for the completed response.
+            state: Continuation state to retain until expiry or eviction.
+        """
         with self._lock:
             self._expire_responses(time.monotonic())
             previous = self._responses.pop(response_id, None)
@@ -381,7 +396,15 @@ def create_router_endpoint(
         request: HttpChatRequest,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> Response:
-        """Serve one OpenAI Chat Completions request through the selected runtime."""
+        """Serve one OpenAI Chat Completions request through the selected runtime.
+
+        Args:
+            request: Validated OpenAI Chat Completions request.
+            idempotency_key: Optional standard key for durable replay.
+
+        Returns:
+            A JSON or event-stream response with OpenAI-compatible content.
+        """
         if idempotency_key is not None and not idempotency_key.strip():
             return _error(400, "Idempotency-Key must not be empty")
         runtime = endpoints.get(request.model)
@@ -436,7 +459,15 @@ def create_router_endpoint(
         request: HttpResponseRequest,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> Response:
-        """Serve one OpenAI Responses request with bounded continuation state."""
+        """Serve one OpenAI Responses request with bounded continuation state.
+
+        Args:
+            request: Validated OpenAI Responses request.
+            idempotency_key: Optional standard key for durable replay.
+
+        Returns:
+            A JSON or event-stream response with OpenAI-compatible content.
+        """
         if idempotency_key is not None and not idempotency_key.strip():
             return _error(400, "Idempotency-Key must not be empty")
         runtime = endpoints.get(request.model)
@@ -623,7 +654,15 @@ def _response_history_messages(request: HttpResponseRequest) -> tuple[HttpMessag
 
 
 def _response_state(episode_id: str, messages: tuple[HttpMessage, ...]) -> _ResponseState:
-    """Measure one continuation state and assign its finite retention deadline."""
+    """Measure one continuation state and assign its finite retention deadline.
+
+    Args:
+        episode_id: Internal sticky-routing identity for the conversation.
+        messages: Complete visible message history to retain.
+
+    Returns:
+        Bounded continuation state with its serialized size and expiry.
+    """
     payload = [message.model_dump(mode="json") for message in messages]
     size_bytes = len(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
     return _ResponseState(
@@ -672,7 +711,17 @@ def _chat_completion(
     *,
     idempotency_key: str | None = None,
 ) -> ChatCompletion:
-    """Build an official Chat Completions result from a routed model response."""
+    """Build an official Chat Completions result from a routed model response.
+
+    Args:
+        model: Public routed model name requested by the caller.
+        action: Provider-neutral assistant output.
+        response: Provider result with termination and usage metadata.
+        idempotency_key: Optional caller key used to derive replay-stable identity.
+
+    Returns:
+        An official OpenAI Chat Completion envelope.
+    """
     usage = _usage(response)
     completion_id, created = _response_identity("chatcmpl-", response, idempotency_key)
     return ChatCompletion.model_validate(
@@ -703,7 +752,19 @@ def _openai_response(
     idempotency_key: str | None,
     previous_response_id: str | None,
 ) -> OpenAIResponse:
-    """Build an official Responses result from a routed model response."""
+    """Build an official Responses result from a routed model response.
+
+    Args:
+        model: Public routed model name requested by the caller.
+        action: Provider-neutral assistant output.
+        response: Provider result with termination and usage metadata.
+        request: Validated request whose supported metadata must be preserved.
+        idempotency_key: Optional caller key used to derive replay-stable identity.
+        previous_response_id: Optional public identity of the continued response.
+
+    Returns:
+        An official OpenAI Responses envelope.
+    """
     response_id, created = _response_identity("resp_", response, idempotency_key)
     output: list[JsonObject] = []
     if action.content is not None:
@@ -760,7 +821,16 @@ def _chat_finish_reason(response: ModelResponse, action: AssistantAction) -> str
 def _response_identity(
     prefix: str, response: ModelResponse, idempotency_key: str | None
 ) -> tuple[str, int]:
-    """Return a replay-stable public identity only for a caller-keyed interaction."""
+    """Derive a public identity for one response.
+
+    Args:
+        prefix: OpenAI object-specific ID prefix.
+        response: Provider result included in keyed identity material.
+        idempotency_key: Optional caller key that requires replay-stable identity.
+
+    Returns:
+        Public object ID and creation timestamp. Keyed responses use stable values.
+    """
     if idempotency_key is None:
         return f"{prefix}{uuid.uuid4().hex}", int(time.time())
     material = idempotency_key.encode() + response.model_dump_json().encode()
@@ -769,7 +839,16 @@ def _response_identity(
 
 
 def _child_id(prefix: str, response_id: str, identity: str) -> str:
-    """Derive a stable child item identity from its public response and logical item."""
+    """Derive a stable child item identity.
+
+    Args:
+        prefix: OpenAI child object-specific ID prefix.
+        response_id: Public identity of the parent response.
+        identity: Logical identity of the child item.
+
+    Returns:
+        Deterministic public child item identity.
+    """
     digest = hashlib.sha256(f"{response_id}:{identity}".encode()).hexdigest()
     return f"{prefix}_{digest[:32]}"
 

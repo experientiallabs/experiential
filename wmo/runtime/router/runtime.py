@@ -473,7 +473,17 @@ class RouterRuntime:
         request_sha256: Sha256,
         episode_id: str,
     ) -> RoutingDecision:
-        """Use a frozen eligible candidate when the original selection cannot serve the request."""
+        """Use a frozen eligible candidate when the original selection cannot serve the request.
+
+        Args:
+            request: Provider-neutral request whose capabilities must be supported.
+            decision: Original guarded routing decision.
+            request_sha256: Frozen feature identity for the request.
+            episode_id: Stable caller identity used by fallback decisions.
+
+        Returns:
+            The original decision when eligible, otherwise a guarded fallback decision.
+        """
         if _supports_request(self._resolve(decision.selected_alias), request):
             return decision
         eligible = tuple(
@@ -572,7 +582,15 @@ def _validate_idempotency_key(value: str) -> None:
 
 
 def _supports_request(resolved: ResolvedModel, request: ModelRequest) -> bool:
-    """Return whether one frozen resolved model proves every requested protocol capability."""
+    """Check whether a resolved model proves every requested protocol capability.
+
+    Args:
+        resolved: Frozen runtime model and its declared capabilities.
+        request: Provider-neutral request to evaluate.
+
+    Returns:
+        True when tool and output-token requirements are both proven.
+    """
     if _requires_tool_protocol(request) and not resolved.capabilities.supports_tools:
         return False
     requested = request.maximum_output_tokens

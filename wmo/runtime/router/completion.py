@@ -36,4 +36,18 @@ class RouterCompletionService(Protocol):
         idempotency_key: str,
         conversation_id: str | None = None,
     ) -> RoutedModelResponse:
-        """Complete or replay one durable caller-keyed interaction."""
+        """Complete or replay one durable caller-keyed interaction.
+
+        Args:
+            request: Provider-neutral request to route and execute.
+            idempotency_key: Caller key that identifies the logical interaction.
+            conversation_id: Optional stable identity for sticky conversation routing.
+
+        Returns:
+            The original or replayed routed model response.
+
+        Raises:
+            RouterCompletionConflictError: The key names different request state.
+            RouterCompletionInProgressError: The keyed interaction is still running.
+            RouterCompletionFailedError: The keyed interaction has a terminal failure.
+        """
