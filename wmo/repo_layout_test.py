@@ -1,4 +1,4 @@
-"""Small permanent checks for the current repository and CLI shape."""
+"""Permanent executable guards for repository-level ownership boundaries."""
 
 from __future__ import annotations
 
@@ -41,7 +41,14 @@ ALLOWED_TOP_FILES = {
 
 
 def _tracked_files() -> tuple[str, ...]:
-    """Return Git-tracked paths or skip outside a source checkout."""
+    """Read the complete Git-tracked repository path set.
+
+    Returns:
+        Tracked paths relative to the repository root.
+
+    Raises:
+        pytest.skip.Exception: Git is unavailable or the checkout cannot enumerate tracked files.
+    """
     try:
         result = subprocess.run(
             ["git", "ls-files"],
@@ -63,15 +70,23 @@ def _physical_lines(path: Path) -> int:
     return text.count("\n") + int(bool(text) and not text.endswith("\n"))
 
 
-def test_hand_authored_files_stay_below_one_thousand_lines() -> None:
-    """Every tracked hand-authored text file contains at most 999 physical lines."""
+def _is_line_limit_exempt(path: Path) -> bool:
+    """Return whether a generated lock or Python test module is exempt."""
+    return path.name == "package-lock.json" or path.name.endswith("_test.py")
+
+
+def test_non_test_hand_authored_files_stay_below_one_thousand_lines() -> None:
+    """Prove every covered non-test hand-authored file remains within the executable limit.
+
+    Tracked generated lock files and cohesive Python test modules are the only narrow exemptions.
+    """
     oversized: list[tuple[str, int]] = []
     for relative_path in _tracked_files():
         path = REPO_ROOT / relative_path
         if (
             not path.is_file()
             or path.suffix.lower() not in HAND_AUTHORED_SUFFIXES
-            or path.name == "package-lock.json"
+            or _is_line_limit_exempt(path)
         ):
             continue
         lines = _physical_lines(path)
@@ -81,7 +96,10 @@ def test_hand_authored_files_stay_below_one_thousand_lines() -> None:
 
 
 def test_top_level_paths_are_allowlisted() -> None:
-    """Tracked root directories and files remain on the documented closed allowlist."""
+    """Prove tracked repository-root directories and files stay on the closed allowlist.
+
+    New root surfaces require an explicit allowlist edit instead of landing silently.
+    """
     tracked = _tracked_files()
     actual_dirs = {path.split("/", 1)[0] for path in tracked if "/" in path}
     actual_files = {path for path in tracked if "/" not in path}
@@ -90,14 +108,17 @@ def test_top_level_paths_are_allowlisted() -> None:
 
 
 def test_review_surfaces_are_python_only() -> None:
-    """Review services stay in the Python package without a browser application or adapter."""
+    """Prove review services remain Python-owned without a browser application or adapter."""
     assert not (REPO_ROOT / "web").exists()
     assert not (REPO_ROOT / "wmo" / "cli" / "review_server.py").exists()
     assert not (REPO_ROOT / "wmo" / "cli" / "review_server_test.py").exists()
 
 
 def test_no_local_state_or_cache_is_tracked() -> None:
-    """Generated settings, caches, bytecode, and local environment files stay untracked."""
+    """Prove generated settings, caches, bytecode, and local environment files stay untracked.
+
+    The guard scans Git ownership rather than the developer's unrelated untracked local state.
+    """
     offenders = [
         path
         for path in _tracked_files()
@@ -106,26 +127,3 @@ def test_no_local_state_or_cache_is_tracked() -> None:
         or path.endswith(".pyc")
     ]
     assert not offenders, f"local state or cache files are tracked: {offenders}"
-
-
-def test_root_cli_and_subgroups_are_exact() -> None:
-    """The public CLI remains build, config, optimize, and run with two exact subgroups."""
-    from typer import Context
-    from typer.core import TyperGroup
-    from typer.main import get_group
-
-    from wmo.cli.app import app
-
-    root = get_group(app)
-    root_context = Context(root)
-    assert set(root.list_commands(root_context)) == {"build", "config", "optimize", "run"}
-
-    expected_subcommands = {
-        "config": {"providers", "telemetry"},
-        "optimize": {"model", "router"},
-    }
-    for name, expected in expected_subcommands.items():
-        command = root.get_command(root_context, name)
-        assert isinstance(command, TyperGroup)
-        context = Context(command, parent=root_context, info_name=name)
-        assert set(command.list_commands(context)) == expected

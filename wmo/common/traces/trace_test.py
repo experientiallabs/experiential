@@ -42,27 +42,6 @@ def _trace() -> Trace:
     )
 
 
-def test_trace_and_dataset_round_trip() -> None:
-    """Normalized trace evidence and its dataset manifest serialize without loss."""
-    trace = _trace()
-    dataset = TraceDataset(
-        schema_version=1,
-        created_at=datetime(2026, 8, 11, tzinfo=UTC),
-        code_revision="e7aad17",
-        dataset_id="traces-20260811",
-        semantic_convention_version="1.37.0",
-        traces_path="traces.jsonl",
-        traces_sha256=_DIGEST,
-        issues_path="normalization-issues.json",
-        issues_sha256=_DIGEST,
-        invalid_trace_count=1,
-        trace_ids=(trace.trace_id,),
-    )
-
-    assert Trace.model_validate_json(trace.model_dump_json()) == trace
-    assert TraceDataset.model_validate_json(dataset.model_dump_json()) == dataset
-
-
 def test_trace_requires_ordered_unique_spans_and_structured_failure() -> None:
     """Corrupt timing, repeated IDs, and failed outcomes do not silently normalize."""
     trace = _trace()

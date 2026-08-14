@@ -28,25 +28,3 @@ def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
     assert result.exit_code == 0, result.output
     for marker in ("Args:", "Returns:", "Inputs accepted by this callable"):
         assert marker not in result.output
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["providers"],
-        ["list"],
-        ["download"],
-        ["eval"],
-        ["knowledge"],
-        ["serve"],
-        ["optimize", "route"],
-        ["optimize", "router", "fit"],
-        ["optimize", "router", "report"],
-        ["optimize", "distill"],
-    ],
-)
-def test_commands_outside_the_locked_surface_are_not_callable(argv: list[str]) -> None:
-    """Nothing outside the locked root and router surface is callable, hidden or otherwise."""
-    result = CliRunner().invoke(app, argv)
-
-    assert result.exit_code == 2

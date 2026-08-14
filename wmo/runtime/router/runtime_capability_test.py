@@ -1,10 +1,23 @@
 """Request-time capability eligibility for the frozen router runtime."""
 
+from typing import cast
+
 import pytest
 
-from wmo.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall
+from wmo.common.core.artifacts import sha256_json
+from wmo.common.models import (
+    AssistantAction,
+    ModelCapabilities,
+    ModelMessage,
+    ModelRequest,
+    ModelSnapshot,
+    RoutedCandidateSnapshot,
+    ToolCall,
+)
+from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router import RouterModelCapabilityError
-from wmo.runtime.router.runtime_test import _request, _runtime
+from wmo.runtime.router.runtime import RouterRuntime
+from wmo.runtime.router.runtime_test import _Catalog, _fixture, _request, _runtime
 
 
 def test_selected_model_must_prove_tool_capability_before_dispatch() -> None:
@@ -51,3 +64,143 @@ def test_replayed_tool_history_requires_tool_capability() -> None:
         runtime.complete(request, episode_id="history-episode")
 
     assert client.complete_calls == 0
+
+
+def test_selection_uses_an_eligible_frozen_candidate_before_dispatch() -> None:
+    """Prove an incapable preferred alias cannot mask an eligible frozen candidate.
+
+    The runtime evaluates request-time capabilities before dispatch and selects the frozen
+    baseline that supports the requested tool protocol.
+    """
+    policy, manifest, bank, snapshots, client = _fixture()
+    capabilities = {
+        "cheap": ModelCapabilities(),
+        "baseline": ModelCapabilities(supports_tools=True),
+        "embedder": ModelCapabilities(supports_embeddings=True),
+    }
+    snapshots = {
+        alias: snapshot.model_copy(update={"capabilities_sha256": sha256_json(capabilities[alias])})
+        for alias, snapshot in snapshots.items()
+    }
+    policy = policy.model_copy(
+        update={
+            "candidates": tuple(
+                RoutedCandidateSnapshot(alias=item.alias, model=snapshots[item.alias])
+                for item in policy.candidates
+            ),
+            "embedder": snapshots[policy.embedder_alias],
+        }
+    )
+
+    class _MixedCatalog(_Catalog):
+        def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+            """Return the frozen model and capabilities for an alias."""
+            return snapshots[alias], capabilities[alias]
+
+        def resolve(self, alias: str) -> ResolvedModel:
+            """Resolve an alias to the shared test client and frozen metadata.
+
+            Args:
+                alias: Frozen candidate alias to resolve.
+
+            Returns:
+                Resolved model with capability-appropriate embedding support.
+            """
+            snapshot, capability = self.snapshot(alias)
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capability,
+                client,
+                client if capability.supports_embeddings else None,
+            )
+
+    runtime = RouterRuntime(
+        policy,
+        manifest,
+        bank,
+        cast(RuntimeModelCatalog, _MixedCatalog(snapshots, client)),
+        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_sha256="a" * 64,
+        pricing_candidate_aliases=bank.candidate_aliases,
+    )
+
+    result = runtime.complete(_request(tool_name="read"), episode_id="eligible")
+
+    assert result.decision.selected_alias == "baseline"
+    assert result.decision.fallback_reason == "capability_eligibility"
+    assert client.complete_calls == 1
+
+
+def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
+    """Prove a capability fallback replaces the episode's sticky model.
+
+    An ordinary turn first selects the cheap model, a tool turn falls back to the eligible model,
+    and both a later turn and an exact replay of the first request remain on that replacement.
+    """
+    policy, manifest, bank, snapshots, client = _fixture()
+    capabilities = {
+        "cheap": ModelCapabilities(),
+        "baseline": ModelCapabilities(supports_tools=True),
+        "embedder": ModelCapabilities(supports_embeddings=True),
+    }
+    snapshots = {
+        alias: snapshot.model_copy(update={"capabilities_sha256": sha256_json(capabilities[alias])})
+        for alias, snapshot in snapshots.items()
+    }
+    policy = policy.model_copy(
+        update={
+            "candidates": tuple(
+                RoutedCandidateSnapshot(alias=item.alias, model=snapshots[item.alias])
+                for item in policy.candidates
+            ),
+            "embedder": snapshots[policy.embedder_alias],
+        }
+    )
+
+    class _MixedCatalog(_Catalog):
+        def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+            """Return the frozen model and capabilities for an alias."""
+            return snapshots[alias], capabilities[alias]
+
+        def resolve(self, alias: str) -> ResolvedModel:
+            """Resolve an alias to the shared test client and frozen metadata.
+
+            Args:
+                alias: Frozen candidate alias to resolve.
+
+            Returns:
+                Resolved model with capability-appropriate embedding support.
+            """
+            snapshot, capability = self.snapshot(alias)
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capability,
+                client,
+                client if capability.supports_embeddings else None,
+            )
+
+    runtime = RouterRuntime(
+        policy,
+        manifest,
+        bank,
+        cast(RuntimeModelCatalog, _MixedCatalog(snapshots, client)),
+        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_sha256="a" * 64,
+        pricing_candidate_aliases=bank.candidate_aliases,
+    )
+
+    first = runtime.select(_request(), episode_id="eligible-sticky")
+    fallback = runtime.select(_request(tool_name="read"), episode_id="eligible-sticky")
+    later = runtime.select(
+        ModelRequest(messages=(ModelMessage(role="user", content="ordinary later turn"),)),
+        episode_id="eligible-sticky",
+    )
+    replayed_first = runtime.select(_request(), episode_id="eligible-sticky")
+
+    assert first.selected_alias == "cheap"
+    assert fallback.selected_alias == "baseline"
+    assert fallback.fallback_reason == "capability_eligibility"
+    assert later.selected_alias == "baseline"
+    assert replayed_first.selected_alias == "baseline"

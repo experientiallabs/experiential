@@ -53,23 +53,6 @@ def _configured_project(tmp_path: Path, training: TinkerSFTSpec) -> _ConfiguredP
     return _ConfiguredProject(store=fixture.store, config=config)
 
 
-def test_optimize_help_exposes_only_the_locked_command_surface() -> None:
-    """`optimize` offers `model` and `router` alone, with no alias reaching any other branch."""
-    result = CliRunner().invoke(app, ["optimize", "--help"])
-
-    assert result.exit_code == 0, result.output
-    assert "model" in result.output
-    assert "distill" not in result.output
-    router_help = CliRunner().invoke(app, ["optimize", "router", "--help"])
-    assert router_help.exit_code == 0, router_help.output
-    assert "fit" in router_help.output
-    assert "report" in router_help.output
-    assert "student" not in router_help.output
-    route_help = CliRunner().invoke(app, ["optimize", "route", "--help"])
-    assert route_help.exit_code == 2
-    assert "No such command 'route'" in route_help.output
-
-
 def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

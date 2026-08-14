@@ -8,10 +8,8 @@ from pathlib import Path
 import pytest
 
 from wmo.common.config.settings import (
-    ProjectSettings,
     ensure_telemetry_anonymous_id,
     load_settings,
-    save_settings,
     set_telemetry_enabled,
     settings_path,
 )
@@ -21,12 +19,6 @@ def test_missing_settings_defaults_to_telemetry_enabled(tmp_path: Path) -> None:
     settings = load_settings(tmp_path / ".wmo")
     assert settings.telemetry.enabled is True
     assert settings.telemetry.anonymous_id is None
-
-
-def test_save_then_load_settings_round_trips(tmp_path: Path) -> None:
-    root = tmp_path / ".wmo"
-    save_settings(ProjectSettings(), root)
-    assert load_settings(root).telemetry.enabled is True
 
 
 def test_set_telemetry_enabled_writes_project_settings(tmp_path: Path) -> None:

@@ -9,25 +9,20 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Iterator
 from typing import Literal, cast
 
 from fastapi import APIRouter, Header, Response
 from fastapi.responses import StreamingResponse
-from openai.types.chat import ChatCompletion, ChatCompletionChunk
+from openai.types.chat import ChatCompletion
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses import Response as OpenAIResponse
-from openai.types.responses import (
-    ResponseCompletedEvent,
-    ResponseCreatedEvent,
-    ResponseTextDeltaEvent,
-)
 from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, model_validator
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -35,14 +30,23 @@ from wmo.common.models import (
     ToolChoice,
 )
 from wmo.common.tasks import ToolSchema
+from wmo.runtime.router.completion import (
+    RouterCompletionConflictError,
+    RouterCompletionFailedError,
+    RouterCompletionInProgressError,
+    RouterCompletionService,
+)
 from wmo.runtime.router.runtime import (
+    RoutedModelResponse,
     RouterEpisodeConflictError,
     RouterModelCapabilityError,
     RouterRuntime,
 )
+from wmo.runtime.router.streaming import chat_stream, responses_stream
 
 _AFFINITY_CAPACITY = 4096
-_IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
+_RESPONSE_TTL_SECONDS = 24 * 60 * 60
+_RESPONSE_CAPACITY_BYTES = 64 * 1024 * 1024
 logger = logging.getLogger(__name__)
 _CHAT_REQUEST_ADAPTER = TypeAdapter(CompletionCreateParams)
 _RESPONSE_REQUEST_ADAPTER = TypeAdapter(ResponseCreateParams)
@@ -55,6 +59,7 @@ _CHAT_FIELDS = frozenset(
         "temperature",
         "max_tokens",
         "max_completion_tokens",
+        "parallel_tool_calls",
         "stream",
     }
 )
@@ -68,17 +73,42 @@ _RESPONSE_FIELDS = frozenset(
         "tool_choice",
         "temperature",
         "max_output_tokens",
+        "parallel_tool_calls",
         "stream",
     }
 )
 
 
-class OpenAIRequestConflictError(ValueError):
-    """A standard OpenAI request identity conflicts with prior local state."""
+class _UnsupportedIdempotencyService:
+    """Fail closed when no durable service owns caller-keyed interactions."""
+
+    def complete(
+        self,
+        request: ModelRequest,
+        *,
+        idempotency_key: str,
+        conversation_id: str | None = None,
+    ) -> RoutedModelResponse:
+        """Reject a keyed interaction before routing or provider dispatch.
+
+        Args:
+            request: Request that cannot be completed durably.
+            idempotency_key: Caller key with no durable owner.
+            conversation_id: Optional conversation identity supplied by the endpoint.
+
+        Raises:
+            RouterCompletionConflictError: Always, because no durable service is configured.
+        """
+        del request, idempotency_key, conversation_id
+        raise RouterCompletionConflictError(
+            "this router has no durable idempotency service; retry without Idempotency-Key"
+        )
 
 
 class HttpFunctionCall(BaseModel):
     """OpenAI function name and JSON arguments string."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     arguments: str
@@ -86,6 +116,8 @@ class HttpFunctionCall(BaseModel):
 
 class HttpToolCall(BaseModel):
     """OpenAI assistant function call."""
+
+    model_config = ConfigDict(extra="forbid")
 
     id: str
     type: Literal["function"] = "function"
@@ -95,12 +127,16 @@ class HttpToolCall(BaseModel):
 class HttpTextPart(BaseModel):
     """One supported OpenAI text content part."""
 
+    model_config = ConfigDict(extra="forbid")
+
     type: Literal["text", "input_text", "output_text"]
     text: str
 
 
 class HttpMessage(BaseModel):
     """Ordered OpenAI message preserving assistant calls and tool results."""
+
+    model_config = ConfigDict(extra="forbid")
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | tuple[HttpTextPart, ...] | None = None
@@ -123,13 +159,25 @@ class HttpMessage(BaseModel):
 class HttpFunctionDefinition(BaseModel):
     """One request-visible function schema."""
 
+    model_config = ConfigDict(extra="forbid")
+
     name: str
-    description: str = ""
+    description: str | None = None
     parameters: dict[str, JsonValue] = Field(default_factory=dict)
+    strict: bool | None = None
+
+    @model_validator(mode="after")
+    def _reject_strict_mode(self) -> HttpFunctionDefinition:
+        """Reject strict schemas because routed candidates cannot guarantee them."""
+        if self.strict is not None:
+            raise ValueError("strict function schemas are not supported by this routed endpoint")
+        return self
 
 
 class HttpTool(BaseModel):
     """One OpenAI function tool."""
+
+    model_config = ConfigDict(extra="forbid")
 
     type: Literal["function"] = "function"
     function: HttpFunctionDefinition
@@ -147,6 +195,7 @@ class HttpChatRequest(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
+    parallel_tool_calls: bool | None = None
     stream: bool = False
 
     @model_validator(mode="before")
@@ -157,18 +206,37 @@ class HttpChatRequest(BaseModel):
         _reject_unsupported_fields(value, _CHAT_FIELDS, "Chat Completions")
         return value
 
+    @model_validator(mode="after")
+    def _require_parallel_tool_calls(self) -> HttpChatRequest:
+        """Reject requests that require serial tool-call execution."""
+        if self.parallel_tool_calls is False:
+            raise ValueError("parallel_tool_calls=false is not supported by this routed endpoint")
+        return self
+
 
 class HttpResponseTool(BaseModel):
     """One OpenAI Responses function tool."""
 
+    model_config = ConfigDict(extra="forbid")
+
     type: Literal["function"] = "function"
     name: str
-    description: str = ""
+    description: str | None = None
     parameters: dict[str, JsonValue] = Field(default_factory=dict)
+    strict: bool | None = None
+
+    @model_validator(mode="after")
+    def _reject_strict_mode(self) -> HttpResponseTool:
+        """Reject strict schemas because routed candidates cannot guarantee them."""
+        if self.strict is not None:
+            raise ValueError("strict function schemas are not supported by this routed endpoint")
+        return self
 
 
 class HttpResponseFunctionCall(BaseModel):
     """One Responses function-call item replayed as assistant history."""
+
+    model_config = ConfigDict(extra="forbid")
 
     type: Literal["function_call"]
     call_id: str
@@ -178,6 +246,8 @@ class HttpResponseFunctionCall(BaseModel):
 
 class HttpResponseFunctionOutput(BaseModel):
     """One Responses function result replayed as tool history."""
+
+    model_config = ConfigDict(extra="forbid")
 
     type: Literal["function_call_output"]
     call_id: str
@@ -197,6 +267,7 @@ class HttpResponseRequest(BaseModel):
     tool_choice: JsonValue = None
     temperature: float | None = None
     max_output_tokens: int | None = None
+    parallel_tool_calls: bool | None = None
     stream: bool = False
 
     @model_validator(mode="before")
@@ -207,12 +278,21 @@ class HttpResponseRequest(BaseModel):
         _reject_unsupported_fields(value, _RESPONSE_FIELDS, "Responses")
         return value
 
+    @model_validator(mode="after")
+    def _require_parallel_tool_calls(self) -> HttpResponseRequest:
+        """Reject requests that require serial tool-call execution."""
+        if self.parallel_tool_calls is False:
+            raise ValueError("parallel_tool_calls=false is not supported by this routed endpoint")
+        return self
+
 
 class _ResponseState(BaseModel):
     """Conversation state retained for one OpenAI Responses result."""
 
     episode_id: str
     messages: tuple[HttpMessage, ...]
+    expires_at: float
+    size_bytes: int = Field(ge=0)
 
 
 class _OpenAIRequestState:
@@ -220,100 +300,102 @@ class _OpenAIRequestState:
 
     Identity comes only from the standard ``Idempotency-Key`` and ``previous_response_id`` inputs.
     Two unrelated callers can send the same transcript, so a transcript is never treated as a
-    conversation identity here.
+    conversation identity here. Stored continuation content has count, byte, and time ceilings.
     """
 
     def __init__(self) -> None:
+        """Initialize empty bounded continuation state."""
         self._lock = threading.RLock()
-        self._idempotency: OrderedDict[str, tuple[str, str, float]] = OrderedDict()
         self._responses: OrderedDict[str, _ResponseState] = OrderedDict()
-
-    def chat_episode(self, request_sha256: str, idempotency_key: str | None) -> str:
-        """Return a stable internal episode only for a standard idempotent retry."""
-        return self._idempotent_episode(request_sha256, idempotency_key, existing_episode=None)
+        self._response_bytes = 0
 
     def response_context(
         self,
         previous_response_id: str | None,
-        request_sha256: str,
-        idempotency_key: str | None,
     ) -> _ResponseState:
-        """Resolve prior Responses state or start a new internal conversation."""
+        """Resolve prior Responses state or start a new internal conversation.
+
+        Args:
+            previous_response_id: Optional opaque response identity to continue.
+
+        Returns:
+            Retained state for the named response, or empty state for a new conversation.
+
+        Raises:
+            ValueError: The response identity is unknown or expired.
+        """
         with self._lock:
+            self._expire_responses(time.monotonic())
             if previous_response_id is not None:
                 state = self._responses.get(previous_response_id)
                 if state is None:
-                    raise ValueError("previous_response_id does not name a local response")
+                    raise ValueError("previous_response_id does not name a live local response")
                 self._responses.move_to_end(previous_response_id)
-                identity = self._idempotent_episode(
-                    request_sha256, idempotency_key, existing_episode=state.episode_id
-                )
-                return _ResponseState(episode_id=identity, messages=state.messages)
-        identity = self._idempotent_episode(request_sha256, idempotency_key, existing_episode=None)
-        return _ResponseState(episode_id=identity, messages=())
+                return state
+        return _ResponseState(
+            episode_id=f"openai-{uuid.uuid4().hex}",
+            messages=(),
+            expires_at=time.monotonic() + _RESPONSE_TTL_SECONDS,
+            size_bytes=0,
+        )
 
     def remember_response(self, response_id: str, state: _ResponseState) -> None:
-        """Remember one bounded Responses continuation."""
+        """Remember one count-, time-, and byte-bounded Responses continuation.
+
+        Args:
+            response_id: Opaque public identity for the completed response.
+            state: Continuation state to retain until expiry or eviction.
+        """
         with self._lock:
+            self._expire_responses(time.monotonic())
+            previous = self._responses.pop(response_id, None)
+            if previous is not None:
+                self._response_bytes -= previous.size_bytes
             self._responses[response_id] = state
             self._responses.move_to_end(response_id)
-            while len(self._responses) > _AFFINITY_CAPACITY:
-                self._responses.popitem(last=False)
+            self._response_bytes += state.size_bytes
+            while self._responses and (
+                len(self._responses) > _AFFINITY_CAPACITY
+                or self._response_bytes > _RESPONSE_CAPACITY_BYTES
+            ):
+                _, evicted = self._responses.popitem(last=False)
+                self._response_bytes -= evicted.size_bytes
 
-    def _idempotent_episode(
-        self,
-        request_sha256: str,
-        idempotency_key: str | None,
-        *,
-        existing_episode: str | None,
-    ) -> str:
-        """Bind a standard key to one exact request and internal episode."""
-        if idempotency_key is None:
-            return existing_episode or f"openai-{uuid.uuid4().hex}"
-        key_sha256 = hashlib.sha256(idempotency_key.encode()).hexdigest()
-        with self._lock:
-            now = time.monotonic()
-            expired = tuple(
-                key for key, (_, _, deadline) in self._idempotency.items() if deadline <= now
-            )
-            for key in expired:
-                del self._idempotency[key]
-            existing = self._idempotency.get(key_sha256)
-            if existing is not None:
-                if existing[0] != request_sha256:
-                    raise OpenAIRequestConflictError(
-                        "Idempotency-Key is already bound to a different request"
-                    )
-                self._idempotency.move_to_end(key_sha256)
-                return existing[1]
-            if len(self._idempotency) >= _AFFINITY_CAPACITY:
-                raise OpenAIRequestConflictError("live idempotency-key capacity is exhausted")
-            # An expired key starts a new logical request. Its episode must not be
-            # derived from the key, because RouterRuntime intentionally retains
-            # prior episode decisions longer than this bounded transport cache.
-            episode_id = existing_episode or f"idempotency-{uuid.uuid4().hex}"
-            self._idempotency[key_sha256] = (
-                request_sha256,
-                episode_id,
-                now + _IDEMPOTENCY_TTL_SECONDS,
-            )
-            return episode_id
+    def _expire_responses(self, now: float) -> None:
+        """Remove continuations whose monotonic expiry is at or before ``now``."""
+        expired = tuple(key for key, state in self._responses.items() if state.expires_at <= now)
+        for key in expired:
+            self._response_bytes -= self._responses.pop(key).size_bytes
 
 
-def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
+def create_router_endpoint(
+    endpoints: dict[str, RouterRuntime],
+    *,
+    completion_services: dict[str, RouterCompletionService] | None = None,
+) -> APIRouter:
     """Mount OpenAI Chat Completions and Responses over exact router decisions.
 
     Args:
         endpoints: Public model names mapped to activated local runtimes.
+        completion_services: Optional durable idempotent services for standard keyed requests.
 
     Returns:
         Loopback-hostable OpenAI API router.
     """
     router = APIRouter()
     affinity = _OpenAIRequestState()
+    services: dict[str, RouterCompletionService] = {
+        name: _UnsupportedIdempotencyService() for name in endpoints
+    }
+    services.update(completion_services or {})
 
     @router.get("/v1/models")
     def models() -> dict[str, object]:
+        """List the routed model names exposed by this endpoint.
+
+        Returns:
+            OpenAI-compatible model-list envelope in deterministic name order.
+        """
         return {
             "object": "list",
             "data": [
@@ -327,15 +409,38 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
         request: HttpChatRequest,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> Response:
+        """Serve one OpenAI Chat Completions request through the selected runtime.
+
+        Args:
+            request: Validated OpenAI Chat Completions request.
+            idempotency_key: Optional standard key for durable replay.
+
+        Returns:
+            A JSON or event-stream response with OpenAI-compatible content.
+        """
+        if idempotency_key is not None and not idempotency_key.strip():
+            return _error(400, "Idempotency-Key must not be empty")
         runtime = endpoints.get(request.model)
         if runtime is None:
             return _error(404, f"no routed endpoint {request.model!r}")
         try:
             model_request = _chat_model_request(request)
-            episode_id = affinity.chat_episode(_request_sha256(request), idempotency_key)
-            routed = runtime.complete(model_request, episode_id=episode_id)
-        except OpenAIRequestConflictError:
-            return _error(409, "Idempotency-Key conflicts with live request state")
+            routed = (
+                runtime.complete(model_request)
+                if idempotency_key is None
+                else services[request.model].complete(
+                    model_request,
+                    idempotency_key=idempotency_key,
+                )
+            )
+        except RouterCompletionConflictError:
+            return _error(409, "Idempotency-Key conflicts with durable request state")
+        except RouterCompletionInProgressError:
+            return _error(
+                409, "idempotent request is still in progress", code="request_in_progress"
+            )
+        except RouterCompletionFailedError:
+            return _error(502, "idempotent routed model call failed")
         except RouterEpisodeConflictError:
             return _error(409, "request conflicts with an earlier routed turn")
         except RouterModelCapabilityError as exc:
@@ -345,11 +450,16 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
         except Exception:  # noqa: BLE001
             logger.exception("routed Chat Completions call failed")
             return _error(502, "routed model call failed")
-        completion = _chat_completion(request.model, routed.response.output, routed.response)
+        completion = _chat_completion(
+            request.model,
+            routed.response.output,
+            routed.response,
+            idempotency_key=idempotency_key,
+        )
         headers = {"X-WMO-Routed-Model": routed.decision.selected_alias}
         if request.stream:
             return StreamingResponse(
-                _chat_stream(completion), media_type="text/event-stream", headers=headers
+                chat_stream(completion), media_type="text/event-stream", headers=headers
             )
         return Response(
             content=completion.model_dump_json(exclude_none=True),
@@ -362,19 +472,42 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
         request: HttpResponseRequest,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> Response:
+        """Serve one OpenAI Responses request with bounded continuation state.
+
+        Args:
+            request: Validated OpenAI Responses request.
+            idempotency_key: Optional standard key for durable replay.
+
+        Returns:
+            A JSON or event-stream response with OpenAI-compatible content.
+        """
+        if idempotency_key is not None and not idempotency_key.strip():
+            return _error(400, "Idempotency-Key must not be empty")
         runtime = endpoints.get(request.model)
         if runtime is None:
             return _error(404, f"no routed endpoint {request.model!r}")
         try:
-            prior = affinity.response_context(
-                request.previous_response_id, _request_sha256(request), idempotency_key
-            )
+            prior = affinity.response_context(request.previous_response_id)
             visible = _response_messages(request)
             all_messages = (*prior.messages, *visible)
             model_request = _responses_model_request(request, all_messages)
-            routed = runtime.complete(model_request, episode_id=prior.episode_id)
-        except OpenAIRequestConflictError:
-            return _error(409, "Idempotency-Key conflicts with live request state")
+            routed = (
+                runtime.complete(model_request, episode_id=prior.episode_id)
+                if idempotency_key is None
+                else services[request.model].complete(
+                    model_request,
+                    idempotency_key=idempotency_key,
+                    conversation_id=prior.episode_id,
+                )
+            )
+        except RouterCompletionConflictError:
+            return _error(409, "Idempotency-Key conflicts with durable request state")
+        except RouterCompletionInProgressError:
+            return _error(
+                409, "idempotent request is still in progress", code="request_in_progress"
+            )
+        except RouterCompletionFailedError:
+            return _error(502, "idempotent routed model call failed")
         except RouterEpisodeConflictError:
             return _error(409, "response continuation conflicts with an earlier routed turn")
         except RouterModelCapabilityError as exc:
@@ -388,17 +521,22 @@ def create_router_endpoint(endpoints: dict[str, RouterRuntime]) -> APIRouter:
             request.model,
             routed.response.output,
             routed.response,
+            request=request,
+            idempotency_key=idempotency_key,
             previous_response_id=request.previous_response_id,
         )
         assistant = _assistant_message(routed.response.output)
         affinity.remember_response(
             response.id,
-            _ResponseState(episode_id=prior.episode_id, messages=(*all_messages, assistant)),
+            _response_state(
+                prior.episode_id,
+                (*prior.messages, *_response_history_messages(request), assistant),
+            ),
         )
         headers = {"X-WMO-Routed-Model": routed.decision.selected_alias}
         if request.stream:
             return StreamingResponse(
-                _responses_stream(response), media_type="text/event-stream", headers=headers
+                responses_stream(response), media_type="text/event-stream", headers=headers
             )
         return Response(
             content=response.model_dump_json(exclude_none=True),
@@ -522,6 +660,32 @@ def _response_messages(request: HttpResponseRequest) -> tuple[HttpMessage, ...]:
     return tuple(messages)
 
 
+def _response_history_messages(request: HttpResponseRequest) -> tuple[HttpMessage, ...]:
+    """Return continuation history without the request-scoped instructions field."""
+    visible = _response_messages(request)
+    return visible[1:] if request.instructions is not None else visible
+
+
+def _response_state(episode_id: str, messages: tuple[HttpMessage, ...]) -> _ResponseState:
+    """Measure one continuation state and assign its finite retention deadline.
+
+    Args:
+        episode_id: Internal sticky-routing identity for the conversation.
+        messages: Complete visible message history to retain.
+
+    Returns:
+        Bounded continuation state with its serialized size and expiry.
+    """
+    payload = [message.model_dump(mode="json") for message in messages]
+    size_bytes = len(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+    return _ResponseState(
+        episode_id=episode_id,
+        messages=messages,
+        expires_at=time.monotonic() + _RESPONSE_TTL_SECONDS,
+        size_bytes=size_bytes,
+    )
+
+
 def _arguments(value: str) -> JsonObject:
     parsed = json.loads(value)
     if not isinstance(parsed, dict):
@@ -554,20 +718,36 @@ def _content_text(content: str | tuple[HttpTextPart, ...] | None) -> str | None:
 
 
 def _chat_completion(
-    model: str, action: AssistantAction, response: ModelResponse
+    model: str,
+    action: AssistantAction,
+    response: ModelResponse,
+    *,
+    idempotency_key: str | None = None,
 ) -> ChatCompletion:
+    """Build an official Chat Completions result from a routed model response.
+
+    Args:
+        model: Public routed model name requested by the caller.
+        action: Provider-neutral assistant output.
+        response: Provider result with termination and usage metadata.
+        idempotency_key: Optional caller key used to derive replay-stable identity.
+
+    Returns:
+        An official OpenAI Chat Completion envelope.
+    """
     usage = _usage(response)
+    completion_id, created = _response_identity("chatcmpl-", response, idempotency_key)
     return ChatCompletion.model_validate(
         {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "id": completion_id,
             "object": "chat.completion",
-            "created": int(time.time()),
+            "created": created,
             "model": model,
             "choices": [
                 {
                     "index": 0,
                     "message": _assistant_message(action).model_dump(mode="json"),
-                    "finish_reason": "tool_calls" if action.tool_calls else "stop",
+                    "finish_reason": _chat_finish_reason(response, action),
                     "logprobs": None,
                 }
             ],
@@ -581,14 +761,29 @@ def _openai_response(
     action: AssistantAction,
     response: ModelResponse,
     *,
+    request: HttpResponseRequest,
+    idempotency_key: str | None,
     previous_response_id: str | None,
 ) -> OpenAIResponse:
-    response_id = f"resp_{uuid.uuid4().hex}"
+    """Build an official Responses result from a routed model response.
+
+    Args:
+        model: Public routed model name requested by the caller.
+        action: Provider-neutral assistant output.
+        response: Provider result with termination and usage metadata.
+        request: Validated request whose supported metadata must be preserved.
+        idempotency_key: Optional caller key used to derive replay-stable identity.
+        previous_response_id: Optional public identity of the continued response.
+
+    Returns:
+        An official OpenAI Responses envelope.
+    """
+    response_id, created = _response_identity("resp_", response, idempotency_key)
     output: list[JsonObject] = []
     if action.content is not None:
         output.append(
             {
-                "id": f"msg_{uuid.uuid4().hex}",
+                "id": _child_id("msg", response_id, "text"),
                 "type": "message",
                 "role": "assistant",
                 "status": "completed",
@@ -597,7 +792,7 @@ def _openai_response(
         )
     output.extend(
         {
-            "id": f"fc_{uuid.uuid4().hex}",
+            "id": _child_id("fc", response_id, call.call_id),
             "type": "function_call",
             "call_id": call.call_id,
             "name": call.name,
@@ -606,22 +801,69 @@ def _openai_response(
         }
         for call in action.tool_calls
     )
+    incomplete = response.finish_reason == ModelFinishReason.LENGTH
     return OpenAIResponse.model_validate(
         {
             "id": response_id,
             "object": "response",
-            "created_at": time.time(),
-            "completed_at": time.time(),
-            "status": "completed",
+            "created_at": float(created),
+            "completed_at": None if incomplete else float(created),
+            "status": "incomplete" if incomplete else "completed",
+            "incomplete_details": {"reason": "max_output_tokens"} if incomplete else None,
             "model": model,
             "output": output,
-            "parallel_tool_calls": True,
-            "tool_choice": "auto",
-            "tools": [],
+            "parallel_tool_calls": request.parallel_tool_calls is not False,
+            "tool_choice": request.tool_choice or "auto",
+            "tools": [tool.model_dump(mode="json") for tool in request.tools],
+            "instructions": request.instructions,
+            "temperature": request.temperature,
+            "max_output_tokens": request.max_output_tokens,
             "previous_response_id": previous_response_id,
             "usage": _responses_usage(response),
         }
     )
+
+
+def _chat_finish_reason(response: ModelResponse, action: AssistantAction) -> str:
+    """Map provider termination with truncation taking priority over tool calls."""
+    if response.finish_reason == ModelFinishReason.LENGTH:
+        return "length"
+    return "tool_calls" if action.tool_calls else "stop"
+
+
+def _response_identity(
+    prefix: str, response: ModelResponse, idempotency_key: str | None
+) -> tuple[str, int]:
+    """Derive a public identity for one response.
+
+    Args:
+        prefix: OpenAI object-specific ID prefix.
+        response: Provider result included in keyed identity material.
+        idempotency_key: Optional caller key that requires replay-stable identity.
+
+    Returns:
+        Public object ID and creation timestamp. Keyed responses use stable values.
+    """
+    if idempotency_key is None:
+        return f"{prefix}{uuid.uuid4().hex}", int(time.time())
+    material = idempotency_key.encode() + response.model_dump_json().encode()
+    digest = hashlib.sha256(material).hexdigest()
+    return f"{prefix}{digest[:32]}", 0
+
+
+def _child_id(prefix: str, response_id: str, identity: str) -> str:
+    """Derive a stable child item identity.
+
+    Args:
+        prefix: OpenAI child object-specific ID prefix.
+        response_id: Public identity of the parent response.
+        identity: Logical identity of the child item.
+
+    Returns:
+        Deterministic public child item identity.
+    """
+    digest = hashlib.sha256(f"{response_id}:{identity}".encode()).hexdigest()
+    return f"{prefix}_{digest[:32]}"
 
 
 def _usage(response: ModelResponse) -> JsonObject:
@@ -646,93 +888,6 @@ def _responses_usage(response: ModelResponse) -> JsonObject:
         "output_tokens_details": {"reasoning_tokens": 0},
         "total_tokens": prompt + completion,
     }
-
-
-def _chat_stream(completion: ChatCompletion) -> Iterator[str]:
-    choice = completion.choices[0]
-    message = choice.message
-    delta: JsonObject = {"role": "assistant"}
-    if message.content is not None:
-        delta["content"] = message.content
-    if message.tool_calls:
-        delta["tool_calls"] = [
-            {**tool.model_dump(mode="json", exclude_none=True), "index": index}
-            for index, tool in enumerate(message.tool_calls)
-        ]
-    first = ChatCompletionChunk.model_validate(
-        {
-            "id": completion.id,
-            "object": "chat.completion.chunk",
-            "created": completion.created,
-            "model": completion.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": None,
-                    "logprobs": None,
-                }
-            ],
-        }
-    )
-    terminal = ChatCompletionChunk.model_validate(
-        {
-            "id": completion.id,
-            "object": "chat.completion.chunk",
-            "created": completion.created,
-            "model": completion.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": choice.finish_reason,
-                    "logprobs": None,
-                }
-            ],
-            "usage": completion.usage.model_dump(mode="json") if completion.usage else None,
-        }
-    )
-    yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
-    yield f"data: {terminal.model_dump_json(exclude_none=True)}\n\n"
-    yield "data: [DONE]\n\n"
-
-
-def _responses_stream(response: OpenAIResponse) -> Iterator[str]:
-    created = ResponseCreatedEvent(response=response, sequence_number=0, type="response.created")
-    yield _response_event(created.type, created.model_dump_json(exclude_none=True))
-    sequence = 1
-    for output_index, item in enumerate(response.output):
-        if item.type != "message":
-            continue
-        for content_index, content in enumerate(item.content):
-            if content.type != "output_text":
-                continue
-            event = ResponseTextDeltaEvent(
-                content_index=content_index,
-                delta=content.text,
-                item_id=item.id,
-                logprobs=[],
-                output_index=output_index,
-                sequence_number=sequence,
-                type="response.output_text.delta",
-            )
-            yield _response_event(event.type, event.model_dump_json(exclude_none=True))
-            sequence += 1
-    completed = ResponseCompletedEvent(
-        response=response, sequence_number=sequence, type="response.completed"
-    )
-    yield _response_event(completed.type, completed.model_dump_json(exclude_none=True))
-
-
-def _response_event(name: str, data: str) -> str:
-    return f"event: {name}\ndata: {data}\n\n"
-
-
-def _request_sha256(request: BaseModel) -> str:
-    """Return the complete canonical OpenAI request digest for idempotency binding."""
-    payload = request.model_dump(mode="json")
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _reject_unsupported_fields(value: object, supported: frozenset[str], api_name: str) -> None:

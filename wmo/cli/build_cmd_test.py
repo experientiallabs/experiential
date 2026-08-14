@@ -289,24 +289,15 @@ def test_build_rejects_unknown_source_and_missing_local_evidence(tmp_path: Path)
     assert "trace file not found" in missing.output
 
 
-def test_build_rejects_the_removed_name_compatibility_alias(tmp_path: Path) -> None:
-    """The direct task-set build accepts only --project for its local destination."""
+def test_build_requires_an_explicit_project(tmp_path: Path) -> None:
+    """Prove the locked build surface requires its explicit project option.
+
+    Args:
+        tmp_path: Isolated directory receiving the canonical trace fixture.
+    """
     source = _otlp_export(tmp_path, count=1)
 
-    result = _RUNNER.invoke(app, ["build", str(source), "--name", "support"])
+    result = _RUNNER.invoke(app, ["build", str(source)])
 
     assert result.exit_code == 2
-    assert "No such option: --name" in unstyle(result.output)
-
-
-def test_build_rejects_removed_file_alias_and_requires_project(tmp_path: Path) -> None:
-    """The locked build surface has one positional trace and one explicit project."""
-    source = _otlp_export(tmp_path, count=1)
-
-    alias = _RUNNER.invoke(app, ["build", "--file", str(source), "--project", "support"])
-    missing_project = _RUNNER.invoke(app, ["build", str(source)])
-
-    assert alias.exit_code == 2
-    assert "No such option: --file" in unstyle(alias.output)
-    assert missing_project.exit_code == 2
-    assert "--project" in unstyle(missing_project.output)
+    assert "--project" in unstyle(result.output)

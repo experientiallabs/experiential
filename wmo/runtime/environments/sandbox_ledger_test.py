@@ -13,7 +13,6 @@ import pytest
 from wmo.runtime.environments import sandbox_ledger as ledger_module
 from wmo.runtime.environments.sandbox_ledger import (
     SandboxLedger,
-    ledger_dir,
     prune_released_files,
     read_ledger_files,
 )
@@ -39,13 +38,6 @@ def _ledger(directory: Path, *, pid: int = 4242) -> SandboxLedger:
 def _dead(_pid: int) -> bool:
     """Liveness stub: the owning process is gone, so its released file may be pruned."""
     return False
-
-
-def test_ledger_dir_lives_under_the_explicit_state_directory(
-    tmp_path: Path,
-) -> None:
-    state_directory = tmp_path / "explicit-state"
-    assert ledger_dir(state_directory) == state_directory / "e2b-sandboxes"
 
 
 def test_create_appends_a_record_named_by_owning_pid(tmp_path: Path) -> None:

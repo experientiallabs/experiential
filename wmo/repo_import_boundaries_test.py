@@ -144,20 +144,18 @@ def test_production_imports_follow_dependency_direction() -> None:
     assert not violations, f"forbidden production imports: {sorted(violations)}"
 
 
-@pytest.mark.parametrize(
-    ("owner", "dependency"),
-    sorted(
-        (owner, dependency)
-        for owner, dependencies in FORBIDDEN_IMPORTS.items()
-        for dependency in dependencies
-    ),
-)
-def test_each_forbidden_direction_is_detected(owner: str, dependency: str) -> None:
-    """Each forbidden dependency direction has a direct fixture."""
-    path = WMO_DIR / owner / "fixture.py"
-    assert _violations(path, f"from wmo.{dependency} import forbidden\n") == {
-        (f"wmo/{owner}/fixture.py", f"wmo.{dependency}")
-    }
+def test_every_forbidden_direction_is_detected() -> None:
+    """Prove the import gate detects every configured forbidden dependency edge.
+
+    Each owner and forbidden dependency pair is rendered as a synthetic import and must produce the
+    exact normalized violation tuple.
+    """
+    for owner, dependencies in FORBIDDEN_IMPORTS.items():
+        for dependency in dependencies:
+            path = WMO_DIR / owner / "fixture.py"
+            assert _violations(path, f"from wmo.{dependency} import forbidden\n") == {
+                (f"wmo/{owner}/fixture.py", f"wmo.{dependency}")
+            }
 
 
 def test_relative_and_dynamic_imports_are_detected() -> None:

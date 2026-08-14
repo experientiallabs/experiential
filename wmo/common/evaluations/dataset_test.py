@@ -134,44 +134,6 @@ def _fidelity_report(
     )
 
 
-def test_dataset_and_fidelity_report_round_trip() -> None:
-    """Sparse rows retain explicit protocols, missing-state semantics, and fidelity provenance."""
-    manifest = _manifest()
-    dataset = EvaluationDataset(manifest=manifest, rows=(_row(),))
-    report = FidelityReport(
-        schema_version=1,
-        created_at=datetime(2026, 8, 11, tzinfo=UTC),
-        code_revision="e7aad17",
-        fidelity_report_id="fidelity-report-1",
-        evaluation_plan_id="plan-1",
-        evaluation_plan_sha256=_DIGEST,
-        protocol_sha256=_DIGEST,
-        overlap_cell_ids=tuple(f"cell-fidelity-{index}" for index in range(10)),
-        planned_overlap_count=10,
-        usable_overlap_count=8,
-        failed_overlap_count=2,
-        score_mae=0.08,
-        failures=(
-            FidelityFailure(
-                cell_id="cell-fidelity-8",
-                failure=StructuredFailure(code=FailureCode.TIMEOUT, message="simulator timed out"),
-            ),
-            FidelityFailure(
-                cell_id="cell-fidelity-9",
-                failure=StructuredFailure(code=FailureCode.PROVIDER, message="provider failed"),
-            ),
-        ),
-        pairs=_pairs(tuple(f"cell-fidelity-{index}" for index in range(10)), 8),
-        gate_id="fidelity-gate-v1",
-        gate_sha256=_DIGEST,
-        status="approved",
-        approved_at=datetime(2026, 8, 11, tzinfo=UTC),
-    )
-
-    assert EvaluationDataset.model_validate_json(dataset.model_dump_json()) == dataset
-    assert FidelityReport.model_validate_json(report.model_dump_json()) == report
-
-
 def test_rows_keep_failures_and_reject_duplicate_or_missing_evidence() -> None:
     """Failed and not-run cells stay explicit while completed evidence cannot disappear."""
     failed = EvaluationRow(

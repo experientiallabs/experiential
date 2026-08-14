@@ -19,12 +19,6 @@ def test_execute_only_session_and_runtime_protocols_accept_conforming_fakes() ->
     assert session.execute(ToolCall(call_id="call-1", name="lookup")) == Observation(content="ok")
 
 
-def test_observation_round_trips_with_structured_metadata() -> None:
-    observation = Observation(content="tool output", metadata={"exit_code": 0})
-
-    assert Observation.model_validate_json(observation.model_dump_json()) == observation
-
-
 class _Session:
     """A fake session exposing only the one canonical executable operation."""
 

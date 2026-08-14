@@ -18,21 +18,22 @@ uv run pytest -q
 
 ## Repository checks
 
-- Every new or rewritten hand-authored source, test, configuration, and documentation file with a
+- Every new or rewritten hand-authored source, configuration, and documentation file with a
   covered suffix stays below 1,000 physical lines. The executable limit is 999 lines and counts
-  comments and blank lines. Generated lock files are excluded. Generated code belongs in an
-  explicitly named `generated/` directory and is never edited by hand.
+  comments and blank lines. Test modules named `*_test.py` are exempt so cohesive tests are not
+  split solely to satisfy a line count. Generated lock files are excluded. Generated code belongs
+  in an explicitly named `generated/` directory and is never edited by hand.
 - Full-repository Ruff check, Ruff format check, and ty check are required on every change. No
   pre-existing lint or type failures are grandfathered.
 - Production imports follow the approved dependency direction: common may not import runtime,
   simulation, optimize, or cli; runtime may not import simulation, optimize, or cli; simulation
   may not import optimize or cli; optimize may not import simulation or cli. The AST gate rejects
   every current forbidden edge directly.
-- Public Python modules, classes, protocols, functions, and methods use Google-style docstrings.
-  A trivial public function may use one clear summary line. Private helpers and test functions do
-  not need a docstring when their behavior is obvious.
-- The root CLI command set is exact: `build`, `config`, `optimize`, and `run`; package-layout and
-  release tests enforce the current module and distribution shape.
+- Every Python function and method uses a Google-style docstring. An absolutely trivial function
+  or method may use one clear summary line. This rule includes private helpers, nested functions,
+  and test helpers so each callable states its current contract locally.
+- The root CLI command set is exact: `build`, `config`, `optimize`, and `run`;
+  `wmo/cli/app_test.py` and the release tests enforce the current command and distribution shape.
 - There is no 800-line warning and no numeric modules-per-directory gate.
 
 ## Evidence, simulation, and routing lifecycle
@@ -110,8 +111,8 @@ uv run pytest -q
 ## Python
 
 - Every Python file must have a module docstring.
-- Write Google-style docstrings for all classes and functions with significant logic. Use plain
-  one-line docstrings for simple/self-explanatory classes and functions.
+- Write Google-style docstrings for all classes and functions. Use plain one-line docstrings only
+  for absolutely trivial classes and functions.
 - **Never `print`.** All diagnostic/progress output goes through a module logger
   (`logging.getLogger(__name__)`), never the `print` builtin — enforced by ruff's `T20` rules.
   The one exception is deliberate user-facing CLI presentation, which goes through a local rich
@@ -184,11 +185,11 @@ uv run pytest -q
    put it under the closest one and say so — do not invent a sibling. The only way a new
    top-level directory is ever added is that a human names the exact directory and grants
    permission for that name; then, in the same change, it is added to `ALLOWED_TOP_DIRS` in
-   `wmo/repo_layout_test.py` and documented here. Blanket approval to "restructure" or
-   "add whatever you need" is not permission for a directory name. Absent that, an agent that
-   wants a new surface asks and waits. The same rule binds top-level FILES, against
-   `ALLOWED_TOP_FILES` in the same test. Both lists are enforced by the gate, so an unapproved
-   directory fails CI rather than landing quietly. What each surface is for:
+   `wmo/repo_layout_test.py` and documented here. Blanket approval to "restructure" or "add whatever
+   you need" is not permission for a directory name. Absent that, an agent that wants a new surface
+   asks and waits. The same rule binds top-level FILES, against `ALLOWED_TOP_FILES` in the same
+   test. Both lists are enforced by the gate, so an unapproved path fails CI rather than landing
+   quietly. What each surface is for:
    - `docs/`: **reviewed public documentation** in `docs/research/` (completed research writeups
      and their rendered figures under `docs/research/figures/`), `docs/reference/` (how-to
      references verified against main), and `docs/cookbook/` (end-to-end walks through the whole

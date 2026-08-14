@@ -6,6 +6,12 @@ from wmo.runtime.router.application import (
     load_project_router,
     load_router,
 )
+from wmo.runtime.router.completion import (
+    RouterCompletionConflictError,
+    RouterCompletionFailedError,
+    RouterCompletionInProgressError,
+    RouterCompletionService,
+)
 from wmo.runtime.router.endpoint import create_router_endpoint
 from wmo.runtime.router.journal import (
     JournaledRouterRuntime,
@@ -41,6 +47,10 @@ __all__ = [
     "RuntimeJournalEvent",
     "RouterEpisodeConflictError",
     "RouterModelCapabilityError",
+    "RouterCompletionService",
+    "RouterCompletionConflictError",
+    "RouterCompletionInProgressError",
+    "RouterCompletionFailedError",
     "RouterRuntime",
     "RouterRuntimeIntegrityError",
     "create_router_endpoint",
