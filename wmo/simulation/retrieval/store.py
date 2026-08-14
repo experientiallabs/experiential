@@ -21,10 +21,9 @@ from wmo.simulation.retrieval.contracts import (
     RAGIndex,
     RAGTransition,
     RAGVector,
+    RealTraceSourceIdentity,
 )
 from wmo.simulation.retrieval.transitions import render_rag_key
-
-_REAL_SOURCE_KINDS = frozenset({"file", "otlp", "production"})
 
 
 @dataclass(frozen=True)
@@ -169,7 +168,17 @@ def _verify_sources(
     index: RAGIndex,
     transitions: tuple[RAGTransition, ...],
 ) -> None:
-    """Reopen every exact real source and bind transitions to its trace and span identities."""
+    """Reopen exact real sources and bind transitions to trace and span identities.
+
+    Args:
+        store: Project artifact store containing the index sources.
+        index: Loaded retrieval envelope with exact source pointers.
+        transitions: Parsed transition records that must trace back to source spans.
+
+    Raises:
+        ArtifactCorruptionError: A source, trace, transition field, span, order, or typed
+            provenance differs from the persisted retrieval contract.
+    """
     traces: dict[str, Trace] = {}
     for source in index.sources:
         stored = store.read(source.artifact_input.artifact_id)
@@ -179,14 +188,22 @@ def _verify_sources(
             raise ArtifactCorruptionError("RAG source is not a supported real trace dataset")
         loaded = load_trace_dataset(store, source.artifact_input.artifact_id)
         if (
-            loaded.dataset.source != source.source
+            loaded.dataset.source is None
+            or loaded.dataset.source.model_dump(mode="json")
+            != source.source.model_dump(mode="json")
             or loaded.dataset.traces_sha256 != source.records_sha256
             or tuple(sorted(loaded.dataset.trace_ids)) != source.trace_ids
         ):
             raise ArtifactCorruptionError("RAG source reference differs from its trace dataset")
-        if source.source.kind not in _REAL_SOURCE_KINDS:
-            raise ArtifactCorruptionError("RAG source provenance is not verified real evidence")
         for trace in loaded.traces:
+            try:
+                RealTraceSourceIdentity.model_validate(
+                    trace.source.identity.model_dump(mode="json")
+                )
+            except ValueError as exc:
+                raise ArtifactCorruptionError(
+                    "RAG source trace provenance is not verified real evidence"
+                ) from exc
             if trace.trace_id in traces:
                 raise ArtifactCorruptionError("RAG sources repeat a trace ID")
             traces[trace.trace_id] = trace

@@ -84,3 +84,27 @@ for name in banned:
 assert not bad, f"light commands pulled: {bad}"
 """
     )
+
+
+def test_runtime_rag_refresh_public_imports_resolve_without_eager_router_import() -> None:
+    """Resolve runtime refresh services without loading router application code eagerly."""
+    _run(
+        """
+import sys
+import wmo.simulation.retrieval as retrieval
+names = {"RuntimeRAGRefresh", "RuntimeTraceStitchingError", "refresh_runtime_trace_rag"}
+assert names.issubset(dir(retrieval))
+assert "wmo.runtime.router" not in sys.modules
+try:
+    getattr(retrieval, "unknown_retrieval_export")
+except AttributeError:
+    pass
+else:
+    raise AssertionError("unknown retrieval export resolved")
+from wmo.simulation.retrieval import RuntimeRAGRefresh, refresh_runtime_trace_rag
+from wmo.simulation.retrieval.refresh import RuntimeRAGRefresh as nested_refresh_type
+from wmo.simulation.retrieval.refresh import refresh_runtime_trace_rag as nested_refresh
+assert RuntimeRAGRefresh is nested_refresh_type
+assert refresh_runtime_trace_rag is nested_refresh
+"""
+    )

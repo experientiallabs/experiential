@@ -53,6 +53,22 @@ def load_trace_dataset(store: ArtifactStore, dataset_id: str) -> LoadedTraceData
         raise ArtifactCorruptionError(
             f"trace-dataset envelope ID {dataset.dataset_id} does not match artifact {dataset_id}"
         )
+    if (
+        dataset.schema_version,
+        dataset.created_at,
+        dataset.inputs,
+        dataset.code_revision,
+        dataset.source,
+    ) != (
+        stored.manifest.schema_version,
+        stored.manifest.created_at,
+        stored.manifest.inputs,
+        stored.manifest.code_revision,
+        stored.manifest.source,
+    ):
+        raise ArtifactCorruptionError(
+            f"trace dataset {dataset_id} envelope differs from its artifact manifest"
+        )
     payload = store.read_bytes(dataset_id, dataset.traces_path)
     if hashlib.sha256(payload).hexdigest() != dataset.traces_sha256:
         raise ArtifactCorruptionError(

@@ -26,12 +26,18 @@ RAG_VECTORS_PATH = "vectors.jsonl"
 RAG_INDEX_PATH = "rag-index.json"
 
 
+class RealTraceSourceIdentity(SourceIdentity):
+    """Typed external provenance accepted as observed retrieval evidence."""
+
+    kind: Literal["file", "otlp", "production"]
+
+
 class RAGSourceRef(ContractModel):
     """Exact verified real-trace artifact consumed by one RAG index."""
 
     kind: Literal["trace_dataset", "runtime_trace_snapshot"]
     artifact_input: ArtifactInput
-    source: SourceIdentity
+    source: RealTraceSourceIdentity
     records_sha256: Sha256
     trace_ids: tuple[str, ...] = Field(min_length=1)
 

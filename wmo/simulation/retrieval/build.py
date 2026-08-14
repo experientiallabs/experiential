@@ -33,6 +33,7 @@ from wmo.simulation.retrieval.contracts import (
     RAGSourceRef,
     RAGTransition,
     RAGVector,
+    RealTraceSourceIdentity,
 )
 from wmo.simulation.retrieval.embedding import (
     RAGEmbedderBinding,
@@ -41,8 +42,6 @@ from wmo.simulation.retrieval.embedding import (
 )
 from wmo.simulation.retrieval.store import load_rag_index
 from wmo.simulation.retrieval.transitions import extract_real_transitions
-
-_REAL_SOURCE_KINDS = frozenset({"file", "otlp", "production"})
 
 
 @dataclass(frozen=True)
@@ -194,7 +193,19 @@ def _load_real_sources(
     store: ArtifactStore,
     supplied_inputs: Sequence[ArtifactInput],
 ) -> tuple[tuple[RAGSourceRef, ...], tuple[Trace, ...]]:
-    """Verify exact source manifests and reject generated or evaluation evidence."""
+    """Verify exact source manifests and reject generated or evaluation evidence.
+
+    Args:
+        store: Project artifact store containing every supplied dataset.
+        supplied_inputs: Exact immutable trace-dataset manifest pointers.
+
+    Returns:
+        Sorted typed real-source references and all verified canonical trace records.
+
+    Raises:
+        ValueError: Inputs repeat, drift, use another artifact type, or include any dataset or
+            individual trace without typed real-observation provenance.
+    """
     by_id = {item.artifact_id: item for item in supplied_inputs}
     if len(by_id) != len(supplied_inputs):
         raise ValueError("RAG source inputs must not repeat an artifact")
@@ -214,18 +225,35 @@ def _load_real_sources(
             )
         loaded = load_trace_dataset(store, source_input.artifact_id)
         source = loaded.dataset.source
-        if source is None or source.kind not in _REAL_SOURCE_KINDS:
-            kind = "missing" if source is None else source.kind
+        if source is None:
             raise ValueError(
-                f"RAG source {source_input.artifact_id} has forbidden provenance {kind!r}; "
+                f"RAG source {source_input.artifact_id} has missing provenance; "
                 "generated, simulation, teacher, judgment, evaluation, and manual evidence "
                 "cannot ground retrieval"
             )
+        try:
+            real_source = RealTraceSourceIdentity.model_validate(source.model_dump(mode="json"))
+        except ValueError as exc:
+            raise ValueError(
+                f"RAG source {source_input.artifact_id} has forbidden provenance "
+                f"{source.kind!r}; generated, simulation, teacher, judgment, evaluation, and "
+                "manual evidence cannot ground retrieval"
+            ) from exc
+        for trace in loaded.traces:
+            try:
+                RealTraceSourceIdentity.model_validate(
+                    trace.source.identity.model_dump(mode="json")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"RAG source {source_input.artifact_id} trace {trace.trace_id!r} has "
+                    f"forbidden provenance {trace.source.identity.kind!r}"
+                ) from exc
         sources.append(
             RAGSourceRef(
                 kind="trace_dataset",
                 artifact_input=source_input,
-                source=source,
+                source=real_source,
                 records_sha256=loaded.dataset.traces_sha256,
                 trace_ids=tuple(sorted(loaded.dataset.trace_ids)),
             )
