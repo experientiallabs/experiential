@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import pty
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
+import termios
+import time
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -188,6 +194,129 @@ def _run_checked(
     return result
 
 
+def _run_tty_child(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    answers: list[tuple[str, str]],
+    completion_marker: str | None = None,
+    timeout: float = 30,
+) -> str:
+    """Drive one interactive child and require a clean bounded exit.
+
+    Args:
+        command: Exact executable and argument vector.
+        cwd: Isolated working directory for the child.
+        environment: Complete child environment.
+        answers: Ordered prompt substring and terminal answer pairs.
+        completion_marker: Optional output required before terminal input closes.
+        timeout: Maximum total child lifetime in seconds.
+
+    Returns:
+        Combined terminal transcript.
+
+    Raises:
+        AssertionError: The child times out, exits unsuccessfully, omits a prompt, or omits the
+            required completion marker.
+        OSError: The pseudo-terminal fails for a reason other than normal slave closure.
+    """
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+    )
+    os.close(slave)
+    transcript = ""
+    search_from = 0
+    pending = list(answers)
+    input_closed = False
+    completion_seen = completion_marker is None
+    terminal_closed = False
+    deadline = time.monotonic() + timeout
+    try:
+        while process.poll() is None and time.monotonic() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.1)
+            if readable:
+                try:
+                    chunk = os.read(master, 65_536)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    terminal_closed = True
+                    break
+                if not chunk:
+                    terminal_closed = True
+                    break
+                transcript += chunk.decode(errors="replace")
+            if pending and (prompt_position := transcript.find(pending[0][0], search_from)) >= 0:
+                prompt, answer = pending[0]
+                search_from = prompt_position + len(prompt)
+                try:
+                    os.write(master, (answer + "\n").encode())
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    terminal_closed = True
+                    break
+                pending.pop(0)
+            if completion_marker is not None and completion_marker in transcript:
+                completion_seen = True
+            if not pending and completion_seen and not input_closed:
+                try:
+                    canonical_input = bool(termios.tcgetattr(master)[3] & termios.ICANON)
+                except termios.error as error:
+                    if error.args and error.args[0] == errno.EIO:
+                        terminal_closed = True
+                        break
+                    if process.poll() is None and not terminal_closed:
+                        raise
+                    continue
+                if canonical_input:
+                    try:
+                        os.write(master, b"\x04")
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
+                        terminal_closed = True
+                        break
+                    input_closed = True
+        if terminal_closed and process.poll() is None:
+            try:
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)
+            raise AssertionError(f"interactive CLI timed out:\n{transcript}")
+        if not terminal_closed:
+            while True:
+                readable, _, _ = select.select([master], [], [], 0)
+                if not readable:
+                    break
+                try:
+                    chunk = os.read(master, 65_536)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    break
+                if not chunk:
+                    break
+                transcript += chunk.decode(errors="replace")
+    finally:
+        os.close(master)
+    assert process.returncode == 0, transcript
+    assert not pending, f"unanswered prompts {pending}:\n{transcript}"
+    assert completion_seen, f"missing completion marker {completion_marker!r}:\n{transcript}"
+    return transcript
+
+
 def _installed_release_driver() -> None:
     """Execute the isolated installed-wheel no-spend release evidence flow.
 
@@ -197,13 +326,8 @@ def _installed_release_driver() -> None:
     import hashlib
     import json
     import math
-    import pty
-    import select
-    import signal
     import socket
-    import termios
     import threading
-    import time
     from collections import Counter
     from datetime import UTC, datetime
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -657,71 +781,13 @@ def _installed_release_driver() -> None:
         Returns:
             Combined terminal transcript.
         """
-        master, slave = pty.openpty()
-        process = subprocess.Popen(
+        return _run_tty_child(
             [str(executable), *arguments],
             cwd=execution_root,
-            env=child_environment,
-            stdin=slave,
-            stdout=slave,
-            stderr=slave,
-            close_fds=True,
+            environment=child_environment,
+            answers=answers,
+            completion_marker=completion_marker,
         )
-        os.close(slave)
-        transcript = ""
-        search_from = 0
-        pending = list(answers)
-        input_closed = False
-        completion_seen = completion_marker is None
-        deadline = time.monotonic() + 30
-        try:
-            while process.poll() is None and time.monotonic() < deadline:
-                readable, _, _ = select.select([master], [], [], 0.1)
-                if readable:
-                    try:
-                        transcript += os.read(master, 65_536).decode(errors="replace")
-                    except OSError:
-                        break
-                if (
-                    pending
-                    and (prompt_position := transcript.find(pending[0][0], search_from)) >= 0
-                ):
-                    prompt, answer = pending.pop(0)
-                    search_from = prompt_position + len(prompt)
-                    os.write(master, (answer + "\n").encode())
-                if completion_marker is not None and completion_marker in transcript:
-                    completion_seen = True
-                if not pending and completion_seen and not input_closed:
-                    try:
-                        canonical_input = bool(termios.tcgetattr(master)[3] & termios.ICANON)
-                    except termios.error:
-                        if process.poll() is None:
-                            raise
-                        continue
-                    if canonical_input:
-                        os.write(master, b"\x04")
-                        input_closed = True
-            if process.poll() is None:
-                process.send_signal(signal.SIGTERM)
-                process.wait(timeout=5)
-                raise AssertionError(f"interactive CLI timed out:\n{transcript}")
-            while True:
-                readable, _, _ = select.select([master], [], [], 0)
-                if not readable:
-                    break
-                try:
-                    chunk = os.read(master, 65_536)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                transcript += chunk.decode(errors="replace")
-        finally:
-            os.close(master)
-        assert process.returncode == 0, transcript
-        assert not pending, f"unanswered prompts {pending}:\n{transcript}"
-        assert completion_seen, f"missing completion marker {completion_marker!r}:\n{transcript}"
-        return transcript
 
     def model_answers(
         alias: str,
@@ -1289,6 +1355,47 @@ def _installed_release_driver() -> None:
         server.server_close()
         server_thread.join(timeout=5)
         assert not server_thread.is_alive()
+
+
+def test_tty_child_exit_survives_terminal_close_races(tmp_path: Path) -> None:
+    """Treat terminal closure before child reaping as a clean bounded exit.
+
+    Args:
+        tmp_path: Pytest-owned working directory shared by isolated child processes.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    child = (
+        "import os, sys, time; "
+        "answer = input('Prompt: '); "
+        "assert answer == 'yes'; "
+        "print('COMPLETE', flush=True); "
+        "os.close(0); os.close(1); os.close(2); "
+        "time.sleep(0.02)"
+    )
+
+    def invoke(_: int) -> str:
+        """Run one child that closes its terminal before its process exits.
+
+        Args:
+            _: Unused invocation index supplied by the concurrent map.
+
+        Returns:
+            Complete prompt and completion-marker transcript.
+        """
+        return _run_tty_child(
+            [sys.executable, "-c", child],
+            cwd=tmp_path,
+            environment=os.environ.copy(),
+            answers=[("Prompt:", "yes")],
+            completion_marker="COMPLETE",
+            timeout=2,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        transcripts = tuple(executor.map(invoke, range(32)))
+    assert all("Prompt:" in transcript for transcript in transcripts)
+    assert all("COMPLETE" in transcript for transcript in transcripts)
 
 
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
