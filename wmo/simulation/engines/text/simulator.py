@@ -29,7 +29,6 @@ from wmo.common.rollouts import (
     SimulationMode,
     StopReason,
 )
-from wmo.common.tasks import LoadedTaskSet, load_task_set
 from wmo.runtime.agents import AgentRuntime
 from wmo.runtime.models import ResolvedModel
 from wmo.simulation.engines.text.artifact_set import persist_artifact_set
@@ -50,7 +49,10 @@ from wmo.simulation.engines.text.errors import (
 )
 from wmo.simulation.engines.text.grounded_rollout import GroundedRolloutBuilder
 from wmo.simulation.engines.text.grounding import (
-    query_reservation_failure,
+    completion_reservations,
+    episode_reservation_failure,
+    load_completion_contract,
+    load_simulation_task_set,
     require_grounding_settings,
     verify_fit_retriever,
 )
@@ -109,6 +111,7 @@ class WorldModelSimulator:
         world_models: Independently resolved world-model providers keyed by local alias.
         grounded_world_models: Artifact-bound fit-only executors keyed by world-model alias.
         agent_factory: Creates an isolated customer-agent runtime for each episode worker.
+        completion_contract_input: Optional exact automatic-simulation reservation artifact.
         redacted_field_names: Project-configured labels removed before evidence persists.
         clock: Time source for artifact and span timestamps.
         monotonic: Monotonic time source for orchestration latency measurements.
@@ -128,6 +131,7 @@ class WorldModelSimulator:
         world_models: Mapping[str, ResolvedModel],
         grounded_world_models: Mapping[str, GroundedWorldModel],
         agent_factory: Callable[[], AgentRuntime],
+        completion_contract_input: ArtifactInput | None = None,
         redacted_field_names: tuple[str, ...] = (),
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -146,6 +150,7 @@ class WorldModelSimulator:
             world_models: Remote world-model aliases resolved through the canonical runtime package.
             grounded_world_models: Persisted fit-bound executors for those world models.
             agent_factory: Per-episode customer-agent construction seam.
+            completion_contract_input: Optional exact completion reservation manifest.
             redacted_field_names: Local field labels removed before artifact persistence.
             clock: Time source, injectable for deterministic tests.
             monotonic: Duration source, injectable for deterministic tests.
@@ -165,13 +170,15 @@ class WorldModelSimulator:
         self._fit_rag_input = fit_rag_input
         self._fit_retriever = fit_retriever
         verify_fit_retriever(fit_retriever, fit_rag_input)
-        loaded_task_set = self._load_and_verify_task_set(task_set_input)
+        loaded_task_set = load_simulation_task_set(self._store, task_set_input)
         self._task_set = loaded_task_set.task_set
         self._tasks = {task.task_id: task for task in loaded_task_set.tasks}
         self._candidate_models = dict(candidate_models)
         self._world_models = dict(world_models)
         self._grounded_world_models = dict(grounded_world_models)
         self._agent_factory = agent_factory
+        self._completion_contract_input = completion_contract_input
+        self._completion_contract = load_completion_contract(self._store, completion_contract_input)
         self._redacted_field_names = redacted_field_set(redacted_field_names)
         self._clock = clock or utc_now
         self._monotonic = monotonic
@@ -185,28 +192,6 @@ class WorldModelSimulator:
         )
         self._leases = TextCellLeaseStore(store.project_directory, clock=self._clock)
         self._verify_persisted_evaluation_plan()
-
-    def _load_and_verify_task_set(self, task_set_input: ArtifactInput) -> LoadedTaskSet:
-        """Load the exact task-set manifest and reject an ID paired with a different digest."""
-        try:
-            stored = self._store.read(task_set_input.artifact_id)
-        except ArtifactCorruptionError as exc:
-            raise SimulationConfigurationError(
-                f"simulation task set {task_set_input.artifact_id!r} cannot be read safely"
-            ) from exc
-        if (
-            stored.manifest.artifact_type != "task-set"
-            or artifact_input(stored.manifest) != task_set_input
-        ):
-            raise SimulationConfigurationError(
-                "simulation task_set_input must name the exact persisted task-set manifest"
-            )
-        try:
-            return load_task_set(self._store, task_set_input.artifact_id)
-        except ArtifactCorruptionError as exc:
-            raise SimulationConfigurationError(
-                f"simulation task set {task_set_input.artifact_id!r} has invalid task content"
-            ) from exc
 
     def _verify_persisted_evaluation_plan(self) -> None:
         """Reject a caller-provided plan object that differs from its immutable manifest input."""
@@ -268,16 +253,19 @@ class WorldModelSimulator:
 
         if pending:
             completed.update(
-                self._run_with_spend_limit(
-                    spec,
-                    pending,
-                    world_model,
-                    grounded_world_model,
-                    spec_input,
-                    resolution,
-                    resolution_input,
-                    bindings,
-                )
+                {
+                    cell.cell_id: self._execute_and_persist_cell(
+                        spec,
+                        cell,
+                        world_model,
+                        grounded_world_model,
+                        spec_input,
+                        resolution,
+                        resolution_input,
+                        bindings,
+                    )
+                    for cell in pending
+                }
             )
         ordered_rollouts = tuple(completed[cell.cell_id] for cell in cells)
         return persist_artifact_set(
@@ -319,6 +307,13 @@ class WorldModelSimulator:
             raise SimulationConfigurationError(
                 "simulation spec inputs must include the exact task-set manifest reference"
             )
+        if (
+            self._completion_contract_input is not None
+            and self._completion_contract_input not in spec.inputs
+        ):
+            raise SimulationConfigurationError(
+                "simulation spec inputs omit the exact completion reservation contract"
+            )
         settings = require_grounding_settings(
             spec,
             fit_rag_input=self._fit_rag_input,
@@ -355,7 +350,7 @@ class WorldModelSimulator:
         plan_cells = {cell.cell_id: cell for cell in self._plan.cells}
         cells = []
         expected_candidates = {
-            snapshot.alias: snapshot.model for snapshot in self._plan.candidate_snapshots
+            snapshot.alias: snapshot for snapshot in self._plan.candidate_snapshots
         }
         for cell_id in spec.cell_ids:
             cell = plan_cells.get(cell_id)
@@ -379,7 +374,7 @@ class WorldModelSimulator:
                     f"no resolved candidate is configured for alias {cell.candidate_alias!r}"
                 )
             expected = expected_candidates[cell.candidate_alias]
-            if candidate.snapshot != expected:
+            if candidate.snapshot != expected.model:
                 raise SimulationConfigurationError(
                     f"candidate {cell.candidate_alias!r} does not match the plan's pinned snapshot"
                 )
@@ -387,6 +382,12 @@ class WorldModelSimulator:
                 raise SimulationConfigurationError(
                     "candidate and world model must be resolved to independent model-client objects"
                 )
+            completion_reservations(
+                self._completion_contract,
+                candidate_alias=cell.candidate_alias,
+                candidate=candidate,
+                world_model=world_model,
+            )
             cells.append(cell)
         return tuple(cells), world_model, grounded_world_model
 
@@ -512,32 +513,6 @@ class WorldModelSimulator:
                 self._validate_resume_rollout(rollout, cell, binding, resolution_input)
                 completed[cell.cell_id] = rollout
         return completed
-
-    def _run_with_spend_limit(
-        self,
-        spec: SimulationSpec,
-        cells: Sequence[EvaluationCell],
-        world_model: ResolvedModel,
-        grounded_world_model: GroundedWorldModel,
-        spec_input: ArtifactInput,
-        resolution: SimulationResolution,
-        resolution_input: ArtifactInput,
-        bindings: Mapping[ArtifactId, SimulationCellBinding],
-    ) -> dict[ArtifactId, RolloutArtifact]:
-        """Run finite-budget cells serially while durable claims reserve all remaining budget."""
-        return {
-            cell.cell_id: self._execute_and_persist_cell(
-                spec,
-                cell,
-                world_model,
-                grounded_world_model,
-                spec_input,
-                resolution,
-                resolution_input,
-                bindings,
-            )
-            for cell in cells
-        }
 
     def _execute_and_persist_cell(
         self,
@@ -702,9 +677,12 @@ class WorldModelSimulator:
             raise SimulationConfigurationError("world-model simulation settings are missing")
         if settings.query_embedding is None:  # pragma: no cover - validated before execution
             raise SimulationConfigurationError("query-embedding reservation is missing")
-        reservation_failure = query_reservation_failure(
-            settings.query_embedding,
-            maximum_cell_cost_usd,
+        reservation_failure = episode_reservation_failure(
+            settings,
+            completion_contract=self._completion_contract,
+            candidate_alias=cell.candidate_alias,
+            maximum_steps=spec.maximum_steps,
+            remaining_cost_usd=maximum_cell_cost_usd,
         )
         if reservation_failure is not None:
             return self._failure_rollout(
@@ -719,12 +697,25 @@ class WorldModelSimulator:
                 reservation_failure,
                 duration_seconds=elapsed_seconds(started_monotonic, self._monotonic()),
             )
+        candidate_request, world_request = completion_reservations(
+            self._completion_contract,
+            candidate_alias=cell.candidate_alias,
+            candidate=candidate,
+            world_model=world_model,
+        )
         recorder = RecordingCandidateClient(
             task=task,
             candidate=candidate,
             world_model=world_model,
             grounded_world_model=grounded_world_model,
             query_embedding=settings.query_embedding,
+            candidate_request=candidate_request,
+            world_model_request=world_request,
+            completion_maximum_attempts=(
+                self._completion_contract.maximum_attempts
+                if self._completion_contract is not None
+                else 1
+            ),
             maximum_cost_usd=maximum_cell_cost_usd,
             maximum_steps=spec.maximum_steps,
             maximum_output_tokens=settings.maximum_output_tokens,

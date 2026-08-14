@@ -7,7 +7,13 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from wmo.common.evaluations import EvaluationCell, EvaluationPlan
+from wmo.common.core.artifacts import stable_id
+from wmo.common.evaluations import (
+    EvaluationCell,
+    EvaluationPlan,
+    FidelityThresholds,
+    default_fidelity_thresholds,
+)
 from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
 
 _DIGEST = "a" * 64
@@ -101,4 +107,39 @@ def test_evaluation_cells_reject_implicit_or_inconsistent_evidence() -> None:
                     execution="simulate",
                 ),
             ),
+        )
+
+
+def test_fidelity_thresholds_preserve_a_smaller_exact_denominator() -> None:
+    """A positive low-evidence plan remains eligible for explicit approval."""
+    thresholds = default_fidelity_thresholds(
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="e7aad17",
+        planned_overlaps=1,
+        minimum_usable_overlaps=1,
+    )
+
+    assert thresholds.planned_overlaps == 1
+    assert thresholds.minimum_usable_overlaps == 1
+    legacy = default_fidelity_thresholds(
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="e7aad17",
+    )
+    assert legacy.fidelity_thresholds_id == stable_id(
+        "fidelity-thresholds",
+        {
+            "version": "world-model-fidelity-v1",
+            "planned_overlaps": 10,
+            "minimum_usable_overlaps": 8,
+            "maximum_score_mae": 0.10,
+        },
+    )
+    with pytest.raises(ValidationError, match="cannot exceed"):
+        FidelityThresholds(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            code_revision="e7aad17",
+            fidelity_thresholds_id="invalid-thresholds",
+            planned_overlaps=1,
+            minimum_usable_overlaps=2,
         )

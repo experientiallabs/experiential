@@ -308,13 +308,27 @@ def _prompt_model(
     supports_structured_output = Confirm.ask(
         "Supports structured output?", default=False, console=console
     )
+    supports_completions = Confirm.ask("Supports chat completions?", default=False, console=console)
     context_window = _prompt_optional_positive_int("Context window tokens", console=console)
     maximum_output = _prompt_optional_positive_int("Maximum output tokens", console=console)
-    input_cost = (
-        _prompt_nonnegative_float("Input cost per million tokens in USD", console=console)
-        if supports_embeddings
-        else None
-    )
+    input_cost = None
+    output_cost = None
+    cached_input_cost = None
+    cache_write_cost = None
+    if supports_embeddings or supports_completions:
+        input_cost = _prompt_nonnegative_float(
+            "Input cost per million tokens in USD", console=console
+        )
+    if supports_completions:
+        output_cost = _prompt_nonnegative_float(
+            "Output cost per million tokens in USD", console=console
+        )
+        cached_input_cost = _prompt_nonnegative_float(
+            "Cached input cost per million tokens in USD", console=console
+        )
+        cache_write_cost = _prompt_nonnegative_float(
+            "Cache write cost per million tokens in USD", console=console
+        )
     return ProviderModelSelection(
         alias=alias,
         connection=connection,
@@ -322,9 +336,13 @@ def _prompt_model(
         supports_tools=supports_tools,
         supports_embeddings=supports_embeddings,
         supports_structured_output=supports_structured_output,
+        supports_completions=supports_completions,
         context_window_tokens=context_window,
         maximum_output_tokens=maximum_output,
         input_cost_per_million_tokens_usd=input_cost,
+        output_cost_per_million_tokens_usd=output_cost,
+        cached_input_cost_per_million_tokens_usd=cached_input_cost,
+        cache_write_cost_per_million_tokens_usd=cache_write_cost,
     )
 
 
@@ -464,7 +482,8 @@ def _render_summary(
         console.print(
             f"model {model.alias}: {model.connection}/{model.model}, "
             f"tools={model.supports_tools}, embeddings={model.supports_embeddings}, "
-            f"structured_output={model.supports_structured_output}"
+            f"structured_output={model.supports_structured_output}, "
+            f"completions={model.supports_completions}"
         )
     console.print(
         f"roles: world_model={setup.world_model}, judge={setup.judge}, embedder={setup.embedder}"
@@ -521,12 +540,22 @@ def _existing_models(existing: ModelCatalog | None) -> tuple[ProviderModelSelect
                 supports_structured_output=(
                     capabilities.supports_structured_output if capabilities else False
                 ),
+                supports_completions=(capabilities.supports_completions if capabilities else None),
                 context_window_tokens=capabilities.context_window_tokens if capabilities else None,
                 maximum_output_tokens=(
                     capabilities.maximum_output_tokens if capabilities else None
                 ),
                 input_cost_per_million_tokens_usd=(
                     capabilities.input_cost_per_million_tokens_usd if capabilities else None
+                ),
+                output_cost_per_million_tokens_usd=(
+                    capabilities.output_cost_per_million_tokens_usd if capabilities else None
+                ),
+                cached_input_cost_per_million_tokens_usd=(
+                    capabilities.cached_input_cost_per_million_tokens_usd if capabilities else None
+                ),
+                cache_write_cost_per_million_tokens_usd=(
+                    capabilities.cache_write_cost_per_million_tokens_usd if capabilities else None
                 ),
             )
         )
@@ -612,7 +641,11 @@ def provider_setup_json_examples() -> tuple[str, str]:
             "model": "your-model-id",
             "supports_embeddings": True,
             "supports_structured_output": True,
+            "supports_completions": True,
             "input_cost_per_million_tokens_usd": 0,
+            "output_cost_per_million_tokens_usd": 0,
+            "cached_input_cost_per_million_tokens_usd": 0,
+            "cache_write_cost_per_million_tokens_usd": 0,
         },
         separators=(",", ":"),
     )

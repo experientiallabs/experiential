@@ -50,10 +50,7 @@ from wmo.common.project import (
     ProjectStore,
     artifact_input,
 )
-from wmo.common.rollouts import (
-    SimulationArtifactSet,
-    SimulationMode,
-)
+from wmo.common.rollouts import SimulationArtifactSet
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import KnnBankManifest
 from wmo.optimize.router import (
@@ -69,14 +66,14 @@ from wmo.optimize.router.spec import RouterFitResult
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime
 from wmo.runtime.router.application import load_project_router
-from wmo.simulation.build import ProjectBuild, build_project
+from wmo.simulation.build import ProjectBuild
 from wmo.simulation.ingest.otlp import TraceNormalizationResult, load_otlp_file
 from wmo.simulation.ingest.posthog import load_posthog_file
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
 from wmo.workflow.completed_build import (
     completed_project_build,
-    verify_completed_build_inputs,
+    reconstruct_completed_project_build,
 )
 from wmo.workflow.errors import RouterCompositionError
 from wmo.workflow.judgment_budget import (
@@ -86,6 +83,7 @@ from wmo.workflow.judgment_budget import (
     read_dispatch_reservation,
 )
 from wmo.workflow.router_setup import verify_router_evaluation_setup
+from wmo.workflow.router_simulation_spec import build_router_simulation_spec
 from wmo.workflow.simulation_spend import observed_rollout_spend
 
 
@@ -124,6 +122,9 @@ class RouterEvaluationSetup(ContractModel):
     incumbent_alias: ArtifactId | None = None
     judgment_status: Literal["provisional", "human_calibrated"]
     world_model_settings: WorldModelSettings
+    simulation_completion_input: ArtifactInput | None = None
+    fidelity_planned_overlaps: int = Field(default=10, gt=0)
+    fidelity_minimum_usable_overlaps: int = Field(default=8, gt=0)
     agent_id: str = Field(min_length=1, max_length=256)
     seed: int
     maximum_steps: int = Field(gt=0)
@@ -246,6 +247,7 @@ class RouterWorkflowServices:
     judge: Judge
     fidelity_approval: FidelityApproval
     runtime_catalog: RuntimeModelCatalog
+    evaluation_plan_inputs: tuple[ArtifactInput, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -300,13 +302,11 @@ def compose_router(
     normalized = (
         trace_source if isinstance(trace_source, TraceNormalizationResult) else trace_source.load()
     )
-    built = build_project(
-        normalized,
+    built = reconstruct_completed_project_build(
         project,
+        normalized,
         created_at=created_at,
-        code_revision=code_revision,
     )
-    verify_completed_build_inputs(completed_build, built)
     _phase(phase_hook, "review")
     review = services.review_supplier(project, built, budget)
     _verify_review(project, review)
@@ -321,7 +321,12 @@ def compose_router(
         calibration_id=review.calibration_id,
     )
 
-    thresholds = default_fidelity_thresholds(created_at=created_at, code_revision=code_revision)
+    thresholds = default_fidelity_thresholds(
+        created_at=created_at,
+        code_revision=code_revision,
+        planned_overlaps=setup.fidelity_planned_overlaps,
+        minimum_usable_overlaps=setup.fidelity_minimum_usable_overlaps,
+    )
     persist_fidelity_thresholds(project.artifacts, thresholds)
     plan = build_evaluation_plan(
         project.artifacts,
@@ -331,6 +336,7 @@ def compose_router(
         observed_cells=setup.observed_cells,
         fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
         fidelity_protocol_sha256=_protocol_digest(setup.simulation_protocol),
+        additional_inputs=services.evaluation_plan_inputs,
         created_at=created_at,
         code_revision=code_revision,
     )
@@ -340,7 +346,7 @@ def compose_router(
 
     _phase(phase_hook, "fidelity_fit_started")
     phase_a_cells = tuple(cell for cell in plan.cells if cell.purpose in {"fit", "fidelity"})
-    spec = _simulation_spec(
+    spec = build_router_simulation_spec(
         plan,
         plan_input,
         task_input,
@@ -416,7 +422,7 @@ def compose_router(
 
     held_cells = tuple(cell for cell in plan.cells if cell.purpose == "held_out")
     _phase(phase_hook, "heldout_opened")
-    held_spec = _simulation_spec(
+    held_spec = build_router_simulation_spec(
         plan,
         plan_input,
         task_input,
@@ -491,73 +497,6 @@ def compose_router(
         total_simulation_spend_usd=total_spend,
         optimization=optimized,
         runtime=runtime,
-    )
-
-
-def _simulation_spec(
-    plan: EvaluationPlan,
-    plan_input: ArtifactInput,
-    task_input: ArtifactInput,
-    setup: RouterEvaluationSetup,
-    maximum_cost_usd: float,
-    created_at: datetime,
-    code_revision: str,
-    cells: tuple[EvaluationCell, ...],
-    *,
-    phase: Literal["fidelity-fit", "heldout"],
-) -> SimulationSpec:
-    """Create one phase-scoped simulation spec over the exact fit-only RAG.
-
-    Args:
-        plan: Frozen evaluation plan containing the selected cells.
-        plan_input: Exact persisted evaluation-plan pointer.
-        task_input: Exact persisted task-set pointer.
-        setup: Reviewed candidates, protocols, retrieval pointer, and world-model settings.
-        maximum_cost_usd: Finite provider-spend ceiling for this phase.
-        created_at: Immutable specification timestamp.
-        code_revision: Exact source revision bound to generated artifacts.
-        cells: Phase-specific plan cells eligible for simulation.
-        phase: Fidelity-fit or held-out phase label used in stable identity.
-
-    Returns:
-        Sparse immutable specification that binds the same fit RAG in either phase.
-    """
-    cell_ids = tuple(
-        sorted(cell.cell_id for cell in cells if getattr(cell, "execution", None) == "simulate")
-    )
-    binding = {
-        "phase": phase,
-        "plan": plan_input.model_dump(mode="json"),
-        "task_set": task_input.model_dump(mode="json"),
-        "cells": cell_ids,
-        "settings": setup.world_model_settings.model_dump(mode="json"),
-        "agent_id": setup.agent_id,
-        "seed": setup.seed,
-        "maximum_steps": setup.maximum_steps,
-        "maximum_concurrency": setup.maximum_concurrency,
-        "maximum_cost_usd": maximum_cost_usd,
-        "code_revision": code_revision,
-    }
-    return SimulationSpec(
-        schema_version=1,
-        created_at=created_at,
-        inputs=_sorted_artifact_inputs(
-            plan_input,
-            task_input,
-            setup.fit_rag_input,
-            setup.world_model_settings.grounded_world_model_input,
-        ),
-        code_revision=code_revision,
-        simulation_id=stable_id("simulation", binding),
-        evaluation_plan_id=plan.plan_id,
-        cell_ids=cell_ids,
-        agent_id=setup.agent_id,
-        mode=SimulationMode.WORLD_MODEL,
-        world_model=setup.world_model_settings,
-        seed=setup.seed,
-        maximum_steps=setup.maximum_steps,
-        maximum_concurrency=setup.maximum_concurrency,
-        maximum_cost_usd=maximum_cost_usd,
     )
 
 

@@ -63,7 +63,11 @@ def find_verified_judgment(
         if stored.manifest.artifact_type != "judgment":
             continue
         judgment, _input = read_judgment(project.artifacts, artifact_id)
-        if judgment.rollout_id != rollout_id:
+        if (
+            judgment.rollout_id != rollout_id
+            or judgment.rubric_id != rubric_id
+            or judgment.calibration_id != calibration_id
+        ):
             continue
         _require_judgment(project, judgment, rollout_id, rubric_id, calibration_id, protocol)
         matches.append(judgment)

@@ -1,96 +1,317 @@
-"""Thin CLI adapter for the single provider-free router workflow."""
+"""Configless ``wmo optimize router PROJECT`` composition."""
 
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
+from rich.console import Console
+from rich.prompt import Confirm
 
-from wmo.common.judging import verify_persisted_calibration
+from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.router_candidate_setup import collect_router_candidate_setup
+from wmo.common.evaluations import EvaluationCellEvidence, EvaluationPlan
+from wmo.common.models import ProviderModelSelection, load_model_catalog
 from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.project import ProjectStore
-from wmo.optimize.router.workflow import RouterOptimizationConfig, optimize_router
-from wmo.workflow.manual_judge_contracts import ManualJudgeReviewState
+from wmo.common.release_revision import installed_release_revision
+from wmo.runtime.models import RuntimeModelCatalog
+from wmo.workflow.automatic_router import (
+    AutomaticRouterOptions,
+    optimize_project_router,
+)
+from wmo.workflow.automatic_router_preflight import (
+    AutomaticRouterPreflight,
+    preflight_automatic_router,
+)
+from wmo.workflow.automatic_router_replay import find_completed_automatic_router_replay
+from wmo.workflow.router import (
+    FidelityApprovalDecision,
+    RouterCompositionBudget,
+)
 
-_ROOT_OPTION = typer.Option(Path(".wmo"), "--root", help="Local .wmo artifact root.")
-_CONFIG_OPTION = typer.Option(
-    ...,
-    "--config",
-    exists=True,
-    dir_okay=False,
-    help="Single provider-free fit and held-out evidence config.",
+_console = Console()
+_ROOT_OPTION = typer.Option(Path(".wmo"), "--root", help="Local .wmo project root.")
+_CANDIDATE_OPTION = typer.Option(
+    None,
+    "--candidate",
+    help="Repeat a configured completion alias. At least two distinct aliases are required.",
+)
+_CANDIDATE_MODEL_OPTION = typer.Option(
+    None,
+    "--candidate-model",
+    help="Repeat a complete ProviderModelSelection JSON object for a new candidate alias.",
 )
 
 
 def router(
-    project: str = typer.Argument(..., help="Canonical project ID."),
-    config: Path = _CONFIG_OPTION,
+    project: str = typer.Argument(..., metavar="PROJECT", help="Configured local project ID."),
     root: Path = _ROOT_OPTION,
+    candidate: list[str] | None = _CANDIDATE_OPTION,
+    candidate_model: list[str] | None = _CANDIDATE_MODEL_OPTION,
+    incumbent: str | None = typer.Option(None, "--incumbent", help="Quality baseline alias."),
+    maximum_provider_cost_usd: float = typer.Option(
+        25.0,
+        "--maximum-provider-cost-usd",
+        min=0.000001,
+        help="One ceiling for embeddings, simulation, and judging.",
+    ),
+    maximum_judgments: int = typer.Option(100, "--maximum-judgments", min=1),
+    preferred_fidelity_overlaps: int = typer.Option(
+        10,
+        "--preferred-fidelity-overlaps",
+        min=1,
+        help="Use every available real fit overlap up to this preferred target.",
+    ),
+    maximum_model_calls: int = typer.Option(8, "--maximum-model-calls", min=1),
+    maximum_router_feature_tokens: int = typer.Option(
+        8_192, "--maximum-router-feature-tokens", min=1
+    ),
+    maximum_retrieval_query_tokens: int = typer.Option(
+        32_768, "--maximum-retrieval-query-tokens", min=1
+    ),
+    simulation_maximum_output_tokens: int = typer.Option(
+        16_000, "--simulation-maximum-output-tokens", min=8_000
+    ),
+    maximum_concurrency: int = typer.Option(1, "--maximum-concurrency", min=1),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the displayed shared provider-spend ceiling.",
+    ),
+    approve_fidelity: bool = typer.Option(
+        False,
+        "--approve-fidelity",
+        help="Approve passing measured fidelity; required for noninteractive execution.",
+    ),
+    non_interactive: bool = typer.Option(False, "--non-interactive"),
 ) -> None:
-    """Fit and report a frozen router from explicit completed evidence.
+    """Optimize a router automatically from the project's completed grounded build.
 
     Args:
-        project: Canonical project identifier.
-        config: One local validated workflow configuration.
-        root: Project artifact-store root.
+        project: Local project ID below ``<root>/projects``.
+        root: Local ``.wmo`` root containing the project and shared model catalog.
+        candidate: Repeatable explicit completion candidate aliases.
+        candidate_model: Repeatable complete JSON definitions for new candidate aliases.
+        incumbent: Explicit quality incumbent among the selected candidates.
+        maximum_provider_cost_usd: Shared ceiling for all optimization provider calls.
+        maximum_judgments: Maximum rollout judgments admitted by composition.
+        preferred_fidelity_overlaps: Bounded preferred real-overlap denominator.
+        maximum_model_calls: Candidate turns admitted per simulation episode.
+        maximum_router_feature_tokens: Input ceiling for each router feature embedding.
+        maximum_retrieval_query_tokens: Input ceiling for each grounded retrieval query.
+        simulation_maximum_output_tokens: Candidate and world-model output ceiling per turn.
+        maximum_concurrency: Maximum simulation workers.
+        yes: Explicit shared provider-spend consent.
+        approve_fidelity: Explicit approval for passing measured fidelity evidence.
+        non_interactive: Refuse prompts and require complete repeatable inputs.
 
     Raises:
-        typer.BadParameter: The configuration or any immutable input is invalid.
+        typer.BadParameter: Candidate, build, judge, budget, consent, or artifact input is invalid.
     """
     started = time.monotonic()
+    now = datetime.now(UTC)
+    options = AutomaticRouterOptions(
+        maximum_provider_cost_usd=maximum_provider_cost_usd,
+        maximum_judgments=maximum_judgments,
+        preferred_fidelity_overlaps=preferred_fidelity_overlaps,
+        maximum_model_calls=maximum_model_calls,
+        maximum_router_feature_tokens=maximum_router_feature_tokens,
+        maximum_retrieval_query_tokens=maximum_retrieval_query_tokens,
+        simulation_maximum_output_tokens=simulation_maximum_output_tokens,
+        maximum_concurrency=maximum_concurrency,
+    )
+    effective_noninteractive = non_interactive or not can_prompt(_console)
     try:
-        value = RouterOptimizationConfig.model_validate_json(config.read_bytes())
+        producer_revision = installed_release_revision()
         store = ProjectStore(root, project)
-        if value.judgment_status == "human_calibrated":
-            _require_approved_manual_calibration(store)
-        result = optimize_router(store.artifacts, value)
+        catalog = load_model_catalog(store.model_catalog_path)
+        definitions = tuple(
+            ProviderModelSelection.model_validate_json(value)
+            for value in tuple(candidate_model or ())
+        )
+        candidate_plan = collect_router_candidate_setup(
+            store.model_catalog_path,
+            catalog,
+            candidates=tuple(candidate or ()),
+            candidate_models=definitions,
+            incumbent=incumbent,
+            non_interactive=effective_noninteractive,
+            console=_console,
+        )
+        preflight = preflight_automatic_router(
+            store,
+            candidate_plan.selection,
+            catalog_override=candidate_plan.prospective_catalog,
+            maximum_model_calls=options.maximum_model_calls,
+            preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
+            maximum_router_feature_tokens=options.maximum_router_feature_tokens,
+            maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+            router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
+            completion_maximum_attempts=options.completion_maximum_attempts,
+            simulation_maximum_output_tokens=options.simulation_maximum_output_tokens,
+            maximum_judgments=options.maximum_judgments,
+            maximum_simulation_cost_usd=options.maximum_provider_cost_usd,
+        )
+        replay = find_completed_automatic_router_replay(
+            store,
+            preflight,
+            options=options,
+            code_revision=producer_revision,
+        )
+        if replay is None and effective_noninteractive and not approve_fidelity:
+            raise ValueError("noninteractive router optimization requires --approve-fidelity")
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+    if replay is not None:
+        _console.print("replay: verified completed optimization")
+        _console.print(f"policy: {replay.policy_id}")
+        _console.print(f"report: {replay.report_id}")
+        return
+    _render_preflight(preflight, options)
+    spend = (
+        f"at most ${options.maximum_provider_cost_usd:.4f}, including "
+        f"${preflight.router_embedding_reservation.estimated_cost_usd:.4f} for router "
+        f"embeddings, ${preflight.judge_reservation_cost_usd:.4f} for all judge calls, and "
+        f"${preflight.remaining_simulation_cost_usd:.4f} for candidate, retrieval, and "
+        "world-model simulation"
+    )
+    if not require_spend_consent(
+        _console,
+        yes=yes,
+        spend=spend,
+        command="wmo optimize router",
+    ):
+        _console.print("Router optimization was not started.")
+        return
+    approval = _CliFidelityApproval(
+        approve=approve_fidelity,
+        non_interactive=effective_noninteractive,
+        preferred_overlaps=options.preferred_fidelity_overlaps,
+        approved_at=now,
+    )
+    try:
+        result = optimize_project_router(
+            store,
+            candidate_plan,
+            RuntimeModelCatalog(catalog),
+            options=options,
+            provider_spend_consented=True,
+            fidelity_approval=approval,
+            created_at=now,
+            code_revision=producer_revision,
+        )
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from None
     capture_completion_once(
         "wmo router completed",
-        result.optimization.report.report_id,
+        result.composition.optimization.optimization.report.report_id,
         {
             "success": True,
-            "fit_cell_count": len(value.fit.cell_evidence),
-            "heldout_cell_count": len(value.held_out.cell_evidence),
-            "candidate_count": len(result.optimization.policy.candidates),
+            "candidate_count": len(preflight.candidates),
+            "fidelity_overlap_count": preflight.fidelity_overlap_count,
             "duration_seconds": max(time.monotonic() - started, 0.0),
         },
         root=root,
     )
-    typer.echo(f"fit evaluation: {result.fit_evaluation_id}")
-    typer.echo(f"bank: {result.optimization.bank.bank_artifact_id}")
-    typer.echo(f"policy: {result.optimization.policy.policy_id}")
-    typer.echo(f"held-out evaluation: {result.held_out_evaluation_id}")
-    typer.echo(f"report: {result.optimization.report.report_id}")
+    _console.print(f"policy: {result.composition.optimization.optimization.policy.policy_id}")
+    _console.print(f"report: {result.composition.optimization.optimization.report.report_id}")
 
 
-def _require_approved_manual_calibration(store: ProjectStore) -> None:
-    """Require an explicitly approved human calibration for calibrated optimization.
+class _CliFidelityApproval:
+    """Interactive or flag-backed approval of the exact measured fidelity denominator."""
+
+    def __init__(
+        self,
+        *,
+        approve: bool,
+        non_interactive: bool,
+        preferred_overlaps: int,
+        approved_at: datetime,
+    ) -> None:
+        """Configure the separate post-simulation approval boundary.
+
+        Args:
+            approve: Explicit non-prompt approval flag.
+            non_interactive: Whether prompting is forbidden.
+            preferred_overlaps: Preferred denominator used for the low-evidence warning.
+            approved_at: Approval time retained in immutable evidence.
+        """
+        self._approve = approve
+        self._non_interactive = non_interactive
+        self._preferred = preferred_overlaps
+        self._approved_at = approved_at
+
+    def __call__(
+        self,
+        project: ProjectStore,
+        plan: EvaluationPlan,
+        evidence: tuple[EvaluationCellEvidence, ...],
+        budget: RouterCompositionBudget,
+    ) -> FidelityApprovalDecision:
+        """Display the exact denominator and obtain separate approval.
+
+        Args:
+            project: Project owning immutable evidence.
+            plan: Frozen evaluation plan.
+            evidence: Completed fidelity-cell evidence selected by composition.
+            budget: Finite simulation and judgment ceilings.
+
+        Returns:
+            Immutable actor evidence for passing fidelity.
+
+        Raises:
+            ValueError: Approval is absent or evidence is empty.
+        """
+        del project, budget
+        if not evidence:
+            raise ValueError("fidelity approval requires completed overlap evidence")
+        denominator = len(evidence)
+        low = denominator < self._preferred
+        _console.print(
+            f"Fidelity evidence: {denominator}/{self._preferred} preferred real overlaps."
+        )
+        if low:
+            _console.print(
+                "[yellow]Low-evidence warning: the exact denominator is below the preferred "
+                "target.[/yellow]"
+            )
+        approved = self._approve
+        if not approved:
+            if self._non_interactive:
+                raise ValueError("fidelity approval requires --approve-fidelity")
+            approved = Confirm.ask(
+                "Approve this plan-bound fidelity evidence?",
+                default=False,
+                console=_console,
+            )
+        if not approved:
+            raise ValueError("router optimization stopped without fidelity approval")
+        return FidelityApprovalDecision(
+            actor_id="cli-operator",
+            evidence=(
+                f"Approved {denominator} plan-bound fidelity overlaps"
+                + (" with the low-evidence warning acknowledged." if low else ".")
+            ),
+            approved_at=self._approved_at,
+        )
+
+
+def _render_preflight(
+    preflight: AutomaticRouterPreflight,
+    options: AutomaticRouterOptions,
+) -> None:
+    """Render the confirmed scope and one shared provider-spend allocation.
 
     Args:
-        store: Project-local review and immutable artifact store.
-
-    Raises:
-        ValueError: Manual setup, calibration audit, or approved calibration is unavailable.
+        preflight: Verified automatic preflight result.
+        options: User-selected bounded controls.
     """
-    review = store.read_review()
-    guidance = (
-        "project has no approved judge calibration; run "
-        "`wmo config judge setup PROJECT`, then "
-        "`wmo config judge calibrate PROJECT --approve`"
-    )
-    if not isinstance(review, dict) or review.get("manual_judge") is None:
-        raise ValueError(guidance)
-    try:
-        state = ManualJudgeReviewState.model_validate(review["manual_judge"])
-    except ValueError as exc:
-        raise ValueError("project manual judge state is invalid") from exc
-    if state.approved_calibration is None:
-        raise ValueError(guidance)
-    calibration, calibration_input = verify_persisted_calibration(
-        store, state.approved_calibration.artifact_id
-    )
-    if calibration_input != state.approved_calibration or calibration.status != "human_calibrated":
-        raise ValueError(guidance)
+    _console.print("[bold]Router optimization plan[/bold]")
+    _console.print(f"provider ceiling: ${options.maximum_provider_cost_usd:.4f}")
+    _console.print(f"fidelity overlaps: {preflight.fidelity_overlap_count}")
+    if preflight.low_fidelity_evidence:
+        _console.print("[yellow]Fidelity evidence is below the preferred target.[/yellow]")

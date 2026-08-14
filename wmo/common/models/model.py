@@ -133,26 +133,56 @@ class ModelCapabilities(ContractModel):
     supports_tools: bool = False
     supports_embeddings: bool = False
     supports_structured_output: bool = False
+    supports_completions: bool | None = None
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
+    output_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
+    cached_input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
+    cache_write_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
+
+    @field_validator(
+        "input_cost_per_million_tokens_usd",
+        "output_cost_per_million_tokens_usd",
+        "cached_input_cost_per_million_tokens_usd",
+        "cache_write_cost_per_million_tokens_usd",
+    )
+    @classmethod
+    def _require_finite_prices(cls, value: float | None) -> float | None:
+        """Reject non-finite catalog prices before they enter budget arithmetic.
+
+        Args:
+            value: Optional nonnegative price declared by the operator.
+
+        Returns:
+            The unchanged finite price or ``None`` when pricing is unknown.
+
+        Raises:
+            ValueError: The declared price is infinite or NaN.
+        """
+        if value is not None and not math.isfinite(value):
+            raise ValueError("model token prices must be finite")
+        return value
 
     def identity_sha256(self) -> Sha256:
-        """Hash protocol capabilities while preserving existing frozen model identities.
+        """Hash capabilities that identify the provider model protocol.
 
-        Structured-output declarations and mutable pricing guide workflow selection and consent,
-        but they do not identify provider model bytes. Excluding them also preserves compatibility
-        with snapshots created before those catalog fields were available.
+        Workflow-only completion, structured-output, and pricing declarations are excluded from
+        provider model identity. Router evaluation freezes its exact execution declarations in a
+        separate candidate capability digest and freezes prices in the pricing snapshot.
 
         Returns:
             Stable digest of capability fields that identify the provider protocol boundary.
         """
-        return sha256_json(
-            self.model_dump(
-                mode="json",
-                exclude={"supports_structured_output", "input_cost_per_million_tokens_usd"},
-            )
-        )
+        excluded = {
+            "supports_structured_output",
+            "input_cost_per_million_tokens_usd",
+            "output_cost_per_million_tokens_usd",
+            "cached_input_cost_per_million_tokens_usd",
+            "cache_write_cost_per_million_tokens_usd",
+        }
+        excluded.add("supports_completions")
+        return sha256_json(self.model_dump(mode="json", exclude=excluded))
 
 
 class ToolChoice(ContractModel):

@@ -19,7 +19,10 @@ from wmo.common.evaluations import (
     EvaluationDatasetManifest,
     EvaluationPlan,
     EvaluationProtocol,
+    FidelityGate,
+    FidelityPair,
     FidelityReport,
+    FidelityThresholds,
 )
 from wmo.common.models import (
     AssistantAction,
@@ -777,6 +780,21 @@ def _persist_runtime_fixture(
         files={"pricing.json": pricing},
     )
     pricing_input = artifact_input(pricing_manifest)
+    thresholds = FidelityThresholds(
+        schema_version=1,
+        created_at=_TIME,
+        code_revision="test",
+        fidelity_thresholds_id="thresholds-a",
+        planned_overlaps=1,
+        minimum_usable_overlaps=1,
+    )
+    thresholds_manifest = store.write_json(
+        artifact_id=thresholds.fidelity_thresholds_id,
+        artifact_type="fidelity-thresholds",
+        envelope=thresholds,
+        files={"thresholds.json": thresholds},
+    )
+    thresholds_input = artifact_input(thresholds_manifest)
     tasks = tuple(
         TaskCase(
             task_id=task_id,
@@ -808,7 +826,12 @@ def _persist_runtime_fixture(
     plan = EvaluationPlan(
         schema_version=2,
         created_at=_TIME,
-        inputs=tuple(sorted((pricing_input, task_input), key=lambda item: item.artifact_id)),
+        inputs=tuple(
+            sorted(
+                (pricing_input, task_input, thresholds_input),
+                key=lambda item: item.artifact_id,
+            )
+        ),
         code_revision="test",
         plan_id="plan-a",
         task_set_id=task_set.task_set_id,
@@ -816,7 +839,7 @@ def _persist_runtime_fixture(
         pricing_snapshot_id=pricing.pricing_snapshot_id,
         pricing_snapshot_sha256=pricing_input.sha256,
         fidelity_thresholds_id="thresholds-a",
-        fidelity_thresholds_sha256=_DIGEST,
+        fidelity_thresholds_sha256=thresholds_input.sha256,
         fidelity_protocol_sha256=_DIGEST,
         cells=tuple(
             EvaluationCell(
@@ -839,22 +862,59 @@ def _persist_runtime_fixture(
         files={"plan.json": plan},
     )
     plan_input = artifact_input(plan_manifest)
+    gate = FidelityGate(
+        schema_version=1,
+        created_at=_TIME,
+        inputs=tuple(sorted((plan_input, thresholds_input), key=lambda item: item.artifact_id)),
+        code_revision="test",
+        fidelity_gate_id="gate-a",
+        fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
+        fidelity_thresholds_sha256=thresholds_input.sha256,
+        evaluation_plan_id=plan.plan_id,
+        evaluation_plan_sha256=plan_input.sha256,
+        protocol_sha256=_DIGEST,
+        task_model_scope_sha256=_DIGEST,
+        overlap_cell_ids=("fidelity-cell-a",),
+        planned_overlaps=1,
+        minimum_usable_overlaps=1,
+    )
+    gate_manifest = store.write_json(
+        artifact_id=gate.fidelity_gate_id,
+        artifact_type="fidelity-gate",
+        envelope=gate,
+        files={"gate.json": gate},
+    )
+    gate_input = artifact_input(gate_manifest)
     fidelity_report = FidelityReport(
         schema_version=1,
         created_at=_TIME,
+        inputs=(gate_input,),
         code_revision="test",
         fidelity_report_id="fidelity-a",
         evaluation_plan_id=plan.plan_id,
         evaluation_plan_sha256=plan_input.sha256,
         protocol_sha256=_DIGEST,
-        overlap_cell_ids=(),
-        planned_overlap_count=0,
-        usable_overlap_count=0,
+        overlap_cell_ids=("fidelity-cell-a",),
+        planned_overlap_count=1,
+        usable_overlap_count=1,
         failed_overlap_count=0,
-        pairs=(),
+        score_mae=0.0,
+        pairs=(
+            FidelityPair(
+                fidelity_cell_id="fidelity-cell-a",
+                observed_cell_id="observed-cell-a",
+                observed_rollout_id="observed-rollout-a",
+                simulated_rollout_id="simulated-rollout-a",
+                observed_score=0.5,
+                simulated_score=0.5,
+                absolute_error=0.0,
+                status="usable",
+            ),
+        ),
         gate_id="gate-a",
-        gate_sha256=_DIGEST,
-        status="insufficient",
+        gate_sha256=gate_input.sha256,
+        status="approved",
+        approved_at=_TIME,
     )
     fidelity_manifest = store.write_json(
         artifact_id=fidelity_report.fidelity_report_id,

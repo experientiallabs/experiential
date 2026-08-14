@@ -189,7 +189,7 @@ def prepare_manual_judge_setup(
         raise ManualJudgeError("judge setup preview count must be positive")
     project = store.load_project()
     build = _load_build_review(store)
-    if build.project_config != project:
+    if build.project_config != project.model_copy(update={"build": None}):
         raise ManualJudgeError("completed build belongs to a different project configuration")
     selected_alias = judge_alias or catalog.roles.judge
     if selected_alias is None:

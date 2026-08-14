@@ -18,6 +18,18 @@ from wmo.common.core.artifacts import (
 from wmo.common.core.files import write_text_atomic
 
 
+def _exclude_absent(value: object) -> bool:
+    """Return whether an optional compatibility field should be omitted from serialization.
+
+    Args:
+        value: Field value being serialized.
+
+    Returns:
+        True only for an absent optional value.
+    """
+    return value is None
+
+
 class ProjectConfigError(ValueError):
     """A project configuration file was absent, malformed, or violated its local contract."""
 
@@ -26,6 +38,12 @@ class AgentConfiguration(ContractModel):
     """Optional explicit factory for a customer-provided injectable agent runtime."""
 
     factory: str = Field(min_length=1, max_length=512)
+    code_revision: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        exclude_if=_exclude_absent,
+    )
 
 
 class ProjectModelConfiguration(ContractModel):

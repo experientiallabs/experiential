@@ -21,7 +21,7 @@ optimize_app = typer.Typer(
 
 optimize_app.command(
     "router",
-    help="Fit, freeze, and report one guarded router from completed evidence.",
+    help="Optimize a guarded router automatically from one completed project build.",
 )(router)
 optimize_app.command(
     "model", help="Run W13 Tinker SFT from an explicit persisted W12 dataset configuration."

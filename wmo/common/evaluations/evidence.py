@@ -167,7 +167,37 @@ def read_fidelity_report(
         model_type=FidelityReport,
     )
     _require_identity(value.fidelity_report_id, artifact_id, "fidelity report")
+    gate, gate_input = read_fidelity_gate(store, value.gate_id)
+    if (
+        gate_input.sha256 != value.gate_sha256
+        or gate_input not in value.inputs
+        or gate.planned_overlaps != value.planned_overlap_count
+    ):
+        raise EvaluationEvidenceError("fidelity report differs from its exact frozen gate")
+    verify_fidelity_report_gate(value, gate)
     return value, input_record
+
+
+def verify_fidelity_report_gate(report: FidelityReport, gate: FidelityGate) -> None:
+    """Verify report status and measurements against its recursively loaded gate.
+
+    Args:
+        report: Structurally valid fidelity report.
+        gate: Exact immutable gate named by the report.
+
+    Raises:
+        EvaluationEvidenceError: Status, denominator, usable count, or MAE violates the gate.
+    """
+    if gate.planned_overlaps != report.planned_overlap_count:
+        raise EvaluationEvidenceError("fidelity report denominator differs from its frozen gate")
+    insufficient = report.usable_overlap_count < gate.minimum_usable_overlaps
+    excessive_mae = report.score_mae is None or report.score_mae > gate.maximum_score_mae
+    if report.status == "approved" and (insufficient or excessive_mae):
+        raise EvaluationEvidenceError("approved fidelity report does not satisfy its frozen gate")
+    if report.status == "insufficient" and not insufficient:
+        raise EvaluationEvidenceError("fidelity report meets the gate's usable evidence minimum")
+    if report.status == "rejected" and (insufficient or not excessive_mae):
+        raise EvaluationEvidenceError("rejected fidelity report does not exceed its frozen MAE")
 
 
 def read_rollout(

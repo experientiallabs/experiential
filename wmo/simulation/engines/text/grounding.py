@@ -8,10 +8,90 @@ from wmo.common.core.artifacts import (
     FailureCode,
     StructuredFailure,
 )
-from wmo.common.models import EmbeddingCostReservation, NumericMeasurement, OperationEconomics
+from wmo.common.models import (
+    CompletionCostReservation,
+    EmbeddingCostReservation,
+    NumericMeasurement,
+    OperationEconomics,
+    verify_completion_reservation,
+)
+from wmo.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
+from wmo.common.tasks import LoadedTaskSet, load_task_set
+from wmo.runtime.models import ResolvedModel
 from wmo.simulation.engines.text.errors import SimulationConfigurationError
 from wmo.simulation.retrieval import TraceRAGRetriever
-from wmo.simulation.specs import SimulationSpec, WorldModelSettings
+from wmo.simulation.specs import (
+    SimulationCompletionContract,
+    SimulationSpec,
+    WorldModelSettings,
+    load_simulation_completion_contract,
+)
+
+
+def load_completion_contract(
+    store: ArtifactStore, contract_input: ArtifactInput | None
+) -> SimulationCompletionContract | None:
+    """Load the exact optional completion reservation artifact.
+
+    Args:
+        store: Project-local immutable artifact store.
+        contract_input: Expected immutable contract manifest.
+
+    Returns:
+        Verified completion contract, or ``None`` for v1 simulation callers.
+
+    Raises:
+        SimulationConfigurationError: The artifact is missing, corrupt, or hash-mismatched.
+    """
+    if contract_input is None:
+        return None
+    try:
+        contract, persisted_input = load_simulation_completion_contract(
+            store, contract_input.artifact_id
+        )
+    except (OSError, ValueError) as exc:
+        raise SimulationConfigurationError(
+            "simulation completion reservation artifact cannot be read safely"
+        ) from exc
+    if persisted_input != contract_input:
+        raise SimulationConfigurationError(
+            "simulation completion reservation manifest differs from its frozen input"
+        )
+    return contract
+
+
+def load_simulation_task_set(store: ArtifactStore, task_set_input: ArtifactInput) -> LoadedTaskSet:
+    """Load the exact manifest-bound task set selected for simulation.
+
+    Args:
+        store: Project-local immutable artifact store.
+        task_set_input: Expected immutable task-set manifest.
+
+    Returns:
+        Verified task-set envelope and task rows.
+
+    Raises:
+        SimulationConfigurationError: Artifact type, digest, or task content differs.
+    """
+    try:
+        stored = store.read(task_set_input.artifact_id)
+    except ArtifactCorruptionError as exc:
+        raise SimulationConfigurationError(
+            f"simulation task set {task_set_input.artifact_id!r} cannot be read safely"
+        ) from exc
+    if (
+        stored.manifest.artifact_type != "task-set"
+        or artifact_input(stored.manifest) != task_set_input
+    ):
+        raise SimulationConfigurationError(
+            "simulation task_set_input must name the exact persisted task-set manifest"
+        )
+    try:
+        return load_task_set(store, task_set_input.artifact_id)
+    except ArtifactCorruptionError as exc:
+        raise SimulationConfigurationError(
+            f"simulation task set {task_set_input.artifact_id!r} has invalid task content"
+        ) from exc
 
 
 def verify_fit_retriever(
@@ -143,6 +223,115 @@ def query_reservation_failure(
         details={
             "phase": "query_embedding_reservation",
             "reserved_cost_usd": cost.value,
+            "remaining_cost_usd": remaining_cost_usd,
+        },
+    )
+
+
+def completion_reservations(
+    contract: SimulationCompletionContract | None,
+    *,
+    candidate_alias: str,
+    candidate: ResolvedModel,
+    world_model: ResolvedModel,
+) -> tuple[CompletionCostReservation | None, CompletionCostReservation | None]:
+    """Resolve and verify exact candidate and world request ceilings.
+
+    Args:
+        contract: Frozen automatic-simulation reservations, or ``None`` for v1 callers.
+        candidate_alias: Evaluation cell candidate alias.
+        candidate: Active exact candidate model.
+        world_model: Active exact world model.
+
+    Returns:
+        Candidate and world request reservations, or two ``None`` values for legacy settings.
+
+    Raises:
+        SimulationConfigurationError: A reservation is absent or differs from active metadata.
+    """
+    if contract is None:
+        return None, None
+    if contract.world_model_alias != world_model.alias:
+        raise SimulationConfigurationError(
+            "completion reservation contract selects a different world-model alias"
+        )
+    attempts = contract.maximum_attempts
+    world = contract.world_model_request
+    candidates = {item.candidate_alias: item.request for item in contract.candidate_requests}
+    selected = candidates.get(candidate_alias)
+    if selected is None:
+        raise SimulationConfigurationError(
+            f"candidate {candidate_alias!r} lacks a completion cost reservation"
+        )
+    try:
+        verify_completion_reservation(
+            selected,
+            model=candidate.snapshot,
+            capabilities=candidate.capabilities,
+            maximum_attempts=attempts,
+        )
+        verify_completion_reservation(
+            world,
+            model=world_model.snapshot,
+            capabilities=world_model.capabilities,
+            maximum_attempts=attempts,
+        )
+    except ValueError as exc:
+        raise SimulationConfigurationError(str(exc)) from exc
+    return selected, world
+
+
+def episode_reservation_failure(
+    settings: WorldModelSettings,
+    *,
+    completion_contract: SimulationCompletionContract | None,
+    candidate_alias: str,
+    maximum_steps: int,
+    remaining_cost_usd: float,
+) -> StructuredFailure | None:
+    """Admit all possible candidate, retrieval, and world calls before an episode starts.
+
+    Args:
+        settings: Frozen retrieval and completion reservations.
+        completion_contract: Frozen completion reservations, or ``None`` for v1 callers.
+        candidate_alias: Evaluation cell candidate alias.
+        maximum_steps: Maximum possible candidate/world turn pairs.
+        remaining_cost_usd: Reconciled cell budget remaining under the durable lease.
+
+    Returns:
+        Structured zero-dispatch failure when the full episode ceiling cannot fit.
+
+    Raises:
+        SimulationConfigurationError: A configured reservation is missing or unpriced.
+    """
+    query = settings.query_embedding
+    if query is None:  # pragma: no cover - grounding settings require it
+        raise SimulationConfigurationError("query-embedding reservation is missing")
+    if completion_contract is None:
+        return query_reservation_failure(query, remaining_cost_usd)
+    query_cost = maximum_query_reservation(query).cost_usd
+    if query_cost is None:  # pragma: no cover - maximum query reservation always prices
+        raise SimulationConfigurationError("query-embedding reservation has unknown cost")
+    turn_cost = query_cost.value
+    candidates = {
+        item.candidate_alias: item.request for item in completion_contract.candidate_requests
+    }
+    candidate = candidates.get(candidate_alias)
+    world = completion_contract.world_model_request
+    if candidate is None:
+        raise SimulationConfigurationError("completion cost reservations are incomplete")
+    turn_cost += candidate.estimated_maximum_call_cost_usd
+    turn_cost += world.estimated_maximum_call_cost_usd
+    reserved = turn_cost * maximum_steps
+    if reserved <= remaining_cost_usd:
+        return None
+    return StructuredFailure(
+        code=FailureCode.BUDGET,
+        message="full episode provider reservation exceeds remaining simulation spend",
+        attribution=FailureAttribution.MODEL,
+        details={
+            "phase": "episode_provider_reservation",
+            "reserved_cost_usd": reserved,
             "remaining_cost_usd": remaining_cost_usd,
         },
     )

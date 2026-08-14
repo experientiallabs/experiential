@@ -21,6 +21,10 @@ from wmo.common.project import (
 )
 from wmo.common.routing import KnnRouterPolicy
 from wmo.runtime.models import RuntimeModelCatalog
+from wmo.runtime.router.capability import (
+    load_router_runtime_capability_contract,
+    verify_router_runtime_capabilities,
+)
 from wmo.runtime.router.completion import (
     JournaledRouterCompletionService,
     RouterCompletionService,
@@ -70,6 +74,7 @@ def load_project_router(
                 load_model_catalog(project_store.model_catalog_path),
                 environment=environment,
             )
+        _verify_automatic_runtime_capabilities(project_store.artifacts, policy, catalog)
         return RouterRuntime.load(
             project_store.artifacts,
             resolved_policy_id,
@@ -232,3 +237,66 @@ def _load_policy(store: ArtifactStore, policy_id: ArtifactId) -> KnnRouterPolicy
     if policy.policy_id != policy_id:
         raise RouterApplicationError("router policy identity differs from its artifact")
     return policy
+
+
+def _verify_automatic_runtime_capabilities(
+    store: ArtifactStore,
+    policy: KnnRouterPolicy,
+    catalog: RuntimeModelCatalog,
+) -> None:
+    """Verify an automatic plan's separate capability contract before credential access.
+
+    Legacy plans contain neither automatic artifact and retain their existing activation path.
+    Automatic plans must freeze exactly one capability contract and one execution contract, with
+    the execution manifest recursively binding the capability pointer.
+
+    Args:
+        store: Project-local immutable artifact store.
+        policy: Selected frozen router policy.
+        catalog: Current credential-free catalog resolver.
+
+    Raises:
+        RouterApplicationError: Automatic artifacts are missing, ambiguous, or drifted.
+    """
+    from wmo.common.evaluations.evidence import read_evaluation_plan
+    from wmo.common.project import artifact_input
+    from wmo.workflow.router_execution_contract import load_router_execution_contract
+
+    plan, _plan_input = read_evaluation_plan(store, policy.evaluation_plan_id)
+    capability_inputs = []
+    execution_inputs = []
+    for item in plan.inputs:
+        stored = store.read(item.artifact_id)
+        if artifact_input(stored.manifest) != item:
+            raise RouterApplicationError(
+                f"router plan input {item.artifact_id!r} differs from its manifest"
+            )
+        if stored.manifest.artifact_type == "router-runtime-capabilities":
+            capability_inputs.append(item)
+        elif stored.manifest.artifact_type == "router-execution-contract":
+            execution_inputs.append(item)
+    if not capability_inputs and not execution_inputs:
+        return
+    if len(capability_inputs) != 1 or len(execution_inputs) != 1:
+        raise RouterApplicationError(
+            "automatic router plan must bind one capability and one execution contract"
+        )
+    capability_input = capability_inputs[0]
+    execution = load_router_execution_contract(store, execution_inputs[0].artifact_id)
+    if execution.runtime_capability_input != capability_input:
+        raise RouterApplicationError(
+            "automatic router execution contract differs from its runtime capability binding"
+        )
+    execution_candidates = tuple(
+        (item.candidate_alias, item.model) for item in execution.candidates
+    )
+    policy_candidates = tuple((item.alias, item.model) for item in policy.candidates)
+    if (
+        execution_candidates != policy_candidates
+        or execution.incumbent_alias != policy.baseline_alias
+    ):
+        raise RouterApplicationError(
+            "automatic router execution candidates or incumbent differ from the policy"
+        )
+    contract = load_router_runtime_capability_contract(store, capability_input.artifact_id)
+    verify_router_runtime_capabilities(contract, policy.candidates, catalog)

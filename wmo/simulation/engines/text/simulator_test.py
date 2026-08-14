@@ -18,6 +18,7 @@ from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import (
     AssistantAction,
+    CompletionCostReservation,
     Embedding,
     EmbeddingCostReservation,
     ModelCapabilities,
@@ -32,6 +33,7 @@ from wmo.common.models import (
     RoutedCandidateSnapshot,
     ToolCall,
     Usage,
+    completion_cost_reservation,
 )
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
 from wmo.common.rollouts import RolloutArtifact, SimulationCellBinding, SimulationMode, StopReason
@@ -61,7 +63,13 @@ from wmo.simulation.retrieval import (
 )
 from wmo.simulation.retrieval.retrieval_test import _persist_traces
 from wmo.simulation.retrieval.transitions import render_rag_key
-from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
+from wmo.simulation.specs import (
+    CandidateCompletionReservation,
+    SimulationSpec,
+    WorldModelSettings,
+    persist_simulation_completion_contract,
+    simulation_spec_digest,
+)
 from wmo.simulation.world_model import GroundedWorldModel, GroundedWorldModelArtifact
 from wmo.simulation.world_model.artifact import (
     GROUNDED_WORLD_MODEL_PROMPT_VERSION,
@@ -417,18 +425,85 @@ def _query_embedding(
     )
 
 
+def _completion_reservation(alias: str) -> CompletionCostReservation:
+    """Build a complete one-attempt request reservation for one fixture model.
+
+    Args:
+        alias: Exact candidate or world-model alias.
+
+    Returns:
+        Conservative full-context completion request reservation.
+    """
+    return completion_cost_reservation(
+        model=_snapshot(alias),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=2,
+        cached_input_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=1.5,
+        maximum_attempts=1,
+        maximum_input_tokens=80_000,
+        maximum_output_tokens=16_000,
+    )
+
+
+def _persist_completion_contract(store: ArtifactStore) -> ArtifactInput:
+    """Persist the complete candidate and world reservation fixture.
+
+    Args:
+        store: Project-local artifact store.
+
+    Returns:
+        Exact completion-contract manifest input.
+    """
+    _contract, contract_input = persist_simulation_completion_contract(
+        store,
+        inputs=(),
+        candidate_requests=(
+            CandidateCompletionReservation(
+                candidate_alias="candidate-a",
+                request=_completion_reservation("candidate-a"),
+            ),
+            CandidateCompletionReservation(
+                candidate_alias="candidate-b",
+                request=_completion_reservation("candidate-b"),
+            ),
+        ),
+        world_model_alias="world-model-a",
+        world_model_request=_completion_reservation("world-model-a"),
+        maximum_attempts=1,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+    return contract_input
+
+
 def _resolved(
     alias: str,
     client: ModelClient,
     *,
     context_window: int = 100_000,
 ) -> ResolvedModel:
+    """Build one resolved completion model for simulator tests.
+
+    Args:
+        alias: Catalog alias and model identifier used by the fixture.
+        client: Provider-neutral client injected into the resolved model.
+        context_window: Declared maximum input context.
+
+    Returns:
+        Resolved model with complete completion capabilities and pricing.
+    """
     return ResolvedModel(
         alias=alias,
         snapshot=_snapshot(alias),
         capabilities=ModelCapabilities(
+            supports_completions=True,
             context_window_tokens=context_window,
             maximum_output_tokens=16_000,
+            input_cost_per_million_tokens_usd=1,
+            output_cost_per_million_tokens_usd=2,
+            cached_input_cost_per_million_tokens_usd=0.5,
+            cache_write_cost_per_million_tokens_usd=1.5,
         ),
         client=client,
         embedding_client=None,
@@ -441,6 +516,7 @@ def _spec(
     cells: tuple[str, ...],
     *,
     fit_rag_input: ArtifactInput | None = None,
+    completion_contract_input: ArtifactInput | None = None,
     query_embedding: EmbeddingCostReservation | None = None,
     **updates: object,
 ) -> SimulationSpec:
@@ -452,6 +528,7 @@ def _spec(
         cells: Ordered evaluation-cell identities selected for execution.
         fit_rag_input: Optional explicit fit-only RAG pointer.
         query_embedding: Optional explicit query-embedding reservation.
+        completion_contract_input: Optional exact completion reservation artifact.
         **updates: Additional specification fields overriding fixture defaults.
 
     Returns:
@@ -459,12 +536,15 @@ def _spec(
     """
     rag_input = fit_rag_input or _fit_rag_input()
     grounded_input = _grounded_world_model_input()
+    inputs = [plan_input, task_set_input, rag_input, grounded_input]
+    if completion_contract_input is not None:
+        inputs.append(completion_contract_input)
     values: dict[str, object] = {
         "schema_version": 1,
         "created_at": _TIME,
         "inputs": tuple(
             sorted(
-                (plan_input, task_set_input, rag_input, grounded_input),
+                inputs,
                 key=lambda item: item.artifact_id,
             )
         ),
@@ -500,6 +580,7 @@ def _simulator(
     agent_factory: Callable[[], AgentRuntime] = _OneTurnAgent,
     fit_retriever: TraceRAGRetriever | _FitRetriever | None = None,
     fit_rag_input: ArtifactInput | None = None,
+    completion_contract_input: ArtifactInput | None = None,
 ) -> WorldModelSimulator:
     """Bind deterministic clients and an exact fit retriever to the simulator.
 
@@ -514,6 +595,7 @@ def _simulator(
         agent_factory: Factory creating one isolated agent runtime per episode.
         fit_retriever: Optional exact read-only fit retriever.
         fit_rag_input: Optional explicit fit-only RAG pointer.
+        completion_contract_input: Optional exact completion reservation artifact.
 
     Returns:
         Fully bound text-world-model simulator.
@@ -540,6 +622,7 @@ def _simulator(
             "world-model-a": _grounded_world_model(world_client, typed_retriever)
         },
         agent_factory=agent_factory,
+        completion_contract_input=completion_contract_input,
         clock=lambda: _TIME,
         monotonic=lambda: 1.0,
     )
@@ -772,6 +855,79 @@ def test_query_reservation_exceeding_remaining_budget_blocks_every_dispatch(
     assert retriever.queries == []
 
 
+def test_full_episode_reservation_blocks_candidate_retrieval_and_world_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Reserve every possible turn before the first candidate or retrieval call.
+
+    Args:
+        tmp_path: Isolated project root used to verify zero provider dispatch.
+    """
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient([])
+    world_client = _ScriptedClient([])
+    retriever = _FitRetriever(_fit_rag_input())
+    _contract, completion_input = persist_simulation_completion_contract(
+        store,
+        inputs=(),
+        candidate_requests=(
+            CandidateCompletionReservation(
+                candidate_alias="candidate-a",
+                request=_completion_reservation("candidate-a"),
+            ),
+            CandidateCompletionReservation(
+                candidate_alias="candidate-b",
+                request=_completion_reservation("candidate-b"),
+            ),
+        ),
+        world_model_alias="world-model-a",
+        world_model_request=_completion_reservation("world-model-a"),
+        maximum_attempts=1,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        fit_retriever=retriever,
+        completion_contract_input=completion_input,
+    )
+    settings = WorldModelSettings(
+        world_model_alias="world-model-a",
+        grounded_world_model_input=_grounded_world_model_input(),
+        prompt_version="text-world-model-v1",
+        query_embedding=_query_embedding(),
+    )
+
+    artifact_set = simulator.run(
+        _spec(
+            plan_input,
+            task_set_input,
+            ("cell-a",),
+            world_model=settings,
+            completion_contract_input=completion_input,
+            maximum_cost_usd=0.1,
+        )
+    )
+    rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
+
+    assert rollout.stop_reason == StopReason.MAXIMUM_COST
+    assert rollout.failure is not None
+    assert rollout.failure.details["phase"] == "episode_provider_reservation"
+    assert candidate_client.requests == []
+    assert world_client.requests == []
+    assert retriever.estimate_calls == 0
+    assert retriever.queries == []
+
+
 @pytest.mark.parametrize(
     ("price", "maximum_attempts", "message"),
     (
@@ -984,6 +1140,76 @@ def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
     assert second_rollout.stop_reason == StopReason.MAXIMUM_COST
     assert len(candidate_client.requests) == 1
     assert world_client.requests == []
+
+
+@pytest.mark.parametrize("invalid_role", ["candidate", "world_model"])
+def test_invalid_production_usage_poisons_later_paid_cells_and_exact_resume(
+    tmp_path: Path,
+    invalid_role: str,
+) -> None:
+    """Persist unknown spend and prevent later or replayed provider dispatch.
+
+    Args:
+        tmp_path: Isolated project root for durable failure evidence.
+        invalid_role: Candidate or world-model response whose usage cannot be priced.
+    """
+    cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(
+        store,
+        {"task-a": _task("task-a"), "task-b": _task("task-b")},
+    )
+    missing_usage = _response(
+        "I can help.", snapshot=_snapshot("candidate-a"), cost=None
+    ).model_copy(update={"economics": OperationEconomics()})
+    valid_candidate = _response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)
+    invalid_world = _response(
+        '{"message":"done","terminal":true}',
+        snapshot=_snapshot("world-model-a"),
+        cost=None,
+    ).model_copy(
+        update={
+            "economics": OperationEconomics(
+                usage=Usage(input_tokens=8, output_tokens=4, cached_input_tokens=9)
+            )
+        }
+    )
+    candidate_client = _ScriptedClient(
+        [missing_usage if invalid_role == "candidate" else valid_candidate]
+    )
+    world_client = _ScriptedClient([invalid_world] if invalid_role == "world_model" else [])
+    completion_input = _persist_completion_contract(store)
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        completion_contract_input=completion_input,
+    )
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a", "cell-b"),
+        completion_contract_input=completion_input,
+        maximum_cost_usd=1.0,
+    )
+
+    artifact_set = simulator.run(spec)
+    first = simulator._load_rollout(artifact_set.artifact_ids[0])
+    second = simulator._load_rollout(artifact_set.artifact_ids[1])
+    calls = (len(candidate_client.requests), len(world_client.requests))
+    replay = simulator.run(spec)
+
+    assert first.stop_reason == StopReason.FAILURE
+    assert first.failure is not None
+    assert first.failure.details["provider_dispatch_unknown_spend"] is True
+    assert second.stop_reason == StopReason.MAXIMUM_COST
+    assert replay == artifact_set
+    assert (len(candidate_client.requests), len(world_client.requests)) == calls
 
 
 def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: Path) -> None:

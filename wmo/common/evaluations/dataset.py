@@ -215,20 +215,6 @@ class FidelityReport(ArtifactEnvelope):
             self.approved_at.tzinfo is None or self.approved_at.utcoffset() is None
         ):
             raise ValueError("fidelity approval times must include a timezone")
-        if self.status == "approved" and (
-            self.usable_overlap_count < 8 or self.score_mae is None or self.score_mae > 0.10
-        ):
-            raise ValueError(
-                "approved fidelity reports must satisfy the frozen 8-pair and 0.10 gate"
-            )
-        if self.status == "insufficient" and self.usable_overlap_count >= 8:
-            raise ValueError(
-                "fidelity reports with eight usable pairs must be approved or rejected"
-            )
-        if self.status == "rejected" and (
-            self.usable_overlap_count < 8 or self.score_mae is None or self.score_mae <= 0.10
-        ):
-            raise ValueError("rejected fidelity reports require eight pairs and MAE above 0.10")
         return self
 
 

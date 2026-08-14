@@ -6,9 +6,10 @@ from typing import cast
 
 import pytest
 
-from wmo.common.core.artifacts import ArtifactInput
+from wmo.common.core.artifacts import ArtifactInput, JsonObject
 from wmo.common.models import (
     AssistantAction,
+    CompletionCostReservation,
     EmbeddingCostReservation,
     ModelCapabilities,
     ModelFinishReason,
@@ -19,10 +20,12 @@ from wmo.common.models import (
     NumericMeasurement,
     OperationEconomics,
     Usage,
+    completion_cost_reservation,
 )
 from wmo.common.rollouts import StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.models import ResolvedModel
+from wmo.runtime.models.providers.openai import openai_responses_response
 from wmo.simulation.engines.text.recording import (
     RecordingCandidateClient,
     TextSimulationError,
@@ -109,6 +112,43 @@ def _response(
     )
 
 
+def _openai_payload(
+    *,
+    model: str,
+    content: str,
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int,
+) -> JsonObject:
+    """Return one native OpenAI Responses payload with usage but no dollar cost.
+
+    Args:
+        model: Served provider model identifier.
+        content: Visible assistant output text.
+        input_tokens: Provider-reported total input tokens.
+        output_tokens: Provider-reported generated tokens.
+        cached_tokens: Provider-reported cached-read input tokens.
+
+    Returns:
+        Schema-valid completed Responses payload.
+    """
+    return {
+        "status": "completed",
+        "model": model,
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": content}],
+            }
+        ],
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "input_tokens_details": {"cached_tokens": cached_tokens},
+        },
+    }
+
+
 def _task() -> TaskCase:
     return TaskCase(
         task_id="task-a",
@@ -126,13 +166,32 @@ def _resolved(
     client: _ScriptedClient,
     *,
     context_window_tokens: int = 100_000,
+    completion_pricing: bool = False,
+    input_price: float | None = 1.0,
 ) -> ResolvedModel:
+    """Resolve one scripted model with optional complete finite-cost metadata.
+
+    Args:
+        alias: Stable fixture alias.
+        client: Scripted provider client.
+        context_window_tokens: Declared request context capacity.
+        completion_pricing: Whether to declare completion eligibility and prices.
+        input_price: Explicit input price, or ``None`` for an unknown-price test.
+
+    Returns:
+        Exact scripted runtime model.
+    """
     return ResolvedModel(
         alias=alias,
         snapshot=_snapshot(alias),
         capabilities=ModelCapabilities(
+            supports_completions=True if completion_pricing else None,
             context_window_tokens=context_window_tokens,
             maximum_output_tokens=16_000,
+            input_cost_per_million_tokens_usd=input_price if completion_pricing else None,
+            output_cost_per_million_tokens_usd=2.0 if completion_pricing else None,
+            cached_input_cost_per_million_tokens_usd=0.5 if completion_pricing else None,
+            cache_write_cost_per_million_tokens_usd=1.5 if completion_pricing else None,
         ),
         client=client,
         embedding_client=None,
@@ -146,6 +205,9 @@ def _recorder(
     candidate_context_window: int = 100_000,
     candidate_served_model_id: str | None = None,
     resolved_world_client: _ScriptedClient | None = None,
+    candidate_request: CompletionCostReservation | None = None,
+    world_request: CompletionCostReservation | None = None,
+    active_input_price: float | None = 1.0,
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -155,6 +217,9 @@ def _recorder(
         candidate_context_window: Candidate request context-window ceiling.
         candidate_served_model_id: Optional observed served-model identity.
         resolved_world_client: Optional decoy client retained only in the resolved identity.
+        candidate_request: Optional secure candidate request reservation.
+        world_request: Optional secure world-model request reservation.
+        active_input_price: Active catalog input price for secure reservation tests.
 
     Returns:
         Recorder configured for one deterministic task.
@@ -163,12 +228,18 @@ def _recorder(
         "candidate-a",
         candidate_client,
         context_window_tokens=candidate_context_window,
+        completion_pricing=candidate_request is not None,
+        input_price=active_input_price,
     )
     if candidate_served_model_id is not None:
         candidate = replace(candidate, served_model_id=candidate_served_model_id)
     retriever = cast(TraceRAGRetriever, _Retriever())
     serving_input = ArtifactInput(artifact_id="serving-rag", sha256="c" * 64)
-    world_model = _resolved("world-model-a", resolved_world_client or world_client)
+    world_model = _resolved(
+        "world-model-a",
+        resolved_world_client or world_client,
+        completion_pricing=world_request is not None,
+    )
     grounded = GroundedWorldModel(
         artifact_input=ArtifactInput(artifact_id="grounded-world-model", sha256="d" * 64),
         artifact=GroundedWorldModelArtifact(
@@ -198,12 +269,39 @@ def _recorder(
             maximum_attempts=2,
             maximum_input_tokens=10_000,
         ),
+        candidate_request=candidate_request,
+        world_model_request=world_request,
+        completion_maximum_attempts=1,
         maximum_cost_usd=10.0,
         maximum_steps=2,
         maximum_output_tokens=16_000,
         redacted_field_names=frozenset(),
         clock=lambda: _TIME,
         token_counter=_Utf8Counter(),
+    )
+
+
+def _completion_reservation(
+    alias: str, *, maximum_input_tokens: int = 80_000
+) -> CompletionCostReservation:
+    """Return a complete one-attempt request reservation for a scripted alias.
+
+    Args:
+        alias: Exact candidate or world-model alias.
+        maximum_input_tokens: Full request input ceiling.
+
+    Returns:
+        Conservative completion request reservation.
+    """
+    return completion_cost_reservation(
+        model=_snapshot(alias),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=2,
+        cached_input_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=1.5,
+        maximum_attempts=1,
+        maximum_input_tokens=maximum_input_tokens,
+        maximum_output_tokens=16_000,
     )
 
 
@@ -246,6 +344,112 @@ def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free() -> No
     )
 
 
+def test_recorder_persists_estimated_cost_for_native_candidate_and_world_usage() -> None:
+    """Price production-shaped candidate and world responses before rollout persistence."""
+    candidate_snapshot = _snapshot("candidate-a")
+    world_snapshot = _snapshot("world-model-a")
+    candidate_response = openai_responses_response(
+        _openai_payload(
+            model="candidate-a",
+            content="I can help.",
+            input_tokens=10,
+            output_tokens=2,
+            cached_tokens=4,
+        ),
+        configured_model=candidate_snapshot,
+        latency_seconds=0.1,
+    )
+    world_response = openai_responses_response(
+        _openai_payload(
+            model="world-model-a",
+            content='{"message":"Done.","terminal":true}',
+            input_tokens=20,
+            output_tokens=3,
+            cached_tokens=5,
+        ),
+        configured_model=world_snapshot,
+        latency_seconds=0.2,
+    )
+    recorder = _recorder(
+        _ScriptedClient([candidate_response]),
+        _ScriptedClient([world_response]),
+        candidate_request=_completion_reservation("candidate-a"),
+        world_request=_completion_reservation("world-model-a"),
+    )
+
+    recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Help me."),)))
+
+    candidate_cost = recorder.recorded.candidate_economics.cost_usd
+    world_cost = recorder.recorded.world_model_economics.cost_usd
+    assert candidate_cost is not None and candidate_cost.provenance == "estimated"
+    assert world_cost is not None and world_cost.provenance == "estimated"
+    assert candidate_cost.value > 0
+    assert world_cost.value > 0
+
+
+def test_candidate_unknown_usage_retains_unknown_spend_after_dispatch() -> None:
+    """Mark a paid candidate response unknown when its usage cannot be priced."""
+    candidate = openai_responses_response(
+        {
+            "status": "completed",
+            "model": "candidate-a",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "I can help."}],
+                }
+            ],
+        },
+        configured_model=_snapshot("candidate-a"),
+        latency_seconds=0.1,
+    )
+    candidate_client = _ScriptedClient([candidate])
+    world_client = _ScriptedClient([])
+    recorder = _recorder(
+        candidate_client,
+        world_client,
+        candidate_request=_completion_reservation("candidate-a"),
+        world_request=_completion_reservation("world-model-a"),
+    )
+
+    with pytest.raises(TextSimulationError) as error:
+        recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Help."),)))
+
+    assert error.value.failure.details["provider_dispatch_unknown_spend"] is True
+    assert len(candidate_client.requests) == 1
+    assert world_client.requests == []
+
+
+def test_world_invalid_usage_retains_unknown_spend_after_dispatch() -> None:
+    """Mark a paid world response unknown when cached usage is inconsistent."""
+    candidate_client = _ScriptedClient([_response("I can help.", model=_snapshot("candidate-a"))])
+    world = openai_responses_response(
+        _openai_payload(
+            model="world-model-a",
+            content='{"message":"Done.","terminal":true}',
+            input_tokens=10,
+            output_tokens=2,
+            cached_tokens=11,
+        ),
+        configured_model=_snapshot("world-model-a"),
+        latency_seconds=0.1,
+    )
+    world_client = _ScriptedClient([world])
+    recorder = _recorder(
+        candidate_client,
+        world_client,
+        candidate_request=_completion_reservation("candidate-a"),
+        world_request=_completion_reservation("world-model-a"),
+    )
+
+    with pytest.raises(TextSimulationError) as error:
+        recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Help."),)))
+
+    assert error.value.failure.details["provider_dispatch_unknown_spend"] is True
+    assert len(candidate_client.requests) == 1
+    assert len(world_client.requests) == 1
+
+
 def test_recorder_dispatches_only_through_the_artifact_bound_grounded_executor() -> None:
     """A distinct raw resolved client cannot bypass fit retrieval and grounded prompt framing."""
     candidate_client = _ScriptedClient([_response("I can help.", model=_snapshot("candidate-a"))])
@@ -285,6 +489,41 @@ def test_recorder_rejects_tool_requests_before_any_provider_call() -> None:
         )
 
     assert error.value.stop_reason == StopReason.FAILURE
+    assert candidate_client.requests == []
+    assert world_client.requests == []
+
+
+@pytest.mark.parametrize(
+    ("maximum_input_tokens", "active_input_price", "message"),
+    ((1, 1.0, "reserved input-token ceiling"), (80_000, None, "pricing is incomplete")),
+)
+def test_candidate_reservation_failure_blocks_every_provider_call(
+    maximum_input_tokens: int,
+    active_input_price: float | None,
+    message: str,
+) -> None:
+    """Under-reserved or unpriced candidate calls fail before candidate and world dispatch.
+
+    Args:
+        maximum_input_tokens: Frozen candidate request ceiling.
+        active_input_price: Active catalog input price or unknown marker.
+        message: Expected fail-closed diagnostic.
+    """
+    candidate_client = _ScriptedClient([])
+    world_client = _ScriptedClient([])
+    recorder = _recorder(
+        candidate_client,
+        world_client,
+        candidate_request=_completion_reservation(
+            "candidate-a", maximum_input_tokens=maximum_input_tokens
+        ),
+        world_request=_completion_reservation("world-model-a"),
+        active_input_price=active_input_price,
+    )
+
+    with pytest.raises(TextSimulationError, match=message):
+        recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Help"),)))
+
     assert candidate_client.requests == []
     assert world_client.requests == []
 

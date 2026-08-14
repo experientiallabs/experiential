@@ -18,6 +18,8 @@ from wmo.common.evaluations import (
     FidelityPair,
     FidelityReport,
 )
+from wmo.common.evaluations.evidence import EvaluationEvidenceError, verify_fidelity_report_gate
+from wmo.common.evaluations.plan import FidelityGate
 from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
 
 _DIGEST = "a" * 64
@@ -166,35 +168,72 @@ def test_rows_keep_failures_and_reject_duplicate_or_missing_evidence() -> None:
         EvaluationDataset(manifest=_manifest(), rows=(_row(), _row()))
     with pytest.raises(ValidationError, match="started evaluation rows require a source_run_id"):
         EvaluationRow.model_validate({**_row().model_dump(), "source_run_id": None})
-    with pytest.raises(ValidationError, match="frozen 8-pair"):
-        FidelityReport(
-            schema_version=1,
-            created_at=datetime(2026, 8, 11, tzinfo=UTC),
-            code_revision="e7aad17",
-            fidelity_report_id="fidelity-report-2",
-            evaluation_plan_id="plan-1",
-            evaluation_plan_sha256=_DIGEST,
-            protocol_sha256=_DIGEST,
-            overlap_cell_ids=tuple(f"cell-fidelity-{index}" for index in range(10)),
-            planned_overlap_count=10,
-            usable_overlap_count=7,
-            failed_overlap_count=3,
-            score_mae=0.08,
-            failures=tuple(
-                FidelityFailure(
-                    cell_id=f"cell-fidelity-{index}",
-                    failure=StructuredFailure(
-                        code=FailureCode.TIMEOUT, message="simulator timed out"
-                    ),
-                )
-                for index in range(7, 10)
-            ),
-            pairs=_pairs(tuple(f"cell-fidelity-{index}" for index in range(10)), 7),
-            gate_id="fidelity-gate-v1",
-            gate_sha256=_DIGEST,
-            status="approved",
-            approved_at=datetime(2026, 8, 11, tzinfo=UTC),
-        )
+
+
+def test_fidelity_report_legacy_payload_reserializes_without_new_gate_fields() -> None:
+    """Parsing a v1 report preserves its exact identity-bearing JSON field set."""
+    report = _fidelity_report(
+        overlap_cell_ids=(),
+        usable_overlap_count=0,
+        failed_overlap_count=0,
+    )
+    payload = report.model_dump(mode="json")
+
+    assert FidelityReport.model_validate(payload).model_dump(mode="json") == payload
+    assert "minimum_usable_overlap_count" not in payload
+    assert "maximum_allowed_score_mae" not in payload
+
+
+def test_low_denominator_statuses_are_verified_against_the_exact_gate() -> None:
+    """One usable pair may approve or reject while one failed pair stays insufficient."""
+    cell_ids = ("cell-fidelity-0",)
+    gate = FidelityGate(
+        schema_version=1,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="test-revision",
+        fidelity_gate_id="fidelity-gate-v1",
+        fidelity_thresholds_id="thresholds-v2",
+        fidelity_thresholds_sha256=_DIGEST,
+        evaluation_plan_id="plan-1",
+        evaluation_plan_sha256=_DIGEST,
+        protocol_sha256=_DIGEST,
+        task_model_scope_sha256=_DIGEST,
+        overlap_cell_ids=cell_ids,
+        planned_overlaps=1,
+        minimum_usable_overlaps=1,
+        maximum_score_mae=0.10,
+    )
+    approved = _fidelity_report(
+        overlap_cell_ids=cell_ids,
+        usable_overlap_count=1,
+        failed_overlap_count=0,
+        status="approved",
+        score_mae=0.05,
+    )
+    failure = FidelityFailure(
+        cell_id=cell_ids[0],
+        failure=StructuredFailure(code=FailureCode.TIMEOUT, message="simulator timed out"),
+    )
+    insufficient = _fidelity_report(
+        overlap_cell_ids=cell_ids,
+        usable_overlap_count=0,
+        failed_overlap_count=1,
+        failures=(failure,),
+        status="insufficient",
+    )
+    rejected = _fidelity_report(
+        overlap_cell_ids=cell_ids,
+        usable_overlap_count=1,
+        failed_overlap_count=0,
+        status="rejected",
+        score_mae=0.2,
+    )
+
+    verify_fidelity_report_gate(approved, gate)
+    verify_fidelity_report_gate(insufficient, gate)
+    verify_fidelity_report_gate(rejected, gate)
+    with pytest.raises(EvaluationEvidenceError, match="does not satisfy"):
+        verify_fidelity_report_gate(approved.model_copy(update={"score_mae": 0.2}), gate)
 
 
 def test_fidelity_reports_account_for_each_unique_planned_overlap() -> None:

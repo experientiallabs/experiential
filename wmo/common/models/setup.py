@@ -72,25 +72,48 @@ class ProviderModelSelection(ContractModel):
     supports_tools: bool = False
     supports_embeddings: bool = False
     supports_structured_output: bool = False
+    supports_completions: bool | None = None
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
+    output_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
+    cached_input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
+    cache_write_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
-    def _require_embedding_price(self) -> ProviderModelSelection:
-        """Require explicit input pricing for models selected as embedders.
+    def _require_explicit_prices(self) -> ProviderModelSelection:
+        """Require every price needed by each declared request protocol.
 
         Returns:
             The validated model selection.
 
         Raises:
-            ValueError: The model supports embeddings but omits its input price.
+            ValueError: An embedding or completion price required by a declared protocol is absent.
         """
-        if self.supports_embeddings and self.input_cost_per_million_tokens_usd is None:
+        if (
+            self.supports_embeddings or self.supports_completions
+        ) and self.input_cost_per_million_tokens_usd is None:
             raise ValueError(
-                "embedding-capable models require explicit input cost per million tokens; "
+                "embedding- or completion-capable models require explicit input cost per "
+                "million tokens; "
                 "use 0 for a model with no input charge"
             )
+        if self.supports_completions:
+            missing = tuple(
+                name
+                for name, value in (
+                    ("output", self.output_cost_per_million_tokens_usd),
+                    ("cached input", self.cached_input_cost_per_million_tokens_usd),
+                    ("cache write", self.cache_write_cost_per_million_tokens_usd),
+                )
+                if value is None
+            )
+            if missing:
+                raise ValueError(
+                    "completion-capable models require explicit "
+                    + ", ".join(missing)
+                    + " cost per million tokens; use 0 for an unsupported or free cache path"
+                )
         return self
 
     def capabilities(self) -> ModelCapabilities:
@@ -103,9 +126,15 @@ class ProviderModelSelection(ContractModel):
             supports_tools=self.supports_tools,
             supports_embeddings=self.supports_embeddings,
             supports_structured_output=self.supports_structured_output,
+            supports_completions=self.supports_completions,
             context_window_tokens=self.context_window_tokens,
             maximum_output_tokens=self.maximum_output_tokens,
             input_cost_per_million_tokens_usd=self.input_cost_per_million_tokens_usd,
+            output_cost_per_million_tokens_usd=self.output_cost_per_million_tokens_usd,
+            cached_input_cost_per_million_tokens_usd=(
+                self.cached_input_cost_per_million_tokens_usd
+            ),
+            cache_write_cost_per_million_tokens_usd=(self.cache_write_cost_per_million_tokens_usd),
         )
 
     def catalog_record(self) -> ModelRecord:

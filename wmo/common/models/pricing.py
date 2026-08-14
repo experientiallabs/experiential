@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
-from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel
-from wmo.common.models.model import ModelAlias, ModelSnapshot
-from wmo.common.project import ArtifactStore, artifact_input
+from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel, stable_id
+from wmo.common.models.model import (
+    ModelAlias,
+    ModelCapabilities,
+    ModelSnapshot,
+    NumericMeasurement,
+    OperationEconomics,
+)
+from wmo.common.project import ArtifactAlreadyExistsError, ArtifactStore, artifact_input
 
 
 class CandidateTokenPrice(ContractModel):
@@ -60,6 +67,326 @@ class EmbeddingCostReservation(ContractModel):
         return value
 
 
+class CompletionCostReservation(ContractModel):
+    """Conservative retry-bound ceiling for one completion provider request."""
+
+    model: ModelSnapshot
+    input_usd_per_million_tokens: float = Field(ge=0)
+    output_usd_per_million_tokens: float = Field(ge=0)
+    cached_input_usd_per_million_tokens: float = Field(ge=0)
+    cache_write_usd_per_million_tokens: float = Field(ge=0)
+    maximum_attempts: int = Field(gt=0)
+    maximum_input_tokens: int = Field(gt=0)
+    maximum_output_tokens: int = Field(gt=0)
+    estimated_maximum_call_cost_usd: float = Field(ge=0)
+
+    @field_validator(
+        "input_usd_per_million_tokens",
+        "output_usd_per_million_tokens",
+        "cached_input_usd_per_million_tokens",
+        "cache_write_usd_per_million_tokens",
+        "estimated_maximum_call_cost_usd",
+    )
+    @classmethod
+    def _require_finite_prices(cls, value: float) -> float:
+        """Reject non-finite completion prices and reservations.
+
+        Args:
+            value: Nonnegative price or estimated ceiling.
+
+        Returns:
+            The unchanged finite value.
+
+        Raises:
+            ValueError: The value is infinite or NaN.
+        """
+        if not math.isfinite(value):
+            raise ValueError("completion reservation economics must be finite")
+        return value
+
+    @staticmethod
+    def _input_price_ceiling(
+        input_price: float,
+        cached_input_price: float,
+        cache_write_price: float,
+    ) -> float:
+        """Return the highest mutually exclusive provider input billing rate.
+
+        Args:
+            input_price: Ordinary input price.
+            cached_input_price: Cached-read input price.
+            cache_write_price: Total cache-write input rate.
+
+        Returns:
+            Maximum possible price applied to one input token.
+        """
+        return max(input_price, cached_input_price, cache_write_price)
+
+    def expected_maximum_call_cost_usd(self) -> float:
+        """Calculate the complete retry-bound cost ceiling for one request.
+
+        Returns:
+            Conservative maximum cost in USD.
+        """
+        input_price = self._input_price_ceiling(
+            self.input_usd_per_million_tokens,
+            self.cached_input_usd_per_million_tokens,
+            self.cache_write_usd_per_million_tokens,
+        )
+        return (
+            self.maximum_attempts
+            * (
+                self.maximum_input_tokens * input_price
+                + self.maximum_output_tokens * self.output_usd_per_million_tokens
+            )
+            / 1_000_000
+        )
+
+    @model_validator(mode="after")
+    def _require_complete_ceiling(self) -> CompletionCostReservation:
+        """Require the persisted total to equal its retry-bound request ceiling.
+
+        Returns:
+            The unchanged validated reservation.
+
+        Raises:
+            ValueError: The total omits a price, token ceiling, or retry factor.
+        """
+        if not math.isclose(
+            self.estimated_maximum_call_cost_usd,
+            self.expected_maximum_call_cost_usd(),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("completion maximum call cost differs from its reservation")
+        return self
+
+
+def completion_cost_reservation(
+    *,
+    model: ModelSnapshot,
+    input_usd_per_million_tokens: float,
+    output_usd_per_million_tokens: float,
+    cached_input_usd_per_million_tokens: float,
+    cache_write_usd_per_million_tokens: float,
+    maximum_attempts: int,
+    maximum_input_tokens: int,
+    maximum_output_tokens: int,
+) -> CompletionCostReservation:
+    """Create one exact conservative completion-call reservation.
+
+    Args:
+        model: Exact provider model identity.
+        input_usd_per_million_tokens: Ordinary request-input price.
+        output_usd_per_million_tokens: Generated-output price.
+        cached_input_usd_per_million_tokens: Cached-read input price.
+        cache_write_usd_per_million_tokens: Total cache-write input rate.
+        maximum_attempts: Runtime request-attempt ceiling.
+        maximum_input_tokens: Full serialized request-input ceiling.
+        maximum_output_tokens: Provider output ceiling.
+
+    Returns:
+        Validated retry-bound maximum call cost.
+    """
+    input_price = CompletionCostReservation._input_price_ceiling(
+        input_usd_per_million_tokens,
+        cached_input_usd_per_million_tokens,
+        cache_write_usd_per_million_tokens,
+    )
+    estimated = (
+        maximum_attempts
+        * (
+            maximum_input_tokens * input_price
+            + maximum_output_tokens * output_usd_per_million_tokens
+        )
+        / 1_000_000
+    )
+    return CompletionCostReservation(
+        model=model,
+        input_usd_per_million_tokens=input_usd_per_million_tokens,
+        output_usd_per_million_tokens=output_usd_per_million_tokens,
+        cached_input_usd_per_million_tokens=cached_input_usd_per_million_tokens,
+        cache_write_usd_per_million_tokens=cache_write_usd_per_million_tokens,
+        maximum_attempts=maximum_attempts,
+        maximum_input_tokens=maximum_input_tokens,
+        maximum_output_tokens=maximum_output_tokens,
+        estimated_maximum_call_cost_usd=estimated,
+    )
+
+
+def completion_request_cost_usd(
+    reservation: CompletionCostReservation,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+) -> float:
+    """Price one exact pending request under its conservative retry ceiling.
+
+    Args:
+        reservation: Frozen model, price, retry, and per-request bounds.
+        input_tokens: Full serialized request token upper bound.
+        output_tokens: Requested provider output ceiling.
+
+    Returns:
+        Conservative retry-inclusive pending request cost.
+
+    Raises:
+        ValueError: Actual request input or output exceeds the frozen reservation.
+    """
+    if input_tokens > reservation.maximum_input_tokens:
+        raise ValueError("completion request exceeds its reserved input-token ceiling")
+    if output_tokens > reservation.maximum_output_tokens:
+        raise ValueError("completion request exceeds its reserved output-token ceiling")
+    input_price = CompletionCostReservation._input_price_ceiling(
+        reservation.input_usd_per_million_tokens,
+        reservation.cached_input_usd_per_million_tokens,
+        reservation.cache_write_usd_per_million_tokens,
+    )
+    return (
+        reservation.maximum_attempts
+        * (input_tokens * input_price + output_tokens * reservation.output_usd_per_million_tokens)
+        / 1_000_000
+    )
+
+
+def reconcile_completion_economics(
+    reservation: CompletionCostReservation,
+    economics: OperationEconomics,
+) -> OperationEconomics:
+    """Derive a conservative retry-inclusive charge from response economics.
+
+    A successful response exposes usage for its completed attempt but provider adapters do not
+    expose whether earlier retry attempts were billed. The derived charge therefore prices the
+    successful usage exactly under the frozen mutually exclusive rates and reserves the full
+    per-attempt ceiling for every possible earlier attempt. A provider cost measurement has no
+    retry-coverage marker, so it is treated as successful-attempt evidence and never as proof that
+    earlier attempts were free.
+
+    Args:
+        reservation: Frozen model prices, token bounds, and retry ceiling.
+        economics: Provider response usage and optional exact cost measurement.
+
+    Returns:
+        Economics with the provider measurement for a one-attempt operation, or an estimated
+        conservative retry-inclusive cost.
+
+    Raises:
+        ValueError: Usage is absent, inconsistent, outside the reservation, or measured spend
+            exceeds the frozen request ceiling.
+    """
+    usage = economics.usage
+    measured = economics.cost_usd
+    if usage is None:
+        raise ValueError("completion provider returned unknown usage and spend")
+    if measured is not None and measured.value < 0:
+        raise ValueError("completion provider spend cannot be negative")
+    if (
+        usage.input_tokens > reservation.maximum_input_tokens
+        or usage.output_tokens > reservation.maximum_output_tokens
+    ):
+        raise ValueError("completion provider usage exceeds its request reservation")
+    cached = usage.cached_input_tokens
+    if cached is not None and cached > usage.input_tokens:
+        raise ValueError("cached input usage exceeds total input usage")
+    if cached is None:
+        successful_input_cost = usage.input_tokens * CompletionCostReservation._input_price_ceiling(
+            reservation.input_usd_per_million_tokens,
+            reservation.cached_input_usd_per_million_tokens,
+            reservation.cache_write_usd_per_million_tokens,
+        )
+    else:
+        uncached_price = max(
+            reservation.input_usd_per_million_tokens,
+            reservation.cache_write_usd_per_million_tokens,
+        )
+        successful_input_cost = (
+            cached * reservation.cached_input_usd_per_million_tokens
+            + (usage.input_tokens - cached) * uncached_price
+        )
+    successful_cost = (
+        successful_input_cost + usage.output_tokens * reservation.output_usd_per_million_tokens
+    ) / 1_000_000
+    maximum_attempt_cost = (
+        reservation.maximum_input_tokens
+        * CompletionCostReservation._input_price_ceiling(
+            reservation.input_usd_per_million_tokens,
+            reservation.cached_input_usd_per_million_tokens,
+            reservation.cache_write_usd_per_million_tokens,
+        )
+        + reservation.maximum_output_tokens * reservation.output_usd_per_million_tokens
+    ) / 1_000_000
+    retry_inclusive_cost = (
+        successful_cost + (reservation.maximum_attempts - 1) * maximum_attempt_cost
+    )
+    derived_cost = max(
+        retry_inclusive_cost,
+        measured.value if measured is not None else 0.0,
+    )
+    if derived_cost > reservation.estimated_maximum_call_cost_usd:
+        raise ValueError("derived completion spend exceeds its request reservation")
+    if (
+        measured is not None
+        and reservation.maximum_attempts == 1
+        and measured.value >= successful_cost
+    ):
+        return economics
+    return economics.model_copy(
+        update={"cost_usd": NumericMeasurement(value=derived_cost, provenance="estimated")}
+    )
+
+
+def verify_completion_reservation(
+    reservation: CompletionCostReservation,
+    *,
+    model: ModelSnapshot,
+    capabilities: ModelCapabilities,
+    maximum_attempts: int,
+) -> None:
+    """Verify one frozen reservation against the exact active runtime metadata.
+
+    Args:
+        reservation: Frozen model, price, retry, and token bounds.
+        model: Active exact model identity.
+        capabilities: Active explicit capability and pricing declaration.
+        maximum_attempts: Active provider retry ceiling.
+
+    Raises:
+        ValueError: Model, pricing, capacity, or retry metadata drifted or is unknown.
+    """
+    expected_prices = (
+        capabilities.input_cost_per_million_tokens_usd,
+        capabilities.output_cost_per_million_tokens_usd,
+        capabilities.cached_input_cost_per_million_tokens_usd,
+        capabilities.cache_write_cost_per_million_tokens_usd,
+    )
+    if reservation.model != model:
+        raise ValueError("completion reservation model differs from the active model")
+    if capabilities.supports_completions is not True:
+        raise ValueError("active model does not explicitly support completions")
+    if None in expected_prices:
+        raise ValueError("active completion pricing is incomplete")
+    if (
+        reservation.input_usd_per_million_tokens,
+        reservation.output_usd_per_million_tokens,
+        reservation.cached_input_usd_per_million_tokens,
+        reservation.cache_write_usd_per_million_tokens,
+    ) != expected_prices:
+        raise ValueError("completion reservation pricing differs from the active catalog")
+    if reservation.maximum_attempts != maximum_attempts:
+        raise ValueError("completion reservation retry bound differs from the active client")
+    if (
+        capabilities.context_window_tokens is None
+        or reservation.maximum_input_tokens + reservation.maximum_output_tokens
+        > capabilities.context_window_tokens
+    ):
+        raise ValueError("completion reservation exceeds the active context capacity")
+    if (
+        capabilities.maximum_output_tokens is None
+        or reservation.maximum_output_tokens > capabilities.maximum_output_tokens
+    ):
+        raise ValueError("completion reservation exceeds the active output capacity")
+
+
 class PricingSnapshot(ArtifactEnvelope):
     """Frozen candidate aliases and token-price units used by evaluation and routing."""
 
@@ -99,3 +426,57 @@ def load_pricing_snapshot(
     if value.pricing_snapshot_id != artifact_id:
         raise ValueError("pricing snapshot identity differs from its artifact")
     return value, artifact_input(stored.manifest).sha256
+
+
+def persist_pricing_snapshot(
+    store: ArtifactStore,
+    prices: tuple[CandidateTokenPrice, ...],
+    *,
+    created_at: datetime,
+    code_revision: str,
+) -> PricingSnapshot:
+    """Persist or exactly replay one candidate pricing snapshot.
+
+    Args:
+        store: Project-local immutable artifact store.
+        prices: Complete explicit prices in selected candidate order.
+        created_at: Artifact completion time.
+        code_revision: Exact producer revision.
+
+    Returns:
+        Persisted pricing snapshot.
+
+    Raises:
+        ValueError: Existing immutable content differs from deterministic replay.
+    """
+    pricing_snapshot_id = stable_id(
+        "pricing",
+        {
+            "version": "candidate-pricing-v1",
+            "prices": [price.model_dump(mode="json") for price in prices],
+        },
+    )
+    snapshot = PricingSnapshot(
+        schema_version=1,
+        created_at=created_at,
+        inputs=(),
+        code_revision=code_revision,
+        pricing_snapshot_id=pricing_snapshot_id,
+        candidate_prices=prices,
+    )
+    try:
+        store.write_json(
+            artifact_id=pricing_snapshot_id,
+            artifact_type="pricing-snapshot",
+            envelope=snapshot,
+            files={"pricing.json": snapshot},
+        )
+    except ArtifactAlreadyExistsError:
+        existing, _manifest_sha256 = load_pricing_snapshot(store, pricing_snapshot_id)
+        replay = snapshot.model_copy(update={"created_at": existing.created_at})
+        if existing != replay:
+            raise ValueError(
+                "existing pricing snapshot differs from deterministic replay"
+            ) from None
+        return existing
+    return snapshot

@@ -27,6 +27,28 @@ def test_project_config_round_trip_preserves_safe_local_metadata(tmp_path: Path)
     write_project_config(path, config)
 
     assert load_project_config(path) == config
+    assert "code_revision" not in path.read_text(encoding="utf-8")
+
+
+def test_custom_agent_revision_round_trip_is_explicit(tmp_path: Path) -> None:
+    """Persist an explicit custom-agent revision without changing revisionless serialization.
+
+    Args:
+        tmp_path: Isolated project configuration directory.
+    """
+    path = tmp_path / "project.toml"
+    config = ProjectConfig(
+        project_id="support-project",
+        agent=AgentConfiguration(
+            factory="acme_support.wmo:create_agent_runtime",
+            code_revision="agent-release-42",
+        ),
+    )
+
+    write_project_config(path, config)
+
+    assert load_project_config(path) == config
+    assert 'code_revision = "agent-release-42"' in path.read_text(encoding="utf-8")
 
 
 def test_project_config_rejects_secret_reference(tmp_path: Path) -> None:

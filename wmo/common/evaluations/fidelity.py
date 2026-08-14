@@ -31,6 +31,7 @@ from wmo.common.evaluations.evidence import (
     read_judgment,
     read_rollout,
     sorted_evaluation_inputs,
+    verify_fidelity_report_gate,
 )
 from wmo.common.evaluations.plan import EvaluationCell
 from wmo.common.evaluations.planning import plan_bound_fidelity_gate_id
@@ -68,7 +69,7 @@ def build_fidelity_report(
 
     Args:
         store: Project-local immutable artifact store.
-        evaluation_plan_id: Frozen plan containing ten fit-only fidelity cells.
+        evaluation_plan_id: Frozen plan containing its exact fit-only fidelity denominator.
         protocol: World-model protocol used by the simulated overlap cells.
         cell_evidence: Explicit evidence for fidelity cells and their observed comparisons.
         created_at: Time the report is completed.
@@ -241,6 +242,7 @@ def build_fidelity_report(
         status=status,
         approved_at=approved_at if status == "approved" else None,
     )
+    verify_fidelity_report_gate(report, gate)
     destination = store.project_directory / "artifacts" / report.fidelity_report_id
     if destination.exists():
         existing, _input = read_fidelity_report(store, report.fidelity_report_id)

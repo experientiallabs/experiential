@@ -9,7 +9,7 @@ from wmo.workflow.errors import RouterCompositionError
 
 
 def observed_rollout_spend(rollout: RolloutArtifact) -> float:
-    """Reconcile one rollout's observed spend and conservative retrieval estimates.
+    """Reconcile observed spend and reservation-derived simulation estimates.
 
     Args:
         rollout: Completed simulation evidence whose provider economics are inspected.
@@ -29,7 +29,7 @@ def observed_rollout_spend(rollout: RolloutArtifact) -> float:
     economics = []
     costs = []
     if any(span.kind == RolloutEventKind.AGENT_MODEL_CALL for span in rollout.spans):
-        economics.append(rollout.candidate_economics)
+        economics.append((rollout.candidate_economics, True))
     if rollout.evidence_source == "world_model":
         retrieval = rollout.retrieval_economics
         if retrieval is not None and retrieval.cost_usd is not None:
@@ -47,22 +47,25 @@ def observed_rollout_spend(rollout: RolloutArtifact) -> float:
                 "simulation retrieval spend is missing before a world-model dispatch"
             )
         if world_dispatched:
-            economics.append(rollout.world_model_economics)
+            economics.append((rollout.world_model_economics, True))
     elif rollout.evidence_source == "sandbox":
         binding = rollout.sandbox_binding
         if binding is None:
             raise RouterCompositionError("sandbox rollout lacks its environment cost binding")
         if binding.environment_maximum_episode_cost_usd != 0:
-            economics.append(rollout.sandbox_economics)
+            economics.append((rollout.sandbox_economics, False))
     else:
         raise RouterCompositionError("production evidence cannot count as simulation spend")
     if rollout.orchestration_economics is not None:
         orchestration_cost = rollout.orchestration_economics.cost_usd
         if orchestration_cost is not None:
-            economics.append(rollout.orchestration_economics)
-    for operation in economics:
+            economics.append((rollout.orchestration_economics, False))
+    for operation, allows_completion_estimate in economics:
         cost = operation.cost_usd if operation is not None else None
-        if cost is None or cost.provenance != "observed" or cost.value < 0:
+        allowed_provenance = (
+            {"observed", "estimated"} if allows_completion_estimate else {"observed"}
+        )
+        if cost is None or cost.provenance not in allowed_provenance or cost.value < 0:
             raise RouterCompositionError("simulation rollout spend is not fully observed")
         costs.append(cost.value)
     return math.fsum(costs)

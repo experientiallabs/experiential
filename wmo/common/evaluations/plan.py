@@ -40,9 +40,23 @@ class FidelityThresholds(ArtifactEnvelope):
     """Reusable numerical thresholds with no authority over any evaluation plan."""
 
     fidelity_thresholds_id: ArtifactId
-    planned_overlaps: Literal[10] = 10
-    minimum_usable_overlaps: Literal[8] = 8
+    planned_overlaps: int = Field(default=10, gt=0)
+    minimum_usable_overlaps: int = Field(default=8, gt=0)
     maximum_score_mae: float = Field(default=0.10, ge=0)
+
+    @model_validator(mode="after")
+    def _require_usable_denominator(self) -> FidelityThresholds:
+        """Keep the usable requirement within the exact planned denominator.
+
+        Returns:
+            Validated reusable thresholds.
+
+        Raises:
+            ValueError: The usable minimum exceeds the planned overlaps.
+        """
+        if self.minimum_usable_overlaps > self.planned_overlaps:
+            raise ValueError("minimum usable fidelity overlaps cannot exceed planned overlaps")
+        return self
 
 
 class FidelityGate(ArtifactEnvelope):
@@ -56,9 +70,23 @@ class FidelityGate(ArtifactEnvelope):
     protocol_sha256: Sha256
     task_model_scope_sha256: Sha256
     overlap_cell_ids: tuple[ArtifactId, ...]
-    planned_overlaps: Literal[10] = 10
-    minimum_usable_overlaps: Literal[8] = 8
+    planned_overlaps: int = Field(default=10, gt=0)
+    minimum_usable_overlaps: int = Field(default=8, gt=0)
     maximum_score_mae: float = Field(default=0.10, ge=0)
+
+    @model_validator(mode="after")
+    def _require_usable_denominator(self) -> FidelityGate:
+        """Keep the bound usable requirement within its exact overlap scope.
+
+        Returns:
+            Validated plan-bound gate.
+
+        Raises:
+            ValueError: The usable minimum exceeds the planned overlaps.
+        """
+        if self.minimum_usable_overlaps > self.planned_overlaps:
+            raise ValueError("minimum usable fidelity overlaps cannot exceed planned overlaps")
+        return self
 
 
 class EvaluationPlan(ArtifactEnvelope):

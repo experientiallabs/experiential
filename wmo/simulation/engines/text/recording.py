@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
@@ -17,15 +17,20 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.models import (
     AssistantAction,
+    CompletionCostReservation,
     EmbeddingCostReservation,
     ModelCapabilities,
     ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
     Usage,
+    completion_request_cost_usd,
+    reconcile_completion_economics,
+    verify_completion_reservation,
 )
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
@@ -107,6 +112,9 @@ class RecordingCandidateClient:
         world_model: ResolvedModel,
         grounded_world_model: GroundedWorldModel,
         query_embedding: EmbeddingCostReservation,
+        candidate_request: CompletionCostReservation | None,
+        world_model_request: CompletionCostReservation | None,
+        completion_maximum_attempts: int,
         maximum_cost_usd: float,
         maximum_steps: int,
         maximum_output_tokens: int,
@@ -122,6 +130,9 @@ class RecordingCandidateClient:
             world_model: Model that simulates the next visible text turn.
             grounded_world_model: Artifact-bound executor over the exact fit-only index.
             query_embedding: Exact query-embedding identity, price, and retry reservation.
+            candidate_request: Frozen candidate request ceiling for finite-cost execution.
+            world_model_request: Frozen world-model request ceiling for finite-cost execution.
+            completion_maximum_attempts: Active provider request-attempt ceiling.
             maximum_cost_usd: Spend remaining for candidate, retrieval, and world-model calls.
             maximum_steps: Maximum candidate model turns allowed in this episode.
             maximum_output_tokens: Per-call output budget used without silent truncation.
@@ -134,6 +145,9 @@ class RecordingCandidateClient:
         self._world_model = world_model
         self._grounded_world_model = grounded_world_model
         self._query_embedding = query_embedding
+        self._candidate_request = candidate_request
+        self._world_model_request = world_model_request
+        self._completion_maximum_attempts = completion_maximum_attempts
         self._maximum_cost_usd = maximum_cost_usd
         self._maximum_steps = maximum_steps
         self._maximum_output_tokens = maximum_output_tokens
@@ -293,10 +307,36 @@ class RecordingCandidateClient:
             candidate_request,
             self._token_counter,
         )
+        if self._candidate_request is not None:
+            _verify_completion_budget_binding(
+                self._candidate_request,
+                model=self._candidate.snapshot,
+                capabilities=self._candidate.capabilities,
+                maximum_attempts=self._completion_maximum_attempts,
+                role="candidate",
+            )
+            _require_completion_budget(
+                role="candidate",
+                reservation=self._candidate_request,
+                request=candidate_request,
+                token_counter=self._token_counter,
+                candidate_responses=tuple(self._candidate_responses),
+                world_model_responses=tuple(self._world_model_responses),
+                prior_retrieval=tuple(self._retrieval_economics),
+                maximum_cost_usd=self._maximum_cost_usd,
+            )
         candidate_started_at = _timestamp(self._clock)
         self._provider_dispatch_unknown_spend = True
         candidate_response = self._candidate.client.complete(candidate_request)
-        self._provider_dispatch_unknown_spend = False
+        if self._candidate_request is not None:
+            candidate_response = candidate_response.model_copy(
+                update={
+                    "economics": reconcile_completion_economics(
+                        self._candidate_request,
+                        candidate_response.economics,
+                    )
+                }
+            )
         candidate_ended_at = _timestamp(self._clock, not_before=candidate_started_at)
         self._candidate_responses.append(candidate_response)
         self._candidate_spans.append(
@@ -311,6 +351,7 @@ class RecordingCandidateClient:
             )
         )
         _require_response_identity(candidate_response, self._candidate, role="candidate")
+        self._provider_dispatch_unknown_spend = False
         _require_complete_response(candidate_response, role="candidate")
         _require_text_only_action(candidate_response.output, role="candidate")
         candidate_content = candidate_response.output.content
@@ -350,12 +391,39 @@ class RecordingCandidateClient:
             prepared.request,
             self._token_counter,
         )
+        if self._world_model_request is not None:
+            _verify_completion_budget_binding(
+                self._world_model_request,
+                model=self._world_model.snapshot,
+                capabilities=self._world_model.capabilities,
+                maximum_attempts=self._completion_maximum_attempts,
+                role="world model",
+            )
+            _require_completion_budget(
+                role="world model",
+                reservation=self._world_model_request,
+                request=prepared.request,
+                token_counter=self._token_counter,
+                candidate_responses=tuple(self._candidate_responses),
+                world_model_responses=tuple(self._world_model_responses),
+                prior_retrieval=tuple(self._retrieval_economics),
+                maximum_cost_usd=self._maximum_cost_usd,
+            )
         world_started_at = _timestamp(self._clock, not_before=candidate_ended_at)
         self._provider_dispatch_unknown_spend = True
         dispatched = self._grounded_world_model.complete_turn(prepared)
-        self._provider_dispatch_unknown_spend = False
         world_request = dispatched.request
         world_response = dispatched.response
+        if self._world_model_request is not None:
+            world_response = world_response.model_copy(
+                update={
+                    "economics": reconcile_completion_economics(
+                        self._world_model_request,
+                        world_response.economics,
+                    )
+                }
+            )
+            dispatched = replace(dispatched, response=world_response)
         world_ended_at = _timestamp(self._clock, not_before=world_started_at)
         self._retrieved_transition_ids.append(
             tuple(match.transition.transition_id for match in dispatched.matches)
@@ -373,6 +441,7 @@ class RecordingCandidateClient:
             )
         )
         _require_response_identity(world_response, self._world_model, role="world model")
+        self._provider_dispatch_unknown_spend = False
         _require_complete_response(world_response, role="world model")
         try:
             transition = self._grounded_world_model.parse_turn(dispatched).transition
@@ -458,6 +527,111 @@ def _require_query_budget(
             "query embedding reservation exceeds the remaining simulation spend ceiling",
             phase="query_embedding_budget",
         )
+
+
+def _require_completion_budget(
+    *,
+    role: str,
+    reservation: CompletionCostReservation,
+    request: ModelRequest,
+    token_counter: TokenCounter,
+    candidate_responses: Sequence[ModelResponse],
+    world_model_responses: Sequence[ModelResponse],
+    prior_retrieval: Sequence[OperationEconomics],
+    maximum_cost_usd: float,
+) -> None:
+    """Refuse one completion unless known prior spend plus its ceiling fits.
+
+    Args:
+        role: Candidate or world-model label for safe diagnostics.
+        reservation: Exact active retry-bound request reservation.
+        request: Complete provider-neutral pending request.
+        token_counter: Conservative full serialized request counter.
+        candidate_responses: Completed candidate calls in this cell.
+        world_model_responses: Completed world-model calls in this cell.
+        prior_retrieval: Completed conservative retrieval costs in this cell.
+        maximum_cost_usd: Provider-spend ceiling assigned to the cell.
+
+    Raises:
+        TextSimulationError: Prior spend is unknown, bounds drifted, or the call exceeds budget.
+    """
+    output_tokens = request.maximum_output_tokens
+    if output_tokens is None:
+        raise _text_failure(
+            StopReason.MAXIMUM_COST,
+            FailureCode.BUDGET,
+            f"{role} request lacks a reserved output ceiling",
+            phase=f"{role.replace(' ', '_')}_budget",
+        )
+    try:
+        pending = completion_request_cost_usd(
+            reservation,
+            input_tokens=token_counter.count(request),
+            output_tokens=output_tokens,
+        )
+    except ValueError as exc:
+        raise _text_failure(
+            StopReason.MAXIMUM_COST,
+            FailureCode.BUDGET,
+            str(exc),
+            phase=f"{role.replace(' ', '_')}_budget",
+        ) from exc
+    costs = [
+        *(response.economics.cost_usd for response in candidate_responses),
+        *(response.economics.cost_usd for response in world_model_responses),
+        *(economics.cost_usd for economics in prior_retrieval),
+    ]
+    if any(cost is None for cost in costs):
+        raise _text_failure(
+            StopReason.MAXIMUM_COST,
+            FailureCode.BUDGET,
+            f"{role} call is blocked because prior provider spend is unknown",
+            phase=f"{role.replace(' ', '_')}_budget",
+        )
+    total = math.fsum((*(cast(NumericMeasurement, cost).value for cost in costs), pending))
+    if total > maximum_cost_usd:
+        raise _text_failure(
+            StopReason.MAXIMUM_COST,
+            FailureCode.BUDGET,
+            f"{role} reservation exceeds the remaining simulation spend ceiling",
+            phase=f"{role.replace(' ', '_')}_budget",
+        )
+
+
+def _verify_completion_budget_binding(
+    reservation: CompletionCostReservation,
+    *,
+    model: ModelSnapshot,
+    capabilities: ModelCapabilities,
+    maximum_attempts: int,
+    role: str,
+) -> None:
+    """Translate active reservation drift into a structured zero-dispatch budget failure.
+
+    Args:
+        reservation: Frozen request ceiling.
+        model: Active exact model snapshot.
+        capabilities: Active explicit prices and capacities.
+        maximum_attempts: Active provider retry ceiling.
+        role: Candidate or world-model diagnostic label.
+
+    Raises:
+        TextSimulationError: Active model, economics, capacity, or retry metadata drifted.
+    """
+    try:
+        verify_completion_reservation(
+            reservation,
+            model=model,
+            capabilities=capabilities,
+            maximum_attempts=maximum_attempts,
+        )
+    except ValueError as exc:
+        raise _text_failure(
+            StopReason.MAXIMUM_COST,
+            FailureCode.BUDGET,
+            str(exc),
+            phase=f"{role.replace(' ', '_')}_budget",
+        ) from exc
 
 
 def text_prompt_digest() -> str:

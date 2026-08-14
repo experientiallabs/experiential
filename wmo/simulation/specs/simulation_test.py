@@ -57,6 +57,26 @@ def test_spec_preserves_only_the_selected_mode_settings_and_is_digest_stable() -
     assert simulation_spec_digest(first) == simulation_spec_digest(second)
 
 
+def test_v1_world_model_spec_preserves_exact_identity_payload() -> None:
+    """A pre-extension v1 specification retains its exact serialized fields and digest."""
+    payload = _spec().model_dump(mode="json")
+    parsed = SimulationSpec.model_validate(payload)
+
+    assert parsed.model_dump(mode="json") == payload
+    assert parsed.world_model is not None
+    assert set(parsed.world_model.model_dump(mode="json")) == {
+        "world_model_alias",
+        "grounded_world_model_input",
+        "prompt_version",
+        "query_embedding",
+        "maximum_output_tokens",
+        "allow_tools",
+    }
+    assert simulation_spec_digest(parsed) == (
+        "c6ed1992b5e18efe9f245ab93007a846b5f95fdd60ef1d0a813bf7626f67950e"
+    )
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [

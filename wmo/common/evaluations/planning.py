@@ -52,22 +52,35 @@ class ObservedProductionCell(ContractModel):
         return value
 
 
-def default_fidelity_thresholds(*, created_at: datetime, code_revision: str) -> FidelityThresholds:
-    """Create the frozen v1 world-model fidelity gate.
+def default_fidelity_thresholds(
+    *,
+    created_at: datetime,
+    code_revision: str,
+    planned_overlaps: int = 10,
+    minimum_usable_overlaps: int = 8,
+) -> FidelityThresholds:
+    """Create a frozen world-model fidelity gate for an exact real-evidence denominator.
 
     Args:
         created_at: Time the immutable threshold record is created.
         code_revision: Exact WMO revision creating the gate.
+        planned_overlaps: Positive exact number of real fit overlaps frozen into the plan.
+        minimum_usable_overlaps: Positive numerical gate no larger than the denominator.
 
     Returns:
-        A ten-overlap, eight-usable, 0.10-MAE fidelity gate.
+        Exact-denominator 0.10-MAE fidelity thresholds.
     """
+    version = (
+        "world-model-fidelity-v1"
+        if planned_overlaps == 10 and minimum_usable_overlaps == 8
+        else "world-model-fidelity-v2"
+    )
     thresholds_id = stable_id(
         "fidelity-thresholds",
         {
-            "version": "world-model-fidelity-v1",
-            "planned_overlaps": 10,
-            "minimum_usable_overlaps": 8,
+            "version": version,
+            "planned_overlaps": planned_overlaps,
+            "minimum_usable_overlaps": minimum_usable_overlaps,
             "maximum_score_mae": 0.10,
         },
     )
@@ -77,6 +90,8 @@ def default_fidelity_thresholds(*, created_at: datetime, code_revision: str) -> 
         inputs=(),
         code_revision=code_revision,
         fidelity_thresholds_id=thresholds_id,
+        planned_overlaps=planned_overlaps,
+        minimum_usable_overlaps=minimum_usable_overlaps,
     )
 
 
@@ -116,6 +131,7 @@ def build_evaluation_plan(
     observed_cells: Sequence[ObservedProductionCell],
     fidelity_thresholds_id: ArtifactId,
     fidelity_protocol_sha256: Sha256,
+    additional_inputs: Sequence[ArtifactInput] = (),
     repeats: Sequence[int] = (0,),
     created_at: datetime,
     code_revision: str,
@@ -123,8 +139,8 @@ def build_evaluation_plan(
     """Build and persist a complete sparse plan from observed and missing cells.
 
     Observed production evidence takes the main fit or held-out cell. Every other requested
-    candidate cell is explicitly marked for simulation. Ten distinct observed fit lineages are
-    selected deterministically for separate fidelity-only simulation cells.
+    candidate cell is explicitly marked for simulation. The frozen threshold denominator selects
+    that many distinct observed fit lineages for separate fidelity-only simulation cells.
 
     Args:
         store: Project-local immutable artifact store containing tasks, gate, and rollouts.
@@ -132,7 +148,8 @@ def build_evaluation_plan(
         candidate_snapshots: Exact aliases and model identities to evaluate.
         pricing_snapshot_id: Exact candidate-pricing artifact bound to the plan.
         observed_cells: Production rollout assignments that already fill matrix cells.
-        fidelity_gate_id: Precommitted world-model fidelity gate artifact.
+        fidelity_thresholds_id: Precommitted world-model fidelity thresholds artifact.
+        additional_inputs: Optional manifest-bound workflow contracts to freeze into the plan.
         repeats: Nonnegative repeat indexes planned for every task and candidate.
         created_at: Time the plan is completed.
         code_revision: Exact WMO revision creating the plan.
@@ -141,8 +158,8 @@ def build_evaluation_plan(
         The persisted immutable evaluation plan.
 
     Raises:
-        EvaluationEvidenceError: Inputs conflict, held-out state leaks, or ten fit overlaps are
-            unavailable.
+        EvaluationEvidenceError: Inputs conflict, held-out state leaks, or the exact planned fit
+            overlap denominator is unavailable.
     """
     loaded_tasks = load_task_set(store, task_set_id)
     task_manifest = store.read(task_set_id).manifest
@@ -150,6 +167,17 @@ def build_evaluation_plan(
     thresholds, thresholds_input = read_fidelity_thresholds(store, fidelity_thresholds_id)
     candidates = tuple(sorted(candidate_snapshots, key=lambda item: item.alias))
     _require_unique_candidates(candidates)
+    for item in additional_inputs:
+        try:
+            current = artifact_input(store.read(item.artifact_id).manifest)
+        except (ArtifactCorruptionError, ValueError) as exc:
+            raise EvaluationEvidenceError(
+                f"additional plan input is unavailable or invalid: {item.artifact_id}"
+            ) from exc
+        if current != item:
+            raise EvaluationEvidenceError(
+                f"additional plan input manifest changed: {item.artifact_id}"
+            )
     try:
         pricing, pricing_sha256 = load_pricing_snapshot(store, pricing_snapshot_id)
         pricing_input = artifact_input(store.read(pricing_snapshot_id).manifest)
@@ -208,7 +236,13 @@ def build_evaluation_plan(
     )
     cells = (*main_cells, *fidelity_cells)
     plan_inputs = sorted_evaluation_inputs(
-        (task_input, pricing_input, thresholds_input, *observed_inputs)
+        (
+            task_input,
+            pricing_input,
+            thresholds_input,
+            *observed_inputs,
+            *additional_inputs,
+        )
     )
     plan_id = stable_id(
         "evaluation-plan",

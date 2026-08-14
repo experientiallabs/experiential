@@ -861,6 +861,30 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     unknown = rollout.model_copy(update={"candidate_economics": OperationEconomics()})
     with pytest.raises(RouterCompositionError, match="not fully observed"):
         observed_rollout_spend(unknown)
+    assert rollout.candidate_economics.cost_usd is not None
+    assert rollout.world_model_economics is not None
+    assert rollout.world_model_economics.cost_usd is not None
+    reservation_derived = rollout.model_copy(
+        update={
+            "candidate_economics": rollout.candidate_economics.model_copy(
+                update={
+                    "cost_usd": rollout.candidate_economics.cost_usd.model_copy(
+                        update={"provenance": "estimated"}
+                    )
+                }
+            ),
+            "world_model_economics": rollout.world_model_economics.model_copy(
+                update={
+                    "cost_usd": rollout.world_model_economics.cost_usd.model_copy(
+                        update={"provenance": "estimated"}
+                    )
+                }
+            ),
+        }
+    )
+    assert observed_rollout_spend(reservation_derived) == pytest.approx(
+        observed_rollout_spend(rollout)
+    )
 
     decision = first.runtime.select(_request(), episode_id="customer-episode")
     assert first.runtime.select(_request(), episode_id="customer-episode") == decision

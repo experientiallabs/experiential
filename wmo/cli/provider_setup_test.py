@@ -230,7 +230,7 @@ def test_interactive_final_rejection_writes_no_catalog(tmp_path: Path) -> None:
         app,
         ["config", "providers", "--root", str(root)],
         input=(
-            "y\n\n\nn\nn\nn\nn\nn\nopenai\nall\nmodel-id\nn\ny\ny\nn\nn\n0\nn\nall\ny\nall\nn\n"
+            "y\n\n\nn\nn\nn\nn\nn\nopenai\nall\nmodel-id\nn\ny\ny\nn\nn\nn\n0\nn\nall\ny\nall\nn\n"
         ),
     )
 

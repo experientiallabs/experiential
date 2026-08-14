@@ -1,5 +1,11 @@
 """Typed sparse simulation specifications shared by simulation engines."""
 
+from wmo.simulation.specs.completion import (
+    CandidateCompletionReservation,
+    SimulationCompletionContract,
+    load_simulation_completion_contract,
+    persist_simulation_completion_contract,
+)
 from wmo.simulation.specs.simulation import (
     MixedRealitySettings,
     SandboxSettings,
@@ -10,8 +16,12 @@ from wmo.simulation.specs.simulation import (
 
 __all__ = [
     "MixedRealitySettings",
+    "CandidateCompletionReservation",
     "SandboxSettings",
     "SimulationSpec",
+    "SimulationCompletionContract",
     "WorldModelSettings",
+    "load_simulation_completion_contract",
+    "persist_simulation_completion_contract",
     "simulation_spec_digest",
 ]
