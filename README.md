@@ -37,6 +37,16 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
 ```
 
+To exercise the build path with a public trace export, download the
+[terminal-tasks OTLP dataset](https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces)
+and pass it to the same command without a source adapter or conversion step:
+
+```bash
+curl -L -o traces.otel.jsonl \
+  https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl
+wmo build terminal-tasks traces.otel.jsonl
+```
+
 After collecting traces from your router, fine-tune an open source model you own using
 [Tinker](https://tinker.thinkingmachines.ai/).
 

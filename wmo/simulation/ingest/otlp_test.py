@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
 from typing import cast
+
+import pytest
 
 from wmo.common.core.artifacts import SourceIdentity
 from wmo.common.models import ConnectionConfig
@@ -103,6 +106,63 @@ def _payload(trace_id: str = _TRACE_ID) -> dict[str, object]:
 
 def _source() -> SourceIdentity:
     return SourceIdentity(kind="otlp", source_id="fixture", sha256="a" * 64)
+
+
+def _environment_capture_payloads(trace_id: str = _TRACE_ID) -> list[dict[str, object]]:
+    """Return one exact environment-capture action and observation pair.
+
+    Args:
+        trace_id: W3C trace identity assigned to both records.
+
+    Returns:
+        Source action and result spans in JSONL order.
+    """
+    prefix = f"{trace_id[:12]}0000"
+    return [
+        {
+            "traceId": trace_id,
+            "spanId": f"{prefix}a",
+            "parentSpanId": "",
+            "name": "chat terminal",
+            "startTimeUnixNano": 0,
+            "endTimeUnixNano": 1,
+            "status": {"code": "STATUS_CODE_OK"},
+            "attributes": [
+                _attribute("gen_ai.operation.name", "chat"),
+                _attribute("gen_ai.request.model", "terminal-agent"),
+                _attribute("gen_ai.tool.name", "bash"),
+                _attribute(
+                    "gen_ai.tool.call.arguments",
+                    json.dumps({"command": "printf ready"}),
+                ),
+                _attribute("gen_ai.prompt", "Print ready"),
+                _attribute(
+                    "wmh.trace.metadata",
+                    json.dumps(
+                        {
+                            "benchmark": "terminal-tasks",
+                            "returncode": 0,
+                            "task_category": "Filesystem + text processing",
+                        }
+                    ),
+                ),
+            ],
+        },
+        {
+            "traceId": trace_id,
+            "spanId": f"{prefix}b",
+            "parentSpanId": "",
+            "name": "execute_tool terminal",
+            "startTimeUnixNano": 2,
+            "endTimeUnixNano": 3,
+            "status": {"code": "STATUS_CODE_OK"},
+            "attributes": [
+                _attribute("gen_ai.operation.name", "execute_tool"),
+                _attribute("gen_ai.tool.name", "bash"),
+                _attribute("gen_ai.tool.message", "ready"),
+            ],
+        },
+    ]
 
 
 def _payload_spans(payload: dict[str, object]) -> list[object]:
@@ -312,6 +372,145 @@ def test_jsonl_preserves_a_malformed_line_as_an_explicit_exclusion(tmp_path: Pat
     assert len(result.traces) == 1
     assert result.invalid_trace_count == 1
     assert result.traces[0].source.identity.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_environment_capture_jsonl_normalizes_through_default_otlp_loader(tmp_path: Path) -> None:
+    """The exact owned profile loads without a converter or source override.
+
+    Args:
+        tmp_path: Temporary directory receiving the direct-span JSONL fixture.
+    """
+    path = tmp_path / "traces.otel.jsonl"
+    path.write_text(
+        "".join(f"{json.dumps(payload)}\n" for payload in _environment_capture_payloads()),
+        encoding="utf-8",
+    )
+
+    result = load_otlp_file(path)
+
+    assert result.issues == ()
+    assert len(result.traces) == 1
+    trace = result.traces[0]
+    assert trace.task == "Print ready"
+    assert trace.conversation_id == _TRACE_ID
+    assert tuple(span.span_id for span in trace.spans) == (
+        "111111111110000a",
+        "111111111110000b",
+    )
+    assert trace.spans[0].parent_span_id is None
+    assert trace.spans[1].parent_span_id == trace.spans[0].span_id
+    assert trace.spans[0].attributes["gen_ai.tool.call.id"]
+    assert (
+        trace.spans[1].attributes["gen_ai.tool.call.id"]
+        == trace.spans[0].attributes["gen_ai.tool.call.id"]
+    )
+    assert trace.spans[0].attributes["gen_ai.operation.name"] == "invoke_agent"
+    assert trace.spans[0].model is None
+    assert result.identity_evidence == ()
+    assert trace.source.identity.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_environment_capture_trace_ids_become_distinct_conversation_lineages(
+    tmp_path: Path,
+) -> None:
+    """Each source episode receives its own stable conversation lineage.
+
+    Args:
+        tmp_path: Temporary directory receiving a two-trace JSONL fixture.
+    """
+    second_trace_id = "5" * 32
+    payloads = _environment_capture_payloads() + _environment_capture_payloads(second_trace_id)
+    path = tmp_path / "two-traces.otel.jsonl"
+    path.write_text(
+        "".join(f"{json.dumps(payload)}\n" for payload in payloads),
+        encoding="utf-8",
+    )
+
+    result = load_otlp_file(path)
+
+    assert result.issues == ()
+    assert {trace.conversation_id for trace in result.traces} == {_TRACE_ID, second_trace_id}
+
+
+def test_environment_capture_near_match_remains_strict_otlp_failure(tmp_path: Path) -> None:
+    """A provider-bearing near-match cannot use profile identity repair.
+
+    Args:
+        tmp_path: Temporary directory receiving the near-match JSONL fixture.
+    """
+    payloads = copy.deepcopy(_environment_capture_payloads())
+    attributes = cast(list[dict[str, object]], payloads[0]["attributes"])
+    attributes.append(_attribute("gen_ai.provider.name", "openai"))
+    path = tmp_path / "near-match.otel.jsonl"
+    path.write_text(
+        "".join(f"{json.dumps(payload)}\n" for payload in payloads),
+        encoding="utf-8",
+    )
+
+    result = load_otlp_file(path)
+
+    assert result.traces == ()
+    assert len(result.issues) == 1
+    assert "span ID must be a non-zero lowercase 16-hex W3C ID" in result.issues[0].message
+
+
+def test_environment_capture_malformed_line_disables_whole_file_repair(tmp_path: Path) -> None:
+    """Do not repair surviving capture records after a JSONL parse failure.
+
+    Args:
+        tmp_path: Temporary directory receiving the malformed mixed JSONL file.
+    """
+    records = "".join(f"{json.dumps(payload)}\n" for payload in _environment_capture_payloads())
+    path = tmp_path / "malformed-profile.otel.jsonl"
+    path.write_text(f"{{broken\n{records}", encoding="utf-8")
+
+    result = load_otlp_file(path)
+
+    assert result.traces == ()
+    assert any(issue.source_record == "line-1" for issue in result.issues)
+    assert any(
+        "span ID must be a non-zero lowercase 16-hex W3C ID" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize("duplicate_target", ["span", "status"])
+def test_environment_capture_duplicate_json_key_disables_whole_file_repair(
+    tmp_path: Path,
+    duplicate_target: str,
+) -> None:
+    """Do not profile-repair a last-key-wins JSON object.
+
+    Args:
+        tmp_path: Temporary directory receiving the ambiguous JSONL file.
+        duplicate_target: Outer or nested object whose key is repeated.
+    """
+    payloads = _environment_capture_payloads()
+    action = json.dumps(payloads[0], separators=(",", ":"))
+    if duplicate_target == "span":
+        exact_span_id = cast(str, payloads[0]["spanId"])
+        action = action.replace(
+            f'"spanId":"{exact_span_id}"',
+            f'"spanId":"bad","spanId":"{exact_span_id}"',
+            1,
+        )
+    else:
+        action = action.replace(
+            '"status":{"code":"STATUS_CODE_OK"}',
+            '"status":{"code":"STATUS_CODE_ERROR","code":"STATUS_CODE_OK"}',
+            1,
+        )
+    result_line = json.dumps(payloads[1], separators=(",", ":"))
+    path = tmp_path / f"duplicate-{duplicate_target}.otel.jsonl"
+    path.write_text(f"{action}\n{result_line}\n", encoding="utf-8")
+
+    result = load_otlp_file(path)
+
+    assert result.traces == ()
+    assert any(
+        "span ID must be a non-zero lowercase 16-hex W3C ID" in issue.message
+        for issue in result.issues
+    )
 
 
 def test_otlp_sorts_unordered_export_before_selecting_the_initial_task() -> None:

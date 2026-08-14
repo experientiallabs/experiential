@@ -148,6 +148,67 @@ def _otlp_export(tmp_path: Path, count: int = 1) -> Path:
     return path
 
 
+def _environment_capture_otlp_export(tmp_path: Path) -> Path:
+    """Write one exact environment-capture direct-span JSONL export.
+
+    Args:
+        tmp_path: Temporary directory receiving the trace export.
+
+    Returns:
+        Path to the completed JSONL export.
+    """
+    trace_id = "1" * 32
+    prefix = f"{trace_id[:12]}0000"
+    records = (
+        {
+            "traceId": trace_id,
+            "spanId": f"{prefix}a",
+            "parentSpanId": "",
+            "name": "chat terminal",
+            "startTimeUnixNano": 0,
+            "endTimeUnixNano": 1,
+            "status": {"code": "STATUS_CODE_OK"},
+            "attributes": [
+                _attribute("gen_ai.operation.name", "chat"),
+                _attribute("gen_ai.request.model", "terminal-agent"),
+                _attribute("gen_ai.tool.name", "bash"),
+                _attribute(
+                    "gen_ai.tool.call.arguments",
+                    json.dumps({"command": "printf ready"}),
+                ),
+                _attribute("gen_ai.prompt", "Print ready"),
+                _attribute(
+                    "wmh.trace.metadata",
+                    json.dumps(
+                        {
+                            "benchmark": "terminal-tasks",
+                            "returncode": 0,
+                            "task_category": "Filesystem + text processing",
+                        }
+                    ),
+                ),
+            ],
+        },
+        {
+            "traceId": trace_id,
+            "spanId": f"{prefix}b",
+            "parentSpanId": "",
+            "name": "execute_tool terminal",
+            "startTimeUnixNano": 2,
+            "endTimeUnixNano": 3,
+            "status": {"code": "STATUS_CODE_OK"},
+            "attributes": [
+                _attribute("gen_ai.operation.name", "execute_tool"),
+                _attribute("gen_ai.tool.name", "bash"),
+                _attribute("gen_ai.tool.message", "ready"),
+            ],
+        },
+    )
+    path = tmp_path / "traces.otel.jsonl"
+    path.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+    return path
+
+
 class _EmbeddingClient:
     """Deterministic semantic-shaped client for no-network build tests."""
 
@@ -343,6 +404,36 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     with pytest.raises(ProjectStoreError, match="completed build graph"):
         store.bind_completed_build(swapped)
     assert store.load_project().build == config.build
+
+
+def test_build_accepts_environment_capture_jsonl_through_default_otlp_source(
+    tmp_path: Path,
+) -> None:
+    """The direct capture download shape completes the positional build path.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
+    source = _environment_capture_otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+
+    result = _RUNNER.invoke(app, ["build", "terminal", str(source), "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "built 1 accepted, 0 invalid" in result.output
+    store = ProjectStore(root, "terminal")
+    config = store.load_project()
+    assert config.build is not None
+    traces = load_trace_dataset(store.artifacts, config.build.trace_dataset.artifact_id)
+    assert len(traces.traces) == 1
+    assert traces.traces[0].conversation_id == traces.traces[0].trace_id
+    identity_evidence = read_trace_model_identity_evidence(store.artifacts, traces)
+    assert identity_evidence is not None
+    assert identity_evidence.records == ()
+    serving = load_rag_index(store.artifacts, config.build.serving_rag.artifact_id)
+    assert serving.index.transition_count == 1
 
 
 def test_build_package_upgrade_creates_new_immutable_graph(

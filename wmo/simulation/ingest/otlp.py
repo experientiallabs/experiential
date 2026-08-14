@@ -22,6 +22,7 @@ from wmo.common.core.text import normalize_durable_text
 from wmo.common.models import ModelSnapshot, Usage
 from wmo.common.tasks import ToolSchema
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from wmo.simulation.ingest.environment_capture import canonicalize_environment_capture_payloads
 from wmo.simulation.ingest.model_identity import (
     TraceModelIdentityEvidence,
     normalized_capabilities_sha256,
@@ -49,6 +50,10 @@ _CONVERSATION_KEYS = ("wmo.conversation.id", "gen_ai.conversation.id")
 
 class OtlpTraceFormatError(ValueError):
     """Raised when a trace upload cannot be decoded as OpenTelemetry JSON."""
+
+
+class _DuplicateJsonKeyError(ValueError):
+    """Raised when profile-eligibility parsing finds an ambiguous JSON object."""
 
 
 @dataclass(frozen=True)
@@ -246,26 +251,71 @@ def _normalize_jsonl(
     source: SourceIdentity,
     semantic_convention_version: str,
 ) -> TraceNormalizationResult:
-    """Decode JSONL while retaining every malformed-line exclusion for review."""
+    """Decode JSONL and admit only an unambiguous complete capture profile.
+
+    Args:
+        text: UTF-8 JSONL source text.
+        source: Immutable identity of the original source bytes.
+        semantic_convention_version: Pinned GenAI convention used for normalization.
+
+    Returns:
+        Canonical traces plus every retained parse or validation exclusion.
+
+    Raises:
+        OtlpTraceFormatError: The source contains neither records nor parse issues.
+    """
     payloads: list[JsonValue] = []
+    profile_payloads: list[JsonValue] = []
+    profile_eligible = True
     issues: list[TraceNormalizationIssue] = []
     for line_number, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
             continue
         try:
-            payloads.append(json.loads(line))
+            payload = json.loads(line)
         except json.JSONDecodeError as exc:
+            profile_eligible = False
             issues.append(
                 TraceNormalizationIssue(f"line-{line_number}", f"invalid JSONL record: {exc.msg}")
             )
+            continue
+        payloads.append(payload)
+        try:
+            profile_payloads.append(json.loads(line, object_pairs_hook=_reject_duplicate_json_keys))
+        except _DuplicateJsonKeyError:
+            profile_eligible = False
     if not payloads and not issues:
         raise OtlpTraceFormatError("OTLP JSONL file contains no records")
+    if profile_eligible and not issues:
+        canonical_payloads = canonicalize_environment_capture_payloads(profile_payloads)
+        if canonical_payloads is not None:
+            payloads = list(canonical_payloads)
     return normalize_otlp_payloads(
         payloads,
         source=source,
         semantic_convention_version=semantic_convention_version,
         initial_issues=issues,
     )
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
+    """Decode one JSON object while rejecting repeated keys.
+
+    Args:
+        pairs: Object members in their original source order.
+
+    Returns:
+        Decoded JSON object with unique keys.
+
+    Raises:
+        _DuplicateJsonKeyError: A key occurs more than once in the object.
+    """
+    result: JsonObject = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKeyError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
 
 
 def _extract_raw_spans(payload: JsonValue, ordinal: int) -> list[_RawSpan]:
