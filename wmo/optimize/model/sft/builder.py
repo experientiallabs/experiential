@@ -29,6 +29,8 @@ from wmo.optimize.model.sft.contracts import (
     InfrastructureFailureEvent,
     PartitionedSFTExample,
     ProductionSFTSource,
+    RuntimeInteractionExampleSource,
+    RuntimeSFTSource,
     SFTBuildSpec,
     SFTContextEvent,
     SFTDataset,
@@ -49,6 +51,7 @@ from wmo.optimize.model.sft.rendering import (
     context_target_fingerprint,
     partitioned_rows_sha256,
 )
+from wmo.optimize.model.sft.runtime_source import resolve_runtime_source
 from wmo.optimize.model.sft.sources import (
     PreparedSFTSource,
     SFTSourceVerificationError,
@@ -103,6 +106,7 @@ def build_sft_dataset(
     store: ProjectStore,
     production_sources: Sequence[ProductionSFTSource],
     teacher_sources: Sequence[TeacherSFTSource],
+    runtime_sources: Sequence[RuntimeSFTSource] = (),
     spec: SFTBuildSpec,
     created_at: datetime,
     code_revision: str,
@@ -113,6 +117,7 @@ def build_sft_dataset(
         store: One project-local immutable artifact store that owns every source chain.
         production_sources: Pointers to persisted production-acceptance artifacts.
         teacher_sources: Pointers to persisted teacher-acceptance artifacts.
+        runtime_sources: Pointers to verified routed-interaction snapshots.
         spec: Frozen split and sampling controls for this build.
         created_at: Time recorded in the resulting immutable dataset envelope.
         code_revision: Exact revision that built the artifact.
@@ -154,6 +159,21 @@ def build_sft_dataset(
         _require_unique_source_key(seen_source_keys, (candidate.kind, candidate.source_id))
         prepared.append(candidate)
         source_references.append(candidate.reference())
+
+    for source in sorted(runtime_sources, key=lambda item: item.snapshot_id):
+        try:
+            resolved = resolve_runtime_source(store, source)
+        except SFTSourceVerificationError as exc:
+            raise SFTBuildError(
+                f"runtime source {source.snapshot_id} is not verified production evidence: {exc}"
+            ) from exc
+        for candidate in resolved.prepared:
+            _require_unique_source_key(seen_source_keys, (candidate.kind, candidate.source_id))
+            prepared.append(candidate)
+        for reference in resolved.references:
+            _require_unique_reference(source_references, reference)
+            source_references.append(reference)
+        exclusions.extend(resolved.exclusions)
 
     scanned_actions: list[_ScannedAction] = []
     for source in prepared:
@@ -205,9 +225,23 @@ def build_sft_dataset(
         dataset_id=dataset_id,
         build_sha256=build_sha256,
         status="accepted" if train_rows else "insufficient",
-        acceptance_rule_ids=tuple(sorted({source.acceptance_rule_id for source in prepared})),
+        acceptance_rule_ids=tuple(
+            sorted(
+                {
+                    source.acceptance_rule_id
+                    for source in prepared
+                    if source.acceptance_rule_id is not None
+                }
+            )
+        ),
         acceptance_evidence_ids=tuple(
-            sorted({source.acceptance_evidence_id for source in prepared})
+            sorted(
+                {
+                    source.acceptance_evidence_id
+                    for source in prepared
+                    if source.acceptance_evidence_id is not None
+                }
+            )
         ),
         train_leakage_group_ids=train_groups,
         held_out_leakage_group_ids=held_out_groups,
@@ -399,18 +433,29 @@ def load_verified_sft_dataset(
     production_sources = tuple(
         ProductionSFTSource(acceptance_evidence_id=source.acceptance_evidence.artifact_id)
         for source in loaded.sources
-        if source.kind == "production_trace"
+        if source.kind == "production_trace" and source.acceptance_evidence is not None
     )
     teacher_sources = tuple(
         TeacherSFTSource(acceptance_evidence_id=source.acceptance_evidence.artifact_id)
         for source in loaded.sources
-        if source.kind == "teacher_rollout"
+        if source.kind == "teacher_rollout" and source.acceptance_evidence is not None
+    )
+    runtime_sources = tuple(
+        RuntimeSFTSource(snapshot_id=snapshot_id)
+        for snapshot_id in sorted(
+            {
+                source.source_artifact.artifact_id
+                for source in loaded.sources
+                if source.kind == "runtime_interaction"
+            }
+        )
     )
     try:
         rebuilt = build_sft_dataset(
             store=store,
             production_sources=production_sources,
             teacher_sources=teacher_sources,
+            runtime_sources=runtime_sources,
             spec=build_spec,
             created_at=loaded.dataset.created_at,
             code_revision=loaded.dataset.code_revision,
@@ -431,7 +476,14 @@ def load_verified_sft_dataset(
 def _scan_source_actions(
     source: PreparedSFTSource,
 ) -> tuple[list[_ScannedAction], list[SFTExclusion]]:
-    """Scan targets and fingerprints without emitting examples or assigning a partition."""
+    """Scan eligible targets and fingerprints before assigning a partition.
+
+    Args:
+        source: Verified transcript source with optional exact target indexes.
+
+    Returns:
+        Eligible action scans and source-local exclusions in transcript order.
+    """
     history: list[SFTContextEvent] = []
     scanned: list[_ScannedAction] = []
     exclusions: list[SFTExclusion] = []
@@ -466,6 +518,9 @@ def _scan_source_actions(
                     detail="infrastructure failures are excluded from SFT targets",
                 )
             )
+            continue
+        if source.target_action_indexes is not None and index not in source.target_action_indexes:
+            history.append(event)
             continue
         if index in failed_action_indexes:
             exclusions.append(
@@ -594,7 +649,7 @@ def _expand_scanned_actions(
                 partition=partition,
                 fingerprint=action.fingerprint,
                 example=SFTExample(
-                    example_id=stable_id("sft-example", {"fingerprint": action.fingerprint}),
+                    example_id=_example_id(action),
                     leakage_group_id=action.source.leakage_group_id,
                     task=action.source.task,
                     history=action.history,
@@ -612,7 +667,15 @@ def _globally_deduplicate(
     rows: Sequence[PartitionedSFTExample],
     scanned_actions: Sequence[_ScannedAction],
 ) -> tuple[tuple[PartitionedSFTExample, ...], tuple[SFTExclusion, ...]]:
-    """Keep one deterministic representative for every normalized fingerprint globally."""
+    """Retain runtime multiplicity while deduplicating other accepted evidence.
+
+    Args:
+        rows: Partitioned provisional rows for every eligible action.
+        scanned_actions: Source scans used to construct precise duplicate exclusions.
+
+    Returns:
+        Retained rows and exclusions for duplicate production or teacher examples.
+    """
     scanned_by_row_key = {
         (action.fingerprint, action.source.source_id, action.source_step_index): action
         for action in scanned_actions
@@ -624,8 +687,20 @@ def _globally_deduplicate(
     exclusions: list[SFTExclusion] = []
     for fingerprint in sorted(rows_by_fingerprint):
         candidates = sorted(rows_by_fingerprint[fingerprint], key=_dedupe_row_sort_key)
-        kept.append(candidates[0])
-        for duplicate in candidates[1:]:
+        runtime_candidates = [
+            row
+            for row in candidates
+            if isinstance(row.example.source, RuntimeInteractionExampleSource)
+        ]
+        accepted_candidates = [
+            row
+            for row in candidates
+            if not isinstance(row.example.source, RuntimeInteractionExampleSource)
+        ]
+        kept.extend(runtime_candidates)
+        if accepted_candidates:
+            kept.append(accepted_candidates[0])
+        for duplicate in accepted_candidates[1:]:
             key = (
                 duplicate.fingerprint,
                 _source_id_from_example(duplicate.example),
@@ -642,6 +717,26 @@ def _globally_deduplicate(
                 )
             )
     return tuple(kept), tuple(exclusions)
+
+
+def _example_id(action: _ScannedAction) -> ArtifactId:
+    """Derive one stable example identity without collapsing routed multiplicity.
+
+    Args:
+        action: Scanned source action and its normalized fingerprint.
+
+    Returns:
+        Fingerprint identity for accepted sources or interaction-scoped identity for runtime data.
+    """
+    material: dict[str, str | int] = {"fingerprint": action.fingerprint}
+    if action.source.kind == "runtime_interaction":
+        material.update(
+            {
+                "source_id": action.source.source_id,
+                "source_step_index": action.source_step_index,
+            }
+        )
+    return stable_id("sft-example", material)
 
 
 def _sorted_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactInput, ...]:
@@ -747,6 +842,26 @@ def _require_unique_source_key(seen: set[tuple[str, str]], key: tuple[str, str])
     seen.add(key)
 
 
+def _require_unique_reference(
+    references: Sequence[SFTSourceReference],
+    candidate: SFTSourceReference,
+) -> None:
+    """Reject one routed interaction repeated through overlapping snapshots.
+
+    Args:
+        references: Source references already admitted to the build.
+        candidate: Next completed, failed, or incomplete runtime reference.
+
+    Raises:
+        SFTBuildError: The candidate kind and source identity already appear.
+    """
+    if any(
+        reference.kind == candidate.kind and reference.source_id == candidate.source_id
+        for reference in references
+    ):
+        raise SFTBuildError(f"SFT build repeats source {candidate.kind}:{candidate.source_id}")
+
+
 def _require_timezone(value: datetime, *, label: str) -> None:
     """Reject an artifact timestamp that cannot safely round trip as immutable provenance."""
     if value.tzinfo is None or value.utcoffset() is None:
@@ -757,6 +872,8 @@ def _source_id_from_example(example: SFTExample) -> str:
     """Return the source identifier encoded by one normalized SFT example."""
     if isinstance(example.source, TraceExampleSource):
         return example.source.trace_id
+    if isinstance(example.source, RuntimeInteractionExampleSource):
+        return example.source.interaction_id
     return example.source.rollout_id
 
 

@@ -38,6 +38,7 @@ from wmo.optimize.model.sft.contracts import (
     ProductionAcceptanceRule,
     ProductionSFTSource,
     RolloutExampleSource,
+    RuntimeInteractionExampleSource,
     SFTContextEvent,
     SFTSourceReference,
     SFTTranscript,
@@ -56,7 +57,7 @@ class SFTSourceVerificationError(ValueError):
 class PreparedSFTSource:
     """One accepted source hydrated exclusively from verified immutable artifact bytes."""
 
-    kind: Literal["production_trace", "teacher_rollout"]
+    kind: Literal["production_trace", "teacher_rollout", "runtime_interaction"]
     source_id: str
     source_artifact: ArtifactInput
     source_record_sha256: Sha256
@@ -66,12 +67,13 @@ class PreparedSFTSource:
         SFTContextEvent | InfrastructureFailureEvent,
         ...,
     ]
-    example_source: TraceExampleSource | RolloutExampleSource
+    example_source: TraceExampleSource | RolloutExampleSource | RuntimeInteractionExampleSource
     score: float | None
     direct_inputs: tuple[ArtifactInput, ...]
-    acceptance_rule_id: ArtifactId
-    acceptance_evidence_id: ArtifactId
-    acceptance_evidence: ArtifactInput
+    acceptance_rule_id: ArtifactId | None
+    acceptance_evidence_id: ArtifactId | None
+    acceptance_evidence: ArtifactInput | None
+    target_action_indexes: tuple[int, ...] | None = None
 
     def reference(self) -> SFTSourceReference:
         """Return the auditable immutable-source record for a frozen dataset manifest."""

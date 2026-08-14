@@ -30,6 +30,8 @@ from wmo.optimize.model.sft.contracts import (
     ProductionAcceptanceEvidence,
     ProductionAcceptanceRule,
     ProductionSFTSource,
+    RuntimeInteractionExampleSource,
+    RuntimeSFTSource,
     SFTDataset,
     SFTDatasetArtifact,
     SFTExample,
@@ -45,6 +47,10 @@ from wmo.optimize.model.sft.rendering import (
     context_target_fingerprint,
     parse_rendered_turn,
     render_context_target,
+)
+from wmo.optimize.model.sft.runtime_source import (
+    PreparedRuntimeSFTSnapshot,
+    resolve_runtime_source,
 )
 from wmo.optimize.model.sft.tinker import (
     TinkerSFTDatum,
@@ -76,6 +82,9 @@ __all__ = [
     "ProductionAcceptanceEvidence",
     "ProductionAcceptanceRule",
     "ProductionSFTSource",
+    "PreparedRuntimeSFTSnapshot",
+    "RuntimeInteractionExampleSource",
+    "RuntimeSFTSource",
     "SFTBuildError",
     "SFTModelOptimizationConfig",
     "SFTModelOptimizationError",
@@ -116,6 +125,7 @@ __all__ = [
     "parse_rendered_turn",
     "preflight_sft_model_optimization",
     "render_context_target",
+    "resolve_runtime_source",
     "run_sft_model_optimization",
     "sft_model_optimization_output_dir",
     "tinker_messages_from_example",

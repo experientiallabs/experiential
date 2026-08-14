@@ -286,6 +286,12 @@ class TeacherSFTSource(ContractModel):
     acceptance_evidence_id: ArtifactId
 
 
+class RuntimeSFTSource(ContractModel):
+    """A pointer to one verified routed-interaction snapshot artifact."""
+
+    snapshot_id: ArtifactId
+
+
 class TraceExampleSource(ContractModel):
     """Production trace provenance retained on an extracted SFT example."""
 
@@ -302,8 +308,18 @@ class RolloutExampleSource(ContractModel):
     acceptance_evidence: ArtifactInput
 
 
+class RuntimeInteractionExampleSource(ContractModel):
+    """Exact routed-interaction and snapshot provenance for one SFT target."""
+
+    kind: Literal["runtime_interaction"] = "runtime_interaction"
+    snapshot: ArtifactInput
+    interaction_id: ArtifactId
+    accepted_ordinal: int = Field(gt=0)
+    completed_ordinal: int = Field(gt=0)
+
+
 SFTExampleSource = Annotated[
-    TraceExampleSource | RolloutExampleSource,
+    TraceExampleSource | RolloutExampleSource | RuntimeInteractionExampleSource,
     Field(discriminator="kind"),
 ]
 
@@ -365,19 +381,32 @@ class SFTBuildSpec(ContractModel):
 
 
 class SFTSourceReference(ContractModel):
-    """An auditable source and acceptance-evidence reference in a frozen dataset manifest."""
+    """Auditable immutable source provenance retained in a frozen dataset manifest."""
 
-    kind: Literal["production_trace", "teacher_rollout"]
+    kind: Literal["production_trace", "teacher_rollout", "runtime_interaction"]
     source_id: str = Field(min_length=1, max_length=512)
     source_artifact: ArtifactInput
     source_record_sha256: Sha256
     leakage_group_id: ArtifactId
-    acceptance_evidence: ArtifactInput
+    acceptance_evidence: ArtifactInput | None = None
     accepted: bool
     exclusion_reason: str | None = None
 
     @model_validator(mode="after")
     def _require_consistent_source_status(self) -> SFTSourceReference:
+        """Validate evidence requirements and accepted or excluded status.
+
+        Returns:
+            The validated source reference.
+
+        Raises:
+            ValueError: Evidence is missing or forbidden, or status and exclusion disagree.
+        """
+        if self.kind == "runtime_interaction":
+            if self.acceptance_evidence is not None:
+                raise ValueError("runtime SFT sources cannot name acceptance evidence")
+        elif self.acceptance_evidence is None:
+            raise ValueError("accepted production and teacher sources require acceptance evidence")
         if self.accepted and self.exclusion_reason is not None:
             raise ValueError("accepted SFT sources must not carry an exclusion reason")
         if not self.accepted and self.exclusion_reason is None:
@@ -388,7 +417,7 @@ class SFTSourceReference(ContractModel):
 class SFTExclusion(ContractModel):
     """One source-level or action-level reason data was withheld from an SFT dataset."""
 
-    source_kind: Literal["production_trace", "teacher_rollout"]
+    source_kind: Literal["production_trace", "teacher_rollout", "runtime_interaction"]
     source_id: str = Field(min_length=1, max_length=512)
     action_index: int | None = Field(default=None, ge=0)
     reason: Literal[
@@ -397,6 +426,8 @@ class SFTExclusion(ContractModel):
         "invalid_production_acceptance",
         "invalid_teacher_acceptance",
         "observation_context_only",
+        "runtime_interaction_failed",
+        "runtime_interaction_incomplete",
         "unapproved_action",
     ]
     detail: str = Field(min_length=1)
