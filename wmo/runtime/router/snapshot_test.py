@@ -27,7 +27,12 @@ from wmo.common.models import (
     OperationEconomics,
     Usage,
 )
-from wmo.common.project import ArtifactStore, ArtifactStoreError, ProjectPaths
+from wmo.common.project import (
+    ArtifactCorruptionError,
+    ArtifactStore,
+    ArtifactStoreError,
+    ProjectPaths,
+)
 from wmo.common.routing import RouterFeatureExtractor, RoutingDecision
 from wmo.common.traces import load_trace_dataset
 from wmo.runtime.router.journal import (
@@ -49,7 +54,14 @@ _TIME = datetime(2026, 8, 13, tzinfo=UTC)
 
 
 def _snapshot(*, model_id: str = "gpt-test") -> ModelSnapshot:
-    """Build a frozen test model snapshot."""
+    """Build a frozen test model snapshot.
+
+    Args:
+        model_id: Provider model identity to preserve in the fixture.
+
+    Returns:
+        Deterministic model snapshot with fixed capability and connection digests.
+    """
     return ModelSnapshot(
         provider="openai",
         model_id=model_id,
@@ -59,7 +71,14 @@ def _snapshot(*, model_id: str = "gpt-test") -> ModelSnapshot:
 
 
 def _request(content: str = "Help me") -> ModelRequest:
-    """Build a deterministic two-message model request."""
+    """Build a deterministic two-message model request.
+
+    Args:
+        content: User message included after the fixed system instruction.
+
+    Returns:
+        Provider-neutral request used by runtime snapshot fixtures.
+    """
     return ModelRequest(
         messages=(
             ModelMessage(role="system", content="You are helpful."),
@@ -69,7 +88,15 @@ def _request(content: str = "Help me") -> ModelRequest:
 
 
 def _response(*, model: ModelSnapshot | None = None, content: str = "Done") -> ModelResponse:
-    """Build a deterministic successful model response."""
+    """Build a deterministic successful model response.
+
+    Args:
+        model: Optional provider-resolved model identity.
+        content: Assistant text returned by the fixture.
+
+    Returns:
+        Successful response with fixed token economics.
+    """
     return ModelResponse(
         output=AssistantAction(content=content),
         model=model or _snapshot(),
@@ -80,7 +107,15 @@ def _response(*, model: ModelSnapshot | None = None, content: str = "Done") -> M
 
 
 def _decision(lineage_id: str, request: ModelRequest) -> RoutingDecision:
-    """Build a content-addressed routing decision for one request lineage."""
+    """Build a content-addressed routing decision for one request lineage.
+
+    Args:
+        lineage_id: Stable conversation lineage used by the runtime journal.
+        request: Request whose extracted feature defines the decision identity.
+
+    Returns:
+        Deterministic candidate selection with canonical content identity.
+    """
     episode_sha256 = hashlib.sha256(lineage_id.encode("utf-8"), usedforsecurity=False).hexdigest()
     feature = RouterFeatureExtractor().from_request(request)
     material = {
@@ -121,7 +156,18 @@ def _accept(
     conversation_id: str | None = None,
     now: datetime = _TIME,
 ) -> RuntimeAcceptedEvent:
-    """Accept one deterministic interaction into the runtime journal."""
+    """Accept one deterministic interaction into the runtime journal.
+
+    Args:
+        journal: Mutable runtime journal receiving the acceptance.
+        key: Caller idempotency key used only to derive the interaction identity.
+        request: Optional request override.
+        conversation_id: Optional stable routed conversation identity.
+        now: Acceptance timestamp.
+
+    Returns:
+        Durable accepted event produced by the journal claim.
+    """
     routed_request = request or _request()
     identity = _interaction_identity(
         journal.project_id,
@@ -157,7 +203,19 @@ def _complete(
     now: datetime = _TIME,
     response: ModelResponse | None = None,
 ) -> RuntimeAcceptedEvent:
-    """Accept and complete one deterministic journal interaction."""
+    """Accept and complete one deterministic journal interaction.
+
+    Args:
+        journal: Mutable runtime journal receiving both events.
+        key: Caller idempotency key used to derive the interaction identity.
+        request: Optional request override.
+        conversation_id: Optional stable routed conversation identity.
+        now: Acceptance timestamp used to derive completion time.
+        response: Optional provider result override.
+
+    Returns:
+        Accepted event named by the recorded completion.
+    """
     accepted = _accept(
         journal,
         key=key,
@@ -174,7 +232,15 @@ def _complete(
 
 
 def _artifact_bytes(store: ArtifactStore, artifact_id: str) -> dict[str, bytes]:
-    """Read every file in an artifact directory as stable relative-path bytes."""
+    """Read every file in an artifact directory as stable relative-path bytes.
+
+    Args:
+        store: Project artifact store containing the target artifact.
+        artifact_id: Immutable artifact identity to inspect.
+
+    Returns:
+        Mapping from relative file paths to exact bytes.
+    """
     directory = store.read(artifact_id).directory
     return {
         path.relative_to(directory).as_posix(): path.read_bytes()
@@ -184,7 +250,11 @@ def _artifact_bytes(store: ArtifactStore, artifact_id: str) -> dict[str, bytes]:
 
 
 def test_identical_replay_and_later_append_preserve_old_snapshot(tmp_path: Path) -> None:
-    """The same prefix replays exactly, while a later prefix creates new immutable siblings."""
+    """Prove exact replay and later append preserve the original snapshot.
+
+    The same prefix reuses identical artifact bytes, while a newly appended journal event creates
+    distinct immutable snapshot and dataset siblings without changing the first export.
+    """
     journal, store = _journal_and_store(tmp_path)
     _complete(journal, key="first-key", conversation_id="conversation-a")
 
@@ -240,7 +310,11 @@ def test_identical_replay_and_later_append_preserve_old_snapshot(tmp_path: Path)
 
 
 def test_equivalent_prefixes_produce_identical_artifact_files(tmp_path: Path) -> None:
-    """Canonical serialization yields the same IDs and bytes in independent project roots."""
+    """Prove equivalent prefixes produce identical artifacts across project roots.
+
+    Independently materialized journals with equal events yield the same content identities and
+    byte-for-byte artifact files.
+    """
     first_journal, first_store = _journal_and_store(tmp_path / "first")
     second_journal, second_store = _journal_and_store(tmp_path / "second")
     for journal in (first_journal, second_journal):
@@ -269,10 +343,92 @@ def test_equivalent_prefixes_produce_identical_artifact_files(tmp_path: Path) ->
     )
 
 
+def test_code_revision_drift_creates_distinct_snapshot_and_dataset_ids(tmp_path: Path) -> None:
+    """Prove revision-sensitive envelopes receive distinct content identities.
+
+    Sealing the same journal prefix from another code revision produces immutable snapshot and
+    dataset siblings instead of colliding with the original envelopes.
+    """
+    journal, store = _journal_and_store(tmp_path)
+    _complete(journal, key="revision-key")
+
+    first = seal_runtime_trace_snapshot(
+        journal,
+        store,
+        created_at=_TIME + timedelta(minutes=1),
+        code_revision="revision-a",
+    )
+    second = seal_runtime_trace_snapshot(
+        journal,
+        store,
+        created_at=_TIME + timedelta(minutes=2),
+        code_revision="revision-b",
+    )
+
+    assert first.snapshot.snapshot_id != second.snapshot.snapshot_id
+    assert first.dataset.dataset_id != second.dataset.dataset_id
+    assert first.snapshot.prefix_sha256 == second.snapshot.prefix_sha256
+    assert first.dataset.trace_ids == second.dataset.trace_ids
+    assert first.traces[0].model_dump(exclude={"source"}) == second.traces[0].model_dump(
+        exclude={"source"}
+    )
+    assert first.traces[0].source != second.traces[0].source
+
+
+@pytest.mark.parametrize("mutation", ["inputs", "source-id"])
+def test_loader_rejects_forged_snapshot_provenance(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Prove verified artifact files cannot attach unbound snapshot provenance.
+
+    Args:
+        tmp_path: Isolated project root.
+        mutation: Shared envelope and manifest field rewritten with valid digests.
+    """
+    journal, store = _journal_and_store(tmp_path)
+    _complete(journal, key="forged-provenance-key")
+    exported = seal_runtime_trace_snapshot(
+        journal,
+        store,
+        created_at=_TIME + timedelta(minutes=1),
+        code_revision="test-revision",
+    )
+    directory = store.read(exported.snapshot.snapshot_id).directory
+    snapshot_path = directory / "runtime-trace-snapshot.json"
+    manifest_path = directory / "manifest.json"
+    snapshot = json.loads(snapshot_path.read_bytes())
+    manifest = json.loads(manifest_path.read_bytes())
+    if mutation == "inputs":
+        forged_inputs = [
+            ArtifactInput(artifact_id="forged-input", sha256="f" * 64).model_dump(mode="json")
+        ]
+        snapshot["inputs"] = forged_inputs
+        manifest["inputs"] = forged_inputs
+    else:
+        snapshot["source"]["source_id"] = "forged/runtime/interactions"
+        manifest["source"]["source_id"] = "forged/runtime/interactions"
+    snapshot_payload = canonical_json_bytes(snapshot)
+    snapshot_path.write_bytes(snapshot_payload)
+    snapshot_entry = next(
+        entry for entry in manifest["files"] if entry["path"] == "runtime-trace-snapshot.json"
+    )
+    snapshot_entry["sha256"] = hashlib.sha256(snapshot_payload).hexdigest()
+    snapshot_entry["size_bytes"] = len(snapshot_payload)
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+
+    with pytest.raises(ArtifactCorruptionError, match="invalid envelope"):
+        load_runtime_trace_snapshot(store, exported.snapshot.snapshot_id)
+
+
 def test_retry_success_is_one_target_and_failures_remain_prefix_provenance(
     tmp_path: Path,
 ) -> None:
-    """Failed attempts stay in the snapshot, and only the eventual response enters traces."""
+    """Prove retry failures remain provenance while one success becomes the target.
+
+    The snapshot retains both failed and completed attempts, but normalized traces contain exactly
+    the eventual completed response for the logical interaction.
+    """
     journal, store = _journal_and_store(tmp_path)
     request = _request("Reset my password")
     first = _accept(
@@ -361,7 +517,11 @@ def test_retry_success_is_one_target_and_failures_remain_prefix_provenance(
 
 
 def test_late_original_success_preserves_failure_and_superseded_retry(tmp_path: Path) -> None:
-    """A late winning target retains both the failed original attempt and its unused retry."""
+    """Prove a late original success preserves failure and superseded retry evidence.
+
+    A retry accepted after a retryable failure becomes superseded when the original attempt later
+    completes, and the original acceptance time remains the trace span start.
+    """
     journal, store = _journal_and_store(tmp_path)
     request = _request("Summarize the account")
     original = _accept(journal, key="late-key", request=request)
@@ -419,7 +579,12 @@ def test_late_original_success_preserves_failure_and_superseded_retry(tmp_path: 
     ["duplicate", "event-id", "request-hash", "response-hash"],
 )
 def test_malformed_ids_digests_and_transitions_fail_closed(tmp_path: Path, corruption: str) -> None:
-    """A structurally valid rewrite cannot bypass journal identity and transition checks."""
+    """Prove structural rewrites cannot bypass journal identity and transition checks.
+
+    Args:
+        tmp_path: Isolated project root.
+        corruption: Event mutation applied before sealing the journal.
+    """
     journal, store = _journal_and_store(tmp_path)
     _complete(journal, key="corrupt-key")
     lines = [json.loads(line) for line in journal.path.read_text(encoding="utf-8").splitlines()]
@@ -445,7 +610,11 @@ def test_malformed_ids_digests_and_transitions_fail_closed(tmp_path: Path, corru
 def test_provider_resolved_response_model_preserves_both_model_identities(
     tmp_path: Path,
 ) -> None:
-    """The routed snapshot and provider-resolved response model remain distinct provenance."""
+    """Prove routed and provider-resolved model identities remain distinct provenance.
+
+    The normalized trace records both the selected frozen model and the exact model identity
+    returned by the provider rather than requiring them to be equal.
+    """
     journal, store = _journal_and_store(tmp_path)
     _complete(
         journal,
@@ -471,7 +640,11 @@ def test_provider_resolved_response_model_preserves_both_model_identities(
 def test_torn_tail_is_ignored_but_newline_terminated_corruption_is_rejected(
     tmp_path: Path,
 ) -> None:
-    """Only the journal's explicit non-newline final tear is outside the sealed prefix."""
+    """Prove only an explicit non-newline journal tail is excluded from sealing.
+
+    A torn final write is ignored by journal recovery, while newline-terminated malformed content
+    remains part of the durable prefix and fails closed.
+    """
     journal, store = _journal_and_store(tmp_path)
     _complete(journal, key="tail-key")
     clean = journal.path.read_bytes()
@@ -506,7 +679,11 @@ def test_torn_tail_is_ignored_but_newline_terminated_corruption_is_rejected(
 def test_secret_idempotency_key_is_hashed_and_secret_prompts_are_rejected(
     tmp_path: Path,
 ) -> None:
-    """Runtime artifacts omit caller keys and reject detectable credentials in trace content."""
+    """Prove runtime artifacts hash caller keys and reject credentials in prompts.
+
+    A benign interaction leaves no raw idempotency key in artifact bytes, while a detectable secret
+    in request content prevents canonical trace persistence.
+    """
     journal, store = _journal_and_store(tmp_path / "safe")
     raw_key = "sk-this-is-fake-secret-material-123456789"
     _complete(journal, key=raw_key)
@@ -541,7 +718,11 @@ def test_secret_idempotency_key_is_hashed_and_secret_prompts_are_rejected(
 
 
 def test_empty_or_failed_only_prefix_has_no_canonical_target_dataset(tmp_path: Path) -> None:
-    """A trace dataset is created only when the selected prefix has a completed target."""
+    """Prove a dataset requires a completed target in the selected prefix.
+
+    Empty journals and prefixes containing only accepted or failed attempts fail before a canonical
+    target dataset can be materialized.
+    """
     journal, store = _journal_and_store(tmp_path)
     with pytest.raises(RuntimeTraceSnapshotError, match="no durable events"):
         seal_runtime_trace_snapshot(
@@ -575,7 +756,11 @@ def test_empty_or_failed_only_prefix_has_no_canonical_target_dataset(tmp_path: P
 def test_attempt_contract_requires_terminal_evidence_for_terminal_dispositions(
     tmp_path: Path,
 ) -> None:
-    """A standalone attempt cannot claim completion or failure without its terminal event."""
+    """Prove terminal attempt dispositions require corresponding terminal evidence.
+
+    Pydantic validation rejects completed and failed dispositions when the attempt contains only
+    its acceptance event.
+    """
     journal, _ = _journal_and_store(tmp_path)
     accepted = _accept(journal, key="contract-key")
     with pytest.raises(ValidationError, match="must be open or superseded"):

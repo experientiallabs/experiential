@@ -79,7 +79,14 @@ class RuntimeTraceAttempt(ContractModel):
 
     @model_validator(mode="after")
     def _require_coherent_attempt(self) -> RuntimeTraceAttempt:
-        """Validate ordered terminal events and derive the attempt disposition."""
+        """Validate ordered terminal events and derive the attempt disposition.
+
+        Returns:
+            The validated attempt with a disposition matching its terminal events.
+
+        Raises:
+            ValueError: Event identity, order, multiplicity, or disposition is inconsistent.
+        """
         event_ordinals = tuple(event.ordinal for event in self.terminal_events)
         if event_ordinals != tuple(sorted(event_ordinals)) or len(set(event_ordinals)) != len(
             event_ordinals
@@ -129,7 +136,14 @@ class RuntimeTraceInteraction(ContractModel):
 
     @model_validator(mode="after")
     def _require_coherent_interaction(self) -> RuntimeTraceInteraction:
-        """Validate retry lineage and the interaction's unique terminal target."""
+        """Validate retry lineage and the interaction's unique terminal target.
+
+        Returns:
+            The validated logical interaction.
+
+        Raises:
+            ValueError: Attempts diverge from their lineage or terminal-target contract.
+        """
         accepted = tuple(attempt.accepted for attempt in self.attempts)
         if any(event.interaction_id != self.interaction_id for event in accepted):
             raise ValueError("runtime interaction attempts name another interaction")
@@ -186,7 +200,17 @@ class RuntimeTraceSnapshot(ArtifactEnvelope):
     @field_validator("interaction_ids")
     @classmethod
     def _require_unique_interactions(cls, value: tuple[ArtifactId, ...]) -> tuple[ArtifactId, ...]:
-        """Require a nonempty ordered set of unique interaction IDs."""
+        """Require a nonempty ordered set of unique interaction IDs.
+
+        Args:
+            value: Ordered interaction identities declared by the snapshot.
+
+        Returns:
+            The validated interaction identities.
+
+        Raises:
+            ValueError: The sequence is empty or repeats an identity.
+        """
         if not value:
             raise ValueError("a runtime trace snapshot needs at least one interaction")
         if len(set(value)) != len(value):
@@ -195,15 +219,25 @@ class RuntimeTraceSnapshot(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_content_identity(self) -> RuntimeTraceSnapshot:
-        """Validate snapshot identity, counts, and production-source binding."""
+        """Validate snapshot identity, counts, and production-source binding.
+
+        Returns:
+            The validated immutable snapshot envelope.
+
+        Raises:
+            ValueError: Counts, inputs, source identity, or content identity are inconsistent.
+        """
         if self.completed_target_count > len(self.interaction_ids):
             raise ValueError("completed target count exceeds the interaction count")
+        if self.inputs:
+            raise ValueError("runtime trace snapshots cannot declare upstream artifact inputs")
         expected_id = stable_id(
             "runtime-trace-snapshot",
             {
                 "project_id": self.project_id,
                 "last_ordinal": self.last_ordinal,
                 "prefix_sha256": self.prefix_sha256,
+                "code_revision": self.code_revision,
             },
         )
         if self.snapshot_id != expected_id:
@@ -211,6 +245,7 @@ class RuntimeTraceSnapshot(ArtifactEnvelope):
         if (
             self.source is None
             or self.source.kind != "production"
+            or self.source.source_id != f"{self.project_id}/runtime/interactions"
             or self.source.sha256 != self.prefix_sha256
         ):
             raise ValueError("runtime trace snapshot source must name its production prefix")
@@ -295,6 +330,7 @@ def seal_runtime_trace_snapshot(
             "project_id": journal.project_id,
             "last_ordinal": events[-1].ordinal,
             "prefix_sha256": prefix_sha256,
+            "code_revision": code_revision,
         },
     )
     snapshot = RuntimeTraceSnapshot(
@@ -332,7 +368,19 @@ def seal_runtime_trace_snapshot(
 def load_runtime_trace_snapshot(
     store: ArtifactStore, snapshot_id: str
 ) -> LoadedRuntimeTraceSnapshot:
-    """Load and fully validate one immutable runtime journal prefix."""
+    """Load and fully validate one immutable runtime journal prefix.
+
+    Args:
+        store: Project artifact store containing the snapshot.
+        snapshot_id: Content identity of the snapshot to load.
+
+    Returns:
+        Verified envelope, manifest, and canonical interactions.
+
+    Raises:
+        ArtifactCorruptionError: Artifact type, envelope, files, events, or provenance differ from
+            the declared immutable snapshot.
+    """
     stored = store.read(snapshot_id)
     if stored.manifest.artifact_type != _SNAPSHOT_ARTIFACT_TYPE:
         raise ArtifactCorruptionError(f"artifact {snapshot_id} is not a runtime trace snapshot")
@@ -395,7 +443,19 @@ def load_runtime_trace_snapshot(
 def _select_prefix(
     events: tuple[RuntimeJournalEvent, ...], last_ordinal: int | None
 ) -> tuple[RuntimeJournalEvent, ...]:
-    """Return one inclusive validated prefix boundary."""
+    """Select one inclusive validated journal prefix.
+
+    Args:
+        events: Complete durable journal event sequence.
+        last_ordinal: Optional inclusive final event ordinal.
+
+    Returns:
+        Nonempty validated event prefix.
+
+    Raises:
+        RuntimeTraceSnapshotError: The journal is empty or the boundary is outside the journal.
+        RuntimeJournalError: The selected prefix violates journal event contracts.
+    """
     if not events:
         raise RuntimeTraceSnapshotError("runtime journal has no durable events to snapshot")
     if last_ordinal is None:
@@ -412,7 +472,18 @@ def _select_prefix(
 def _build_interactions(
     events: tuple[RuntimeJournalEvent, ...],
 ) -> tuple[RuntimeTraceInteraction, ...]:
-    """Group globally ordered journal events into canonical logical interactions."""
+    """Group globally ordered journal events into canonical logical interactions.
+
+    Args:
+        events: Validated durable journal prefix in ordinal order.
+
+    Returns:
+        Interactions ordered by first acceptance, with retry dispositions and terminal evidence.
+
+    Raises:
+        RuntimeTraceSnapshotError: Grouping cannot reproduce the exact global event prefix.
+        ValueError: An interaction or attempt violates its validated contract.
+    """
     accepted_by_interaction: dict[str, list[RuntimeAcceptedEvent]] = {}
     terminals_by_attempt: dict[tuple[str, int], list[RuntimeTerminalEvent]] = {}
     interaction_ids = []
@@ -502,7 +573,19 @@ def _build_interactions(
 def _derive_traces(
     interactions: tuple[RuntimeTraceInteraction, ...], snapshot: RuntimeTraceSnapshot
 ) -> tuple[Trace, ...]:
-    """Map one completed target per interaction into the shared trace contracts."""
+    """Map one completed target per interaction into the shared trace contracts.
+
+    Args:
+        interactions: Canonical logical interactions from the sealed prefix.
+        snapshot: Immutable snapshot that binds trace provenance.
+
+    Returns:
+        Canonical production traces for completed interaction targets only.
+
+    Raises:
+        RuntimeTraceSnapshotError: Derived target count differs from the snapshot contract.
+        ValidationError: Preserved request or response metadata is not canonical JSON.
+    """
     traces = []
     trace_source = TraceSource(
         identity=SourceIdentity(
@@ -575,7 +658,14 @@ def _derive_traces(
 
 
 def _task_text(accepted: RuntimeAcceptedEvent) -> str:
-    """Choose a stable human-readable task while retaining the full request context."""
+    """Choose a stable human-readable task from an accepted request.
+
+    Args:
+        accepted: Accepted runtime event containing the full model request.
+
+    Returns:
+        Last visible user text, first available message text, or a stable fallback task.
+    """
     for message in reversed(accepted.request.messages):
         if message.role == "user" and message.content:
             return message.content
@@ -591,7 +681,21 @@ def _persist_snapshot(
     interactions: tuple[RuntimeTraceInteraction, ...],
     interactions_payload: bytes,
 ) -> LoadedRuntimeTraceSnapshot:
-    """Write a new prefix snapshot or return its exact existing materialization."""
+    """Write a new prefix snapshot or return its exact existing materialization.
+
+    Args:
+        store: Project artifact store receiving the snapshot.
+        snapshot: Validated immutable snapshot envelope.
+        interactions: Canonical logical interactions bound by the envelope.
+        interactions_payload: Canonical serialized interaction records.
+
+    Returns:
+        Fully reloaded and verified snapshot materialization.
+
+    Raises:
+        RuntimeTraceSnapshotError: An existing snapshot differs from exact replay.
+        ArtifactStoreError: A new artifact cannot be persisted safely.
+    """
     try:
         store.write(
             artifact_id=snapshot.snapshot_id,
@@ -618,7 +722,20 @@ def _persist_dataset(
     traces: tuple[Trace, ...],
     loaded_snapshot: LoadedRuntimeTraceSnapshot,
 ) -> tuple[TraceDataset, ArtifactManifest]:
-    """Persist completed runtime targets through the shared canonical trace envelope."""
+    """Persist completed runtime targets through the shared canonical trace envelope.
+
+    Args:
+        store: Project artifact store receiving the dataset.
+        traces: Canonical completed-target traces.
+        loaded_snapshot: Verified snapshot that owns the dataset provenance.
+
+    Returns:
+        Canonical trace dataset and its verified artifact manifest.
+
+    Raises:
+        RuntimeTraceSnapshotError: Existing dataset material differs from exact replay.
+        ArtifactStoreError: A new dataset cannot be persisted safely.
+    """
     traces_payload = _jsonl_bytes(traces)
     snapshot_input = artifact_input(loaded_snapshot.manifest)
     dataset_id = stable_id(
@@ -626,6 +743,8 @@ def _persist_dataset(
         {
             "snapshot": snapshot_input.model_dump(mode="json"),
             "traces_sha256": _sha256(traces_payload),
+            "code_revision": loaded_snapshot.snapshot.code_revision,
+            "semantic_convention_version": _RUNTIME_TRACE_CONVENTION,
         },
     )
     dataset = TraceDataset(
@@ -664,7 +783,19 @@ def _load_exact_dataset_replay(
     expected: TraceDataset,
     traces_payload: bytes,
 ) -> tuple[TraceDataset, ArtifactManifest]:
-    """Return an existing byte-identical dataset derived from the same snapshot."""
+    """Load an existing byte-identical dataset derived from the same snapshot.
+
+    Args:
+        store: Project artifact store containing the expected dataset.
+        expected: Exact dataset envelope derived from the current snapshot.
+        traces_payload: Exact canonical trace bytes derived from the current snapshot.
+
+    Returns:
+        Verified existing dataset and artifact manifest.
+
+    Raises:
+        RuntimeTraceSnapshotError: Type, envelope, trace bytes, or provenance differs from replay.
+    """
     stored = store.read(expected.dataset_id)
     if stored.manifest.artifact_type != _TRACE_DATASET_ARTIFACT_TYPE:
         raise RuntimeTraceSnapshotError(
@@ -693,7 +824,17 @@ def _load_exact_dataset_replay(
 def _parse_canonical_interactions(
     payload: bytes,
 ) -> tuple[RuntimeTraceInteraction, ...]:
-    """Parse canonical logical interactions from newline-terminated JSONL."""
+    """Parse canonical logical interactions from newline-terminated JSONL.
+
+    Args:
+        payload: Serialized interaction records to parse and canonicalize.
+
+    Returns:
+        Validated logical interactions in serialized order.
+
+    Raises:
+        RuntimeJournalError: Encoding, line framing, validation, or canonical bytes are invalid.
+    """
     if payload and not payload.endswith(b"\n"):
         raise RuntimeJournalError("snapshot interaction JSONL must end with a newline")
     interactions = []
@@ -715,7 +856,17 @@ def _parse_canonical_interactions(
 def _events_from_interactions(
     interactions: tuple[RuntimeTraceInteraction, ...],
 ) -> tuple[RuntimeJournalEvent, ...]:
-    """Restore the exact global event prefix from canonical interaction provenance."""
+    """Restore the exact global event prefix from canonical interaction provenance.
+
+    Args:
+        interactions: Canonical logical interactions ordered by first acceptance.
+
+    Returns:
+        Validated journal events in global ordinal order.
+
+    Raises:
+        RuntimeJournalError: Event ordering or first-acceptance interaction ordering is invalid.
+    """
     events: list[RuntimeJournalEvent] = []
     for interaction in interactions:
         for attempt in interaction.attempts:
@@ -745,7 +896,15 @@ def _accepted_pins(event: RuntimeAcceptedEvent) -> JsonObject:
 
 
 def _require_same_project(journal: RuntimeInteractionJournal, store: ArtifactStore) -> None:
-    """Require mutable and immutable paths to belong to one project boundary."""
+    """Require mutable and immutable paths to belong to one project boundary.
+
+    Args:
+        journal: Mutable routed-interaction journal.
+        store: Immutable project artifact store.
+
+    Raises:
+        RuntimeTraceSnapshotError: Project identity or canonical journal path differs.
+    """
     expected_path = store.project_directory / "runtime" / "interactions.jsonl"
     if journal.project_id != store.project_directory.name or (
         journal.path.resolve() != expected_path.resolve()
@@ -758,7 +917,15 @@ def _require_same_project(journal: RuntimeInteractionJournal, store: ArtifactSto
 def _require_envelope_matches_manifest(
     envelope: ArtifactEnvelope, manifest: ArtifactManifest
 ) -> None:
-    """Require shared provenance fields to match the immutable artifact manifest."""
+    """Require shared provenance fields to match the immutable artifact manifest.
+
+    Args:
+        envelope: Domain artifact envelope loaded from a data file.
+        manifest: Store-level manifest that digests that file.
+
+    Raises:
+        ArtifactCorruptionError: Shared schema or provenance fields differ.
+    """
     if (
         manifest.schema_version,
         manifest.created_at,
