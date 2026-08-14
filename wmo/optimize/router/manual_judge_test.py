@@ -12,8 +12,8 @@ from typing import Literal, cast
 
 import pytest
 
+import wmo.optimize.router.manual_judge as manual_judge_workflow
 import wmo.simulation.build as simulation_build
-import wmo.workflow.manual_judge as manual_judge_workflow
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
     JsonObject,
@@ -50,11 +50,7 @@ from wmo.common.project import (
     artifact_input,
 )
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
-from wmo.runtime.models.registry import ResolvedModel, RuntimeModelCatalog
-from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
-from wmo.simulation.ingest.otlp import TraceNormalizationResult
-from wmo.simulation.mining.service import MiningSpec
-from wmo.workflow.manual_judge import (
+from wmo.optimize.router.manual_judge import (
     ManualJudgeError,
     calibrate_manual_judge,
     commit_manual_judge_setup,
@@ -62,13 +58,17 @@ from wmo.workflow.manual_judge import (
     prepare_manual_judge_calibration,
     prepare_manual_judge_setup,
 )
-from wmo.workflow.manual_judge_contracts import (
+from wmo.optimize.router.manual_judge_contracts import (
     JudgePromptTemplate,
     JudgeScoreProjection,
     ManualJudgeLabel,
     ManualJudgeSetupArtifact,
     judge_feedback_schema,
 )
+from wmo.runtime.models.registry import ResolvedModel, RuntimeModelCatalog
+from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
+from wmo.simulation.ingest.otlp import TraceNormalizationResult
+from wmo.simulation.mining.service import MiningSpec
 
 _TIME = datetime(2026, 8, 13, tzinfo=UTC)
 _DIGEST = "a" * 64

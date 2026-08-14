@@ -10,7 +10,7 @@ uploads machine-readable JSON plus JUnit output. Symbolic or mismatched revision
 
 ## Router workflow
 
-`wmo/workflow/router_evidence_test.py` drives `wmo.compose_router` from 100 normalized traces.
+`wmo/optimize/router/composition_evidence_test.py` drives `wmo.compose_router` from 100 normalized traces.
 The build produces 50 fit tasks and 20 sealed held-out tasks. A reviewed rubric and calibration,
 two frozen candidates, one pricing snapshot, ten production overlaps, and one frozen embedder feed
 the real text `WorldModelSimulator`, W10 fit lock and held-out report, and W11 HTTP runtime.
@@ -39,7 +39,7 @@ workspace process directory. Terminal agreement is structural, not a task-qualit
 Run the evidence with:
 
 ```console
-uv run pytest -q wmo/workflow/router_evidence_test.py \
+uv run pytest -q wmo/optimize/router/composition_evidence_test.py \
   wmo/simulation/comparison_evidence_test.py
 ```
 

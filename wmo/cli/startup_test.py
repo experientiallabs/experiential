@@ -12,10 +12,12 @@ import sys
 
 
 def _run(code: str) -> None:
+    """Run one isolated Python startup probe."""
     subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
 
 
 def test_cli_import_stays_free_of_heavy_third_parties() -> None:
+    """Importing the CLI shell does not load heavy serving dependencies."""
     _run(
         """
 import sys
@@ -29,6 +31,7 @@ assert not bad, f"heavy packages loaded on import wmo.cli: {bad}"
 
 
 def test_cli_help_stays_free_of_heavy_product_modules() -> None:
+    """Rendering root help does not initialize heavy product modules."""
     _run(
         """
 import sys
@@ -59,6 +62,7 @@ assert not bad, f"heavy modules loaded for wmo --help: {bad}"
 
 
 def test_config_does_not_load_router_runtime_or_optimizer() -> None:
+    """Telemetry configuration stays independent of router product owners."""
     _run(
         """
 import sys
@@ -121,23 +125,26 @@ assert load_world_model.__module__ == "wmo.simulation.world_model.application"
     )
 
 
-def test_router_server_public_imports_resolve_after_lazy_package_import() -> None:
-    """Resolve public router application and endpoint services through lazy exports."""
+def test_router_server_and_optimizer_activation_imports_resolve_lazily() -> None:
+    """Resolve runtime server adapters separately from optimizer-owned activation."""
     _run(
         """
 import wmo.runtime.router as router
-assert {"create_router_endpoint", "load_router"}.issubset(dir(router))
+import wmo.optimize.router as optimizer
+assert {"create_router_endpoint", "create_project_router_app"}.issubset(dir(router))
+assert {"load_project_router", "load_router"}.issubset(dir(optimizer))
 try:
     getattr(router, "p17_unknown_router_export")
 except AttributeError:
     pass
 else:
     raise AssertionError("unknown router export resolved")
-from wmo.runtime.router import create_router_endpoint, load_router
-from wmo.runtime.router.application import load_router as nested_load_router
+from wmo.optimize.router import load_router
+from wmo.optimize.router.activation import load_router as nested_load_router
+from wmo.runtime.router import create_router_endpoint
 from wmo.runtime.router.endpoint import create_router_endpoint as nested_endpoint
 assert create_router_endpoint.__module__ == "wmo.runtime.router.endpoint"
-assert load_router.__module__ == "wmo.runtime.router.application"
+assert load_router.__module__ == "wmo.optimize.router.activation"
 assert create_router_endpoint is nested_endpoint
 assert load_router is nested_load_router
 """

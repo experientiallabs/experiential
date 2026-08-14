@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -12,19 +12,17 @@ from fastapi.testclient import TestClient
 from openai import OpenAI
 
 from wmo.common.core.artifacts import ArtifactId
+from wmo.common.evaluations.evidence import read_evaluation_plan
 from wmo.common.models import ModelRequest, load_model_catalog
 from wmo.common.project import (
     ArtifactStore,
     ArtifactStoreError,
     ProjectStore,
     ProjectStoreError,
+    artifact_input,
 )
 from wmo.common.routing import KnnRouterPolicy
 from wmo.runtime.models import RuntimeModelCatalog
-from wmo.runtime.router.capability import (
-    load_router_runtime_capability_contract,
-    verify_router_runtime_capabilities,
-)
 from wmo.runtime.router.completion import (
     JournaledRouterCompletionService,
     RouterCompletionService,
@@ -32,6 +30,12 @@ from wmo.runtime.router.completion import (
 from wmo.runtime.router.endpoint import create_router_endpoint
 from wmo.runtime.router.journal import JournaledRouterRuntime, RuntimeInteractionJournal
 from wmo.runtime.router.runtime import DecisionSink, RoutedModelResponse, RouterRuntime
+
+RouterPolicyVerifier = Callable[[ArtifactStore, KnnRouterPolicy, RuntimeModelCatalog], None]
+
+_AUTOMATIC_POLICY_INPUT_TYPES = frozenset(
+    {"router-execution-contract", "router-runtime-capabilities"}
+)
 
 
 class RouterApplicationError(ValueError):
@@ -74,6 +78,7 @@ def load_project_router(
     environment: Mapping[str, str] | None = None,
     runtime_catalog: RuntimeModelCatalog | None = None,
     decision_sink: DecisionSink | None = None,
+    policy_verifier: RouterPolicyVerifier | None = None,
 ) -> RouterRuntime:
     """Load one project's frozen router without selecting or calling a provider.
 
@@ -84,6 +89,7 @@ def load_project_router(
         environment: Optional credential mapping used only to construct runtime clients.
         runtime_catalog: Optional explicit runtime catalog for deterministic local tests.
         decision_sink: Optional aggregate-safe routing-decision recorder.
+        policy_verifier: Optimizer-owned verification for automatic policy inputs.
 
     Returns:
         Activated immutable router runtime. No model request is issued during loading.
@@ -102,7 +108,12 @@ def load_project_router(
                 load_model_catalog(project_store.model_catalog_path),
                 environment=environment,
             )
-        _verify_automatic_runtime_capabilities(project_store.artifacts, policy, catalog)
+        _verify_policy_activation(
+            project_store.artifacts,
+            policy,
+            catalog,
+            policy_verifier=policy_verifier,
+        )
         return RouterRuntime.load(
             project_store.artifacts,
             resolved_policy_id,
@@ -208,6 +219,7 @@ def load_router(
     environment: Mapping[str, str] | None = None,
     runtime_catalog: RuntimeModelCatalog | None = None,
     decision_sink: DecisionSink | None = None,
+    policy_verifier: RouterPolicyVerifier | None = None,
     ghost: bool = False,
 ) -> OpenAI:
     """Load one local project as an official synchronous OpenAI client.
@@ -219,6 +231,7 @@ def load_router(
         environment: Optional credential mapping for runtime client construction.
         runtime_catalog: Optional explicit catalog for deterministic applications and tests.
         decision_sink: Optional aggregate-safe routing-decision recorder.
+        policy_verifier: Optimizer-owned verification for automatic policy inputs.
         ghost: Whether completed traffic must bypass durable journal and replay state.
 
     Returns:
@@ -235,6 +248,7 @@ def load_router(
         environment=environment,
         runtime_catalog=runtime_catalog,
         decision_sink=decision_sink,
+        policy_verifier=policy_verifier,
     )
     store = ProjectStore(root, project)
     completion_service = create_project_completion_service(store, runtime, ghost=ghost)
@@ -279,64 +293,42 @@ def _load_policy(store: ArtifactStore, policy_id: ArtifactId) -> KnnRouterPolicy
     return policy
 
 
-def _verify_automatic_runtime_capabilities(
+def _verify_policy_activation(
     store: ArtifactStore,
     policy: KnnRouterPolicy,
     catalog: RuntimeModelCatalog,
+    *,
+    policy_verifier: RouterPolicyVerifier | None,
 ) -> None:
-    """Verify an automatic plan's separate capability contract before credential access.
+    """Require optimizer verification whenever a plan contains automatic artifacts.
 
-    Legacy plans contain neither automatic artifact and retain their existing activation path.
-    Automatic plans must freeze exactly one capability contract and one execution contract, with
-    the execution manifest recursively binding the capability pointer.
+    Runtime owns provider activation but does not depend on offline optimization. Automatic plans
+    therefore require their optimizer owner to inject the complete artifact verifier. Plans with
+    no automatic inputs retain the provider-free runtime loading path.
 
     Args:
         store: Project-local immutable artifact store.
         policy: Selected frozen router policy.
         catalog: Current credential-free catalog resolver.
+        policy_verifier: Optional optimizer-owned automatic artifact verifier.
 
     Raises:
-        RouterApplicationError: Automatic artifacts are missing, ambiguous, or drifted.
+        RouterApplicationError: Plan inputs drift or automatic verification is unavailable.
     """
-    from wmo.common.evaluations.evidence import read_evaluation_plan
-    from wmo.common.project import artifact_input
-    from wmo.workflow.router_execution_contract import load_router_execution_contract
-
     plan, _plan_input = read_evaluation_plan(store, policy.evaluation_plan_id)
-    capability_inputs = []
-    execution_inputs = []
+    automatic_inputs = []
     for item in plan.inputs:
         stored = store.read(item.artifact_id)
         if artifact_input(stored.manifest) != item:
             raise RouterApplicationError(
                 f"router plan input {item.artifact_id!r} differs from its manifest"
             )
-        if stored.manifest.artifact_type == "router-runtime-capabilities":
-            capability_inputs.append(item)
-        elif stored.manifest.artifact_type == "router-execution-contract":
-            execution_inputs.append(item)
-    if not capability_inputs and not execution_inputs:
+        if stored.manifest.artifact_type in _AUTOMATIC_POLICY_INPUT_TYPES:
+            automatic_inputs.append(item)
+    if policy_verifier is not None:
+        policy_verifier(store, policy, catalog)
         return
-    if len(capability_inputs) != 1 or len(execution_inputs) != 1:
+    if automatic_inputs:
         raise RouterApplicationError(
-            "automatic router plan must bind one capability and one execution contract"
+            "automatic router policy requires optimizer-owned activation verification"
         )
-    capability_input = capability_inputs[0]
-    execution = load_router_execution_contract(store, execution_inputs[0].artifact_id)
-    if execution.runtime_capability_input != capability_input:
-        raise RouterApplicationError(
-            "automatic router execution contract differs from its runtime capability binding"
-        )
-    execution_candidates = tuple(
-        (item.candidate_alias, item.model) for item in execution.candidates
-    )
-    policy_candidates = tuple((item.alias, item.model) for item in policy.candidates)
-    if (
-        execution_candidates != policy_candidates
-        or execution.incumbent_alias != policy.baseline_alias
-    ):
-        raise RouterApplicationError(
-            "automatic router execution candidates or incumbent differ from the policy"
-        )
-    contract = load_router_runtime_capability_contract(store, capability_input.artifact_id)
-    verify_router_runtime_capabilities(contract, policy.candidates, catalog)

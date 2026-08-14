@@ -43,7 +43,12 @@ from wmo.common.evaluations.evidence import (
 )
 from wmo.common.evaluations.planning import plan_bound_fidelity_gate_id
 from wmo.common.judging import Judge, Judgment
-from wmo.common.models import RoutedCandidateSnapshot
+from wmo.common.models import (
+    ModelCatalog,
+    ProviderModelSelection,
+    RoutedCandidateSnapshot,
+    RouterCandidateSelection,
+)
 from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.project import (
     ArtifactAlreadyExistsError,
@@ -53,7 +58,23 @@ from wmo.common.project import (
 from wmo.common.rollouts import SimulationArtifactSet
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import KnnBankManifest
-from wmo.optimize.router import (
+from wmo.optimize.router.activation import load_project_router
+from wmo.optimize.router.completed_build import (
+    completed_project_build,
+    reconstruct_completed_project_build,
+)
+from wmo.optimize.router.errors import RouterCompositionError
+from wmo.optimize.router.judgment_budget import (
+    JudgmentBudgetError,
+    find_verified_judgment,
+    persist_dispatch_reservation,
+    read_dispatch_reservation,
+)
+from wmo.optimize.router.router_setup import verify_router_evaluation_setup
+from wmo.optimize.router.router_simulation_spec import build_router_simulation_spec
+from wmo.optimize.router.simulation_spend import observed_rollout_spend
+from wmo.optimize.router.spec import RouterFitResult
+from wmo.optimize.router.workflow import (
     EvaluationInputs,
     RouterFitConfig,
     RouterFitWorkflowResult,
@@ -62,29 +83,13 @@ from wmo.optimize.router import (
     fit_router,
     report_router,
 )
-from wmo.optimize.router.spec import RouterFitResult
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime
-from wmo.runtime.router.application import load_project_router
 from wmo.simulation.build import ProjectBuild
 from wmo.simulation.ingest.otlp import TraceNormalizationResult, load_otlp_file
 from wmo.simulation.ingest.posthog import load_posthog_file
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
-from wmo.workflow.completed_build import (
-    completed_project_build,
-    reconstruct_completed_project_build,
-)
-from wmo.workflow.errors import RouterCompositionError
-from wmo.workflow.judgment_budget import (
-    JudgmentBudgetError,
-    find_verified_judgment,
-    persist_dispatch_reservation,
-    read_dispatch_reservation,
-)
-from wmo.workflow.router_setup import verify_router_evaluation_setup
-from wmo.workflow.router_simulation_spec import build_router_simulation_spec
-from wmo.workflow.simulation_spend import observed_rollout_spend
 
 
 class RouterCompositionBudget(ContractModel):
@@ -96,9 +101,20 @@ class RouterCompositionBudget(ContractModel):
     @field_validator("maximum_simulation_cost_usd")
     @classmethod
     def _require_finite_cost(cls, value: float) -> float:
+        """Return a finite simulation ceiling or reject it."""
         if not math.isfinite(value):
             raise ValueError("simulation budget must be finite")
         return value
+
+
+@dataclass(frozen=True)
+class RouterCandidateSetupPlan:
+    """Confirmed candidate roles paired with the catalog state shown to the operator."""
+
+    selection: RouterCandidateSelection
+    candidate_models: tuple[ProviderModelSelection, ...]
+    prospective_catalog: ModelCatalog
+    expected_catalog_sha256: str
 
 
 class ApprovedRouterReview(ContractModel):

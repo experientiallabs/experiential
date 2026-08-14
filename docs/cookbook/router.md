@@ -35,7 +35,7 @@ The setup supplier provides the application-owned facts WMO cannot invent: appro
 calibration, candidate snapshots, reviewed production overlap rollouts, exact protocols, frozen
 embeddings, pricing, and guard thresholds. The simulator factory binds explicit candidate and
 world-model clients plus the customer `AgentRuntime` to WMO's frozen plan. See the executable
-public example in the root README and exact contracts in `wmo.workflow.router`.
+public example in the root README and exact contracts in `wmo.optimize.router.composition`.
 
 Create `router-optimization.json` from those exact typed outputs using
 [the configuration recipe](../reference/router_optimization_config.md). The recipe names and

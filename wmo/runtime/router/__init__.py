@@ -15,8 +15,6 @@ if TYPE_CHECKING:
     from wmo.runtime.router.application import (
         create_project_router_app as create_project_router_app,
     )
-    from wmo.runtime.router.application import load_project_router as load_project_router
-    from wmo.runtime.router.application import load_router as load_router
     from wmo.runtime.router.endpoint import create_router_endpoint as create_router_endpoint
 
 from wmo.runtime.router.completion import (
@@ -61,8 +59,6 @@ _SERVER_EXPORT_MODULES = {
     "create_project_completion_service": "wmo.runtime.router.application",
     "create_project_router_app": "wmo.runtime.router.application",
     "create_router_endpoint": "wmo.runtime.router.endpoint",
-    "load_project_router": "wmo.runtime.router.application",
-    "load_router": "wmo.runtime.router.application",
 }
 
 __all__ = [
@@ -98,8 +94,6 @@ __all__ = [
     "RouterApplicationError",
     "create_project_completion_service",
     "create_project_router_app",
-    "load_router",
-    "load_project_router",
 ]
 
 

@@ -58,7 +58,7 @@ identity whenever scoring semantics change.
 
 Add the smallest failing regression beside the common judging owner. Prefer focused tests for the
 rubric, LM judge, calibration metrics, provenance, review, or risk-acceptance layer. For workflow
-behavior, add coverage beside `wmo/workflow/router_test.py`.
+behavior, add coverage beside `wmo/optimize/router/composition_test.py`.
 
 Use a counter-control for every change that could overcorrect. Model comparisons use the same
 frozen rollout, rubric, human labels, prompt identity, and lineage split. Never compare runs whose

@@ -46,6 +46,17 @@ from wmo.common.project import (
 from wmo.common.rollouts import SimulationArtifactSet
 from wmo.common.routing import KnnGuard
 from wmo.common.tasks import load_task_set
+from wmo.optimize.router.composition import (
+    ApprovedRouterReview,
+    FidelityApprovalDecision,
+    RouterCompositionBudget,
+    RouterCompositionError,
+    RouterEvaluationSetup,
+    RouterWorkflowServices,
+    compose_router,
+)
+from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
+from wmo.optimize.router.simulation_spend import observed_rollout_spend
 from wmo.optimize.router.workflow_test import _persist_embeddings, _persist_pricing
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.runtime_test import _Client, _request
@@ -66,17 +77,6 @@ from wmo.simulation.retrieval import (
 from wmo.simulation.retrieval.retrieval_test import _message_trace as _trace
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings
 from wmo.simulation.world_model import bind_fit_grounded_world_model, persist_grounded_world_model
-from wmo.workflow.judgment_budget import JudgmentDispatchReceipt
-from wmo.workflow.router import (
-    ApprovedRouterReview,
-    FidelityApprovalDecision,
-    RouterCompositionBudget,
-    RouterCompositionError,
-    RouterEvaluationSetup,
-    RouterWorkflowServices,
-    compose_router,
-)
-from wmo.workflow.simulation_spend import observed_rollout_spend
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
@@ -185,13 +185,16 @@ class _Catalog:
     """Resolve the exact simulation-capable identities frozen by this composition test."""
 
     def __init__(self, snapshots: dict[str, ModelSnapshot], client: _Client) -> None:
+        """Store exact model snapshots and their shared deterministic client."""
         self.snapshots = snapshots
         self.client = client
 
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+        """Return one alias snapshot and its deterministic capabilities."""
         return self.snapshots[alias], _capabilities(alias)
 
     def resolve(self, alias: str) -> ResolvedModel:
+        """Resolve one alias to the shared deterministic client."""
         snapshot, capabilities = self.snapshot(alias)
         return ResolvedModel(
             alias=alias,
@@ -211,6 +214,7 @@ class _ReviewSupplier:
         build: ProjectBuild,
         budget: RouterCompositionBudget,
     ) -> ApprovedRouterReview:
+        """Persist or replay one exact approved rubric and calibration."""
         del budget
         if "rubric-a" not in project.artifacts.list_ids():
             task_input = build.review.task_set
@@ -394,6 +398,7 @@ class _Judge:
     """Return one stable score while counting actual dispatches."""
 
     def __init__(self) -> None:
+        """Initialize dispatch counters and optional failure injection."""
         self.calls = 0
         self.log: list[tuple[str, bool]] = []
         self.fail_on_call: int | None = None
@@ -406,6 +411,7 @@ class _Judge:
         rubric_artifact_id: str,
         calibration_artifact_id: str,
     ) -> Judgment:
+        """Persist one stable judgment unless the configured call must fail."""
         self.calls += 1
         if self.calls == self.fail_on_call:
             raise RuntimeError("simulated judgment dispatch interruption")
@@ -467,6 +473,7 @@ class _SimulatorFactory:
     """Bind the real text simulator to deterministic explicit fake model clients."""
 
     def __init__(self) -> None:
+        """Initialize deterministic candidate and world-model simulators."""
         self.log: list[tuple[tuple[str, ...], bool]] = []
         self.candidate = _ScriptedClient(
             [_response("Resolved.", snapshot=_snapshot("candidate-a"), cost=0.01)] * 80
@@ -531,11 +538,13 @@ class _LoggingSimulator:
         simulator: WorldModelSimulator,
         log: list[tuple[tuple[str, ...], bool]],
     ) -> None:
+        """Store the delegated simulator and phase observation log."""
         self.project = project
         self.simulator = simulator
         self.log = log
 
     def run(self, spec: SimulationSpec) -> SimulationArtifactSet:
+        """Record policy-lock state and delegate one simulation phase."""
         locked = any(
             self.project.artifacts.read(artifact_id).manifest.artifact_type == "router-policy-lock"
             for artifact_id in self.project.artifacts.list_ids()
@@ -548,6 +557,7 @@ class _FidelityApproval:
     """Assert the callback sees only fidelity cells and return auditable actor evidence."""
 
     def __init__(self) -> None:
+        """Initialize the fidelity-approval call counter."""
         self.calls = 0
 
     def __call__(
@@ -557,6 +567,7 @@ class _FidelityApproval:
         evidence: tuple[EvaluationCellEvidence, ...],
         budget: RouterCompositionBudget,
     ) -> FidelityApprovalDecision:
+        """Approve measured fidelity evidence and record the callback."""
         del project, budget
         self.calls += 1
         cells = {cell.cell_id: cell for cell in plan.cells}
@@ -679,6 +690,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     receipts: set[str] = set()
 
     def capture(event, completion_id, properties, *, root):  # noqa: ANN001, ANN202
+        """Record idempotent telemetry attempts for composition replay."""
         attempt = (event, completion_id, properties, root)
         attempts.append(attempt)
         if completion_id in receipts:
@@ -687,12 +699,13 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         emitted.append(attempt)
         return True
 
-    monkeypatch.setattr("wmo.workflow.router.capture_completion_once", capture)
+    monkeypatch.setattr("wmo.optimize.router.composition.capture_completion_once", capture)
 
     crash_after_policy = True
     crash_after_report = True
 
     def crash_after_lock(phase: str) -> None:
+        """Crash once after each durable lock and report boundary."""
         nonlocal crash_after_policy, crash_after_report
         phases.append(phase)
         if phase == "policy_locked" and crash_after_policy:
@@ -713,7 +726,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
             phase_hook=crash_after_lock,
         )
     assert approval.calls == 1
-    from wmo.workflow import router as workflow_module
+    from wmo.optimize.router import composition as workflow_module
 
     monkeypatch.setattr(
         workflow_module,
@@ -826,6 +839,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         phase_project: ProjectStore,
         artifact_set: SimulationArtifactSet,
     ) -> float:
+        """Return spend that exactly exhausts the admitted phase budget."""
         del phase_project, artifact_set
         return 1.0
 
@@ -889,103 +903,3 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     decision = first.runtime.select(_request(), episode_id="customer-episode")
     assert first.runtime.select(_request(), episode_id="customer-episode") == decision
     assert first.plan.cells
-
-
-def test_judgment_budget_reservation_blocks_partial_retry_dispatch(
-    tmp_path: Path,
-) -> None:
-    """Consume a failed paid-call slot and block duplicate retry dispatch.
-
-    Args:
-        tmp_path: Isolated project root for durable judgment reservations.
-    """
-    project = ProjectStore(tmp_path, "project-a")
-    project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
-    )
-    _bind_completed_build(project, normalized, revision="test-revision")
-    judge = _Judge()
-    judge.fail_on_call = 3
-    runtime_client = _Client()
-    services = RouterWorkflowServices(
-        review_supplier=_ReviewSupplier(),
-        setup_supplier=_SetupSupplier(),
-        simulator_factory=_SimulatorFactory(),
-        judge=judge,
-        fidelity_approval=_FidelityApproval(),
-        runtime_catalog=cast(
-            RuntimeModelCatalog,
-            _Catalog(
-                {
-                    "candidate-a": _snapshot("candidate-a"),
-                    "embedder": _snapshot("embedder"),
-                },
-                runtime_client,
-            ),
-        ),
-    )
-    budget = RouterCompositionBudget(
-        maximum_simulation_cost_usd=10.0,
-        maximum_judgments=3,
-    )
-
-    with pytest.raises(RuntimeError, match="judgment dispatch interruption"):
-        compose_router(
-            project,
-            normalized,
-            services=services,
-            budget=budget,
-            created_at=_TIME,
-            code_revision="test-revision",
-        )
-    assert judge.calls == 3
-    assert (
-        sum(
-            project.artifacts.read(artifact_id).manifest.artifact_type == "judgment-dispatch"
-            for artifact_id in project.artifacts.list_ids()
-        )
-        == budget.maximum_judgments
-    )
-
-    with pytest.raises(RouterCompositionError, match="reserved judgment dispatch"):
-        compose_router(
-            project,
-            normalized,
-            services=services,
-            budget=budget,
-            created_at=_TIME,
-            code_revision="test-revision",
-        )
-    assert judge.calls == 3
-
-    first_judgment_id = next(
-        artifact_id
-        for artifact_id in project.artifacts.list_ids()
-        if project.artifacts.read(artifact_id).manifest.artifact_type == "judgment"
-    )
-    first_judgment = Judgment.model_validate_json(
-        project.artifacts.read_bytes(first_judgment_id, "judgment.json")
-    )
-    forged = first_judgment.model_copy(
-        update={
-            "judgment_id": "judgment-forged-cross-plan",
-            "judge_prompt_sha256": "f" * 64,
-        }
-    )
-    project.artifacts.write_json(
-        artifact_id=forged.judgment_id,
-        artifact_type="judgment",
-        envelope=forged,
-        files={"judgment.json": forged},
-    )
-    with pytest.raises(RouterCompositionError, match="exact plan review pins"):
-        compose_router(
-            project,
-            normalized,
-            services=services,
-            budget=budget,
-            created_at=_TIME,
-            code_revision="test-revision",
-        )
-    assert judge.calls == 3

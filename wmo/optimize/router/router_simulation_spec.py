@@ -11,7 +11,7 @@ from wmo.common.rollouts import SimulationMode
 from wmo.simulation.specs import SimulationSpec
 
 if TYPE_CHECKING:
-    from wmo.workflow.router import RouterEvaluationSetup
+    from wmo.optimize.router.composition import RouterEvaluationSetup
 
 
 def build_router_simulation_spec(

@@ -19,8 +19,8 @@ from wmo.common.routing import (
     router_feature_token_upper_bound,
 )
 from wmo.common.tasks import TaskCase
+from wmo.optimize.router.manual_judge_contracts import ManualJudgeCalibrationAudit
 from wmo.simulation.specs import CandidateCompletionReservation
-from wmo.workflow.manual_judge_contracts import ManualJudgeCalibrationAudit
 
 
 def router_feature_reservation(

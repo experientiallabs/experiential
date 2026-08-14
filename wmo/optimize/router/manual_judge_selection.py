@@ -10,8 +10,8 @@ from wmo.common.project import ProjectStore
 from wmo.common.rollouts import RolloutArtifact
 from wmo.common.tasks import TaskCase
 from wmo.common.traces import Trace
-from wmo.workflow.manual_judge_artifacts import rollout_id
-from wmo.workflow.manual_judge_contracts import (
+from wmo.optimize.router.manual_judge_artifacts import rollout_id
+from wmo.optimize.router.manual_judge_contracts import (
     JudgeTracePreview,
     ManualJudgeError,
 )

@@ -31,6 +31,24 @@ from wmo.common.project import (
 from wmo.common.routing import RouterEmbeddingReservation
 from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, load_trace_dataset
+from wmo.optimize.router.automatic_router_reservations import (
+    judge_completion_reservation,
+    remaining_simulation_budget,
+    retrieval_embedding_reservation,
+    router_feature_reservation,
+    simulation_completion_reservations,
+)
+from wmo.optimize.router.manual_judge_artifacts import read_audit
+from wmo.optimize.router.manual_judge_contracts import (
+    ManualJudgeCalibrationAudit,
+    ManualJudgeReviewState,
+    ManualJudgeSetupArtifact,
+)
+from wmo.optimize.router.router_attribution import (
+    RouterAttributionError,
+    RouterObservedAttribution,
+    resolve_router_observed_attributions,
+)
 from wmo.runtime.agents import agent_factory_sha256
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.simulation.ingest.dataset import (
@@ -39,24 +57,6 @@ from wmo.simulation.ingest.dataset import (
 )
 from wmo.simulation.ingest.model_identity import TraceModelIdentityEvidenceSet
 from wmo.simulation.specs import CandidateCompletionReservation
-from wmo.workflow.automatic_router_reservations import (
-    judge_completion_reservation,
-    remaining_simulation_budget,
-    retrieval_embedding_reservation,
-    router_feature_reservation,
-    simulation_completion_reservations,
-)
-from wmo.workflow.manual_judge_artifacts import read_audit
-from wmo.workflow.manual_judge_contracts import (
-    ManualJudgeCalibrationAudit,
-    ManualJudgeReviewState,
-    ManualJudgeSetupArtifact,
-)
-from wmo.workflow.router_attribution import (
-    RouterAttributionError,
-    RouterObservedAttribution,
-    resolve_router_observed_attributions,
-)
 
 
 class AutomaticRouterPreflightError(ValueError):

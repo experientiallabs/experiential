@@ -31,8 +31,7 @@ from wmo.common.rollouts import RolloutArtifact, SimulationMode, StopReason
 from wmo.common.rollouts.otel import ProductionSimulatorSnapshot, RolloutEventKind, RolloutSpan
 from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, TraceSpan
-from wmo.simulation.build import BuildReviewReadiness, coordinate_selected_build_review
-from wmo.workflow.manual_judge_contracts import (
+from wmo.optimize.router.manual_judge_contracts import (
     JudgeCalibrationBudget,
     JudgeRunEvidence,
     ManualJudgeCalibrationAudit,
@@ -41,6 +40,7 @@ from wmo.workflow.manual_judge_contracts import (
     ManualJudgeReviewState,
     ManualJudgeSetupArtifact,
 )
+from wmo.simulation.build import BuildReviewReadiness, coordinate_selected_build_review
 
 
 class _BuildEvidence(Protocol):

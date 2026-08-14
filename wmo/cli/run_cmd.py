@@ -47,10 +47,10 @@ def run(
     import uvicorn
 
     from wmo.common.project import ProjectStore
+    from wmo.optimize.router.activation import load_project_router
     from wmo.runtime.router.application import (
         create_project_completion_service,
         create_project_router_app,
-        load_project_router,
     )
 
     try:

@@ -39,6 +39,21 @@ from wmo.common.models import (
 from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
 from wmo.common.routing import FrozenEmbedding, FrozenEmbeddingSet, KnnGuard, RouterFeatureExtractor
 from wmo.common.tasks import load_task_set
+from wmo.optimize.router.composition import (
+    ApprovedRouterReview,
+    RouterCompositionBudget,
+    RouterEvaluationSetup,
+    RouterWorkflowServices,
+)
+from wmo.optimize.router.composition_test import (
+    _bind_completed_build,
+    _capabilities,
+    _FidelityApproval,
+    _Judge,
+    _resolved,
+    _snapshot,
+)
+from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
 from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.application import create_project_router_app
@@ -54,21 +69,6 @@ from wmo.simulation.retrieval import load_fit_rag_retriever, load_rag_index
 from wmo.simulation.retrieval.retrieval_test import _message_trace as _trace
 from wmo.simulation.specs import WorldModelSettings
 from wmo.simulation.world_model import bind_fit_grounded_world_model
-from wmo.workflow.judgment_budget import JudgmentDispatchReceipt
-from wmo.workflow.router import (
-    ApprovedRouterReview,
-    RouterCompositionBudget,
-    RouterEvaluationSetup,
-    RouterWorkflowServices,
-)
-from wmo.workflow.router_test import (
-    _bind_completed_build,
-    _capabilities,
-    _FidelityApproval,
-    _Judge,
-    _resolved,
-    _snapshot,
-)
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 
@@ -77,6 +77,7 @@ class _EvidenceSetupSupplier:
     """Persist two measured candidates, reviewed overlaps, embeddings, and pricing."""
 
     def __init__(self, revision: str) -> None:
+        """Store the exact release revision used by persisted evidence."""
         self.revision = revision
 
     def __call__(
@@ -213,6 +214,7 @@ class _EvidenceSimulatorFactory:
     """Bind the actual text simulator to deterministic local model-client fakes."""
 
     def __init__(self) -> None:
+        """Initialize deterministic candidate clients and a call counter."""
         self.calls = 0
         self.candidates = {
             "candidate-baseline": _ScriptedClient(
@@ -292,6 +294,7 @@ class _EvidenceJudge(_Judge):
     """Persist the deterministic judgment with exact revision and observed zero-dollar cost."""
 
     def __init__(self, revision: str) -> None:
+        """Initialize the exact-revision deterministic judge."""
         super().__init__()
         self.revision = revision
 
@@ -303,6 +306,7 @@ class _EvidenceJudge(_Judge):
         rubric_artifact_id: str,
         calibration_artifact_id: str,
     ) -> Judgment:
+        """Persist one zero-cost judgment under the exact release revision."""
         judgment = super().judge_persisted(
             store,
             rollout_artifact_id=rollout_artifact_id,
@@ -323,11 +327,14 @@ class _RuntimeClient:
     """Return one exact routed candidate identity while counting local calls."""
 
     def __init__(self, alias: str) -> None:
+        """Initialize counters for one exact routed alias."""
         self.alias = alias
         self.complete_calls = 0
         self.embed_calls = 0
 
     def complete(self, request: ModelRequest) -> ModelResponse:
+        """Return one deterministic tool call and record the dispatch."""
+        del request
         self.complete_calls += 1
         return ModelResponse(
             output=AssistantAction(
@@ -342,6 +349,7 @@ class _RuntimeClient:
         )
 
     def embed(self, texts) -> tuple:  # noqa: ANN001, ANN201 - protocol fixture
+        """Return one deterministic embedding for one input text."""
         self.embed_calls += 1
         assert len(texts) == 1
         from wmo.common.models import Embedding
@@ -353,15 +361,18 @@ class _RuntimeCatalog:
     """Resolve exact candidate and embedder clients without a provider or environment."""
 
     def __init__(self) -> None:
+        """Create exact local clients for every release-evidence model."""
         self.clients = {
             alias: _RuntimeClient(alias)
             for alias in ("candidate-baseline", "candidate-economy", "embedder")
         }
 
     def snapshot(self, alias: str) -> tuple:
+        """Return the exact snapshot and capabilities for one alias."""
         return _snapshot(alias), _capabilities(alias)
 
     def resolve(self, alias: str) -> ResolvedModel:
+        """Resolve one alias without environment or provider access."""
         snapshot, capabilities = self.snapshot(alias)
         client = self.clients[alias]
         return ResolvedModel(
@@ -411,6 +422,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     telemetry_delivered: set[str] = set()
 
     def capture(_event, completion_id, _properties, *, root):  # noqa: ANN001, ANN202
+        """Record one local telemetry attempt with idempotent delivery."""
         assert root == tmp_path
         telemetry_attempts.append(completion_id)
         if completion_id in telemetry_delivered:
@@ -418,11 +430,12 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
         telemetry_delivered.add(completion_id)
         return True
 
-    monkeypatch.setattr("wmo.workflow.router.capture_completion_once", capture)
+    monkeypatch.setattr("wmo.optimize.router.composition.capture_completion_once", capture)
     crash_after_policy = True
     crash_after_report = True
 
     def checkpoint(phase: str) -> None:
+        """Inject one crash after each durable composition boundary."""
         nonlocal crash_after_policy, crash_after_report
         if phase == "policy_locked" and crash_after_policy:
             crash_after_policy = False
@@ -569,6 +582,7 @@ class _EvidenceReviewSupplier:
     """Persist one exact-revision approved rubric and sealed calibration."""
 
     def __init__(self, revision: str) -> None:
+        """Store the exact release revision used by review artifacts."""
         self.revision = revision
 
     def __call__(
@@ -577,6 +591,7 @@ class _EvidenceReviewSupplier:
         build: wmo.ProjectBuild,
         budget: RouterCompositionBudget,
     ) -> ApprovedRouterReview:
+        """Persist or replay one exact approved rubric and calibration."""
         del budget
         if "rubric-a" not in project.artifacts.list_ids():
             task_input = build.review.task_set

@@ -16,6 +16,13 @@ from wmo.common.models import (
 )
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.routing import ReservedFrozenEmbeddingSet, persist_router_embeddings
+from wmo.optimize.router.automatic_router_preflight import AutomaticRouterPreflight
+from wmo.optimize.router.manual_judge_artifacts import write_production_rollout
+from wmo.optimize.router.router_execution_contract import (
+    CandidateExecutionBinding,
+    RouterExecutionContract,
+    persist_router_execution_contract,
+)
 from wmo.runtime.models import CapabilityRequirement, RuntimeModelCatalog
 from wmo.runtime.router.capability import (
     RouterRuntimeCapabilityContract,
@@ -26,13 +33,6 @@ from wmo.runtime.router.capability import (
 from wmo.simulation.specs import (
     SimulationCompletionContract,
     persist_simulation_completion_contract,
-)
-from wmo.workflow.automatic_router_preflight import AutomaticRouterPreflight
-from wmo.workflow.manual_judge_artifacts import write_production_rollout
-from wmo.workflow.router_execution_contract import (
-    CandidateExecutionBinding,
-    RouterExecutionContract,
-    persist_router_execution_contract,
 )
 
 

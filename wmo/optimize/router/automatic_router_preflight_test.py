@@ -18,12 +18,12 @@ from wmo.common.models import (
 )
 from wmo.common.project import ProjectConfig, ProjectStore
 from wmo.common.routing import router_embedding_reservation
-from wmo.runtime.models import RuntimeModelCatalog
-from wmo.workflow.automatic_router_preflight import (
+from wmo.optimize.router.automatic_router_preflight import (
     AutomaticRouterPreflightError,
     preflight_automatic_router,
 )
-from wmo.workflow.automatic_router_reservations import remaining_simulation_budget
+from wmo.optimize.router.automatic_router_reservations import remaining_simulation_budget
+from wmo.runtime.models import RuntimeModelCatalog
 
 
 def test_preflight_aggregates_missing_inputs_before_credentials_or_writes(

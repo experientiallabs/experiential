@@ -96,7 +96,7 @@ def test_run_loads_once_and_can_only_bind_loopback(
         """
         served.append((value, host, port))
 
-    monkeypatch.setattr("wmo.runtime.router.application.load_project_router", load)
+    monkeypatch.setattr("wmo.optimize.router.activation.load_project_router", load)
     monkeypatch.setattr("wmo.runtime.router.application.create_project_completion_service", compose)
     monkeypatch.setattr("wmo.runtime.router.application.create_project_router_app", create)
     monkeypatch.setattr("uvicorn.run", serve)

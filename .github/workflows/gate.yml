@@ -41,7 +41,7 @@ jobs:
         run: >-
           uv run pytest -q
           --junitxml=w16-darwin-evidence.xml
-          wmo/workflow/router_evidence_test.py
+          wmo/optimize/router/composition_evidence_test.py
           wmo/simulation/comparison_evidence_test.py
       - name: Upload W16 Darwin evidence result
         if: always()

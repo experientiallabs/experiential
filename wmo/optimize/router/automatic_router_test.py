@@ -51,9 +51,34 @@ from wmo.common.project import (
 )
 from wmo.common.project.manifests import file_digest
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from wmo.optimize.router.activation import load_project_router
+from wmo.optimize.router.automatic_router import (
+    AutomaticRouterError,
+    AutomaticRouterOptions,
+    optimize_project_router,
+)
+from wmo.optimize.router.automatic_router_preflight import (
+    AutomaticRouterPreflightError,
+    preflight_automatic_router,
+)
+from wmo.optimize.router.automatic_router_replay import find_completed_automatic_router_replay
+from wmo.optimize.router.composition import FidelityApprovalDecision, RouterCompositionBudget
+from wmo.optimize.router.manual_judge import (
+    calibrate_manual_judge,
+    commit_manual_judge_setup,
+    estimate_manual_judge_budget,
+    prepare_manual_judge_calibration,
+    prepare_manual_judge_setup,
+)
+from wmo.optimize.router.manual_judge_artifacts import read_audit, write_audit, write_review_state
+from wmo.optimize.router.manual_judge_contracts import ManualJudgeLabel, ManualJudgeReviewState
+from wmo.optimize.router.router_attribution import (
+    RouterObservedAttributionSet,
+    persist_router_observed_attribution_set,
+)
 from wmo.runtime.agents import ChatAgentRuntime
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
-from wmo.runtime.router.application import RouterApplicationError, load_project_router
+from wmo.runtime.router.application import RouterApplicationError
 from wmo.simulation.build import build_project, select_completed_build
 from wmo.simulation.ingest.model_identity import (
     normalized_capabilities_sha256,
@@ -61,30 +86,6 @@ from wmo.simulation.ingest.model_identity import (
 )
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.mining.service import MiningSpec
-from wmo.workflow.automatic_router import (
-    AutomaticRouterError,
-    AutomaticRouterOptions,
-    optimize_project_router,
-)
-from wmo.workflow.automatic_router_preflight import (
-    AutomaticRouterPreflightError,
-    preflight_automatic_router,
-)
-from wmo.workflow.automatic_router_replay import find_completed_automatic_router_replay
-from wmo.workflow.manual_judge import (
-    calibrate_manual_judge,
-    commit_manual_judge_setup,
-    estimate_manual_judge_budget,
-    prepare_manual_judge_calibration,
-    prepare_manual_judge_setup,
-)
-from wmo.workflow.manual_judge_artifacts import read_audit, write_audit, write_review_state
-from wmo.workflow.manual_judge_contracts import ManualJudgeLabel, ManualJudgeReviewState
-from wmo.workflow.router import FidelityApprovalDecision, RouterCompositionBudget
-from wmo.workflow.router_attribution import (
-    RouterObservedAttributionSet,
-    persist_router_observed_attribution_set,
-)
 
 _TIME = datetime(2026, 8, 14, tzinfo=UTC)
 _REVISION = "a" * 40
@@ -492,7 +493,7 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
     changed_config = store.load_project().model_copy(
         update={
             "agent": AgentConfiguration(
-                factory="wmo.workflow.automatic_router_test:_custom_agent_factory",
+                factory="wmo.optimize.router.automatic_router_test:_custom_agent_factory",
                 code_revision="custom-agent-v1",
             )
         }
@@ -831,7 +832,7 @@ def test_completed_custom_agent_replay_does_not_import_or_construct_factory(
     store, catalog, state = _completed_project(
         tmp_path,
         agent=AgentConfiguration(
-            factory="wmo.workflow.automatic_router_test:_custom_agent_factory",
+            factory="wmo.optimize.router.automatic_router_test:_custom_agent_factory",
             code_revision="custom-agent-v1",
         ),
     )

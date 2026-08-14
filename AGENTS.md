@@ -27,8 +27,9 @@ uv run pytest -q
   pre-existing lint or type failures are grandfathered.
 - Production imports follow the approved dependency direction: common may not import runtime,
   simulation, optimize, or cli; runtime may not import simulation, optimize, or cli; simulation
-  may not import optimize or cli; optimize may not import simulation or cli. The AST gate rejects
-  every current forbidden edge directly.
+  may not import optimize or cli; optimize may not import cli. Optimize owns application
+  orchestration and may depend inward on common, runtime, and simulation. The AST gate rejects
+  every current forbidden edge directly and proves that the package graph is acyclic.
 - The root CLI command set is exact: `build`, `config`, `optimize`, and `run`;
   `wmo/cli/app_test.py` and the release tests enforce the current command and distribution shape.
 
@@ -86,9 +87,9 @@ uv run pytest -q
   in `wmo/runtime/environments/`, and sandbox simulation lives only in
   `wmo/simulation/engines/sandbox.py`. Agent-search and benchmark-scoring work belongs to the
   private `agent-optimization` repo; send it there.
-- `wmo/optimize/router/` owns provider-free offline fit, policy locking, held-out reporting, and
-  their immutable artifacts. Online selection belongs to `wmo/runtime/router/`; customer workflow
-  composition belongs to `wmo/workflow/router.py`. Keep those three boundaries explicit.
+- `wmo/optimize/router/` owns provider-free offline fit, policy locking, held-out reporting,
+  application composition, and their immutable artifacts. Online selection and provider execution
+  belong to `wmo/runtime/router/`. Keep those two boundaries explicit.
 - The root CLI is locked to `build`, `optimize`, `run`, and `config`. The optimize group is locked
   to `router` and `model`; the config group is locked to `telemetry` and `providers`. Widening any
   of those three sets, whether with a command, an alias, or a flag, is a deliberate change to the
@@ -137,8 +138,8 @@ uv run pytest -q
    has unrelated failures, record them and keep them out of the patch; fix them only when they are
    in scope or prevent meaningful validation.
 
-2. **Tests live inline, one test file per module.** `wmo/workflow/router.py` is tested by
-   `wmo/workflow/router_test.py`, next to it. Pytest is configured (`python_files =
+2. **Tests live inline, one test file per module.** `wmo/optimize/router/composition.py` is tested by
+   `wmo/optimize/router/composition_test.py`, next to it. Pytest is configured (`python_files =
    ["*_test.py"]`) to find these, and there is no top-level `tests/` directory.
 
    - Give every module a `_test.py` beside it.
@@ -151,13 +152,12 @@ uv run pytest -q
    JSON use `wmo.common.core.artifacts.JsonObject`, not `Any`.
 
 4. **Keep the structure coherent and the command surface intentional.** Agent execution is nested
-   under `wmo/runtime/`; evidence construction, simulation, and orchestration are nested under
-   `wmo/simulation/`; offline router fitting and SFT are nested under `wmo/optimize/`; public
-   workflow composition is under `wmo/workflow/`; shared contracts, model metadata, minimal
-   configuration, and product telemetry are under `wmo/common/`. Provider execution belongs under
-   `wmo/runtime/models/providers/`. Common code must not import a product domain, and runtime code
-   must not import simulation or optimization. Keep the locked CLI small, and give every production
-   module a domain subpackage rather than the flat `wmo/` namespace.
+   under `wmo/runtime/`; evidence construction and simulation are nested under `wmo/simulation/`;
+   router fitting, application orchestration, and SFT are nested under `wmo/optimize/`; shared
+   contracts, model metadata, minimal configuration, and product telemetry are under `wmo/common/`.
+   Provider execution belongs under `wmo/runtime/models/providers/`. Common, runtime, and simulation
+   must not import optimize. Keep the locked CLI small and do not return production modules to the
+   flat `wmo/` namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
    `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.

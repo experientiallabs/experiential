@@ -53,11 +53,16 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "wmo/runtime/router/application.py",
         "wmo/simulation/comparison.py",
         "wmo/simulation/engines/sandbox.py",
-        "wmo/workflow/router.py",
+        "wmo/optimize/router/composition.py",
     }
 )
 REQUIRED_SDIST_MEMBERS = frozenset(
-    {"README.md", "assets/wmo-workflow.png", "pyproject.toml", "wmo/workflow/router.py"}
+    {
+        "README.md",
+        "assets/wmo-workflow.png",
+        "pyproject.toml",
+        "wmo/optimize/router/composition.py",
+    }
 )
 _RELEASE_REVISION = "1" * 40
 
@@ -116,6 +121,9 @@ def _assert_current_archive_members(
         allow_tests: Whether test modules are valid archive members.
     """
     file_names = frozenset(name for name in names if name and not name.endswith("/"))
+    removed_package = PurePosixPath("wmo", "workflow").as_posix() + "/"
+    removed_members = sorted(name for name in file_names if name.startswith(removed_package))
+    assert not removed_members, f"archive contains removed package: {removed_members}"
     assert required.issubset(file_names), (
         f"archive is missing current members: {required - file_names}"
     )
@@ -345,6 +353,7 @@ def _installed_release_driver() -> None:
         prepare_runtime_sft_model_optimization,
     )
     from wmo.optimize.model.sft.selection import load_latest_sft_model_optimization
+    from wmo.optimize.router.manual_judge import prepare_manual_judge_calibration
     from wmo.runtime.models import CapabilityRequirement, RuntimeModelCatalog
     from wmo.runtime.router import (
         RuntimeAcceptedEvent,
@@ -356,7 +365,6 @@ def _installed_release_driver() -> None:
         load_completed_build_rag_lineage_bindings,
         refresh_runtime_trace_rag,
     )
-    from wmo.workflow.manual_judge import prepare_manual_judge_calibration
 
     execution_root = Path.cwd().resolve()
     source_checkout = Path(os.environ["WMO_SOURCE_CHECKOUT"]).resolve()

@@ -19,18 +19,18 @@ from wmo.common.models import (
 )
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.routing import KnnRouterPolicy
+from wmo.optimize.router.activation import load_project_router
+from wmo.optimize.router.automatic_router import AutomaticRouterOptions
+from wmo.optimize.router.automatic_router_preflight import AutomaticRouterPreflight
+from wmo.optimize.router.composition import FidelityApprovalReceipt, RouterPolicyLock
 from wmo.optimize.router.report import HeldOutRouterReport
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
-from wmo.runtime.router.application import load_project_router
-from wmo.simulation.specs import SimulationSpec
-from wmo.workflow.automatic_router import AutomaticRouterOptions
-from wmo.workflow.automatic_router_preflight import AutomaticRouterPreflight
-from wmo.workflow.router import FidelityApprovalReceipt, RouterPolicyLock
-from wmo.workflow.router_attribution import load_router_observed_attribution_set
-from wmo.workflow.router_execution_contract import (
+from wmo.optimize.router.router_attribution import load_router_observed_attribution_set
+from wmo.optimize.router.router_execution_contract import (
     RouterExecutionContract,
     load_router_execution_contract,
 )
+from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.simulation.specs import SimulationSpec
 
 
 class AutomaticRouterReplayError(ValueError):

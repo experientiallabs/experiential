@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 
 from wmo.common.rollouts import RolloutArtifact, RolloutEventKind
-from wmo.workflow.errors import RouterCompositionError
+from wmo.optimize.router.errors import RouterCompositionError
 
 
 def observed_rollout_spend(rollout: RolloutArtifact) -> float:

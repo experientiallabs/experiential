@@ -15,8 +15,9 @@ FORBIDDEN_IMPORTS = {
     "common": frozenset({"runtime", "simulation", "optimize", "cli"}),
     "runtime": frozenset({"simulation", "optimize", "cli"}),
     "simulation": frozenset({"optimize", "cli"}),
-    "optimize": frozenset({"simulation", "cli"}),
+    "optimize": frozenset({"cli"}),
 }
+PACKAGE_ORDER = {"common": 0, "runtime": 1, "simulation": 2, "optimize": 3, "cli": 4}
 
 
 def _module_name(path: Path) -> str:
@@ -134,6 +135,25 @@ def _violations(path: Path, source: str) -> frozenset[tuple[str, str]]:
     return frozenset(violations)
 
 
+def _production_edges() -> frozenset[tuple[str, str]]:
+    """Return current cross-package production import edges."""
+    edges: set[tuple[str, str]] = set()
+    for path in WMO_DIR.rglob("*.py"):
+        if path.name.endswith("_test.py") or path.name == "conftest.py":
+            continue
+        owner_parts = _module_name(path).split(".")
+        if len(owner_parts) < 2 or owner_parts[0] != "wmo":
+            continue
+        owner = owner_parts[1]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for target in _import_targets(tree, _module_package(path)):
+            parts = target.split(".")
+            if len(parts) >= 2 and parts[0] == "wmo" and parts[1] != owner:
+                if owner in PACKAGE_ORDER and parts[1] in PACKAGE_ORDER:
+                    edges.add((owner, parts[1]))
+    return frozenset(edges)
+
+
 def test_production_imports_follow_dependency_direction() -> None:
     """Current production code has no outward package dependency edge."""
     violations: set[tuple[str, str]] = set()
@@ -142,6 +162,14 @@ def test_production_imports_follow_dependency_direction() -> None:
             continue
         violations.update(_violations(path, path.read_text(encoding="utf-8")))
     assert not violations, f"forbidden production imports: {sorted(violations)}"
+
+
+def test_production_package_graph_is_acyclic() -> None:
+    """Every cross-package edge points inward in the strict ownership order."""
+    outward = {
+        edge for edge in _production_edges() if PACKAGE_ORDER[edge[1]] >= PACKAGE_ORDER[edge[0]]
+    }
+    assert not outward, f"outward or cyclic production imports: {sorted(outward)}"
 
 
 def test_every_forbidden_direction_is_detected() -> None:

@@ -21,9 +21,9 @@ from wmo.common.models import (
 )
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact
+from wmo.optimize.router.manual_judge_contracts import ManualJudgeError, ManualJudgeSetupArtifact
+from wmo.optimize.router.manual_judge_protocol import TemplateJudgeClient
 from wmo.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
-from wmo.workflow.manual_judge_contracts import ManualJudgeError, ManualJudgeSetupArtifact
-from wmo.workflow.manual_judge_protocol import TemplateJudgeClient
 
 
 class ReservedJudgeClient:

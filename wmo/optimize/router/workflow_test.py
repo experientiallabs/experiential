@@ -43,13 +43,13 @@ from wmo.common.routing import (
     KnnGuard,
     RouterFeatureExtractor,
 )
+from wmo.optimize.router.activation import load_project_router
 from wmo.optimize.router.workflow import (
     EvaluationInputs,
     RouterOptimizationConfig,
     optimize_router,
 )
 from wmo.runtime.models import RuntimeModelCatalog
-from wmo.runtime.router.application import load_project_router
 from wmo.runtime.router.runtime_test import _Catalog, _Client, _request, _snapshot
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
@@ -73,6 +73,7 @@ def test_single_workflow_freezes_before_held_out_and_resumes_exactly(
     opened: list[tuple[str, ...]] = []
 
     def checked_build(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202 - local seam
+        """Record evaluation purposes and enforce policy-first held-out replay."""
         purposes = tuple(kwargs["purposes"])
         if purposes == ("held_out",):
             assert any(

@@ -6,7 +6,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-from wmo.cli.router_candidate_setup import RouterCandidateSetupPlan
 from wmo.common.core.artifacts import stable_id
 from wmo.common.evaluations import EvaluationPlan, EvaluationProtocol
 from wmo.common.models import (
@@ -15,6 +14,26 @@ from wmo.common.models import (
 )
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.routing import KnnGuard
+from wmo.optimize.router.automatic_router_artifacts import (
+    AutomaticRouterArtifacts,
+    materialize_automatic_router_artifacts,
+)
+from wmo.optimize.router.automatic_router_judge import AutomaticRouterJudge, ReservedJudgeClient
+from wmo.optimize.router.automatic_router_preflight import (
+    AutomaticRouterPreflight,
+    preflight_automatic_router,
+)
+from wmo.optimize.router.composition import (
+    ApprovedRouterReview,
+    FidelityApproval,
+    RouterCandidateSetupPlan,
+    RouterCompositionBudget,
+    RouterCompositionResult,
+    RouterEvaluationSetup,
+    RouterWorkflowServices,
+    compose_router,
+)
+from wmo.optimize.router.router_attribution import persist_router_observed_attribution_set
 from wmo.runtime.agents import (
     AgentFactory,
     preflight_agent_factory,
@@ -31,25 +50,6 @@ from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.retrieval import RAGEmbedderBinding, load_fit_rag_retriever
 from wmo.simulation.specs import WorldModelSettings
 from wmo.simulation.world_model import bind_fit_grounded_world_model
-from wmo.workflow.automatic_router_artifacts import (
-    AutomaticRouterArtifacts,
-    materialize_automatic_router_artifacts,
-)
-from wmo.workflow.automatic_router_judge import AutomaticRouterJudge, ReservedJudgeClient
-from wmo.workflow.automatic_router_preflight import (
-    AutomaticRouterPreflight,
-    preflight_automatic_router,
-)
-from wmo.workflow.router import (
-    ApprovedRouterReview,
-    FidelityApproval,
-    RouterCompositionBudget,
-    RouterCompositionResult,
-    RouterEvaluationSetup,
-    RouterWorkflowServices,
-    compose_router,
-)
-from wmo.workflow.router_attribution import persist_router_observed_attribution_set
 
 
 class AutomaticRouterError(ValueError):

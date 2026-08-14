@@ -65,7 +65,7 @@ jobs:
           from wmo.runtime.router import RouterRuntime, create_project_router_app
           from wmo.simulation import compare_text_and_sandbox
           from wmo.simulation.engines import SandboxSimulator
-          from wmo.workflow import RouterCompositionResult
+          from wmo.optimize.router import RouterCompositionResult
           from wmo.simulation import SimulationSpec
 
           assert callable(wmo.compose_router)

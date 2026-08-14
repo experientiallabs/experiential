@@ -17,20 +17,20 @@ from wmo.common.models import ProviderModelSelection, load_model_catalog
 from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.project import ProjectStore
 from wmo.common.release_revision import installed_release_revision
-from wmo.runtime.models import RuntimeModelCatalog
-from wmo.workflow.automatic_router import (
+from wmo.optimize.router.automatic_router import (
     AutomaticRouterOptions,
     optimize_project_router,
 )
-from wmo.workflow.automatic_router_preflight import (
+from wmo.optimize.router.automatic_router_preflight import (
     AutomaticRouterPreflight,
     preflight_automatic_router,
 )
-from wmo.workflow.automatic_router_replay import find_completed_automatic_router_replay
-from wmo.workflow.router import (
+from wmo.optimize.router.automatic_router_replay import find_completed_automatic_router_replay
+from wmo.optimize.router.composition import (
     FidelityApprovalDecision,
     RouterCompositionBudget,
 )
+from wmo.runtime.models import RuntimeModelCatalog
 
 _console = Console()
 _ROOT_OPTION = typer.Option(Path(".wmo"), "--root", help="Local .wmo project root.")

@@ -5,8 +5,8 @@ from __future__ import annotations
 from wmo.common.core.artifacts import ArtifactId, ArtifactInput
 from wmo.common.evaluations import EvaluationProtocol
 from wmo.common.project import ProjectBuildArtifacts
-from wmo.workflow.completed_build import verify_completed_grounding_inputs
-from wmo.workflow.errors import RouterCompositionError
+from wmo.optimize.router.completed_build import verify_completed_grounding_inputs
+from wmo.optimize.router.errors import RouterCompositionError
 
 
 def verify_router_evaluation_setup(

@@ -10,8 +10,8 @@ from wmo.common.models import (
     ModelSnapshot,
     completion_cost_reservation,
 )
+from wmo.optimize.router.automatic_router_judge import ReservedJudgeClient
 from wmo.runtime.models.providers.openai import openai_responses_response
-from wmo.workflow.automatic_router_judge import ReservedJudgeClient
 
 
 class _Client:

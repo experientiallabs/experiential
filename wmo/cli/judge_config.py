@@ -16,8 +16,7 @@ from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import load_model_catalog
 from wmo.common.project import ProjectStore
 from wmo.common.release_revision import installed_release_revision
-from wmo.runtime.models.registry import RuntimeModelCatalog
-from wmo.workflow.manual_judge import (
+from wmo.optimize.router.manual_judge import (
     DEFAULT_JUDGE_TEMPLATE,
     ManualJudgeError,
     ManualJudgeSetupPlan,
@@ -27,13 +26,14 @@ from wmo.workflow.manual_judge import (
     prepare_manual_judge_calibration,
     prepare_manual_judge_setup,
 )
-from wmo.workflow.manual_judge_contracts import (
+from wmo.optimize.router.manual_judge_contracts import (
     JudgePromptTemplate,
     JudgeTracePreview,
     ManualJudgeCalibrationResult,
     ManualJudgeLabel,
     ManualJudgeSetupArtifact,
 )
+from wmo.runtime.models.registry import RuntimeModelCatalog
 
 judge_app = typer.Typer(help="Set up and manually calibrate a project judge.", no_args_is_help=True)
 _console = Console()

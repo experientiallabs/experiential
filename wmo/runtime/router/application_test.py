@@ -22,6 +22,7 @@ from wmo.common.routing import RoutingDecision
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.application import (
     RouterApplicationError,
+    RouterPolicyVerifier,
     create_project_completion_service,
     create_project_router_app,
     load_router,
@@ -203,9 +204,10 @@ def test_ghost_router_dispatches_without_durable_traffic(
         environment: Mapping[str, str] | None = None,
         runtime_catalog: RuntimeModelCatalog | None = None,
         decision_sink: DecisionSink | None = None,
+        policy_verifier: RouterPolicyVerifier | None = None,
     ) -> RouterRuntime:
         """Return the already verified runtime without reconstructing providers."""
-        del policy_id, environment, runtime_catalog, decision_sink
+        del policy_id, environment, runtime_catalog, decision_sink, policy_verifier
         return runtime
 
     monkeypatch.setattr(
@@ -335,6 +337,7 @@ def test_load_router_preserves_runtime_selection_parameters(
         environment: Mapping[str, str] | None,
         runtime_catalog: RuntimeModelCatalog | None,
         decision_sink: DecisionSink | None,
+        policy_verifier: RouterPolicyVerifier | None,
     ) -> RouterRuntime:
         """Capture the complete runtime selection call.
 
@@ -345,10 +348,12 @@ def test_load_router_preserves_runtime_selection_parameters(
             environment: Explicit credential environment mapping.
             runtime_catalog: Explicit runtime catalog override.
             decision_sink: Explicit routing-decision sink.
+            policy_verifier: Optional optimizer-owned automatic-policy verifier.
 
         Returns:
             Provider-idle runtime fixture.
         """
+        assert policy_verifier is None
         calls.append(
             (project, selected_root, policy_id, environment, runtime_catalog, decision_sink)
         )

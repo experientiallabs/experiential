@@ -6,9 +6,9 @@ from datetime import datetime
 
 from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.project import ProjectBuildArtifacts, ProjectStore, artifact_input
+from wmo.optimize.router.errors import RouterCompositionError
 from wmo.simulation.build import BuildReviewReadiness, ProjectBuild, build_project
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
-from wmo.workflow.errors import RouterCompositionError
 
 
 def completed_project_build(project: ProjectStore) -> ProjectBuildArtifacts:

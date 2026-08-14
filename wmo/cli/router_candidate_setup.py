@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
 import typer
@@ -17,16 +16,7 @@ from wmo.common.models import (
     completion_candidate_aliases,
     validate_router_candidate_selection,
 )
-
-
-@dataclass(frozen=True)
-class RouterCandidateSetupPlan:
-    """Confirmed candidate roles paired with the catalog state shown to the operator."""
-
-    selection: RouterCandidateSelection
-    candidate_models: tuple[ProviderModelSelection, ...]
-    prospective_catalog: ModelCatalog
-    expected_catalog_sha256: str
+from wmo.optimize.router.composition import RouterCandidateSetupPlan
 
 
 def collect_router_candidate_setup(

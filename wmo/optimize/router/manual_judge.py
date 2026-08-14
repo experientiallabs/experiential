@@ -31,10 +31,7 @@ from wmo.common.models import (
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, load_trace_dataset
-from wmo.runtime.models.providers.retry import RetryPolicy
-from wmo.runtime.models.registry import RuntimeModelCatalog
-from wmo.simulation.build import BuildReviewReadiness
-from wmo.workflow.manual_judge_artifacts import (
+from wmo.optimize.router.manual_judge_artifacts import (
     coordinate_manual_judge_calibration,
     coordinate_manual_judge_setup,
     find_provisional_calibration,
@@ -43,13 +40,13 @@ from wmo.workflow.manual_judge_artifacts import (
     write_production_rollout,
     write_review_state,
 )
-from wmo.workflow.manual_judge_artifacts import (
+from wmo.optimize.router.manual_judge_artifacts import (
     load_build_review as _load_build_review,
 )
-from wmo.workflow.manual_judge_artifacts import (
+from wmo.optimize.router.manual_judge_artifacts import (
     require_exact_build_inputs as _require_exact_build_inputs,
 )
-from wmo.workflow.manual_judge_contracts import (
+from wmo.optimize.router.manual_judge_contracts import (
     JudgeCalibrationBudget,
     JudgePromptTemplate,
     JudgeRunEvidence,
@@ -61,14 +58,17 @@ from wmo.workflow.manual_judge_contracts import (
     ManualJudgeSetupArtifact,
     judge_feedback_schema,
 )
-from wmo.workflow.manual_judge_protocol import TemplateJudgeClient, positional_bias_count
-from wmo.workflow.manual_judge_selection import (
+from wmo.optimize.router.manual_judge_protocol import TemplateJudgeClient, positional_bias_count
+from wmo.optimize.router.manual_judge_selection import (
     pairwise_references,
     read_rollout,
     representative_pairs,
     representative_pairwise_pairs,
     trace_preview,
 )
+from wmo.runtime.models.providers.retry import RetryPolicy
+from wmo.runtime.models.registry import RuntimeModelCatalog
+from wmo.simulation.build import BuildReviewReadiness
 
 _PROMPT_TEXT = (
     "Evaluate the supplied rollout against every rubric dimension. Use only evidence in the "

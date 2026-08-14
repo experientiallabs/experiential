@@ -7,11 +7,13 @@ import sys
 from inspect import signature
 
 import wmo
+import wmo.cli.router_app as router_cli
+from wmo.optimize.router import automatic_router
+from wmo.optimize.router.activation import load_project_router, load_router
+from wmo.optimize.router.composition import compose_router
 from wmo.optimize.router.workflow import fit_router, optimize_router, report_router
 from wmo.runtime.router.application import (
     create_project_router_app,
-    load_project_router,
-    load_router,
 )
 from wmo.runtime.router.runtime import RouterRuntime
 from wmo.simulation.build import build_project
@@ -24,7 +26,6 @@ from wmo.simulation.world_model.application import (
     WorldModelSessionLimits,
     load_world_model,
 )
-from wmo.workflow.router import compose_router
 
 
 def test_public_api_matches_quickstart() -> None:
@@ -39,6 +40,8 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.report_router is report_router
     assert wmo.RouterRuntime is RouterRuntime
     assert wmo.compose_router is compose_router
+    assert automatic_router.compose_router is compose_router
+    assert router_cli.optimize_project_router is automatic_router.optimize_project_router
     assert wmo.load_project_router is load_project_router
     assert wmo.load_router is load_router
     assert "ghost" in signature(wmo.load_router).parameters

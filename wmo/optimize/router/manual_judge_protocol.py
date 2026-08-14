@@ -29,7 +29,7 @@ from wmo.common.models import (
 )
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact
-from wmo.workflow.manual_judge_contracts import (
+from wmo.optimize.router.manual_judge_contracts import (
     JudgePromptTemplate,
     JudgeProtocolProbeArtifact,
     ManualJudgeError,
