@@ -3,7 +3,7 @@
 """`wmo optimize`: the one switch over the product optimizers.
 
 The group is exactly two commands: `router` (the guarded offline kNN path) and
-`model` (offline SFT from persisted artifacts). This module owns the switch only,
+`model` (automatic routed-interaction SFT). This module owns the switch only,
 so no optimization logic lives here.
 """
 
@@ -24,5 +24,5 @@ optimize_app.command(
     help="Optimize a guarded router automatically from one completed project build.",
 )(router)
 optimize_app.command(
-    "model", help="Run W13 Tinker SFT from an explicit persisted W12 dataset configuration."
+    "model", help="Build routed interactions into W12 and run bounded W13 Tinker SFT."
 )(optimize_model)

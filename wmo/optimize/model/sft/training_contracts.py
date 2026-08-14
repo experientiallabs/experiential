@@ -50,13 +50,57 @@ class TinkerSFTSpec(ContractModel):
     maximum_steps: int | None = Field(default=None, gt=0)
     maximum_datum_tokens: int | None = Field(default=None, gt=1)
     maximum_cost_usd: float | None = Field(default=None, gt=0)
+    training_usd_per_million_tokens: float | None = Field(default=None, ge=0)
 
-    @field_validator("learning_rate", "maximum_cost_usd")
+    @field_validator(
+        "learning_rate",
+        "maximum_cost_usd",
+        "training_usd_per_million_tokens",
+    )
     @classmethod
     def _require_finite_float(cls, value: float | None) -> float | None:
+        """Reject nonfinite prices, caps, and learning rates.
+
+        Args:
+            value: Optional numeric setting validated by Pydantic.
+
+        Returns:
+            The unchanged finite value or ``None``.
+
+        Raises:
+            ValueError: ``value`` is nonfinite.
+        """
         if value is not None and not math.isfinite(value):
             raise ValueError("Tinker SFT numeric settings must be finite")
         return value
+
+
+def conservative_training_step_cost(
+    spec: TinkerSFTSpec, *, batch_example_count: int
+) -> NumericMeasurement | None:
+    """Bound one logical training step from explicit price and maximum token settings.
+
+    Args:
+        spec: Frozen settings containing a caller-confirmed price and per-datum token ceiling.
+        batch_example_count: Exact positive number of examples scheduled for the step.
+
+    Returns:
+        The maximum caller-priced cost for the step, or ``None`` when price or token ceiling is
+        unknown.
+
+    Raises:
+        ValueError: ``batch_example_count`` is not positive.
+    """
+    if batch_example_count <= 0:
+        raise ValueError("batch_example_count must be positive")
+    price = spec.training_usd_per_million_tokens
+    maximum_tokens = spec.maximum_datum_tokens
+    if price is None or maximum_tokens is None:
+        return None
+    return NumericMeasurement(
+        value=price * maximum_tokens * batch_example_count / 1_000_000,
+        provenance="estimated",
+    )
 
 
 class TrainerBatchResult(ContractModel):
@@ -70,6 +114,17 @@ class TrainerBatchResult(ContractModel):
     @field_validator("loss", "gradient_norm")
     @classmethod
     def _require_finite_metric(cls, value: float | None) -> float | None:
+        """Reject nonfinite backend loss or gradient observations.
+
+        Args:
+            value: Optional backend metric validated by Pydantic.
+
+        Returns:
+            The unchanged finite value or ``None``.
+
+        Raises:
+            ValueError: ``value`` is nonfinite.
+        """
         if value is not None and not math.isfinite(value):
             raise ValueError("Tinker SFT backend metrics must be finite")
         return value
@@ -138,6 +193,14 @@ class TinkerSFTRunManifest(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_exact_dataset_and_spec_bindings(self) -> TinkerSFTRunManifest:
+        """Verify the run identity binds the exact dataset and training settings.
+
+        Returns:
+            This verified immutable run manifest.
+
+        Raises:
+            ValueError: Any input, digest, or content-addressed identity differs.
+        """
         expected_inputs = (
             ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_manifest_sha256),
         )
@@ -181,6 +244,17 @@ class TinkerSFTMetric(ContractModel):
     @field_validator("loss", "gradient_norm")
     @classmethod
     def _require_finite_metric(cls, value: float | None) -> float | None:
+        """Reject nonfinite persisted loss or gradient observations.
+
+        Args:
+            value: Optional metric validated by Pydantic.
+
+        Returns:
+            The unchanged finite value or ``None``.
+
+        Raises:
+            ValueError: ``value`` is nonfinite.
+        """
         if value is not None and not math.isfinite(value):
             raise ValueError("Tinker SFT metrics must be finite")
         return value
@@ -257,6 +331,14 @@ class TinkerSFTModelArtifact(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_exact_dataset_binding(self) -> TinkerSFTModelArtifact:
+        """Verify the terminal model binds its dataset and provider handle.
+
+        Returns:
+            This verified immutable model artifact.
+
+        Raises:
+            ValueError: Inputs or content-addressed model identity differ.
+        """
         expected_inputs = (
             ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_manifest_sha256),
         )
@@ -294,6 +376,14 @@ class TinkerSFTResult(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_exact_terminal_inputs(self) -> TinkerSFTResult:
+        """Verify the terminal result binds its exact dataset and model artifacts.
+
+        Returns:
+            This verified immutable result artifact.
+
+        Raises:
+            ValueError: Inputs or content-addressed result identity differ.
+        """
         expected_inputs = tuple(
             sorted(
                 (

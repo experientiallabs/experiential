@@ -92,6 +92,10 @@ from wmo.common.project import (
 from wmo.optimize.model.sft.builder import SFTBuildError, load_verified_sft_dataset
 from wmo.optimize.model.sft.contracts import PartitionedSFTExample
 from wmo.optimize.model.sft.provider_resources import validate_provider_resource_id
+from wmo.optimize.model.sft.selection import (
+    SFTModelOptimizationSelectionError,
+    require_selected_sft_model_optimization_config,
+)
 from wmo.optimize.model.sft.training import TinkerSFTOptimizer, train_tinker_sft
 from wmo.optimize.model.sft.training_contracts import (
     TinkerSFTError,
@@ -292,13 +296,19 @@ def create_sft_model_optimization_config(
 
 
 def write_sft_model_optimization_config(
-    store: ProjectStore, config: SFTModelOptimizationConfig
+    store: ProjectStore,
+    config: SFTModelOptimizationConfig,
+    *,
+    bind_project: bool = True,
 ) -> SFTModelOptimizationConfig:
-    """Persist W14M intent and bind its ID to the project exactly once.
+    """Persist W14M intent and optionally establish the bootstrap project binding.
 
     Args:
         store: Project store that owns the config artifact and project pointer.
         config: Immutable config produced by ``create_sft_model_optimization_config``.
+        bind_project: Whether to establish or verify the project's bootstrap config binding.
+            Automatic journal composition persists later immutable configs with this disabled,
+            then advances the separately verified latest pointer.
 
     Returns:
         The persisted config.
@@ -316,23 +326,26 @@ def write_sft_model_optimization_config(
         )
     except ArtifactAlreadyExistsError:
         existing, stored = _load_sft_model_optimization_config_artifact(store, config.config_id)
-        if existing != config:
+        replay = config.model_copy(update={"created_at": existing.created_at})
+        if existing != replay:
             raise SFTModelOptimizationError(
                 "existing SFT model optimization config does not match its content-addressed ID"
             ) from None
+        config = existing
         config_manifest = stored.manifest
     except (ArtifactCorruptionError, ValueError) as exc:
         raise SFTModelOptimizationError(
             f"cannot persist SFT model optimization config {config.config_id}: {exc}"
         ) from exc
-    try:
-        store.bind_model_optimization_config(
-            artifact_input(config_manifest), artifact_type=_CONFIG_ARTIFACT_TYPE
-        )
-    except ProjectStoreError as exc:
-        raise SFTModelOptimizationError(
-            f"cannot bind SFT model optimization config to the project: {exc}"
-        ) from exc
+    if bind_project:
+        try:
+            store.bind_model_optimization_config(
+                artifact_input(config_manifest), artifact_type=_CONFIG_ARTIFACT_TYPE
+            )
+        except ProjectStoreError as exc:
+            raise SFTModelOptimizationError(
+                f"cannot bind SFT model optimization config to the project: {exc}"
+            ) from exc
     return config
 
 
@@ -353,23 +366,9 @@ def load_sft_model_optimization_config(
     """
     config, manifest = _load_sft_model_optimization_config_artifact(store, config_id)
     try:
-        bound = store.load_project().model_optimization_config
-    except ProjectStoreError as exc:
-        raise SFTModelOptimizationError(
-            f"cannot load project binding for SFT model optimization config {config_id}: {exc}"
-        ) from exc
-    if bound is None:
-        raise SFTModelOptimizationError(
-            "project has no immutable SFT model optimization config artifact binding"
-        )
-    if bound.artifact_id != config_id:
-        raise SFTModelOptimizationError(
-            "requested SFT model optimization config is not the project-bound config artifact"
-        )
-    if bound != artifact_input(manifest.manifest):
-        raise SFTModelOptimizationError(
-            "project SFT model optimization binding does not match the config artifact manifest"
-        )
+        require_selected_sft_model_optimization_config(store, artifact_input(manifest.manifest))
+    except SFTModelOptimizationSelectionError as exc:
+        raise SFTModelOptimizationError(str(exc)) from exc
     return config
 
 

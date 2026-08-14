@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 from wmo.common.core.artifacts import canonical_json_bytes
-from wmo.common.models import AssistantAction, ToolCall
+from wmo.common.models import AssistantAction, NumericMeasurement, ToolCall
 from wmo.optimize.model.sft.contracts import (
     AssistantActionEvent,
     SFTExample,
@@ -26,6 +26,7 @@ from wmo.optimize.model.sft.training_contracts import (
     TrainerBatchResult,
     TrainerDatum,
     TrainerSession,
+    conservative_training_step_cost,
 )
 
 if TYPE_CHECKING:
@@ -92,17 +93,25 @@ class TinkerTrainerBackend:
         """
         self._service = service
 
-    def conservative_step_cost(self, spec: TinkerSFTSpec, *, batch_example_count: int) -> None:
-        """Return no cost bound because the pinned SDK exposes no supported estimator.
+    def conservative_step_cost(
+        self, spec: TinkerSFTSpec, *, batch_example_count: int
+    ) -> NumericMeasurement | None:
+        """Bound one logical training step from explicit price and maximum token settings.
 
         Args:
-            spec: Frozen training settings, unused because no SDK estimate exists.
-            batch_example_count: Planned row count, also insufficient for an SDK-backed bound.
+            spec: Frozen training settings containing the caller-confirmed token price and datum
+                token ceiling.
+            batch_example_count: Exact number of examples scheduled for this logical step.
 
         Returns:
-            None. A run with ``maximum_cost_usd`` therefore fails before opening this backend.
+            A conservative caller-priced bound, or ``None`` when either required setting is
+            unknown. Each logical step has one durable pre-dispatch intent, so a failed or
+            ambiguous dispatch cannot be retried as another billable step.
         """
-        return None
+        return conservative_training_step_cost(
+            spec,
+            batch_example_count=batch_example_count,
+        )
 
     def open(self, spec: TinkerSFTSpec, resume_state_path: str | None) -> TrainerSession:
         """Create a managed LoRA client and restore a durable state before rendering any datum.

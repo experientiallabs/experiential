@@ -699,6 +699,45 @@ def _build(
     )
 
 
+def test_default_build_spec_reloads_and_rebuilds_without_identity_drift(tmp_path: Path) -> None:
+    """Preserve the canonical default W12 spec and artifact identity across all-train support.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+    """
+    store = _store(tmp_path)
+    source = _write_production_source(store, "default-spec-compatibility")
+    pre_change_payload = {
+        "held_out_fraction": 0.2,
+        "representative_sample_count": 3,
+        "split_salt": "wmo-sft-split-v1",
+    }
+    spec = SFTBuildSpec.model_validate(pre_change_payload)
+    first = build_sft_dataset(
+        store=store,
+        production_sources=(source,),
+        teacher_sources=(),
+        spec=spec,
+        created_at=_TIME,
+        code_revision="w12-default-compatibility-test",
+    )
+    write_sft_dataset(store, first)
+    loaded = load_sft_dataset(store, first.dataset.dataset_id)
+    rebuilt = build_sft_dataset(
+        store=store,
+        production_sources=(source,),
+        teacher_sources=(),
+        spec=spec,
+        created_at=_TIME,
+        code_revision="w12-default-compatibility-test",
+    )
+
+    assert spec.model_dump(mode="json", exclude_none=False) == pre_change_payload
+    assert loaded.build_spec == spec
+    assert rebuilt.dataset.dataset_id == first.dataset.dataset_id
+    assert rebuilt.dataset.build_sha256 == first.dataset.build_sha256
+
+
 def test_store_backed_sources_hydrate_transcripts_and_preserve_full_actions(tmp_path: Path) -> None:
     """Production and teacher rows come from verified evidence, not caller-owned transcripts."""
     store = _store(tmp_path)

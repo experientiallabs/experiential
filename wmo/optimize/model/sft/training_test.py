@@ -56,9 +56,18 @@ class _FakeSession:
     """Record deterministic training calls without creating a Tinker client."""
 
     def __init__(self, backend: _FakeBackend) -> None:
+        """Bind the shared fake backend call journal."""
         self._backend = backend
 
     def render_examples(self, examples: Sequence[SFTExample]) -> tuple[_FakeDatum, ...]:
+        """Render deterministic datum identities and supervised-token counts.
+
+        Args:
+            examples: Frozen W12 examples supplied to the trainer.
+
+        Returns:
+            One fake datum for each example in the original order.
+        """
         self._backend.rendered_example_ids.extend(example.example_id for example in examples)
         return tuple(
             _FakeDatum(example_id=example.example_id, supervised_token_count=index + 3)
@@ -68,6 +77,19 @@ class _FakeSession:
     def train_batch(
         self, datums: Sequence[TrainerDatum], *, learning_rate: float
     ) -> TrainerBatchResult:
+        """Record one batch and return deterministic metrics or an injected failure.
+
+        Args:
+            datums: Rendered examples scheduled for this optimizer step.
+            learning_rate: Frozen learning rate accepted by the backend seam.
+
+        Returns:
+            Deterministic loss, gradient, and observed cost facts.
+
+        Raises:
+            RuntimeError: The configured failure boundary is reached.
+        """
+        del learning_rate
         self._backend.train_calls += 1
         if self._backend.fail_on_train_call == self._backend.train_calls:
             raise RuntimeError("injected training failure")
@@ -85,10 +107,26 @@ class _FakeSession:
         return result
 
     def save_state(self, checkpoint_name: str) -> str:
+        """Record a checkpoint request and return its deterministic provider handle.
+
+        Args:
+            checkpoint_name: Stable checkpoint name selected by the trainer.
+
+        Returns:
+            Configured or derived fake provider state handle.
+        """
         self._backend.saved_state_names.append(checkpoint_name)
         return self._backend.state_resource or f"fake://state/{checkpoint_name}"
 
     def save_sampling_handle(self, model_name: str) -> str:
+        """Record terminal model persistence and return a fake sampling handle.
+
+        Args:
+            model_name: Stable terminal model name selected by the trainer.
+
+        Returns:
+            Deterministic fake sampling handle.
+        """
         self._backend.saved_model_names.append(model_name)
         return f"fake://model/{model_name}"
 
@@ -106,6 +144,16 @@ class _FakeBackend:
         fail_on_cost_call: int | None = None,
         state_resource: str | None = None,
     ) -> None:
+        """Configure deterministic costs, failures, state, and empty call journals.
+
+        Args:
+            cost_per_batch: Observed cost returned after each completed batch.
+            conservative_cost_per_batch: Pre-dispatch upper bound, or ``None`` when unknown.
+            fail_on_train_call: Batch number that fails before a result is returned.
+            fail_after_train_call: Batch number that fails after simulated provider work.
+            fail_on_cost_call: Estimate call number that raises a planning failure.
+            state_resource: Optional fixed provider checkpoint handle.
+        """
         self.cost_per_batch = cost_per_batch
         self.conservative_cost_per_batch = conservative_cost_per_batch
         self.fail_on_train_call = fail_on_train_call
@@ -123,6 +171,19 @@ class _FakeBackend:
     def conservative_step_cost(
         self, spec: TinkerSFTSpec, *, batch_example_count: int
     ) -> NumericMeasurement | None:
+        """Return the configured batch bound or an injected planning failure.
+
+        Args:
+            spec: Frozen training settings accepted by the backend seam.
+            batch_example_count: Exact examples in the planned batch.
+
+        Returns:
+            Configured conservative measurement, or ``None`` when unknown.
+
+        Raises:
+            RuntimeError: The configured estimate failure boundary is reached.
+        """
+        del spec, batch_example_count
         self.cost_calls += 1
         if self.fail_on_cost_call == self.cost_calls:
             raise RuntimeError("injected pre-dispatch planning failure")
@@ -134,6 +195,16 @@ class _FakeBackend:
         )
 
     def open(self, spec: TinkerSFTSpec, resume_state_path: str | None) -> _FakeSession:
+        """Record the resume handle and return a session sharing this call journal.
+
+        Args:
+            spec: Frozen training settings accepted without provider access.
+            resume_state_path: Optional durable checkpoint handle.
+
+        Returns:
+            A deterministic fake training session.
+        """
+        del spec
         self.open_resume_paths.append(resume_state_path)
         return _FakeSession(self)
 
@@ -192,6 +263,7 @@ def _spec(**overrides: int | float | str | None) -> TinkerSFTSpec:
         "maximum_steps": None,
         "maximum_datum_tokens": 128,
         "maximum_cost_usd": None,
+        "training_usd_per_million_tokens": None,
     }
     return TinkerSFTSpec.model_validate(fields | overrides)
 

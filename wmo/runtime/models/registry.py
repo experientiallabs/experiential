@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
+from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     EmbeddingClient,
     ModelCapabilities,
@@ -145,6 +146,20 @@ class RuntimeModelCatalog:
             raise ModelConnectionError(f"unknown model alias {alias!r}")
         connection = self._catalog.connections[record.connection]
         snapshot, capabilities = self.snapshot(alias)
+        provenance = record.sft_provenance
+        if provenance is not None:
+            current_connection_sha256 = sha256_json(
+                {
+                    "provider": connection.provider,
+                    "base_url": connection.base_url,
+                    "api_key_env": connection.api_key_env,
+                }
+            )
+            if provenance.connection_config_sha256 != current_connection_sha256:
+                raise ModelConnectionError(
+                    f"trained model alias {alias!r} connection metadata drifted from its "
+                    "verified SFT provenance"
+                )
         api_key = read_connection_api_key(connection, environment=self._environment)
         provider = connection.provider
         if provider == "openai":

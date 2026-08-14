@@ -375,7 +375,7 @@ class SFTPartition(ContractModel):
 class SFTBuildSpec(ContractModel):
     """Deterministic controls persisted with one frozen SFT dataset build."""
 
-    held_out_fraction: float = Field(default=0.20, gt=0, lt=1)
+    held_out_fraction: float = Field(default=0.20, ge=0, lt=1)
     representative_sample_count: int = Field(default=3, ge=0)
     split_salt: str = Field(default="wmo-sft-split-v1", min_length=1, max_length=256)
 

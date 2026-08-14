@@ -143,6 +143,7 @@ class _DatumRenderer:
     """Return fixed local token and weight tensors without fetching a tokenizer or model."""
 
     def __init__(self) -> None:
+        """Initialize empty call journals for deterministic renderer assertions."""
         self.conversations: list[list[TinkerConversationMessage]] = []
         self.train_on_what: list[TrainOnWhat] = []
 
@@ -167,6 +168,7 @@ class _Future[ValueT]:
     """A synchronous local stand-in for the small Tinker future surface used by the adapter."""
 
     def __init__(self, value: ValueT) -> None:
+        """Store one already-computed local response."""
         self._value = value
 
     def result(self) -> ValueT:
@@ -178,6 +180,7 @@ class _TrainingClient:
     """Record local concrete training calls without creating a Tinker service session."""
 
     def __init__(self) -> None:
+        """Initialize empty forward, backward, and optimizer call journals."""
         self.forward_backward_calls: list[tuple[Sequence[tinker.Datum], str]] = []
         self.optim_steps: list[tinker.AdamParams] = []
 
@@ -315,6 +318,18 @@ def test_context_truncation_retains_the_complete_two_token_target() -> None:
     assert datum.datum.model_input.to_ints() == [11, 12]
     assert datum.datum.loss_fn_inputs["target_tokens"].data == [12, 13]
     assert datum.datum.loss_fn_inputs["weights"].data == [1.0, 1.0]
+
+
+def test_backend_cost_bound_uses_explicit_price_and_maximum_tokens() -> None:
+    """Calculate a model-specific full-datum bound without accessing the service client."""
+    backend = TinkerTrainerBackend(cast("tinker.ServiceClient", object()))
+    spec = _spec().model_copy(update={"training_usd_per_million_tokens": 250.0})
+
+    cost = backend.conservative_step_cost(spec, batch_example_count=3)
+
+    assert cost is not None
+    assert cost.value == 250.0 * 32 * 3 / 1_000_000
+    assert cost.provenance == "estimated"
 
 
 def test_datum_limit_rejects_instead_of_truncating_the_two_token_target() -> None:

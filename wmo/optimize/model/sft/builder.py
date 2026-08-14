@@ -567,7 +567,15 @@ def _scan_source_actions(
 def _build_partitions(
     scanned_actions: Sequence[_ScannedAction], spec: SFTBuildSpec
 ) -> tuple[dict[ArtifactId, Literal["train", "held_out"]], tuple[SFTPartition, ...]]:
-    """Union shared fingerprints, then split only complete leakage components."""
+    """Union shared fingerprints, then assign components by held-out fraction.
+
+    Args:
+        scanned_actions: Eligible targets with their lineage and normalized fingerprint identity.
+        spec: Frozen partition sizing and fingerprint contract.
+
+    Returns:
+        Per-lineage partition assignments and complete leakage components.
+    """
     group_ids = tuple(sorted({action.source.leakage_group_id for action in scanned_actions}))
     if not group_ids:
         return {}, ()
@@ -629,8 +637,16 @@ def _build_partitions(
 
 
 def _held_out_component_count(component_count: int, held_out_fraction: float) -> int:
-    """Choose a deterministic nonempty held-out component set when splitting is possible."""
-    if component_count < 2:
+    """Choose the deterministic held-out count, including an explicit all-train mode.
+
+    Args:
+        component_count: Number of complete leakage components eligible for partitioning.
+        held_out_fraction: Persisted fraction, where exactly zero explicitly selects all training.
+
+    Returns:
+        Held-out component count that preserves at least one training component.
+    """
+    if component_count < 2 or held_out_fraction == 0:
         return 0
     target = math.floor(component_count * held_out_fraction + 0.5)
     return min(component_count - 1, max(1, target))
