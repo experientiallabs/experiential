@@ -4,7 +4,6 @@ from typing import cast
 
 import pytest
 
-from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     AssistantAction,
     ModelCapabilities,
@@ -79,7 +78,9 @@ def test_selection_uses_an_eligible_frozen_candidate_before_dispatch() -> None:
         "embedder": ModelCapabilities(supports_embeddings=True),
     }
     snapshots = {
-        alias: snapshot.model_copy(update={"capabilities_sha256": sha256_json(capabilities[alias])})
+        alias: snapshot.model_copy(
+            update={"capabilities_sha256": capabilities[alias].identity_sha256()}
+        )
         for alias, snapshot in snapshots.items()
     }
     policy = policy.model_copy(
@@ -145,7 +146,9 @@ def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
         "embedder": ModelCapabilities(supports_embeddings=True),
     }
     snapshots = {
-        alias: snapshot.model_copy(update={"capabilities_sha256": sha256_json(capabilities[alias])})
+        alias: snapshot.model_copy(
+            update={"capabilities_sha256": capabilities[alias].identity_sha256()}
+        )
         for alias, snapshot in snapshots.items()
     }
     policy = policy.model_copy(
