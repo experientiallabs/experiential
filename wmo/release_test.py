@@ -640,12 +640,18 @@ def _installed_release_driver() -> None:
                 time.sleep(0.05)
         raise AssertionError(f"wmo run did not listen on port {port}")
 
-    def run_tty(arguments: list[str], answers: list[tuple[str, str]]) -> str:
+    def run_tty(
+        arguments: list[str],
+        answers: list[tuple[str, str]],
+        *,
+        completion_marker: str | None = None,
+    ) -> str:
         """Drive one installed interactive CLI process through ordered prompt matches.
 
         Args:
             arguments: CLI arguments after the installed executable.
             answers: Ordered prompt substring and terminal answer pairs.
+            completion_marker: Optional output that must appear before terminal input closes.
 
         Returns:
             Combined terminal transcript.
@@ -665,6 +671,7 @@ def _installed_release_driver() -> None:
         search_from = 0
         pending = list(answers)
         input_closed = False
+        completion_seen = completion_marker is None
         deadline = time.monotonic() + 30
         try:
             while process.poll() is None and time.monotonic() < deadline:
@@ -681,9 +688,11 @@ def _installed_release_driver() -> None:
                     prompt, answer = pending.pop(0)
                     search_from = prompt_position + len(prompt)
                     os.write(master, (answer + "\n").encode())
-                    if not pending and not input_closed:
-                        os.write(master, b"\x04")
-                        input_closed = True
+                if completion_marker is not None and completion_marker in transcript:
+                    completion_seen = True
+                if not pending and completion_seen and not input_closed:
+                    os.write(master, b"\x04")
+                    input_closed = True
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
                 process.wait(timeout=5)
@@ -703,6 +712,7 @@ def _installed_release_driver() -> None:
             os.close(master)
         assert process.returncode == 0, transcript
         assert not pending, f"unanswered prompts {pending}:\n{transcript}"
+        assert completion_seen, f"missing completion marker {completion_marker!r}:\n{transcript}"
         return transcript
 
     def model_answers(
@@ -1189,6 +1199,7 @@ def _installed_release_driver() -> None:
                 ("Use Tinker connection 'tinker-local'", "y"),
                 ("Proceed?", "n"),
             ],
+            completion_marker="Managed Tinker SFT was not started.",
         )
         assert "Managed Tinker SFT was not started." in model_optimization_output
         assert state.snapshot() == provider_before_model_optimization
