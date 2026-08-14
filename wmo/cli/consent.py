@@ -6,15 +6,14 @@ redirected `< /dev/null` or heredoc stdin) is not consent, it is the absence of 
 so a spending run refuses there instead of starting. Nor is a blank line or an EOF an answer:
 the safe direction is refusal, so neither can authorize spend.
 
-"Interactive" means BOTH streams. Prompting reads stdin while the console reports on stdout, so
-a terminal stdout with a redirected stdin was a real hole: the gate saw a terminal, the prompt
-read whatever the redirect supplied, and a blank line was taken as approval.
+"Interactive" means BOTH streams. Prompting reads stdin while the console reports on stdout, so a
+terminal stdout paired with a redirected stdin does not count: taking it for interactive lets the
+prompt read whatever the redirect supplies and a blank line pass as approval.
 
-This lives in one place because the rule kept being re-implemented per command and a site kept
-being missed: `wmo optimize model` shipped proceed-and-note and spent a scripted caller's real
-money (#305). Later router-composition and managed SFT spend surfaces exposed the same class of
-failure. Every retained gate now calls `require_spend_consent`, so there is one behaviour to read
-and one place a future spend surface has to reach for.
+This lives in one place because a per-command copy of the rule is a per-command chance to miss a
+site, and a missed site spends a scripted caller's real money. Every spend gate calls
+`require_spend_consent`, so there is one behaviour to read and one place a new spend surface has
+to reach for.
 """
 
 from __future__ import annotations

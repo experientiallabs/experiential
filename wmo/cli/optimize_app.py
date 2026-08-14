@@ -2,10 +2,9 @@
 
 """`wmo optimize`: the one switch over the product optimizers.
 
-Extracted from the former `harness_app` module, which co-located the product's
-optimize switch with the harness-search CLI; the search program now lives in the
-agent-optimization repo, and this module owns only what the product ships:
-`router` (the guarded offline kNN path) and `model` (offline SFT from persisted artifacts).
+The group is exactly two commands: `router` (the guarded offline kNN path) and
+`model` (offline SFT from persisted artifacts). This module owns the switch only,
+so no optimization logic lives here.
 """
 
 from __future__ import annotations
