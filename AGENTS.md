@@ -139,12 +139,22 @@ uv run pytest -q
    has unrelated failures, record them and keep them out of the patch; fix them only when they are
    in scope or prevent meaningful validation.
 
-2. **Tests live inline next to the code.** Keep behavior-oriented `_test.py` files in the package
-   that owns the behavior. A cohesive test module may cover several cooperating production modules
-   when that gives the behavior one clear home; there is no paired-test-file requirement. Cohesive
-   `_test.py` files may exceed the 999-line production limit and should not be split solely for
-   line count. Do not add empty test markers or vacuous assertions. There is no top-level `tests/`
-   directory. Pytest is configured (`python_files = ["*_test.py"]`) to discover these files.
+2. **Tests live inline next to the code, one test file per module.** A module `foo.py` is tested by
+   `foo_test.py` in the same directory (for example, `wmo/workflow/router.py` maps to
+   `wmo/workflow/router_test.py`). There is no top-level `tests/` directory. Pytest is configured
+   (`python_files = ["*_test.py"]`) to discover these.
+
+   The pairing runs both ways, so a reader finds a module's coverage without searching for it.
+   **An empty `_test.py` is valid and preferred over a vacuous test**: leave the file empty, or
+   give it a module docstring naming what is deliberately not covered, rather than filling it. A
+   test that a constructor stores its arguments, that a pydantic model round-trips through its own
+   serializer, or that a constant still equals itself costs suite time, breaks on harmless edits,
+   and makes an uncovered module look covered.
+
+   A test file whose subject spans several modules, or which tests the package rather than one
+   module, goes in a `tests/` subdirectory of the package that owns the behavior (for example
+   `wmo/simulation/tests/`), never at the repository root. Existing standalone test files are
+   relocated when the surrounding area is edited, not in a bulk sweep.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
