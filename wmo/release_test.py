@@ -46,7 +46,9 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "wmo/workflow/router.py",
     }
 )
-REQUIRED_SDIST_MEMBERS = frozenset({"README.md", "pyproject.toml", "wmo/workflow/router.py"})
+REQUIRED_SDIST_MEMBERS = frozenset(
+    {"README.md", "assets/wmo-workflow.svg", "pyproject.toml", "wmo/workflow/router.py"}
+)
 
 
 def _normalized_path(member_name: str) -> str:
@@ -117,7 +119,16 @@ def _assert_current_archive_members(
 def _tracked_sdist_members() -> frozenset[str]:
     """Return current tracked members admitted by the explicit sdist include contract."""
     result = subprocess.run(
-        ["git", "ls-files", ".gitignore", "README.md", "pyproject.toml", "conftest.py", "wmo"],
+        [
+            "git",
+            "ls-files",
+            ".gitignore",
+            "README.md",
+            "assets",
+            "pyproject.toml",
+            "conftest.py",
+            "wmo",
+        ],
         cwd=Path(__file__).resolve().parent.parent,
         capture_output=True,
         text=True,

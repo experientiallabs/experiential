@@ -158,7 +158,7 @@ uv run pytest -q
    production modules to the flat `wmo/` namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
-   `docs/`, `.claude/`, `.github/`. That list is closed.
+   `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.
 
    `.agents/` is the one sanctioned scratchpad: a local, gitignored working directory for agent
    sessions (notes, probe scripts, run outputs). It is never tracked, never part of a PR, and
@@ -189,6 +189,7 @@ uv run pytest -q
      Everything generated stays out of git: project evidence and model artifacts under the local
      `.wmo/` root, distribution archives under ignored `dist/`, and external benchmark inputs.
      Never commit local settings files (`settings.toml` anywhere).
+   - `assets/` contains the small, reviewed visual assets referenced by the README and public docs.
    - `wmo/` is the flagship package and the only importable code. Domain subpackages own their
      area under the rule 4 hierarchy. Provider-neutral model contracts live under
      `wmo/common/models/`, and explicit HTTP-backed clients live under

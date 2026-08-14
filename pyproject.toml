@@ -48,6 +48,7 @@ exclude = ["**/*_test.py", "wmo/conftest.py"]
 # One flagship distribution: everything importable lives under /wmo.
 include = [
     "/wmo",
+    "/assets",
     "/README.md",
     "/pyproject.toml",
     "/conftest.py",

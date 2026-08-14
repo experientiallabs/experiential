@@ -26,7 +26,7 @@ HAND_AUTHORED_SUFFIXES = {
     ".yaml",
     ".yml",
 }
-ALLOWED_TOP_DIRS = {".claude", ".github", "docs", "wmo"}
+ALLOWED_TOP_DIRS = {".claude", ".github", "assets", "docs", "wmo"}
 ALLOWED_TOP_FILES = {
     ".env.example",
     ".gitignore",
