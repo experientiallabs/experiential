@@ -139,25 +139,26 @@ uv run pytest -q
    has unrelated failures, record them and keep them out of the patch; fix them only when they are
    in scope or prevent meaningful validation.
 
-2. **Tests live inline next to the code they own.** A test file sits in the same directory as its
-   subject and ends in `_test.py`; `wmo/workflow/router.py` is tested by
-   `wmo/workflow/router_test.py`. There is no top-level `tests/` directory. Pytest is configured
+2. **Tests live inline next to the code, one test file per module.** A module `foo.py` is tested by
+   `foo_test.py` in the same directory (for example, `wmo/workflow/router.py` maps to
+   `wmo/workflow/router_test.py`). There is no top-level `tests/` directory. Pytest is configured
    (`python_files = ["*_test.py"]`) to discover these.
 
-   **Organize tests by behavior, not by module count.** One cohesive `_test.py` may cover several
-   cooperating modules when that is the clearest ownership boundary, and such a file may exceed the
-   999-line limit that binds non-test files; splitting coverage across many thin files to satisfy a
-   line count or a naming symmetry makes behavior harder to find, not easier. A module needs no
-   paired test file of its own, and a test file named for a package or a behavior rather than for a
-   single module is fine as long as it lives in the package that owns that behavior, never at the
-   repository root, which rule 5 forbids anyway.
+   The pairing runs both ways. Every module carries its own `_test.py`, so a reader knows where a
+   module's coverage lives without searching, and an untested module reads as an empty or nearly
+   empty test file rather than as coverage hidden somewhere else. An **empty `_test.py` is a valid
+   and expected state**: prefer an empty file, or one with only a module docstring saying what is
+   intentionally not covered here, over a vacuous test. A test that asserts a constructor stores
+   its arguments, that a pydantic model round-trips through its own serializer, or that a constant
+   still equals itself is worse than no test: it costs suite time, it fails on harmless edits, and
+   it makes an uncovered module look covered. Never add an assertion just to fill a file.
 
-   **Never write a test to fill space.** Do not create an empty `_test.py` as a marker that a
-   module exists, and do not add an assertion to make a file look covered. A test that asserts a
-   constructor stores its arguments, that a pydantic model round-trips through its own serializer,
-   or that a constant still equals itself is worse than no test: it costs suite time, it fails on
-   harmless edits, and it disguises an uncovered module as a covered one. An absent test file is an
-   honest signal; a vacuous one is not.
+   Equally, **no `_test.py` exists without the `.py` it names.** A test file whose subject spans
+   several modules, or which tests the package rather than one module, does not get to squat on a
+   name that implies a module. Put it in a `tests/` subdirectory of the package that owns the
+   behavior (for example `wmo/simulation/tests/`), never a `tests/` directory at the repository
+   root, which rule 5 forbids anyway. Existing standalone test files predate this rule and are
+   relocated opportunistically when the surrounding area is edited, not in a bulk sweep.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
