@@ -20,7 +20,11 @@ from wmo.common.judging.provenance import (
     sorted_verified_inputs,
 )
 from wmo.common.judging.rubric import Rubric, RubricDimension, ScoreAnchor
-from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
+from wmo.common.project import (
+    ArtifactAlreadyExistsError,
+    ProjectStore,
+    coordinate_completed_build_selection,
+)
 
 
 class RubricReviewError(RuntimeError):
@@ -170,7 +174,8 @@ class RubricReview:
             selected.append(draft)
             return root
 
-        store.update_review(initialize)
+        with coordinate_completed_build_selection(store, task_set_id=source_task_set_id):
+            store.update_review(initialize)
         return cls(store, selected[0], supplied_proposals, code_revision, now)
 
     @property
@@ -595,7 +600,11 @@ class RubricReview:
             selected.append(working._draft)
             return root
 
-        self._store.update_review(update)
+        with coordinate_completed_build_selection(
+            self._store,
+            task_set_id=self._draft.source_task_set_id,
+        ):
+            self._store.update_review(update)
         self._draft = selected[0]
 
     def _event(

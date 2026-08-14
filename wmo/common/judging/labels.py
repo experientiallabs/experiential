@@ -17,7 +17,11 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.judging.rubric import Rubric
-from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
+from wmo.common.project import (
+    ArtifactAlreadyExistsError,
+    ProjectStore,
+    coordinate_completed_build_selection,
+)
 
 
 class HumanScore(ContractModel):
@@ -190,7 +194,8 @@ class HumanScoreReview:
             selected.append((root, history))
             return root
 
-        store.update_review(initialize)
+        with coordinate_completed_build_selection(store):
+            store.update_review(initialize)
         root, history = selected[0]
         return cls(store, root, history)
 
@@ -205,7 +210,7 @@ class HumanScoreReview:
         Args:
             score: New score with no correction predecessor.
         """
-        self._mutate(lambda history: history.append(score))
+        self._mutate(lambda history: history.append(score), rubric_id=score.rubric_id)
 
     def correct(self, score: HumanScore) -> None:
         """Persist one correction while retaining its superseded historical label.
@@ -213,7 +218,7 @@ class HumanScoreReview:
         Args:
             score: New score that names the earlier label it supersedes.
         """
-        self._mutate(lambda history: history.correct(score))
+        self._mutate(lambda history: history.correct(score), rubric_id=score.rubric_id)
 
     def upsert(
         self,
@@ -317,7 +322,9 @@ class HumanScoreReview:
             return root
 
         selected: list[tuple[JsonObject, HumanScoreHistory]] = []
-        self._store.update_review(update)
+        with coordinate_completed_build_selection(self._store):
+            _require_rubric_matches_selected_build(self._store, rubric_id)
+            self._store.update_review(update)
         self._root_review, self._history = selected[0]
         return result[0]
 
@@ -351,7 +358,7 @@ class HumanScoreReview:
             )
             return history
 
-        self._mutate(transition)
+        self._mutate(transition, rubric_id=rubric_id)
         return result[0]
 
     def _finalize(
@@ -434,8 +441,15 @@ class HumanScoreReview:
     def _mutate(
         self,
         transition: Callable[[HumanScoreHistory], HumanScoreHistory],
+        *,
+        rubric_id: ArtifactId,
     ) -> None:
-        """Reload and apply one score-history transition while the review lock is held."""
+        """Apply one score transition while build selection and review state are locked.
+
+        Args:
+            transition: Pure history transition to apply to the latest persisted namespace.
+            rubric_id: Immutable rubric whose source task set must remain selected.
+        """
         selected: list[tuple[JsonObject, HumanScoreHistory]] = []
 
         def update(current: JsonValue | None) -> JsonObject:
@@ -445,8 +459,43 @@ class HumanScoreReview:
             selected.append((root, history))
             return root
 
-        self._store.update_review(update)
+        with coordinate_completed_build_selection(self._store):
+            _require_rubric_matches_selected_build(self._store, rubric_id)
+            self._store.update_review(update)
         self._root_review, self._history = selected[0]
+
+
+def _require_rubric_matches_selected_build(
+    store: ProjectStore,
+    rubric_id: ArtifactId,
+) -> None:
+    """Reject a score writer whose rubric belongs to an older selected task set.
+
+    Args:
+        store: Project whose completed build is stable under the caller's coordination lock.
+        rubric_id: Immutable rubric used by the score transition.
+
+    Raises:
+        ValueError: The rubric is unavailable or names a task set other than the selected build.
+    """
+    completed = store.load_project().build
+    if completed is None:
+        return
+    try:
+        rubric, _rubric_input = read_artifact_json(
+            store,
+            artifact_id=rubric_id,
+            expected_artifact_type="rubric",
+            relative_path="rubric.json",
+            model_type=Rubric,
+        )
+    except JudgingProvenanceError as exc:
+        raise ValueError("human scores require a completed immutable finalized rubric") from exc
+    if rubric.source_task_set_id != completed.task_set.artifact_id:
+        raise ValueError(
+            "human score rubric differs from the selected completed build; reopen labels from "
+            "the current project build"
+        )
 
 
 def _root_review_from_value(review: JsonValue | None) -> JsonObject:

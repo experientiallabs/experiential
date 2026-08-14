@@ -74,8 +74,10 @@ def test_build_task_set_uses_only_the_persisted_trace_dataset_as_task_set_input(
     assert store.read(built.task_set.task_set_id).manifest.inputs == (dataset_input,)
 
 
-def test_build_project_resumes_and_records_provider_free_review_readiness(tmp_path: Path) -> None:
-    """A repeated local build reuses immutable IDs and never invents rubric proposals."""
+def test_build_project_resumes_without_publishing_unselected_review_readiness(
+    tmp_path: Path,
+) -> None:
+    """A repeated local build returns one handoff without publishing it before selection."""
     store = ProjectStore(tmp_path, "project-a")
     store.initialize(ProjectConfig(project_id="project-a"))
     normalized = TraceNormalizationResult(
@@ -106,26 +108,14 @@ def test_build_project_resumes_and_records_provider_free_review_readiness(tmp_pa
     assert replay.review.source == _trace(0).source.identity
     assert replay.review.mining_spec == MiningSpec(fit_task_budget=1, held_out_task_budget=1)
     assert replay.review.code_revision == "test-revision"
-    assert store.read_review() == {"build_review": replay.review.model_dump(mode="json")}
+    assert store.read_review() is None
     assert len(store.artifacts.list_ids()) == 2
 
-    corrupt_review = replay.review.model_dump(mode="json")
-    corrupt_review["readiness_id"] = "build-review-00000000000000000000"
-    store.write_review({"build_review": corrupt_review})
-    with pytest.raises(ValueError, match="invalid build readiness"):
-        build_project(
-            normalized,
-            store,
-            created_at=datetime(2026, 8, 12, tzinfo=UTC),
-            code_revision="test-revision",
-            mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
-        )
 
-
-def test_build_project_refuses_unselected_revision_and_corrupt_replay_payload(
+def test_build_project_keeps_unselected_candidates_local_and_verifies_replay_payload(
     tmp_path: Path,
 ) -> None:
-    """An incomplete build cannot replace review state, and replay verifies stored bytes."""
+    """Candidate revisions do not publish readiness, and exact replay verifies stored bytes."""
     store = ProjectStore(tmp_path, "project-a")
     store.initialize(ProjectConfig(project_id="project-a"))
     normalized = TraceNormalizationResult(
@@ -138,17 +128,15 @@ def test_build_project_refuses_unselected_revision_and_corrupt_replay_payload(
         code_revision="test-revision",
         mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
     )
-    first_review = store.read_review()
-
-    with pytest.raises(ValueError, match="already binds a different completed build"):
-        build_project(
-            normalized,
-            store,
-            created_at=datetime(2026, 8, 12, tzinfo=UTC),
-            code_revision="changed-revision",
-            mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
-        )
-    assert store.read_review() == first_review
+    changed = build_project(
+        normalized,
+        store,
+        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+        code_revision="changed-revision",
+        mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
+    )
+    assert changed.review != first.review
+    assert store.read_review() is None
 
     trace_directory = store.artifacts.read(first.review.trace_dataset.artifact_id).directory
     (trace_directory / "traces.jsonl").write_text("corrupt\n", encoding="utf-8")

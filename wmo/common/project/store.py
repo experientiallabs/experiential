@@ -7,7 +7,9 @@ import logging
 import os
 import shutil
 import stat
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
@@ -16,6 +18,7 @@ from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
+    ArtifactId,
     ArtifactInput,
     SecretBoundaryError,
     assert_secret_free,
@@ -37,6 +40,10 @@ from wmo.common.project.project import (
 logger = logging.getLogger(__name__)
 
 _JSON_VALUE_ADAPTER = TypeAdapter(JsonValue)
+_ACTIVE_COMPLETED_BUILD_COORDINATION: ContextVar[str | None] = ContextVar(
+    "active_completed_build_coordination",
+    default=None,
+)
 
 
 class ArtifactStoreError(RuntimeError):
@@ -571,6 +578,74 @@ class ProjectStore:
             return _JSON_VALUE_ADAPTER.validate_json(self.paths.review_json.read_bytes())
         except (OSError, ValidationError) as exc:
             raise ProjectStoreError("review.json is not valid JSON") from exc
+
+
+@contextmanager
+def coordinate_completed_build_selection(
+    store: ProjectStore,
+    *,
+    task_set_id: ArtifactId | None = None,
+) -> Iterator[None]:
+    """Serialize build selection with mutable review writers for the selected task set.
+
+    The coordination lock is reentrant only for the same project inside one execution context.
+    This lets a workflow hold the transaction across common review services without reacquiring
+    the non-reentrant filesystem lock. A task-set-bound writer verifies the current selection
+    after acquiring the lock, so a service opened for an older build cannot restore its namespace
+    after a replacement commits.
+
+    Args:
+        store: Project whose completed build and review namespaces must change atomically.
+        task_set_id: Optional immutable task-set identity required by the review mutation.
+
+    Yields:
+        None while completed-build replacement is excluded.
+
+    Raises:
+        ProjectStoreError: Nested coordination targets another project, or the selected build uses
+            a different task set from the review writer.
+    """
+    project_key = str(store.paths.project_directory.absolute())
+    active = _ACTIVE_COMPLETED_BUILD_COORDINATION.get()
+    if active is not None:
+        if active != project_key:
+            raise ProjectStoreError(
+                "nested completed-build coordination cannot target another project"
+            )
+        _require_selected_task_set(store, task_set_id)
+        yield
+        return
+    coordination_path = store.paths.project_directory / "completed-build-selection"
+    with file_write_lock(coordination_path, what="completed build and review state"):
+        token = _ACTIVE_COMPLETED_BUILD_COORDINATION.set(project_key)
+        try:
+            _require_selected_task_set(store, task_set_id)
+            yield
+        finally:
+            _ACTIVE_COMPLETED_BUILD_COORDINATION.reset(token)
+
+
+def _require_selected_task_set(
+    store: ProjectStore,
+    task_set_id: ArtifactId | None,
+) -> None:
+    """Reject a build-scoped writer whose task set is no longer selected.
+
+    Args:
+        store: Project containing the optional completed-build selection.
+        task_set_id: Task-set identity required by the writer, or None for the selector itself.
+
+    Raises:
+        ProjectStoreError: A completed build selects a different task set.
+    """
+    if task_set_id is None:
+        return
+    completed = store.load_project().build
+    if completed is not None and completed.task_set.artifact_id != task_set_id:
+        raise ProjectStoreError(
+            "review evidence differs from the selected completed build; reopen the review from "
+            "the current project build"
+        )
 
 
 def _assert_payload_secret_free(relative_path: str, payload: bytes) -> None:

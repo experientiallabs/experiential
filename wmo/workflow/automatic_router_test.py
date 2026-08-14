@@ -53,7 +53,7 @@ from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.runtime.agents import ChatAgentRuntime
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.application import RouterApplicationError, load_project_router
-from wmo.simulation.build import build_project
+from wmo.simulation.build import build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.mining.service import MiningSpec
 from wmo.workflow.automatic_router import (
@@ -904,7 +904,7 @@ def _completed_project(
         resolved_embedder=runtime.resolve("embedder"),
         top_k=2,
     )
-    store.bind_completed_build(completed)
+    select_completed_build(store, completed, built.review)
     return store, catalog, state
 
 

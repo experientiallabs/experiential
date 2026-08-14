@@ -49,7 +49,7 @@ from wmo.common.tasks import load_task_set
 from wmo.optimize.router.workflow_test import _persist_embeddings, _persist_pricing
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.runtime_test import _Client, _request
-from wmo.simulation.build import ProjectBuild, build_project
+from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
     _OneTurnAgent,
@@ -140,7 +140,7 @@ def _bind_completed_build(
         fit_rag=artifact_input(fit.manifest),
         world_model=artifact_input(world.manifest),
     )
-    project.bind_completed_build(completed)
+    select_completed_build(project, completed, built.review)
     return completed
 
 

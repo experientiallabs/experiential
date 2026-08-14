@@ -520,6 +520,59 @@ def test_build_package_upgrade_decline_preserves_selected_review(
     assert store.read_review() == first_review
 
 
+@pytest.mark.parametrize("failure_mode", ["cost", "decline", "grounded"])
+def test_first_build_failure_does_not_publish_review_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    """No first-build readiness is visible until its completed graph is selected.
+
+    Args:
+        tmp_path: Temporary trace, catalog, and project root.
+        monkeypatch: Pytest patch fixture selecting the pre-selection failure boundary.
+        failure_mode: Cost rejection, explicit spend decline, or grounded construction failure.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+    if failure_mode == "cost":
+        monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 6.0)
+    elif failure_mode == "decline":
+        monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 1.0)
+        monkeypatch.setattr(
+            build_command,
+            "require_spend_consent",
+            lambda *_args, **_kwargs: False,
+        )
+    else:
+
+        def fail_grounded_build(*_args: object, **_kwargs: object) -> None:
+            """Simulate grounded artifact construction failing before selection.
+
+            Raises:
+                ValueError: Always, at the provider-backed construction boundary.
+            """
+            raise ValueError("injected first grounded build failure")
+
+        monkeypatch.setattr(build_command, "_build_grounded_artifacts", fail_grounded_build)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", str(source), "--root", str(root)],
+        env={"WMO_RELEASE_REVISION": "a" * 40},
+    )
+
+    if failure_mode == "decline":
+        assert result.exit_code == 0, result.output
+    else:
+        assert result.exit_code == 2
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is None
+    assert store.read_review() is None
+
+
 def test_build_package_upgrade_recovers_selection_before_review_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

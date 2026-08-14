@@ -18,13 +18,13 @@ from wmo.common.core.artifacts import (
     SourceIdentity,
     stable_id,
 )
-from wmo.common.core.locks import file_write_lock
 from wmo.common.project import (
     ArtifactStore,
     ProjectBuildArtifacts,
     ProjectConfig,
     ProjectStore,
     artifact_input,
+    coordinate_completed_build_selection,
 )
 from wmo.common.tasks import TaskSet
 from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
@@ -223,7 +223,6 @@ def build_project(
         descriptor_dimensions=descriptor_dimensions,
         code_revision=code_revision,
     )
-    _prepare_build_review(store, review)
     return ProjectBuild(artifacts=artifacts, review=review)
 
 
@@ -298,8 +297,7 @@ def _build_review_coordination(store: ProjectStore) -> Iterator[None]:
     Yields:
         None while the project-local cross-process lock is held.
     """
-    coordination_path = store.paths.project_directory / "completed-build-selection"
-    with file_write_lock(coordination_path, what="completed build and review state"):
+    with coordinate_completed_build_selection(store):
         yield
 
 
@@ -341,49 +339,6 @@ def select_build_review(store: ProjectStore, review: BuildReviewReadiness) -> No
         return _advance_build_review(root_review, prior=prior, review=review)
 
     store.update_review(update)
-
-
-def _prepare_build_review(store: ProjectStore, review: BuildReviewReadiness) -> None:
-    """Persist first-build readiness or defer replacement until completed-build selection.
-
-    Args:
-        store: Project store owning review and completed-build state.
-        review: Readiness record for the deterministic trace and task build.
-
-    Raises:
-        ValueError: Existing review state is invalid or is not bound to a selected build.
-    """
-
-    def update(current: JsonValue | None) -> JsonObject:
-        """Validate and transition the build-review member under the review lock.
-
-        Args:
-            current: Current complete review JSON value.
-
-        Returns:
-            Current or updated object-shaped review state.
-
-        Raises:
-            ValueError: Existing build-review state is invalid or unselected.
-        """
-        root_review = _review_object(current)
-        prior = root_review.get("build_review")
-        if prior is None:
-            return _advance_build_review(root_review, prior=None, review=review)
-        try:
-            existing = BuildReviewReadiness.model_validate(prior)
-        except ValueError as exc:
-            raise ValueError("review.json contains invalid build readiness") from exc
-        if existing == review:
-            return root_review
-        if _completed_build_matches_review(store, review):
-            return _advance_build_review(root_review, prior=existing, review=review)
-        if _completed_build_matches_review(store, existing):
-            return root_review
-        raise ValueError("review.json already binds a different completed build")
-
-    with _build_review_coordination(store):
-        store.update_review(update)
 
 
 def _advance_build_review(

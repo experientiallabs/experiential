@@ -21,6 +21,7 @@ from wmo.common.project.store import (
     ProjectStore,
     ProjectStoreError,
     StoredArtifact,
+    coordinate_completed_build_selection,
 )
 
 __all__ = [
@@ -43,6 +44,7 @@ __all__ = [
     "ProjectStoreError",
     "StoredArtifact",
     "artifact_input",
+    "coordinate_completed_build_selection",
     "load_project_config",
     "write_project_config",
 ]
