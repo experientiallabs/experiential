@@ -30,6 +30,17 @@ def test_forbidden_provider_imports_are_absent() -> None:
 
 
 def _banned_imports(root: Path, banned: set[str]) -> list[str]:
+    """Report production imports of banned modules found under a package tree.
+
+    Args:
+        root: Package directory searched recursively for Python sources. Test modules and
+            `conftest.py` are skipped, so only production imports are reported.
+        banned: Module paths that production code may not import. A source matches when it
+            imports the exact path or any submodule of it.
+
+    Returns:
+        One `path:line imports module` entry per banned import, ordered by file path.
+    """
     violations: list[str] = []
     for path in sorted(root.rglob("*.py")):
         if path.name == "conftest.py" or path.name.endswith("_test.py"):
@@ -37,13 +48,15 @@ def _banned_imports(root: Path, banned: set[str]) -> list[str]:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             modules: list[str] = []
+            line = 0
             if isinstance(node, ast.Import):
                 modules = [alias.name for alias in node.names]
+                line = node.lineno
             elif isinstance(node, ast.ImportFrom) and node.module is not None:
                 modules = [node.module]
+                line = node.lineno
             for module in modules:
                 if any(module == prefix or module.startswith(f"{prefix}.") for prefix in banned):
                     relative = path.relative_to(WMO_DIR)
-                    line = getattr(node, "lineno", 0)
                     violations.append(f"{relative}:{line} imports {module}")
     return violations
