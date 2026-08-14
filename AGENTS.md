@@ -148,9 +148,9 @@ uv run pytest -q
      checks a constructor stored its arguments, that a pydantic model round-trips through itself,
      or that a constant equals itself.
    - Do not create a `_test.py` whose module does not exist. A test that covers a whole package
-     goes in that package's own `tests/` directory, such as `wmo/simulation/tests/`.
-   - 25 existing test files already break the last point. Leave them; move one into a `tests/`
-     directory only when you are editing that code anyway.
+     goes in that package's own `tests/` directory, such as `wmo/simulation/tests/`. Older test
+     files that break this are not a bug to fix on sight: move one when you are editing that code
+     anyway.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
