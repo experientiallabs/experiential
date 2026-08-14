@@ -286,9 +286,20 @@ def reconcile_completion_economics(
     ):
         raise ValueError("completion provider usage exceeds its request reservation")
     cached = usage.cached_input_tokens
+    written = usage.cache_write_input_tokens
     if cached is not None and cached > usage.input_tokens:
         raise ValueError("cached input usage exceeds total input usage")
-    if cached is None:
+    if written is not None and written > usage.input_tokens:
+        raise ValueError("cache-write usage exceeds total input usage")
+    if cached is not None and written is not None:
+        if cached + written > usage.input_tokens:
+            raise ValueError("cache token counts must be subsets of input_tokens")
+        successful_input_cost = (
+            (usage.input_tokens - cached - written) * reservation.input_usd_per_million_tokens
+            + cached * reservation.cached_input_usd_per_million_tokens
+            + written * reservation.cache_write_usd_per_million_tokens
+        )
+    elif cached is None:
         successful_input_cost = usage.input_tokens * CompletionCostReservation._input_price_ceiling(
             reservation.input_usd_per_million_tokens,
             reservation.cached_input_usd_per_million_tokens,

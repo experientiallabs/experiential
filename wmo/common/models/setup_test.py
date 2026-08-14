@@ -237,28 +237,55 @@ def test_embedding_model_requires_explicit_input_price() -> None:
 
 
 @pytest.mark.parametrize(
-    ("provider", "base_url"),
+    ("provider", "base_url", "api_key_env", "api_version", "region"),
     [
-        ("openai", None),
-        ("openrouter", None),
-        ("anthropic", None),
-        ("gemini", None),
-        ("openai-compatible", "https://models.example.test/v1"),
+        ("openai", None, "SELECTED_API_KEY", None, None),
+        ("openrouter", None, "SELECTED_API_KEY", None, None),
+        ("anthropic", None, "SELECTED_API_KEY", None, None),
+        ("gemini", None, "SELECTED_API_KEY", None, None),
+        ("openai-compatible", "https://models.example.test/v1", "SELECTED_API_KEY", None, None),
+        ("azure", "https://resource.openai.azure.com", "AZURE_OPENAI_API_KEY", "v1", None),
+        ("bedrock", None, None, None, "us-east-1"),
     ],
 )
-def test_setup_accepts_each_supported_connection(provider: str, base_url: str | None) -> None:
+def test_setup_accepts_each_supported_connection(
+    provider: str,
+    base_url: str | None,
+    api_key_env: str | None,
+    api_version: str | None,
+    region: str | None,
+) -> None:
     """Every supported provider remains an explicit user-selected connection.
 
     Args:
         provider: Parameterized supported provider kind.
-        base_url: Required compatible endpoint or ``None`` for native providers.
+        base_url: Required Azure or compatible endpoint, otherwise ``None``.
+        api_key_env: Named credential variable, or ``None`` for Bedrock.
+        api_version: Required Azure API version, otherwise ``None``.
+        region: Optional Bedrock region.
     """
     connection = ProviderConnection(
         name="selected",
         provider=provider,
-        api_key_env="SELECTED_API_KEY",
+        api_key_env=api_key_env,
         base_url=base_url,
+        api_version=api_version,
+        region=region,
     )
 
     assert connection.provider == provider
     assert connection.base_url == base_url
+    assert connection.api_key_env == api_key_env
+    assert connection.api_version == api_version
+    assert connection.region == region
+
+
+def test_setup_rejects_bedrock_api_key_env() -> None:
+    """Bedrock setup cannot invent an API-key abstraction."""
+    with pytest.raises(ValueError, match="api_key_env"):
+        ProviderConnection(
+            name="bedrock",
+            provider="bedrock",
+            api_key_env="AWS_ACCESS_KEY_ID",
+            region="us-east-1",
+        )

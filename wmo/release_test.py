@@ -23,11 +23,13 @@ if os.environ.get("WMO_INSTALLED_RELEASE_EVIDENCE") != "1":
 
 BUILT_DIST_ENV = "WMO_BUILT_DIST_DIR"
 FORBIDDEN_REQUIREMENT = re.compile(
-    r"(?mi)^Requires-Dist:\s*(?:anthropic|boto3|environment-capture|gepa|mlx-lm|"
+    r"(?mi)^Requires-Dist:\s*(?:anthropic|environment-capture|gepa|mlx-lm|"
     r"opentelemetry-proto|scikit-learn|transformers)(?:\s|[<>=;~!])"
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
     {
+        "boto3",
+        "botocore",
         "click",
         "fastapi",
         "filelock",
@@ -880,6 +882,8 @@ def _installed_release_driver() -> None:
         ("Add a OpenRouter connection?", "n"),
         ("Add a Anthropic connection?", "n"),
         ("Add a Gemini connection?", "n"),
+        ("Add a Azure connection?", "n"),
+        ("Add a Bedrock connection?", "n"),
         ("Add a OpenAI-compatible connection?", "y"),
         ("Connection name", "loopback"),
         ("API key environment variable", "P17_PROVIDER_KEY"),

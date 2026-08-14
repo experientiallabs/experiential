@@ -1,0 +1,390 @@
+"""Azure adapter, catalog pairing, and RuntimeModelCatalog resolution tests."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+import pytest
+
+from wmo.common.core.artifacts import JsonObject
+from wmo.common.models import (
+    AssistantAction,
+    ConnectionConfig,
+    EmbeddingClient,
+    ModelCapabilities,
+    ModelCatalog,
+    ModelClient,
+    ModelFinishReason,
+    ModelMessage,
+    ModelRecord,
+    ModelRequest,
+    ModelRoles,
+    ModelSnapshot,
+    ToolCall,
+    ToolChoice,
+)
+from wmo.common.tasks import ToolSchema
+from wmo.runtime.models.credentials import ModelCredentialError
+from wmo.runtime.models.providers.azure import (
+    AZURE_OPENAI_API_KEY_ENV,
+    AZURE_OPENAI_ENDPOINT_ENV,
+    AzureClient,
+    azure_request_url,
+    bind_azure_api_key,
+    same_azure_endpoint,
+)
+from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleResponseError
+from wmo.runtime.models.providers.retry import RetryPolicy
+from wmo.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
+from wmo.runtime.models.registry import RuntimeModelCatalog
+
+_SECRET = "azure-secret-key-value"
+_ENDPOINT = "https://resource.openai.azure.com"
+_OTHER_ENDPOINT = "https://other.openai.azure.com"
+
+
+class _ScriptedTransport(JsonHttpTransport):
+    """Returns frozen JSON responses while retaining calls for wire assertions."""
+
+    def __init__(self, responses: list[JsonHttpResponse]) -> None:
+        self._responses = list(responses)
+        self.requests: list[tuple[str, Mapping[str, str], JsonObject]] = []
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        """Record one fake call and return the next frozen response."""
+        del timeout_seconds
+        self.requests.append((url, headers, payload))
+        if not self._responses:
+            raise AssertionError("test made an unexpected provider request")
+        return self._responses.pop(0)
+
+
+def _snapshot(model_id: str = "gpt-deployment") -> ModelSnapshot:
+    """Build an immutable Azure identity fixture."""
+    return ModelSnapshot(
+        provider="azure",
+        model_id=model_id,
+        revision="fixture-revision",
+        capabilities_sha256="a" * 64,
+        connection_sha256="a" * 64,
+    )
+
+
+def _request() -> ModelRequest:
+    """Build a visible transcript containing an earlier tool call and result."""
+    return ModelRequest(
+        messages=(
+            ModelMessage(role="system", content="You are precise."),
+            ModelMessage(role="user", content="Create a ticket."),
+            ModelMessage(
+                role="assistant",
+                assistant_action=AssistantAction(
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-old",
+                            name="create_ticket",
+                            arguments={"priority": "normal"},
+                        ),
+                    )
+                ),
+            ),
+            ModelMessage(role="tool", content="created", tool_call_id="call-old"),
+        ),
+        tools=(
+            ToolSchema(
+                name="create_ticket",
+                description="Create one support ticket.",
+                input_schema={"type": "object"},
+            ),
+        ),
+        tool_choice=ToolChoice(name="create_ticket"),
+        temperature=0.2,
+        maximum_output_tokens=128,
+    )
+
+
+def _completion_response() -> JsonObject:
+    """Return one complete Azure Chat Completions payload."""
+    return {
+        "id": "chatcmpl-fixture",
+        "model": "gpt-deployment",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-new",
+                            "type": "function",
+                            "function": {
+                                "name": "create_ticket",
+                                "arguments": '{"priority":"urgent"}',
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 20,
+            "completion_tokens": 6,
+            "prompt_tokens_details": {"cached_tokens": 4},
+        },
+    }
+
+
+def test_v1_route_sends_deployment_and_api_key_header() -> None:
+    """Foundry and Azure OpenAI v1 keep the deployment in the body and authenticate with api-key."""
+    transport = _ScriptedTransport([JsonHttpResponse(status_code=200, body=_completion_response())])
+    client = AzureClient(
+        model=_snapshot(),
+        endpoint=_ENDPOINT,
+        api_key=_SECRET,
+        api_version="v1",
+        transport=transport,
+    )
+
+    response = client.complete(_request())
+
+    assert isinstance(client, ModelClient)
+    assert response.model.model_id == "gpt-deployment"
+    assert response.output.tool_calls[0].call_id == "call-new"
+    assert response.economics.usage is not None
+    assert response.economics.usage.cached_input_tokens == 4
+    url, headers, payload = transport.requests[0]
+    assert url == "https://resource.openai.azure.com/openai/v1/chat/completions"
+    assert headers["api-key"] == _SECRET
+    assert "Authorization" not in headers
+    assert payload["model"] == "gpt-deployment"
+    assert payload["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "create_ticket"},
+    }
+    assert payload["temperature"] == 0.2
+    assert payload["max_tokens"] == 128
+
+
+def test_classic_route_puts_the_exact_deployment_in_the_path() -> None:
+    """Dated Azure OpenAI versions keep the deployment in the URL and the body."""
+    transport = _ScriptedTransport([JsonHttpResponse(status_code=200, body=_completion_response())])
+    client = AzureClient(
+        model=_snapshot("exact-deployment"),
+        endpoint=_ENDPOINT,
+        api_key=_SECRET,
+        api_version="2024-10-21",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    url, _headers, payload = transport.requests[0]
+    assert url == (
+        "https://resource.openai.azure.com/openai/deployments/exact-deployment/"
+        "chat/completions?api-version=2024-10-21"
+    )
+    assert payload["model"] == "exact-deployment"
+
+
+def test_malformed_response_fails_closed_without_exposing_the_key() -> None:
+    """Incomplete Azure responses raise a typed error that never includes the credential."""
+    transport = _ScriptedTransport([JsonHttpResponse(status_code=200, body={"choices": []})])
+    client = AzureClient(
+        model=_snapshot(),
+        endpoint=_ENDPOINT,
+        api_key=_SECRET,
+        api_version="v1",
+        transport=transport,
+    )
+
+    with pytest.raises(OpenAICompatibleResponseError, match="no choices") as captured:
+        client.complete(_request())
+    assert _SECRET not in str(captured.value)
+    assert _SECRET not in repr(captured.value)
+
+
+def test_retries_stay_on_the_same_azure_url() -> None:
+    """A retryable Azure status retries the same resource, deployment, and API version."""
+    transport = _ScriptedTransport(
+        [
+            JsonHttpResponse(status_code=503, body={"error": {"message": "busy"}}),
+            JsonHttpResponse(status_code=200, body=_completion_response()),
+        ]
+    )
+    client = AzureClient(
+        model=_snapshot(),
+        endpoint=_ENDPOINT,
+        api_key=_SECRET,
+        api_version="v1",
+        transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0),
+    )
+
+    assert client.complete(_request()).output.tool_calls[0].call_id == "call-new"
+    assert [request[0] for request in transport.requests] == [
+        "https://resource.openai.azure.com/openai/v1/chat/completions",
+        "https://resource.openai.azure.com/openai/v1/chat/completions",
+    ]
+
+
+def test_embeddings_use_the_configured_deployment_alias() -> None:
+    """Embedding aliases send their own deployment ID rather than a guessed base model."""
+    transport = _ScriptedTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={"data": [{"index": 0, "embedding": [3.0, 4.0]}]},
+            )
+        ]
+    )
+    client = AzureClient(
+        model=_snapshot("embed-deployment"),
+        endpoint=_ENDPOINT,
+        api_key=_SECRET,
+        api_version="v1",
+        transport=transport,
+    )
+
+    embeddings = client.embed(["hello"])
+
+    assert isinstance(client, EmbeddingClient)
+    assert embeddings[0].values == (0.6, 0.8)
+    url, _headers, payload = transport.requests[0]
+    assert url == "https://resource.openai.azure.com/openai/v1/embeddings"
+    assert payload["model"] == "embed-deployment"
+
+
+def test_trusted_azure_key_is_not_sent_to_a_different_endpoint() -> None:
+    """AZURE_OPENAI_API_KEY stays bound to AZURE_OPENAI_ENDPOINT."""
+    with pytest.raises(ModelCredentialError, match="AZURE_OPENAI_ENDPOINT") as captured:
+        bind_azure_api_key(
+            endpoint=_OTHER_ENDPOINT,
+            api_key_env=AZURE_OPENAI_API_KEY_ENV,
+            api_key=_SECRET,
+            environment={AZURE_OPENAI_ENDPOINT_ENV: _ENDPOINT},
+        )
+    assert _SECRET not in str(captured.value)
+    assert (
+        bind_azure_api_key(
+            endpoint=_ENDPOINT,
+            api_key_env=AZURE_OPENAI_API_KEY_ENV,
+            api_key=_SECRET,
+            environment={AZURE_OPENAI_ENDPOINT_ENV: _ENDPOINT + "/"},
+        )
+        == _SECRET
+    )
+    assert (
+        bind_azure_api_key(
+            endpoint=_OTHER_ENDPOINT,
+            api_key_env="AZURE_FOUNDRY_API_KEY",
+            api_key=_SECRET,
+            environment={AZURE_OPENAI_ENDPOINT_ENV: _ENDPOINT},
+        )
+        == _SECRET
+    )
+
+
+def test_canonical_endpoint_comparison_is_host_insensitive_and_path_sensitive() -> None:
+    """Trailing slashes and host case do not split a resource; path case does."""
+    assert same_azure_endpoint(
+        "HTTPS://Resource.openai.azure.com/",
+        "https://resource.openai.azure.com",
+    )
+    assert not same_azure_endpoint(
+        "https://resource.openai.azure.com/Azure",
+        "https://resource.openai.azure.com/azure",
+    )
+    assert not same_azure_endpoint(_ENDPOINT, None)
+
+
+def test_azure_request_url_does_not_double_append_a_v1_root() -> None:
+    """Operators may store either the resource root or the v1 root."""
+    assert (
+        azure_request_url(
+            "https://resource.openai.azure.com/openai/v1",
+            deployment="gpt-deployment",
+            api_version="v1",
+            route="chat/completions",
+        )
+        == "https://resource.openai.azure.com/openai/v1/chat/completions"
+    )
+
+
+def test_catalog_resolution_pairs_one_endpoint_with_its_key() -> None:
+    """RuntimeModelCatalog constructs Azure clients without contacting the provider."""
+    catalog = RuntimeModelCatalog(
+        ModelCatalog(
+            connections={
+                "azure": ConnectionConfig(
+                    provider="azure",
+                    base_url=_ENDPOINT,
+                    api_key_env=AZURE_OPENAI_API_KEY_ENV,
+                    api_version="v1",
+                )
+            },
+            models={
+                "gpt": ModelRecord(
+                    connection="azure",
+                    model="gpt-deployment",
+                    capabilities=ModelCapabilities(
+                        supports_tools=True,
+                        supports_completions=True,
+                        supports_embeddings=True,
+                    ),
+                )
+            },
+            roles=ModelRoles(world_model="gpt", judge="gpt", embedder="gpt"),
+        ),
+        environment={
+            AZURE_OPENAI_API_KEY_ENV: _SECRET,
+            AZURE_OPENAI_ENDPOINT_ENV: _ENDPOINT,
+        },
+        transport_factory=lambda: _ScriptedTransport(
+            [JsonHttpResponse(status_code=200, body=_completion_response())]
+        ),
+    )
+
+    snapshot, _capabilities = catalog.snapshot("gpt")
+    resolved = catalog.resolve("gpt")
+    response = resolved.client.complete(_request())
+
+    assert snapshot.provider == "azure"
+    assert snapshot.model_id == "gpt-deployment"
+    assert isinstance(resolved.client, AzureClient)
+    assert resolved.embedding_client is resolved.client
+    assert response.finish_reason == ModelFinishReason.COMPLETED
+    mismatched = RuntimeModelCatalog(
+        ModelCatalog(
+            connections={
+                "azure": ConnectionConfig(
+                    provider="azure",
+                    base_url=_OTHER_ENDPOINT,
+                    api_key_env=AZURE_OPENAI_API_KEY_ENV,
+                    api_version="v1",
+                )
+            },
+            models={
+                "gpt": ModelRecord(
+                    connection="azure",
+                    model="gpt-deployment",
+                    capabilities=ModelCapabilities(supports_completions=True),
+                )
+            },
+        ),
+        environment={
+            AZURE_OPENAI_API_KEY_ENV: _SECRET,
+            AZURE_OPENAI_ENDPOINT_ENV: _ENDPOINT,
+        },
+        transport_factory=lambda: _ScriptedTransport([]),
+    )
+    with pytest.raises(ModelCredentialError, match="different Azure resource"):
+        mismatched.resolve("gpt")
