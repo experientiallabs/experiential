@@ -11,7 +11,7 @@ from wmo.common.core.artifacts import ArtifactId
 from wmo.common.evaluations.evidence import read_evaluation_plan
 from wmo.common.project import ArtifactStore, artifact_input
 from wmo.common.routing import KnnRouterPolicy
-from wmo.optimize.router.router_execution_contract import load_router_execution_contract
+from wmo.optimize.router.automatic.execution_contract import load_router_execution_contract
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.application import (
     RouterApplicationError,

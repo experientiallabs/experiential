@@ -55,9 +55,9 @@ from wmo.optimize.router.composition import (
     RouterWorkflowServices,
     compose_router,
 )
+from wmo.optimize.router.evaluation.spend import observed_rollout_spend
+from wmo.optimize.router.fit.workflow_test import _persist_embeddings, _persist_pricing
 from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
-from wmo.optimize.router.simulation_spend import observed_rollout_spend
-from wmo.optimize.router.workflow_test import _persist_embeddings, _persist_pricing
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.runtime_test import _Client, _request
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build

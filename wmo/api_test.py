@@ -8,10 +8,10 @@ from inspect import signature
 
 import wmo
 import wmo.cli.router_app as router_cli
-from wmo.optimize.router import automatic_router
 from wmo.optimize.router.activation import load_project_router, load_router
+from wmo.optimize.router.automatic import service as automatic_router
 from wmo.optimize.router.composition import compose_router
-from wmo.optimize.router.workflow import fit_router, optimize_router, report_router
+from wmo.optimize.router.fit.workflow import fit_router, optimize_router, report_router
 from wmo.runtime.router.application import (
     create_project_router_app,
 )

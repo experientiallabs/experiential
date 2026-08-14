@@ -16,7 +16,14 @@ from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import load_model_catalog
 from wmo.common.project import ProjectStore
 from wmo.common.release_revision import installed_release_revision
-from wmo.optimize.router.manual_judge import (
+from wmo.optimize.router.judging.contracts import (
+    JudgePromptTemplate,
+    JudgeTracePreview,
+    ManualJudgeCalibrationResult,
+    ManualJudgeLabel,
+    ManualJudgeSetupArtifact,
+)
+from wmo.optimize.router.judging.service import (
     DEFAULT_JUDGE_TEMPLATE,
     ManualJudgeError,
     ManualJudgeSetupPlan,
@@ -25,13 +32,6 @@ from wmo.optimize.router.manual_judge import (
     estimate_manual_judge_budget,
     prepare_manual_judge_calibration,
     prepare_manual_judge_setup,
-)
-from wmo.optimize.router.manual_judge_contracts import (
-    JudgePromptTemplate,
-    JudgeTracePreview,
-    ManualJudgeCalibrationResult,
-    ManualJudgeLabel,
-    ManualJudgeSetupArtifact,
 )
 from wmo.runtime.models.registry import RuntimeModelCatalog
 

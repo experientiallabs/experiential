@@ -53,7 +53,12 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "wmo/runtime/router/application.py",
         "wmo/simulation/comparison.py",
         "wmo/simulation/engines/sandbox.py",
+        "wmo/optimize/router/automatic/service.py",
         "wmo/optimize/router/composition.py",
+        "wmo/optimize/router/evaluation/setup.py",
+        "wmo/optimize/router/fit/workflow.py",
+        "wmo/optimize/router/judging/service.py",
+        "wmo/optimize/router/judgment_budget.py",
     }
 )
 REQUIRED_SDIST_MEMBERS = frozenset(
@@ -61,7 +66,38 @@ REQUIRED_SDIST_MEMBERS = frozenset(
         "README.md",
         "assets/wmo-workflow.png",
         "pyproject.toml",
+        "wmo/optimize/router/automatic/service.py",
         "wmo/optimize/router/composition.py",
+        "wmo/optimize/router/evaluation/setup.py",
+        "wmo/optimize/router/fit/workflow.py",
+        "wmo/optimize/router/judging/service.py",
+        "wmo/optimize/router/judgment_budget.py",
+    }
+)
+FORBIDDEN_FLAT_ROUTER_MODULES = frozenset(
+    {
+        "wmo/optimize/router/automatic_router.py",
+        "wmo/optimize/router/automatic_router_artifacts.py",
+        "wmo/optimize/router/automatic_router_judge.py",
+        "wmo/optimize/router/automatic_router_preflight.py",
+        "wmo/optimize/router/automatic_router_replay.py",
+        "wmo/optimize/router/automatic_router_reservations.py",
+        "wmo/optimize/router/completed_build.py",
+        "wmo/optimize/router/manual_judge.py",
+        "wmo/optimize/router/manual_judge_artifacts.py",
+        "wmo/optimize/router/manual_judge_contracts.py",
+        "wmo/optimize/router/manual_judge_protocol.py",
+        "wmo/optimize/router/manual_judge_selection.py",
+        "wmo/optimize/router/optimizer.py",
+        "wmo/optimize/router/persistence.py",
+        "wmo/optimize/router/report.py",
+        "wmo/optimize/router/router_attribution.py",
+        "wmo/optimize/router/router_execution_contract.py",
+        "wmo/optimize/router/router_setup.py",
+        "wmo/optimize/router/router_simulation_spec.py",
+        "wmo/optimize/router/simulation_spend.py",
+        "wmo/optimize/router/spec.py",
+        "wmo/optimize/router/workflow.py",
     }
 )
 _RELEASE_REVISION = "1" * 40
@@ -124,6 +160,10 @@ def _assert_current_archive_members(
     removed_package = PurePosixPath("wmo", "workflow").as_posix() + "/"
     removed_members = sorted(name for name in file_names if name.startswith(removed_package))
     assert not removed_members, f"archive contains removed package: {removed_members}"
+    flat_router_members = sorted(file_names & FORBIDDEN_FLAT_ROUTER_MODULES)
+    assert not flat_router_members, (
+        f"archive contains flat router implementation modules: {flat_router_members}"
+    )
     assert required.issubset(file_names), (
         f"archive is missing current members: {required - file_names}"
     )
@@ -353,7 +393,7 @@ def _installed_release_driver() -> None:
         prepare_runtime_sft_model_optimization,
     )
     from wmo.optimize.model.sft.selection import load_latest_sft_model_optimization
-    from wmo.optimize.router.manual_judge import prepare_manual_judge_calibration
+    from wmo.optimize.router.judging.service import prepare_manual_judge_calibration
     from wmo.runtime.models import CapabilityRequirement, RuntimeModelCatalog
     from wmo.runtime.router import (
         RuntimeAcceptedEvent,

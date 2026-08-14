@@ -90,6 +90,10 @@ uv run pytest -q
 - `wmo/optimize/router/` owns provider-free offline fit, policy locking, held-out reporting,
   application composition, and their immutable artifacts. Online selection and provider execution
   belong to `wmo/runtime/router/`. Keep those two boundaries explicit.
+- Router application entrypoints stay in `composition.py` and `activation.py`. Automatic evidence
+  orchestration lives in `automatic/`, manual judge calibration in `judging/`, offline policy work
+  in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
+  `judgment_budget.py`.
 - The root CLI is locked to `build`, `optimize`, `run`, and `config`. The optimize group is locked
   to `router` and `model`; the config group is locked to `telemetry` and `providers`. Widening any
   of those three sets, whether with a command, an alias, or a flag, is a deliberate change to the

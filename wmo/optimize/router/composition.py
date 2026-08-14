@@ -59,22 +59,16 @@ from wmo.common.rollouts import SimulationArtifactSet
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import KnnBankManifest
 from wmo.optimize.router.activation import load_project_router
-from wmo.optimize.router.completed_build import (
+from wmo.optimize.router.errors import RouterCompositionError
+from wmo.optimize.router.evaluation.build import (
     completed_project_build,
     reconstruct_completed_project_build,
 )
-from wmo.optimize.router.errors import RouterCompositionError
-from wmo.optimize.router.judgment_budget import (
-    JudgmentBudgetError,
-    find_verified_judgment,
-    persist_dispatch_reservation,
-    read_dispatch_reservation,
-)
-from wmo.optimize.router.router_setup import verify_router_evaluation_setup
-from wmo.optimize.router.router_simulation_spec import build_router_simulation_spec
-from wmo.optimize.router.simulation_spend import observed_rollout_spend
-from wmo.optimize.router.spec import RouterFitResult
-from wmo.optimize.router.workflow import (
+from wmo.optimize.router.evaluation.setup import verify_router_evaluation_setup
+from wmo.optimize.router.evaluation.simulation_spec import build_router_simulation_spec
+from wmo.optimize.router.evaluation.spend import observed_rollout_spend
+from wmo.optimize.router.fit.spec import RouterFitResult
+from wmo.optimize.router.fit.workflow import (
     EvaluationInputs,
     RouterFitConfig,
     RouterFitWorkflowResult,
@@ -82,6 +76,12 @@ from wmo.optimize.router.workflow import (
     RouterWorkflowResult,
     fit_router,
     report_router,
+)
+from wmo.optimize.router.judgment_budget import (
+    JudgmentBudgetError,
+    find_verified_judgment,
+    persist_dispatch_reservation,
+    read_dispatch_reservation,
 )
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime
