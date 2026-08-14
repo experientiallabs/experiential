@@ -9,7 +9,11 @@ WMO_DIR = Path(__file__).resolve().parent.parent
 
 
 def test_forbidden_provider_imports_are_absent() -> None:
-    """Callers use canonical model contracts and explicit HTTP clients and nothing else."""
+    """Prove production callers stay on the lean provider dependency surface.
+
+    The repository scan rejects direct imports of provider SDKs, retired provider layers, and
+    heavyweight model libraries outside the canonical contracts and HTTP clients.
+    """
     violations = _banned_imports(
         WMO_DIR,
         {

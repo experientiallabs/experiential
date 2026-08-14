@@ -290,7 +290,11 @@ def test_build_rejects_unknown_source_and_missing_local_evidence(tmp_path: Path)
 
 
 def test_build_requires_an_explicit_project(tmp_path: Path) -> None:
-    """The locked build surface has one positional trace and one explicit project."""
+    """Prove the locked build surface requires its explicit project option.
+
+    Args:
+        tmp_path: Isolated directory receiving the canonical trace fixture.
+    """
     source = _otlp_export(tmp_path, count=1)
 
     result = _RUNNER.invoke(app, ["build", str(source)])

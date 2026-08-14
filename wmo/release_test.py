@@ -95,7 +95,13 @@ def _assert_current_archive_members(
     required: frozenset[str],
     allow_tests: bool,
 ) -> None:
-    """Reject a missing current member, and reject test members where tests are excluded."""
+    """Validate archive membership against the current release contract.
+
+    Args:
+        names: Normalized paths contained in the built archive.
+        required: Current paths that the archive must contain.
+        allow_tests: Whether test modules are valid archive members.
+    """
     file_names = frozenset(name for name in names if name and not name.endswith("/"))
     assert required.issubset(file_names), (
         f"archive is missing current members: {required - file_names}"
@@ -130,7 +136,11 @@ def _tracked_wheel_members() -> frozenset[str]:
 
 
 def test_built_archives_match_current_package_contract() -> None:
-    """Fresh wheel and sdist contain current code and minimal dependency metadata."""
+    """Prove fresh wheel and sdist match the current package contract.
+
+    The test compares archive membership to tracked release sources, rejects package leakage and
+    forbidden requirements, and validates the exact minimal core dependency set.
+    """
     configured_dir = os.environ.get(BUILT_DIST_ENV)
     if configured_dir is None:
         pytest.skip(f"set {BUILT_DIST_ENV} to scan freshly built release archives")

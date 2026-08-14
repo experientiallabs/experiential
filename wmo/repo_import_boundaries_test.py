@@ -145,7 +145,11 @@ def test_production_imports_follow_dependency_direction() -> None:
 
 
 def test_every_forbidden_direction_is_detected() -> None:
-    """The gate flags each forbidden dependency edge rather than a subset of them."""
+    """Prove the import gate detects every configured forbidden dependency edge.
+
+    Each owner and forbidden dependency pair is rendered as a synthetic import and must produce the
+    exact normalized violation tuple.
+    """
     for owner, dependencies in FORBIDDEN_IMPORTS.items():
         for dependency in dependencies:
             path = WMO_DIR / owner / "fixture.py"

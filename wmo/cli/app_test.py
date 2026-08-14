@@ -15,7 +15,11 @@ EXPECTED_SUBCOMMANDS = {
 
 
 def test_root_cli_and_subgroups_are_exact() -> None:
-    """The public CLI remains build, config, optimize, and run with two exact subgroups."""
+    """Prove the root command and nested subgroup surfaces remain exact.
+
+    The test enumerates the public root commands and then verifies each configured subgroup exposes
+    only its approved child commands.
+    """
     root = get_group(app)
     root_context = Context(root)
     assert set(root.list_commands(root_context)) == {"build", "config", "optimize", "run"}
