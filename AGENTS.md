@@ -125,6 +125,11 @@ uv run pytest -q
   (the /ready-for-merge audit); pre-existing occurrences (including in this file) are
   grandfathered and cleaned opportunistically when a line is edited anyway, not in bulk sweeps.
   Verbatim data quoted inside code fences keeps its original punctuation.
+- Production code and docstrings must describe the current behavior, contract, and rationale as a
+  self-contained system. Do not reference commit SHAs, deleted implementations, refactor history,
+  prior architecture, or the process used to build the code unless required to explain an active
+  backward-compatibility constraint. Historical provenance and migration narratives belong in
+  design documents, pull requests, or changelogs, not in the implementation.
 
 ## Rules
 
