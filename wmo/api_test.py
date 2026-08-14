@@ -14,11 +14,24 @@ from wmo.runtime.router.application import (
 )
 from wmo.runtime.router.runtime import RouterRuntime
 from wmo.simulation.build import build_project
+from wmo.simulation.world_model.application import (
+    WorldModel,
+    WorldModelLoadError,
+    WorldModelObservation,
+    WorldModelSession,
+    WorldModelSessionError,
+    WorldModelSessionLimits,
+    load_world_model,
+)
 from wmo.workflow.router import compose_router
 
 
 def test_public_api_matches_quickstart() -> None:
-    """The customer workflow uses only deliberate package-root service exports."""
+    """The quickstart uses only deliberate package-root services.
+
+    Every supported build, optimization, router, and world-model entrypoint resolves to its owning
+    implementation while unsupported conveniences remain absent.
+    """
     assert wmo.build_project is build_project
     assert wmo.optimize_router is optimize_router
     assert wmo.fit_router is fit_router
@@ -28,6 +41,13 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.load_project_router is load_project_router
     assert wmo.load_router is load_router
     assert wmo.create_project_router_app is create_project_router_app
+    assert wmo.load_world_model is load_world_model
+    assert wmo.WorldModel is WorldModel
+    assert wmo.WorldModelLoadError is WorldModelLoadError
+    assert wmo.WorldModelSession is WorldModelSession
+    assert wmo.WorldModelSessionError is WorldModelSessionError
+    assert wmo.WorldModelSessionLimits is WorldModelSessionLimits
+    assert wmo.WorldModelObservation is WorldModelObservation
     assert "ActionKind" not in wmo.__all__
 
 

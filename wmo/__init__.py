@@ -30,6 +30,23 @@ if TYPE_CHECKING:
     from wmo.simulation.build import TaskSetBuild as TaskSetBuild
     from wmo.simulation.build import build_project as build_project
     from wmo.simulation.build import build_task_set as build_task_set
+    from wmo.simulation.world_model.application import WorldModel as WorldModel
+    from wmo.simulation.world_model.application import (
+        WorldModelLoadError as WorldModelLoadError,
+    )
+    from wmo.simulation.world_model.application import (
+        WorldModelObservation as WorldModelObservation,
+    )
+    from wmo.simulation.world_model.application import (
+        WorldModelSession as WorldModelSession,
+    )
+    from wmo.simulation.world_model.application import (
+        WorldModelSessionError as WorldModelSessionError,
+    )
+    from wmo.simulation.world_model.application import (
+        WorldModelSessionLimits as WorldModelSessionLimits,
+    )
+    from wmo.simulation.world_model.application import load_world_model as load_world_model
     from wmo.workflow.router import (
         ApprovedRouterReview as ApprovedRouterReview,
     )
@@ -53,6 +70,13 @@ _EXPORT_MODULES = {
     "TaskSetBuild": "wmo.simulation.build",
     "build_project": "wmo.simulation.build",
     "build_task_set": "wmo.simulation.build",
+    "WorldModel": "wmo.simulation.world_model.application",
+    "WorldModelLoadError": "wmo.simulation.world_model.application",
+    "WorldModelObservation": "wmo.simulation.world_model.application",
+    "WorldModelSession": "wmo.simulation.world_model.application",
+    "WorldModelSessionError": "wmo.simulation.world_model.application",
+    "WorldModelSessionLimits": "wmo.simulation.world_model.application",
+    "load_world_model": "wmo.simulation.world_model.application",
     "EvaluationInputs": "wmo.optimize.router.workflow",
     "RouterFitConfig": "wmo.optimize.router.workflow",
     "RouterFitWorkflowResult": "wmo.optimize.router.workflow",
