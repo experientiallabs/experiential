@@ -119,3 +119,50 @@ assert callable(load_world_model)
 assert load_world_model.__module__ == "wmo.simulation.world_model.application"
 """
     )
+
+
+def test_router_server_public_imports_resolve_after_lazy_package_import() -> None:
+    """Resolve public router application and endpoint services through lazy exports."""
+    _run(
+        """
+import wmo.runtime.router as router
+assert {"create_router_endpoint", "load_router"}.issubset(dir(router))
+try:
+    getattr(router, "p17_unknown_router_export")
+except AttributeError:
+    pass
+else:
+    raise AssertionError("unknown router export resolved")
+from wmo.runtime.router import create_router_endpoint, load_router
+from wmo.runtime.router.application import load_router as nested_load_router
+from wmo.runtime.router.endpoint import create_router_endpoint as nested_endpoint
+assert create_router_endpoint.__module__ == "wmo.runtime.router.endpoint"
+assert load_router.__module__ == "wmo.runtime.router.application"
+assert create_router_endpoint is nested_endpoint
+assert load_router is nested_load_router
+"""
+    )
+
+
+def test_runtime_rag_refresh_public_imports_resolve_after_lazy_package_import() -> None:
+    """Resolve public runtime refresh services through lazy retrieval exports."""
+    _run(
+        """
+import sys
+import wmo.simulation.retrieval as retrieval
+names = {"RuntimeRAGRefresh", "RuntimeTraceStitchingError", "refresh_runtime_trace_rag"}
+assert names.issubset(dir(retrieval))
+assert "wmo.runtime.router" not in sys.modules
+try:
+    getattr(retrieval, "p17_unknown_retrieval_export")
+except AttributeError:
+    pass
+else:
+    raise AssertionError("unknown retrieval export resolved")
+from wmo.simulation.retrieval import RuntimeRAGRefresh, refresh_runtime_trace_rag
+from wmo.simulation.retrieval.refresh import RuntimeRAGRefresh as nested_refresh_type
+from wmo.simulation.retrieval.refresh import refresh_runtime_trace_rag as nested_refresh
+assert RuntimeRAGRefresh is nested_refresh_type
+assert refresh_runtime_trace_rag is nested_refresh
+"""
+    )
