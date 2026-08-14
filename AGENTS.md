@@ -35,8 +35,8 @@ uv run pytest -q
 ## Evidence, simulation, and routing lifecycle
 
 - `wmo/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
-  current engines, orchestration, artifact construction, and comparisons. Keep
-  those responsibilities nested instead of returning production modules to flat `wmo/` paths.
+  current engines, orchestration, artifact construction, and comparisons. New modules for those
+  responsibilities go inside `wmo/simulation/`, never at the flat `wmo/` root.
 - `wmo build TRACE_FILE --source otlp|posthog --project PROJECT --root ROOT` is the only CLI path
   from local traces to immutable task evidence. It accepts 100 through 1000 normalized traces,
   writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, and makes no
@@ -65,35 +65,32 @@ uv run pytest -q
   environments, model clients, and frozen router execution. Optimization may depend on runtime;
   runtime code must not depend on simulation or optimization algorithms.
 - `wmo run` serves only a frozen local router policy. Simulation callers choose an `AgentRuntime`
-  and `EnvironmentRuntime` directly. There is no hosted-agent transport, run-control client,
-  benchmark evaluator, or harness-document execution surface in this repository.
+  and `EnvironmentRuntime` directly, in process.
 - Local Pi and process-environment adapters execute external code on the user's machine only when
   a caller explicitly selects them. Preserve bounded processes, the explicit working directory,
   and fail-closed support checks.
 - Customer agents implement the whole-episode `AgentRuntime` contract and receive only an injected
   candidate model plus an execute-only `EnvironmentSession`. The built-in Pi adapter invokes an
-  installed external executable. WMO carries no Pi source.
+  externally installed executable.
 - Executable environments implement the lifecycle-owning `EnvironmentRuntime` contract. Local and
   injected remote backends preserve exact resource identity, bounded execution, usage metering,
-  and fail-closed cleanup evidence. A remote adapter must declare and implement its own finite
-  close primitive before use; WMO does not place arbitrary cleanup in an unkillable thread. The
-  sandbox ledger releases an exact ID only after that bounded adapter positively proves cleanup.
+  and fail-closed cleanup evidence. A remote adapter declares and implements its own finite close
+  primitive before use, and all of its cleanup runs inside that primitive. The sandbox ledger
+  releases an exact ID only after the adapter positively proves cleanup.
 
 ## Optimization surfaces
 
-- This repository owns no harness search, world-model delta search, Harbor benchmark scoring, or
-  live agent session surface; that work belongs to the private `agent-optimization` repo. Customer
-  agent execution lives only in `wmo/runtime/agents/`, executable environments live only in
-  `wmo/runtime/environments/`, and sandbox simulation lives only in
-  `wmo/simulation/engines/sandbox.py`. Keep harness documents, benchmark ownership, and mutation
-  machinery out of this repository.
+- Customer agent execution lives only in `wmo/runtime/agents/`, executable environments live only
+  in `wmo/runtime/environments/`, and sandbox simulation lives only in
+  `wmo/simulation/engines/sandbox.py`. Agent-search and benchmark-scoring work belongs to the
+  private `agent-optimization` repo; send it there.
 - `wmo/optimize/router/` owns provider-free offline fit, policy locking, held-out reporting, and
   their immutable artifacts. Online selection belongs to `wmo/runtime/router/`; customer workflow
   composition belongs to `wmo/workflow/router.py`. Keep those three boundaries explicit.
 - The root CLI is locked to `build`, `optimize`, `run`, and `config`. The optimize group is locked
-  to `router` and `model`; the config group is locked to `telemetry` and `providers`. Adding a root
-  command, an alias, a hosted-session flag, or separate fit and report commands requires widening
-  that locked surface deliberately.
+  to `router` and `model`; the config group is locked to `telemetry` and `providers`. Widening any
+  of those three sets, whether with a command, an alias, or a flag, is a deliberate change to the
+  locked surface and needs the same scrutiny as a public API change.
 - `wmo optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
   It never builds a dataset, creates teacher rollouts, changes routing roles, or launches a
   simulator. The config freezes the W12 manifest, native Tinker base-model snapshot, capability
@@ -102,8 +99,9 @@ uv run pytest -q
   after those checks. Completed W13 artifacts are recursively verified before an opaque sampling
   handle is atomically registered in `models.toml`.
 - Changes to this composition seam require focused persisted-dataset, resume, budget, immutable
-  pointer, drift, and catalog-provenance coverage. Rollout, reverse-KL, cross-token loss,
-  promotion, adapter-store, and route-registration paths do not belong on this seam.
+  pointer, drift, and catalog-provenance coverage. The seam composes a persisted dataset into an
+  SFT run and stops there; training-objective, promotion, and route-registration concerns belong to
+  their own owners.
 
 ## Python
 
@@ -156,8 +154,8 @@ uv run pytest -q
    workflow composition is under `wmo/workflow/`; shared contracts, model metadata, minimal
    configuration, and product telemetry are under `wmo/common/`. Provider execution belongs under
    `wmo/runtime/models/providers/`. Common code must not import a product domain, and runtime code
-   must not import simulation or optimization. Keep the locked CLI small and do not return
-   production modules to the flat `wmo/` namespace.
+   must not import simulation or optimization. Keep the locked CLI small, and give every production
+   module a domain subpackage rather than the flat `wmo/` namespace.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
    `docs/`, `.claude/`, `.github/`. That list is closed.
@@ -183,10 +181,10 @@ uv run pytest -q
      pipeline on one benchmark, each step one real CLI command plus the artifact it creates),
      plus two root pages: `docs/usage.md` (the terse map of the CLI surface: one line of purpose
      and one artifact per command) and `docs/release-scope.md` (the supported and explicitly
-     excluded claims of the current release, checked by `wmo/release_test.py`). Nothing else: raw result JSONs, vector sources, design
-     notes, and drafts do not belong in the repo at all. `docs/README.md` indexes every
-     doc and records its purpose. Update or remove superseded material only after checking
-     references and retaining durable evidence.
+     excluded claims of the current release, checked by `wmo/release_test.py`). Nothing else: raw
+     result JSONs, vector sources, design notes, and drafts stay out of the repo. `docs/README.md`
+     indexes every doc and records its purpose. Update or remove superseded material only after
+     checking references and retaining durable evidence.
      Reproduction lives in the report itself, quoted as public `wmo` API/CLI plus the exact
      parameter pins.
      Everything generated stays out of git: project evidence and model artifacts under the local
@@ -209,7 +207,7 @@ uv run pytest -q
    local OTLP or PostHog export, then use only the locked `config`, `optimize`, and `run` surfaces
    for persisted project artifacts. Do not vendor benchmark data, gold dirs, or capture scripts.
 
-7. **Give reusable workflows a clear owner.** Avoid parallel top-level scripts for harness actions.
+7. **Give reusable workflows a clear owner.** A workflow has exactly one home, inside `wmo/`.
    If a workflow is generally useful, implement it in `wmo/` and expose it through the CLI. When a
    published dependency already owns the right contract, prefer its public API; use a separate
    implementation when requirements differ materially and document the boundary.
@@ -267,13 +265,14 @@ uv run pytest -q
 This repo publishes **one distribution**: `world-model-optimizer`, whose importable code is all of
 `wmo/` and nothing else. Rules of the road:
 
-- **No workspace, no members**: there is no `[tool.uv.workspace]` and no `[tool.uv.sources]`. A
-  dependency is either a normal PyPI requirement in `[project.dependencies]` or it is code under
-  `wmo/`. Do not reintroduce a member directory (rule 5 forbids the top-level dir anyway).
+- **One package, no workspace**: a dependency is either a normal PyPI requirement in
+  `[project.dependencies]` or it is code under `wmo/`. `pyproject.toml` declares no uv workspace
+  and no path sources, and a member directory would need a new top-level directory that rule 5
+  forbids.
 - **Keep dependency ownership explicit**: published shared building blocks are normal PyPI
   requirements. Provider-neutral catalog metadata and immutable snapshots live under
-  `wmo/common/models/`; explicit runtime clients use the shared HTTP transport. Releases do not
-  depend on an unpublished workspace member or a copied provider stack.
+  `wmo/common/models/`; explicit runtime clients use the shared HTTP transport. A release resolves
+  entirely from published requirements plus `wmo/`.
 - **Gate scoping**: the root gate is `uv run ruff check .`, `uv run ty check`, `uv run pytest -q`,
   all over the single `testpaths = ["wmo"]`. Tests are inline `*_test.py` beside the module they
   cover. There is exactly one ruff config and one ty config, at the root.
@@ -284,8 +283,7 @@ This repo publishes **one distribution**: `world-model-optimizer`, whose importa
 ## Docs
 
 The repo is the single source of truth for project docs: finished, production-ready reports in
-`docs/` (rule 5). There is no in-repo home for working docs, plans, or drafts — keep them outside
-the checkout (see rule 5) until they are worth promoting. The former Notion docs database (Eng
-Docs → world-model-optimizer, page `38e0f8b3-f591-8087-b6b7-fc883178dc5e`) is deprecated — do not
-add new project docs to Notion. Promote durable decisions and evidence to `docs/`; remove obsolete
-material only after checking references and preserving anything unique.
+`docs/` (rule 5). Working docs, plans, and drafts stay outside the checkout (see rule 5) until they
+are worth promoting, and project docs go in `docs/` rather than Notion. Promote durable decisions
+and evidence to `docs/`; remove obsolete material only after checking references and preserving
+anything unique.
