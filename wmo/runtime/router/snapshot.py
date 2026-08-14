@@ -181,11 +181,12 @@ _INTERACTION_ADAPTER = TypeAdapter(RuntimeTraceInteraction)
 class RuntimeTraceSnapshot(ArtifactEnvelope):
     """One immutable, content-addressed prefix of a routed-interaction journal."""
 
+    schema_version: Literal[1] = 1
     snapshot_id: ArtifactId
     project_id: ArtifactId
     last_ordinal: int = Field(gt=0)
     prefix_sha256: Sha256
-    interactions_path: str = Field(min_length=1)
+    interactions_path: Literal["interactions.jsonl"] = _INTERACTIONS_PATH
     interactions_sha256: Sha256
     interaction_ids: tuple[ArtifactId, ...]
     completed_target_count: int = Field(ge=0)
@@ -233,12 +234,7 @@ class RuntimeTraceSnapshot(ArtifactEnvelope):
             raise ValueError("runtime trace snapshots cannot declare upstream artifact inputs")
         expected_id = stable_id(
             "runtime-trace-snapshot",
-            {
-                "project_id": self.project_id,
-                "last_ordinal": self.last_ordinal,
-                "prefix_sha256": self.prefix_sha256,
-                "code_revision": self.code_revision,
-            },
+            self.model_dump(mode="json", exclude={"created_at", "snapshot_id"}),
         )
         if self.snapshot_id != expected_id:
             raise ValueError("runtime trace snapshot ID differs from its canonical prefix")
@@ -324,18 +320,28 @@ def seal_runtime_trace_snapshot(
         for attempt in interaction.attempts
         for event in attempt.terminal_events
     )
+    interactions_sha256 = _sha256(interactions_payload)
     snapshot_id = stable_id(
         "runtime-trace-snapshot",
         {
+            "schema_version": 1,
+            "inputs": [],
+            "code_revision": code_revision,
+            "source": source.model_dump(mode="json"),
             "project_id": journal.project_id,
             "last_ordinal": events[-1].ordinal,
             "prefix_sha256": prefix_sha256,
-            "code_revision": code_revision,
+            "interactions_path": _INTERACTIONS_PATH,
+            "interactions_sha256": interactions_sha256,
+            "interaction_ids": list(interaction_ids),
+            "completed_target_count": completed_target_count,
+            "failed_attempt_count": failed_attempt_count,
         },
     )
     snapshot = RuntimeTraceSnapshot(
         schema_version=1,
         created_at=created_at,
+        inputs=(),
         code_revision=code_revision,
         source=source,
         snapshot_id=snapshot_id,
@@ -343,7 +349,7 @@ def seal_runtime_trace_snapshot(
         last_ordinal=events[-1].ordinal,
         prefix_sha256=prefix_sha256,
         interactions_path=_INTERACTIONS_PATH,
-        interactions_sha256=_sha256(interactions_payload),
+        interactions_sha256=interactions_sha256,
         interaction_ids=interaction_ids,
         completed_target_count=completed_target_count,
         failed_attempt_count=failed_attempt_count,
@@ -737,14 +743,28 @@ def _persist_dataset(
         ArtifactStoreError: A new dataset cannot be persisted safely.
     """
     traces_payload = _jsonl_bytes(traces)
+    traces_sha256 = _sha256(traces_payload)
     snapshot_input = artifact_input(loaded_snapshot.manifest)
+    source = SourceIdentity(
+        kind="production",
+        source_id=loaded_snapshot.snapshot.snapshot_id,
+        sha256=loaded_snapshot.snapshot.prefix_sha256,
+    )
+    trace_ids = tuple(trace.trace_id for trace in traces)
     dataset_id = stable_id(
         "trace-dataset",
         {
-            "snapshot": snapshot_input.model_dump(mode="json"),
-            "traces_sha256": _sha256(traces_payload),
+            "schema_version": 1,
+            "inputs": [snapshot_input.model_dump(mode="json")],
             "code_revision": loaded_snapshot.snapshot.code_revision,
+            "source": source.model_dump(mode="json"),
             "semantic_convention_version": _RUNTIME_TRACE_CONVENTION,
+            "traces_path": _TRACES_PATH,
+            "traces_sha256": traces_sha256,
+            "issues_path": None,
+            "issues_sha256": None,
+            "invalid_trace_count": 0,
+            "trace_ids": list(trace_ids),
         },
     )
     dataset = TraceDataset(
@@ -752,16 +772,12 @@ def _persist_dataset(
         created_at=loaded_snapshot.snapshot.created_at,
         inputs=(snapshot_input,),
         code_revision=loaded_snapshot.snapshot.code_revision,
-        source=SourceIdentity(
-            kind="production",
-            source_id=loaded_snapshot.snapshot.snapshot_id,
-            sha256=loaded_snapshot.snapshot.prefix_sha256,
-        ),
+        source=source,
         dataset_id=dataset_id,
         semantic_convention_version=_RUNTIME_TRACE_CONVENTION,
         traces_path=_TRACES_PATH,
-        traces_sha256=_sha256(traces_payload),
-        trace_ids=tuple(trace.trace_id for trace in traces),
+        traces_sha256=traces_sha256,
+        trace_ids=trace_ids,
     )
     try:
         manifest = store.write(
@@ -809,6 +825,14 @@ def _load_exact_dataset_replay(
         raise RuntimeTraceSnapshotError(
             f"existing trace dataset {expected.dataset_id} has an invalid envelope"
         ) from exc
+    expected_existing_id = stable_id(
+        "trace-dataset",
+        existing.model_dump(mode="json", exclude={"created_at", "dataset_id"}),
+    )
+    if existing.dataset_id != expected_existing_id:
+        raise RuntimeTraceSnapshotError(
+            "existing runtime trace dataset ID differs from its canonical content"
+        )
     if existing != expected:
         raise RuntimeTraceSnapshotError(
             "existing runtime trace dataset differs from the snapshot replay"

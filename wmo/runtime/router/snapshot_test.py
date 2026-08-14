@@ -375,7 +375,7 @@ def test_code_revision_drift_creates_distinct_snapshot_and_dataset_ids(tmp_path:
     assert first.traces[0].source != second.traces[0].source
 
 
-@pytest.mark.parametrize("mutation", ["inputs", "source-id"])
+@pytest.mark.parametrize("mutation", ["inputs", "source-id", "schema-version", "path"])
 def test_loader_rejects_forged_snapshot_provenance(
     tmp_path: Path,
     mutation: str,
@@ -405,9 +405,14 @@ def test_loader_rejects_forged_snapshot_provenance(
         ]
         snapshot["inputs"] = forged_inputs
         manifest["inputs"] = forged_inputs
-    else:
+    elif mutation == "source-id":
         snapshot["source"]["source_id"] = "forged/runtime/interactions"
         manifest["source"]["source_id"] = "forged/runtime/interactions"
+    elif mutation == "schema-version":
+        snapshot["schema_version"] = 2
+        manifest["schema_version"] = 2
+    else:
+        snapshot["interactions_path"] = "forged-interactions.jsonl"
     snapshot_payload = canonical_json_bytes(snapshot)
     snapshot_path.write_bytes(snapshot_payload)
     snapshot_entry = next(
@@ -419,6 +424,88 @@ def test_loader_rejects_forged_snapshot_provenance(
 
     with pytest.raises(ArtifactCorruptionError, match="invalid envelope"):
         load_runtime_trace_snapshot(store, exported.snapshot.snapshot_id)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "schema-version",
+        "traces-path",
+        "semantic-convention",
+        "inputs",
+        "code-revision",
+        "trace-ids",
+        "source",
+        "traces-digest",
+        "issues",
+    ],
+)
+def test_dataset_replay_rejects_envelope_fields_outside_its_identity(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Prove every replay-sensitive dataset field is bound to its content identity.
+
+    Args:
+        tmp_path: Isolated project root.
+        mutation: Valid envelope field rewrite applied with updated file and manifest digests.
+    """
+    journal, store = _journal_and_store(tmp_path)
+    _complete(journal, key="forged-dataset-key")
+    exported = seal_runtime_trace_snapshot(
+        journal,
+        store,
+        created_at=_TIME + timedelta(minutes=1),
+        code_revision="test-revision",
+    )
+    directory = store.read(exported.dataset.dataset_id).directory
+    dataset_path = directory / "trace-dataset.json"
+    manifest_path = directory / "manifest.json"
+    dataset = json.loads(dataset_path.read_bytes())
+    manifest = json.loads(manifest_path.read_bytes())
+    if mutation == "schema-version":
+        dataset["schema_version"] = 2
+        manifest["schema_version"] = 2
+    elif mutation == "traces-path":
+        dataset["traces_path"] = "alternate-traces.jsonl"
+    elif mutation == "semantic-convention":
+        dataset["semantic_convention_version"] = "wmo.runtime.router.v2"
+    elif mutation == "inputs":
+        forged_inputs = [
+            ArtifactInput(artifact_id="forged-input", sha256="f" * 64).model_dump(mode="json")
+        ]
+        dataset["inputs"] = forged_inputs
+        manifest["inputs"] = forged_inputs
+    elif mutation == "code-revision":
+        dataset["code_revision"] = "forged-revision"
+        manifest["code_revision"] = "forged-revision"
+    elif mutation == "trace-ids":
+        dataset["trace_ids"] = ["forged-trace"]
+    elif mutation == "source":
+        dataset["source"]["source_id"] = "forged-snapshot"
+        manifest["source"]["source_id"] = "forged-snapshot"
+    elif mutation == "traces-digest":
+        dataset["traces_sha256"] = "f" * 64
+    else:
+        dataset["issues_path"] = "issues.jsonl"
+        dataset["issues_sha256"] = "f" * 64
+        dataset["invalid_trace_count"] = 1
+    dataset_payload = canonical_json_bytes(dataset)
+    dataset_path.write_bytes(dataset_payload)
+    dataset_entry = next(
+        entry for entry in manifest["files"] if entry["path"] == "trace-dataset.json"
+    )
+    dataset_entry["sha256"] = hashlib.sha256(dataset_payload).hexdigest()
+    dataset_entry["size_bytes"] = len(dataset_payload)
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+
+    with pytest.raises(RuntimeTraceSnapshotError, match="ID differs"):
+        seal_runtime_trace_snapshot(
+            journal,
+            store,
+            created_at=_TIME + timedelta(minutes=2),
+            code_revision="test-revision",
+        )
 
 
 def test_retry_success_is_one_target_and_failures_remain_prefix_provenance(
