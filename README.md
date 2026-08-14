@@ -9,9 +9,9 @@ WMO optimizes agent workflows from traces through a three-step process:
 ![Your traces flow through simulation into routing and training optimization](https://raw.githubusercontent.com/experientiallabs/world-model-optimizer/main/assets/wmo-workflow.png)
 
 <p align="center">
-  <a href="https://platform.experientiallabs.ai">Platform</a> ·
-  <a href="https://github.com/experientiallabs/world-model-optimizer/tree/main/docs">Docs</a> ·
-  <a href="https://discord.gg/B6sM8xTVwU">Discord</a>
+  🌐 <a href="https://platform.experientiallabs.ai">Platform</a> |
+  📚 <a href="https://github.com/experientiallabs/world-model-optimizer/tree/main/docs">Docs</a> |
+  <a href="https://discord.gg/B6sM8xTVwU"><img src="https://cdn.simpleicons.org/discord/5865F2" alt="" width="16" height="16"> Discord</a>
 </p>
 
 ## Getting Started
