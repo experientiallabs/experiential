@@ -38,6 +38,7 @@ from wmo.common.routing import RoutingDecision
 from wmo.runtime.models.providers.transport import ProviderTransportError
 from wmo.runtime.router.runtime import (
     RoutedModelResponse,
+    RouterModelCapabilityError,
     RouterRuntime,
     RouterRuntimeIntegrityError,
 )
@@ -147,7 +148,7 @@ class RuntimeAcceptedEvent(ContractModel):
 
 
 class RuntimeAttemptFailedEvent(ContractModel):
-    """One provider attempt that ended without a response target."""
+    """One completion attempt that ended without a response target."""
 
     event: Literal["attempt_failed"] = "attempt_failed"
     event_id: str = Field(pattern=r"^runtime-event-[0-9a-f]{20}$")
@@ -556,6 +557,8 @@ class JournaledRouterRuntime:
             if claim.status == "failed":
                 if claim.failure is None:
                     raise RuntimeJournalError("failed journal claim omitted its failure")
+                if claim.failure.failure.code == FailureCode.UNSUPPORTED:
+                    raise RouterModelCapabilityError(claim.failure.failure.message)
                 raise RuntimeInteractionFailedError(claim.failure.failure)
             if claim.status == "live":
                 remaining = deadline - self._monotonic()
@@ -577,7 +580,7 @@ class JournaledRouterRuntime:
                 provider_idempotency_key=idempotency_key,
             )
         except Exception as exc:
-            failure = _structured_provider_failure(exc)
+            failure = _structured_completion_failure(exc)
             terminal = self.journal.record_failure(accepted, failure, failed_at=self._clock())
             if isinstance(terminal, RuntimeCompletedEvent):
                 return RoutedModelResponse(
@@ -853,8 +856,16 @@ def _selected_model(runtime: RouterRuntime, alias: str) -> ModelSnapshot:
     raise RuntimeJournalError("routing decision selected an alias outside the frozen policy")
 
 
-def _structured_provider_failure(exception: Exception) -> StructuredFailure:
-    """Normalize a target-call exception without persisting its possibly secret message."""
+def _structured_completion_failure(exception: Exception) -> StructuredFailure:
+    """Normalize a completion exception without retaining provider secrets."""
+    if isinstance(exception, RouterModelCapabilityError):
+        return StructuredFailure(
+            code=FailureCode.UNSUPPORTED,
+            message=str(exception),
+            retryable=False,
+            exception_type=type(exception).__name__,
+            attribution=FailureAttribution.MODEL,
+        )
     if isinstance(exception, (RouterRuntimeIntegrityError, ValueError)):
         return StructuredFailure(
             code=FailureCode.INTERNAL,

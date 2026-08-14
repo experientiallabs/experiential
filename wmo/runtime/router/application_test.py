@@ -16,7 +16,7 @@ from openai import ConflictError, InternalServerError, OpenAI
 from openai.types.chat import ChatCompletion
 from openai.types.responses import Response
 
-from wmo.common.core.artifacts import ArtifactId
+from wmo.common.core.artifacts import ArtifactId, FailureCode
 from wmo.common.project import ProjectStore
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.application import (
@@ -757,6 +757,59 @@ def test_standard_idempotency_key_rejects_changed_request(
     assert conflict.status_code == 409
     assert model_client.embed_calls == model_client.complete_calls == 1
     assert sum(isinstance(event, RuntimeCompletedEvent) for event in journal.read_events()) == 1
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+@pytest.mark.parametrize("capability", ["tools", "output_capacity"])
+def test_capability_rejection_replays_exactly_after_application_restart(
+    tmp_path: Path,
+    path: str,
+    capability: str,
+) -> None:
+    """Replay a durable pre-dispatch capability rejection with its original 501 meaning.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        path: OpenAI endpoint path exercised by the parameterized regression.
+        capability: Request capability that the selected model cannot prove.
+    """
+    root = tmp_path / ".wmo"
+    first_runtime, first_client = _runtime(candidate_tools=False)
+    first_application, journal = _journaled_application(root, first_runtime)
+    payload = _payload(path, "unsupported")
+    if capability == "tools":
+        payload["tools"] = (
+            [{"type": "function", "name": "read", "parameters": {}}]
+            if path.endswith("responses")
+            else [
+                {
+                    "type": "function",
+                    "function": {"name": "read", "parameters": {}},
+                }
+            ]
+        )
+    elif path.endswith("responses"):
+        payload["max_output_tokens"] = 20_000
+    else:
+        payload["max_completion_tokens"] = 20_000
+    headers = {"Idempotency-Key": f"unsupported-{capability}"}
+
+    first = TestClient(first_application).post(path, json=payload, headers=headers)
+    restarted_runtime, restarted_client = _runtime(candidate_tools=False)
+    restarted_application, _ = _journaled_application(root, restarted_runtime)
+    replay = TestClient(restarted_application).post(path, json=payload, headers=headers)
+
+    assert first.status_code == replay.status_code == 501
+    assert first.content == replay.content
+    assert first_client.complete_calls == restarted_client.complete_calls == 0
+    assert restarted_client.embed_calls == 0
+    events = journal.read_events()
+    assert [event.event for event in events] == ["accepted", "attempt_failed"]
+    failure = cast(RuntimeAttemptFailedEvent, events[-1])
+    assert failure.failure.code == FailureCode.UNSUPPORTED
+    assert failure.failure.exception_type == "RouterModelCapabilityError"
+    assert not failure.retryable
+    assert not any(isinstance(event, RuntimeCompletedEvent) for event in events)
 
 
 def test_provider_failure_has_no_completed_sft_target(tmp_path: Path) -> None:
