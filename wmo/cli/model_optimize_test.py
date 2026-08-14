@@ -30,6 +30,9 @@ from wmo.optimize.model.sft import (
     SFTModelOptimizationConfig,
     TinkerSFTSpec,
     create_sft_model_optimization_config,
+    load_sft_model_optimization_config,
+    load_verified_sft_dataset,
+    sft_model_optimization_output_dir,
     write_sft_model_optimization_config,
 )
 from wmo.optimize.model.sft.runtime_source_test import _complete, _request
@@ -717,6 +720,319 @@ def test_declined_spend_consent_does_not_resolve_credentials_or_construct_sdk(
     assert result.exit_code == 0, result.output
     assert "was not started" in result.output
     assert backend_calls == []
+
+
+def test_completion_before_consent_refreshes_the_schedule_and_trains_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Include a completion that lands after the first snapshot but before consent.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+        monkeypatch: Scoped race injection, consent, backend, and revision replacements.
+    """
+    configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
+    command = importlib.import_module("wmo.cli.model_optimize")
+    original_preflight = command.preflight_sft_model_optimization
+    preflight_calls = 0
+    consented_row_counts: list[int] = []
+    backend = _FakeBackend(conservative_cost_per_batch=0.10)
+
+    def preflight_then_complete(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        """Append one completion after the first local preflight returns.
+
+        Args:
+            args: Positional preflight inputs forwarded unchanged.
+            kwargs: Keyword preflight inputs forwarded unchanged.
+
+        Returns:
+            The original recursively verified preflight result.
+        """
+        nonlocal preflight_calls
+        result = original_preflight(*args, **kwargs)
+        preflight_calls += 1
+        if preflight_calls == 1:
+            _complete(
+                RuntimeInteractionJournal(configured.store.paths),
+                key="completion-before-consent",
+                conversation="runtime-sft-conversation",
+                request=_request(ModelMessage(role="user", content="Second routed request")),
+                output=AssistantAction(content="Second routed response"),
+                now=_TIME,
+            )
+        return result
+
+    def approve_refreshed_schedule(*args: object, **kwargs: object) -> bool:
+        """Record the exact refreshed W12 denominator shown for consent.
+
+        Args:
+            args: Consent positional inputs accepted without inspection.
+            kwargs: Consent keyword inputs accepted without inspection.
+
+        Returns:
+            ``True`` to authorize the refreshed immutable schedule.
+        """
+        del args, kwargs
+        latest = load_latest_sft_model_optimization(configured.store)
+        assert latest is not None
+        config = load_sft_model_optimization_config(configured.store, latest.config.artifact_id)
+        dataset = load_verified_sft_dataset(configured.store, config.dataset.artifact_id)
+        consented_row_counts.append(len(dataset.rows))
+        return True
+
+    monkeypatch.setattr(command, "preflight_sft_model_optimization", preflight_then_complete)
+    monkeypatch.setattr(command, "require_spend_consent", approve_refreshed_schedule)
+    monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: backend)
+    monkeypatch.setattr(command, "_current_revision", lambda: "pre-consent-refresh-test")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "optimize",
+            "model",
+            configured.store.paths.project_id,
+            "--root",
+            str(configured.store.paths.root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert consented_row_counts == [2]
+    assert len(backend.trained_example_ids) == 2
+    assert len(set(backend.trained_example_ids)) == 2
+
+
+def test_completion_during_consent_fails_before_run_acceptance_and_reconsents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject stale consent before credentials, then train the refreshed graph once.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+        monkeypatch: Scoped consent-race, backend, and revision replacements.
+    """
+    configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
+    command = importlib.import_module("wmo.cli.model_optimize")
+    backend_calls: list[bool] = []
+    consent_calls: list[str] = []
+
+    def consent_then_complete(*args: object, **kwargs: object) -> bool:
+        """Append a durable completion inside the first consent boundary.
+
+        Args:
+            args: Consent positional inputs accepted without inspection.
+            kwargs: Consent keyword inputs accepted without inspection.
+
+        Returns:
+            ``True`` after the journal advances beyond the consented snapshot.
+        """
+        del args, kwargs
+        consent_calls.append("stale")
+        _complete(
+            RuntimeInteractionJournal(configured.store.paths),
+            key="completion-during-consent",
+            conversation="runtime-sft-conversation",
+            request=_request(ModelMessage(role="user", content="Second routed request")),
+            output=AssistantAction(content="Second routed response"),
+            now=_TIME,
+        )
+        return True
+
+    def forbidden_backend(*args: object, **kwargs: object) -> Never:
+        """Fail if stale consent reaches credential or trainer composition.
+
+        Args:
+            args: Unexpected positional backend inputs.
+            kwargs: Unexpected keyword backend inputs.
+        """
+        del args, kwargs
+        backend_calls.append(True)
+        raise AssertionError("stale consent must fail before backend composition")
+
+    monkeypatch.setattr(command, "require_spend_consent", consent_then_complete)
+    monkeypatch.setattr(command, "_compose_tinker_backend", forbidden_backend)
+    monkeypatch.setattr(command, "_current_revision", lambda: "consent-race-test")
+    arguments = [
+        "optimize",
+        "model",
+        configured.store.paths.project_id,
+        "--root",
+        str(configured.store.paths.root),
+    ]
+
+    stale = CliRunner().invoke(app, arguments)
+
+    assert stale.exit_code == 2
+    assert "everydurablecompletion" in _flat_cli_output(stale.output)
+    assert backend_calls == []
+    latest = load_latest_sft_model_optimization(configured.store)
+    assert latest is not None
+    assert not sft_model_optimization_output_dir(
+        configured.store, latest.config.artifact_id
+    ).exists()
+
+    refreshed_backend = _FakeBackend(conservative_cost_per_batch=0.10)
+
+    def approve_retry(*args: object, **kwargs: object) -> bool:
+        """Record and approve the refreshed retry schedule.
+
+        Args:
+            args: Consent positional inputs accepted without inspection.
+            kwargs: Consent keyword inputs accepted without inspection.
+
+        Returns:
+            ``True`` for the refreshed second consent.
+        """
+        del args, kwargs
+        consent_calls.append("refreshed")
+        return True
+
+    monkeypatch.setattr(command, "require_spend_consent", approve_retry)
+    monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: refreshed_backend)
+
+    retry = CliRunner().invoke(app, arguments)
+
+    assert retry.exit_code == 0, retry.output
+    assert consent_calls == ["stale", "refreshed"]
+    assert len(refreshed_backend.trained_example_ids) == 2
+    assert len(set(refreshed_backend.trained_example_ids)) == 2
+
+
+def test_accepted_prefix_resumes_after_crash_and_defers_later_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume one accepted prefix without reconsent and train later appends next.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+        monkeypatch: Scoped consent, crash, backend, and revision replacements.
+    """
+    configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
+    command = importlib.import_module("wmo.cli.model_optimize")
+    consent_calls: list[str] = []
+    compose_calls: list[str] = []
+    runner = CliRunner()
+    arguments = [
+        "optimize",
+        "model",
+        configured.store.paths.project_id,
+        "--root",
+        str(configured.store.paths.root),
+    ]
+
+    def approve_initial(*args: object, **kwargs: object) -> bool:
+        """Approve the initial one-row immutable schedule.
+
+        Args:
+            args: Consent positional inputs accepted without inspection.
+            kwargs: Consent keyword inputs accepted without inspection.
+
+        Returns:
+            ``True`` to create the durable W13 acceptance manifest.
+        """
+        del args, kwargs
+        consent_calls.append("initial")
+        return True
+
+    def crash_before_backend(*args: object, **kwargs: object) -> Never:
+        """Simulate a crash after acceptance but before trainer construction.
+
+        Args:
+            args: Backend positional inputs accepted without inspection.
+            kwargs: Backend keyword inputs accepted without inspection.
+
+        Raises:
+            ModelCredentialError: Always, after recording the composition attempt.
+        """
+        del args, kwargs
+        compose_calls.append("crash")
+        raise command.ModelCredentialError("simulated crash after local W13 acceptance")
+
+    monkeypatch.setattr(command, "require_spend_consent", approve_initial)
+    monkeypatch.setattr(command, "_compose_tinker_backend", crash_before_backend)
+    monkeypatch.setattr(command, "_current_revision", lambda: "accepted-prefix-resume-test")
+
+    crashed = runner.invoke(app, arguments)
+
+    assert crashed.exit_code == 2
+    assert consent_calls == ["initial"]
+    latest_before_append = load_latest_sft_model_optimization(configured.store)
+    assert latest_before_append is not None
+    accepted_config = load_sft_model_optimization_config(
+        configured.store, latest_before_append.config.artifact_id
+    )
+    accepted_dataset = load_verified_sft_dataset(
+        configured.store, accepted_config.dataset.artifact_id
+    )
+    assert len(accepted_dataset.rows) == 1
+    assert (
+        sft_model_optimization_output_dir(configured.store, accepted_config.config_id)
+        / "manifest.json"
+    ).is_file()
+    _complete(
+        RuntimeInteractionJournal(configured.store.paths),
+        key="completion-after-acceptance",
+        conversation="runtime-sft-conversation",
+        request=_request(ModelMessage(role="user", content="Deferred routed request")),
+        output=AssistantAction(content="Deferred routed response"),
+        now=_TIME,
+    )
+
+    def reject_repeat_consent(*args: object, **kwargs: object) -> Never:
+        """Fail if recovery asks again for consent already bound to the accepted prefix.
+
+        Args:
+            args: Unexpected consent positional inputs.
+            kwargs: Unexpected consent keyword inputs.
+        """
+        del args, kwargs
+        raise AssertionError("accepted incomplete W13 run must resume without new consent")
+
+    resumed_backend = _FakeBackend(conservative_cost_per_batch=0.10)
+    monkeypatch.setattr(command, "require_spend_consent", reject_repeat_consent)
+    monkeypatch.setattr(
+        command,
+        "_compose_tinker_backend",
+        lambda *_args: compose_calls.append("resume") or resumed_backend,
+    )
+
+    resumed = runner.invoke(app, arguments)
+
+    assert resumed.exit_code == 0, resumed.output
+    assert compose_calls == ["crash", "resume"]
+    assert len(resumed_backend.trained_example_ids) == 1
+    assert load_latest_sft_model_optimization(configured.store) == latest_before_append
+
+    next_consent_calls: list[int] = []
+    next_backend = _FakeBackend(conservative_cost_per_batch=0.10)
+
+    def approve_next_prefix(*args: object, **kwargs: object) -> bool:
+        """Approve the new graph that includes the deferred completion.
+
+        Args:
+            args: Consent positional inputs accepted without inspection.
+            kwargs: Consent keyword inputs accepted without inspection.
+
+        Returns:
+            ``True`` after recording the exact new W12 denominator.
+        """
+        del args, kwargs
+        latest = load_latest_sft_model_optimization(configured.store)
+        assert latest is not None
+        config = load_sft_model_optimization_config(configured.store, latest.config.artifact_id)
+        dataset = load_verified_sft_dataset(configured.store, config.dataset.artifact_id)
+        next_consent_calls.append(len(dataset.rows))
+        return True
+
+    monkeypatch.setattr(command, "require_spend_consent", approve_next_prefix)
+    monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: next_backend)
+
+    next_run = runner.invoke(app, arguments)
+
+    assert next_run.exit_code == 0, next_run.output
+    assert next_consent_calls == [2]
+    assert len(next_backend.trained_example_ids) == 2
+    assert len(set(next_backend.trained_example_ids)) == 2
 
 
 def test_connection_drift_after_consent_fails_before_credential_or_sdk(

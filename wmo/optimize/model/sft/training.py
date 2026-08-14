@@ -21,11 +21,14 @@ from wmo.common.core.artifacts import (
 from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
 from wmo.common.models import NumericMeasurement
-from wmo.common.project import ArtifactCorruptionError, ProjectStore, artifact_input
-from wmo.optimize.model.sft.builder import SFTBuildError, load_verified_sft_dataset
+from wmo.common.project import ProjectStore
 from wmo.optimize.model.sft.contracts import SFTBuildSpec, SFTDatasetArtifact
 from wmo.optimize.model.sft.provider_resources import validate_provider_resource_id
-from wmo.optimize.model.sft.rendering import partitioned_rows_sha256
+from wmo.optimize.model.sft.run_manifest import (
+    load_or_create_manifest,
+    validate_run_inputs,
+    verified_training_inputs,
+)
 from wmo.optimize.model.sft.training_contracts import (
     TINKER_SFT_EVENT_ADAPTER,
     TinkerSFTAmbiguousStepError,
@@ -127,16 +130,12 @@ def train_tinker_sft(
     Raises:
         TinkerSFTError: Dataset, budget, or append-only resume state is unsafe to continue.
     """
-    try:
-        dataset = load_verified_sft_dataset(
-            store,
-            dataset_id,
-            legacy_build_spec=legacy_build_spec,
-        )
-        dataset_input = artifact_input(store.artifacts.read(dataset_id).manifest)
-    except (ArtifactCorruptionError, SFTBuildError) as exc:
-        raise TinkerSFTError(f"W12 dataset {dataset_id} is not safe for training: {exc}") from exc
-    _validate_run_inputs(dataset, created_at=created_at, code_revision=code_revision)
+    dataset, dataset_input = verified_training_inputs(
+        store,
+        dataset_id,
+        legacy_build_spec=legacy_build_spec,
+    )
+    validate_run_inputs(dataset, created_at=created_at, code_revision=code_revision)
     manifest_path = output_dir / _MANIFEST_FILE
     with file_write_lock(manifest_path, what="the Tinker SFT run"):
         return _train_locked(
@@ -160,7 +159,7 @@ def _train_locked(
     created_at: datetime,
     code_revision: str,
 ) -> TinkerSFTResult:
-    manifest = _load_or_create_manifest(
+    manifest = load_or_create_manifest(
         dataset=dataset,
         dataset_input=dataset_input,
         spec=spec,
@@ -326,109 +325,6 @@ def _train_locked(
         dataset_input=dataset_input,
         expected_schedule=expected_schedule,
     )
-
-
-def _validate_run_inputs(
-    dataset: SFTDatasetArtifact, *, created_at: datetime, code_revision: str
-) -> None:
-    if created_at.tzinfo is None or created_at.utcoffset() is None:
-        raise TinkerSFTError("Tinker SFT creation time must include a timezone")
-    if not code_revision:
-        raise TinkerSFTError("Tinker SFT code_revision must be non-empty")
-    if dataset.dataset.status != "accepted":
-        raise TinkerSFTError("Tinker SFT only accepts an accepted frozen W12 dataset")
-    if dataset.dataset.examples_sha256 != partitioned_rows_sha256(dataset.rows):
-        raise TinkerSFTError("Tinker SFT dataset rows do not match the W12 examples digest")
-    train_rows = tuple(row for row in dataset.rows if row.partition == "train")
-    held_out_rows = tuple(row for row in dataset.rows if row.partition == "held_out")
-    if not train_rows:
-        raise TinkerSFTError("an accepted W12 dataset needs at least one train example")
-    if dataset.dataset.train_example_ids != tuple(
-        sorted(row.example.example_id for row in train_rows)
-    ):
-        raise TinkerSFTError("Tinker SFT train rows do not match the W12 manifest")
-    if dataset.dataset.held_out_example_ids != tuple(
-        sorted(row.example.example_id for row in held_out_rows)
-    ):
-        raise TinkerSFTError("Tinker SFT held-out rows do not match the W12 manifest")
-
-
-def _load_or_create_manifest(
-    *,
-    dataset: SFTDatasetArtifact,
-    dataset_input: ArtifactInput,
-    spec: TinkerSFTSpec,
-    output_dir: Path,
-    created_at: datetime,
-    code_revision: str,
-) -> TinkerSFTRunManifest:
-    path = output_dir / _MANIFEST_FILE
-    if path.exists():
-        manifest = _read_model(path, TinkerSFTRunManifest, "Tinker SFT manifest")
-        _validate_manifest(
-            manifest,
-            dataset=dataset,
-            dataset_input=dataset_input,
-            spec=spec,
-            code_revision=code_revision,
-        )
-        return manifest
-    if dataset_input.artifact_id != dataset.dataset.dataset_id:
-        raise TinkerSFTError("canonical W12 manifest names a different dataset")
-    spec_sha256 = sha256_json(spec)
-    run_id = stable_id(
-        "tinker-sft-run",
-        {
-            "dataset_id": dataset.dataset.dataset_id,
-            "dataset_manifest_sha256": dataset_input.sha256,
-            "dataset_build_sha256": dataset.dataset.build_sha256,
-            "dataset_examples_sha256": dataset.dataset.examples_sha256,
-            "spec_sha256": spec_sha256,
-        },
-    )
-    manifest = TinkerSFTRunManifest(
-        schema_version=1,
-        created_at=created_at,
-        inputs=(dataset_input,),
-        code_revision=code_revision,
-        run_id=run_id,
-        dataset_id=dataset.dataset.dataset_id,
-        dataset_manifest_sha256=dataset_input.sha256,
-        dataset_build_sha256=dataset.dataset.build_sha256,
-        dataset_examples_sha256=dataset.dataset.examples_sha256,
-        spec=spec,
-        spec_sha256=spec_sha256,
-    )
-    _write_new_json(path, manifest, "Tinker SFT manifest")
-    return manifest
-
-
-def _validate_manifest(
-    manifest: TinkerSFTRunManifest,
-    *,
-    dataset: SFTDatasetArtifact,
-    dataset_input: ArtifactInput,
-    spec: TinkerSFTSpec,
-    code_revision: str,
-) -> None:
-    if manifest.dataset_id != dataset.dataset.dataset_id:
-        raise TinkerSFTResumeError("existing Tinker SFT run belongs to a different W12 dataset")
-    if manifest.inputs != (dataset_input,):
-        raise TinkerSFTResumeError(
-            "existing Tinker SFT run does not name the canonical W12 artifact manifest"
-        )
-    if manifest.dataset_manifest_sha256 != dataset_input.sha256:
-        raise TinkerSFTResumeError(
-            "existing Tinker SFT run has a different W12 artifact manifest digest"
-        )
-    if manifest.dataset_build_sha256 != dataset.dataset.build_sha256:
-        raise TinkerSFTResumeError("existing Tinker SFT run has a different W12 dataset build")
-    if manifest.dataset_examples_sha256 != dataset.dataset.examples_sha256:
-        raise TinkerSFTResumeError("existing Tinker SFT run has different W12 example rows")
-    if manifest.spec != spec:
-        raise TinkerSFTResumeError("existing Tinker SFT run has a different training spec")
-    if manifest.code_revision != code_revision:
-        raise TinkerSFTResumeError("existing Tinker SFT run has a different code revision")
 
 
 def _read_events(output_dir: Path, run_id: ArtifactId) -> tuple[TinkerSFTEvent, ...]:

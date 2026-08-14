@@ -4,6 +4,7 @@ from wmo.optimize.model.sft.automatic import (
     AutomaticSFTPreparation,
     AutomaticSFTPreparationError,
     InitialSFTModelOptimizationSettings,
+    accept_runtime_sft_model_optimization,
     prepare_runtime_sft_model_optimization,
     require_completed_runtime_interactions,
 )
@@ -125,6 +126,7 @@ __all__ = [
     "TinkerTrainerSession",
     "ToolEvent",
     "TrainerBackend",
+    "accept_runtime_sft_model_optimization",
     "build_sft_dataset",
     "create_sft_model_optimization_config",
     "context_target_fingerprint",

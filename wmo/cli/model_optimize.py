@@ -35,6 +35,7 @@ from wmo.optimize.model.sft import (
     TinkerSFTDependencyError,
     TinkerTrainerBackend,
     TrainerBackend,
+    accept_runtime_sft_model_optimization,
     load_sft_model_optimization_config,
     preflight_sft_model_optimization,
     prepare_runtime_sft_model_optimization,
@@ -153,6 +154,20 @@ def optimize_model(
             _LocalPreflightBackend(),
             code_revision=code_revision,
         )
+        if local_preflight.completed_result is None and not preparation.accepted:
+            preparation = prepare_runtime_sft_model_optimization(
+                store,
+                created_at=created_at,
+                code_revision=code_revision,
+            )
+            config = preparation.config
+            config_id = config.config_id
+            local_preflight = preflight_sft_model_optimization(
+                store,
+                config_id,
+                _LocalPreflightBackend(),
+                code_revision=code_revision,
+            )
         backend: TrainerBackend = _LocalPreflightBackend()
         preflight = local_preflight
     except (
@@ -166,7 +181,7 @@ def optimize_model(
     ) as exc:
         raise typer.BadParameter(str(exc)) from None
 
-    if preflight.completed_result is None:
+    if preflight.completed_result is None and not preparation.accepted:
         assert config.training.maximum_cost_usd is not None
         assert preflight.conservative_schedule_cost_usd is not None
         spend = (
@@ -182,6 +197,16 @@ def optimize_model(
         ):
             _console.print("Managed Tinker SFT was not started.")
             return
+        try:
+            accept_runtime_sft_model_optimization(
+                store,
+                preparation,
+                created_at=created_at,
+                code_revision=code_revision,
+            )
+        except AutomaticSFTPreparationError as exc:
+            raise typer.BadParameter(str(exc)) from None
+    if preflight.completed_result is None:
         try:
             backend = _compose_tinker_backend(
                 store,

@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import shutil
+import threading
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from typing import Never
 
 import pytest
 
 import wmo.optimize.model.sft.automatic as automatic_module
-from wmo.common.core.artifacts import canonical_json_bytes
+import wmo.optimize.model.sft.run_manifest as run_manifest_module
+from wmo.common.core.artifacts import canonical_json_bytes, sha256_json
 from wmo.common.models import (
     AssistantAction,
     ConnectionConfig,
@@ -22,12 +26,14 @@ from wmo.common.project import ProjectStore, artifact_input
 from wmo.optimize.model.sft.automatic import (
     AutomaticSFTPreparationError,
     InitialSFTModelOptimizationSettings,
+    accept_runtime_sft_model_optimization,
     prepare_runtime_sft_model_optimization,
 )
 from wmo.optimize.model.sft.composition import (
     SFTModelOptimizationConfig,
     create_sft_model_optimization_config,
     preflight_sft_model_optimization,
+    sft_model_optimization_output_dir,
     write_sft_model_optimization_config,
 )
 from wmo.optimize.model.sft.contracts import SFTBuildSpec
@@ -36,8 +42,10 @@ from wmo.optimize.model.sft.selection import (
     SFTModelOptimizationSelectionError,
     latest_sft_model_optimization_path,
     load_latest_sft_model_optimization,
+    versioned_sft_model_alias,
     write_latest_sft_model_optimization,
 )
+from wmo.optimize.model.sft.training_contracts import TinkerSFTResumeError
 from wmo.optimize.model.sft.training_test import _TIME, _FakeBackend, _persisted_dataset, _spec
 from wmo.runtime.router import RuntimeInteractionJournal
 
@@ -299,6 +307,434 @@ def test_appended_interaction_creates_new_graph_without_mutating_old_artifacts(
             first_pointer.model_copy(update={"updated_at": _TIME + timedelta(hours=3)}),
             expected_current=bootstrap_input,
         )
+
+
+def test_run_acceptance_rejects_an_advanced_journal_before_manifest_write(
+    tmp_path: Path,
+) -> None:
+    """Require a new graph and consent when a completion precedes W13 acceptance.
+
+    Args:
+        tmp_path: Pytest-owned project and artifact directory.
+    """
+    bootstrap = _bootstrap(tmp_path)
+    _append_completed(bootstrap.store, key="first", minute=1)
+    prepared = prepare_runtime_sft_model_optimization(
+        bootstrap.store,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="automatic-sft-test",
+    )
+    output_dir = sft_model_optimization_output_dir(bootstrap.store, prepared.config.config_id)
+    _append_completed(bootstrap.store, key="second", minute=2)
+
+    with pytest.raises(AutomaticSFTPreparationError, match="rerun.*every durable completion"):
+        accept_runtime_sft_model_optimization(
+            bootstrap.store,
+            prepared,
+            created_at=_TIME + timedelta(hours=1),
+            code_revision="automatic-sft-test",
+        )
+
+    assert not output_dir.exists()
+    refreshed = prepare_runtime_sft_model_optimization(
+        bootstrap.store,
+        created_at=_TIME + timedelta(hours=2),
+        code_revision="automatic-sft-test",
+    )
+    manifest = accept_runtime_sft_model_optimization(
+        bootstrap.store,
+        refreshed,
+        created_at=_TIME + timedelta(hours=2),
+        code_revision="automatic-sft-test",
+    )
+
+    assert len(refreshed.dataset.rows) == 2
+    assert manifest.dataset_id == refreshed.dataset.dataset.dataset_id
+    assert (
+        sft_model_optimization_output_dir(bootstrap.store, refreshed.config.config_id)
+        / "manifest.json"
+    ).is_file()
+
+
+def test_run_acceptance_holds_journal_lock_through_w13_manifest_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Serialize concurrent appends until the config-bound W13 manifest is durable.
+
+    Args:
+        tmp_path: Pytest-owned project and artifact directory.
+        monkeypatch: Scoped W13 initializer wrapper used to expose the lock boundary.
+    """
+    bootstrap = _bootstrap(tmp_path)
+    _append_completed(bootstrap.store, key="first", minute=1)
+    prepared = prepare_runtime_sft_model_optimization(
+        bootstrap.store,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="automatic-sft-test",
+    )
+    output_dir = sft_model_optimization_output_dir(bootstrap.store, prepared.config.config_id)
+    original_initialize = automatic_module.initialize_tinker_sft_run
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+    manifest_committed_before_writer: list[bool] = []
+
+    def append_concurrently() -> None:
+        """Attempt one append while the acceptance callback owns the journal lock."""
+        writer_started.set()
+        _append_completed(bootstrap.store, key="second", minute=2)
+        writer_finished.set()
+
+    def initialize_while_writer_waits(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        """Expose that W13 initialization runs before a queued append can finish.
+
+        Args:
+            args: Positional W13 initializer inputs forwarded unchanged.
+            kwargs: Keyword W13 initializer inputs forwarded unchanged.
+
+        Returns:
+            The original initializer's durable run manifest.
+        """
+        writer = threading.Thread(target=append_concurrently)
+        writer.start()
+        assert writer_started.wait(timeout=1.0)
+        assert not writer_finished.wait(timeout=0.05)
+        manifest = original_initialize(*args, **kwargs)
+        manifest_committed_before_writer.append((output_dir / "manifest.json").is_file())
+        assert not writer_finished.is_set()
+        return manifest
+
+    monkeypatch.setattr(
+        automatic_module,
+        "initialize_tinker_sft_run",
+        initialize_while_writer_waits,
+    )
+
+    accepted = accept_runtime_sft_model_optimization(
+        bootstrap.store,
+        prepared,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="automatic-sft-test",
+    )
+
+    assert writer_finished.wait(timeout=1.0)
+    assert manifest_committed_before_writer == [True]
+    assert accepted.dataset_id == prepared.dataset.dataset.dataset_id
+    refreshed = prepare_runtime_sft_model_optimization(
+        bootstrap.store,
+        created_at=_TIME + timedelta(hours=2),
+        code_revision="automatic-sft-test",
+    )
+    assert refreshed.config == prepared.config
+    assert refreshed.accepted is True
+    assert len(refreshed.dataset.rows) == 1
+
+
+def test_crash_before_acceptance_pointer_leaves_orphan_inert_and_reconsents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Treat a crash after the immutable receipt but before its CAS pointer as unaccepted.
+
+    Args:
+        tmp_path: Pytest-owned project and artifact directory.
+        monkeypatch: Scoped acceptance-pointer crash replacement.
+    """
+    bootstrap = _bootstrap(tmp_path)
+    _append_completed(bootstrap.store, key="first", minute=1)
+    prepared = prepare_runtime_sft_model_optimization(
+        bootstrap.store,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="automatic-sft-test",
+    )
+    original_select = automatic_module.write_automatic_sft_acceptance_selection_unlocked
+
+    def crash_before_pointer(*args: object, **kwargs: object) -> Never:
+        """Interrupt after immutable acceptance persistence but before pointer selection.
+
+        Args:
+            args: Unexpected selection positional inputs.
+            kwargs: Unexpected selection keyword inputs.
+
+        Raises:
+            RuntimeError: Always, at the selected crash boundary.
+        """
+        del args, kwargs
+        raise RuntimeError("simulated crash before acceptance pointer")
+
+    monkeypatch.setattr(
+        automatic_module,
+        "write_automatic_sft_acceptance_selection_unlocked",
+        crash_before_pointer,
+    )
+    with pytest.raises(RuntimeError, match="before acceptance pointer"):
+        accept_runtime_sft_model_optimization(
+            bootstrap.store,
+            prepared,
+            created_at=_TIME + timedelta(hours=1),
+            code_revision="automatic-sft-test",
+        )
+
+    assert run_manifest_module.load_automatic_sft_acceptance_selection(bootstrap.store) is None
+    retry = prepare_runtime_sft_model_optimization(
+        bootstrap.store,
+        created_at=_TIME + timedelta(hours=2),
+        code_revision="automatic-sft-test",
+    )
+    assert retry.config == prepared.config
+    assert retry.accepted is False
+
+    monkeypatch.setattr(
+        automatic_module,
+        "write_automatic_sft_acceptance_selection_unlocked",
+        original_select,
+    )
+    accept_runtime_sft_model_optimization(
+        bootstrap.store,
+        retry,
+        created_at=_TIME + timedelta(hours=2),
+        code_revision="automatic-sft-test",
+    )
+    selected = run_manifest_module.load_automatic_sft_acceptance_selection(bootstrap.store)
+    assert selected is not None
+    resumed = prepare_runtime_sft_model_optimization(
+        bootstrap.store,
+        created_at=_TIME + timedelta(hours=3),
+        code_revision="automatic-sft-test",
+    )
+    assert resumed.accepted is True
+
+
+def test_copied_w13_acceptance_cannot_authorize_another_selected_config(
+    tmp_path: Path,
+) -> None:
+    """Reject a manifest and acceptance copied into a different config namespace.
+
+    Args:
+        tmp_path: Pytest-owned project and artifact directory.
+    """
+    bootstrap = _bootstrap(tmp_path)
+    _append_completed(bootstrap.store, key="first", minute=1)
+    prepared = prepare_runtime_sft_model_optimization(
+        bootstrap.store,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="automatic-sft-test",
+    )
+    accept_runtime_sft_model_optimization(
+        bootstrap.store,
+        prepared,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="automatic-sft-test",
+    )
+    latest_a = load_latest_sft_model_optimization(bootstrap.store)
+    assert latest_a is not None
+    selected_a = run_manifest_module.load_automatic_sft_acceptance_selection(bootstrap.store)
+    assert selected_a is not None
+    with pytest.raises(TinkerSFTResumeError, match="changed before consent commit"):
+        run_manifest_module.write_automatic_sft_acceptance_selection_unlocked(
+            bootstrap.store,
+            selected_a.model_copy(
+                update={
+                    "acceptance": selected_a.acceptance.model_copy(
+                        update={"artifact_id": "forged-automatic-acceptance"}
+                    ),
+                    "updated_at": _TIME + timedelta(hours=2),
+                }
+            ),
+            expected_current=None,
+        )
+    pointer_path = run_manifest_module.automatic_sft_acceptance_path(bootstrap.store)
+    pointer_bytes = pointer_path.read_bytes()
+    bootstrap_config_input = artifact_input(
+        bootstrap.store.artifacts.read(bootstrap.config.config_id).manifest
+    )
+    pointer_path.write_bytes(
+        canonical_json_bytes(selected_a.model_copy(update={"config": bootstrap_config_input}))
+    )
+    with pytest.raises(AutomaticSFTPreparationError, match="pointer differs"):
+        prepare_runtime_sft_model_optimization(
+            bootstrap.store,
+            created_at=_TIME + timedelta(hours=2),
+            code_revision="automatic-sft-test",
+        )
+    pointer_path.write_bytes(pointer_bytes)
+    alias_prefix_b = "alternate-trained"
+    config_b = create_sft_model_optimization_config(
+        bootstrap.store,
+        dataset_id=prepared.dataset.dataset.dataset_id,
+        model_alias=versioned_sft_model_alias(alias_prefix_b, prepared.dataset.dataset.dataset_id),
+        tinker_connection=prepared.config.tinker_connection,
+        base_model_alias=prepared.config.base_model_alias,
+        training=prepared.config.training,
+        created_at=_TIME + timedelta(hours=2),
+        code_revision="automatic-sft-test",
+    )
+    write_sft_model_optimization_config(bootstrap.store, config_b, bind_project=False)
+    config_b_input = artifact_input(bootstrap.store.artifacts.read(config_b.config_id).manifest)
+    output_a = sft_model_optimization_output_dir(bootstrap.store, prepared.config.config_id)
+    latest_b = latest_a.model_copy(
+        update={
+            "config": config_b_input,
+            "model_alias_prefix": alias_prefix_b,
+            "updated_at": _TIME + timedelta(hours=2),
+        }
+    )
+    write_latest_sft_model_optimization(
+        bootstrap.store,
+        latest_b,
+        expected_current=latest_a.config,
+    )
+    output_b = sft_model_optimization_output_dir(bootstrap.store, config_b.config_id)
+    output_b.mkdir(parents=True)
+    shutil.copyfile(output_a / "manifest.json", output_b / "manifest.json")
+
+    with pytest.raises(AutomaticSFTPreparationError, match="incomplete"):
+        prepare_runtime_sft_model_optimization(
+            bootstrap.store,
+            created_at=_TIME + timedelta(hours=3),
+            code_revision="automatic-sft-test",
+        )
+
+    manifest_b = run_manifest_module.load_tinker_sft_run(
+        bootstrap.store,
+        prepared.dataset.dataset.dataset_id,
+        config_b.training,
+        output_b,
+        code_revision="automatic-sft-test",
+    )
+    assert manifest_b is not None
+    _receipt_b, acceptance_b_input = run_manifest_module.initialize_automatic_sft_acceptance(
+        bootstrap.store,
+        manifest=manifest_b,
+        previous_acceptance=selected_a.acceptance,
+        config=config_b_input,
+        dataset=latest_b.dataset,
+        runtime_snapshot=latest_b.runtime_snapshot,
+        model_alias=config_b.model_alias,
+        tinker_connection=config_b.tinker_connection,
+        base_model=config_b.base_model,
+        connection_config_sha256=config_b.connection_config_sha256,
+        training_spec_sha256=sha256_json(config_b.training),
+        runtime_last_ordinal=prepared.snapshot.last_ordinal,
+        runtime_prefix_sha256=prepared.snapshot.prefix_sha256,
+        created_at=_TIME + timedelta(hours=3),
+        code_revision="automatic-sft-test",
+    )
+    run_manifest_module.write_automatic_sft_acceptance_selection_unlocked(
+        bootstrap.store,
+        run_manifest_module.AutomaticSFTRunAcceptanceSelection(
+            schema_version=1,
+            project_id=bootstrap.store.paths.project_id,
+            acceptance=acceptance_b_input,
+            previous_acceptance=selected_a.acceptance,
+            config=config_b_input,
+            updated_at=_TIME + timedelta(hours=3),
+        ),
+        expected_current=selected_a.acceptance,
+    )
+
+    with pytest.raises(AutomaticSFTPreparationError, match="incomplete"):
+        prepare_runtime_sft_model_optimization(
+            bootstrap.store,
+            created_at=_TIME + timedelta(hours=4),
+            code_revision="automatic-sft-test",
+        )
+
+
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_automatic_acceptance_pointer_rejects_broken_and_live_symlinks_before_write(
+    tmp_path: Path,
+    *,
+    target_exists: bool,
+) -> None:
+    """Reject a redirected acceptance pointer without creating or changing its target.
+
+    Args:
+        tmp_path: Pytest-owned project and external target directory.
+        target_exists: Whether the redirect names an existing external file.
+    """
+    bootstrap = _bootstrap(tmp_path)
+    _append_completed(bootstrap.store, key="first", minute=1)
+    prepared = prepare_runtime_sft_model_optimization(
+        bootstrap.store,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="automatic-sft-test",
+    )
+    pointer_path = run_manifest_module.automatic_sft_acceptance_path(bootstrap.store)
+    external_target = tmp_path / "external-automatic-acceptance.json"
+    original_external_bytes = b"external pointer must remain unchanged"
+    if target_exists:
+        external_target.write_bytes(original_external_bytes)
+    pointer_path.symlink_to(external_target)
+
+    with pytest.raises(TinkerSFTResumeError, match="not a safe file"):
+        run_manifest_module.load_automatic_sft_acceptance_selection(bootstrap.store)
+    with pytest.raises(AutomaticSFTPreparationError, match="not a safe file"):
+        accept_runtime_sft_model_optimization(
+            bootstrap.store,
+            prepared,
+            created_at=_TIME + timedelta(hours=1),
+            code_revision="automatic-sft-test",
+        )
+
+    if target_exists:
+        assert external_target.read_bytes() == original_external_bytes
+    else:
+        assert not external_target.exists()
+
+
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_automatic_acceptance_pointer_replaces_a_symlink_swapped_at_write_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    target_exists: bool,
+) -> None:
+    """Replace a raced pointer link itself without following or changing its target.
+
+    Args:
+        tmp_path: Pytest-owned project and external target directory.
+        monkeypatch: Pytest mutation helper used at the exact atomic-replace boundary.
+        target_exists: Whether the raced redirect names an existing external file.
+    """
+    bootstrap = _bootstrap(tmp_path)
+    _append_completed(bootstrap.store, key="first", minute=1)
+    prepared = prepare_runtime_sft_model_optimization(
+        bootstrap.store,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="automatic-sft-test",
+    )
+    pointer_path = run_manifest_module.automatic_sft_acceptance_path(bootstrap.store)
+    external_target = tmp_path / "raced-external-automatic-acceptance.json"
+    original_external_bytes = b"raced external pointer must remain unchanged"
+    if target_exists:
+        external_target.write_bytes(original_external_bytes)
+    real_replace = run_manifest_module.os.replace
+
+    def swap_pointer_before_replace(source: str | Path, destination: str | Path) -> None:
+        """Install the adversarial link immediately before the production replace.
+
+        Args:
+            source: Exclusive sibling staging path.
+            destination: Canonical acceptance pointer path.
+        """
+        if Path(destination) == pointer_path:
+            pointer_path.symlink_to(external_target)
+        real_replace(source, destination)
+
+    monkeypatch.setattr(run_manifest_module.os, "replace", swap_pointer_before_replace)
+    accept_runtime_sft_model_optimization(
+        bootstrap.store,
+        prepared,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="automatic-sft-test",
+    )
+
+    assert pointer_path.is_file()
+    assert not pointer_path.is_symlink()
+    assert run_manifest_module.load_automatic_sft_acceptance_selection(bootstrap.store) is not None
+    if target_exists:
+        assert external_target.read_bytes() == original_external_bytes
+    else:
+        assert not external_target.exists()
 
 
 def test_empty_or_incomplete_journal_fails_without_materializing_runtime_artifacts(
