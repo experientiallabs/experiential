@@ -8,7 +8,7 @@ from typing import cast
 
 import pytest
 
-from wmo.common.core.artifacts import sha256_json, stable_id
+from wmo.common.core.artifacts import stable_id
 from wmo.common.evaluations import (
     EvaluationCellEvidence,
     EvaluationPlan,
@@ -81,7 +81,7 @@ def _snapshot(alias: str) -> ModelSnapshot:
         provider="test",
         model_id=alias,
         revision="fixture",
-        capabilities_sha256=sha256_json(_capabilities(alias)),
+        capabilities_sha256=_capabilities(alias).identity_sha256(),
         connection_sha256="b" * 64,
     )
 
