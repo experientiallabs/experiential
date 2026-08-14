@@ -395,10 +395,26 @@ def write_audit(
         )
     except ArtifactAlreadyExistsError:
         existing = read_audit(store, artifact_input(store.artifacts.read(audit_id).manifest))
-        if existing != audit:
+        if not _same_audit_identity(existing, audit):
             raise ManualJudgeError("existing judge calibration audit conflicts") from None
         return existing
     return audit
+
+
+def _same_audit_identity(
+    existing: ManualJudgeCalibrationAudit,
+    replay: ManualJudgeCalibrationAudit,
+) -> bool:
+    """Compare an existing audit with a retry while ignoring materialization time only.
+
+    Args:
+        existing: Manifest-verified immutable audit written by an earlier attempt.
+        replay: Audit reconstructed from the current verified calibration evidence.
+
+    Returns:
+        Whether every semantic field and input matches after preserving the original timestamp.
+    """
+    return existing == replay.model_copy(update={"created_at": existing.created_at})
 
 
 def read_audit(store: ProjectStore, expected: ArtifactInput) -> ManualJudgeCalibrationAudit:

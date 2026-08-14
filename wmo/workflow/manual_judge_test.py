@@ -11,6 +11,7 @@ from typing import Literal, cast
 
 import pytest
 
+import wmo.workflow.manual_judge as manual_judge_workflow
 from wmo.common.core.artifacts import JsonObject, SourceIdentity, sha256_json
 from wmo.common.judging import PromptDefinition
 from wmo.common.judging.judgment import Judgment
@@ -835,6 +836,111 @@ def test_interrupted_calibration_reuses_completed_probes_at_later_time(tmp_path:
     assert result.provider_calls_made == 2
     assert len(retry_client.requests) == 2
     assert len(result.audit.judgments) == 3
+
+
+def test_retry_reuses_audit_when_review_pointer_write_was_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume a verified audit after interruption before its review pointer is saved.
+
+    Args:
+        tmp_path: Isolated project root for immutable calibration evidence.
+        monkeypatch: Pytest patch service for the review-pointer crash boundary.
+    """
+    store = _built_store(tmp_path)
+    _setup(store)
+    plan = prepare_manual_judge_calibration(store, sample_size=1)
+    labels = _labels(store)[:1]
+    budget = estimate_manual_judge_budget(
+        plan,
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=2.0,
+        maximum_input_tokens_per_call=4_096,
+        maximum_cost_usd=1.0,
+    )
+    first_client = _StructuredJudgeClient(plan.setup.judge_model, "scalar")
+    first_runtime = _RuntimeCatalog(
+        ResolvedModel(
+            alias="judge-main",
+            snapshot=plan.setup.judge_model,
+            capabilities=ModelCapabilities(),
+            client=first_client,
+            embedding_client=None,
+        )
+    )
+    original_write_review_state = manual_judge_workflow.write_review_state
+
+    def interrupt_review_pointer(*args: object, **kwargs: object) -> None:
+        """Raise at the exact boundary after audit persistence and before state publication.
+
+        Args:
+            args: Positional review-state writer arguments.
+            kwargs: Keyword review-state writer arguments.
+
+        Raises:
+            RuntimeError: Always, to model process interruption before the pointer write.
+        """
+        del args, kwargs
+        raise RuntimeError("simulated review pointer interruption")
+
+    monkeypatch.setattr(manual_judge_workflow, "write_review_state", interrupt_review_pointer)
+    with pytest.raises(RuntimeError, match="simulated review pointer interruption"):
+        calibrate_manual_judge(
+            store,
+            cast(RuntimeModelCatalog, first_runtime),
+            plan,
+            labels,
+            budget,
+            spend_consented=True,
+            approve=False,
+            accept_insufficient_labels=True,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+    audits = tuple(
+        artifact_id
+        for artifact_id in store.artifacts.list_ids()
+        if store.artifacts.read(artifact_id).manifest.artifact_type
+        == "manual-judge-calibration-audit"
+    )
+    assert len(audits) == 1
+    review = store.read_review()
+    assert isinstance(review, dict)
+    assert review["manual_judge"]["audit"] is None
+
+    monkeypatch.setattr(
+        manual_judge_workflow,
+        "write_review_state",
+        original_write_review_state,
+    )
+    retry_client = _StructuredJudgeClient(plan.setup.judge_model, "scalar")
+    retry_runtime = _RuntimeCatalog(
+        ResolvedModel(
+            alias="judge-main",
+            snapshot=plan.setup.judge_model,
+            capabilities=ModelCapabilities(),
+            client=retry_client,
+            embedding_client=None,
+        )
+    )
+    result = calibrate_manual_judge(
+        store,
+        cast(RuntimeModelCatalog, retry_runtime),
+        plan,
+        labels,
+        budget,
+        spend_consented=True,
+        approve=False,
+        accept_insufficient_labels=True,
+        created_at=_TIME + timedelta(minutes=10),
+        code_revision="test-revision",
+    )
+
+    assert result.audit.audit_id == audits[0]
+    assert result.audit.created_at == _TIME
+    assert result.provider_calls_made == 0
+    assert retry_client.requests == []
 
 
 def test_interrupted_pairwise_probe_reuses_forward_order(tmp_path: Path) -> None:
