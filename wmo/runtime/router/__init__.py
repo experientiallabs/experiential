@@ -32,6 +32,16 @@ from wmo.runtime.router.runtime import (
     RouterRuntime,
     RouterRuntimeIntegrityError,
 )
+from wmo.runtime.router.snapshot import (
+    LoadedRuntimeTraceSnapshot,
+    PersistedRuntimeTraceExport,
+    RuntimeTraceAttempt,
+    RuntimeTraceInteraction,
+    RuntimeTraceSnapshot,
+    RuntimeTraceSnapshotError,
+    load_runtime_trace_snapshot,
+    seal_runtime_trace_snapshot,
+)
 
 __all__ = [
     "RoutedModelResponse",
@@ -53,6 +63,14 @@ __all__ = [
     "RouterCompletionFailedError",
     "RouterRuntime",
     "RouterRuntimeIntegrityError",
+    "LoadedRuntimeTraceSnapshot",
+    "PersistedRuntimeTraceExport",
+    "RuntimeTraceAttempt",
+    "RuntimeTraceInteraction",
+    "RuntimeTraceSnapshot",
+    "RuntimeTraceSnapshotError",
+    "load_runtime_trace_snapshot",
+    "seal_runtime_trace_snapshot",
     "create_router_endpoint",
     "RouterApplicationError",
     "create_project_router_app",
