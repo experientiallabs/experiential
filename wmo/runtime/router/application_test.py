@@ -18,6 +18,7 @@ from openai.types.responses import Response
 
 from wmo.common.core.artifacts import ArtifactId, FailureCode
 from wmo.common.project import ProjectStore
+from wmo.common.routing import RoutingDecision
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.application import (
     RouterApplicationError,
@@ -175,6 +176,101 @@ def test_load_router_exposes_official_chat_and_responses_resources(
     assert model_client.complete_calls == 2
     events = RuntimeInteractionJournal(store.paths).read_events()
     assert sum(isinstance(event, RuntimeCompletedEvent) for event in events) == 2
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_ghost_router_dispatches_without_durable_traffic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api: Literal["chat", "responses"],
+) -> None:
+    """Ghost calls accept caller keys but never create replay or training state.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        monkeypatch: Scoped loaded-runtime replacement.
+        api: Official OpenAI resource exercised by the parameterized regression.
+    """
+    runtime, model_client = _runtime()
+    root = tmp_path / ".wmo"
+    store = _store_with_policy(root, "support-agent", runtime)
+
+    def load_selected_runtime(
+        _project: str,
+        _root: Path,
+        *,
+        policy_id: ArtifactId | None = None,
+        environment: Mapping[str, str] | None = None,
+        runtime_catalog: RuntimeModelCatalog | None = None,
+        decision_sink: DecisionSink | None = None,
+    ) -> RouterRuntime:
+        """Return the already verified runtime without reconstructing providers."""
+        del policy_id, environment, runtime_catalog, decision_sink
+        return runtime
+
+    monkeypatch.setattr(
+        "wmo.runtime.router.application.load_project_router",
+        load_selected_runtime,
+    )
+    before = {
+        path.relative_to(store.paths.project_directory): path.read_bytes()
+        for path in store.paths.project_directory.rglob("*")
+        if path.is_file()
+    }
+    headers = {"Idempotency-Key": "ghost-request"}
+
+    with load_router("support-agent", root=root, ghost=True) as router:
+        for content in ("first", "changed"):
+            if api == "responses":
+                router.responses.create(
+                    model="support-agent",
+                    input=content,
+                    extra_headers=headers,
+                )
+            else:
+                router.chat.completions.create(
+                    model="support-agent",
+                    messages=[{"role": "user", "content": content}],
+                    extra_headers=headers,
+                )
+
+    assert model_client.complete_calls == 2
+    assert not store.paths.runtime_journal.exists()
+    after = {
+        path.relative_to(store.paths.project_directory): path.read_bytes()
+        for path in store.paths.project_directory.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_ghost_router_rejects_a_persistent_decision_sink(
+    tmp_path: Path,
+) -> None:
+    """Fail before activation when ghost mode is paired with a decision recorder.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+    """
+
+    def decision_sink(_decision: RoutingDecision) -> None:
+        """Accept a routing decision for the rejected option combination."""
+
+    runtime, model_client = _runtime()
+    store = _store_with_policy(tmp_path / ".wmo", "support-agent", runtime)
+    runtime._decision_sink = decision_sink  # noqa: SLF001 - adversarial composition regression
+
+    with pytest.raises(RouterApplicationError, match="ghost mode cannot use"):
+        create_project_completion_service(store, runtime, ghost=True)
+
+    with pytest.raises(RouterApplicationError, match="ghost mode cannot use"):
+        load_router(
+            "support-agent",
+            root=tmp_path / ".wmo",
+            ghost=True,
+            decision_sink=decision_sink,
+        )
+    assert model_client.complete_calls == 0
 
 
 def test_load_and_close_are_provider_and_journal_idle(

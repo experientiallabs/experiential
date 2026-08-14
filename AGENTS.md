@@ -53,12 +53,13 @@ uv run pytest -q
   world model, approved manual judge calibration, and confirmed router candidates from the
   project. It freezes one shared provider ceiling before calls, simulates and judges missing
   evidence, locks the fit policy before held-out execution, and exactly replays completed work.
-- `wmo run PROJECT --root ROOT --port PORT` loads one frozen policy and exposes OpenAI Chat
+- `wmo run PROJECT --root ROOT --port PORT [--ghost]` loads one frozen policy and exposes OpenAI Chat
   Completions, Responses, and Models routes on loopback. Public request and response types come
   from the official OpenAI SDK. Chat retries use the standard `Idempotency-Key`; Responses
   continuations use `previous_response_id`. WMO never joins unrelated Chat callers by transcript
-  prefix and requires no proprietary request fields or headers. Request-time embedding failure
-  uses the frozen conservative baseline, and neither path mutates policy or evidence.
+  prefix and requires no proprietary request fields or headers. Durable journaling is the default;
+  ghost mode performs routed calls without saving traffic or replay state. Request-time embedding
+  failure uses the frozen conservative baseline, and neither path mutates policy or evidence.
 
 ## Worker-agent execution
 

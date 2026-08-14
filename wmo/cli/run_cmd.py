@@ -14,6 +14,11 @@ _POLICY_OPTION = typer.Option(
     help="Exact frozen policy ID; required only when the project contains several.",
 )
 _PORT_OPTION = typer.Option(8000, "--port", min=1, max=65_535)
+_GHOST_OPTION = typer.Option(
+    False,
+    "--ghost",
+    help="Route traffic without durable interaction journals or replay state.",
+)
 
 
 def run(
@@ -21,6 +26,7 @@ def run(
     root: Path = _ROOT_OPTION,
     policy: str | None = _POLICY_OPTION,
     port: int = _PORT_OPTION,
+    ghost: bool = _GHOST_OPTION,
 ) -> None:
     """Start a development-only loopback adapter over one frozen router.
 
@@ -33,6 +39,7 @@ def run(
         root: Local artifact and model-catalog root.
         policy: Optional exact policy identity for an otherwise ambiguous project.
         port: Local loopback TCP port.
+        ghost: Whether completed traffic must bypass durable journal and replay state.
 
     Raises:
         typer.BadParameter: Project runtime activation fails before the server starts.
@@ -49,12 +56,18 @@ def run(
     try:
         runtime = load_project_router(project, root, policy_id=policy)
         project_store = ProjectStore(root, project)
-        completion_service = create_project_completion_service(project_store, runtime)
+        completion_service = create_project_completion_service(
+            project_store,
+            runtime,
+            ghost=ghost,
+        )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     typer.echo(
         f"loaded policy {runtime.policy.policy_id} with {runtime.policy.judgment_status} judgment"
     )
+    if ghost:
+        typer.echo("ghost mode enabled: durable interaction journaling is disabled")
     typer.echo(f"OpenAI API router at http://{_LOOPBACK_HOST}:{port}/v1")
     uvicorn.run(
         create_project_router_app(

@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from openai import OpenAI
 
 from wmo.common.core.artifacts import ArtifactId
-from wmo.common.models import load_model_catalog
+from wmo.common.models import ModelRequest, load_model_catalog
 from wmo.common.project import (
     ArtifactStore,
     ArtifactStoreError,
@@ -31,11 +31,39 @@ from wmo.runtime.router.completion import (
 )
 from wmo.runtime.router.endpoint import create_router_endpoint
 from wmo.runtime.router.journal import JournaledRouterRuntime, RuntimeInteractionJournal
-from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
+from wmo.runtime.router.runtime import DecisionSink, RoutedModelResponse, RouterRuntime
 
 
 class RouterApplicationError(ValueError):
     """A project cannot select one verified frozen router for local execution."""
+
+
+class _GhostRouterCompletionService:
+    """Route requests without creating durable interaction state."""
+
+    def __init__(self, runtime: RouterRuntime) -> None:
+        """Bind the stateless completion adapter to one verified runtime."""
+        self._runtime = runtime
+
+    def complete(
+        self,
+        request: ModelRequest,
+        *,
+        idempotency_key: str,
+        conversation_id: str | None = None,
+    ) -> RoutedModelResponse:
+        """Dispatch directly while accepting but not persisting caller identity.
+
+        Args:
+            request: Provider-neutral request to route and execute.
+            idempotency_key: Caller key intentionally ignored in ghost mode.
+            conversation_id: Optional in-memory Responses affinity identity.
+
+        Returns:
+            Newly routed provider response with no durable replay record.
+        """
+        del idempotency_key
+        return self._runtime.complete(request, episode_id=conversation_id)
 
 
 def load_project_router(
@@ -136,15 +164,19 @@ def create_project_router_app(
 def create_project_completion_service(
     store: ProjectStore,
     runtime: RouterRuntime,
+    *,
+    ghost: bool = False,
 ) -> RouterCompletionService:
-    """Compose one project's durable completion boundary without provider dispatch.
+    """Compose one project's selected durable or ghost completion boundary.
 
     Args:
-        store: Initialized project whose canonical runtime journal receives interactions.
-        runtime: Loaded frozen router wrapped by the durable journal service.
+        store: Initialized project that owns the selected runtime policy.
+        runtime: Loaded frozen router wrapped by the selected traffic service.
+        ghost: Whether requests must bypass all durable interaction state.
 
     Returns:
-        Neutral completion service shared by every endpoint request in one application.
+        Neutral completion service shared by every endpoint request in one application. Ghost
+        services accept caller keys but never provide durable idempotent replay.
 
     Raises:
         RouterApplicationError: The store does not own the runtime's exact verified policy.
@@ -157,8 +189,12 @@ def create_project_completion_service(
         ) from exc
     if stored_policy != runtime.policy:
         raise RouterApplicationError(
-            "project router policy content differs from the runtime selected for journaling"
+            "project router policy content differs from the runtime selected for completion"
         )
+    if ghost:
+        if runtime.records_decisions:
+            raise RouterApplicationError("ghost mode cannot use a routing decision sink")
+        return _GhostRouterCompletionService(runtime)
     return JournaledRouterCompletionService(
         JournaledRouterRuntime(runtime, RuntimeInteractionJournal(store.paths))
     )
@@ -172,6 +208,7 @@ def load_router(
     environment: Mapping[str, str] | None = None,
     runtime_catalog: RuntimeModelCatalog | None = None,
     decision_sink: DecisionSink | None = None,
+    ghost: bool = False,
 ) -> OpenAI:
     """Load one local project as an official synchronous OpenAI client.
 
@@ -182,12 +219,15 @@ def load_router(
         environment: Optional credential mapping for runtime client construction.
         runtime_catalog: Optional explicit catalog for deterministic applications and tests.
         decision_sink: Optional aggregate-safe routing-decision recorder.
+        ghost: Whether completed traffic must bypass durable journal and replay state.
 
     Returns:
         Official OpenAI client whose Chat Completions and Responses resources call the local
-        verified router in process and durably journal every completed interaction. Close it or
-        use it as a context manager when finished.
+        verified router in process. By default every completion is journaled; ghost mode keeps no
+        durable traffic or replay state. Close it or use it as a context manager when finished.
     """
+    if ghost and decision_sink is not None:
+        raise RouterApplicationError("ghost mode cannot use a routing decision sink")
     runtime = load_project_router(
         project,
         root,
@@ -197,7 +237,7 @@ def load_router(
         decision_sink=decision_sink,
     )
     store = ProjectStore(root, project)
-    completion_service = create_project_completion_service(store, runtime)
+    completion_service = create_project_completion_service(store, runtime, ghost=ghost)
     application = create_project_router_app(
         project,
         runtime,

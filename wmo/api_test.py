@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from inspect import signature
 
 import wmo
 from wmo.optimize.router.workflow import fit_router, optimize_router, report_router
@@ -40,6 +41,7 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.compose_router is compose_router
     assert wmo.load_project_router is load_project_router
     assert wmo.load_router is load_router
+    assert "ghost" in signature(wmo.load_router).parameters
     assert wmo.create_project_router_app is create_project_router_app
     assert wmo.load_world_model is load_world_model
     assert wmo.WorldModel is WorldModel

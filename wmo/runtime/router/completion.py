@@ -34,7 +34,7 @@ class RouterCompletionFailedError(RuntimeError):
 
 
 class RouterCompletionService(Protocol):
-    """Durable idempotent completion boundary used by public router adapters."""
+    """Completion boundary used by public router adapters in a selected traffic mode."""
 
     def complete(
         self,
@@ -43,15 +43,15 @@ class RouterCompletionService(Protocol):
         idempotency_key: str,
         conversation_id: str | None = None,
     ) -> RoutedModelResponse:
-        """Complete or replay one durable caller-keyed interaction.
+        """Complete one caller-keyed interaction under the service's traffic mode.
 
         Args:
             request: Provider-neutral request to route and execute.
-            idempotency_key: Caller key that identifies the logical interaction.
+            idempotency_key: Caller key used for replay only by durable implementations.
             conversation_id: Optional stable identity for sticky conversation routing.
 
         Returns:
-            The original or replayed routed model response.
+            Newly completed or durably replayed routed model response.
 
         Raises:
             RouterCompletionConflictError: The key names different request state.

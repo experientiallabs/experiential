@@ -64,15 +64,25 @@ identity fails instead of overwriting evidence.
 wmo run support-agent --root .wmo --port 8000
 ```
 
-This development adapter binds only to `127.0.0.1`. Send a caller-owned episode ID with every
-request:
+This development adapter binds only to `127.0.0.1`. Send a standard OpenAI request:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-WMO-Episode-ID: customer-conversation-42' \
   -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
 ```
 
-The first decision is sticky for that episode. Request-time embedding failure falls back to the
-frozen conservative baseline. Neither path updates the policy or evidence bank.
+Chat requests are stateless. Responses continuations preserve routing affinity through the official
+`previous_response_id` field. Request-time embedding failure falls back to the frozen conservative
+baseline. Neither path updates the policy or evidence bank.
+
+By default, completed traffic enters the durable project journal and can later feed runtime RAG and
+SFT preparation. Use ghost mode when traffic must not be saved:
+
+```bash
+wmo run support-agent --root .wmo --ghost
+```
+
+Python applications use the same boundary with `wmo.load_router("support-agent", ghost=True)`.
+Ghost mode still performs routed provider calls, but it writes no interaction, replay, RAG, or SFT
+state. Caller idempotency keys are accepted but cannot replay, so a retry may dispatch again.

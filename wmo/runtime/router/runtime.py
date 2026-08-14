@@ -90,6 +90,11 @@ class RouterRuntime:
             raise RouterRuntimeIntegrityError("frozen router embedder lacks embedding capability")
         self._embedder = embedder.embedding_client
 
+    @property
+    def records_decisions(self) -> bool:
+        """Return whether selections are sent to an injected decision recorder."""
+        return self._decision_sink is not None
+
     @classmethod
     def load(
         cls,

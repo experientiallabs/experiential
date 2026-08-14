@@ -354,7 +354,7 @@ def create_router_endpoint(
 
     Args:
         endpoints: Public model names mapped to activated local runtimes.
-        completion_services: Optional durable idempotent services for standard keyed requests.
+        completion_services: Optional traffic-mode services for standard keyed requests.
 
     Returns:
         Loopback-hostable OpenAI API router.
