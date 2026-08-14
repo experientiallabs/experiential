@@ -138,10 +138,26 @@ uv run pytest -q
    has unrelated failures, record them and keep them out of the patch; fix them only when they are
    in scope or prevent meaningful validation.
 
-2. **Tests live inline next to the code.** A module `foo.py` is tested by `foo_test.py` in the same
-   directory (for example, `wmo/workflow/router.py` maps to `wmo/workflow/router_test.py`). There
-   is no top-level `tests/` directory. Pytest is configured (`python_files = ["*_test.py"]`) to
-   discover these.
+2. **Tests live inline next to the code, one test file per module.** A module `foo.py` is tested by
+   `foo_test.py` in the same directory (for example, `wmo/workflow/router.py` maps to
+   `wmo/workflow/router_test.py`). There is no top-level `tests/` directory. Pytest is configured
+   (`python_files = ["*_test.py"]`) to discover these.
+
+   The pairing runs both ways. Every module carries its own `_test.py`, so a reader knows where a
+   module's coverage lives without searching, and an untested module is visible as an absence
+   rather than hidden in an unrelated file. An **empty `_test.py` is a valid and expected state**:
+   prefer an empty file, or one with only a module docstring saying what is intentionally not
+   covered here, over a vacuous test. A test that asserts a constructor stores its arguments, that
+   a pydantic model round-trips through its own serializer, or that a constant still equals itself
+   is worse than no test: it costs suite time, it fails on harmless edits, and it makes an
+   uncovered module look covered. Never add an assertion just to fill a file.
+
+   Equally, **no `_test.py` exists without the `.py` it names.** A test file whose subject spans
+   several modules, or which tests the package rather than one module, does not get to squat on a
+   name that implies a module. Put it in a `tests/` subdirectory of the package that owns the
+   behavior (for example `wmo/simulation/tests/`), never a `tests/` directory at the repository
+   root, which rule 5 forbids anyway. Existing standalone test files predate this rule and are
+   relocated opportunistically when the surrounding area is edited, not in a bulk sweep.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
