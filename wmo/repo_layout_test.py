@@ -95,6 +95,14 @@ def test_non_test_hand_authored_files_stay_below_one_thousand_lines() -> None:
     assert not oversized, f"hand-authored files exceed 999 physical lines: {oversized}"
 
 
+def test_line_limit_exempts_only_generated_lock_and_python_test_modules() -> None:
+    """Keep the narrow line-limit exemptions explicit."""
+    assert _is_line_limit_exempt(Path("wmo/runtime/router/runtime_test.py"))
+    assert _is_line_limit_exempt(Path("package-lock.json"))
+    assert not _is_line_limit_exempt(Path("wmo/runtime/router/runtime.py"))
+    assert not _is_line_limit_exempt(Path("docs/runtime_test.md"))
+
+
 def test_top_level_paths_are_allowlisted() -> None:
     """Prove tracked repository-root directories and files stay on the closed allowlist.
 
