@@ -19,6 +19,7 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
     sha256_json,
     stable_id,
+    unique_sorted_inputs,
     validate_artifact_file_path,
 )
 
@@ -105,3 +106,19 @@ def test_structured_failures_preserve_runtime_attribution() -> None:
     )
 
     assert StructuredFailure.model_validate_json(failure.model_dump_json()) == failure
+
+
+def test_unique_sorted_inputs_deduplicates_and_reports_conflicts() -> None:
+    """Equal inputs collapse in artifact-ID order and conflicting digests raise the caller error."""
+    first = ArtifactInput(artifact_id="trace-a", sha256=_DIGEST_A)
+    second = ArtifactInput(artifact_id="trace-b", sha256=_DIGEST_B)
+
+    assert unique_sorted_inputs(
+        (second, first, first), conflict_error=lambda artifact_id: ValueError(artifact_id)
+    ) == (first, second)
+
+    with pytest.raises(LookupError, match="trace-a"):
+        unique_sorted_inputs(
+            (first, ArtifactInput(artifact_id="trace-a", sha256=_DIGEST_B)),
+            conflict_error=lambda artifact_id: LookupError(artifact_id),
+        )

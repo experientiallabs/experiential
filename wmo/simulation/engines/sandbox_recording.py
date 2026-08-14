@@ -206,7 +206,7 @@ def execute_bounded_sandbox_episode(
         if remaining_cost_usd is None
         else remaining_cost_usd - (environment_maximum_episode_cost_usd or 0.0)
     )
-    event_clock = clock or _utc_now
+    event_clock = clock or sandbox_utc_now
     deadline = _Deadline(maximum_time_seconds, monotonic)
     model = _RecordingCandidateClient(
         candidate,
@@ -316,13 +316,13 @@ class _RecordingCandidateClient:
                 raise SandboxCostLimitError(failure.message)
         call_index = self._calls
         self._calls += 1
-        started_at = _timestamp(self._clock)
+        started_at = sandbox_timestamp(self._clock)
         started = self._monotonic()
         self._record_dispatch_intent()
         try:
             response = self._client.complete(request)
         except Exception as exc:
-            ended_at = _timestamp(self._clock, not_before=started_at)
+            ended_at = sandbox_timestamp(self._clock, not_before=started_at)
             failure = StructuredFailure(
                 code=FailureCode.TIMEOUT if isinstance(exc, TimeoutError) else FailureCode.PROVIDER,
                 message=f"candidate provider failed with {type(exc).__name__}",
@@ -339,7 +339,7 @@ class _RecordingCandidateClient:
             if isinstance(exc, SandboxTimeLimitError):
                 self._set_limit(StopReason.MAXIMUM_TIME, failure)
             raise
-        ended_at = _timestamp(self._clock, not_before=started_at)
+        ended_at = sandbox_timestamp(self._clock, not_before=started_at)
         if response.model != self._snapshot:
             failure = StructuredFailure(
                 code=FailureCode.PROVIDER,
@@ -499,13 +499,13 @@ class _RecordingEnvironmentSession:
         self._owner._deadline.remaining()
         index = self._index
         self._index += 1
-        started_at = _timestamp(self._owner._clock)
+        started_at = sandbox_timestamp(self._owner._clock)
         started = self._owner._monotonic()
         self._owner._record_dispatch_intent()
         try:
             observation = self._session.execute(action)
         except Exception as exc:
-            ended_at = _timestamp(self._owner._clock, not_before=started_at)
+            ended_at = sandbox_timestamp(self._owner._clock, not_before=started_at)
             failure = StructuredFailure(
                 code=FailureCode.TIMEOUT if isinstance(exc, TimeoutError) else FailureCode.INTERNAL,
                 message=f"environment action failed with {type(exc).__name__}",
@@ -520,7 +520,7 @@ class _RecordingEnvironmentSession:
                 self._owner.limit_stop_reason = StopReason.MAXIMUM_TIME
                 self._owner.limit_failure = failure
             raise
-        ended_at = _timestamp(self._owner._clock, not_before=started_at)
+        ended_at = sandbox_timestamp(self._owner._clock, not_before=started_at)
         duration = max(0.0, self._owner._monotonic() - started)
         economics = _observation_economics(observation, duration)
         self._owner.economics.append(economics)
@@ -794,18 +794,29 @@ def _environment_cost_failure(
     )
 
 
-def _timestamp(
+def sandbox_timestamp(
     clock: Callable[[], datetime],
     *,
     not_before: datetime | None = None,
 ) -> datetime:
-    """Return one aware timestamp that never moves behind an earlier event."""
+    """Return one aware sandbox timestamp that never moves behind an earlier event.
+
+    Args:
+        clock: Injected event clock that must return timezone-aware datetimes.
+        not_before: Earliest acceptable time, used to keep recorded spans ordered.
+
+    Returns:
+        The clock reading, or `not_before` when the clock would order an event backwards.
+
+    Raises:
+        ValueError: The clock returned a naive datetime.
+    """
     value = clock()
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("sandbox simulation clock must return timezone-aware datetimes")
     return not_before if not_before is not None and value < not_before else value
 
 
-def _utc_now() -> datetime:
-    """Return an aware UTC event timestamp."""
+def sandbox_utc_now() -> datetime:
+    """Return an aware UTC sandbox event timestamp."""
     return datetime.now(UTC)

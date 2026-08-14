@@ -18,6 +18,7 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
     sha256_json,
     stable_id,
+    unique_sorted_inputs,
 )
 from wmo.common.project import (
     ArtifactAlreadyExistsError,
@@ -646,15 +647,12 @@ def _globally_deduplicate(
 
 def _sorted_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactInput, ...]:
     """Sort verified input identities and reject conflicting hashes for one artifact ID."""
-    by_id: dict[ArtifactId, ArtifactInput] = {}
-    for item in inputs:
-        existing = by_id.get(item.artifact_id)
-        if existing is not None and existing != item:
-            raise SFTBuildError(
-                f"immutable dataset input {item.artifact_id} has conflicting digests"
-            )
-        by_id[item.artifact_id] = item
-    return tuple(by_id[item_id] for item_id in sorted(by_id))
+    return unique_sorted_inputs(
+        inputs,
+        conflict_error=lambda artifact_id: SFTBuildError(
+            f"immutable dataset input {artifact_id} has conflicting digests"
+        ),
+    )
 
 
 def _build_digest(

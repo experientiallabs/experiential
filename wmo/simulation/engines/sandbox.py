@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import datetime
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -54,6 +54,8 @@ from wmo.simulation.engines.sandbox_recording import (
     execute_bounded_sandbox_episode,
     merge_sandbox_spans,
     require_hard_wall_timeout_support,
+    sandbox_timestamp,
+    sandbox_utc_now,
 )
 from wmo.simulation.engines.text.leases import (
     TextCellLeaseError,
@@ -141,7 +143,7 @@ class SandboxSimulator:
         self._environment_id = environment_id
         self._environment_sha256 = environment_sha256
         self._source_run_id = source_run_id
-        self._clock = clock or _utc_now
+        self._clock = clock or sandbox_utc_now
         self._monotonic = monotonic
         self._leases = TextCellLeaseStore(store.project_directory, clock=self._clock)
         self._verify_persisted_evaluation_plan()
@@ -354,7 +356,7 @@ class SandboxSimulator:
             evaluation_plan_input=self._plan_input,
             task_set_input=self._task_set_input,
             bindings=tuple(bindings[cell.cell_id] for cell in cells),
-            created_at=_timestamp(self._clock),
+            created_at=sandbox_timestamp(self._clock),
         )
         try:
             manifest = self._store.write_json(
@@ -538,7 +540,7 @@ class SandboxSimulator:
         record_dispatch_intent: Callable[[], None],
     ) -> RolloutArtifact:
         """Execute one bounded customer episode and convert every normal failure into evidence."""
-        started_at = _timestamp(self._clock)
+        started_at = sandbox_timestamp(self._clock)
         started = self._monotonic()
         candidate = self._candidates[cell.candidate_alias]
         settings = spec.sandbox
@@ -597,7 +599,7 @@ class SandboxSimulator:
                 limit_failure=None,
             )
         stop_reason, failure = _terminal_state(episode, evidence)
-        ended_at = _timestamp(self._clock, not_before=started_at)
+        ended_at = sandbox_timestamp(self._clock, not_before=started_at)
         spans = merge_sandbox_spans(episode, evidence)
         if not spans:
             spans = (_terminal_span(started_at, ended_at, failure),)
@@ -633,7 +635,7 @@ class SandboxSimulator:
             attribution=FailureAttribution.MODEL,
             details={"phase": phase, "observed_spend_usd": spent},
         )
-        now = _timestamp(self._clock)
+        now = sandbox_timestamp(self._clock)
         return self._make_rollout(
             spec,
             cell,
@@ -667,7 +669,7 @@ class SandboxSimulator:
         rollout_id = sandbox_rollout_id(binding)
         return RolloutArtifact(
             schema_version=1,
-            created_at=_timestamp(self._clock),
+            created_at=sandbox_timestamp(self._clock),
             inputs=_sorted_inputs(
                 self._plan_input,
                 self._task_set_input,
@@ -789,7 +791,7 @@ class SandboxSimulator:
         )
         artifact_set = SimulationArtifactSet(
             schema_version=1,
-            created_at=_timestamp(self._clock),
+            created_at=sandbox_timestamp(self._clock),
             inputs=_sorted_inputs(
                 self._plan_input,
                 self._task_set_input,
@@ -918,23 +920,6 @@ def _jsonl_bytes(records: Sequence[Mapping[str, str]]) -> bytes:
     """Render deterministic small JSONL artifact-index records."""
     payload = b"\n".join(canonical_json_bytes(dict(record)) for record in records)
     return payload + (b"\n" if payload else b"")
-
-
-def _timestamp(
-    clock: Callable[[], datetime],
-    *,
-    not_before: datetime | None = None,
-) -> datetime:
-    """Return an aware timestamp that cannot precede an earlier event."""
-    value = clock()
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("sandbox simulation clock must return timezone-aware datetimes")
-    return not_before if not_before is not None and value < not_before else value
-
-
-def _utc_now() -> datetime:
-    """Return the current aware UTC timestamp."""
-    return datetime.now(UTC)
 
 
 __all__ = [

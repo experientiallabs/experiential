@@ -13,6 +13,7 @@ from wmo.common.core.artifacts import (
     ContractModel,
     StructuredFailure,
     sha256_json,
+    unique_sorted_inputs,
 )
 from wmo.common.evaluations.dataset import EvaluationProtocol, FidelityReport
 from wmo.common.evaluations.plan import EvaluationPlan, FidelityGate, FidelityThresholds
@@ -259,15 +260,12 @@ def sorted_evaluation_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactI
     Raises:
         EvaluationEvidenceError: One ID appears with conflicting digests.
     """
-    by_id: dict[str, ArtifactInput] = {}
-    for item in inputs:
-        previous = by_id.get(item.artifact_id)
-        if previous is not None and previous != item:
-            raise EvaluationEvidenceError(
-                f"artifact input {item.artifact_id} has conflicting manifest hashes"
-            )
-        by_id[item.artifact_id] = item
-    return tuple(by_id[artifact_id] for artifact_id in sorted(by_id))
+    return unique_sorted_inputs(
+        inputs,
+        conflict_error=lambda artifact_id: EvaluationEvidenceError(
+            f"artifact input {artifact_id} has conflicting manifest hashes"
+        ),
+    )
 
 
 def _read_json[ModelT: BaseModel](

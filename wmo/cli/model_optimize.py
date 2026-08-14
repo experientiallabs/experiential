@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,6 +10,7 @@ import typer
 from rich.console import Console
 
 from wmo.cli.consent import require_spend_consent
+from wmo.cli.revision import current_revision
 from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.project import ProjectStore, ProjectStoreError
 from wmo.optimize.model.sft import (
@@ -53,7 +53,7 @@ def optimize_model(
         typer.BadParameter: Local configuration, preflight, W13, or registration is unsafe.
     """
     started = time.monotonic()
-    code_revision = _current_revision()
+    code_revision = current_revision()
     try:
         store = ProjectStore(root, project)
         project_config = store.load_project()
@@ -147,16 +147,3 @@ def _compose_tinker_backend() -> TrainerBackend:
             "Tinker SFT requires the optional sft dependencies; run `uv sync --extra sft`"
         ) from exc
     return TinkerTrainerBackend(tinker.ServiceClient())
-
-
-def _current_revision() -> str:
-    """Return the local Git revision without changing repository or provider state."""
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=Path(__file__).resolve().parents[2],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    revision = result.stdout.strip()
-    return revision if result.returncode == 0 and revision else "local-unversioned"

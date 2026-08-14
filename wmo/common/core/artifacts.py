@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
@@ -161,6 +162,34 @@ class ArtifactEnvelope(ContractModel):
         if input_ids != tuple(sorted(input_ids)):
             raise ValueError("artifact inputs must be sorted by artifact_id")
         return value
+
+
+def unique_sorted_inputs(
+    inputs: Iterable[ArtifactInput],
+    *,
+    conflict_error: Callable[[str], Exception],
+) -> tuple[ArtifactInput, ...]:
+    """Return one verified input per artifact ID in canonical artifact-ID order.
+
+    Args:
+        inputs: Manifest-derived immutable input references, in any order.
+        conflict_error: Builds the domain error for one artifact ID that appears twice with
+            different digests, so each caller keeps its own failure type and message.
+
+    Returns:
+        Deduplicated inputs ordered by artifact ID, ready for an `ArtifactEnvelope`.
+
+    Raises:
+        Exception: The error built by `conflict_error` when one artifact ID carries conflicting
+            manifest hashes.
+    """
+    by_id: dict[str, ArtifactInput] = {}
+    for item in inputs:
+        existing = by_id.get(item.artifact_id)
+        if existing is not None and existing != item:
+            raise conflict_error(item.artifact_id)
+        by_id[item.artifact_id] = item
+    return tuple(by_id[artifact_id] for artifact_id in sorted(by_id))
 
 
 class SecretBoundaryError(ValueError):

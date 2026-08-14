@@ -61,7 +61,7 @@ def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(
     command = importlib.import_module("wmo.cli.model_optimize")
     first_backend = _FakeBackend(conservative_cost_per_batch=0.10)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda: first_backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "w14m-test")
+    monkeypatch.setattr(command, "current_revision", lambda: "w14m-test")
     attempts = []
     emitted = []
     receipts: set[str] = set()
@@ -137,7 +137,7 @@ def test_cli_crash_after_sft_receipt_replays_without_duplicate_event_or_dispatch
     command = importlib.import_module("wmo.cli.model_optimize")
     first_backend = _FakeBackend(conservative_cost_per_batch=0.10)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda: first_backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "w14m-test")
+    monkeypatch.setattr(command, "current_revision", lambda: "w14m-test")
     attempts = []
     emitted = []
     receipts: set[str] = set()
@@ -187,7 +187,7 @@ def test_cli_yes_does_not_bypass_the_unsupported_budget_estimate_gate(
     command = importlib.import_module("wmo.cli.model_optimize")
     backend = _FakeBackend(conservative_cost_per_batch=None)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda: backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "w14m-test")
+    monkeypatch.setattr(command, "current_revision", lambda: "w14m-test")
 
     result = CliRunner().invoke(
         app,

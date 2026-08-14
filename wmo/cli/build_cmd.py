@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from wmo.cli.revision import current_revision
 from wmo.common.config import ARTIFACT_DIR
 from wmo.common.observability.telemetry import BuildTelemetryStats, capture_build_completed
 from wmo.common.project import ArtifactStoreError, ProjectConfig, ProjectStore, ProjectStoreError
@@ -78,7 +78,7 @@ def build(
             normalized,
             store,
             created_at=datetime.now(UTC),
-            code_revision=_current_revision(),
+            code_revision=current_revision(),
         )
     except (ArtifactStoreError, ProjectStoreError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from None
@@ -123,19 +123,6 @@ def _project_store(root: Path, project_id: str) -> ProjectStore:
     else:
         store.initialize(ProjectConfig(project_id=project_id))
     return store
-
-
-def _current_revision() -> str:
-    """Return the local Git revision when available without changing repository state."""
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=Path(__file__).resolve().parents[2],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    revision = result.stdout.strip()
-    return revision if result.returncode == 0 and revision else "local-unversioned"
 
 
 def _capture_local_build_telemetry(
