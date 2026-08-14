@@ -14,6 +14,7 @@ from pydantic import Field, field_validator, model_validator
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactId,
+    ArtifactInput,
     ContractModel,
     Sha256,
     sha256_json,
@@ -30,6 +31,7 @@ class WorldModelSettings(ContractModel):
     """
 
     world_model_alias: ArtifactId
+    grounded_world_model_input: ArtifactInput
     prompt_version: str = Field(min_length=1, max_length=256)
     query_embedding: EmbeddingCostReservation | None = None
     maximum_output_tokens: int = Field(default=16_000, ge=8_000)

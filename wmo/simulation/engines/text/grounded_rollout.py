@@ -21,7 +21,6 @@ from wmo.runtime.models import ResolvedModel
 from wmo.simulation.engines.text.bindings import rollout_id_for_binding, sorted_artifact_inputs
 from wmo.simulation.engines.text.prompt import (
     WORLD_MODEL_TEXT_PROMPT_ID,
-    WORLD_MODEL_TEXT_PROMPT_VERSION,
 )
 from wmo.simulation.engines.text.redaction import redact_action, redact_failure
 from wmo.simulation.engines.text.rollout_support import timestamp
@@ -95,6 +94,7 @@ class GroundedRolloutBuilder:
                 self.plan_input,
                 self.task_set_input,
                 self.fit_rag_input,
+                binding.grounded_world_model_input,
                 binding.simulation_spec_input,
                 resolution_input,
             ),
@@ -113,7 +113,7 @@ class GroundedRolloutBuilder:
             simulator=WorldModelSimulatorSnapshot(
                 simulator_id=TEXT_WORLD_MODEL_SIMULATOR_ID,
                 prompt_id=WORLD_MODEL_TEXT_PROMPT_ID,
-                prompt_version=WORLD_MODEL_TEXT_PROMPT_VERSION,
+                prompt_version=binding.prompt_version,
                 prompt_sha256=binding.prompt_sha256,
                 world_model=world_model.snapshot,
             ),

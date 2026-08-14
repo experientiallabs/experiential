@@ -6,7 +6,7 @@ import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from pydantic import JsonValue
 
@@ -33,12 +33,13 @@ from wmo.runtime.models import ResolvedModel
 from wmo.simulation.engines.text.prompt import (
     TextWorldModelProtocolError,
     TextWorldModelTransition,
-    build_world_model_request,
-    parse_world_model_transition,
     text_prompt_sha256,
 )
 from wmo.simulation.engines.text.redaction import redact_json
-from wmo.simulation.retrieval import RAGAction, RAGQuery, TraceRAGRetriever
+from wmo.simulation.retrieval import RAGAction, RAGQuery
+
+if TYPE_CHECKING:
+    from wmo.simulation.world_model import GroundedWorldModel
 
 
 class TextSimulationError(RuntimeError):
@@ -104,7 +105,7 @@ class RecordingCandidateClient:
         task: TaskCase,
         candidate: ResolvedModel,
         world_model: ResolvedModel,
-        fit_retriever: TraceRAGRetriever,
+        grounded_world_model: GroundedWorldModel,
         query_embedding: EmbeddingCostReservation,
         maximum_cost_usd: float,
         maximum_steps: int,
@@ -119,7 +120,7 @@ class RecordingCandidateClient:
             task: Canonical no-tools task currently being simulated.
             candidate: Candidate model injected into the customer agent.
             world_model: Model that simulates the next visible text turn.
-            fit_retriever: Read-only retriever bound to the completed build's fit-only index.
+            grounded_world_model: Artifact-bound executor over the exact fit-only index.
             query_embedding: Exact query-embedding identity, price, and retry reservation.
             maximum_cost_usd: Spend remaining for candidate, retrieval, and world-model calls.
             maximum_steps: Maximum candidate model turns allowed in this episode.
@@ -131,7 +132,7 @@ class RecordingCandidateClient:
         self._task = task
         self._candidate = candidate
         self._world_model = world_model
-        self._fit_retriever = fit_retriever
+        self._grounded_world_model = grounded_world_model
         self._query_embedding = query_embedding
         self._maximum_cost_usd = maximum_cost_usd
         self._maximum_steps = maximum_steps
@@ -320,8 +321,9 @@ class RecordingCandidateClient:
             initial_context=self._task.initial_context,
             action=RAGAction(kind="message", content=candidate_content),
             excluded_lineage_ids=(self._task.lineage_group_id,),
+            top_k=self._grounded_world_model.artifact.top_k,
         )
-        query_economics = self._fit_retriever.estimate_query_economics(
+        query_economics = self._grounded_world_model.retriever.estimate_query_economics(
             rag_query,
             self._query_embedding,
         )
@@ -334,29 +336,30 @@ class RecordingCandidateClient:
         )
         self._retrieval_economics.append(query_economics)
         self._provider_dispatch_unknown_spend = True
-        grounded_examples = self._fit_retriever.retrieve(rag_query)
-        self._provider_dispatch_unknown_spend = False
-        self._retrieved_transition_ids.append(
-            tuple(match.transition.transition_id for match in grounded_examples)
-        )
-        world_request = build_world_model_request(
-            self._task,
+        prepared = self._grounded_world_model.prepare_turn(
+            task=self._task,
             visible_messages=candidate_request.messages,
             candidate_response=candidate_response.output,
-            grounded_examples=grounded_examples,
+            excluded_lineage_ids=(self._task.lineage_group_id,),
             maximum_output_tokens=self._maximum_output_tokens,
         )
+        self._provider_dispatch_unknown_spend = False
         _preflight_context(
             self._world_model.alias,
             self._world_model.capabilities,
-            world_request,
+            prepared.request,
             self._token_counter,
         )
         world_started_at = _timestamp(self._clock, not_before=candidate_ended_at)
         self._provider_dispatch_unknown_spend = True
-        world_response = self._world_model.client.complete(world_request)
+        dispatched = self._grounded_world_model.complete_turn(prepared)
         self._provider_dispatch_unknown_spend = False
+        world_request = dispatched.request
+        world_response = dispatched.response
         world_ended_at = _timestamp(self._clock, not_before=world_started_at)
+        self._retrieved_transition_ids.append(
+            tuple(match.transition.transition_id for match in dispatched.matches)
+        )
         self._world_model_responses.append(world_response)
         self._world_model_spans.append(
             _model_span(
@@ -372,7 +375,7 @@ class RecordingCandidateClient:
         _require_response_identity(world_response, self._world_model, role="world model")
         _require_complete_response(world_response, role="world model")
         try:
-            transition = parse_world_model_transition(world_response.output)
+            transition = self._grounded_world_model.parse_turn(dispatched).transition
         except TextWorldModelProtocolError as exc:
             raise _text_failure(
                 StopReason.FAILURE,

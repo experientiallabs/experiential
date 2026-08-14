@@ -44,10 +44,12 @@ def _rollout() -> RolloutArtifact:
     spec_input = ArtifactInput(artifact_id="simulation-spec", sha256=_DIGEST)
     task_set_input = ArtifactInput(artifact_id="task-set", sha256=_DIGEST)
     fit_rag_input = ArtifactInput(artifact_id="fit-rag", sha256=_DIGEST)
+    grounded_world_model_input = ArtifactInput(artifact_id="grounded-world-model", sha256=_DIGEST)
     binding = SimulationCellBinding(
         evaluation_plan_input=plan_input,
         task_set_input=task_set_input,
         fit_rag_input=fit_rag_input,
+        grounded_world_model_input=grounded_world_model_input,
         task_set_tasks_sha256=_DIGEST,
         task_sha256=_DIGEST,
         candidate_alias="candidate-a",
@@ -73,7 +75,13 @@ def _rollout() -> RolloutArtifact:
     return RolloutArtifact(
         schema_version=1,
         created_at=started_at,
-        inputs=(plan_input, fit_rag_input, spec_input, task_set_input),
+        inputs=(
+            plan_input,
+            fit_rag_input,
+            grounded_world_model_input,
+            spec_input,
+            task_set_input,
+        ),
         code_revision="e7aad17",
         artifact_id="rollout-artifact-1",
         simulation_id="simulation-1",

@@ -44,16 +44,16 @@ from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.application import create_project_router_app
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
-    _FitRetriever,
     _OneTurnAgent,
     _response,
     _ScriptedClient,
 )
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
-from wmo.simulation.retrieval import TraceRAGRetriever, load_rag_index
+from wmo.simulation.retrieval import load_fit_rag_retriever, load_rag_index
 from wmo.simulation.retrieval.retrieval_test import _message_trace as _trace
 from wmo.simulation.specs import WorldModelSettings
+from wmo.simulation.world_model import bind_fit_grounded_world_model
 from wmo.workflow.judgment_budget import JudgmentDispatchReceipt
 from wmo.workflow.router import (
     ApprovedRouterReview,
@@ -193,6 +193,7 @@ class _EvidenceSetupSupplier:
             judgment_status="provisional",
             world_model_settings=WorldModelSettings(
                 world_model_alias="world-model-a",
+                grounded_world_model_input=completed.world_model,
                 prompt_version="text-world-model-v1",
                 query_embedding=EmbeddingCostReservation(
                     model=fit_index.embedder,
@@ -259,28 +260,27 @@ class _EvidenceSimulatorFactory:
         self.calls += 1
         completed = project.load_project().build
         assert completed is not None
-        fit_index = load_rag_index(project.artifacts, completed.fit_rag.artifact_id).index
+        fit_retriever = load_fit_rag_retriever(project.artifacts, completed.fit_rag)
+        world_model = _resolved("world-model-a", cast(ModelClient, self.world))
         return WorldModelSimulator(
             store=project.artifacts,
             evaluation_plan=plan,
             evaluation_plan_input=artifact_input(project.artifacts.read(plan.plan_id).manifest),
             task_set_input=artifact_input(project.artifacts.read(plan.task_set_id).manifest),
             fit_rag_input=completed.fit_rag,
-            fit_retriever=cast(
-                TraceRAGRetriever,
-                _FitRetriever(
-                    completed.fit_rag,
-                    maximum_attempts=1,
-                    input_usd_per_million_tokens=0.0,
-                    embedder=fit_index.embedder,
-                ),
-            ),
+            fit_retriever=fit_retriever,
             candidate_models={
                 alias: _resolved(alias, cast(ModelClient, client))
                 for alias, client in self.candidates.items()
             },
-            world_models={
-                "world-model-a": _resolved("world-model-a", cast(ModelClient, self.world))
+            world_models={"world-model-a": world_model},
+            grounded_world_models={
+                "world-model-a": bind_fit_grounded_world_model(
+                    project.artifacts,
+                    completed.world_model,
+                    client=world_model.client,
+                    fit_retriever=fit_retriever,
+                )
             },
             agent_factory=_OneTurnAgent,
             clock=lambda: _TIME,

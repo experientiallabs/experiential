@@ -23,17 +23,28 @@ from wmo.common.models import (
 )
 from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
 from wmo.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
+from wmo.simulation.engines.text.prompt import (
+    WORLD_MODEL_TEXT_SYSTEM_PROMPT,
+    text_prompt_sha256,
+)
 from wmo.simulation.retrieval import (
     RAGAction,
     RAGEmbedderBinding,
     RAGLineageBinding,
+    load_fit_rag_retriever,
     load_rag_index,
     persist_trace_rag,
 )
-from wmo.simulation.world_model import load_grounded_world_model, persist_grounded_world_model
+from wmo.simulation.world_model import (
+    bind_fit_grounded_world_model,
+    load_grounded_world_model,
+    persist_grounded_world_model,
+)
 from wmo.simulation.world_model.artifact import (
     GROUNDED_WORLD_MODEL_ARTIFACT_TYPE,
+    GROUNDED_WORLD_MODEL_SYSTEM_PROMPT,
     WORLD_MODEL_ARTIFACT_PATH,
+    grounded_world_model_prompt_sha256,
 )
 
 
@@ -87,6 +98,12 @@ class _WorldClient:
         )
 
 
+def test_build_and_simulation_share_one_grounded_prompt_identity() -> None:
+    """The persisted world-model protocol exactly matches active simulation framing."""
+    assert GROUNDED_WORLD_MODEL_SYSTEM_PROMPT == WORLD_MODEL_TEXT_SYSTEM_PROMPT
+    assert grounded_world_model_prompt_sha256() == text_prompt_sha256()
+
+
 def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: Path) -> None:
     """A completed build artifact executes with immutable observed-transition grounding.
 
@@ -137,6 +154,8 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
         created_at=created_at,
         code_revision="fixture-revision",
         embedder=binding,
+        default_top_k=5,
+        included_partitions=frozenset({"fit", "held_out"}),
     )
     world_snapshot = ModelSnapshot(
         provider="fixture",
@@ -177,6 +196,45 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
     unchanged = load_rag_index(store.artifacts, rag.index.rag_id)
     assert unchanged.transitions == rag.transitions
     assert unchanged.vectors == rag.vectors
+
+    fit_rag = persist_trace_rag(
+        store.artifacts,
+        (artifact_input(trace_manifest),),
+        (RAGLineageBinding(trace_id=trace.trace_id, lineage_id="lineage-a", partition="fit"),),
+        created_at=created_at,
+        code_revision="fixture-revision",
+        included_partitions=frozenset({"fit"}),
+        embedder=binding,
+        default_top_k=5,
+    )
+    fit_retriever = load_fit_rag_retriever(
+        store.artifacts,
+        artifact_input(fit_rag.manifest),
+        embedder=binding,
+    )
+    fit_runtime = bind_fit_grounded_world_model(
+        store.artifacts,
+        artifact_input(artifact.manifest),
+        client=client,
+        fit_retriever=fit_retriever,
+    )
+    assert runtime.retriever.rag_input == artifact_input(rag.manifest)
+    assert fit_runtime.retriever.rag_input == artifact_input(fit_rag.manifest)
+    assert fit_runtime.artifact_input == artifact_input(artifact.manifest)
+    with pytest.raises(ValueError, match="fit-only"):
+        bind_fit_grounded_world_model(
+            store.artifacts,
+            artifact_input(artifact.manifest),
+            client=client,
+            fit_retriever=runtime.retriever,
+        )
+    with pytest.raises(ValueError, match="manifest differs"):
+        bind_fit_grounded_world_model(
+            store.artifacts,
+            artifact_input(artifact.manifest).model_copy(update={"sha256": "0" * 64}),
+            client=client,
+            fit_retriever=fit_retriever,
+        )
 
     inconsistent = artifact.artifact.model_copy(update={"world_model_id": "inconsistent-world"})
     store.artifacts.write(

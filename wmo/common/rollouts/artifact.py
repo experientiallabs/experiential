@@ -76,6 +76,7 @@ class SimulationCellBinding(ContractModel):
     evaluation_plan_input: ArtifactInput
     task_set_input: ArtifactInput
     fit_rag_input: ArtifactInput
+    grounded_world_model_input: ArtifactInput
     task_set_tasks_sha256: Sha256
     task_sha256: Sha256
     candidate_alias: ModelAlias
@@ -261,6 +262,7 @@ def _require_world_model_binding(rollout: RolloutArtifact) -> None:
         binding.evaluation_plan_input,
         binding.task_set_input,
         binding.fit_rag_input,
+        binding.grounded_world_model_input,
         binding.simulation_spec_input,
     }
     if not required_inputs.issubset(set(rollout.inputs)):

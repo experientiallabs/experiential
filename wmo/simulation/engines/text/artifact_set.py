@@ -49,6 +49,8 @@ def persist_artifact_set(
     Raises:
         SimulationResumeError: Existing terminal index content or inputs differ.
     """
+    if spec.world_model is None:  # pragma: no cover - text simulator validates this first
+        raise SimulationResumeError("text artifact sets require grounded world-model settings")
     artifact_ids = tuple(rollout.artifact_id for rollout in rollouts)
     index_payload = jsonl_bytes(tuple({"artifact_id": item} for item in artifact_ids))
     artifact_set_id = stable_id(
@@ -62,6 +64,7 @@ def persist_artifact_set(
             plan_input,
             task_set_input,
             fit_rag_input,
+            spec.world_model.grounded_world_model_input,
             spec_input,
             resolution_input,
         ),

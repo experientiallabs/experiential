@@ -23,16 +23,22 @@ from wmo.common.project import (
     artifact_input,
 )
 from wmo.simulation.retrieval import load_rag_index
+from wmo.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
 
 GROUNDED_WORLD_MODEL_ARTIFACT_TYPE = "grounded-world-model"
 WORLD_MODEL_ARTIFACT_PATH = "world-model.json"
-GROUNDED_WORLD_MODEL_PROMPT_VERSION = "grounded-world-model-v1"
-GROUNDED_WORLD_MODEL_SYSTEM_PROMPT = """Protocol version: grounded-world-model-v1.
-Predict the next visible user or environment message after the supplied agent action. Use only the
-retrieved real transitions as grounding. Do not execute or invent tools. Return only this JSON
-object: {"message":"the next visible user or environment message","terminal":false}
-Set terminal to true only when the scenario has reached a visible terminal state. Do not include
-markdown fences or other keys."""
+GROUNDED_WORLD_MODEL_PROMPT_ID = "world-model-text-v1"
+GROUNDED_WORLD_MODEL_PROMPT_VERSION = "text-world-model-v1"
+GROUNDED_WORLD_MODEL_GROUNDING_SCHEMA_VERSION = "fit-rag-examples-v1"
+GROUNDED_WORLD_MODEL_SYSTEM_PROMPT = """Protocol version: text-world-model-v1.
+You simulate the next visible user or environment message in a text-only
+customer-agent scenario. You receive the task, safe initial context, the candidate's visible
+conversation, and its latest visible assistant response. Do not execute, invent, or describe tools.
+Do not infer or reveal candidate hidden reasoning. You may reason internally if your provider
+supports it, but return only this JSON object:
+{"message":"the next visible user or environment message","terminal":false}
+Set terminal to true only when the scenario has reached a visible terminal state. The message may be
+empty only for a terminal state. Do not include markdown fences or other keys."""
 
 
 def grounded_world_model_prompt_sha256() -> str:
@@ -43,8 +49,11 @@ def grounded_world_model_prompt_sha256() -> str:
     """
     return sha256_json(
         {
+            "prompt_id": GROUNDED_WORLD_MODEL_PROMPT_ID,
             "prompt_version": GROUNDED_WORLD_MODEL_PROMPT_VERSION,
             "system_prompt": GROUNDED_WORLD_MODEL_SYSTEM_PROMPT,
+            "grounding_schema_version": GROUNDED_WORLD_MODEL_GROUNDING_SCHEMA_VERSION,
+            "rag_key_schema_version": RAG_KEY_SCHEMA_VERSION,
         }
     )
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -63,6 +64,7 @@ from wmo.simulation.engines.text.recording import (
     RecordingCandidateClient,
     TokenCounter,
     Utf8UpperBoundTokenCounter,
+    text_prompt_digest,
 )
 from wmo.simulation.engines.text.redaction import redacted_field_set
 from wmo.simulation.engines.text.rollout_support import (
@@ -79,6 +81,9 @@ from wmo.simulation.engines.text.rollout_support import (
 from wmo.simulation.orchestration import require_implemented_mode
 from wmo.simulation.retrieval import TraceRAGRetriever
 from wmo.simulation.specs import SimulationSpec
+
+if TYPE_CHECKING:
+    from wmo.simulation.world_model import GroundedWorldModel
 
 _SPEC_FILE = "simulation-spec.json"
 _ROLLOUT_FILE = "rollout.json"
@@ -102,6 +107,7 @@ class WorldModelSimulator:
         fit_retriever: Read-only retriever bound to ``fit_rag_input`` and its exact embedder.
         candidate_models: Independently resolved candidate models keyed by plan alias.
         world_models: Independently resolved world-model providers keyed by local alias.
+        grounded_world_models: Artifact-bound fit-only executors keyed by world-model alias.
         agent_factory: Creates an isolated customer-agent runtime for each episode worker.
         redacted_field_names: Project-configured labels removed before evidence persists.
         clock: Time source for artifact and span timestamps.
@@ -120,6 +126,7 @@ class WorldModelSimulator:
         fit_retriever: TraceRAGRetriever,
         candidate_models: Mapping[str, ResolvedModel],
         world_models: Mapping[str, ResolvedModel],
+        grounded_world_models: Mapping[str, GroundedWorldModel],
         agent_factory: Callable[[], AgentRuntime],
         redacted_field_names: tuple[str, ...] = (),
         clock: Callable[[], datetime] | None = None,
@@ -137,6 +144,7 @@ class WorldModelSimulator:
             fit_retriever: Retriever that can query only the frozen fit lineage set.
             candidate_models: Candidate aliases resolved through the canonical runtime package.
             world_models: Remote world-model aliases resolved through the canonical runtime package.
+            grounded_world_models: Persisted fit-bound executors for those world models.
             agent_factory: Per-episode customer-agent construction seam.
             redacted_field_names: Local field labels removed before artifact persistence.
             clock: Time source, injectable for deterministic tests.
@@ -162,6 +170,7 @@ class WorldModelSimulator:
         self._tasks = {task.task_id: task for task in loaded_task_set.tasks}
         self._candidate_models = dict(candidate_models)
         self._world_models = dict(world_models)
+        self._grounded_world_models = dict(grounded_world_models)
         self._agent_factory = agent_factory
         self._redacted_field_names = redacted_field_set(redacted_field_names)
         self._clock = clock or utc_now
@@ -245,13 +254,14 @@ class WorldModelSimulator:
             SimulationResumeError: Existing immutable artifacts do not match this simulation.
         """
         require_implemented_mode(spec, SimulationMode.WORLD_MODEL)
-        cells, world_model = self._validate_spec_and_bindings(spec)
+        cells, world_model, grounded_world_model = self._validate_spec_and_bindings(spec)
         spec_input = self._persist_specification(spec)
         resolution, resolution_input, bindings = self._persist_resolution(
             spec,
             spec_input,
             cells,
             world_model,
+            grounded_world_model,
         )
         completed = self._load_completed_rollouts(cells, bindings, resolution_input)
         pending = tuple(cell for cell in cells if cell.cell_id not in completed)
@@ -262,6 +272,7 @@ class WorldModelSimulator:
                     spec,
                     pending,
                     world_model,
+                    grounded_world_model,
                     spec_input,
                     resolution,
                     resolution_input,
@@ -284,14 +295,14 @@ class WorldModelSimulator:
     def _validate_spec_and_bindings(
         self,
         spec: SimulationSpec,
-    ) -> tuple[tuple[EvaluationCell, ...], ResolvedModel]:
+    ) -> tuple[tuple[EvaluationCell, ...], ResolvedModel, GroundedWorldModel]:
         """Validate all local inputs before any artifact write or provider call.
 
         Args:
             spec: Sparse finite-cost specification selected for execution or replay.
 
         Returns:
-            Ordered selected cells and the exact resolved world model.
+            Ordered cells, exact resolved model, and its persisted fit-bound executor.
 
         Raises:
             SimulationConfigurationError: A plan, task, RAG, model, prompt, or cell pin differs.
@@ -322,6 +333,24 @@ class WorldModelSimulator:
         if world_model is None:
             raise SimulationConfigurationError(
                 f"no resolved world model is configured for alias {settings.world_model_alias!r}"
+            )
+        grounded_world_model = self._grounded_world_models.get(settings.world_model_alias)
+        if grounded_world_model is None:
+            raise SimulationConfigurationError(
+                "no persisted grounded executor is configured for the selected world model"
+            )
+        artifact = grounded_world_model.artifact
+        if (
+            grounded_world_model.artifact_input != settings.grounded_world_model_input
+            or grounded_world_model.retriever is not self._fit_retriever
+            or grounded_world_model.client is not world_model.client
+            or artifact.model_alias != settings.world_model_alias
+            or artifact.model != world_model.snapshot
+            or artifact.prompt_version != settings.prompt_version
+            or artifact.prompt_sha256 != text_prompt_digest()
+        ):
+            raise SimulationConfigurationError(
+                "grounded executor differs from the persisted model, prompt, or fit RAG binding"
             )
         plan_cells = {cell.cell_id: cell for cell in self._plan.cells}
         cells = []
@@ -359,7 +388,7 @@ class WorldModelSimulator:
                     "candidate and world model must be resolved to independent model-client objects"
                 )
             cells.append(cell)
-        return tuple(cells), world_model
+        return tuple(cells), world_model, grounded_world_model
 
     def _persist_specification(self, spec: SimulationSpec) -> ArtifactInput:
         """Atomically write or verify the immutable specification before rollout execution."""
@@ -397,6 +426,7 @@ class WorldModelSimulator:
         spec_input: ArtifactInput,
         cells: Sequence[EvaluationCell],
         world_model: ResolvedModel,
+        grounded_world_model: GroundedWorldModel,
     ) -> tuple[SimulationResolution, ArtifactInput, dict[ArtifactId, SimulationCellBinding]]:
         """Persist or verify the complete pre-dispatch simulation resolution.
 
@@ -405,6 +435,7 @@ class WorldModelSimulator:
             spec_input: Exact persisted specification manifest pointer.
             cells: Ordered sparse cells selected for this run.
             world_model: Exact resolved world-model client and snapshot.
+            grounded_world_model: Persisted prompt and fit-RAG executor for that model.
 
         Returns:
             Resolution envelope, its manifest pointer, and bindings keyed by cell ID.
@@ -424,6 +455,7 @@ class WorldModelSimulator:
                 task=self._tasks[cell.task_id],
                 candidate=self._candidate_models[cell.candidate_alias],
                 world_model=world_model,
+                grounded_world_model=grounded_world_model,
             )
             for cell in cells
         }
@@ -486,6 +518,7 @@ class WorldModelSimulator:
         spec: SimulationSpec,
         cells: Sequence[EvaluationCell],
         world_model: ResolvedModel,
+        grounded_world_model: GroundedWorldModel,
         spec_input: ArtifactInput,
         resolution: SimulationResolution,
         resolution_input: ArtifactInput,
@@ -494,7 +527,14 @@ class WorldModelSimulator:
         """Run finite-budget cells serially while durable claims reserve all remaining budget."""
         return {
             cell.cell_id: self._execute_and_persist_cell(
-                spec, cell, world_model, spec_input, resolution, resolution_input, bindings
+                spec,
+                cell,
+                world_model,
+                grounded_world_model,
+                spec_input,
+                resolution,
+                resolution_input,
+                bindings,
             )
             for cell in cells
         }
@@ -504,6 +544,7 @@ class WorldModelSimulator:
         spec: SimulationSpec,
         cell: EvaluationCell,
         world_model: ResolvedModel,
+        grounded_world_model: GroundedWorldModel,
         spec_input: ArtifactInput,
         resolution: SimulationResolution,
         resolution_input: ArtifactInput,
@@ -515,6 +556,7 @@ class WorldModelSimulator:
             spec: Validated finite-cost simulation specification.
             cell: Exact selected evaluation cell.
             world_model: Resolved world model pinned by the specification.
+            grounded_world_model: Persisted fit-bound executor for that resolved model.
             spec_input: Persisted specification pointer used by the durable lease.
             resolution: Immutable resolution owning the cell binding.
             resolution_input: Exact resolution manifest pointer.
@@ -578,6 +620,7 @@ class WorldModelSimulator:
                 spec,
                 cell,
                 world_model,
+                grounded_world_model,
                 binding,
                 resolution_input,
                 maximum_cell_cost_usd=maximum_cell_cost_usd,
@@ -609,6 +652,7 @@ class WorldModelSimulator:
         spec: SimulationSpec,
         cell: EvaluationCell,
         world_model: ResolvedModel,
+        grounded_world_model: GroundedWorldModel,
         binding: SimulationCellBinding,
         resolution_input: ArtifactInput,
         *,
@@ -620,6 +664,7 @@ class WorldModelSimulator:
             spec: Validated finite-cost simulation specification.
             cell: Exact selected evaluation cell.
             world_model: Resolved world model pinned by the specification.
+            grounded_world_model: Persisted fit-bound executor for that resolved model.
             binding: Complete immutable binding for this cell.
             resolution_input: Exact resolution pointer retained by the rollout.
             maximum_cell_cost_usd: Reconciled provider-spend remainder for the cell.
@@ -678,7 +723,7 @@ class WorldModelSimulator:
             task=task,
             candidate=candidate,
             world_model=world_model,
-            fit_retriever=self._fit_retriever,
+            grounded_world_model=grounded_world_model,
             query_embedding=settings.query_embedding,
             maximum_cost_usd=maximum_cell_cost_usd,
             maximum_steps=spec.maximum_steps,
@@ -928,6 +973,7 @@ class WorldModelSimulator:
             self._plan_input,
             self._task_set_input,
             self._fit_rag_input,
+            binding.grounded_world_model_input,
             binding.simulation_spec_input,
             resolution_input,
         )

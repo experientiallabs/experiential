@@ -6,7 +6,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 
@@ -455,13 +455,18 @@ def _persist_spec(
     """
     simulation_id = artifact_id or f"simulation-{mode.value}"
     fit_rag_input = ArtifactInput(artifact_id="fit-rag", sha256="f" * 64)
+    grounded_world_model_input = ArtifactInput(artifact_id="grounded-world-model", sha256="e" * 64)
     spec = SimulationSpec(
         schema_version=1,
         created_at=created_at,
         inputs=_inputs(
             plan_input,
             task_input,
-            *((fit_rag_input,) if mode is SimulationMode.WORLD_MODEL else ()),
+            *(
+                (fit_rag_input, grounded_world_model_input)
+                if mode is SimulationMode.WORLD_MODEL
+                else ()
+            ),
         ),
         code_revision="fixture-revision",
         simulation_id=simulation_id,
@@ -472,6 +477,7 @@ def _persist_spec(
         world_model=(
             WorldModelSettings(
                 world_model_alias="world-model-a",
+                grounded_world_model_input=grounded_world_model_input,
                 prompt_version="text-world-model-v1",
                 query_embedding=EmbeddingCostReservation(
                     model=_world_model(),
@@ -538,7 +544,7 @@ def _persist_rollout(
     prefix = "text" if is_text else "sandbox"
     suffix = cell.cell_id.rsplit("-", maxsplit=1)[-1]
     rollout_id = f"{prefix}-rollout-{suffix}"
-    common_binding = {
+    common_binding: dict[str, Any] = {
         "evaluation_plan_input": plan_input,
         "task_set_input": task_input,
         "task_set_tasks_sha256": task_set.tasks_sha256,
@@ -555,10 +561,12 @@ def _persist_rollout(
         ),
     }
     fit_rag_input = ArtifactInput(artifact_id="fit-rag", sha256="f" * 64)
+    grounded_world_model_input = ArtifactInput(artifact_id="grounded-world-model", sha256="e" * 64)
     text_binding = (
         SimulationCellBinding(
             **common_binding,
             fit_rag_input=fit_rag_input,
+            grounded_world_model_input=grounded_world_model_input,
             world_model_alias="world-model-a",
             world_model=_world_model(),
             prompt_id=simulator.prompt_id,
@@ -598,7 +606,7 @@ def _persist_rollout(
             plan_input,
             task_input,
             spec_input,
-            *((fit_rag_input,) if is_text else ()),
+            *((fit_rag_input, grounded_world_model_input) if is_text else ()),
         ),
         code_revision="fixture-revision",
         artifact_id=rollout_id,

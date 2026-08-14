@@ -62,6 +62,11 @@ from wmo.simulation.retrieval import (
 from wmo.simulation.retrieval.retrieval_test import _persist_traces
 from wmo.simulation.retrieval.transitions import render_rag_key
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
+from wmo.simulation.world_model import GroundedWorldModel, GroundedWorldModelArtifact
+from wmo.simulation.world_model.artifact import (
+    GROUNDED_WORLD_MODEL_PROMPT_VERSION,
+    grounded_world_model_prompt_sha256,
+)
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 
@@ -342,6 +347,52 @@ def _fit_rag_input() -> ArtifactInput:
     return ArtifactInput(artifact_id="fit-rag", sha256="f" * 64)
 
 
+def _grounded_world_model_input() -> ArtifactInput:
+    """Return the immutable grounded world-model pointer used by simulator fixtures.
+
+    Returns:
+        Stable completed world-model manifest pointer.
+    """
+    return ArtifactInput(artifact_id="grounded-world-model", sha256="e" * 64)
+
+
+def _grounded_world_model(
+    world_client: ModelClient,
+    retriever: TraceRAGRetriever,
+    *,
+    artifact_input: ArtifactInput | None = None,
+) -> GroundedWorldModel:
+    """Bind a fixture provider client to the exact fake fit retriever.
+
+    Args:
+        world_client: Provider seam that executes grounded requests.
+        retriever: Exact fit-only retriever shared with the simulator.
+        artifact_input: Optional exact persisted world-model pointer.
+
+    Returns:
+        Artifact-bound fixture executor.
+    """
+    serving_input = ArtifactInput(artifact_id="serving-rag", sha256="c" * 64)
+    return GroundedWorldModel(
+        artifact_input=artifact_input or _grounded_world_model_input(),
+        artifact=GroundedWorldModelArtifact(
+            schema_version=1,
+            created_at=_TIME,
+            inputs=(serving_input,),
+            code_revision="test-revision",
+            world_model_id="grounded-world-model",
+            serving_rag=serving_input,
+            model_alias="world-model-a",
+            model=_snapshot("world-model-a"),
+            prompt_version=GROUNDED_WORLD_MODEL_PROMPT_VERSION,
+            prompt_sha256=grounded_world_model_prompt_sha256(),
+            top_k=8,
+        ),
+        retriever=retriever,
+        client=world_client,
+    )
+
+
 def _query_embedding(
     *,
     price: float = 0.001,
@@ -407,12 +458,13 @@ def _spec(
         Validated finite-cost world-model specification.
     """
     rag_input = fit_rag_input or _fit_rag_input()
+    grounded_input = _grounded_world_model_input()
     values: dict[str, object] = {
         "schema_version": 1,
         "created_at": _TIME,
         "inputs": tuple(
             sorted(
-                (plan_input, task_set_input, rag_input),
+                (plan_input, task_set_input, rag_input, grounded_input),
                 key=lambda item: item.artifact_id,
             )
         ),
@@ -424,6 +476,7 @@ def _spec(
         "mode": SimulationMode.WORLD_MODEL,
         "world_model": WorldModelSettings(
             world_model_alias="world-model-a",
+            grounded_world_model_input=grounded_input,
             prompt_version="text-world-model-v1",
             query_embedding=query_embedding or _query_embedding(),
         ),
@@ -467,13 +520,14 @@ def _simulator(
     """
     retriever = fit_retriever or _FitRetriever(_fit_rag_input())
     rag_input = fit_rag_input or retriever.rag_input
+    typed_retriever = cast(TraceRAGRetriever, retriever)
     return WorldModelSimulator(
         store=store,
         evaluation_plan=plan,
         evaluation_plan_input=plan_input,
         task_set_input=task_set_input,
         fit_rag_input=rag_input,
-        fit_retriever=cast(TraceRAGRetriever, retriever),
+        fit_retriever=typed_retriever,
         candidate_models={
             "candidate-a": _resolved(
                 "candidate-a",
@@ -482,6 +536,9 @@ def _simulator(
             )
         },
         world_models={"world-model-a": _resolved("world-model-a", world_client)},
+        grounded_world_models={
+            "world-model-a": _grounded_world_model(world_client, typed_retriever)
+        },
         agent_factory=agent_factory,
         clock=lambda: _TIME,
         monotonic=lambda: 1.0,
@@ -690,6 +747,7 @@ def test_query_reservation_exceeding_remaining_budget_blocks_every_dispatch(
     )
     settings = WorldModelSettings(
         world_model_alias="world-model-a",
+        grounded_world_model_input=_grounded_world_model_input(),
         prompt_version="text-world-model-v1",
         query_embedding=_query_embedding(price=100.0),
     )
@@ -754,6 +812,7 @@ def test_query_embedding_catalog_drift_blocks_every_dispatch(
     )
     settings = WorldModelSettings(
         world_model_alias="world-model-a",
+        grounded_world_model_input=_grounded_world_model_input(),
         prompt_version="text-world-model-v1",
         query_embedding=_query_embedding(
             price=price,
@@ -996,10 +1055,10 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
         world_client,
     )
     spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
-    selected, world_model = recovery._validate_spec_and_bindings(spec)
+    selected, world_model, grounded_world_model = recovery._validate_spec_and_bindings(spec)
     spec_input = recovery._persist_specification(spec)
     resolution, resolution_input, bindings = recovery._persist_resolution(
-        spec, spec_input, selected, world_model
+        spec, spec_input, selected, world_model, grounded_world_model
     )
     first_binding = bindings["cell-a"]
     holder = TextCellLeaseStore(store.project_directory, clock=lambda: _TIME)
@@ -1054,6 +1113,7 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
                     spec,
                     selected[1],
                     world_model,
+                    grounded_world_model,
                     spec_input,
                     resolution,
                     resolution_input,
@@ -1218,10 +1278,10 @@ def test_text_simulation_live_hung_claim_times_out_without_calls_or_result_artif
         world_client,
     )
     spec = _spec(plan_input, task_set_input, ("cell-a",), maximum_cost_usd=1.0)
-    cells, world_model = simulator._validate_spec_and_bindings(spec)
+    cells, world_model, grounded_world_model = simulator._validate_spec_and_bindings(spec)
     spec_input = simulator._persist_specification(spec)
     resolution, resolution_input, bindings = simulator._persist_resolution(
-        spec, spec_input, cells, world_model
+        spec, spec_input, cells, world_model, grounded_world_model
     )
     binding = bindings[cell.cell_id]
     rollout_id = rollout_id_for_binding(binding)

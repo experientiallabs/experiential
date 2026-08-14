@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from pydantic import Field, field_validator
 
@@ -21,12 +21,11 @@ from wmo.common.evaluations import EvaluationCell
 from wmo.common.rollouts import SimulationCellBinding
 from wmo.common.tasks import TaskCase, TaskSet
 from wmo.runtime.models import ResolvedModel
-from wmo.simulation.engines.text.prompt import (
-    WORLD_MODEL_TEXT_PROMPT_ID,
-    WORLD_MODEL_TEXT_PROMPT_VERSION,
-    text_prompt_sha256,
-)
-from wmo.simulation.specs import SimulationSpec
+from wmo.simulation.engines.text.prompt import WORLD_MODEL_TEXT_PROMPT_ID
+from wmo.simulation.specs import SimulationSpec, WorldModelSettings
+
+if TYPE_CHECKING:
+    from wmo.simulation.world_model import GroundedWorldModel
 
 
 class SimulationResolution(ArtifactEnvelope):
@@ -65,6 +64,7 @@ def make_cell_binding(
     task: TaskCase,
     candidate: ResolvedModel,
     world_model: ResolvedModel,
+    grounded_world_model: GroundedWorldModel,
 ) -> SimulationCellBinding:
     """Bind one selected cell to all immutable data and resolved model identities.
 
@@ -79,6 +79,7 @@ def make_cell_binding(
         task: Loaded canonical task content for the cell.
         candidate: Candidate alias resolved before any provider call.
         world_model: World-model alias resolved before any provider call.
+        grounded_world_model: Persisted prompt and fit-RAG executor for that alias.
 
     Returns:
         A complete identity record used for rollout IDs, persistence, and resume checks.
@@ -95,6 +96,7 @@ def make_cell_binding(
         evaluation_plan_input=evaluation_plan_input,
         task_set_input=task_set_input,
         fit_rag_input=fit_rag_input,
+        grounded_world_model_input=settings.grounded_world_model_input,
         task_set_tasks_sha256=task_set.tasks_sha256,
         task_sha256=sha256_json(task),
         candidate_alias=cell.candidate_alias,
@@ -105,8 +107,8 @@ def make_cell_binding(
         world_model=world_model.snapshot,
         simulator_id="text-world-model-v1",
         prompt_id=WORLD_MODEL_TEXT_PROMPT_ID,
-        prompt_version=WORLD_MODEL_TEXT_PROMPT_VERSION,
-        prompt_sha256=text_prompt_sha256(),
+        prompt_version=grounded_world_model.artifact.prompt_version,
+        prompt_sha256=grounded_world_model.artifact.prompt_sha256,
         query_embedding=settings.query_embedding,
         simulation_spec_input=simulation_spec_input,
         simulation_spec_sha256=sha256_json(spec),
@@ -154,7 +156,13 @@ def make_resolution(
         created_at=created_at,
         inputs=tuple(
             sorted(
-                (evaluation_plan_input, task_set_input, fit_rag_input, simulation_spec_input),
+                (
+                    evaluation_plan_input,
+                    task_set_input,
+                    fit_rag_input,
+                    cast(WorldModelSettings, spec.world_model).grounded_world_model_input,
+                    simulation_spec_input,
+                ),
                 key=lambda item: item.artifact_id,
             )
         ),

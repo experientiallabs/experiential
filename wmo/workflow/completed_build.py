@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.project import ProjectBuildArtifacts, ProjectStore, artifact_input
 from wmo.simulation.build import ProjectBuild
 from wmo.workflow.errors import RouterCompositionError
@@ -42,4 +43,26 @@ def verify_completed_build_inputs(
     if trace_input != completed.trace_dataset or built.review.task_set != completed.task_set:
         raise RouterCompositionError(
             "router composition traces or tasks differ from the completed project build"
+        )
+
+
+def verify_completed_grounding_inputs(
+    completed: ProjectBuildArtifacts,
+    *,
+    fit_rag_input: ArtifactInput,
+    grounded_world_model_input: ArtifactInput,
+) -> None:
+    """Require simulation grounding to match the completed build graph.
+
+    Args:
+        completed: Exact completed-build pointers selected by the project.
+        fit_rag_input: Reviewed fit-only RAG pointer supplied for optimization.
+        grounded_world_model_input: Reviewed world-model artifact pointer supplied for simulation.
+
+    Raises:
+        RouterCompositionError: Either grounding input differs from the completed build.
+    """
+    if fit_rag_input != completed.fit_rag or grounded_world_model_input != completed.world_model:
+        raise RouterCompositionError(
+            "evaluation setup grounding differs from the completed project build"
         )

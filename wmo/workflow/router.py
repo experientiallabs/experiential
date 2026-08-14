@@ -74,7 +74,10 @@ from wmo.simulation.ingest.otlp import TraceNormalizationResult, load_otlp_file
 from wmo.simulation.ingest.posthog import load_posthog_file
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
-from wmo.workflow.completed_build import completed_project_build, verify_completed_build_inputs
+from wmo.workflow.completed_build import (
+    completed_project_build,
+    verify_completed_build_inputs,
+)
 from wmo.workflow.errors import RouterCompositionError
 from wmo.workflow.judgment_budget import (
     JudgmentBudgetError,
@@ -82,6 +85,7 @@ from wmo.workflow.judgment_budget import (
     persist_dispatch_reservation,
     read_dispatch_reservation,
 )
+from wmo.workflow.router_setup import verify_router_evaluation_setup
 from wmo.workflow.simulation_spend import observed_rollout_spend
 
 
@@ -307,7 +311,15 @@ def compose_router(
     review = services.review_supplier(project, built, budget)
     _verify_review(project, review)
     setup = services.setup_supplier(project, built, review, budget)
-    _verify_setup(setup, review, completed_build.fit_rag)
+    verify_router_evaluation_setup(
+        completed=completed_build,
+        fit_rag_input=setup.fit_rag_input,
+        grounded_world_model_input=setup.world_model_settings.grounded_world_model_input,
+        production_protocol=setup.production_protocol,
+        simulation_protocol=setup.simulation_protocol,
+        rubric_id=review.rubric_id,
+        calibration_id=review.calibration_id,
+    )
 
     thresholds = default_fidelity_thresholds(created_at=created_at, code_revision=code_revision)
     persist_fidelity_thresholds(project.artifacts, thresholds)
@@ -529,7 +541,12 @@ def _simulation_spec(
     return SimulationSpec(
         schema_version=1,
         created_at=created_at,
-        inputs=_sorted_artifact_inputs(plan_input, task_input, setup.fit_rag_input),
+        inputs=_sorted_artifact_inputs(
+            plan_input,
+            task_input,
+            setup.fit_rag_input,
+            setup.world_model_settings.grounded_world_model_input,
+        ),
         code_revision=code_revision,
         simulation_id=stable_id("simulation", binding),
         evaluation_plan_id=plan.plan_id,
@@ -822,40 +839,6 @@ def _verify_review(project: ProjectStore, review: ApprovedRouterReview) -> None:
     for artifact_id, artifact_type in expected:
         if project.artifacts.read(artifact_id).manifest.artifact_type != artifact_type:
             raise RouterCompositionError(f"{artifact_id} is not a completed {artifact_type}")
-
-
-def _verify_setup(
-    setup: RouterEvaluationSetup,
-    review: ApprovedRouterReview,
-    fit_rag_input: ArtifactInput,
-) -> None:
-    """Bind protocols and retrieval to the approved review and completed build.
-
-    Args:
-        setup: Reviewed evaluation inputs supplied for router composition.
-        review: Approved rubric and manual judge calibration.
-        fit_rag_input: Exact completed-build fit-only retrieval pointer.
-
-    Raises:
-        RouterCompositionError: Review, protocol, evidence role, or RAG identity differs.
-    """
-    if setup.fit_rag_input != fit_rag_input:
-        raise RouterCompositionError(
-            "evaluation setup fit RAG differs from the completed project build"
-        )
-    protocols = (setup.production_protocol, setup.simulation_protocol)
-    if any(
-        protocol.rubric_id != review.rubric_id
-        or protocol.judge_calibration_id != review.calibration_id
-        for protocol in protocols
-    ):
-        raise RouterCompositionError("evaluation protocols differ from approved review artifacts")
-    if setup.production_protocol.evidence_source != "production":
-        raise RouterCompositionError("production_protocol must name production evidence")
-    if setup.simulation_protocol.evidence_source != "world_model":
-        raise RouterCompositionError("simulation_protocol must name world-model evidence")
-    if setup.simulation_protocol.fidelity_report_id is not None:
-        raise RouterCompositionError("simulation protocol cannot preclaim a fidelity report")
 
 
 def _complete_cell_evidence(

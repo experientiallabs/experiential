@@ -70,6 +70,10 @@ def require_grounding_settings(
     settings = spec.world_model
     if settings is None:  # pragma: no cover - selected settings are validated by SimulationSpec
         raise SimulationConfigurationError("world-model simulation settings are missing")
+    if settings.grounded_world_model_input not in spec.inputs:
+        raise SimulationConfigurationError(
+            "simulation spec inputs must include the grounded world-model artifact"
+        )
     reservation = settings.query_embedding
     if reservation is None:
         raise SimulationConfigurationError(
