@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Protocol, cast, runtime_checkable
+from typing import Literal, Protocol, cast, runtime_checkable
 
 import pytest
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import Response as FastAPIResponse
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
-from openai import OpenAI
+from openai import ConflictError, InternalServerError, OpenAI
 from openai.types.chat import ChatCompletion
 from openai.types.responses import Response
 
+from wmo.common.core.artifacts import ArtifactId
 from wmo.common.project import ProjectStore
+from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.application import (
     RouterApplicationError,
     create_project_completion_service,
@@ -29,7 +32,7 @@ from wmo.runtime.router.journal import (
     RuntimeCompletedEvent,
     RuntimeInteractionJournal,
 )
-from wmo.runtime.router.runtime import RouterRuntime
+from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
 from wmo.runtime.router.runtime_test import _runtime
 
 
@@ -53,15 +56,7 @@ def _journaled_application(
     Returns:
         Integrated application and the same project's readable journal.
     """
-    store = ProjectStore(root, "support-agent")
-    policy_directory = store.paths.artifact_directory(runtime.policy.policy_id)
-    if not policy_directory.exists():
-        store.artifacts.write_json(
-            artifact_id=runtime.policy.policy_id,
-            artifact_type="router-policy",
-            envelope=runtime.policy,
-            files={"policy.json": runtime.policy},
-        )
+    store = _store_with_policy(root, "support-agent", runtime)
     service = create_project_completion_service(store, runtime)
     return (
         create_project_router_app(
@@ -71,6 +66,33 @@ def _journaled_application(
         ),
         RuntimeInteractionJournal(store.paths),
     )
+
+
+def _store_with_policy(
+    root: Path,
+    project: str,
+    runtime: RouterRuntime,
+) -> ProjectStore:
+    """Persist the exact runtime policy under one test project when absent.
+
+    Args:
+        root: Pytest-owned local artifact root.
+        project: Project identity that must own the runtime policy.
+        runtime: Frozen runtime whose policy file is persisted exactly.
+
+    Returns:
+        Project store that passes journal composition integrity checks.
+    """
+    store = ProjectStore(root, project)
+    policy_directory = store.paths.artifact_directory(runtime.policy.policy_id)
+    if not policy_directory.exists():
+        store.artifacts.write_json(
+            artifact_id=runtime.policy.policy_id,
+            artifact_type="router-policy",
+            envelope=runtime.policy,
+            files={"policy.json": runtime.policy},
+        )
+    return store
 
 
 def _post_handler(
@@ -123,16 +145,24 @@ def _payload(path: str, content: str, *, stream: bool = False) -> dict[str, obje
 
 
 def test_load_router_exposes_official_chat_and_responses_resources(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The happy-path Python API needs no WMO request or message types."""
+    """The journaling Python API needs no WMO request or message types.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        monkeypatch: Scoped loaded-runtime replacement.
+    """
     runtime, model_client = _runtime()
+    root = tmp_path / ".wmo"
+    store = _store_with_policy(root, "support-agent", runtime)
     monkeypatch.setattr(
         "wmo.runtime.router.application.load_project_router",
         lambda project, root, **kwargs: runtime,
     )
 
-    with load_router("support-agent") as router:
+    with load_router("support-agent", root=root) as router:
         assert isinstance(router, OpenAI)
         chat = router.chat.completions.create(
             model="support-agent",
@@ -143,6 +173,447 @@ def test_load_router_exposes_official_chat_and_responses_resources(
     assert isinstance(chat, ChatCompletion)
     assert isinstance(response, Response)
     assert model_client.complete_calls == 2
+    events = RuntimeInteractionJournal(store.paths).read_events()
+    assert sum(isinstance(event, RuntimeCompletedEvent) for event in events) == 2
+
+
+def test_load_and_close_are_provider_and_journal_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Load and close the official client without routing or journal state.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        monkeypatch: Scoped loaded-runtime replacement.
+    """
+    runtime, model_client = _runtime()
+    root = tmp_path / ".wmo"
+    store = _store_with_policy(root, "support-agent", runtime)
+    monkeypatch.setattr(
+        "wmo.runtime.router.application.load_project_router",
+        lambda project, selected_root, **kwargs: runtime,
+    )
+
+    router = load_router("support-agent", root=root)
+    router.close()
+
+    assert model_client.embed_calls == model_client.complete_calls == 0
+    assert not store.paths.runtime_journal.exists()
+
+
+def test_load_router_preserves_runtime_selection_parameters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forward policy, environment, catalog, and decision sink through journal composition.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        monkeypatch: Scoped runtime-loader capture.
+    """
+    runtime, model_client = _runtime()
+    root = tmp_path / ".wmo"
+    _store_with_policy(root, "support-agent", runtime)
+    environment = {"TEST_API_KEY": "value"}
+
+    def decision_sink(_decision: object) -> None:
+        """Accept a routing decision without external side effects."""
+
+    calls: list[
+        tuple[
+            str,
+            Path,
+            ArtifactId | None,
+            Mapping[str, str] | None,
+            RuntimeModelCatalog | None,
+            DecisionSink | None,
+        ]
+    ] = []
+
+    def load(
+        project: str,
+        selected_root: Path,
+        *,
+        policy_id: ArtifactId | None,
+        environment: Mapping[str, str] | None,
+        runtime_catalog: RuntimeModelCatalog | None,
+        decision_sink: DecisionSink | None,
+    ) -> RouterRuntime:
+        """Capture the complete runtime selection call.
+
+        Args:
+            project: Requested project identifier.
+            selected_root: Requested artifact root.
+            policy_id: Explicit frozen policy selection.
+            environment: Explicit credential environment mapping.
+            runtime_catalog: Explicit runtime catalog override.
+            decision_sink: Explicit routing-decision sink.
+
+        Returns:
+            Provider-idle runtime fixture.
+        """
+        calls.append(
+            (project, selected_root, policy_id, environment, runtime_catalog, decision_sink)
+        )
+        return runtime
+
+    monkeypatch.setattr("wmo.runtime.router.application.load_project_router", load)
+
+    router = load_router(
+        "support-agent",
+        root=root,
+        policy_id="policy-a",
+        environment=environment,
+        runtime_catalog=runtime.catalog,
+        decision_sink=decision_sink,
+    )
+    router.close()
+
+    assert calls == [
+        (
+            "support-agent",
+            root,
+            "policy-a",
+            environment,
+            runtime.catalog,
+            decision_sink,
+        )
+    ]
+    assert model_client.embed_calls == model_client.complete_calls == 0
+
+
+def test_loaded_router_keeps_identical_unkeyed_chat_calls_distinct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assign separate durable identities to identical stateless Chat calls.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        monkeypatch: Scoped loaded-runtime replacement.
+    """
+    runtime, model_client = _runtime()
+    root = tmp_path / ".wmo"
+    store = _store_with_policy(root, "support-agent", runtime)
+    monkeypatch.setattr(
+        "wmo.runtime.router.application.load_project_router",
+        lambda project, selected_root, **kwargs: runtime,
+    )
+
+    with load_router("support-agent", root=root) as router:
+        for _ in range(2):
+            router.chat.completions.create(
+                model="support-agent",
+                messages=[{"role": "user", "content": "same transcript"}],
+            )
+
+    accepted = tuple(
+        event
+        for event in RuntimeInteractionJournal(store.paths).read_events()
+        if isinstance(event, RuntimeAcceptedEvent)
+    )
+    assert len({event.interaction_id for event in accepted}) == 2
+    assert len({event.lineage_id for event in accepted}) == 2
+    assert model_client.embed_calls == model_client.complete_calls == 2
+
+
+def test_loaded_router_responses_continuation_keeps_one_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve Responses routing lineage through the official previous response ID.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        monkeypatch: Scoped loaded-runtime replacement.
+    """
+    runtime, model_client = _runtime()
+    root = tmp_path / ".wmo"
+    store = _store_with_policy(root, "support-agent", runtime)
+    monkeypatch.setattr(
+        "wmo.runtime.router.application.load_project_router",
+        lambda project, selected_root, **kwargs: runtime,
+    )
+
+    with load_router("support-agent", root=root) as router:
+        first = router.responses.create(model="support-agent", input="first")
+        router.responses.create(
+            model="support-agent",
+            input="second",
+            previous_response_id=first.id,
+        )
+
+    accepted = tuple(
+        event
+        for event in RuntimeInteractionJournal(store.paths).read_events()
+        if isinstance(event, RuntimeAcceptedEvent)
+    )
+    assert len(accepted) == 2
+    assert accepted[0].lineage_id == accepted[1].lineage_id
+    assert model_client.embed_calls == 1
+    assert model_client.complete_calls == 2
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_loaded_router_key_replays_across_separate_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api: Literal["chat", "responses"],
+) -> None:
+    """Replay one standard caller key after a process-style runtime reload.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        monkeypatch: Scoped runtime sequence replacement.
+        api: Official OpenAI resource exercised by the parameterized regression.
+    """
+    root = tmp_path / ".wmo"
+    first_runtime, first_client = _runtime()
+    restarted_runtime, restarted_client = _runtime()
+    _store_with_policy(root, "support-agent", first_runtime)
+    runtimes = iter((first_runtime, restarted_runtime))
+    monkeypatch.setattr(
+        "wmo.runtime.router.application.load_project_router",
+        lambda project, selected_root, **kwargs: next(runtimes),
+    )
+    headers = {"Idempotency-Key": "official-replay"}
+
+    with load_router("support-agent", root=root) as first_router:
+        first = (
+            first_router.responses.create(
+                model="support-agent",
+                input="same",
+                extra_headers=headers,
+            )
+            if api == "responses"
+            else first_router.chat.completions.create(
+                model="support-agent",
+                messages=[{"role": "user", "content": "same"}],
+                extra_headers=headers,
+            )
+        )
+    with load_router("support-agent", root=root) as restarted_router:
+        replay = (
+            restarted_router.responses.create(
+                model="support-agent",
+                input="same",
+                extra_headers=headers,
+            )
+            if api == "responses"
+            else restarted_router.chat.completions.create(
+                model="support-agent",
+                messages=[{"role": "user", "content": "same"}],
+                extra_headers=headers,
+            )
+        )
+
+    assert first.id == replay.id
+    assert first_client.complete_calls == 1
+    assert restarted_client.embed_calls == restarted_client.complete_calls == 0
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_loaded_router_key_rejects_changed_content_with_official_409(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api: Literal["chat", "responses"],
+) -> None:
+    """Expose durable request conflict through the official SDK status exception.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        monkeypatch: Scoped loaded-runtime replacement.
+        api: Official OpenAI resource exercised by the parameterized regression.
+    """
+    runtime, model_client = _runtime()
+    root = tmp_path / ".wmo"
+    _store_with_policy(root, "support-agent", runtime)
+    monkeypatch.setattr(
+        "wmo.runtime.router.application.load_project_router",
+        lambda project, selected_root, **kwargs: runtime,
+    )
+    headers = {"Idempotency-Key": "official-conflict"}
+
+    with load_router("support-agent", root=root) as router:
+        if api == "responses":
+            router.responses.create(
+                model="support-agent",
+                input="first",
+                extra_headers=headers,
+            )
+            with pytest.raises(ConflictError) as caught:
+                router.responses.create(
+                    model="support-agent",
+                    input="changed",
+                    extra_headers=headers,
+                )
+        else:
+            router.chat.completions.create(
+                model="support-agent",
+                messages=[{"role": "user", "content": "first"}],
+                extra_headers=headers,
+            )
+            with pytest.raises(ConflictError) as caught:
+                router.chat.completions.create(
+                    model="support-agent",
+                    messages=[{"role": "user", "content": "changed"}],
+                    extra_headers=headers,
+                )
+
+    assert caught.value.status_code == 409
+    assert model_client.embed_calls == model_client.complete_calls == 1
+
+
+def test_loaded_router_provider_failure_has_no_completed_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persist a provider failure without producing an automatic SFT target.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        monkeypatch: Scoped loaded-runtime replacement.
+    """
+    runtime, model_client = _runtime()
+    model_client.completion_error = RuntimeError("provider secret")
+    root = tmp_path / ".wmo"
+    store = _store_with_policy(root, "support-agent", runtime)
+    monkeypatch.setattr(
+        "wmo.runtime.router.application.load_project_router",
+        lambda project, selected_root, **kwargs: runtime,
+    )
+
+    with load_router("support-agent", root=root) as router:
+        with pytest.raises(InternalServerError) as caught:
+            router.chat.completions.create(
+                model="support-agent",
+                messages=[{"role": "user", "content": "fail"}],
+                extra_headers={"Idempotency-Key": "official-failure"},
+            )
+
+    assert caught.value.status_code == 502
+    events = RuntimeInteractionJournal(store.paths).read_events()
+    assert sum(isinstance(event, RuntimeAttemptFailedEvent) for event in events) == 1
+    assert not any(isinstance(event, RuntimeCompletedEvent) for event in events)
+    assert model_client.complete_calls == 1
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_loaded_router_stream_is_completed_before_consumption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api: Literal["chat", "responses"],
+) -> None:
+    """Commit buffered provider success before the official stream is consumed.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        monkeypatch: Scoped loaded-runtime replacement.
+        api: Official OpenAI streaming resource exercised by the regression.
+    """
+    runtime, model_client = _runtime()
+    root = tmp_path / ".wmo"
+    store = _store_with_policy(root, "support-agent", runtime)
+    monkeypatch.setattr(
+        "wmo.runtime.router.application.load_project_router",
+        lambda project, selected_root, **kwargs: runtime,
+    )
+    headers = {"Idempotency-Key": "official-stream"}
+
+    with load_router("support-agent", root=root) as router:
+        stream = (
+            router.responses.create(
+                model="support-agent",
+                input="stream",
+                stream=True,
+                extra_headers=headers,
+            )
+            if api == "responses"
+            else router.chat.completions.create(
+                model="support-agent",
+                messages=[{"role": "user", "content": "stream"}],
+                stream=True,
+                extra_headers=headers,
+            )
+        )
+        completed = tuple(
+            event
+            for event in RuntimeInteractionJournal(store.paths).read_events()
+            if isinstance(event, RuntimeCompletedEvent)
+        )
+        stream.close()
+
+    assert len(completed) == 1
+    assert model_client.embed_calls == model_client.complete_calls == 1
+
+
+def test_two_loaded_clients_share_one_project_journal_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Serialize one concurrent keyed interaction across separately loaded clients.
+
+    Args:
+        tmp_path: Pytest-owned local artifact root.
+        monkeypatch: Scoped runtime sequence replacement.
+    """
+    root = tmp_path / ".wmo"
+    first_runtime, first_client = _runtime()
+    second_runtime, second_client = _runtime()
+    store = _store_with_policy(root, "support-agent", first_runtime)
+    runtimes = iter((first_runtime, second_runtime))
+    monkeypatch.setattr(
+        "wmo.runtime.router.application.load_project_router",
+        lambda project, selected_root, **kwargs: next(runtimes),
+    )
+    first_router = load_router("support-agent", root=root)
+    second_router = load_router("support-agent", root=root)
+    barrier = threading.Barrier(3)
+    response_ids: list[str] = []
+    errors: list[Exception] = []
+
+    def complete(router: OpenAI) -> None:
+        """Start together and capture one keyed official completion.
+
+        Args:
+            router: Separately loaded client sharing the project journal.
+        """
+        try:
+            barrier.wait()
+            response = router.chat.completions.create(
+                model="support-agent",
+                messages=[{"role": "user", "content": "concurrent"}],
+                extra_headers={"Idempotency-Key": "concurrent-request"},
+            )
+            response_ids.append(response.id)
+        except Exception as exc:  # noqa: BLE001 - capture thread failures for the main assertion
+            errors.append(exc)
+
+    threads = (
+        threading.Thread(target=complete, args=(first_router,), daemon=True),
+        threading.Thread(target=complete, args=(second_router,), daemon=True),
+    )
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=2.0)
+    assert all(not thread.is_alive() for thread in threads), "loaded clients deadlocked"
+    first_router.close()
+    second_router.close()
+
+    assert errors == []
+    assert len(response_ids) == 2 and len(set(response_ids)) == 1
+    assert first_client.complete_calls + second_client.complete_calls == 1
+    assert first_client.embed_calls + second_client.embed_calls == 1
+    assert (
+        sum(
+            isinstance(event, RuntimeCompletedEvent)
+            for event in RuntimeInteractionJournal(store.paths).read_events()
+        )
+        == 1
+    )
 
 
 def test_injected_project_service_journals_every_unkeyed_openai_call(tmp_path: Path) -> None:

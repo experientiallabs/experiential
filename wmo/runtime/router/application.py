@@ -180,7 +180,8 @@ def load_router(
 
     Returns:
         Official OpenAI client whose Chat Completions and Responses resources call the local
-        verified router in process. Close it or use it as a context manager when finished.
+        verified router in process and durably journal every completed interaction. Close it or
+        use it as a context manager when finished.
     """
     runtime = load_project_router(
         project,
@@ -190,7 +191,13 @@ def load_router(
         runtime_catalog=runtime_catalog,
         decision_sink=decision_sink,
     )
-    application = create_project_router_app(project, runtime)
+    store = ProjectStore(root, project)
+    completion_service = create_project_completion_service(store, runtime)
+    application = create_project_router_app(
+        project,
+        runtime,
+        completion_service=completion_service,
+    )
     transport = TestClient(application, raise_server_exceptions=False)
     return OpenAI(
         api_key="wmo-local-runtime",
