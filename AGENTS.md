@@ -144,17 +144,13 @@ uv run pytest -q
    `wmo/workflow/router_test.py`). There is no top-level `tests/` directory. Pytest is configured
    (`python_files = ["*_test.py"]`) to discover these.
 
-   The pairing runs both ways, so a reader finds a module's coverage without searching for it.
-   **An empty `_test.py` is valid and preferred over a vacuous test**: leave the file empty, or
-   give it a module docstring naming what is deliberately not covered, rather than filling it. A
-   test that a constructor stores its arguments, that a pydantic model round-trips through its own
-   serializer, or that a constant still equals itself costs suite time, breaks on harmless edits,
-   and makes an uncovered module look covered.
-
-   A test file whose subject spans several modules, or which tests the package rather than one
-   module, goes in a `tests/` subdirectory of the package that owns the behavior (for example
-   `wmo/simulation/tests/`), never at the repository root. Existing standalone test files are
-   relocated when the surrounding area is edited, not in a bulk sweep.
+   The pairing runs both ways, so coverage sits where a reader expects it and an uncovered module
+   reads as an empty file instead of hiding. **An empty `_test.py` is valid and preferred over a
+   vacuous test**: a constructor-stores-its-arguments test, a pydantic self-round-trip, or a
+   constant asserted against itself costs suite time and makes an uncovered module look covered. A
+   test whose subject spans several modules goes in a `tests/` subdirectory of the package that owns
+   the behavior, never at the repository root; existing standalone files are relocated when the
+   surrounding area is edited, not in a bulk sweep.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
