@@ -47,7 +47,7 @@ REQUIRED_WHEEL_MODULES = frozenset(
     }
 )
 REQUIRED_SDIST_MEMBERS = frozenset(
-    {"README.md", "assets/wmo-workflow.svg", "pyproject.toml", "wmo/workflow/router.py"}
+    {"README.md", "assets/wmo-workflow.png", "pyproject.toml", "wmo/workflow/router.py"}
 )
 
 
