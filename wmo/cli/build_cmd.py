@@ -46,7 +46,8 @@ from wmo.simulation.retrieval import (
     persist_trace_rag,
 )
 from wmo.simulation.retrieval.transitions import extract_real_transitions
-from wmo.simulation.world_model import load_grounded_world_model, persist_grounded_world_model
+from wmo.simulation.world_model.artifact import persist_grounded_world_model
+from wmo.simulation.world_model.runtime import load_grounded_world_model
 
 _console = Console()
 _CANONICAL_SOURCES = ("otlp", "posthog")

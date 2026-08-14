@@ -108,3 +108,14 @@ assert RuntimeRAGRefresh is nested_refresh_type
 assert refresh_runtime_trace_rag is nested_refresh
 """
     )
+
+
+def test_world_model_public_import_resolves_after_lazy_package_import() -> None:
+    """Resolve the public world-model loader through the lazy package export."""
+    _run(
+        """
+from wmo.simulation.world_model import load_world_model
+assert callable(load_world_model)
+assert load_world_model.__module__ == "wmo.simulation.world_model.application"
+"""
+    )
