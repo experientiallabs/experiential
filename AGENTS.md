@@ -144,9 +144,7 @@ uv run pytest -q
    ["*_test.py"]`) to find these, and there is no top-level `tests/` directory.
 
    - Give every module a `_test.py` beside it.
-   - Leaving that file empty is fine, and better than a filler test. Do not write a test that only
-     checks a constructor stored its arguments, that a pydantic model round-trips through itself,
-     or that a constant equals itself.
+   - Leaving that file empty is fine, and better than a vacuous test.
    - Do not create a `_test.py` whose module does not exist. A test that covers a whole package
      goes in that package's own `tests/` directory, such as `wmo/simulation/tests/`.
 
