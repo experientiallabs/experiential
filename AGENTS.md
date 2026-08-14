@@ -144,13 +144,13 @@ uv run pytest -q
    (`python_files = ["*_test.py"]`) to discover these.
 
    The pairing runs both ways. Every module carries its own `_test.py`, so a reader knows where a
-   module's coverage lives without searching, and an untested module is visible as an absence
-   rather than hidden in an unrelated file. An **empty `_test.py` is a valid and expected state**:
-   prefer an empty file, or one with only a module docstring saying what is intentionally not
-   covered here, over a vacuous test. A test that asserts a constructor stores its arguments, that
-   a pydantic model round-trips through its own serializer, or that a constant still equals itself
-   is worse than no test: it costs suite time, it fails on harmless edits, and it makes an
-   uncovered module look covered. Never add an assertion just to fill a file.
+   module's coverage lives without searching, and an untested module reads as an empty or nearly
+   empty test file rather than as coverage hidden somewhere else. An **empty `_test.py` is a valid
+   and expected state**: prefer an empty file, or one with only a module docstring saying what is
+   intentionally not covered here, over a vacuous test. A test that asserts a constructor stores
+   its arguments, that a pydantic model round-trips through its own serializer, or that a constant
+   still equals itself is worse than no test: it costs suite time, it fails on harmless edits, and
+   it makes an uncovered module look covered. Never add an assertion just to fill a file.
 
    Equally, **no `_test.py` exists without the `.py` it names.** A test file whose subject spans
    several modules, or which tests the package rather than one module, does not get to squat on a
