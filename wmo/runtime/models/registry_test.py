@@ -92,7 +92,10 @@ def _catalog(
 
 
 def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
-    """Static identity resolves before credential reads or provider construction."""
+    """Static identity resolves before credential reads or provider construction.
+
+    The regression proves snapshots contain only secret-free capability evidence.
+    """
     catalog = RuntimeModelCatalog(
         _catalog(),
         environment={},
@@ -108,7 +111,31 @@ def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
         context_window_tokens=128_000,
         maximum_output_tokens=16_000,
     )
-    assert snapshot.capabilities_sha256 == sha256_json(capabilities)
+    assert snapshot.capabilities_sha256 == capabilities.identity_sha256()
+
+
+def test_snapshot_identity_excludes_workflow_metadata_added_to_existing_catalogs() -> None:
+    """Pricing and structured-output metadata do not invalidate frozen model identities.
+
+    The regression preserves compatibility for snapshots frozen before workflow metadata exists.
+    """
+    original = ModelCapabilities(supports_tools=True, maximum_output_tokens=16_000)
+    enriched = original.model_copy(
+        update={
+            "supports_structured_output": True,
+            "input_cost_per_million_tokens_usd": 0.25,
+        }
+    )
+
+    assert original.identity_sha256() == enriched.identity_sha256()
+    assert original.identity_sha256() == sha256_json(
+        {
+            "supports_tools": True,
+            "supports_embeddings": False,
+            "context_window_tokens": None,
+            "maximum_output_tokens": 16_000,
+        }
+    )
 
 
 def test_snapshot_connection_digest_is_normalized_and_endpoint_specific() -> None:

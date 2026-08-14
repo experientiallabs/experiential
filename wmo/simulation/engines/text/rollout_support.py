@@ -112,13 +112,14 @@ def known_total_spend(rollouts: Sequence[RolloutArtifact]) -> float | None:
 
 
 def rollout_spend(rollout: RolloutArtifact) -> float | None:
-    """Return observed provider cost, never interpreting an unpriced provider call as zero.
+    """Return reconciled provider cost without treating unknown dispatches as free.
 
     Args:
         rollout: Completed text-simulation rollout whose recorded calls are inspected.
 
     Returns:
-        The recorded provider cost, or ``None`` when any paid call has unknown spend.
+        Observed candidate and world-model cost plus conservative retrieval estimates, or ``None``
+        when any dispatched operation has unknown spend.
     """
     if rollout.failure is not None and (
         rollout.failure.details.get("provider_dispatch_unknown_spend") is True
@@ -137,6 +138,9 @@ def rollout_spend(rollout: RolloutArtifact) -> float | None:
         if economics is None or economics.cost_usd is None:
             return None
         total += economics.cost_usd.value
+    retrieval = rollout.retrieval_economics
+    if retrieval is not None and retrieval.cost_usd is not None:
+        total += retrieval.cost_usd.value
     return total
 
 

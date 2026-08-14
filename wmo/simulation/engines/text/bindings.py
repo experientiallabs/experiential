@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from pydantic import Field, field_validator
 
@@ -21,12 +21,11 @@ from wmo.common.evaluations import EvaluationCell
 from wmo.common.rollouts import SimulationCellBinding
 from wmo.common.tasks import TaskCase, TaskSet
 from wmo.runtime.models import ResolvedModel
-from wmo.simulation.engines.text.prompt import (
-    WORLD_MODEL_TEXT_PROMPT_ID,
-    WORLD_MODEL_TEXT_PROMPT_VERSION,
-    text_prompt_sha256,
-)
-from wmo.simulation.specs import SimulationSpec
+from wmo.simulation.engines.text.prompt import WORLD_MODEL_TEXT_PROMPT_ID
+from wmo.simulation.specs import SimulationSpec, WorldModelSettings
+
+if TYPE_CHECKING:
+    from wmo.simulation.world_model import GroundedWorldModel
 
 
 class SimulationResolution(ArtifactEnvelope):
@@ -59,11 +58,13 @@ def make_cell_binding(
     simulation_spec_input: ArtifactInput,
     evaluation_plan_input: ArtifactInput,
     task_set_input: ArtifactInput,
+    fit_rag_input: ArtifactInput,
     task_set: TaskSet,
     cell: EvaluationCell,
     task: TaskCase,
     candidate: ResolvedModel,
     world_model: ResolvedModel,
+    grounded_world_model: GroundedWorldModel,
 ) -> SimulationCellBinding:
     """Bind one selected cell to all immutable data and resolved model identities.
 
@@ -72,11 +73,13 @@ def make_cell_binding(
         simulation_spec_input: Manifest identity of the persisted specification artifact.
         evaluation_plan_input: Manifest identity of the frozen evaluation plan.
         task_set_input: Manifest identity of the full selected task set.
+        fit_rag_input: Manifest identity of the frozen fit-only retrieval index.
         task_set: Digest-bearing task-set envelope that owns ``task``.
         cell: Explicit plan cell selected by the simulation specification.
         task: Loaded canonical task content for the cell.
         candidate: Candidate alias resolved before any provider call.
         world_model: World-model alias resolved before any provider call.
+        grounded_world_model: Persisted prompt and fit-RAG executor for that alias.
 
     Returns:
         A complete identity record used for rollout IDs, persistence, and resume checks.
@@ -87,9 +90,13 @@ def make_cell_binding(
     settings = spec.world_model
     if settings is None:  # pragma: no cover - concrete text callers validate the mode first
         raise ValueError("text simulation binding requires world-model settings")
+    if settings.query_embedding is None:
+        raise ValueError("text simulation binding requires query-embedding cost reservation")
     return SimulationCellBinding(
         evaluation_plan_input=evaluation_plan_input,
         task_set_input=task_set_input,
+        fit_rag_input=fit_rag_input,
+        grounded_world_model_input=settings.grounded_world_model_input,
         task_set_tasks_sha256=task_set.tasks_sha256,
         task_sha256=sha256_json(task),
         candidate_alias=cell.candidate_alias,
@@ -100,8 +107,9 @@ def make_cell_binding(
         world_model=world_model.snapshot,
         simulator_id="text-world-model-v1",
         prompt_id=WORLD_MODEL_TEXT_PROMPT_ID,
-        prompt_version=WORLD_MODEL_TEXT_PROMPT_VERSION,
-        prompt_sha256=text_prompt_sha256(),
+        prompt_version=grounded_world_model.artifact.prompt_version,
+        prompt_sha256=grounded_world_model.artifact.prompt_sha256,
+        query_embedding=settings.query_embedding,
         simulation_spec_input=simulation_spec_input,
         simulation_spec_sha256=sha256_json(spec),
         simulation_inputs_sha256=sha256_json(
@@ -116,6 +124,7 @@ def make_resolution(
     simulation_spec_input: ArtifactInput,
     evaluation_plan_input: ArtifactInput,
     task_set_input: ArtifactInput,
+    fit_rag_input: ArtifactInput,
     bindings: Sequence[SimulationCellBinding],
     created_at: datetime,
 ) -> SimulationResolution:
@@ -126,6 +135,7 @@ def make_resolution(
         simulation_spec_input: Verified persisted specification manifest reference.
         evaluation_plan_input: Verified immutable evaluation-plan reference.
         task_set_input: Verified immutable task-set reference.
+        fit_rag_input: Verified immutable fit-only retrieval index reference.
         bindings: Complete cell bindings in selected-cell order.
         created_at: Timestamp for the immutable resolution envelope.
 
@@ -146,7 +156,13 @@ def make_resolution(
         created_at=created_at,
         inputs=tuple(
             sorted(
-                (evaluation_plan_input, task_set_input, simulation_spec_input),
+                (
+                    evaluation_plan_input,
+                    task_set_input,
+                    fit_rag_input,
+                    cast(WorldModelSettings, spec.world_model).grounded_world_model_input,
+                    simulation_spec_input,
+                ),
                 key=lambda item: item.artifact_id,
             )
         ),
@@ -203,3 +219,21 @@ def lease_id_for_binding(
             "binding_sha256": binding_digest(binding),
         },
     )
+
+
+def sorted_artifact_inputs(*inputs: ArtifactInput) -> tuple[ArtifactInput, ...]:
+    """Return exactly one immutable input per ID in artifact-envelope order.
+
+    Args:
+        inputs: Immutable manifest pointers that must have distinct artifact IDs.
+
+    Returns:
+        Inputs sorted by artifact ID.
+
+    Raises:
+        ValueError: Multiple inputs reuse the same artifact ID.
+    """
+    by_id = {item.artifact_id: item for item in inputs}
+    if len(by_id) != len(inputs):
+        raise ValueError("simulation artifact inputs must have distinct IDs")
+    return tuple(by_id[artifact_id] for artifact_id in sorted(by_id))

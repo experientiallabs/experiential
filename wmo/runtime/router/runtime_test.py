@@ -401,7 +401,10 @@ def test_catalog_resolution_failure_is_normalized_to_integrity_error() -> None:
 
 
 def test_embedder_candidate_alias_overlap_requires_the_same_frozen_identity() -> None:
-    """An embedder alias cannot hide a differently pinned routed-candidate snapshot."""
+    """An embedder alias cannot hide a differently pinned routed-candidate snapshot.
+
+    The regression rejects activation before the runtime can dispatch any provider call.
+    """
     policy, manifest, bank, snapshots, client = _fixture()
     different = policy.model_copy(
         update={
@@ -425,7 +428,7 @@ def test_embedder_candidate_alias_overlap_requires_the_same_frozen_identity() ->
 
     embedding_capabilities = ModelCapabilities(supports_tools=True, supports_embeddings=True)
     overlapping_snapshot = snapshots["baseline"].model_copy(
-        update={"capabilities_sha256": sha256_json(embedding_capabilities)}
+        update={"capabilities_sha256": embedding_capabilities.identity_sha256()}
     )
     overlapping_candidates = tuple(
         candidate.model_copy(update={"model": overlapping_snapshot})
@@ -723,6 +726,15 @@ def _fixture(
 
 
 def _snapshot(alias: str, *, candidate_tools: bool = True) -> ModelSnapshot:
+    """Create one deterministic frozen model snapshot for router fixtures.
+
+    Args:
+        alias: Stable local model alias.
+        candidate_tools: Whether non-embedder aliases advertise tool support.
+
+    Returns:
+        Fixture snapshot using the runtime identity digest contract.
+    """
     capabilities = ModelCapabilities(
         supports_tools=candidate_tools and alias != "embedder",
         supports_embeddings=alias == "embedder",
@@ -731,7 +743,7 @@ def _snapshot(alias: str, *, candidate_tools: bool = True) -> ModelSnapshot:
         provider="test",
         model_id=alias,
         revision="fixture",
-        capabilities_sha256=sha256_json(capabilities),
+        capabilities_sha256=capabilities.identity_sha256(),
         connection_sha256="b" * 64,
     )
 

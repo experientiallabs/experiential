@@ -6,7 +6,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 
@@ -22,6 +22,7 @@ from wmo.common.core.artifacts import (
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import (
     AssistantAction,
+    EmbeddingCostReservation,
     ModelSnapshot,
     OperationEconomics,
     RoutedCandidateSnapshot,
@@ -438,12 +439,35 @@ def _persist_spec(
     *,
     artifact_id: str | None = None,
 ) -> tuple[SimulationSpec, ArtifactInput]:
-    """Persist one exact shared simulation spec for the selected mode."""
+    """Persist one exact shared simulation specification for a selected mode.
+
+    Args:
+        store: Immutable store receiving the specification.
+        plan: Frozen evaluation plan selected for execution.
+        plan_input: Exact persisted plan pointer.
+        task_input: Exact persisted task-set pointer.
+        mode: Simulator mode represented by the specification.
+        created_at: Deterministic artifact creation time.
+        artifact_id: Optional explicit simulation identity.
+
+    Returns:
+        Persisted specification and its exact manifest pointer.
+    """
     simulation_id = artifact_id or f"simulation-{mode.value}"
+    fit_rag_input = ArtifactInput(artifact_id="fit-rag", sha256="f" * 64)
+    grounded_world_model_input = ArtifactInput(artifact_id="grounded-world-model", sha256="e" * 64)
     spec = SimulationSpec(
         schema_version=1,
         created_at=created_at,
-        inputs=_inputs(plan_input, task_input),
+        inputs=_inputs(
+            plan_input,
+            task_input,
+            *(
+                (fit_rag_input, grounded_world_model_input)
+                if mode is SimulationMode.WORLD_MODEL
+                else ()
+            ),
+        ),
         code_revision="fixture-revision",
         simulation_id=simulation_id,
         evaluation_plan_id=plan.plan_id,
@@ -453,7 +477,14 @@ def _persist_spec(
         world_model=(
             WorldModelSettings(
                 world_model_alias="world-model-a",
+                grounded_world_model_input=grounded_world_model_input,
                 prompt_version="text-world-model-v1",
+                query_embedding=EmbeddingCostReservation(
+                    model=_world_model(),
+                    input_usd_per_million_tokens=0.0,
+                    maximum_attempts=1,
+                    maximum_input_tokens=1,
+                ),
             )
             if mode is SimulationMode.WORLD_MODEL
             else None
@@ -491,12 +522,29 @@ def _persist_rollout(
     failure: StructuredFailure | None,
     created_at: datetime,
 ) -> tuple[RolloutArtifact, ArtifactInput]:
-    """Persist one canonical bound rollout without executing either simulator."""
+    """Persist one canonical bound rollout without simulator dispatch.
+
+    Args:
+        store: Immutable store receiving the rollout.
+        task: Exact task represented by the rollout.
+        cell: Evaluation cell represented by the rollout.
+        plan_input: Exact persisted evaluation-plan pointer.
+        task_input: Exact persisted task-set pointer.
+        task_set: Immutable task set owning the task.
+        spec: Simulation specification owning the rollout.
+        spec_input: Exact persisted specification pointer.
+        simulator: Text or sandbox simulator identity bound to the evidence.
+        failure: Optional structured terminal failure.
+        created_at: Deterministic artifact creation time.
+
+    Returns:
+        Persisted rollout and its exact manifest pointer.
+    """
     is_text = isinstance(simulator, WorldModelSimulatorSnapshot)
     prefix = "text" if is_text else "sandbox"
     suffix = cell.cell_id.rsplit("-", maxsplit=1)[-1]
     rollout_id = f"{prefix}-rollout-{suffix}"
-    common_binding = {
+    common_binding: dict[str, Any] = {
         "evaluation_plan_input": plan_input,
         "task_set_input": task_input,
         "task_set_tasks_sha256": task_set.tasks_sha256,
@@ -512,14 +560,24 @@ def _persist_rollout(
             [item.model_dump(mode="json") for item in spec.inputs]
         ),
     }
+    fit_rag_input = ArtifactInput(artifact_id="fit-rag", sha256="f" * 64)
+    grounded_world_model_input = ArtifactInput(artifact_id="grounded-world-model", sha256="e" * 64)
     text_binding = (
         SimulationCellBinding(
             **common_binding,
+            fit_rag_input=fit_rag_input,
+            grounded_world_model_input=grounded_world_model_input,
             world_model_alias="world-model-a",
             world_model=_world_model(),
             prompt_id=simulator.prompt_id,
             prompt_version=simulator.prompt_version,
             prompt_sha256=simulator.prompt_sha256,
+            query_embedding=EmbeddingCostReservation(
+                model=_world_model(),
+                input_usd_per_million_tokens=0.0,
+                maximum_attempts=1,
+                maximum_input_tokens=1,
+            ),
         )
         if is_text and isinstance(simulator, WorldModelSimulatorSnapshot)
         else None
@@ -544,7 +602,12 @@ def _persist_rollout(
     rollout = RolloutArtifact(
         schema_version=1,
         created_at=created_at,
-        inputs=_inputs(plan_input, task_input, spec_input),
+        inputs=_inputs(
+            plan_input,
+            task_input,
+            spec_input,
+            *((fit_rag_input, grounded_world_model_input) if is_text else ()),
+        ),
         code_revision="fixture-revision",
         artifact_id=rollout_id,
         simulation_id=spec.simulation_id,
@@ -575,6 +638,7 @@ def _persist_rollout(
         failure=failure,
         candidate_economics=OperationEconomics(),
         world_model_economics=OperationEconomics() if is_text else None,
+        retrieval_economics=OperationEconomics() if is_text else None,
         sandbox_economics=OperationEconomics() if not is_text else None,
         simulation_spec_sha256=sha256_json(spec),
         simulation_binding=text_binding,

@@ -120,17 +120,26 @@ def _verify_records(
     transitions: tuple[RAGTransition, ...],
     vectors: tuple[RAGVector, ...],
 ) -> None:
-    """Verify ordering, IDs, key hashes, lineage membership, and vector dimensions."""
+    """Verify ordering, IDs, key hashes, lineage membership, and vector dimensions.
+
+    Args:
+        index: Persisted immutable RAG envelope.
+        transitions: Parsed ordered transition records.
+        vectors: Parsed ordered embedding vectors.
+
+    Raises:
+        ArtifactCorruptionError: Any record contradicts the frozen index identity.
+    """
     transition_ids = tuple(item.transition_id for item in transitions)
     vector_ids = tuple(item.transition_id for item in vectors)
     if transition_ids != index.transition_ids or vector_ids != index.transition_ids:
         raise ArtifactCorruptionError("RAG records do not match ordered transition IDs")
     if len(transitions) != index.transition_count or len(vectors) != index.transition_count:
         raise ArtifactCorruptionError("RAG record counts do not match the envelope")
-    fit_lineages = set(index.fit_lineage_ids)
+    included_lineages = set(index.included_lineage_ids or index.fit_lineage_ids)
     for transition, vector in zip(transitions, vectors, strict=True):
-        if transition.lineage_id not in fit_lineages:
-            raise ArtifactCorruptionError("RAG transition is outside the frozen fit lineages")
+        if transition.lineage_id not in included_lineages:
+            raise ArtifactCorruptionError("RAG transition is outside the frozen included lineages")
         key_text = render_rag_key(
             task=transition.task,
             initial_context=transition.initial_context,

@@ -2,11 +2,14 @@
 
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 
+from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.models import (
     AssistantAction,
+    EmbeddingCostReservation,
     ModelCapabilities,
     ModelFinishReason,
     ModelMessage,
@@ -24,6 +27,12 @@ from wmo.simulation.engines.text.recording import (
     RecordingCandidateClient,
     TextSimulationError,
 )
+from wmo.simulation.retrieval import RAGMatch, RAGQuery, TraceRAGRetriever
+from wmo.simulation.world_model import GroundedWorldModel, GroundedWorldModelArtifact
+from wmo.simulation.world_model.artifact import (
+    GROUNDED_WORLD_MODEL_PROMPT_VERSION,
+    grounded_world_model_prompt_sha256,
+)
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 
@@ -36,6 +45,42 @@ class _ScriptedClient:
     def complete(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         return self.responses.pop(0)
+
+
+class _Retriever:
+    def __init__(self) -> None:
+        """Initialize an empty ordered query log."""
+        self.queries: list[RAGQuery] = []
+
+    def estimate_query_economics(
+        self,
+        query: RAGQuery,
+        reservation: EmbeddingCostReservation,
+    ) -> OperationEconomics:
+        """Return deterministic query economics for recorder tests.
+
+        Args:
+            query: Canonical retrieval query being estimated.
+            reservation: Immutable embedding price and retry reservation.
+
+        Returns:
+            Fixed conservative query cost.
+        """
+        del query
+        del reservation
+        return OperationEconomics(cost_usd=NumericMeasurement(value=0.01, provenance="estimated"))
+
+    def retrieve(self, query: RAGQuery) -> tuple[RAGMatch, ...]:
+        """Record a query and return no grounding examples.
+
+        Args:
+            query: Canonical retrieval query dispatched by the recorder.
+
+        Returns:
+            Empty deterministic result set.
+        """
+        self.queries.append(query)
+        return ()
 
 
 def _snapshot(name: str) -> ModelSnapshot:
@@ -100,7 +145,20 @@ def _recorder(
     *,
     candidate_context_window: int = 100_000,
     candidate_served_model_id: str | None = None,
+    resolved_world_client: _ScriptedClient | None = None,
 ) -> RecordingCandidateClient:
+    """Build a recorder with explicit fake candidate, world model, and retriever.
+
+    Args:
+        candidate_client: Scripted candidate provider client.
+        world_client: Scripted world-model provider client.
+        candidate_context_window: Candidate request context-window ceiling.
+        candidate_served_model_id: Optional observed served-model identity.
+        resolved_world_client: Optional decoy client retained only in the resolved identity.
+
+    Returns:
+        Recorder configured for one deterministic task.
+    """
     candidate = _resolved(
         "candidate-a",
         candidate_client,
@@ -108,10 +166,39 @@ def _recorder(
     )
     if candidate_served_model_id is not None:
         candidate = replace(candidate, served_model_id=candidate_served_model_id)
+    retriever = cast(TraceRAGRetriever, _Retriever())
+    serving_input = ArtifactInput(artifact_id="serving-rag", sha256="c" * 64)
+    world_model = _resolved("world-model-a", resolved_world_client or world_client)
+    grounded = GroundedWorldModel(
+        artifact_input=ArtifactInput(artifact_id="grounded-world-model", sha256="d" * 64),
+        artifact=GroundedWorldModelArtifact(
+            schema_version=1,
+            created_at=_TIME,
+            inputs=(serving_input,),
+            code_revision="test-revision",
+            world_model_id="grounded-world-model",
+            serving_rag=serving_input,
+            model_alias="world-model-a",
+            model=world_model.snapshot,
+            prompt_version=GROUNDED_WORLD_MODEL_PROMPT_VERSION,
+            prompt_sha256=grounded_world_model_prompt_sha256(),
+            top_k=8,
+        ),
+        retriever=retriever,
+        client=world_client,
+    )
     return RecordingCandidateClient(
         task=_task(),
         candidate=candidate,
-        world_model=_resolved("world-model-a", world_client),
+        world_model=world_model,
+        grounded_world_model=grounded,
+        query_embedding=EmbeddingCostReservation(
+            model=_snapshot("embedder-a"),
+            input_usd_per_million_tokens=1.0,
+            maximum_attempts=2,
+            maximum_input_tokens=10_000,
+        ),
+        maximum_cost_usd=10.0,
         maximum_steps=2,
         maximum_output_tokens=16_000,
         redacted_field_names=frozenset(),
@@ -157,6 +244,30 @@ def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free() -> No
         value=0.10,
         provenance="observed",
     )
+
+
+def test_recorder_dispatches_only_through_the_artifact_bound_grounded_executor() -> None:
+    """A distinct raw resolved client cannot bypass fit retrieval and grounded prompt framing."""
+    candidate_client = _ScriptedClient([_response("I can help.", model=_snapshot("candidate-a"))])
+    grounded_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Done.","terminal":true}',
+                model=_snapshot("world-model-a"),
+            )
+        ]
+    )
+    raw_client = _ScriptedClient([])
+    recorder = _recorder(
+        candidate_client,
+        grounded_client,
+        resolved_world_client=raw_client,
+    )
+
+    recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Help me."),)))
+
+    assert len(grounded_client.requests) == 1
+    assert raw_client.requests == []
 
 
 def test_recorder_rejects_tool_requests_before_any_provider_call() -> None:

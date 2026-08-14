@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from wmo.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
+from wmo.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
 from wmo.common.tasks import ToolSchema
 
 ModelAlias = ArtifactId
@@ -132,8 +132,27 @@ class ModelCapabilities(ContractModel):
 
     supports_tools: bool = False
     supports_embeddings: bool = False
+    supports_structured_output: bool = False
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
+    input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
+
+    def identity_sha256(self) -> Sha256:
+        """Hash protocol capabilities while preserving existing frozen model identities.
+
+        Structured-output declarations and mutable pricing guide workflow selection and consent,
+        but they do not identify provider model bytes. Excluding them also preserves compatibility
+        with snapshots created before those catalog fields were available.
+
+        Returns:
+            Stable digest of capability fields that identify the provider protocol boundary.
+        """
+        return sha256_json(
+            self.model_dump(
+                mode="json",
+                exclude={"supports_structured_output", "input_cost_per_million_tokens_usd"},
+            )
+        )
 
 
 class ToolChoice(ContractModel):

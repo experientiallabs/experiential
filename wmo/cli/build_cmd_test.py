@@ -1,8 +1,11 @@
-"""End-to-end local tests for the canonical trace-to-task-set build command."""
+"""End-to-end tests for the named grounded-world-model build command."""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -10,294 +13,468 @@ from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
-from wmo.common.observability.telemetry import BuildTelemetryStats
-from wmo.common.project import ProjectStore, artifact_input
-from wmo.common.tasks import TaskSet
-from wmo.common.traces import TraceDataset
+from wmo.common.core.artifacts import sha256_json
+from wmo.common.models import (
+    ConnectionConfig,
+    Embedding,
+    ModelCapabilities,
+    ModelCatalog,
+    ModelRecord,
+    ModelRequest,
+    ModelResponse,
+    ModelRoles,
+    ModelSnapshot,
+    write_model_catalog,
+)
+from wmo.common.project import ProjectStore, ProjectStoreError
+from wmo.runtime.models import ResolvedModel
+from wmo.simulation.retrieval import load_rag_index
+from wmo.simulation.world_model import GroundedWorldModelArtifact
 
 _RUNNER = CliRunner()
 
 
 def _attribute(key: str, value: str) -> dict[str, object]:
-    """Encode one textual OpenTelemetry attribute for a local canonical fixture."""
+    """Encode one textual OpenTelemetry attribute for a canonical fixture.
+
+    Args:
+        key: Semantic-convention attribute key.
+        value: Text stored in the OTLP value envelope.
+
+    Returns:
+        Serialized OTLP attribute mapping.
+    """
     return {"key": key, "value": {"stringValue": value}}
 
 
-def _otlp_export(tmp_path: Path, count: int = 100) -> Path:
-    """Write distinct valid OTLP JSONL traces that exercise the approved 50/20 default split."""
+def _otlp_export(tmp_path: Path, count: int = 1) -> Path:
+    """Write real two-turn traces with one observed assistant-to-user transition each.
+
+    Args:
+        tmp_path: Temporary directory receiving the trace export.
+        count: Number of independent trace lineages to write.
+
+    Returns:
+        Path to the completed OTLP JSON export.
+    """
     records = []
     for index in range(count):
         trace_id = f"{index + 1:032x}"
-        span_id = f"{index + 1:016x}"
-        records.append(
-            {
-                "traceId": trace_id,
-                "spanId": span_id,
-                "name": "agent.model_call",
-                "startTimeUnixNano": str(1_760_000_000_000_000_000 + index * 1_000_000_000),
-                "endTimeUnixNano": str(1_760_000_001_000_000_000 + index * 1_000_000_000),
-                "attributes": [
-                    _attribute("gen_ai.operation.name", "chat"),
-                    _attribute("gen_ai.provider.name", "openai"),
-                    _attribute("gen_ai.request.model", "gpt-test"),
-                    _attribute(
-                        "gen_ai.input.messages",
-                        json.dumps(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": f"Resolve support request {index}",
-                                }
-                            ]
+        base = 1_760_000_000_000_000_000 + index * 10_000_000_000
+        common = [
+            _attribute("gen_ai.operation.name", "chat"),
+            _attribute("gen_ai.provider.name", "openai"),
+            _attribute("gen_ai.request.model", "gpt-test"),
+            _attribute("wmo.customer.id", f"customer-{index}"),
+            _attribute("wmo.conversation.id", f"conversation-{index}"),
+        ]
+        records.extend(
+            (
+                {
+                    "traceId": trace_id,
+                    "spanId": f"{index * 2 + 1:016x}",
+                    "name": "agent.model_call",
+                    "startTimeUnixNano": str(base),
+                    "endTimeUnixNano": str(base + 1_000_000_000),
+                    "attributes": common
+                    + [
+                        _attribute(
+                            "gen_ai.input.messages",
+                            json.dumps([{"role": "user", "content": f"Support request {index}"}]),
                         ),
-                    ),
-                    _attribute("wmo.customer.id", f"customer-{index}"),
-                    _attribute("wmo.conversation.id", f"conversation-{index}"),
-                ],
-            }
+                        _attribute(
+                            "gen_ai.output.messages",
+                            json.dumps([{"role": "assistant", "content": "What account email?"}]),
+                        ),
+                    ],
+                },
+                {
+                    "traceId": trace_id,
+                    "spanId": f"{index * 2 + 2:016x}",
+                    "name": "agent.model_call",
+                    "startTimeUnixNano": str(base + 2_000_000_000),
+                    "endTimeUnixNano": str(base + 3_000_000_000),
+                    "attributes": common
+                    + [
+                        _attribute(
+                            "gen_ai.input.messages",
+                            json.dumps(
+                                [
+                                    {"role": "assistant", "content": "What account email?"},
+                                    {"role": "user", "content": f"customer-{index}@example.test"},
+                                ]
+                            ),
+                        ),
+                        _attribute(
+                            "gen_ai.output.messages",
+                            json.dumps(
+                                [{"role": "assistant", "content": "Reset instructions sent."}]
+                            ),
+                        ),
+                    ],
+                },
+            )
         )
     path = tmp_path / "traces.jsonl"
     path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
     return path
 
 
-def _posthog_export(tmp_path: Path, count: int = 100) -> Path:
-    """Write distinct local PostHog generation traces without an HTTP call."""
-    path = tmp_path / "posthog.json"
-    path.write_text(
-        json.dumps(
-            [
-                {
-                    "event": "$ai_generation",
-                    "timestamp": f"2026-08-11T00:{index // 60:02d}:{index % 60:02d}Z",
-                    "properties": {
-                        "$ai_trace_id": f"{index + 1:032x}",
-                        "$ai_span_id": f"generation-{index}",
-                        "$ai_provider": "openai",
-                        "$ai_model": "gpt-test",
-                        "$ai_input": [
-                            {
-                                "role": "user",
-                                "content": f"Resolve distinct support request {index}",
-                            }
-                        ],
-                        "$ai_output_choices": [
-                            {"role": "assistant", "content": "I sent reset instructions."}
-                        ],
-                        "wmo.customer.id": f"customer-{index}",
-                        "wmo.conversation.id": f"conversation-{index}",
-                        "wmo.outcome.status": "success",
-                    },
-                }
-                for index in range(count)
-            ]
-        ),
-        encoding="utf-8",
-    )
-    return path
+class _EmbeddingClient:
+    """Deterministic semantic-shaped client for no-network build tests."""
+
+    def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Return stable distinct unit vectors for each input text.
+
+        Args:
+            texts: Canonical RAG key texts.
+
+        Returns:
+            Deterministic fixture embeddings in input order.
+        """
+        results = []
+        for text in texts:
+            digest = hashlib.sha256(text.encode()).digest()
+            raw = [float(value + 1) for value in digest[:8]]
+            norm = math.sqrt(sum(value * value for value in raw))
+            results.append(Embedding(values=tuple(value / norm for value in raw)))
+        return tuple(results)
 
 
-def _task_set_for(root: Path, project_id: str) -> tuple[TraceDataset, TaskSet]:
-    """Read the two canonical artifacts written by a successful local build."""
-    artifacts = ProjectStore(root, project_id).artifacts
-    manifests = tuple(artifacts.read(artifact_id).manifest for artifact_id in artifacts.list_ids())
-    trace_manifest = next(
-        manifest for manifest in manifests if manifest.artifact_type == "trace-dataset"
-    )
-    task_manifest = next(manifest for manifest in manifests if manifest.artifact_type == "task-set")
-    trace_dataset = TraceDataset.model_validate_json(
-        artifacts.read_bytes(trace_manifest.artifact_id, "trace-dataset.json")
-    )
-    task_set = TaskSet.model_validate_json(
-        artifacts.read_bytes(task_manifest.artifact_id, "task-set.json")
-    )
-    return trace_dataset, task_set
+class _CompletionClient:
+    """Unused completion client proving build does not call the world model or judge."""
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Fail if deterministic build dispatches a completion.
+
+        Args:
+            request: Unexpected provider completion request.
+
+        Raises:
+            AssertionError: Always, because build must not call completion models.
+        """
+        raise AssertionError(f"build must not dispatch completion: {request}")
 
 
-def test_build_reads_the_raw_otlp_file_once_and_persists_the_immutable_boundary(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The CLI performs exactly one raw read, then derives TaskSet only from TraceDataset input."""
-    source = _otlp_export(tmp_path)
-    original_read_bytes = Path.read_bytes
-    reads = 0
-    captured: list[BuildTelemetryStats] = []
+class _RuntimeCatalog:
+    """Resolve catalog aliases to deterministic no-network test clients."""
 
-    def count_source_reads(path: Path) -> bytes:
-        nonlocal reads
-        if path == source:
-            reads += 1
-        return original_read_bytes(path)
+    def __init__(self, _catalog: ModelCatalog) -> None:
+        """Create deterministic embedding and completion clients.
 
-    monkeypatch.setattr(Path, "read_bytes", count_source_reads)
+        Args:
+            _catalog: Unused catalog accepted by the production constructor seam.
+        """
+        self._embedding = _EmbeddingClient()
+        self._completion = _CompletionClient()
 
-    def capture(*, stats: BuildTelemetryStats, **_kwargs: object) -> None:
-        captured.append(stats)
+    def preflight(self, alias: str, _requirement: object | None = None) -> ResolvedModel:
+        """Return exact static identities with alias-specific capabilities.
 
-    monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", capture)
-    root = tmp_path / ".wmo"
-    result = _RUNNER.invoke(
-        app,
-        [
-            "build",
-            str(source),
-            "--source",
-            "otlp",
-            "--project",
-            "support",
-            "--root",
-            str(root),
-        ],
-    )
+        Args:
+            alias: Configured fixture model alias.
+            _requirement: Unused requirement accepted by the runtime seam.
 
-    assert result.exit_code == 0, result.output
-    assert reads == 1
-    trace_dataset, task_set = _task_set_for(root, "support")
-    manifest = ProjectStore(root, "support").artifacts.read(trace_dataset.dataset_id).manifest
-    assert task_set.inputs == (artifact_input(manifest),)
-    assert len(trace_dataset.trace_ids) == 100
-    assert sum(task_id.startswith("task-") for task_id in task_set.task_ids) == 70
-    tasks = ProjectStore(root, "support").artifacts.read_bytes(task_set.task_set_id, "tasks.jsonl")
-    task_records = tuple(line for line in tasks.decode("utf-8").splitlines() if line)
-    assert sum('"partition":"fit"' in line for line in task_records) == 50
-    assert sum('"partition":"held_out"' in line for line in task_records) == 20
-    assert len(captured) == 1
-    stats = captured[0]
-    assert stats.input_trace_count == 100
-    assert stats.train_trace_count == 50
-    assert stats.heldout_trace_count == 20
-    assert stats.llm_call_count == 0
-    assert stats.input_tokens == 0
-    assert stats.output_tokens == 0
-    assert stats.cost_usd == 0.0
+        Returns:
+            Deterministic resolved fixture model.
+        """
+        if alias == "embed":
+            capabilities = ModelCapabilities(
+                supports_embeddings=True,
+                input_cost_per_million_tokens_usd=0,
+            )
+            embedding = self._embedding
+        else:
+            capabilities = ModelCapabilities(maximum_output_tokens=16_000)
+            embedding = None
+        snapshot = ModelSnapshot(
+            provider="fixture",
+            model_id=f"fixture-{alias}",
+            capabilities_sha256=sha256_json(capabilities),
+            connection_sha256=sha256_json({"connection": alias}),
+        )
+        return ResolvedModel(alias, snapshot, capabilities, self._completion, embedding)
+
+    def resolve(self, alias: str) -> ResolvedModel:
+        """Reuse local preflight for roles with no extra capability requirement.
+
+        Args:
+            alias: Configured fixture model alias.
+
+        Returns:
+            Deterministic resolved fixture model.
+        """
+        return self.preflight(alias)
 
 
-def test_build_accepts_a_local_posthog_export_without_using_the_hogql_transport(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """PostHog local exports use the focused canonical converter and persist normal evidence."""
-
-    def fail_pull(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("local PostHog build must not invoke the HogQL pull transport")
-
-    def fail_http_client(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("local PostHog build must not construct an HTTP client")
-
-    monkeypatch.setattr("wmo.simulation.ingest.posthog.pull_posthog_traces", fail_pull)
-    monkeypatch.setattr("wmo.simulation.ingest.posthog_pull.httpx.Client", fail_http_client)
-    monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
-    source = _posthog_export(tmp_path)
-    root = tmp_path / ".wmo"
-    original_read_bytes = Path.read_bytes
-    reads = 0
-
-    def count_source_reads(path: Path) -> bytes:
-        nonlocal reads
-        if path == source:
-            reads += 1
-        return original_read_bytes(path)
-
-    monkeypatch.setattr(Path, "read_bytes", count_source_reads)
-
-    result = _RUNNER.invoke(
-        app,
-        [
-            "build",
-            str(source),
-            "--source",
-            "posthog",
-            "--project",
-            "support",
-            "--root",
-            str(root),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    trace_dataset, task_set = _task_set_for(root, "support")
-    assert trace_dataset.source is not None
-    assert trace_dataset.source.kind == "file"
-    assert trace_dataset.invalid_trace_count == 0
-    assert len(trace_dataset.trace_ids) == 100
-    assert task_set.task_ids
-    assert reads == 1
-
-
-@pytest.mark.parametrize("source_kind", ["otlp", "posthog"])
-@pytest.mark.parametrize(
-    ("trace_count", "accepted"),
-    [(99, False), (100, True), (1_000, True), (1_001, False)],
-)
-def test_build_enforces_normalized_trace_operating_range_for_each_source(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    source_kind: str,
-    trace_count: int,
-    accepted: bool,
-) -> None:
-    """Both canonical loaders enforce the exact 100 through 1000 trace build range."""
-    monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
-    source = (
-        _otlp_export(tmp_path, trace_count)
-        if source_kind == "otlp"
-        else _posthog_export(tmp_path, trace_count)
-    )
-    root = tmp_path / ".wmo"
-
-    result = _RUNNER.invoke(
-        app,
-        [
-            "build",
-            str(source),
-            "--source",
-            source_kind,
-            "--project",
-            "boundary",
-            "--root",
-            str(root),
-        ],
-    )
-
-    if accepted:
-        assert result.exit_code == 0, result.output
-        trace_dataset, _task_set = _task_set_for(root, "boundary")
-        assert len(trace_dataset.trace_ids) == trace_count
-    else:
-        assert result.exit_code == 2
-        assert "requires 100 to 1000 valid normalized traces" in result.output
-        assert ProjectStore(root, "boundary").artifacts.list_ids() == ()
-
-
-def test_build_rejects_unknown_source_and_missing_local_evidence(tmp_path: Path) -> None:
-    """The direct build surface names only its two canonical input formats and local file need."""
-    source = _otlp_export(tmp_path, count=1)
-
-    unknown = _RUNNER.invoke(
-        app,
-        ["build", str(source), "--source", "langsmith", "--project", "support"],
-    )
-    missing = _RUNNER.invoke(
-        app,
-        ["build", str(tmp_path / "missing.json"), "--project", "support"],
-    )
-
-    assert unknown.exit_code == 2
-    assert "choose one of: otlp, posthog" in " ".join(
-        unstyle(unknown.output).replace("│", " ").split()
-    )
-    assert missing.exit_code == 2
-    assert "trace file not found" in missing.output
-
-
-def test_build_requires_an_explicit_project(tmp_path: Path) -> None:
-    """Prove the locked build surface requires its explicit project option.
+def _catalog(root: Path) -> None:
+    """Write complete secret-free build roles while leaving router candidates empty.
 
     Args:
-        tmp_path: Isolated directory receiving the canonical trace fixture.
+        root: Temporary WMO root receiving ``models.toml``.
     """
-    source = _otlp_export(tmp_path, count=1)
+    write_model_catalog(
+        root / "models.toml",
+        ModelCatalog(
+            connections={
+                "fixture": ConnectionConfig(provider="openai", api_key_env="FIXTURE_API_KEY")
+            },
+            models={
+                "world": ModelRecord(
+                    connection="fixture",
+                    model="world-id",
+                    capabilities=ModelCapabilities(maximum_output_tokens=16_000),
+                ),
+                "judge": ModelRecord(connection="fixture", model="judge-id"),
+                "embed": ModelRecord(
+                    connection="fixture",
+                    model="embed-id",
+                    capabilities=ModelCapabilities(
+                        supports_embeddings=True,
+                        input_cost_per_million_tokens_usd=0,
+                    ),
+                ),
+            },
+            roles=ModelRoles(world_model="world", judge="judge", embedder="embed"),
+        ),
+    )
 
-    result = _RUNNER.invoke(app, ["build", str(source)])
+
+@pytest.fixture(autouse=True)
+def _fake_runtime_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep build tests local and prove no provider network is necessary.
+
+    Args:
+        monkeypatch: Pytest patch fixture replacing provider-backed seams.
+    """
+    monkeypatch.setattr("wmo.cli.build_cmd.RuntimeModelCatalog", _RuntimeCatalog)
+    monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
+
+
+def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """One real trace is enough to complete the named project happy path.
+
+    Args:
+        monkeypatch: Pytest patch fixture used to forbid replay rebuilds.
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+
+    result = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "100 to 1,000 traces is the usual starting range" in result.output
+    store = ProjectStore(root, "support")
+    config = store.load_project()
+    assert config.models is not None
+    assert config.models.candidates == ()
+    assert config.build is not None
+    assert config.build.serving_rag != config.build.fit_rag
+    serving = load_rag_index(store.artifacts, config.build.serving_rag.artifact_id)
+    fit = load_rag_index(store.artifacts, config.build.fit_rag.artifact_id)
+    assert serving.index.transition_count == 1
+    assert fit.index.transition_count == 1
+    world = GroundedWorldModelArtifact.model_validate_json(
+        store.artifacts.read_bytes(config.build.world_model.artifact_id, "world-model.json")
+    )
+    assert world.serving_rag == config.build.serving_rag
+    assert world.model_alias == "world"
+
+    def forbid_rebuild(*_args: object, **_kwargs: object) -> None:
+        """Fail if exact replay attempts to rebuild immutable RAG artifacts.
+
+        Raises:
+            AssertionError: Always, because exact replay must reuse persisted artifacts.
+        """
+        raise AssertionError("exact replay must not rebuild provider-backed RAG artifacts")
+
+    monkeypatch.setattr("wmo.cli.build_cmd._build_grounded_artifacts", forbid_rebuild)
+    replay = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+    assert replay.exit_code == 0, replay.output
+    assert "embedding spend ceiling: $0.000000" in replay.output
+
+    swapped = config.build.model_copy(
+        update={
+            "serving_rag": config.build.fit_rag,
+            "fit_rag": config.build.serving_rag,
+        }
+    )
+    with pytest.raises(ProjectStoreError, match="completed build graph"):
+        store.bind_completed_build(swapped)
+    assert store.load_project().build == config.build
+
+
+@pytest.mark.parametrize("count", [2, 100, 1_001])
+def test_build_accepts_trace_counts_outside_or_inside_guidance(tmp_path: Path, count: int) -> None:
+    """The 100 to 1,000 range is guidance and never a validity gate.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+        count: Parameterized positive trace count.
+    """
+    source = _otlp_export(tmp_path, count=count)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+
+    result = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    config = ProjectStore(root, "support").load_project()
+    assert config.build is not None
+    if count == 2:
+        store = ProjectStore(root, "support")
+        serving = load_rag_index(store.artifacts, config.build.serving_rag.artifact_id)
+        fit = load_rag_index(store.artifacts, config.build.fit_rag.artifact_id)
+        assert serving.index.included_partitions == ("fit", "held_out")
+        assert fit.index.included_partitions == ("fit",)
+        assert serving.index.transition_count == 2
+        assert fit.index.transition_count == 1
+    if count < 100 or count > 1_000:
+        assert "usual starting range" in result.output
+    else:
+        assert "usual starting range" not in result.output
+
+
+def test_missing_config_noninteractive_fails_before_project_write(tmp_path: Path) -> None:
+    """Automation receives complete remediation and no partial project state.
+
+    Args:
+        tmp_path: Temporary root without model configuration.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", str(source), "--root", str(root), "--no-interactive"],
+    )
 
     assert result.exit_code == 2
-    assert "--project" in unstyle(result.output)
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    for missing in ("models.toml", "provider connections", "world_model", "judge", "embedder"):
+        assert missing in output
+    assert "wmo config providers" in output
+    assert not (root / "projects" / "support").exists()
+
+
+def test_missing_config_is_reported_before_a_missing_trace_path(tmp_path: Path) -> None:
+    """First build handles required setup before inspecting trace-file contents.
+
+    Args:
+        tmp_path: Temporary root without configuration or trace input.
+    """
+    root = tmp_path / ".wmo"
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            str(tmp_path / "missing.jsonl"),
+            "--root",
+            str(root),
+            "--no-interactive",
+        ],
+    )
+
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert result.exit_code == 2
+    assert "model configuration is incomplete before build" in output
+    assert "trace file not found" not in output
+    assert not (root / "projects" / "support").exists()
+
+
+def test_interactive_first_build_commits_setup_before_trace_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A real terminal enters setup first and preserves valid catalog state after trace failure.
+
+    Args:
+        monkeypatch: Pytest patch fixture simulating terminal setup.
+        tmp_path: Temporary root receiving the configured catalog.
+    """
+    root = tmp_path / ".wmo"
+    configured: list[Path] = []
+    catalog = ModelCatalog(
+        connections={"fixture": ConnectionConfig(provider="openai", api_key_env="FIXTURE_API_KEY")},
+        models={
+            "world": ModelRecord(
+                connection="fixture",
+                model="world-id",
+                capabilities=ModelCapabilities(maximum_output_tokens=16_000),
+            ),
+            "judge": ModelRecord(connection="fixture", model="judge-id"),
+            "embed": ModelRecord(
+                connection="fixture",
+                model="embed-id",
+                capabilities=ModelCapabilities(
+                    supports_embeddings=True,
+                    input_cost_per_million_tokens_usd=0,
+                ),
+            ),
+        },
+        roles=ModelRoles(world_model="world", judge="judge", embedder="embed"),
+    )
+
+    monkeypatch.setattr("wmo.cli.build_cmd.can_prompt", lambda _console: True)
+
+    def configure(path: Path, *_args: object, **_kwargs: object) -> ModelCatalog:
+        """Persist the fixture catalog as the simulated interactive setup result.
+
+        Args:
+            path: Local WMO root receiving the shared catalog.
+
+        Returns:
+            Complete fixture catalog returned by simulated setup.
+        """
+        configured.append(path)
+        path.mkdir(parents=True, exist_ok=True)
+        write_model_catalog(path / "models.toml", catalog)
+        return catalog
+
+    monkeypatch.setattr("wmo.cli.build_cmd.run_provider_setup", configure)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", str(tmp_path / "missing.jsonl"), "--root", str(root)],
+    )
+
+    assert result.exit_code == 2
+    assert configured == [root]
+    assert (root / "models.toml").exists()
+    assert "trace file not found" in result.output
+    assert not (root / "projects" / "support").exists()
+
+
+def test_build_rejects_old_project_option_shape(tmp_path: Path) -> None:
+    """The command has exactly PROJECT then TRACES as its positional happy path.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    result = _RUNNER.invoke(app, ["build", str(source), "--project", "support"])
+
+    assert result.exit_code == 2
+    assert "No such option: --project" in unstyle(result.output)
+
+
+def test_build_help_describes_the_completed_grounded_artifact() -> None:
+    """CLI guidance names the reusable output of the build happy path.
+
+    The regression asserts the public help without constructing project state.
+    """
+    result = _RUNNER.invoke(app, ["build", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "Build a reusable grounded world model from local trace evidence." in unstyle(
+        result.output
+    )

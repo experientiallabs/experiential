@@ -1,12 +1,16 @@
 """Deterministic end-to-end tests for atomic text world-model simulation."""
 
 import hashlib
+import json
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -14,6 +18,8 @@ from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import (
     AssistantAction,
+    Embedding,
+    EmbeddingCostReservation,
     ModelCapabilities,
     ModelClient,
     ModelFinishReason,
@@ -39,8 +45,28 @@ from wmo.simulation.engines.text.bindings import (
     rollout_id_for_binding,
 )
 from wmo.simulation.engines.text.leases import TextCellLeaseStore
-from wmo.simulation.engines.text.simulator import SimulationContentionError, WorldModelSimulator
+from wmo.simulation.engines.text.simulator import (
+    SimulationConfigurationError,
+    SimulationContentionError,
+    WorldModelSimulator,
+)
+from wmo.simulation.retrieval import (
+    RAGEmbedderBinding,
+    RAGLineageBinding,
+    RAGMatch,
+    RAGQuery,
+    TraceRAGRetriever,
+    load_fit_rag_retriever,
+    persist_trace_rag,
+)
+from wmo.simulation.retrieval.retrieval_test import _persist_traces
+from wmo.simulation.retrieval.transitions import render_rag_key
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
+from wmo.simulation.world_model import GroundedWorldModel, GroundedWorldModelArtifact
+from wmo.simulation.world_model.artifact import (
+    GROUNDED_WORLD_MODEL_PROMPT_VERSION,
+    grounded_world_model_prompt_sha256,
+)
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 
@@ -78,6 +104,102 @@ class _TimeoutClient:
     def complete(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         raise TimeoutError("provider outcome is unknown")
+
+
+class _CountingEmbedder:
+    """Return stable vectors while recording every embedding dispatch."""
+
+    def __init__(self) -> None:
+        """Initialize an empty ordered dispatch log."""
+        self.calls: list[tuple[str, ...]] = []
+
+    def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Record one batch and return equal deterministic unit vectors.
+
+        Args:
+            texts: Canonical RAG texts submitted in one embedding operation.
+
+        Returns:
+            One fixed two-dimensional unit vector per input text.
+        """
+        self.calls.append(tuple(texts))
+        return tuple(Embedding(values=(1.0, 0.0)) for _ in texts)
+
+
+@dataclass
+class _FitRetriever:
+    """Small read-only fit retriever used to isolate text-simulator tests."""
+
+    rag_input: ArtifactInput
+    maximum_attempts: int = 2
+    input_usd_per_million_tokens: float = 0.001
+    embedder: ModelSnapshot | None = None
+    index: SimpleNamespace = field(init=False)
+    queries: list[RAGQuery] = field(init=False, default_factory=list)
+    estimate_calls: int = field(init=False, default=0)
+
+    def __post_init__(self) -> None:
+        """Bind the configured immutable fit scope to the fake index.
+
+        Returns:
+            None after initializing the read-only index metadata.
+        """
+        self.index = SimpleNamespace(
+            embedder=self.embedder or _snapshot("embedder-a"),
+            included_partitions=("fit",),
+            included_lineage_ids=(
+                "lineage-task-a",
+                "lineage-task-b",
+                "lineage-task-c",
+                "lineage-task-d",
+            ),
+            fit_lineage_ids=(
+                "lineage-task-a",
+                "lineage-task-b",
+                "lineage-task-c",
+                "lineage-task-d",
+            ),
+        )
+
+    def estimate_query_economics(
+        self,
+        query: RAGQuery,
+        reservation: EmbeddingCostReservation,
+    ) -> OperationEconomics:
+        """Record one pre-dispatch estimate using the production upper bound.
+
+        Args:
+            query: Canonical retrieval query being estimated.
+            reservation: Immutable embedding price and retry reservation.
+
+        Returns:
+            Retry-inclusive conservative query economics.
+        """
+        self.estimate_calls += 1
+        key_text = render_rag_key(
+            task=query.task,
+            initial_context=query.initial_context,
+            action=query.action,
+        )
+        reserved_tokens = len(key_text.encode("utf-8")) * reservation.maximum_attempts
+        return OperationEconomics(
+            cost_usd=NumericMeasurement(
+                value=(reserved_tokens * reservation.input_usd_per_million_tokens / 1_000_000),
+                provenance="estimated",
+            )
+        )
+
+    def retrieve(self, query: RAGQuery) -> tuple[RAGMatch, ...]:
+        """Record one retrieval without returning fixture examples.
+
+        Args:
+            query: Canonical retrieval query dispatched by the simulator.
+
+        Returns:
+            Empty deterministic result set.
+        """
+        self.queries.append(query)
+        return ()
 
 
 class _OneTurnAgent:
@@ -216,6 +338,85 @@ def _persist_task_set(store: ArtifactStore, tasks: dict[str, TaskCase]) -> Artif
     return artifact_input(manifest)
 
 
+def _fit_rag_input() -> ArtifactInput:
+    """Return the canonical fit-only RAG pointer used by simulator fixtures.
+
+    Returns:
+        Stable fit-only RAG manifest pointer.
+    """
+    return ArtifactInput(artifact_id="fit-rag", sha256="f" * 64)
+
+
+def _grounded_world_model_input() -> ArtifactInput:
+    """Return the immutable grounded world-model pointer used by simulator fixtures.
+
+    Returns:
+        Stable completed world-model manifest pointer.
+    """
+    return ArtifactInput(artifact_id="grounded-world-model", sha256="e" * 64)
+
+
+def _grounded_world_model(
+    world_client: ModelClient,
+    retriever: TraceRAGRetriever,
+    *,
+    artifact_input: ArtifactInput | None = None,
+) -> GroundedWorldModel:
+    """Bind a fixture provider client to the exact fake fit retriever.
+
+    Args:
+        world_client: Provider seam that executes grounded requests.
+        retriever: Exact fit-only retriever shared with the simulator.
+        artifact_input: Optional exact persisted world-model pointer.
+
+    Returns:
+        Artifact-bound fixture executor.
+    """
+    serving_input = ArtifactInput(artifact_id="serving-rag", sha256="c" * 64)
+    return GroundedWorldModel(
+        artifact_input=artifact_input or _grounded_world_model_input(),
+        artifact=GroundedWorldModelArtifact(
+            schema_version=1,
+            created_at=_TIME,
+            inputs=(serving_input,),
+            code_revision="test-revision",
+            world_model_id="grounded-world-model",
+            serving_rag=serving_input,
+            model_alias="world-model-a",
+            model=_snapshot("world-model-a"),
+            prompt_version=GROUNDED_WORLD_MODEL_PROMPT_VERSION,
+            prompt_sha256=grounded_world_model_prompt_sha256(),
+            top_k=8,
+        ),
+        retriever=retriever,
+        client=world_client,
+    )
+
+
+def _query_embedding(
+    *,
+    price: float = 0.001,
+    maximum_attempts: int = 2,
+    maximum_input_tokens: int = 10_000,
+) -> EmbeddingCostReservation:
+    """Build a bounded query-embedding reservation for simulator fixtures.
+
+    Args:
+        price: Catalog input price in USD per million tokens.
+        maximum_attempts: Maximum provider attempts reserved per query.
+        maximum_input_tokens: Maximum query input admitted for dispatch.
+
+    Returns:
+        Immutable reservation pinned to the fixture embedder.
+    """
+    return EmbeddingCostReservation(
+        model=_snapshot("embedder-a"),
+        input_usd_per_million_tokens=price,
+        maximum_attempts=maximum_attempts,
+        maximum_input_tokens=maximum_input_tokens,
+    )
+
+
 def _resolved(
     alias: str,
     client: ModelClient,
@@ -238,12 +439,35 @@ def _spec(
     plan_input: ArtifactInput,
     task_set_input: ArtifactInput,
     cells: tuple[str, ...],
+    *,
+    fit_rag_input: ArtifactInput | None = None,
+    query_embedding: EmbeddingCostReservation | None = None,
     **updates: object,
 ) -> SimulationSpec:
+    """Build a finite text-simulation specification over immutable inputs.
+
+    Args:
+        plan_input: Exact persisted evaluation-plan pointer.
+        task_set_input: Exact persisted task-set pointer.
+        cells: Ordered evaluation-cell identities selected for execution.
+        fit_rag_input: Optional explicit fit-only RAG pointer.
+        query_embedding: Optional explicit query-embedding reservation.
+        **updates: Additional specification fields overriding fixture defaults.
+
+    Returns:
+        Validated finite-cost world-model specification.
+    """
+    rag_input = fit_rag_input or _fit_rag_input()
+    grounded_input = _grounded_world_model_input()
     values: dict[str, object] = {
         "schema_version": 1,
         "created_at": _TIME,
-        "inputs": (plan_input, task_set_input),
+        "inputs": tuple(
+            sorted(
+                (plan_input, task_set_input, rag_input, grounded_input),
+                key=lambda item: item.artifact_id,
+            )
+        ),
         "code_revision": "test-revision",
         "simulation_id": "simulation-a",
         "evaluation_plan_id": "evaluation-plan",
@@ -252,10 +476,13 @@ def _spec(
         "mode": SimulationMode.WORLD_MODEL,
         "world_model": WorldModelSettings(
             world_model_alias="world-model-a",
+            grounded_world_model_input=grounded_input,
             prompt_version="text-world-model-v1",
+            query_embedding=query_embedding or _query_embedding(),
         ),
         "seed": 11,
         "maximum_steps": 2,
+        "maximum_cost_usd": 10.0,
     }
     values.update(updates)
     return SimulationSpec.model_validate(values)
@@ -271,12 +498,36 @@ def _simulator(
     *,
     candidate_context_window: int = 100_000,
     agent_factory: Callable[[], AgentRuntime] = _OneTurnAgent,
+    fit_retriever: TraceRAGRetriever | _FitRetriever | None = None,
+    fit_rag_input: ArtifactInput | None = None,
 ) -> WorldModelSimulator:
+    """Bind deterministic clients and an exact fit retriever to the simulator.
+
+    Args:
+        store: Immutable artifact store receiving simulator evidence.
+        plan: Frozen evaluation plan selected for execution.
+        plan_input: Exact persisted plan pointer.
+        task_set_input: Exact persisted task-set pointer.
+        candidate_client: Candidate model client used by the agent.
+        world_client: Text-world-model client used for environment transitions.
+        candidate_context_window: Candidate request context-window ceiling.
+        agent_factory: Factory creating one isolated agent runtime per episode.
+        fit_retriever: Optional exact read-only fit retriever.
+        fit_rag_input: Optional explicit fit-only RAG pointer.
+
+    Returns:
+        Fully bound text-world-model simulator.
+    """
+    retriever = fit_retriever or _FitRetriever(_fit_rag_input())
+    rag_input = fit_rag_input or retriever.rag_input
+    typed_retriever = cast(TraceRAGRetriever, retriever)
     return WorldModelSimulator(
         store=store,
         evaluation_plan=plan,
         evaluation_plan_input=plan_input,
         task_set_input=task_set_input,
+        fit_rag_input=rag_input,
+        fit_retriever=typed_retriever,
         candidate_models={
             "candidate-a": _resolved(
                 "candidate-a",
@@ -285,6 +536,9 @@ def _simulator(
             )
         },
         world_models={"world-model-a": _resolved("world-model-a", world_client)},
+        grounded_world_models={
+            "world-model-a": _grounded_world_model(world_client, typed_retriever)
+        },
         agent_factory=agent_factory,
         clock=lambda: _TIME,
         monotonic=lambda: 1.0,
@@ -294,13 +548,120 @@ def _simulator(
 def test_text_simulation_persists_separate_economics_and_resumes_without_duplicate_calls(
     tmp_path: Path,
 ) -> None:
-    """The candidate cost is distinct from world-model cost and an immutable rollout resumes."""
+    """Persist separate economics and replay an immutable rollout without calls.
+
+    Args:
+        tmp_path: Isolated project root for immutable simulator artifacts.
+    """
     cell = _cell("cell-a", "task-a")
     plan = _plan((cell,))
     store = _store(tmp_path)
     plan_input = _persist_plan(store, plan)
     tasks = {"task-a": _task("task-a")}
     task_set_input = _persist_task_set(store, tasks)
+    candidate_client = _ScriptedClient(
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.2)]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Thanks.","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+                cost=0.8,
+            )
+        ]
+    )
+    retriever = _FitRetriever(_fit_rag_input())
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        fit_retriever=retriever,
+    )
+    spec = _spec(plan_input, task_set_input, ("cell-a",))
+
+    artifact_set = simulator.run(spec)
+    rollout_id = artifact_set.artifact_ids[0]
+    rollout = simulator._load_rollout(rollout_id)
+    resumed = simulator.run(spec)
+
+    assert rollout.candidate_economics.cost_usd == NumericMeasurement(
+        value=0.2,
+        provenance="observed",
+    )
+    assert rollout.world_model_economics is not None
+    assert rollout.world_model_economics.cost_usd == NumericMeasurement(
+        value=0.8,
+        provenance="observed",
+    )
+    assert rollout.retrieval_economics is not None
+    query = retriever.queries[0]
+    query_text = render_rag_key(
+        task=query.task,
+        initial_context=query.initial_context,
+        action=query.action,
+    )
+    assert rollout.retrieval_economics.cost_usd == NumericMeasurement(
+        value=len(query_text.encode("utf-8")) * 2 * 0.001 / 1_000_000,
+        provenance="estimated",
+    )
+    assert retriever.estimate_calls == 1
+    assert len(retriever.queries) == 1
+    assert retriever.queries[0].excluded_lineage_ids == ("lineage-task-a",)
+    assert rollout.simulation_spec_sha256 == simulation_spec_digest(spec)
+    assert len(rollout.spans) == 2
+    assert len(candidate_client.requests) == 1
+    assert len(world_client.requests) == 1
+    assert retriever.estimate_calls == 1
+    assert len(retriever.queries) == 1
+    assert resumed.artifact_ids == artifact_set.artifact_ids
+
+
+def test_persisted_fit_rag_grounds_active_simulation_and_replay_has_zero_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Ground the prompt in frozen real traces and replay without dispatch.
+
+    Args:
+        tmp_path: Isolated project root for immutable simulator artifacts.
+    """
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    trace_input, traces = _persist_traces(store, count=2)
+    embedding_client = _CountingEmbedder()
+    embedding = RAGEmbedderBinding(
+        client=embedding_client,
+        snapshot=_snapshot("embedder-a"),
+        maximum_attempts=2,
+        input_usd_per_million_tokens=0.001,
+    )
+    persisted = persist_trace_rag(
+        store,
+        (trace_input,),
+        (
+            RAGLineageBinding(
+                trace_id=traces[0].trace_id,
+                lineage_id="lineage-task-a",
+                partition="fit",
+            ),
+            RAGLineageBinding(
+                trace_id=traces[1].trace_id,
+                lineage_id="lineage-other",
+                partition="fit",
+            ),
+        ),
+        created_at=_TIME,
+        code_revision="test-revision",
+        embedder=embedding,
+    )
+    fit_rag_input = artifact_input(persisted.manifest)
+    retriever = load_fit_rag_retriever(store, fit_rag_input, embedder=embedding)
     candidate_client = _ScriptedClient(
         [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.2)]
     )
@@ -320,28 +681,154 @@ def test_text_simulation_persists_separate_economics_and_resumes_without_duplica
         task_set_input,
         candidate_client,
         world_client,
+        fit_retriever=retriever,
+        fit_rag_input=fit_rag_input,
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a",))
+    reservation = _query_embedding()
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a",),
+        fit_rag_input=fit_rag_input,
+        query_embedding=reservation,
+    )
+    rag_before = store.read_bytes(persisted.index.rag_id, "rag-index.json")
 
-    artifact_set = simulator.run(spec)
-    rollout_id = artifact_set.artifact_ids[0]
-    rollout = simulator._load_rollout(rollout_id)
-    resumed = simulator.run(spec)
+    first = simulator.run(spec)
+    dispatches = (
+        len(embedding_client.calls),
+        len(candidate_client.requests),
+        len(world_client.requests),
+    )
+    replay = simulator.run(spec)
 
-    assert rollout.candidate_economics.cost_usd == NumericMeasurement(
-        value=0.2,
-        provenance="observed",
+    evidence = world_client.requests[0].messages[1].content
+    assert evidence is not None
+    grounded = json.loads(evidence)["grounded_examples"]
+    assert [item["transition_id"] for item in grounded] == [
+        transition.transition_id
+        for transition in persisted.transitions
+        if transition.lineage_id == "lineage-other"
+    ]
+    assert dispatches == (2, 1, 1)
+    assert (
+        len(embedding_client.calls),
+        len(candidate_client.requests),
+        len(world_client.requests),
+    ) == dispatches
+    assert replay == first
+    assert store.read_bytes(persisted.index.rag_id, "rag-index.json") == rag_before
+
+
+def test_query_reservation_exceeding_remaining_budget_blocks_every_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Reject a query reservation that exceeds the remaining cell budget.
+
+    Args:
+        tmp_path: Isolated project root used to verify zero provider dispatch.
+    """
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient([])
+    world_client = _ScriptedClient([])
+    retriever = _FitRetriever(_fit_rag_input(), input_usd_per_million_tokens=100.0)
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        fit_retriever=retriever,
     )
-    assert rollout.world_model_economics is not None
-    assert rollout.world_model_economics.cost_usd == NumericMeasurement(
-        value=0.8,
-        provenance="observed",
+    settings = WorldModelSettings(
+        world_model_alias="world-model-a",
+        grounded_world_model_input=_grounded_world_model_input(),
+        prompt_version="text-world-model-v1",
+        query_embedding=_query_embedding(price=100.0),
     )
-    assert rollout.simulation_spec_sha256 == simulation_spec_digest(spec)
-    assert len(rollout.spans) == 2
-    assert len(candidate_client.requests) == 1
-    assert len(world_client.requests) == 1
-    assert resumed.artifact_ids == artifact_set.artifact_ids
+
+    artifact_set = simulator.run(
+        _spec(
+            plan_input,
+            task_set_input,
+            ("cell-a",),
+            world_model=settings,
+            maximum_cost_usd=0.1,
+        )
+    )
+    rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
+
+    assert rollout.stop_reason == StopReason.MAXIMUM_COST
+    assert rollout.failure is not None
+    assert rollout.failure.details["phase"] == "query_embedding_reservation"
+    assert candidate_client.requests == []
+    assert world_client.requests == []
+    assert retriever.estimate_calls == 0
+    assert retriever.queries == []
+
+
+@pytest.mark.parametrize(
+    ("price", "maximum_attempts", "message"),
+    (
+        (0.002, 2, "price reservation"),
+        (0.001, 3, "retry reservation"),
+    ),
+)
+def test_query_embedding_catalog_drift_blocks_every_dispatch(
+    tmp_path: Path,
+    price: float,
+    maximum_attempts: int,
+    message: str,
+) -> None:
+    """Reject catalog drift before artifacts or provider dispatch.
+
+    Args:
+        tmp_path: Isolated project root used to verify zero provider dispatch.
+        price: Active catalog price supplied by the retriever fixture.
+        maximum_attempts: Active retry bound supplied by the retriever fixture.
+        message: Expected validation-error fragment for the drift case.
+    """
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient([])
+    world_client = _ScriptedClient([])
+    retriever = _FitRetriever(_fit_rag_input())
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        fit_retriever=retriever,
+    )
+    settings = WorldModelSettings(
+        world_model_alias="world-model-a",
+        grounded_world_model_input=_grounded_world_model_input(),
+        prompt_version="text-world-model-v1",
+        query_embedding=_query_embedding(
+            price=price,
+            maximum_attempts=maximum_attempts,
+        ),
+    )
+    artifacts_before = store.list_ids()
+
+    with pytest.raises(SimulationConfigurationError, match=message):
+        simulator.run(_spec(plan_input, task_set_input, ("cell-a",), world_model=settings))
+
+    assert store.list_ids() == artifacts_before
+    assert candidate_client.requests == []
+    assert world_client.requests == []
+    assert retriever.estimate_calls == 0
+    assert retriever.queries == []
 
 
 def test_text_simulation_records_tool_tasks_and_context_overflow_as_failed_cells(
@@ -458,7 +945,11 @@ def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path
 def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
     tmp_path: Path,
 ) -> None:
-    """A finite budget cannot admit later cells after a completed provider call has unknown cost."""
+    """Block retrieval and later paid cells after unknown candidate spend.
+
+    Args:
+        tmp_path: Isolated project root for failure evidence.
+    """
     cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
     plan = _plan(cells)
     store = _store(tmp_path)
@@ -492,7 +983,7 @@ def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
 
     assert second_rollout.stop_reason == StopReason.MAXIMUM_COST
     assert len(candidate_client.requests) == 1
-    assert len(world_client.requests) == 1
+    assert world_client.requests == []
 
 
 def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: Path) -> None:
@@ -564,10 +1055,10 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
         world_client,
     )
     spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
-    selected, world_model = recovery._validate_spec_and_bindings(spec)
+    selected, world_model, grounded_world_model = recovery._validate_spec_and_bindings(spec)
     spec_input = recovery._persist_specification(spec)
     resolution, resolution_input, bindings = recovery._persist_resolution(
-        spec, spec_input, selected, world_model
+        spec, spec_input, selected, world_model, grounded_world_model
     )
     first_binding = bindings["cell-a"]
     holder = TextCellLeaseStore(store.project_directory, clock=lambda: _TIME)
@@ -622,6 +1113,7 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
                     spec,
                     selected[1],
                     world_model,
+                    grounded_world_model,
                     spec_input,
                     resolution,
                     resolution_input,
@@ -639,8 +1131,12 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
     assert world_client.requests == []
 
 
-def test_text_simulation_enforces_configured_concurrency_bound(tmp_path: Path) -> None:
-    """A no-spend-limit batch uses at most the pinned number of independent episode workers."""
+def test_text_simulation_serializes_finite_cost_admission(tmp_path: Path) -> None:
+    """Serialize cells so later admission uses reconciled provider spend.
+
+    Args:
+        tmp_path: Isolated project root for durable admission leases.
+    """
     cells = tuple(_cell(f"cell-{letter}", f"task-{letter}") for letter in "abcd")
     plan = _plan(cells)
     store = _store(tmp_path)
@@ -681,8 +1177,8 @@ def test_text_simulation_enforces_configured_concurrency_bound(tmp_path: Path) -
     artifact_set = simulator.run(spec)
 
     assert len(artifact_set.artifact_ids) == 4
-    assert candidate_client.maximum_active_calls == 2
-    assert world_client.maximum_active_calls <= 2
+    assert candidate_client.maximum_active_calls == 1
+    assert world_client.maximum_active_calls == 1
 
 
 def test_text_simulation_continues_after_agent_completion_until_world_terminal(
@@ -782,10 +1278,10 @@ def test_text_simulation_live_hung_claim_times_out_without_calls_or_result_artif
         world_client,
     )
     spec = _spec(plan_input, task_set_input, ("cell-a",), maximum_cost_usd=1.0)
-    cells, world_model = simulator._validate_spec_and_bindings(spec)
+    cells, world_model, grounded_world_model = simulator._validate_spec_and_bindings(spec)
     spec_input = simulator._persist_specification(spec)
     resolution, resolution_input, bindings = simulator._persist_resolution(
-        spec, spec_input, cells, world_model
+        spec, spec_input, cells, world_model, grounded_world_model
     )
     binding = bindings[cell.cell_id]
     rollout_id = rollout_id_for_binding(binding)

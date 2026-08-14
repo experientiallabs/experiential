@@ -65,6 +65,7 @@ class EvaluationRow(ContractModel):
     candidate_cost_usd: NumericMeasurement | None = None
     candidate_latency_seconds: NumericMeasurement | None = None
     world_model_cost_usd: NumericMeasurement | None = None
+    retrieval_cost_usd: NumericMeasurement | None = None
     sandbox_cost_usd: NumericMeasurement | None = None
     orchestration_cost_usd: NumericMeasurement | None = None
     judge_cost_usd: NumericMeasurement | None = None
@@ -79,6 +80,14 @@ class EvaluationRow(ContractModel):
 
     @model_validator(mode="after")
     def _require_status_consistency(self) -> EvaluationRow:
+        """Require status-specific evidence and economics fields to remain consistent.
+
+        Returns:
+            The validated row when its status agrees with every execution field.
+
+        Raises:
+            ValueError: Required evidence is absent or forbidden evidence is present.
+        """
         if self.status == "failed" and self.error is None:
             raise ValueError("failed evaluation rows require a structured error")
         if self.status != "failed" and self.error is not None:
@@ -101,6 +110,7 @@ class EvaluationRow(ContractModel):
                 self.candidate_cost_usd,
                 self.candidate_latency_seconds,
                 self.world_model_cost_usd,
+                self.retrieval_cost_usd,
                 self.sandbox_cost_usd,
                 self.orchestration_cost_usd,
                 self.judge_cost_usd,

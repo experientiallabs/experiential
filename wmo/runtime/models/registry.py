@@ -7,7 +7,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
-from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     EmbeddingClient,
     ModelCapabilities,
@@ -123,7 +122,7 @@ class RuntimeModelCatalog:
                 provider=connection.provider,
                 model_id=record.model,
                 revision=record.revision,
-                capabilities_sha256=sha256_json(capabilities),
+                capabilities_sha256=capabilities.identity_sha256(),
                 connection_sha256=connection.identity_sha256(),
             ),
             capabilities,

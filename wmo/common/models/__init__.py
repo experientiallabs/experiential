@@ -28,12 +28,19 @@ from wmo.common.models.model import (
     ToolChoice,
     Usage,
 )
-from wmo.common.models.pricing import CandidateTokenPrice, PricingSnapshot, load_pricing_snapshot
+from wmo.common.models.pricing import (
+    CandidateTokenPrice,
+    EmbeddingCostReservation,
+    PricingSnapshot,
+    load_pricing_snapshot,
+)
 from wmo.common.models.setup import (
+    EMPTY_CATALOG_SHA256,
     ProviderConnection,
     ProviderModelSelection,
     ProviderSetup,
     ProviderSetupError,
+    catalog_state_sha256,
     configure_provider_catalog,
 )
 
@@ -43,7 +50,9 @@ __all__ = [
     "ConnectionConfig",
     "Embedding",
     "EmbeddingClient",
+    "EmbeddingCostReservation",
     "IdempotentModelClient",
+    "EMPTY_CATALOG_SHA256",
     "ModelCatalog",
     "ModelCatalogError",
     "ModelAlias",
@@ -68,8 +77,9 @@ __all__ = [
     "ToolCall",
     "ToolChoice",
     "Usage",
+    "catalog_state_sha256",
+    "configure_provider_catalog",
     "load_model_catalog",
     "load_pricing_snapshot",
-    "configure_provider_catalog",
     "write_model_catalog",
 ]

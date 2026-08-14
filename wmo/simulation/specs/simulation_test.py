@@ -18,13 +18,14 @@ from wmo.simulation.specs import (
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _PLAN_INPUT = ArtifactInput(artifact_id="evaluation-plan", sha256="a" * 64)
+_WORLD_MODEL_INPUT = ArtifactInput(artifact_id="grounded-world-model", sha256="b" * 64)
 
 
 def _spec(**updates: object) -> SimulationSpec:
     values: dict[str, object] = {
         "schema_version": 1,
         "created_at": _TIME,
-        "inputs": (_PLAN_INPUT,),
+        "inputs": (_PLAN_INPUT, _WORLD_MODEL_INPUT),
         "code_revision": "test-revision",
         "simulation_id": "simulation-a",
         "evaluation_plan_id": "evaluation-plan",
@@ -33,6 +34,7 @@ def _spec(**updates: object) -> SimulationSpec:
         "mode": SimulationMode.WORLD_MODEL,
         "world_model": WorldModelSettings(
             world_model_alias="world-model-a",
+            grounded_world_model_input=_WORLD_MODEL_INPUT,
             prompt_version="text-world-model-v1",
         ),
         "seed": 7,

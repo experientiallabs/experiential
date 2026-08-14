@@ -6,7 +6,7 @@ import tomllib
 from pathlib import Path
 
 import tomli_w
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -28,11 +28,71 @@ class AgentConfiguration(ContractModel):
     factory: str = Field(min_length=1, max_length=512)
 
 
+class ProjectModelConfiguration(ContractModel):
+    """Project-selected aliases isolated from later shared catalog role changes."""
+
+    world_model: ArtifactId
+    judge: ArtifactId
+    embedder: ArtifactId
+    candidates: tuple[ArtifactId, ...] = ()
+
+
+class ProjectRetrievalConfiguration(ContractModel):
+    """Mutable retrieval controls applied to future immutable build artifacts."""
+
+    top_k: int = Field(default=5, gt=0)
+
+
+class ProjectBudgetConfiguration(ContractModel):
+    """Finite spend limits applied to future project workflow calls."""
+
+    maximum_build_cost_usd: float = Field(default=5.0, gt=0)
+
+
+class ProjectBuildArtifacts(ContractModel):
+    """Exact immutable outputs selected as the project's current completed build."""
+
+    trace_dataset: ArtifactInput
+    task_set: ArtifactInput
+    serving_rag: ArtifactInput
+    fit_rag: ArtifactInput
+    world_model: ArtifactInput
+
+    @model_validator(mode="after")
+    def _require_distinct_artifacts(self) -> ProjectBuildArtifacts:
+        """Reject a completed build whose semantic outputs reuse one artifact ID.
+
+        Returns:
+            The validated completed-build pointers.
+
+        Raises:
+            ValueError: Two distinct build outputs name the same immutable artifact.
+        """
+        artifact_ids = tuple(
+            item.artifact_id
+            for item in (
+                self.trace_dataset,
+                self.task_set,
+                self.serving_rag,
+                self.fit_rag,
+                self.world_model,
+            )
+        )
+        if len(set(artifact_ids)) != len(artifact_ids):
+            raise ValueError("project build pointers must name distinct immutable artifacts")
+        return self
+
+
 class ProjectConfig(ContractModel):
     """Project-local configuration that names no provider credentials or secret references."""
 
-    schema_version: int = Field(default=1, ge=1)
+    schema_version: int = Field(default=2, ge=1)
     project_id: ArtifactId
+    trace_source: str | None = Field(default=None, max_length=64)
+    models: ProjectModelConfiguration | None = None
+    retrieval: ProjectRetrievalConfiguration = Field(default_factory=ProjectRetrievalConfiguration)
+    budgets: ProjectBudgetConfiguration = Field(default_factory=ProjectBudgetConfiguration)
+    build: ProjectBuildArtifacts | None = None
     agent: AgentConfiguration | None = None
     model_optimization_config: ArtifactInput | None = None
     redacted_field_names: tuple[str, ...] = ()

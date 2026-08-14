@@ -1,24 +1,34 @@
-"""Simple Rich provider setup reused by CLI entrypoints."""
+"""Concise provider and model setup shared by configuration and first build."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.common.models import (
     ModelCatalog,
     ProviderConnection,
     ProviderModelSelection,
     ProviderSetup,
+    catalog_state_sha256,
     configure_provider_catalog,
+    load_model_catalog,
 )
 
-_PROVIDERS = ("openai", "openrouter", "anthropic", "gemini", "openai-compatible")
-_EMBEDDING_PROVIDERS = ("openai", "openrouter", "gemini", "openai-compatible")
+_NATIVE_PROVIDERS = ("openai", "openrouter", "anthropic", "gemini")
+_PROVIDER_LABELS = {
+    "openai": "OpenAI",
+    "openrouter": "OpenRouter",
+    "anthropic": "Anthropic",
+    "gemini": "Gemini",
+    "openai-compatible": "OpenAI-compatible",
+}
 _CREDENTIAL_ENV_SUGGESTIONS = {
     "openai": "OPENAI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
@@ -26,34 +36,17 @@ _CREDENTIAL_ENV_SUGGESTIONS = {
     "gemini": "GEMINI_API_KEY",
     "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
 }
-_JUDGE_GUIDANCE = {
-    "openai": "an exact OpenAI model ID with enough reasoning quality for stable scoring",
-    "openrouter": ("an exact provider/model ID on OpenRouter, preferably a stable, pinned judge"),
-    "anthropic": "an exact Anthropic model ID with enough quality for stable scoring",
-    "gemini": "an exact Gemini model ID with enough quality for stable scoring",
-    "openai-compatible": (
-        "an exact model ID that this endpoint serves and can use reliably for scoring"
-    ),
-}
 
 
 @dataclass(frozen=True)
 class ProviderSetupOptions:
-    """Optional CLI values used directly or completed with Rich prompts."""
+    """Structured automation values or optional role choices for setup."""
 
-    provider: str | None = None
-    connection: str | None = None
-    api_key_env: str | None = None
-    base_url: str | None = None
+    connection_json: tuple[str, ...] = ()
+    model_json: tuple[str, ...] = ()
     world_model: str | None = None
     judge: str | None = None
     embedder: str | None = None
-    embedder_provider: str | None = None
-    embedder_connection: str | None = None
-    embedder_api_key_env: str | None = None
-    embedder_base_url: str | None = None
-    world_model_tools: bool = False
-    judge_tools: bool = False
 
 
 def run_provider_setup(
@@ -64,222 +57,563 @@ def run_provider_setup(
     replace: bool,
     console: Console,
 ) -> ModelCatalog:
-    """Collect a complete setup before atomically updating ``models.toml``.
-
-    This is the CLI reuse seam for a later build command. All prompts finish before the service
-    writes, so cancellation cannot leave a partial catalog.
+    """Collect a complete catalog update before one conflict-checked atomic write.
 
     Args:
         root: Local ``.wmo`` root.
-        options: Values supplied through command flags.
-        non_interactive: Whether missing values must fail instead of prompting.
-        replace: Whether existing conflicting build-time role aliases may be replaced.
-        console: Rich console used for prompts and guidance.
+        options: Structured connection, model, and role inputs.
+        non_interactive: Whether absent values must be reported instead of prompted.
+        replace: Whether conflicting collected entries may replace unprotected catalog state.
+        console: Rich console used for prompts, summaries, and guidance.
 
     Returns:
-        The complete validated catalog written by the setup service.
+        The complete catalog committed after final confirmation.
 
     Raises:
-        typer.BadParameter: Required noninteractive values are absent.
+        typer.BadParameter: Structured input is invalid or incomplete.
+        typer.Abort: Interactive collection is cancelled or reaches EOF.
     """
-    setup = (
-        _noninteractive_setup(options)
-        if non_interactive
-        else _interactive_setup(options, console=console)
-    )
-    return configure_provider_catalog(root / "models.toml", setup, replace=replace)
-
-
-def _noninteractive_setup(options: ProviderSetupOptions) -> ProviderSetup:
-    """Build exact setup input from flags or report every missing value."""
-    required = {
-        "--provider": options.provider,
-        "--connection": options.connection,
-        "--api-key-env": options.api_key_env,
-        "--world-model": options.world_model,
-        "--judge": options.judge,
-        "--embedder": options.embedder,
-    }
-    missing = tuple(flag for flag, value in required.items() if value is None)
-    if missing:
-        raise typer.BadParameter(
-            "--non-interactive requires " + ", ".join(missing) + "; add the missing flags"
+    path = root / "models.toml"
+    starting_digest = catalog_state_sha256(path)
+    existing = load_model_catalog(path) if path.exists() else None
+    try:
+        setup = (
+            _noninteractive_setup(options, existing=existing)
+            if non_interactive
+            else _interactive_setup(options, existing=existing, console=console)
         )
-    assert options.provider is not None
-    assert options.connection is not None
-    assert options.api_key_env is not None
-    assert options.world_model is not None
-    assert options.judge is not None
-    assert options.embedder is not None
-
-    primary = ProviderConnection(
-        name=options.connection,
-        provider=options.provider,
-        api_key_env=options.api_key_env,
-        base_url=options.base_url,
-    )
-    embedder_connection = _noninteractive_embedder_connection(options, primary=primary)
-    connections = (primary,) if embedder_connection == primary else (primary, embedder_connection)
-    return _setup_from_values(
-        options, connections=connections, primary=primary, embedder_connection=embedder_connection
+    except (EOFError, KeyboardInterrupt):
+        raise typer.Abort() from None
+    return configure_provider_catalog(
+        path,
+        setup,
+        replace=replace,
+        expected_state_sha256=starting_digest,
     )
 
 
-def _noninteractive_embedder_connection(
+def _noninteractive_setup(
     options: ProviderSetupOptions,
     *,
-    primary: ProviderConnection,
-) -> ProviderConnection:
-    """Resolve an optional separate embedder connection without provider inference."""
-    separate_values = (
-        options.embedder_provider,
-        options.embedder_connection,
-        options.embedder_api_key_env,
-        options.embedder_base_url,
-    )
-    if not any(value is not None for value in separate_values):
-        return primary
-    required = {
-        "--embedder-provider": options.embedder_provider,
-        "--embedder-connection": options.embedder_connection,
-        "--embedder-api-key-env": options.embedder_api_key_env,
+    existing: ModelCatalog | None,
+) -> ProviderSetup:
+    """Parse repeatable JSON objects and list every missing automation input.
+
+    Args:
+        options: Structured connection, model, and role arguments.
+        existing: Existing catalog whose compatible entries remain available.
+
+    Returns:
+        Complete validated setup ready for atomic catalog merge.
+
+    Raises:
+        typer.BadParameter: Any JSON record is invalid or required input is missing.
+    """
+    connections: list[ProviderConnection] = []
+    models: list[ProviderModelSelection] = []
+    errors: list[str] = []
+    for position, payload in enumerate(options.connection_json, start=1):
+        try:
+            connections.append(ProviderConnection.model_validate_json(payload))
+        except ValidationError as exc:
+            errors.append(f"--connection-json #{position}: {exc.errors()[0]['msg']}")
+    for position, payload in enumerate(options.model_json, start=1):
+        try:
+            models.append(ProviderModelSelection.model_validate_json(payload))
+        except ValidationError as exc:
+            errors.append(f"--model-json #{position}: {exc.errors()[0]['msg']}")
+    roles = {
+        "--world-model": options.world_model or _existing_role(existing, "world_model"),
+        "--judge": options.judge or _existing_role(existing, "judge"),
+        "--embedder": options.embedder or _existing_role(existing, "embedder"),
     }
-    missing = tuple(flag for flag, value in required.items() if value is None)
-    if missing:
-        raise typer.BadParameter("a separate embedder connection requires " + ", ".join(missing))
-    assert options.embedder_provider is not None
-    assert options.embedder_connection is not None
-    assert options.embedder_api_key_env is not None
-    return ProviderConnection(
-        name=options.embedder_connection,
-        provider=options.embedder_provider,
-        api_key_env=options.embedder_api_key_env,
-        base_url=options.embedder_base_url,
-    )
-
-
-def _interactive_setup(options: ProviderSetupOptions, *, console: Console) -> ProviderSetup:
-    """Collect provider connections first, then exact build-time role model IDs."""
-    console.print("[bold]Provider setup[/bold]")
-    primary = _prompt_connection(
-        console,
-        provider=options.provider,
-        name=options.connection,
-        api_key_env=options.api_key_env,
-        base_url=options.base_url,
-        providers=_PROVIDERS,
-        label="Primary",
-    )
-    use_primary_for_embeddings = primary.provider != "anthropic" and Confirm.ask(
-        "Use this connection for embeddings?", default=True, console=console
-    )
-    if use_primary_for_embeddings:
-        embedder_connection = primary
-    else:
-        if primary.provider == "anthropic":
-            console.print("Anthropic needs a separate embedding provider in the current runtime.")
-        embedder_connection = _prompt_connection(
-            console,
-            provider=options.embedder_provider,
-            name=options.embedder_connection,
-            api_key_env=options.embedder_api_key_env,
-            base_url=options.embedder_base_url,
-            providers=_EMBEDDING_PROVIDERS,
-            label="Embedder",
+    existing_connections = _existing_connections(existing)
+    existing_models = _existing_models(existing)
+    available_connections = (*existing_connections, *connections)
+    available_models = (*existing_models, *models)
+    missing = []
+    if not available_connections:
+        missing.append("at least one --connection-json")
+    if not available_models:
+        missing.append("at least one --model-json")
+    missing.extend(flag for flag, value in roles.items() if value is None)
+    if errors or missing:
+        details = (*errors, *(f"missing {item}" for item in missing))
+        raise typer.BadParameter(
+            "noninteractive provider setup is incomplete: " + "; ".join(details)
         )
-    connections = (primary,) if embedder_connection == primary else (primary, embedder_connection)
-
-    world_model = options.world_model or Prompt.ask("Exact world model ID", console=console).strip()
-    console.print(
-        f"[dim]Judge suggestion: reuse {world_model!r} for consistency, or choose "
-        f"{_JUDGE_GUIDANCE[primary.provider]}.[/dim]"
+    assert roles["--world-model"] is not None
+    assert roles["--judge"] is not None
+    assert roles["--embedder"] is not None
+    return ProviderSetup(
+        connections=_deduplicate_connections(connections),
+        models=_deduplicate_models(models),
+        known_existing_connections=tuple(item.name for item in existing_connections),
+        known_existing_aliases=tuple(model.alias for model in existing_models),
+        world_model=roles["--world-model"],
+        judge=roles["--judge"],
+        embedder=roles["--embedder"],
     )
-    judge = options.judge or Prompt.ask("Exact judge model ID", console=console).strip()
-    if options.judge is None and not Confirm.ask(
-        f"Use {judge!r} as the judge?", default=True, console=console
-    ):
-        raise typer.Abort()
-    embedder = options.embedder or Prompt.ask("Exact embedding model ID", console=console).strip()
-    completed = replace(
-        options,
+
+
+def _interactive_setup(
+    options: ProviderSetupOptions,
+    *,
+    existing: ModelCatalog | None,
+    console: Console,
+) -> ProviderSetup:
+    """Collect available connections and models before selecting independent roles.
+
+    Args:
+        options: Optional explicit role selections.
+        existing: Existing catalog whose compatible entries remain available.
+        console: Terminal used for collection, summary, and confirmation.
+
+    Returns:
+        Confirmed provider setup ready for atomic catalog merge.
+
+    Raises:
+        typer.BadParameter: No usable provider connection or model is collected.
+        typer.Abort: The user rejects the completed configuration summary.
+    """
+    console.print("[bold]Model setup[/bold]")
+    console.print("WMO stores credential environment-variable names, never credentials.")
+    existing_connections = _existing_connections(existing)
+    existing_models = _existing_models(existing)
+    connections = list(existing_connections)
+    models = list(existing_models)
+    if connections:
+        console.print("Existing connections: " + ", ".join(item.name for item in connections))
+    for provider in _NATIVE_PROVIDERS:
+        _collect_provider_connections(connections, provider=provider, console=console)
+    _collect_provider_connections(connections, provider="openai-compatible", console=console)
+    if not connections:
+        raise typer.BadParameter("setup needs at least one available provider connection")
+
+    if models:
+        console.print("Existing model aliases: " + ", ".join(item.alias for item in models))
+    add_model = not models
+    while add_model or Confirm.ask("Add another available model?", default=False, console=console):
+        models.append(_prompt_model(connections, console=console))
+        add_model = False
+    models = list(_deduplicate_models(models))
+    if not models:
+        raise typer.BadParameter("setup needs at least one available model alias")
+
+    aliases = tuple(model.alias for model in models)
+    world_model = options.world_model or _prompt_alias(
+        "World model alias",
+        aliases,
+        default=_existing_role(existing, "world_model"),
+        console=console,
+    )
+    judge = options.judge or _prompt_judge(
+        models,
+        world_model=world_model,
+        current=_existing_role(existing, "judge"),
+        console=console,
+    )
+    embedder = options.embedder or _prompt_alias(
+        "Embedder alias",
+        tuple(model.alias for model in models if model.supports_embeddings),
+        default=_existing_role(existing, "embedder"),
+        console=console,
+    )
+    setup = ProviderSetup(
+        connections=tuple(
+            connection
+            for connection in _deduplicate_connections(connections)
+            if connection.name not in {item.name for item in existing_connections}
+        ),
+        models=tuple(
+            model for model in models if model.alias not in {item.alias for item in existing_models}
+        ),
+        known_existing_connections=tuple(item.name for item in existing_connections),
+        known_existing_aliases=tuple(item.alias for item in existing_models),
         world_model=world_model,
         judge=judge,
         embedder=embedder,
     )
-    return _setup_from_values(
-        completed,
-        connections=connections,
-        primary=primary,
-        embedder_connection=embedder_connection,
+    _render_summary(
+        setup,
+        connections=tuple(connections),
+        models=tuple(models),
+        console=console,
     )
+    if not Confirm.ask("Save this configuration?", default=False, console=console):
+        raise typer.Abort()
+    return setup
 
 
-def _prompt_connection(
-    console: Console,
+def _collect_provider_connections(
+    connections: list[ProviderConnection],
     *,
-    provider: str | None,
-    name: str | None,
-    api_key_env: str | None,
-    base_url: str | None,
-    providers: tuple[str, ...],
+    provider: str,
+    console: Console,
+) -> None:
+    """Collect zero or more explicitly available connections for one provider kind.
+
+    Args:
+        connections: Mutable collection receiving confirmed connection records.
+        provider: Supported provider kind being collected.
+        console: Terminal used for prompts.
+    """
+    label = _PROVIDER_LABELS[provider]
+    another = Confirm.ask(f"Add a {label} connection?", default=False, console=console)
+    while another:
+        default_name = provider if not any(item.name == provider for item in connections) else None
+        name = (
+            Prompt.ask("Connection name", default=default_name, console=console)
+            if default_name is not None
+            else Prompt.ask("Connection name", console=console)
+        ).strip()
+        default_env = _CREDENTIAL_ENV_SUGGESTIONS[provider]
+        api_key_env = Prompt.ask(
+            "API key environment variable", default=default_env, console=console
+        ).strip()
+        base_url = None
+        if provider == "openai-compatible":
+            base_url = Prompt.ask("Base URL", console=console).strip()
+        connections.append(
+            ProviderConnection(
+                name=name,
+                provider=provider,
+                api_key_env=api_key_env,
+                base_url=base_url,
+            )
+        )
+        another = Confirm.ask(f"Add another {label} connection?", default=False, console=console)
+
+
+def _prompt_model(
+    connections: list[ProviderConnection],
+    *,
+    console: Console,
+) -> ProviderModelSelection:
+    """Collect one explicit model alias and its complete known local capabilities.
+
+    Args:
+        connections: Available provider connections.
+        console: Terminal used for prompts.
+
+    Returns:
+        Explicit model selection with declared capabilities and pricing.
+    """
+    connection_names = tuple(connection.name for connection in connections)
+    connection = _prompt_alias("Connection", connection_names, default=None, console=console)
+    alias = Prompt.ask("Model alias", console=console).strip()
+    model = Prompt.ask("Provider model ID", console=console).strip()
+    supports_tools = Confirm.ask("Supports tools?", default=False, console=console)
+    supports_embeddings = Confirm.ask("Supports embeddings?", default=False, console=console)
+    supports_structured_output = Confirm.ask(
+        "Supports structured output?", default=False, console=console
+    )
+    context_window = _prompt_optional_positive_int("Context window tokens", console=console)
+    maximum_output = _prompt_optional_positive_int("Maximum output tokens", console=console)
+    input_cost = (
+        _prompt_nonnegative_float("Input cost per million tokens in USD", console=console)
+        if supports_embeddings
+        else None
+    )
+    return ProviderModelSelection(
+        alias=alias,
+        connection=connection,
+        model=model,
+        supports_tools=supports_tools,
+        supports_embeddings=supports_embeddings,
+        supports_structured_output=supports_structured_output,
+        context_window_tokens=context_window,
+        maximum_output_tokens=maximum_output,
+        input_cost_per_million_tokens_usd=input_cost,
+    )
+
+
+def _prompt_optional_positive_int(label: str, *, console: Console) -> int | None:
+    """Collect an optional positive integer without inventing provider metadata.
+
+    Args:
+        label: Human-readable capability field.
+        console: Terminal used for prompts.
+
+    Returns:
+        Confirmed positive value, or ``None`` when the field is omitted.
+    """
+    if not Confirm.ask(f"Record {label.casefold()}?", default=False, console=console):
+        return None
+    return IntPrompt.ask(label, console=console)
+
+
+def _prompt_nonnegative_float(label: str, *, console: Console) -> float:
+    """Collect explicit local pricing without contacting a provider.
+
+    Args:
+        label: Human-readable pricing field.
+        console: Terminal used for prompts.
+
+    Returns:
+        Confirmed finite nonnegative value.
+
+    Raises:
+        typer.BadParameter: The entered price is negative.
+    """
+    value = float(Prompt.ask(label, console=console))
+    if value < 0:
+        raise typer.BadParameter(f"{label} cannot be negative")
+    return value
+
+
+def _prompt_alias(
     label: str,
-) -> ProviderConnection:
-    """Prompt for one connection without selecting a provider automatically."""
-    selected_provider = provider or Prompt.ask(
-        f"{label} provider", choices=list(providers), console=console
-    )
-    if selected_provider not in providers:
-        raise typer.BadParameter(f"{label} provider must be one of: {', '.join(providers)}")
-    selected_name = (
-        name
-        or Prompt.ask(
-            f"{label} connection name", default=selected_provider, console=console
-        ).strip()
-    )
-    selected_env = (
-        api_key_env
-        or Prompt.ask(
-            "Credential environment variable",
-            default=_CREDENTIAL_ENV_SUGGESTIONS[selected_provider],
-            console=console,
-        ).strip()
-    )
-    selected_base_url = base_url
-    if selected_provider == "openai-compatible" and selected_base_url is None:
-        selected_base_url = Prompt.ask("OpenAI-compatible base URL", console=console).strip()
-    return ProviderConnection(
-        name=selected_name,
-        provider=selected_provider,
-        api_key_env=selected_env,
-        base_url=selected_base_url,
-    )
+    aliases: tuple[str, ...],
+    *,
+    default: str | None,
+    console: Console,
+) -> str:
+    """Prompt for one alias from an explicit available set.
+
+    Args:
+        label: Human-readable role or connection label.
+        aliases: Exact available choices.
+        default: Optional preselected alias.
+        console: Terminal used for prompts.
+
+    Returns:
+        Confirmed alias from ``aliases``.
+
+    Raises:
+        typer.BadParameter: No compatible aliases exist or the response is outside the set.
+    """
+    if not aliases:
+        raise typer.BadParameter(f"{label} has no compatible configured model aliases")
+    selected = (
+        Prompt.ask(label, choices=list(aliases), default=default, console=console)
+        if default is not None
+        else Prompt.ask(label, choices=list(aliases), console=console)
+    ).strip()
+    if selected not in aliases:
+        raise typer.BadParameter(f"{label} must be one of: {', '.join(aliases)}")
+    return selected
 
 
-def _setup_from_values(
-    options: ProviderSetupOptions,
+def _prompt_judge(
+    models: list[ProviderModelSelection],
+    *,
+    world_model: str,
+    current: str | None,
+    console: Console,
+) -> str:
+    """Offer one explainable judge alias suggestion and require explicit acceptance.
+
+    Args:
+        models: Available declared model selections.
+        world_model: Confirmed world-model alias used as a locality preference.
+        current: Existing judge role when still available.
+        console: Terminal used for explanation and confirmation.
+
+    Returns:
+        Explicitly confirmed judge alias.
+    """
+    aliases = tuple(model.alias for model in models)
+    if current in aliases:
+        return _prompt_alias("Judge alias", aliases, default=current, console=console)
+    by_alias = {model.alias: model for model in models}
+    world_connection = by_alias[world_model].connection
+    ranked = sorted(
+        models,
+        key=lambda model: (
+            not model.supports_structured_output,
+            model.context_window_tokens is None,
+            -1 * (model.context_window_tokens or 0),
+            model.connection != world_connection,
+            model.alias,
+        ),
+    )
+    suggestion = ranked[0].alias
+    console.print(
+        f"[dim]Suggested judge: {suggestion}. It is the strongest declared structured-output "
+        "and context match among your configured aliases.[/dim]"
+    )
+    if Confirm.ask(f"Use {suggestion!r} as the judge?", default=True, console=console):
+        return suggestion
+    return _prompt_alias("Judge alias", aliases, default=None, console=console)
+
+
+def _render_summary(
+    setup: ProviderSetup,
     *,
     connections: tuple[ProviderConnection, ...],
-    primary: ProviderConnection,
-    embedder_connection: ProviderConnection,
-) -> ProviderSetup:
-    """Create typed role selections after all connection and model input is complete."""
-    assert options.world_model is not None
-    assert options.judge is not None
-    assert options.embedder is not None
-    return ProviderSetup(
-        connections=connections,
-        world_model=ProviderModelSelection(
-            connection=primary.name,
-            model=options.world_model,
-            supports_tools=options.world_model_tools,
-        ),
-        judge=ProviderModelSelection(
-            connection=primary.name,
-            model=options.judge,
-            supports_tools=options.judge_tools,
-        ),
-        embedder=ProviderModelSelection(
-            connection=embedder_connection.name,
-            model=options.embedder,
-        ),
+    models: tuple[ProviderModelSelection, ...],
+    console: Console,
+) -> None:
+    """Show every connection, model, role, and credential reference before commit.
+
+    Args:
+        setup: Collected role assignments.
+        connections: All existing and newly collected provider connections.
+        models: All existing and newly collected model aliases.
+        console: Terminal receiving the summary.
+    """
+    console.print("[bold]Configuration summary[/bold]")
+    for connection in connections:
+        endpoint = f", base_url={connection.base_url}" if connection.base_url else ""
+        console.print(
+            f"connection {connection.name}: {connection.provider}, "
+            f"api_key_env={connection.api_key_env}{endpoint}"
+        )
+    for model in models:
+        console.print(
+            f"model {model.alias}: {model.connection}/{model.model}, "
+            f"tools={model.supports_tools}, embeddings={model.supports_embeddings}, "
+            f"structured_output={model.supports_structured_output}"
+        )
+    console.print(
+        f"roles: world_model={setup.world_model}, judge={setup.judge}, embedder={setup.embedder}"
     )
+
+
+def _existing_connections(existing: ModelCatalog | None) -> tuple[ProviderConnection, ...]:
+    """Convert supported existing catalog connections into setup input records.
+
+    Args:
+        existing: Existing catalog, or ``None`` on first setup.
+
+    Returns:
+        Compatible secret-free connection records in deterministic order.
+    """
+    if existing is None:
+        return ()
+    return tuple(
+        ProviderConnection(
+            name=name,
+            provider=connection.provider,
+            api_key_env=connection.api_key_env,
+            base_url=connection.base_url,
+        )
+        for name, connection in sorted(existing.connections.items())
+        if connection.provider in _PROVIDER_LABELS and connection.api_key_env is not None
+    )
+
+
+def _existing_models(existing: ModelCatalog | None) -> tuple[ProviderModelSelection, ...]:
+    """Convert supported existing model aliases into setup input records.
+
+    Args:
+        existing: Existing catalog, or ``None`` on first setup.
+
+    Returns:
+        Compatible explicit model selections in deterministic order.
+    """
+    if existing is None:
+        return ()
+    supported_connections = {item.name for item in _existing_connections(existing)}
+    records = []
+    for alias, model in sorted(existing.models.items()):
+        if model.connection not in supported_connections:
+            continue
+        capabilities = model.capabilities
+        records.append(
+            ProviderModelSelection(
+                alias=alias,
+                connection=model.connection,
+                model=model.model,
+                supports_tools=capabilities.supports_tools if capabilities else False,
+                supports_embeddings=capabilities.supports_embeddings if capabilities else False,
+                supports_structured_output=(
+                    capabilities.supports_structured_output if capabilities else False
+                ),
+                context_window_tokens=capabilities.context_window_tokens if capabilities else None,
+                maximum_output_tokens=(
+                    capabilities.maximum_output_tokens if capabilities else None
+                ),
+                input_cost_per_million_tokens_usd=(
+                    capabilities.input_cost_per_million_tokens_usd if capabilities else None
+                ),
+            )
+        )
+    return tuple(records)
+
+
+def _existing_role(existing: ModelCatalog | None, role: str) -> str | None:
+    """Return one prior build role when it is present.
+
+    Args:
+        existing: Existing catalog, or ``None`` on first setup.
+        role: Build-role field to inspect.
+
+    Returns:
+        Existing alias string, or ``None`` when the role is absent.
+    """
+    if existing is None:
+        return None
+    value = getattr(existing.roles, role)
+    return value if isinstance(value, str) else None
+
+
+def _deduplicate_connections(
+    connections: list[ProviderConnection],
+) -> tuple[ProviderConnection, ...]:
+    """Keep one equal record per name and reject ambiguous collected duplicates.
+
+    Args:
+        connections: Collected provider connection records.
+
+    Returns:
+        Unique records sorted by connection name.
+
+    Raises:
+        typer.BadParameter: One name maps to unequal records.
+    """
+    by_name: dict[str, ProviderConnection] = {}
+    for connection in connections:
+        prior = by_name.get(connection.name)
+        if prior is not None and prior != connection:
+            raise typer.BadParameter(f"connection {connection.name!r} was supplied more than once")
+        by_name[connection.name] = connection
+    return tuple(by_name[name] for name in sorted(by_name))
+
+
+def _deduplicate_models(
+    models: list[ProviderModelSelection],
+) -> tuple[ProviderModelSelection, ...]:
+    """Keep one equal record per alias and reject ambiguous collected duplicates.
+
+    Args:
+        models: Collected explicit model selections.
+
+    Returns:
+        Unique records sorted by alias.
+
+    Raises:
+        typer.BadParameter: One alias maps to unequal records.
+    """
+    by_alias: dict[str, ProviderModelSelection] = {}
+    for model in models:
+        prior = by_alias.get(model.alias)
+        if prior is not None and prior != model:
+            raise typer.BadParameter(f"model alias {model.alias!r} was supplied more than once")
+        by_alias[model.alias] = model
+    return tuple(by_alias[alias] for alias in sorted(by_alias))
+
+
+def provider_setup_json_examples() -> tuple[str, str]:
+    """Return compact structured examples used in noninteractive remediation messages.
+
+    Returns:
+        Connection and model JSON examples suitable for quoting as CLI values.
+    """
+    connection = json.dumps(
+        {"name": "openai", "provider": "openai", "api_key_env": "OPENAI_API_KEY"},
+        separators=(",", ":"),
+    )
+    model = json.dumps(
+        {
+            "alias": "model",
+            "connection": "openai",
+            "model": "your-model-id",
+            "supports_embeddings": True,
+            "supports_structured_output": True,
+            "input_cost_per_million_tokens_usd": 0,
+        },
+        separators=(",", ":"),
+    )
+    return connection, model

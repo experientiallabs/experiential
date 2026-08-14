@@ -154,18 +154,12 @@ def build_project(
     Raises:
         ValueError: Existing review state binds a different deterministic build.
     """
-    trace_count = len(normalized.traces)
-    if trace_count < 100 or trace_count > 1_000:
-        raise ValueError(
-            "wmo build requires 100 to 1000 valid normalized traces after validation and "
-            f"deduplication; received {trace_count}"
-        )
     resolved_spec = mining_spec or MiningSpec()
     resolved_embedder = embedder or HashingDescriptorEmbedder()
     if not isinstance(resolved_embedder, HashingDescriptorEmbedder):
         raise ValueError(
-            "the provider-free build workflow requires HashingDescriptorEmbedder; use the "
-            "lower-level build_task_set API for an explicitly configured external embedder"
+            "the provider-free project build requires HashingDescriptorEmbedder; use "
+            "build_task_set for an explicitly configured external descriptor embedder"
         )
     artifacts = build_task_set(
         normalized,
@@ -183,10 +177,11 @@ def build_project(
     task_input = artifact_input(task_stored.manifest)
     if artifacts.task_set.inputs != (trace_input,):
         raise ValueError("loaded task set does not bind the exact trace dataset manifest")
-    project_config = store.load_project()
+    project_config = store.load_project().model_copy(update={"build": None})
     source = artifacts.trace_dataset.dataset.source
     if source is None:
         raise ValueError("completed trace dataset has no immutable source identity")
+    descriptor_dimensions = len(artifacts.mining.analysis.candidates[0].vector)
     review_binding = {
         "schema_version": 1,
         "status": "proposals_pending",
@@ -196,7 +191,7 @@ def build_project(
         "source": source.model_dump(mode="json"),
         "mining_spec": resolved_spec.model_dump(mode="json"),
         "descriptor_embedder": "hashing-descriptor-v1",
-        "descriptor_dimensions": resolved_embedder.dimensions,
+        "descriptor_dimensions": descriptor_dimensions,
         "code_revision": code_revision,
         "paid_calls_made": 0,
     }
@@ -207,7 +202,8 @@ def build_project(
         project_config=project_config,
         source=source,
         mining_spec=resolved_spec,
-        descriptor_dimensions=resolved_embedder.dimensions,
+        descriptor_embedder="hashing-descriptor-v1",
+        descriptor_dimensions=descriptor_dimensions,
         code_revision=code_revision,
     )
     current = store.read_review()

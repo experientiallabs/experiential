@@ -28,7 +28,10 @@ def test_actions_need_payload_and_measurements_are_finite() -> None:
 
 
 def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> None:
-    """A request retains typed tool behavior and rejects incoherent choices."""
+    """A request retains typed tool behavior and rejects incoherent choices.
+
+    The regression also verifies deterministic capability identity hashing.
+    """
     tool = ToolSchema(
         name="create_ticket",
         description="Create one support ticket.",
@@ -45,8 +48,10 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
     assert ModelCapabilities(supports_tools=True).model_dump(mode="json") == {
         "supports_tools": True,
         "supports_embeddings": False,
+        "supports_structured_output": False,
         "context_window_tokens": None,
         "maximum_output_tokens": None,
+        "input_cost_per_million_tokens_usd": None,
     }
     with pytest.raises(ValidationError, match="named tool_choice"):
         ModelRequest(

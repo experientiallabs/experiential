@@ -45,10 +45,12 @@ from wmo.common.evaluations.planning import plan_bound_fidelity_gate_id
 from wmo.common.judging import Judge, Judgment
 from wmo.common.models import RoutedCandidateSnapshot
 from wmo.common.observability.telemetry import capture_completion_once
-from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
+from wmo.common.project import (
+    ArtifactAlreadyExistsError,
+    ProjectStore,
+    artifact_input,
+)
 from wmo.common.rollouts import (
-    RolloutArtifact,
-    RolloutEventKind,
     SimulationArtifactSet,
     SimulationMode,
 )
@@ -72,16 +74,19 @@ from wmo.simulation.ingest.otlp import TraceNormalizationResult, load_otlp_file
 from wmo.simulation.ingest.posthog import load_posthog_file
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
+from wmo.workflow.completed_build import (
+    completed_project_build,
+    verify_completed_build_inputs,
+)
+from wmo.workflow.errors import RouterCompositionError
 from wmo.workflow.judgment_budget import (
     JudgmentBudgetError,
     find_verified_judgment,
     persist_dispatch_reservation,
     read_dispatch_reservation,
 )
-
-
-class RouterCompositionError(ValueError):
-    """Explicit workflow inputs cannot safely produce a frozen router."""
+from wmo.workflow.router_setup import verify_router_evaluation_setup
+from wmo.workflow.simulation_spend import observed_rollout_spend
 
 
 class RouterCompositionBudget(ContractModel):
@@ -113,6 +118,7 @@ class RouterEvaluationSetup(ContractModel):
     production_protocol: EvaluationProtocol
     simulation_protocol: EvaluationProtocol
     embedding_set_id: ArtifactId
+    fit_rag_input: ArtifactInput
     pricing_snapshot_id: ArtifactId
     guard: KnnGuard
     incumbent_alias: ArtifactId | None = None
@@ -290,6 +296,7 @@ def compose_router(
     """
     started = time.monotonic()
     _preflight(project, services, budget, code_revision)
+    completed_build = completed_project_build(project)
     normalized = (
         trace_source if isinstance(trace_source, TraceNormalizationResult) else trace_source.load()
     )
@@ -299,11 +306,20 @@ def compose_router(
         created_at=created_at,
         code_revision=code_revision,
     )
+    verify_completed_build_inputs(completed_build, built)
     _phase(phase_hook, "review")
     review = services.review_supplier(project, built, budget)
     _verify_review(project, review)
     setup = services.setup_supplier(project, built, review, budget)
-    _verify_setup(setup, review)
+    verify_router_evaluation_setup(
+        completed=completed_build,
+        fit_rag_input=setup.fit_rag_input,
+        grounded_world_model_input=setup.world_model_settings.grounded_world_model_input,
+        production_protocol=setup.production_protocol,
+        simulation_protocol=setup.simulation_protocol,
+        rubric_id=review.rubric_id,
+        calibration_id=review.calibration_id,
+    )
 
     thresholds = default_fidelity_thresholds(created_at=created_at, code_revision=code_revision)
     persist_fidelity_thresholds(project.artifacts, thresholds)
@@ -490,7 +506,22 @@ def _simulation_spec(
     *,
     phase: Literal["fidelity-fit", "heldout"],
 ) -> SimulationSpec:
-    """Create one phase-scoped sparse simulation spec without opening the other phase."""
+    """Create one phase-scoped simulation spec over the exact fit-only RAG.
+
+    Args:
+        plan: Frozen evaluation plan containing the selected cells.
+        plan_input: Exact persisted evaluation-plan pointer.
+        task_input: Exact persisted task-set pointer.
+        setup: Reviewed candidates, protocols, retrieval pointer, and world-model settings.
+        maximum_cost_usd: Finite provider-spend ceiling for this phase.
+        created_at: Immutable specification timestamp.
+        code_revision: Exact source revision bound to generated artifacts.
+        cells: Phase-specific plan cells eligible for simulation.
+        phase: Fidelity-fit or held-out phase label used in stable identity.
+
+    Returns:
+        Sparse immutable specification that binds the same fit RAG in either phase.
+    """
     cell_ids = tuple(
         sorted(cell.cell_id for cell in cells if getattr(cell, "execution", None) == "simulate")
     )
@@ -510,7 +541,12 @@ def _simulation_spec(
     return SimulationSpec(
         schema_version=1,
         created_at=created_at,
-        inputs=(plan_input, task_input),
+        inputs=_sorted_artifact_inputs(
+            plan_input,
+            task_input,
+            setup.fit_rag_input,
+            setup.world_model_settings.grounded_world_model_input,
+        ),
         code_revision=code_revision,
         simulation_id=stable_id("simulation", binding),
         evaluation_plan_id=plan.plan_id,
@@ -578,7 +614,18 @@ def _verified_simulation_spend(
     project: ProjectStore,
     expected: SimulationArtifactSet,
 ) -> float:
-    """Recompute one phase's observed dispatch spend from verified immutable rollouts."""
+    """Recompute one phase's spend from verified immutable rollouts.
+
+    Args:
+        project: Project store containing the completed simulation artifacts.
+        expected: Exact artifact set returned for the simulation phase.
+
+    Returns:
+        Finite total of candidate, world-model, and retrieval dispatch spend.
+
+    Raises:
+        RouterCompositionError: The set, index, rollout, or economics cannot be verified.
+    """
     stored = project.artifacts.read(expected.artifact_set_id)
     if stored.manifest.artifact_type != "simulation-artifact-set":
         raise RouterCompositionError("simulation spend source has the wrong artifact type")
@@ -593,45 +640,10 @@ def _verified_simulation_spend(
     if hashlib.sha256(index_payload).hexdigest() != artifact_set.artifacts_sha256:
         raise RouterCompositionError("simulation spend index digest has drifted")
     values = tuple(
-        _observed_rollout_spend(read_rollout(project.artifacts, rollout_id)[0])
+        observed_rollout_spend(read_rollout(project.artifacts, rollout_id)[0])
         for rollout_id in artifact_set.artifact_ids
     )
     return math.fsum(values)
-
-
-def _observed_rollout_spend(rollout: RolloutArtifact) -> float:
-    """Total observed paid candidate plus simulator or environment spend for one rollout."""
-    if rollout.failure is not None and (
-        rollout.failure.details.get("provider_dispatch_unknown_spend") is True
-        or rollout.failure.details.get("environment_dispatch_unknown_spend") is True
-        or rollout.failure.details.get("phase") == "paid_cell_stale_lease"
-    ):
-        raise RouterCompositionError("simulation rollout has unknown dispatched spend")
-    economics = []
-    if any(span.kind == RolloutEventKind.AGENT_MODEL_CALL for span in rollout.spans):
-        economics.append(rollout.candidate_economics)
-    if rollout.evidence_source == "world_model":
-        if any(span.kind == RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL for span in rollout.spans):
-            economics.append(rollout.world_model_economics)
-    elif rollout.evidence_source == "sandbox":
-        binding = rollout.sandbox_binding
-        if binding is None:
-            raise RouterCompositionError("sandbox rollout lacks its environment cost binding")
-        if binding.environment_maximum_episode_cost_usd != 0:
-            economics.append(rollout.sandbox_economics)
-    else:
-        raise RouterCompositionError("production evidence cannot count as simulation spend")
-    if rollout.orchestration_economics is not None:
-        orchestration_cost = rollout.orchestration_economics.cost_usd
-        if orchestration_cost is not None:
-            economics.append(rollout.orchestration_economics)
-    costs = []
-    for operation in economics:
-        cost = operation.cost_usd if operation is not None else None
-        if cost is None or cost.provenance != "observed" or cost.value < 0:
-            raise RouterCompositionError("simulation rollout spend is not fully observed")
-        costs.append(cost.value)
-    return math.fsum(costs)
 
 
 def _approve_fidelity_once(
@@ -827,23 +839,6 @@ def _verify_review(project: ProjectStore, review: ApprovedRouterReview) -> None:
     for artifact_id, artifact_type in expected:
         if project.artifacts.read(artifact_id).manifest.artifact_type != artifact_type:
             raise RouterCompositionError(f"{artifact_id} is not a completed {artifact_type}")
-
-
-def _verify_setup(setup: RouterEvaluationSetup, review: ApprovedRouterReview) -> None:
-    """Bind both protocols to the approved review and require source-specific roles."""
-    protocols = (setup.production_protocol, setup.simulation_protocol)
-    if any(
-        protocol.rubric_id != review.rubric_id
-        or protocol.judge_calibration_id != review.calibration_id
-        for protocol in protocols
-    ):
-        raise RouterCompositionError("evaluation protocols differ from approved review artifacts")
-    if setup.production_protocol.evidence_source != "production":
-        raise RouterCompositionError("production_protocol must name production evidence")
-    if setup.simulation_protocol.evidence_source != "world_model":
-        raise RouterCompositionError("simulation_protocol must name world-model evidence")
-    if setup.simulation_protocol.fidelity_report_id is not None:
-        raise RouterCompositionError("simulation protocol cannot preclaim a fidelity report")
 
 
 def _complete_cell_evidence(
