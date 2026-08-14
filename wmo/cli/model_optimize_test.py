@@ -9,6 +9,7 @@ from typing import Never
 
 import pytest
 import typer
+from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
@@ -64,6 +65,22 @@ class _RestartSampler:
             output=AssistantAction(content="resolved after restart"),
             served_model_id="tinker://trained-handle",
         )
+
+
+def _flat_cli_output(output: str) -> str:
+    """Remove terminal styling, whitespace, and table borders from CLI output.
+
+    Args:
+        output: Rich-formatted text captured by the CLI test runner.
+
+    Returns:
+        Stable text suitable for cross-platform substring assertions.
+    """
+    return "".join(
+        character
+        for character in unstyle(output)
+        if not character.isspace() and character not in "│┃"
+    )
 
 
 def _configured_project(tmp_path: Path, training: TinkerSFTSpec) -> _ConfiguredProject:
@@ -334,11 +351,7 @@ def test_cli_first_run_noninteractive_reports_all_required_tinker_flags(
         ],
     )
 
-    flat = "".join(
-        character
-        for character in result.output
-        if not character.isspace() and character not in "│┃"
-    )
+    flat = _flat_cli_output(result.output)
     assert result.exit_code == 2
     assert "--tinker-connection" in flat
     assert "--tinker-api-key-env" in flat
@@ -600,11 +613,7 @@ def test_cli_yes_does_not_bypass_the_unsupported_budget_estimate_gate(
     )
 
     assert result.exit_code == 2
-    assert "nosupportedconservativecostestimate" in "".join(
-        character
-        for character in result.output
-        if not character.isspace() and character not in "│┃"
-    )
+    assert "nosupportedconservativecostestimate" in _flat_cli_output(result.output)
     assert backend.open_resume_paths == []
 
 
@@ -662,11 +671,7 @@ def test_cli_empty_journal_fails_before_backend_or_consent(
     )
 
     assert result.exit_code == 2
-    assert "nointeractions" in "".join(
-        character
-        for character in result.output
-        if not character.isspace() and character not in "│┃"
-    )
+    assert "nointeractions" in _flat_cli_output(result.output)
     assert backend_calls == []
     assert consent_calls == []
 
@@ -792,11 +797,7 @@ def test_connection_drift_after_consent_fails_before_credential_or_sdk(
     )
 
     assert result.exit_code == 2
-    assert "metadatadriftedbeforecredentialresolution" in "".join(
-        character
-        for character in result.output
-        if not character.isspace() and character not in "│┃"
-    )
+    assert "metadatadriftedbeforecredentialresolution" in _flat_cli_output(result.output)
     assert credential_reads == []
     assert service_calls == []
 
@@ -926,11 +927,7 @@ def test_schedule_ceiling_refuses_before_tinker_backend_construction(
     )
 
     assert result.exit_code == 2
-    assert "exceedsmaximum_cost_usd" in "".join(
-        character
-        for character in result.output
-        if not character.isspace() and character not in "│┃"
-    )
+    assert "exceedsmaximum_cost_usd" in _flat_cli_output(result.output)
     assert backend_calls == []
 
 
@@ -974,11 +971,7 @@ def test_selected_price_replay_rejects_explicit_drift_before_backend(
     )
 
     assert result.exit_code == 2
-    assert "differsfromtheselectedimmutable" in "".join(
-        character
-        for character in result.output
-        if not character.isspace() and character not in "│┃"
-    )
+    assert "differsfromtheselectedimmutable" in _flat_cli_output(result.output)
     assert backend_calls == []
 
 
