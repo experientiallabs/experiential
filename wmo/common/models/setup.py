@@ -94,7 +94,11 @@ class ProviderModelSelection(ContractModel):
         return self
 
     def capabilities(self) -> ModelCapabilities:
-        """Return the explicit per-model capabilities captured by setup."""
+        """Return the explicit per-model capabilities captured by setup.
+
+        Returns:
+            Canonical capability record for the selected model alias.
+        """
         return ModelCapabilities(
             supports_tools=self.supports_tools,
             supports_embeddings=self.supports_embeddings,
@@ -105,7 +109,11 @@ class ProviderModelSelection(ContractModel):
         )
 
     def catalog_record(self) -> ModelRecord:
-        """Return the exact catalog record represented by this selection."""
+        """Return the exact catalog record represented by this selection.
+
+        Returns:
+            Model-catalog entry that preserves connection, model ID, and capabilities.
+        """
         return ModelRecord(
             connection=self.connection,
             model=self.model,

@@ -72,7 +72,11 @@ def _setup(*, judge_model: str = "judge-id") -> ProviderSetup:
 
 
 def test_setup_writes_named_models_and_independent_roles(tmp_path: Path) -> None:
-    """Collected aliases remain reusable instead of becoming fixed role-named records."""
+    """Collected aliases remain reusable instead of becoming fixed role-named records.
+
+    Args:
+        tmp_path: Temporary root receiving the shared catalog.
+    """
     path = tmp_path / "models.toml"
 
     first = configure_provider_catalog(path, _setup())
@@ -90,7 +94,11 @@ def test_setup_writes_named_models_and_independent_roles(tmp_path: Path) -> None
 
 
 def test_setup_preserves_unrelated_models_and_router_candidates(tmp_path: Path) -> None:
-    """Build setup cannot silently choose or replace router candidate state."""
+    """Build setup cannot silently choose or replace router candidate state.
+
+    Args:
+        tmp_path: Temporary root containing preserved catalog roles.
+    """
     path = tmp_path / "models.toml"
     candidate = ModelRecord(connection="router", model="vendor/candidate")
     existing = ModelCatalog(
@@ -115,7 +123,11 @@ def test_setup_preserves_unrelated_models_and_router_candidates(tmp_path: Path) 
 def test_conflicting_alias_requires_replace_and_protected_alias_never_replaces(
     tmp_path: Path,
 ) -> None:
-    """Conflicts fail atomically, including when a router role protects the alias."""
+    """Conflicts fail atomically, including when a router role protects the alias.
+
+    Args:
+        tmp_path: Temporary root containing conflicting model aliases.
+    """
     path = tmp_path / "models.toml"
     original = configure_provider_catalog(path, _setup())
     payload = path.read_bytes()
@@ -137,7 +149,11 @@ def test_conflicting_alias_requires_replace_and_protected_alias_never_replaces(
 
 
 def test_prompt_session_digest_rejects_concurrent_catalog_change(tmp_path: Path) -> None:
-    """A completed prompt session cannot overwrite catalog edits made during collection."""
+    """A completed prompt session cannot overwrite catalog edits made during collection.
+
+    Args:
+        tmp_path: Temporary root whose catalog changes during simulated collection.
+    """
     path = tmp_path / "models.toml"
     starting = catalog_state_sha256(path)
     configure_provider_catalog(path, _setup())
@@ -147,7 +163,11 @@ def test_prompt_session_digest_rejects_concurrent_catalog_change(tmp_path: Path)
 
 
 def test_non_role_alias_collision_fails_without_writing(tmp_path: Path) -> None:
-    """Every confirmed model alias is either saved exactly or rejected before commit."""
+    """Every confirmed model alias is either saved exactly or rejected before commit.
+
+    Args:
+        tmp_path: Temporary root containing a conflicting non-role alias.
+    """
     path = tmp_path / "models.toml"
     setup = _setup()
     first = setup.model_copy(
@@ -183,7 +203,10 @@ def test_non_role_alias_collision_fails_without_writing(tmp_path: Path) -> None:
 
 
 def test_embedder_role_requires_explicit_embedding_capability() -> None:
-    """Provider identity never implies per-model embedding support."""
+    """Provider identity never implies per-model embedding support.
+
+    The regression validates the complete setup model without writing catalog state.
+    """
     setup = _setup()
     models = tuple(
         model.model_copy(update={"supports_embeddings": False}) if model.alias == "embed" else model
@@ -200,7 +223,10 @@ def test_embedder_role_requires_explicit_embedding_capability() -> None:
 
 
 def test_embedding_model_requires_explicit_input_price() -> None:
-    """Build consent never relies on an invented or silently absent embedding price."""
+    """Build consent never relies on an invented or silently absent embedding price.
+
+    The regression covers both rejected unknown pricing and explicit zero pricing.
+    """
     with pytest.raises(ValueError, match="explicit input cost"):
         ProviderModelSelection(
             alias="embed",
@@ -221,7 +247,12 @@ def test_embedding_model_requires_explicit_input_price() -> None:
     ],
 )
 def test_setup_accepts_each_supported_connection(provider: str, base_url: str | None) -> None:
-    """Every supported provider remains an explicit user-selected connection."""
+    """Every supported provider remains an explicit user-selected connection.
+
+    Args:
+        provider: Parameterized supported provider kind.
+        base_url: Required compatible endpoint or ``None`` for native providers.
+    """
     connection = ProviderConnection(
         name="selected",
         provider=provider,

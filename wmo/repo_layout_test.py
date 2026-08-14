@@ -96,7 +96,10 @@ def test_non_test_hand_authored_files_stay_below_one_thousand_lines() -> None:
 
 
 def test_line_limit_exempts_only_generated_lock_and_python_test_modules() -> None:
-    """Keep the narrow line-limit exemptions explicit."""
+    """Keep the narrow line-limit exemptions explicit.
+
+    The regression distinguishes Python test modules from similarly named documentation.
+    """
     assert _is_line_limit_exempt(Path("wmo/runtime/router/runtime_test.py"))
     assert _is_line_limit_exempt(Path("package-lock.json"))
     assert not _is_line_limit_exempt(Path("wmo/runtime/router/runtime.py"))

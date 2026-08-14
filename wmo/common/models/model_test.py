@@ -28,7 +28,10 @@ def test_actions_need_payload_and_measurements_are_finite() -> None:
 
 
 def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> None:
-    """A request retains typed tool behavior and rejects incoherent choices."""
+    """A request retains typed tool behavior and rejects incoherent choices.
+
+    The regression also verifies deterministic capability identity hashing.
+    """
     tool = ToolSchema(
         name="create_ticket",
         description="Create one support ticket.",

@@ -65,7 +65,11 @@ def _model_json(
 
 
 def test_noninteractive_setup_collects_many_connections_models_and_roles(tmp_path: Path) -> None:
-    """Automation supplies repeatable collections before independent role aliases."""
+    """Automation supplies repeatable collections before independent role aliases.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the model catalog.
+    """
     root = tmp_path / ".wmo"
     result = _RUNNER.invoke(
         app,
@@ -102,7 +106,11 @@ def test_noninteractive_setup_collects_many_connections_models_and_roles(tmp_pat
 
 
 def test_noninteractive_setup_reports_every_missing_collection_and_role(tmp_path: Path) -> None:
-    """One failure lists the complete remediation instead of serial missing prompts."""
+    """One failure lists the complete remediation instead of serial missing prompts.
+
+    Args:
+        tmp_path: Temporary WMO root without provider configuration.
+    """
     result = _RUNNER.invoke(
         app,
         ["config", "providers", "--root", str(tmp_path / ".wmo"), "--non-interactive"],
@@ -123,7 +131,11 @@ def test_noninteractive_setup_reports_every_missing_collection_and_role(tmp_path
 
 
 def test_setup_preserves_router_candidates_and_unrelated_entries(tmp_path: Path) -> None:
-    """Editing build roles does not consume or mutate router candidate selection."""
+    """Editing build roles does not consume or mutate router candidate selection.
+
+    Args:
+        tmp_path: Temporary WMO root containing preserved catalog state.
+    """
     root = tmp_path / ".wmo"
     root.mkdir()
     write_model_catalog(
@@ -166,7 +178,11 @@ def test_setup_preserves_router_candidates_and_unrelated_entries(tmp_path: Path)
 
 
 def test_structured_input_rejects_openai_compatible_without_capabilities(tmp_path: Path) -> None:
-    """Private compatible endpoints cannot acquire provider-wide capability guesses."""
+    """Private compatible endpoints cannot acquire provider-wide capability guesses.
+
+    Args:
+        tmp_path: Temporary WMO root receiving rejected structured input.
+    """
     connection = json.dumps(
         {
             "name": "private",
@@ -204,7 +220,11 @@ def test_structured_input_rejects_openai_compatible_without_capabilities(tmp_pat
 
 
 def test_interactive_final_rejection_writes_no_catalog(tmp_path: Path) -> None:
-    """All answers remain in memory until the user confirms the complete summary."""
+    """All answers remain in memory until the user confirms the complete summary.
+
+    Args:
+        tmp_path: Temporary WMO root used to prove no catalog write occurs.
+    """
     root = tmp_path / ".wmo"
     result = _RUNNER.invoke(
         app,

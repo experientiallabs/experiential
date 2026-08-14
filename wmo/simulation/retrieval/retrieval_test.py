@@ -144,7 +144,11 @@ def test_held_out_lineages_never_enter_the_index(tmp_path: Path) -> None:
 
 
 def test_held_out_only_index_is_not_a_supported_fit_evidence_artifact(tmp_path: Path) -> None:
-    """Every retrieval artifact retains fit evidence when serving also includes held out."""
+    """Every retrieval artifact retains fit evidence when serving also includes held out.
+
+    Args:
+        tmp_path: Temporary project root receiving the rejected index build.
+    """
     store = _store(tmp_path, "held-out-only")
     source_input, traces = _persist_traces(store, count=1)
 

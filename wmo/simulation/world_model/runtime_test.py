@@ -62,12 +62,23 @@ class _WorldClient:
     """Capture the grounded request and return one strict protocol transition."""
 
     def __init__(self, snapshot: ModelSnapshot) -> None:
-        """Record requests under one exact fixture model identity."""
+        """Record requests under one exact fixture model identity.
+
+        Args:
+            snapshot: Frozen world-model identity returned with every response.
+        """
         self.snapshot = snapshot
         self.requests: list[ModelRequest] = []
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Return one visible environment observation."""
+        """Return one visible environment observation.
+
+        Args:
+            request: Grounded world-model completion request to capture.
+
+        Returns:
+            Strict typed transition response under the configured fixture identity.
+        """
         self.requests.append(request)
         return ModelResponse(
             output=AssistantAction(content='{"message":"Use the saved email.","terminal":false}'),
@@ -77,7 +88,11 @@ class _WorldClient:
 
 
 def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: Path) -> None:
-    """A completed build artifact executes with immutable observed-transition grounding."""
+    """A completed build artifact executes with immutable observed-transition grounding.
+
+    Args:
+        tmp_path: Temporary project root containing the RAG and world-model artifacts.
+    """
     store = ProjectStore(tmp_path / ".wmo", "support")
     store.initialize(ProjectConfig(project_id="support"))
     created_at = datetime(2026, 8, 13, tzinfo=UTC)

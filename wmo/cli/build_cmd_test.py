@@ -145,7 +145,14 @@ class _CompletionClient:
     """Unused completion client proving build does not call the world model or judge."""
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Fail if deterministic build dispatches a completion."""
+        """Fail if deterministic build dispatches a completion.
+
+        Args:
+            request: Unexpected provider completion request.
+
+        Raises:
+            AssertionError: Always, because build must not call completion models.
+        """
         raise AssertionError(f"build must not dispatch completion: {request}")
 
 
@@ -153,7 +160,11 @@ class _RuntimeCatalog:
     """Resolve catalog aliases to deterministic no-network test clients."""
 
     def __init__(self, _catalog: ModelCatalog) -> None:
-        """Create deterministic embedding and completion clients."""
+        """Create deterministic embedding and completion clients.
+
+        Args:
+            _catalog: Unused catalog accepted by the production constructor seam.
+        """
         self._embedding = _EmbeddingClient()
         self._completion = _CompletionClient()
 
@@ -185,7 +196,14 @@ class _RuntimeCatalog:
         return ResolvedModel(alias, snapshot, capabilities, self._completion, embedding)
 
     def resolve(self, alias: str) -> ResolvedModel:
-        """Reuse local preflight for roles with no extra capability requirement."""
+        """Reuse local preflight for roles with no extra capability requirement.
+
+        Args:
+            alias: Configured fixture model alias.
+
+        Returns:
+            Deterministic resolved fixture model.
+        """
         return self.preflight(alias)
 
 
@@ -237,7 +255,12 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """One real trace is enough to complete the named project happy path."""
+    """One real trace is enough to complete the named project happy path.
+
+    Args:
+        monkeypatch: Pytest patch fixture used to forbid replay rebuilds.
+        tmp_path: Temporary project and trace root.
+    """
     source = _otlp_export(tmp_path)
     root = tmp_path / ".wmo"
     root.mkdir()
@@ -264,7 +287,11 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     assert world.model_alias == "world"
 
     def forbid_rebuild(*_args: object, **_kwargs: object) -> None:
-        """Fail if exact replay attempts to rebuild immutable RAG artifacts."""
+        """Fail if exact replay attempts to rebuild immutable RAG artifacts.
+
+        Raises:
+            AssertionError: Always, because exact replay must reuse persisted artifacts.
+        """
         raise AssertionError("exact replay must not rebuild provider-backed RAG artifacts")
 
     monkeypatch.setattr("wmo.cli.build_cmd._build_grounded_artifacts", forbid_rebuild)
@@ -285,7 +312,12 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
 
 @pytest.mark.parametrize("count", [2, 100, 1_001])
 def test_build_accepts_trace_counts_outside_or_inside_guidance(tmp_path: Path, count: int) -> None:
-    """The 100 to 1,000 range is guidance and never a validity gate."""
+    """The 100 to 1,000 range is guidance and never a validity gate.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+        count: Parameterized positive trace count.
+    """
     source = _otlp_export(tmp_path, count=count)
     root = tmp_path / ".wmo"
     root.mkdir()
@@ -311,7 +343,11 @@ def test_build_accepts_trace_counts_outside_or_inside_guidance(tmp_path: Path, c
 
 
 def test_missing_config_noninteractive_fails_before_project_write(tmp_path: Path) -> None:
-    """Automation receives complete remediation and no partial project state."""
+    """Automation receives complete remediation and no partial project state.
+
+    Args:
+        tmp_path: Temporary root without model configuration.
+    """
     source = _otlp_export(tmp_path)
     root = tmp_path / ".wmo"
 
@@ -329,7 +365,11 @@ def test_missing_config_noninteractive_fails_before_project_write(tmp_path: Path
 
 
 def test_missing_config_is_reported_before_a_missing_trace_path(tmp_path: Path) -> None:
-    """First build handles required setup before inspecting trace-file contents."""
+    """First build handles required setup before inspecting trace-file contents.
+
+    Args:
+        tmp_path: Temporary root without configuration or trace input.
+    """
     root = tmp_path / ".wmo"
 
     result = _RUNNER.invoke(
@@ -355,7 +395,12 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A real terminal enters setup first and preserves valid catalog state after trace failure."""
+    """A real terminal enters setup first and preserves valid catalog state after trace failure.
+
+    Args:
+        monkeypatch: Pytest patch fixture simulating terminal setup.
+        tmp_path: Temporary root receiving the configured catalog.
+    """
     root = tmp_path / ".wmo"
     configured: list[Path] = []
     catalog = ModelCatalog(
@@ -382,7 +427,14 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
     monkeypatch.setattr("wmo.cli.build_cmd.can_prompt", lambda _console: True)
 
     def configure(path: Path, *_args: object, **_kwargs: object) -> ModelCatalog:
-        """Persist the fixture catalog as the simulated interactive setup result."""
+        """Persist the fixture catalog as the simulated interactive setup result.
+
+        Args:
+            path: Local WMO root receiving the shared catalog.
+
+        Returns:
+            Complete fixture catalog returned by simulated setup.
+        """
         configured.append(path)
         path.mkdir(parents=True, exist_ok=True)
         write_model_catalog(path / "models.toml", catalog)
@@ -403,7 +455,11 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
 
 
 def test_build_rejects_old_project_option_shape(tmp_path: Path) -> None:
-    """The command has exactly PROJECT then TRACES as its positional happy path."""
+    """The command has exactly PROJECT then TRACES as its positional happy path.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
     source = _otlp_export(tmp_path)
     result = _RUNNER.invoke(app, ["build", str(source), "--project", "support"])
 
@@ -412,7 +468,10 @@ def test_build_rejects_old_project_option_shape(tmp_path: Path) -> None:
 
 
 def test_build_help_describes_the_completed_grounded_artifact() -> None:
-    """CLI guidance names the reusable output of the build happy path."""
+    """CLI guidance names the reusable output of the build happy path.
+
+    The regression asserts the public help without constructing project state.
+    """
     result = _RUNNER.invoke(app, ["build", "--help"])
 
     assert result.exit_code == 0, result.output

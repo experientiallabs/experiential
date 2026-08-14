@@ -401,7 +401,10 @@ def test_catalog_resolution_failure_is_normalized_to_integrity_error() -> None:
 
 
 def test_embedder_candidate_alias_overlap_requires_the_same_frozen_identity() -> None:
-    """An embedder alias cannot hide a differently pinned routed-candidate snapshot."""
+    """An embedder alias cannot hide a differently pinned routed-candidate snapshot.
+
+    The regression rejects activation before the runtime can dispatch any provider call.
+    """
     policy, manifest, bank, snapshots, client = _fixture()
     different = policy.model_copy(
         update={

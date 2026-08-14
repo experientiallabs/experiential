@@ -599,7 +599,15 @@ def _capture_local_build_telemetry(
 
 
 def _rag_transition_count(store: ProjectStore, artifact_id: str) -> int:
-    """Read the completed RAG transition count for telemetry only."""
+    """Read the completed RAG transition count for telemetry only.
+
+    Args:
+        store: Project store containing the immutable index.
+        artifact_id: Exact RAG artifact identifier.
+
+    Returns:
+        Count of persisted real transitions.
+    """
     return load_rag_index(store.artifacts, artifact_id).index.transition_count
 
 
