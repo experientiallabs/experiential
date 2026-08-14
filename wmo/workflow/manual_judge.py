@@ -35,11 +35,19 @@ from wmo.runtime.models.providers.retry import RetryPolicy
 from wmo.runtime.models.registry import RuntimeModelCatalog
 from wmo.simulation.build import BuildReviewReadiness
 from wmo.workflow.manual_judge_artifacts import (
+    coordinate_manual_judge_calibration,
+    coordinate_manual_judge_setup,
     find_provisional_calibration,
     replay_or_approve,
     write_audit,
     write_production_rollout,
     write_review_state,
+)
+from wmo.workflow.manual_judge_artifacts import (
+    load_build_review as _load_build_review,
+)
+from wmo.workflow.manual_judge_artifacts import (
+    require_exact_build_inputs as _require_exact_build_inputs,
 )
 from wmo.workflow.manual_judge_contracts import (
     JudgeCalibrationBudget,
@@ -220,6 +228,7 @@ def prepare_manual_judge_setup(
     )
 
 
+@coordinate_manual_judge_setup
 def commit_manual_judge_setup(
     store: ProjectStore,
     plan: ManualJudgeSetupPlan,
@@ -407,6 +416,7 @@ def estimate_manual_judge_budget(
     )
 
 
+@coordinate_manual_judge_calibration
 def calibrate_manual_judge(
     store: ProjectStore,
     runtime_catalog: RuntimeModelCatalog,
@@ -606,46 +616,6 @@ def calibrate_manual_judge(
         approved_at=created_at,
         provider_calls_made=provider_calls,
     )
-
-
-def _load_build_review(store: ProjectStore) -> BuildReviewReadiness:
-    """Load the exact completed-build handoff from mutable review state.
-
-    Args:
-        store: Project-local review store.
-
-    Returns:
-        Validated completed-build readiness.
-
-    Raises:
-        ManualJudgeError: The build handoff is absent or malformed.
-    """
-    review = store.read_review()
-    if not isinstance(review, dict) or "build_review" not in review:
-        raise ManualJudgeError("project has no completed build; run wmo build first")
-    try:
-        return BuildReviewReadiness.model_validate(review["build_review"])
-    except ValueError as exc:
-        raise ManualJudgeError("project build review is invalid") from exc
-
-
-def _require_exact_build_inputs(store: ProjectStore, build: BuildReviewReadiness) -> None:
-    """Verify build trace and task manifests before preview or persistence.
-
-    Args:
-        store: Project-local immutable artifact store.
-        build: Build handoff naming exact trace and task inputs.
-
-    Raises:
-        ManualJudgeError: Either manifest changed or the task set is not trace-bound.
-    """
-    trace_input = artifact_input(store.artifacts.read(build.trace_dataset.artifact_id).manifest)
-    task_input = artifact_input(store.artifacts.read(build.task_set.artifact_id).manifest)
-    if trace_input != build.trace_dataset or task_input != build.task_set:
-        raise ManualJudgeError("completed build artifact manifest changed")
-    task_set = load_task_set(store.artifacts, build.task_set.artifact_id).task_set
-    if task_set.inputs != (trace_input,):
-        raise ManualJudgeError("completed task set does not bind the exact trace dataset")
 
 
 def _write_setup(store: ProjectStore, setup: ManualJudgeSetupArtifact) -> ArtifactInput:

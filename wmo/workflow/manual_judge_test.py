@@ -7,12 +7,20 @@ import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event, Thread
 from typing import Literal, cast
 
 import pytest
 
+import wmo.simulation.build as simulation_build
 import wmo.workflow.manual_judge as manual_judge_workflow
-from wmo.common.core.artifacts import JsonObject, SourceIdentity, sha256_json
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    JsonObject,
+    SourceIdentity,
+    sha256_json,
+    stable_id,
+)
 from wmo.common.judging import PromptDefinition
 from wmo.common.judging.judgment import Judgment
 from wmo.common.models import (
@@ -27,10 +35,10 @@ from wmo.common.models import (
     ModelSnapshot,
     OperationEconomics,
 )
-from wmo.common.project import ProjectConfig, ProjectStore
+from wmo.common.project import ProjectBuildArtifacts, ProjectConfig, ProjectStore, artifact_input
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.runtime.models.registry import ResolvedModel, RuntimeModelCatalog
-from wmo.simulation.build import build_project
+from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.mining.service import MiningSpec
 from wmo.workflow.manual_judge import (
@@ -275,6 +283,83 @@ def _unique_task_trace(index: int) -> Trace:
     return _trace(index).model_copy(update={"task": f"Handle unique request {suffix}"})
 
 
+def _persist_grounded_build(
+    store: ProjectStore,
+    built: ProjectBuild,
+    *,
+    select: bool,
+) -> ProjectBuildArtifacts:
+    """Persist a complete immutable graph and optionally select it for judge mutations.
+
+    Args:
+        store: Initialized project receiving the grounded graph.
+        built: Deterministic trace and task build awaiting grounded artifacts.
+        select: Whether to bind the graph and advance its build review immediately.
+
+    Returns:
+        Complete grounded artifact pointers, selected when requested.
+    """
+    trace_input = artifact_input(built.artifacts.trace_dataset.manifest)
+    created_at = built.artifacts.trace_dataset.dataset.created_at
+    revision = built.review.code_revision
+    serving_id = stable_id(
+        "test-serving-rag",
+        {"trace_dataset": trace_input.model_dump(mode="json")},
+    )
+    serving_manifest = store.artifacts.write_json(
+        artifact_id=serving_id,
+        artifact_type="trace-rag-index",
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=created_at,
+            inputs=(trace_input,),
+            code_revision=revision,
+        ),
+        files={"fixture.json": {"partition": "serving"}},
+    )
+    fit_id = stable_id(
+        "test-fit-rag",
+        {"trace_dataset": trace_input.model_dump(mode="json")},
+    )
+    fit_manifest = store.artifacts.write_json(
+        artifact_id=fit_id,
+        artifact_type="trace-rag-index",
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=created_at,
+            inputs=(trace_input,),
+            code_revision=revision,
+        ),
+        files={"fixture.json": {"partition": "fit"}},
+    )
+    serving_input = artifact_input(serving_manifest)
+    world_id = stable_id(
+        "test-grounded-world-model",
+        {"serving_rag": serving_input.model_dump(mode="json")},
+    )
+    world_manifest = store.artifacts.write_json(
+        artifact_id=world_id,
+        artifact_type="grounded-world-model",
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=created_at,
+            inputs=(serving_input,),
+            code_revision=revision,
+        ),
+        files={"fixture.json": {"model_alias": "judge-main"}},
+    )
+    completed = ProjectBuildArtifacts(
+        trace_dataset=trace_input,
+        task_set=built.review.task_set,
+        serving_rag=serving_input,
+        fit_rag=artifact_input(fit_manifest),
+        world_model=artifact_input(world_manifest),
+    )
+    if select:
+        select_completed_build(store, completed, built.review)
+    return completed
+
+
 def _built_store(tmp_path: Path) -> ProjectStore:
     """Create a completed build with three fit lineages and one held-out lineage.
 
@@ -286,13 +371,14 @@ def _built_store(tmp_path: Path) -> ProjectStore:
     """
     store = ProjectStore(tmp_path / ".wmo", "support")
     store.initialize(ProjectConfig(project_id="support"))
-    build_project(
+    built = build_project(
         TraceNormalizationResult(traces=tuple(_trace(index) for index in range(100)), issues=()),
         store,
         created_at=_TIME,
         code_revision="test-revision",
         mining_spec=MiningSpec(fit_task_budget=3, held_out_task_budget=1),
     )
+    _persist_grounded_build(store, built, select=True)
     return store
 
 
@@ -307,7 +393,7 @@ def _unpaired_trace_store(tmp_path: Path) -> ProjectStore:
     """
     store = ProjectStore(tmp_path / ".wmo", "support")
     store.initialize(ProjectConfig(project_id="support"))
-    build_project(
+    built = build_project(
         TraceNormalizationResult(
             traces=tuple(_unique_task_trace(index) for index in range(100)), issues=()
         ),
@@ -320,6 +406,7 @@ def _unpaired_trace_store(tmp_path: Path) -> ProjectStore:
             semantic_duplicate_threshold=1.0,
         ),
     )
+    _persist_grounded_build(store, built, select=True)
     return store
 
 
@@ -418,6 +505,134 @@ def test_setup_failure_is_read_only_and_setup_never_calls_a_model(tmp_path: Path
         commit_manual_judge_setup(store, plan, confirmed=False)
     assert store.read_review() == before_review
     assert store.artifacts.list_ids() == before_artifacts
+
+
+def test_build_replacement_crash_blocks_stale_judge_commit_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale judge setup cannot cross an interrupted replacement selection.
+
+    Args:
+        tmp_path: Isolated project and immutable artifact root.
+        monkeypatch: Patch fixture controlling the bind-to-review interruption.
+    """
+    store = _built_store(tmp_path)
+    selected_a = store.load_project().build
+    assert selected_a is not None
+    old_manifests = {
+        pointer.artifact_id: store.artifacts.read(pointer.artifact_id).manifest
+        for pointer in (
+            selected_a.trace_dataset,
+            selected_a.task_set,
+            selected_a.serving_rag,
+            selected_a.fit_rag,
+            selected_a.world_model,
+        )
+    }
+    stale_plan = prepare_manual_judge_setup(
+        store,
+        _catalog(),
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+    selected_setup = commit_manual_judge_setup(store, stale_plan, confirmed=True)
+    selected_review = store.read_review()
+    assert isinstance(selected_review, dict)
+    assert selected_review["manual_judge"]["setup"]["artifact_id"] == selected_setup.setup_id
+    assert "rubric_review" in selected_review
+    replacement = build_project(
+        TraceNormalizationResult(traces=tuple(_trace(index) for index in range(100)), issues=()),
+        store,
+        created_at=_TIME + timedelta(seconds=1),
+        code_revision="replacement-revision",
+        mining_spec=MiningSpec(fit_task_budget=3, held_out_task_budget=1),
+    )
+    completed_b = _persist_grounded_build(store, replacement, select=False)
+    selection_paused = Event()
+    release_selection = Event()
+    judge_started = Event()
+    builder_errors: list[BaseException] = []
+    judge_errors: list[BaseException] = []
+    original_select_review = simulation_build.select_build_review
+
+    def interrupt_after_bind(*_args: object, **_kwargs: object) -> None:
+        """Pause after selecting graph B, then simulate interruption before review B.
+
+        Raises:
+            RuntimeError: Always after the test releases the paused selection.
+        """
+        selection_paused.set()
+        assert release_selection.wait(timeout=5)
+        raise RuntimeError("injected interruption after completed-build selection")
+
+    def run_builder() -> None:
+        """Capture the expected interrupted replacement result."""
+        try:
+            select_completed_build(store, completed_b, replacement.review)
+        except BaseException as exc:  # noqa: BLE001 - thread must report every terminal result
+            builder_errors.append(exc)
+
+    def run_stale_judge() -> None:
+        """Capture the stale judge commit result without terminating the test process."""
+        judge_started.set()
+        try:
+            commit_manual_judge_setup(store, stale_plan, confirmed=True)
+        except BaseException as exc:  # noqa: BLE001 - thread must report every terminal result
+            judge_errors.append(exc)
+
+    monkeypatch.setattr(simulation_build, "select_build_review", interrupt_after_bind)
+    builder = Thread(target=run_builder, daemon=True)
+    builder.start()
+    assert selection_paused.wait(timeout=5)
+    assert store.load_project().build == completed_b
+    stale_review = store.read_review()
+    assert isinstance(stale_review, dict)
+    assert stale_review["build_review"]["readiness_id"] == stale_plan.build.readiness_id
+
+    judge = Thread(target=run_stale_judge, daemon=True)
+    judge.start()
+    assert judge_started.wait(timeout=5)
+    judge.join(timeout=0.1)
+    assert judge.is_alive()
+    release_selection.set()
+    builder.join(timeout=5)
+    judge.join(timeout=5)
+    assert not builder.is_alive()
+    assert not judge.is_alive()
+    assert len(builder_errors) == 1
+    assert "injected interruption" in str(builder_errors[0])
+    assert len(judge_errors) == 1
+    assert isinstance(judge_errors[0], ManualJudgeError)
+    assert "not synchronized" in str(judge_errors[0])
+    assert store.load_project().build == completed_b
+    assert store.read_review() == stale_review
+
+    monkeypatch.setattr(simulation_build, "select_build_review", original_select_review)
+    select_completed_build(store, completed_b, replacement.review)
+    recovered_review = store.read_review()
+    assert isinstance(recovered_review, dict)
+    assert recovered_review["build_review"]["readiness_id"] == replacement.review.readiness_id
+    for stale_key in (
+        "manual_judge",
+        "rubric_review",
+        "human_score_history",
+        "human_score_submissions",
+    ):
+        assert stale_key not in recovered_review
+    for artifact_id, manifest in old_manifests.items():
+        assert store.artifacts.read(artifact_id).manifest == manifest
+
+    current_plan = prepare_manual_judge_setup(
+        store,
+        _catalog(),
+        created_at=_TIME + timedelta(seconds=2),
+        code_revision="replacement-revision",
+    )
+    current_setup = commit_manual_judge_setup(store, current_plan, confirmed=True)
+    final_review = store.read_review()
+    assert isinstance(final_review, dict)
+    assert final_review["manual_judge"]["setup"]["artifact_id"] == current_setup.setup_id
 
 
 def test_calibration_refuses_before_resolution_write_or_model_call(tmp_path: Path) -> None:

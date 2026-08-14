@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
-from typing import TYPE_CHECKING
+from functools import wraps
+from typing import Concatenate, Protocol
 
 from pydantic import JsonValue
 
 from wmo.common.core.artifacts import ArtifactInput, JsonObject, stable_id
+from wmo.common.core.locks import FileLockTimeout
 from wmo.common.judging import (
     CalibrationReport,
     JudgeCalibration,
@@ -15,11 +20,18 @@ from wmo.common.judging import (
 )
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.models import AssistantAction, OperationEconomics, Usage
-from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
+from wmo.common.project import (
+    ArtifactAlreadyExistsError,
+    ArtifactStoreError,
+    ProjectStore,
+    ProjectStoreError,
+    artifact_input,
+)
 from wmo.common.rollouts import RolloutArtifact, SimulationMode, StopReason
 from wmo.common.rollouts.otel import ProductionSimulatorSnapshot, RolloutEventKind, RolloutSpan
-from wmo.common.tasks import TaskCase
+from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, TraceSpan
+from wmo.simulation.build import BuildReviewReadiness, coordinate_selected_build_review
 from wmo.workflow.manual_judge_contracts import (
     JudgeCalibrationBudget,
     JudgeRunEvidence,
@@ -30,8 +42,198 @@ from wmo.workflow.manual_judge_contracts import (
     ManualJudgeSetupArtifact,
 )
 
-if TYPE_CHECKING:
-    pass
+
+class _BuildEvidence(Protocol):
+    """Structural trace and task binding required by coordinated judge plans."""
+
+    @property
+    def trace_dataset(self) -> ArtifactInput:
+        """Return the exact trace dataset pointer."""
+        ...
+
+    @property
+    def task_set(self) -> ArtifactInput:
+        """Return the exact task-set pointer."""
+        ...
+
+
+class _SetupMutationPlan(Protocol):
+    """Structural setup plan exposing its completed-build evidence."""
+
+    @property
+    def build(self) -> _BuildEvidence:
+        """Return the reviewed completed-build binding."""
+        ...
+
+
+class _CalibrationMutationPlan(Protocol):
+    """Structural calibration plan exposing its finalized setup evidence."""
+
+    @property
+    def setup(self) -> _BuildEvidence:
+        """Return the finalized setup build binding."""
+        ...
+
+
+_ACTIVE_BUILD_BINDING: ContextVar[tuple[str, ArtifactInput, ArtifactInput] | None] = ContextVar(
+    "manual_judge_active_build_binding",
+    default=None,
+)
+
+
+def coordinate_manual_judge_setup[SetupPlanT: _SetupMutationPlan, **P, R](
+    operation: Callable[Concatenate[ProjectStore, SetupPlanT, P], R],
+) -> Callable[Concatenate[ProjectStore, SetupPlanT, P], R]:
+    """Wrap a setup mutation in the plan's stable selected-build transaction.
+
+    Args:
+        operation: Setup mutation whose first arguments are the project store and setup plan.
+
+    Returns:
+        Signature-preserving operation serialized with completed-build replacement.
+    """
+
+    @wraps(operation)
+    def coordinated(
+        store: ProjectStore,
+        plan: SetupPlanT,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R:
+        """Run the setup mutation against one stable selected build."""
+        with coordinate_manual_judge_review(
+            store,
+            trace_dataset=plan.build.trace_dataset,
+            task_set=plan.build.task_set,
+        ):
+            return operation(store, plan, *args, **kwargs)
+
+    return coordinated
+
+
+def coordinate_manual_judge_calibration[
+    CatalogT,
+    CalibrationPlanT: _CalibrationMutationPlan,
+    **P,
+    R,
+](
+    operation: Callable[
+        Concatenate[ProjectStore, CatalogT, CalibrationPlanT, P],
+        R,
+    ],
+) -> Callable[Concatenate[ProjectStore, CatalogT, CalibrationPlanT, P], R]:
+    """Wrap calibration in the finalized setup's stable selected-build transaction.
+
+    Args:
+        operation: Calibration mutation beginning with store, runtime catalog, and plan.
+
+    Returns:
+        Signature-preserving operation serialized with completed-build replacement.
+    """
+
+    @wraps(operation)
+    def coordinated(
+        store: ProjectStore,
+        catalog: CatalogT,
+        plan: CalibrationPlanT,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R:
+        """Run calibration against one stable selected build."""
+        with coordinate_manual_judge_review(
+            store,
+            trace_dataset=plan.setup.trace_dataset,
+            task_set=plan.setup.task_set,
+        ):
+            return operation(store, catalog, plan, *args, **kwargs)
+
+    return coordinated
+
+
+@contextmanager
+def coordinate_manual_judge_review(
+    store: ProjectStore,
+    *,
+    trace_dataset: ArtifactInput,
+    task_set: ArtifactInput,
+) -> Iterator[None]:
+    """Keep one manual-judge operation bound to a stable selected build.
+
+    Nested review-state writes reuse the outer operation lock only when they name the same exact
+    trace and task inputs. Independent operations contend through the project-local build-review
+    coordination lock.
+
+    Args:
+        store: Project whose selected build supplies the judge evidence.
+        trace_dataset: Exact trace artifact consumed by the judge operation.
+        task_set: Exact task artifact consumed by the judge operation.
+
+    Yields:
+        None while completed-build replacement is excluded.
+
+    Raises:
+        ManualJudgeError: The nested or selected build binding differs from the requested inputs.
+    """
+    requested = (str(store.paths.project_directory.absolute()), trace_dataset, task_set)
+    active = _ACTIVE_BUILD_BINDING.get()
+    if active is not None:
+        if active != requested:
+            raise ManualJudgeError("nested manual judge state names a different project or build")
+        yield
+        return
+    try:
+        with coordinate_selected_build_review(
+            store,
+            trace_dataset=trace_dataset,
+            task_set=task_set,
+        ):
+            token = _ACTIVE_BUILD_BINDING.set(requested)
+            try:
+                yield
+            finally:
+                _ACTIVE_BUILD_BINDING.reset(token)
+    except (ArtifactStoreError, FileLockTimeout, ProjectStoreError, ValueError) as exc:
+        raise ManualJudgeError(str(exc)) from exc
+
+
+def load_build_review(store: ProjectStore) -> BuildReviewReadiness:
+    """Load the exact completed-build handoff from mutable review state.
+
+    Args:
+        store: Project-local review store.
+
+    Returns:
+        Validated completed-build readiness.
+
+    Raises:
+        ManualJudgeError: The build handoff is absent or malformed.
+    """
+    review = store.read_review()
+    if not isinstance(review, dict) or "build_review" not in review:
+        raise ManualJudgeError("project has no completed build; run wmo build first")
+    try:
+        return BuildReviewReadiness.model_validate(review["build_review"])
+    except ValueError as exc:
+        raise ManualJudgeError("project build review is invalid") from exc
+
+
+def require_exact_build_inputs(store: ProjectStore, build: BuildReviewReadiness) -> None:
+    """Verify build trace and task manifests before preview or persistence.
+
+    Args:
+        store: Project-local immutable artifact store.
+        build: Build handoff naming exact trace and task inputs.
+
+    Raises:
+        ManualJudgeError: Either manifest changed or the task set is not trace-bound.
+    """
+    trace_input = artifact_input(store.artifacts.read(build.trace_dataset.artifact_id).manifest)
+    task_input = artifact_input(store.artifacts.read(build.task_set.artifact_id).manifest)
+    if trace_input != build.trace_dataset or task_input != build.task_set:
+        raise ManualJudgeError("completed build artifact manifest changed")
+    task_set = load_task_set(store.artifacts, build.task_set.artifact_id).task_set
+    if task_set.inputs != (trace_input,):
+        raise ManualJudgeError("completed task set does not bind the exact trace dataset")
 
 
 def rollout_id(task: TaskCase, trace: Trace) -> str:
@@ -55,15 +257,27 @@ def rollout_id(task: TaskCase, trace: Trace) -> str:
 
 
 def write_review_state(store: ProjectStore, state: ManualJudgeReviewState) -> None:
-    """Update only the manual judge namespace under the project review lock.
+    """Update manual judge state only while its selected build remains current.
 
     Args:
         store: Project-local review store.
         state: Complete replacement manual judge state.
 
     Raises:
-        ManualJudgeError: Existing review state is not an object.
+        ManualJudgeError: Setup provenance, selected build, or review state is invalid.
     """
+    try:
+        setup, setup_input = read_artifact_json(
+            store,
+            artifact_id=state.setup.artifact_id,
+            expected_artifact_type="manual-judge-setup",
+            relative_path="setup.json",
+            model_type=ManualJudgeSetupArtifact,
+        )
+    except JudgingProvenanceError as exc:
+        raise ManualJudgeError("manual judge setup is unavailable for review update") from exc
+    if setup_input != state.setup:
+        raise ManualJudgeError("manual judge setup manifest differs from review state")
 
     def update(current: JsonValue | None) -> JsonObject:
         """Preserve unrelated review namespaces while replacing manual judge state.
@@ -86,7 +300,12 @@ def write_review_state(store: ProjectStore, state: ManualJudgeReviewState) -> No
         root["manual_judge"] = state.model_dump(mode="json")
         return root
 
-    store.update_review(update)
+    with coordinate_manual_judge_review(
+        store,
+        trace_dataset=setup.trace_dataset,
+        task_set=setup.task_set,
+    ):
+        store.update_review(update)
 
 
 def find_provisional_calibration(

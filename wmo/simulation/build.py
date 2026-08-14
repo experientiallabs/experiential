@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -239,10 +241,59 @@ def select_completed_build(
     """
     if build.trace_dataset != review.trace_dataset or build.task_set != review.task_set:
         raise ValueError("completed build does not match proposed build review")
-    coordination_path = store.paths.project_directory / "completed-build-selection"
-    with file_write_lock(coordination_path, what="completed build selection"):
+    with _build_review_coordination(store):
         store.bind_completed_build(build)
         select_build_review(store, review)
+
+
+@contextmanager
+def coordinate_selected_build_review(
+    store: ProjectStore,
+    *,
+    trace_dataset: ArtifactInput,
+    task_set: ArtifactInput,
+) -> Iterator[BuildReviewReadiness]:
+    """Hold the build-review transaction while a dependent review mutation completes.
+
+    Args:
+        store: Project store whose selected build and review state must remain aligned.
+        trace_dataset: Exact trace artifact required by the dependent mutation.
+        task_set: Exact task artifact required by the dependent mutation.
+
+    Yields:
+        The verified selected-build readiness while replacement selection is excluded.
+
+    Raises:
+        ValueError: Review state is absent, malformed, stale, or names different evidence.
+    """
+    with _build_review_coordination(store):
+        current = store.read_review()
+        if not isinstance(current, dict) or "build_review" not in current:
+            raise ValueError("project has no completed build review")
+        try:
+            review = BuildReviewReadiness.model_validate(current["build_review"])
+        except ValueError as exc:
+            raise ValueError("project build review is invalid") from exc
+        if review.trace_dataset != trace_dataset or review.task_set != task_set:
+            raise ValueError("manual judge evidence differs from the selected build review")
+        if not _completed_build_matches_review(store, review):
+            raise ValueError("selected completed build and review state are not synchronized")
+        yield review
+
+
+@contextmanager
+def _build_review_coordination(store: ProjectStore) -> Iterator[None]:
+    """Serialize completed-build selection with dependent mutable review transactions.
+
+    Args:
+        store: Project store whose build and review state share the coordination boundary.
+
+    Yields:
+        None while the project-local cross-process lock is held.
+    """
+    coordination_path = store.paths.project_directory / "completed-build-selection"
+    with file_write_lock(coordination_path, what="completed build and review state"):
+        yield
 
 
 def select_build_review(store: ProjectStore, review: BuildReviewReadiness) -> None:
@@ -262,15 +313,32 @@ def select_build_review(store: ProjectStore, review: BuildReviewReadiness) -> No
         raise ValueError("selected completed build does not match proposed build review")
 
     def update(current: JsonValue | None) -> JsonObject:
-        """Replace only the build-review member while preserving unrelated review state.
+        """Advance build review and discard judge state bound to replaced evidence.
 
         Args:
             current: Current complete review JSON value.
 
         Returns:
-            Updated object with the selected build-review handoff.
+            Updated object with the selected build-review handoff and compatible judge state.
         """
         root_review = _review_object(current)
+        prior_value = root_review.get("build_review")
+        try:
+            prior = (
+                BuildReviewReadiness.model_validate(prior_value)
+                if prior_value is not None
+                else None
+            )
+        except ValueError as exc:
+            raise ValueError("review.json contains invalid build readiness") from exc
+        if prior != review:
+            for key in (
+                "manual_judge",
+                "rubric_review",
+                "human_score_history",
+                "human_score_submissions",
+            ):
+                root_review.pop(key, None)
         root_review["build_review"] = review.model_dump(mode="json")
         return root_review
 
