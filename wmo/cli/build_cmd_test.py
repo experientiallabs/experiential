@@ -26,7 +26,7 @@ from wmo.common.models import (
     ModelSnapshot,
     write_model_catalog,
 )
-from wmo.common.project import ProjectStore
+from wmo.common.project import ProjectStore, ProjectStoreError
 from wmo.runtime.models import ResolvedModel
 from wmo.simulation.retrieval import load_rag_index
 from wmo.simulation.world_model import GroundedWorldModelArtifact
@@ -194,6 +194,7 @@ def _fake_runtime_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """One real trace is enough to complete the named project happy path."""
@@ -221,6 +222,24 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     )
     assert world.serving_rag == config.build.serving_rag
     assert world.model_alias == "world"
+
+    def forbid_rebuild(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("exact replay must not rebuild provider-backed RAG artifacts")
+
+    monkeypatch.setattr("wmo.cli.build_cmd._build_grounded_artifacts", forbid_rebuild)
+    replay = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+    assert replay.exit_code == 0, replay.output
+    assert "embedding spend ceiling: $0.000000" in replay.output
+
+    swapped = config.build.model_copy(
+        update={
+            "serving_rag": config.build.fit_rag,
+            "fit_rag": config.build.serving_rag,
+        }
+    )
+    with pytest.raises(ProjectStoreError, match="completed build graph"):
+        store.bind_completed_build(swapped)
+    assert store.load_project().build == config.build
 
 
 @pytest.mark.parametrize("count", [2, 100, 1_001])

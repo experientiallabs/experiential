@@ -464,7 +464,7 @@ class RouterRuntime:
                 expected is None
                 or resolved.alias != alias
                 or resolved.snapshot != expected
-                or sha256_json(resolved.capabilities) != expected.capabilities_sha256
+                or resolved.capabilities.identity_sha256() != expected.capabilities_sha256
             ):
                 raise RouterRuntimeIntegrityError(
                     f"resolved runtime alias {alias!r} differs from its frozen identity"

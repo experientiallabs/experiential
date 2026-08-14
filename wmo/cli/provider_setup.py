@@ -474,10 +474,12 @@ def provider_setup_json_examples() -> tuple[str, str]:
     )
     model = json.dumps(
         {
-            "alias": "world",
+            "alias": "model",
             "connection": "openai",
             "model": "your-model-id",
+            "supports_embeddings": True,
             "supports_structured_output": True,
+            "input_cost_per_million_tokens_usd": 0,
         },
         separators=(",", ":"),
     )

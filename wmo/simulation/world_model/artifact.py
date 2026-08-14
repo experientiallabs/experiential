@@ -45,6 +45,28 @@ def grounded_world_model_prompt_sha256() -> str:
     )
 
 
+def grounded_world_model_content(
+    *,
+    serving_rag: ArtifactInput,
+    model_alias: str,
+    model: ModelSnapshot,
+    prompt_version: str,
+    prompt_sha256: str,
+    top_k: int,
+    code_revision: str,
+) -> dict[str, object]:
+    """Return the complete content-addressed identity of a grounded world model."""
+    return {
+        "serving_rag": serving_rag.model_dump(mode="json"),
+        "model_alias": model_alias,
+        "model": model.model_dump(mode="json"),
+        "prompt_version": prompt_version,
+        "prompt_sha256": prompt_sha256,
+        "top_k": top_k,
+        "code_revision": code_revision,
+    }
+
+
 class GroundedWorldModelArtifact(ArtifactEnvelope):
     """Executable text world model bound to one immutable serving RAG snapshot."""
 
@@ -101,15 +123,15 @@ def persist_grounded_world_model(
     loaded = load_rag_index(store, serving_rag.artifact_id)
     if artifact_input(loaded.manifest) != serving_rag:
         raise ValueError("serving RAG manifest differs from the supplied artifact input")
-    content = {
-        "serving_rag": serving_rag.model_dump(mode="json"),
-        "model_alias": model_alias,
-        "model": model.model_dump(mode="json"),
-        "prompt_version": GROUNDED_WORLD_MODEL_PROMPT_VERSION,
-        "prompt_sha256": grounded_world_model_prompt_sha256(),
-        "top_k": top_k,
-        "code_revision": code_revision,
-    }
+    content = grounded_world_model_content(
+        serving_rag=serving_rag,
+        model_alias=model_alias,
+        model=model,
+        prompt_version=GROUNDED_WORLD_MODEL_PROMPT_VERSION,
+        prompt_sha256=grounded_world_model_prompt_sha256(),
+        top_k=top_k,
+        code_revision=code_revision,
+    )
     artifact = GroundedWorldModelArtifact(
         schema_version=1,
         created_at=created_at,

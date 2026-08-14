@@ -9,7 +9,9 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from wmo.common.core.artifacts import SourceIdentity, sha256_json
+import pytest
+
+from wmo.common.core.artifacts import SourceIdentity, canonical_json_bytes, sha256_json
 from wmo.common.models import (
     AssistantAction,
     Embedding,
@@ -29,6 +31,10 @@ from wmo.simulation.retrieval import (
     persist_trace_rag,
 )
 from wmo.simulation.world_model import load_grounded_world_model, persist_grounded_world_model
+from wmo.simulation.world_model.artifact import (
+    GROUNDED_WORLD_MODEL_ARTIFACT_TYPE,
+    WORLD_MODEL_ARTIFACT_PATH,
+)
 
 
 class _Embedder:
@@ -148,6 +154,21 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
     unchanged = load_rag_index(store.artifacts, rag.index.rag_id)
     assert unchanged.transitions == rag.transitions
     assert unchanged.vectors == rag.vectors
+
+    inconsistent = artifact.artifact.model_copy(update={"world_model_id": "inconsistent-world"})
+    store.artifacts.write(
+        artifact_id=inconsistent.world_model_id,
+        artifact_type=GROUNDED_WORLD_MODEL_ARTIFACT_TYPE,
+        envelope=inconsistent,
+        files={WORLD_MODEL_ARTIFACT_PATH: canonical_json_bytes(inconsistent)},
+    )
+    with pytest.raises(ValueError, match="complete content"):
+        load_grounded_world_model(
+            store.artifacts,
+            inconsistent.world_model_id,
+            client=client,
+            embedder=binding,
+        )
 
 
 def _trace(created_at: datetime) -> Trace:

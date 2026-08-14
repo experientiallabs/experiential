@@ -425,7 +425,7 @@ def test_embedder_candidate_alias_overlap_requires_the_same_frozen_identity() ->
 
     embedding_capabilities = ModelCapabilities(supports_tools=True, supports_embeddings=True)
     overlapping_snapshot = snapshots["baseline"].model_copy(
-        update={"capabilities_sha256": sha256_json(embedding_capabilities)}
+        update={"capabilities_sha256": embedding_capabilities.identity_sha256()}
     )
     overlapping_candidates = tuple(
         candidate.model_copy(update={"model": overlapping_snapshot})
@@ -731,7 +731,7 @@ def _snapshot(alias: str, *, candidate_tools: bool = True) -> ModelSnapshot:
         provider="test",
         model_id=alias,
         revision="fixture",
-        capabilities_sha256=sha256_json(capabilities),
+        capabilities_sha256=capabilities.identity_sha256(),
         connection_sha256="b" * 64,
     )
 

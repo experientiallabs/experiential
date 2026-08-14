@@ -67,7 +67,7 @@ def persist_trace_rag(
     default_top_k: int = 5,
     included_partitions: frozenset[Literal["fit", "held_out"]] = frozenset({"fit"}),
 ) -> PersistedRAGIndex:
-    """Build a read-only fit-side index from any positive number of real imported traces.
+    """Build a read-only index from selected partitions of real imported traces.
 
     Trace count is not a product restriction. Roughly 100 to 1,000 traces is a useful common
     starting range, but one trace and corpora larger than 1,000 follow the same contract.
@@ -90,7 +90,7 @@ def persist_trace_rag(
 
     Raises:
         ValueError: A source is not verified real trace evidence, lineage is incomplete, no real
-            fit transition exists, or the embedder violates its contract.
+            included transition exists, or the embedder violates its contract.
     """
     if not source_inputs:
         raise ValueError("RAG construction needs at least one verified real trace source")
@@ -98,8 +98,8 @@ def persist_trace_rag(
         raise ValueError("RAG default top_k must be positive")
     sources, traces = _load_real_sources(store, source_inputs)
     invalid_partitions = included_partitions.difference({"fit", "held_out"})
-    if not included_partitions or invalid_partitions:
-        raise ValueError("RAG included_partitions must contain fit, held_out, or both")
+    if "fit" not in included_partitions or invalid_partitions:
+        raise ValueError("RAG included_partitions must contain fit and may also contain held_out")
     transitions = extract_real_transitions(
         traces,
         lineage_bindings,

@@ -56,7 +56,7 @@ class TraceRAGRetriever:
                 limit. An omitted limit uses the immutable index default.
 
         Returns:
-            Up to ``top_k`` fit-side real transitions. Equal scores use transition ID order.
+            Up to ``top_k`` eligible real transitions. Equal scores use transition ID order.
 
         Raises:
             ValueError: Query embedding dimensions differ from the frozen index.

@@ -88,7 +88,7 @@ def default_rag_embedder(
             provider="local",
             model_id=f"wmo-hashing-v1-{dimensions}",
             revision="1",
-            capabilities_sha256=sha256_json(capabilities),
+            capabilities_sha256=capabilities.identity_sha256(),
             connection_sha256=sha256_json(identity),
         ),
     )

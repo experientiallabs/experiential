@@ -49,7 +49,7 @@ class BuildReviewReadiness(ContractModel):
     project_config: ProjectConfig
     source: SourceIdentity
     mining_spec: MiningSpec
-    descriptor_embedder: str = Field(min_length=1, max_length=128)
+    descriptor_embedder: Literal["hashing-descriptor-v1"] = "hashing-descriptor-v1"
     descriptor_dimensions: int = Field(ge=8)
     code_revision: str = Field(min_length=1, max_length=256)
     paid_calls_made: Literal[0] = 0
@@ -156,6 +156,11 @@ def build_project(
     """
     resolved_spec = mining_spec or MiningSpec()
     resolved_embedder = embedder or HashingDescriptorEmbedder()
+    if not isinstance(resolved_embedder, HashingDescriptorEmbedder):
+        raise ValueError(
+            "the provider-free project build requires HashingDescriptorEmbedder; use "
+            "build_task_set for an explicitly configured external descriptor embedder"
+        )
     artifacts = build_task_set(
         normalized,
         store.artifacts,
@@ -172,7 +177,7 @@ def build_project(
     task_input = artifact_input(task_stored.manifest)
     if artifacts.task_set.inputs != (trace_input,):
         raise ValueError("loaded task set does not bind the exact trace dataset manifest")
-    project_config = store.load_project()
+    project_config = store.load_project().model_copy(update={"build": None})
     source = artifacts.trace_dataset.dataset.source
     if source is None:
         raise ValueError("completed trace dataset has no immutable source identity")

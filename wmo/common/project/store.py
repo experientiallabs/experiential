@@ -409,6 +409,7 @@ class ProjectStore:
         }
         with file_write_lock(self.paths.project_toml, what="completed project build"):
             try:
+                manifests: dict[str, ArtifactManifest] = {}
                 for field_name, artifact_type in expected_types.items():
                     pointer = getattr(build, field_name)
                     stored = self.artifacts.read(pointer.artifact_id)
@@ -419,6 +420,18 @@ class ProjectStore:
                         )
                     if artifact_input(stored.manifest) != pointer:
                         raise ValueError(f"{field_name} artifact manifest digest changed")
+                    manifests[field_name] = stored.manifest
+                expected_inputs = {
+                    "task_set": (build.trace_dataset,),
+                    "serving_rag": (build.trace_dataset,),
+                    "fit_rag": (build.trace_dataset,),
+                    "world_model": (build.serving_rag,),
+                }
+                for field_name, inputs in expected_inputs.items():
+                    if manifests[field_name].inputs != inputs:
+                        raise ValueError(
+                            f"{field_name} artifact does not bind the completed build graph"
+                        )
                 existing = load_project_config(self.paths.project_toml)
                 updated = existing.model_copy(update={"build": build})
                 write_project_config(self.paths.project_toml, updated)

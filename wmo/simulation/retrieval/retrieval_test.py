@@ -143,6 +143,28 @@ def test_held_out_lineages_never_enter_the_index(tmp_path: Path) -> None:
     assert {item.trace_id for item in result.transitions} == {traces[0].trace_id}
 
 
+def test_held_out_only_index_is_not_a_supported_fit_evidence_artifact(tmp_path: Path) -> None:
+    """Every retrieval artifact retains fit evidence when serving also includes held out."""
+    store = _store(tmp_path, "held-out-only")
+    source_input, traces = _persist_traces(store, count=1)
+
+    with pytest.raises(ValueError, match="must contain fit"):
+        persist_trace_rag(
+            store,
+            (source_input,),
+            (
+                RAGLineageBinding(
+                    trace_id=traces[0].trace_id,
+                    lineage_id="lineage-held-out",
+                    partition="held_out",
+                ),
+            ),
+            created_at=_CREATED_AT,
+            code_revision="revision-a",
+            included_partitions=frozenset({"held_out"}),
+        )
+
+
 def test_retrieve_filters_lineage_before_stable_tie_break_and_never_mutates(
     tmp_path: Path,
 ) -> None:

@@ -31,6 +31,7 @@ from wmo.common.project import (
     artifact_input,
 )
 from wmo.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models.providers.retry import RetryPolicy
 from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project
 from wmo.simulation.ingest.otlp import (
     OtlpTraceFormatError,
@@ -44,7 +45,8 @@ from wmo.simulation.retrieval import (
     load_rag_index,
     persist_trace_rag,
 )
-from wmo.simulation.world_model import persist_grounded_world_model
+from wmo.simulation.retrieval.transitions import extract_real_transitions
+from wmo.simulation.world_model import load_grounded_world_model, persist_grounded_world_model
 
 _console = Console()
 _CANONICAL_SOURCES = ("otlp", "posthog")
@@ -125,19 +127,6 @@ def build(
                 "no valid canonical traces were produced; inspect the input and provide at least "
                 "one valid OTLP or PostHog trace"
             )
-        estimate = _embedding_cost_ceiling(normalized, resolved_embedder)
-        if estimate > maximum_build_cost_usd:
-            raise ValueError(
-                f"conservative embedding estimate ${estimate:.6f} exceeds "
-                f"--max-build-cost-usd ${maximum_build_cost_usd:.6f}"
-            )
-        if estimate > 0 and not require_spend_consent(
-            _console,
-            yes=yes,
-            spend=f"at most ${estimate:.6f} for provider embeddings",
-            command=f"wmo build {project} {trace_file}",
-        ):
-            return
         store = _project_store(
             root,
             ProjectConfig(
@@ -154,13 +143,35 @@ def build(
             created_at=datetime.now(UTC),
             code_revision=_current_revision(),
         )
-        built = _build_grounded_artifacts(
+        built = _reuse_completed_grounded_artifacts(
             store,
             completed,
             resolved_world=resolved_world,
             resolved_embedder=resolved_embedder,
             top_k=top_k,
         )
+        estimate = 0.0
+        if built is None:
+            estimate = _embedding_cost_ceiling(completed, resolved_embedder)
+            if estimate > maximum_build_cost_usd:
+                raise ValueError(
+                    f"conservative embedding estimate ${estimate:.6f} exceeds "
+                    f"--max-build-cost-usd ${maximum_build_cost_usd:.6f}"
+                )
+            if estimate > 0 and not require_spend_consent(
+                _console,
+                yes=yes,
+                spend=f"at most ${estimate:.6f} for provider embeddings",
+                command=f"wmo build {project} {trace_file}",
+            ):
+                return
+            built = _build_grounded_artifacts(
+                store,
+                completed,
+                resolved_world=resolved_world,
+                resolved_embedder=resolved_embedder,
+                top_k=top_k,
+            )
         store.bind_completed_build(built)
     except (ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from None
@@ -196,7 +207,8 @@ def _load_or_setup_catalog(root: Path, *, no_interactive: bool) -> ModelCatalog:
         + ", ".join(missing)
         + ". Run `wmo config providers` interactively, or configure automation with "
         f"`wmo config providers --non-interactive --connection-json '{connection_example}' "
-        f"--model-json '{model_example}' --world-model ALIAS --judge ALIAS --embedder ALIAS`."
+        f"--model-json '{model_example}' --world-model model --judge model --embedder model`. "
+        "Replace the example model ID and zero price with the provider's exact values."
     )
 
 
@@ -252,18 +264,30 @@ def _selected_roles(
 
 
 def _embedding_cost_ceiling(
-    normalized: TraceNormalizationResult,
+    completed: ProjectBuild,
     embedder: ResolvedModel,
 ) -> float:
-    """Estimate a conservative three-attempt ceiling from UTF-8 bytes and explicit pricing."""
+    """Bound retry-inclusive embedding spend from the exact rendered retrieval inputs."""
     price = embedder.capabilities.input_cost_per_million_tokens_usd
     if price is None:
         raise ValueError(
             f"embedder alias {embedder.alias!r} has no input_cost_per_million_tokens_usd; "
             "record explicit pricing before a provider-backed build"
         )
-    byte_count = sum(len(trace.model_dump_json().encode("utf-8")) for trace in normalized.traces)
-    maximum_input_tokens = byte_count * 9
+    bindings = _lineage_bindings(completed)
+    traces = completed.artifacts.trace_dataset.traces
+    serving = extract_real_transitions(
+        traces,
+        bindings,
+        included_partitions=frozenset({"fit", "held_out"}),
+    )
+    fit = extract_real_transitions(
+        traces,
+        bindings,
+        included_partitions=frozenset({"fit"}),
+    )
+    byte_count = sum(len(transition.key_text.encode("utf-8")) for transition in (*serving, *fit))
+    maximum_input_tokens = byte_count * RetryPolicy().maximum_attempts
     return maximum_input_tokens * price / 1_000_000
 
 
@@ -336,6 +360,55 @@ def _build_grounded_artifacts(
         fit_rag=artifact_input(fit.manifest),
         world_model=artifact_input(world.manifest),
     )
+
+
+def _reuse_completed_grounded_artifacts(
+    store: ProjectStore,
+    completed: ProjectBuild,
+    *,
+    resolved_world: ResolvedModel,
+    resolved_embedder: ResolvedModel,
+    top_k: int,
+) -> ProjectBuildArtifacts | None:
+    """Reuse a completely matching verified build without another provider embedding call."""
+    existing = store.load_project().build
+    if existing is None:
+        return None
+    trace_input = artifact_input(completed.artifacts.trace_dataset.manifest)
+    task_input = artifact_input(
+        store.artifacts.read(completed.artifacts.task_set.task_set_id).manifest
+    )
+    if existing.trace_dataset != trace_input or existing.task_set != task_input:
+        return None
+    serving = load_rag_index(store.artifacts, existing.serving_rag.artifact_id)
+    fit = load_rag_index(store.artifacts, existing.fit_rag.artifact_id)
+    expected_embedder = resolved_embedder.snapshot
+    if (
+        serving.index.embedder != expected_embedder
+        or fit.index.embedder != expected_embedder
+        or serving.index.default_top_k != top_k
+        or fit.index.default_top_k != top_k
+        or serving.index.included_partitions != ("fit", "held_out")
+        or fit.index.included_partitions != ("fit",)
+    ):
+        return None
+    assert resolved_embedder.embedding_client is not None
+    runtime = load_grounded_world_model(
+        store.artifacts,
+        existing.world_model.artifact_id,
+        client=resolved_world.client,
+        embedder=RAGEmbedderBinding(
+            client=resolved_embedder.embedding_client,
+            snapshot=resolved_embedder.snapshot,
+        ),
+    )
+    if (
+        runtime.artifact.model_alias != resolved_world.alias
+        or runtime.artifact.model != resolved_world.snapshot
+        or runtime.artifact.top_k != top_k
+    ):
+        return None
+    return existing
 
 
 def _lineage_bindings(completed: ProjectBuild) -> tuple[RAGLineageBinding, ...]:

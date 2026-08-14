@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from wmo.common.core.artifacts import JsonObject
+from wmo.common.core.artifacts import JsonObject, stable_id
 from wmo.common.models import ModelClient, ModelMessage, ModelRequest
 from wmo.common.project import ArtifactStore, artifact_input
 from wmo.simulation.engines.text import TextWorldModelTransition, parse_world_model_transition
@@ -16,6 +16,7 @@ from wmo.simulation.world_model.artifact import (
     GROUNDED_WORLD_MODEL_SYSTEM_PROMPT,
     WORLD_MODEL_ARTIFACT_PATH,
     GroundedWorldModelArtifact,
+    grounded_world_model_content,
     grounded_world_model_prompt_sha256,
 )
 
@@ -35,7 +36,7 @@ class GroundedWorldModel:
         action: RAGAction,
         initial_context: JsonObject | None = None,
         excluded_lineage_ids: tuple[str, ...] = (),
-        maximum_output_tokens: int = 16_000,
+        maximum_output_tokens: int = 1_024,
     ) -> TextWorldModelTransition:
         """Predict one next visible observation grounded on nearest real transitions.
 
@@ -121,8 +122,35 @@ def load_grounded_world_model(
     artifact = GroundedWorldModelArtifact.model_validate_json(
         store.read_bytes(artifact_id, WORLD_MODEL_ARTIFACT_PATH)
     )
+    manifest_identity = (
+        stored.manifest.schema_version,
+        stored.manifest.created_at,
+        stored.manifest.inputs,
+        stored.manifest.code_revision,
+        stored.manifest.source,
+    )
+    envelope_identity = (
+        artifact.schema_version,
+        artifact.created_at,
+        artifact.inputs,
+        artifact.code_revision,
+        artifact.source,
+    )
+    if manifest_identity != envelope_identity:
+        raise ValueError("grounded world-model envelope differs from its artifact manifest")
     if artifact.world_model_id != artifact_id:
         raise ValueError("grounded world-model artifact ID differs from its directory")
+    content = grounded_world_model_content(
+        serving_rag=artifact.serving_rag,
+        model_alias=artifact.model_alias,
+        model=artifact.model,
+        prompt_version=artifact.prompt_version,
+        prompt_sha256=artifact.prompt_sha256,
+        top_k=artifact.top_k,
+        code_revision=artifact.code_revision,
+    )
+    if stable_id("grounded-world-model", content) != artifact_id:
+        raise ValueError("grounded world-model artifact ID differs from its complete content")
     if artifact.prompt_version != GROUNDED_WORLD_MODEL_PROMPT_VERSION:
         raise ValueError("grounded world-model prompt version is not supported by this runtime")
     if artifact.prompt_sha256 != grounded_world_model_prompt_sha256():
