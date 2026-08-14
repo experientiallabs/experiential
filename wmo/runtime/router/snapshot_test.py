@@ -426,6 +426,55 @@ def test_loader_rejects_forged_snapshot_provenance(
         load_runtime_trace_snapshot(store, exported.snapshot.snapshot_id)
 
 
+@pytest.mark.parametrize("mutation", ["schema-version", "path"])
+def test_loader_rejects_reidentified_noncanonical_snapshot_constants(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Prove a recomputed ID cannot legitimize unsupported snapshot constants.
+
+    Args:
+        tmp_path: Isolated project root.
+        mutation: Schema or interactions-path constant rewritten before identity recomputation.
+    """
+    journal, store = _journal_and_store(tmp_path)
+    _complete(journal, key="reidentified-constant-key")
+    exported = seal_runtime_trace_snapshot(
+        journal,
+        store,
+        created_at=_TIME + timedelta(minutes=1),
+        code_revision="test-revision",
+    )
+    directory = store.read(exported.snapshot.snapshot_id).directory
+    snapshot_path = directory / "runtime-trace-snapshot.json"
+    manifest_path = directory / "manifest.json"
+    snapshot = json.loads(snapshot_path.read_bytes())
+    manifest = json.loads(manifest_path.read_bytes())
+    if mutation == "schema-version":
+        snapshot["schema_version"] = 2
+        manifest["schema_version"] = 2
+    else:
+        snapshot["interactions_path"] = "alternate-interactions.jsonl"
+    identity_material = {
+        key: value for key, value in snapshot.items() if key not in {"created_at", "snapshot_id"}
+    }
+    forged_id = stable_id("runtime-trace-snapshot", identity_material)
+    snapshot["snapshot_id"] = forged_id
+    manifest["artifact_id"] = forged_id
+    snapshot_payload = canonical_json_bytes(snapshot)
+    snapshot_path.write_bytes(snapshot_payload)
+    snapshot_entry = next(
+        entry for entry in manifest["files"] if entry["path"] == "runtime-trace-snapshot.json"
+    )
+    snapshot_entry["sha256"] = hashlib.sha256(snapshot_payload).hexdigest()
+    snapshot_entry["size_bytes"] = len(snapshot_payload)
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    directory.rename(directory.parent / forged_id)
+
+    with pytest.raises(ArtifactCorruptionError, match="invalid envelope"):
+        load_runtime_trace_snapshot(store, forged_id)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
