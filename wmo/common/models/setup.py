@@ -76,6 +76,15 @@ class ProviderModelSelection(ContractModel):
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
 
+    @model_validator(mode="after")
+    def _require_embedding_price(self) -> ProviderModelSelection:
+        if self.supports_embeddings and self.input_cost_per_million_tokens_usd is None:
+            raise ValueError(
+                "embedding-capable models require explicit input cost per million tokens; "
+                "use 0 for a model with no input charge"
+            )
+        return self
+
     def capabilities(self) -> ModelCapabilities:
         """Return the explicit per-model capabilities captured by setup."""
         return ModelCapabilities(

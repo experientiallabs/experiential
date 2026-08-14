@@ -192,6 +192,17 @@ def test_embedder_role_requires_explicit_embedding_capability() -> None:
         )
 
 
+def test_embedding_model_requires_explicit_input_price() -> None:
+    """Build consent never relies on an invented or silently absent embedding price."""
+    with pytest.raises(ValueError, match="explicit input cost"):
+        ProviderModelSelection(
+            alias="embed",
+            connection="gemini",
+            model="embedding-id",
+            supports_embeddings=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("provider", "base_url"),
     [

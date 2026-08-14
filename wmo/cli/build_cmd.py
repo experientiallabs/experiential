@@ -112,10 +112,7 @@ def build(
             embedder=embedder,
         )
         runtime_catalog = RuntimeModelCatalog(catalog)
-        resolved_world = runtime_catalog.preflight(
-            selected.world_model,
-            CapabilityRequirement(minimum_output_tokens=8_000),
-        )
+        resolved_world = runtime_catalog.resolve(selected.world_model)
         runtime_catalog.resolve(selected.judge)
         resolved_embedder = runtime_catalog.preflight(
             selected.embedder,

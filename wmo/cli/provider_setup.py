@@ -272,8 +272,10 @@ def _prompt_model(
     )
     context_window = _prompt_optional_positive_int("Context window tokens", console=console)
     maximum_output = _prompt_optional_positive_int("Maximum output tokens", console=console)
-    input_cost = _prompt_optional_nonnegative_float(
-        "Input cost per million tokens in USD", console=console
+    input_cost = (
+        _prompt_nonnegative_float("Input cost per million tokens in USD", console=console)
+        if supports_embeddings
+        else None
     )
     return ProviderModelSelection(
         alias=alias,
@@ -295,10 +297,8 @@ def _prompt_optional_positive_int(label: str, *, console: Console) -> int | None
     return IntPrompt.ask(label, console=console)
 
 
-def _prompt_optional_nonnegative_float(label: str, *, console: Console) -> float | None:
-    """Collect optional explicit local pricing without contacting a provider."""
-    if not Confirm.ask(f"Record {label.casefold()}?", default=False, console=console):
-        return None
+def _prompt_nonnegative_float(label: str, *, console: Console) -> float:
+    """Collect explicit local pricing without contacting a provider."""
     value = float(Prompt.ask(label, console=console))
     if value < 0:
         raise typer.BadParameter(f"{label} cannot be negative")
