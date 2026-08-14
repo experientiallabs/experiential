@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import Field, field_validator, model_validator
 
@@ -19,7 +19,7 @@ from wmo.common.judging import (
     CalibrationReport,
     PromptDefinition,
 )
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import ModelSnapshot, OperationEconomics
 
 
 class ManualJudgeError(ValueError):
@@ -27,11 +27,47 @@ class ManualJudgeError(ValueError):
 
 
 class ManualJudgeLabel(ContractModel):
-    """One human score supplied for a real trace preview."""
+    """One human score or typed pairwise preference for real trace evidence."""
 
     trace_id: str = Field(min_length=1, max_length=512)
+    reference_trace_id: str | None = Field(default=None, min_length=1, max_length=512)
     dimension_id: ArtifactId
-    score: Literal[0, 1, 2, 3, 4, 5]
+    score: Literal[0, 1, 2, 3, 4, 5] | None = None
+    winner: Literal["winner_a", "winner_b", "tie"] | None = None
+
+    @model_validator(mode="after")
+    def _require_one_label_shape(self) -> ManualJudgeLabel:
+        """Require either one scalar score or one fully identified pairwise preference.
+
+        Returns:
+            The validated human label.
+
+        Raises:
+            ValueError: Scalar and pairwise fields are mixed or incomplete.
+        """
+        scalar = self.score is not None and self.winner is None and self.reference_trace_id is None
+        pairwise = (
+            self.score is None and self.winner is not None and self.reference_trace_id is not None
+        )
+        if not scalar and not pairwise:
+            raise ValueError("human labels must be either scalar or fully specified pairwise")
+        if self.reference_trace_id == self.trace_id:
+            raise ValueError("pairwise labels require two distinct traces")
+        return self
+
+
+class JudgeScoreProjection(ContractModel):
+    """Versioned explicit projection from structured feedback to router scores."""
+
+    projection_version: Literal["1"] = "1"
+    boolean_scores: dict[Literal["false", "true"], Literal[0, 1, 2, 3, 4, 5]] = Field(
+        default_factory=dict
+    )
+    categorical_scores: dict[str, Literal[0, 1, 2, 3, 4, 5]] = Field(default_factory=dict)
+    pairwise_scores: dict[Literal["winner_a", "winner_b", "tie"], Literal[0, 1, 2, 3, 4, 5]] = (
+        Field(default_factory=dict)
+    )
+    pairwise_aggregation: Literal["rounded_mean"] | None = None
 
 
 class JudgePromptTemplate(ContractModel):
@@ -39,9 +75,76 @@ class JudgePromptTemplate(ContractModel):
 
     template_id: Literal["wmo-judge-evidence-json"] = "wmo-judge-evidence-json"
     template_version: Literal["1"] = "1"
+    response_shape: Literal["scalar", "boolean", "categorical", "pairwise"] = "scalar"
     prompt: PromptDefinition
     variable_mapping: JsonObject
     response_schema: JsonObject
+    score_projection: JudgeScoreProjection = Field(default_factory=JudgeScoreProjection)
+
+    @model_validator(mode="after")
+    def _require_executable_contract(self) -> JudgePromptTemplate:
+        """Require an exact supported schema, mapping, and explicit numeric projection.
+
+        Returns:
+            The executable prompt contract.
+
+        Raises:
+            ValueError: The schema, variables, or projection cannot be executed exactly.
+        """
+        required = (
+            {"rubric", "candidate_a", "candidate_b"}
+            if self.response_shape == "pairwise"
+            else {"rubric", "rollout"}
+        )
+        if set(self.variable_mapping) != required or any(
+            not isinstance(value, str) or not value.strip()
+            for value in self.variable_mapping.values()
+        ):
+            raise ValueError(
+                "judge variable mapping must name every required canonical input exactly once"
+            )
+        if len(set(cast(str, value) for value in self.variable_mapping.values())) != len(required):
+            raise ValueError("judge variable mapping values must be unique")
+        projection = self.score_projection
+        if self.response_shape == "scalar":
+            valid_projection = not (
+                projection.boolean_scores
+                or projection.categorical_scores
+                or projection.pairwise_scores
+                or projection.pairwise_aggregation
+            )
+        elif self.response_shape == "boolean":
+            valid_projection = (
+                set(projection.boolean_scores) == {"false", "true"}
+                and not projection.categorical_scores
+                and not projection.pairwise_scores
+                and projection.pairwise_aggregation is None
+            )
+        elif self.response_shape == "categorical":
+            valid_projection = (
+                bool(projection.categorical_scores)
+                and not projection.boolean_scores
+                and not projection.pairwise_scores
+                and projection.pairwise_aggregation is None
+            )
+        else:
+            valid_projection = (
+                set(projection.pairwise_scores) == {"winner_a", "winner_b", "tie"}
+                and projection.pairwise_aggregation == "rounded_mean"
+                and not projection.boolean_scores
+                and not projection.categorical_scores
+            )
+        if not valid_projection:
+            raise ValueError(
+                f"judge {self.response_shape} response shape requires its exact saved score map"
+            )
+        expected_schema = judge_feedback_schema(
+            self.response_shape,
+            categories=tuple(sorted(projection.categorical_scores)),
+        )
+        if self.response_schema != expected_schema:
+            raise ValueError("judge response schema is not the supported canonical schema")
+        return self
 
 
 class JudgeTracePreview(ContractModel):
@@ -54,6 +157,8 @@ class JudgeTracePreview(ContractModel):
     task: str = Field(min_length=1)
     outcome: str = Field(min_length=1, max_length=128)
     span_names: tuple[str, ...]
+    reference_trace_id: str | None = Field(default=None, min_length=1, max_length=512)
+    reference_rollout_id: ArtifactId | None = None
 
 
 class ManualJudgeSetupArtifact(ArtifactEnvelope):
@@ -140,7 +245,139 @@ class JudgeRunEvidence(ContractModel):
     """One calibration rollout and its persisted structured judgment."""
 
     rollout: ArtifactInput
+    reference_rollout: ArtifactInput | None = None
     judgment: ArtifactInput
+    probes: tuple[ArtifactInput, ...] = ()
+
+
+class JudgeProtocolProbeArtifact(ArtifactEnvelope):
+    """One immutable schema-valid provider probe used by manual calibration."""
+
+    probe_id: ArtifactId
+    setup: ArtifactInput
+    rollout: ArtifactInput
+    reference_rollout: ArtifactInput | None = None
+    order: Literal["single", "forward", "reverse"]
+    response: JsonObject
+    model: ModelSnapshot
+    economics: OperationEconomics
+
+    @model_validator(mode="after")
+    def _require_complete_probe_inputs(self) -> JudgeProtocolProbeArtifact:
+        """Bind a provider probe to setup and every visible rollout.
+
+        Returns:
+            The probe after exact input-graph validation.
+
+        Raises:
+            ValueError: An input is missing, duplicated, or ordered incorrectly.
+        """
+        expected = tuple(
+            sorted(
+                (
+                    self.setup,
+                    self.rollout,
+                    *((self.reference_rollout,) if self.reference_rollout is not None else ()),
+                ),
+                key=lambda item: item.artifact_id,
+            )
+        )
+        if len({item.artifact_id for item in expected}) != len(expected):
+            raise ValueError("manual judge probe inputs must be unique")
+        if self.inputs != expected:
+            raise ValueError("manual judge probe must hash its complete input graph")
+        if self.order == "single" and self.reference_rollout is not None:
+            raise ValueError("single judge probes cannot bind a reference rollout")
+        if self.order != "single" and self.reference_rollout is None:
+            raise ValueError("counterbalanced judge probes require a reference rollout")
+        return self
+
+
+def judge_feedback_schema(
+    shape: Literal["scalar", "boolean", "categorical", "pairwise"],
+    *,
+    categories: tuple[str, ...] = (),
+) -> JsonObject:
+    """Build the exact supported structured-feedback schema for one response shape.
+
+    Args:
+        shape: Supported structured feedback shape.
+        categories: Saved categorical values when ``shape`` is categorical.
+
+    Returns:
+        Canonical strict JSON schema persisted in judge setup.
+
+    Raises:
+        ValueError: Categorical feedback does not define at least one category.
+    """
+    dimension_properties: JsonObject = {
+        "dimension_id": {"type": "string"},
+        "feedback": {"type": "string", "minLength": 1},
+    }
+    required = ["dimension_id", "feedback"]
+    if shape == "scalar":
+        dimension_properties["raw_score"] = {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 5,
+        }
+        dimension_properties["evidence_span_ids"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "uniqueItems": True,
+        }
+        required.extend(("raw_score", "evidence_span_ids"))
+    elif shape == "boolean":
+        dimension_properties["passed"] = {"type": "boolean"}
+        dimension_properties["evidence_span_ids"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "uniqueItems": True,
+        }
+        required.extend(("passed", "evidence_span_ids"))
+    elif shape == "categorical":
+        if not categories:
+            raise ValueError("categorical judge feedback requires at least one saved category")
+        dimension_properties["category"] = {"type": "string", "enum": list(categories)}
+        dimension_properties["evidence_span_ids"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "uniqueItems": True,
+        }
+        required.extend(("category", "evidence_span_ids"))
+    else:
+        dimension_properties["winner"] = {
+            "type": "string",
+            "enum": ["winner_a", "winner_b", "tie"],
+        }
+        for key in ("evidence_span_ids_a", "evidence_span_ids_b"):
+            dimension_properties[key] = {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "uniqueItems": True,
+            }
+        required.extend(("winner", "evidence_span_ids_a", "evidence_span_ids_b"))
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "dimensions": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": dimension_properties,
+                    "required": required,
+                },
+            }
+        },
+        "required": ["dimensions"],
+    }
 
 
 class ManualJudgeCalibrationAudit(ArtifactEnvelope):
@@ -154,6 +391,8 @@ class ManualJudgeCalibrationAudit(ArtifactEnvelope):
     report: ArtifactInput
     budget: JudgeCalibrationBudget
     judgments: tuple[JudgeRunEvidence, ...]
+    positional_bias_comparisons: int | None = Field(default=None, ge=1)
+    positional_bias_flips: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _require_complete_audit_inputs(self) -> ManualJudgeCalibrationAudit:
@@ -174,7 +413,13 @@ class ManualJudgeCalibrationAudit(ArtifactEnvelope):
                     self.provisional_calibration,
                     self.report,
                     *(item.rollout for item in self.judgments),
+                    *(
+                        item.reference_rollout
+                        for item in self.judgments
+                        if item.reference_rollout is not None
+                    ),
                     *(item.judgment for item in self.judgments),
+                    *(probe for item in self.judgments for probe in item.probes),
                 ),
                 key=lambda item: item.artifact_id,
             )
@@ -183,6 +428,14 @@ class ManualJudgeCalibrationAudit(ArtifactEnvelope):
             raise ValueError("manual judge audit must hash its complete canonical input graph")
         if not self.judgments:
             raise ValueError("manual judge audit requires at least one judge probe")
+        if (self.positional_bias_comparisons is None) != (self.positional_bias_flips is None):
+            raise ValueError("positional-bias counts must be both present or both absent")
+        if (
+            self.positional_bias_comparisons is not None
+            and self.positional_bias_flips is not None
+            and self.positional_bias_flips > self.positional_bias_comparisons
+        ):
+            raise ValueError("positional-bias flips cannot exceed comparisons")
         return self
 
 

@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING
 from pydantic import JsonValue
 
 from wmo.common.core.artifacts import ArtifactInput, JsonObject, stable_id
-from wmo.common.judging import CalibrationReport, JudgeCalibrationService
+from wmo.common.judging import (
+    CalibrationReport,
+    JudgeCalibration,
+    JudgeCalibrationService,
+)
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.models import AssistantAction, OperationEconomics, Usage
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
@@ -85,6 +89,64 @@ def write_review_state(store: ProjectStore, state: ManualJudgeReviewState) -> No
     store.update_review(update)
 
 
+def find_provisional_calibration(
+    store: ProjectStore,
+    setup: ManualJudgeSetupArtifact,
+    lineage_split_id: str,
+) -> JudgeCalibration | None:
+    """Find the unique completed provisional binding for an interrupted calibration.
+
+    Args:
+        store: Project-local immutable artifact store.
+        setup: Finalized setup defining rubric, model, and prompt identity.
+        lineage_split_id: Frozen calibration lineage split.
+
+    Returns:
+        Matching provisional calibration, or ``None`` before bootstrap completes.
+
+    Raises:
+        ManualJudgeError: Matching evidence is malformed, conflicting, or ambiguous.
+    """
+    matches: list[JudgeCalibration] = []
+    for artifact_id in store.artifacts.list_ids():
+        stored = store.artifacts.read(artifact_id)
+        if stored.manifest.artifact_type != "judge-calibration":
+            continue
+        try:
+            calibration, _calibration_input = read_artifact_json(
+                store,
+                artifact_id=artifact_id,
+                expected_artifact_type="judge-calibration",
+                relative_path="calibration.json",
+                model_type=JudgeCalibration,
+            )
+        except JudgingProvenanceError as exc:
+            raise ManualJudgeError("existing provisional calibration cannot be resumed") from exc
+        if (
+            calibration.status != "provisional"
+            or calibration.rubric_id != setup.rubric.artifact_id
+            or calibration.judge_model != setup.judge_model
+            or calibration.judge_prompt_id != setup.prompt_template.prompt.prompt_id
+            or calibration.judge_prompt_sha256 != setup.prompt_template.prompt.sha256
+        ):
+            continue
+        try:
+            report, _report_input = read_artifact_json(
+                store,
+                artifact_id=calibration.out_of_fold_report_id,
+                expected_artifact_type="judge-calibration-report",
+                relative_path="report.json",
+                model_type=CalibrationReport,
+            )
+        except JudgingProvenanceError as exc:
+            raise ManualJudgeError("provisional calibration report cannot be resumed") from exc
+        if report.router_lineage_split_id == lineage_split_id:
+            matches.append(calibration)
+    if len(matches) > 1:
+        raise ManualJudgeError("multiple provisional calibrations match the finalized setup")
+    return matches[0] if matches else None
+
+
 def write_production_rollout(
     store: ProjectStore,
     setup: ManualJudgeSetupArtifact,
@@ -159,12 +221,25 @@ def write_production_rollout(
             )
         except JudgingProvenanceError as exc:
             raise ManualJudgeError("existing production rollout cannot be resumed safely") from exc
-        if existing != rollout:
+        if not _same_rollout_identity(existing, rollout):
             raise ManualJudgeError(
                 "existing production rollout conflicts with the selected trace"
             ) from None
         return existing_input
     return artifact_input(manifest)
+
+
+def _same_rollout_identity(left: RolloutArtifact, right: RolloutArtifact) -> bool:
+    """Compare immutable rollout content while excluding materialization time.
+
+    Args:
+        left: Persisted rollout from an earlier attempt.
+        right: Freshly materialized rollout for the same real trace.
+
+    Returns:
+        Whether all semantically immutable fields match.
+    """
+    return left.model_copy(update={"created_at": right.created_at}) == right
 
 
 def _rollout_span(span: TraceSpan) -> RolloutSpan:
@@ -244,6 +319,7 @@ def write_audit(
     report_input: ArtifactInput,
     budget: JudgeCalibrationBudget,
     judgments: tuple[JudgeRunEvidence, ...],
+    positional_bias: tuple[int, int] | None,
     created_at: datetime,
     code_revision: str,
 ) -> ManualJudgeCalibrationAudit:
@@ -258,6 +334,7 @@ def write_audit(
         report_input: Completed disagreement report pointer.
         budget: Consent-bound conservative spend reservation.
         judgments: Persisted rollout and structured judgment pairs.
+        positional_bias: Pairwise comparison and order-flip counts, otherwise ``None``.
         created_at: Artifact completion time.
         code_revision: Exact producer revision.
 
@@ -273,7 +350,13 @@ def write_audit(
                 provisional_input,
                 report_input,
                 *(item.rollout for item in judgments),
+                *(
+                    item.reference_rollout
+                    for item in judgments
+                    if item.reference_rollout is not None
+                ),
                 *(item.judgment for item in judgments),
+                *(probe for item in judgments for probe in item.probes),
             ),
             key=lambda item: item.artifact_id,
         )
@@ -284,6 +367,7 @@ def write_audit(
             "inputs": [item.model_dump(mode="json") for item in inputs],
             "budget": budget.model_dump(mode="json"),
             "judgments": [item.model_dump(mode="json") for item in judgments],
+            "positional_bias": positional_bias,
         },
     )
     audit = ManualJudgeCalibrationAudit(
@@ -299,6 +383,8 @@ def write_audit(
         report=report_input,
         budget=budget,
         judgments=judgments,
+        positional_bias_comparisons=(positional_bias[0] if positional_bias is not None else None),
+        positional_bias_flips=(positional_bias[1] if positional_bias is not None else None),
     )
     try:
         store.artifacts.write_json(

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
-from rich.prompt import Confirm, IntPrompt
+from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.common.judging import Rubric, RubricDimension
@@ -49,7 +49,10 @@ _TEMPLATE_FILE_OPTION = typer.Option(
 _LABEL_OPTION = typer.Option(
     None,
     "--label",
-    help="Repeat TRACE_ID:DIMENSION_ID=SCORE for noninteractive labels.",
+    help=(
+        "Repeat TRACE_ID:DIMENSION_ID=SCORE, or "
+        "TRACE_ID:REFERENCE_TRACE_ID:DIMENSION_ID=winner_a|winner_b|tie for pairwise labels."
+    ),
 )
 
 
@@ -279,10 +282,15 @@ def _render_setup(plan: ManualJudgeSetupPlan) -> None:
     _console.print(
         f"Prompt: {plan.prompt_template.prompt.prompt_id} ({plan.prompt_template.prompt.sha256})"
     )
+    _console.print(f"Response shape: {plan.prompt_template.response_shape}")
     _console.print(f"Variable mapping: {json.dumps(plan.prompt_template.variable_mapping)}")
     _console.print(
         "Structured response schema: "
         + json.dumps(plan.prompt_template.response_schema, sort_keys=True)
+    )
+    _console.print(
+        "Score projection: "
+        + json.dumps(plan.prompt_template.score_projection.model_dump(mode="json"), sort_keys=True)
     )
     _console.print("Rubric:")
     for dimension in plan.dimensions:
@@ -303,8 +311,11 @@ def _render_calibration_previews(previews: tuple[JudgeTracePreview, ...]) -> Non
     """
     _console.print("Calibration traces:")
     for preview in previews:
+        comparison = (
+            f" vs {preview.reference_trace_id}" if preview.reference_trace_id is not None else ""
+        )
         _console.print(
-            f"  {preview.trace_id} [{preview.outcome}] {preview.task} "
+            f"  {preview.trace_id}{comparison} [{preview.outcome}] {preview.task} "
             f"spans={', '.join(preview.span_names)}"
         )
 
@@ -332,15 +343,15 @@ def _collect_labels(
     Raises:
         ValueError: A label is malformed, duplicated, missing, or outside zero through five.
     """
-    del setup
-    parsed: dict[tuple[str, str], int] = {}
+    pairwise = setup.prompt_template.response_shape == "pairwise"
+    parsed: dict[tuple[str, str | None, str], int | str] = {}
     for item in supplied:
-        key = _label_key(item)
+        key = _label_key(item, pairwise=pairwise)
         if key in parsed:
-            raise ValueError(f"duplicate label for {key[0]}:{key[1]}")
-        parsed[key] = _label_value(item)
+            raise ValueError("duplicate label for " + ":".join(part or "-" for part in key))
+        parsed[key] = _label_value(item, pairwise=pairwise)
     expected = tuple(
-        (preview.trace_id, dimension.dimension_id)
+        (preview.trace_id, preview.reference_trace_id, dimension.dimension_id)
         for preview in previews
         for dimension in rubric.dimensions
     )
@@ -348,60 +359,87 @@ def _collect_labels(
     if unexpected:
         raise ValueError(
             "unexpected labels: "
-            + ", ".join(f"{trace}:{dimension}" for trace, dimension in unexpected)
+            + ", ".join(":".join(part or "-" for part in key) for key in unexpected)
         )
     missing = tuple(key for key in expected if key not in parsed)
     if missing and non_interactive:
         raise ValueError(
-            "missing labels: " + ", ".join(f"{trace}:{dimension}" for trace, dimension in missing)
+            "missing labels: " + ", ".join(":".join(part or "-" for part in key) for key in missing)
         )
-    for trace_id, dimension_id in missing:
-        score = IntPrompt.ask(f"Score {trace_id} on {dimension_id} (0-5)")
-        if score not in range(6):
-            raise ValueError("judge labels must be integers from zero through five")
-        parsed[(trace_id, dimension_id)] = score
+    for trace_id, reference_id, dimension_id in missing:
+        if pairwise:
+            winner = Prompt.ask(
+                f"Winner for {trace_id} vs {reference_id} on {dimension_id}",
+                choices=["winner_a", "winner_b", "tie"],
+            )
+            parsed[(trace_id, reference_id, dimension_id)] = winner
+        else:
+            score = IntPrompt.ask(f"Score {trace_id} on {dimension_id} (0-5)")
+            if score not in range(6):
+                raise ValueError("judge labels must be integers from zero through five")
+            parsed[(trace_id, reference_id, dimension_id)] = score
     return tuple(
         ManualJudgeLabel.model_validate(
-            {"trace_id": trace_id, "dimension_id": dimension_id, "score": parsed[key]}
+            {
+                "trace_id": trace_id,
+                "reference_trace_id": reference_id,
+                "dimension_id": dimension_id,
+                **({"winner": parsed[key]} if pairwise else {"score": parsed[key]}),
+            }
         )
         for key in expected
-        for trace_id, dimension_id in (key,)
+        for trace_id, reference_id, dimension_id in (key,)
     )
 
 
-def _label_key(value: str) -> tuple[str, str]:
+def _label_key(value: str, *, pairwise: bool) -> tuple[str, str | None, str]:
     """Parse the trace and dimension key from one CLI label expression.
 
     Args:
-        value: ``TRACE_ID:DIMENSION_ID=SCORE`` expression.
+        value: Scalar or pairwise CLI label expression.
+        pairwise: Whether the finalized setup requires a comparison trace.
 
     Returns:
-        Trace and dimension identifiers.
+        Trace, optional reference trace, and dimension identifiers.
 
     Raises:
         ValueError: The expression does not have the required separators.
     """
     target, separator, _score = value.rpartition("=")
-    trace_id, dimension_separator, dimension_id = target.partition(":")
-    if not separator or not dimension_separator or not trace_id or not dimension_id:
-        raise ValueError("labels must use TRACE_ID:DIMENSION_ID=SCORE")
-    return trace_id, dimension_id
+    parts = target.split(":")
+    expected_parts = 3 if pairwise else 2
+    if not separator or len(parts) != expected_parts or any(not part for part in parts):
+        expected = (
+            "TRACE_ID:REFERENCE_TRACE_ID:DIMENSION_ID=winner_a|winner_b|tie"
+            if pairwise
+            else "TRACE_ID:DIMENSION_ID=SCORE"
+        )
+        raise ValueError(f"labels must use {expected}")
+    if pairwise:
+        return parts[0], parts[1], parts[2]
+    return parts[0], None, parts[1]
 
 
-def _label_value(value: str) -> int:
+def _label_value(value: str, *, pairwise: bool) -> int | str:
     """Parse and validate the zero-to-five score from one CLI expression.
 
     Args:
-        value: ``TRACE_ID:DIMENSION_ID=SCORE`` expression.
+        value: Scalar or pairwise CLI label expression.
+        pairwise: Whether the finalized setup requires a typed winner.
 
     Returns:
-        Integer score.
+        Integer score or typed pairwise winner.
 
     Raises:
         ValueError: The score is not an integer from zero through five.
     """
+    raw = value.rpartition("=")[2]
+    if pairwise:
+        if raw not in {"winner_a", "winner_b", "tie"}:
+            raise ValueError("pairwise judge labels must use winner_a, winner_b, or tie")
+        return raw
     try:
-        score = int(value.rpartition("=")[2])
+        score = int(raw)
     except ValueError as exc:
         raise ValueError("judge labels must use an integer score") from exc
     if score not in range(6):
@@ -435,7 +473,7 @@ def _load_setup_rubric(store: ProjectStore, setup: ManualJudgeSetupArtifact) -> 
 
 
 def _render_report(result: ManualJudgeCalibrationResult) -> None:
-    """Display agreement, disagreement, and scalar-schema bias applicability.
+    """Display agreement, disagreement, and schema-appropriate positional bias.
 
     Args:
         result: Completed immutable audit and calibration report.
@@ -458,7 +496,15 @@ def _render_report(result: ManualJudgeCalibrationResult) -> None:
             f"rollout={prediction.rollout_id} human={prediction.human_score} "
             f"judge={prediction.calibrated_score:.3f}"
         )
-    _console.print("Positional-bias probe: not applicable to the scalar score schema.")
+    comparisons = result.audit.positional_bias_comparisons
+    flips = result.audit.positional_bias_flips
+    if comparisons is None or flips is None:
+        _console.print("Positional-bias probe: n/a for non-pairwise feedback.")
+    else:
+        _console.print(
+            f"Positional-bias probe: {flips}/{comparisons} order-flip disagreements "
+            f"({flips / comparisons:.1%})."
+        )
 
 
 def _metric(value: float | None) -> str:
