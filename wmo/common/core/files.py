@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 def write_bytes_atomic(path: Path, payload: bytes) -> None:
     """Write `payload` to `path` so a reader sees the previous file or the whole new one.
 
-    Four properties, each answering a failure this codebase has actually shipped:
+    Four properties, each answering a distinct durable-state failure:
 
     - **Same-directory staging file plus `replace`.** A rename within a filesystem is atomic, so a
       crash or a full disk leaves the previous file intact instead of a truncated one. Writing in
@@ -89,10 +89,9 @@ def resolve_write_target(path: Path) -> Path:
     stale contents, with nothing raised and nothing to notice until something reads the target and
     gets an old answer.
 
-    Resolving restores the behaviour those writers had before they became atomic, and extends it to
-    the files that were always atomic (`project.toml`, `models.toml`, `settings.toml`), where
-    the clobbering was longstanding rather than new. Following the link is what the operator asked
-    for in every case; nothing wants a symlink quietly turned into a file.
+    Resolving keeps every writer, including `project.toml`, `models.toml`, and `settings.toml`,
+    writing where the operator pointed it. Following the link is what they asked for in every case;
+    nothing wants a symlink quietly turned into a file.
 
     Resolving is also what keeps the write atomic, and what keeps the LOCK correct.
     `wmo.common.core.locks.file_write_lock` derives its lock file from this answer, so two callers

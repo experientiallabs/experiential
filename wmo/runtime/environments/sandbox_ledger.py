@@ -1,11 +1,11 @@
 """A durable record of remote sandboxes created through the executable environment seam.
 
-E2B caps concurrent sandboxes per account. Every wmo harbor trial creates one sandbox with a
-long timeout (hours), so a run that dies without graceful shutdown (crash, SIGKILL, budget
-abort, machine sleep) leaves its sandboxes running until they expire on their own. The next
-sweep then starves at the cap and every trial fails at sandbox creation with
-`RateLimitException: 429 ... maximum number of concurrent E2B sandboxes`, which in a distill
-run looks exactly like a model producing zero token spans.
+E2B caps concurrent sandboxes per account. Each remote executable-environment session creates one
+sandbox with a long timeout (hours), so a run that dies without graceful shutdown (crash, SIGKILL,
+budget abort, machine sleep) leaves its sandboxes running until they expire on their own. The next
+run then starves at the cap and every episode fails at sandbox creation with
+`RateLimitException: 429 ... maximum number of concurrent E2B sandboxes`, a failure that is easy to
+misread as a model producing no token spans.
 
 This ledger makes those orphans identifiable by exact ID. Each create appends one line to a
 per-owning-process JSONL file under an explicit caller-owned state directory, and each proven
@@ -14,7 +14,7 @@ the record on disk. No global configuration or implicit home directory participa
 runtime boundary.
 
 Ledger bookkeeping is best-effort by design: a write failure logs a warning and never fails
-the trial that owns the sandbox. Nothing here imports a sandbox SDK, so reading the ledger needs
+the episode that owns the sandbox. Nothing here imports a sandbox SDK, so reading the ledger needs
 neither an adapter package nor credentials.
 """
 
@@ -78,12 +78,12 @@ class SandboxCreated(BaseModel):
     event: Literal["created"] = "created"
     sandbox_id: str
     template_id: str | None = None
-    """The template identity the sandbox was created from: for harbor trials that is the
+    """The template identity the sandbox was created from. A remote adapter records its
     resource-qualified alias, which E2B accepts wherever it accepts a template id."""
 
     created_at: datetime
     trial_name: str | None = None
-    """The harbor trial that owns the sandbox, when the caller knows it."""
+    """The external trial name that owns the sandbox, when the caller supplies one."""
 
     pid: int
     """The process that created the sandbox, probed for liveness when reaping."""

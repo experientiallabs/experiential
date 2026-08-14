@@ -218,9 +218,9 @@ class _ResponseState(BaseModel):
 class _OpenAIRequestState:
     """Bounded standard request and response identity without a proprietary caller header.
 
-    This retains bounded standard request and response identities without restoring the unsafe
-    global transcript-prefix map from ``e7aad17b:wmo/simulation/serving/chat.py``. Two unrelated
-    callers can send the same transcript, so a transcript alone cannot be a conversation identity.
+    Identity comes only from the standard ``Idempotency-Key`` and ``previous_response_id`` inputs.
+    Two unrelated callers can send the same transcript, so a transcript is never treated as a
+    conversation identity here.
     """
 
     def __init__(self) -> None:
