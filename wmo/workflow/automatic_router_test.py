@@ -284,20 +284,29 @@ class _FidelityApproval:
         )
 
 
+@pytest.mark.parametrize(
+    "candidate_order",
+    [
+        ("candidate-a", "candidate-b"),
+        ("candidate-b", "candidate-a"),
+    ],
+)
 def test_configless_automatic_router_composes_and_replays_without_dispatch(
     tmp_path: Path,
+    candidate_order: tuple[str, str],
 ) -> None:
     """Run the real happy path, then replay it through the CLI without approval or calls.
 
     Args:
         tmp_path: Isolated local WMO root.
+        candidate_order: User-selected aliases in lexical or reversed order.
     """
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
     plan = collect_router_candidate_setup(
         store.model_catalog_path,
         catalog,
-        candidates=("candidate-a", "candidate-b"),
+        candidates=candidate_order,
         incumbent="candidate-a",
         non_interactive=True,
         console=Console(file=StringIO(), force_terminal=False),
@@ -328,6 +337,23 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
 
     assert result.composition.optimization.optimization.policy.policy_id
     assert result.composition.optimization.optimization.report.report_id
+    canonical_aliases = ("candidate-a", "candidate-b")
+    assert tuple(item.alias for item in result.preflight.candidates) == canonical_aliases
+    assert (
+        tuple(item.candidate_alias for item in result.artifacts.pricing.candidate_prices)
+        == canonical_aliases
+    )
+    assert (
+        tuple(item.candidate_alias for item in result.artifacts.execution_contract.candidates)
+        == canonical_aliases
+    )
+    assert tuple(item.alias for item in result.composition.plan.candidate_snapshots) == (
+        canonical_aliases
+    )
+    assert (
+        tuple(item.alias for item in result.composition.optimization.optimization.policy.candidates)
+        == canonical_aliases
+    )
     assert result.artifacts.execution_contract.maximum_provider_cost_usd == 25.0
     assert result.artifacts.attribution_input in result.artifacts.execution_contract.inputs
     assert result.artifacts.attribution_input in result.composition.plan.inputs

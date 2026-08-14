@@ -424,7 +424,7 @@ def _candidate_snapshots(
         selection: Explicit candidate aliases.
 
     Returns:
-        Successfully resolved candidate snapshots in selection order.
+        Successfully resolved candidate snapshots in canonical alias order.
     """
     resolved = []
     for alias in selection.candidates:
@@ -438,7 +438,7 @@ def _candidate_snapshots(
         problems.append(
             "selected candidate aliases must resolve to distinct exact model identities"
         )
-    return tuple(resolved)
+    return tuple(sorted(resolved, key=lambda item: item.alias))
 
 
 def _project_model_roles(

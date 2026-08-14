@@ -8,6 +8,7 @@ from datetime import datetime
 from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.evaluations import ObservedProductionCell
 from wmo.common.models import (
+    CandidateTokenPrice,
     PricingSnapshot,
     load_model_catalog,
     persist_pricing_snapshot,
@@ -105,7 +106,7 @@ def materialize_automatic_router_artifacts(
     )
     pricing = persist_pricing_snapshot(
         project.artifacts,
-        preflight.candidate_prices,
+        _canonical_candidate_prices(preflight),
         created_at=created_at,
         code_revision=code_revision,
     )
@@ -204,6 +205,27 @@ def materialize_automatic_router_artifacts(
         execution_contract=execution,
         execution_contract_input=execution_input,
     )
+
+
+def _canonical_candidate_prices(
+    preflight: AutomaticRouterPreflight,
+) -> tuple[CandidateTokenPrice, ...]:
+    """Align selected prices with the canonical candidate snapshot order.
+
+    Args:
+        preflight: Verified candidate snapshots and complete catalog-derived prices.
+
+    Returns:
+        Exact price rows ordered by canonical candidate alias.
+
+    Raises:
+        ValueError: Prices repeat, omit, or add a selected candidate alias.
+    """
+    prices = {item.candidate_alias: item for item in preflight.candidate_prices}
+    aliases = tuple(item.alias for item in preflight.candidates)
+    if len(prices) != len(preflight.candidate_prices) or set(prices) != set(aliases):
+        raise ValueError("candidate pricing differs from the canonical selected candidates")
+    return tuple(prices[alias] for alias in aliases)
 
 
 def _persist_observed_cells(
