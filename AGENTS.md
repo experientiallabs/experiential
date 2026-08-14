@@ -139,10 +139,12 @@ uv run pytest -q
    has unrelated failures, record them and keep them out of the patch; fix them only when they are
    in scope or prevent meaningful validation.
 
-2. **Tests live inline next to the code.** A module `foo.py` is tested by `foo_test.py` in the same
-   directory (for example, `wmo/workflow/router.py` maps to `wmo/workflow/router_test.py`). There
-   is no top-level `tests/` directory. Pytest is configured (`python_files = ["*_test.py"]`) to
-   discover these.
+2. **Tests live inline next to the code.** Keep behavior-oriented `_test.py` files in the package
+   that owns the behavior. A cohesive test module may cover several cooperating production modules
+   when that gives the behavior one clear home; there is no paired-test-file requirement. Cohesive
+   `_test.py` files may exceed the 999-line production limit and should not be split solely for
+   line count. Do not add empty test markers or vacuous assertions. There is no top-level `tests/`
+   directory. Pytest is configured (`python_files = ["*_test.py"]`) to discover these files.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
