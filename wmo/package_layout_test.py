@@ -7,6 +7,24 @@ import pytest
 WMO_DIR = Path(__file__).resolve().parent
 
 DOMAIN_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "common": (
+        frozenset(
+            {
+                "config",
+                "core",
+                "evaluations",
+                "judging",
+                "models",
+                "observability",
+                "project",
+                "rollouts",
+                "routing",
+                "tasks",
+                "traces",
+            }
+        ),
+        frozenset({"__init__.py"}),
+    ),
     "runtime": (
         frozenset({"agents", "environments", "models", "router"}),
         frozenset(),
