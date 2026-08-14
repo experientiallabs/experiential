@@ -6,7 +6,7 @@ WMO optimizes agent workflows from traces through a three-step process:
 2. Fit a router that determines which model every request should be sent to.
 3. Train custom open source models just for your agent.
 
-![Simulation, routing, and optimization](assets/wmo-workflow.svg)
+![Simulation, routing, and optimization](https://raw.githubusercontent.com/experientiallabs/world-model-optimizer/main/assets/wmo-workflow.svg)
 
 <p align="center">
   <a href="https://platform.experientiallabs.ai">Platform</a> ·
