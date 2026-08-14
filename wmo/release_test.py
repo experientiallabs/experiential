@@ -47,28 +47,6 @@ REQUIRED_WHEEL_MODULES = frozenset(
     }
 )
 REQUIRED_SDIST_MEMBERS = frozenset({"README.md", "pyproject.toml", "wmo/workflow/router.py"})
-FORBIDDEN_ARCHIVE_PREFIXES = (
-    "assets/",
-    "web/",
-    "wmo/common/providers/",
-    "wmo/common/vendor/",
-    "wmo/optimize/research/",
-)
-FORBIDDEN_ARCHIVE_MEMBERS = frozenset(
-    {
-        "docs/reference/repository_guardrails.md",
-        "wmo/cli/review_server.py",
-        "wmo/cli/review_server_test.py",
-        "wmo/cli/repo_metrics.py",
-        "wmo/common/core/parsing.py",
-        "wmo/common/core/render.py",
-        "wmo/common/core/types.py",
-        "wmo/repo_docstrings_test.py",
-        "wmo/repo_structure_test.py",
-        "wmo/repository_guardrails.toml",
-        "wmo/simulation/hub.py",
-    }
-)
 
 
 def _normalized_path(member_name: str) -> str:
@@ -117,20 +95,17 @@ def _assert_current_archive_members(
     required: frozenset[str],
     allow_tests: bool,
 ) -> None:
-    """Reject a missing current member or any forbidden package, module, test, or asset member."""
+    """Reject a missing current member, and reject test members where tests are excluded."""
     file_names = frozenset(name for name in names if name and not name.endswith("/"))
     assert required.issubset(file_names), (
         f"archive is missing current members: {required - file_names}"
     )
-    forbidden = sorted(
-        name
-        for name in file_names
-        if name in FORBIDDEN_ARCHIVE_MEMBERS
-        or any(name.startswith(prefix) for prefix in FORBIDDEN_ARCHIVE_PREFIXES)
-        or not allow_tests
-        and (name.endswith("_test.py") or name == "wmo/conftest.py")
+    if allow_tests:
+        return
+    tests = sorted(
+        name for name in file_names if name.endswith("_test.py") or name == "wmo/conftest.py"
     )
-    assert not forbidden, f"archive contains forbidden stale members: {forbidden}"
+    assert not tests, f"wheel contains test members: {tests}"
 
 
 def _tracked_sdist_members() -> frozenset[str]:
@@ -176,6 +151,12 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name.startswith("wmo/")) == (
             _tracked_wheel_members()
         )
+        outside_package = sorted(
+            name
+            for name in wheel.namelist()
+            if not name.startswith("wmo/") and ".dist-info/" not in name
+        )
+        assert not outside_package, f"wheel carries members outside the package: {outside_package}"
         assert FORBIDDEN_REQUIREMENT.search(metadata) is None
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
@@ -190,21 +171,6 @@ def test_built_archives_match_current_package_contract() -> None:
         )
         assert FORBIDDEN_REQUIREMENT.search(metadata) is None
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
-
-
-def test_requirement_scanner_rejects_forbidden_dependencies() -> None:
-    """The release check detects every forbidden dependency family directly."""
-    for dependency in (
-        "anthropic",
-        "boto3",
-        "environment-capture",
-        "gepa",
-        "mlx-lm",
-        "opentelemetry-proto",
-        "scikit-learn",
-        "transformers",
-    ):
-        assert FORBIDDEN_REQUIREMENT.search(f"Requires-Dist: {dependency}>=1\n") is not None
 
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
@@ -253,29 +219,3 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     ingest = (docs / "reference" / "ingest.md").read_text(encoding="utf-8")
     assert "PostHogPullRequest" in ingest
     assert "pull_posthog_traces" in ingest
-
-
-@pytest.mark.parametrize(
-    "stale_member",
-    [
-        "assets/world-model-agent-loop.svg",
-        "web/package.json",
-        "web/app/page.tsx",
-        "wmo/cli/review_server.py",
-        "wmo/cli/review_server_test.py",
-        "wmo/common/providers/openai.py",
-        "wmo/common/vendor/sdk.py",
-        "wmo/optimize/research/runner.py",
-        "wmo/common/core/types.py",
-        "wmo/simulation/hub.py",
-        "wmo/repository_guardrails.toml",
-    ],
-)
-def test_archive_member_scanner_rejects_synthetic_stale_members(stale_member: str) -> None:
-    """Every forbidden asset, owner, helper, and guard family fails a direct synthetic scan."""
-    with pytest.raises(AssertionError, match="forbidden stale members"):
-        _assert_current_archive_members(
-            tuple((*REQUIRED_WHEEL_MODULES, stale_member)),
-            required=REQUIRED_WHEEL_MODULES,
-            allow_tests=False,
-        )

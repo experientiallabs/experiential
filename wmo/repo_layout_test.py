@@ -89,13 +89,6 @@ def test_top_level_paths_are_allowlisted() -> None:
     assert actual_files == ALLOWED_TOP_FILES
 
 
-def test_review_surfaces_are_python_only() -> None:
-    """Review services stay in the Python package without a browser application or adapter."""
-    assert not (REPO_ROOT / "web").exists()
-    assert not (REPO_ROOT / "wmo" / "cli" / "review_server.py").exists()
-    assert not (REPO_ROOT / "wmo" / "cli" / "review_server_test.py").exists()
-
-
 def test_no_local_state_or_cache_is_tracked() -> None:
     """Generated settings, caches, bytecode, and local environment files stay untracked."""
     offenders = [

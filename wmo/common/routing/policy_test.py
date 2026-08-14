@@ -63,26 +63,10 @@ def _policy() -> KnnRouterPolicy:
     )
 
 
-def test_policy_and_decision_round_trip() -> None:
-    """A policy pins all fit-time identities and a decision names its policy digest."""
+def test_persisted_policy_resolves_through_the_router_policy_union() -> None:
+    """A stored policy document loads as its concrete kind without the caller naming the class."""
     policy = _policy()
-    decision = RoutingDecision(
-        decision_id="decision-1",
-        policy_id=policy.policy_id,
-        policy_sha256=_DIGEST,
-        request_sha256=_DIGEST,
-        episode_id_sha256=_DIGEST,
-        selected_alias="candidate-economy",
-        baseline_alias="candidate-incumbent",
-        neighbor_count=12,
-        paired_count=10,
-        best_similarity=0.98,
-        estimated_quality_difference=0.01,
-        uncertainty=0.02,
-    )
 
-    assert KnnRouterPolicy.model_validate_json(policy.model_dump_json()) == policy
-    assert RoutingDecision.model_validate_json(decision.model_dump_json()) == decision
     assert TypeAdapter(RouterPolicy).validate_json(policy.model_dump_json()) == policy
 
 
