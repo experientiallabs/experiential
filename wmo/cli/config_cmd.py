@@ -7,6 +7,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from wmo.cli.defer import add_deferred_typer
 from wmo.cli.provider_setup import ProviderSetupOptions, run_provider_setup
 from wmo.common.config import (
     ARTIFACT_DIR,
@@ -17,6 +18,14 @@ from wmo.common.config import (
 from wmo.common.core.locks import FileLockTimeout
 
 config_app = typer.Typer(help="Manage project-local wmo settings.", no_args_is_help=True)
+add_deferred_typer(
+    config_app,
+    name="judge",
+    module="wmo.cli.judge_config",
+    attr="judge_app",
+    help="Set up and manually calibrate a project judge.",
+    known_names=("setup", "calibrate"),
+)
 _console = Console()
 _PROVIDER_ROOT_OPTION = typer.Option(Path(ARTIFACT_DIR), "--root", help="Local .wmo root.")
 

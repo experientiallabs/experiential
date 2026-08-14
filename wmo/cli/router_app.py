@@ -7,9 +7,11 @@ from pathlib import Path
 
 import typer
 
+from wmo.common.judging import verify_persisted_calibration
 from wmo.common.observability.telemetry import capture_completion_once
-from wmo.common.project import ArtifactStore, ProjectPaths
+from wmo.common.project import ProjectStore
 from wmo.optimize.router.workflow import RouterOptimizationConfig, optimize_router
+from wmo.workflow.manual_judge_contracts import ManualJudgeReviewState
 
 _ROOT_OPTION = typer.Option(Path(".wmo"), "--root", help="Local .wmo artifact root.")
 _CONFIG_OPTION = typer.Option(
@@ -39,7 +41,10 @@ def router(
     started = time.monotonic()
     try:
         value = RouterOptimizationConfig.model_validate_json(config.read_bytes())
-        result = optimize_router(ArtifactStore(ProjectPaths(root=root, project_id=project)), value)
+        store = ProjectStore(root, project)
+        if value.judgment_status == "human_calibrated":
+            _require_approved_manual_calibration(store)
+        result = optimize_router(store.artifacts, value)
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from None
     capture_completion_once(
@@ -59,3 +64,33 @@ def router(
     typer.echo(f"policy: {result.optimization.policy.policy_id}")
     typer.echo(f"held-out evaluation: {result.held_out_evaluation_id}")
     typer.echo(f"report: {result.optimization.report.report_id}")
+
+
+def _require_approved_manual_calibration(store: ProjectStore) -> None:
+    """Require an explicitly approved human calibration for calibrated optimization.
+
+    Args:
+        store: Project-local review and immutable artifact store.
+
+    Raises:
+        ValueError: Manual setup, calibration audit, or approved calibration is unavailable.
+    """
+    review = store.read_review()
+    guidance = (
+        "project has no approved judge calibration; run "
+        "`wmo config judge setup PROJECT`, then "
+        "`wmo config judge calibrate PROJECT --approve`"
+    )
+    if not isinstance(review, dict) or review.get("manual_judge") is None:
+        raise ValueError(guidance)
+    try:
+        state = ManualJudgeReviewState.model_validate(review["manual_judge"])
+    except ValueError as exc:
+        raise ValueError("project manual judge state is invalid") from exc
+    if state.approved_calibration is None:
+        raise ValueError(guidance)
+    calibration, calibration_input = verify_persisted_calibration(
+        store, state.approved_calibration.artifact_id
+    )
+    if calibration_input != state.approved_calibration or calibration.status != "human_calibrated":
+        raise ValueError(guidance)

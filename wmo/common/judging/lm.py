@@ -5,11 +5,17 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import Field, field_validator
 
-from wmo.common.core.artifacts import ArtifactId, ArtifactInput, ContractModel, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactId,
+    ArtifactInput,
+    ContractModel,
+    JsonObject,
+    stable_id,
+)
 from wmo.common.judging.calibration import CalibrationError
 from wmo.common.judging.calibration_provenance import (
     _load_authoritative_persisted_calibration,
@@ -22,7 +28,14 @@ from wmo.common.judging.provenance import (
     sorted_verified_inputs,
 )
 from wmo.common.judging.rubric import JudgeCalibration, Rubric
-from wmo.common.models import ModelClient, ModelMessage, ModelRequest, ToolCall
+from wmo.common.models import (
+    ModelClient,
+    ModelMessage,
+    ModelRequest,
+    ModelSnapshot,
+    OperationEconomics,
+    ToolCall,
+)
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
 from wmo.common.rollouts import RolloutArtifact
 
@@ -53,6 +66,29 @@ class _RawJudgment(ContractModel):
     """Strict top-level structured score emitted by an LM judge."""
 
     dimensions: tuple[_RawDimensionJudgment, ...]
+
+
+class JudgeProbe(ContractModel):
+    """One structured scalar judge response retained without persistence.
+
+    Args:
+        model: Exact model identity returned by the provider.
+        dimensions: Canonically rubric-ordered raw and calibrated dimension scores.
+        economics: Provider-reported usage, cost, and latency for the request.
+    """
+
+    model: ModelSnapshot
+    dimensions: tuple[DimensionJudgment, ...]
+    economics: OperationEconomics
+
+
+def judge_response_schema() -> JsonObject:
+    """Return the strict JSON schema accepted from every configured LM judge.
+
+    Returns:
+        Pydantic-derived object schema for the dimension judgment response.
+    """
+    return cast(JsonObject, _RawJudgment.model_json_schema())
 
 
 class LMJudge:
@@ -100,25 +136,86 @@ class LMJudge:
             JudgmentError: A source is absent, calibration is ineligible, or model output is
                 invalid.
         """
-        (
-            rollout,
-            rollout_input,
-            rubric,
-            rubric_input,
-            calibration,
-            calibration_input,
-        ) = _load_authoritative_judging_inputs(
+        inputs = _load_authoritative_judging_inputs(
             store,
             rollout_artifact_id=rollout_artifact_id,
             rubric_artifact_id=rubric_artifact_id,
             calibration_artifact_id=calibration_artifact_id,
         )
+        rollout, rollout_input, rubric, rubric_input, calibration, calibration_input = inputs
+        probe = self._probe(rollout, rubric, calibration)
+        return self._judgment_from_probe(
+            rollout=rollout,
+            rollout_input=rollout_input,
+            rubric=rubric,
+            rubric_input=rubric_input,
+            calibration=calibration,
+            calibration_input=calibration_input,
+            probe=probe,
+        )
+
+    def probe_persisted(
+        self,
+        store: ProjectStore,
+        *,
+        rollout_artifact_id: ArtifactId,
+        rubric_artifact_id: ArtifactId,
+        calibration_artifact_id: ArtifactId,
+    ) -> JudgeProbe:
+        """Score persisted scalar evidence without writing a judgment artifact.
+
+        Args:
+            store: Project store that owns completed immutable judging inputs.
+            rollout_artifact_id: Completed source rollout artifact to score.
+            rubric_artifact_id: Completed rubric artifact used for scoring.
+            calibration_artifact_id: Provisional or approved calibration binding the prompt.
+        Returns:
+            Structured provider response with observed economics and no persistence side effect.
+
+        Raises:
+            JudgmentError: A source, binding, response, or model identity is invalid.
+        """
+        rollout, _rollout_input, rubric, _rubric_input, calibration, _calibration_input = (
+            _load_authoritative_judging_inputs(
+                store,
+                rollout_artifact_id=rollout_artifact_id,
+                rubric_artifact_id=rubric_artifact_id,
+                calibration_artifact_id=calibration_artifact_id,
+            )
+        )
+        return self._probe(
+            rollout,
+            rubric,
+            calibration,
+        )
+
+    def _probe(
+        self,
+        rollout: RolloutArtifact,
+        rubric: Rubric,
+        calibration: JudgeCalibration,
+    ) -> JudgeProbe:
+        """Dispatch and validate one structured scalar judge request.
+
+        Args:
+            rollout: Verified immutable rollout evidence.
+            rubric: Verified human-approved scoring rubric.
+            calibration: Verified calibration that binds model, prompt, and score maps.
+        Returns:
+            Canonically ordered validated dimensions and provider economics.
+
+        Raises:
+            JudgmentError: Prompt bindings, response identity, JSON, scores, or citations fail.
+        """
         _validate_bindings(rubric, calibration, self._prompt)
         response = self._model.complete(
             ModelRequest(
                 messages=(
                     ModelMessage(role="system", content=self._prompt.text),
-                    ModelMessage(role="user", content=_render_judgment_request(rollout, rubric)),
+                    ModelMessage(
+                        role="user",
+                        content=_render_judgment_request(rollout, rubric),
+                    ),
                 ),
                 temperature=0.0,
                 maximum_output_tokens=4_096,
@@ -130,10 +227,44 @@ class LMJudge:
             )
         raw = _parse_response(response.output.content, response.output.tool_calls)
         dimensions = _build_dimensions(raw, rollout, rubric, calibration)
+        return JudgeProbe(
+            model=response.model,
+            dimensions=dimensions,
+            economics=response.economics,
+        )
+
+    def _judgment_from_probe(
+        self,
+        *,
+        rollout: RolloutArtifact,
+        rollout_input: ArtifactInput,
+        rubric: Rubric,
+        rubric_input: ArtifactInput,
+        calibration: JudgeCalibration,
+        calibration_input: ArtifactInput,
+        probe: JudgeProbe,
+    ) -> Judgment:
+        """Build one canonical persisted-judgment value from a forward probe.
+
+        Args:
+            rollout: Verified immutable rollout evidence.
+            rollout_input: Exact rollout manifest pointer.
+            rubric: Verified human-approved rubric.
+            rubric_input: Exact rubric manifest pointer.
+            calibration: Verified prompt and score-map binding.
+            calibration_input: Exact calibration manifest pointer.
+            probe: Validated forward provider response.
+
+        Returns:
+            Unwritten canonical judgment bound to every authoritative input.
+
+        """
         created_at = self._clock()
         if created_at.tzinfo is None or created_at.utcoffset() is None:
             raise JudgmentError("judge clock must return a timezone-aware time")
-        overall_score = sum(item.calibrated_score / 5 for item in dimensions) / len(dimensions)
+        overall_score = sum(item.calibrated_score / 5 for item in probe.dimensions) / len(
+            probe.dimensions
+        )
         inputs = sorted_verified_inputs((rollout_input, rubric_input, calibration_input))
         return Judgment(
             schema_version=1,
@@ -146,8 +277,8 @@ class LMJudge:
                     "rollout_id": rollout.rollout_id,
                     "rubric_id": rubric.rubric_id,
                     "calibration_id": calibration.calibration_id,
-                    "dimensions": [item.model_dump(mode="json") for item in dimensions],
-                    "judge_model": response.model.model_dump(mode="json"),
+                    "dimensions": [item.model_dump(mode="json") for item in probe.dimensions],
+                    "judge_model": probe.model.model_dump(mode="json"),
                     "judge_prompt_sha256": self._prompt.sha256,
                     "judging_code_revision": self._code_revision,
                     "inputs": [item.model_dump(mode="json") for item in inputs],
@@ -156,12 +287,12 @@ class LMJudge:
             rollout_id=rollout.rollout_id,
             rubric_id=rubric.rubric_id,
             calibration_id=calibration.calibration_id,
-            judge_model=response.model,
+            judge_model=probe.model,
             judge_prompt_id=self._prompt.prompt_id,
             judge_prompt_sha256=self._prompt.sha256,
-            dimensions=dimensions,
+            dimensions=probe.dimensions,
             overall_score=overall_score,
-            judge_economics=response.economics,
+            judge_economics=probe.economics,
         )
 
     def judge_and_write(
@@ -352,7 +483,14 @@ def _build_dimensions(
 
 
 def _render_judgment_request(rollout: RolloutArtifact, rubric: Rubric) -> str:
-    """Render every valid scoring anchor and rollout span for evidence-cited judgment."""
+    """Render scoring anchors and rollout spans for scalar judgment.
+
+    Args:
+        rollout: Verified immutable rollout evidence to score.
+        rubric: Human-approved rubric defining all dimensions and anchors.
+    Returns:
+        Deterministic JSON-grounded user request for the structured judge.
+    """
     rubric_payload = [
         {
             "dimension_id": dimension.dimension_id,

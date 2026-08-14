@@ -15,11 +15,23 @@ from wmo.cli.app import app
         ["build", "--help"],
         ["config", "telemetry", "--help"],
         ["config", "providers", "--help"],
+        ["config", "judge", "setup", "--help"],
+        ["config", "judge", "calibrate", "--help"],
         ["optimize", "router", "--help"],
         ["optimize", "model", "--help"],
         ["run", "--help"],
     ],
-    ids=["root", "build", "telemetry", "providers", "router", "model", "run"],
+    ids=[
+        "root",
+        "build",
+        "telemetry",
+        "providers",
+        "judge-setup",
+        "judge-calibrate",
+        "router",
+        "model",
+        "run",
+    ],
 )
 def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
     """Command help exposes the approved surface without docstring scaffolding."""

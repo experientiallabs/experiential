@@ -16,10 +16,11 @@ def test_root_command_surface_is_locked() -> None:
     assert group_names == {"config", "optimize"}
 
 
-def test_config_exposes_telemetry_and_provider_setup() -> None:
-    """Config contains only local telemetry and model-provider state."""
+def test_config_exposes_telemetry_provider_and_manual_judge_setup() -> None:
+    """Config contains local telemetry, model-provider, and manual judge state."""
     result = CliRunner().invoke(app, ["config", "--help"])
 
     assert result.exit_code == 0, result.output
     assert "telemetry" in result.output
     assert "providers" in result.output
+    assert "judge" in result.output

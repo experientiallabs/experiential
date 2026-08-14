@@ -27,7 +27,7 @@ from wmo.common.judging.lineage import (
     RouterLineageSplit,
     write_router_lineage_split,
 )
-from wmo.common.judging.lm import JudgmentError, LMJudge
+from wmo.common.judging.lm import JudgeProbe, JudgmentError, LMJudge, judge_response_schema
 from wmo.common.judging.prompts import PromptDefinition
 from wmo.common.judging.proposal import (
     LMRubricProposer,
@@ -65,6 +65,7 @@ __all__ = [
     "HumanScoreReview",
     "InsufficientCalibrationRiskAcceptance",
     "Judge",
+    "JudgeProbe",
     "JudgeCalibration",
     "JudgeCalibrationService",
     "JudgeScoreObservation",
@@ -92,5 +93,6 @@ __all__ = [
     "write_router_lineage_split",
     "write_rubric_proposal_evidence",
     "verify_persisted_calibration",
+    "judge_response_schema",
     "utc_now",
 ]
