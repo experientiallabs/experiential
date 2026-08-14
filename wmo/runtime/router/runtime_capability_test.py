@@ -90,9 +90,11 @@ def test_selection_uses_an_eligible_frozen_candidate_before_dispatch() -> None:
 
     class _MixedCatalog(_Catalog):
         def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+            """Return the frozen model and capabilities for an alias."""
             return snapshots[alias], capabilities[alias]
 
         def resolve(self, alias: str) -> ResolvedModel:
+            """Resolve an alias to the shared test client and frozen metadata."""
             snapshot, capability = self.snapshot(alias)
             return ResolvedModel(
                 alias,
@@ -143,9 +145,11 @@ def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
 
     class _MixedCatalog(_Catalog):
         def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+            """Return the frozen model and capabilities for an alias."""
             return snapshots[alias], capabilities[alias]
 
         def resolve(self, alias: str) -> ResolvedModel:
+            """Resolve an alias to the shared test client and frozen metadata."""
             snapshot, capability = self.snapshot(alias)
             return ResolvedModel(
                 alias,

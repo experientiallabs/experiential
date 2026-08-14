@@ -116,6 +116,7 @@ def responses_stream(response: OpenAIResponse) -> Iterator[str]:
 def _text_events(
     item: ResponseOutputMessage, output_index: int, sequence: int
 ) -> Generator[str, None, int]:
+    """Yield the official content-part and text lifecycle for one output message."""
     for content_index, content in enumerate(item.content):
         if content.type != "output_text":
             continue
@@ -165,6 +166,7 @@ def _text_events(
 def _function_events(
     item: ResponseFunctionToolCall, output_index: int, sequence: int
 ) -> Generator[str, None, int]:
+    """Yield the official argument lifecycle for one function-call item."""
     if item.id is None:
         raise ValueError("Responses function-call output omitted its item ID")
     events = (
@@ -190,4 +192,5 @@ def _function_events(
 
 
 def _event(name: str, data: str) -> str:
+    """Encode one named server-sent event."""
     return f"event: {name}\ndata: {data}\n\n"

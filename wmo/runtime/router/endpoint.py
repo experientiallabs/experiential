@@ -159,6 +159,7 @@ class HttpFunctionDefinition(BaseModel):
 
     @model_validator(mode="after")
     def _reject_strict_mode(self) -> HttpFunctionDefinition:
+        """Reject strict schemas because routed candidates cannot guarantee them."""
         if self.strict is not None:
             raise ValueError("strict function schemas are not supported by this routed endpoint")
         return self
@@ -198,6 +199,7 @@ class HttpChatRequest(BaseModel):
 
     @model_validator(mode="after")
     def _require_parallel_tool_calls(self) -> HttpChatRequest:
+        """Reject requests that require serial tool-call execution."""
         if self.parallel_tool_calls is False:
             raise ValueError("parallel_tool_calls=false is not supported by this routed endpoint")
         return self
@@ -216,6 +218,7 @@ class HttpResponseTool(BaseModel):
 
     @model_validator(mode="after")
     def _reject_strict_mode(self) -> HttpResponseTool:
+        """Reject strict schemas because routed candidates cannot guarantee them."""
         if self.strict is not None:
             raise ValueError("strict function schemas are not supported by this routed endpoint")
         return self
@@ -268,6 +271,7 @@ class HttpResponseRequest(BaseModel):
 
     @model_validator(mode="after")
     def _require_parallel_tool_calls(self) -> HttpResponseRequest:
+        """Reject requests that require serial tool-call execution."""
         if self.parallel_tool_calls is False:
             raise ValueError("parallel_tool_calls=false is not supported by this routed endpoint")
         return self
@@ -291,6 +295,7 @@ class _OpenAIRequestState:
     """
 
     def __init__(self) -> None:
+        """Initialize empty bounded continuation state."""
         self._lock = threading.RLock()
         self._responses: OrderedDict[str, _ResponseState] = OrderedDict()
         self._response_bytes = 0
@@ -333,6 +338,7 @@ class _OpenAIRequestState:
                 self._response_bytes -= evicted.size_bytes
 
     def _expire_responses(self, now: float) -> None:
+        """Remove continuations whose monotonic expiry is at or before ``now``."""
         expired = tuple(key for key, state in self._responses.items() if state.expires_at <= now)
         for key in expired:
             self._response_bytes -= self._responses.pop(key).size_bytes
@@ -361,6 +367,7 @@ def create_router_endpoint(
 
     @router.get("/v1/models")
     def models() -> dict[str, object]:
+        """List the routed model names exposed by this endpoint."""
         return {
             "object": "list",
             "data": [
@@ -374,6 +381,7 @@ def create_router_endpoint(
         request: HttpChatRequest,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> Response:
+        """Serve one OpenAI Chat Completions request through the selected runtime."""
         if idempotency_key is not None and not idempotency_key.strip():
             return _error(400, "Idempotency-Key must not be empty")
         runtime = endpoints.get(request.model)
@@ -428,6 +436,7 @@ def create_router_endpoint(
         request: HttpResponseRequest,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> Response:
+        """Serve one OpenAI Responses request with bounded continuation state."""
         if idempotency_key is not None and not idempotency_key.strip():
             return _error(400, "Idempotency-Key must not be empty")
         runtime = endpoints.get(request.model)
@@ -663,6 +672,7 @@ def _chat_completion(
     *,
     idempotency_key: str | None = None,
 ) -> ChatCompletion:
+    """Build an official Chat Completions result from a routed model response."""
     usage = _usage(response)
     completion_id, created = _response_identity("chatcmpl-", response, idempotency_key)
     return ChatCompletion.model_validate(
@@ -693,6 +703,7 @@ def _openai_response(
     idempotency_key: str | None,
     previous_response_id: str | None,
 ) -> OpenAIResponse:
+    """Build an official Responses result from a routed model response."""
     response_id, created = _response_identity("resp_", response, idempotency_key)
     output: list[JsonObject] = []
     if action.content is not None:

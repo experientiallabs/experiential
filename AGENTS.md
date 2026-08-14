@@ -28,9 +28,9 @@ uv run pytest -q
   simulation, optimize, or cli; runtime may not import simulation, optimize, or cli; simulation
   may not import optimize or cli; optimize may not import simulation or cli. The AST gate rejects
   every current forbidden edge directly.
-- Public Python modules, classes, protocols, functions, and methods use Google-style docstrings.
-  A trivial public function may use one clear summary line. Private helpers and test functions do
-  not need a docstring when their behavior is obvious.
+- Every Python function and method uses a Google-style docstring. An absolutely trivial function
+  or method may use one clear summary line. This rule includes private helpers, nested functions,
+  and test helpers so each callable states its current contract locally.
 - The root CLI command set is exact: `build`, `config`, `optimize`, and `run`; package-layout and
   release tests enforce the current module and distribution shape.
 - There is no 800-line warning and no numeric modules-per-directory gate.
@@ -110,8 +110,8 @@ uv run pytest -q
 ## Python
 
 - Every Python file must have a module docstring.
-- Write Google-style docstrings for all classes and functions with significant logic. Use plain
-  one-line docstrings for simple/self-explanatory classes and functions.
+- Write Google-style docstrings for all classes and functions. Use plain one-line docstrings only
+  for absolutely trivial classes and functions.
 - **Never `print`.** All diagnostic/progress output goes through a module logger
   (`logging.getLogger(__name__)`), never the `print` builtin — enforced by ruff's `T20` rules.
   The one exception is deliberate user-facing CLI presentation, which goes through a local rich

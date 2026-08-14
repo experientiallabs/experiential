@@ -21,6 +21,7 @@ class RouterCompletionFailedError(RuntimeError):
     """A durable interaction has a stable terminal provider failure."""
 
     def __init__(self, failure: StructuredFailure) -> None:
+        """Initialize the error with its durable structured failure."""
         super().__init__(failure.message)
         self.failure = failure
 

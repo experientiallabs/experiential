@@ -6,6 +6,7 @@ from wmo.runtime.router.endpoint import HttpMessage, _OpenAIRequestState, _Respo
 
 
 def _state(*, expires_at: float, size_bytes: int) -> _ResponseState:
+    """Build retained response state with controlled expiry and size."""
     return _ResponseState(
         episode_id="episode-a",
         messages=(HttpMessage(role="user", content="x"),),

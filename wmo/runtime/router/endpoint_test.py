@@ -38,6 +38,7 @@ class _ReplayService:
     """Thread-safe test double for the durable journal completion contract."""
 
     def __init__(self, runtime: RouterRuntime) -> None:
+        """Initialize the replay service around a router runtime."""
         self.runtime = runtime
         self._lock = threading.Lock()
         self._completed: dict[str, tuple[ModelRequest, RoutedModelResponse]] = {}
@@ -49,6 +50,7 @@ class _ReplayService:
         idempotency_key: str,
         conversation_id: str | None = None,
     ) -> RoutedModelResponse:
+        """Complete a request once per key and replay the durable result."""
         if not idempotency_key:
             return self.runtime.complete(request, episode_id=conversation_id)
         with self._lock:
@@ -65,6 +67,7 @@ class _ReplayService:
 def _clients(
     *, candidate_tools: bool = True, durable: bool = False
 ) -> tuple[OpenAI, TestClient, RouterRuntime, _Client]:
+    """Build official and loopback clients over one test router runtime."""
     runtime, model_client = _runtime(candidate_tools=candidate_tools)
     service = _ReplayService(runtime) if durable else None
     app = create_project_router_app("router-a", runtime, completion_service=service)
