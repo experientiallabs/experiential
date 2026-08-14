@@ -16,9 +16,13 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
     stable_id,
 )
-from wmo.common.project import ArtifactAlreadyExistsError, ArtifactStore
+from wmo.common.project import ArtifactAlreadyExistsError, ArtifactStore, artifact_input
 from wmo.common.tasks import TaskCase, TaskSet, load_task_set
-from wmo.common.traces import Trace
+from wmo.common.traces import Trace, load_trace_dataset
+from wmo.simulation.mining.bindings import (
+    TaskSetLineageBindings,
+    build_task_set_lineage_bindings,
+)
 from wmo.simulation.mining.cleanup import (
     InstructionCleanupModel,
     InstructionCleanupResult,
@@ -236,6 +240,13 @@ def persist_task_set(
     """
     task_payload = _jsonl_bytes(result.tasks)
     coverage_payload = canonical_json_bytes(result.coverage)
+    lineage_payload = None
+    if inputs:
+        if len(inputs) != 1:
+            raise ValueError("built task sets require exactly one source trace-dataset input")
+        lineage_bindings = build_task_set_lineage_bindings(task_set_id, inputs[0], result)
+        _require_complete_source_bindings(store, inputs[0], lineage_bindings)
+        lineage_payload = canonical_json_bytes(lineage_bindings)
     task_set = TaskSet(
         schema_version=1,
         created_at=created_at,
@@ -257,17 +268,21 @@ def persist_task_set(
             raise ValueError("existing task set differs from replayed mining evidence")
         if store.read_bytes(task_set_id, "coverage.json") != coverage_payload:
             raise ValueError("existing task-set coverage differs from replayed mining evidence")
+        _require_lineage_replay(store, task_set_id, lineage_payload)
         return loaded.task_set
+    files = {
+        "tasks.jsonl": task_payload,
+        "coverage.json": coverage_payload,
+        "task-set.json": canonical_json_bytes(task_set),
+    }
+    if lineage_payload is not None:
+        files["lineage-bindings.json"] = lineage_payload
     try:
         store.write(
             artifact_id=task_set_id,
             artifact_type="task-set",
             envelope=task_set,
-            files={
-                "tasks.jsonl": task_payload,
-                "coverage.json": coverage_payload,
-                "task-set.json": canonical_json_bytes(task_set),
-            },
+            files=files,
         )
     except ArtifactAlreadyExistsError:
         loaded = load_task_set(store, task_set_id)
@@ -278,8 +293,66 @@ def persist_task_set(
             raise ValueError(
                 "existing task-set coverage differs from replayed mining evidence"
             ) from None
+        _require_lineage_replay(store, task_set_id, lineage_payload)
         return loaded.task_set
     return task_set
+
+
+def _require_lineage_replay(
+    store: ArtifactStore,
+    task_set_id: str,
+    expected_payload: bytes | None,
+) -> None:
+    """Verify that replay preserves the complete optional lineage payload.
+
+    Args:
+        store: Project artifact store owning the existing task set.
+        task_set_id: Existing immutable task-set identity.
+        expected_payload: Canonical payload expected for a built task set, or None for legacy
+            source-free persistence.
+
+    Raises:
+        ValueError: Existing lineage evidence differs from the replay.
+    """
+    paths = {entry.path for entry in store.read(task_set_id).manifest.files}
+    has_payload = "lineage-bindings.json" in paths
+    if expected_payload is None:
+        if has_payload:
+            raise ValueError("existing task set unexpectedly contains lineage bindings")
+        return
+    if (
+        not has_payload
+        or store.read_bytes(task_set_id, "lineage-bindings.json") != expected_payload
+    ):
+        raise ValueError("existing task-set lineage bindings differ from replayed mining evidence")
+
+
+def _require_complete_source_bindings(
+    store: ArtifactStore,
+    trace_dataset_input: ArtifactInput,
+    payload: TaskSetLineageBindings,
+) -> None:
+    """Reject incomplete mining lineage evidence before task-set publication.
+
+    Args:
+        store: Project artifact store owning the exact source trace dataset.
+        trace_dataset_input: Claimed immutable source dataset manifest input.
+        payload: Typed complete lineage payload produced from mining.
+
+    Raises:
+        ValueError: Bindings omit or add traces relative to the exact source dataset.
+        ArtifactCorruptionError: The source artifact or manifest input cannot be verified.
+    """
+    stored = store.read(trace_dataset_input.artifact_id)
+    if artifact_input(stored.manifest) != trace_dataset_input:
+        raise ValueError("task-set source trace-dataset manifest digest differs")
+    source = load_trace_dataset(store, trace_dataset_input.artifact_id)
+    source_trace_ids = tuple(sorted(trace.trace_id for trace in source.traces))
+    binding_trace_ids = tuple(binding.trace_id for binding in payload.bindings)
+    if binding_trace_ids != source_trace_ids:
+        raise ValueError(
+            "task-set lineage bindings must cover every exact source trace once and only once"
+        )
 
 
 def _materialize_tasks(

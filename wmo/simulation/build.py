@@ -29,6 +29,10 @@ from wmo.common.project import (
 from wmo.common.tasks import TaskSet
 from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
+from wmo.simulation.mining.bindings import (
+    bindings_for_mining,
+    task_set_content_id,
+)
 from wmo.simulation.mining.descriptors import DescriptorEmbedder, HashingDescriptorEmbedder
 from wmo.simulation.mining.service import MiningSpec, TaskMiningResult, mine_tasks, persist_task_set
 
@@ -429,13 +433,11 @@ def _completed_build_matches_review(store: ProjectStore, review: BuildReviewRead
 
 def _task_set_id(dataset_input: ArtifactInput, mining: TaskMiningResult) -> str:
     """Return the content-addressed task-set ID for one immutable dataset and selection result."""
-    return stable_id(
-        "task-set",
-        {
-            "trace_dataset": dataset_input.model_dump(mode="json"),
-            "tasks": [task.model_dump(mode="json") for task in mining.tasks],
-            "coverage": mining.coverage.model_dump(mode="json"),
-        },
+    return task_set_content_id(
+        dataset_input,
+        mining.tasks,
+        mining.coverage,
+        bindings_for_mining(mining),
     )
 
 

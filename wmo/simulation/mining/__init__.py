@@ -1,5 +1,10 @@
 """Canonical representative-task mining from normalized production traces."""
 
+from wmo.simulation.mining.bindings import (
+    TaskSetLineageBindings,
+    TaskTraceLineageBinding,
+    load_task_set_lineage_bindings,
+)
 from wmo.simulation.mining.cleanup import (
     InstructionCleanupModel,
     InstructionCleanupResult,
@@ -26,10 +31,13 @@ __all__ = [
     "MiningSpec",
     "RoutingDescriptor",
     "TaskMiningResult",
+    "TaskSetLineageBindings",
+    "TaskTraceLineageBinding",
     "assign_source_lineages",
     "clean_instruction",
     "coverage_descriptor",
     "mine_tasks",
+    "load_task_set_lineage_bindings",
     "persist_task_set",
     "routing_descriptor",
 ]

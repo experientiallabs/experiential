@@ -35,6 +35,7 @@ from wmo.common.models import (
 from wmo.common.project import (
     ArtifactCorruptionError,
     ArtifactStore,
+    ProjectBuildArtifacts,
     ProjectPaths,
     artifact_input,
 )
@@ -42,8 +43,10 @@ from wmo.common.routing import RouterFeatureExtractor, RoutingDecision
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.runtime.router import RuntimeAcceptedEvent, RuntimeInteractionJournal
 from wmo.runtime.router.journal import RuntimeAcceptance, _interaction_identity
+from wmo.simulation.build import build_task_set
 from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
+from wmo.simulation.mining.service import MiningSpec
 from wmo.simulation.retrieval import (
     PersistedRuntimeRAGRefresh,
     RAGAction,
@@ -54,6 +57,7 @@ from wmo.simulation.retrieval import (
     RuntimeRAGRefreshError,
     RuntimeTraceStitchingError,
     TraceRAGRetriever,
+    load_completed_build_rag_lineage_bindings,
     load_rag_index,
     load_runtime_rag_refresh,
     refresh_runtime_trace_rag,
@@ -855,21 +859,30 @@ def test_real_import_and_runtime_snapshot_build_one_new_union_and_index(tmp_path
         tmp_path: Pytest-owned project directory.
     """
     journal, store, first = _two_turn_journal(tmp_path)
-    imported = _persist_imported_trace(store, source_kind="otlp")
+    built = build_task_set(
+        TraceNormalizationResult(traces=(_imported_trace(source_kind="otlp"),), issues=()),
+        store,
+        created_at=_TIME,
+        code_revision="test-revision",
+        mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=0),
+    )
+    imported = built.trace_dataset
     imported_input = artifact_input(imported.manifest)
+    completed = ProjectBuildArtifacts(
+        trace_dataset=imported_input,
+        task_set=artifact_input(store.read(built.task_set.task_set_id).manifest),
+        serving_rag=ArtifactInput(artifact_id="serving-rag-placeholder", sha256="1" * 64),
+        fit_rag=ArtifactInput(artifact_id="fit-rag-placeholder", sha256="2" * 64),
+        world_model=ArtifactInput(artifact_id="world-model-placeholder", sha256="3" * 64),
+    )
+    imported_bindings = load_completed_build_rag_lineage_bindings(store, completed)
     binding = _binding(CountingEmbedder())
 
     result = refresh_runtime_trace_rag(
         journal,
         store,
         (imported_input,),
-        (
-            RAGLineageBinding(
-                trace_id=imported.traces[0].trace_id,
-                lineage_id="imported-lineage",
-                partition="fit",
-            ),
-        ),
+        imported_bindings,
         embedder=binding,
         embedding_reservation=_reservation(binding),
         maximum_embedding_cost_usd=1.0,
@@ -890,7 +903,7 @@ def test_real_import_and_runtime_snapshot_build_one_new_union_and_index(tmp_path
     assert {
         (transition.trace_id, transition.lineage_id) for transition in result.retrieval.transitions
     } == {
-        (imported.traces[0].trace_id, "imported-lineage"),
+        (imported.traces[0].trace_id, imported_bindings[0].lineage_id),
         (first.interaction_id, first.lineage_id),
     }
 
@@ -1101,6 +1114,27 @@ def _persist_imported_trace(
     Returns:
         Completed canonical imported dataset.
     """
+    trace = _imported_trace(source_kind=source_kind)
+    return persist_trace_dataset(
+        TraceNormalizationResult(traces=(trace,), issues=()),
+        store,
+        created_at=_TIME - timedelta(minutes=1),
+        code_revision="import-revision",
+    )
+
+
+def _imported_trace(
+    *,
+    source_kind: Literal["file", "otlp", "production", "simulation", "manual", "generated"],
+) -> Trace:
+    """Create one imported trace with selectable source provenance.
+
+    Args:
+        source_kind: SourceIdentity kind used for trace provenance.
+
+    Returns:
+        Canonical imported trace with one observed transition.
+    """
     source = TraceSource(
         identity=SourceIdentity(
             kind=source_kind,
@@ -1109,7 +1143,7 @@ def _persist_imported_trace(
         ),
         semantic_convention_version="1.0",
     )
-    trace = Trace(
+    return Trace(
         trace_id=f"{source_kind}-trace",
         conversation_id="imported-lineage",
         task="Imported task",
@@ -1136,10 +1170,4 @@ def _persist_imported_trace(
         ),
         outcome=TraceOutcome(status="success"),
         source=source,
-    )
-    return persist_trace_dataset(
-        TraceNormalizationResult(traces=(trace,), issues=()),
-        store,
-        created_at=_TIME - timedelta(minutes=1),
-        code_revision="import-revision",
     )

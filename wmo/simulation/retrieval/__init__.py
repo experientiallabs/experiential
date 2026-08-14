@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     )
 
 from wmo.simulation.retrieval.build import PersistedRAGIndex, persist_trace_rag
+from wmo.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
 from wmo.simulation.retrieval.contracts import (
     RAGAction,
     RAGIndex,
@@ -87,6 +88,7 @@ __all__ = [
     "load_runtime_rag_refresh",
     "load_rag_index",
     "load_fit_rag_retriever",
+    "load_completed_build_rag_lineage_bindings",
     "persist_trace_rag",
     "refresh_runtime_trace_rag",
 ]
