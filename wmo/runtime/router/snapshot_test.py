@@ -49,6 +49,7 @@ _TIME = datetime(2026, 8, 13, tzinfo=UTC)
 
 
 def _snapshot(*, model_id: str = "gpt-test") -> ModelSnapshot:
+    """Build a frozen test model snapshot."""
     return ModelSnapshot(
         provider="openai",
         model_id=model_id,
@@ -58,6 +59,7 @@ def _snapshot(*, model_id: str = "gpt-test") -> ModelSnapshot:
 
 
 def _request(content: str = "Help me") -> ModelRequest:
+    """Build a deterministic two-message model request."""
     return ModelRequest(
         messages=(
             ModelMessage(role="system", content="You are helpful."),
@@ -67,6 +69,7 @@ def _request(content: str = "Help me") -> ModelRequest:
 
 
 def _response(*, model: ModelSnapshot | None = None, content: str = "Done") -> ModelResponse:
+    """Build a deterministic successful model response."""
     return ModelResponse(
         output=AssistantAction(content=content),
         model=model or _snapshot(),
@@ -77,6 +80,7 @@ def _response(*, model: ModelSnapshot | None = None, content: str = "Done") -> M
 
 
 def _decision(lineage_id: str, request: ModelRequest) -> RoutingDecision:
+    """Build a content-addressed routing decision for one request lineage."""
     episode_sha256 = hashlib.sha256(lineage_id.encode("utf-8"), usedforsecurity=False).hexdigest()
     feature = RouterFeatureExtractor().from_request(request)
     material = {
@@ -104,6 +108,7 @@ def _decision(lineage_id: str, request: ModelRequest) -> RoutingDecision:
 def _journal_and_store(
     tmp_path: Path,
 ) -> tuple[RuntimeInteractionJournal, ArtifactStore]:
+    """Build an isolated runtime journal and artifact store."""
     paths = ProjectPaths(root=tmp_path / ".wmo", project_id="support-agent")
     return RuntimeInteractionJournal(paths), ArtifactStore(paths)
 
@@ -116,6 +121,7 @@ def _accept(
     conversation_id: str | None = None,
     now: datetime = _TIME,
 ) -> RuntimeAcceptedEvent:
+    """Accept one deterministic interaction into the runtime journal."""
     routed_request = request or _request()
     identity = _interaction_identity(
         journal.project_id,
@@ -151,6 +157,7 @@ def _complete(
     now: datetime = _TIME,
     response: ModelResponse | None = None,
 ) -> RuntimeAcceptedEvent:
+    """Accept and complete one deterministic journal interaction."""
     accepted = _accept(
         journal,
         key=key,
@@ -167,6 +174,7 @@ def _complete(
 
 
 def _artifact_bytes(store: ArtifactStore, artifact_id: str) -> dict[str, bytes]:
+    """Read every file in an artifact directory as stable relative-path bytes."""
     directory = store.read(artifact_id).directory
     return {
         path.relative_to(directory).as_posix(): path.read_bytes()

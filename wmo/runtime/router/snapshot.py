@@ -79,6 +79,7 @@ class RuntimeTraceAttempt(ContractModel):
 
     @model_validator(mode="after")
     def _require_coherent_attempt(self) -> RuntimeTraceAttempt:
+        """Validate ordered terminal events and derive the attempt disposition."""
         event_ordinals = tuple(event.ordinal for event in self.terminal_events)
         if event_ordinals != tuple(sorted(event_ordinals)) or len(set(event_ordinals)) != len(
             event_ordinals
@@ -128,6 +129,7 @@ class RuntimeTraceInteraction(ContractModel):
 
     @model_validator(mode="after")
     def _require_coherent_interaction(self) -> RuntimeTraceInteraction:
+        """Validate retry lineage and the interaction's unique terminal target."""
         accepted = tuple(attempt.accepted for attempt in self.attempts)
         if any(event.interaction_id != self.interaction_id for event in accepted):
             raise ValueError("runtime interaction attempts name another interaction")
@@ -178,11 +180,13 @@ class RuntimeTraceSnapshot(ArtifactEnvelope):
     @field_validator("interactions_path")
     @classmethod
     def _require_safe_interactions_path(cls, value: str) -> str:
+        """Normalize and validate the relative interactions artifact path."""
         return validate_artifact_file_path(value).as_posix()
 
     @field_validator("interaction_ids")
     @classmethod
     def _require_unique_interactions(cls, value: tuple[ArtifactId, ...]) -> tuple[ArtifactId, ...]:
+        """Require a nonempty ordered set of unique interaction IDs."""
         if not value:
             raise ValueError("a runtime trace snapshot needs at least one interaction")
         if len(set(value)) != len(value):
@@ -191,6 +195,7 @@ class RuntimeTraceSnapshot(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_content_identity(self) -> RuntimeTraceSnapshot:
+        """Validate snapshot identity, counts, and production-source binding."""
         if self.completed_target_count > len(self.interaction_ids):
             raise ValueError("completed target count exceeds the interaction count")
         expected_id = stable_id(
