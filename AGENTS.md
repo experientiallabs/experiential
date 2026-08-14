@@ -139,18 +139,18 @@ uv run pytest -q
    has unrelated failures, record them and keep them out of the patch; fix them only when they are
    in scope or prevent meaningful validation.
 
-2. **Tests live inline next to the code, one test file per module.** A module `foo.py` is tested by
-   `foo_test.py` in the same directory (for example, `wmo/workflow/router.py` maps to
-   `wmo/workflow/router_test.py`). There is no top-level `tests/` directory. Pytest is configured
-   (`python_files = ["*_test.py"]`) to discover these.
+2. **Tests live inline, one test file per module.** `wmo/workflow/router.py` is tested by
+   `wmo/workflow/router_test.py`, next to it. Pytest is configured (`python_files =
+   ["*_test.py"]`) to find these, and there is no top-level `tests/` directory.
 
-   The pairing runs both ways, so coverage sits where a reader expects it and an uncovered module
-   reads as an empty file instead of hiding. **An empty `_test.py` is valid and preferred over a
-   vacuous test**: a constructor-stores-its-arguments test, a pydantic self-round-trip, or a
-   constant asserted against itself costs suite time and makes an uncovered module look covered. A
-   test whose subject spans several modules goes in a `tests/` subdirectory of the package that owns
-   the behavior, never at the repository root; existing standalone files are relocated when the
-   surrounding area is edited, not in a bulk sweep.
+   - Give every module a `_test.py` beside it.
+   - Leaving that file empty is fine, and better than a filler test. Do not write a test that only
+     checks a constructor stored its arguments, that a pydantic model round-trips through itself,
+     or that a constant equals itself.
+   - Do not create a `_test.py` whose module does not exist. A test that covers a whole package
+     goes in that package's own `tests/` directory, such as `wmo/simulation/tests/`.
+   - 25 existing test files already break the last point. Leave them; move one into a `tests/`
+     directory only when you are editing that code anyway.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
