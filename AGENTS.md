@@ -139,19 +139,12 @@ uv run pytest -q
    has unrelated failures, record them and keep them out of the patch; fix them only when they are
    in scope or prevent meaningful validation.
 
-2. **Tests live inline next to the code, one test file per module.** A module `foo.py` is tested by
-   `foo_test.py` in the same directory (for example, `wmo/workflow/router.py` maps to
-   `wmo/workflow/router_test.py`). There is no top-level `tests/` directory. Pytest is configured
-   (`python_files = ["*_test.py"]`) to discover these.
-
-   The pairing runs both ways, and **an empty `_test.py` is valid and preferred over a vacuous
-   test**. A test that a constructor stores its arguments, that a pydantic model round-trips
-   through its own serializer, or that a constant still equals itself costs suite time and makes an
-   uncovered module look covered. Never add an assertion just to fill a file.
-
-   A test file whose subject spans several modules goes in a `tests/` subdirectory of the package
-   that owns the behavior, never at the repository root. Existing standalone test files are
-   relocated when the surrounding area is edited, not in a bulk sweep.
+2. **Tests live inline next to the code.** Keep behavior-oriented `_test.py` files in the package
+   that owns the behavior. A cohesive test module may cover several cooperating production modules
+   when that gives the behavior one clear home; there is no paired-test-file requirement. Cohesive
+   `_test.py` files may exceed the 999-line production limit and should not be split solely for
+   line count. Do not add empty test markers or vacuous assertions. There is no top-level `tests/`
+   directory. Pytest is configured (`python_files = ["*_test.py"]`) to discover these files.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
