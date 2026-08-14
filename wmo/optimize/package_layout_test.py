@@ -34,19 +34,19 @@ def test_optimization_domains_are_nested() -> None:
         f"optimization packages are {sorted(actual)}, expected {sorted(expected)}"
     )
 
-    legacy = sorted(name for name in ("distill", "harness") if (WMO_DIR / name).exists())
-    assert not legacy, f"optimization packages returned to the flat wmo namespace: {legacy}"
+    flat_namespace = sorted(name for name in ("distill", "harness") if (WMO_DIR / name).exists())
+    assert not flat_namespace, (
+        f"optimization packages sit in the flat wmo namespace: {flat_namespace}"
+    )
 
     assert not (OPTIMIZE_DIR / "harness").exists(), (
         "agent execution belongs under wmo/runtime/agents, not wmo/optimize/harness"
     )
 
-    retired_modules = sorted(
+    forbidden_modules = sorted(
         name for name in ("base.py", "gepa.py") if (OPTIMIZE_DIR / name).exists()
     )
-    assert not retired_modules, f"retired optimizer modules returned: {retired_modules}"
+    assert not forbidden_modules, f"forbidden optimizer modules present: {forbidden_modules}"
 
     flat_routing = sorted(name for name in ROUTING_MODULES if (OPTIMIZE_DIR / name).exists())
-    assert not flat_routing, (
-        f"routing modules returned to the optimize package root: {flat_routing}"
-    )
+    assert not flat_routing, f"routing modules sit in the optimize package root: {flat_routing}"

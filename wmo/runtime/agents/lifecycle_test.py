@@ -362,10 +362,10 @@ class _TextSession:
         return Observation(content="text observation")
 
     def reset(self) -> None:
-        """Represent a legacy reset capability that must not reach the agent."""
+        """Represent a reset capability that must not reach the agent."""
 
     def close(self) -> None:
-        """Represent a legacy close capability that must not reach the agent."""
+        """Represent a close capability that must not reach the agent."""
 
 
 class _ExecutableSession:

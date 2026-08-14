@@ -695,7 +695,7 @@ class _TimeoutFactory:
 
 
 class _PermanentHangFactory:
-    """Legacy generic-context shape that WMO must reject without invoking."""
+    """Generic context-manager shape that WMO must reject without invoking."""
 
     def __init__(self) -> None:
         self.open_calls = 0
@@ -707,7 +707,7 @@ class _PermanentHangFactory:
 
 
 class _PermanentHangContext:
-    """Adversarial old context whose exit would never return if WMO invoked it."""
+    """Adversarial context whose exit would never return if WMO invoked it."""
 
     def __enter__(self) -> _Session:
         return _Session()

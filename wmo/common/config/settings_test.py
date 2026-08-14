@@ -55,7 +55,7 @@ def test_ensure_telemetry_anonymous_id_persists_value(tmp_path: Path) -> None:
     ],
 )
 def test_invalid_or_pii_shaped_anonymous_ids_fail_closed(tmp_path: Path, anonymous_id: str) -> None:
-    """Stored telemetry identity is exactly lowercase UUID hex, never arbitrary legacy text."""
+    """Stored telemetry identity is exactly lowercase UUID hex, never arbitrary text."""
     root = tmp_path / ".wmo"
     root.mkdir()
     settings_path(root).write_text(
@@ -104,8 +104,8 @@ def test_non_utf8_settings_name_the_path_and_the_repair(tmp_path: Path) -> None:
     assert "delete it and rerun `wmo config telemetry status`" in message
 
 
-def test_telemetry_write_drops_retired_model_role_settings(tmp_path: Path) -> None:
-    """The first telemetry write completes the one-way settings migration without a shim."""
+def test_telemetry_write_drops_unknown_model_role_settings(tmp_path: Path) -> None:
+    """A telemetry write persists the current settings shape only, dropping unknown sections."""
     root = tmp_path / ".wmo"
     root.mkdir()
     settings_path(root).write_text(

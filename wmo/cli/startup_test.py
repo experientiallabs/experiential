@@ -1,4 +1,4 @@
-"""Startup / import-isolation tests for the light CLI shell (#344).
+"""Startup / import-isolation tests for the light CLI shell.
 
 Each probe runs in a fresh subprocess so pytest collection of other CLI tests cannot pollute
 ``sys.modules``. Light paths must stay free of FastAPI, sklearn, scipy, uvicorn, and the heavy

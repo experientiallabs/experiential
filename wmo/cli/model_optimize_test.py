@@ -53,8 +53,8 @@ def _configured_project(tmp_path: Path, training: TinkerSFTSpec) -> _ConfiguredP
     return _ConfiguredProject(store=fixture.store, config=config)
 
 
-def test_optimize_help_exposes_persisted_sft_and_not_the_deleted_distill_branch() -> None:
-    """The W14M command replaces the old training CLI branch without a compatibility alias."""
+def test_optimize_help_exposes_only_the_locked_command_surface() -> None:
+    """`optimize` offers `model` and `router` alone, with no alias reaching any other branch."""
     result = CliRunner().invoke(app, ["optimize", "--help"])
 
     assert result.exit_code == 0, result.output

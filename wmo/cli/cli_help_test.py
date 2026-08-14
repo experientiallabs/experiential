@@ -45,8 +45,8 @@ def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
         ["optimize", "distill"],
     ],
 )
-def test_obsolete_commands_are_not_callable(argv: list[str]) -> None:
-    """Clean-break router and root aliases do not survive as hidden commands."""
+def test_commands_outside_the_locked_surface_are_not_callable(argv: list[str]) -> None:
+    """Nothing outside the locked root and router surface is callable, hidden or otherwise."""
     result = CliRunner().invoke(app, argv)
 
     assert result.exit_code == 2

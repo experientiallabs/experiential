@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 import pytest
 
 BUILT_DIST_ENV = "WMO_BUILT_DIST_DIR"
-RETIRED_REQUIREMENT = re.compile(
+FORBIDDEN_REQUIREMENT = re.compile(
     r"(?mi)^Requires-Dist:\s*(?:anthropic|boto3|environment-capture|gepa|mlx-lm|"
     r"opentelemetry-proto|scikit-learn|transformers)(?:\s|[<>=;~!])"
 )
@@ -111,7 +111,7 @@ def _assert_current_archive_members(
     required: frozenset[str],
     allow_tests: bool,
 ) -> None:
-    """Reject missing current members or any retired package, module, test, or asset member."""
+    """Reject a missing current member or any forbidden package, module, test, or asset member."""
     file_names = frozenset(name for name in names if name and not name.endswith("/"))
     assert required.issubset(file_names), (
         f"archive is missing current members: {required - file_names}"
@@ -170,7 +170,7 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name.startswith("wmo/")) == (
             _tracked_wheel_members()
         )
-        assert RETIRED_REQUIREMENT.search(metadata) is None
+        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
@@ -182,12 +182,12 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name and not name.endswith("/")) == (
             _tracked_sdist_members() | {"PKG-INFO"}
         )
-        assert RETIRED_REQUIREMENT.search(metadata) is None
+        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
 
-def test_requirement_scanner_rejects_removed_dependencies() -> None:
-    """The release check detects every removed dependency family directly."""
+def test_requirement_scanner_rejects_forbidden_dependencies() -> None:
+    """The release check detects every forbidden dependency family directly."""
     for dependency in (
         "anthropic",
         "boto3",
@@ -198,7 +198,7 @@ def test_requirement_scanner_rejects_removed_dependencies() -> None:
         "scikit-learn",
         "transformers",
     ):
-        assert RETIRED_REQUIREMENT.search(f"Requires-Dist: {dependency}>=1\n") is not None
+        assert FORBIDDEN_REQUIREMENT.search(f"Requires-Dist: {dependency}>=1\n") is not None
 
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
@@ -258,7 +258,7 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     ],
 )
 def test_archive_member_scanner_rejects_synthetic_stale_members(stale_member: str) -> None:
-    """Every removed asset, owner, helper, and guard family fails a direct synthetic scan."""
+    """Every forbidden asset, owner, helper, and guard family fails a direct synthetic scan."""
     with pytest.raises(AssertionError, match="forbidden stale members"):
         _assert_current_archive_members(
             tuple((*REQUIRED_WHEEL_MODULES, stale_member)),

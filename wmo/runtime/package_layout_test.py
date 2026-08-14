@@ -16,19 +16,21 @@ def test_runtime_domains_are_nested() -> None:
         f"runtime packages are {sorted(actual_dirs)}, expected {sorted(expected_dirs)}"
     )
 
-    retired = sorted(
+    forbidden = sorted(
         name
         for name in ("__init__.py", "environment.py", "episode.py", "evaluation", "harness")
         if (RUNTIME_DIR / name).exists()
     )
-    assert not retired, f"retired runtime owners returned under wmo/runtime: {retired}"
+    assert not forbidden, f"forbidden runtime owners under wmo/runtime: {forbidden}"
 
-    legacy_dirs = sorted(
+    flat_namespace = sorted(
         name for name in ("agents", "platform", "runs") if (WMO_DIR / name).exists()
     )
-    assert not legacy_dirs, f"runtime packages returned to the flat wmo namespace: {legacy_dirs}"
+    assert not flat_namespace, f"runtime packages sit in the flat wmo namespace: {flat_namespace}"
 
-    assert not (WMO_DIR / "optimize" / "harness").exists(), "retired harness search returned"
+    assert not (WMO_DIR / "optimize" / "harness").exists(), (
+        "harness search is not owned by this package"
+    )
     assert not (WMO_DIR / "evals" / "harbor").exists(), (
-        "runtime evaluator returned to the simulation evaluation namespace"
+        "the runtime evaluator does not belong in the simulation evaluation namespace"
     )

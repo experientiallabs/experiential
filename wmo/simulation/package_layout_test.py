@@ -32,14 +32,14 @@ def test_simulation_domains_are_nested() -> None:
         f"simulation modules are {sorted(actual_modules)}, expected current build and comparison"
     )
 
-    retired = sorted(
+    forbidden = sorted(
         name
         for name in ("evaluation", "model", "retrieval", "environment.py")
         if (SIMULATION_DIR / name).is_file() or any((SIMULATION_DIR / name).rglob("*.py"))
     )
-    assert not retired, f"retired simulation owners returned: {retired}"
+    assert not forbidden, f"forbidden simulation owners present: {forbidden}"
 
-    legacy_dirs = sorted(
+    flat_namespace = sorted(
         name
         for name in (
             "connect",
@@ -53,4 +53,6 @@ def test_simulation_domains_are_nested() -> None:
         )
         if (WMO_DIR / name).exists()
     )
-    assert not legacy_dirs, f"simulation packages returned to the flat wmo namespace: {legacy_dirs}"
+    assert not flat_namespace, (
+        f"simulation packages sit in the flat wmo namespace: {flat_namespace}"
+    )

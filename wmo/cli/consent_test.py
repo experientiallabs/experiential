@@ -85,7 +85,7 @@ def test_a_terminal_is_asked_and_a_yes_consents(
 def test_no_terminal_and_no_yes_refuses_naming_the_spend_and_the_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The money bug: a pipe, CI, or cron used to be read as consent. It now exits 2.
+    """A pipe, CI, or cron is not consent to spend: the run exits 2 instead of starting.
 
     The refusal has to be actionable on its own, so it carries what would have been spent, the
     command that would have spent it, and the flag that authorizes it.

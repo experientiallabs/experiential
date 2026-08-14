@@ -56,8 +56,8 @@ def test_common_and_runtime_imports_point_inward() -> None:
     assert not runtime_violations, f"runtime imports outer domains: {runtime_violations}"
 
 
-def test_retired_provider_imports_do_not_return() -> None:
-    """Callers use canonical model contracts and HTTP clients, never the retired provider stack."""
+def test_forbidden_provider_imports_are_absent() -> None:
+    """Callers use canonical model contracts and explicit HTTP clients and nothing else."""
     violations = _banned_imports(
         WMO_DIR,
         {
@@ -74,11 +74,11 @@ def test_retired_provider_imports_do_not_return() -> None:
             "wmo.common.vendor",
         },
     )
-    assert not violations, f"retired provider imports returned: {violations}"
+    assert not violations, f"forbidden provider imports present: {violations}"
 
 
-def test_retired_provider_packages_are_absent() -> None:
-    """The removed provider stack has no package directory to import accidentally."""
+def test_provider_packages_are_absent_under_common() -> None:
+    """`wmo.common` carries no provider or vendor package for a caller to import."""
     assert not (COMMON_DIR / "providers").exists()
     assert not (COMMON_DIR / "vendor").exists()
 
