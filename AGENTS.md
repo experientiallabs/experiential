@@ -19,9 +19,9 @@ uv run pytest -q
 ## Repository checks
 
 - Every new or rewritten hand-authored source, test, configuration, and documentation file with a
-  covered suffix stays below 1,000 physical lines. The executable limit is 999 lines and counts
-  comments and blank lines. Generated lock files are excluded. Generated code belongs in an
-  explicitly named `generated/` directory and is never edited by hand.
+  covered suffix stays below 1,000 physical lines. The limit is 999 lines, counts comments and
+  blank lines, and is checked in review. Generated lock files are excluded. Generated code belongs
+  in an explicitly named `generated/` directory and is never edited by hand.
 - Full-repository Ruff check, Ruff format check, and ty check are required on every change. No
   pre-existing lint or type failures are grandfathered.
 - Production imports follow the approved dependency direction: common may not import runtime,
@@ -31,8 +31,8 @@ uv run pytest -q
 - Every Python function and method uses a Google-style docstring. An absolutely trivial function
   or method may use one clear summary line. This rule includes private helpers, nested functions,
   and test helpers so each callable states its current contract locally.
-- The root CLI command set is exact: `build`, `config`, `optimize`, and `run`; package-layout and
-  release tests enforce the current module and distribution shape.
+- The root CLI command set is exact: `build`, `config`, `optimize`, and `run`;
+  `wmo/cli/app_test.py` and the release tests enforce the current command and distribution shape.
 - There is no 800-line warning and no numeric modules-per-directory gate.
 
 ## Evidence, simulation, and routing lifecycle
@@ -168,12 +168,11 @@ uv run pytest -q
    one-off script, not for output, not "temporarily". If work does not fit an existing surface,
    put it under the closest one and say so — do not invent a sibling. The only way a new
    top-level directory is ever added is that a human names the exact directory and grants
-   permission for that name; then, in the same change, it is added to `ALLOWED_TOP_DIRS` in
-   `wmo/repo_layout_test.py` and documented here. Blanket approval to "restructure" or
-   "add whatever you need" is not permission for a directory name. Absent that, an agent that
-   wants a new surface asks and waits. The same rule binds top-level FILES, against
-   `ALLOWED_TOP_FILES` in the same test. Both lists are enforced by the gate, so an unapproved
-   directory fails CI rather than landing quietly. What each surface is for:
+   permission for that name; then, in the same change, it is documented here. Blanket approval to
+   "restructure" or "add whatever you need" is not permission for a directory name. Absent that,
+   an agent that wants a new surface asks and waits. The same rule binds top-level FILES: the
+   tracked ones are exactly `.env.example`, `.gitignore`, `AGENTS.md`, `CLAUDE.md`, `README.md`,
+   `conftest.py`, `justfile`, `pyproject.toml`, and `uv.lock`. What each surface is for:
    - `docs/`: **reviewed public documentation** in `docs/research/` (completed research writeups
      and their rendered figures under `docs/research/figures/`), `docs/reference/` (how-to
      references verified against main), and `docs/cookbook/` (end-to-end walks through the whole
