@@ -60,6 +60,14 @@ class ProjectBuildArtifacts(ContractModel):
 
     @model_validator(mode="after")
     def _require_distinct_artifacts(self) -> ProjectBuildArtifacts:
+        """Reject a completed build whose semantic outputs reuse one artifact ID.
+
+        Returns:
+            The validated completed-build pointers.
+
+        Raises:
+            ValueError: Two distinct build outputs name the same immutable artifact.
+        """
         artifact_ids = tuple(
             item.artifact_id
             for item in (

@@ -156,6 +156,17 @@ class RAGIndex(ArtifactEnvelope):
     @field_validator("transition_ids", "fit_lineage_ids", "included_lineage_ids")
     @classmethod
     def _require_sorted_unique_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Require deterministic unique ordering for index identity collections.
+
+        Args:
+            value: Candidate ordered identifiers.
+
+        Returns:
+            The validated identifier tuple.
+
+        Raises:
+            ValueError: Identifiers repeat or are not sorted.
+        """
         if len(set(value)) != len(value):
             raise ValueError("RAG artifact IDs must be unique")
         if value != tuple(sorted(value)):
@@ -167,6 +178,17 @@ class RAGIndex(ArtifactEnvelope):
     def _require_ordered_unique_partitions(
         cls, value: tuple[Literal["fit", "held_out"], ...]
     ) -> tuple[Literal["fit", "held_out"], ...]:
+        """Require a nonempty deterministic retrieval-partition selection.
+
+        Args:
+            value: Candidate partition tuple.
+
+        Returns:
+            The validated partition tuple.
+
+        Raises:
+            ValueError: The tuple is empty, repeated, or unsorted.
+        """
         if not value or len(set(value)) != len(value):
             raise ValueError("RAG included partitions must be non-empty and unique")
         if value != tuple(sorted(value)):
@@ -175,6 +197,14 @@ class RAGIndex(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_consistent_counts_and_inputs(self) -> RAGIndex:
+        """Verify index counts, source inputs, and lineage containment.
+
+        Returns:
+            The internally consistent RAG index.
+
+        Raises:
+            ValueError: Counts, inputs, or included lineages contradict the index.
+        """
         if self.transition_count != len(self.transition_ids):
             raise ValueError("RAG transition count must match transition IDs")
         source_inputs = tuple(source.artifact_input for source in self.sources)

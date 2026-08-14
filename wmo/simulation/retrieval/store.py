@@ -120,7 +120,16 @@ def _verify_records(
     transitions: tuple[RAGTransition, ...],
     vectors: tuple[RAGVector, ...],
 ) -> None:
-    """Verify ordering, IDs, key hashes, lineage membership, and vector dimensions."""
+    """Verify ordering, IDs, key hashes, lineage membership, and vector dimensions.
+
+    Args:
+        index: Persisted immutable RAG envelope.
+        transitions: Parsed ordered transition records.
+        vectors: Parsed ordered embedding vectors.
+
+    Raises:
+        ArtifactCorruptionError: Any record contradicts the frozen index identity.
+    """
     transition_ids = tuple(item.transition_id for item in transitions)
     vector_ids = tuple(item.transition_id for item in vectors)
     if transition_ids != index.transition_ids or vector_ids != index.transition_ids:

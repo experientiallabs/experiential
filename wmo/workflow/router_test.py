@@ -76,7 +76,14 @@ def _capabilities(alias: str) -> ModelCapabilities:
 
 
 def _snapshot(alias: str) -> ModelSnapshot:
-    """Freeze one model identity over the capabilities needed by text simulation."""
+    """Freeze one model identity over the capabilities needed by text simulation.
+
+    Args:
+        alias: Stable local model alias.
+
+    Returns:
+        Deterministic fixture snapshot with the exact capability digest.
+    """
     return ModelSnapshot(
         provider="test",
         model_id=alias,

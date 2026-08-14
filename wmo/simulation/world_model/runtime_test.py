@@ -41,7 +41,14 @@ class _Embedder:
     """Stable local embedding client shared by index build and runtime query."""
 
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
-        """Return deterministic unit vectors."""
+        """Return deterministic unit vectors.
+
+        Args:
+            texts: Canonical query or transition texts.
+
+        Returns:
+            Stable unit vectors in input order.
+        """
         embedded = []
         for text in texts:
             digest = hashlib.sha256(text.encode()).digest()
@@ -55,6 +62,7 @@ class _WorldClient:
     """Capture the grounded request and return one strict protocol transition."""
 
     def __init__(self, snapshot: ModelSnapshot) -> None:
+        """Record requests under one exact fixture model identity."""
         self.snapshot = snapshot
         self.requests: list[ModelRequest] = []
 
@@ -172,7 +180,14 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
 
 
 def _trace(created_at: datetime) -> Trace:
-    """Create one real assistant-to-user transition."""
+    """Create one real assistant-to-user transition.
+
+    Args:
+        created_at: Fixture timestamp shared by the trace spans.
+
+    Returns:
+        Canonical two-span production trace.
+    """
     source = TraceSource(
         identity=SourceIdentity(kind="otlp", source_id="fixture-source"),
         semantic_convention_version="1.37.0",

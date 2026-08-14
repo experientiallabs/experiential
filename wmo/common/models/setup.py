@@ -78,6 +78,14 @@ class ProviderModelSelection(ContractModel):
 
     @model_validator(mode="after")
     def _require_embedding_price(self) -> ProviderModelSelection:
+        """Require explicit input pricing for models selected as embedders.
+
+        Returns:
+            The validated model selection.
+
+        Raises:
+            ValueError: The model supports embeddings but omits its input price.
+        """
         if self.supports_embeddings and self.input_cost_per_million_tokens_usd is None:
             raise ValueError(
                 "embedding-capable models require explicit input cost per million tokens; "
@@ -118,6 +126,14 @@ class ProviderSetup(ContractModel):
 
     @model_validator(mode="after")
     def _require_unique_references_and_role_capabilities(self) -> ProviderSetup:
+        """Validate collected identities and the three independently selected roles.
+
+        Returns:
+            The complete validated provider setup.
+
+        Raises:
+            ValueError: Connections, aliases, references, or role capabilities are invalid.
+        """
         connection_names = tuple(connection.name for connection in self.connections)
         if len(set(connection_names)) != len(connection_names):
             raise ValueError("provider connection names must be unique")
@@ -149,7 +165,14 @@ class ProviderSetup(ContractModel):
 
 
 def catalog_state_sha256(path: Path) -> str:
-    """Return the exact catalog-file digest, or the empty-state digest when absent."""
+    """Return the exact catalog-file digest, or the empty-state digest when absent.
+
+    Args:
+        path: Shared model-catalog path.
+
+    Returns:
+        SHA-256 digest of the current bytes or the canonical empty state.
+    """
     try:
         payload = path.read_bytes()
     except FileNotFoundError:
@@ -201,7 +224,19 @@ def _merge_provider_setup(
     *,
     replace: bool,
 ) -> ModelCatalog:
-    """Merge one collected setup while retaining unrelated models and role assignments."""
+    """Merge one collected setup while retaining unrelated models and role assignments.
+
+    Args:
+        existing: Existing catalog, or ``None`` for first setup.
+        setup: Fully validated collected provider setup.
+        replace: Whether unequal unprotected records may be replaced.
+
+    Returns:
+        Complete merged catalog with updated build roles.
+
+    Raises:
+        ProviderSetupError: A collected record conflicts with preserved or protected state.
+    """
     connections = dict(existing.connections) if existing is not None else {}
     models = dict(existing.models) if existing is not None else {}
     roles = existing.roles if existing is not None else ModelRoles()

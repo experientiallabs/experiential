@@ -36,7 +36,11 @@ markdown fences or other keys."""
 
 
 def grounded_world_model_prompt_sha256() -> str:
-    """Return the digest of the complete grounded world-model system prompt."""
+    """Return the digest of the complete grounded world-model system prompt.
+
+    Returns:
+        Stable SHA-256 prompt identity.
+    """
     return sha256_json(
         {
             "prompt_version": GROUNDED_WORLD_MODEL_PROMPT_VERSION,
@@ -55,7 +59,20 @@ def grounded_world_model_content(
     top_k: int,
     code_revision: str,
 ) -> dict[str, object]:
-    """Return the complete content-addressed identity of a grounded world model."""
+    """Return the complete content-addressed identity of a grounded world model.
+
+    Args:
+        serving_rag: Exact serving RAG manifest reference.
+        model_alias: Configured local world-model alias.
+        model: Frozen provider model identity.
+        prompt_version: Grounded prediction protocol version.
+        prompt_sha256: Exact prompt-content digest.
+        top_k: Number of real transitions retrieved per prediction.
+        code_revision: Exact code revision that creates the artifact.
+
+    Returns:
+        Canonical content mapping used to derive the artifact identity.
+    """
     return {
         "serving_rag": serving_rag.model_dump(mode="json"),
         "model_alias": model_alias,
@@ -80,6 +97,14 @@ class GroundedWorldModelArtifact(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_single_rag_input(self) -> GroundedWorldModelArtifact:
+        """Bind the artifact envelope to exactly its serving RAG input.
+
+        Returns:
+            The validated grounded world-model artifact.
+
+        Raises:
+            ValueError: Envelope inputs differ from the selected serving RAG.
+        """
         if self.inputs != (self.serving_rag,):
             raise ValueError("grounded world model input must be its exact serving RAG artifact")
         return self

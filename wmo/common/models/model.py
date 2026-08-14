@@ -143,6 +143,9 @@ class ModelCapabilities(ContractModel):
         Structured-output declarations and mutable pricing guide workflow selection and consent,
         but they do not identify provider model bytes. Excluding them also preserves compatibility
         with snapshots created before those catalog fields were available.
+
+        Returns:
+            Stable digest of capability fields that identify the provider protocol boundary.
         """
         return sha256_json(
             self.model_dump(

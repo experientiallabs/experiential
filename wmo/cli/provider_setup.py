@@ -97,7 +97,18 @@ def _noninteractive_setup(
     *,
     existing: ModelCatalog | None,
 ) -> ProviderSetup:
-    """Parse repeatable JSON objects and list every missing automation input."""
+    """Parse repeatable JSON objects and list every missing automation input.
+
+    Args:
+        options: Structured connection, model, and role arguments.
+        existing: Existing catalog whose compatible entries remain available.
+
+    Returns:
+        Complete validated setup ready for atomic catalog merge.
+
+    Raises:
+        typer.BadParameter: Any JSON record is invalid or required input is missing.
+    """
     connections: list[ProviderConnection] = []
     models: list[ProviderModelSelection] = []
     errors: list[str] = []
@@ -151,7 +162,20 @@ def _interactive_setup(
     existing: ModelCatalog | None,
     console: Console,
 ) -> ProviderSetup:
-    """Collect available connections and models before selecting independent roles."""
+    """Collect available connections and models before selecting independent roles.
+
+    Args:
+        options: Optional explicit role selections.
+        existing: Existing catalog whose compatible entries remain available.
+        console: Terminal used for collection, summary, and confirmation.
+
+    Returns:
+        Confirmed provider setup ready for atomic catalog merge.
+
+    Raises:
+        typer.BadParameter: No usable provider connection or model is collected.
+        typer.Abort: The user rejects the completed configuration summary.
+    """
     console.print("[bold]Model setup[/bold]")
     console.print("WMO stores credential environment-variable names, never credentials.")
     existing_connections = _existing_connections(existing)
@@ -227,7 +251,13 @@ def _collect_provider_connections(
     provider: str,
     console: Console,
 ) -> None:
-    """Collect zero or more explicitly available connections for one provider kind."""
+    """Collect zero or more explicitly available connections for one provider kind.
+
+    Args:
+        connections: Mutable collection receiving confirmed connection records.
+        provider: Supported provider kind being collected.
+        console: Terminal used for prompts.
+    """
     label = _PROVIDER_LABELS[provider]
     another = Confirm.ask(f"Add a {label} connection?", default=False, console=console)
     while another:
@@ -260,7 +290,15 @@ def _prompt_model(
     *,
     console: Console,
 ) -> ProviderModelSelection:
-    """Collect one explicit model alias and its complete known local capabilities."""
+    """Collect one explicit model alias and its complete known local capabilities.
+
+    Args:
+        connections: Available provider connections.
+        console: Terminal used for prompts.
+
+    Returns:
+        Explicit model selection with declared capabilities and pricing.
+    """
     connection_names = tuple(connection.name for connection in connections)
     connection = _prompt_alias("Connection", connection_names, default=None, console=console)
     alias = Prompt.ask("Model alias", console=console).strip()
@@ -291,14 +329,33 @@ def _prompt_model(
 
 
 def _prompt_optional_positive_int(label: str, *, console: Console) -> int | None:
-    """Collect an optional positive integer without inventing provider metadata."""
+    """Collect an optional positive integer without inventing provider metadata.
+
+    Args:
+        label: Human-readable capability field.
+        console: Terminal used for prompts.
+
+    Returns:
+        Confirmed positive value, or ``None`` when the field is omitted.
+    """
     if not Confirm.ask(f"Record {label.casefold()}?", default=False, console=console):
         return None
     return IntPrompt.ask(label, console=console)
 
 
 def _prompt_nonnegative_float(label: str, *, console: Console) -> float:
-    """Collect explicit local pricing without contacting a provider."""
+    """Collect explicit local pricing without contacting a provider.
+
+    Args:
+        label: Human-readable pricing field.
+        console: Terminal used for prompts.
+
+    Returns:
+        Confirmed finite nonnegative value.
+
+    Raises:
+        typer.BadParameter: The entered price is negative.
+    """
     value = float(Prompt.ask(label, console=console))
     if value < 0:
         raise typer.BadParameter(f"{label} cannot be negative")
@@ -312,7 +369,20 @@ def _prompt_alias(
     default: str | None,
     console: Console,
 ) -> str:
-    """Prompt for one alias from an explicit available set."""
+    """Prompt for one alias from an explicit available set.
+
+    Args:
+        label: Human-readable role or connection label.
+        aliases: Exact available choices.
+        default: Optional preselected alias.
+        console: Terminal used for prompts.
+
+    Returns:
+        Confirmed alias from ``aliases``.
+
+    Raises:
+        typer.BadParameter: No compatible aliases exist or the response is outside the set.
+    """
     if not aliases:
         raise typer.BadParameter(f"{label} has no compatible configured model aliases")
     selected = (
@@ -332,7 +402,17 @@ def _prompt_judge(
     current: str | None,
     console: Console,
 ) -> str:
-    """Offer one explainable judge alias suggestion and require explicit acceptance."""
+    """Offer one explainable judge alias suggestion and require explicit acceptance.
+
+    Args:
+        models: Available declared model selections.
+        world_model: Confirmed world-model alias used as a locality preference.
+        current: Existing judge role when still available.
+        console: Terminal used for explanation and confirmation.
+
+    Returns:
+        Explicitly confirmed judge alias.
+    """
     aliases = tuple(model.alias for model in models)
     if current in aliases:
         return _prompt_alias("Judge alias", aliases, default=current, console=console)
@@ -365,7 +445,14 @@ def _render_summary(
     models: tuple[ProviderModelSelection, ...],
     console: Console,
 ) -> None:
-    """Show every connection, model, role, and credential reference before commit."""
+    """Show every connection, model, role, and credential reference before commit.
+
+    Args:
+        setup: Collected role assignments.
+        connections: All existing and newly collected provider connections.
+        models: All existing and newly collected model aliases.
+        console: Terminal receiving the summary.
+    """
     console.print("[bold]Configuration summary[/bold]")
     for connection in connections:
         endpoint = f", base_url={connection.base_url}" if connection.base_url else ""
@@ -385,7 +472,14 @@ def _render_summary(
 
 
 def _existing_connections(existing: ModelCatalog | None) -> tuple[ProviderConnection, ...]:
-    """Convert supported existing catalog connections into setup input records."""
+    """Convert supported existing catalog connections into setup input records.
+
+    Args:
+        existing: Existing catalog, or ``None`` on first setup.
+
+    Returns:
+        Compatible secret-free connection records in deterministic order.
+    """
     if existing is None:
         return ()
     return tuple(
@@ -401,7 +495,14 @@ def _existing_connections(existing: ModelCatalog | None) -> tuple[ProviderConnec
 
 
 def _existing_models(existing: ModelCatalog | None) -> tuple[ProviderModelSelection, ...]:
-    """Convert supported existing model aliases into setup input records."""
+    """Convert supported existing model aliases into setup input records.
+
+    Args:
+        existing: Existing catalog, or ``None`` on first setup.
+
+    Returns:
+        Compatible explicit model selections in deterministic order.
+    """
     if existing is None:
         return ()
     supported_connections = {item.name for item in _existing_connections(existing)}
@@ -433,7 +534,15 @@ def _existing_models(existing: ModelCatalog | None) -> tuple[ProviderModelSelect
 
 
 def _existing_role(existing: ModelCatalog | None, role: str) -> str | None:
-    """Return one prior build role when it is present."""
+    """Return one prior build role when it is present.
+
+    Args:
+        existing: Existing catalog, or ``None`` on first setup.
+        role: Build-role field to inspect.
+
+    Returns:
+        Existing alias string, or ``None`` when the role is absent.
+    """
     if existing is None:
         return None
     value = getattr(existing.roles, role)
@@ -443,7 +552,17 @@ def _existing_role(existing: ModelCatalog | None, role: str) -> str | None:
 def _deduplicate_connections(
     connections: list[ProviderConnection],
 ) -> tuple[ProviderConnection, ...]:
-    """Keep one equal record per name and reject ambiguous collected duplicates."""
+    """Keep one equal record per name and reject ambiguous collected duplicates.
+
+    Args:
+        connections: Collected provider connection records.
+
+    Returns:
+        Unique records sorted by connection name.
+
+    Raises:
+        typer.BadParameter: One name maps to unequal records.
+    """
     by_name: dict[str, ProviderConnection] = {}
     for connection in connections:
         prior = by_name.get(connection.name)
@@ -456,7 +575,17 @@ def _deduplicate_connections(
 def _deduplicate_models(
     models: list[ProviderModelSelection],
 ) -> tuple[ProviderModelSelection, ...]:
-    """Keep one equal record per alias and reject ambiguous collected duplicates."""
+    """Keep one equal record per alias and reject ambiguous collected duplicates.
+
+    Args:
+        models: Collected explicit model selections.
+
+    Returns:
+        Unique records sorted by alias.
+
+    Raises:
+        typer.BadParameter: One alias maps to unequal records.
+    """
     by_alias: dict[str, ProviderModelSelection] = {}
     for model in models:
         prior = by_alias.get(model.alias)
@@ -467,7 +596,11 @@ def _deduplicate_models(
 
 
 def provider_setup_json_examples() -> tuple[str, str]:
-    """Return compact structured examples used in noninteractive remediation messages."""
+    """Return compact structured examples used in noninteractive remediation messages.
+
+    Returns:
+        Connection and model JSON examples suitable for quoting as CLI values.
+    """
     connection = json.dumps(
         {"name": "openai", "provider": "openai", "api_key_env": "OPENAI_API_KEY"},
         separators=(",", ":"),

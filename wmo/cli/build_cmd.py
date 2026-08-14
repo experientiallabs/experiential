@@ -185,7 +185,18 @@ def build(
 
 
 def _load_or_setup_catalog(root: Path, *, no_interactive: bool) -> ModelCatalog:
-    """Load complete build roles or run inline setup only for a real terminal."""
+    """Load complete build roles or run inline setup only for a real terminal.
+
+    Args:
+        root: Local WMO root containing the shared model catalog.
+        no_interactive: Whether inline provider setup is forbidden.
+
+    Returns:
+        A complete model catalog with all required build roles.
+
+    Raises:
+        ValueError: Required configuration is missing outside an interactive terminal.
+    """
     path = root / "models.toml"
     catalog = load_model_catalog(path) if path.exists() else None
     missing = _missing_build_configuration(catalog)
@@ -213,7 +224,14 @@ def _load_or_setup_catalog(root: Path, *, no_interactive: bool) -> ModelCatalog:
 
 
 def _missing_build_configuration(catalog: ModelCatalog | None) -> tuple[str, ...]:
-    """List every absent connection, model, and required build role."""
+    """List every absent connection, model, and required build role.
+
+    Args:
+        catalog: Existing catalog, or ``None`` when no catalog file exists.
+
+    Returns:
+        Complete ordered labels for missing first-build configuration.
+    """
     if catalog is None:
         return (
             "models.toml",
@@ -241,7 +259,20 @@ def _selected_roles(
     judge: str | None,
     embedder: str | None,
 ) -> ProjectModelConfiguration:
-    """Validate independent project overrides against available model aliases."""
+    """Validate independent project overrides against available model aliases.
+
+    Args:
+        catalog: Complete shared model catalog.
+        world_model: Optional project-specific world-model alias.
+        judge: Optional project-specific judge alias.
+        embedder: Optional project-specific embedder alias.
+
+    Returns:
+        Frozen role selections for the project build.
+
+    Raises:
+        ValueError: A required role is absent or names an unknown alias.
+    """
     selected = {
         "world_model": world_model or catalog.roles.world_model,
         "judge": judge or catalog.roles.judge,
@@ -267,7 +298,18 @@ def _embedding_cost_ceiling(
     completed: ProjectBuild,
     embedder: ResolvedModel,
 ) -> float:
-    """Bound retry-inclusive embedding spend from the exact rendered retrieval inputs."""
+    """Bound retry-inclusive embedding spend from the exact rendered retrieval inputs.
+
+    Args:
+        completed: Persisted trace and task build whose transitions will be embedded.
+        embedder: Exact resolved embedding model and price metadata.
+
+    Returns:
+        Conservative USD ceiling across serving and fit-only index construction.
+
+    Raises:
+        ValueError: The selected embedder omits explicit input pricing.
+    """
     price = embedder.capabilities.input_cost_per_million_tokens_usd
     if price is None:
         raise ValueError(
@@ -292,7 +334,18 @@ def _embedding_cost_ceiling(
 
 
 def _project_store(root: Path, proposed: ProjectConfig) -> ProjectStore:
-    """Initialize one project or verify mutable build pointers are the only difference."""
+    """Initialize one project or verify mutable build pointers are the only difference.
+
+    Args:
+        root: Local WMO root.
+        proposed: Complete project configuration for this build invocation.
+
+    Returns:
+        Initialized or verified project store.
+
+    Raises:
+        ValueError: Existing project configuration differs outside completed-build pointers.
+    """
     store = ProjectStore(root, proposed.project_id)
     if not store.paths.project_toml.exists():
         store.initialize(proposed)
@@ -311,7 +364,18 @@ def _build_grounded_artifacts(
     resolved_embedder: ResolvedModel,
     top_k: int,
 ) -> ProjectBuildArtifacts:
-    """Build serving and fit-only RAG plus the executable world-model binding."""
+    """Build serving and fit-only RAG plus the executable world-model binding.
+
+    Args:
+        store: Project artifact store receiving immutable outputs.
+        completed: Persisted trace and task build.
+        resolved_world: Exact world-model runtime binding.
+        resolved_embedder: Exact provider embedding binding.
+        top_k: Default number of retrieved transitions.
+
+    Returns:
+        Exact manifest pointers for every completed build output.
+    """
     created_at = completed.artifacts.trace_dataset.dataset.created_at
     revision = completed.review.code_revision
     trace_input = artifact_input(completed.artifacts.trace_dataset.manifest)
@@ -370,7 +434,18 @@ def _reuse_completed_grounded_artifacts(
     resolved_embedder: ResolvedModel,
     top_k: int,
 ) -> ProjectBuildArtifacts | None:
-    """Reuse a completely matching verified build without another provider embedding call."""
+    """Reuse a completely matching verified build without another provider embedding call.
+
+    Args:
+        store: Project artifact store containing a possible completed build.
+        completed: Current persisted trace and task build.
+        resolved_world: Exact world-model runtime binding.
+        resolved_embedder: Exact provider embedding binding.
+        top_k: Requested retrieval result count.
+
+    Returns:
+        Verified existing build pointers, or ``None`` when any identity differs.
+    """
     existing = store.load_project().build
     if existing is None:
         return None
@@ -412,7 +487,14 @@ def _reuse_completed_grounded_artifacts(
 
 
 def _lineage_bindings(completed: ProjectBuild) -> tuple[RAGLineageBinding, ...]:
-    """Convert frozen duplicate groups into complete RAG lineage partition bindings."""
+    """Convert frozen duplicate groups into complete RAG lineage partition bindings.
+
+    Args:
+        completed: Persisted mining output with leakage groups and split assignments.
+
+    Returns:
+        Deterministically ordered trace-to-lineage partition bindings.
+    """
     mining = completed.artifacts.mining
     result = []
     for group in mining.analysis.leakage_groups:
@@ -429,7 +511,17 @@ def _lineage_bindings(completed: ProjectBuild) -> tuple[RAGLineageBinding, ...]:
 
 
 def _resolve_trace_file(trace_file: Path) -> Path:
-    """Validate one explicit local trace-file selection without opening its content."""
+    """Validate one explicit local trace-file selection without opening its content.
+
+    Args:
+        trace_file: User-selected local trace export.
+
+    Returns:
+        The validated file path.
+
+    Raises:
+        typer.BadParameter: The path is absent or is not a regular file.
+    """
     if not trace_file.exists():
         raise typer.BadParameter(f"trace file not found: {trace_file}")
     if not trace_file.is_file():
@@ -438,7 +530,18 @@ def _resolve_trace_file(trace_file: Path) -> Path:
 
 
 def _load_canonical_traces(path: Path, source: str) -> TraceNormalizationResult:
-    """Read a raw source once through its explicit canonical loader."""
+    """Read a raw source once through its explicit canonical loader.
+
+    Args:
+        path: Validated local trace export.
+        source: Explicit supported source format.
+
+    Returns:
+        Canonical normalized trace result.
+
+    Raises:
+        typer.BadParameter: The format is unsupported or normalization fails.
+    """
     normalized_source = source.strip().casefold()
     try:
         if normalized_source == "otlp":
@@ -471,7 +574,14 @@ def _capture_local_build_telemetry(
     indexed_steps: int,
     duration_seconds: float,
 ) -> None:
-    """Emit anonymous aggregate local build counts after completed persistence."""
+    """Emit anonymous aggregate local build counts after completed persistence.
+
+    Args:
+        completed: Persisted task-set build used only for aggregate counts.
+        root: Local WMO root holding telemetry preference state.
+        indexed_steps: Count of indexed real transitions.
+        duration_seconds: Completed build wall-clock duration.
+    """
     tasks = completed.mining.tasks
     capture_build_completed(
         completion_id=completed.task_set.task_set_id,
@@ -499,7 +609,13 @@ def _render_completed_build(
     built: ProjectBuildArtifacts,
     estimate: float,
 ) -> None:
-    """Present exact accepted, excluded, split, and grounded artifact identities."""
+    """Present exact accepted, excluded, split, and grounded artifact identities.
+
+    Args:
+        completed: Persisted project build and mining results.
+        built: Exact completed grounded-artifact pointers.
+        estimate: Conservative provider embedding spend ceiling.
+    """
     dataset = completed.artifacts.trace_dataset.dataset
     tasks = completed.artifacts.mining.tasks
     duplicate_count = len(dataset.trace_ids) - len(completed.artifacts.mining.analysis.candidates)

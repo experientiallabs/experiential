@@ -23,7 +23,14 @@ from wmo.common.models import (
 
 
 def _setup(*, judge_model: str = "judge-id") -> ProviderSetup:
-    """Return three independent aliases on two explicitly available connections."""
+    """Return three independent aliases on two explicitly available connections.
+
+    Args:
+        judge_model: Provider model ID assigned to the judge alias.
+
+    Returns:
+        Complete provider setup fixture.
+    """
     return ProviderSetup(
         connections=(
             ProviderConnection(

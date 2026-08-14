@@ -723,6 +723,15 @@ def _fixture(
 
 
 def _snapshot(alias: str, *, candidate_tools: bool = True) -> ModelSnapshot:
+    """Create one deterministic frozen model snapshot for router fixtures.
+
+    Args:
+        alias: Stable local model alias.
+        candidate_tools: Whether non-embedder aliases advertise tool support.
+
+    Returns:
+        Fixture snapshot using the runtime identity digest contract.
+    """
     capabilities = ModelCapabilities(
         supports_tools=candidate_tools and alias != "embedder",
         supports_embeddings=alias == "embedder",

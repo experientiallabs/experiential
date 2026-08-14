@@ -456,6 +456,17 @@ class RouterRuntime:
             raise RouterRuntimeIntegrityError("router bank content has mutated from fit time")
 
     def _resolve(self, alias: str) -> ResolvedModel:
+        """Resolve and cache one model only after its frozen identity verifies.
+
+        Args:
+            alias: Candidate alias pinned by the frozen router policy.
+
+        Returns:
+            The verified runtime model binding for ``alias``.
+
+        Raises:
+            RouterRuntimeIntegrityError: The runtime binding differs from its fit-time identity.
+        """
         resolved = self._resolved.get(alias)
         if resolved is None:
             resolved = self.catalog.resolve(alias)

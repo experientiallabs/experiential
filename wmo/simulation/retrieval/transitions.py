@@ -221,7 +221,14 @@ def _message_observation(
 
 
 def _assistant_text(attributes: Mapping[str, JsonValue]) -> str | None:
-    """Read visible assistant output from supported GenAI semantic-convention attributes."""
+    """Read visible assistant output from supported GenAI semantic-convention attributes.
+
+    Args:
+        attributes: Canonical trace-span attribute mapping.
+
+    Returns:
+        Latest visible assistant text, or ``None`` when no supported field contains it.
+    """
     messages = _json_value(attributes.get("gen_ai.output.messages"))
     text = _last_role_message(messages, frozenset({"assistant", "model"}))
     if text is not None:

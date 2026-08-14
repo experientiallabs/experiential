@@ -35,12 +35,28 @@ _RUNNER = CliRunner()
 
 
 def _attribute(key: str, value: str) -> dict[str, object]:
-    """Encode one textual OpenTelemetry attribute for a canonical fixture."""
+    """Encode one textual OpenTelemetry attribute for a canonical fixture.
+
+    Args:
+        key: Semantic-convention attribute key.
+        value: Text stored in the OTLP value envelope.
+
+    Returns:
+        Serialized OTLP attribute mapping.
+    """
     return {"key": key, "value": {"stringValue": value}}
 
 
 def _otlp_export(tmp_path: Path, count: int = 1) -> Path:
-    """Write real two-turn traces with one observed assistant-to-user transition each."""
+    """Write real two-turn traces with one observed assistant-to-user transition each.
+
+    Args:
+        tmp_path: Temporary directory receiving the trace export.
+        count: Number of independent trace lineages to write.
+
+    Returns:
+        Path to the completed OTLP JSON export.
+    """
     records = []
     for index in range(count):
         trace_id = f"{index + 1:032x}"
@@ -108,7 +124,14 @@ class _EmbeddingClient:
     """Deterministic semantic-shaped client for no-network build tests."""
 
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
-        """Return stable distinct unit vectors for each input text."""
+        """Return stable distinct unit vectors for each input text.
+
+        Args:
+            texts: Canonical RAG key texts.
+
+        Returns:
+            Deterministic fixture embeddings in input order.
+        """
         results = []
         for text in texts:
             digest = hashlib.sha256(text.encode()).digest()
@@ -130,11 +153,20 @@ class _RuntimeCatalog:
     """Resolve catalog aliases to deterministic no-network test clients."""
 
     def __init__(self, _catalog: ModelCatalog) -> None:
+        """Create deterministic embedding and completion clients."""
         self._embedding = _EmbeddingClient()
         self._completion = _CompletionClient()
 
     def preflight(self, alias: str, _requirement: object | None = None) -> ResolvedModel:
-        """Return exact static identities with alias-specific capabilities."""
+        """Return exact static identities with alias-specific capabilities.
+
+        Args:
+            alias: Configured fixture model alias.
+            _requirement: Unused requirement accepted by the runtime seam.
+
+        Returns:
+            Deterministic resolved fixture model.
+        """
         if alias == "embed":
             capabilities = ModelCapabilities(
                 supports_embeddings=True,
@@ -158,7 +190,11 @@ class _RuntimeCatalog:
 
 
 def _catalog(root: Path) -> None:
-    """Write complete secret-free build roles while leaving router candidates empty."""
+    """Write complete secret-free build roles while leaving router candidates empty.
+
+    Args:
+        root: Temporary WMO root receiving ``models.toml``.
+    """
     write_model_catalog(
         root / "models.toml",
         ModelCatalog(
@@ -188,7 +224,11 @@ def _catalog(root: Path) -> None:
 
 @pytest.fixture(autouse=True)
 def _fake_runtime_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep build tests local and prove no provider network is necessary."""
+    """Keep build tests local and prove no provider network is necessary.
+
+    Args:
+        monkeypatch: Pytest patch fixture replacing provider-backed seams.
+    """
     monkeypatch.setattr("wmo.cli.build_cmd.RuntimeModelCatalog", _RuntimeCatalog)
     monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
 
@@ -224,6 +264,7 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     assert world.model_alias == "world"
 
     def forbid_rebuild(*_args: object, **_kwargs: object) -> None:
+        """Fail if exact replay attempts to rebuild immutable RAG artifacts."""
         raise AssertionError("exact replay must not rebuild provider-backed RAG artifacts")
 
     monkeypatch.setattr("wmo.cli.build_cmd._build_grounded_artifacts", forbid_rebuild)
@@ -341,6 +382,7 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
     monkeypatch.setattr("wmo.cli.build_cmd.can_prompt", lambda _console: True)
 
     def configure(path: Path, *_args: object, **_kwargs: object) -> ModelCatalog:
+        """Persist the fixture catalog as the simulated interactive setup result."""
         configured.append(path)
         path.mkdir(parents=True, exist_ok=True)
         write_model_catalog(path / "models.toml", catalog)

@@ -22,7 +22,16 @@ _RUNNER = CliRunner()
 
 
 def _connection_json(name: str, provider: str, env: str) -> str:
-    """Return one concise structured connection flag value."""
+    """Return one concise structured connection flag value.
+
+    Args:
+        name: Local connection name.
+        provider: Supported provider kind.
+        env: Credential environment-variable name.
+
+    Returns:
+        JSON value accepted by ``--connection-json``.
+    """
     return json.dumps({"name": name, "provider": provider, "api_key_env": env})
 
 
@@ -33,7 +42,17 @@ def _model_json(
     *,
     embeddings: bool = False,
 ) -> str:
-    """Return one concise structured model flag value."""
+    """Return one concise structured model flag value.
+
+    Args:
+        alias: Stable local model alias.
+        connection: Referenced local provider connection.
+        model: Exact provider-side model ID.
+        embeddings: Whether this model supports embeddings.
+
+    Returns:
+        JSON value accepted by ``--model-json``.
+    """
     return json.dumps(
         {
             "alias": alias,
