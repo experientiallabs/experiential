@@ -366,6 +366,7 @@ def _refresh(
     binding: RAGEmbedderBinding,
     *,
     created_at: datetime = _TIME + timedelta(hours=1),
+    maximum_embedding_cost_usd: float = 1.0,
 ) -> PersistedRuntimeRAGRefresh:
     """Run one fixture refresh with no imported source datasets.
 
@@ -374,6 +375,7 @@ def _refresh(
         store: Same-project immutable artifact store.
         binding: Explicit configured embedder.
         created_at: Materialization time for new artifacts.
+        maximum_embedding_cost_usd: Caller-authorized total embedding ceiling.
 
     Returns:
         Completed runtime retrieval refresh result.
@@ -385,10 +387,85 @@ def _refresh(
         (),
         embedder=binding,
         embedding_reservation=_reservation(binding),
-        maximum_embedding_cost_usd=1.0,
+        maximum_embedding_cost_usd=maximum_embedding_cost_usd,
         created_at=created_at,
         code_revision="test-revision",
     )
+
+
+def test_zero_cost_int_and_float_share_identity_and_replay_without_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Canonicalize a public integer zero before identity and durable materialization.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+    """
+    journal, store, _first = _two_turn_journal(tmp_path)
+    client = CountingEmbedder()
+    configured = _binding(client)
+    binding = RAGEmbedderBinding(
+        client=client,
+        snapshot=configured.snapshot,
+        maximum_attempts=configured.maximum_attempts,
+        input_usd_per_million_tokens=0.0,
+    )
+
+    first = _refresh(
+        journal,
+        store,
+        binding,
+        maximum_embedding_cost_usd=0,
+    )
+    completed_artifacts = {path.name for path in (store.project_directory / "artifacts").iterdir()}
+    replay = _refresh(
+        journal,
+        store,
+        binding,
+        created_at=_TIME + timedelta(days=1),
+        maximum_embedding_cost_usd=0.0,
+    )
+
+    assert first.refresh.maximum_embedding_cost_usd == 0.0
+    assert isinstance(first.refresh.maximum_embedding_cost_usd, float)
+    assert replay.refresh == first.refresh
+    assert replay.retrieval.index == first.retrieval.index
+    assert client.calls == 1
+    assert {
+        path.name for path in (store.project_directory / "artifacts").iterdir()
+    } == completed_artifacts
+
+
+@pytest.mark.parametrize(
+    "ceiling",
+    (True, -0.01, float("nan"), float("inf"), float("-inf")),
+)
+def test_invalid_cost_ceiling_fails_before_artifact_or_embedding(
+    tmp_path: Path,
+    ceiling: float,
+) -> None:
+    """Reject invalid public ceilings before sealing evidence or spending.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+        ceiling: Boolean, negative, or non-finite caller input.
+    """
+    journal, store, _first = _two_turn_journal(tmp_path)
+    client = CountingEmbedder()
+
+    with pytest.raises(
+        RuntimeRAGRefreshError,
+        match="maximum_embedding_cost_usd must be finite and nonnegative",
+    ):
+        _refresh(
+            journal,
+            store,
+            _binding(client),
+            maximum_embedding_cost_usd=ceiling,
+        )
+
+    assert client.calls == 0
+    assert not (store.project_directory / "artifacts").exists()
 
 
 def test_two_turn_refresh_indexes_observed_turn_and_excludes_terminal_output(

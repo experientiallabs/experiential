@@ -114,20 +114,20 @@ class RuntimeRAGRefresh(ArtifactEnvelope):
     @field_validator("maximum_embedding_cost_usd", "reserved_embedding_cost_usd")
     @classmethod
     def _require_finite_cost(cls, value: float) -> float:
-        """Reject non-finite refresh costs.
+        """Canonicalize finite refresh costs stored in the receipt.
 
         Args:
             value: Nonnegative cost supplied for validation.
 
         Returns:
-            The unchanged finite value.
+            The finite value with every signed zero represented as ``0.0``.
 
         Raises:
             ValueError: The cost is infinite or NaN.
         """
         if not math.isfinite(value):
             raise ValueError("runtime RAG refresh costs must be finite")
-        return value
+        return 0.0 if value == 0.0 else value
 
     @model_validator(mode="after")
     def _require_receipt_identity(self) -> RuntimeRAGRefresh:
@@ -227,7 +227,7 @@ def refresh_runtime_trace_rag(
             cannot be proven before or after dispatch.
         RuntimeTraceSnapshotError: The selected journal prefix cannot be sealed.
     """
-    _require_finite_nonnegative_cost(maximum_embedding_cost_usd)
+    maximum_embedding_cost_usd = _normalize_finite_nonnegative_cost(maximum_embedding_cost_usd)
     imports = tuple(sorted(imported_trace_datasets, key=lambda item: item.artifact_id))
     if len({item.artifact_id for item in imports}) != len(imports):
         raise RuntimeRAGRefreshError("imported runtime RAG datasets must not repeat")
@@ -794,14 +794,19 @@ def _envelope_identity(
     )
 
 
-def _require_finite_nonnegative_cost(value: float) -> None:
-    """Reject an unknown or negative refresh cost ceiling.
+def _normalize_finite_nonnegative_cost(value: float) -> float:
+    """Normalize one caller-authorized refresh ceiling before observable work.
 
     Args:
         value: Caller-authorized maximum USD spend.
 
+    Returns:
+        A finite nonnegative float with every signed zero represented as ``0.0``.
+
     Raises:
-        RuntimeRAGRefreshError: The ceiling is negative, infinite, or NaN.
+        RuntimeRAGRefreshError: The ceiling is boolean, negative, infinite, or NaN.
     """
-    if not math.isfinite(value) or value < 0:
+    if isinstance(value, bool) or not math.isfinite(value) or value < 0:
         raise RuntimeRAGRefreshError("maximum_embedding_cost_usd must be finite and nonnegative")
+    normalized = float(value)
+    return 0.0 if normalized == 0.0 else normalized
