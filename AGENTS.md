@@ -38,10 +38,12 @@ uv run pytest -q
 - `wmo/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
   current engines, orchestration, artifact construction, and comparisons. New modules for those
   responsibilities go inside `wmo/simulation/`, never at the flat `wmo/` root.
-- `wmo build TRACE_FILE --source otlp|posthog --project PROJECT --root ROOT` is the only CLI path
+- `wmo build PROJECT TRACES --source otlp|posthog --root ROOT` is the only CLI path
   from local traces to immutable task evidence. It accepts 100 through 1000 normalized traces,
-  writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, and makes no
-  model, provider, or judge calls. Route each corpus through an explicit canonical source loader.
+  writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, and
+  authorizes build-time embeddings when the conservative estimate is within
+  `--max-build-cost-usd`. It makes no judge or completion calls. Route each corpus through an
+  explicit canonical source loader.
 - New trace sources belong in `wmo/simulation/ingest/`, normalize into the `Trace` and `TraceSpan`
   contracts in `wmo/common/traces/`, support file ingestion, and register from
   `wmo/simulation/ingest/__init__.py`.

@@ -1,7 +1,8 @@
 # Router optimization configuration
 
-`wmo build` stops with `proposals_pending`. It does not create simulation, judgment, fidelity,
-embedding, or pricing artifacts. The completed-evidence CLI path requires these inputs. A Python
+`wmo build` stops with `proposals_pending` after grounding retrieval. It does not create
+simulation, judgment, fidelity, router embedding-set, or pricing artifacts. The completed-evidence
+CLI path requires these inputs. A Python
 application may instead use `wmo.compose_router` with explicit suppliers, simulator, judge, runtime
 catalog, and finite budgets to have WMO create and verify the remaining artifact chain. Before
 either path, the application must provide these approved inputs with explicit user consent:

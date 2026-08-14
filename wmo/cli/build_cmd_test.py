@@ -16,7 +16,6 @@ from typer.testing import CliRunner
 import wmo.cli.build_cmd as build_command
 import wmo.simulation.build as simulation_build
 from wmo.cli.app import app
-from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     ConnectionConfig,
     Embedding,
@@ -245,20 +244,47 @@ class _CompletionClient:
         raise AssertionError(f"build must not dispatch completion: {request}")
 
 
+_RESOLVE_CALLS: list[str] = []
+
+
 class _RuntimeCatalog:
     """Resolve catalog aliases to deterministic no-network test clients."""
 
-    def __init__(self, _catalog: ModelCatalog) -> None:
+    def __init__(self, catalog: ModelCatalog) -> None:
         """Create deterministic embedding and completion clients.
 
         Args:
-            _catalog: Unused catalog accepted by the production constructor seam.
+            catalog: Fixture catalog used for secret-free snapshots.
         """
+        self._catalog = catalog
         self._embedding = _EmbeddingClient()
         self._completion = _CompletionClient()
 
+    def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+        """Return catalog identity and capabilities without recording a credential lookup.
+
+        Args:
+            alias: Configured fixture model alias.
+
+        Returns:
+            Secret-free snapshot and the alias-specific capability record.
+        """
+        record = self._catalog.models[alias]
+        connection = self._catalog.connections[record.connection]
+        capabilities = record.capabilities or ModelCapabilities()
+        return (
+            ModelSnapshot(
+                provider=connection.provider,
+                model_id=record.model,
+                revision=record.revision,
+                capabilities_sha256=capabilities.identity_sha256(),
+                connection_sha256=connection.identity_sha256(),
+            ),
+            capabilities,
+        )
+
     def preflight(self, alias: str, _requirement: object | None = None) -> ResolvedModel:
-        """Return exact static identities with alias-specific capabilities.
+        """Return exact static identities and record the credential-bearing construction.
 
         Args:
             alias: Configured fixture model alias.
@@ -267,21 +293,9 @@ class _RuntimeCatalog:
         Returns:
             Deterministic resolved fixture model.
         """
-        if alias == "embed":
-            capabilities = ModelCapabilities(
-                supports_embeddings=True,
-                input_cost_per_million_tokens_usd=0,
-            )
-            embedding = self._embedding
-        else:
-            capabilities = ModelCapabilities(maximum_output_tokens=16_000)
-            embedding = None
-        snapshot = ModelSnapshot(
-            provider="fixture",
-            model_id=f"fixture-{alias}",
-            capabilities_sha256=sha256_json(capabilities),
-            connection_sha256=sha256_json({"connection": alias}),
-        )
+        _RESOLVE_CALLS.append(alias)
+        snapshot, capabilities = self.snapshot(alias)
+        embedding = self._embedding if capabilities.supports_embeddings else None
         return ResolvedModel(alias, snapshot, capabilities, self._completion, embedding)
 
     def resolve(self, alias: str) -> ResolvedModel:
@@ -296,11 +310,12 @@ class _RuntimeCatalog:
         return self.preflight(alias)
 
 
-def _catalog(root: Path) -> None:
+def _catalog(root: Path, *, embedder_input_usd_per_million: float = 0) -> None:
     """Write complete secret-free build roles while leaving router candidates empty.
 
     Args:
         root: Temporary WMO root receiving ``models.toml``.
+        embedder_input_usd_per_million: Explicit embedder input price used for preflight.
     """
     write_model_catalog(
         root / "models.toml",
@@ -320,7 +335,7 @@ def _catalog(root: Path) -> None:
                     model="embed-id",
                     capabilities=ModelCapabilities(
                         supports_embeddings=True,
-                        input_cost_per_million_tokens_usd=0,
+                        input_cost_per_million_tokens_usd=embedder_input_usd_per_million,
                     ),
                 ),
             },
@@ -336,6 +351,7 @@ def _fake_runtime_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
     Args:
         monkeypatch: Pytest patch fixture replacing provider-backed seams.
     """
+    _RESOLVE_CALLS.clear()
     monkeypatch.setattr("wmo.cli.build_cmd.RuntimeModelCatalog", _RuntimeCatalog)
     monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
 
@@ -358,6 +374,8 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     result = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
 
     assert result.exit_code == 0, result.output
+    assert "Proceed?" not in result.output
+    assert "World model: world (world-id)" in result.output
     assert "100 to 1,000 traces is the usual starting range" in result.output
     store = ProjectStore(root, "support")
     config = store.load_project()
@@ -582,15 +600,15 @@ def test_build_package_upgrade_graphs_remain_independently_verified(
         store.artifacts.read(selected.trace_dataset.artifact_id)
 
 
-def test_build_package_upgrade_decline_preserves_selected_review(
+def test_build_package_upgrade_over_ceiling_preserves_selected_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Declining replacement spend leaves the selected build and review handoff together.
+    """An over-ceiling replacement leaves the selected build and review handoff together.
 
     Args:
         tmp_path: Temporary trace, catalog, and project root.
-        monkeypatch: Pytest patch fixture forcing a paid-build decline.
+        monkeypatch: Pytest patch fixture forcing a paid-build ceiling failure.
     """
     source = _otlp_export(tmp_path)
     root = tmp_path / ".wmo"
@@ -606,21 +624,26 @@ def test_build_package_upgrade_decline_preserves_selected_review(
     first_build = store.load_project().build
     first_review = store.read_review()
     assert first_build is not None
-    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 1.0)
-    monkeypatch.setattr(build_command, "require_spend_consent", lambda *_args, **_kwargs: False)
+    _RESOLVE_CALLS.clear()
+    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 6.0)
 
-    declined = _RUNNER.invoke(
+    blocked = _RUNNER.invoke(
         app,
         ["build", "support", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "b" * 40},
     )
 
-    assert declined.exit_code == 0, declined.output
+    assert blocked.exit_code == 2
+    output = " ".join(unstyle(blocked.output).replace("│", " ").split())
+    assert "conservative embedding estimate $6.000000 exceeds" in output
+    assert "--max-build-cost-usd $5.000000" in output
+    assert "wmo build support" in output
+    assert _RESOLVE_CALLS == []
     assert store.load_project().build == first_build
     assert store.read_review() == first_review
 
 
-@pytest.mark.parametrize("failure_mode", ["cost", "decline", "grounded"])
+@pytest.mark.parametrize("failure_mode", ["cost", "grounded"])
 def test_first_build_failure_does_not_publish_review_readiness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -631,7 +654,7 @@ def test_first_build_failure_does_not_publish_review_readiness(
     Args:
         tmp_path: Temporary trace, catalog, and project root.
         monkeypatch: Pytest patch fixture selecting the pre-selection failure boundary.
-        failure_mode: Cost rejection, explicit spend decline, or grounded construction failure.
+        failure_mode: Cost rejection or grounded construction failure.
     """
     source = _otlp_export(tmp_path)
     root = tmp_path / ".wmo"
@@ -639,13 +662,6 @@ def test_first_build_failure_does_not_publish_review_readiness(
     _catalog(root)
     if failure_mode == "cost":
         monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 6.0)
-    elif failure_mode == "decline":
-        monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 1.0)
-        monkeypatch.setattr(
-            build_command,
-            "require_spend_consent",
-            lambda *_args, **_kwargs: False,
-        )
     else:
 
         def fail_grounded_build(*_args: object, **_kwargs: object) -> None:
@@ -664,10 +680,11 @@ def test_first_build_failure_does_not_publish_review_readiness(
         env={"WMO_RELEASE_REVISION": "a" * 40},
     )
 
-    if failure_mode == "decline":
-        assert result.exit_code == 0, result.output
-    else:
-        assert result.exit_code == 2
+    assert result.exit_code == 2
+    if failure_mode == "cost":
+        assert _RESOLVE_CALLS == []
+        output = " ".join(unstyle(result.output).replace("│", " ").split())
+        assert "conservative embedding estimate $6.000000 exceeds" in output
     store = ProjectStore(root, "support")
     assert store.load_project().build is None
     assert store.read_review() is None
@@ -938,6 +955,236 @@ def test_build_help_describes_the_completed_grounded_artifact() -> None:
     result = _RUNNER.invoke(app, ["build", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert "Build a reusable grounded world model from local trace evidence." in unstyle(
-        result.output
+    help_text = unstyle(result.output)
+    assert "Build a reusable grounded world model from local trace evidence." in help_text
+    assert "--dry-run" in help_text
+    assert "--max-build-cost-usd" in help_text
+    assert "--yes" not in help_text
+
+
+def _forbid_proceed(prompt: str, **_kwargs: object) -> bool:
+    """Fail if build still reaches the shared spend-consent prompt.
+
+    Args:
+        prompt: Unexpected confirmation question.
+
+    Raises:
+        AssertionError: Always, because build must not ask ``Proceed?``.
+    """
+    raise AssertionError(f"build must not ask {prompt!r}")
+
+
+def test_interactive_build_never_asks_proceed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A terminal session continues automatically when the estimate is under the ceiling.
+
+    Args:
+        monkeypatch: Pytest patch fixture simulating an interactive session.
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1.0)
+    monkeypatch.setattr(build_command, "can_prompt", lambda _console: True)
+    monkeypatch.setattr("wmo.cli.consent.Confirm.ask", _forbid_proceed)
+    monkeypatch.setattr("rich.prompt.Confirm.ask", _forbid_proceed)
+
+    result = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "Proceed?" not in result.output
+    assert ProjectStore(root, "support").load_project().build is not None
+
+
+def test_noninteractive_build_runs_under_ceiling_without_yes(tmp_path: Path) -> None:
+    """Scripted builds do not need ``--yes`` when the estimate is under the ceiling.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1.0)
+
+    result = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "Proceed?" not in result.output
+    assert "cannot ask for spend consent" not in result.output
+    assert ProjectStore(root, "support").load_project().build is not None
+
+
+def test_preflight_names_models_and_shows_estimate_plus_ceiling(tmp_path: Path) -> None:
+    """The preflight names selected models and quotes estimate plus ceiling before spend.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1.0)
+
+    result = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    output = unstyle(result.output)
+    assert "World model: world (world-id)" in output
+    assert "Embedder: embed (embed-id)" in output
+    assert "Conservative maximum embedding cost: $" in output
+    assert "Configured build-cost ceiling: $5.000000" in output
+    assert "Accepted traces:" in output
+    assert "Fit tasks:" in output
+    assert "next: wmo optimize router support" in output
+
+
+def test_over_ceiling_build_fails_before_credentials(tmp_path: Path) -> None:
+    """An over-ceiling estimate fails before credential lookup or provider construction.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1_000_000.0)
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            str(source),
+            "--root",
+            str(root),
+            "--max-build-cost-usd",
+            "0.01",
+        ],
     )
+
+    assert result.exit_code == 2
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert "conservative embedding estimate $" in output
+    assert "exceeds --max-build-cost-usd $0.010000" in output
+    assert "wmo build support" in output
+    assert "--max-build-cost-usd" in output
+    assert _RESOLVE_CALLS == []
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is None
+    assert store.read_review() is None
+
+
+def test_dry_run_performs_zero_calls_and_does_not_select_build(tmp_path: Path) -> None:
+    """``--dry-run`` prints the complete preflight without credentials or selection.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1.0)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", str(source), "--root", str(root), "--dry-run"],
+    )
+
+    assert result.exit_code == 0, result.output
+    output = unstyle(result.output)
+    assert "World model: world (world-id)" in output
+    assert "Embedder: embed (embed-id)" in output
+    assert "Conservative maximum embedding cost: $" in output
+    assert "Configured build-cost ceiling: $5.000000" in output
+    assert "Dry run complete" in output
+    assert "Proceed?" not in output
+    assert _RESOLVE_CALLS == []
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is None
+    assert store.read_review() is None
+
+
+def test_provider_failure_does_not_publish_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A provider embedding failure leaves no completed-build selection.
+
+    Args:
+        monkeypatch: Pytest patch fixture injecting a provider failure.
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1.0)
+
+    def fail_embed(self: _EmbeddingClient, texts: Sequence[str]) -> tuple[object, ...]:
+        """Fail at the first provider embedding dispatch.
+
+        Args:
+            texts: Canonical RAG key texts that would have been embedded.
+
+        Raises:
+            ValueError: Always, to simulate a provider embedding failure.
+        """
+        del self, texts
+        raise ValueError("injected provider embedding failure")
+
+    monkeypatch.setattr(_EmbeddingClient, "embed", fail_embed)
+    result = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+
+    assert result.exit_code == 2
+    assert "injected provider embedding failure" in result.output
+    assert _RESOLVE_CALLS == ["embed"]
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is None
+    assert store.read_review() is None
+
+
+def test_exact_replay_performs_zero_provider_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exact replay reuses grounded artifacts without credentials, prompts, or spend.
+
+    Args:
+        monkeypatch: Pytest patch fixture forbidding rebuilds and spend prompts.
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1.0)
+    first = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+    assert first.exit_code == 0, first.output
+    first_build = ProjectStore(root, "support").load_project().build
+    assert first_build is not None
+    _RESOLVE_CALLS.clear()
+    monkeypatch.setattr("wmo.cli.consent.Confirm.ask", _forbid_proceed)
+    monkeypatch.setattr(build_command, "_build_grounded_artifacts", lambda *_a, **_k: None)
+
+    replay = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+
+    assert replay.exit_code == 0, replay.output
+    assert "Proceed?" not in replay.output
+    assert "Reusing completed grounded artifacts." in replay.output
+    assert "embedding spend ceiling: $0.000000" in replay.output
+    assert _RESOLVE_CALLS == []
+    assert ProjectStore(root, "support").load_project().build == first_build
+
+
+def test_other_spend_consent_commands_still_require_yes() -> None:
+    """Removing build confirmation does not change other spend-consent command flags.
+
+    The regression reads public help only and does not execute those commands.
+    """
+    model_help = unstyle(_RUNNER.invoke(app, ["optimize", "model", "--help"]).output)
+    router_help = unstyle(_RUNNER.invoke(app, ["optimize", "router", "--help"]).output)
+    assert "--yes" in model_help
+    assert "--yes" in router_help
+    assert "--yes" not in unstyle(_RUNNER.invoke(app, ["build", "--help"]).output)

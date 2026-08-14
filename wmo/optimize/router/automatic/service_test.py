@@ -1186,10 +1186,12 @@ def _completed_project(
             semantic_duplicate_threshold=1.0,
         ),
     )
+    resolved_world = runtime.resolve("world")
     completed = _build_grounded_artifacts(
         store,
         built,
-        resolved_world=runtime.resolve("world"),
+        world_alias=resolved_world.alias,
+        world_snapshot=resolved_world.snapshot,
         resolved_embedder=runtime.resolve("embedder"),
         top_k=2,
     )

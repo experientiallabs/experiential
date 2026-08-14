@@ -910,6 +910,36 @@ def _installed_release_driver() -> None:
         build_counts = state.counts()
         assert build_counts["/v1/embeddings"] > 0
         assert build_counts["/v1/chat/completions"] == 0
+        assert "Proceed?" not in build_output
+        assert "World model:" in build_output
+        assert "core-model" in build_output
+        assert "Conservative maximum embedding cost:" in build_output
+        assert "Configured build-cost ceiling:" in build_output
+        dry_run = run_cli(
+            "build",
+            "support-agent",
+            str(traces),
+            "--root",
+            str(root),
+            "--dry-run",
+            "--no-interactive",
+        )
+        assert "Dry run complete" in dry_run.stdout
+        assert "Proceed?" not in dry_run.stdout
+        assert "Conservative maximum embedding cost:" in dry_run.stdout
+        assert state.counts()["/v1/embeddings"] == build_counts["/v1/embeddings"]
+        assert support_store.load_project().build is not None
+        replay_build = run_cli(
+            "build",
+            "support-agent",
+            str(traces),
+            "--root",
+            str(root),
+            "--no-interactive",
+        )
+        assert "Reusing completed grounded artifacts." in replay_build.stdout
+        assert "Proceed?" not in replay_build.stdout
+        assert state.counts()["/v1/embeddings"] == build_counts["/v1/embeddings"]
         world_model = wmo.load_world_model(
             "support-agent",
             root=root,
