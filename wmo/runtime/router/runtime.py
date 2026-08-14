@@ -82,7 +82,7 @@ class RouterRuntime:
             for candidate in policy.candidates:
                 self._resolve(candidate.alias)
             embedder = self._resolve(policy.embedder_alias)
-        except Exception as exc:  # noqa: BLE001 - normalize catalog/provider construction errors
+        except Exception as exc:  # normalize catalog and provider construction errors
             raise RouterRuntimeIntegrityError(
                 "runtime model catalog cannot resolve policy pins"
             ) from exc

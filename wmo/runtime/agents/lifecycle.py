@@ -206,7 +206,7 @@ class _ExecuteOnlySession:
             )
         try:
             return executor(action)
-        except Exception as exc:  # noqa: BLE001 - tool boundary failures become episode evidence
+        except Exception as exc:  # tool boundary failures become episode evidence
             raise _ToolExecutionError(exc) from exc
 
 

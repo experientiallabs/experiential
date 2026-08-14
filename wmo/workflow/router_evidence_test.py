@@ -294,7 +294,7 @@ class _RuntimeClient:
             finish_reason=ModelFinishReason.COMPLETED,
         )
 
-    def embed(self, texts) -> tuple:  # noqa: ANN001, ANN201 - protocol fixture
+    def embed(self, texts) -> tuple:  # noqa: ANN001 - protocol fixture
         self.embed_calls += 1
         assert len(texts) == 1
         from wmo.common.models import Embedding

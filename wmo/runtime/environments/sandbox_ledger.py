@@ -186,25 +186,6 @@ def _owner_pid(path: Path, record_pid: int | None) -> int:
     return record_pid if record_pid is not None else 0
 
 
-def append_release(path: Path, *, sandbox_id: str, pid: int, released_at: datetime) -> None:
-    """Append one release record to an existing ledger file (used by a reaper).
-
-    Records are single short lines appended to a file opened `O_APPEND`, so a reaper writing
-    into another process's ledger cannot interleave with that process's own appends.
-
-    Args:
-        path: Existing owning-process ledger file.
-        sandbox_id: Exact remote resource ID whose cleanup was proved.
-        pid: Process ID that observed the cleanup proof.
-        released_at: Time at which cleanup was proved.
-
-    Raises:
-        OSError: If the record cannot be written; the caller decides whether that is fatal
-            (`SandboxLedger` treats its own write failures as warnings).
-    """
-    _append_line(path, SandboxReleased(sandbox_id=sandbox_id, released_at=released_at, pid=pid))
-
-
 def prune_released_files(
     state_directory: Path,
     *,

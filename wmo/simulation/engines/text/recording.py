@@ -34,7 +34,6 @@ from wmo.simulation.engines.text.prompt import (
     TextWorldModelTransition,
     build_world_model_request,
     parse_world_model_transition,
-    text_prompt_sha256,
 )
 from wmo.simulation.engines.text.redaction import redact_json
 
@@ -216,7 +215,7 @@ class RecordingCandidateClient:
         except TextSimulationError as exc:
             self._failure = self._failure or exc
             raise
-        except Exception as exc:  # noqa: BLE001 - provider exceptions become durable episode evidence
+        except Exception as exc:  # provider exceptions become durable episode evidence
             details: dict[str, JsonValue] = {"phase": "candidate_or_world_model"}
             if self._provider_dispatch_unknown_spend:
                 details["provider_dispatch_unknown_spend"] = True
@@ -352,11 +351,6 @@ def combine_economics(records: Sequence[OperationEconomics]) -> OperationEconomi
         cost_usd=_combine_measurement(tuple(record.cost_usd for record in records)),
         latency_seconds=_combine_measurement(tuple(record.latency_seconds for record in records)),
     )
-
-
-def text_prompt_digest() -> str:
-    """Return the immutable prompt digest retained alongside a world-model simulator snapshot."""
-    return text_prompt_sha256()
 
 
 def _bounded_candidate_request(

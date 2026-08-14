@@ -447,7 +447,7 @@ def create_router_endpoint(
             return _error(501, str(exc), code="tool_calling_unsupported")
         except (ValueError, json.JSONDecodeError) as exc:
             return _error(400, f"invalid routed request ({exc})")
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("routed Chat Completions call failed")
             return _error(502, "routed model call failed")
         completion = _chat_completion(
@@ -514,7 +514,7 @@ def create_router_endpoint(
             return _error(501, str(exc), code="tool_calling_unsupported")
         except (ValueError, json.JSONDecodeError) as exc:
             return _error(400, f"invalid routed request ({exc})")
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("routed Responses call failed")
             return _error(502, "routed model call failed")
         response = _openai_response(

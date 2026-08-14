@@ -159,7 +159,7 @@ class _DescendantTracker:
                 daemon=True,
             )
             self._thread.start()
-        except BaseException:  # noqa: BLE001 - constructor must close its partially-owned FD
+        except BaseException:  # constructor must close its partially-owned FD
             self._kqueue.close()
             raise
 
@@ -604,7 +604,7 @@ class _LocalProcessSession:
             self._descendants = _DescendantTracker(root_identity, bindings)
             os.write(gate_write, b"1")
             _close_fd(gate_write)
-        except BaseException as error:  # noqa: BLE001 - preserve startup errors after no-fail cleanup
+        except BaseException as error:  # preserve startup errors after no-fail cleanup
             evidence = self._abort_gated_start(gate_write, root_identity)
             if evidence:
                 error.add_note("local startup cleanup evidence: " + "; ".join(evidence))
