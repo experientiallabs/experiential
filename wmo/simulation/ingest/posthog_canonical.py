@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections import defaultdict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -21,17 +20,23 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
 )
 from wmo.common.core.text import normalize_durable_text
-from wmo.common.models import ConnectionConfig, ModelSnapshot
+from wmo.common.models import ModelSnapshot
 from wmo.common.tasks import ToolSchema
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from wmo.simulation.ingest.model_identity import (
+    CAPABILITIES_DIGEST_ATTRIBUTE,
+    CONNECTION_DIGEST_ATTRIBUTE,
+    normalized_capabilities_sha256,
+    normalized_connection_sha256,
+    normalized_model_identity_evidence,
+)
 from wmo.simulation.ingest.otlp import (
     GENAI_SEMANTIC_CONVENTION_VERSION,
     TraceNormalizationIssue,
     TraceNormalizationResult,
 )
+from wmo.simulation.ingest.posthog_ids import posthog_w3c_id
 
-_TRACE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
-_SPAN_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 _OUTCOME_STATUS_KEY = "wmo.outcome.status"
 _OUTCOME_NAME_KEY = "wmo.outcome.name"
 _OUTCOME_FAILURE_CODE_KEY = "wmo.outcome.failure.code"
@@ -170,7 +175,12 @@ def normalize_posthog_payload(
         except PostHogPullError as exc:
             issues.append(TraceNormalizationIssue(f"trace-{source_trace_id}", str(exc)))
     traces.sort(key=lambda trace: (trace.spans[0].started_at, trace.trace_id))
-    return TraceNormalizationResult(traces=tuple(traces), issues=tuple(issues))
+    normalized_traces = tuple(traces)
+    return TraceNormalizationResult(
+        traces=normalized_traces,
+        issues=tuple(issues),
+        identity_evidence=normalized_model_identity_evidence(normalized_traces),
+    )
 
 
 def _normalize_jsonl(
@@ -241,7 +251,7 @@ def _normalize_trace_events(
     semantic_convention_version: str,
 ) -> Trace:
     """Convert ordered PostHog root, generation, tool, and error events to one canonical trace."""
-    trace_id = _w3c_trace_id(source_trace_id, kind="trace", namespace="trace")
+    trace_id = posthog_w3c_id(source_trace_id, kind="trace", namespace="trace")
     ordered = sorted(
         events,
         key=lambda event: (_event_timestamp(event.event), event.source_order_key, event.ordinal),
@@ -490,7 +500,7 @@ def _span(
     """Build one canonical span with deterministic W3C-shaped IDs and PostHog error mapping."""
     properties = _properties(event.event)
     source_span_id = _source_span_id(event)
-    span_id = _w3c_trace_id(
+    span_id = posthog_w3c_id(
         f"{source_trace_id}\0{source_span_id}\0{suffix}", kind="span", namespace="span"
     )
     failure = _event_failure(properties)
@@ -666,6 +676,8 @@ def _mapped_extensions(properties: JsonObject) -> JsonObject:
         "wmo.request.context",
         "wmo.request.tags",
         "wmo.request.tools",
+        CAPABILITIES_DIGEST_ATTRIBUTE,
+        CONNECTION_DIGEST_ATTRIBUTE,
         "wmo.outcome.escalated",
         _OUTCOME_STATUS_KEY,
         _OUTCOME_NAME_KEY,
@@ -821,8 +833,18 @@ def _model_snapshot(properties: JsonObject) -> ModelSnapshot | None:
     if provider is None:
         raise PostHogPullError("PostHog model identity has a model but no provider")
     revision = _first_property_text(properties, ("$ai_model_revision", "model_revision"))
-    digest = hashlib.sha256(f"{provider}\0{model_id}\0{revision or ''}".encode()).hexdigest()
-    connection_sha256 = _connection_sha256(properties, provider)
+    digest = normalized_capabilities_sha256(
+        properties,
+        provider,
+        model_id,
+        revision,
+        error_type=PostHogPullError,
+    )
+    connection_sha256 = normalized_connection_sha256(
+        properties,
+        provider,
+        error_type=PostHogPullError,
+    )
     return ModelSnapshot(
         provider=provider,
         model_id=model_id,
@@ -830,23 +852,6 @@ def _model_snapshot(properties: JsonObject) -> ModelSnapshot | None:
         capabilities_sha256=digest,
         connection_sha256=connection_sha256,
     )
-
-
-def _connection_sha256(properties: JsonObject, provider: str) -> str:
-    """Return declared connection evidence or the provider's standard endpoint identity.
-
-    PostHog exports do not reliably retain a safe endpoint spelling. Producers can include the
-    canonical digest directly. Otherwise the provider-only identity records that the trace used
-    the provider's standard endpoint without copying a credential or raw endpoint into WMO.
-    """
-    declared_connection = properties.get("wmo.model.connection_sha256")
-    if declared_connection is not None:
-        if not isinstance(declared_connection, str) or not re.fullmatch(
-            r"[0-9a-f]{64}", declared_connection
-        ):
-            raise PostHogPullError("wmo.model.connection_sha256 must be a SHA-256 digest")
-        return declared_connection
-    return ConnectionConfig(provider=provider).identity_sha256()
 
 
 def _event_failure(properties: JsonObject) -> StructuredFailure | None:
@@ -984,13 +989,3 @@ def _first_property_text(properties: JsonObject, keys: tuple[str, ...]) -> str |
         if isinstance(value, str) and value.strip():
             return normalize_durable_text(value.strip())
     return None
-
-
-def _w3c_trace_id(value: str, *, kind: str, namespace: str) -> str:
-    """Keep valid W3C IDs and deterministically hash PostHog opaque IDs into W3C width."""
-    normalized = value.casefold()
-    pattern = _TRACE_ID_PATTERN if kind == "trace" else _SPAN_ID_PATTERN
-    if pattern.fullmatch(normalized) and set(normalized) != {"0"}:
-        return normalized
-    width = 32 if kind == "trace" else 16
-    return hashlib.sha256(f"posthog\0{namespace}\0{value}".encode()).hexdigest()[:width]

@@ -246,6 +246,29 @@ def test_posthog_retains_a_declared_model_connection_digest() -> None:
     assert result.issues == ()
     assert result.traces[0].spans[0].model is not None
     assert result.traces[0].spans[0].model.connection_sha256 == "d" * 64
+    assert result.identity_evidence is not None
+    assert result.identity_evidence[0].capabilities == "inferred"
+    assert result.identity_evidence[0].connection == "declared"
+    assert result.traces[0].spans[0].attributes["wmo.model.connection_sha256"] == "d" * 64
+
+
+def test_posthog_retains_independent_declared_model_identity_components() -> None:
+    """PostHog capability and connection digests remain safe canonical span extensions."""
+    events = _posthog_events()
+    properties = _event_properties(events[0])
+    properties["wmo.model.capabilities_sha256"] = "c" * 64
+    properties["wmo.model.connection_sha256"] = "d" * 64
+
+    result = normalize_posthog_payload(events, source=_source())
+
+    assert result.issues == ()
+    assert result.identity_evidence is not None
+    assert result.identity_evidence[0].capabilities == "declared"
+    assert result.identity_evidence[0].connection == "declared"
+    model_span = result.traces[0].spans[0]
+    assert model_span.model is not None
+    assert model_span.model.capabilities_sha256 == "c" * 64
+    assert model_span.attributes["wmo.model.capabilities_sha256"] == "c" * 64
 
 
 def test_posthog_rejects_an_invalid_declared_model_connection_digest() -> None:
@@ -257,6 +280,17 @@ def test_posthog_rejects_an_invalid_declared_model_connection_digest() -> None:
 
     assert result.traces == ()
     assert "connection_sha256" in result.issues[0].message
+
+
+def test_posthog_rejects_an_invalid_declared_model_capability_digest() -> None:
+    """Malformed capability provenance excludes the complete source trace."""
+    events = _posthog_events()
+    _event_properties(events[0])["wmo.model.capabilities_sha256"] = "not-a-digest"
+
+    result = normalize_posthog_payload(events, source=_source())
+
+    assert result.traces == ()
+    assert "capabilities_sha256" in result.issues[0].message
 
 
 def test_posthog_error_and_jsonl_export_are_retained_as_canonical_failure_evidence(

@@ -19,7 +19,7 @@ from wmo.common.judging import (
     JudgeCalibrationService,
 )
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
-from wmo.common.models import AssistantAction, OperationEconomics, Usage
+from wmo.common.models import AssistantAction, ModelSnapshot, OperationEconomics, Usage
 from wmo.common.project import (
     ArtifactAlreadyExistsError,
     ArtifactStoreError,
@@ -373,6 +373,9 @@ def write_production_rollout(
     trace: Trace,
     created_at: datetime,
     code_revision: str,
+    *,
+    attributed_candidate: ModelSnapshot | None = None,
+    attribution_input: ArtifactInput | None = None,
 ) -> ArtifactInput:
     """Persist one real trace as immutable production rollout evidence.
 
@@ -383,6 +386,8 @@ def write_production_rollout(
         trace: Real normalized trace to preserve.
         created_at: Artifact completion time.
         code_revision: Exact producer revision.
+        attributed_candidate: Selected candidate proven by immutable attribution evidence.
+        attribution_input: Exact attribution artifact authorizing the selected candidate.
 
     Returns:
         Exact rollout manifest pointer.
@@ -390,21 +395,54 @@ def write_production_rollout(
     Raises:
         ManualJudgeError: The trace has no recorded model identity or conflicts on replay.
     """
-    candidate = next((span.model for span in trace.spans if span.model is not None), None)
+    if (attributed_candidate is None) != (attribution_input is None):
+        raise ManualJudgeError(
+            "attributed production rollouts require both candidate and attribution input"
+        )
+    candidate = attributed_candidate or next(
+        (span.model for span in trace.spans if span.model is not None),
+        None,
+    )
     if candidate is None:
         raise ManualJudgeError(
             f"trace {trace.trace_id!r} has no recorded model identity and cannot be calibrated"
         )
-    artifact_id = rollout_id(task, trace)
+    base_rollout_id = rollout_id(task, trace)
+    artifact_id = (
+        base_rollout_id
+        if attribution_input is None
+        else stable_id(
+            "attributed-production-rollout",
+            {
+                "version": "attributed-production-rollout-v1",
+                "base_rollout_id": base_rollout_id,
+                "candidate": candidate.model_dump(mode="json"),
+                "attribution": attribution_input.model_dump(mode="json"),
+            },
+        )
+    )
+    inputs = tuple(
+        sorted(
+            (
+                setup.trace_dataset,
+                *((attribution_input,) if attribution_input is not None else ()),
+            ),
+            key=lambda item: item.artifact_id,
+        )
+    )
     failure = trace.outcome.failure if trace.outcome is not None else None
     rollout = RolloutArtifact(
         schema_version=1,
         created_at=created_at,
-        inputs=(setup.trace_dataset,),
+        inputs=inputs,
         code_revision=code_revision,
         source=trace.source.identity,
         artifact_id=artifact_id,
-        simulation_id="production-import-v1",
+        simulation_id=(
+            "production-import-v1"
+            if attribution_input is None
+            else "attributed-production-import-v1"
+        ),
         cell_id=stable_id("production-cell", {"rollout_id": artifact_id}),
         mode=SimulationMode.WORLD_MODEL,
         rollout_id=artifact_id,

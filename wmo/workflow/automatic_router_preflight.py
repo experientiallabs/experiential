@@ -33,6 +33,11 @@ from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, load_trace_dataset
 from wmo.runtime.agents import agent_factory_sha256
 from wmo.runtime.models import RuntimeModelCatalog
+from wmo.simulation.ingest.dataset import (
+    read_trace_model_identity_evidence,
+    verify_current_trace_dataset,
+)
+from wmo.simulation.ingest.model_identity import TraceModelIdentityEvidenceSet
 from wmo.simulation.specs import CandidateCompletionReservation
 from wmo.workflow.automatic_router_reservations import (
     judge_completion_reservation,
@@ -47,6 +52,11 @@ from wmo.workflow.manual_judge_contracts import (
     ManualJudgeReviewState,
     ManualJudgeSetupArtifact,
 )
+from wmo.workflow.router_attribution import (
+    RouterAttributionError,
+    RouterObservedAttribution,
+    resolve_router_observed_attributions,
+)
 
 
 class AutomaticRouterPreflightError(ValueError):
@@ -60,6 +70,7 @@ class ObservedRouterTrace:
     task: TaskCase
     trace: Trace
     candidate_alias: str
+    attribution: RouterObservedAttribution
 
 
 @dataclass(frozen=True)
@@ -69,6 +80,7 @@ class AutomaticRouterPreflight:
     project_config: ProjectConfig
     completed_build: ProjectBuildArtifacts
     catalog: ModelCatalog
+    catalog_sha256: Sha256
     candidates: tuple[RoutedCandidateSnapshot, ...]
     candidate_prices: tuple[CandidateTokenPrice, ...]
     incumbent_alias: str
@@ -86,6 +98,7 @@ class AutomaticRouterPreflight:
     approved_calibration_input: ArtifactInput
     tasks: tuple[TaskCase, ...]
     traces: tuple[Trace, ...]
+    trace_identity_evidence: TraceModelIdentityEvidenceSet | None
     observed_traces: tuple[ObservedRouterTrace, ...]
     fidelity_overlap_count: int
     preferred_fidelity_overlaps: int
@@ -195,9 +208,16 @@ def preflight_automatic_router(
         judge_alias,
         judge,
     )
-    tasks, traces = _build_evidence(problems, project, completed)
-    observed = _observed_traces(tasks, traces, candidates)
-    fidelity_overlap_count = min(len(observed), preferred_fidelity_overlaps)
+    tasks, traces, identity_evidence = _build_evidence(problems, project, completed)
+    observed = _observed_traces(
+        problems,
+        tasks,
+        traces,
+        identity_evidence,
+        candidates,
+        preferred_fidelity_overlaps,
+    )
+    fidelity_overlap_count = len(observed)
     if not observed:
         problems.append(
             "fidelity evidence: no real fit trace matches an exact selected candidate model; "
@@ -274,6 +294,7 @@ def preflight_automatic_router(
         project_config=config,
         completed_build=completed,
         catalog=catalog,
+        catalog_sha256=sha256_json(catalog.model_dump(mode="json")),
         candidates=candidates,
         candidate_prices=router_candidate_prices(
             catalog.model_copy(
@@ -302,6 +323,7 @@ def preflight_automatic_router(
         approved_calibration_input=approved_calibration_input,
         tasks=tasks,
         traces=traces,
+        trace_identity_evidence=identity_evidence,
         observed_traces=observed,
         fidelity_overlap_count=fidelity_overlap_count,
         preferred_fidelity_overlaps=preferred_fidelity_overlaps,
@@ -693,7 +715,11 @@ def _verify_manual_judge_chain(
 
 def _build_evidence(
     problems: list[str], project: ProjectStore, completed: ProjectBuildArtifacts | None
-) -> tuple[tuple[TaskCase, ...], tuple[Trace, ...]]:
+) -> tuple[
+    tuple[TaskCase, ...],
+    tuple[Trace, ...],
+    TraceModelIdentityEvidenceSet | None,
+]:
     """Load exact completed tasks and traces for overlap planning.
 
     Args:
@@ -702,63 +728,76 @@ def _build_evidence(
         completed: Completed build pointers, if available.
 
     Returns:
-        Verified task and trace tuples, or empty values after recording a failure.
+        Verified tasks, traces, and optional versioned identity evidence, or empty values after
+        recording a failure.
     """
     if completed is None:
-        return (), ()
+        return (), (), None
     try:
+        from wmo.simulation.mining.bindings import load_task_set_lineage_bindings
+
         tasks = load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
-        traces = load_trace_dataset(project.artifacts, completed.trace_dataset.artifact_id).traces
-        return tasks, traces
+        load_task_set_lineage_bindings(project.artifacts, completed.task_set.artifact_id)
+        loaded_traces = load_trace_dataset(
+            project.artifacts,
+            completed.trace_dataset.artifact_id,
+        )
+        verify_current_trace_dataset(project.artifacts, loaded_traces)
+        identity_evidence = read_trace_model_identity_evidence(
+            project.artifacts,
+            loaded_traces,
+        )
+        return tasks, loaded_traces.traces, identity_evidence
     except (OSError, ValueError) as exc:
         problems.append(f"completed build evidence: {exc}")
-        return (), ()
+        return (), (), None
 
 
 def _observed_traces(
+    problems: list[str],
     tasks: tuple[TaskCase, ...],
     traces: tuple[Trace, ...],
+    identity_evidence: TraceModelIdentityEvidenceSet | None,
     candidates: tuple[RoutedCandidateSnapshot, ...],
+    preferred_overlap_limit: int,
 ) -> tuple[ObservedRouterTrace, ...]:
-    """Match all real fit lineages to exact selected candidate identities.
+    """Resolve real fit lineages through verified declared or unique inferred identity.
 
     Args:
+        problems: Mutable aggregate preflight failures.
         tasks: Verified representative tasks.
         traces: Verified normalized production traces.
+        identity_evidence: Verified model-span digest provenance, if the dataset carries it.
         candidates: Exact selected candidate identities.
+        preferred_overlap_limit: Maximum fidelity overlaps admitted to evaluation.
 
     Returns:
-        One deterministic matching trace per distinct fit lineage.
+        One deterministic attributed trace per admitted fit lineage.
     """
+    if not tasks or not traces or not candidates:
+        return ()
+    try:
+        attributions = resolve_router_observed_attributions(
+            tasks,
+            traces,
+            identity_evidence,
+            candidates,
+            preferred_overlap_limit=preferred_overlap_limit,
+        )
+    except RouterAttributionError as exc:
+        problems.append(f"fidelity identity attribution: {exc}")
+        return ()
+    tasks_by_id = {task.task_id: task for task in tasks}
     traces_by_id = {trace.trace_id: trace for trace in traces}
-    aliases_by_model = {candidate.model: candidate.alias for candidate in candidates}
-    selected = []
-    lineages = set()
-    for task in tasks:
-        if task.partition != "fit" or task.lineage_group_id in lineages:
-            continue
-        for trace_id in task.source_trace_ids:
-            trace = traces_by_id.get(trace_id)
-            model = _trace_model(trace) if trace is not None else None
-            alias = aliases_by_model.get(model) if model is not None else None
-            if trace is not None and alias is not None:
-                selected.append(ObservedRouterTrace(task=task, trace=trace, candidate_alias=alias))
-                lineages.add(task.lineage_group_id)
-                break
-    return tuple(selected)
-
-
-def _trace_model(trace: Trace) -> ModelSnapshot | None:
-    """Return the unique recorded candidate identity for one real trace.
-
-    Args:
-        trace: Normalized production trace.
-
-    Returns:
-        One exact model identity, or ``None`` for absent or ambiguous records.
-    """
-    models = {span.model for span in trace.spans if span.model is not None}
-    return next(iter(models)) if len(models) == 1 else None
+    return tuple(
+        ObservedRouterTrace(
+            task=tasks_by_id[item.task_id],
+            trace=traces_by_id[item.trace_id],
+            candidate_alias=item.candidate_alias,
+            attribution=item,
+        )
+        for item in attributions
+    )
 
 
 def _preflight_error(problems: list[str]) -> AutomaticRouterPreflightError:

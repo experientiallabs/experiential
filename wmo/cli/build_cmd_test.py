@@ -30,7 +30,9 @@ from wmo.common.models import (
     write_model_catalog,
 )
 from wmo.common.project import ArtifactCorruptionError, ProjectStore, ProjectStoreError
+from wmo.common.traces import load_trace_dataset
 from wmo.runtime.models import ResolvedModel
+from wmo.simulation.ingest.dataset import read_trace_model_identity_evidence
 from wmo.simulation.retrieval import load_rag_index
 from wmo.simulation.world_model import GroundedWorldModelArtifact
 
@@ -302,6 +304,13 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     assert config.models.candidates == ()
     assert config.build is not None
     assert config.build.serving_rag != config.build.fit_rag
+    loaded_traces = load_trace_dataset(store.artifacts, config.build.trace_dataset.artifact_id)
+    identity_evidence = read_trace_model_identity_evidence(store.artifacts, loaded_traces)
+    assert identity_evidence is not None
+    assert identity_evidence.records
+    assert {(record.capabilities, record.connection) for record in identity_evidence.records} == {
+        ("inferred", "inferred")
+    }
     serving = load_rag_index(store.artifacts, config.build.serving_rag.artifact_id)
     fit = load_rag_index(store.artifacts, config.build.fit_rag.artifact_id)
     assert serving.index.transition_count == 1

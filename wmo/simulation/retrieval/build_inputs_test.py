@@ -24,7 +24,11 @@ from wmo.common.project.paths import ProjectPaths
 from wmo.common.tasks import TaskSet
 from wmo.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
 from wmo.simulation.build import TaskSetBuild, build_task_set
-from wmo.simulation.ingest.dataset import current_trace_dataset_id, persist_trace_dataset
+from wmo.simulation.ingest.dataset import (
+    MODEL_IDENTITY_EVIDENCE_PATH,
+    current_trace_dataset_id,
+    persist_trace_dataset,
+)
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.mining.bindings import (
     LINEAGE_BINDINGS_PATH,
@@ -492,11 +496,13 @@ def test_binding_loader_rejects_malformed_normalization_issue_payloads(
     assert original.source is not None
     traces_bytes = store.read_bytes(original.dataset_id, "traces.jsonl")
     issues_bytes = canonical_json_bytes(issues_value)
+    identity_bytes = store.read_bytes(original.dataset_id, MODEL_IDENTITY_EVIDENCE_PATH)
     malicious_id = current_trace_dataset_id(
         source=original.source,
         semantic_convention_version=original.semantic_convention_version,
         traces_sha256=hashlib.sha256(traces_bytes).hexdigest(),
         issues_sha256=hashlib.sha256(issues_bytes).hexdigest(),
+        identity_evidence_sha256=hashlib.sha256(identity_bytes).hexdigest(),
         code_revision=original.code_revision,
     )
     malicious = original.model_copy(
@@ -512,6 +518,7 @@ def test_binding_loader_rejects_malformed_normalization_issue_payloads(
         files={
             "traces.jsonl": traces_bytes,
             "normalization-issues.json": issues_bytes,
+            MODEL_IDENTITY_EVIDENCE_PATH: identity_bytes,
             "trace-dataset.json": canonical_json_bytes(malicious),
         },
     )
@@ -570,6 +577,7 @@ def test_binding_loader_rejects_noncanonical_trace_dataset_payloads(
     assert original.source is not None
     traces_bytes = store.read_bytes(original.dataset_id, "traces.jsonl")
     issues_bytes = store.read_bytes(original.dataset_id, "normalization-issues.json")
+    identity_bytes = store.read_bytes(original.dataset_id, MODEL_IDENTITY_EVIDENCE_PATH)
     if relative_path == "traces.jsonl":
         traces_bytes = b" " + traces_bytes
     elif relative_path == "normalization-issues.json":
@@ -579,6 +587,7 @@ def test_binding_loader_rejects_noncanonical_trace_dataset_payloads(
         semantic_convention_version=original.semantic_convention_version,
         traces_sha256=hashlib.sha256(traces_bytes).hexdigest(),
         issues_sha256=hashlib.sha256(issues_bytes).hexdigest(),
+        identity_evidence_sha256=hashlib.sha256(identity_bytes).hexdigest(),
         code_revision=original.code_revision,
     )
     rewritten = original.model_copy(
@@ -607,6 +616,7 @@ def test_binding_loader_rejects_noncanonical_trace_dataset_payloads(
             files={
                 "traces.jsonl": traces_bytes,
                 "normalization-issues.json": issues_bytes,
+                MODEL_IDENTITY_EVIDENCE_PATH: identity_bytes,
                 "trace-dataset.json": envelope_bytes,
             },
         )

@@ -42,6 +42,7 @@ from wmo.common.models import (
 )
 from wmo.common.project import (
     AgentConfiguration,
+    ArtifactCorruptionError,
     ProjectConfig,
     ProjectModelConfiguration,
     ProjectStore,
@@ -54,6 +55,10 @@ from wmo.runtime.agents import ChatAgentRuntime
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.application import RouterApplicationError, load_project_router
 from wmo.simulation.build import build_project, select_completed_build
+from wmo.simulation.ingest.model_identity import (
+    normalized_capabilities_sha256,
+    normalized_model_identity_evidence,
+)
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.mining.service import MiningSpec
 from wmo.workflow.automatic_router import (
@@ -61,7 +66,10 @@ from wmo.workflow.automatic_router import (
     AutomaticRouterOptions,
     optimize_project_router,
 )
-from wmo.workflow.automatic_router_preflight import preflight_automatic_router
+from wmo.workflow.automatic_router_preflight import (
+    AutomaticRouterPreflightError,
+    preflight_automatic_router,
+)
 from wmo.workflow.automatic_router_replay import find_completed_automatic_router_replay
 from wmo.workflow.manual_judge import (
     calibrate_manual_judge,
@@ -73,6 +81,10 @@ from wmo.workflow.manual_judge import (
 from wmo.workflow.manual_judge_artifacts import read_audit, write_audit, write_review_state
 from wmo.workflow.manual_judge_contracts import ManualJudgeLabel, ManualJudgeReviewState
 from wmo.workflow.router import FidelityApprovalDecision, RouterCompositionBudget
+from wmo.workflow.router_attribution import (
+    RouterObservedAttributionSet,
+    persist_router_observed_attribution_set,
+)
 
 _TIME = datetime(2026, 8, 14, tzinfo=UTC)
 _REVISION = "a" * 40
@@ -317,6 +329,9 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
     assert result.composition.optimization.optimization.policy.policy_id
     assert result.composition.optimization.optimization.report.report_id
     assert result.artifacts.execution_contract.maximum_provider_cost_usd == 25.0
+    assert result.artifacts.attribution_input in result.artifacts.execution_contract.inputs
+    assert result.artifacts.attribution_input in result.composition.plan.inputs
+    assert result.preflight.observed_traces[0].attribution.match_kind == "strict_snapshot"
     assert result.composition.plan.inputs
     assert approval.calls == 1
     assert len(state.completion_calls) > before_completion
@@ -366,6 +381,20 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
             store,
             expanded_fidelity,
             options=replace(options, preferred_fidelity_overlaps=2),
+            code_revision=_REVISION,
+        )
+        is None
+    )
+    assert tuple(state.completion_calls) == completed_completion
+    assert tuple(state.embedding_calls) == completed_embedding
+    assert state.credential_resolutions == completed_credentials
+
+    catalog_drift = replace(result.preflight, catalog_sha256="0" * 64)
+    assert (
+        find_completed_automatic_router_replay(
+            store,
+            catalog_drift,
+            options=options,
             code_revision=_REVISION,
         )
         is None
@@ -552,6 +581,214 @@ def test_automatic_router_refuses_spend_before_credentials_calls_or_writes(
     assert store.artifacts.list_ids() == before_artifacts
     assert store.model_catalog_path.read_bytes() == before_catalog
     assert store.read_review() == before_review
+
+
+def test_provider_model_only_telemetry_composes_with_inferred_unique_attribution(
+    tmp_path: Path,
+) -> None:
+    """Normal provider/model OTLP evidence completes the configless production path.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+    """
+    store, catalog, state = _completed_project(tmp_path, inferred_identity=True)
+    _approve_manual_judge(store, catalog, state)
+    plan = collect_router_candidate_setup(
+        store.model_catalog_path,
+        catalog,
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    result = optimize_project_router(
+        store,
+        plan,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        options=AutomaticRouterOptions(
+            maximum_judgments=20,
+            preferred_fidelity_overlaps=1,
+            maximum_model_calls=1,
+            simulation_maximum_output_tokens=8_000,
+        ),
+        provider_spend_consented=True,
+        fidelity_approval=_FidelityApproval(),
+        created_at=_TIME + timedelta(hours=1),
+        code_revision=_REVISION,
+    )
+
+    attribution = result.preflight.observed_traces[0].attribution
+    assert attribution.candidate_alias == "candidate-a"
+    assert attribution.match_kind == "inferred_unique"
+    assert result.artifacts.attribution_input in result.composition.plan.inputs
+
+
+def test_ambiguous_inferred_telemetry_fails_before_stateful_boundaries(tmp_path: Path) -> None:
+    """Candidate ambiguity is aggregated before writes, credentials, factories, or providers.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+    """
+    store, catalog, state = _completed_project(tmp_path, inferred_identity=True)
+    _approve_manual_judge(store, catalog, state)
+    ambiguous = catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                "candidate-b": catalog.models["candidate-b"].model_copy(
+                    update={"model": "candidate-a"}
+                ),
+            }
+        }
+    )
+    plan = collect_router_candidate_setup(
+        store.model_catalog_path,
+        ambiguous,
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    before_artifacts = store.artifacts.list_ids()
+    before_catalog = store.model_catalog_path.read_bytes()
+    before_completion = tuple(state.completion_calls)
+    before_embedding = tuple(state.embedding_calls)
+    before_credentials = state.credential_resolutions
+
+    with pytest.raises(AutomaticRouterPreflightError, match="ambiguous"):
+        optimize_project_router(
+            store,
+            plan,
+            cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+            options=AutomaticRouterOptions(
+                maximum_judgments=20,
+                preferred_fidelity_overlaps=1,
+                maximum_model_calls=1,
+                simulation_maximum_output_tokens=8_000,
+            ),
+            provider_spend_consented=True,
+            fidelity_approval=_FidelityApproval(),
+            created_at=_TIME + timedelta(hours=1),
+            code_revision=_REVISION,
+        )
+
+    assert store.artifacts.list_ids() == before_artifacts
+    assert store.model_catalog_path.read_bytes() == before_catalog
+    assert tuple(state.completion_calls) == before_completion
+    assert tuple(state.embedding_calls) == before_embedding
+    assert state.credential_resolutions == before_credentials
+
+
+@pytest.mark.parametrize("tamper", ["payload", "source", "extra-file", "lineage-record"])
+def test_completed_replay_rejects_attribution_tamper_before_provider_access(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    """A manifest-valid changed attribution payload poisons replay before any provider call.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+        tamper: Manifest-valid attribution mutation to apply.
+    """
+    store, catalog, state = _completed_project(tmp_path)
+    _approve_manual_judge(store, catalog, state)
+    plan = collect_router_candidate_setup(
+        store.model_catalog_path,
+        catalog,
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    options = AutomaticRouterOptions(
+        maximum_judgments=20,
+        preferred_fidelity_overlaps=1,
+        maximum_model_calls=1,
+        simulation_maximum_output_tokens=8_000,
+    )
+    result = optimize_project_router(
+        store,
+        plan,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        options=options,
+        provider_spend_consented=True,
+        fidelity_approval=_FidelityApproval(),
+        created_at=_TIME + timedelta(hours=1),
+        code_revision=_REVISION,
+    )
+    if tamper == "lineage-record":
+        before_artifacts = store.artifacts.list_ids()
+        record = result.preflight.observed_traces[0].attribution.model_copy(
+            update={"lineage_id": "forged-lineage"}
+        )
+        with pytest.raises(ArtifactCorruptionError, match="partition, or lineage"):
+            persist_router_observed_attribution_set(
+                store.artifacts,
+                trace_dataset=result.preflight.completed_build.trace_dataset,
+                task_set=result.preflight.completed_build.task_set,
+                catalog_sha256=result.preflight.catalog_sha256,
+                candidates=result.preflight.candidates,
+                preferred_overlap_limit=1,
+                records=(record,),
+                created_at=_TIME + timedelta(hours=2),
+                code_revision=_REVISION,
+            )
+        assert store.artifacts.list_ids() == before_artifacts
+        return
+    attribution_id = result.artifacts.attribution_input.artifact_id
+    stored = store.artifacts.read(attribution_id)
+    if tamper == "payload":
+        value = RouterObservedAttributionSet.model_validate_json(
+            store.artifacts.read_bytes(attribution_id, "attribution.json")
+        ).model_copy(update={"catalog_sha256": "0" * 64})
+        payload = canonical_json_bytes(value)
+        manifest = stored.manifest.model_copy(
+            update={"files": (file_digest("attribution.json", payload),)}
+        )
+        (stored.directory / "attribution.json").write_bytes(payload)
+        match = "content identity differs"
+    elif tamper == "source":
+        manifest = stored.manifest.model_copy(
+            update={
+                "source": SourceIdentity(
+                    kind="otlp",
+                    source_id="forged",
+                    sha256="0" * 64,
+                )
+            }
+        )
+        match = "must not have source"
+    else:
+        extra = b"{}"
+        (stored.directory / "extra.json").write_bytes(extra)
+        manifest = stored.manifest.model_copy(
+            update={
+                "files": tuple(
+                    sorted(
+                        (*stored.manifest.files, file_digest("extra.json", extra)),
+                        key=lambda item: item.path,
+                    )
+                )
+            }
+        )
+        match = "exact one-file shape"
+    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+    before_completion = tuple(state.completion_calls)
+    before_embedding = tuple(state.embedding_calls)
+    before_credentials = state.credential_resolutions
+
+    with pytest.raises(ArtifactCorruptionError, match=match):
+        find_completed_automatic_router_replay(
+            store,
+            result.preflight,
+            options=options,
+            code_revision=_REVISION,
+        )
+
+    assert tuple(state.completion_calls) == before_completion
+    assert tuple(state.embedding_calls) == before_embedding
+    assert state.credential_resolutions == before_credentials
 
 
 def test_completed_custom_agent_replay_does_not_import_or_construct_factory(
@@ -854,12 +1091,15 @@ def _completed_project(
     tmp_path: Path,
     *,
     agent: AgentConfiguration | None = None,
+    inferred_identity: bool = False,
 ) -> tuple[ProjectStore, ModelCatalog, _ProviderState]:
     """Create one exact completed build with candidate-attributed real traces.
 
     Args:
         tmp_path: Isolated local WMO root.
         agent: Optional exact custom agent configuration frozen during build.
+        inferred_identity: Whether source model digests use telemetry fallbacks rather than the
+            selected catalog snapshot.
 
     Returns:
         Completed project, catalog, and shared provider counters.
@@ -883,10 +1123,32 @@ def _completed_project(
     )
     runtime = _RuntimeCatalog(catalog, state)
     candidate_model, _capabilities = runtime.snapshot("candidate-a")
+    recorded_model = (
+        candidate_model.model_copy(
+            update={
+                "capabilities_sha256": normalized_capabilities_sha256(
+                    {},
+                    candidate_model.provider,
+                    candidate_model.model_id,
+                    candidate_model.revision,
+                    error_type=ValueError,
+                ),
+                "connection_sha256": ConnectionConfig(
+                    provider=candidate_model.provider
+                ).identity_sha256(),
+            }
+        )
+        if inferred_identity
+        else candidate_model
+    )
+    traces = tuple(_trace(index, recorded_model) for index in range(12))
     built = build_project(
         TraceNormalizationResult(
-            traces=tuple(_trace(index, candidate_model) for index in range(12)),
+            traces=traces,
             issues=(),
+            identity_evidence=(
+                normalized_model_identity_evidence(traces) if inferred_identity else None
+            ),
         ),
         store,
         created_at=_TIME,

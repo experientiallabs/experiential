@@ -19,9 +19,15 @@ from pydantic import JsonValue
 
 from wmo.common.core.artifacts import FailureCode, JsonObject, SourceIdentity, StructuredFailure
 from wmo.common.core.text import normalize_durable_text
-from wmo.common.models import ConnectionConfig, ModelSnapshot, Usage
+from wmo.common.models import ModelSnapshot, Usage
 from wmo.common.tasks import ToolSchema
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from wmo.simulation.ingest.model_identity import (
+    TraceModelIdentityEvidence,
+    normalized_capabilities_sha256,
+    normalized_connection_sha256,
+    normalized_model_identity_evidence,
+)
 
 GENAI_SEMANTIC_CONVENTION_VERSION = "1.37.0"
 
@@ -65,10 +71,16 @@ class TraceNormalizationResult:
     Args:
         traces: Valid normalized production traces in deterministic order.
         issues: Corrupt or incomplete source records that were excluded without repair.
+        identity_evidence: Exact model-span provenance from a telemetry-aware normalizer. ``None``
+            marks direct or programmatic records whose digest origin is unspecified.
+        include_identity_evidence: Whether persistence materializes the provenance payload. Only
+            exact reconstruction of a verified legacy dataset should disable it.
     """
 
     traces: tuple[Trace, ...]
     issues: tuple[TraceNormalizationIssue, ...]
+    identity_evidence: tuple[TraceModelIdentityEvidence, ...] | None = None
+    include_identity_evidence: bool = True
 
     @property
     def invalid_trace_count(self) -> int:
@@ -220,7 +232,12 @@ def normalize_otlp_payloads(
         else:
             traces.append(trace)
     traces.sort(key=lambda trace: (trace.spans[0].started_at, trace.trace_id))
-    return TraceNormalizationResult(traces=tuple(traces), issues=tuple(issues))
+    normalized_traces = tuple(traces)
+    return TraceNormalizationResult(
+        traces=normalized_traces,
+        issues=tuple(issues),
+        identity_evidence=normalized_model_identity_evidence(normalized_traces),
+    )
 
 
 def _normalize_jsonl(
@@ -463,18 +480,18 @@ def _model_snapshot(attributes: JsonObject, operation: str) -> ModelSnapshot | N
     revision = _first_text(
         attributes, ("gen_ai.response.model.version", "gen_ai.request.model.version")
     )
-    declared_capabilities = attributes.get("wmo.model.capabilities_sha256")
-    if declared_capabilities is not None:
-        if not isinstance(declared_capabilities, str) or not re.fullmatch(
-            r"[0-9a-f]{64}", declared_capabilities
-        ):
-            raise OtlpTraceFormatError("wmo.model.capabilities_sha256 must be a SHA-256 digest")
-        capabilities_sha256 = declared_capabilities
-    else:
-        capabilities_sha256 = hashlib.sha256(
-            f"{provider}\0{model_id}\0{revision or ''}".encode()
-        ).hexdigest()
-    connection_sha256 = _connection_sha256(attributes, provider)
+    capabilities_sha256 = normalized_capabilities_sha256(
+        attributes,
+        provider,
+        model_id,
+        revision,
+        error_type=OtlpTraceFormatError,
+    )
+    connection_sha256 = normalized_connection_sha256(
+        attributes,
+        provider,
+        error_type=OtlpTraceFormatError,
+    )
     return ModelSnapshot(
         provider=provider,
         model_id=model_id,
@@ -482,23 +499,6 @@ def _model_snapshot(attributes: JsonObject, operation: str) -> ModelSnapshot | N
         capabilities_sha256=capabilities_sha256,
         connection_sha256=connection_sha256,
     )
-
-
-def _connection_sha256(attributes: JsonObject, provider: str) -> str:
-    """Return declared connection evidence or the provider's standard endpoint identity.
-
-    An imported trace cannot safely infer an endpoint from arbitrary telemetry attributes. An
-    exporter may therefore provide the secret-free canonical digest explicitly. When it does
-    not, the provider-only connection identity represents that provider's standard endpoint.
-    """
-    declared_connection = attributes.get("wmo.model.connection_sha256")
-    if declared_connection is not None:
-        if not isinstance(declared_connection, str) or not re.fullmatch(
-            r"[0-9a-f]{64}", declared_connection
-        ):
-            raise OtlpTraceFormatError("wmo.model.connection_sha256 must be a SHA-256 digest")
-        return declared_connection
-    return ConnectionConfig(provider=provider).identity_sha256()
 
 
 def _usage(attributes: JsonObject) -> Usage | None:

@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
 
-from wmo.common.core.artifacts import ArtifactId
+from wmo.common.core.artifacts import ArtifactId, ArtifactInput
 from wmo.common.evaluations.evidence import read_evaluation_plan
 from wmo.common.models import (
     Embedding,
@@ -26,6 +26,7 @@ from wmo.simulation.specs import SimulationSpec
 from wmo.workflow.automatic_router import AutomaticRouterOptions
 from wmo.workflow.automatic_router_preflight import AutomaticRouterPreflight
 from wmo.workflow.router import FidelityApprovalReceipt, RouterPolicyLock
+from wmo.workflow.router_attribution import load_router_observed_attribution_set
 from wmo.workflow.router_execution_contract import (
     RouterExecutionContract,
     load_router_execution_contract,
@@ -158,6 +159,8 @@ def find_completed_automatic_router_replay(
         execution = load_router_execution_contract(project.artifacts, execution_input.artifact_id)
         if not _execution_matches(execution, preflight, options, code_revision):
             continue
+        if not _attribution_matches(project, plan.inputs, execution, preflight, code_revision):
+            continue
         if not _simulation_specs_match(project, plan.plan_id, preflight, options, code_revision):
             continue
         approval_id = _matching_approval(project, policy)
@@ -187,6 +190,58 @@ def find_completed_automatic_router_replay(
             "multiple completed automatic router optimizations match these exact inputs"
         )
     return matches[0] if matches else None
+
+
+def _attribution_matches(
+    project: ProjectStore,
+    plan_inputs: tuple[ArtifactInput, ...],
+    execution: RouterExecutionContract,
+    preflight: AutomaticRouterPreflight,
+    code_revision: str,
+) -> bool:
+    """Verify the unique transitive observed-attribution input against current evidence.
+
+    Args:
+        project: Project-local immutable artifact store.
+        plan_inputs: Exact recursively verified evaluation-plan inputs.
+        execution: Current candidate execution contract.
+        preflight: Newly derived read-only attribution and catalog scope.
+        code_revision: Current package-owned producer identity.
+
+    Returns:
+        True only when plan and execution bind the same exact current attribution set.
+
+    Raises:
+        AutomaticRouterReplayError: Attribution inputs are ambiguous or corrupt.
+    """
+    attribution_inputs = tuple(
+        item
+        for item in execution.inputs
+        if project.artifacts.read(item.artifact_id).manifest.artifact_type
+        == "router-observed-attribution"
+    )
+    if not attribution_inputs:
+        return False
+    if len(attribution_inputs) != 1:
+        raise AutomaticRouterReplayError("automatic router execution has ambiguous attribution")
+    attribution_input = attribution_inputs[0]
+    if attribution_input not in plan_inputs:
+        return False
+    attribution, verified_input = load_router_observed_attribution_set(
+        project.artifacts,
+        attribution_input.artifact_id,
+    )
+    return (
+        verified_input == attribution_input
+        and attribution.code_revision == code_revision
+        and attribution.trace_dataset == preflight.completed_build.trace_dataset
+        and attribution.task_set == preflight.completed_build.task_set
+        and attribution.catalog_sha256 == preflight.catalog_sha256
+        and attribution.candidates
+        == tuple(sorted(preflight.candidates, key=lambda item: item.alias))
+        and attribution.preferred_overlap_limit == preflight.preferred_fidelity_overlaps
+        and attribution.records == tuple(item.attribution for item in preflight.observed_traces)
+    )
 
 
 def _execution_matches(

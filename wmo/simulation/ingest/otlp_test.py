@@ -174,6 +174,9 @@ def test_normalizes_w3c_genai_trace_and_wmo_outcome_extensions() -> None:
     result = normalize_otlp_payload(_payload(), source=_source())
 
     assert result.issues == ()
+    assert result.identity_evidence is not None
+    assert result.identity_evidence[0].capabilities == "inferred"
+    assert result.identity_evidence[0].connection == "inferred"
     assert len(result.traces) == 1
     trace = result.traces[0]
     assert trace.trace_id == _TRACE_ID
@@ -202,6 +205,30 @@ def test_otlp_retains_a_declared_model_connection_digest() -> None:
     assert result.issues == ()
     assert result.traces[0].spans[0].model is not None
     assert result.traces[0].spans[0].model.connection_sha256 == "d" * 64
+    assert result.identity_evidence is not None
+    assert result.identity_evidence[0].capabilities == "inferred"
+    assert result.identity_evidence[0].connection == "declared"
+
+
+def test_otlp_retains_independent_declared_model_identity_components() -> None:
+    """Capability and connection provenance remain independently declared."""
+    payload = _payload()
+    attributes = cast(list[dict[str, object]], _span(payload, 0)["attributes"])
+    attributes.extend(
+        (
+            _attribute("wmo.model.capabilities_sha256", "c" * 64),
+            _attribute("wmo.model.connection_sha256", "d" * 64),
+        )
+    )
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.issues == ()
+    assert result.identity_evidence is not None
+    assert result.identity_evidence[0].capabilities == "declared"
+    assert result.identity_evidence[0].connection == "declared"
+    assert result.traces[0].spans[0].model is not None
+    assert result.traces[0].spans[0].model.capabilities_sha256 == "c" * 64
 
 
 def test_otlp_rejects_an_invalid_declared_model_connection_digest() -> None:

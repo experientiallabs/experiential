@@ -49,6 +49,7 @@ from wmo.workflow.router import (
     RouterWorkflowServices,
     compose_router,
 )
+from wmo.workflow.router_attribution import persist_router_observed_attribution_set
 
 
 class AutomaticRouterError(ValueError):
@@ -145,6 +146,17 @@ def optimize_project_router(
         project.model_catalog_path,
         candidate_plan.expected_catalog_sha256,
     )
+    _attribution, attribution_input = persist_router_observed_attribution_set(
+        project.artifacts,
+        trace_dataset=preflight.completed_build.trace_dataset,
+        task_set=preflight.completed_build.task_set,
+        catalog_sha256=preflight.catalog_sha256,
+        candidates=preflight.candidates,
+        preferred_overlap_limit=preflight.preferred_fidelity_overlaps,
+        records=tuple(item.attribution for item in preflight.observed_traces),
+        created_at=created_at,
+        code_revision=code_revision,
+    )
     resolved_catalog = runtime_catalog.with_catalog(candidate_plan.prospective_catalog)
     agent_factory = _resolve_agent_factory(preflight, options)
     resolved = _resolve_all_models(preflight, resolved_catalog, options)
@@ -160,6 +172,7 @@ def optimize_project_router(
         project,
         preflight,
         resolved_catalog,
+        attribution_input=attribution_input,
         router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
         completion_maximum_attempts=options.completion_maximum_attempts,
         maximum_provider_cost_usd=options.maximum_provider_cost_usd,
@@ -180,7 +193,16 @@ def optimize_project_router(
     )
     composition = compose_router(
         project,
-        TraceNormalizationResult(traces=preflight.traces, issues=()),
+        TraceNormalizationResult(
+            traces=preflight.traces,
+            issues=(),
+            identity_evidence=(
+                None
+                if preflight.trace_identity_evidence is None
+                else preflight.trace_identity_evidence.records
+            ),
+            include_identity_evidence=preflight.trace_identity_evidence is not None,
+        ),
         services=services,
         budget=RouterCompositionBudget(
             maximum_simulation_cost_usd=preflight.remaining_simulation_cost_usd,
@@ -511,6 +533,7 @@ def _workflow_services(
         fidelity_approval=fidelity_approval,
         runtime_catalog=runtime_catalog,
         evaluation_plan_inputs=(
+            artifacts.attribution_input,
             artifacts.runtime_capability_input,
             artifacts.execution_contract_input,
         ),
