@@ -71,6 +71,7 @@ def persist_trace_dataset(
             "semantic_convention_version": semantic_convention_version,
             "traces_sha256": hashlib.sha256(traces_payload).hexdigest(),
             "issues_sha256": hashlib.sha256(issues_payload).hexdigest(),
+            "code_revision": code_revision,
         },
     )
     dataset = TraceDataset(

@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from wmo.common.core.artifacts import SourceIdentity
+from wmo.common.core.artifacts import SourceIdentity, stable_id
 from wmo.common.project import ArtifactStore, artifact_input
 from wmo.common.project.paths import ProjectPaths
-from wmo.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
+from wmo.common.traces import Trace, TraceDataset, TraceSource, TraceSpan, load_trace_dataset
 from wmo.simulation.ingest.dataset import persist_trace_dataset
 from wmo.simulation.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
 
@@ -111,10 +111,10 @@ def test_persist_trace_dataset_is_content_addressed_despite_input_order(tmp_path
     assert first_persisted.manifest == second_persisted.manifest
 
 
-def test_persist_trace_dataset_returns_exact_replay_and_refuses_changed_envelope(
+def test_persist_trace_dataset_returns_exact_replay_and_versions_producer_revision(
     tmp_path: Path,
 ) -> None:
-    """A completed dataset resumes exactly but rejects changed provenance under the same ID."""
+    """A completed dataset resumes exactly and a new producer revision gets a new identity."""
     result = TraceNormalizationResult(traces=(_trace(1),), issues=())
     store = _store(tmp_path, "project-a")
     first = persist_trace_dataset(
@@ -132,15 +132,73 @@ def test_persist_trace_dataset_returns_exact_replay_and_refuses_changed_envelope
     )
     assert replay == first
 
+    changed_revision = persist_trace_dataset(
+        result,
+        store,
+        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+        code_revision="changed-revision",
+    )
+
+    assert changed_revision.dataset.dataset_id != first.dataset.dataset_id
+    assert changed_revision.dataset.code_revision == "changed-revision"
+    assert store.read(first.dataset.dataset_id).manifest == first.manifest
+
+
+def test_persist_trace_dataset_rejects_changed_evidence_under_explicit_id(
+    tmp_path: Path,
+) -> None:
+    """An explicit immutable dataset identity cannot be reused for changed evidence."""
+    store = _store(tmp_path, "project-a")
+    persist_trace_dataset(
+        TraceNormalizationResult(traces=(_trace(1),), issues=()),
+        store,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="test-revision",
+        dataset_id="trace-dataset-explicit",
+    )
+
     with pytest.raises(ValueError, match="differs from replayed normalized evidence"):
         persist_trace_dataset(
-            result,
+            TraceNormalizationResult(traces=(_trace(2),), issues=()),
             store,
             created_at=datetime(2026, 8, 12, tzinfo=UTC),
-            code_revision="changed-revision",
+            code_revision="test-revision",
+            dataset_id="trace-dataset-explicit",
         )
 
-    assert store.read(first.dataset.dataset_id).manifest == first.manifest
+
+def test_load_trace_dataset_accepts_pre_revision_identity(tmp_path: Path) -> None:
+    """The loader keeps accepting artifacts whose historical ID omitted producer revision."""
+    result = TraceNormalizationResult(traces=(_trace(1),), issues=())
+    probe = persist_trace_dataset(
+        result,
+        _store(tmp_path / "probe", "project-a"),
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="test-revision",
+    )
+    assert probe.dataset.source is not None
+    legacy_id = stable_id(
+        "trace-dataset",
+        {
+            "source": probe.dataset.source.model_dump(mode="json"),
+            "semantic_convention_version": probe.dataset.semantic_convention_version,
+            "traces_sha256": probe.dataset.traces_sha256,
+            "issues_sha256": probe.dataset.issues_sha256,
+        },
+    )
+    legacy_store = _store(tmp_path / "legacy", "project-a")
+    legacy = persist_trace_dataset(
+        result,
+        legacy_store,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="test-revision",
+        dataset_id=legacy_id,
+    )
+
+    loaded = load_trace_dataset(legacy_store, legacy_id)
+
+    assert loaded.dataset == legacy.dataset
+    assert loaded.traces == legacy.traces
 
 
 def test_persist_trace_dataset_rejects_mixed_raw_source_provenance(tmp_path: Path) -> None:

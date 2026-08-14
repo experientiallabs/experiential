@@ -122,8 +122,10 @@ def test_build_project_resumes_and_records_provider_free_review_readiness(tmp_pa
         )
 
 
-def test_build_project_refuses_changed_revision_and_corrupt_replay_payload(tmp_path: Path) -> None:
-    """Resume verifies the exact artifact envelope and bytes before returning readiness."""
+def test_build_project_refuses_unselected_revision_and_corrupt_replay_payload(
+    tmp_path: Path,
+) -> None:
+    """An incomplete build cannot replace review state, and replay verifies stored bytes."""
     store = ProjectStore(tmp_path, "project-a")
     store.initialize(ProjectConfig(project_id="project-a"))
     normalized = TraceNormalizationResult(
@@ -136,8 +138,9 @@ def test_build_project_refuses_changed_revision_and_corrupt_replay_payload(tmp_p
         code_revision="test-revision",
         mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
     )
+    first_review = store.read_review()
 
-    with pytest.raises(ValueError, match="differs from replayed normalized evidence"):
+    with pytest.raises(ValueError, match="already binds a different completed build"):
         build_project(
             normalized,
             store,
@@ -145,6 +148,7 @@ def test_build_project_refuses_changed_revision_and_corrupt_replay_payload(tmp_p
             code_revision="changed-revision",
             mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
         )
+    assert store.read_review() == first_review
 
     trace_directory = store.artifacts.read(first.review.trace_dataset.artifact_id).directory
     (trace_directory / "traces.jsonl").write_text("corrupt\n", encoding="utf-8")

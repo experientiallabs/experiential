@@ -6,16 +6,24 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, JsonValue, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
     ContractModel,
+    JsonObject,
     SourceIdentity,
     stable_id,
 )
-from wmo.common.project import ArtifactStore, ProjectConfig, ProjectStore, artifact_input
+from wmo.common.core.locks import file_write_lock
+from wmo.common.project import (
+    ArtifactStore,
+    ProjectBuildArtifacts,
+    ProjectConfig,
+    ProjectStore,
+    artifact_input,
+)
 from wmo.common.tasks import TaskSet
 from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
@@ -206,25 +214,171 @@ def build_project(
         descriptor_dimensions=descriptor_dimensions,
         code_revision=code_revision,
     )
-    current = store.read_review()
-    if current is None:
-        root_review: dict[str, object] = {}
-    elif isinstance(current, dict):
-        root_review = dict(current)
-    else:
-        raise ValueError("review.json must be an object before build readiness can be recorded")
-    prior = root_review.get("build_review")
-    serialized = review.model_dump(mode="json")
-    if prior is not None:
+    _prepare_build_review(store, review)
+    return ProjectBuild(artifacts=artifacts, review=review)
+
+
+def select_completed_build(
+    store: ProjectStore,
+    build: ProjectBuildArtifacts,
+    review: BuildReviewReadiness,
+) -> None:
+    """Select a completed graph before advancing its recoverable review handoff.
+
+    Official build writers share one cross-process coordination lock. The immutable build is
+    selected first, then review readiness advances. If execution stops between those writes, an
+    exact restart verifies the selected graph and repairs the review handoff without provider work.
+
+    Args:
+        store: Project store receiving the completed-build selection.
+        build: Verified immutable trace, task, RAG, and world-model graph.
+        review: Exact readiness record derived from the graph's trace and task artifacts.
+
+    Raises:
+        ValueError: The proposed graph and review name different trace or task artifacts.
+    """
+    if build.trace_dataset != review.trace_dataset or build.task_set != review.task_set:
+        raise ValueError("completed build does not match proposed build review")
+    coordination_path = store.paths.project_directory / "completed-build-selection"
+    with file_write_lock(coordination_path, what="completed build selection"):
+        store.bind_completed_build(build)
+        select_build_review(store, review)
+
+
+def select_build_review(store: ProjectStore, review: BuildReviewReadiness) -> None:
+    """Advance review readiness after the exact completed build has been selected.
+
+    The completed-build selection is written first. If execution stops before this function
+    finishes, a later identical build verifies the selected graph and repairs the review pointer.
+
+    Args:
+        store: Project store owning the selected build and mutable review handoff.
+        review: Exact readiness record derived from the selected trace and task artifacts.
+
+    Raises:
+        ValueError: The selected completed build does not match the proposed review.
+    """
+    if not _completed_build_matches_review(store, review):
+        raise ValueError("selected completed build does not match proposed build review")
+
+    def update(current: JsonValue | None) -> JsonObject:
+        """Replace only the build-review member while preserving unrelated review state.
+
+        Args:
+            current: Current complete review JSON value.
+
+        Returns:
+            Updated object with the selected build-review handoff.
+        """
+        root_review = _review_object(current)
+        root_review["build_review"] = review.model_dump(mode="json")
+        return root_review
+
+    store.update_review(update)
+
+
+def _prepare_build_review(store: ProjectStore, review: BuildReviewReadiness) -> None:
+    """Persist first-build readiness or defer replacement until completed-build selection.
+
+    Args:
+        store: Project store owning review and completed-build state.
+        review: Readiness record for the deterministic trace and task build.
+
+    Raises:
+        ValueError: Existing review state is invalid or is not bound to a selected build.
+    """
+
+    def update(current: JsonValue | None) -> JsonObject:
+        """Validate and transition the build-review member under the review lock.
+
+        Args:
+            current: Current complete review JSON value.
+
+        Returns:
+            Current or updated object-shaped review state.
+
+        Raises:
+            ValueError: Existing build-review state is invalid or unselected.
+        """
+        root_review = _review_object(current)
+        prior = root_review.get("build_review")
+        if prior is None:
+            root_review["build_review"] = review.model_dump(mode="json")
+            return root_review
         try:
             existing = BuildReviewReadiness.model_validate(prior)
         except ValueError as exc:
             raise ValueError("review.json contains invalid build readiness") from exc
-        if existing != review:
-            raise ValueError("review.json already binds a different completed build")
-    root_review["build_review"] = serialized
-    store.write_review(root_review)
-    return ProjectBuild(artifacts=artifacts, review=review)
+        if existing == review or _completed_build_matches_review(store, review):
+            root_review["build_review"] = review.model_dump(mode="json")
+            return root_review
+        if _completed_build_matches_review(store, existing):
+            return root_review
+        raise ValueError("review.json already binds a different completed build")
+
+    store.update_review(update)
+
+
+def _review_object(current: JsonValue | None) -> JsonObject:
+    """Return mutable object-shaped review state.
+
+    Args:
+        current: Current parsed review value, or ``None`` before any review exists.
+
+    Returns:
+        Mutable copy of the current object-shaped review state.
+
+    Raises:
+        ValueError: Existing review state is not an object.
+    """
+    if current is None:
+        return {}
+    if isinstance(current, dict):
+        return dict(current)
+    raise ValueError("review.json must be an object before build readiness can be recorded")
+
+
+def _completed_build_matches_review(store: ProjectStore, review: BuildReviewReadiness) -> bool:
+    """Verify that the selected completed build authorizes advancing its review handoff.
+
+    Args:
+        store: Project store containing the mutable completed-build selection.
+        review: Existing review handoff that a subsequent build would replace.
+
+    Returns:
+        Whether the selected build and verified immutable manifests match the review handoff.
+    """
+    completed = store.load_project().build
+    if completed is None:
+        return False
+    if completed.trace_dataset != review.trace_dataset or completed.task_set != review.task_set:
+        return False
+    expected_types = {
+        "trace_dataset": "trace-dataset",
+        "task_set": "task-set",
+        "serving_rag": "trace-rag-index",
+        "fit_rag": "trace-rag-index",
+        "world_model": "grounded-world-model",
+    }
+    manifests = {}
+    for field_name, artifact_type in expected_types.items():
+        pointer = getattr(completed, field_name)
+        stored = store.artifacts.read(pointer.artifact_id)
+        if stored.manifest.artifact_type != artifact_type:
+            return False
+        if artifact_input(stored.manifest) != pointer:
+            return False
+        manifests[field_name] = stored.manifest
+    expected_inputs = {
+        "task_set": (completed.trace_dataset,),
+        "serving_rag": (completed.trace_dataset,),
+        "fit_rag": (completed.trace_dataset,),
+        "world_model": (completed.serving_rag,),
+    }
+    for field_name, inputs in expected_inputs.items():
+        if manifests[field_name].inputs != inputs:
+            return False
+    return True
 
 
 def _task_set_id(dataset_input: ArtifactInput, mining: TaskMiningResult) -> str:

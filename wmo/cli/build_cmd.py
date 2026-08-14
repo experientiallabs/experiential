@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,9 +29,10 @@ from wmo.common.project import (
     ProjectStoreError,
     artifact_input,
 )
+from wmo.common.release_revision import installed_release_revision
 from wmo.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.models.providers.retry import RetryPolicy
-from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project
+from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import (
     OtlpTraceFormatError,
     TraceNormalizationResult,
@@ -105,6 +105,7 @@ def build(
     """
     started = time.monotonic()
     try:
+        code_revision = installed_release_revision()
         ProjectStore(root, project)
         catalog = _load_or_setup_catalog(root, no_interactive=no_interactive)
         selected = _selected_roles(
@@ -141,7 +142,7 @@ def build(
             normalized,
             store,
             created_at=datetime.now(UTC),
-            code_revision=_current_revision(),
+            code_revision=code_revision,
         )
         built = _reuse_completed_grounded_artifacts(
             store,
@@ -172,7 +173,7 @@ def build(
                 resolved_embedder=resolved_embedder,
                 top_k=top_k,
             )
-        store.bind_completed_build(built)
+        select_completed_build(store, built, completed.review)
     except (ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from None
     _capture_local_build_telemetry(
@@ -568,19 +569,6 @@ def _load_canonical_traces(path: Path, source: str) -> TraceNormalizationResult:
         raise typer.BadParameter(f"{normalized_source} trace normalization failed: {exc}") from None
     choices = ", ".join(_CANONICAL_SOURCES)
     raise typer.BadParameter(f"unsupported --source {source!r}; choose one of: {choices}")
-
-
-def _current_revision() -> str:
-    """Return the local Git revision when available without changing repository state."""
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=Path(__file__).resolve().parents[2],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    revision = result.stdout.strip()
-    return revision if result.returncode == 0 and revision else "local-unversioned"
 
 
 def _capture_local_build_telemetry(

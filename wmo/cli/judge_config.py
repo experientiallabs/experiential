@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from wmo.common.judging import Rubric, RubricDimension
 from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import load_model_catalog
 from wmo.common.project import ProjectStore
+from wmo.common.release_revision import installed_release_revision
 from wmo.runtime.models.registry import RuntimeModelCatalog
 from wmo.workflow.manual_judge import (
     DEFAULT_JUDGE_TEMPLATE,
@@ -90,6 +90,7 @@ def judge_setup(
         typer.BadParameter: Local files, build evidence, or confirmation are invalid.
     """
     try:
+        revision = installed_release_revision()
         store = ProjectStore(root, project)
         dimensions = _load_rubric_dimensions(rubric_file)
         template = _load_prompt_template(template_file)
@@ -101,7 +102,7 @@ def judge_setup(
             prompt_template=template,
             preview_count=preview_count,
             created_at=datetime.now(UTC),
-            code_revision=_current_revision(),
+            code_revision=revision,
         )
         _render_setup(plan)
         confirmed = approve or _confirm(
@@ -161,10 +162,10 @@ def judge_calibrate(
     Raises:
         typer.BadParameter: Evidence, labels, budget, consent, or approval is invalid.
     """
-    store = ProjectStore(root, project)
-    now = datetime.now(UTC)
-    revision = _current_revision()
     try:
+        revision = installed_release_revision()
+        store = ProjectStore(root, project)
+        now = datetime.now(UTC)
         plan = prepare_manual_judge_calibration(store, sample_size=sample_size)
         rubric = _load_setup_rubric(store, plan.setup)
         _render_calibration_previews(plan.previews)
@@ -536,20 +537,3 @@ def _confirm(question: str, *, non_interactive: bool, required_flag: str) -> boo
     if non_interactive or not can_prompt(_console):
         raise ValueError(f"noninteractive judge review requires {required_flag}")
     return Confirm.ask(question, default=False)
-
-
-def _current_revision() -> str:
-    """Return the local Git revision without provider or project state changes.
-
-    Returns:
-        Current Git commit, or a stable local marker outside a repository.
-    """
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=Path(__file__).resolve().parents[2],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    revision = result.stdout.strip()
-    return revision if result.returncode == 0 and revision else "local-unversioned"
