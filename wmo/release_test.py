@@ -201,6 +201,7 @@ def _installed_release_driver() -> None:
     import select
     import signal
     import socket
+    import termios
     import threading
     import time
     from collections import Counter
@@ -691,8 +692,15 @@ def _installed_release_driver() -> None:
                 if completion_marker is not None and completion_marker in transcript:
                     completion_seen = True
                 if not pending and completion_seen and not input_closed:
-                    os.write(master, b"\x04")
-                    input_closed = True
+                    try:
+                        canonical_input = bool(termios.tcgetattr(master)[3] & termios.ICANON)
+                    except termios.error:
+                        if process.poll() is None:
+                            raise
+                        continue
+                    if canonical_input:
+                        os.write(master, b"\x04")
+                        input_closed = True
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
                 process.wait(timeout=5)
