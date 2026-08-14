@@ -8,7 +8,8 @@ from typing import cast
 
 import pytest
 
-from wmo.common.core.artifacts import stable_id
+from wmo.cli.build_cmd import _lineage_bindings
+from wmo.common.core.artifacts import ArtifactInput, stable_id
 from wmo.common.evaluations import (
     EvaluationCellEvidence,
     EvaluationPlan,
@@ -29,30 +30,43 @@ from wmo.common.judging import (
     ScoreAnchor,
 )
 from wmo.common.models import (
+    EmbeddingCostReservation,
     ModelCapabilities,
     ModelClient,
     ModelSnapshot,
     OperationEconomics,
     RoutedCandidateSnapshot,
 )
-from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
+from wmo.common.project import (
+    ProjectBuildArtifacts,
+    ProjectConfig,
+    ProjectStore,
+    artifact_input,
+)
 from wmo.common.rollouts import SimulationArtifactSet
 from wmo.common.routing import KnnGuard
 from wmo.common.tasks import load_task_set
 from wmo.optimize.router.workflow_test import _persist_embeddings, _persist_pricing
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.runtime_test import _Client, _request
-from wmo.simulation.build import ProjectBuild
-from wmo.simulation.build_test import _trace
+from wmo.simulation.build import ProjectBuild, build_project
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
+    _FitRetriever,
     _OneTurnAgent,
     _response,
     _ScriptedClient,
 )
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
+from wmo.simulation.retrieval import (
+    TraceRAGRetriever,
+    load_rag_index,
+    persist_trace_rag,
+)
+from wmo.simulation.retrieval.retrieval_test import _message_trace as _trace
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings
+from wmo.simulation.world_model import persist_grounded_world_model
 from wmo.workflow.judgment_budget import JudgmentDispatchReceipt
 from wmo.workflow.router import (
     ApprovedRouterReview,
@@ -63,9 +77,72 @@ from wmo.workflow.router import (
     RouterWorkflowServices,
     compose_router,
 )
+from wmo.workflow.simulation_spend import observed_rollout_spend
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
+
+
+def _bind_completed_build(
+    project: ProjectStore,
+    normalized: TraceNormalizationResult,
+    *,
+    revision: str,
+) -> ProjectBuildArtifacts:
+    """Persist and select the exact grounded build consumed by router composition.
+
+    Args:
+        project: Initialized test project receiving the immutable build graph.
+        normalized: Canonical real traces used for tasks and retrieval.
+        revision: Exact source revision bound to every artifact.
+
+    Returns:
+        Completed project build pointers selected in ``project.toml``.
+    """
+    built = build_project(
+        normalized,
+        project,
+        created_at=_TIME,
+        code_revision=revision,
+    )
+    trace_input = artifact_input(built.artifacts.trace_dataset.manifest)
+    task_input = built.review.task_set
+    bindings = _lineage_bindings(built)
+    serving = persist_trace_rag(
+        project.artifacts,
+        (trace_input,),
+        bindings,
+        created_at=_TIME,
+        code_revision=revision,
+        included_partitions=frozenset({"fit", "held_out"}),
+    )
+    fit = persist_trace_rag(
+        project.artifacts,
+        (trace_input,),
+        bindings,
+        created_at=_TIME,
+        code_revision=revision,
+        included_partitions=frozenset({"fit"}),
+    )
+    serving_input = artifact_input(serving.manifest)
+    world = persist_grounded_world_model(
+        project.artifacts,
+        serving_input,
+        model_alias="world-model-a",
+        model=_snapshot("world-model-a"),
+        created_at=_TIME,
+        code_revision=revision,
+        top_k=5,
+    )
+    completed = ProjectBuildArtifacts(
+        trace_dataset=trace_input,
+        task_set=task_input,
+        serving_rag=serving_input,
+        fit_rag=artifact_input(fit.manifest),
+        world_model=artifact_input(world.manifest),
+    )
+    project.bind_completed_build(completed)
+    return completed
 
 
 def _capabilities(alias: str) -> ModelCapabilities:
@@ -192,7 +269,21 @@ class _SetupSupplier:
         review: ApprovedRouterReview,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
+        """Persist reviewed evaluation inputs bound to the selected completed build.
+
+        Args:
+            project: Project owning the completed build and evaluation artifacts.
+            build: Deterministic trace and task-set build reused by composition.
+            review: Approved rubric and manual calibration identifiers.
+            budget: Finite composition budget already validated by the workflow.
+
+        Returns:
+            Complete evaluation setup using the project's exact fit-only RAG pointer.
+        """
         del review, budget
+        completed = project.load_project().build
+        assert completed is not None
+        fit_index = load_rag_index(project.artifacts, completed.fit_rag.artifact_id).index
         tasks = load_task_set(project.artifacts, build.artifacts.task_set.task_set_id).tasks
         candidate = RoutedCandidateSnapshot(alias="candidate-a", model=_snapshot("candidate-a"))
         observed = []
@@ -244,6 +335,7 @@ class _SetupSupplier:
             production_protocol=production,
             simulation_protocol=world,
             embedding_set_id="embeddings-a",
+            fit_rag_input=completed.fit_rag,
             pricing_snapshot_id="pricing-a",
             incumbent_alias="candidate-a",
             guard=KnnGuard(
@@ -257,11 +349,44 @@ class _SetupSupplier:
             world_model_settings=WorldModelSettings(
                 world_model_alias="world-model-a",
                 prompt_version="text-world-model-v1",
+                query_embedding=EmbeddingCostReservation(
+                    model=fit_index.embedder,
+                    input_usd_per_million_tokens=0.0,
+                    maximum_attempts=1,
+                    maximum_input_tokens=10_000,
+                ),
             ),
             agent_id="agent-a",
             seed=7,
             maximum_steps=2,
             maximum_concurrency=1,
+        )
+
+
+class _MismatchedSetupSupplier(_SetupSupplier):
+    """Return a reviewed setup whose fit pointer is outside the completed build."""
+
+    def __call__(
+        self,
+        project: ProjectStore,
+        build: ProjectBuild,
+        review: ApprovedRouterReview,
+        budget: RouterCompositionBudget,
+    ) -> RouterEvaluationSetup:
+        """Replace the valid setup fit pointer with an unrelated immutable pointer.
+
+        Args:
+            project: Project owning the completed build and evaluation artifacts.
+            build: Deterministic trace and task-set build reused by composition.
+            review: Approved rubric and manual calibration identifiers.
+            budget: Finite composition budget already validated by the workflow.
+
+        Returns:
+            Otherwise valid evaluation setup with a deliberately mismatched fit RAG.
+        """
+        setup = super().__call__(project, build, review, budget)
+        return setup.model_copy(
+            update={"fit_rag_input": ArtifactInput(artifact_id="other-fit-rag", sha256=_DIGEST)}
         )
 
 
@@ -358,11 +483,33 @@ class _SimulatorFactory:
         )
 
     def __call__(self, project: ProjectStore, plan: EvaluationPlan) -> Simulator:
+        """Bind the real text simulator to the project's exact completed fit RAG.
+
+        Args:
+            project: Project owning the completed immutable build graph.
+            plan: Frozen evaluation plan selected for simulation.
+
+        Returns:
+            Logging adapter around the grounded text simulator.
+        """
+        completed = project.load_project().build
+        assert completed is not None
+        fit_index = load_rag_index(project.artifacts, completed.fit_rag.artifact_id).index
         simulator = WorldModelSimulator(
             store=project.artifacts,
             evaluation_plan=plan,
             evaluation_plan_input=artifact_input(project.artifacts.read(plan.plan_id).manifest),
             task_set_input=artifact_input(project.artifacts.read(plan.task_set_id).manifest),
+            fit_rag_input=completed.fit_rag,
+            fit_retriever=cast(
+                TraceRAGRetriever,
+                _FitRetriever(
+                    completed.fit_rag,
+                    maximum_attempts=1,
+                    input_usd_per_million_tokens=0.0,
+                    embedder=fit_index.embedder,
+                ),
+            ),
             candidate_models={
                 "candidate-a": _resolved("candidate-a", cast(ModelClient, self.candidate))
             },
@@ -423,16 +570,84 @@ class _FidelityApproval:
         )
 
 
-def test_public_composition_runs_and_resumes_complete_frozen_router(
+def test_composition_rejects_fit_rag_outside_completed_build_before_simulation(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One explicit workflow reaches sticky runtime without duplicate dispatch on resume."""
+    """Reject an unrelated setup fit RAG before simulation or model dispatch.
+
+    Args:
+        tmp_path: Isolated project root for build and setup artifacts.
+    """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
     normalized = TraceNormalizationResult(
         traces=tuple(_trace(index) for index in range(100)), issues=()
     )
+    _bind_completed_build(project, normalized, revision="test-revision")
+    simulator = _SimulatorFactory()
+    judge = _Judge()
+    approval = _FidelityApproval()
+    services = RouterWorkflowServices(
+        review_supplier=_ReviewSupplier(),
+        setup_supplier=_MismatchedSetupSupplier(),
+        simulator_factory=simulator,
+        judge=judge,
+        fidelity_approval=approval,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _Catalog(
+                {
+                    "candidate-a": _snapshot("candidate-a"),
+                    "embedder": _snapshot("embedder"),
+                },
+                _Client(),
+            ),
+        ),
+    )
+
+    with pytest.raises(RouterCompositionError, match="differs from the completed project build"):
+        compose_router(
+            project,
+            normalized,
+            services=services,
+            budget=RouterCompositionBudget(
+                maximum_simulation_cost_usd=10.0,
+                maximum_judgments=100,
+            ),
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+
+    artifact_types = {
+        project.artifacts.read(artifact_id).manifest.artifact_type
+        for artifact_id in project.artifacts.list_ids()
+    }
+    assert not artifact_types.intersection(
+        {"simulation-spec", "simulation-resolution", "simulation-artifact-set"}
+    )
+    assert simulator.log == []
+    assert simulator.candidate.requests == []
+    assert simulator.world.requests == []
+    assert judge.calls == 0
+    assert approval.calls == 0
+
+
+def test_public_composition_runs_and_resumes_complete_frozen_router(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reach sticky runtime and resume without duplicate provider dispatch.
+
+    Args:
+        tmp_path: Isolated project root for composed router artifacts.
+        monkeypatch: Patch fixture used to bind the runtime loader.
+    """
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
+    completed_build = _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     judge = _Judge()
     approval = _FidelityApproval()
@@ -543,6 +758,8 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     )
 
     assert second.optimization == first.optimization
+    assert completed_build.fit_rag in first.simulation_spec.inputs
+    assert completed_build.fit_rag in first.held_out_simulation_spec.inputs
     assert first.held_out_simulation_spec.maximum_cost_usd == pytest.approx(
         budget.maximum_simulation_cost_usd - first.phase_a_simulation_spend_usd
     )
@@ -644,7 +861,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     rollout = read_rollout(project.artifacts, phase_a_set.artifact_ids[0])[0]
     unknown = rollout.model_copy(update={"candidate_economics": OperationEconomics()})
     with pytest.raises(RouterCompositionError, match="not fully observed"):
-        workflow_module._observed_rollout_spend(unknown)
+        observed_rollout_spend(unknown)
 
     decision = first.runtime.select(_request(), episode_id="customer-episode")
     assert first.runtime.select(_request(), episode_id="customer-episode") == decision
@@ -654,12 +871,17 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
 def test_judgment_budget_reservation_blocks_partial_retry_dispatch(
     tmp_path: Path,
 ) -> None:
-    """A failed paid-call boundary consumes its durable slot and cannot dispatch again."""
+    """Consume a failed paid-call slot and block duplicate retry dispatch.
+
+    Args:
+        tmp_path: Isolated project root for durable judgment reservations.
+    """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
     normalized = TraceNormalizationResult(
         traces=tuple(_trace(index) for index in range(100)), issues=()
     )
+    _bind_completed_build(project, normalized, revision="test-revision")
     judge = _Judge()
     judge.fail_on_call = 3
     runtime_client = _Client()

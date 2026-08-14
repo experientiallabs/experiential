@@ -28,7 +28,11 @@ def _task() -> TaskCase:
 
 
 def test_text_prompt_uses_visible_evidence_only_and_never_enables_tools() -> None:
-    """The remote world model receives only scenario and candidate-visible transcript fields."""
+    """Send only visible scenario and candidate transcript fields.
+
+    Returns:
+        None after verifying the tool-free prompt boundary.
+    """
     request = build_world_model_request(
         _task(),
         visible_messages=(
@@ -36,6 +40,7 @@ def test_text_prompt_uses_visible_evidence_only_and_never_enables_tools() -> Non
             ModelMessage(role="user", content="Please help me."),
         ),
         candidate_response=AssistantAction(content="I can help."),
+        grounded_examples=(),
         maximum_output_tokens=16_000,
     )
 

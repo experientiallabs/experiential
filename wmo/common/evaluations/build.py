@@ -530,7 +530,19 @@ def _row_from_rollout(
     judgment: Judgment | None = None,
     error: StructuredFailure | None = None,
 ) -> EvaluationRow:
-    """Copy separated candidate, simulator, orchestration, and judge economics into one row."""
+    """Copy separated operation economics into one evaluation row.
+
+    Args:
+        cell: Planned evaluation cell that owns the row identity.
+        protocol: Evidence protocol used for the rollout.
+        rollout: Immutable rollout supplying execution evidence and economics.
+        status: Terminal evaluation-row status.
+        judgment: Optional completed judgment and judge economics.
+        error: Optional structured evaluation failure.
+
+    Returns:
+        Evaluation row retaining candidate, retrieval, simulator, orchestration, and judge costs.
+    """
     return EvaluationRow(
         cell_id=cell.cell_id,
         task_id=cell.task_id,
@@ -548,6 +560,11 @@ def _row_from_rollout(
         world_model_cost_usd=(
             rollout.world_model_economics.cost_usd
             if rollout.world_model_economics is not None
+            else None
+        ),
+        retrieval_cost_usd=(
+            rollout.retrieval_economics.cost_usd
+            if rollout.retrieval_economics is not None
             else None
         ),
         sandbox_cost_usd=(

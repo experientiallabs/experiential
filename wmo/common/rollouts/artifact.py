@@ -17,7 +17,13 @@ from wmo.common.core.artifacts import (
     StructuredFailure,
     validate_artifact_file_path,
 )
-from wmo.common.models import AssistantAction, ModelAlias, ModelSnapshot, OperationEconomics
+from wmo.common.models import (
+    AssistantAction,
+    EmbeddingCostReservation,
+    ModelAlias,
+    ModelSnapshot,
+    OperationEconomics,
+)
 from wmo.common.rollouts.otel import (
     ProductionSimulatorSnapshot,
     RolloutSpan,
@@ -69,6 +75,7 @@ class SimulationCellBinding(ContractModel):
 
     evaluation_plan_input: ArtifactInput
     task_set_input: ArtifactInput
+    fit_rag_input: ArtifactInput
     task_set_tasks_sha256: Sha256
     task_sha256: Sha256
     candidate_alias: ModelAlias
@@ -81,6 +88,7 @@ class SimulationCellBinding(ContractModel):
     prompt_id: str = Field(min_length=1, max_length=256)
     prompt_version: str = Field(min_length=1, max_length=256)
     prompt_sha256: Sha256
+    query_embedding: EmbeddingCostReservation
     simulation_spec_input: ArtifactInput
     simulation_spec_sha256: Sha256
     simulation_inputs_sha256: Sha256
@@ -145,6 +153,7 @@ class RolloutArtifact(SimulationArtifact):
     failure: StructuredFailure | None = None
     candidate_economics: OperationEconomics
     world_model_economics: OperationEconomics | None = None
+    retrieval_economics: OperationEconomics | None = None
     sandbox_economics: OperationEconomics | None = None
     orchestration_economics: OperationEconomics | None = None
     simulation_spec_sha256: Sha256 | None = None
@@ -163,6 +172,14 @@ class RolloutArtifact(SimulationArtifact):
 
     @model_validator(mode="after")
     def _require_consistent_source_provenance(self) -> RolloutArtifact:
+        """Validate source-specific simulator, binding, and economics provenance.
+
+        Returns:
+            The rollout after its evidence source agrees with all bound fields.
+
+        Raises:
+            ValueError: The rollout mixes production, world-model, or sandbox provenance.
+        """
         if self.evidence_source == "production" and self.simulation_spec_sha256 is not None:
             raise ValueError("production rollouts must not name a simulation specification")
         if self.evidence_source != "production" and self.simulation_spec_sha256 is None:
@@ -176,6 +193,8 @@ class RolloutArtifact(SimulationArtifact):
                 raise ValueError("production rollouts must not name a world model")
             if self.sandbox_binding is not None:
                 raise ValueError("production rollouts must not contain a sandbox binding")
+            if self.retrieval_economics is not None:
+                raise ValueError("production rollouts must not contain retrieval economics")
         elif self.evidence_source == "world_model":
             if self.mode != SimulationMode.WORLD_MODEL:
                 raise ValueError("world-model rollouts require world_model mode")
@@ -185,6 +204,8 @@ class RolloutArtifact(SimulationArtifact):
                 raise ValueError("world-model rollout identity must match its simulator snapshot")
             if self.sandbox_binding is not None:
                 raise ValueError("world-model rollouts must not contain a sandbox binding")
+            if self.retrieval_economics is None:
+                raise ValueError("world-model rollouts require retrieval economics")
             _require_world_model_binding(self)
         elif self.evidence_source == "sandbox":
             if self.mode != SimulationMode.SANDBOX:
@@ -195,12 +216,21 @@ class RolloutArtifact(SimulationArtifact):
                 raise ValueError("sandbox rollouts must not name a world model")
             if self.simulation_binding is not None:
                 raise ValueError("sandbox rollouts must not contain a world-model binding")
+            if self.retrieval_economics is not None:
+                raise ValueError("sandbox rollouts must not contain retrieval economics")
             _require_sandbox_binding(self)
         return self
 
 
 def _require_world_model_binding(rollout: RolloutArtifact) -> None:
-    """Verify the text-simulation binding agrees with the persisted rollout envelope."""
+    """Verify the text-simulation binding agrees with the persisted rollout envelope.
+
+    Args:
+        rollout: World-model rollout whose complete immutable binding is required.
+
+    Raises:
+        ValueError: Any task, model, prompt, RAG, specification, or input pin differs.
+    """
     binding = rollout.simulation_binding
     simulator = rollout.simulator
     if binding is None:
@@ -230,6 +260,7 @@ def _require_world_model_binding(rollout: RolloutArtifact) -> None:
     required_inputs = {
         binding.evaluation_plan_input,
         binding.task_set_input,
+        binding.fit_rag_input,
         binding.simulation_spec_input,
     }
     if not required_inputs.issubset(set(rollout.inputs)):

@@ -18,7 +18,13 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
     sha256_json,
 )
-from wmo.common.models import Embedding, ModelCapabilities, ModelSnapshot
+from wmo.common.models import (
+    Embedding,
+    EmbeddingCostReservation,
+    ModelCapabilities,
+    ModelSnapshot,
+    NumericMeasurement,
+)
 from wmo.common.project import (
     ArtifactCorruptionError,
     ArtifactFile,
@@ -38,9 +44,11 @@ from wmo.simulation.retrieval import (
     RAGLineageBinding,
     RAGQuery,
     TraceRAGRetriever,
+    load_fit_rag_retriever,
     load_rag_index,
     persist_trace_rag,
 )
+from wmo.simulation.retrieval.transitions import render_rag_key
 
 _CREATED_AT = datetime(2026, 8, 13, tzinfo=UTC)
 SourceKind = Literal["file", "otlp", "production", "simulation", "manual", "generated"]
@@ -201,6 +209,66 @@ def test_retrieve_filters_lineage_before_stable_tie_break_and_never_mutates(
     assert query.model_dump_json() == query_before
     assert loaded == index_before
     assert store.read_bytes(persisted.index.rag_id, "vectors.jsonl") == artifact_before
+
+
+def test_fit_loader_pins_manifest_embedder_price_retry_and_query_economics(
+    tmp_path: Path,
+) -> None:
+    """Bind every query to the completed fit pointer and catalog economics.
+
+    Args:
+        tmp_path: Isolated project root for persisted fit-RAG evidence.
+    """
+    store = _store(tmp_path, "fit-loader")
+    source_input, traces = _persist_traces(store, count=2)
+    embedder = _constant_binding(
+        maximum_attempts=3,
+        input_usd_per_million_tokens=2.0,
+    )
+    persisted = persist_trace_rag(
+        store,
+        (source_input,),
+        _bindings(traces),
+        created_at=_CREATED_AT,
+        code_revision="revision-a",
+        embedder=embedder,
+    )
+    fit_input = artifact_input(persisted.manifest)
+    retriever = load_fit_rag_retriever(store, fit_input, embedder=embedder)
+    query = RAGQuery(
+        task="reset password",
+        action=RAGAction(kind="message", content="Which email is on the account?"),
+        excluded_lineage_ids=(persisted.index.fit_lineage_ids[0],),
+    )
+    reservation = EmbeddingCostReservation(
+        model=embedder.snapshot,
+        input_usd_per_million_tokens=2.0,
+        maximum_attempts=3,
+        maximum_input_tokens=10_000,
+    )
+    key = render_rag_key(
+        task=query.task,
+        initial_context=query.initial_context,
+        action=query.action,
+    )
+
+    economics = retriever.estimate_query_economics(query, reservation)
+
+    assert economics.cost_usd == NumericMeasurement(
+        value=len(key.encode("utf-8")) * 3 * 2.0 / 1_000_000,
+        provenance="estimated",
+    )
+    with pytest.raises(ValueError, match="manifest digest"):
+        load_fit_rag_retriever(
+            store,
+            fit_input.model_copy(update={"sha256": "f" * 64}),
+            embedder=embedder,
+        )
+    with pytest.raises(ValueError, match="price"):
+        retriever.estimate_query_economics(
+            query,
+            reservation.model_copy(update={"input_usd_per_million_tokens": 3.0}),
+        )
 
 
 def test_equal_scores_use_transition_id_order(tmp_path: Path) -> None:
@@ -566,8 +634,20 @@ def _tool_trace(*, with_result: bool, index: int = 1) -> Trace:
     )
 
 
-def _constant_binding() -> RAGEmbedderBinding:
-    """Return a semantic-style explicit constant embedding binding."""
+def _constant_binding(
+    *,
+    maximum_attempts: int = 1,
+    input_usd_per_million_tokens: float = 0.0,
+) -> RAGEmbedderBinding:
+    """Return an explicit constant embedding binding with pinned query economics.
+
+    Args:
+        maximum_attempts: Maximum calls made by one embedding operation.
+        input_usd_per_million_tokens: Active catalog input price.
+
+    Returns:
+        Deterministic semantic-style embedding binding.
+    """
     capabilities = ModelCapabilities(supports_embeddings=True)
     return RAGEmbedderBinding(
         client=_ConstantEmbedder(),
@@ -578,4 +658,6 @@ def _constant_binding() -> RAGEmbedderBinding:
             capabilities_sha256=sha256_json(capabilities),
             connection_sha256="b" * 64,
         ),
+        maximum_attempts=maximum_attempts,
+        input_usd_per_million_tokens=input_usd_per_million_tokens,
     )

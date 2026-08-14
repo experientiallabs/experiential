@@ -20,6 +20,7 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import (
+    EmbeddingCostReservation,
     ModelCapabilities,
     ModelClient,
     ModelMessage,
@@ -58,7 +59,13 @@ from wmo.simulation import (
 from wmo.simulation.comparison_test import _inputs
 from wmo.simulation.engines import CandidateBinding, SandboxSimulator
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
-from wmo.simulation.engines.text.simulator_test import _response, _ScriptedClient
+from wmo.simulation.engines.text.simulator_test import (
+    _fit_rag_input,
+    _FitRetriever,
+    _response,
+    _ScriptedClient,
+)
+from wmo.simulation.retrieval import TraceRAGRetriever
 
 _PLAN_AT = datetime(2026, 8, 12, 10, tzinfo=UTC)
 _LOCK_AT = datetime(2026, 8, 12, 11, tzinfo=UTC)
@@ -121,15 +128,27 @@ class _CountingEnvironmentRuntime:
 def test_w16_actual_text_and_local_process_comparison_preserves_failure_denominator(
     tmp_path: Path,
 ) -> None:
-    """Two actual modes replay exactly while one process failure remains in the denominator."""
+    """Verify exact replay and preserve one process failure in the denominator.
+
+    Args:
+        tmp_path: Isolated project root for immutable comparison artifacts.
+    """
     revision = exact_checkout_revision()
     store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="w16-comparison"))
     lock_input = _persist_policy_lock(store, revision)
     tasks = (_task("task-a"), _task("task-b"))
     task_set, task_input = _persist_tasks(store, tasks, revision)
+    fit_rag_input = _persist_fit_rag_pointer(store, revision)
     text_plan, text_plan_input = _persist_plan(store, tasks, task_input, "text", revision)
     sandbox_plan, sandbox_plan_input = _persist_plan(store, tasks, task_input, "sandbox", revision)
-    text_spec = _spec(text_plan, text_plan_input, task_input, SimulationMode.WORLD_MODEL, revision)
+    text_spec = _spec(
+        text_plan,
+        text_plan_input,
+        task_input,
+        SimulationMode.WORLD_MODEL,
+        revision,
+        fit_rag_input=fit_rag_input,
+    )
     sandbox_spec = _spec(
         sandbox_plan,
         sandbox_plan_input,
@@ -163,6 +182,11 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
         evaluation_plan=text_plan,
         evaluation_plan_input=text_plan_input,
         task_set_input=task_input,
+        fit_rag_input=fit_rag_input,
+        fit_retriever=cast(
+            TraceRAGRetriever,
+            _FitRetriever(fit_rag_input, input_usd_per_million_tokens=0.0),
+        ),
         candidate_models={
             "candidate-a": _resolved("candidate-a", candidate_snapshot, candidate_text)
         },
@@ -367,18 +391,61 @@ def _persist_policy_lock(store: ArtifactStore, revision: str) -> ArtifactInput:
     return artifact_input(manifest)
 
 
+def _persist_fit_rag_pointer(store: ArtifactStore, revision: str) -> ArtifactInput:
+    """Persist the immutable fit-RAG input traversed by release verification.
+
+    Args:
+        store: Artifact store receiving the fit-RAG fixture.
+        revision: Exact source revision bound to release evidence.
+
+    Returns:
+        Exact manifest pointer used by the text simulator and specification.
+    """
+    envelope = ArtifactEnvelope(
+        schema_version=1,
+        created_at=_LOCK_AT,
+        code_revision=revision,
+    )
+    manifest = store.write_json(
+        artifact_id="w16-fit-rag",
+        artifact_type="rag-index",
+        envelope=envelope,
+        files={"rag-index.json": {"scope": "fit-only"}},
+    )
+    return artifact_input(manifest)
+
+
 def _spec(
     plan: EvaluationPlan,
     plan_input: ArtifactInput,
     task_input: ArtifactInput,
     mode: SimulationMode,
     revision: str,
+    *,
+    fit_rag_input: ArtifactInput | None = None,
 ) -> SimulationSpec:
-    """Return one exact executable specification without pre-persisting its outputs."""
+    """Return one executable specification without pre-persisting outputs.
+
+    Args:
+        plan: Frozen evaluation plan selected for execution.
+        plan_input: Exact plan manifest pointer.
+        task_input: Exact task-set manifest pointer.
+        mode: Simulator mode selected for the specification.
+        revision: Exact source revision bound to created artifacts.
+        fit_rag_input: Exact persisted fit-only RAG pointer for world-model mode.
+
+    Returns:
+        Finite specification bound to the selected plan and task set.
+    """
+    rag_input = fit_rag_input or _fit_rag_input()
     return SimulationSpec(
         schema_version=1,
         created_at=_EVIDENCE_AT,
-        inputs=_inputs(plan_input, task_input),
+        inputs=_inputs(
+            plan_input,
+            task_input,
+            *((rag_input,) if mode is SimulationMode.WORLD_MODEL else ()),
+        ),
         code_revision=revision,
         simulation_id=f"w16-{mode.value}-simulation",
         evaluation_plan_id=plan.plan_id,
@@ -389,6 +456,12 @@ def _spec(
             WorldModelSettings(
                 world_model_alias="world-model-a",
                 prompt_version="text-world-model-v1",
+                query_embedding=EmbeddingCostReservation(
+                    model=_world_snapshot().model_copy(update={"model_id": "embedder-a"}),
+                    input_usd_per_million_tokens=0.0,
+                    maximum_attempts=2,
+                    maximum_input_tokens=10_000,
+                ),
             )
             if mode is SimulationMode.WORLD_MODEL
             else None
@@ -404,6 +477,7 @@ def _spec(
         ),
         seed=16,
         maximum_steps=2,
+        maximum_cost_usd=10.0 if mode is SimulationMode.WORLD_MODEL else None,
     )
 
 

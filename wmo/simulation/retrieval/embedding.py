@@ -59,10 +59,28 @@ class RAGEmbedderBinding:
     Args:
         client: Explicit provider-free or semantic embedding implementation.
         snapshot: Exact model, capability, and secret-free connection identity.
+        maximum_attempts: Maximum provider attempts made by one ``embed`` call.
+        input_usd_per_million_tokens: Active catalog input price used for query reservations.
     """
 
     client: EmbeddingClient
     snapshot: ModelSnapshot
+    maximum_attempts: int = 1
+    input_usd_per_million_tokens: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Validate retry and price bounds before the binding can dispatch.
+
+        Raises:
+            ValueError: The retry ceiling is nonpositive or the input price is invalid.
+        """
+        if self.maximum_attempts <= 0:
+            raise ValueError("RAG embedder maximum_attempts must be positive")
+        if (
+            not math.isfinite(self.input_usd_per_million_tokens)
+            or self.input_usd_per_million_tokens < 0
+        ):
+            raise ValueError("RAG embedder input price must be finite and nonnegative")
 
 
 def default_rag_embedder(

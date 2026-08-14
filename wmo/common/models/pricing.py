@@ -7,7 +7,7 @@ import math
 from pydantic import Field, field_validator
 
 from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel
-from wmo.common.models.model import ModelAlias
+from wmo.common.models.model import ModelAlias, ModelSnapshot
 from wmo.common.project import ArtifactStore, artifact_input
 
 
@@ -30,6 +30,33 @@ class CandidateTokenPrice(ContractModel):
     def _finite(cls, value: float | None) -> float | None:
         if value is not None and not math.isfinite(value):
             raise ValueError("candidate token prices must be finite")
+        return value
+
+
+class EmbeddingCostReservation(ContractModel):
+    """Exact model, price, and retry bound reserved for one embedding request."""
+
+    model: ModelSnapshot
+    input_usd_per_million_tokens: float = Field(ge=0)
+    maximum_attempts: int = Field(gt=0)
+    maximum_input_tokens: int = Field(gt=0)
+
+    @field_validator("input_usd_per_million_tokens")
+    @classmethod
+    def _finite_input_price(cls, value: float) -> float:
+        """Reject a non-finite embedding input price.
+
+        Args:
+            value: Nonnegative catalog price supplied for validation.
+
+        Returns:
+            The unchanged finite price.
+
+        Raises:
+            ValueError: The price is infinite or NaN.
+        """
+        if not math.isfinite(value):
+            raise ValueError("embedding input price must be finite")
         return value
 
 

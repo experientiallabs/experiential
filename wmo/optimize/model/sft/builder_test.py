@@ -37,6 +37,7 @@ from wmo.common.judging import (
 )
 from wmo.common.models import (
     AssistantAction,
+    EmbeddingCostReservation,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
@@ -349,13 +350,25 @@ def _rollout(
     task_set: TaskSet,
     task_set_input: ArtifactInput,
 ) -> RolloutArtifact:
-    """Build one successful world-model rollout suitable for authoritative W6 judging."""
+    """Build one successful world-model rollout suitable for authoritative judging.
+
+    Args:
+        tag: Stable suffix used to isolate fixture artifact identities.
+        task: Exact task represented by the rollout.
+        task_set: Immutable task set owning the task.
+        task_set_input: Manifest pointer for the owning task set.
+
+    Returns:
+        Successful rollout with complete grounded simulation provenance.
+    """
     model = _model("candidate-model")
     plan_input = ArtifactInput(artifact_id=f"evaluation-plan-{tag}", sha256=_DIGEST)
     spec_input = ArtifactInput(artifact_id=f"simulation-spec-{tag}", sha256=_DIGEST)
+    fit_rag_input = ArtifactInput(artifact_id=f"fit-rag-{tag}", sha256=_DIGEST)
     binding = SimulationCellBinding(
         evaluation_plan_input=plan_input,
         task_set_input=task_set_input,
+        fit_rag_input=fit_rag_input,
         task_set_tasks_sha256=task_set.tasks_sha256,
         task_sha256=sha256_json(task),
         candidate_alias="candidate-a",
@@ -368,6 +381,12 @@ def _rollout(
         prompt_id="world-prompt-v1",
         prompt_version="v1",
         prompt_sha256=_DIGEST,
+        query_embedding=EmbeddingCostReservation(
+            model=model,
+            input_usd_per_million_tokens=0.0,
+            maximum_attempts=1,
+            maximum_input_tokens=1,
+        ),
         simulation_spec_input=spec_input,
         simulation_spec_sha256=_DIGEST,
         simulation_inputs_sha256=_DIGEST,
@@ -375,7 +394,7 @@ def _rollout(
     return RolloutArtifact(
         schema_version=1,
         created_at=_TIME,
-        inputs=_inputs(plan_input, spec_input, task_set_input),
+        inputs=_inputs(plan_input, fit_rag_input, spec_input, task_set_input),
         code_revision="w12-test",
         artifact_id=f"rollout-artifact-{tag}",
         simulation_id=f"simulation-{tag}",
@@ -411,6 +430,7 @@ def _rollout(
         final_output=AssistantAction(content="Resolved support request."),
         stop_reason=StopReason.COMPLETED,
         candidate_economics=OperationEconomics(),
+        retrieval_economics=OperationEconomics(),
         simulation_spec_sha256=_DIGEST,
         simulation_binding=binding,
     )

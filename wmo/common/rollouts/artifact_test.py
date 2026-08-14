@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.common.core.artifacts import ArtifactInput, FailureCode, SourceIdentity, StructuredFailure
-from wmo.common.models import ModelSnapshot, OperationEconomics
+from wmo.common.models import EmbeddingCostReservation, ModelSnapshot, OperationEconomics
 from wmo.common.rollouts import (
     ProductionSimulatorSnapshot,
     RolloutArtifact,
@@ -34,13 +34,20 @@ def _model() -> ModelSnapshot:
 
 
 def _rollout() -> RolloutArtifact:
+    """Build one complete grounded rollout fixture.
+
+    Returns:
+        Canonical world-model rollout with retrieval economics.
+    """
     started_at = datetime(2026, 8, 11, tzinfo=UTC)
     plan_input = ArtifactInput(artifact_id="evaluation-plan", sha256=_DIGEST)
     spec_input = ArtifactInput(artifact_id="simulation-spec", sha256=_DIGEST)
     task_set_input = ArtifactInput(artifact_id="task-set", sha256=_DIGEST)
+    fit_rag_input = ArtifactInput(artifact_id="fit-rag", sha256=_DIGEST)
     binding = SimulationCellBinding(
         evaluation_plan_input=plan_input,
         task_set_input=task_set_input,
+        fit_rag_input=fit_rag_input,
         task_set_tasks_sha256=_DIGEST,
         task_sha256=_DIGEST,
         candidate_alias="candidate-a",
@@ -53,6 +60,12 @@ def _rollout() -> RolloutArtifact:
         prompt_id="world-prompt-v1",
         prompt_version="v1",
         prompt_sha256=_DIGEST,
+        query_embedding=EmbeddingCostReservation(
+            model=_model(),
+            input_usd_per_million_tokens=0.0,
+            maximum_attempts=1,
+            maximum_input_tokens=1,
+        ),
         simulation_spec_input=spec_input,
         simulation_spec_sha256=_DIGEST,
         simulation_inputs_sha256=_DIGEST,
@@ -60,7 +73,7 @@ def _rollout() -> RolloutArtifact:
     return RolloutArtifact(
         schema_version=1,
         created_at=started_at,
-        inputs=(plan_input, spec_input, task_set_input),
+        inputs=(plan_input, fit_rag_input, spec_input, task_set_input),
         code_revision="e7aad17",
         artifact_id="rollout-artifact-1",
         simulation_id="simulation-1",
@@ -94,6 +107,7 @@ def _rollout() -> RolloutArtifact:
         ),
         stop_reason=StopReason.COMPLETED,
         candidate_economics=OperationEconomics(),
+        retrieval_economics=OperationEconomics(),
         simulation_spec_sha256=_DIGEST,
         simulation_binding=binding,
     )
@@ -118,7 +132,11 @@ def test_rollout_subtype_and_artifact_set_round_trip() -> None:
 
 
 def test_rollout_rejects_missing_simulation_digest_and_failure_details() -> None:
-    """Simulated and failed episodes preserve exactly the required provenance evidence."""
+    """Require simulation digests and structured failure provenance.
+
+    Raises:
+        AssertionError: Invalid provenance is unexpectedly accepted.
+    """
     rollout = _rollout()
     with pytest.raises(ValidationError, match="require a simulation specification"):
         RolloutArtifact.model_validate({**rollout.model_dump(), "simulation_spec_sha256": None})
@@ -135,6 +153,7 @@ def test_rollout_rejects_missing_simulation_digest_and_failure_details() -> None
             "simulator": ProductionSimulatorSnapshot(
                 source=SourceIdentity(kind="production", source_id="trace-1", sha256=_DIGEST)
             ).model_dump(),
+            "retrieval_economics": None,
             "failure": StructuredFailure(
                 code=FailureCode.PROVIDER,
                 message="captured failure",
@@ -154,3 +173,14 @@ def test_rollout_rejects_missing_simulation_digest_and_failure_details() -> None
                 },
             }
         )
+
+
+def test_world_model_rollout_requires_retrieval_economics() -> None:
+    """Reject world-model evidence that omits retrieval dispatch economics.
+
+    Raises:
+        AssertionError: The rollout unexpectedly accepts missing retrieval economics.
+    """
+    rollout = _rollout()
+    with pytest.raises(ValidationError, match="require retrieval economics"):
+        RolloutArtifact.model_validate({**rollout.model_dump(), "retrieval_economics": None})

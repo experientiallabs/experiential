@@ -18,6 +18,7 @@ from wmo.common.core.artifacts import (
     Sha256,
     sha256_json,
 )
+from wmo.common.models import EmbeddingCostReservation
 from wmo.common.rollouts import SimulationMode
 
 
@@ -30,6 +31,7 @@ class WorldModelSettings(ContractModel):
 
     world_model_alias: ArtifactId
     prompt_version: str = Field(min_length=1, max_length=256)
+    query_embedding: EmbeddingCostReservation | None = None
     maximum_output_tokens: int = Field(default=16_000, ge=8_000)
     allow_tools: Literal[False] = False
 

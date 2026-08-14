@@ -10,9 +10,12 @@ from pydantic import ValidationError
 from wmo.common.core.artifacts import ContractModel, JsonObject, sha256_json
 from wmo.common.models import AssistantAction, ModelMessage, ModelRequest
 from wmo.common.tasks import TaskCase
+from wmo.simulation.retrieval import RAGMatch
+from wmo.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
 
 WORLD_MODEL_TEXT_PROMPT_VERSION = "text-world-model-v1"
 WORLD_MODEL_TEXT_PROMPT_ID = "world-model-text-v1"
+WORLD_MODEL_TEXT_GROUNDING_SCHEMA_VERSION = "fit-rag-examples-v1"
 WORLD_MODEL_TEXT_SYSTEM_PROMPT = """Protocol version: text-world-model-v1.
 You simulate the next visible user or environment message in a text-only
 customer-agent scenario. You receive the task, safe initial context, the candidate's visible
@@ -45,6 +48,7 @@ def build_world_model_request(
     *,
     visible_messages: Sequence[ModelMessage],
     candidate_response: AssistantAction,
+    grounded_examples: Sequence[RAGMatch],
     maximum_output_tokens: int,
 ) -> ModelRequest:
     """Build one tool-free request from visible candidate evidence only.
@@ -54,6 +58,7 @@ def build_world_model_request(
         visible_messages: Candidate-visible request messages, including prior simulated turns.
         candidate_response: Candidate's visible text response. Tool calls are rejected by the
             caller before this function is reached.
+        grounded_examples: Nearest immutable real transitions after current-lineage exclusion.
         maximum_output_tokens: Explicit non-truncating provider output budget.
 
     Returns:
@@ -76,6 +81,17 @@ def build_world_model_request(
             message.model_dump(mode="json", exclude_none=True) for message in visible_messages
         ],
         "candidate_response": candidate_response.content,
+        "grounding_schema_version": WORLD_MODEL_TEXT_GROUNDING_SCHEMA_VERSION,
+        "grounded_examples": [
+            {
+                "transition_id": match.transition.transition_id,
+                "task": match.transition.task,
+                "initial_context": match.transition.initial_context,
+                "action": match.transition.action.model_dump(mode="json", exclude_none=True),
+                "observation": match.transition.observation.model_dump(mode="json"),
+            }
+            for match in grounded_examples
+        ],
     }
     return ModelRequest(
         messages=(
@@ -131,11 +147,17 @@ def parse_world_model_transition(output: AssistantAction) -> TextWorldModelTrans
 
 
 def text_prompt_sha256() -> str:
-    """Return the pinned digest recorded in every text-world-model simulator snapshot."""
+    """Return the digest pinned in every text-world-model simulator snapshot.
+
+    Returns:
+        Canonical digest covering the prompt and grounding schema identities.
+    """
     return sha256_json(
         {
             "prompt_id": WORLD_MODEL_TEXT_PROMPT_ID,
             "prompt_version": WORLD_MODEL_TEXT_PROMPT_VERSION,
             "system_prompt": WORLD_MODEL_TEXT_SYSTEM_PROMPT,
+            "grounding_schema_version": WORLD_MODEL_TEXT_GROUNDING_SCHEMA_VERSION,
+            "rag_key_schema_version": RAG_KEY_SCHEMA_VERSION,
         }
     )

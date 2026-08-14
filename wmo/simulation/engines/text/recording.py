@@ -17,6 +17,7 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.models import (
     AssistantAction,
+    EmbeddingCostReservation,
     ModelCapabilities,
     ModelFinishReason,
     ModelMessage,
@@ -37,6 +38,7 @@ from wmo.simulation.engines.text.prompt import (
     text_prompt_sha256,
 )
 from wmo.simulation.engines.text.redaction import redact_json
+from wmo.simulation.retrieval import RAGAction, RAGQuery, TraceRAGRetriever
 
 
 class TextSimulationError(RuntimeError):
@@ -88,7 +90,9 @@ class RecordedTextCalls:
     world_model_spans: tuple[RolloutSpan, ...]
     candidate_economics: OperationEconomics
     world_model_economics: OperationEconomics
+    retrieval_economics: OperationEconomics
     transitions: tuple[TextWorldModelTransition, ...]
+    retrieved_transition_ids: tuple[tuple[str, ...], ...]
 
 
 class RecordingCandidateClient:
@@ -100,6 +104,9 @@ class RecordingCandidateClient:
         task: TaskCase,
         candidate: ResolvedModel,
         world_model: ResolvedModel,
+        fit_retriever: TraceRAGRetriever,
+        query_embedding: EmbeddingCostReservation,
+        maximum_cost_usd: float,
         maximum_steps: int,
         maximum_output_tokens: int,
         redacted_field_names: frozenset[str],
@@ -112,6 +119,9 @@ class RecordingCandidateClient:
             task: Canonical no-tools task currently being simulated.
             candidate: Candidate model injected into the customer agent.
             world_model: Model that simulates the next visible text turn.
+            fit_retriever: Read-only retriever bound to the completed build's fit-only index.
+            query_embedding: Exact query-embedding identity, price, and retry reservation.
+            maximum_cost_usd: Spend remaining for candidate, retrieval, and world-model calls.
             maximum_steps: Maximum candidate model turns allowed in this episode.
             maximum_output_tokens: Per-call output budget used without silent truncation.
             redacted_field_names: Project fields redacted before events persist.
@@ -121,6 +131,9 @@ class RecordingCandidateClient:
         self._task = task
         self._candidate = candidate
         self._world_model = world_model
+        self._fit_retriever = fit_retriever
+        self._query_embedding = query_embedding
+        self._maximum_cost_usd = maximum_cost_usd
         self._maximum_steps = maximum_steps
         self._maximum_output_tokens = maximum_output_tokens
         self._redacted_field_names = redacted_field_names
@@ -131,6 +144,8 @@ class RecordingCandidateClient:
         self._candidate_responses: list[ModelResponse] = []
         self._world_model_responses: list[ModelResponse] = []
         self._transitions: list[TextWorldModelTransition] = []
+        self._retrieved_transition_ids: list[tuple[str, ...]] = []
+        self._retrieval_economics: list[OperationEconomics] = []
         self._visible_transcript: tuple[ModelMessage, ...] = ()
         self._terminal = False
         self._failure: TextSimulationError | None = None
@@ -185,7 +200,11 @@ class RecordingCandidateClient:
 
     @property
     def recorded(self) -> RecordedTextCalls:
-        """Return immutable span and economics evidence accumulated during the episode."""
+        """Return immutable call, retrieval, transition, and economics evidence.
+
+        Returns:
+            Snapshot of every completed candidate, retrieval, and world-model operation.
+        """
         return RecordedTextCalls(
             candidate_spans=tuple(self._candidate_spans),
             world_model_spans=tuple(self._world_model_spans),
@@ -195,7 +214,9 @@ class RecordingCandidateClient:
             world_model_economics=combine_economics(
                 tuple(response.economics for response in self._world_model_responses)
             ),
+            retrieval_economics=combine_economics(tuple(self._retrieval_economics)),
             transitions=tuple(self._transitions),
+            retrieved_transition_ids=tuple(self._retrieved_transition_ids),
         )
 
     def complete(self, request: ModelRequest) -> ModelResponse:
@@ -232,7 +253,18 @@ class RecordingCandidateClient:
             raise text_error from exc
 
     def _complete(self, request: ModelRequest) -> ModelResponse:
-        """Run the concrete candidate then world-model sequence after boundary validation."""
+        """Run one candidate, retrieval, and grounded world-model sequence.
+
+        Args:
+            request: Candidate-visible request emitted by the agent runtime.
+
+        Returns:
+            Validated candidate response after its grounded world transition is recorded.
+
+        Raises:
+            TextSimulationError: A boundary, budget, context, identity, or response check fails.
+            Exception: The active candidate, embedder, or world-model provider fails.
+        """
         if self._terminal:
             raise _text_failure(
                 StopReason.COMPLETED,
@@ -280,10 +312,38 @@ class RecordingCandidateClient:
         _require_response_identity(candidate_response, self._candidate, role="candidate")
         _require_complete_response(candidate_response, role="candidate")
         _require_text_only_action(candidate_response.output, role="candidate")
+        candidate_content = candidate_response.output.content
+        if candidate_content is None:  # pragma: no cover - text-only validation guarantees text
+            raise TypeError("text-only candidate response omitted visible content")
+        rag_query = RAGQuery(
+            task=self._task.instruction,
+            initial_context=self._task.initial_context,
+            action=RAGAction(kind="message", content=candidate_content),
+            excluded_lineage_ids=(self._task.lineage_group_id,),
+        )
+        query_economics = self._fit_retriever.estimate_query_economics(
+            rag_query,
+            self._query_embedding,
+        )
+        _require_query_budget(
+            candidate_responses=tuple(self._candidate_responses),
+            world_model_responses=tuple(self._world_model_responses),
+            prior_retrieval=tuple(self._retrieval_economics),
+            query=query_economics,
+            maximum_cost_usd=self._maximum_cost_usd,
+        )
+        self._retrieval_economics.append(query_economics)
+        self._provider_dispatch_unknown_spend = True
+        grounded_examples = self._fit_retriever.retrieve(rag_query)
+        self._provider_dispatch_unknown_spend = False
+        self._retrieved_transition_ids.append(
+            tuple(match.transition.transition_id for match in grounded_examples)
+        )
         world_request = build_world_model_request(
             self._task,
             visible_messages=candidate_request.messages,
             candidate_response=candidate_response.output,
+            grounded_examples=grounded_examples,
             maximum_output_tokens=self._maximum_output_tokens,
         )
         _preflight_context(
@@ -352,6 +412,49 @@ def combine_economics(records: Sequence[OperationEconomics]) -> OperationEconomi
         cost_usd=_combine_measurement(tuple(record.cost_usd for record in records)),
         latency_seconds=_combine_measurement(tuple(record.latency_seconds for record in records)),
     )
+
+
+def _require_query_budget(
+    *,
+    candidate_responses: Sequence[ModelResponse],
+    world_model_responses: Sequence[ModelResponse],
+    prior_retrieval: Sequence[OperationEconomics],
+    query: OperationEconomics,
+    maximum_cost_usd: float,
+) -> None:
+    """Refuse an embedding call unless known spend and its reservation fit.
+
+    Args:
+        candidate_responses: Completed candidate calls in this cell.
+        world_model_responses: Completed world-model calls in this cell.
+        prior_retrieval: Estimated query-embedding costs already dispatched in this cell.
+        query: Conservative economics for the pending exact query.
+        maximum_cost_usd: Remaining provider-spend ceiling assigned to this cell.
+
+    Raises:
+        TextSimulationError: Prior spend is unknown or the pending query would exceed the ceiling.
+    """
+    costs = [
+        *(response.economics.cost_usd for response in candidate_responses),
+        *(response.economics.cost_usd for response in world_model_responses),
+        *(economics.cost_usd for economics in prior_retrieval),
+        query.cost_usd,
+    ]
+    if any(cost is None for cost in costs):
+        raise _text_failure(
+            StopReason.MAXIMUM_COST,
+            FailureCode.BUDGET,
+            "query embedding is blocked because prior provider spend is unknown",
+            phase="query_embedding_budget",
+        )
+    total = math.fsum(cast(NumericMeasurement, cost).value for cost in costs)
+    if total > maximum_cost_usd:
+        raise _text_failure(
+            StopReason.MAXIMUM_COST,
+            FailureCode.BUDGET,
+            "query embedding reservation exceeds the remaining simulation spend ceiling",
+            phase="query_embedding_budget",
+        )
 
 
 def text_prompt_digest() -> str:

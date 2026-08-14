@@ -375,6 +375,9 @@ def _build_grounded_artifacts(
 
     Returns:
         Exact manifest pointers for every completed build output.
+
+    Raises:
+        ValueError: The selected embedder lacks an explicit catalog input price.
     """
     created_at = completed.artifacts.trace_dataset.dataset.created_at
     revision = completed.review.code_revision
@@ -384,9 +387,14 @@ def _build_grounded_artifacts(
     )
     bindings = _lineage_bindings(completed)
     assert resolved_embedder.embedding_client is not None
+    embedding_price = resolved_embedder.capabilities.input_cost_per_million_tokens_usd
+    if embedding_price is None:  # pragma: no cover - setup and capability preflight require it
+        raise ValueError("the selected embedder has no explicit input price")
     rag_embedder = RAGEmbedderBinding(
         client=resolved_embedder.embedding_client,
         snapshot=resolved_embedder.snapshot,
+        maximum_attempts=RetryPolicy().maximum_attempts,
+        input_usd_per_million_tokens=embedding_price,
     )
     serving = persist_trace_rag(
         store.artifacts,
@@ -445,6 +453,9 @@ def _reuse_completed_grounded_artifacts(
 
     Returns:
         Verified existing build pointers, or ``None`` when any identity differs.
+
+    Raises:
+        ValueError: The selected embedder lacks an explicit catalog input price.
     """
     existing = store.load_project().build
     if existing is None:
@@ -468,6 +479,9 @@ def _reuse_completed_grounded_artifacts(
     ):
         return None
     assert resolved_embedder.embedding_client is not None
+    embedding_price = resolved_embedder.capabilities.input_cost_per_million_tokens_usd
+    if embedding_price is None:  # pragma: no cover - setup and capability preflight require it
+        raise ValueError("the selected embedder has no explicit input price")
     runtime = load_grounded_world_model(
         store.artifacts,
         existing.world_model.artifact_id,
@@ -475,6 +489,8 @@ def _reuse_completed_grounded_artifacts(
         embedder=RAGEmbedderBinding(
             client=resolved_embedder.embedding_client,
             snapshot=resolved_embedder.snapshot,
+            maximum_attempts=RetryPolicy().maximum_attempts,
+            input_usd_per_million_tokens=embedding_price,
         ),
     )
     if (

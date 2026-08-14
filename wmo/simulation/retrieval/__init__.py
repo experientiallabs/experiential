@@ -17,7 +17,7 @@ from wmo.simulation.retrieval.embedding import (
     RAGEmbedderBinding,
     default_rag_embedder,
 )
-from wmo.simulation.retrieval.retriever import TraceRAGRetriever
+from wmo.simulation.retrieval.retriever import TraceRAGRetriever, load_fit_rag_retriever
 from wmo.simulation.retrieval.store import LoadedRAGIndex, load_rag_index
 
 __all__ = [
@@ -37,5 +37,6 @@ __all__ = [
     "TraceRAGRetriever",
     "default_rag_embedder",
     "load_rag_index",
+    "load_fit_rag_retriever",
     "persist_trace_rag",
 ]

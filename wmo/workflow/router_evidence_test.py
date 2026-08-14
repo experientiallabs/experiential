@@ -24,6 +24,7 @@ from wmo.common.judging import (
 from wmo.common.models import (
     AssistantAction,
     CandidateTokenPrice,
+    EmbeddingCostReservation,
     ModelClient,
     ModelFinishReason,
     ModelRequest,
@@ -41,15 +42,17 @@ from wmo.common.tasks import load_task_set
 from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.application import create_project_router_app
-from wmo.simulation.build_test import _trace
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
+    _FitRetriever,
     _OneTurnAgent,
     _response,
     _ScriptedClient,
 )
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
+from wmo.simulation.retrieval import TraceRAGRetriever, load_rag_index
+from wmo.simulation.retrieval.retrieval_test import _message_trace as _trace
 from wmo.simulation.specs import WorldModelSettings
 from wmo.workflow.judgment_budget import JudgmentDispatchReceipt
 from wmo.workflow.router import (
@@ -59,6 +62,7 @@ from wmo.workflow.router import (
     RouterWorkflowServices,
 )
 from wmo.workflow.router_test import (
+    _bind_completed_build,
     _capabilities,
     _FidelityApproval,
     _Judge,
@@ -82,7 +86,21 @@ class _EvidenceSetupSupplier:
         review: ApprovedRouterReview,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
+        """Persist reviewed evidence bound to the project's completed fit RAG.
+
+        Args:
+            project: Project owning the completed build and release evidence.
+            build: Deterministic trace and task-set build reused by composition.
+            review: Approved rubric and calibration identifiers.
+            budget: Finite composition budget already validated by the workflow.
+
+        Returns:
+            Complete release evaluation setup over the exact completed fit RAG.
+        """
         del review, budget
+        completed = project.load_project().build
+        assert completed is not None
+        fit_index = load_rag_index(project.artifacts, completed.fit_rag.artifact_id).index
         tasks = load_task_set(project.artifacts, build.artifacts.task_set.task_set_id).tasks
         candidates = tuple(
             RoutedCandidateSnapshot(alias=alias, model=_snapshot(alias))
@@ -162,6 +180,7 @@ class _EvidenceSetupSupplier:
             production_protocol=production,
             simulation_protocol=world,
             embedding_set_id="embeddings-a",
+            fit_rag_input=completed.fit_rag,
             pricing_snapshot_id="w16-pricing",
             incumbent_alias="candidate-baseline",
             guard=KnnGuard(
@@ -175,6 +194,12 @@ class _EvidenceSetupSupplier:
             world_model_settings=WorldModelSettings(
                 world_model_alias="world-model-a",
                 prompt_version="text-world-model-v1",
+                query_embedding=EmbeddingCostReservation(
+                    model=fit_index.embedder,
+                    input_usd_per_million_tokens=0.0,
+                    maximum_attempts=1,
+                    maximum_input_tokens=10_000,
+                ),
             ),
             agent_id="agent-a",
             seed=16,
@@ -222,12 +247,34 @@ class _EvidenceSimulatorFactory:
         )
 
     def __call__(self, project: ProjectStore, plan: EvaluationPlan) -> Simulator:
+        """Bind the release simulator to the project's exact completed fit RAG.
+
+        Args:
+            project: Project owning the completed immutable build graph.
+            plan: Frozen evaluation plan selected for simulation.
+
+        Returns:
+            Grounded text simulator with deterministic local model clients.
+        """
         self.calls += 1
+        completed = project.load_project().build
+        assert completed is not None
+        fit_index = load_rag_index(project.artifacts, completed.fit_rag.artifact_id).index
         return WorldModelSimulator(
             store=project.artifacts,
             evaluation_plan=plan,
             evaluation_plan_input=artifact_input(project.artifacts.read(plan.plan_id).manifest),
             task_set_input=artifact_input(project.artifacts.read(plan.task_set_id).manifest),
+            fit_rag_input=completed.fit_rag,
+            fit_retriever=cast(
+                TraceRAGRetriever,
+                _FitRetriever(
+                    completed.fit_rag,
+                    maximum_attempts=1,
+                    input_usd_per_million_tokens=0.0,
+                    embedder=fit_index.embedder,
+                ),
+            ),
             candidate_models={
                 alias: _resolved(alias, cast(ModelClient, client))
                 for alias, client in self.candidates.items()
@@ -330,7 +377,12 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One 100-trace public workflow proves phase locks, replay, budgets, and HTTP stickiness."""
+    """Prove phase locks, replay, budgets, and HTTP stickiness end to end.
+
+    Args:
+        tmp_path: Isolated project root for composed router evidence.
+        monkeypatch: Patch fixture used to bind runtime loading.
+    """
     revision = exact_checkout_revision()
     project = ProjectStore(tmp_path, "w16-project")
     project.initialize(ProjectConfig(project_id="w16-project"))
@@ -338,6 +390,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
         traces=tuple(_trace(index) for index in range(100)),
         issues=(),
     )
+    completed_build = _bind_completed_build(project, normalized, revision=revision)
     simulator = _EvidenceSimulatorFactory()
     judge = _EvidenceJudge(revision)
     approval = _FidelityApproval()
@@ -438,6 +491,8 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert result.held_out_simulation_spend_usd == 0.0
     assert result.total_simulation_spend_usd == 0.0
     assert result.held_out_simulation_spec.maximum_cost_usd == (budget.maximum_simulation_cost_usd)
+    assert completed_build.fit_rag in result.simulation_spec.inputs
+    assert completed_build.fit_rag in result.held_out_simulation_spec.inputs
     assert report.run_spend.candidate.known_total_usd == 0.0
     assert report.run_spend.world_model.known_total_usd == 0.0
     assert report.run_spend.judge.known_total_usd == 0.0

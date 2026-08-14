@@ -2,11 +2,13 @@
 
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 
 from wmo.common.models import (
     AssistantAction,
+    EmbeddingCostReservation,
     ModelCapabilities,
     ModelFinishReason,
     ModelMessage,
@@ -24,6 +26,7 @@ from wmo.simulation.engines.text.recording import (
     RecordingCandidateClient,
     TextSimulationError,
 )
+from wmo.simulation.retrieval import RAGMatch, RAGQuery, TraceRAGRetriever
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 
@@ -36,6 +39,42 @@ class _ScriptedClient:
     def complete(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         return self.responses.pop(0)
+
+
+class _Retriever:
+    def __init__(self) -> None:
+        """Initialize an empty ordered query log."""
+        self.queries: list[RAGQuery] = []
+
+    def estimate_query_economics(
+        self,
+        query: RAGQuery,
+        reservation: EmbeddingCostReservation,
+    ) -> OperationEconomics:
+        """Return deterministic query economics for recorder tests.
+
+        Args:
+            query: Canonical retrieval query being estimated.
+            reservation: Immutable embedding price and retry reservation.
+
+        Returns:
+            Fixed conservative query cost.
+        """
+        del query
+        del reservation
+        return OperationEconomics(cost_usd=NumericMeasurement(value=0.01, provenance="estimated"))
+
+    def retrieve(self, query: RAGQuery) -> tuple[RAGMatch, ...]:
+        """Record a query and return no grounding examples.
+
+        Args:
+            query: Canonical retrieval query dispatched by the recorder.
+
+        Returns:
+            Empty deterministic result set.
+        """
+        self.queries.append(query)
+        return ()
 
 
 def _snapshot(name: str) -> ModelSnapshot:
@@ -101,6 +140,17 @@ def _recorder(
     candidate_context_window: int = 100_000,
     candidate_served_model_id: str | None = None,
 ) -> RecordingCandidateClient:
+    """Build a recorder with explicit fake candidate, world model, and retriever.
+
+    Args:
+        candidate_client: Scripted candidate provider client.
+        world_client: Scripted world-model provider client.
+        candidate_context_window: Candidate request context-window ceiling.
+        candidate_served_model_id: Optional observed served-model identity.
+
+    Returns:
+        Recorder configured for one deterministic task.
+    """
     candidate = _resolved(
         "candidate-a",
         candidate_client,
@@ -112,6 +162,14 @@ def _recorder(
         task=_task(),
         candidate=candidate,
         world_model=_resolved("world-model-a", world_client),
+        fit_retriever=cast(TraceRAGRetriever, _Retriever()),
+        query_embedding=EmbeddingCostReservation(
+            model=_snapshot("embedder-a"),
+            input_usd_per_million_tokens=1.0,
+            maximum_attempts=2,
+            maximum_input_tokens=10_000,
+        ),
+        maximum_cost_usd=10.0,
         maximum_steps=2,
         maximum_output_tokens=16_000,
         redacted_field_names=frozenset(),
