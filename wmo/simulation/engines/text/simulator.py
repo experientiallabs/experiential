@@ -567,11 +567,8 @@ class WorldModelSimulator:
             return self._persist_rollout(rollout, cell, binding, resolution_input)
         if claim.lease is None:  # pragma: no cover - owned state always creates an exact lease
             raise SimulationResumeError("owned text-cell admission omitted its durable lease")
-        try:
-            rollout = self._execute_cell(spec, cell, world_model, binding, resolution_input)
-            persisted = self._persist_rollout(rollout, cell, binding, resolution_input)
-        except BaseException:
-            raise
+        rollout = self._execute_cell(spec, cell, world_model, binding, resolution_input)
+        persisted = self._persist_rollout(rollout, cell, binding, resolution_input)
         self._leases.release(claim.lease)
         return persisted
 

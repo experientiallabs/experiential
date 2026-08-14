@@ -188,18 +188,17 @@ def analyze_duplicates(
     leakage_by_initial = _leakage_ids(assignments, lineage_union)
     leakage_groups = _build_leakage_groups(assignments, leakage_by_initial)
     candidate_groups = _groups_by_root((trace.trace_id for trace in traces), trace_union)
-    candidates = []
-    for trace_ids in candidate_groups.values():
-        candidates.append(
-            _candidate_from_duplicate_group(
-                trace_ids=tuple(sorted(trace_ids)),
-                assignment_by_trace=assignment_by_trace,
-                descriptor_by_trace=descriptor_by_trace,
-                coverage_by_trace=coverage_by_trace,
-                vector_by_trace=vector_by_trace,
-                leakage_by_initial=leakage_by_initial,
-            )
+    candidates = [
+        _candidate_from_duplicate_group(
+            trace_ids=tuple(sorted(trace_ids)),
+            assignment_by_trace=assignment_by_trace,
+            descriptor_by_trace=descriptor_by_trace,
+            coverage_by_trace=coverage_by_trace,
+            vector_by_trace=vector_by_trace,
+            leakage_by_initial=leakage_by_initial,
         )
+        for trace_ids in candidate_groups.values()
+    ]
     candidates.sort(key=lambda candidate: candidate.representative_trace_id)
     return DuplicateAnalysis(
         edges=tuple(edges),

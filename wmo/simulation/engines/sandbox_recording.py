@@ -536,7 +536,8 @@ def require_hard_wall_timeout_support() -> tuple[float, float]:
     """Verify that this thread can install the timer required for sandbox execution.
 
     Returns:
-        The inactive prior timer settings that the caller must restore after execution.
+        The prior `ITIMER_REAL` delay and interval, which are always zero because an already
+        active timer fails closed instead.
 
     Raises:
         SandboxTimeLimitError: Hard wall-time enforcement is unavailable or already claimed.
@@ -556,7 +557,7 @@ def require_hard_wall_timeout_support() -> tuple[float, float]:
 @contextmanager
 def _hard_wall_timeout(deadline: _Deadline) -> Iterator[None]:
     """Install a POSIX main-thread timer so a silent hung agent cannot evade its limit."""
-    previous_delay, previous_interval = require_hard_wall_timeout_support()
+    require_hard_wall_timeout_support()
     previous_handler = signal.getsignal(signal.SIGALRM)
 
     def raise_timeout(_signum: int, _frame: object) -> None:

@@ -179,7 +179,7 @@ def select_partition_representatives(
 
 def _cluster_candidates(candidates: Sequence[DeduplicatedTrace], target: int) -> dict[str, int]:
     """Build deterministic request-vector clusters and return candidate-to-cluster assignments."""
-    cluster_count = min(len(candidates), max(1, int(round(math.sqrt(len(candidates))))), target)
+    cluster_count = min(len(candidates), max(1, round(math.sqrt(len(candidates)))), target)
     if cluster_count == 1:
         return {candidate.representative_trace_id: 0 for candidate in candidates}
     by_id = {candidate.representative_trace_id: candidate for candidate in candidates}
@@ -433,7 +433,7 @@ def _assign_workload(
 ) -> list[SelectedRepresentative]:
     """Assign every candidate's full duplicate workload to its nearest selected task."""
     by_id = {candidate.representative_trace_id: candidate for candidate in candidates}
-    mass: dict[str, int] = {selected_id: 0 for selected_id in selected_ids}
+    mass: dict[str, int] = dict.fromkeys(selected_ids, 0)
     for candidate in candidates:
         selected_id = min(
             selected_ids,
