@@ -14,6 +14,7 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
+    Sha256,
 )
 from wmo.common.judging import (
     CalibrationReport,
@@ -439,12 +440,63 @@ class ManualJudgeCalibrationAudit(ArtifactEnvelope):
         return self
 
 
+class ManualJudgeLabelDraft(ContractModel):
+    """Human labels persisted for one frozen calibration sample before provider work.
+
+    Human rating is the expensive part of manual calibration, so completed ratings become durable
+    local review state as soon as they exist. The sample digest binds a draft to one exact setup,
+    trace selection, rubric, and response shape, so a later attempt resumes the same work and an
+    unrelated sample never inherits stale scores.
+    """
+
+    draft_version: Literal["manual-judge-label-draft-v1"] = "manual-judge-label-draft-v1"
+    setup_id: ArtifactId
+    sample_sha256: Sha256
+    labels: tuple[ManualJudgeLabel, ...]
+    updated_at: datetime
+
+    @field_validator("labels")
+    @classmethod
+    def _require_unique_label_keys(
+        cls, value: tuple[ManualJudgeLabel, ...]
+    ) -> tuple[ManualJudgeLabel, ...]:
+        """Reject two drafted scores for one trace, reference, and dimension key."""
+        keys = tuple(
+            (label.trace_id, label.reference_trace_id, label.dimension_id) for label in value
+        )
+        if len(set(keys)) != len(keys):
+            raise ValueError("a label draft must not repeat a trace dimension")
+        return value
+
+
 class ManualJudgeReviewState(ContractModel):
-    """Mutable review pointers for resumable setup, audit, and explicit approval."""
+    """Mutable review pointers for resumable setup, labels, audit, and explicit approval."""
 
     setup: ArtifactInput
+    label_drafts: tuple[ManualJudgeLabelDraft, ...] = ()
     audit: ArtifactInput | None = None
     approved_calibration: ArtifactInput | None = None
+
+    @field_validator("label_drafts")
+    @classmethod
+    def _require_one_draft_per_sample(
+        cls, value: tuple[ManualJudgeLabelDraft, ...]
+    ) -> tuple[ManualJudgeLabelDraft, ...]:
+        """Keep at most one label draft per setup and frozen trace sample.
+
+        Args:
+            value: Persisted label drafts of one project.
+
+        Returns:
+            The same drafts when every sample appears once.
+
+        Raises:
+            ValueError: Two drafts claim the same setup and trace sample.
+        """
+        keys = tuple((draft.setup_id, draft.sample_sha256) for draft in value)
+        if len(set(keys)) != len(keys):
+            raise ValueError("review state must not hold two drafts for one calibration sample")
+        return value
 
 
 class ManualJudgeCalibrationResult(ContractModel):

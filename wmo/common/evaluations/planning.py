@@ -397,6 +397,10 @@ def _require_observed_rollout(
         raise EvaluationEvidenceError(
             "production rollout trace is not bound to the task source lineage"
         )
+    if rollout.candidate is None:
+        raise EvaluationEvidenceError(
+            "observed evaluation cells require production rollouts with recorded model identity"
+        )
     if rollout.candidate != candidate.model:
         raise EvaluationEvidenceError(
             "production rollout model identity does not match the candidate snapshot"

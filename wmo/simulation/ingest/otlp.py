@@ -426,6 +426,22 @@ def _normalize_span(raw: JsonObject, attributes: JsonObject) -> TraceSpan:
     )
 
 
+def decode_otlp_attributes(raw: JsonValue, *, label: str = "OTLP attributes") -> JsonObject:
+    """Decode one OTLP key/value attribute array into a canonical attribute mapping.
+
+    Args:
+        raw: OTLP ``attributes`` array, or ``None`` for a span that declares none.
+        label: Source label used in validation messages.
+
+    Returns:
+        Decoded attribute mapping keyed by the exact source attribute names.
+
+    Raises:
+        OtlpTraceFormatError: The array, an entry, or an ``AnyValue`` is malformed.
+    """
+    return _decode_attributes(raw, label=label)
+
+
 def _decode_attributes(raw: JsonValue, *, label: str) -> JsonObject:
     """Decode OpenTelemetry key/value attributes into JSON values."""
     if raw is None:

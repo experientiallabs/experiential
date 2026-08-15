@@ -133,6 +133,24 @@ class SandboxSimulationCellBinding(ContractModel):
         return value
 
 
+class ProviderFreeSourceProvenance(ContractModel):
+    """Typed evidence that a historical source trace records no model identity at all.
+
+    Some real trace exports capture environment activity without provider or model attribution,
+    so their normalized spans carry no model snapshot. That evidence still grounds human judge
+    calibration, which reads task, action, and outcome content rather than generator identity.
+    A production rollout imported from such a trace states the absence as immutable evidence
+    instead of borrowing an identity from the judge model, the catalog, or a placeholder, and it
+    stays unusable for candidate evaluation, pricing, routing, and attribution.
+    """
+
+    provenance_version: Literal["provider-free-source-v1"] = "provider-free-source-v1"
+    reason: Literal["source_trace_records_no_model_identity"] = (
+        "source_trace_records_no_model_identity"
+    )
+    checked_span_count: int = Field(gt=0)
+
+
 class RolloutArtifact(SimulationArtifact):
     """The v1 simulation artifact subtype that preserves one full agent episode."""
 
@@ -142,7 +160,8 @@ class RolloutArtifact(SimulationArtifact):
     evidence_source: Literal["production", "world_model", "sandbox"]
     source_run_id: str = Field(min_length=1, max_length=512)
     task_id: ArtifactId
-    candidate: ModelSnapshot
+    candidate: ModelSnapshot | None = None
+    provider_free_source: ProviderFreeSourceProvenance | None = None
     agent_id: str = Field(min_length=1, max_length=256)
     simulator: SimulatorSnapshot
     world_model: ModelSnapshot | None = None
@@ -181,6 +200,7 @@ class RolloutArtifact(SimulationArtifact):
         Raises:
             ValueError: The rollout mixes production, world-model, or sandbox provenance.
         """
+        self._require_exact_generator_provenance()
         if self.evidence_source == "production" and self.simulation_spec_sha256 is not None:
             raise ValueError("production rollouts must not name a simulation specification")
         if self.evidence_source != "production" and self.simulation_spec_sha256 is None:
@@ -221,6 +241,27 @@ class RolloutArtifact(SimulationArtifact):
                 raise ValueError("sandbox rollouts must not contain retrieval economics")
             _require_sandbox_binding(self)
         return self
+
+    def _require_exact_generator_provenance(self) -> None:
+        """Require either an exact generator identity or explicit provider-free source evidence.
+
+        Raises:
+            ValueError: Generator identity is missing, doubled, or contradicted by span evidence.
+        """
+        provider_free = self.provider_free_source
+        if (self.candidate is None) == (provider_free is None):
+            raise ValueError(
+                "rollouts record either a candidate model snapshot or explicit provider-free "
+                "source provenance"
+            )
+        if provider_free is None:
+            return
+        if self.evidence_source != "production":
+            raise ValueError("only production rollouts may record provider-free source evidence")
+        if provider_free.checked_span_count != len(self.spans):
+            raise ValueError("provider-free source evidence must cover every rollout span")
+        if any(span.model is not None for span in self.spans):
+            raise ValueError("provider-free rollouts must not contain span model identity")
 
 
 def _require_world_model_binding(rollout: RolloutArtifact) -> None:
