@@ -57,11 +57,13 @@ declaration never holds a credential:
 The connection string comes from the declaration's optional `dsn` or from `WMO_POSTGRES_DSN`. The
 table and column names accept only plain identifiers, and dynamic names reach SQL only as quoted
 identifiers. `row_shape` is `document` when one row holds one whole trace payload, or `message`
-when one row holds one chat message; message rows require `chat-json` and a `trace_id_column`, and
-a row with no declared trace identity becomes an explicit issue instead of a guessed conversation.
-`since` requires `order_column`, and rows tied on it are ordered by trace identity and payload text
-so equal timestamps cannot reorder a conversation between builds. The driver is optional: install
-it with
+when one row holds one chat message; message rows require `chat-json`, a `trace_id_column`, and an
+`order_column`, and a row with no declared trace identity becomes an explicit issue instead of a
+guessed conversation. Turn order is never invented: when the message rows of one conversation share
+one order value, that conversation is retained as an explicit issue rather than assembled in an
+arbitrary order. Document rows tied on the order column are broken by trace identity and payload
+text, so equal timestamps cannot reorder a corpus between builds. `since` requires `order_column`.
+The driver is optional: install it with
 `uv sync --extra postgres` or `world-model-optimizer[postgres]`. A Python caller may inject its own
 row reader through `load_postgres_source(config, reader=...)` and keep its existing pool.
 

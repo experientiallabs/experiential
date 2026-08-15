@@ -55,6 +55,12 @@ _CHAT_CONFIG = PostgresSourceConfig(
     payload_format="chat-json",
     dsn="postgresql://localhost/wmo",
 )
+_MESSAGE_CONFIG = replace(
+    _CHAT_CONFIG,
+    row_shape="message",
+    trace_id_column="trace_id",
+    order_column="created_at",
+)
 
 
 def test_load_postgres_source_normalizes_document_rows() -> None:
@@ -117,13 +123,15 @@ def test_normalize_postgres_rows_assembles_message_rows() -> None:
         PostgresRow(
             source_trace_id="conversation-1",
             payload={"role": "user", "content": "What is the weather in Paris?"},
+            order_value="1",
         ),
         PostgresRow(
             source_trace_id="conversation-1",
             payload={"role": "assistant", "content": "It is 18C in Paris."},
+            order_value="2",
         ),
     ]
-    config = replace(_CHAT_CONFIG, row_shape="message", trace_id_column="trace_id")
+    config = _MESSAGE_CONFIG
 
     result = normalize_postgres_rows(
         rows,
@@ -144,14 +152,20 @@ def test_load_postgres_source_retains_untraceable_message_rows_as_issues() -> No
         PostgresRow(
             source_trace_id="conversation-1",
             payload={"role": "user", "content": "What is the weather in Paris?"},
+            order_value="1",
         ),
         PostgresRow(
             source_trace_id="conversation-1",
             payload={"role": "assistant", "content": "It is 18C in Paris."},
+            order_value="2",
         ),
-        PostgresRow(payload={"role": "user", "content": "And in Berlin?"}, source_trace_id=None),
+        PostgresRow(
+            payload={"role": "user", "content": "And in Berlin?"},
+            source_trace_id=None,
+            order_value="3",
+        ),
     ]
-    config = replace(_CHAT_CONFIG, row_shape="message", trace_id_column="trace_id")
+    config = _MESSAGE_CONFIG
 
     result = load_postgres_source(config, reader=_StubReader(rows))
 
@@ -206,6 +220,8 @@ def test_postgres_source_config_rejects_unsupported_row_shapes() -> None:
         )
     with pytest.raises(PostgresSourceError, match="trace id column"):
         replace(_CHAT_CONFIG, row_shape="message")
+    with pytest.raises(PostgresSourceError, match="order column"):
+        replace(_CHAT_CONFIG, row_shape="message", trace_id_column="trace_id")
 
 
 def test_postgres_source_config_requires_an_order_column_for_since() -> None:
@@ -216,16 +232,18 @@ def test_postgres_source_config_requires_an_order_column_for_since() -> None:
 
 def test_decode_postgres_row_reads_driver_and_text_payloads() -> None:
     """A payload column arrives already decoded or as JSON text, and is never repaired."""
-    decoded = decode_postgres_row(["conversation-1", {"messages": []}], index=1)
-    text = decode_postgres_row([None, json.dumps({"messages": []})], index=2)
+    decoded = decode_postgres_row(["conversation-1", {"messages": []}, "1"], index=1)
+    text = decode_postgres_row([None, json.dumps({"messages": []}), None], index=2)
 
-    assert decoded == PostgresRow(source_trace_id="conversation-1", payload={"messages": []})
+    assert decoded == PostgresRow(
+        source_trace_id="conversation-1", payload={"messages": []}, order_value="1"
+    )
     assert text == PostgresRow(source_trace_id=None, payload={"messages": []})
 
     with pytest.raises(PostgresSourceError, match="not valid JSON"):
-        decode_postgres_row([None, "{oops"], index=3)
-    with pytest.raises(PostgresSourceError, match="did not select two columns"):
-        decode_postgres_row(["conversation-1"], index=4)
+        decode_postgres_row([None, "{oops", None], index=3)
+    with pytest.raises(PostgresSourceError, match="did not select three columns"):
+        decode_postgres_row(["conversation-1", {"messages": []}], index=4)
 
 
 def test_psycopg_row_reader_requires_the_optional_extra(
@@ -314,6 +332,28 @@ class _FakeConnection:
         return _FakeCursor(self._captured)
 
 
+def test_normalize_postgres_rows_excludes_message_rows_without_declared_turn_order() -> None:
+    """A conversation whose rows share one order value is excluded instead of ordered by content."""
+    rows = [
+        PostgresRow(
+            source_trace_id="conversation-1",
+            payload={"role": "user", "content": "What is the weather in Paris?"},
+            order_value="2024-05-01T00:00:00Z",
+        ),
+        PostgresRow(
+            source_trace_id="conversation-1",
+            payload={"role": "assistant", "content": "It is 18C in Paris."},
+            order_value="2024-05-01T00:00:00Z",
+        ),
+    ]
+
+    result = load_postgres_source(_MESSAGE_CONFIG, reader=_StubReader(rows))
+
+    assert result.traces == ()
+    assert [issue.source_record for issue in result.issues] == ["conversation-1"]
+    assert "turn order is not declared" in result.issues[0].message
+
+
 def test_psycopg_row_reader_orders_tied_rows_deterministically(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -345,3 +385,31 @@ def test_psycopg_row_reader_orders_tied_rows_deterministically(
     assert captured.statement.endswith(
         'ORDER BY "created_at", "trace_id", "payload"::text',
     )
+
+
+def test_psycopg_row_reader_never_orders_message_rows_by_payload_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Message rows are ordered only by declared columns, never by their own content."""
+    captured = _CapturedQuery()
+
+    def _connect(dsn: str, *, connect_timeout: int) -> _FakeConnection:
+        """Return the recording connection.
+
+        Args:
+            dsn: Requested connection string.
+            connect_timeout: Requested connection timeout.
+
+        Returns:
+            The recording connection.
+        """
+        return _FakeConnection(captured)
+
+    monkeypatch.setattr(psycopg, "connect", _connect)
+
+    assert (
+        PsycopgRowReader().read_rows(replace(_MESSAGE_CONFIG, dsn="postgresql://localhost/wmo"))
+        == ()
+    )
+    assert captured.statement is not None
+    assert captured.statement.endswith('ORDER BY "created_at", "trace_id"')

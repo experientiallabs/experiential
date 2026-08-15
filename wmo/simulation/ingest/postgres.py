@@ -82,10 +82,12 @@ class PostgresRow:
     Args:
         source_trace_id: Value of the declared trace-id column, if the source declares one.
         payload: Decoded JSON payload of the declared payload column.
+        order_value: Text of the declared order column, if the source declares one.
     """
 
     source_trace_id: str | None
     payload: JsonValue
+    order_value: str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +138,10 @@ class PostgresSourceConfig:
             if self.trace_id_column is None:
                 raise PostgresSourceError(
                     "message rows need a trace id column to group them into conversations"
+                )
+            if self.order_column is None:
+                raise PostgresSourceError(
+                    "message rows need an order column to establish conversation turn order"
                 )
         if self.since is not None and self.order_column is None:
             raise PostgresSourceError("bounding rows by since requires an order column")
@@ -315,14 +321,20 @@ def _conversation_payloads(
 ) -> list[JsonValue]:
     """Assemble message rows into one chat conversation document per source trace identity.
 
+    Turn order carries meaning, so it is never invented. A conversation whose rows share one order
+    value has no declared turn order and is retained as an explicit exclusion instead of being
+    assembled from an arbitrary order.
+
     Args:
-        rows: Selected message rows in source order.
-        issues: Accumulator for rows excluded because they declare no trace identity.
+        rows: Selected message rows in declared order.
+        issues: Accumulator for rows and conversations excluded from normalization.
 
     Returns:
-        One conversation document per source trace identity, in first-seen order.
+        One conversation document per unambiguously ordered source trace identity, in first-seen
+        order.
     """
     conversations: dict[str, list[JsonValue]] = {}
+    order_values: dict[str, list[str | None]] = {}
     for index, row in enumerate(rows, start=1):
         if row.source_trace_id is None:
             issues.append(
@@ -330,9 +342,20 @@ def _conversation_payloads(
             )
             continue
         conversations.setdefault(row.source_trace_id, []).append(row.payload)
-    return [
-        {"trace_id": trace_id, "messages": messages} for trace_id, messages in conversations.items()
-    ]
+        order_values.setdefault(row.source_trace_id, []).append(row.order_value)
+    payloads: list[JsonValue] = []
+    for trace_id, messages in conversations.items():
+        values = order_values[trace_id]
+        if len(set(values)) != len(values):
+            issues.append(
+                TraceNormalizationIssue(
+                    trace_id,
+                    "message rows share one order value, so their turn order is not declared",
+                )
+            )
+            continue
+        payloads.append({"trace_id": trace_id, "messages": messages})
+    return payloads
 
 
 class PsycopgRowReader:
@@ -345,9 +368,11 @@ class PsycopgRowReader:
             config: Explicit Postgres trace source.
 
         Returns:
-            Selected rows in ``order_column`` order when the source declares one. Rows tied on the
-            order column are broken by the trace identity and then by the payload text, so equal
-            timestamps cannot reorder a conversation between builds.
+            Selected rows in ``order_column`` order when the source declares one. Document rows
+            tied on the order column are broken by the trace identity and then by the payload
+            text, so equal values cannot reorder a corpus between builds. Message-row order is
+            never broken by payload text, because a payload-derived order would read as a declared
+            conversation order; tied message rows are excluded by ``normalize_postgres_rows``.
 
         Raises:
             PostgresSourceError: The driver, connection string, table, or a column is unusable.
@@ -363,8 +388,13 @@ class PsycopgRowReader:
             if config.trace_id_column is not None
             else sql.SQL("NULL")
         )
-        query = sql.SQL("SELECT {}, {} FROM {}").format(
-            trace_id, sql.Identifier(config.payload_column), table
+        order_value: sql.Composable = (
+            sql.SQL("{}::text").format(sql.Identifier(config.order_column))
+            if config.order_column is not None
+            else sql.SQL("NULL")
+        )
+        query = sql.SQL("SELECT {}, {}, {} FROM {}").format(
+            trace_id, sql.Identifier(config.payload_column), order_value, table
         )
         parameters: tuple[str, ...] = ()
         if config.order_column is not None:
@@ -374,7 +404,10 @@ class PsycopgRowReader:
             order_terms: list[sql.Composable] = [sql.Identifier(config.order_column)]
             if config.trace_id_column is not None:
                 order_terms.append(sql.Identifier(config.trace_id_column))
-            order_terms.append(sql.SQL("{}::text").format(sql.Identifier(config.payload_column)))
+            if config.row_shape == "document":
+                order_terms.append(
+                    sql.SQL("{}::text").format(sql.Identifier(config.payload_column))
+                )
             query += sql.SQL(" ORDER BY ") + sql.SQL(", ").join(order_terms)
         try:
             with psycopg.connect(dsn, connect_timeout=10) as connection:
@@ -393,7 +426,7 @@ def decode_postgres_row(fetched: Sequence[object], *, index: int) -> PostgresRow
     """Decode one selected row into a trace row.
 
     Args:
-        fetched: Selected trace identity and payload values, in that order.
+        fetched: Selected trace identity, payload, and order values, in that order.
         index: One-based row position used in validation messages.
 
     Returns:
@@ -402,13 +435,14 @@ def decode_postgres_row(fetched: Sequence[object], *, index: int) -> PostgresRow
     Raises:
         PostgresSourceError: The row shape or its payload cannot be decoded.
     """
-    if len(fetched) != 2:
-        raise PostgresSourceError(f"postgres row {index} did not select two columns")
-    raw_trace_id, raw_payload = fetched
+    if len(fetched) != 3:
+        raise PostgresSourceError(f"postgres row {index} did not select three columns")
+    raw_trace_id, raw_payload, raw_order_value = fetched
     source_trace_id = None if raw_trace_id is None else str(raw_trace_id)
     return PostgresRow(
         source_trace_id=source_trace_id,
         payload=_decoded_payload(raw_payload, index=index),
+        order_value=None if raw_order_value is None else str(raw_order_value),
     )
 
 
