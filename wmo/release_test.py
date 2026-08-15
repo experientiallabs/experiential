@@ -460,6 +460,21 @@ def _installed_release_driver() -> None:
             """Suppress nondeterministic HTTP server logs."""
             del format, args
 
+        def do_GET(self) -> None:
+            """Publish the model IDs this loopback account may call."""
+            state.append(self.path, {})
+            body = json.dumps(
+                {
+                    "object": "list",
+                    "data": [{"id": "core-model"}, {"id": "candidate-b-model"}],
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_POST(self) -> None:
             """Serve deterministic embeddings and chat completions on loopback only.
 
@@ -839,60 +854,32 @@ def _installed_release_driver() -> None:
             completion_marker=completion_marker,
         )
 
-    def model_answers(
-        alias: str,
-        model: str,
-        *,
-        embeddings: bool,
-        add_another: bool,
-    ) -> list[tuple[str, str]]:
-        """Return ordered interactive answers for one explicit model declaration.
-
-        Args:
-            alias: Stable local model alias.
-            model: Provider model identifier.
-            embeddings: Whether the alias supports embeddings.
-            add_another: Whether setup should collect another model afterward.
-
-        Returns:
-            Ordered prompt and answer pairs.
-        """
-        answers = [
-            ("Connection", "loopback"),
-            ("Model alias", alias),
-            ("Provider model ID", model),
-            ("Supports tools?", "y"),
-            ("Supports embeddings?", "y" if embeddings else "n"),
-            ("Supports structured output?", "y"),
-            ("Supports chat completions?", "y"),
-            ("Record context window tokens?", "y"),
-            ("Context window tokens", "128000"),
-            ("Record maximum output tokens?", "y"),
-            ("Maximum output tokens", "16000"),
-            ("Input cost per million tokens in USD", "0"),
-            ("Output cost per million tokens in USD", "0"),
-            ("Cached input cost per million tokens in USD", "0"),
-            ("Cache write cost per million tokens in USD", "0"),
-            ("Add another available model?", "y" if add_another else "n"),
-        ]
-        return answers
-
     setup_answers = [
-        ("Add a OpenAI connection?", "n"),
-        ("Add a OpenRouter connection?", "n"),
-        ("Add a Anthropic connection?", "n"),
-        ("Add a Gemini connection?", "n"),
-        ("Add a Azure connection?", "n"),
-        ("Add a Bedrock connection?", "n"),
-        ("Add a OpenAI-compatible connection?", "y"),
-        ("Connection name", "loopback"),
-        ("API key environment variable", "P17_PROVIDER_KEY"),
-        ("Base URL", provider_url),
-        ("Add another OpenAI-compatible connection?", "n"),
-        *model_answers("core", "core-model", embeddings=True, add_another=False),
-        ("World model alias", "core"),
-        ("Use 'core' as the judge?", "y"),
-        ("Embedder alias", "core"),
+        ("Select the providers you want to use", "5,8,9"),
+        ("empty line accepts", ""),
+        ("OpenAI-compatible endpoint base URL", provider_url),
+        ("credential environment variable", "P17_PROVIDER_KEY"),
+        ("Continue without this provider", "2"),
+        ("Select the models to configure", "1"),
+        ("empty line accepts", ""),
+        ("Connection for the declared model", "1"),
+        ("Provider model ID", "core-model"),
+        ("Supports chat completions?", "y"),
+        ("Supports embeddings?", "y"),
+        ("Supports tools?", "y"),
+        ("Supports structured output?", "y"),
+        ("Record context window tokens?", "y"),
+        ("Context window tokens", "128000"),
+        ("Record maximum output tokens?", "y"),
+        ("Maximum output tokens", "16000"),
+        ("Input cost per million tokens in USD", "0"),
+        ("Output cost per million tokens in USD", "0"),
+        ("Cached input cost per million tokens in USD", "0"),
+        ("Cache write cost per million tokens in USD", "0"),
+        ("empty line accepts", ""),
+        ("World model", "1"),
+        ("Judge model", "1"),
+        ("Embedder model", "1"),
         ("Save this configuration?", "y"),
     ]
     try:
@@ -1013,7 +1000,7 @@ def _installed_release_driver() -> None:
             optimize_arguments,
             [
                 ("Candidate alias", "candidate-b"),
-                ("Provider connection", "loopback"),
+                ("Provider connection", "openai-compatible"),
                 ("Provider model ID", "candidate-b-model"),
                 ("Supports tools?", "y"),
                 ("Context window tokens", "128000"),
@@ -1022,8 +1009,8 @@ def _installed_release_driver() -> None:
                 ("Output USD per million tokens", "0"),
                 ("Cached input USD per million tokens", "0"),
                 ("Cache write USD per million tokens", "0"),
-                ("Candidate aliases (comma separated)", "core,candidate-b"),
-                ("Incumbent alias", "core"),
+                ("Candidate aliases (comma separated)", "core-model,candidate-b"),
+                ("Incumbent alias", "core-model"),
                 ("Save these router candidates?", "y"),
             ],
         )

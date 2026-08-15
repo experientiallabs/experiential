@@ -265,7 +265,11 @@ def prepare_providers(
             )
         if discovered is None:
             return None
-        if not discovered and provider not in _MANUAL_MODEL_PROVIDERS:
+        if (
+            not discovered
+            and provider not in _MANUAL_MODEL_PROVIDERS
+            and not session.advanced_models
+        ):
             console.print(f"[yellow]Skipping {label}.[/yellow]")
             continue
         endpoints.append(endpoint)

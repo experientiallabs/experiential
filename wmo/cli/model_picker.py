@@ -207,6 +207,7 @@ def assign_roles(
         chosen,
         role=SetupRole.WORLD_MODEL,
         title="World model",
+        role_name="world model",
         default=role_inputs.world_model,
         console=console,
     )
@@ -215,7 +216,8 @@ def assign_roles(
     judge = _assign_one_role(
         chosen,
         role=SetupRole.JUDGE,
-        title="Judge",
+        title="Judge model",
+        role_name="judge",
         default=role_inputs.judge,
         console=console,
     )
@@ -224,7 +226,8 @@ def assign_roles(
     embedder = _assign_one_role(
         chosen,
         role=SetupRole.EMBEDDER,
-        title="Embedder",
+        title="Embedder model",
+        role_name="embedder",
         default=role_inputs.embedder,
         console=console,
     )
@@ -247,6 +250,7 @@ def _assign_one_role(
     *,
     role: SetupRole,
     title: str,
+    role_name: str,
     default: str | None,
     console: Console,
 ) -> str | None:
@@ -256,6 +260,7 @@ def _assign_one_role(
         chosen: Models the user selected.
         role: Build role being assigned.
         title: Screen heading for the role.
+        role_name: Readable role name used when no selected model can serve it.
         default: Prior alias accepted with an empty line.
         console: Terminal used for the screen.
 
@@ -268,13 +273,13 @@ def _assign_one_role(
     eligible = tuple(item for item in chosen if serves_role(item.capabilities, role))
     if not eligible:
         console.print(
-            f"[yellow]No selected model can serve the {title.casefold()} role. "
+            f"[yellow]No selected model can serve the {role_name} role. "
             "Select more models.[/yellow]"
         )
         return None
     result = select_one(
         console,
-        title=f"{title} model",
+        title=title,
         options=[
             PickerOption(value=item.alias, label=item.label(), detail=item.detail())
             for item in eligible
