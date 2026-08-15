@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from wmo.common.core.artifacts import sha256_json
+from wmo.common.core.hashing import signed_token_embedding
 from wmo.common.models import (
     Embedding,
     EmbeddingClient,
@@ -17,7 +16,6 @@ from wmo.common.models import (
 )
 
 DEFAULT_HASHING_DIMENSIONS = 256
-_TOKEN_PATTERN = re.compile(r"[\w]+", re.UNICODE)
 
 
 class HashingRAGEmbedder:
@@ -37,19 +35,9 @@ class HashingRAGEmbedder:
         Returns:
             One normalized hashing vector per input text.
         """
-        return tuple(Embedding(values=self._embed_one(text)) for text in texts)
-
-    def _embed_one(self, text: str) -> tuple[float, ...]:
-        """Hash normalized tokens into one fixed-width signed vector."""
-        vector = [0.0] * self.dimensions
-        tokens = _TOKEN_PATTERN.findall(text.casefold()) or ["empty"]
-        for token in tokens:
-            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-            index = int.from_bytes(digest[:4], "big") % self.dimensions
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vector[index] += sign
-        norm = math.sqrt(sum(value * value for value in vector))
-        return tuple(value / norm for value in vector)
+        return tuple(
+            Embedding(values=signed_token_embedding(text, self.dimensions)) for text in texts
+        )
 
 
 @dataclass(frozen=True)

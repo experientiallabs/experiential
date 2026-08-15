@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from wmo.common.core.artifacts import stable_id
+from wmo.common.core.union_find import UnionFind
 from wmo.common.traces import Trace
 from wmo.simulation.mining.descriptors import CoverageDescriptor, RoutingDescriptor
 from wmo.simulation.mining.lineage import LineageAssignment
@@ -170,8 +171,8 @@ def analyze_duplicates(
         trace.trace_id: vector for trace, vector in zip(traces, vectors, strict=True)
     }
 
-    trace_union = _UnionFind(trace.trace_id for trace in traces)
-    lineage_union = _UnionFind(assignment.lineage_group_id for assignment in assignments)
+    trace_union = UnionFind(trace.trace_id for trace in traces)
+    lineage_union = UnionFind(assignment.lineage_group_id for assignment in assignments)
     edges = _duplicate_edges(
         traces,
         assignments,
@@ -388,7 +389,7 @@ def _edge(
     )
 
 
-def _leakage_ids(assignments: Sequence[LineageAssignment], _union: _UnionFind) -> dict[str, str]:
+def _leakage_ids(assignments: Sequence[LineageAssignment], _union: UnionFind) -> dict[str, str]:
     """Create stable IDs for connected initial-lineage components."""
     by_root = _groups_by_root((assignment.lineage_group_id for assignment in assignments), _union)
     by_initial: dict[str, str] = {}
@@ -486,7 +487,7 @@ def _aggregate_coverage(
     )
 
 
-def _groups_by_root(values: Iterable[str], union: _UnionFind) -> dict[str, list[str]]:
+def _groups_by_root(values: Iterable[str], union: UnionFind) -> dict[str, list[str]]:
     """Group stable string identities by a union-find root."""
     grouped: dict[str, list[str]] = defaultdict(list)
     for value in values:
@@ -497,37 +498,3 @@ def _groups_by_root(values: Iterable[str], union: _UnionFind) -> dict[str, list[
 def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
     """Return a bounded dot product for pre-normalized vectors."""
     return max(-1.0, min(1.0, sum(a * b for a, b in zip(left, right, strict=True))))
-
-
-class _UnionFind:
-    """Small deterministic union-find implementation for lineage and duplicate components."""
-
-    def __init__(self, values: Iterable[str]) -> None:
-        """Initialize each source identity as its own component."""
-        self._parent: dict[str, str] = {}
-        for value in values:
-            self.add(value)
-
-    def add(self, value: str) -> None:
-        """Add one identity when it has not been seen before."""
-        self._parent.setdefault(value, value)
-
-    def find(self, value: str) -> str:
-        """Return one component root with path compression."""
-        self.add(value)
-        parent = self._parent[value]
-        if parent != value:
-            parent = self.find(parent)
-            self._parent[value] = parent
-        return parent
-
-    def union(self, left: str, right: str) -> None:
-        """Join two components using the lexically smallest root for deterministic ownership."""
-        left_root = self.find(left)
-        right_root = self.find(right)
-        if left_root == right_root:
-            return
-        if left_root < right_root:
-            self._parent[right_root] = left_root
-        else:
-            self._parent[left_root] = right_root

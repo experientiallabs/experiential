@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from enum import StrEnum
 from typing import Literal
 
@@ -63,6 +64,62 @@ class OperationEconomics(ContractModel):
     usage: Usage | None = None
     cost_usd: NumericMeasurement | None = None
     latency_seconds: NumericMeasurement | None = None
+
+
+def combine_economics(records: Sequence[OperationEconomics]) -> OperationEconomics:
+    """Aggregate same-role calls without representing a partial total as complete.
+
+    Usage is summed when present. Cost and latency are summed only when every call
+    exposed that measurement, preserving a clear unknown rather than a partial sum.
+
+    Args:
+        records: Economics for all calls made by one named role in one episode.
+
+    Returns:
+        One economics value for the combined series.
+    """
+    if not records:
+        return OperationEconomics()
+    usages = [record.usage for record in records]
+    usage = None
+    if any(item is not None for item in usages):
+        usage = _combine_usage(tuple(item for item in usages if item is not None))
+    return OperationEconomics(
+        usage=usage,
+        cost_usd=_combine_measurement(tuple(record.cost_usd for record in records)),
+        latency_seconds=_combine_measurement(tuple(record.latency_seconds for record in records)),
+    )
+
+
+def _combine_usage(records: Sequence[Usage]) -> Usage:
+    """Return a typed usage sum after callers excluded absent usage values."""
+    cached = tuple(item.cached_input_tokens for item in records)
+    cached_input_tokens = (
+        None
+        if any(item is None for item in cached)
+        else sum(item for item in cached if item is not None)
+    )
+    return Usage(
+        input_tokens=sum(item.input_tokens for item in records),
+        output_tokens=sum(item.output_tokens for item in records),
+        cached_input_tokens=cached_input_tokens,
+    )
+
+
+def _combine_measurement(
+    records: Sequence[NumericMeasurement | None],
+) -> NumericMeasurement | None:
+    """Sum a measurement only when every call provided a compatible finite value."""
+    if any(record is None for record in records):
+        return None
+    measurements = tuple(record for record in records if record is not None)
+    values = tuple(item.value for item in measurements)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    provenance = (
+        "observed" if all(item.provenance == "observed" for item in measurements) else "estimated"
+    )
+    return NumericMeasurement(value=sum(values), provenance=provenance)
 
 
 class ToolCall(ContractModel):

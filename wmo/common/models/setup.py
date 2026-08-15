@@ -20,7 +20,6 @@ from wmo.common.models.catalog import (
 from wmo.common.models.model import ModelCapabilities
 
 SETUP_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openai-compatible", "openrouter"})
-EMPTY_CATALOG_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 class ProviderSetupError(ValueError):

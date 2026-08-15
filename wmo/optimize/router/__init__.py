@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from wmo.optimize.router.composition import (
         FidelityApprovalReceipt as FidelityApprovalReceipt,
     )
-    from wmo.optimize.router.composition import LocalTraceSource as LocalTraceSource
     from wmo.optimize.router.composition import (
         RouterCandidateSetupPlan as RouterCandidateSetupPlan,
     )
@@ -69,7 +68,6 @@ _EXPORT_MODULES = {
     "ApprovedRouterReview": "wmo.optimize.router.composition",
     "FidelityApprovalDecision": "wmo.optimize.router.composition",
     "FidelityApprovalReceipt": "wmo.optimize.router.composition",
-    "LocalTraceSource": "wmo.optimize.router.composition",
     "RouterCandidateSetupPlan": "wmo.optimize.router.composition",
     "RouterCompositionBudget": "wmo.optimize.router.composition",
     "RouterCompositionResult": "wmo.optimize.router.composition",

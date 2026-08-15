@@ -6,7 +6,7 @@ import os
 import signal
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -26,7 +26,7 @@ from wmo.common.models import (
     NumericMeasurement,
     OperationEconomics,
     ToolCall,
-    Usage,
+    combine_economics,
 )
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
@@ -232,8 +232,8 @@ def execute_bounded_sandbox_episode(
     evidence = SandboxExecutionEvidence(
         candidate_spans=tuple(model.spans),
         environment_spans=tuple(environment.spans),
-        candidate_economics=_combine_economics(model.economics),
-        sandbox_economics=_combine_economics(environment.economics),
+        candidate_economics=combine_economics(model.economics),
+        sandbox_economics=combine_economics(environment.economics),
         limit_stop_reason=model.limit_stop_reason or environment.limit_stop_reason,
         limit_failure=model.limit_failure or environment.limit_failure,
     )
@@ -704,52 +704,6 @@ def _with_observed_latency(
                 provenance="observed",
             )
         }
-    )
-
-
-def _combine_economics(records: Sequence[OperationEconomics]) -> OperationEconomics:
-    """Aggregate only measurements actually present on every recorded operation."""
-    if not records:
-        return OperationEconomics()
-    usages = tuple(record.usage for record in records)
-    usage = None if any(item is None for item in usages) else _sum_usage(usages)
-    costs = tuple(record.cost_usd for record in records)
-    latencies = tuple(record.latency_seconds for record in records)
-    return OperationEconomics(
-        usage=usage,
-        cost_usd=_sum_measurements(costs),
-        latency_seconds=_sum_measurements(latencies),
-    )
-
-
-def _sum_usage(values: Sequence[Usage | None]) -> Usage:
-    """Sum complete provider usage without manufacturing missing cache counts."""
-    present = tuple(value for value in values if value is not None)
-    cached = tuple(value.cached_input_tokens for value in present)
-    cached_total = (
-        None
-        if any(value is None for value in cached)
-        else sum(value for value in cached if value is not None)
-    )
-    return Usage(
-        input_tokens=sum(value.input_tokens for value in present),
-        output_tokens=sum(value.output_tokens for value in present),
-        cached_input_tokens=cached_total,
-    )
-
-
-def _sum_measurements(
-    values: Sequence[NumericMeasurement | None],
-) -> NumericMeasurement | None:
-    """Sum a complete measurement series while retaining its weakest provenance."""
-    if any(value is None for value in values):
-        return None
-    present = tuple(value for value in values if value is not None)
-    return NumericMeasurement(
-        value=sum(value.value for value in present),
-        provenance=(
-            "observed" if all(value.provenance == "observed" for value in present) else "estimated"
-        ),
     )
 
 

@@ -13,7 +13,6 @@ import pytest
 from wmo.runtime.environments import sandbox_ledger as ledger_module
 from wmo.runtime.environments.sandbox_ledger import (
     SandboxLedger,
-    prune_released_files,
     read_ledger_files,
 )
 
@@ -33,11 +32,6 @@ def _clock(start: datetime | None = None) -> Callable[[], datetime]:
 
 def _ledger(directory: Path, *, pid: int = 4242) -> SandboxLedger:
     return SandboxLedger(directory, pid=pid, now=_clock())
-
-
-def _dead(_pid: int) -> bool:
-    """Liveness stub: the owning process is gone, so its released file may be pruned."""
-    return False
 
 
 def test_create_appends_a_record_named_by_owning_pid(tmp_path: Path) -> None:
@@ -74,7 +68,9 @@ def test_created_and_released_records_are_fsynced(
     assert len(calls) == 2
 
 
-def test_release_marks_the_record_and_a_fully_released_file_is_pruned(tmp_path: Path) -> None:
+def test_release_marks_held_ids_and_fully_released_state(tmp_path: Path) -> None:
+    """Release records drop held IDs and mark a file fully released without deleting it."""
+
     state_directory = tmp_path / "state"
     ledger = _ledger(state_directory)
     ledger.record_created(sandbox_id="ix1", template_id="tpl", trial_name="t1")
@@ -86,26 +82,11 @@ def test_release_marks_the_record_and_a_fully_released_file_is_pruned(tmp_path: 
     assert held_file.released_ids == ("ix1",)
     assert held_file.fully_released is False
     assert held_file.owner_pid == 4242
-    assert prune_released_files(state_directory, owner_alive=_dead) == ()
 
     ledger.record_released("ix2")
     [empty_file] = read_ledger_files(state_directory)
     assert empty_file.held == ()
     assert empty_file.fully_released is True
-
-    assert prune_released_files(state_directory, owner_alive=_dead) == (ledger.path,)
-    assert not ledger.path.exists()
-    assert read_ledger_files(state_directory) == ()
-
-
-def test_a_live_owners_released_file_is_kept(tmp_path: Path) -> None:
-    """The owner can append a new create at any moment; deleting under it would lose that id."""
-    state_directory = tmp_path / "state"
-    ledger = _ledger(state_directory)
-    ledger.record_created(sandbox_id="ix1", template_id="tpl")
-    ledger.record_released("ix1")
-
-    assert prune_released_files(state_directory, owner_alive=lambda _pid: True) == ()
     assert ledger.path.exists()
 
 
@@ -145,4 +126,3 @@ def test_a_ledger_write_failure_is_logged_and_never_raises(
 
 def test_read_ledger_files_tolerates_a_missing_directory(tmp_path: Path) -> None:
     assert read_ledger_files(tmp_path / "absent") == ()
-    assert prune_released_files(tmp_path / "absent") == ()

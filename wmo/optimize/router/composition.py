@@ -8,7 +8,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Literal, Protocol
 
 from pydantic import Field, field_validator
@@ -86,8 +85,7 @@ from wmo.optimize.router.judgment_budget import (
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime
 from wmo.simulation.build import ProjectBuild
-from wmo.simulation.ingest.otlp import TraceNormalizationResult, load_otlp_file
-from wmo.simulation.ingest.posthog import load_posthog_file
+from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
 
@@ -156,24 +154,6 @@ class TraceSource(Protocol):
         Returns:
             Canonical normalized traces and any rejected-source issues.
         """
-
-
-@dataclass(frozen=True)
-class LocalTraceSource:
-    """One explicit canonical local trace export selected by path and format."""
-
-    path: Path
-    source: Literal["otlp", "posthog"] = "otlp"
-
-    def load(self) -> TraceNormalizationResult:
-        """Read and normalize this local file through its selected canonical loader.
-
-        Returns:
-            Canonical normalized traces and any rejected-source issues.
-        """
-        if self.source == "otlp":
-            return load_otlp_file(self.path)
-        return load_posthog_file(self.path)
 
 
 class ReviewSupplier(Protocol):

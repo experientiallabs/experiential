@@ -27,7 +27,7 @@ from wmo.common.models import (
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
-    Usage,
+    combine_economics,
     completion_request_cost_usd,
     reconcile_completion_economics,
     verify_completion_reservation,
@@ -463,29 +463,6 @@ class RecordingCandidateClient:
         return candidate_response
 
 
-def combine_economics(records: Sequence[OperationEconomics]) -> OperationEconomics:
-    """Aggregate same-role calls without representing a partial total as complete.
-
-    Args:
-        records: Economics for all calls made by one named role in one episode.
-
-    Returns:
-        One economics value. Usage is summed when present. Cost and latency are summed only when
-        every call exposed that measurement, preserving a clear unknown rather than a partial sum.
-    """
-    if not records:
-        return OperationEconomics()
-    usages = [record.usage for record in records]
-    usage = None
-    if any(item is not None for item in usages):
-        usage = _combine_usage(tuple(item for item in usages if item is not None))
-    return OperationEconomics(
-        usage=usage,
-        cost_usd=_combine_measurement(tuple(record.cost_usd for record in records)),
-        latency_seconds=_combine_measurement(tuple(record.latency_seconds for record in records)),
-    )
-
-
 def _require_query_budget(
     *,
     candidate_responses: Sequence[ModelResponse],
@@ -828,38 +805,6 @@ def _model_span(
         model=response.model,
         usage=response.economics.usage,
     )
-
-
-def _combine_usage(records: Sequence[Usage]) -> Usage:
-    """Return a typed usage sum after callers excluded absent usage values."""
-    if not records:  # pragma: no cover - callers guard this before reaching the helper
-        raise ValueError("at least one usage record is required")
-    cached = tuple(item.cached_input_tokens for item in records)
-    cached_input_tokens: int | None
-    if all(item is not None for item in cached):
-        cached_input_tokens = sum(cast(int, item) for item in cached)
-    else:
-        cached_input_tokens = None
-    return Usage(
-        input_tokens=sum(item.input_tokens for item in records),
-        output_tokens=sum(item.output_tokens for item in records),
-        cached_input_tokens=cached_input_tokens,
-    )
-
-
-def _combine_measurement(
-    records: Sequence[NumericMeasurement | None],
-) -> NumericMeasurement | None:
-    """Sum a measurement only when every call provided a compatible finite value."""
-    if any(record is None for record in records):
-        return None
-    measurements = tuple(cast(NumericMeasurement, record) for record in records)
-    values = tuple(item.value for item in measurements)
-    if not all(math.isfinite(value) for value in values):  # pragma: no cover - contract rejects it
-        return None
-    all_observed = all(item.provenance == "observed" for item in measurements)
-    provenance = "observed" if all_observed else "estimated"
-    return NumericMeasurement(value=sum(values), provenance=provenance)
 
 
 def _text_failure(

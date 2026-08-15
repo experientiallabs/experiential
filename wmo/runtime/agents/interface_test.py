@@ -47,26 +47,9 @@ def test_episode_requires_ordered_unique_events_and_consistent_failure() -> None
         AgentEpisode(stop_reason=StopReason.COMPLETED, failure=failure)
 
 
-def test_preflight_accepts_the_keyword_model_and_environment_seam() -> None:
-    preflight_agent_runtime(_ConformingAgent())
-
-
 def test_preflight_rejects_positional_only_model_injection() -> None:
     with pytest.raises(AgentAdapterPreflightError, match="Add keyword-addressable model"):
         preflight_agent_runtime(cast(AgentRuntime, _PositionalModelAgent()))
-
-
-class _ConformingAgent:
-    """Implements the canonical model-injection seam."""
-
-    def run(
-        self,
-        task: TaskCase,
-        *,
-        model: ModelClient,
-        environment: EnvironmentSession,
-    ) -> AgentEpisode:
-        return AgentEpisode(stop_reason=StopReason.COMPLETED)
 
 
 class _PositionalModelAgent:

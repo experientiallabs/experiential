@@ -27,6 +27,7 @@ from wmo.common.models.model import (
     ToolCall,
     ToolChoice,
     Usage,
+    combine_economics,
 )
 from wmo.common.models.pricing import (
     CandidateTokenPrice,
@@ -51,7 +52,6 @@ from wmo.common.models.router_candidates import (
     verify_router_candidate_catalog_state,
 )
 from wmo.common.models.setup import (
-    EMPTY_CATALOG_SHA256,
     ProviderConnection,
     ProviderModelSelection,
     ProviderSetup,
@@ -69,7 +69,6 @@ __all__ = [
     "EmbeddingClient",
     "EmbeddingCostReservation",
     "IdempotentModelClient",
-    "EMPTY_CATALOG_SHA256",
     "ModelCatalog",
     "ModelCatalogError",
     "ModelAlias",
@@ -97,6 +96,7 @@ __all__ = [
     "ToolChoice",
     "Usage",
     "catalog_state_sha256",
+    "combine_economics",
     "completion_candidate_aliases",
     "completion_cost_reservation",
     "completion_request_cost_usd",

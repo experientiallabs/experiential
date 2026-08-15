@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pydantic import JsonValue
 
 from wmo.common.core.artifacts import JsonObject
+from wmo.simulation.ingest.json_strict import DuplicateJsonKeyError, reject_duplicate_json_keys
 
 _TRACE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _ACTION_KEY_ORDER = (
@@ -42,10 +43,6 @@ _RESULT_NAME = "execute_tool terminal"
 _BENCHMARK = "terminal-tasks"
 _MODEL = "terminal-agent"
 _TOOL = "bash"
-
-
-class _DuplicateJsonKeyError(ValueError):
-    """Raised when embedded profile JSON repeats an object key."""
 
 
 def canonicalize_environment_capture_payloads(
@@ -352,9 +349,9 @@ def _first_action_evidence(attributes: dict[str, str]) -> bool:
         return False
     try:
         metadata = json.loads(
-            attributes["wmh.trace.metadata"], object_pairs_hook=_reject_duplicate_json_keys
+            attributes["wmh.trace.metadata"], object_pairs_hook=reject_duplicate_json_keys
         )
-    except (json.JSONDecodeError, _DuplicateJsonKeyError):
+    except (json.JSONDecodeError, DuplicateJsonKeyError):
         return False
     return (
         isinstance(metadata, dict)
@@ -376,8 +373,8 @@ def _command_arguments(value: str) -> bool:
         Whether the decoded object contains only one nonempty command string.
     """
     try:
-        decoded = json.loads(value, object_pairs_hook=_reject_duplicate_json_keys)
-    except (json.JSONDecodeError, _DuplicateJsonKeyError):
+        decoded = json.loads(value, object_pairs_hook=reject_duplicate_json_keys)
+    except (json.JSONDecodeError, DuplicateJsonKeyError):
         return False
     return (
         isinstance(decoded, dict)
@@ -385,26 +382,6 @@ def _command_arguments(value: str) -> bool:
         and isinstance(decoded.get("command"), str)
         and bool(decoded["command"].strip())
     )
-
-
-def _reject_duplicate_json_keys(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
-    """Decode one embedded JSON object while rejecting repeated keys.
-
-    Args:
-        pairs: Object members in source order.
-
-    Returns:
-        Decoded object with unique keys.
-
-    Raises:
-        _DuplicateJsonKeyError: A key occurs more than once in the object.
-    """
-    result: JsonObject = {}
-    for key, value in pairs:
-        if key in result:
-            raise _DuplicateJsonKeyError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
 
 
 def _exact_timestamps(span: JsonObject, start: int, end: int) -> bool:
