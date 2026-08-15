@@ -6,7 +6,9 @@ import json
 from collections.abc import Sequence
 from dataclasses import replace
 
+import psycopg
 import pytest
+from psycopg import sql
 
 from wmo.simulation.ingest import postgres as postgres_module
 from wmo.simulation.ingest.postgres import (
@@ -245,3 +247,101 @@ def test_psycopg_row_reader_requires_a_connection_string(
 
     with pytest.raises(PostgresSourceError, match="connection string"):
         PsycopgRowReader().read_rows(config)
+
+
+class _CapturedQuery:
+    """Holds the single statement composed by the driver-backed reader."""
+
+    def __init__(self) -> None:
+        """Start with no captured statement."""
+        self.statement: str | None = None
+
+
+class _FakeCursor:
+    """Records one executed statement and returns no rows."""
+
+    def __init__(self, captured: _CapturedQuery) -> None:
+        """Bind the shared capture.
+
+        Args:
+            captured: Capture shared with the test.
+        """
+        self._captured = captured
+
+    def __enter__(self) -> _FakeCursor:
+        """Return this cursor for the caller's context block."""
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Leave the cursor context without suppressing an exception."""
+        return None
+
+    def execute(self, query: sql.Composable, parameters: Sequence[str]) -> None:
+        """Capture the composed statement.
+
+        Args:
+            query: Composed statement.
+            parameters: Bound query parameters.
+        """
+        self._captured.statement = query.as_string(None)
+
+    def fetchall(self) -> list[Sequence[object]]:
+        """Return no selected rows."""
+        return []
+
+
+class _FakeConnection:
+    """Yields one recording cursor."""
+
+    def __init__(self, captured: _CapturedQuery) -> None:
+        """Bind the shared capture.
+
+        Args:
+            captured: Capture shared with the test.
+        """
+        self._captured = captured
+
+    def __enter__(self) -> _FakeConnection:
+        """Return this connection for the caller's context block."""
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Leave the connection context without suppressing an exception."""
+        return None
+
+    def cursor(self) -> _FakeCursor:
+        """Return the recording cursor."""
+        return _FakeCursor(self._captured)
+
+
+def test_psycopg_row_reader_orders_tied_rows_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rows tied on the order column are broken by trace identity and payload text."""
+    captured = _CapturedQuery()
+
+    def _connect(dsn: str, *, connect_timeout: int) -> _FakeConnection:
+        """Return the recording connection.
+
+        Args:
+            dsn: Requested connection string.
+            connect_timeout: Requested connection timeout.
+
+        Returns:
+            The recording connection.
+        """
+        return _FakeConnection(captured)
+
+    monkeypatch.setattr(psycopg, "connect", _connect)
+    config = replace(
+        _CHAT_CONFIG,
+        dsn="postgresql://localhost/wmo",
+        trace_id_column="trace_id",
+        order_column="created_at",
+    )
+
+    assert PsycopgRowReader().read_rows(config) == ()
+    assert captured.statement is not None
+    assert captured.statement.endswith(
+        'ORDER BY "created_at", "trace_id", "payload"::text',
+    )

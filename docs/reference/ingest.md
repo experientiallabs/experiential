@@ -27,6 +27,16 @@ without a provider stays as `gen_ai.request.model` evidence and is never complet
 Tool results pair with tool calls by explicit call identifier, falling back to tool name and source
 order only when the export declares no identifier.
 
+A Python caller reaches the same seam by name instead of importing one loader per vendor:
+
+```python
+from wmo.simulation.ingest import CANONICAL_TRACE_SOURCES, load_trace_source
+
+result = load_trace_source("langfuse", Path("export.jsonl"))
+```
+
+The source table is explicit, so an undeclared name fails closed rather than being detected.
+
 ## Postgres tables
 
 `--source postgres` takes a local JSON declaration instead of an export, so a checked-in
@@ -49,7 +59,9 @@ table and column names accept only plain identifiers, and dynamic names reach SQ
 identifiers. `row_shape` is `document` when one row holds one whole trace payload, or `message`
 when one row holds one chat message; message rows require `chat-json` and a `trace_id_column`, and
 a row with no declared trace identity becomes an explicit issue instead of a guessed conversation.
-`since` requires `order_column`. The driver is optional: install it with
+`since` requires `order_column`, and rows tied on it are ordered by trace identity and payload text
+so equal timestamps cannot reorder a conversation between builds. The driver is optional: install
+it with
 `uv sync --extra postgres` or `world-model-optimizer[postgres]`. A Python caller may inject its own
 row reader through `load_postgres_source(config, reader=...)` and keep its existing pool.
 

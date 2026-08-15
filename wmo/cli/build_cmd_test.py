@@ -1245,7 +1245,7 @@ def test_build_rejects_an_undeclared_trace_source(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 2
-    assert "unsupported --source 'helicone'" in unstyle(result.output)
+    assert "unsupported trace source 'helicone'" in unstyle(result.output)
     assert "postgres" in unstyle(result.output)
 
 
@@ -1270,4 +1270,4 @@ def test_build_reports_an_invalid_postgres_source_declaration(tmp_path: Path) ->
     )
 
     assert result.exit_code == 2
-    assert "postgres trace normalization failed" in unstyle(result.output)
+    assert "postgres normalization failed" in unstyle(result.output)

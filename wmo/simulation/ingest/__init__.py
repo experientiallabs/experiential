@@ -37,9 +37,15 @@ from wmo.simulation.ingest.posthog import (
     normalize_posthog_payload,
     pull_posthog_traces,
 )
+from wmo.simulation.ingest.sources import (
+    CANONICAL_TRACE_SOURCES,
+    TraceSourceError,
+    load_trace_source,
+)
 from wmo.simulation.ingest.vendor_records import VendorTraceFormatError
 
 __all__ = [
+    "CANONICAL_TRACE_SOURCES",
     "GENAI_SEMANTIC_CONVENTION_VERSION",
     "OtlpTraceFormatError",
     "PersistedTraceDataset",
@@ -53,6 +59,7 @@ __all__ = [
     "PostgresSourceError",
     "TraceNormalizationIssue",
     "TraceNormalizationResult",
+    "TraceSourceError",
     "VendorTraceFormatError",
     "load_braintrust_file",
     "load_chat_json_file",
@@ -64,6 +71,7 @@ __all__ = [
     "load_phoenix_file",
     "load_postgres_source",
     "load_posthog_file",
+    "load_trace_source",
     "normalize_braintrust_payloads",
     "normalize_chat_json_payloads",
     "normalize_langfuse_payloads",

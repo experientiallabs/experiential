@@ -345,7 +345,9 @@ class PsycopgRowReader:
             config: Explicit Postgres trace source.
 
         Returns:
-            Selected rows in ``order_column`` order when the source declares one.
+            Selected rows in ``order_column`` order when the source declares one. Rows tied on the
+            order column are broken by the trace identity and then by the payload text, so equal
+            timestamps cannot reorder a conversation between builds.
 
         Raises:
             PostgresSourceError: The driver, connection string, table, or a column is unusable.
@@ -369,7 +371,11 @@ class PsycopgRowReader:
             if config.since is not None:
                 query += sql.SQL(" WHERE {} >= %s").format(sql.Identifier(config.order_column))
                 parameters = (config.since,)
-            query += sql.SQL(" ORDER BY {}").format(sql.Identifier(config.order_column))
+            order_terms: list[sql.Composable] = [sql.Identifier(config.order_column)]
+            if config.trace_id_column is not None:
+                order_terms.append(sql.Identifier(config.trace_id_column))
+            order_terms.append(sql.SQL("{}::text").format(sql.Identifier(config.payload_column)))
+            query += sql.SQL(" ORDER BY ") + sql.SQL(", ").join(order_terms)
         try:
             with psycopg.connect(dsn, connect_timeout=10) as connection:
                 with connection.cursor() as cursor:
