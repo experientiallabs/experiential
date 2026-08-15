@@ -10,6 +10,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.prompt import Confirm
 
 from wmo.cli.consent import can_prompt
 from wmo.cli.provider_setup import (
@@ -106,11 +107,13 @@ def build(
 ) -> None:
     """Build a reusable grounded world model and immutable fit evidence.
 
-    The explicit invocation plus ``--max-build-cost-usd`` authorizes embedding work. Model setup
-    runs first when required catalog state is absent and both terminal streams are interactive.
-    The shared catalog commits before project creation. Noninteractive missing state fails before
-    any project or artifact write. Provider credentials are read only after preflight and the
-    cost ceiling pass.
+    The explicit invocation plus ``--max-build-cost-usd`` authorizes embedding work. An
+    interactive terminal sees the preflight, then a ``Proceed`` prompt that names the conservative
+    estimate and defaults to yes. Noninteractive sessions continue automatically when the estimate
+    is within the ceiling. Model setup runs first when required catalog state is absent and both
+    terminal streams are interactive. The shared catalog commits before project creation.
+    Noninteractive missing state fails before any project or artifact write. Provider credentials
+    are read only after preflight, the cost ceiling pass, and any interactive confirmation.
 
     Args:
         project: Safe local project identifier below ``<root>/projects``.
@@ -215,6 +218,9 @@ def build(
                         top_k=top_k,
                     )
                 )
+            if not _confirm_embedding_spend(estimate):
+                _console.print("Build was not started.")
+                return
             resolved_embedder = runtime_catalog.preflight(
                 selected.embedder,
                 CapabilityRequirement(requires_embeddings=True),
@@ -706,6 +712,28 @@ def _rag_transition_count(store: ProjectStore, artifact_id: str) -> int:
         Count of persisted real transitions.
     """
     return load_rag_index(store.artifacts, artifact_id).index.transition_count
+
+
+def _confirm_embedding_spend(estimate: float) -> bool:
+    """Confirm under-ceiling embedding spend after the preflight is visible.
+
+    Interactive sessions ask ``Proceed`` with the conservative estimate and default to yes.
+    Noninteractive sessions treat the explicit ``wmo build`` invocation plus the configured
+    ceiling as authorization and do not prompt.
+
+    Args:
+        estimate: Conservative maximum embedding cost in USD.
+
+    Returns:
+        True when the run should continue, or False when the operator declined.
+    """
+    if not can_prompt(_console):
+        return True
+    prompt = f"Proceed with at most ${estimate:.6f} embedding spend?"
+    try:
+        return Confirm.ask(prompt, default=True, console=_console)
+    except EOFError:
+        return False
 
 
 def _render_preflight(

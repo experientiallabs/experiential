@@ -890,6 +890,7 @@ def _installed_release_driver() -> None:
         ("Use 'core' as the judge?", "y"),
         ("Embedder alias", "core"),
         ("Save this configuration?", "y"),
+        ("Proceed with at most", ""),
     ]
     try:
         assert not root.exists()
@@ -910,7 +911,8 @@ def _installed_release_driver() -> None:
         build_counts = state.counts()
         assert build_counts["/v1/embeddings"] > 0
         assert build_counts["/v1/chat/completions"] == 0
-        assert "Proceed?" not in build_output
+        assert "Proceed with at most $" in build_output
+        assert "embedding spend?" in build_output
         assert "World model:" in build_output
         assert "core-model" in build_output
         assert "Conservative maximum embedding cost:" in build_output

@@ -11,9 +11,11 @@ wmo build support-agent traces.otel.jsonl --source otlp --root .wmo
 
 The command reads the raw file once, persists normalized traces and representative fit and
 held-out tasks, then grounds serving and fit-only retrieval when the conservative embedding
-estimate is within `--max-build-cost-usd`. It records a manifest-bound readiness state with rubric
-proposals pending. It makes no judge or completion calls. `--dry-run` prints the complete
-preflight without credentials or a completed-build selection. Anonymous aggregate PostHog product
+estimate is within `--max-build-cost-usd`. An interactive terminal confirms after the preflight
+with a ``Proceed`` prompt that names the estimate and defaults to yes. It records a
+manifest-bound readiness state with rubric proposals pending. It makes no judge or completion
+calls. `--dry-run` prints the complete preflight without credentials or a completed-build
+selection. Anonymous aggregate PostHog product
 telemetry may send after persistence unless disabled. Repeating the command with identical source
 content and code revision verifies and reuses the exact artifact manifests and payloads.
 

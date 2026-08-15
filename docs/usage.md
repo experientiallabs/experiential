@@ -11,7 +11,9 @@ The root surface is deliberately small:
 | `wmo config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.wmo/settings.toml`. |
 
 `build` authorizes provider embeddings when the conservative estimate is within
-`--max-build-cost-usd`. It makes no judge or completion calls. `--dry-run` prints the complete
+`--max-build-cost-usd`. An interactive terminal confirms after the preflight with a ``Proceed``
+prompt that names the estimate and defaults to yes. Noninteractive sessions continue automatically
+under the ceiling. It makes no judge or completion calls. `--dry-run` prints the complete
 preflight without credentials, provider calls, or a completed-build selection. Successful build,
 router, simulation, and SFT operations preserve anonymous aggregate PostHog product telemetry,
 which may send unless disabled. `optimize router` does not make provider calls. `optimize model`

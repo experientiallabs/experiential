@@ -963,22 +963,50 @@ def test_build_help_describes_the_completed_grounded_artifact() -> None:
 
 
 def _forbid_proceed(prompt: str, **_kwargs: object) -> bool:
-    """Fail if build still reaches the shared spend-consent prompt.
+    """Fail if a path that must not prompt still reaches a confirmation.
 
     Args:
         prompt: Unexpected confirmation question.
 
     Raises:
-        AssertionError: Always, because build must not ask ``Proceed?``.
+        AssertionError: Always, because this path must not ask to proceed.
     """
     raise AssertionError(f"build must not ask {prompt!r}")
 
 
-def test_interactive_build_never_asks_proceed(
+class _RecordedConfirm:
+    """Record one build confirmation and return a scripted answer."""
+
+    def __init__(self, answer: bool) -> None:
+        """Store the scripted answer.
+
+        Args:
+            answer: Value returned by ``ask``.
+        """
+        self.answer = answer
+        self.prompts: list[str] = []
+        self.defaults: list[bool] = []
+
+    def ask(self, prompt: str, *, default: bool = False, **_kwargs: object) -> bool:
+        """Record the prompt and default, then return the scripted answer.
+
+        Args:
+            prompt: Confirmation question shown after preflight.
+            default: Default used when the operator presses Enter.
+
+        Returns:
+            The scripted answer.
+        """
+        self.prompts.append(prompt)
+        self.defaults.append(default)
+        return self.answer
+
+
+def test_interactive_build_asks_proceed_with_cost_and_defaults_to_yes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A terminal session continues automatically when the estimate is under the ceiling.
+    """A terminal session names the estimate and continues when Enter accepts the default.
 
     Args:
         monkeypatch: Pytest patch fixture simulating an interactive session.
@@ -988,15 +1016,85 @@ def test_interactive_build_never_asks_proceed(
     root = tmp_path / ".wmo"
     root.mkdir()
     _catalog(root, embedder_input_usd_per_million=1.0)
+    confirm = _RecordedConfirm(True)
     monkeypatch.setattr(build_command, "can_prompt", lambda _console: True)
-    monkeypatch.setattr("wmo.cli.consent.Confirm.ask", _forbid_proceed)
-    monkeypatch.setattr("rich.prompt.Confirm.ask", _forbid_proceed)
+    monkeypatch.setattr(build_command, "Confirm", confirm)
 
     result = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
 
     assert result.exit_code == 0, result.output
-    assert "Proceed?" not in result.output
+    assert len(confirm.prompts) == 1
+    assert confirm.prompts[0].startswith("Proceed with at most $")
+    assert confirm.prompts[0].endswith(" embedding spend?")
+    assert confirm.defaults == [True]
+    assert "Conservative maximum embedding cost: $" in unstyle(result.output)
     assert ProjectStore(root, "support").load_project().build is not None
+
+
+def test_interactive_build_decline_does_not_publish_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Declining the cost-aware prompt spends nothing and selects no completed build.
+
+    Args:
+        monkeypatch: Pytest patch fixture simulating an interactive decline.
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1.0)
+    confirm = _RecordedConfirm(False)
+    monkeypatch.setattr(build_command, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(build_command, "Confirm", confirm)
+
+    result = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "Build was not started." in result.output
+    assert confirm.defaults == [True]
+    assert _RESOLVE_CALLS == []
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is None
+    assert store.read_review() is None
+
+
+def test_over_ceiling_interactive_fails_before_proceed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An over-ceiling estimate fails before the Proceed prompt or credentials.
+
+    Args:
+        monkeypatch: Pytest patch fixture simulating an interactive session.
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1_000_000.0)
+    confirm = _RecordedConfirm(True)
+    monkeypatch.setattr(build_command, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(build_command, "Confirm", confirm)
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            str(source),
+            "--root",
+            str(root),
+            "--max-build-cost-usd",
+            "0.01",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert confirm.prompts == []
+    assert _RESOLVE_CALLS == []
+    assert ProjectStore(root, "support").load_project().build is None
 
 
 def test_noninteractive_build_runs_under_ceiling_without_yes(tmp_path: Path) -> None:
@@ -1165,7 +1263,8 @@ def test_exact_replay_performs_zero_provider_calls(
     first_build = ProjectStore(root, "support").load_project().build
     assert first_build is not None
     _RESOLVE_CALLS.clear()
-    monkeypatch.setattr("wmo.cli.consent.Confirm.ask", _forbid_proceed)
+    monkeypatch.setattr(build_command, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(build_command.Confirm, "ask", _forbid_proceed)
     monkeypatch.setattr(build_command, "_build_grounded_artifacts", lambda *_a, **_k: None)
 
     replay = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
