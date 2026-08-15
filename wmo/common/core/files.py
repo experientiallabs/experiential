@@ -27,7 +27,7 @@ from uuid import uuid4
 logger = logging.getLogger(__name__)
 
 
-def write_bytes_atomic(path: Path, payload: bytes) -> None:
+def write_bytes_atomic(path: Path, payload: bytes, *, follow_symlinks: bool = True) -> None:
     """Write `payload` to `path` so a reader sees the previous file or the whole new one.
 
     Four properties, each answering a distinct durable-state failure:
@@ -46,6 +46,8 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
     - **The destination's mode is carried over.** `replace` installs a NEW inode, so without this
       a file an operator or an installer had restricted comes back as 0644 on the first write.
     - **A symlinked destination is written THROUGH, not replaced.** See `resolve_write_target`.
+      Pass `follow_symlinks=False` for security-checked pointer files: the rename then replaces a
+      swapped destination symlink itself instead of writing through it.
 
     Cleanup is `BaseException`, not `OSError`: a Ctrl-C between the write and the rename would
     otherwise strand a staging file in an artifact directory that serving and the fitter scan.
@@ -61,7 +63,8 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
             rename, so a raised error always means the write did not land: see
             `fsync_directory_best_effort` for the one step that is deliberately best effort.
     """
-    path = resolve_write_target(path)
+    if follow_symlinks:
+        path = resolve_write_target(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     staging = path.with_name(f".{path.name}.{uuid4().hex}.partial")
     try:

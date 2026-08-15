@@ -275,6 +275,26 @@ def test_write_text_atomic_writes_through_a_symlinked_destination(tmp_path: Path
     assert target.read_text(encoding="utf-8") == "new"
 
 
+def test_write_bytes_atomic_no_follow_replaces_a_swapped_destination_symlink(
+    tmp_path: Path,
+) -> None:
+    """A security-checked pointer file must never write through a link swapped in after the check.
+
+    With `follow_symlinks=False` the rename replaces the LINK itself with a regular file, so the
+    link's target stays untouched and the pointer path holds the payload.
+    """
+    target = tmp_path / "victim.json"
+    target.write_bytes(b"original")
+    pointer = tmp_path / "pointer.json"
+    pointer.symlink_to(target)
+
+    write_bytes_atomic(pointer, b"selection", follow_symlinks=False)
+
+    assert not pointer.is_symlink(), "the swapped symlink survived the pointer write"
+    assert pointer.read_bytes() == b"selection"
+    assert target.read_bytes() == b"original"
+
+
 def test_write_text_atomic_stages_beside_the_symlink_target_not_the_link(tmp_path: Path) -> None:
     """Atomicity depends on this: `replace` across filesystems fails with EXDEV.
 

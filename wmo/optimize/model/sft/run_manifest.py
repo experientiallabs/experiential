@@ -339,7 +339,7 @@ def write_automatic_sft_acceptance_selection_unlocked(
     _require_safe_automatic_acceptance_path(store, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _require_safe_automatic_acceptance_path(store, path)
-    write_bytes_atomic(path, canonical_json_bytes(selection))
+    write_bytes_atomic(path, canonical_json_bytes(selection), follow_symlinks=False)
     stored = load_automatic_sft_acceptance_selection(store)
     if stored is None or stored != selection:
         raise TinkerSFTResumeError("automatic SFT acceptance pointer did not preserve selection")

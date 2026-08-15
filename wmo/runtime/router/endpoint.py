@@ -614,6 +614,21 @@ def _model_request(
     temperature: float | None,
     maximum_output_tokens: int | None,
 ) -> ModelRequest:
+    """Validate one routed chat request and convert it into the provider-neutral ModelRequest.
+
+    Args:
+        messages: Ordered chat transcript from the public request body.
+        tools: Public tool definitions offered to the routed model.
+        tool_choice: Verbatim OpenAI tool-choice value from the request.
+        temperature: Requested sampling temperature, when present.
+        maximum_output_tokens: Requested completion-token ceiling, when present.
+
+    Returns:
+        The provider-neutral request handed to the routed model client.
+
+    Raises:
+        ValueError: No user message carries non-empty content.
+    """
     if not any(message.role == "user" and _content_text(message.content) for message in messages):
         raise ValueError("routed requests require at least one user message with content")
     return ModelRequest(
