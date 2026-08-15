@@ -25,11 +25,14 @@ dependencies = [
 [project.optional-dependencies]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
 sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
+# The Postgres trace source reads rows through the native driver.
+postgres = ["psycopg[binary]>=3.1"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
     "world-model-optimizer[sft]",
+    "world-model-optimizer[postgres]",
 ]
 
 [project.scripts]

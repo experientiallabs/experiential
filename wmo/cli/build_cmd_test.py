@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -941,3 +941,333 @@ def test_build_help_describes_the_completed_grounded_artifact() -> None:
     assert "Build a reusable grounded world model from local trace evidence." in unstyle(
         result.output
     )
+
+
+_TURNS = (
+    ("Support request", "What account email?"),
+    ("customer@example.test", "Reset instructions sent."),
+)
+
+
+def _chat_json_export(tmp_path: Path) -> Path:
+    """Write one two-turn chat JSON conversation export.
+
+    Args:
+        tmp_path: Temporary directory receiving the trace export.
+
+    Returns:
+        Path to the completed chat JSON export.
+    """
+    messages: list[JsonValue] = []
+    for request, completion in _TURNS:
+        messages.append({"role": "user", "content": request})
+        messages.append({"role": "assistant", "content": completion})
+    path = tmp_path / "chat.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "trace_id": "conversation-1",
+                    "provider": "openai",
+                    "model": "gpt-test",
+                    "messages": messages,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _history(turn: int) -> list[JsonValue]:
+    """Return the visible request history observed by one conversation turn.
+
+    Args:
+        turn: Zero-based turn index.
+
+    Returns:
+        Messages the model saw for that turn.
+    """
+    messages: list[JsonValue] = []
+    for index in range(turn):
+        request, completion = _TURNS[index]
+        messages.append({"role": "user", "content": request})
+        messages.append({"role": "assistant", "content": completion})
+    messages.append({"role": "user", "content": _TURNS[turn][0]})
+    return messages
+
+
+def _langfuse_export(tmp_path: Path) -> Path:
+    """Write one two-turn Langfuse trace export.
+
+    Args:
+        tmp_path: Temporary directory receiving the trace export.
+
+    Returns:
+        Path to the completed Langfuse export.
+    """
+    observations: list[JsonValue] = [
+        {
+            "id": f"obs-{turn}",
+            "traceId": "trace-1",
+            "type": "GENERATION",
+            "name": "answer",
+            "startTime": f"2026-02-01T00:00:0{turn * 2}Z",
+            "endTime": f"2026-02-01T00:00:0{turn * 2 + 1}Z",
+            "model": "gpt-test",
+            "input": _history(turn),
+            "output": {"role": "assistant", "content": _TURNS[turn][1]},
+        }
+        for turn in range(len(_TURNS))
+    ]
+    path = tmp_path / "langfuse.json"
+    path.write_text(
+        json.dumps(
+            {
+                "id": "trace-1",
+                "timestamp": "2026-02-01T00:00:00Z",
+                "input": {"messages": [{"role": "user", "content": _TURNS[0][0]}]},
+                "metadata": {"provider": "openai"},
+                "observations": observations,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _langsmith_export(tmp_path: Path) -> Path:
+    """Write one two-turn LangSmith run export.
+
+    Args:
+        tmp_path: Temporary directory receiving the trace export.
+
+    Returns:
+        Path to the completed LangSmith export.
+    """
+    runs: list[JsonValue] = [
+        {
+            "id": f"run-{turn}",
+            "trace_id": "trace-1",
+            "run_type": "llm",
+            "name": "ChatOpenAI",
+            "start_time": f"2026-03-01T00:00:0{turn * 2}Z",
+            "end_time": f"2026-03-01T00:00:0{turn * 2 + 1}Z",
+            "inputs": {"messages": _history(turn)},
+            "outputs": {"generations": [[{"text": _TURNS[turn][1]}]]},
+            "extra": {"metadata": {"ls_provider": "openai", "ls_model_name": "gpt-test"}},
+        }
+        for turn in range(len(_TURNS))
+    ]
+    path = tmp_path / "langsmith.json"
+    path.write_text(json.dumps({"runs": runs}), encoding="utf-8")
+    return path
+
+
+def _braintrust_export(tmp_path: Path) -> Path:
+    """Write one two-turn Braintrust log export.
+
+    Args:
+        tmp_path: Temporary directory receiving the trace export.
+
+    Returns:
+        Path to the completed Braintrust export.
+    """
+    rows: list[JsonValue] = [
+        {
+            "id": f"row-{turn}",
+            "span_id": f"span-{turn}",
+            "root_span_id": "root-1",
+            "span_attributes": {"type": "llm", "name": "chat"},
+            "metrics": {
+                "start": 1_772_000_000.0 + turn * 2,
+                "end": 1_772_000_001.0 + turn * 2,
+            },
+            "metadata": {"provider": "openai", "model": "gpt-test"},
+            "input": _history(turn),
+            "output": {"role": "assistant", "content": _TURNS[turn][1]},
+        }
+        for turn in range(len(_TURNS))
+    ]
+    path = tmp_path / "braintrust.json"
+    path.write_text(json.dumps({"events": rows}), encoding="utf-8")
+    return path
+
+
+def _mastra_export(tmp_path: Path) -> Path:
+    """Write one two-turn Mastra span export.
+
+    Args:
+        tmp_path: Temporary directory receiving the trace export.
+
+    Returns:
+        Path to the completed Mastra export.
+    """
+    spans: list[JsonValue] = [
+        {
+            "traceId": "trace-1",
+            "id": f"span-{turn}",
+            "type": "model_generation",
+            "name": "generate",
+            "startTime": f"2026-04-01T00:00:0{turn * 2}Z",
+            "endTime": f"2026-04-01T00:00:0{turn * 2 + 1}Z",
+            "attributes": {"provider": "openai", "model": "gpt-test"},
+            "input": {"messages": _history(turn)},
+            "output": {"text": _TURNS[turn][1]},
+        }
+        for turn in range(len(_TURNS))
+    ]
+    path = tmp_path / "mastra.json"
+    path.write_text(json.dumps({"spans": spans}), encoding="utf-8")
+    return path
+
+
+def _phoenix_export(tmp_path: Path) -> Path:
+    """Write one two-turn Phoenix span export.
+
+    Args:
+        tmp_path: Temporary directory receiving the trace export.
+
+    Returns:
+        Path to the completed Phoenix export.
+    """
+    spans: list[JsonValue] = [
+        {
+            "context": {"trace_id": "trace-1", "span_id": f"span-{turn}"},
+            "name": "ChatCompletion",
+            "start_time": f"2026-05-01T00:00:0{turn * 2}Z",
+            "end_time": f"2026-05-01T00:00:0{turn * 2 + 1}Z",
+            "attributes": {
+                "openinference": {"span": {"kind": "LLM"}},
+                "llm": {
+                    "provider": "openai",
+                    "model_name": "gpt-test",
+                    "input_messages": [{"message": message} for message in _history(turn)],
+                    "output_messages": [
+                        {"message": {"role": "assistant", "content": _TURNS[turn][1]}}
+                    ],
+                },
+            },
+        }
+        for turn in range(len(_TURNS))
+    ]
+    path = tmp_path / "phoenix.json"
+    path.write_text(json.dumps(spans), encoding="utf-8")
+    return path
+
+
+def _otel_genai_export(tmp_path: Path) -> Path:
+    """Write one two-turn exported OpenTelemetry GenAI span corpus.
+
+    Args:
+        tmp_path: Temporary directory receiving the trace export.
+
+    Returns:
+        Path to the completed GenAI span export.
+    """
+    spans: list[JsonValue] = [
+        {
+            "trace_id": "9" * 32,
+            "span_id": f"{turn + 1:016x}",
+            "name": "agent.model_call",
+            "start_time": f"2026-06-01T00:00:0{turn * 2}Z",
+            "end_time": f"2026-06-01T00:00:0{turn * 2 + 1}Z",
+            "attributes": {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.provider.name": "openai",
+                "gen_ai.request.model": "gpt-test",
+                "gen_ai.input.messages": json.dumps(_history(turn)),
+                "gen_ai.output.messages": json.dumps(
+                    [{"role": "assistant", "content": _TURNS[turn][1]}]
+                ),
+            },
+        }
+        for turn in range(len(_TURNS))
+    ]
+    path = tmp_path / "otel-genai.json"
+    path.write_text(json.dumps(spans), encoding="utf-8")
+    return path
+
+
+_VENDOR_EXPORTS: dict[str, Callable[[Path], Path]] = {
+    "braintrust": _braintrust_export,
+    "chat-json": _chat_json_export,
+    "langfuse": _langfuse_export,
+    "langsmith": _langsmith_export,
+    "mastra": _mastra_export,
+    "otel-genai": _otel_genai_export,
+    "phoenix": _phoenix_export,
+}
+
+
+@pytest.mark.parametrize("source", sorted(_VENDOR_EXPORTS))
+def test_build_accepts_every_declared_vendor_source(source: str, tmp_path: Path) -> None:
+    """Each declared vendor export completes the positional build path.
+
+    Args:
+        source: Declared canonical source format.
+        tmp_path: Temporary project and trace root.
+    """
+    export = _VENDOR_EXPORTS[source](tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", str(export), "--source", source, "--root", str(root)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "built 1 accepted, 0 invalid" in result.output
+    store = ProjectStore(root, "support")
+    config = store.load_project()
+    assert config.build is not None
+    traces = load_trace_dataset(store.artifacts, config.build.trace_dataset.artifact_id)
+    assert len(traces.traces) == 1
+    assert traces.traces[0].source.identity.source_id.startswith(f"{source}:")
+
+
+def test_build_rejects_an_undeclared_trace_source(tmp_path: Path) -> None:
+    """An unknown source names every supported canonical format.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
+    export = _chat_json_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", str(export), "--source", "helicone", "--root", str(root)],
+    )
+
+    assert result.exit_code == 2
+    assert "unsupported --source 'helicone'" in unstyle(result.output)
+    assert "postgres" in unstyle(result.output)
+
+
+def test_build_reports_an_invalid_postgres_source_declaration(tmp_path: Path) -> None:
+    """The postgres source reads a validated local table declaration.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
+    declaration = tmp_path / "postgres.json"
+    declaration.write_text(
+        json.dumps({"table": "traces; drop table users", "payload_format": "chat-json"}),
+        encoding="utf-8",
+    )
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", str(declaration), "--source", "postgres", "--root", str(root)],
+    )
+
+    assert result.exit_code == 2
+    assert "postgres trace normalization failed" in unstyle(result.output)
