@@ -1,45 +1,53 @@
-"""Concise provider and model setup shared by configuration and first build."""
+"""Provider and model setup shared by configuration and first build.
+
+Interactive setup runs the provider and model picker in ``provider_picker``: providers, missing
+credentials, models, roles, and one confirmation. Automation supplies the same catalog update as
+repeatable JSON. Both paths end in one conflict-checked atomic ``models.toml`` write.
+"""
 
 from __future__ import annotations
 
 import json
 import os
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
 import typer
 from pydantic import ValidationError
 from rich.console import Console
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import Confirm
 
+from wmo.cli.model_picker import (
+    assign_roles,
+    available_models,
+    build_result,
+    configured_models,
+    render_summary,
+    select_models,
+)
+from wmo.cli.provider_picker import (
+    CREDENTIAL_NOTE,
+    ProviderSetupResult,
+    SetupCancelled,
+    SetupRoleInputs,
+    SetupSession,
+    prepare_providers,
+    select_providers,
+)
 from wmo.common.models import (
     ModelCatalog,
     ProviderConnection,
     ProviderModelSelection,
     ProviderSetup,
+    RouterCandidateSelection,
     catalog_state_sha256,
     configure_provider_catalog,
+    configure_router_candidates,
     load_model_catalog,
 )
-
-_NATIVE_PROVIDERS = ("openai", "openrouter", "anthropic", "gemini", "azure", "bedrock")
-_PROVIDER_LABELS = {
-    "openai": "OpenAI",
-    "openrouter": "OpenRouter",
-    "anthropic": "Anthropic",
-    "gemini": "Gemini",
-    "azure": "Azure",
-    "bedrock": "Bedrock",
-    "openai-compatible": "OpenAI-compatible",
-}
-_CREDENTIAL_ENV_SUGGESTIONS = {
-    "openai": "OPENAI_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-    "azure": "AZURE_OPENAI_API_KEY",
-    "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
-}
+from wmo.common.models.setup import SETUP_PROVIDERS
+from wmo.runtime.models.providers import HttpProviderModelLister, ProviderModelLister
 
 
 @dataclass(frozen=True)
@@ -60,6 +68,7 @@ def run_provider_setup(
     non_interactive: bool,
     replace: bool,
     console: Console,
+    lister: ProviderModelLister | None = None,
 ) -> ModelCatalog:
     """Collect a complete catalog update before one conflict-checked atomic write.
 
@@ -69,6 +78,7 @@ def run_provider_setup(
         non_interactive: Whether absent values must be reported instead of prompted.
         replace: Whether conflicting collected entries may replace unprotected catalog state.
         console: Rich console used for prompts, summaries, and guidance.
+        lister: Provider listing seam, injected by tests so no live request is made.
 
     Returns:
         The complete catalog committed after final confirmation.
@@ -80,19 +90,186 @@ def run_provider_setup(
     path = root / "models.toml"
     starting_digest = catalog_state_sha256(path)
     existing = load_model_catalog(path) if path.exists() else None
-    try:
-        setup = (
-            _noninteractive_setup(options, existing=existing)
-            if non_interactive
-            else _interactive_setup(options, existing=existing, console=console)
+    if non_interactive:
+        try:
+            setup = _noninteractive_setup(options, existing=existing)
+        except (EOFError, KeyboardInterrupt):
+            raise typer.Abort() from None
+        return configure_provider_catalog(
+            path,
+            setup,
+            replace=replace,
+            expected_state_sha256=starting_digest,
         )
-    except (EOFError, KeyboardInterrupt):
-        raise typer.Abort() from None
-    return configure_provider_catalog(
+    result = _interactive_setup(
+        existing_connections=_existing_connections(existing),
+        existing_models=_existing_models(existing),
+        role_inputs=_role_inputs(options, existing=existing),
+        console=console,
+        lister=lister if lister is not None else HttpProviderModelLister(),
+        environment=os.environ,
+    )
+    if result is None:
+        raise typer.Abort()
+    return _commit(path, result, replace=replace, expected_state_sha256=starting_digest)
+
+
+def _interactive_setup(
+    *,
+    existing_connections: tuple[ProviderConnection, ...],
+    existing_models: tuple[ProviderModelSelection, ...],
+    role_inputs: SetupRoleInputs,
+    console: Console,
+    lister: ProviderModelLister,
+    environment: MutableMapping[str, str],
+) -> ProviderSetupResult | None:
+    """Collect one complete catalog update from the provider and model picker.
+
+    Args:
+        existing_connections: Secret-free connections already configured in the catalog.
+        existing_models: Model aliases already configured in the catalog.
+        role_inputs: Role values supplied by flags or already persisted.
+        console: Terminal used for every screen.
+        lister: Provider listing seam, injected by tests so no live request is made.
+        environment: Process environment consulted and updated for pasted credentials.
+
+    Returns:
+        The confirmed setup, or ``None`` when the user cancelled or declined to save.
+    """
+    console.print("[bold]Model setup[/bold]")
+    console.print(f"[dim]{CREDENTIAL_NOTE}[/dim]")
+    configured = configured_models(existing_models, existing_connections=existing_connections)
+    session = SetupSession(selected=tuple(model.alias for model in configured))
+    try:
+        while True:
+            selection = select_providers(session, console=console, environment=environment)
+            if selection is None:
+                return None
+            session.providers, session.advanced_credentials, session.advanced_models = selection
+            prepared = prepare_providers(
+                session,
+                existing_connections=existing_connections,
+                existing_aliases=tuple(model.alias for model in existing_models),
+                console=console,
+                lister=lister,
+                environment=environment,
+            )
+            if prepared is None:
+                continue
+            session.endpoints, discovered = prepared
+            session.available = (*configured, *discovered)
+            result = _collect_models_and_roles(
+                session,
+                existing_connections=existing_connections,
+                existing_models=existing_models,
+                role_inputs=role_inputs,
+                console=console,
+            )
+            if result is not None:
+                return result
+    except SetupCancelled:
+        console.print("Setup cancelled. Nothing was written.")
+        return None
+
+
+def _collect_models_and_roles(
+    session: SetupSession,
+    *,
+    existing_connections: tuple[ProviderConnection, ...],
+    existing_models: tuple[ProviderModelSelection, ...],
+    role_inputs: SetupRoleInputs,
+    console: Console,
+) -> ProviderSetupResult | None:
+    """Run the model, role, and confirmation screens for one prepared provider set.
+
+    Args:
+        session: Answers already collected in this setup session.
+        existing_connections: Connections already configured in the catalog.
+        existing_models: Model aliases already configured in the catalog.
+        role_inputs: Role values supplied by flags or already persisted.
+        console: Terminal used for every screen.
+
+    Returns:
+        The confirmed result, or ``None`` when the user asked to change providers.
+
+    Raises:
+        SetupCancelled: The user cancelled setup or declined to save.
+    """
+    while True:
+        selected = select_models(session, console=console)
+        if selected is None:
+            return None
+        session.selected = selected
+        chosen = tuple(item for item in available_models(session) if item.alias in selected)
+        roles = assign_roles(chosen, role_inputs=role_inputs, console=console)
+        if roles is None:
+            continue
+        result = build_result(
+            chosen,
+            roles=roles,
+            endpoints=session.endpoints,
+            existing_connections=existing_connections,
+            existing_models=existing_models,
+        )
+        render_summary(result, chosen=chosen, endpoints=session.endpoints, console=console)
+        if not Confirm.ask("Save this configuration?", default=True, console=console):
+            raise SetupCancelled
+        return result
+
+
+def _commit(
+    path: Path,
+    result: ProviderSetupResult,
+    *,
+    replace: bool,
+    expected_state_sha256: str | None,
+) -> ModelCatalog:
+    """Write the confirmed setup, then assign any confirmed router candidate roles.
+
+    Args:
+        path: Shared ``models.toml`` path.
+        result: Confirmed setup and optional router roles.
+        replace: Whether conflicting collected entries may replace unprotected catalog state.
+        expected_state_sha256: Catalog digest captured before collection began.
+
+    Returns:
+        The complete catalog after every confirmed role is committed.
+    """
+    catalog = configure_provider_catalog(
         path,
-        setup,
+        result.setup,
         replace=replace,
-        expected_state_sha256=starting_digest,
+        expected_state_sha256=expected_state_sha256,
+    )
+    if not result.candidates or result.incumbent is None:
+        return catalog
+    return configure_router_candidates(
+        path,
+        RouterCandidateSelection(candidates=result.candidates, incumbent=result.incumbent),
+        expected_state_sha256=catalog_state_sha256(path),
+    )
+
+
+def _role_inputs(
+    options: ProviderSetupOptions,
+    *,
+    existing: ModelCatalog | None,
+) -> SetupRoleInputs:
+    """Combine explicit role flags with the roles already present in the catalog.
+
+    Args:
+        options: Structured setup arguments, including optional role flags.
+        existing: Existing catalog, or ``None`` on first setup.
+
+    Returns:
+        Prior role values the picker offers as defaults.
+    """
+    return SetupRoleInputs(
+        world_model=options.world_model or _existing_role(existing, "world_model"),
+        judge=options.judge or _existing_role(existing, "judge"),
+        embedder=options.embedder or _existing_role(existing, "embedder"),
+        candidates=existing.roles.candidates if existing is not None else (),
+        incumbent=existing.roles.incumbent if existing is not None else None,
     )
 
 
@@ -160,361 +337,6 @@ def _noninteractive_setup(
     )
 
 
-def _interactive_setup(
-    options: ProviderSetupOptions,
-    *,
-    existing: ModelCatalog | None,
-    console: Console,
-) -> ProviderSetup:
-    """Collect available connections and models before selecting independent roles.
-
-    Args:
-        options: Optional explicit role selections.
-        existing: Existing catalog whose compatible entries remain available.
-        console: Terminal used for collection, summary, and confirmation.
-
-    Returns:
-        Confirmed provider setup ready for atomic catalog merge.
-
-    Raises:
-        typer.BadParameter: No usable provider connection or model is collected.
-        typer.Abort: The user rejects the completed configuration summary.
-    """
-    console.print("[bold]Model setup[/bold]")
-    console.print("WMO stores credential environment-variable names, never credentials.")
-    existing_connections = _existing_connections(existing)
-    existing_models = _existing_models(existing)
-    connections = list(existing_connections)
-    models = list(existing_models)
-    if connections:
-        console.print("Existing connections: " + ", ".join(item.name for item in connections))
-    for provider in _NATIVE_PROVIDERS:
-        _collect_provider_connections(connections, provider=provider, console=console)
-    _collect_provider_connections(connections, provider="openai-compatible", console=console)
-    if not connections:
-        raise typer.BadParameter("setup needs at least one available provider connection")
-
-    if models:
-        console.print("Existing model aliases: " + ", ".join(item.alias for item in models))
-    add_model = not models
-    while add_model or Confirm.ask("Add another available model?", default=False, console=console):
-        models.append(_prompt_model(connections, console=console))
-        add_model = False
-    models = list(_deduplicate_models(models))
-    if not models:
-        raise typer.BadParameter("setup needs at least one available model alias")
-
-    aliases = tuple(model.alias for model in models)
-    world_model = options.world_model or _prompt_alias(
-        "World model alias",
-        aliases,
-        default=_existing_role(existing, "world_model"),
-        console=console,
-    )
-    judge = options.judge or _prompt_judge(
-        models,
-        world_model=world_model,
-        current=_existing_role(existing, "judge"),
-        console=console,
-    )
-    embedder = options.embedder or _prompt_alias(
-        "Embedder alias",
-        tuple(model.alias for model in models if model.supports_embeddings),
-        default=_existing_role(existing, "embedder"),
-        console=console,
-    )
-    setup = ProviderSetup(
-        connections=tuple(
-            connection
-            for connection in _deduplicate_connections(connections)
-            if connection.name not in {item.name for item in existing_connections}
-        ),
-        models=tuple(
-            model for model in models if model.alias not in {item.alias for item in existing_models}
-        ),
-        known_existing_connections=tuple(item.name for item in existing_connections),
-        known_existing_aliases=tuple(item.alias for item in existing_models),
-        world_model=world_model,
-        judge=judge,
-        embedder=embedder,
-    )
-    _render_summary(
-        setup,
-        connections=tuple(connections),
-        models=tuple(models),
-        console=console,
-    )
-    if not Confirm.ask("Save this configuration?", default=False, console=console):
-        raise typer.Abort()
-    return setup
-
-
-def _collect_provider_connections(
-    connections: list[ProviderConnection],
-    *,
-    provider: str,
-    console: Console,
-) -> None:
-    """Collect zero or more explicitly available connections for one provider kind.
-
-    Args:
-        connections: Mutable collection receiving confirmed connection records.
-        provider: Supported provider kind being collected.
-        console: Terminal used for prompts.
-    """
-    label = _PROVIDER_LABELS[provider]
-    another = Confirm.ask(f"Add a {label} connection?", default=False, console=console)
-    while another:
-        default_name = provider if not any(item.name == provider for item in connections) else None
-        name = (
-            Prompt.ask("Connection name", default=default_name, console=console)
-            if default_name is not None
-            else Prompt.ask("Connection name", console=console)
-        ).strip()
-        api_key_env = None
-        base_url = None
-        api_version = None
-        region = None
-        if provider == "bedrock":
-            region_default = os.environ.get("AWS_REGION")
-            region = (
-                Prompt.ask("AWS region", default=region_default, console=console)
-                if region_default
-                else Prompt.ask("AWS region", console=console)
-            ).strip()
-        else:
-            default_env = _CREDENTIAL_ENV_SUGGESTIONS[provider]
-            api_key_env = Prompt.ask(
-                "API key environment variable", default=default_env, console=console
-            ).strip()
-            if provider == "openai-compatible":
-                base_url = Prompt.ask("Base URL", console=console).strip()
-            elif provider == "azure":
-                base_url = Prompt.ask("Azure resource endpoint", console=console).strip()
-                api_version = Prompt.ask("Azure API version", default="v1", console=console).strip()
-        connections.append(
-            ProviderConnection(
-                name=name,
-                provider=provider,
-                api_key_env=api_key_env,
-                base_url=base_url,
-                api_version=api_version,
-                region=region or None,
-            )
-        )
-        another = Confirm.ask(f"Add another {label} connection?", default=False, console=console)
-
-
-def _prompt_model(
-    connections: list[ProviderConnection],
-    *,
-    console: Console,
-) -> ProviderModelSelection:
-    """Collect one explicit model alias and its complete known local capabilities.
-
-    Args:
-        connections: Available provider connections.
-        console: Terminal used for prompts.
-
-    Returns:
-        Explicit model selection with declared capabilities and pricing.
-    """
-    connection_names = tuple(connection.name for connection in connections)
-    connection = _prompt_alias("Connection", connection_names, default=None, console=console)
-    alias = Prompt.ask("Model alias", console=console).strip()
-    model = Prompt.ask("Provider model ID", console=console).strip()
-    supports_tools = Confirm.ask("Supports tools?", default=False, console=console)
-    supports_embeddings = Confirm.ask("Supports embeddings?", default=False, console=console)
-    supports_structured_output = Confirm.ask(
-        "Supports structured output?", default=False, console=console
-    )
-    supports_completions = Confirm.ask("Supports chat completions?", default=False, console=console)
-    context_window = _prompt_optional_positive_int("Context window tokens", console=console)
-    maximum_output = _prompt_optional_positive_int("Maximum output tokens", console=console)
-    input_cost = None
-    output_cost = None
-    cached_input_cost = None
-    cache_write_cost = None
-    if supports_embeddings or supports_completions:
-        input_cost = _prompt_nonnegative_float(
-            "Input cost per million tokens in USD", console=console
-        )
-    if supports_completions:
-        output_cost = _prompt_nonnegative_float(
-            "Output cost per million tokens in USD", console=console
-        )
-        cached_input_cost = _prompt_nonnegative_float(
-            "Cached input cost per million tokens in USD", console=console
-        )
-        cache_write_cost = _prompt_nonnegative_float(
-            "Cache write cost per million tokens in USD", console=console
-        )
-    return ProviderModelSelection(
-        alias=alias,
-        connection=connection,
-        model=model,
-        supports_tools=supports_tools,
-        supports_embeddings=supports_embeddings,
-        supports_structured_output=supports_structured_output,
-        supports_completions=supports_completions,
-        context_window_tokens=context_window,
-        maximum_output_tokens=maximum_output,
-        input_cost_per_million_tokens_usd=input_cost,
-        output_cost_per_million_tokens_usd=output_cost,
-        cached_input_cost_per_million_tokens_usd=cached_input_cost,
-        cache_write_cost_per_million_tokens_usd=cache_write_cost,
-    )
-
-
-def _prompt_optional_positive_int(label: str, *, console: Console) -> int | None:
-    """Collect an optional positive integer without inventing provider metadata.
-
-    Args:
-        label: Human-readable capability field.
-        console: Terminal used for prompts.
-
-    Returns:
-        Confirmed positive value, or ``None`` when the field is omitted.
-    """
-    if not Confirm.ask(f"Record {label.casefold()}?", default=False, console=console):
-        return None
-    return IntPrompt.ask(label, console=console)
-
-
-def _prompt_nonnegative_float(label: str, *, console: Console) -> float:
-    """Collect explicit local pricing without contacting a provider.
-
-    Args:
-        label: Human-readable pricing field.
-        console: Terminal used for prompts.
-
-    Returns:
-        Confirmed finite nonnegative value.
-
-    Raises:
-        typer.BadParameter: The entered price is negative.
-    """
-    value = float(Prompt.ask(label, console=console))
-    if value < 0:
-        raise typer.BadParameter(f"{label} cannot be negative")
-    return value
-
-
-def _prompt_alias(
-    label: str,
-    aliases: tuple[str, ...],
-    *,
-    default: str | None,
-    console: Console,
-) -> str:
-    """Prompt for one alias from an explicit available set.
-
-    Args:
-        label: Human-readable role or connection label.
-        aliases: Exact available choices.
-        default: Optional preselected alias.
-        console: Terminal used for prompts.
-
-    Returns:
-        Confirmed alias from ``aliases``.
-
-    Raises:
-        typer.BadParameter: No compatible aliases exist or the response is outside the set.
-    """
-    if not aliases:
-        raise typer.BadParameter(f"{label} has no compatible configured model aliases")
-    selected = (
-        Prompt.ask(label, choices=list(aliases), default=default, console=console)
-        if default is not None
-        else Prompt.ask(label, choices=list(aliases), console=console)
-    ).strip()
-    if selected not in aliases:
-        raise typer.BadParameter(f"{label} must be one of: {', '.join(aliases)}")
-    return selected
-
-
-def _prompt_judge(
-    models: list[ProviderModelSelection],
-    *,
-    world_model: str,
-    current: str | None,
-    console: Console,
-) -> str:
-    """Offer one explainable judge alias suggestion and require explicit acceptance.
-
-    Args:
-        models: Available declared model selections.
-        world_model: Confirmed world-model alias used as a locality preference.
-        current: Existing judge role when still available.
-        console: Terminal used for explanation and confirmation.
-
-    Returns:
-        Explicitly confirmed judge alias.
-    """
-    aliases = tuple(model.alias for model in models)
-    if current in aliases:
-        return _prompt_alias("Judge alias", aliases, default=current, console=console)
-    by_alias = {model.alias: model for model in models}
-    world_connection = by_alias[world_model].connection
-    ranked = sorted(
-        models,
-        key=lambda model: (
-            not model.supports_structured_output,
-            model.context_window_tokens is None,
-            -1 * (model.context_window_tokens or 0),
-            model.connection != world_connection,
-            model.alias,
-        ),
-    )
-    suggestion = ranked[0].alias
-    console.print(
-        f"[dim]Suggested judge: {suggestion}. It is the strongest declared structured-output "
-        "and context match among your configured aliases.[/dim]"
-    )
-    if Confirm.ask(f"Use {suggestion!r} as the judge?", default=True, console=console):
-        return suggestion
-    return _prompt_alias("Judge alias", aliases, default=None, console=console)
-
-
-def _render_summary(
-    setup: ProviderSetup,
-    *,
-    connections: tuple[ProviderConnection, ...],
-    models: tuple[ProviderModelSelection, ...],
-    console: Console,
-) -> None:
-    """Show every connection, model, role, and credential reference before commit.
-
-    Args:
-        setup: Collected role assignments.
-        connections: All existing and newly collected provider connections.
-        models: All existing and newly collected model aliases.
-        console: Terminal receiving the summary.
-    """
-    console.print("[bold]Configuration summary[/bold]")
-    for connection in connections:
-        details = [connection.provider]
-        if connection.api_key_env is not None:
-            details.append(f"api_key_env={connection.api_key_env}")
-        if connection.base_url is not None:
-            details.append(f"endpoint={connection.base_url}")
-        if connection.api_version is not None:
-            details.append(f"api_version={connection.api_version}")
-        if connection.region is not None:
-            details.append(f"region={connection.region}")
-        console.print(f"connection {connection.name}: " + ", ".join(details))
-    for model in models:
-        console.print(
-            f"model {model.alias}: {model.connection}/{model.model}, "
-            f"tools={model.supports_tools}, embeddings={model.supports_embeddings}, "
-            f"structured_output={model.supports_structured_output}, "
-            f"completions={model.supports_completions}"
-        )
-    console.print(
-        f"roles: world_model={setup.world_model}, judge={setup.judge}, embedder={setup.embedder}"
-    )
-
-
 def _existing_connections(existing: ModelCatalog | None) -> tuple[ProviderConnection, ...]:
     """Convert supported existing catalog connections into setup input records.
 
@@ -536,7 +358,7 @@ def _existing_connections(existing: ModelCatalog | None) -> tuple[ProviderConnec
             region=connection.region,
         )
         for name, connection in sorted(existing.connections.items())
-        if connection.provider in _PROVIDER_LABELS
+        if connection.provider in SETUP_PROVIDERS
         and (connection.provider == "bedrock" or connection.api_key_env is not None)
     )
 

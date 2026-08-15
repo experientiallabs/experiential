@@ -5,18 +5,25 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+import typer
 from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
+from wmo.cli.build_cmd import _missing_build_configuration
+from wmo.cli.picker_test import ScriptedConsole
+from wmo.cli.provider_setup import ProviderSetupOptions, run_provider_setup
 from wmo.common.models import (
     ConnectionConfig,
+    DiscoveredModel,
     ModelCatalog,
     ModelRecord,
     ModelRoles,
     load_model_catalog,
     write_model_catalog,
 )
+from wmo.runtime.models.providers import ProviderEndpoint
 
 _RUNNER = CliRunner()
 
@@ -103,6 +110,82 @@ def test_noninteractive_setup_collects_many_connections_models_and_roles(tmp_pat
     assert tuple(sorted(catalog.connections)) == ("gemini", "openai")
     assert tuple(sorted(catalog.models)) == ("embed", "judge", "world")
     assert catalog.roles == ModelRoles(world_model="world", judge="judge", embedder="embed")
+
+
+def test_noninteractive_setup_accepts_azure_and_bedrock_connections(tmp_path: Path) -> None:
+    """Azure and Bedrock connections persist secret-free catalog fields only.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the model catalog.
+    """
+    root = tmp_path / ".wmo"
+    azure = json.dumps(
+        {
+            "name": "azure",
+            "provider": "azure",
+            "api_key_env": "AZURE_OPENAI_API_KEY",
+            "base_url": "https://resource.openai.azure.com",
+            "api_version": "v1",
+        }
+    )
+    bedrock = json.dumps({"name": "bedrock", "provider": "bedrock", "region": "us-east-1"})
+    completion = json.dumps(
+        {
+            "alias": "gpt",
+            "connection": "azure",
+            "model": "gpt-deployment",
+            "supports_completions": True,
+            "input_cost_per_million_tokens_usd": 0,
+            "output_cost_per_million_tokens_usd": 0,
+            "cached_input_cost_per_million_tokens_usd": 0,
+            "cache_write_cost_per_million_tokens_usd": 0,
+        }
+    )
+    embed = json.dumps(
+        {
+            "alias": "titan",
+            "connection": "bedrock",
+            "model": "amazon.titan-embed-text-v2:0",
+            "supports_embeddings": True,
+            "input_cost_per_million_tokens_usd": 0,
+        }
+    )
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(root),
+            "--non-interactive",
+            "--connection-json",
+            azure,
+            "--connection-json",
+            bedrock,
+            "--model-json",
+            completion,
+            "--model-json",
+            embed,
+            "--world-model",
+            "gpt",
+            "--judge",
+            "gpt",
+            "--embedder",
+            "titan",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    catalog = load_model_catalog(root / "models.toml")
+    assert catalog.connections["azure"].api_version == "v1"
+    assert catalog.connections["bedrock"].region == "us-east-1"
+    assert catalog.connections["bedrock"].api_key_env is None
+    assert catalog.models["gpt"].model == "gpt-deployment"
+    assert catalog.models["titan"].model == "amazon.titan-embed-text-v2:0"
+    text = (root / "models.toml").read_text(encoding="utf-8")
+    assert "AZURE_OPENAI_API_KEY" in text
+    assert "sk-" not in text
 
 
 def test_noninteractive_setup_reports_every_missing_collection_and_role(tmp_path: Path) -> None:
@@ -219,93 +302,283 @@ def test_structured_input_rejects_openai_compatible_without_capabilities(tmp_pat
     assert not (tmp_path / ".wmo" / "models.toml").exists()
 
 
-def test_noninteractive_setup_accepts_azure_and_bedrock_connections(tmp_path: Path) -> None:
-    """Azure and Bedrock connections persist secret-free catalog fields only."""
+def _setup(
+    root: Path,
+    answers: str,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    lister: _FakeLister | None = None,
+    options: ProviderSetupOptions | None = None,
+) -> tuple[ScriptedConsole, ModelCatalog | None]:
+    """Run one scripted interactive setup session against injected provider listings.
+
+    Args:
+        root: Local WMO root receiving the catalog.
+        answers: Newline-separated answers for every screen.
+        monkeypatch: Patch fixture supplying canonical credentials.
+        lister: Injected provider listing seam, defaulting to the OpenAI fixture.
+        options: Optional role flags or automation values.
+
+    Returns:
+        The scripted console and the committed catalog, or ``None`` when setup aborted.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
+    console = ScriptedConsole(answers)
+    try:
+        catalog = run_provider_setup(
+            root,
+            options or ProviderSetupOptions(),
+            non_interactive=False,
+            replace=False,
+            console=console,
+            lister=lister or _FakeLister(),
+        )
+    except typer.Abort:
+        return console, None
+    return console, catalog
+
+
+class _FakeLister:
+    """One provider listing seam that answers from fixed provider catalogs."""
+
+    def __init__(self, catalogs: dict[str, tuple[DiscoveredModel, ...]] | None = None) -> None:
+        """Record what each provider publishes for the authenticated account.
+
+        Args:
+            catalogs: Per-provider model tuples, defaulting to the OpenAI fixture.
+        """
+        self._catalogs = catalogs or {
+            "openai": (
+                DiscoveredModel(provider="openai", model="gpt-5.6-luna"),
+                DiscoveredModel(provider="openai", model="gpt-5.6-terra"),
+                DiscoveredModel(provider="openai", model="text-embedding-3-small"),
+                DiscoveredModel(provider="openai", model="internal-preview-model"),
+            )
+        }
+        self.requests: list[str] = []
+
+    def list_models(self, endpoint: ProviderEndpoint) -> tuple[DiscoveredModel, ...]:
+        """Answer one listing call for the requested provider.
+
+        Args:
+            endpoint: Provider kind, credential, and optional base URL setup resolved.
+
+        Returns:
+            The models this provider publishes in the fixture.
+        """
+        self.requests.append(endpoint.provider)
+        return self._catalogs[endpoint.provider]
+
+
+def test_interactive_setup_saves_providers_models_and_roles_it_derived(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The normal path asks only for providers, models, roles, and one confirmation.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the saved catalog.
+        monkeypatch: Patch fixture supplying the canonical credential.
+    """
     root = tmp_path / ".wmo"
-    azure = json.dumps(
-        {
-            "name": "azure",
-            "provider": "azure",
-            "api_key_env": "AZURE_OPENAI_API_KEY",
-            "base_url": "https://resource.openai.azure.com",
-            "api_version": "v1",
-        }
-    )
-    bedrock = json.dumps({"name": "bedrock", "provider": "bedrock", "region": "us-east-1"})
-    completion = json.dumps(
-        {
-            "alias": "gpt",
-            "connection": "azure",
-            "model": "gpt-deployment",
-            "supports_completions": True,
-            "input_cost_per_million_tokens_usd": 0,
-            "output_cost_per_million_tokens_usd": 0,
-            "cached_input_cost_per_million_tokens_usd": 0,
-            "cache_write_cost_per_million_tokens_usd": 0,
-        }
-    )
-    embed = json.dumps(
-        {
-            "alias": "titan",
-            "connection": "bedrock",
-            "model": "amazon.titan-embed-text-v2:0",
-            "supports_embeddings": True,
-            "input_cost_per_million_tokens_usd": 0,
-        }
-    )
 
-    result = _RUNNER.invoke(
-        app,
-        [
-            "config",
-            "providers",
-            "--root",
-            str(root),
-            "--non-interactive",
-            "--connection-json",
-            azure,
-            "--connection-json",
-            bedrock,
-            "--model-json",
-            completion,
-            "--model-json",
-            embed,
-            "--world-model",
-            "gpt",
-            "--judge",
-            "gpt",
-            "--embedder",
-            "titan",
-        ],
-    )
+    console, catalog = _setup(root, "1\n\n1,2,3\n\n1\n1\n1\n1,2\n\n1\ny\n", monkeypatch=monkeypatch)
 
-    assert result.exit_code == 0, result.output
-    catalog = load_model_catalog(root / "models.toml")
-    assert catalog.connections["azure"].api_version == "v1"
-    assert catalog.connections["bedrock"].region == "us-east-1"
-    assert catalog.connections["bedrock"].api_key_env is None
-    assert catalog.models["gpt"].model == "gpt-deployment"
-    assert catalog.models["titan"].model == "amazon.titan-embed-text-v2:0"
-    text = (root / "models.toml").read_text(encoding="utf-8")
-    assert "AZURE_OPENAI_API_KEY" in text
-    assert "sk-" not in text
+    assert catalog is not None
+    saved = load_model_catalog(root / "models.toml")
+    assert set(saved.connections) == {"openai"}
+    assert saved.connections["openai"].api_key_env == "OPENAI_API_KEY"
+    assert set(saved.models) == {"gpt-5-6-luna", "gpt-5-6-terra", "text-embedding-3-small"}
+    assert saved.roles.world_model == "gpt-5-6-luna"
+    assert saved.roles.judge == "gpt-5-6-luna"
+    assert saved.roles.embedder == "text-embedding-3-small"
+    assert saved.roles.candidates == ("gpt-5-6-luna", "gpt-5-6-terra")
+    assert saved.roles.incumbent == "gpt-5-6-luna"
+    luna = saved.models["gpt-5-6-luna"].capabilities
+    assert luna is not None
+    assert luna.supports_tools
+    assert luna.context_window_tokens == 1_050_000
+    assert luna.input_cost_per_million_tokens_usd == 1.0
+    assert "internal-preview-model" not in {model.model for model in saved.models.values()}
+    printed = unstyle(console.output)
+    assert "connection name" not in printed.casefold()
+    assert "openai-secret" not in printed
 
 
-def test_interactive_final_rejection_writes_no_catalog(tmp_path: Path) -> None:
+def test_interactive_setup_never_writes_a_credential_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the credential variable name is persisted, never the credential itself.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the saved catalog.
+        monkeypatch: Patch fixture supplying the canonical credential.
+    """
+    root = tmp_path / ".wmo"
+
+    _, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\ny\n", monkeypatch=monkeypatch)
+
+    assert catalog is not None
+    persisted = (root / "models.toml").read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY" in persisted
+    assert "openai-secret" not in persisted
+
+
+def test_interactive_final_rejection_writes_no_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """All answers remain in memory until the user confirms the complete summary.
 
     Args:
         tmp_path: Temporary WMO root used to prove no catalog write occurs.
+        monkeypatch: Patch fixture supplying the canonical credential.
     """
     root = tmp_path / ".wmo"
-    result = _RUNNER.invoke(
-        app,
-        ["config", "providers", "--root", str(root)],
-        input=(
-            "y\n\n\nn\nn\nn\nn\nn\nn\nn\nopenai\nall\nmodel-id\nn\ny\ny\nn\nn\nn\n0\nn\nall\ny\nall\nn\n"
+
+    console, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\nn\n", monkeypatch=monkeypatch)
+
+    assert catalog is None
+    assert "Configuration summary" in console.output
+    assert not (root / "models.toml").exists()
+
+
+def test_interactive_cancellation_writes_no_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling any screen ends setup and leaves the catalog untouched.
+
+    Args:
+        tmp_path: Temporary WMO root used to prove no catalog write occurs.
+        monkeypatch: Patch fixture supplying the canonical credential.
+    """
+    root = tmp_path / ".wmo"
+
+    console, catalog = _setup(root, "1\n\nq\n", monkeypatch=monkeypatch)
+
+    assert catalog is None
+    assert "Setup cancelled. Nothing was written." in console.output
+    assert not (root / "models.toml").exists()
+
+
+def test_back_from_the_model_screen_reselects_providers_without_losing_answers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Back returns to the provider screen with the prior provider still selected.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the saved catalog.
+        monkeypatch: Patch fixture supplying both canonical credentials.
+    """
+    root = tmp_path / ".wmo"
+    lister = _FakeLister(
+        {
+            "openai": (
+                DiscoveredModel(provider="openai", model="gpt-5.6-luna"),
+                DiscoveredModel(provider="openai", model="text-embedding-3-small"),
+            ),
+            "anthropic": (DiscoveredModel(provider="anthropic", model="claude-sonnet-5"),),
+        }
+    )
+
+    console, catalog = _setup(
+        root,
+        "1\n\nb\n2\n\nall\n\n1\n1\n1\n1,2\n\n1\ny\n",
+        monkeypatch=monkeypatch,
+        lister=lister,
+    )
+
+    assert catalog is not None
+    assert lister.requests == ["openai", "openai", "anthropic"]
+    saved = load_model_catalog(root / "models.toml")
+    assert set(saved.connections) == {"openai", "anthropic"}
+    assert set(saved.models) == {"claude-sonnet-5", "gpt-5-6-luna", "text-embedding-3-small"}
+    assert saved.roles.embedder == "text-embedding-3-small"
+    assert "Reading models available to your Anthropic account" in unstyle(console.output)
+
+
+def test_rerunning_setup_preserves_unrelated_models_and_router_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second session reassigns build roles without disturbing other catalog state.
+
+    Args:
+        tmp_path: Temporary WMO root containing preserved catalog state.
+        monkeypatch: Patch fixture supplying the canonical credential.
+    """
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    write_model_catalog(
+        root / "models.toml",
+        ModelCatalog(
+            connections={
+                "router": ConnectionConfig(provider="openrouter", api_key_env="OPENROUTER_API_KEY")
+            },
+            models={"candidate": ModelRecord(connection="router", model="vendor/candidate")},
+            roles=ModelRoles(candidates=("candidate",), incumbent="candidate"),
         ),
     )
 
-    assert result.exit_code == 1
-    assert "Configuration summary" in result.output
-    assert not (root / "models.toml").exists()
+    _, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\ny\n", monkeypatch=monkeypatch)
+
+    assert catalog is not None
+    saved = load_model_catalog(root / "models.toml")
+    assert saved.connections["router"].api_key_env == "OPENROUTER_API_KEY"
+    assert saved.models["candidate"].model == "vendor/candidate"
+    assert saved.roles.candidates == ("candidate",)
+    assert saved.roles.incumbent == "candidate"
+    assert saved.roles.world_model == "gpt-5-6-luna"
+
+
+def test_a_completed_setup_is_not_repeated_on_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Roles saved once satisfy every build requirement, so setup never runs again.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the saved catalog.
+        monkeypatch: Patch fixture supplying the canonical credential.
+    """
+    root = tmp_path / ".wmo"
+
+    _, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\ny\n", monkeypatch=monkeypatch)
+
+    assert catalog is not None
+    assert _missing_build_configuration(load_model_catalog(root / "models.toml")) == ()
+
+
+def test_role_flags_preselect_the_roles_the_picker_offers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit role flags are offered as defaults an empty line accepts.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the saved catalog.
+        monkeypatch: Patch fixture supplying the canonical credential.
+    """
+    root = tmp_path / ".wmo"
+    options = ProviderSetupOptions(
+        world_model="gpt-5-6-terra",
+        judge="gpt-5-6-terra",
+        embedder="text-embedding-3-small",
+    )
+
+    _, catalog = _setup(
+        root,
+        "1\n\n1,2,3\n\n\n\n\n\ny\n",
+        monkeypatch=monkeypatch,
+        options=options,
+    )
+
+    assert catalog is not None
+    saved = load_model_catalog(root / "models.toml")
+    assert saved.roles.world_model == "gpt-5-6-terra"
+    assert saved.roles.judge == "gpt-5-6-terra"
+    assert saved.roles.embedder == "text-embedding-3-small"
