@@ -51,6 +51,7 @@ CANONICAL_CREDENTIAL_ENV = {
     "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
 }
 _MANUAL_MODEL_PROVIDERS = frozenset({"azure", "bedrock"})
+_CONFIGURED_ONLY = "configured-models-only"
 _ADVANCED_CREDENTIALS = "advanced-credentials"
 _ADVANCED_MANUAL_MODEL = "advanced-manual-model"
 _RECOVERY_RETRY = "retry"
@@ -135,6 +136,7 @@ def select_providers(
     *,
     console: Console,
     environment: MutableMapping[str, str],
+    configured: bool = False,
 ) -> tuple[tuple[str, ...], bool, bool] | None:
     """Show the one provider screen that opens setup.
 
@@ -142,6 +144,8 @@ def select_providers(
         session: Answers already collected, used to preselect prior choices.
         console: Terminal used for the screen.
         environment: Process environment used to annotate credential availability.
+        configured: Whether the catalog already holds usable models, which makes provider
+            selection optional so roles can be edited offline.
 
     Returns:
         Selected providers with both advanced flags, or ``None`` when the user cancelled.
@@ -166,6 +170,15 @@ def select_providers(
             label="Advanced: declare a model and its capabilities by hand",
         )
     )
+    if configured:
+        options.insert(
+            0,
+            PickerOption(
+                value=_CONFIGURED_ONLY,
+                label="Keep the models already configured",
+                detail="no provider request, roles only",
+            ),
+        )
     preselected = list(session.providers)
     if session.advanced_credentials:
         preselected.append(_ADVANCED_CREDENTIALS)
@@ -184,7 +197,7 @@ def select_providers(
             console.print("[yellow]This is the first screen.[/yellow]")
             continue
         providers = tuple(value for value in result.values if value in SETUP_PROVIDER_LABELS)
-        if not providers:
+        if not providers and _CONFIGURED_ONLY not in result.values:
             console.print("[yellow]Select at least one provider.[/yellow]")
             preselected = list(result.values)
             continue

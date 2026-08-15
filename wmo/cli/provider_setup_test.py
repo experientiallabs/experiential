@@ -17,6 +17,7 @@ from wmo.cli.provider_setup import ProviderSetupOptions, run_provider_setup
 from wmo.common.models import (
     ConnectionConfig,
     DiscoveredModel,
+    ModelCapabilities,
     ModelCatalog,
     ModelRecord,
     ModelRoles,
@@ -551,6 +552,83 @@ def test_a_completed_setup_is_not_repeated_on_replay(
 
     assert catalog is not None
     assert _missing_build_configuration(load_model_catalog(root / "models.toml")) == ()
+
+
+class _UnavailableLister:
+    """One provider listing seam that fails if setup requests any provider."""
+
+    def list_models(self, endpoint: ProviderEndpoint) -> tuple[DiscoveredModel, ...]:
+        """Refuse every listing call.
+
+        Args:
+            endpoint: Provider kind, credential, and optional base URL setup resolved.
+
+        Raises:
+            AssertionError: Setup issued a provider request it did not need.
+        """
+        raise AssertionError(f"unexpected listing request for {endpoint.provider}")
+
+
+def test_configured_models_are_reassignable_without_any_provider_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Roles in a complete catalog can be edited offline, with no credential or listing.
+
+    Args:
+        tmp_path: Temporary WMO root containing a complete catalog.
+        monkeypatch: Patch fixture removing every canonical credential.
+    """
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    chat = ModelCapabilities(
+        supports_tools=True,
+        supports_structured_output=True,
+        supports_completions=True,
+        context_window_tokens=200_000,
+        maximum_output_tokens=32_000,
+        input_cost_per_million_tokens_usd=1.0,
+        output_cost_per_million_tokens_usd=4.0,
+        cached_input_cost_per_million_tokens_usd=0.1,
+        cache_write_cost_per_million_tokens_usd=1.25,
+    )
+    embedding = ModelCapabilities(
+        supports_embeddings=True,
+        context_window_tokens=8_192,
+        input_cost_per_million_tokens_usd=0.02,
+    )
+    write_model_catalog(
+        root / "models.toml",
+        ModelCatalog(
+            connections={
+                "openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")
+            },
+            models={
+                "chat": ModelRecord(connection="openai", model="chat-id", capabilities=chat),
+                "backup": ModelRecord(connection="openai", model="backup-id", capabilities=chat),
+                "embed": ModelRecord(connection="openai", model="embed-id", capabilities=embedding),
+            },
+            roles=ModelRoles(world_model="chat", judge="chat", embedder="embed"),
+        ),
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    console = ScriptedConsole("1\n\n\n1\n1\n1\n1,2\n\n1\ny\n")
+
+    catalog = run_provider_setup(
+        root,
+        ProviderSetupOptions(),
+        non_interactive=False,
+        replace=False,
+        console=console,
+        lister=_UnavailableLister(),
+    )
+
+    assert catalog is not None
+    saved = load_model_catalog(root / "models.toml")
+    assert set(saved.models) == {"backup", "chat", "embed"}
+    assert saved.roles.world_model != "chat"
+    assert saved.roles.embedder == "embed"
+    assert "Keep the models already configured" in unstyle(console.output)
 
 
 def test_role_flags_preselect_the_roles_the_picker_offers(

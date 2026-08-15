@@ -28,6 +28,7 @@ from wmo.cli.model_picker import (
 )
 from wmo.cli.provider_picker import (
     CREDENTIAL_NOTE,
+    AvailableModel,
     ProviderSetupResult,
     SetupCancelled,
     SetupRoleInputs,
@@ -142,21 +143,29 @@ def _interactive_setup(
     session = SetupSession(selected=tuple(model.alias for model in configured))
     try:
         while True:
-            selection = select_providers(session, console=console, environment=environment)
+            selection = select_providers(
+                session,
+                console=console,
+                environment=environment,
+                configured=bool(configured),
+            )
             if selection is None:
                 return None
             session.providers, session.advanced_credentials, session.advanced_models = selection
-            prepared = prepare_providers(
-                session,
-                existing_connections=existing_connections,
-                existing_aliases=tuple(model.alias for model in existing_models),
-                console=console,
-                lister=lister,
-                environment=environment,
-            )
-            if prepared is None:
-                continue
-            session.endpoints, discovered = prepared
+            discovered: tuple[AvailableModel, ...] = ()
+            session.endpoints = ()
+            if session.providers:
+                prepared = prepare_providers(
+                    session,
+                    existing_connections=existing_connections,
+                    existing_aliases=tuple(model.alias for model in existing_models),
+                    console=console,
+                    lister=lister,
+                    environment=environment,
+                )
+                if prepared is None:
+                    continue
+                session.endpoints, discovered = prepared
             session.available = (*configured, *discovered)
             result = _collect_models_and_roles(
                 session,
