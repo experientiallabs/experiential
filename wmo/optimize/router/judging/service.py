@@ -394,6 +394,24 @@ def calibration_sample(
     )
 
 
+def manual_judge_calibration_is_complete(store: ProjectStore) -> bool:
+    """Report whether a completed audit already fixes this project's calibration.
+
+    A completed audit makes calibration replay its own immutable evidence, so callers must
+    not collect new human labels that the replay would ignore.
+
+    Args:
+        store: Project-local review store.
+
+    Returns:
+        ``True`` when calibration is complete and every further run replays it.
+
+    Raises:
+        ManualJudgeError: Setup has not been completed or review state is malformed.
+    """
+    return require_review_state(store).audit is not None
+
+
 def estimate_manual_judge_budget(
     plan: ManualJudgeCalibrationPlan,
     *,

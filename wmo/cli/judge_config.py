@@ -37,6 +37,7 @@ from wmo.optimize.router.judging.service import (
     calibration_sample,
     commit_manual_judge_setup,
     estimate_manual_judge_budget,
+    manual_judge_calibration_is_complete,
     prepare_manual_judge_calibration,
     prepare_manual_judge_setup,
 )
@@ -178,7 +179,13 @@ def judge_calibrate(
         _render_calibration_previews(plan.previews)
         sample_sha256 = calibration_sample_digest(plan.setup, calibration_sample(plan))
         drafted = read_label_draft(store, plan.setup, sample_sha256)
-        if drafted:
+        completed = manual_judge_calibration_is_complete(store)
+        if completed:
+            _console.print(
+                "Judge calibration is already complete; replaying its immutable evidence "
+                "without collecting labels."
+            )
+        elif drafted:
             _console.print(f"Resuming {len(drafted)} saved human labels for this trace sample.")
 
         def persist(collected: tuple[ManualJudgeLabel, ...]) -> None:
@@ -189,14 +196,18 @@ def judge_calibrate(
             """
             save_label_draft(store, plan.setup, sample_sha256, collected, now)
 
-        labels = _collect_labels(
-            plan.setup,
-            rubric,
-            tuple(label or ()),
-            plan.previews,
-            drafted,
-            persist,
-            non_interactive=non_interactive,
+        labels = (
+            drafted
+            if completed
+            else _collect_labels(
+                plan.setup,
+                rubric,
+                tuple(label or ()),
+                plan.previews,
+                drafted,
+                persist,
+                non_interactive=non_interactive,
+            )
         )
         budget = estimate_manual_judge_budget(
             plan,

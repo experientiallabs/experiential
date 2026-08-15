@@ -179,7 +179,9 @@ def _write_catalog(root: Path) -> None:
     )
 
 
-def _calibrate_arguments(root: Path, labels: Sequence[str]) -> list[str]:
+def _calibrate_arguments(
+    root: Path, labels: Sequence[str], sample_size: int = _SAMPLE_SIZE
+) -> list[str]:
     """Return one non-interactive calibrate invocation with explicit zero prices."""
     return [
         "config",
@@ -189,7 +191,7 @@ def _calibrate_arguments(root: Path, labels: Sequence[str]) -> list[str]:
         "--root",
         str(root),
         "--sample-size",
-        str(_SAMPLE_SIZE),
+        str(sample_size),
         "--input-usd-per-million",
         "0",
         "--output-usd-per-million",
@@ -270,6 +272,12 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     replay = runner.invoke(app, _calibrate_arguments(root, ()))
     assert replay.exit_code == 0, replay.output
     assert "Approved judge calibration" in replay.output
+
+    resampled = runner.invoke(app, _calibrate_arguments(root, (), sample_size=_SAMPLE_SIZE - 2))
+    assert resampled.exit_code == 0, resampled.output
+    assert "already complete" in resampled.output
+    assert "Approved judge calibration" in resampled.output
+    assert len(_drafted_labels(store)) == _SAMPLE_SIZE
 
     rollouts = _rollout_payloads(store)
     assert len(rollouts) >= _SAMPLE_SIZE
