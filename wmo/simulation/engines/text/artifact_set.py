@@ -6,10 +6,14 @@ import hashlib
 from collections.abc import Callable, Sequence
 from datetime import datetime
 
-from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactInput,
+    canonical_json_bytes,
+    sorted_unique_inputs,
+    stable_id,
+)
 from wmo.common.project import ArtifactAlreadyExistsError, ArtifactCorruptionError, ArtifactStore
 from wmo.common.rollouts import RolloutArtifact, SimulationArtifactSet
-from wmo.simulation.engines.text.bindings import sorted_artifact_inputs
 from wmo.simulation.engines.text.errors import SimulationResumeError
 from wmo.simulation.engines.text.rollout_support import jsonl_bytes, timestamp
 from wmo.simulation.specs import SimulationSpec
@@ -60,7 +64,7 @@ def persist_artifact_set(
     artifact_set = SimulationArtifactSet(
         schema_version=1,
         created_at=timestamp(clock),
-        inputs=sorted_artifact_inputs(
+        inputs=sorted_unique_inputs(
             plan_input,
             task_set_input,
             fit_rag_input,

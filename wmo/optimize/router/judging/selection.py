@@ -166,15 +166,14 @@ def read_rollout(store: ProjectStore, expected: ArtifactInput) -> RolloutArtifac
         ManualJudgeError: Rollout content or manifest identity changed.
     """
     try:
-        rollout, rollout_input = read_artifact_json(
+        rollout, _rollout_input = read_artifact_json(
             store,
             artifact_id=expected.artifact_id,
             expected_artifact_type="rollout",
             relative_path="rollout.json",
             model_type=RolloutArtifact,
+            expected_input=expected,
         )
     except JudgingProvenanceError as exc:
         raise ManualJudgeError("manual judge production rollout is unavailable") from exc
-    if rollout_input != expected:
-        raise ManualJudgeError("manual judge production rollout manifest changed")
     return rollout

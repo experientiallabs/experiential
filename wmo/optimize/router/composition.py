@@ -20,6 +20,7 @@ from wmo.common.core.artifacts import (
     ContractModel,
     Sha256,
     sha256_json,
+    sorted_unique_inputs,
     stable_id,
 )
 from wmo.common.evaluations import (
@@ -639,8 +640,8 @@ def _approve_fidelity_once(
             or receipt.gate != gate_input
             or receipt.report != report_input
             or receipt.protocol_sha256 != protocol_sha256
-            or _sorted_artifact_inputs(*receipt.inputs)
-            != _sorted_artifact_inputs(plan_input, gate_input, report_input)
+            or sorted_unique_inputs(*receipt.inputs)
+            != sorted_unique_inputs(plan_input, gate_input, report_input)
         ):
             raise RouterCompositionError("fidelity approval receipt binding has drifted")
         replay = build_fidelity_report(
@@ -669,7 +670,7 @@ def _approve_fidelity_once(
     receipt = FidelityApprovalReceipt(
         schema_version=1,
         created_at=created_at,
-        inputs=_sorted_artifact_inputs(plan_input, gate_input, report_input),
+        inputs=sorted_unique_inputs(plan_input, gate_input, report_input),
         code_revision=code_revision,
         approval_id=approval_id,
         plan=plan_input,
@@ -717,8 +718,8 @@ def _fit_and_lock_once(
             or lock.fit_config_sha256 != config_sha256
             or (lock.fit_evaluation, lock.bank, lock.policy)
             != (fit_input, bank_input, policy_input)
-            or _sorted_artifact_inputs(*lock.inputs)
-            != _sorted_artifact_inputs(plan_input, fit_input, bank_input, policy_input)
+            or sorted_unique_inputs(*lock.inputs)
+            != sorted_unique_inputs(plan_input, fit_input, bank_input, policy_input)
         ):
             raise RouterCompositionError("router policy lock binding has drifted")
         policy = KnnRouterPolicy.model_validate_json(
@@ -740,7 +741,7 @@ def _fit_and_lock_once(
     fit_input = artifact_input(project.artifacts.read(fit.fit_evaluation_id).manifest)
     bank_input = artifact_input(project.artifacts.read(fit.locked.bank.bank_artifact_id).manifest)
     policy_input = artifact_input(project.artifacts.read(fit.locked.policy.policy_id).manifest)
-    inputs = _sorted_artifact_inputs(plan_input, fit_input, bank_input, policy_input)
+    inputs = sorted_unique_inputs(plan_input, fit_input, bank_input, policy_input)
     lock = RouterPolicyLock(
         schema_version=1,
         created_at=created_at,
@@ -928,9 +929,3 @@ def _phase(hook: Callable[[str], None] | None, phase: str) -> None:
     """Emit one local ordering marker without changing workflow behavior."""
     if hook is not None:
         hook(phase)
-
-
-def _sorted_artifact_inputs(*values: object) -> tuple[ArtifactInput, ...]:
-    """Normalize Pydantic constructor unions to exact sorted artifact inputs."""
-    inputs = tuple(ArtifactInput.model_validate(value) for value in values)
-    return tuple(sorted(inputs, key=lambda item: item.artifact_id))

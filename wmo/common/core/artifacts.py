@@ -163,6 +163,30 @@ class ArtifactEnvelope(ContractModel):
         return value
 
 
+def sorted_unique_inputs(
+    *inputs: ArtifactInput, error_type: type[Exception] = ValueError
+) -> tuple[ArtifactInput, ...]:
+    """Canonicalize artifact inputs into the exact order and uniqueness an envelope requires.
+
+    Args:
+        *inputs: Manifest-derived references, in any order and with repeated equal references.
+        error_type: Domain error raised when one artifact ID carries conflicting digests.
+
+    Returns:
+        One input per artifact ID, ordered by artifact ID.
+
+    Raises:
+        Exception: `error_type` when an artifact ID appears with two different digests.
+    """
+    by_id: dict[str, ArtifactInput] = {}
+    for item in inputs:
+        previous = by_id.get(item.artifact_id)
+        if previous is not None and previous != item:
+            raise error_type(f"artifact input {item.artifact_id} has conflicting manifest digests")
+        by_id[item.artifact_id] = item
+    return tuple(by_id[artifact_id] for artifact_id in sorted(by_id))
+
+
 class SecretBoundaryError(ValueError):
     """Raised when data intended for an immutable artifact names or contains a secret."""
 

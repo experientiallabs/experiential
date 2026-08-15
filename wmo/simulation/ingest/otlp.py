@@ -44,7 +44,6 @@ _OUTCOME_FAILURE_CODE_KEY = "wmo.outcome.failure.code"
 _OUTCOME_FAILURE_MESSAGE_KEY = "wmo.outcome.failure.message"
 _OUTCOME_FAILURE_RETRYABLE_KEY = "wmo.outcome.failure.retryable"
 _REQUEST_CONTEXT_KEY = "wmo.request.context"
-_REQUEST_TAGS_KEY = "wmo.request.tags"
 _CONVERSATION_KEYS = ("wmo.conversation.id", "gen_ai.conversation.id")
 
 
