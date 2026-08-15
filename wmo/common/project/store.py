@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 import os
 import shutil
 import stat
@@ -26,7 +25,7 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
     validate_artifact_file_path,
 )
-from wmo.common.core.files import write_bytes_atomic
+from wmo.common.core.files import fsync_directory_best_effort, write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
 from wmo.common.project.manifests import ArtifactFile, ArtifactManifest, artifact_input, file_digest
 from wmo.common.project.paths import ProjectPaths, validate_local_id
@@ -36,8 +35,6 @@ from wmo.common.project.project import (
     load_project_config,
     write_project_config,
 )
-
-logger = logging.getLogger(__name__)
 
 _JSON_VALUE_ADAPTER = TypeAdapter(JsonValue)
 _ACTIVE_COMPLETED_BUILD_COORDINATION: ContextVar[str | None] = ContextVar(
@@ -171,7 +168,7 @@ class ArtifactStore:
             except BaseException:
                 shutil.rmtree(staging, ignore_errors=True)
                 raise
-        _fsync_directory_best_effort(self._paths.artifacts_directory)
+        fsync_directory_best_effort(self._paths.artifacts_directory)
         return manifest
 
     def write_json(
@@ -774,13 +771,3 @@ def _fsync_staging_tree(directory: Path) -> None:
     ):
         _fsync_directory_strict(child_directory)
     _fsync_directory_strict(directory)
-
-
-def _fsync_directory_best_effort(directory: Path) -> None:
-    """Attempt to persist a completed directory rename without misreporting a landed write."""
-    try:
-        _fsync_directory_strict(directory)
-    except OSError as exc:
-        logger.warning(
-            "artifact rename at %s landed but directory fsync failed: %s", directory, exc
-        )

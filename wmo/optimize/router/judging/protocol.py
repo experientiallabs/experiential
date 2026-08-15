@@ -36,85 +36,48 @@ from wmo.optimize.router.judging.contracts import (
 )
 
 
-class _ScalarDimension(ContractModel):
+class _CitedDimension(ContractModel):
+    """Citation fields shared by every single-candidate structured-feedback dimension."""
+
+    dimension_id: ArtifactId
+    evidence_span_ids: tuple[str, ...] = Field(min_length=1)
+    feedback: str = Field(min_length=1)
+
+    @field_validator("evidence_span_ids")
+    @classmethod
+    def _require_unique_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Reject repeated evidence citations.
+
+        Args:
+            value: Provider-returned span identifiers.
+
+        Returns:
+            Unique span identifiers in provider order.
+
+        Raises:
+            ValueError: A span identifier repeats.
+        """
+        if len(set(value)) != len(value):
+            raise ValueError("judge evidence span IDs must not repeat")
+        return value
+
+
+class _ScalarDimension(_CitedDimension):
     """One scalar structured-feedback dimension."""
 
-    dimension_id: ArtifactId
     raw_score: Literal[0, 1, 2, 3, 4, 5]
-    evidence_span_ids: tuple[str, ...] = Field(min_length=1)
-    feedback: str = Field(min_length=1)
-
-    @field_validator("evidence_span_ids")
-    @classmethod
-    def _require_unique_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Reject repeated evidence citations.
-
-        Args:
-            value: Provider-returned span identifiers.
-
-        Returns:
-            Unique span identifiers in provider order.
-
-        Raises:
-            ValueError: A span identifier repeats.
-        """
-        if len(set(value)) != len(value):
-            raise ValueError("judge evidence span IDs must not repeat")
-        return value
 
 
-class _BooleanDimension(ContractModel):
+class _BooleanDimension(_CitedDimension):
     """One boolean structured-feedback dimension."""
 
-    dimension_id: ArtifactId
     passed: bool
-    evidence_span_ids: tuple[str, ...] = Field(min_length=1)
-    feedback: str = Field(min_length=1)
-
-    @field_validator("evidence_span_ids")
-    @classmethod
-    def _require_unique_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Reject repeated evidence citations.
-
-        Args:
-            value: Provider-returned span identifiers.
-
-        Returns:
-            Unique span identifiers in provider order.
-
-        Raises:
-            ValueError: A span identifier repeats.
-        """
-        if len(set(value)) != len(value):
-            raise ValueError("judge evidence span IDs must not repeat")
-        return value
 
 
-class _CategoricalDimension(ContractModel):
+class _CategoricalDimension(_CitedDimension):
     """One categorical structured-feedback dimension."""
 
-    dimension_id: ArtifactId
     category: str = Field(min_length=1)
-    evidence_span_ids: tuple[str, ...] = Field(min_length=1)
-    feedback: str = Field(min_length=1)
-
-    @field_validator("evidence_span_ids")
-    @classmethod
-    def _require_unique_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Reject repeated evidence citations.
-
-        Args:
-            value: Provider-returned span identifiers.
-
-        Returns:
-            Unique span identifiers in provider order.
-
-        Raises:
-            ValueError: A span identifier repeats.
-        """
-        if len(set(value)) != len(value):
-            raise ValueError("judge evidence span IDs must not repeat")
-        return value
 
 
 class _PairwiseDimension(ContractModel):

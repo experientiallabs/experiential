@@ -110,7 +110,7 @@ def build_task_set(
 
     This is the supported no-network Python composition path. It intentionally accepts a
     pre-normalized result rather than a file path, so the only raw-source read remains in one
-    selected canonical OTLP or PostHog loader.
+    selected canonical source loader.
 
     Args:
         normalized: Canonical traces and explicit validation exclusions from one source loader.

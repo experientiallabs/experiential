@@ -800,32 +800,6 @@ def _read_model[ModelT: BaseModel](path: Path, model_type: type[ModelT], label: 
         raise TinkerSFTResumeError(f"cannot read {label} at {path}: {exc}") from exc
 
 
-def _read_canonical_model[ModelT: BaseModel](
-    path: Path, model_type: type[ModelT], label: str
-) -> ModelT:
-    """Read one validated model and require exact canonical builder serialization.
-
-    Args:
-        path: Existing local contract path.
-        model_type: Pydantic model class used for exact validation.
-        label: User-facing artifact label used by failures.
-
-    Returns:
-        Validated model whose stored bytes match the current canonical serializer.
-
-    Raises:
-        TinkerSFTResumeError: The file is malformed or not canonical current output.
-    """
-    try:
-        payload = path.read_bytes()
-        model = model_type.model_validate_json(payload)
-    except (OSError, ValueError) as exc:
-        raise TinkerSFTResumeError(f"cannot read {label} at {path}: {exc}") from exc
-    if payload != canonical_json_bytes(model) + b"\n":
-        raise TinkerSFTResumeError(f"{label} at {path} is not canonical current output")
-    return model
-
-
 def _require_safe_automatic_acceptance_path(store: ProjectStore, path: Path) -> None:
     """Reject a pointer path escaping through any project-relative symlinked ancestor.
 

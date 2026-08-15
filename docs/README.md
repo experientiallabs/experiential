@@ -10,7 +10,7 @@ results, and plans do not live here.
 | `usage.md` | Locked CLI map for build, bounded optimize model, optimize router, run, and config. |
 | `cookbook/router.md` | Provider-free local artifact and loopback runtime walkthrough. |
 | `reference/providers.md` | Catalog providers, environment variables, Azure endpoint and deployment rules, and the Bedrock credential chain. |
-| `reference/ingest.md` | Current OTLP and PostHog local trace input contract. |
+| `reference/ingest.md` | Current declared local trace source contract for every supported source. |
 | `reference/immutable-real-trace-rag.md` | Immutable real-trace retrieval provenance, leakage, persistence, and historical restoration contract. |
 | `reference/router_optimization_config.md` | Exact completed-evidence configuration recipe for router optimization. |
 | `release-scope.md` | Supported and explicitly excluded release claims. |

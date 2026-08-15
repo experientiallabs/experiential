@@ -91,7 +91,7 @@ def resolve_task_set(store: ArtifactStore, task_set_id: str | None = None) -> Lo
     )
     if not candidates:
         raise ArtifactCorruptionError(
-            "project has no immutable task set; run wmo build on an OTLP or PostHog export first"
+            "project has no immutable task set; run wmo build on a declared trace export first"
         )
     if len(candidates) > 1:
         raise ArtifactCorruptionError(

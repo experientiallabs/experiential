@@ -50,26 +50,6 @@ def ledger_dir(state_directory: Path) -> Path:
     return Path(state_directory) / LEDGER_DIRNAME
 
 
-def pid_is_alive(pid: int) -> bool:
-    """Return whether the process that owns a ledger file still exists.
-
-    Args:
-        pid: Process ID recorded as the ledger owner.
-
-    Returns:
-        True when the process exists or cannot be probed due to permissions.
-    """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # it exists, it just belongs to another user
-    return True
-
-
 class SandboxCreated(BaseModel):
     """One sandbox a process created, recorded the moment E2B returned it."""
 
@@ -184,56 +164,6 @@ def _owner_pid(path: Path, record_pid: int | None) -> int:
     if head.isdigit():
         return int(head)
     return record_pid if record_pid is not None else 0
-
-
-def append_release(path: Path, *, sandbox_id: str, pid: int, released_at: datetime) -> None:
-    """Append one release record to an existing ledger file (used by a reaper).
-
-    Records are single short lines appended to a file opened `O_APPEND`, so a reaper writing
-    into another process's ledger cannot interleave with that process's own appends.
-
-    Args:
-        path: Existing owning-process ledger file.
-        sandbox_id: Exact remote resource ID whose cleanup was proved.
-        pid: Process ID that observed the cleanup proof.
-        released_at: Time at which cleanup was proved.
-
-    Raises:
-        OSError: If the record cannot be written; the caller decides whether that is fatal
-            (`SandboxLedger` treats its own write failures as warnings).
-    """
-    _append_line(path, SandboxReleased(sandbox_id=sandbox_id, released_at=released_at, pid=pid))
-
-
-def prune_released_files(
-    state_directory: Path,
-    *,
-    owner_alive: Callable[[int], bool] = pid_is_alive,
-) -> tuple[Path, ...]:
-    """Delete every ledger file whose recorded sandboxes are all released.
-
-    A fully released file whose owning process is STILL RUNNING is kept: that process can append
-    a new create record at any moment, and deleting the file underneath it would lose the only
-    record of a live sandbox.
-
-    Args:
-        state_directory: Explicit caller-owned WMO state directory.
-        owner_alive: Liveness probe for a file's owning pid (injected in tests).
-
-    Returns:
-        The paths that were deleted.
-    """
-    removed: list[Path] = []
-    for ledger in read_ledger_files(state_directory):
-        if not ledger.fully_released or owner_alive(ledger.owner_pid):
-            continue
-        try:
-            ledger.path.unlink(missing_ok=True)
-        except OSError as error:
-            logger.warning("cannot delete the released E2B ledger %s: %s", ledger.path, error)
-            continue
-        removed.append(ledger.path)
-    return tuple(removed)
 
 
 class SandboxLedger:

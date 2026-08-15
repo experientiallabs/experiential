@@ -4,7 +4,7 @@ The root surface is deliberately small:
 
 | Command | Purpose | Local result |
 |---|---|---|
-| `wmo build TRACE_FILE --project PROJECT --root ROOT` | Normalize 100 through 1000 local OTLP or PostHog traces and mine representative tasks. | Manifest-bound `TraceDataset`, `TaskSet`, and `proposals_pending` review state. |
+| `wmo build PROJECT TRACES --source SOURCE --root ROOT` | Normalize 100 through 1000 local traces from one [declared source](reference/ingest.md) and mine representative tasks. | Manifest-bound `TraceDataset`, `TaskSet`, and `proposals_pending` review state. |
 | `wmo optimize router PROJECT --config FILE --root ROOT` | Fit, freeze, then report from explicit completed evidence. | Fit evaluation, bank, policy, held-out evaluation, and router report. |
 | `wmo optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `wmo run PROJECT --root ROOT [--ghost]` | Load a frozen policy and expose it on development-only loopback. | Local OpenAI-compatible endpoint with durable journaling by default or no saved traffic in ghost mode. |

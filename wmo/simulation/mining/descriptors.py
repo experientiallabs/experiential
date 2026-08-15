@@ -15,14 +15,11 @@ from pydantic import JsonValue
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.core.text import normalize_durable_text
 from wmo.common.routing.features import (
-    ROUTER_FEATURE_EXTRACTOR_ID,
     RouterFeatureExtractor,
     RouterFeatureRecord,
 )
 from wmo.common.tasks import ToolSchema
 from wmo.common.traces import Trace
-
-ROUTING_DESCRIPTOR_VERSION = ROUTER_FEATURE_EXTRACTOR_ID
 
 _TOKEN_PATTERN = re.compile(r"[\w]+", re.UNICODE)
 

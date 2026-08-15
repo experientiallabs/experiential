@@ -18,6 +18,7 @@ from uuid import uuid4
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, Sha256, canonical_json_bytes
+from wmo.common.core.files import fsync_directory_best_effort
 from wmo.common.core.locks import FileLockTimeout, file_write_lock
 
 logger = logging.getLogger(__name__)
@@ -617,7 +618,7 @@ class TextCellLeaseStore:
         finally:
             os.close(descriptor)
             os.close(directory_descriptor)
-        _fsync_directory(path.parent)
+        fsync_directory_best_effort(path.parent)
 
     @staticmethod
     def _open_directory(directory: Path) -> int:
@@ -648,21 +649,3 @@ def _owner_process_is_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
-
-
-def _fsync_directory(directory: Path) -> None:
-    """Best-effort persistence for a claim creation or release directory mutation."""
-    try:
-        descriptor = os.open(directory, os.O_RDONLY)
-    except OSError as exc:
-        logger.warning("could not open text-cell lease directory %s for fsync: %s", directory, exc)
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError as exc:
-        logger.warning("could not fsync text-cell lease directory %s: %s", directory, exc)
-    finally:
-        try:
-            os.close(descriptor)
-        except OSError as exc:
-            logger.warning("could not close text-cell lease directory %s: %s", directory, exc)

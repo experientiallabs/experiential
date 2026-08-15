@@ -267,17 +267,16 @@ def write_review_state(store: ProjectStore, state: ManualJudgeReviewState) -> No
         ManualJudgeError: Setup provenance, selected build, or review state is invalid.
     """
     try:
-        setup, setup_input = read_artifact_json(
+        setup, _setup_input = read_artifact_json(
             store,
             artifact_id=state.setup.artifact_id,
             expected_artifact_type="manual-judge-setup",
             relative_path="setup.json",
             model_type=ManualJudgeSetupArtifact,
+            expected_input=state.setup,
         )
     except JudgingProvenanceError as exc:
         raise ManualJudgeError("manual judge setup is unavailable for review update") from exc
-    if setup_input != state.setup:
-        raise ManualJudgeError("manual judge setup manifest differs from review state")
 
     def update(current: JsonValue | None) -> JsonObject:
         """Preserve unrelated review namespaces while replacing manual judge state.
@@ -688,17 +687,16 @@ def read_audit(store: ProjectStore, expected: ArtifactInput) -> ManualJudgeCalib
         ManualJudgeError: The audit is unavailable, malformed, or changed.
     """
     try:
-        audit, audit_input = read_artifact_json(
+        audit, _audit_input = read_artifact_json(
             store,
             artifact_id=expected.artifact_id,
             expected_artifact_type="manual-judge-calibration-audit",
             relative_path="audit.json",
             model_type=ManualJudgeCalibrationAudit,
+            expected_input=expected,
         )
     except JudgingProvenanceError as exc:
         raise ManualJudgeError("completed judge calibration audit is unavailable") from exc
-    if audit_input != expected:
-        raise ManualJudgeError("judge calibration audit manifest differs from review state")
     return audit
 
 
@@ -716,17 +714,16 @@ def _read_report(store: ProjectStore, expected: ArtifactInput) -> CalibrationRep
         ManualJudgeError: The report is unavailable, malformed, or changed.
     """
     try:
-        report, report_input = read_artifact_json(
+        report, _report_input = read_artifact_json(
             store,
             artifact_id=expected.artifact_id,
             expected_artifact_type="judge-calibration-report",
             relative_path="report.json",
             model_type=CalibrationReport,
+            expected_input=expected,
         )
     except JudgingProvenanceError as exc:
         raise ManualJudgeError("completed judge calibration report is unavailable") from exc
-    if report_input != expected:
-        raise ManualJudgeError("judge calibration report manifest differs from audit")
     return report
 
 
