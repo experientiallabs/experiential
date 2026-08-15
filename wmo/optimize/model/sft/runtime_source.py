@@ -117,7 +117,7 @@ def _prepared_interaction(
     if completed is None:
         raise SFTSourceVerificationError("runtime SFT completed attempt has no response event")
     accepted = completed_attempt.accepted
-    history = _request_history(accepted.request.messages)
+    history = _request_history(accepted.identity.request.messages)
     target_index = len(history)
     try:
         transcript = SFTTranscript(
@@ -139,7 +139,7 @@ def _prepared_interaction(
             "sft-lineage",
             {
                 "kind": "runtime_interaction",
-                "source_lineage": accepted.lineage_id,
+                "source_lineage": accepted.identity.lineage_id,
             },
         ),
         task=_task_text(accepted),
@@ -184,7 +184,7 @@ def _excluded_interaction(
         "sft-lineage",
         {
             "kind": "runtime_interaction",
-            "source_lineage": accepted.lineage_id,
+            "source_lineage": accepted.identity.lineage_id,
         },
     )
     reference = SFTSourceReference(
@@ -285,10 +285,10 @@ def _task_text(accepted: RuntimeAcceptedEvent) -> str:
     Returns:
         Last user text, first available message text, or a stable fallback.
     """
-    for message in reversed(accepted.request.messages):
+    for message in reversed(accepted.identity.request.messages):
         if message.role == "user" and message.content:
             return message.content
-    for message in accepted.request.messages:
+    for message in accepted.identity.request.messages:
         if message.content:
             return message.content
     return "Complete the routed model request."

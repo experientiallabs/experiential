@@ -58,8 +58,8 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
     Raises:
         OSError: The write or the rename failed, which means the destination is untouched and the
             staging file has been cleaned up. Everything that can fail here fails BEFORE the
-            rename, so a raised error always means the write did not land: see `_fsync_directory`
-            for the one step that is deliberately best effort.
+            rename, so a raised error always means the write did not land: see
+            `fsync_directory_best_effort` for the one step that is deliberately best effort.
     """
     path = resolve_write_target(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -77,7 +77,7 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
     except BaseException:
         staging.unlink(missing_ok=True)  # never leave a stray staging file beside the real one
         raise
-    _fsync_directory(path.parent)
+    fsync_directory_best_effort(path.parent)
 
 
 def resolve_write_target(path: Path) -> Path:
@@ -110,7 +110,7 @@ def resolve_write_target(path: Path) -> Path:
     return path.resolve() if path.is_symlink() else path
 
 
-def _fsync_directory(directory: Path) -> None:
+def fsync_directory_best_effort(directory: Path) -> None:
     """Persist the rename itself. Best effort, and deliberately so: never raises `OSError`.
 
     Every step is individually guarded, including the close. `close` is not a formality on every

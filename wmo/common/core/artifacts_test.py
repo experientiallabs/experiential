@@ -17,7 +17,11 @@ from wmo.common.core.artifacts import (
     StructuredFailure,
     assert_secret_free,
     canonical_json_bytes,
+    canonical_jsonl_bytes,
+    envelope_matches_manifest,
+    sha256_bytes,
     sha256_json,
+    sorted_artifact_inputs,
     stable_id,
     validate_artifact_file_path,
 )
@@ -34,6 +38,19 @@ def test_deterministic_json_hash_and_stable_id_ignore_mapping_order() -> None:
     assert canonical_json_bytes(first) == canonical_json_bytes(second)
     assert sha256_json(first) == sha256_json(second)
     assert stable_id("task-set", first) == stable_id("task-set", second)
+
+
+def test_canonical_jsonl_frames_records_and_digests_exact_payload_bytes() -> None:
+    """JSONL serialization newline-terminates records and hashes the framed payload."""
+    records = ({"b": 2, "a": 1}, {"c": 3})
+
+    payload = canonical_jsonl_bytes(records)
+    expected = b"".join(canonical_json_bytes(record) + b"\n" for record in records)
+
+    assert canonical_jsonl_bytes(()) == b""
+    assert payload == expected
+    assert sha256_bytes(payload) != sha256_bytes(payload[:-1])
+    assert sha256_bytes(canonical_json_bytes(records[0])) == sha256_json(records[0])
 
 
 def test_envelope_requires_timezone_and_sorted_unique_inputs() -> None:
@@ -66,6 +83,40 @@ def test_envelope_requires_timezone_and_sorted_unique_inputs() -> None:
                 ArtifactInput(artifact_id="trace-a", sha256=_DIGEST_B),
             ),
         )
+
+
+def test_sorted_artifact_inputs_dedupes_sorts_and_rejects_conflicting_digests() -> None:
+    """The canonical input normalizer dedupes exact repeats and rejects digest drift."""
+    first = ArtifactInput(artifact_id="trace-a", sha256=_DIGEST_A)
+    second = ArtifactInput(artifact_id="trace-b", sha256=_DIGEST_B)
+
+    assert sorted_artifact_inputs((second, first, second)) == (first, second)
+    assert sorted_artifact_inputs(()) == ()
+
+    conflicting = ArtifactInput(artifact_id="trace-a", sha256=_DIGEST_B)
+    with pytest.raises(ValueError, match="conflicting manifest digests"):
+        sorted_artifact_inputs((first, conflicting))
+
+
+def test_envelope_matches_manifest_compares_the_five_shared_provenance_fields() -> None:
+    """The shared predicate accepts identical provenance and rejects any field drift."""
+    envelope = ArtifactEnvelope(
+        schema_version=1,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="e7aad17",
+        inputs=(ArtifactInput(artifact_id="trace-a", sha256=_DIGEST_A),),
+        source=SourceIdentity(kind="file", source_id="traces.jsonl", sha256=_DIGEST_A),
+    )
+    manifest = envelope.model_copy()
+
+    assert envelope_matches_manifest(envelope, manifest)
+    assert not envelope_matches_manifest(
+        envelope, manifest.model_copy(update={"code_revision": "f00dcafe"})
+    )
+    assert not envelope_matches_manifest(
+        envelope,
+        manifest.model_copy(update={"created_at": datetime(2026, 8, 12, tzinfo=UTC)}),
+    )
 
 
 def test_source_identity_and_secret_boundary_round_trip() -> None:

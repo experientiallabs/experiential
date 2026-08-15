@@ -44,7 +44,7 @@ class JudgmentError(ValueError):
     """Raised when a judge request or structured model verdict violates its contract."""
 
 
-class _RawDimensionJudgment(ContractModel):
+class RawDimensionJudgment(ContractModel):
     """Strict structured score emitted for one rubric dimension by an LM judge."""
 
     dimension_id: ArtifactId
@@ -62,10 +62,10 @@ class _RawDimensionJudgment(ContractModel):
         return value
 
 
-class _RawJudgment(ContractModel):
+class RawJudgment(ContractModel):
     """Strict top-level structured score emitted by an LM judge."""
 
-    dimensions: tuple[_RawDimensionJudgment, ...]
+    dimensions: tuple[RawDimensionJudgment, ...]
 
 
 class JudgeProbe(ContractModel):
@@ -88,7 +88,7 @@ def judge_response_schema() -> JsonObject:
     Returns:
         Pydantic-derived object schema for the dimension judgment response.
     """
-    return cast(JsonObject, _RawJudgment.model_json_schema())
+    return cast(JsonObject, RawJudgment.model_json_schema())
 
 
 class LMJudge:
@@ -434,20 +434,20 @@ def _validate_bindings(
         )
 
 
-def _parse_response(content: str | None, tool_calls: tuple[ToolCall, ...]) -> _RawJudgment:
+def _parse_response(content: str | None, tool_calls: tuple[ToolCall, ...]) -> RawJudgment:
     """Parse only strict JSON text, rejecting unsupported tool and prose outputs."""
     if tool_calls:
         raise JudgmentError("LM judge must return structured JSON text, not tool calls")
     if content is None:
         raise JudgmentError("LM judge returned no structured JSON text")
     try:
-        return _RawJudgment.model_validate_json(content)
+        return RawJudgment.model_validate_json(content)
     except ValueError as exc:
         raise JudgmentError("LM judge returned malformed structured output") from exc
 
 
 def _build_dimensions(
-    raw: _RawJudgment,
+    raw: RawJudgment,
     rollout: RolloutArtifact,
     rubric: Rubric,
     calibration: JudgeCalibration,

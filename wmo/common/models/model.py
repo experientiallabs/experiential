@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from enum import StrEnum
 from typing import Literal
 
@@ -63,6 +64,82 @@ class OperationEconomics(ContractModel):
     usage: Usage | None = None
     cost_usd: NumericMeasurement | None = None
     latency_seconds: NumericMeasurement | None = None
+
+
+def combine_economics(
+    records: Sequence[OperationEconomics],
+    *,
+    require_complete_usage: bool = True,
+) -> OperationEconomics:
+    """Aggregate per-operation economics without representing a partial total as complete.
+
+    Args:
+        records: Economics observed for each aggregated operation.
+        require_complete_usage: When ``True``, report usage only if every record carries it.
+            When ``False``, sum the records that report usage and omit usage only when all
+            records lack it.
+
+    Returns:
+        One economics value. Cost and latency are summed only when every record exposes that
+        measurement, preserving a clear unknown rather than a partial sum.
+    """
+    if not records:
+        return OperationEconomics()
+    usages = tuple(record.usage for record in records)
+    present = tuple(item for item in usages if item is not None)
+    usage: Usage | None = None
+    if present and (not require_complete_usage or len(present) == len(usages)):
+        usage = _sum_usage(present)
+    return OperationEconomics(
+        usage=usage,
+        cost_usd=_sum_measurements(tuple(record.cost_usd for record in records)),
+        latency_seconds=_sum_measurements(tuple(record.latency_seconds for record in records)),
+    )
+
+
+def _sum_usage(values: Sequence[Usage]) -> Usage:
+    """Sum provider token usage without manufacturing missing cache counts.
+
+    Args:
+        values: Usage records reported by the aggregated operations.
+
+    Returns:
+        Summed input and output tokens, with cached input tokens summed only when every
+        record reports them.
+    """
+    cached = tuple(value.cached_input_tokens for value in values)
+    cached_total: int | None = None
+    if all(item is not None for item in cached):
+        cached_total = sum(item for item in cached if item is not None)
+    return Usage(
+        input_tokens=sum(value.input_tokens for value in values),
+        output_tokens=sum(value.output_tokens for value in values),
+        cached_input_tokens=cached_total,
+    )
+
+
+def _sum_measurements(
+    values: Sequence[NumericMeasurement | None],
+) -> NumericMeasurement | None:
+    """Sum a measurement series while retaining its weakest provenance.
+
+    Args:
+        values: Optional measurements from each aggregated operation.
+
+    Returns:
+        The summed measurement, or ``None`` when any operation omitted it.
+    """
+    present: list[NumericMeasurement] = []
+    for value in values:
+        if value is None:
+            return None
+        present.append(value)
+    return NumericMeasurement(
+        value=sum(item.value for item in present),
+        provenance=(
+            "observed" if all(item.provenance == "observed" for item in present) else "estimated"
+        ),
+    )
 
 
 class ToolCall(ContractModel):

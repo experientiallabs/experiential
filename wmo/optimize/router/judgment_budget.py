@@ -6,6 +6,7 @@ from wmo.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     Sha256,
+    sorted_artifact_inputs,
     stable_id,
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationProtocol
@@ -115,7 +116,9 @@ def read_dispatch_reservation(
     receipt = JudgmentDispatchReceipt.model_validate_json(
         project.artifacts.read_bytes(dispatch_id, "dispatch.json")
     )
-    expected_inputs = _sorted_inputs(plan_input, rollout_input, rubric_input, calibration_input)
+    expected_inputs = sorted_artifact_inputs(
+        (plan_input, rollout_input, rubric_input, calibration_input)
+    )
     if (
         receipt.dispatch_id != dispatch_id
         or receipt.plan != plan_input
@@ -124,7 +127,7 @@ def read_dispatch_reservation(
         or receipt.rubric != rubric_input
         or receipt.calibration != calibration_input
         or receipt.protocol_sha256 != protocol_sha256
-        or _sorted_inputs(*receipt.inputs) != expected_inputs
+        or sorted_artifact_inputs(receipt.inputs) != expected_inputs
     ):
         raise JudgmentBudgetError("judgment dispatch reservation binding has drifted")
     return receipt
@@ -161,7 +164,7 @@ def persist_dispatch_reservation(
     receipt = JudgmentDispatchReceipt(
         schema_version=1,
         created_at=plan.created_at,
-        inputs=_sorted_inputs(plan_input, rollout_input, rubric_input, calibration_input),
+        inputs=sorted_artifact_inputs((plan_input, rollout_input, rubric_input, calibration_input)),
         code_revision=plan.code_revision,
         dispatch_id=dispatch_id,
         plan=plan_input,
@@ -202,8 +205,8 @@ def _require_judgment(
         or judgment.judge_model != calibration.judge_model
         or judgment.judge_prompt_id != calibration.judge_prompt_id
         or judgment.judge_prompt_sha256 != calibration.judge_prompt_sha256
-        or _sorted_inputs(*judgment.inputs)
-        != _sorted_inputs(rollout_input, rubric_input, calibration_input)
+        or sorted_artifact_inputs(judgment.inputs)
+        != sorted_artifact_inputs((rollout_input, rubric_input, calibration_input))
     ):
         raise JudgmentBudgetError("persisted judgment differs from its exact plan review pins")
 
@@ -248,9 +251,3 @@ def _rubric_input(project: ProjectStore, rubric_id: str) -> ArtifactInput:
     if stored.manifest.artifact_type != "rubric":
         raise JudgmentBudgetError("approved review rubric has the wrong artifact type")
     return artifact_input(stored.manifest)
-
-
-def _sorted_inputs(*values: object) -> tuple[ArtifactInput, ...]:
-    """Normalize Pydantic constructor unions to exact sorted artifact inputs."""
-    inputs = tuple(ArtifactInput.model_validate(value) for value in values)
-    return tuple(sorted(inputs, key=lambda item: item.artifact_id))

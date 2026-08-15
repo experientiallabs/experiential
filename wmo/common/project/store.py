@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 import os
 import shutil
 import stat
@@ -24,9 +23,11 @@ from wmo.common.core.artifacts import (
     assert_secret_free,
     assert_text_secret_free,
     canonical_json_bytes,
+    canonical_jsonl_bytes,
+    envelope_matches_manifest,
     validate_artifact_file_path,
 )
-from wmo.common.core.files import write_bytes_atomic
+from wmo.common.core.files import fsync_directory_best_effort, write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
 from wmo.common.project.manifests import ArtifactFile, ArtifactManifest, artifact_input, file_digest
 from wmo.common.project.paths import ProjectPaths, validate_local_id
@@ -36,8 +37,6 @@ from wmo.common.project.project import (
     load_project_config,
     write_project_config,
 )
-
-logger = logging.getLogger(__name__)
 
 _JSON_VALUE_ADAPTER = TypeAdapter(JsonValue)
 _ACTIVE_COMPLETED_BUILD_COORDINATION: ContextVar[str | None] = ContextVar(
@@ -171,7 +170,7 @@ class ArtifactStore:
             except BaseException:
                 shutil.rmtree(staging, ignore_errors=True)
                 raise
-        _fsync_directory_best_effort(self._paths.artifacts_directory)
+        fsync_directory_best_effort(self._paths.artifacts_directory)
         return manifest
 
     def write_json(
@@ -238,23 +237,143 @@ class ArtifactStore:
         for relative_path, records in files.items():
             if Path(relative_path).suffix != ".jsonl":
                 raise ArtifactStoreError("write_jsonl requires .jsonl data-file paths")
-            serialized_records = []
             for record in records:
                 try:
                     assert_secret_free(record)
                 except SecretBoundaryError as exc:
                     raise ArtifactStoreError(str(exc)) from exc
-                serialized_records.append(canonical_json_bytes(record))
-            payload = b"\n".join(serialized_records)
-            if payload:
-                payload += b"\n"
-            serialized_files[relative_path] = payload
+            serialized_files[relative_path] = canonical_jsonl_bytes(records)
         return self.write(
             artifact_id=artifact_id,
             artifact_type=artifact_type,
             envelope=envelope,
             files=serialized_files,
         )
+
+    def write_or_verify_exact(
+        self,
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        envelope: ArtifactEnvelope,
+        files: Mapping[str, bytes],
+    ) -> ArtifactManifest:
+        """Write a deterministic artifact or verify an existing exact replay.
+
+        Args:
+            artifact_id: Stable content-derived artifact identity.
+            artifact_type: Expected immutable artifact type.
+            envelope: Exact expected artifact provenance envelope.
+            files: Exact expected serialized payloads.
+
+        Returns:
+            Newly written or byte-for-byte verified artifact manifest.
+
+        Raises:
+            ValueError: An existing artifact has different manifest fields or payload bytes.
+            ArtifactStoreError: The existing artifact is corrupt or the write fails.
+        """
+        try:
+            return self.write(
+                artifact_id=artifact_id,
+                artifact_type=artifact_type,
+                envelope=envelope,
+                files=files,
+            )
+        except ArtifactAlreadyExistsError:
+            manifest = self.read(artifact_id).manifest
+        if manifest.artifact_type != artifact_type or not envelope_matches_manifest(
+            envelope, manifest
+        ):
+            raise ValueError(f"existing artifact {artifact_id} manifest differs from exact replay")
+        self._verify_replay_files(artifact_id, manifest, files)
+        return manifest
+
+    def write_or_replay[EnvelopeT: ArtifactEnvelope](
+        self,
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        envelope: EnvelopeT,
+        envelope_path: str,
+        envelope_type: type[EnvelopeT],
+        files: Mapping[str, bytes],
+    ) -> tuple[EnvelopeT, ArtifactManifest]:
+        """Write a deterministic artifact or adopt its exact existing replay.
+
+        An existing artifact matches when it repeats the expected type, file set, and payload
+        bytes, and its persisted canonical envelope equals the expected envelope after adopting
+        the original materialization time.
+
+        Args:
+            artifact_id: Stable content-derived artifact identity.
+            artifact_type: Expected immutable artifact type.
+            envelope: Exact expected artifact provenance envelope.
+            envelope_path: Data-file path holding the canonical serialized envelope.
+            envelope_type: Concrete envelope model used to parse the stored payload.
+            files: Exact expected serialized payloads, including the envelope file.
+
+        Returns:
+            The newly written or existing verified envelope and its artifact manifest.
+
+        Raises:
+            ValueError: An existing artifact differs from the expected exact replay.
+            ArtifactStoreError: The existing artifact is corrupt or the write fails.
+        """
+        try:
+            manifest = self.write(
+                artifact_id=artifact_id,
+                artifact_type=artifact_type,
+                envelope=envelope,
+                files=files,
+            )
+        except ArtifactAlreadyExistsError:
+            manifest = self.read(artifact_id).manifest
+        else:
+            return envelope, manifest
+        if manifest.artifact_type != artifact_type:
+            raise ValueError(f"existing artifact {artifact_id} manifest differs from exact replay")
+        stored_envelope = self.read_bytes(artifact_id, envelope_path)
+        try:
+            existing = envelope_type.model_validate_json(stored_envelope)
+        except (ValidationError, ValueError) as exc:
+            raise ValueError(f"existing artifact {artifact_id} has an invalid envelope") from exc
+        adopted = envelope.model_copy(update={"created_at": existing.created_at})
+        if stored_envelope != canonical_json_bytes(adopted):
+            raise ValueError(f"existing artifact {artifact_id} envelope differs from exact replay")
+        if not envelope_matches_manifest(existing, manifest):
+            raise ValueError(f"existing artifact {artifact_id} manifest differs from exact replay")
+        self._verify_replay_files(artifact_id, manifest, files, skip=envelope_path)
+        return existing, manifest
+
+    def _verify_replay_files(
+        self,
+        artifact_id: str,
+        manifest: ArtifactManifest,
+        files: Mapping[str, bytes],
+        *,
+        skip: str | None = None,
+    ) -> None:
+        """Require an existing artifact to repeat the expected file set and payload bytes.
+
+        Args:
+            artifact_id: Existing verified artifact identity.
+            manifest: Parsed manifest of the existing artifact.
+            files: Exact expected serialized payloads.
+            skip: Optional path whose bytes the caller compares separately.
+
+        Raises:
+            ValueError: The stored file set or any payload differs from the expected replay.
+        """
+        if tuple(sorted(files)) != tuple(item.path for item in manifest.files):
+            raise ValueError(f"existing artifact {artifact_id} file set differs from exact replay")
+        for relative_path, expected_payload in files.items():
+            if relative_path == skip:
+                continue
+            if self.read_bytes(artifact_id, relative_path) != expected_payload:
+                raise ValueError(
+                    f"existing artifact {artifact_id} payload differs from exact replay"
+                )
 
     def read(self, artifact_id: str) -> StoredArtifact:
         """Read and fully verify one completed immutable artifact.
@@ -774,13 +893,3 @@ def _fsync_staging_tree(directory: Path) -> None:
     ):
         _fsync_directory_strict(child_directory)
     _fsync_directory_strict(directory)
-
-
-def _fsync_directory_best_effort(directory: Path) -> None:
-    """Attempt to persist a completed directory rename without misreporting a landed write."""
-    try:
-        _fsync_directory_strict(directory)
-    except OSError as exc:
-        logger.warning(
-            "artifact rename at %s landed but directory fsync failed: %s", directory, exc
-        )

@@ -406,7 +406,7 @@ def test_persist_trace_dataset_rejects_changed_evidence_under_explicit_id(
         dataset_id="trace-dataset-explicit",
     )
 
-    with pytest.raises(ValueError, match="differs from replayed normalized evidence"):
+    with pytest.raises(ValueError, match="differs from exact replay"):
         persist_trace_dataset(
             TraceNormalizationResult(traces=(_trace(2),), issues=()),
             store,

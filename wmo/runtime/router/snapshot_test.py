@@ -548,7 +548,7 @@ def test_dataset_replay_rejects_envelope_fields_outside_its_identity(
     dataset_entry["size_bytes"] = len(dataset_payload)
     manifest_path.write_bytes(canonical_json_bytes(manifest))
 
-    with pytest.raises(RuntimeTraceSnapshotError, match="ID differs"):
+    with pytest.raises(RuntimeTraceSnapshotError, match="differs from"):
         seal_runtime_trace_snapshot(
             journal,
             store,
@@ -643,7 +643,7 @@ def test_retry_success_is_one_target_and_failures_remain_prefix_provenance(
     assert len(exported.traces) == 1
     trace = exported.traces[0]
     assert trace.trace_id == first.interaction_id
-    assert trace.conversation_id == first.lineage_id
+    assert trace.conversation_id == first.identity.lineage_id
     assert trace.task == "Reset my password"
     assert trace.spans[0].started_at == retry.accepted.attempt_started_at
     assert trace.spans[0].attributes["runtime.attempt_ordinal"] == 2
@@ -729,7 +729,7 @@ def test_malformed_ids_digests_and_transitions_fail_closed(tmp_path: Path, corru
     elif corruption == "event-id":
         lines[0]["event_id"] = "runtime-event-ffffffffffffffffffff"
     elif corruption == "request-hash":
-        lines[0]["request_sha256"] = "f" * 64
+        lines[0]["identity"]["request_sha256"] = "f" * 64
     else:
         lines[1]["response_sha256"] = "f" * 64
     journal.path.write_bytes(b"\n".join(canonical_json_bytes(line) for line in lines) + b"\n")

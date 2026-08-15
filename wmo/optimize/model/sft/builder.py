@@ -17,6 +17,7 @@ from wmo.common.core.artifacts import (
     Sha256,
     canonical_json_bytes,
     sha256_json,
+    sorted_artifact_inputs,
     stable_id,
 )
 from wmo.common.project import (
@@ -189,7 +190,7 @@ def build_sft_dataset(
     rows = tuple(sorted(rows, key=_row_sort_key))
     exclusions = sorted(exclusions, key=_exclusion_sort_key)
 
-    all_inputs = _sorted_inputs(
+    all_inputs = sorted_artifact_inputs(
         input_item for source in prepared for input_item in source.direct_inputs
     )
     source_references = sorted(source_references, key=lambda item: (item.kind, item.source_id))
@@ -753,19 +754,6 @@ def _example_id(action: _ScannedAction) -> ArtifactId:
             }
         )
     return stable_id("sft-example", material)
-
-
-def _sorted_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactInput, ...]:
-    """Sort verified input identities and reject conflicting hashes for one artifact ID."""
-    by_id: dict[ArtifactId, ArtifactInput] = {}
-    for item in inputs:
-        existing = by_id.get(item.artifact_id)
-        if existing is not None and existing != item:
-            raise SFTBuildError(
-                f"immutable dataset input {item.artifact_id} has conflicting digests"
-            )
-        by_id[item.artifact_id] = item
-    return tuple(by_id[item_id] for item_id in sorted(by_id))
 
 
 def _build_digest(

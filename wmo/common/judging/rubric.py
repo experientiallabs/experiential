@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -53,7 +52,7 @@ class Rubric(ArtifactEnvelope):
     source_task_set_id: ArtifactId
     accepted_proposal_evidence_ids: tuple[ArtifactId, ...] = ()
     status: Literal["provisional", "human_approved"]
-    approved_at: datetime | None = None
+    approved_at: AwareDatetime | None = None
 
     @field_validator("dimensions")
     @classmethod
@@ -91,10 +90,6 @@ class Rubric(ArtifactEnvelope):
             raise ValueError("human-approved rubrics require approved_at")
         if self.status == "provisional" and self.approved_at is not None:
             raise ValueError("provisional rubrics must not set approved_at")
-        if self.approved_at is not None and (
-            self.approved_at.tzinfo is None or self.approved_at.utcoffset() is None
-        ):
-            raise ValueError("rubric approval times must include a timezone")
         return self
 
 
@@ -152,7 +147,7 @@ class JudgeCalibration(ArtifactEnvelope):
     label_count: int = Field(default=0, ge=0)
     recommended_label_count: Literal[10] = 10
     status: Literal["provisional", "insufficient", "human_calibrated"] = "provisional"
-    approved_at: datetime | None = None
+    approved_at: AwareDatetime | None = None
     risk_acceptance: ArtifactInput | None = None
 
     @field_validator("calibration_lineage_ids", "excluded_router_held_out_lineage_ids")
@@ -201,8 +196,4 @@ class JudgeCalibration(ArtifactEnvelope):
             raise ValueError("human-calibrated judge calibrations require human labels")
         if self.status == "human_calibrated" and not self.calibration_lineage_ids:
             raise ValueError("human-calibrated judge calibrations require fit lineages")
-        if self.approved_at is not None and (
-            self.approved_at.tzinfo is None or self.approved_at.utcoffset() is None
-        ):
-            raise ValueError("judge calibration approval times must include a timezone")
         return self

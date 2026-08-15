@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import wmo.common.project.store as project_store_module
-from wmo.common.core.artifacts import ArtifactEnvelope
+from wmo.common.core.artifacts import ArtifactEnvelope, canonical_json_bytes
 from wmo.common.project import (
     ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
@@ -67,6 +67,59 @@ def test_artifact_round_trip_is_digest_verified_and_immutable(tmp_path: Path) ->
             files={"tasks.json": {"task_ids": ["task-2"]}},
         )
     assert store.artifacts.read("task-set-v1").manifest == manifest
+
+
+def test_write_or_replay_adopts_exact_replays_and_rejects_any_drift(tmp_path: Path) -> None:
+    """Idempotent writes adopt the original materialization time and reject drifted evidence."""
+    store = _store(tmp_path)
+    envelope = _envelope()
+    files = {
+        "envelope.json": canonical_json_bytes(envelope),
+        "records.jsonl": b'{"row":1}\n',
+    }
+    written, first_manifest = store.artifacts.write_or_replay(
+        artifact_id="replay-v1",
+        artifact_type="task-set",
+        envelope=envelope,
+        envelope_path="envelope.json",
+        envelope_type=ArtifactEnvelope,
+        files=files,
+    )
+    assert written == envelope
+    later = envelope.model_copy(update={"created_at": datetime(2026, 8, 12, tzinfo=UTC)})
+    replayed, manifest = store.artifacts.write_or_replay(
+        artifact_id="replay-v1",
+        artifact_type="task-set",
+        envelope=later,
+        envelope_path="envelope.json",
+        envelope_type=ArtifactEnvelope,
+        files={**files, "envelope.json": canonical_json_bytes(later)},
+    )
+    assert replayed == envelope
+    assert manifest == first_manifest
+    drifted_cases = {
+        "payload differs from exact replay": {**files, "records.jsonl": b'{"row":2}\n'},
+        "file set differs from exact replay": {"envelope.json": files["envelope.json"]},
+    }
+    for message, drifted_files in drifted_cases.items():
+        with pytest.raises(ValueError, match=message):
+            store.artifacts.write_or_replay(
+                artifact_id="replay-v1",
+                artifact_type="task-set",
+                envelope=later,
+                envelope_path="envelope.json",
+                envelope_type=ArtifactEnvelope,
+                files=drifted_files,
+            )
+    with pytest.raises(ValueError, match="envelope differs from exact replay"):
+        store.artifacts.write_or_replay(
+            artifact_id="replay-v1",
+            artifact_type="task-set",
+            envelope=later.model_copy(update={"code_revision": "forged"}),
+            envelope_path="envelope.json",
+            envelope_type=ArtifactEnvelope,
+            files=files,
+        )
 
 
 def test_corruption_and_crash_do_not_create_valid_partial_artifacts(

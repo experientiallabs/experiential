@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.prompt import Confirm, FloatPrompt, Prompt
 
 from wmo.cli.consent import require_spend_consent
+from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.common.core.artifacts import Sha256, sha256_json
 from wmo.common.core.locks import file_write_lock
 from wmo.common.models import (
@@ -50,7 +51,6 @@ from wmo.optimize.model.sft.training_contracts import (
 from wmo.runtime.models.credentials import ModelCredentialError, read_connection_api_key
 
 _console = Console()
-_ROOT_OPTION = typer.Option(Path(".wmo"), "--root", help="Local .wmo project root.")
 _DEFAULT_LORA_RANK = 32
 _DEFAULT_LEARNING_RATE = 0.0001
 _DEFAULT_BATCH_SIZE = 4
@@ -58,11 +58,18 @@ _DEFAULT_EPOCHS = 1
 _DEFAULT_CHECKPOINT_EVERY_STEPS = 10
 _DEFAULT_MAXIMUM_DATUM_TOKENS = 4096
 _DEFAULT_MAXIMUM_COST_USD = 25.0
+_USAGE_ERRORS = (
+    ModelCatalogError,
+    ModelCredentialError,
+    SFTModelOptimizationError,
+    TinkerSFTDependencyError,
+    ValueError,
+)
 
 
 def optimize_model(
     project: str = typer.Argument(..., metavar="PROJECT", help="Configured local project ID."),
-    root: Path = _ROOT_OPTION,
+    root: Path = ROOT_OPTION,
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -126,8 +133,8 @@ def optimize_model(
     """
     started = time.monotonic()
     created_at = datetime.now(UTC)
-    try:
-        code_revision = _current_revision()
+    with usage_error(*_USAGE_ERRORS, ProjectStoreError, AutomaticSFTPreparationError):
+        code_revision = installed_release_revision()
         store = ProjectStore(root, project)
         require_completed_runtime_interactions(store)
         initial_settings = _initial_settings(
@@ -170,16 +177,6 @@ def optimize_model(
             )
         backend: TrainerBackend = _LocalPreflightBackend()
         preflight = local_preflight
-    except (
-        ProjectStoreError,
-        ModelCatalogError,
-        AutomaticSFTPreparationError,
-        SFTModelOptimizationError,
-        TinkerSFTDependencyError,
-        ModelCredentialError,
-        ValueError,
-    ) as exc:
-        raise typer.BadParameter(str(exc)) from None
 
     if preflight.completed_result is None and not preparation.accepted:
         assert config.training.maximum_cost_usd is not None
@@ -197,17 +194,15 @@ def optimize_model(
         ):
             _console.print("Managed Tinker SFT was not started.")
             return
-        try:
+        with usage_error(AutomaticSFTPreparationError):
             accept_runtime_sft_model_optimization(
                 store,
                 preparation,
                 created_at=created_at,
                 code_revision=code_revision,
             )
-        except AutomaticSFTPreparationError as exc:
-            raise typer.BadParameter(str(exc)) from None
     if preflight.completed_result is None:
-        try:
+        with usage_error(*_USAGE_ERRORS):
             backend = _compose_tinker_backend(
                 store,
                 config.tinker_connection,
@@ -219,15 +214,7 @@ def optimize_model(
                 backend,
                 code_revision=code_revision,
             )
-        except (
-            ModelCatalogError,
-            ModelCredentialError,
-            SFTModelOptimizationError,
-            TinkerSFTDependencyError,
-            ValueError,
-        ) as exc:
-            raise typer.BadParameter(str(exc)) from None
-    try:
+    with usage_error(SFTModelOptimizationError):
         completed = run_sft_model_optimization(
             store,
             config_id,
@@ -236,8 +223,6 @@ def optimize_model(
             code_revision=code_revision,
             preflight=preflight,
         )
-    except SFTModelOptimizationError as exc:
-        raise typer.BadParameter(str(exc)) from None
     properties: dict[str, bool | int | float] = {
         "success": True,
         "training_step_count": completed.training_result.training_step_count,
@@ -609,15 +594,3 @@ def _compose_tinker_backend(
         else tinker.ServiceClient(api_key=api_key, base_url=connection.base_url)
     )
     return TinkerTrainerBackend(service)
-
-
-def _current_revision() -> str:
-    """Resolve package-owned producer identity without consulting host Git.
-
-    Returns:
-        Exact configured release revision or installed distribution identity.
-
-    Raises:
-        ReleaseRevisionError: Release metadata is unavailable or malformed.
-    """
-    return installed_release_revision()

@@ -15,6 +15,7 @@ from wmo.common.core.artifacts import (
     ContractModel,
     Sha256,
     canonical_json_bytes,
+    envelope_matches_manifest,
     stable_id,
 )
 from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
@@ -343,19 +344,7 @@ def load_router_observed_attribution_set(
         )
     if value.attribution_set_id != attribution_set_id:
         raise ArtifactCorruptionError("router attribution payload identity differs from its path")
-    if (
-        stored.manifest.schema_version,
-        stored.manifest.created_at,
-        stored.manifest.inputs,
-        stored.manifest.code_revision,
-        stored.manifest.source,
-    ) != (
-        value.schema_version,
-        value.created_at,
-        value.inputs,
-        value.code_revision,
-        value.source,
-    ):
+    if not envelope_matches_manifest(value, stored.manifest):
         raise ArtifactCorruptionError("router attribution manifest differs from its envelope")
     expected_id = stable_id(
         "router-observed-attribution",

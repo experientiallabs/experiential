@@ -27,6 +27,7 @@ from wmo.common.models.model import (
     ToolCall,
     ToolChoice,
     Usage,
+    combine_economics,
 )
 from wmo.common.models.pricing import (
     CandidateTokenPrice,
@@ -97,6 +98,7 @@ __all__ = [
     "ToolChoice",
     "Usage",
     "catalog_state_sha256",
+    "combine_economics",
     "completion_candidate_aliases",
     "completion_cost_reservation",
     "completion_request_cost_usd",

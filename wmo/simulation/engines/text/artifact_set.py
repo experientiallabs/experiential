@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable, Sequence
 from datetime import datetime
 
-from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactInput,
+    canonical_json_bytes,
+    canonical_jsonl_bytes,
+    sha256_bytes,
+    sorted_artifact_inputs,
+    stable_id,
+)
 from wmo.common.project import ArtifactAlreadyExistsError, ArtifactCorruptionError, ArtifactStore
 from wmo.common.rollouts import RolloutArtifact, SimulationArtifactSet
-from wmo.simulation.engines.text.bindings import sorted_artifact_inputs
 from wmo.simulation.engines.text.errors import SimulationResumeError
-from wmo.simulation.engines.text.rollout_support import jsonl_bytes, timestamp
+from wmo.simulation.engines.text.rollout_support import timestamp
 from wmo.simulation.specs import SimulationSpec
 
 _ARTIFACT_SET_FILE = "artifact-set.json"
@@ -52,7 +57,7 @@ def persist_artifact_set(
     if spec.world_model is None:  # pragma: no cover - text simulator validates this first
         raise SimulationResumeError("text artifact sets require grounded world-model settings")
     artifact_ids = tuple(rollout.artifact_id for rollout in rollouts)
-    index_payload = jsonl_bytes(tuple({"artifact_id": item} for item in artifact_ids))
+    index_payload = canonical_jsonl_bytes(tuple({"artifact_id": item} for item in artifact_ids))
     artifact_set_id = stable_id(
         "simulation-artifact-set",
         {"simulation_id": spec.simulation_id, "artifact_ids": artifact_ids},
@@ -61,19 +66,21 @@ def persist_artifact_set(
         schema_version=1,
         created_at=timestamp(clock),
         inputs=sorted_artifact_inputs(
-            plan_input,
-            task_set_input,
-            fit_rag_input,
-            spec.world_model.grounded_world_model_input,
-            spec_input,
-            resolution_input,
+            (
+                plan_input,
+                task_set_input,
+                fit_rag_input,
+                spec.world_model.grounded_world_model_input,
+                spec_input,
+                resolution_input,
+            )
         ),
         code_revision=spec.code_revision,
         artifact_set_id=artifact_set_id,
         simulation_id=spec.simulation_id,
         artifact_ids=artifact_ids,
         artifacts_path=_ARTIFACT_IDS_FILE,
-        artifacts_sha256=hashlib.sha256(index_payload).hexdigest(),
+        artifacts_sha256=sha256_bytes(index_payload),
     )
     try:
         store.write(

@@ -6,10 +6,10 @@ import os
 import signal
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from types import TracebackType
 
 from wmo.common.core.artifacts import (
@@ -26,7 +26,7 @@ from wmo.common.models import (
     NumericMeasurement,
     OperationEconomics,
     ToolCall,
-    Usage,
+    combine_economics,
 )
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
@@ -34,6 +34,7 @@ from wmo.runtime.agents import AgentEpisode, AgentRuntime
 from wmo.runtime.agents.lifecycle import execute_agent_episode
 from wmo.runtime.environments import EnvironmentRuntime, EnvironmentSession, Observation
 from wmo.runtime.environments.harbor import HarborCleanupTimeoutError
+from wmo.simulation.engines.text.rollout_support import timestamp, utc_now
 
 
 class SandboxStepLimitError(RuntimeError):
@@ -206,7 +207,7 @@ def execute_bounded_sandbox_episode(
         if remaining_cost_usd is None
         else remaining_cost_usd - (environment_maximum_episode_cost_usd or 0.0)
     )
-    event_clock = clock or _utc_now
+    event_clock = clock or utc_now
     deadline = _Deadline(maximum_time_seconds, monotonic)
     model = _RecordingCandidateClient(
         candidate,
@@ -232,8 +233,8 @@ def execute_bounded_sandbox_episode(
     evidence = SandboxExecutionEvidence(
         candidate_spans=tuple(model.spans),
         environment_spans=tuple(environment.spans),
-        candidate_economics=_combine_economics(model.economics),
-        sandbox_economics=_combine_economics(environment.economics),
+        candidate_economics=combine_economics(model.economics),
+        sandbox_economics=combine_economics(environment.economics),
         limit_stop_reason=model.limit_stop_reason or environment.limit_stop_reason,
         limit_failure=model.limit_failure or environment.limit_failure,
     )
@@ -316,13 +317,13 @@ class _RecordingCandidateClient:
                 raise SandboxCostLimitError(failure.message)
         call_index = self._calls
         self._calls += 1
-        started_at = _timestamp(self._clock)
+        started_at = timestamp(self._clock)
         started = self._monotonic()
         self._record_dispatch_intent()
         try:
             response = self._client.complete(request)
         except Exception as exc:
-            ended_at = _timestamp(self._clock, not_before=started_at)
+            ended_at = timestamp(self._clock, not_before=started_at)
             failure = StructuredFailure(
                 code=FailureCode.TIMEOUT if isinstance(exc, TimeoutError) else FailureCode.PROVIDER,
                 message=f"candidate provider failed with {type(exc).__name__}",
@@ -339,7 +340,7 @@ class _RecordingCandidateClient:
             if isinstance(exc, SandboxTimeLimitError):
                 self._set_limit(StopReason.MAXIMUM_TIME, failure)
             raise
-        ended_at = _timestamp(self._clock, not_before=started_at)
+        ended_at = timestamp(self._clock, not_before=started_at)
         if response.model != self._snapshot:
             failure = StructuredFailure(
                 code=FailureCode.PROVIDER,
@@ -499,13 +500,13 @@ class _RecordingEnvironmentSession:
         self._owner._deadline.remaining()
         index = self._index
         self._index += 1
-        started_at = _timestamp(self._owner._clock)
+        started_at = timestamp(self._owner._clock)
         started = self._owner._monotonic()
         self._owner._record_dispatch_intent()
         try:
             observation = self._session.execute(action)
         except Exception as exc:
-            ended_at = _timestamp(self._owner._clock, not_before=started_at)
+            ended_at = timestamp(self._owner._clock, not_before=started_at)
             failure = StructuredFailure(
                 code=FailureCode.TIMEOUT if isinstance(exc, TimeoutError) else FailureCode.INTERNAL,
                 message=f"environment action failed with {type(exc).__name__}",
@@ -520,7 +521,7 @@ class _RecordingEnvironmentSession:
                 self._owner.limit_stop_reason = StopReason.MAXIMUM_TIME
                 self._owner.limit_failure = failure
             raise
-        ended_at = _timestamp(self._owner._clock, not_before=started_at)
+        ended_at = timestamp(self._owner._clock, not_before=started_at)
         duration = max(0.0, self._owner._monotonic() - started)
         economics = _observation_economics(observation, duration)
         self._owner.economics.append(economics)
@@ -707,52 +708,6 @@ def _with_observed_latency(
     )
 
 
-def _combine_economics(records: Sequence[OperationEconomics]) -> OperationEconomics:
-    """Aggregate only measurements actually present on every recorded operation."""
-    if not records:
-        return OperationEconomics()
-    usages = tuple(record.usage for record in records)
-    usage = None if any(item is None for item in usages) else _sum_usage(usages)
-    costs = tuple(record.cost_usd for record in records)
-    latencies = tuple(record.latency_seconds for record in records)
-    return OperationEconomics(
-        usage=usage,
-        cost_usd=_sum_measurements(costs),
-        latency_seconds=_sum_measurements(latencies),
-    )
-
-
-def _sum_usage(values: Sequence[Usage | None]) -> Usage:
-    """Sum complete provider usage without manufacturing missing cache counts."""
-    present = tuple(value for value in values if value is not None)
-    cached = tuple(value.cached_input_tokens for value in present)
-    cached_total = (
-        None
-        if any(value is None for value in cached)
-        else sum(value for value in cached if value is not None)
-    )
-    return Usage(
-        input_tokens=sum(value.input_tokens for value in present),
-        output_tokens=sum(value.output_tokens for value in present),
-        cached_input_tokens=cached_total,
-    )
-
-
-def _sum_measurements(
-    values: Sequence[NumericMeasurement | None],
-) -> NumericMeasurement | None:
-    """Sum a complete measurement series while retaining its weakest provenance."""
-    if any(value is None for value in values):
-        return None
-    present = tuple(value for value in values if value is not None)
-    return NumericMeasurement(
-        value=sum(value.value for value in present),
-        provenance=(
-            "observed" if all(value.provenance == "observed" for value in present) else "estimated"
-        ),
-    )
-
-
 def _limit_failure(
     code: FailureCode,
     message: str,
@@ -791,20 +746,3 @@ def _environment_cost_failure(
             "environment_dispatch_unknown_spend": unknown_spend,
         },
     )
-
-
-def _timestamp(
-    clock: Callable[[], datetime],
-    *,
-    not_before: datetime | None = None,
-) -> datetime:
-    """Return one aware timestamp that never moves behind an earlier event."""
-    value = clock()
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("sandbox simulation clock must return timezone-aware datetimes")
-    return not_before if not_before is not None and value < not_before else value
-
-
-def _utc_now() -> datetime:
-    """Return an aware UTC event timestamp."""
-    return datetime.now(UTC)

@@ -1,8 +1,8 @@
-"""Small evidence helpers shared by the text-simulation orchestration path."""
+"""Small evidence helpers shared by the simulation engines' orchestration paths."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import cast
 
@@ -10,7 +10,6 @@ from wmo.common.core.artifacts import (
     FailureAttribution,
     FailureCode,
     StructuredFailure,
-    canonical_json_bytes,
 )
 from wmo.common.models import NumericMeasurement, OperationEconomics
 from wmo.common.rollouts import RolloutArtifact, RolloutEventKind, RolloutSpan
@@ -171,7 +170,7 @@ def timestamp(clock: Callable[[], datetime], *, not_before: datetime | None = No
     """
     value = clock()
     if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("text simulation clock must return timezone-aware datetimes")
+        raise ValueError("simulation clock must return timezone-aware datetimes")
     if not_before is not None and value < not_before:
         return not_before
     return value
@@ -180,18 +179,3 @@ def timestamp(clock: Callable[[], datetime], *, not_before: datetime | None = No
 def utc_now() -> datetime:
     """Return a timezone-aware default timestamp without importing provider state."""
     return datetime.now(UTC)
-
-
-def jsonl_bytes(records: Sequence[Mapping[str, object]]) -> bytes:
-    """Render a deterministic JSONL file from small internal artifact-index records.
-
-    Args:
-        records: JSON-safe records in their persisted artifact-index order.
-
-    Returns:
-        UTF-8 JSONL bytes, including a trailing newline when records are present.
-    """
-    payload = b"\n".join(
-        canonical_json_bytes(cast(dict[str, object], record)) for record in records
-    )
-    return payload + (b"\n" if payload else b"")

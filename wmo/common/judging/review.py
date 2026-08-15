@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import Field, JsonValue, field_validator, model_validator
+from pydantic import AwareDatetime, Field, JsonValue, field_validator, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, JsonObject, stable_id
 from wmo.common.judging.proposal import (
@@ -37,14 +37,7 @@ class RubricReviewEvent(ContractModel):
     event_id: ArtifactId
     kind: Literal["accept", "reject", "edit", "add", "replace_all", "order", "finalize"]
     dimension_ids: tuple[ArtifactId, ...]
-    created_at: datetime
-
-    @field_validator("created_at")
-    @classmethod
-    def _require_timezone(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("rubric review event times must include a timezone")
-        return value
+    created_at: AwareDatetime
 
 
 class RubricReviewDraft(ContractModel):

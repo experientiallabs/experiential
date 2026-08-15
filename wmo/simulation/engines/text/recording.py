@@ -27,7 +27,7 @@ from wmo.common.models import (
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
-    Usage,
+    combine_economics,
     completion_request_cost_usd,
     reconcile_completion_economics,
     verify_completion_reservation,
@@ -41,6 +41,7 @@ from wmo.simulation.engines.text.prompt import (
     text_prompt_sha256,
 )
 from wmo.simulation.engines.text.redaction import redact_json
+from wmo.simulation.engines.text.rollout_support import timestamp
 from wmo.simulation.retrieval import RAGAction, RAGQuery
 
 if TYPE_CHECKING:
@@ -224,12 +225,17 @@ class RecordingCandidateClient:
             candidate_spans=tuple(self._candidate_spans),
             world_model_spans=tuple(self._world_model_spans),
             candidate_economics=combine_economics(
-                tuple(response.economics for response in self._candidate_responses)
+                tuple(response.economics for response in self._candidate_responses),
+                require_complete_usage=False,
             ),
             world_model_economics=combine_economics(
-                tuple(response.economics for response in self._world_model_responses)
+                tuple(response.economics for response in self._world_model_responses),
+                require_complete_usage=False,
             ),
-            retrieval_economics=combine_economics(tuple(self._retrieval_economics)),
+            retrieval_economics=combine_economics(
+                tuple(self._retrieval_economics),
+                require_complete_usage=False,
+            ),
             transitions=tuple(self._transitions),
             retrieved_transition_ids=tuple(self._retrieved_transition_ids),
         )
@@ -325,7 +331,7 @@ class RecordingCandidateClient:
                 prior_retrieval=tuple(self._retrieval_economics),
                 maximum_cost_usd=self._maximum_cost_usd,
             )
-        candidate_started_at = _timestamp(self._clock)
+        candidate_started_at = timestamp(self._clock)
         self._provider_dispatch_unknown_spend = True
         candidate_response = self._candidate.client.complete(candidate_request)
         if self._candidate_request is not None:
@@ -337,7 +343,7 @@ class RecordingCandidateClient:
                     )
                 }
             )
-        candidate_ended_at = _timestamp(self._clock, not_before=candidate_started_at)
+        candidate_ended_at = timestamp(self._clock, not_before=candidate_started_at)
         self._candidate_responses.append(candidate_response)
         self._candidate_spans.append(
             _model_span(
@@ -409,7 +415,7 @@ class RecordingCandidateClient:
                 prior_retrieval=tuple(self._retrieval_economics),
                 maximum_cost_usd=self._maximum_cost_usd,
             )
-        world_started_at = _timestamp(self._clock, not_before=candidate_ended_at)
+        world_started_at = timestamp(self._clock, not_before=candidate_ended_at)
         self._provider_dispatch_unknown_spend = True
         dispatched = self._grounded_world_model.complete_turn(prepared)
         world_request = dispatched.request
@@ -424,7 +430,7 @@ class RecordingCandidateClient:
                 }
             )
             dispatched = replace(dispatched, response=world_response)
-        world_ended_at = _timestamp(self._clock, not_before=world_started_at)
+        world_ended_at = timestamp(self._clock, not_before=world_started_at)
         self._retrieved_transition_ids.append(
             tuple(match.transition.transition_id for match in dispatched.matches)
         )
@@ -461,29 +467,6 @@ class RecordingCandidateClient:
         )
         self._terminal = transition.terminal
         return candidate_response
-
-
-def combine_economics(records: Sequence[OperationEconomics]) -> OperationEconomics:
-    """Aggregate same-role calls without representing a partial total as complete.
-
-    Args:
-        records: Economics for all calls made by one named role in one episode.
-
-    Returns:
-        One economics value. Usage is summed when present. Cost and latency are summed only when
-        every call exposed that measurement, preserving a clear unknown rather than a partial sum.
-    """
-    if not records:
-        return OperationEconomics()
-    usages = [record.usage for record in records]
-    usage = None
-    if any(item is not None for item in usages):
-        usage = _combine_usage(tuple(item for item in usages if item is not None))
-    return OperationEconomics(
-        usage=usage,
-        cost_usd=_combine_measurement(tuple(record.cost_usd for record in records)),
-        latency_seconds=_combine_measurement(tuple(record.latency_seconds for record in records)),
-    )
 
 
 def _require_query_budget(
@@ -830,38 +813,6 @@ def _model_span(
     )
 
 
-def _combine_usage(records: Sequence[Usage]) -> Usage:
-    """Return a typed usage sum after callers excluded absent usage values."""
-    if not records:  # pragma: no cover - callers guard this before reaching the helper
-        raise ValueError("at least one usage record is required")
-    cached = tuple(item.cached_input_tokens for item in records)
-    cached_input_tokens: int | None
-    if all(item is not None for item in cached):
-        cached_input_tokens = sum(cast(int, item) for item in cached)
-    else:
-        cached_input_tokens = None
-    return Usage(
-        input_tokens=sum(item.input_tokens for item in records),
-        output_tokens=sum(item.output_tokens for item in records),
-        cached_input_tokens=cached_input_tokens,
-    )
-
-
-def _combine_measurement(
-    records: Sequence[NumericMeasurement | None],
-) -> NumericMeasurement | None:
-    """Sum a measurement only when every call provided a compatible finite value."""
-    if any(record is None for record in records):
-        return None
-    measurements = tuple(cast(NumericMeasurement, record) for record in records)
-    values = tuple(item.value for item in measurements)
-    if not all(math.isfinite(value) for value in values):  # pragma: no cover - contract rejects it
-        return None
-    all_observed = all(item.provenance == "observed" for item in measurements)
-    provenance = "observed" if all_observed else "estimated"
-    return NumericMeasurement(value=sum(values), provenance=provenance)
-
-
 def _text_failure(
     stop_reason: StopReason,
     code: FailureCode,
@@ -881,13 +832,3 @@ def _text_failure(
             details={"phase": phase},
         ),
     )
-
-
-def _timestamp(clock: Callable[[], datetime], *, not_before: datetime | None = None) -> datetime:
-    """Read a timezone-aware timestamp, never ordering a span backwards in a deterministic fake."""
-    timestamp = clock()
-    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-        raise ValueError("text simulation clock must return timezone-aware datetimes")
-    if not_before is not None and timestamp < not_before:
-        return not_before
-    return timestamp

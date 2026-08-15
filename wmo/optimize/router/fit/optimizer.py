@@ -48,7 +48,6 @@ from wmo.common.routing.bank import (
     load_knn_bank,
 )
 from wmo.common.tasks import TaskCase, load_task_set
-from wmo.optimize.router.fit.persistence import write_or_verify_exact
 from wmo.optimize.router.fit.report import build_held_out_report
 from wmo.optimize.router.fit.spec import (
     RouterFitResult,
@@ -842,8 +841,7 @@ def _persist_bank(
         novelty_floor=bank.novelty_floor,
         evidence_counts=evidence_counts(bank),
     )
-    manifest_record = write_or_verify_exact(
-        store,
+    manifest_record = store.write_or_verify_exact(
         artifact_id=bank_id,
         artifact_type="knn-bank",
         envelope=manifest,
@@ -914,8 +912,7 @@ def _persist_policy(
         fidelity_report_ids=bank.fidelity_report_ids,
         judgment_status=spec.judgment_status,
     )
-    policy_record = write_or_verify_exact(
-        store,
+    policy_record = store.write_or_verify_exact(
         artifact_id=policy.policy_id,
         artifact_type="router-policy",
         envelope=policy,

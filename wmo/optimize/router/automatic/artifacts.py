@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from wmo.common.core.artifacts import ArtifactInput
+from wmo.common.core.artifacts import ArtifactInput, sorted_artifact_inputs
 from wmo.common.evaluations import ObservedProductionCell
 from wmo.common.models import (
     CandidateTokenPrice,
@@ -127,11 +127,13 @@ def materialize_automatic_router_artifacts(
         code_revision=code_revision,
     )
     embedding_input = artifact_input(project.artifacts.read(embeddings.embedding_set_id).manifest)
-    completion_inputs = _sorted_inputs(
-        preflight.completed_build.task_set,
-        preflight.completed_build.fit_rag,
-        preflight.completed_build.world_model,
-        pricing_input,
+    completion_inputs = sorted_artifact_inputs(
+        (
+            preflight.completed_build.task_set,
+            preflight.completed_build.fit_rag,
+            preflight.completed_build.world_model,
+            pricing_input,
+        )
     )
     completion, completion_input = persist_simulation_completion_contract(
         project.artifacts,
@@ -150,19 +152,21 @@ def materialize_automatic_router_artifacts(
         code_revision=code_revision,
     )
     runtime_capability_input = capability_contract_input(project.artifacts, runtime_capabilities)
-    execution_inputs = _sorted_inputs(
-        preflight.completed_build.trace_dataset,
-        preflight.completed_build.task_set,
-        preflight.completed_build.fit_rag,
-        preflight.completed_build.world_model,
-        preflight.setup_input,
-        preflight.judge_audit_input,
-        preflight.approved_calibration_input,
-        attribution_input,
-        pricing_input,
-        embedding_input,
-        completion_input,
-        runtime_capability_input,
+    execution_inputs = sorted_artifact_inputs(
+        (
+            preflight.completed_build.trace_dataset,
+            preflight.completed_build.task_set,
+            preflight.completed_build.fit_rag,
+            preflight.completed_build.world_model,
+            preflight.setup_input,
+            preflight.judge_audit_input,
+            preflight.approved_calibration_input,
+            attribution_input,
+            pricing_input,
+            embedding_input,
+            completion_input,
+            runtime_capability_input,
+        )
     )
     execution = persist_router_execution_contract(
         project.artifacts,
@@ -332,24 +336,3 @@ def _runtime_capability_bindings(
             )
         )
     return tuple(bindings)
-
-
-def _sorted_inputs(*values: ArtifactInput) -> tuple[ArtifactInput, ...]:
-    """Return unique artifact pointers in canonical identifier order.
-
-    Args:
-        *values: Immutable artifact pointers to canonicalize.
-
-    Returns:
-        Sorted unique input pointers.
-
-    Raises:
-        ValueError: One artifact identifier appears with different manifest evidence.
-    """
-    by_id: dict[str, ArtifactInput] = {}
-    for value in values:
-        existing = by_id.get(value.artifact_id)
-        if existing is not None and existing != value:
-            raise ValueError(f"artifact input {value.artifact_id!r} has conflicting manifests")
-        by_id[value.artifact_id] = value
-    return tuple(by_id[key] for key in sorted(by_id))

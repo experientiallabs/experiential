@@ -415,7 +415,7 @@ def test_loaded_router_keeps_identical_unkeyed_chat_calls_distinct(
         if isinstance(event, RuntimeAcceptedEvent)
     )
     assert len({event.interaction_id for event in accepted}) == 2
-    assert len({event.lineage_id for event in accepted}) == 2
+    assert len({event.identity.lineage_id for event in accepted}) == 2
     assert model_client.embed_calls == model_client.complete_calls == 2
 
 
@@ -451,7 +451,7 @@ def test_loaded_router_responses_continuation_keeps_one_lineage(
         if isinstance(event, RuntimeAcceptedEvent)
     )
     assert len(accepted) == 2
-    assert accepted[0].lineage_id == accepted[1].lineage_id
+    assert accepted[0].identity.lineage_id == accepted[1].identity.lineage_id
     assert model_client.embed_calls == 1
     assert model_client.complete_calls == 2
 
@@ -735,7 +735,9 @@ def test_injected_project_service_journals_every_unkeyed_openai_call(tmp_path: P
     accepted = tuple(event for event in events if isinstance(event, RuntimeAcceptedEvent))
     completed = tuple(event for event in events if isinstance(event, RuntimeCompletedEvent))
     assert len(accepted) == len(completed) == 2
-    assert accepted[0].idempotency_key_sha256 != accepted[1].idempotency_key_sha256
+    assert (
+        accepted[0].identity.idempotency_key_sha256 != accepted[1].identity.idempotency_key_sha256
+    )
     assert model_client.embed_calls == model_client.complete_calls == 2
 
 
@@ -757,7 +759,7 @@ def test_identical_unkeyed_chat_calls_remain_distinct_interactions(tmp_path: Pat
         event for event in journal.read_events() if isinstance(event, RuntimeAcceptedEvent)
     )
     assert len({event.interaction_id for event in accepted}) == 2
-    assert len({event.lineage_id for event in accepted}) == 2
+    assert len({event.identity.lineage_id for event in accepted}) == 2
     assert model_client.embed_calls == model_client.complete_calls == 2
 
 
@@ -786,7 +788,7 @@ def test_responses_previous_response_id_preserves_journal_lineage(tmp_path: Path
         event for event in journal.read_events() if isinstance(event, RuntimeAcceptedEvent)
     )
     assert len(accepted) == 2
-    assert accepted[0].lineage_id == accepted[1].lineage_id
+    assert accepted[0].identity.lineage_id == accepted[1].identity.lineage_id
     assert model_client.embed_calls == 1
     assert model_client.complete_calls == 2
 

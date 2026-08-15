@@ -2,22 +2,20 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-
-from pydantic import BaseModel
 
 from wmo.common.core.artifacts import (
     ArtifactInput,
     SourceIdentity,
     canonical_json_bytes,
+    canonical_jsonl_bytes,
+    sha256_bytes,
     sha256_json,
     stable_id,
 )
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
     ArtifactManifest,
     ArtifactStore,
     artifact_input,
@@ -89,8 +87,8 @@ def persist_runtime_rag_dataset(
     trace_ids = tuple(trace.trace_id for trace in traces)
     if len(set(trace_ids)) != len(trace_ids):
         raise RuntimeRAGDatasetError("runtime RAG source datasets repeat a trace ID")
-    traces_payload = _jsonl_bytes(traces)
-    traces_sha256 = hashlib.sha256(traces_payload, usedforsecurity=False).hexdigest()
+    traces_payload = canonical_jsonl_bytes(traces)
+    traces_sha256 = sha256_bytes(traces_payload)
     source = SourceIdentity(
         kind="production",
         source_id=f"{store.project_directory.name}/runtime-rag-refresh",
@@ -126,19 +124,20 @@ def persist_runtime_rag_dataset(
         _DATASET_PATH: canonical_json_bytes(dataset),
         _TRACES_PATH: traces_payload,
     }
-    destination = store.project_directory / "artifacts" / dataset.dataset_id
-    if destination.exists():
-        return _load_exact_replay(store, dataset, traces, files)
     try:
-        manifest = store.write(
+        existing, manifest = store.write_or_replay(
             artifact_id=dataset.dataset_id,
             artifact_type="trace-dataset",
             envelope=dataset,
+            envelope_path=_DATASET_PATH,
+            envelope_type=TraceDataset,
             files=files,
         )
-    except ArtifactAlreadyExistsError:
-        return _load_exact_replay(store, dataset, traces, files)
-    return PersistedRuntimeRAGDataset(dataset, manifest, traces)
+    except ValueError as exc:
+        raise RuntimeRAGDatasetError(
+            f"existing runtime RAG dataset differs from exact replay: {exc}"
+        ) from exc
+    return PersistedRuntimeRAGDataset(existing, manifest, traces)
 
 
 def _load_real_dataset(store: ArtifactStore, source_input: ArtifactInput) -> LoadedTraceDataset:
@@ -210,52 +209,3 @@ def _verify_stitched_runtime_traces(
             raise RuntimeRAGDatasetError(
                 f"stitched runtime trace {source.trace_id!r} changed canonical source evidence"
             )
-
-
-def _load_exact_replay(
-    store: ArtifactStore,
-    expected: TraceDataset,
-    traces: tuple[Trace, ...],
-    files: dict[str, bytes],
-) -> PersistedRuntimeRAGDataset:
-    """Reuse a content-identical union dataset after complete verification.
-
-    Args:
-        store: Project artifact store containing the expected union.
-        expected: Deterministic union envelope for the current source set.
-        traces: Exact deterministic union records.
-        files: Expected canonical artifact payloads.
-
-    Returns:
-        Existing verified union with its original materialization time.
-
-    Raises:
-        RuntimeRAGDatasetError: Existing envelope, input, or bytes differ from replay.
-    """
-    loaded = load_trace_dataset(store, expected.dataset_id)
-    stored = store.read(expected.dataset_id)
-    replay = expected.model_copy(update={"created_at": loaded.dataset.created_at})
-    if loaded.dataset != replay or loaded.traces != traces:
-        raise RuntimeRAGDatasetError("existing runtime RAG dataset differs from exact replay")
-    for path, payload in files.items():
-        if path == _DATASET_PATH:
-            continue
-        if store.read_bytes(expected.dataset_id, path) != payload:
-            raise RuntimeRAGDatasetError(
-                f"existing runtime RAG dataset payload {path} differs from replay"
-            )
-    if artifact_input(stored.manifest).artifact_id != expected.dataset_id:
-        raise RuntimeRAGDatasetError("existing runtime RAG dataset manifest identity differs")
-    return PersistedRuntimeRAGDataset(loaded.dataset, stored.manifest, loaded.traces)
-
-
-def _jsonl_bytes(records: Sequence[BaseModel]) -> bytes:
-    """Serialize ordered models as canonical newline-terminated JSONL.
-
-    Args:
-        records: Pydantic records in the desired immutable order.
-
-    Returns:
-        Canonical UTF-8 JSONL bytes, including the final newline.
-    """
-    return b"\n".join(canonical_json_bytes(record) for record in records) + b"\n"

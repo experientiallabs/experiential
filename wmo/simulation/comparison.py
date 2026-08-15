@@ -20,6 +20,7 @@ from wmo.common.core.artifacts import (
     StructuredFailure,
     canonical_json_bytes,
     sha256_json,
+    sorted_artifact_inputs,
     stable_id,
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
@@ -102,15 +103,17 @@ class SimulationComparisonSpec(ArtifactEnvelope):
     @model_validator(mode="after")
     def _require_exact_inputs(self) -> SimulationComparisonSpec:
         """Make every named immutable dependency a hash-bound envelope input."""
-        expected = _sorted_unique_inputs(
-            self.policy_lock_input,
-            self.task_set_input,
-            self.text_evaluation_plan_input,
-            self.sandbox_evaluation_plan_input,
-            self.text_simulation_spec_input,
-            self.sandbox_simulation_spec_input,
-            self.text_artifact_set_input,
-            self.sandbox_artifact_set_input,
+        expected = sorted_artifact_inputs(
+            (
+                self.policy_lock_input,
+                self.task_set_input,
+                self.text_evaluation_plan_input,
+                self.sandbox_evaluation_plan_input,
+                self.text_simulation_spec_input,
+                self.sandbox_simulation_spec_input,
+                self.text_artifact_set_input,
+                self.sandbox_artifact_set_input,
+            )
         )
         if self.inputs != expected:
             raise ValueError("comparison spec inputs must exactly match every named artifact")
@@ -288,7 +291,7 @@ def compare_text_and_sandbox(
     return SimulationComparisonReport(
         schema_version=1,
         created_at=created_at,
-        inputs=_sorted_unique_inputs(resolved.comparison_spec_input, *spec.inputs),
+        inputs=sorted_artifact_inputs((resolved.comparison_spec_input, *spec.inputs)),
         code_revision=code_revision,
         source=spec.source,
         report_id=report_id,
@@ -779,14 +782,3 @@ def _missing_failure(mode: str, rollout_id: str) -> StructuredFailure:
         message=f"required {mode} rollout {rollout_id} is absent from its frozen artifact set",
         details={"mode": mode, "rollout_id": rollout_id, "phase": "artifact_resolution"},
     )
-
-
-def _sorted_unique_inputs(*inputs: ArtifactInput) -> tuple[ArtifactInput, ...]:
-    """Return one exact reference per artifact ID, rejecting same-ID hash drift."""
-    by_id: dict[str, ArtifactInput] = {}
-    for item in inputs:
-        previous = by_id.get(item.artifact_id)
-        if previous is not None and previous != item:
-            raise ValueError(f"artifact input {item.artifact_id!r} has conflicting digests")
-        by_id[item.artifact_id] = item
-    return tuple(by_id[artifact_id] for artifact_id in sorted(by_id))

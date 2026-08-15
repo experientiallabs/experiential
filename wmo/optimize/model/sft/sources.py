@@ -16,6 +16,7 @@ from wmo.common.core.artifacts import (
     Sha256,
     canonical_json_bytes,
     sha256_json,
+    sorted_artifact_inputs,
     stable_id,
 )
 from wmo.common.evaluations import FidelityReport
@@ -590,12 +591,7 @@ def _read_json[ModelT: BaseModel](
 
 def _sorted_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactInput, ...]:
     """Return exact unique authoritative artifact inputs in stable identity order."""
-    by_id: dict[ArtifactId, ArtifactInput] = {}
-    for item in inputs:
-        existing = by_id.get(item.artifact_id)
-        if existing is not None and existing != item:
-            raise SFTSourceVerificationError(
-                f"verified source has conflicting hashes for artifact {item.artifact_id}"
-            )
-        by_id[item.artifact_id] = item
-    return tuple(by_id[item_id] for item_id in sorted(by_id))
+    try:
+        return sorted_artifact_inputs(inputs)
+    except ValueError as exc:
+        raise SFTSourceVerificationError(str(exc)) from exc
