@@ -18,14 +18,12 @@ from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.project import ProjectStore
 from wmo.common.release_revision import installed_release_revision
 from wmo.optimize.router.automatic.preflight import (
+    AutomaticRouterOptions,
     AutomaticRouterPreflight,
     preflight_automatic_router,
 )
 from wmo.optimize.router.automatic.replay import find_completed_automatic_router_replay
-from wmo.optimize.router.automatic.service import (
-    AutomaticRouterOptions,
-    optimize_project_router,
-)
+from wmo.optimize.router.automatic.service import optimize_project_router
 from wmo.optimize.router.composition import (
     FidelityApprovalDecision,
     RouterCompositionBudget,
@@ -145,15 +143,7 @@ def router(
             store,
             candidate_plan.selection,
             catalog_override=candidate_plan.prospective_catalog,
-            maximum_model_calls=options.maximum_model_calls,
-            preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
-            maximum_router_feature_tokens=options.maximum_router_feature_tokens,
-            maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-            router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
-            completion_maximum_attempts=options.completion_maximum_attempts,
-            simulation_maximum_output_tokens=options.simulation_maximum_output_tokens,
-            maximum_judgments=options.maximum_judgments,
-            maximum_simulation_cost_usd=options.maximum_provider_cost_usd,
+            options=options,
         )
         replay = find_completed_automatic_router_replay(
             store,

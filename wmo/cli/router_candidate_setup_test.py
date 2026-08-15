@@ -197,13 +197,15 @@ def _candidate_model(alias: str) -> ProviderModelSelection:
         alias=alias,
         connection="provider",
         model=alias,
-        supports_completions=True,
-        context_window_tokens=32_000,
-        maximum_output_tokens=4_000,
-        input_cost_per_million_tokens_usd=1,
-        output_cost_per_million_tokens_usd=2,
-        cached_input_cost_per_million_tokens_usd=0.5,
-        cache_write_cost_per_million_tokens_usd=1.5,
+        capabilities=ModelCapabilities(
+            supports_completions=True,
+            context_window_tokens=32_000,
+            maximum_output_tokens=4_000,
+            input_cost_per_million_tokens_usd=1,
+            output_cost_per_million_tokens_usd=2,
+            cached_input_cost_per_million_tokens_usd=0.5,
+            cache_write_cost_per_million_tokens_usd=1.5,
+        ),
     )
 
 

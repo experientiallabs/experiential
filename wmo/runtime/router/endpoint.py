@@ -422,7 +422,7 @@ def create_router_endpoint(
         except Exception:  # noqa: BLE001
             logger.exception("routed Chat Completions call failed")
             return _error(502, "routed model call failed")
-        completion = _chat_completion(
+        completion = chat_completion(
             request.model,
             routed.response.output,
             routed.response,
@@ -567,15 +567,18 @@ def _responses_model_request(
     )
 
 
-def _model_request(
-    messages: tuple[HttpMessage, ...],
-    tools: tuple[HttpTool, ...],
-    tool_choice: JsonValue,
-    temperature: float | None,
-    maximum_output_tokens: int | None,
-) -> ModelRequest:
-    if not any(message.role == "user" and _content_text(message.content) for message in messages):
-        raise ValueError("routed requests require at least one user message with content")
+def model_messages(messages: tuple[HttpMessage, ...]) -> tuple[ModelMessage, ...]:
+    """Convert validated OpenAI messages to WMO's provider-neutral message shape.
+
+    Args:
+        messages: Ordered OpenAI-compatible chat messages.
+
+    Returns:
+        Canonical model messages preserving assistant tool calls and tool results.
+
+    Raises:
+        ValueError: An assistant tool call carries arguments that are not one JSON object.
+    """
     converted = []
     for message in messages:
         role = "system" if message.role == "developer" else message.role
@@ -601,8 +604,20 @@ def _model_request(
                 assistant_action=action,
             )
         )
+    return tuple(converted)
+
+
+def _model_request(
+    messages: tuple[HttpMessage, ...],
+    tools: tuple[HttpTool, ...],
+    tool_choice: JsonValue,
+    temperature: float | None,
+    maximum_output_tokens: int | None,
+) -> ModelRequest:
+    if not any(message.role == "user" and _content_text(message.content) for message in messages):
+        raise ValueError("routed requests require at least one user message with content")
     return ModelRequest(
-        messages=tuple(converted),
+        messages=model_messages(messages),
         tools=tuple(
             ToolSchema(
                 name=tool.function.name,
@@ -705,7 +720,7 @@ def _content_text(content: str | tuple[HttpTextPart, ...] | None) -> str | None:
     return "".join(part.text for part in content)
 
 
-def _chat_completion(
+def chat_completion(
     model: str,
     action: AssistantAction,
     response: ModelResponse,

@@ -69,16 +69,7 @@ class ProviderModelSelection(ContractModel):
     alias: str = Field(min_length=1, max_length=128)
     connection: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=2_048)
-    supports_tools: bool = False
-    supports_embeddings: bool = False
-    supports_structured_output: bool = False
-    supports_completions: bool | None = None
-    context_window_tokens: int | None = Field(default=None, gt=0)
-    maximum_output_tokens: int | None = Field(default=None, gt=0)
-    input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
-    output_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
-    cached_input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
-    cache_write_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
+    capabilities: ModelCapabilities = Field(default_factory=ModelCapabilities)
 
     @model_validator(mode="after")
     def _require_explicit_prices(self) -> ProviderModelSelection:
@@ -90,21 +81,22 @@ class ProviderModelSelection(ContractModel):
         Raises:
             ValueError: An embedding or completion price required by a declared protocol is absent.
         """
+        caps = self.capabilities
         if (
-            self.supports_embeddings or self.supports_completions
-        ) and self.input_cost_per_million_tokens_usd is None:
+            caps.supports_embeddings or caps.supports_completions
+        ) and caps.input_cost_per_million_tokens_usd is None:
             raise ValueError(
                 "embedding- or completion-capable models require explicit input cost per "
                 "million tokens; "
                 "use 0 for a model with no input charge"
             )
-        if self.supports_completions:
+        if caps.supports_completions:
             missing = tuple(
                 name
                 for name, value in (
-                    ("output", self.output_cost_per_million_tokens_usd),
-                    ("cached input", self.cached_input_cost_per_million_tokens_usd),
-                    ("cache write", self.cache_write_cost_per_million_tokens_usd),
+                    ("output", caps.output_cost_per_million_tokens_usd),
+                    ("cached input", caps.cached_input_cost_per_million_tokens_usd),
+                    ("cache write", caps.cache_write_cost_per_million_tokens_usd),
                 )
                 if value is None
             )
@@ -116,27 +108,6 @@ class ProviderModelSelection(ContractModel):
                 )
         return self
 
-    def capabilities(self) -> ModelCapabilities:
-        """Return the explicit per-model capabilities captured by setup.
-
-        Returns:
-            Canonical capability record for the selected model alias.
-        """
-        return ModelCapabilities(
-            supports_tools=self.supports_tools,
-            supports_embeddings=self.supports_embeddings,
-            supports_structured_output=self.supports_structured_output,
-            supports_completions=self.supports_completions,
-            context_window_tokens=self.context_window_tokens,
-            maximum_output_tokens=self.maximum_output_tokens,
-            input_cost_per_million_tokens_usd=self.input_cost_per_million_tokens_usd,
-            output_cost_per_million_tokens_usd=self.output_cost_per_million_tokens_usd,
-            cached_input_cost_per_million_tokens_usd=(
-                self.cached_input_cost_per_million_tokens_usd
-            ),
-            cache_write_cost_per_million_tokens_usd=(self.cache_write_cost_per_million_tokens_usd),
-        )
-
     def catalog_record(self) -> ModelRecord:
         """Return the exact catalog record represented by this selection.
 
@@ -146,7 +117,7 @@ class ProviderModelSelection(ContractModel):
         return ModelRecord(
             connection=self.connection,
             model=self.model,
-            capabilities=self.capabilities(),
+            capabilities=self.capabilities,
         )
 
 
@@ -196,7 +167,8 @@ class ProviderSetup(ContractModel):
                 "build roles name unknown model aliases: " + ", ".join(sorted(unknown_roles))
             )
         by_alias = {model.alias: model for model in self.models}
-        if self.embedder in by_alias and not by_alias[self.embedder].supports_embeddings:
+        selected = by_alias.get(self.embedder)
+        if selected is not None and not selected.capabilities.supports_embeddings:
             raise ValueError(f"embedder alias {self.embedder!r} must declare embedding support")
         return self
 

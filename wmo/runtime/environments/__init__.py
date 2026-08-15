@@ -2,7 +2,6 @@
 
 from wmo.runtime.environments.harbor import (
     BOUNDED_CLEANUP_CONTRACT,
-    E2BTemplateResources,
     HarborCleanupResult,
     HarborCleanupTimeoutError,
     HarborCleanupUnprovenError,
@@ -11,13 +10,7 @@ from wmo.runtime.environments.harbor import (
     HarborExecutableSession,
     HarborRetryableCommandError,
     HarborSessionFactory,
-    HarborTemplateStatusError,
     HarborTranscriptEntry,
-    e2b_template_resource_digest,
-    e2b_template_resource_payload,
-    qualify_harbor_e2b_template_name,
-    resolve_e2b_template_resources,
-    retry_template_status,
 )
 from wmo.runtime.environments.interface import (
     EnvironmentResetError,
@@ -38,7 +31,6 @@ __all__ = [
     "EnvironmentResetError",
     "EnvironmentRuntime",
     "EnvironmentSession",
-    "E2BTemplateResources",
     "HarborCommandResult",
     "HarborCleanupResult",
     "HarborCleanupTimeoutError",
@@ -47,7 +39,6 @@ __all__ = [
     "HarborExecutableSession",
     "HarborRetryableCommandError",
     "HarborSessionFactory",
-    "HarborTemplateStatusError",
     "HarborTranscriptEntry",
     "LocalProcessCleanupError",
     "LocalProcessCrashError",
@@ -55,9 +46,4 @@ __all__ = [
     "LocalProcessLimits",
     "LocalProcessProtocolError",
     "Observation",
-    "e2b_template_resource_digest",
-    "e2b_template_resource_payload",
-    "qualify_harbor_e2b_template_name",
-    "resolve_e2b_template_resources",
-    "retry_template_status",
 ]

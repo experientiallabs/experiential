@@ -3,35 +3,29 @@
 from __future__ import annotations
 
 import json
-import time
-from collections.abc import Sequence
 
-from pydantic import JsonValue
+from openai.types.responses import (
+    Response,
+    ResponseFunctionToolCall,
+    ResponseOutputMessage,
+    ResponseOutputText,
+    ResponseReasoningItem,
+    ResponseUsage,
+)
+from pydantic import ValidationError
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
-    Embedding,
-    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
-    NumericMeasurement,
-    OperationEconomics,
     ToolCall,
     Usage,
 )
 from wmo.runtime.models.providers.errors import ProviderResponseError
-from wmo.runtime.models.providers.openai_compatible import (
-    DEFAULT_RETRY_POLICY,
-    DEFAULT_TIMEOUT_SECONDS,
-    openai_embedding_request,
-    openai_embedding_response,
-)
-from wmo.runtime.models.providers.request import post_json
-from wmo.runtime.models.providers.retry import RetryPolicy
-from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
+from wmo.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
@@ -108,132 +102,65 @@ def openai_responses_response(
     Raises:
         ProviderResponseError: The response status, output, tools, or usage is malformed.
     """
-    status = payload.get("status")
+    try:
+        parsed = Response.model_validate(payload)
+    except ValidationError as exc:
+        raise ProviderResponseError("OpenAI Responses payload is malformed") from exc
+    status = parsed.status
     if status not in {None, "completed", "incomplete"}:
         raise ProviderResponseError(f"OpenAI response ended with status {status!r}")
-    incomplete_details = payload.get("incomplete_details")
-    incomplete_reason = (
-        incomplete_details.get("reason") if isinstance(incomplete_details, dict) else None
-    )
-    if status == "incomplete" and incomplete_reason not in {"max_output_tokens", "max_tokens"}:
+    reason = parsed.incomplete_details.reason if parsed.incomplete_details else None
+    if status == "incomplete" and reason != "max_output_tokens":
         raise ProviderResponseError(
-            f"OpenAI response ended incompletely for unsupported reason {incomplete_reason!r}"
+            f"OpenAI response ended incompletely for unsupported reason {reason!r}"
         )
-    output = _array(payload.get("output"), "output")
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
-    for index, item_value in enumerate(output):
-        item = _object(item_value, f"output[{index}]")
-        item_type = item.get("type")
-        if item_type == "message":
-            text_parts.extend(_response_text_parts(item, index))
-        elif item_type == "function_call":
-            tool_calls.append(_response_tool_call(item, index))
-        elif item_type == "reasoning":
+    for index, item in enumerate(parsed.output):
+        if isinstance(item, ResponseOutputMessage):
+            text_parts.extend(
+                part.text if isinstance(part, ResponseOutputText) else part.refusal
+                for part in item.content
+            )
+        elif isinstance(item, ResponseFunctionToolCall):
+            tool_calls.append(_tool_call(item, index))
+        elif isinstance(item, ResponseReasoningItem):
             continue
         else:
             raise ProviderResponseError(
-                f"OpenAI Responses output[{index}] has unsupported type {item_type!r}"
+                f"OpenAI Responses output[{index}] has unsupported type {item.type!r}"
             )
     content = "".join(text_parts) if text_parts else None
     try:
         action = AssistantAction(content=content, tool_calls=tuple(tool_calls))
     except ValueError as exc:
         raise ProviderResponseError("OpenAI Responses output has no text or tool call") from exc
-    model_id = payload.get("model")
-    model = (
-        configured_model.model_copy(update={"model_id": model_id})
-        if isinstance(model_id, str) and model_id
-        else configured_model
-    )
-    return ModelResponse(
+    return ModelResponse.completed(
         output=action,
-        model=model,
-        economics=OperationEconomics(
-            usage=_responses_usage(payload),
-            latency_seconds=NumericMeasurement(value=latency_seconds, provenance="observed"),
-        ),
-        finish_reason=(
-            ModelFinishReason.LENGTH if status == "incomplete" else ModelFinishReason.COMPLETED
-        ),
+        configured_model=configured_model,
+        served_model_id=parsed.model,
+        usage=_usage(parsed.usage),
+        latency_seconds=latency_seconds,
+        hit_length_limit=status == "incomplete",
     )
 
 
-class OpenAIClient:
+class OpenAIClient(OpenAIEmbeddingMixin):
     """Calls direct OpenAI through its native Responses and embeddings endpoints."""
 
-    def __init__(
-        self,
-        *,
-        model: ModelSnapshot,
-        api_key: str,
-        transport: JsonHttpTransport | None = None,
-        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
-        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-        base_url: str = OPENAI_BASE_URL,
-    ) -> None:
-        """Create a direct OpenAI client with one explicitly resolved credential."""
-        if not api_key:
-            raise ValueError("OpenAI clients require a non-empty API key")
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
-        self._model = model
-        self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
-        self._transport = transport or HttpxJsonTransport()
-        self._retry_policy = retry_policy
-        self._timeout_seconds = timeout_seconds
+    def _completion_path(self) -> str:
+        """Return the native non-streaming Responses route."""
+        return "responses"
 
-    def complete(self, request: ModelRequest) -> ModelResponse:
-        """Complete one request through the native non-streaming Responses endpoint.
+    def _build_request(self, request: ModelRequest) -> JsonObject:
+        """Convert one typed request into a native Responses payload."""
+        return openai_responses_request(self._model.model_id, request)
 
-        Args:
-            request: Visible messages, tool schemas, and sampling controls to send.
-
-        Returns:
-            The typed non-streaming model response with observed request economics.
-        """
-        started_at = time.monotonic()
-        response = post_json(
-            self._transport,
-            f"{self._base_url}/responses",
-            headers=self._headers(),
-            payload=openai_responses_request(self._model.model_id, request),
-            timeout_seconds=self._timeout_seconds,
-            retry_policy=self._retry_policy,
-        )
+    def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
+        """Convert one completed Responses payload into the shared response contract."""
         return openai_responses_response(
-            response,
-            configured_model=self._model,
-            latency_seconds=time.monotonic() - started_at,
+            payload, configured_model=self._model, latency_seconds=latency_seconds
         )
-
-    def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
-        """Embed texts through OpenAI's native embeddings endpoint.
-
-        Args:
-            texts: Ordered visible text values to embed.
-
-        Returns:
-            Unit-normalized embeddings in the input order.
-        """
-        if not texts:
-            return ()
-        response = post_json(
-            self._transport,
-            f"{self._base_url}/embeddings",
-            headers=self._headers(),
-            payload=openai_embedding_request(self._model.model_id, texts),
-            timeout_seconds=self._timeout_seconds,
-            retry_policy=self._retry_policy,
-        )
-        return openai_embedding_response(response, expected_count=len(texts))
-
-    def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
 
 
 def _responses_items_for_message(message: ModelMessage) -> list[JsonObject]:
@@ -272,32 +199,10 @@ def _responses_items_for_message(message: ModelMessage) -> list[JsonObject]:
     return items
 
 
-def _response_text_parts(item: JsonObject, index: int) -> list[str]:
-    """Read text and refusal content blocks from one native response message."""
-    parts: list[str] = []
-    for content_index, value in enumerate(_array(item.get("content"), f"output[{index}].content")):
-        block = _object(value, f"output[{index}].content[{content_index}]")
-        block_type = block.get("type")
-        text = block.get("text")
-        refusal = block.get("refusal")
-        if block_type == "output_text" and isinstance(text, str):
-            parts.append(text)
-        elif block_type == "refusal" and isinstance(refusal, str):
-            parts.append(refusal)
-        else:
-            raise ProviderResponseError(
-                f"OpenAI Responses content block has unsupported type {block_type!r}"
-            )
-    return parts
-
-
-def _response_tool_call(item: JsonObject, index: int) -> ToolCall:
-    """Map one native function call while validating object arguments."""
-    call_id = _string(item.get("call_id"), f"output[{index}].call_id")
-    name = _string(item.get("name"), f"output[{index}].name")
-    raw_arguments = _string(item.get("arguments"), f"output[{index}].arguments")
+def _tool_call(item: ResponseFunctionToolCall, index: int) -> ToolCall:
+    """Map one typed native function call while validating object arguments."""
     try:
-        arguments = json.loads(raw_arguments)
+        arguments = json.loads(item.arguments)
     except json.JSONDecodeError as exc:
         raise ProviderResponseError(
             f"OpenAI Responses output[{index}].arguments is not JSON"
@@ -306,51 +211,23 @@ def _response_tool_call(item: JsonObject, index: int) -> ToolCall:
         raise ProviderResponseError(
             f"OpenAI Responses output[{index}].arguments must decode to an object"
         )
-    return ToolCall(call_id=call_id, name=name, arguments=arguments)
+    try:
+        return ToolCall(call_id=item.call_id, name=item.name, arguments=arguments)
+    except ValidationError as exc:
+        raise ProviderResponseError(
+            f"OpenAI Responses output[{index}] tool call is incomplete"
+        ) from exc
 
 
-def _responses_usage(payload: JsonObject) -> Usage | None:
-    """Read optional Responses usage fields without substituting a different wire schema."""
-    value = payload.get("usage")
-    if value is None:
+def _usage(usage: ResponseUsage | None) -> Usage | None:
+    """Map optional typed Responses usage without accepting negative token counts."""
+    if usage is None:
         return None
-    usage = _object(value, "usage")
-    details = usage.get("input_tokens_details")
-    cached = 0
-    if details is not None:
-        cached = _integer(_object(details, "usage.input_tokens_details").get("cached_tokens"), 0)
-    return Usage(
-        input_tokens=_integer(usage.get("input_tokens"), 0),
-        output_tokens=_integer(usage.get("output_tokens"), 0),
-        cached_input_tokens=cached,
-    )
-
-
-def _array(value: JsonValue | None, label: str) -> list[JsonValue]:
-    """Return a response JSON array or raise a native conversion error."""
-    if not isinstance(value, list):
-        raise ProviderResponseError(f"OpenAI Responses {label} must be an array")
-    return value
-
-
-def _object(value: JsonValue | None, label: str) -> JsonObject:
-    """Return a response JSON object or raise a native conversion error."""
-    if not isinstance(value, dict):
-        raise ProviderResponseError(f"OpenAI Responses {label} must be an object")
-    return value
-
-
-def _string(value: JsonValue | None, label: str) -> str:
-    """Return a required non-empty response string."""
-    if not isinstance(value, str) or not value:
-        raise ProviderResponseError(f"OpenAI Responses {label} must be a non-empty string")
-    return value
-
-
-def _integer(value: JsonValue | None, default: int) -> int:
-    """Read an optional non-negative usage integer."""
-    if value is None:
-        return default
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ProviderResponseError("OpenAI Responses usage values must be non-negative")
-    return value
+    try:
+        return Usage(
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cached_input_tokens=usage.input_tokens_details.cached_tokens,
+        )
+    except ValidationError as exc:
+        raise ProviderResponseError("OpenAI Responses usage values must be non-negative") from exc

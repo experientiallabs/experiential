@@ -8,7 +8,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Literal, Protocol
 
 from pydantic import Field, field_validator
@@ -86,8 +85,7 @@ from wmo.optimize.router.judgment_budget import (
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime
 from wmo.simulation.build import ProjectBuild
-from wmo.simulation.ingest.otlp import TraceNormalizationResult, load_otlp_file
-from wmo.simulation.ingest.posthog import load_posthog_file
+from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
 
@@ -145,35 +143,6 @@ class RouterEvaluationSetup(ContractModel):
     seed: int
     maximum_steps: int = Field(gt=0)
     maximum_concurrency: int = Field(gt=0)
-
-
-class TraceSource(Protocol):
-    """Loads one explicit local source into canonical normalized traces."""
-
-    def load(self) -> TraceNormalizationResult:
-        """Return canonical normalized traces after one explicit source read.
-
-        Returns:
-            Canonical normalized traces and any rejected-source issues.
-        """
-
-
-@dataclass(frozen=True)
-class LocalTraceSource:
-    """One explicit canonical local trace export selected by path and format."""
-
-    path: Path
-    source: Literal["otlp", "posthog"] = "otlp"
-
-    def load(self) -> TraceNormalizationResult:
-        """Read and normalize this local file through its selected canonical loader.
-
-        Returns:
-            Canonical normalized traces and any rejected-source issues.
-        """
-        if self.source == "otlp":
-            return load_otlp_file(self.path)
-        return load_posthog_file(self.path)
 
 
 class ReviewSupplier(Protocol):
@@ -287,7 +256,7 @@ class RouterCompositionResult:
 
 def compose_router(
     project: ProjectStore,
-    trace_source: TraceSource | TraceNormalizationResult,
+    trace_source: TraceNormalizationResult,
     *,
     services: RouterWorkflowServices,
     budget: RouterCompositionBudget,
@@ -299,7 +268,7 @@ def compose_router(
 
     Args:
         project: Initialized local project store.
-        trace_source: Explicit normalized input or a loader that performs the source read.
+        trace_source: Canonical normalized traces used to build task evidence.
         services: Review, simulation, judging, and runtime dependencies. None are auto-resolved.
         budget: Finite simulation spend and judgment-call ceilings.
         created_at: Timezone-aware artifact completion time.
@@ -315,12 +284,9 @@ def compose_router(
     started = time.monotonic()
     _preflight(project, services, budget, code_revision)
     completed_build = completed_project_build(project)
-    normalized = (
-        trace_source if isinstance(trace_source, TraceNormalizationResult) else trace_source.load()
-    )
     built = reconstruct_completed_project_build(
         project,
-        normalized,
+        trace_source,
         created_at=created_at,
     )
     _phase(phase_hook, "review")

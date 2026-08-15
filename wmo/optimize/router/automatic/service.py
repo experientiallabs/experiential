@@ -21,6 +21,7 @@ from wmo.optimize.router.automatic.artifacts import (
 from wmo.optimize.router.automatic.attribution import persist_router_observed_attribution_set
 from wmo.optimize.router.automatic.judge import AutomaticRouterJudge, ReservedJudgeClient
 from wmo.optimize.router.automatic.preflight import (
+    AutomaticRouterOptions,
     AutomaticRouterPreflight,
     preflight_automatic_router,
 )
@@ -54,23 +55,6 @@ from wmo.simulation.world_model import bind_fit_grounded_world_model
 
 class AutomaticRouterError(ValueError):
     """Automatic router composition failed at a consent or immutable binding boundary."""
-
-
-@dataclass(frozen=True)
-class AutomaticRouterOptions:
-    """Tasteful bounded controls for one automatic router optimization."""
-
-    maximum_provider_cost_usd: float = 25.0
-    maximum_judgments: int = 100
-    preferred_fidelity_overlaps: int = 10
-    maximum_model_calls: int = 8
-    maximum_router_feature_tokens: int = 8_192
-    maximum_retrieval_query_tokens: int = 32_768
-    router_embedding_maximum_attempts: int = 3
-    completion_maximum_attempts: int = 3
-    simulation_maximum_output_tokens: int = 16_000
-    maximum_concurrency: int = 1
-    seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -128,15 +112,7 @@ def optimize_project_router(
         project,
         candidate_plan.selection,
         catalog_override=candidate_plan.prospective_catalog,
-        maximum_model_calls=options.maximum_model_calls,
-        preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
-        maximum_router_feature_tokens=options.maximum_router_feature_tokens,
-        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-        router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
-        completion_maximum_attempts=options.completion_maximum_attempts,
-        simulation_maximum_output_tokens=options.simulation_maximum_output_tokens,
-        maximum_judgments=options.maximum_judgments,
-        maximum_simulation_cost_usd=options.maximum_provider_cost_usd,
+        options=options,
     )
     if not provider_spend_consented:
         raise AutomaticRouterError(

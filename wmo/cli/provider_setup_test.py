@@ -58,8 +58,10 @@ def _model_json(
             "alias": alias,
             "connection": connection,
             "model": model,
-            "supports_embeddings": embeddings,
-            "input_cost_per_million_tokens_usd": 0.1 if embeddings else None,
+            "capabilities": {
+                "supports_embeddings": embeddings,
+                "input_cost_per_million_tokens_usd": 0.1 if embeddings else None,
+            },
         }
     )
 
