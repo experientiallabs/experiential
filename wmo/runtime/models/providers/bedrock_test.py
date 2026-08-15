@@ -24,10 +24,13 @@ from wmo.common.models import (
 from wmo.runtime.models.providers.bedrock import (
     AWS_DEFAULT_REGION_ENV,
     AWS_REGION_ENV,
+    CONNECT_TIMEOUT_SECONDS,
     NO_REGION_ERROR,
+    READ_TIMEOUT_SECONDS,
     BedrockClient,
     BedrockRegionError,
     BedrockRuntime,
+    create_bedrock_runtime_client,
     resolve_bedrock_region,
 )
 from wmo.runtime.models.providers.errors import ProviderResponseError
@@ -399,3 +402,75 @@ def test_snapshot_does_not_construct_a_bedrock_runtime() -> None:
 
     assert snapshot.provider == "bedrock"
     assert capabilities.supports_completions is True
+
+
+def test_runtime_construction_uses_the_aws_session_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session() carries no static keys; the client gets an explicit region and bounded config."""
+
+    class _Recorded:
+        """Mutable construction evidence for the fake boto session."""
+
+        session_called = False
+        service = ""
+        region = ""
+        connect_timeout = 0.0
+        read_timeout = 0.0
+        retries: Mapping[str, object] = {}
+        tcp_keepalive = False
+
+    class _FakeConfig:
+        """Record botocore Config keyword arguments."""
+
+        def __init__(
+            self,
+            *,
+            connect_timeout: float,
+            read_timeout: float,
+            retries: Mapping[str, object],
+            tcp_keepalive: bool,
+        ) -> None:
+            """Store the exact Config values used to construct bedrock-runtime."""
+            _Recorded.connect_timeout = connect_timeout
+            _Recorded.read_timeout = read_timeout
+            _Recorded.retries = retries
+            _Recorded.tcp_keepalive = tcp_keepalive
+
+    class _FakeSession:
+        """Record the service client request made from a default boto session."""
+
+        def client(self, service_name: str, *, region_name: str, config: object) -> object:
+            """Store construction arguments and return a dummy client."""
+            del config
+            _Recorded.service = service_name
+            _Recorded.region = region_name
+            return object()
+
+    class _FakeBoto3:
+        """Stand in for boto3 and prove Session() is called with no credential kwargs."""
+
+        def Session(self) -> _FakeSession:
+            """Return a default session without access-key arguments."""
+            _Recorded.session_called = True
+            return _FakeSession()
+
+    monkeypatch.setattr(
+        "wmo.runtime.models.providers.bedrock._import_boto3",
+        lambda: _FakeBoto3(),
+    )
+    monkeypatch.setattr(
+        "wmo.runtime.models.providers.bedrock._import_botocore_config",
+        lambda: _FakeConfig,
+    )
+
+    runtime = create_bedrock_runtime_client(region_name="eu-central-1")
+
+    assert _Recorded.session_called is True
+    assert _Recorded.service == "bedrock-runtime"
+    assert _Recorded.region == "eu-central-1"
+    assert _Recorded.connect_timeout == CONNECT_TIMEOUT_SECONDS
+    assert _Recorded.read_timeout == READ_TIMEOUT_SECONDS
+    assert _Recorded.retries == {"max_attempts": 1, "mode": "standard"}
+    assert _Recorded.tcp_keepalive is True
+    assert runtime is not None

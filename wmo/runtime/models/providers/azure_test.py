@@ -294,16 +294,31 @@ def test_trusted_azure_key_is_not_sent_to_a_different_endpoint() -> None:
 
 
 def test_canonical_endpoint_comparison_is_host_insensitive_and_path_sensitive() -> None:
-    """Trailing slashes and host case do not split a resource; path case does."""
+    """Trailing slashes and host case do not split a resource; path case and port do."""
     assert same_azure_endpoint(
         "HTTPS://Resource.openai.azure.com/",
+        "https://resource.openai.azure.com",
+    )
+    assert same_azure_endpoint(
+        "https://resource.openai.azure.com:443",
         "https://resource.openai.azure.com",
     )
     assert not same_azure_endpoint(
         "https://resource.openai.azure.com/Azure",
         "https://resource.openai.azure.com/azure",
     )
+    assert not same_azure_endpoint(
+        "https://resource.openai.azure.com:8443",
+        "https://resource.openai.azure.com",
+    )
     assert not same_azure_endpoint(_ENDPOINT, None)
+    with pytest.raises(ModelCredentialError, match="different Azure resource"):
+        bind_azure_api_key(
+            endpoint="https://resource.openai.azure.com:8443",
+            api_key_env=AZURE_OPENAI_API_KEY_ENV,
+            api_key=_SECRET,
+            environment={AZURE_OPENAI_ENDPOINT_ENV: _ENDPOINT},
+        )
 
 
 def test_azure_request_url_does_not_double_append_a_v1_root() -> None:

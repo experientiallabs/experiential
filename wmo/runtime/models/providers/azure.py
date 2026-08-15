@@ -35,9 +35,10 @@ _V1_ROOT_SUFFIX = "/openai/v1"
 def same_azure_endpoint(left: str, right: str | None) -> bool:
     """Compare two Azure resource endpoints after canonical host and path normalization.
 
-    Scheme and hostname are compared case-insensitively. The path is compared case-sensitively
-    after trailing slashes are removed. Query strings and fragments are never part of a valid
-    catalog endpoint.
+    Scheme and hostname are compared case-insensitively. Default HTTPS and HTTP ports are
+    equivalent to an omitted port. Other ports are distinct. The path is compared
+    case-sensitively after trailing slashes are removed. Query strings and fragments are never
+    part of a valid catalog endpoint.
 
     Args:
         left: Catalog or request endpoint.
@@ -224,8 +225,19 @@ class AzureClient:
         }
 
 
-def _canonical_azure_endpoint(value: str) -> tuple[str, str, str]:
-    """Return the comparable scheme, host, and path for one Azure endpoint."""
+def _canonical_azure_endpoint(value: str) -> tuple[str, str, int | None, str]:
+    """Return the comparable scheme, host, port, and path for one Azure endpoint.
+
+    Default HTTPS port 443 and HTTP port 80 are treated as omitted so catalog identity and key
+    pairing stay aligned. A non-default port is part of the resource identity.
+    """
     parsed = urlsplit(value)
     hostname = (parsed.hostname or "").lower()
-    return (parsed.scheme.lower(), hostname, parsed.path.rstrip("/"))
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Azure endpoint must use a valid port") from exc
+    scheme = parsed.scheme.lower()
+    default_port = 443 if scheme == "https" else 80
+    comparable_port = None if port in {None, default_port} else port
+    return (scheme, hostname, comparable_port, parsed.path.rstrip("/"))

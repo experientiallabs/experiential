@@ -194,6 +194,20 @@ def test_azure_connection_requires_endpoint_key_and_api_version() -> None:
             api_key_env="AZURE_OPENAI_API_KEY",
             api_version="v1",
         )
+    with pytest.raises(ValueError, match="query parameters or fragments"):
+        ConnectionConfig(
+            provider="azure",
+            base_url="https://resource.openai.azure.com?api-key=secret",
+            api_key_env="AZURE_OPENAI_API_KEY",
+            api_version="v1",
+        )
+    with pytest.raises(ValueError, match="query parameters or fragments"):
+        ConnectionConfig(
+            provider="azure",
+            base_url="https://resource.openai.azure.com#frag",
+            api_key_env="AZURE_OPENAI_API_KEY",
+            api_version="v1",
+        )
 
 
 def test_bedrock_connection_rejects_api_keys_and_includes_region_in_identity() -> None:

@@ -38,8 +38,9 @@ deployment.
 
 `AZURE_OPENAI_API_KEY` is paired with `AZURE_OPENAI_ENDPOINT` when that endpoint variable is set.
 A catalog endpoint that is not the same resource cannot use that key. Comparison lowercases the
-scheme and host, keeps path case, and ignores a trailing slash. Credentials may not appear in the
-endpoint URL, query string, or fragment.
+scheme and host, treats default HTTPS and HTTP ports as equivalent to an omitted port, keeps path
+case, and ignores a trailing slash. Credentials may not appear in the endpoint URL, query string,
+or fragment.
 
 ```toml
 [connections.azure]
