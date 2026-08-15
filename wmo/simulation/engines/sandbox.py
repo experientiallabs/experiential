@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import datetime
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -14,6 +14,7 @@ from wmo.common.core.artifacts import (
     FailureCode,
     StructuredFailure,
     canonical_json_bytes,
+    canonical_jsonl_bytes,
     sorted_unique_inputs,
     stable_id,
 )
@@ -61,6 +62,7 @@ from wmo.simulation.engines.text.leases import (
     TextCellLeaseState,
     TextCellLeaseStore,
 )
+from wmo.simulation.engines.text.rollout_support import timestamp, utc_now
 from wmo.simulation.orchestration import require_implemented_mode
 from wmo.simulation.specs import SimulationSpec
 
@@ -142,7 +144,7 @@ class SandboxSimulator:
         self._environment_id = environment_id
         self._environment_sha256 = environment_sha256
         self._source_run_id = source_run_id
-        self._clock = clock or _utc_now
+        self._clock = clock or utc_now
         self._monotonic = monotonic
         self._leases = TextCellLeaseStore(store.project_directory, clock=self._clock)
         self._verify_persisted_evaluation_plan()
@@ -355,7 +357,7 @@ class SandboxSimulator:
             evaluation_plan_input=self._plan_input,
             task_set_input=self._task_set_input,
             bindings=tuple(bindings[cell.cell_id] for cell in cells),
-            created_at=_timestamp(self._clock),
+            created_at=timestamp(self._clock),
         )
         try:
             manifest = self._store.write_json(
@@ -539,7 +541,7 @@ class SandboxSimulator:
         record_dispatch_intent: Callable[[], None],
     ) -> RolloutArtifact:
         """Execute one bounded customer episode and convert every normal failure into evidence."""
-        started_at = _timestamp(self._clock)
+        started_at = timestamp(self._clock)
         started = self._monotonic()
         candidate = self._candidates[cell.candidate_alias]
         settings = spec.sandbox
@@ -598,7 +600,7 @@ class SandboxSimulator:
                 limit_failure=None,
             )
         stop_reason, failure = _terminal_state(episode, evidence)
-        ended_at = _timestamp(self._clock, not_before=started_at)
+        ended_at = timestamp(self._clock, not_before=started_at)
         spans = merge_sandbox_spans(episode, evidence)
         if not spans:
             spans = (_terminal_span(started_at, ended_at, failure),)
@@ -634,7 +636,7 @@ class SandboxSimulator:
             attribution=FailureAttribution.MODEL,
             details={"phase": phase, "observed_spend_usd": spent},
         )
-        now = _timestamp(self._clock)
+        now = timestamp(self._clock)
         return self._make_rollout(
             spec,
             cell,
@@ -668,8 +670,8 @@ class SandboxSimulator:
         rollout_id = sandbox_rollout_id(binding)
         return RolloutArtifact(
             schema_version=1,
-            created_at=_timestamp(self._clock),
-            inputs=_sorted_inputs(
+            created_at=timestamp(self._clock),
+            inputs=sorted_unique_inputs(
                 self._plan_input,
                 self._task_set_input,
                 binding.simulation_spec_input,
@@ -752,7 +754,7 @@ class SandboxSimulator:
         resolution_input: ArtifactInput,
     ) -> None:
         """Require every resumed cell to match its exact task, model, environment, and inputs."""
-        expected_inputs = _sorted_inputs(
+        expected_inputs = sorted_unique_inputs(
             self._plan_input,
             self._task_set_input,
             binding.simulation_spec_input,
@@ -783,15 +785,15 @@ class SandboxSimulator:
     ) -> SimulationArtifactSet:
         """Write or verify the terminal index after every per-cell artifact is durable."""
         artifact_ids = tuple(rollout.artifact_id for rollout in rollouts)
-        payload = _jsonl_bytes(tuple({"artifact_id": item} for item in artifact_ids))
+        payload = canonical_jsonl_bytes(tuple({"artifact_id": item} for item in artifact_ids))
         artifact_set_id = stable_id(
             "simulation-artifact-set",
             {"simulation_id": spec.simulation_id, "artifact_ids": artifact_ids},
         )
         artifact_set = SimulationArtifactSet(
             schema_version=1,
-            created_at=_timestamp(self._clock),
-            inputs=_sorted_inputs(
+            created_at=timestamp(self._clock),
+            inputs=sorted_unique_inputs(
                 self._plan_input,
                 self._task_set_input,
                 spec_input,
@@ -905,34 +907,6 @@ def _latency_economics(duration_seconds: float) -> OperationEconomics:
     return OperationEconomics(
         latency_seconds=NumericMeasurement(value=duration_seconds, provenance="observed")
     )
-
-
-def _sorted_inputs(*inputs: ArtifactInput) -> tuple[ArtifactInput, ...]:
-    """Return one exact immutable input per artifact ID in stable order."""
-    return sorted_unique_inputs(*inputs, error_type=SandboxSimulationError)
-
-
-def _jsonl_bytes(records: Sequence[Mapping[str, str]]) -> bytes:
-    """Render deterministic small JSONL artifact-index records."""
-    payload = b"\n".join(canonical_json_bytes(dict(record)) for record in records)
-    return payload + (b"\n" if payload else b"")
-
-
-def _timestamp(
-    clock: Callable[[], datetime],
-    *,
-    not_before: datetime | None = None,
-) -> datetime:
-    """Return an aware timestamp that cannot precede an earlier event."""
-    value = clock()
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("sandbox simulation clock must return timezone-aware datetimes")
-    return not_before if not_before is not None and value < not_before else value
-
-
-def _utc_now() -> datetime:
-    """Return the current aware UTC timestamp."""
-    return datetime.now(UTC)
 
 
 __all__ = [

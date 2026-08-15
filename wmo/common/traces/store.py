@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
+from wmo.common.core.artifacts import envelope_matches_manifest
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore
 from wmo.common.traces.trace import Trace, TraceDataset
 
@@ -53,19 +54,7 @@ def load_trace_dataset(store: ArtifactStore, dataset_id: str) -> LoadedTraceData
         raise ArtifactCorruptionError(
             f"trace-dataset envelope ID {dataset.dataset_id} does not match artifact {dataset_id}"
         )
-    if (
-        dataset.schema_version,
-        dataset.created_at,
-        dataset.inputs,
-        dataset.code_revision,
-        dataset.source,
-    ) != (
-        stored.manifest.schema_version,
-        stored.manifest.created_at,
-        stored.manifest.inputs,
-        stored.manifest.code_revision,
-        stored.manifest.source,
-    ):
+    if not envelope_matches_manifest(dataset, stored.manifest):
         raise ArtifactCorruptionError(
             f"trace dataset {dataset_id} envelope differs from its artifact manifest"
         )

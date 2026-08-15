@@ -12,6 +12,8 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     canonical_json_bytes,
+    canonical_jsonl_bytes,
+    envelope_matches_manifest,
     stable_id,
 )
 from wmo.common.project import (
@@ -268,10 +270,7 @@ def load_task_set_lineage_bindings(
             f"task set {task_set_id} envelope is not canonical current-build JSON"
         )
     task_bytes = store.read_bytes(task_set_id, "tasks.jsonl")
-    expected_task_bytes = b"\n".join(canonical_json_bytes(task) for task in loaded_tasks.tasks)
-    if expected_task_bytes:
-        expected_task_bytes += b"\n"
-    if task_bytes != expected_task_bytes:
+    if task_bytes != canonical_jsonl_bytes(loaded_tasks.tasks):
         raise ArtifactCorruptionError(
             f"task set {task_set_id} records are not canonical current-build JSONL"
         )
@@ -375,19 +374,7 @@ def _require_task_set_manifest_matches_envelope(
     Raises:
         ArtifactCorruptionError: The envelope inputs differ from the manifest.
     """
-    if (
-        task_set.schema_version,
-        task_set.created_at,
-        task_set.inputs,
-        task_set.code_revision,
-        task_set.source,
-    ) != (
-        manifest.schema_version,
-        manifest.created_at,
-        manifest.inputs,
-        manifest.code_revision,
-        manifest.source,
-    ):
+    if not envelope_matches_manifest(task_set, manifest):
         raise ArtifactCorruptionError(
             f"task set {task_set.task_set_id} envelope differs from its artifact manifest"
         )

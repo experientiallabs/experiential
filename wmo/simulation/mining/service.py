@@ -14,6 +14,7 @@ from wmo.common.core.artifacts import (
     ContractModel,
     SourceIdentity,
     canonical_json_bytes,
+    canonical_jsonl_bytes,
     stable_id,
 )
 from wmo.common.project import ArtifactAlreadyExistsError, ArtifactStore, artifact_input
@@ -238,7 +239,7 @@ def persist_task_set(
     Raises:
         ValueError: An existing artifact differs from the deterministic replay.
     """
-    task_payload = _jsonl_bytes(result.tasks)
+    task_payload = canonical_jsonl_bytes(result.tasks)
     coverage_payload = canonical_json_bytes(result.coverage)
     lineage_payload = None
     if inputs:
@@ -408,12 +409,6 @@ def _materialize_tasks(
         weights[selection.representative_trace_id] = weight
         cleanup_results.append((selection.representative_trace_id, cleanup))
     return tuple(tasks), task_ids, weights, tuple(cleanup_results)
-
-
-def _jsonl_bytes(records: Sequence[TaskCase]) -> bytes:
-    """Serialize canonical task contracts as deterministic newline-terminated JSONL."""
-    payload = b"\n".join(canonical_json_bytes(record) for record in records)
-    return payload + b"\n" if payload else b""
 
 
 def _selection_budgets(

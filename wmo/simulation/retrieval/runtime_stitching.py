@@ -51,7 +51,7 @@ def stitch_runtime_observations(
     interactions_by_lineage: dict[str, list[RuntimeTraceInteraction]] = defaultdict(list)
     for interaction in export.interactions:
         accepted = interaction.attempts[0].accepted
-        interactions_by_lineage[accepted.lineage_id].append(interaction)
+        interactions_by_lineage[accepted.identity.lineage_id].append(interaction)
     stitched: dict[str, Trace] = dict(traces_by_id)
     for lineage_id, interactions in interactions_by_lineage.items():
         ordered = tuple(sorted(interactions, key=lambda item: item.attempts[0].accepted.ordinal))
@@ -122,7 +122,7 @@ def _stitch_interaction(
     )
     accepted = completed_attempt.accepted
     next_accepted = next_interaction.attempts[0].accepted
-    if next_accepted.lineage_id != accepted.lineage_id:
+    if next_accepted.identity.lineage_id != accepted.identity.lineage_id:
         raise RuntimeTraceStitchingError("runtime observation stitching cannot cross lineages")
     if next_accepted.ordinal < completed.ordinal:
         return None
@@ -208,7 +208,7 @@ def _messages_after_output(
     """
     matching_indexes = tuple(
         index
-        for index, message in enumerate(accepted.request.messages)
+        for index, message in enumerate(accepted.identity.request.messages)
         if _message_matches_output(message, output)
     )
     if not matching_indexes:
@@ -218,7 +218,7 @@ def _messages_after_output(
             f"runtime interaction {accepted.interaction_id} does not preserve the prior "
             "assistant output in its same-lineage request"
         )
-    return accepted.request.messages[matching_indexes[-1] + 1 :]
+    return accepted.identity.request.messages[matching_indexes[-1] + 1 :]
 
 
 def _message_matches_output(message: ModelMessage, output: AssistantAction) -> bool:
@@ -268,7 +268,7 @@ def _provenance(
             "interaction_id": accepted.interaction_id,
             "accepted_ordinal": accepted.ordinal,
             "completed_ordinal": completed.ordinal,
-            "lineage_id": accepted.lineage_id,
+            "lineage_id": accepted.identity.lineage_id,
             "next_interaction_id": next_accepted.interaction_id,
             "next_accepted_ordinal": next_accepted.ordinal,
             "runtime_snapshot_input": snapshot_input.model_dump(mode="json"),

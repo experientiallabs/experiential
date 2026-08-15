@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
-from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, Field
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -76,15 +74,7 @@ class AutomaticSFTRunAcceptanceSelection(ContractModel):
     acceptance: ArtifactInput
     previous_acceptance: ArtifactInput | None = None
     config: ArtifactInput
-    updated_at: datetime
-
-    @field_validator("updated_at")
-    @classmethod
-    def _require_updated_at_timezone(cls, value: datetime) -> datetime:
-        """Require explicit time-zone evidence for the acceptance selection."""
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("automatic SFT acceptance update time must include a timezone")
-        return value
+    updated_at: AwareDatetime
 
 
 def automatic_sft_acceptance_path(store: ProjectStore) -> Path:
@@ -349,7 +339,7 @@ def write_automatic_sft_acceptance_selection_unlocked(
     _require_safe_automatic_acceptance_path(store, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _require_safe_automatic_acceptance_path(store, path)
-    _write_automatic_acceptance_pointer_atomic(path, canonical_json_bytes(selection))
+    write_bytes_atomic(path, canonical_json_bytes(selection))
     stored = load_automatic_sft_acceptance_selection(store)
     if stored is None or stored != selection:
         raise TinkerSFTResumeError("automatic SFT acceptance pointer did not preserve selection")
@@ -828,39 +818,3 @@ def _require_safe_automatic_acceptance_path(store: ProjectStore, path: Path) -> 
         if current == project_directory:
             break
         current = current.parent
-
-
-def _write_automatic_acceptance_pointer_atomic(path: Path, payload: bytes) -> None:
-    """Replace the acceptance pointer without following a swapped destination symlink.
-
-    Args:
-        path: Already validated pointer path whose parent coordination directory exists.
-        payload: Complete canonical pointer bytes.
-
-    Raises:
-        OSError: Exclusive staging, payload durability, or atomic replacement fails.
-    """
-    staging = path.with_name(f".{path.name}.{uuid4().hex}.partial")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(staging, flags, 0o644)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(staging, path)
-    except BaseException:
-        staging.unlink(missing_ok=True)
-        raise
-    try:
-        directory_descriptor = os.open(path.parent, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(directory_descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(directory_descriptor)

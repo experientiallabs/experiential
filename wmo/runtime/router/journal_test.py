@@ -426,8 +426,8 @@ def test_provider_failure_has_no_target_and_retry_reuses_pinned_decision(tmp_pat
     ]
     assert runtime.select_calls == 1
     assert (
-        cast(RuntimeAcceptedEvent, retried[0]).decision
-        == cast(RuntimeAcceptedEvent, retried[2]).decision
+        cast(RuntimeAcceptedEvent, retried[0]).acceptance.decision
+        == cast(RuntimeAcceptedEvent, retried[2]).acceptance.decision
     )
 
 

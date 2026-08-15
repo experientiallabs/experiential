@@ -154,6 +154,33 @@ def test_model_messages_reject_tool_and_assistant_fields_on_the_wrong_roles() ->
         ModelMessage(role="tool", content="missing linkage")
 
 
+def test_combine_economics_reports_partial_totals_only_when_asked() -> None:
+    """Aggregation never presents a partial usage, cost, or provenance as complete."""
+    priced = OperationEconomics(
+        usage=Usage(input_tokens=10, output_tokens=2, cached_input_tokens=4),
+        cost_usd=NumericMeasurement(value=0.5, provenance="observed"),
+        latency_seconds=NumericMeasurement(value=1.0, provenance="observed"),
+    )
+    estimated = OperationEconomics(
+        usage=Usage(input_tokens=5, output_tokens=1),
+        cost_usd=NumericMeasurement(value=0.25, provenance="estimated"),
+    )
+    unmetered = OperationEconomics()
+
+    complete = combine_economics((priced, estimated))
+    partial = combine_economics((priced, unmetered), require_complete_usage=False)
+    strict = combine_economics((priced, unmetered))
+
+    assert combine_economics(()) == OperationEconomics()
+    assert complete.usage == Usage(input_tokens=15, output_tokens=3, cached_input_tokens=None)
+    assert complete.cost_usd == NumericMeasurement(value=0.75, provenance="estimated")
+    assert complete.latency_seconds is None
+    assert partial.usage == priced.usage
+    assert partial.cost_usd is None
+    assert strict.usage is None
+    assert combine_economics((unmetered,), require_complete_usage=False).usage is None
+
+
 def test_embeddings_require_nonempty_finite_vectors() -> None:
     """Embedding output cannot hide empty or non-finite provider data."""
     assert Embedding(values=(1.0, 0.0)).values == (1.0, 0.0)

@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.common.judging import Rubric, RubricDimension
 from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import load_model_catalog
@@ -45,7 +46,6 @@ from wmo.runtime.models.registry import RuntimeModelCatalog
 
 judge_app = typer.Typer(help="Set up and manually calibrate a project judge.", no_args_is_help=True)
 _console = Console()
-_ROOT_OPTION = typer.Option(Path(".wmo"), "--root", help="Local .wmo project root.")
 _RUBRIC_FILE_OPTION = typer.Option(
     None, "--rubric-file", help="JSON array of complete zero-to-five rubric dimensions."
 )
@@ -70,7 +70,7 @@ _LABEL_OPTION = typer.Option(
 )
 def judge_setup(
     project: str = typer.Argument(..., metavar="PROJECT", help="Configured local project ID."),
-    root: Path = _ROOT_OPTION,
+    root: Path = ROOT_OPTION,
     judge_alias: str | None = typer.Option(
         None, "--judge-alias", help="Configured completion alias; defaults to roles.judge."
     ),
@@ -97,7 +97,7 @@ def judge_setup(
     Raises:
         typer.BadParameter: Local files, build evidence, or confirmation are invalid.
     """
-    try:
+    with usage_error(OSError, ValueError, ManualJudgeError):
         revision = installed_release_revision()
         store = ProjectStore(root, project)
         dimensions = _load_rubric_dimensions(rubric_file)
@@ -122,8 +122,6 @@ def judge_setup(
             _console.print("Judge setup was not saved.")
             return
         setup = commit_manual_judge_setup(store, plan, confirmed=True)
-    except (OSError, ValueError, ManualJudgeError) as exc:
-        raise typer.BadParameter(str(exc)) from None
     _console.print(f"Saved judge setup {setup.setup_id} for {project}.")
 
 
@@ -133,7 +131,7 @@ def judge_setup(
 )
 def judge_calibrate(
     project: str = typer.Argument(..., metavar="PROJECT", help="Configured local project ID."),
-    root: Path = _ROOT_OPTION,
+    root: Path = ROOT_OPTION,
     sample_size: int = typer.Option(10, "--sample-size", min=1),
     label: list[str] | None = _LABEL_OPTION,
     input_price: float = typer.Option(..., "--input-usd-per-million", min=0),
@@ -170,7 +168,7 @@ def judge_calibrate(
     Raises:
         typer.BadParameter: Evidence, labels, budget, consent, or approval is invalid.
     """
-    try:
+    with usage_error(OSError, ValueError, ManualJudgeError):
         revision = installed_release_revision()
         store = ProjectStore(root, project)
         now = datetime.now(UTC)
@@ -216,8 +214,6 @@ def judge_calibrate(
             maximum_input_tokens_per_call=maximum_input_tokens,
             maximum_cost_usd=maximum_cost_usd,
         )
-    except (OSError, ValueError, ManualJudgeError) as exc:
-        raise typer.BadParameter(str(exc)) from None
     spend = (
         f"at most ${budget.estimated_cost_usd:.4f} across {budget.call_count} judge calls "
         f"with up to {budget.maximum_attempts_per_call} attempts each"
@@ -230,7 +226,7 @@ def judge_calibrate(
     ):
         _console.print("Judge calibration was not started.")
         return
-    try:
+    with usage_error(OSError, ValueError, ManualJudgeError):
         runtime = RuntimeModelCatalog(load_model_catalog(store.model_catalog_path))
         result = calibrate_manual_judge(
             store,
@@ -263,8 +259,6 @@ def judge_calibrate(
                 created_at=now,
                 code_revision=revision,
             )
-    except (OSError, ValueError, ManualJudgeError) as exc:
-        raise typer.BadParameter(str(exc)) from None
     if result.approved_calibration is None:
         _console.print("Calibration evidence saved but not approved.")
     else:

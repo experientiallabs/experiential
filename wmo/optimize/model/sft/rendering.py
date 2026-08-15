@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 from typing import Annotated, Literal
 
 from pydantic import Field
 
-from wmo.common.core.artifacts import ContractModel, Sha256, canonical_json_bytes, sha256_json
+from wmo.common.core.artifacts import (
+    ContractModel,
+    Sha256,
+    canonical_json_bytes,
+    canonical_jsonl_bytes,
+    sha256_bytes,
+    sha256_json,
+)
 from wmo.common.models import AssistantAction
 from wmo.optimize.model.sft.contracts import (
     AssistantActionEvent,
@@ -82,14 +88,12 @@ def canonical_partitioned_rows_jsonl(rows: Sequence[PartitionedSFTExample]) -> b
     Returns:
         Canonical JSONL bytes, or empty bytes when no examples are present.
     """
-    if not rows:
-        return b""
-    return b"\n".join(canonical_json_bytes(row) for row in rows) + b"\n"
+    return canonical_jsonl_bytes(rows)
 
 
 def partitioned_rows_sha256(rows: Sequence[PartitionedSFTExample]) -> Sha256:
     """Return the SHA-256 digest of persisted canonical partitioned SFT JSONL rows."""
-    return hashlib.sha256(canonical_partitioned_rows_jsonl(rows)).hexdigest()
+    return sha256_bytes(canonical_partitioned_rows_jsonl(rows))
 
 
 def _canonical_turn(

@@ -6,8 +6,9 @@ from pathlib import Path
 
 import typer
 
+from wmo.cli.options import ROOT_OPTION, usage_error
+
 _LOOPBACK_HOST = "127.0.0.1"
-_ROOT_OPTION = typer.Option(Path(".wmo"), "--root", help="Local .wmo artifact root.")
 _POLICY_OPTION = typer.Option(
     None,
     "--policy",
@@ -23,7 +24,7 @@ _GHOST_OPTION = typer.Option(
 
 def run(
     project: str = typer.Argument(..., help="Project and local routed model name."),
-    root: Path = _ROOT_OPTION,
+    root: Path = ROOT_OPTION,
     policy: str | None = _POLICY_OPTION,
     port: int = _PORT_OPTION,
     ghost: bool = _GHOST_OPTION,
@@ -53,7 +54,7 @@ def run(
         create_project_router_app,
     )
 
-    try:
+    with usage_error(ValueError):
         runtime = load_project_router(project, root, policy_id=policy)
         project_store = ProjectStore(root, project)
         completion_service = create_project_completion_service(
@@ -61,8 +62,6 @@ def run(
             runtime,
             ghost=ghost,
         )
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from None
     typer.echo(
         f"loaded policy {runtime.policy.policy_id} with {runtime.policy.judgment_status} judgment"
     )

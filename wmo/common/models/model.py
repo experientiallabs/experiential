@@ -71,60 +71,80 @@ class OperationEconomics(ContractModel):
     latency_seconds: NumericMeasurement | None = None
 
 
-def combine_economics(records: Sequence[OperationEconomics]) -> OperationEconomics:
-    """Aggregate same-role calls without representing a partial total as complete.
-
-    Usage is summed when present. Cost and latency are summed only when every call
-    exposed that measurement, preserving a clear unknown rather than a partial sum.
+def combine_economics(
+    records: Sequence[OperationEconomics],
+    *,
+    require_complete_usage: bool = True,
+) -> OperationEconomics:
+    """Aggregate per-operation economics without representing a partial total as complete.
 
     Args:
-        records: Economics for all calls made by one named role in one episode.
+        records: Economics observed for each aggregated operation.
+        require_complete_usage: When ``True``, report usage only if every record carries it.
+            When ``False``, sum the records that report usage and omit usage only when all
+            records lack it.
 
     Returns:
-        One economics value for the combined series.
+        One economics value. Cost and latency are summed only when every record exposes that
+        measurement, preserving a clear unknown rather than a partial sum.
     """
     if not records:
         return OperationEconomics()
-    usages = [record.usage for record in records]
-    usage = None
-    if any(item is not None for item in usages):
-        usage = _combine_usage(tuple(item for item in usages if item is not None))
+    usages = tuple(record.usage for record in records)
+    present = tuple(item for item in usages if item is not None)
+    usage: Usage | None = None
+    if present and (not require_complete_usage or len(present) == len(usages)):
+        usage = _sum_usage(present)
     return OperationEconomics(
         usage=usage,
-        cost_usd=_combine_measurement(tuple(record.cost_usd for record in records)),
-        latency_seconds=_combine_measurement(tuple(record.latency_seconds for record in records)),
+        cost_usd=_sum_measurements(tuple(record.cost_usd for record in records)),
+        latency_seconds=_sum_measurements(tuple(record.latency_seconds for record in records)),
     )
 
 
-def _combine_usage(records: Sequence[Usage]) -> Usage:
-    """Return a typed usage sum after callers excluded absent usage values."""
-    cached = tuple(item.cached_input_tokens for item in records)
-    cached_input_tokens = (
-        None
-        if any(item is None for item in cached)
-        else sum(item for item in cached if item is not None)
-    )
+def _sum_usage(values: Sequence[Usage]) -> Usage:
+    """Sum provider token usage without manufacturing missing cache counts.
+
+    Args:
+        values: Usage records reported by the aggregated operations.
+
+    Returns:
+        Summed input and output tokens, with cached input tokens summed only when every
+        record reports them.
+    """
+    cached = tuple(value.cached_input_tokens for value in values)
+    cached_total: int | None = None
+    if all(item is not None for item in cached):
+        cached_total = sum(item for item in cached if item is not None)
     return Usage(
-        input_tokens=sum(item.input_tokens for item in records),
-        output_tokens=sum(item.output_tokens for item in records),
-        cached_input_tokens=cached_input_tokens,
+        input_tokens=sum(value.input_tokens for value in values),
+        output_tokens=sum(value.output_tokens for value in values),
+        cached_input_tokens=cached_total,
     )
 
 
-def _combine_measurement(
-    records: Sequence[NumericMeasurement | None],
+def _sum_measurements(
+    values: Sequence[NumericMeasurement | None],
 ) -> NumericMeasurement | None:
-    """Sum a measurement only when every call provided a compatible finite value."""
-    if any(record is None for record in records):
-        return None
-    measurements = tuple(record for record in records if record is not None)
-    values = tuple(item.value for item in measurements)
-    if not all(math.isfinite(value) for value in values):
-        return None
-    provenance = (
-        "observed" if all(item.provenance == "observed" for item in measurements) else "estimated"
+    """Sum a measurement series while retaining its weakest provenance.
+
+    Args:
+        values: Optional measurements from each aggregated operation.
+
+    Returns:
+        The summed measurement, or ``None`` when any operation omitted it.
+    """
+    present: list[NumericMeasurement] = []
+    for value in values:
+        if value is None:
+            return None
+        present.append(value)
+    return NumericMeasurement(
+        value=sum(item.value for item in present),
+        provenance=(
+            "observed" if all(item.provenance == "observed" for item in present) else "estimated"
+        ),
     )
-    return NumericMeasurement(value=sum(values), provenance=provenance)
 
 
 class ToolCall(ContractModel):

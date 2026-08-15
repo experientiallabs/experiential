@@ -8,6 +8,7 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
+from wmo.cli.options import usage_error
 from wmo.common.models import (
     ModelCapabilities,
     ModelCatalog,
@@ -223,10 +224,8 @@ def _noninteractive_selection(
         raise typer.BadParameter("noninteractive router setup is missing: " + "; ".join(missing))
     if selected_incumbent is None:
         raise AssertionError("validated noninteractive selection has an incumbent")
-    try:
+    with usage_error(ValueError):
         return RouterCandidateSelection(candidates=selected, incumbent=selected_incumbent)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from None
 
 
 def _interactive_selection(
@@ -289,7 +288,5 @@ def _interactive_selection(
     )
     if selected_incumbent is None:
         raise AssertionError("interactive incumbent prompt returned no alias")
-    try:
+    with usage_error(ValueError):
         return RouterCandidateSelection(candidates=selected, incumbent=selected_incumbent)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from None
