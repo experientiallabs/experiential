@@ -59,9 +59,10 @@ table and column names accept only plain identifiers, and dynamic names reach SQ
 identifiers. `row_shape` is `document` when one row holds one whole trace payload, or `message`
 when one row holds one chat message; message rows require `chat-json`, a `trace_id_column`, and an
 `order_column`, and a row with no declared trace identity becomes an explicit issue instead of a
-guessed conversation. Turn order is never invented: when the message rows of one conversation share
-one order value, that conversation is retained as an explicit issue rather than assembled in an
-arbitrary order. Document rows tied on the order column are broken by trace identity and payload
+guessed conversation. Turn order is never invented: the database ranks the message rows of each
+conversation on the declared order column, and a conversation holding rows the database ranks alike
+or a row with no order value is retained as an explicit issue rather than assembled in an arbitrary
+order. Document rows tied on the order column are broken by trace identity and payload
 text, so equal timestamps cannot reorder a corpus between builds. `since` requires `order_column`.
 The driver is optional: install it with
 `uv sync --extra postgres` or `world-model-optimizer[postgres]`. A Python caller may inject its own

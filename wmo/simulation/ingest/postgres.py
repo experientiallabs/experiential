@@ -29,7 +29,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
@@ -46,6 +46,9 @@ from wmo.simulation.ingest.otlp import (
     TraceNormalizationResult,
 )
 from wmo.simulation.ingest.phoenix import normalize_phoenix_payloads
+
+if TYPE_CHECKING:
+    from psycopg import sql
 
 DSN_ENV = "WMO_POSTGRES_DSN"
 
@@ -82,12 +85,14 @@ class PostgresRow:
     Args:
         source_trace_id: Value of the declared trace-id column, if the source declares one.
         payload: Decoded JSON payload of the declared payload column.
-        order_value: Text of the declared order column, if the source declares one.
+        order_rank: Rank of the row inside its conversation, as ranked by the database on the
+            declared order column. ``None`` when the source declares no comparable order for the
+            row, which excludes its conversation from message assembly.
     """
 
     source_trace_id: str | None
     payload: JsonValue
-    order_value: str | None = None
+    order_rank: str | None = None
 
 
 @dataclass(frozen=True)
@@ -321,9 +326,10 @@ def _conversation_payloads(
 ) -> list[JsonValue]:
     """Assemble message rows into one chat conversation document per source trace identity.
 
-    Turn order carries meaning, so it is never invented. A conversation whose rows share one order
-    value has no declared turn order and is retained as an explicit exclusion instead of being
-    assembled from an arbitrary order.
+    Turn order carries meaning, so it is never invented. Every row of a conversation must carry one
+    distinct declared rank; a conversation with a missing or repeated rank has no declared turn
+    order and is retained as an explicit exclusion instead of being assembled from an arbitrary
+    order.
 
     Args:
         rows: Selected message rows in declared order.
@@ -334,7 +340,7 @@ def _conversation_payloads(
         order.
     """
     conversations: dict[str, list[JsonValue]] = {}
-    order_values: dict[str, list[str | None]] = {}
+    ranks: dict[str, list[str | None]] = {}
     for index, row in enumerate(rows, start=1):
         if row.source_trace_id is None:
             issues.append(
@@ -342,11 +348,19 @@ def _conversation_payloads(
             )
             continue
         conversations.setdefault(row.source_trace_id, []).append(row.payload)
-        order_values.setdefault(row.source_trace_id, []).append(row.order_value)
+        ranks.setdefault(row.source_trace_id, []).append(row.order_rank)
     payloads: list[JsonValue] = []
     for trace_id, messages in conversations.items():
-        values = order_values[trace_id]
-        if len(set(values)) != len(values):
+        declared = ranks[trace_id]
+        if None in declared:
+            issues.append(
+                TraceNormalizationIssue(
+                    trace_id,
+                    "a message row declares no order value, so the turn order is not declared",
+                )
+            )
+            continue
+        if len(set(declared)) != len(declared):
             issues.append(
                 TraceNormalizationIssue(
                     trace_id,
@@ -370,9 +384,12 @@ class PsycopgRowReader:
         Returns:
             Selected rows in ``order_column`` order when the source declares one. Document rows
             tied on the order column are broken by the trace identity and then by the payload
-            text, so equal values cannot reorder a corpus between builds. Message-row order is
-            never broken by payload text, because a payload-derived order would read as a declared
-            conversation order; tied message rows are excluded by ``normalize_postgres_rows``.
+            text, so equal values cannot reorder a corpus between builds. Message rows are never
+            broken by payload text, because a payload-derived order would read as a declared
+            conversation order. Instead the database ranks each message row inside its conversation
+            on the declared order column, so rows the database itself compares as equal carry the
+            same rank and a row with no order value carries none; ``normalize_postgres_rows``
+            excludes both cases.
 
         Raises:
             PostgresSourceError: The driver, connection string, table, or a column is unusable.
@@ -388,13 +405,8 @@ class PsycopgRowReader:
             if config.trace_id_column is not None
             else sql.SQL("NULL")
         )
-        order_value: sql.Composable = (
-            sql.SQL("{}::text").format(sql.Identifier(config.order_column))
-            if config.order_column is not None
-            else sql.SQL("NULL")
-        )
         query = sql.SQL("SELECT {}, {}, {} FROM {}").format(
-            trace_id, sql.Identifier(config.payload_column), order_value, table
+            trace_id, sql.Identifier(config.payload_column), _order_rank(config), table
         )
         parameters: tuple[str, ...] = ()
         if config.order_column is not None:
@@ -422,11 +434,39 @@ class PsycopgRowReader:
         )
 
 
+def _order_rank(config: PostgresSourceConfig) -> sql.Composable:
+    """Compose the declared order evidence selected for every row.
+
+    Message rows are ranked by the database inside their conversation, so two rows the database
+    compares as equal carry one rank and a row with no order value carries none. Document rows need
+    no per-conversation rank.
+
+    Args:
+        config: Explicit Postgres trace source.
+
+    Returns:
+        Composed order-evidence expression.
+    """
+    from psycopg import sql
+
+    if (
+        config.row_shape != "message"
+        or config.order_column is None
+        or config.trace_id_column is None
+    ):
+        return sql.SQL("NULL")
+    order_column = sql.Identifier(config.order_column)
+    return sql.SQL(
+        "CASE WHEN {order} IS NULL THEN NULL ELSE "
+        "(rank() OVER (PARTITION BY {trace} ORDER BY {order}))::text END"
+    ).format(order=order_column, trace=sql.Identifier(config.trace_id_column))
+
+
 def decode_postgres_row(fetched: Sequence[object], *, index: int) -> PostgresRow:
     """Decode one selected row into a trace row.
 
     Args:
-        fetched: Selected trace identity, payload, and order values, in that order.
+        fetched: Selected trace identity, payload, and order rank, in that order.
         index: One-based row position used in validation messages.
 
     Returns:
@@ -437,12 +477,12 @@ def decode_postgres_row(fetched: Sequence[object], *, index: int) -> PostgresRow
     """
     if len(fetched) != 3:
         raise PostgresSourceError(f"postgres row {index} did not select three columns")
-    raw_trace_id, raw_payload, raw_order_value = fetched
+    raw_trace_id, raw_payload, raw_order_rank = fetched
     source_trace_id = None if raw_trace_id is None else str(raw_trace_id)
     return PostgresRow(
         source_trace_id=source_trace_id,
         payload=_decoded_payload(raw_payload, index=index),
-        order_value=None if raw_order_value is None else str(raw_order_value),
+        order_rank=None if raw_order_rank is None else str(raw_order_rank),
     )
 
 

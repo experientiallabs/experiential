@@ -123,12 +123,12 @@ def test_normalize_postgres_rows_assembles_message_rows() -> None:
         PostgresRow(
             source_trace_id="conversation-1",
             payload={"role": "user", "content": "What is the weather in Paris?"},
-            order_value="1",
+            order_rank="1",
         ),
         PostgresRow(
             source_trace_id="conversation-1",
             payload={"role": "assistant", "content": "It is 18C in Paris."},
-            order_value="2",
+            order_rank="2",
         ),
     ]
     config = _MESSAGE_CONFIG
@@ -152,17 +152,17 @@ def test_load_postgres_source_retains_untraceable_message_rows_as_issues() -> No
         PostgresRow(
             source_trace_id="conversation-1",
             payload={"role": "user", "content": "What is the weather in Paris?"},
-            order_value="1",
+            order_rank="1",
         ),
         PostgresRow(
             source_trace_id="conversation-1",
             payload={"role": "assistant", "content": "It is 18C in Paris."},
-            order_value="2",
+            order_rank="2",
         ),
         PostgresRow(
             payload={"role": "user", "content": "And in Berlin?"},
             source_trace_id=None,
-            order_value="3",
+            order_rank="3",
         ),
     ]
     config = _MESSAGE_CONFIG
@@ -236,7 +236,7 @@ def test_decode_postgres_row_reads_driver_and_text_payloads() -> None:
     text = decode_postgres_row([None, json.dumps({"messages": []}), None], index=2)
 
     assert decoded == PostgresRow(
-        source_trace_id="conversation-1", payload={"messages": []}, order_value="1"
+        source_trace_id="conversation-1", payload={"messages": []}, order_rank="1"
     )
     assert text == PostgresRow(source_trace_id=None, payload={"messages": []})
 
@@ -332,18 +332,18 @@ class _FakeConnection:
         return _FakeCursor(self._captured)
 
 
-def test_normalize_postgres_rows_excludes_message_rows_without_declared_turn_order() -> None:
-    """A conversation whose rows share one order value is excluded instead of ordered by content."""
+def test_normalize_postgres_rows_excludes_message_rows_the_database_ranked_alike() -> None:
+    """Rows the database ranks alike share one rank, so their conversation is excluded."""
     rows = [
         PostgresRow(
             source_trace_id="conversation-1",
             payload={"role": "user", "content": "What is the weather in Paris?"},
-            order_value="2024-05-01T00:00:00Z",
+            order_rank="1",
         ),
         PostgresRow(
             source_trace_id="conversation-1",
             payload={"role": "assistant", "content": "It is 18C in Paris."},
-            order_value="2024-05-01T00:00:00Z",
+            order_rank="1",
         ),
     ]
 
@@ -351,7 +351,29 @@ def test_normalize_postgres_rows_excludes_message_rows_without_declared_turn_ord
 
     assert result.traces == ()
     assert [issue.source_record for issue in result.issues] == ["conversation-1"]
-    assert "turn order is not declared" in result.issues[0].message
+    assert "share one order value" in result.issues[0].message
+
+
+def test_normalize_postgres_rows_excludes_message_rows_without_an_order_value() -> None:
+    """A conversation holding a row with no order value has no declared turn order."""
+    rows = [
+        PostgresRow(
+            source_trace_id="conversation-1",
+            payload={"role": "user", "content": "What is the weather in Paris?"},
+            order_rank="1",
+        ),
+        PostgresRow(
+            source_trace_id="conversation-1",
+            payload={"role": "assistant", "content": "It is 18C in Paris."},
+            order_rank=None,
+        ),
+    ]
+
+    result = load_postgres_source(_MESSAGE_CONFIG, reader=_StubReader(rows))
+
+    assert result.traces == ()
+    assert [issue.source_record for issue in result.issues] == ["conversation-1"]
+    assert "declares no order value" in result.issues[0].message
 
 
 def test_psycopg_row_reader_orders_tied_rows_deterministically(
