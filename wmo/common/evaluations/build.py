@@ -461,6 +461,10 @@ def _require_rollout_binding(
         raise EvaluationEvidenceError("rollout ID must match its immutable artifact ID")
     if rollout.task_id != cell.task_id or rollout.repeat != cell.repeat:
         raise EvaluationEvidenceError("rollout task or repeat differs from its planned cell")
+    if rollout.candidate is None:
+        raise EvaluationEvidenceError(
+            "candidate evaluation requires a rollout with recorded model identity"
+        )
     if rollout.candidate != candidate.model:
         raise EvaluationEvidenceError("rollout candidate identity or connection digest has drifted")
     if rollout.evidence_source != protocol.evidence_source or rollout.agent_id != protocol.agent_id:

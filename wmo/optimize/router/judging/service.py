@@ -35,7 +35,9 @@ from wmo.optimize.router.judging.artifacts import (
     coordinate_manual_judge_calibration,
     coordinate_manual_judge_setup,
     find_provisional_calibration,
+    read_review_state,
     replay_or_approve,
+    require_review_state,
     write_audit,
     write_production_rollout,
     write_review_state,
@@ -58,6 +60,7 @@ from wmo.optimize.router.judging.contracts import (
     ManualJudgeSetupArtifact,
     judge_feedback_schema,
 )
+from wmo.optimize.router.judging.labels import calibration_sample_digest, save_label_draft
 from wmo.optimize.router.judging.protocol import TemplateJudgeClient, positional_bias_count
 from wmo.optimize.router.judging.selection import (
     pairwise_references,
@@ -256,7 +259,7 @@ def commit_manual_judge_setup(
     ):
         raise ManualJudgeError("project build changed after judge setup preview")
     _require_exact_build_inputs(store, plan.build)
-    existing = _load_review_state(store)
+    existing = read_review_state(store)
     if existing is not None:
         saved = _read_setup(store, existing.setup)
         try:
@@ -347,7 +350,7 @@ def prepare_manual_judge_calibration(
     """
     if sample_size < 1:
         raise ManualJudgeError("judge calibration sample size must be positive")
-    state = _require_review_state(store)
+    state = require_review_state(store)
     setup = _read_setup(store, state.setup)
     build = _load_build_review(store)
     if setup.trace_dataset != build.trace_dataset or setup.task_set != build.task_set:
@@ -370,6 +373,24 @@ def prepare_manual_judge_calibration(
             trace_preview(task, trace, reference)
             for (task, trace), reference in zip(selected, reference_traces, strict=True)
         ),
+    )
+
+
+def calibration_sample(
+    plan: ManualJudgeCalibrationPlan,
+) -> tuple[tuple[str, str | None], ...]:
+    """Return the frozen trace identity, with pairwise reference, that labels must cover.
+
+    Args:
+        plan: Frozen representative real-trace calibration plan.
+
+    Returns:
+        Selected trace IDs with their pairwise reference trace ID in plan order.
+    """
+    pairwise = plan.setup.prompt_template.response_shape == "pairwise"
+    return tuple(
+        (trace.trace_id, reference.trace_id if pairwise and reference is not None else None)
+        for trace, reference in zip(plan.traces, plan.reference_traces, strict=True)
     )
 
 
@@ -450,7 +471,7 @@ def calibrate_manual_judge(
     Raises:
         ManualJudgeError: Consent, labels, identity, evidence, or approval is invalid.
     """
-    state = _require_review_state(store)
+    state = require_review_state(store)
     setup = _read_setup(store, state.setup)
     if setup != plan.setup:
         raise ManualJudgeError("judge calibration plan no longer matches finalized setup")
@@ -463,6 +484,13 @@ def calibrate_manual_judge(
             approved_at=created_at,
         )
     _validate_labels(store, plan, setup, labels)
+    save_label_draft(
+        store,
+        setup,
+        calibration_sample_digest(setup, calibration_sample(plan)),
+        labels,
+        created_at,
+    )
     expected_calls = len(plan.traces) * (
         2 if setup.prompt_template.response_shape == "pairwise" else 1
     )
@@ -474,12 +502,28 @@ def calibrate_manual_judge(
     if resolved.snapshot != setup.judge_model:
         raise ManualJudgeError("configured judge identity changed after setup")
     rollout_inputs = tuple(
-        write_production_rollout(store, setup, task, trace, created_at, code_revision)
+        write_production_rollout(
+            store,
+            setup,
+            task,
+            trace,
+            created_at,
+            code_revision,
+            allow_provider_free_source=True,
+        )
         for task, trace in zip(plan.tasks, plan.traces, strict=True)
     )
     reference_inputs = tuple(
         (
-            write_production_rollout(store, setup, task, reference, created_at, code_revision)
+            write_production_rollout(
+                store,
+                setup,
+                task,
+                reference,
+                created_at,
+                code_revision,
+                allow_provider_free_source=True,
+            )
             if reference is not None
             else None
         )
@@ -692,52 +736,6 @@ def _read_setup_with_input(
         )
     except JudgingProvenanceError as exc:
         raise ManualJudgeError("completed manual judge setup is unavailable") from exc
-
-
-def _load_review_state(store: ProjectStore) -> ManualJudgeReviewState | None:
-    """Load the optional manual judge namespace from project review state.
-
-    Args:
-        store: Project-local review store.
-
-    Returns:
-        Validated manual judge state, or ``None`` before setup.
-
-    Raises:
-        ManualJudgeError: Review state is not an object or the namespace is malformed.
-    """
-    review = store.read_review()
-    if review is None:
-        return None
-    if not isinstance(review, dict):
-        raise ManualJudgeError("review.json must be an object")
-    value = review.get("manual_judge")
-    if value is None:
-        return None
-    try:
-        return ManualJudgeReviewState.model_validate(value)
-    except ValueError as exc:
-        raise ManualJudgeError("review.json contains invalid manual judge state") from exc
-
-
-def _require_review_state(store: ProjectStore) -> ManualJudgeReviewState:
-    """Require a completed manual judge setup state.
-
-    Args:
-        store: Project-local review store.
-
-    Returns:
-        Validated manual judge state.
-
-    Raises:
-        ManualJudgeError: Setup has not been completed.
-    """
-    state = _load_review_state(store)
-    if state is None:
-        raise ManualJudgeError(
-            "project has no judge setup; run wmo config judge setup PROJECT first"
-        )
-    return state
 
 
 def _validate_labels(

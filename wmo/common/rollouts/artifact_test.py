@@ -7,13 +7,21 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from wmo.common.core.artifacts import ArtifactInput, FailureCode, SourceIdentity, StructuredFailure
+from wmo.common.core.artifacts import (
+    ArtifactInput,
+    FailureCode,
+    JsonObject,
+    SourceIdentity,
+    StructuredFailure,
+)
 from wmo.common.models import EmbeddingCostReservation, ModelSnapshot, OperationEconomics
 from wmo.common.rollouts import (
     ProductionSimulatorSnapshot,
+    ProviderFreeSourceProvenance,
     RolloutArtifact,
     RolloutEventKind,
     RolloutSpan,
+    SandboxSimulatorSnapshot,
     SimulationArtifactSet,
     SimulationCellBinding,
     SimulationMode,
@@ -179,6 +187,98 @@ def test_rollout_rejects_missing_simulation_digest_and_failure_details() -> None
                     **rollout.world_model.model_dump(),
                     "model_id": "different-world-model",
                 },
+            }
+        )
+
+
+def _provider_free_production() -> JsonObject:
+    """Return one provider-free production rollout payload for validator coverage.
+
+    Returns:
+        Payload of a historical production rollout whose spans carry no model identity.
+    """
+    rollout = _rollout()
+    spans = tuple(
+        {**span.model_dump(mode="json"), "model": None, "kind": "message"} for span in rollout.spans
+    )
+    return {
+        **rollout.model_dump(mode="json"),
+        "evidence_source": "production",
+        "candidate": None,
+        "provider_free_source": ProviderFreeSourceProvenance(
+            checked_span_count=len(spans)
+        ).model_dump(mode="json"),
+        "spans": list(spans),
+        "simulation_spec_sha256": None,
+        "simulation_binding": None,
+        "world_model": None,
+        "simulator": ProductionSimulatorSnapshot(
+            source=SourceIdentity(kind="production", source_id="trace-1", sha256=_DIGEST)
+        ).model_dump(mode="json"),
+        "retrieval_economics": None,
+    }
+
+
+def test_provider_free_production_rollout_states_absent_model_identity() -> None:
+    """Accept historical production evidence that records no generator identity at all."""
+    rollout = RolloutArtifact.model_validate(_provider_free_production())
+
+    assert rollout.candidate is None
+    assert rollout.provider_free_source is not None
+    assert rollout.provider_free_source.reason == "source_trace_records_no_model_identity"
+    assert rollout.provider_free_source.checked_span_count == len(rollout.spans)
+
+
+def test_rollout_requires_exactly_one_generator_provenance() -> None:
+    """Reject a rollout with neither, or both, generator identity and provider-free evidence.
+
+    Raises:
+        AssertionError: Ambiguous generator provenance is unexpectedly accepted.
+    """
+    payload = _provider_free_production()
+    with pytest.raises(ValidationError, match="either a candidate model snapshot"):
+        RolloutArtifact.model_validate({**payload, "provider_free_source": None})
+    with pytest.raises(ValidationError, match="either a candidate model snapshot"):
+        RolloutArtifact.model_validate({**payload, "candidate": _model().model_dump(mode="json")})
+
+
+def test_provider_free_evidence_stays_production_and_span_exact() -> None:
+    """Reject provider-free evidence outside production, or contradicted by span identity.
+
+    Raises:
+        AssertionError: Inconsistent provider-free evidence is unexpectedly accepted.
+    """
+    payload = _provider_free_production()
+    with pytest.raises(ValidationError, match="only production rollouts"):
+        RolloutArtifact.model_validate(
+            {
+                **payload,
+                "evidence_source": "sandbox",
+                "simulator": SandboxSimulatorSnapshot(
+                    simulator_id="sandbox-v1",
+                    environment_id="local-process",
+                    environment_sha256=_DIGEST,
+                ).model_dump(mode="json"),
+            }
+        )
+    spans = payload["spans"]
+    assert isinstance(spans, list)
+    first = spans[0]
+    assert isinstance(first, dict)
+    with pytest.raises(ValidationError, match="must not contain span model identity"):
+        RolloutArtifact.model_validate(
+            {
+                **payload,
+                "spans": [{**first, "model": _model().model_dump(mode="json")}, *spans[1:]],
+            }
+        )
+    with pytest.raises(ValidationError, match="must cover every rollout span"):
+        RolloutArtifact.model_validate(
+            {
+                **payload,
+                "provider_free_source": ProviderFreeSourceProvenance(
+                    checked_span_count=len(spans) + 1
+                ).model_dump(mode="json"),
             }
         )
 

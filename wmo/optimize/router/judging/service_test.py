@@ -17,6 +17,7 @@ import wmo.simulation.build as simulation_build
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
     JsonObject,
+    JsonValue,
     SourceIdentity,
     sha256_json,
     stable_id,
@@ -57,9 +58,11 @@ from wmo.optimize.router.judging.contracts import (
     ManualJudgeSetupArtifact,
     judge_feedback_schema,
 )
+from wmo.optimize.router.judging.labels import calibration_sample_digest, read_label_draft
 from wmo.optimize.router.judging.service import (
     ManualJudgeError,
     calibrate_manual_judge,
+    calibration_sample,
     commit_manual_judge_setup,
     estimate_manual_judge_budget,
     prepare_manual_judge_calibration,
@@ -852,7 +855,7 @@ def test_build_replacement_serializes_human_score_writer_and_removes_stale_state
 
 
 def test_calibration_refuses_before_resolution_write_or_model_call(tmp_path: Path) -> None:
-    """Missing spend consent blocks credentials, artifacts, labels, and provider dispatch."""
+    """Missing spend consent blocks credentials, artifacts, and dispatch, but keeps labels."""
     store = _built_store(tmp_path)
     _setup(store)
     plan = prepare_manual_judge_calibration(store, sample_size=3)
@@ -893,7 +896,18 @@ def test_calibration_refuses_before_resolution_write_or_model_call(tmp_path: Pat
 
     assert runtime.preflight_calls == 0
     assert client.requests == []
-    assert store.read_review() == before_review
+    review = store.read_review()
+    assert isinstance(review, dict)
+    manual_judge = review["manual_judge"]
+    assert isinstance(manual_judge, dict)
+    drafted = manual_judge["label_draft"]
+    assert isinstance(drafted, dict)
+    assert len(cast(list[JsonValue], drafted["labels"])) == len(labels)
+    restored = {
+        **review,
+        "manual_judge": {**manual_judge, "label_draft": None},
+    }
+    assert restored == before_review
     assert store.artifacts.list_ids() == before_artifacts
 
 
@@ -1267,6 +1281,51 @@ def test_interrupted_calibration_reuses_completed_probes_at_later_time(tmp_path:
     assert result.provider_calls_made == 2
     assert len(retry_client.requests) == 2
     assert len(result.audit.judgments) == 3
+
+
+def test_provider_failure_keeps_completed_human_labels_for_replay(tmp_path: Path) -> None:
+    """A provider interruption leaves every completed rating durable and reusable.
+
+    Raises:
+        AssertionError: Completed human labels are lost or a resumed label differs.
+    """
+    store = _built_store(tmp_path)
+    setup = _setup(store)
+    plan = prepare_manual_judge_calibration(store, sample_size=3)
+    labels = _labels(store)
+    client = _StructuredJudgeClient(plan.setup.judge_model, "scalar", fail_after=0)
+    runtime = _RuntimeCatalog(
+        ResolvedModel(
+            alias="judge-main",
+            snapshot=plan.setup.judge_model,
+            capabilities=ModelCapabilities(),
+            client=client,
+            embedding_client=None,
+        )
+    )
+    budget = estimate_manual_judge_budget(
+        plan,
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=2.0,
+        maximum_input_tokens_per_call=4_096,
+        maximum_cost_usd=1.0,
+    )
+    with pytest.raises(RuntimeError, match="simulated provider interruption"):
+        calibrate_manual_judge(
+            store,
+            cast(RuntimeModelCatalog, runtime),
+            plan,
+            labels,
+            budget,
+            spend_consented=True,
+            approve=False,
+            accept_insufficient_labels=True,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+
+    digest = calibration_sample_digest(setup, calibration_sample(plan))
+    assert read_label_draft(store, setup, digest) == labels
 
 
 def test_retry_reuses_audit_when_review_pointer_write_was_interrupted(

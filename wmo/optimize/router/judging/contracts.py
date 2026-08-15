@@ -14,6 +14,7 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
+    Sha256,
 )
 from wmo.common.judging import (
     CalibrationReport,
@@ -439,10 +440,40 @@ class ManualJudgeCalibrationAudit(ArtifactEnvelope):
         return self
 
 
+class ManualJudgeLabelDraft(ContractModel):
+    """Human labels persisted for one frozen calibration sample before provider work.
+
+    Human rating is the expensive part of manual calibration, so completed ratings become durable
+    local review state as soon as they exist. The sample digest binds a draft to one exact setup,
+    trace selection, rubric, and response shape, so a later attempt resumes the same work and an
+    unrelated sample never inherits stale scores.
+    """
+
+    draft_version: Literal["manual-judge-label-draft-v1"] = "manual-judge-label-draft-v1"
+    setup_id: ArtifactId
+    sample_sha256: Sha256
+    labels: tuple[ManualJudgeLabel, ...]
+    updated_at: datetime
+
+    @field_validator("labels")
+    @classmethod
+    def _require_unique_label_keys(
+        cls, value: tuple[ManualJudgeLabel, ...]
+    ) -> tuple[ManualJudgeLabel, ...]:
+        """Reject two drafted scores for one trace, reference, and dimension key."""
+        keys = tuple(
+            (label.trace_id, label.reference_trace_id, label.dimension_id) for label in value
+        )
+        if len(set(keys)) != len(keys):
+            raise ValueError("a label draft must not repeat a trace dimension")
+        return value
+
+
 class ManualJudgeReviewState(ContractModel):
-    """Mutable review pointers for resumable setup, audit, and explicit approval."""
+    """Mutable review pointers for resumable setup, labels, audit, and explicit approval."""
 
     setup: ArtifactInput
+    label_draft: ManualJudgeLabelDraft | None = None
     audit: ArtifactInput | None = None
     approved_calibration: ArtifactInput | None = None
 

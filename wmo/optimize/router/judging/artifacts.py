@@ -27,7 +27,12 @@ from wmo.common.project import (
     ProjectStoreError,
     artifact_input,
 )
-from wmo.common.rollouts import RolloutArtifact, SimulationMode, StopReason
+from wmo.common.rollouts import (
+    ProviderFreeSourceProvenance,
+    RolloutArtifact,
+    SimulationMode,
+    StopReason,
+)
 from wmo.common.rollouts.otel import ProductionSimulatorSnapshot, RolloutEventKind, RolloutSpan
 from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, TraceSpan
@@ -308,6 +313,52 @@ def write_review_state(store: ProjectStore, state: ManualJudgeReviewState) -> No
         store.update_review(update)
 
 
+def read_review_state(store: ProjectStore) -> ManualJudgeReviewState | None:
+    """Load the optional manual judge namespace from project review state.
+
+    Args:
+        store: Project-local review store.
+
+    Returns:
+        Validated manual judge state, or ``None`` before setup.
+
+    Raises:
+        ManualJudgeError: Review state is not an object or the namespace is malformed.
+    """
+    review = store.read_review()
+    if review is None:
+        return None
+    if not isinstance(review, dict):
+        raise ManualJudgeError("review.json must be an object")
+    value = review.get("manual_judge")
+    if value is None:
+        return None
+    try:
+        return ManualJudgeReviewState.model_validate(value)
+    except ValueError as exc:
+        raise ManualJudgeError("review.json contains invalid manual judge state") from exc
+
+
+def require_review_state(store: ProjectStore) -> ManualJudgeReviewState:
+    """Require a completed manual judge setup state.
+
+    Args:
+        store: Project-local review store.
+
+    Returns:
+        Validated manual judge state.
+
+    Raises:
+        ManualJudgeError: Setup has not been completed.
+    """
+    state = read_review_state(store)
+    if state is None:
+        raise ManualJudgeError(
+            "project has no judge setup; run wmo config judge setup PROJECT first"
+        )
+    return state
+
+
 def find_provisional_calibration(
     store: ProjectStore,
     setup: ManualJudgeSetupArtifact,
@@ -376,6 +427,7 @@ def write_production_rollout(
     *,
     attributed_candidate: ModelSnapshot | None = None,
     attribution_input: ArtifactInput | None = None,
+    allow_provider_free_source: bool = False,
 ) -> ArtifactInput:
     """Persist one real trace as immutable production rollout evidence.
 
@@ -388,12 +440,16 @@ def write_production_rollout(
         code_revision: Exact producer revision.
         attributed_candidate: Selected candidate proven by immutable attribution evidence.
         attribution_input: Exact attribution artifact authorizing the selected candidate.
+        allow_provider_free_source: Whether a source trace that records no model identity may be
+            preserved as explicitly provider-free historical evidence. Only human judge
+            calibration sets this, because it reads task, action, and outcome content instead of
+            generator identity.
 
     Returns:
         Exact rollout manifest pointer.
 
     Raises:
-        ManualJudgeError: The trace has no recorded model identity or conflicts on replay.
+        ManualJudgeError: The trace has no usable model identity or conflicts on replay.
     """
     if (attributed_candidate is None) != (attribution_input is None):
         raise ManualJudgeError(
@@ -403,10 +459,15 @@ def write_production_rollout(
         (span.model for span in trace.spans if span.model is not None),
         None,
     )
-    if candidate is None:
+    if candidate is None and not (allow_provider_free_source and attribution_input is None):
         raise ManualJudgeError(
             f"trace {trace.trace_id!r} has no recorded model identity and cannot be calibrated"
         )
+    provider_free_source = (
+        None
+        if candidate is not None
+        else ProviderFreeSourceProvenance(checked_span_count=len(trace.spans))
+    )
     base_rollout_id = rollout_id(task, trace)
     artifact_id = (
         base_rollout_id
@@ -416,7 +477,7 @@ def write_production_rollout(
             {
                 "version": "attributed-production-rollout-v1",
                 "base_rollout_id": base_rollout_id,
-                "candidate": candidate.model_dump(mode="json"),
+                "candidate": _attributed_candidate(candidate).model_dump(mode="json"),
                 "attribution": attribution_input.model_dump(mode="json"),
             },
         )
@@ -451,6 +512,7 @@ def write_production_rollout(
         source_run_id=setup.trace_dataset.artifact_id,
         task_id=task.task_id,
         candidate=candidate,
+        provider_free_source=provider_free_source,
         agent_id=setup.project_id,
         simulator=ProductionSimulatorSnapshot(source=trace.source.identity),
         repeat=0,
@@ -484,6 +546,23 @@ def write_production_rollout(
             ) from None
         return existing_input
     return artifact_input(manifest)
+
+
+def _attributed_candidate(candidate: ModelSnapshot | None) -> ModelSnapshot:
+    """Return the exact candidate that attributed production evidence always carries.
+
+    Args:
+        candidate: Candidate resolved for one production rollout.
+
+    Returns:
+        The same candidate once its presence is proven.
+
+    Raises:
+        ManualJudgeError: Attribution reached a rollout with no candidate identity.
+    """
+    if candidate is None:
+        raise ManualJudgeError("attributed production rollouts require a candidate snapshot")
+    return candidate
 
 
 def _same_rollout_identity(left: RolloutArtifact, right: RolloutArtifact) -> bool:
