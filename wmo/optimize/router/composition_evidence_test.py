@@ -388,7 +388,10 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prove phase locks, replay, budgets, and HTTP stickiness end to end.
+    """Prove replay safety, budgets, and HTTP stickiness end to end.
+
+    Crash-and-resume at the durable phase boundaries is owned by
+    composition_test.py::test_public_composition_runs_and_resumes_complete_frozen_router.
 
     Args:
         tmp_path: Isolated project root for composed router evidence.
@@ -431,40 +434,6 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
         return True
 
     monkeypatch.setattr("wmo.optimize.router.composition.capture_completion_once", capture)
-    crash_after_policy = True
-    crash_after_report = True
-
-    def checkpoint(phase: str) -> None:
-        """Inject one crash after each durable composition boundary."""
-        nonlocal crash_after_policy, crash_after_report
-        if phase == "policy_locked" and crash_after_policy:
-            crash_after_policy = False
-            raise RuntimeError("w16 crash after fit lock")
-        if phase == "report_complete" and crash_after_report:
-            crash_after_report = False
-            raise RuntimeError("w16 crash after durable report and telemetry")
-
-    with pytest.raises(RuntimeError, match="after fit lock"):
-        wmo.compose_router(
-            project,
-            normalized,
-            services=services,
-            budget=budget,
-            created_at=_TIME,
-            code_revision=revision,
-            phase_hook=checkpoint,
-        )
-    dispatches_after_crash = _dispatch_counts(simulator, judge, approval)
-    with pytest.raises(RuntimeError, match="after durable report"):
-        wmo.compose_router(
-            project,
-            normalized,
-            services=services,
-            budget=budget,
-            created_at=_TIME,
-            code_revision=revision,
-            phase_hook=checkpoint,
-        )
     result = wmo.compose_router(
         project,
         normalized,
@@ -472,7 +441,6 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
         budget=budget,
         created_at=_TIME,
         code_revision=revision,
-        phase_hook=checkpoint,
     )
     dispatches_after_completion = _dispatch_counts(simulator, judge, approval)
     replay = wmo.compose_router(
@@ -514,7 +482,6 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert report.run_spend.judge.missing_row_count == 0
     assert replay.optimization == result.optimization
     assert _dispatch_counts(simulator, judge, approval) == dispatches_after_completion
-    assert dispatches_after_completion[0] > dispatches_after_crash[0]
     planned_phase_cells = len(result.simulation_spec.cell_ids) + len(
         result.held_out_simulation_spec.cell_ids
     )
@@ -533,7 +500,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert len(reservations) == judge.calls == len(result.plan.cells) == 150
     assert judge.calls <= budget.maximum_judgments
     assert len(telemetry_delivered) == 1
-    assert len(telemetry_attempts) == 3
+    assert len(telemetry_attempts) == 2
 
     app = create_project_router_app("w16-router", result.runtime)
     http = TestClient(app)

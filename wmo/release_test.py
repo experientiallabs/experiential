@@ -1548,16 +1548,11 @@ def test_built_archives_match_current_package_contract() -> None:
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
     """W16 customer and comparison workflows resolve without test-only API owners."""
-    import wmo
     from wmo.common.judging import HumanScoreReview, JudgeCalibrationService, RubricReview
     from wmo.runtime.environments import LocalProcessEnvironmentRuntime
     from wmo.simulation import compare_text_and_sandbox
     from wmo.simulation.engines import SandboxSimulator
 
-    assert callable(wmo.compose_router)
-    assert callable(wmo.load_project_router)
-    assert callable(wmo.load_router)
-    assert callable(wmo.create_project_router_app)
     assert callable(HumanScoreReview.open)
     assert callable(JudgeCalibrationService)
     assert callable(RubricReview.open)

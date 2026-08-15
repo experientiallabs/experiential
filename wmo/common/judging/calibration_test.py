@@ -39,7 +39,8 @@ from wmo.common.models import (
     ModelSnapshot,
     OperationEconomics,
 )
-from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
+from wmo.common.project import ProjectStore, artifact_input
+from wmo.common.project.store_test import _store
 from wmo.common.rollouts import (
     ProductionSimulatorSnapshot,
     RolloutArtifact,
@@ -126,12 +127,6 @@ def _dimension(dimension_id: str) -> RubricDimension:
             ScoreAnchor(score=5, description=f"{dimension_id} anchor 5."),
         ),
     )
-
-
-def _store(tmp_path: Path) -> ProjectStore:
-    store = ProjectStore(tmp_path / ".wmo", "support-project")
-    store.initialize(ProjectConfig(project_id="support-project"))
-    return store
 
 
 def _inputs(*values: ArtifactInput) -> tuple[ArtifactInput, ...]:

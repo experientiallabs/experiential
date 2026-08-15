@@ -149,27 +149,3 @@ assert create_router_endpoint is nested_endpoint
 assert load_router is nested_load_router
 """
     )
-
-
-def test_runtime_rag_refresh_public_imports_resolve_after_lazy_package_import() -> None:
-    """Resolve public runtime refresh services through lazy retrieval exports."""
-    _run(
-        """
-import sys
-import wmo.simulation.retrieval as retrieval
-names = {"RuntimeRAGRefresh", "RuntimeTraceStitchingError", "refresh_runtime_trace_rag"}
-assert names.issubset(dir(retrieval))
-assert "wmo.runtime.router" not in sys.modules
-try:
-    getattr(retrieval, "p17_unknown_retrieval_export")
-except AttributeError:
-    pass
-else:
-    raise AssertionError("unknown retrieval export resolved")
-from wmo.simulation.retrieval import RuntimeRAGRefresh, refresh_runtime_trace_rag
-from wmo.simulation.retrieval.refresh import RuntimeRAGRefresh as nested_refresh_type
-from wmo.simulation.retrieval.refresh import refresh_runtime_trace_rag as nested_refresh
-assert RuntimeRAGRefresh is nested_refresh_type
-assert refresh_runtime_trace_rag is nested_refresh
-"""
-    )

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
+from wmo.common.evaluations.build_test import _candidate, _snapshot
 from wmo.common.routing import KnnGuard, KnnRouterPolicy, RoutingDecision
 from wmo.common.routing.bank import (
     CandidateEvidenceCount,
@@ -291,20 +291,4 @@ def _select(
         query,
         request_sha256=_REQUEST_DIGEST,
         episode_id="episode-a",
-    )
-
-
-def _candidate(alias: str) -> RoutedCandidateSnapshot:
-    """Create a candidate with its exact model and connection snapshot."""
-    return RoutedCandidateSnapshot(alias=alias, model=_snapshot(alias))
-
-
-def _snapshot(alias: str) -> ModelSnapshot:
-    """Create a secret-free model snapshot."""
-    return ModelSnapshot(
-        provider="test",
-        model_id=alias,
-        revision="fixture",
-        capabilities_sha256=_DIGEST,
-        connection_sha256="c" * 64,
     )
