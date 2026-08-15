@@ -14,6 +14,7 @@ from wmo.common.core.artifacts import (
     FailureCode,
     StructuredFailure,
     canonical_json_bytes,
+    sorted_unique_inputs,
     stable_id,
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
@@ -908,10 +909,7 @@ def _latency_economics(duration_seconds: float) -> OperationEconomics:
 
 def _sorted_inputs(*inputs: ArtifactInput) -> tuple[ArtifactInput, ...]:
     """Return one exact immutable input per artifact ID in stable order."""
-    by_id = {item.artifact_id: item for item in inputs}
-    if len(by_id) != len(inputs):
-        raise SandboxSimulationError("sandbox artifact inputs must have distinct IDs")
-    return tuple(by_id[item] for item in sorted(by_id))
+    return sorted_unique_inputs(*inputs, error_type=SandboxSimulationError)
 
 
 def _jsonl_bytes(records: Sequence[Mapping[str, str]]) -> bytes:

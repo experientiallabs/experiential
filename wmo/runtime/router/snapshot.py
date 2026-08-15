@@ -638,7 +638,7 @@ def _derive_traces(
             Trace(
                 trace_id=interaction.interaction_id,
                 conversation_id=accepted.lineage_id,
-                task=_task_text(accepted),
+                task=routed_task_text(accepted),
                 initial_context=request_context,
                 tools=accepted.request.tools,
                 spans=(
@@ -663,7 +663,7 @@ def _derive_traces(
     return tuple(traces)
 
 
-def _task_text(accepted: RuntimeAcceptedEvent) -> str:
+def routed_task_text(accepted: RuntimeAcceptedEvent) -> str:
     """Choose a stable human-readable task from an accepted request.
 
     Args:

@@ -219,21 +219,3 @@ def lease_id_for_binding(
             "binding_sha256": binding_digest(binding),
         },
     )
-
-
-def sorted_artifact_inputs(*inputs: ArtifactInput) -> tuple[ArtifactInput, ...]:
-    """Return exactly one immutable input per ID in artifact-envelope order.
-
-    Args:
-        inputs: Immutable manifest pointers that must have distinct artifact IDs.
-
-    Returns:
-        Inputs sorted by artifact ID.
-
-    Raises:
-        ValueError: Multiple inputs reuse the same artifact ID.
-    """
-    by_id = {item.artifact_id: item for item in inputs}
-    if len(by_id) != len(inputs):
-        raise ValueError("simulation artifact inputs must have distinct IDs")
-    return tuple(by_id[artifact_id] for artifact_id in sorted(by_id))

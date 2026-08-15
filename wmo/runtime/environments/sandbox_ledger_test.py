@@ -11,10 +11,7 @@ from pathlib import Path
 import pytest
 
 from wmo.runtime.environments import sandbox_ledger as ledger_module
-from wmo.runtime.environments.sandbox_ledger import (
-    SandboxLedger,
-    read_ledger_files,
-)
+from wmo.runtime.environments.sandbox_ledger import SandboxLedger, read_ledger_files
 
 
 def _clock(start: datetime | None = None) -> Callable[[], datetime]:

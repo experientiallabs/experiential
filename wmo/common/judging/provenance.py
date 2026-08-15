@@ -6,7 +6,7 @@ from collections.abc import Iterable
 
 from pydantic import BaseModel, ValidationError
 
-from wmo.common.core.artifacts import ArtifactId, ArtifactInput
+from wmo.common.core.artifacts import ArtifactId, ArtifactInput, sorted_unique_inputs
 from wmo.common.project import (
     ArtifactCorruptionError,
     ProjectStore,
@@ -113,12 +113,4 @@ def sorted_verified_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactInp
     Raises:
         JudgingProvenanceError: One artifact ID is associated with conflicting manifest hashes.
     """
-    by_id: dict[str, ArtifactInput] = {}
-    for item in inputs:
-        existing = by_id.get(item.artifact_id)
-        if existing is not None and existing != item:
-            raise JudgingProvenanceError(
-                f"artifact input {item.artifact_id} has conflicting verified manifest hashes"
-            )
-        by_id[item.artifact_id] = item
-    return tuple(by_id[artifact_id] for artifact_id in sorted(by_id))
+    return sorted_unique_inputs(*inputs, error_type=JudgingProvenanceError)

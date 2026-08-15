@@ -51,6 +51,7 @@ from wmo.runtime.router.snapshot import (
     RuntimeTraceSnapshot,
     RuntimeTraceSnapshotError,
     load_runtime_trace_snapshot,
+    routed_task_text,
     seal_runtime_trace_snapshot,
 )
 
@@ -89,6 +90,7 @@ __all__ = [
     "RuntimeTraceSnapshot",
     "RuntimeTraceSnapshotError",
     "load_runtime_trace_snapshot",
+    "routed_task_text",
     "seal_runtime_trace_snapshot",
     "create_router_endpoint",
     "RouterApplicationError",
