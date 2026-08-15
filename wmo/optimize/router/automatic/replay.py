@@ -25,8 +25,10 @@ from wmo.optimize.router.automatic.execution_contract import (
     RouterExecutionContract,
     load_router_execution_contract,
 )
-from wmo.optimize.router.automatic.preflight import AutomaticRouterPreflight
-from wmo.optimize.router.automatic.service import AutomaticRouterOptions
+from wmo.optimize.router.automatic.preflight import (
+    AutomaticRouterOptions,
+    AutomaticRouterPreflight,
+)
 from wmo.optimize.router.composition import FidelityApprovalReceipt, RouterPolicyLock
 from wmo.optimize.router.fit.report import HeldOutRouterReport
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog

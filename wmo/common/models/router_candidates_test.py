@@ -172,13 +172,15 @@ def test_candidate_definition_cannot_retarget_an_existing_alias(tmp_path: Path) 
         alias="candidate-a",
         connection="provider",
         model="attacker-model",
-        supports_completions=True,
-        context_window_tokens=32_000,
-        maximum_output_tokens=4_000,
-        input_cost_per_million_tokens_usd=1,
-        output_cost_per_million_tokens_usd=2,
-        cached_input_cost_per_million_tokens_usd=0.25,
-        cache_write_cost_per_million_tokens_usd=1.25,
+        capabilities=ModelCapabilities(
+            supports_completions=True,
+            context_window_tokens=32_000,
+            maximum_output_tokens=4_000,
+            input_cost_per_million_tokens_usd=1,
+            output_cost_per_million_tokens_usd=2,
+            cached_input_cost_per_million_tokens_usd=0.25,
+            cache_write_cost_per_million_tokens_usd=1.25,
+        ),
     )
 
     with pytest.raises(RouterCandidateSetupError, match="use a new alias"):

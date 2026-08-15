@@ -26,7 +26,7 @@ from wmo.runtime.models.providers.anthropic import (
 )
 from wmo.runtime.models.providers.gemini import GeminiClient
 from wmo.runtime.models.providers.openai import OpenAIClient
-from wmo.runtime.models.providers.openrouter import OpenRouterClient
+from wmo.runtime.models.providers.openai_compatible import OpenRouterClient
 from wmo.runtime.models.providers.tinker_sampling import (
     TinkerSample,
     TinkerSampler,
@@ -144,8 +144,14 @@ def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity()
             JsonHttpResponse(
                 status_code=200,
                 body={
+                    "id": "resp_native",
+                    "object": "response",
+                    "created_at": 1.0,
                     "status": "completed",
                     "model": "gpt-5.4-2026-08-11",
+                    "parallel_tool_calls": True,
+                    "tool_choice": "auto",
+                    "tools": [],
                     "output": [
                         {
                             "type": "function_call",
@@ -157,7 +163,9 @@ def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity()
                     "usage": {
                         "input_tokens": 13,
                         "output_tokens": 5,
-                        "input_tokens_details": {"cached_tokens": 4},
+                        "total_tokens": 18,
+                        "input_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 0},
+                        "output_tokens_details": {"reasoning_tokens": 0},
                     },
                 },
             )

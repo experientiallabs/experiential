@@ -27,8 +27,8 @@ from wmo.runtime.router.application import create_project_router_app
 from wmo.runtime.router.completion import RouterCompletionConflictError
 from wmo.runtime.router.endpoint import (
     HttpResponseRequest,
-    _chat_completion,
     _openai_response,
+    chat_completion,
 )
 from wmo.runtime.router.runtime import RoutedModelResponse, RouterRuntime
 from wmo.runtime.router.runtime_test import _Client, _runtime, _snapshot
@@ -418,7 +418,7 @@ def test_length_and_responses_request_metadata_are_preserved() -> None:
         }
     )
 
-    chat = _chat_completion("router-a", model_response.output, model_response)
+    chat = chat_completion("router-a", model_response.output, model_response)
     response = _openai_response(
         "router-a",
         model_response.output,

@@ -10,8 +10,10 @@ from wmo.common.models import (
     AssistantAction,
     Embedding,
     ModelCapabilities,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
+    ModelResponse,
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
@@ -31,6 +33,39 @@ def test_actions_need_payload_and_measurements_are_finite() -> None:
         AssistantAction()
     with pytest.raises(ValidationError, match="finite"):
         NumericMeasurement(value=float("inf"), provenance="observed")
+
+
+def test_completed_factory_prefers_served_identity_and_maps_the_length_limit() -> None:
+    """The shared factory keeps served identity, observed latency, and the finish reason."""
+    configured = ModelSnapshot(
+        provider="openai",
+        model_id="configured-model",
+        capabilities_sha256=_CAPABILITIES_DIGEST,
+        connection_sha256="b" * 64,
+    )
+    action = AssistantAction(content="Done.")
+
+    served = ModelResponse.completed(
+        output=action,
+        configured_model=configured,
+        served_model_id="served-model",
+        usage=None,
+        latency_seconds=0.25,
+        hit_length_limit=True,
+    )
+    kept = ModelResponse.completed(
+        output=action,
+        configured_model=configured,
+        served_model_id="",
+        usage=None,
+        latency_seconds=0.25,
+    )
+
+    assert served.model.model_id == "served-model"
+    assert served.finish_reason is ModelFinishReason.LENGTH
+    assert kept.model.model_id == "configured-model"
+    assert kept.finish_reason is ModelFinishReason.COMPLETED
+    assert kept.economics.latency_seconds == NumericMeasurement(value=0.25, provenance="observed")
 
 
 def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> None:

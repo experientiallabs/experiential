@@ -5,8 +5,10 @@ from wmo.runtime.models.providers.azure import AzureClient
 from wmo.runtime.models.providers.bedrock import BedrockClient
 from wmo.runtime.models.providers.gemini import GeminiClient
 from wmo.runtime.models.providers.openai import OpenAIClient
-from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleClient
-from wmo.runtime.models.providers.openrouter import OpenRouterClient
+from wmo.runtime.models.providers.openai_compatible import (
+    OpenAICompatibleClient,
+    OpenRouterClient,
+)
 from wmo.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
     TinkerSample,

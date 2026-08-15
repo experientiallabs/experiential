@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.common.models import (
+    ModelCapabilities,
     ModelCatalog,
     ProviderConnection,
     ProviderModelSelection,
@@ -219,7 +220,7 @@ def _interactive_setup(
     )
     embedder = options.embedder or _prompt_alias(
         "Embedder alias",
-        tuple(model.alias for model in models if model.supports_embeddings),
+        tuple(model.alias for model in models if model.capabilities.supports_embeddings),
         default=_existing_role(existing, "embedder"),
         console=console,
     )
@@ -353,16 +354,18 @@ def _prompt_model(
         alias=alias,
         connection=connection,
         model=model,
-        supports_tools=supports_tools,
-        supports_embeddings=supports_embeddings,
-        supports_structured_output=supports_structured_output,
-        supports_completions=supports_completions,
-        context_window_tokens=context_window,
-        maximum_output_tokens=maximum_output,
-        input_cost_per_million_tokens_usd=input_cost,
-        output_cost_per_million_tokens_usd=output_cost,
-        cached_input_cost_per_million_tokens_usd=cached_input_cost,
-        cache_write_cost_per_million_tokens_usd=cache_write_cost,
+        capabilities=ModelCapabilities(
+            supports_tools=supports_tools,
+            supports_embeddings=supports_embeddings,
+            supports_structured_output=supports_structured_output,
+            supports_completions=supports_completions,
+            context_window_tokens=context_window,
+            maximum_output_tokens=maximum_output,
+            input_cost_per_million_tokens_usd=input_cost,
+            output_cost_per_million_tokens_usd=output_cost,
+            cached_input_cost_per_million_tokens_usd=cached_input_cost,
+            cache_write_cost_per_million_tokens_usd=cache_write_cost,
+        ),
     )
 
 
@@ -459,9 +462,9 @@ def _prompt_judge(
     ranked = sorted(
         models,
         key=lambda model: (
-            not model.supports_structured_output,
-            model.context_window_tokens is None,
-            -1 * (model.context_window_tokens or 0),
+            not model.capabilities.supports_structured_output,
+            model.capabilities.context_window_tokens is None,
+            -1 * (model.capabilities.context_window_tokens or 0),
             model.connection != world_connection,
             model.alias,
         ),
@@ -504,11 +507,12 @@ def _render_summary(
             details.append(f"region={connection.region}")
         console.print(f"connection {connection.name}: " + ", ".join(details))
     for model in models:
+        caps = model.capabilities
         console.print(
             f"model {model.alias}: {model.connection}/{model.model}, "
-            f"tools={model.supports_tools}, embeddings={model.supports_embeddings}, "
-            f"structured_output={model.supports_structured_output}, "
-            f"completions={model.supports_completions}"
+            f"tools={caps.supports_tools}, embeddings={caps.supports_embeddings}, "
+            f"structured_output={caps.supports_structured_output}, "
+            f"completions={caps.supports_completions}"
         )
     console.print(
         f"roles: world_model={setup.world_model}, judge={setup.judge}, embedder={setup.embedder}"
@@ -557,34 +561,12 @@ def _existing_models(existing: ModelCatalog | None) -> tuple[ProviderModelSelect
     for alias, model in sorted(existing.models.items()):
         if model.connection not in supported_connections:
             continue
-        capabilities = model.capabilities
         records.append(
             ProviderModelSelection(
                 alias=alias,
                 connection=model.connection,
                 model=model.model,
-                supports_tools=capabilities.supports_tools if capabilities else False,
-                supports_embeddings=capabilities.supports_embeddings if capabilities else False,
-                supports_structured_output=(
-                    capabilities.supports_structured_output if capabilities else False
-                ),
-                supports_completions=(capabilities.supports_completions if capabilities else None),
-                context_window_tokens=capabilities.context_window_tokens if capabilities else None,
-                maximum_output_tokens=(
-                    capabilities.maximum_output_tokens if capabilities else None
-                ),
-                input_cost_per_million_tokens_usd=(
-                    capabilities.input_cost_per_million_tokens_usd if capabilities else None
-                ),
-                output_cost_per_million_tokens_usd=(
-                    capabilities.output_cost_per_million_tokens_usd if capabilities else None
-                ),
-                cached_input_cost_per_million_tokens_usd=(
-                    capabilities.cached_input_cost_per_million_tokens_usd if capabilities else None
-                ),
-                cache_write_cost_per_million_tokens_usd=(
-                    capabilities.cache_write_cost_per_million_tokens_usd if capabilities else None
-                ),
+                capabilities=model.capabilities or ModelCapabilities(),
             )
         )
     return tuple(records)
@@ -667,13 +649,15 @@ def provider_setup_json_examples() -> tuple[str, str]:
             "alias": "model",
             "connection": "openai",
             "model": "your-model-id",
-            "supports_embeddings": True,
-            "supports_structured_output": True,
-            "supports_completions": True,
-            "input_cost_per_million_tokens_usd": 0,
-            "output_cost_per_million_tokens_usd": 0,
-            "cached_input_cost_per_million_tokens_usd": 0,
-            "cache_write_cost_per_million_tokens_usd": 0,
+            "capabilities": {
+                "supports_embeddings": True,
+                "supports_structured_output": True,
+                "supports_completions": True,
+                "input_cost_per_million_tokens_usd": 0,
+                "output_cost_per_million_tokens_usd": 0,
+                "cached_input_cost_per_million_tokens_usd": 0,
+                "cache_write_cost_per_million_tokens_usd": 0,
+            },
         },
         separators=(",", ":"),
     )

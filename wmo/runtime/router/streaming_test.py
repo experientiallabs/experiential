@@ -6,7 +6,7 @@ from wmo.common.models import (
     ModelResponse,
     OperationEconomics,
 )
-from wmo.runtime.router.endpoint import HttpResponseRequest, _chat_completion, _openai_response
+from wmo.runtime.router.endpoint import HttpResponseRequest, _openai_response, chat_completion
 from wmo.runtime.router.runtime_test import _snapshot
 from wmo.runtime.router.streaming import chat_stream, responses_stream
 
@@ -58,7 +58,7 @@ def test_length_streams_use_incomplete_terminals() -> None:
         economics=OperationEconomics(),
         finish_reason=ModelFinishReason.LENGTH,
     )
-    chat = _chat_completion("router-a", response.output, response)
+    chat = chat_completion("router-a", response.output, response)
     request = HttpResponseRequest(model="router-a", input="hello")
     public = _openai_response(
         "router-a",

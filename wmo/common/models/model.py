@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, JsonValue, field_validator, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
 from wmo.common.tasks import ToolSchema
@@ -183,6 +183,48 @@ class ModelResponse(ContractModel):
     model: ModelSnapshot
     economics: OperationEconomics
     finish_reason: ModelFinishReason = ModelFinishReason.COMPLETED
+
+    @classmethod
+    def completed(
+        cls,
+        *,
+        output: AssistantAction,
+        configured_model: ModelSnapshot,
+        served_model_id: JsonValue | None,
+        usage: Usage | None,
+        latency_seconds: float,
+        hit_length_limit: bool = False,
+    ) -> ModelResponse:
+        """Build the shared completed-response shape every provider returns.
+
+        Args:
+            output: Typed assistant action parsed from the provider payload.
+            configured_model: Resolved catalog identity used for the request.
+            served_model_id: Provider-reported model identifier, preferred over the
+                configured identity when it is a non-empty string.
+            usage: Provider-reported token accounting, when present.
+            latency_seconds: Observed duration of the successful request sequence.
+            hit_length_limit: Whether the provider stopped at its output-token limit.
+
+        Returns:
+            A completed response with observed latency and the served model identity.
+        """
+        model = (
+            configured_model.model_copy(update={"model_id": served_model_id})
+            if isinstance(served_model_id, str) and served_model_id
+            else configured_model
+        )
+        return cls(
+            output=output,
+            model=model,
+            economics=OperationEconomics(
+                usage=usage,
+                latency_seconds=NumericMeasurement(value=latency_seconds, provenance="observed"),
+            ),
+            finish_reason=(
+                ModelFinishReason.LENGTH if hit_length_limit else ModelFinishReason.COMPLETED
+            ),
+        )
 
 
 class ModelCapabilities(ContractModel):

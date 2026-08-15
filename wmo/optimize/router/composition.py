@@ -146,17 +146,6 @@ class RouterEvaluationSetup(ContractModel):
     maximum_concurrency: int = Field(gt=0)
 
 
-class TraceSource(Protocol):
-    """Loads one explicit local source into canonical normalized traces."""
-
-    def load(self) -> TraceNormalizationResult:
-        """Return canonical normalized traces after one explicit source read.
-
-        Returns:
-            Canonical normalized traces and any rejected-source issues.
-        """
-
-
 class ReviewSupplier(Protocol):
     """Obtains approved rubric and calibration artifacts under an explicit budget."""
 
@@ -268,7 +257,7 @@ class RouterCompositionResult:
 
 def compose_router(
     project: ProjectStore,
-    trace_source: TraceSource | TraceNormalizationResult,
+    trace_source: TraceNormalizationResult,
     *,
     services: RouterWorkflowServices,
     budget: RouterCompositionBudget,
@@ -280,7 +269,7 @@ def compose_router(
 
     Args:
         project: Initialized local project store.
-        trace_source: Explicit normalized input or a loader that performs the source read.
+        trace_source: Canonical normalized traces used to build task evidence.
         services: Review, simulation, judging, and runtime dependencies. None are auto-resolved.
         budget: Finite simulation spend and judgment-call ceilings.
         created_at: Timezone-aware artifact completion time.
@@ -296,12 +285,9 @@ def compose_router(
     started = time.monotonic()
     _preflight(project, services, budget, code_revision)
     completed_build = completed_project_build(project)
-    normalized = (
-        trace_source if isinstance(trace_source, TraceNormalizationResult) else trace_source.load()
-    )
     built = reconstruct_completed_project_build(
         project,
-        normalized,
+        trace_source,
         created_at=created_at,
     )
     _phase(phase_hook, "review")

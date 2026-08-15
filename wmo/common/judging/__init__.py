@@ -29,9 +29,7 @@ from wmo.common.judging.lineage import (
 from wmo.common.judging.lm import JudgeProbe, JudgmentError, LMJudge
 from wmo.common.judging.prompts import PromptDefinition
 from wmo.common.judging.proposal import (
-    LMRubricProposer,
     ProposedRubricDimension,
-    RepresentativeRollout,
     RubricProposal,
     RubricProposalError,
     RubricProposalEvidence,
@@ -71,11 +69,9 @@ __all__ = [
     "JudgmentError",
     "Judgment",
     "LMJudge",
-    "LMRubricProposer",
     "OutOfFoldPrediction",
     "PromptDefinition",
     "ProposedRubricDimension",
-    "RepresentativeRollout",
     "Rubric",
     "RubricProposal",
     "RubricProposalEvidence",
