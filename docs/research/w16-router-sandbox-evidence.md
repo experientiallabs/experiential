@@ -22,8 +22,8 @@ The exact deterministic run retains these denominators:
 - 150 persisted judgments under one workflow ceiling of 200
 - one shared simulation ceiling of $2.00 and exactly $0.00 observed fake-client spend
 
-The test crashes once after the fit lock and once after durable report and telemetry creation. Resume
-and exact replay add no model, world-model, judge, approval, or telemetry delivery. Two HTTP turns
+Exact replay adds no model, world-model, judge, approval, or telemetry delivery; crash-and-resume at
+both durable phase boundaries is pinned by wmo/optimize/router/composition_test.py. Two HTTP turns
 with one episode ID retain one hashed episode identity and one sticky routed alias without exposing
 the raw episode ID.
 

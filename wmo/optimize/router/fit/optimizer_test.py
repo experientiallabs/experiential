@@ -27,6 +27,7 @@ from wmo.common.evaluations import (
     build_evaluation_dataset,
     load_evaluation_dataset,
 )
+from wmo.common.evaluations.build_test import _candidate, _money, _snapshot
 from wmo.common.judging import (
     DimensionJudgment,
     DimensionScoreMap,
@@ -36,8 +37,6 @@ from wmo.common.judging import (
 from wmo.common.models import (
     CandidateTokenPrice,
     Embedding,
-    ModelSnapshot,
-    NumericMeasurement,
     OperationEconomics,
     PricingSnapshot,
     RoutedCandidateSnapshot,
@@ -946,24 +945,3 @@ def _task(task_id: str, partition: Literal["fit", "held_out"]) -> TaskCase:
         workload_weight=1.0,
         source_trace_ids=(f"trace-{task_id}",),
     )
-
-
-def _candidate(alias: str) -> RoutedCandidateSnapshot:
-    """Create one exact routed candidate snapshot."""
-    return RoutedCandidateSnapshot(alias=alias, model=_snapshot(alias))
-
-
-def _snapshot(alias: str) -> ModelSnapshot:
-    """Create one secret-free model snapshot."""
-    return ModelSnapshot(
-        provider="test",
-        model_id=alias,
-        revision="fixture",
-        capabilities_sha256=_DIGEST,
-        connection_sha256="b" * 64,
-    )
-
-
-def _money(value: float) -> NumericMeasurement:
-    """Create one observed numeric measurement."""
-    return NumericMeasurement(value=value, provenance="observed")

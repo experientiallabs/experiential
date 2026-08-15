@@ -24,6 +24,7 @@ from wmo.common.models import (
     Embedding,
     EmbeddingCostReservation,
     ModelCapabilities,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -246,8 +247,9 @@ def _complete(
     key: str,
     conversation: str,
     request: ModelRequest,
-    output: str,
+    output: str | AssistantAction,
     now: datetime,
+    finish_reason: ModelFinishReason = ModelFinishReason.COMPLETED,
 ) -> RuntimeAcceptedEvent:
     """Accept and complete one deterministic routed interaction.
 
@@ -256,8 +258,9 @@ def _complete(
         key: Stable idempotency key.
         conversation: Caller conversation identity.
         request: Complete visible request.
-        output: Assistant response text.
+        output: Assistant response text or complete assistant action.
         now: Acceptance timestamp.
+        finish_reason: Provider-reported terminal reason preserved in provenance.
 
     Returns:
         Accepted event named by the completion.
@@ -269,9 +272,17 @@ def _complete(
         request=request,
         now=now,
     )
+    action = output if isinstance(output, AssistantAction) else AssistantAction(content=output)
     journal.record_completed(
         accepted,
-        _response(output),
+        ModelResponse(
+            output=action,
+            model=_model(),
+            economics=OperationEconomics(
+                usage=Usage(input_tokens=8, output_tokens=3, cached_input_tokens=0)
+            ),
+            finish_reason=finish_reason,
+        ),
         completed_at=now + timedelta(seconds=1),
     )
     return accepted
