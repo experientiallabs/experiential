@@ -1178,6 +1178,33 @@ def test_exact_replay_performs_zero_provider_calls(
     assert ProjectStore(root, "support").load_project().build == first_build
 
 
+def test_over_ceiling_command_quotes_paths_and_covers_full_precision() -> None:
+    """The suggested rebuild command quotes paths and authorizes the exact estimate.
+
+    The regression constructs the message directly so it can use a spaced path and a
+    six-decimal-rounding edge without running a full build.
+    """
+    estimate = 1.2345674
+    message = build_command._over_ceiling_message(
+        estimate=estimate,
+        ceiling=0.01,
+        project="support",
+        trace_file=Path("/tmp/my traces/export.jsonl"),
+        source="otlp",
+        root=Path("/tmp/wmo root"),
+        world_model=None,
+        judge=None,
+        embedder=None,
+        top_k=5,
+    )
+    assert "conservative embedding estimate $1.234567 exceeds" in message
+    assert "'/tmp/my traces/export.jsonl'" in message
+    assert "'/tmp/wmo root'" in message
+    suggested = build_command._sufficient_ceiling_usd(estimate)
+    assert float(suggested) >= estimate
+    assert f"--max-build-cost-usd {suggested}" in message
+
+
 def test_other_spend_consent_commands_still_require_yes() -> None:
     """Removing build confirmation does not change other spend-consent command flags.
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import shlex
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -784,12 +786,29 @@ def _over_ceiling_message(
         command.extend(["--embedder", embedder])
     if top_k != 5:
         command.extend(["--top-k", str(top_k)])
-    command.extend(["--max-build-cost-usd", f"{estimate:.6f}"])
+    command.extend(["--max-build-cost-usd", _sufficient_ceiling_usd(estimate)])
     return (
         f"conservative embedding estimate ${estimate:.6f} exceeds "
         f"--max-build-cost-usd ${ceiling:.6f}. "
-        f"Re-run with a higher ceiling: {' '.join(command)}"
+        f"Re-run with a higher ceiling: {shlex.join(command)}"
     )
+
+
+def _sufficient_ceiling_usd(estimate: float) -> str:
+    """Return a six-decimal ceiling that still authorizes the full-precision estimate.
+
+    Args:
+        estimate: Conservative maximum embedding cost in USD.
+
+    Returns:
+        A ``--max-build-cost-usd`` value whose parsed float is at least ``estimate``.
+    """
+    micros = max(math.ceil(estimate * 1_000_000), 1)
+    while True:
+        text = f"{micros / 1_000_000:.6f}"
+        if float(text) >= estimate:
+            return text
+        micros += 1
 
 
 def _render_completed_build(
