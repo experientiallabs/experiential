@@ -261,6 +261,77 @@ def rollout_id(task: TaskCase, trace: Trace) -> str:
     )
 
 
+def update_review_state(
+    store: ProjectStore,
+    setup_input: ArtifactInput,
+    mutate: Callable[[ManualJudgeReviewState], ManualJudgeReviewState],
+) -> ManualJudgeReviewState:
+    """Replace manual judge state from the value read inside the review lock.
+
+    Args:
+        store: Project-local review store.
+        setup_input: Exact setup manifest the mutation belongs to.
+        mutate: Transform applied to the current committed manual judge state.
+
+    Returns:
+        The manual judge state that was committed.
+
+    Raises:
+        ManualJudgeError: Setup provenance, selected build, or review state is invalid.
+    """
+    try:
+        setup, resolved_input = read_artifact_json(
+            store,
+            artifact_id=setup_input.artifact_id,
+            expected_artifact_type="manual-judge-setup",
+            relative_path="setup.json",
+            model_type=ManualJudgeSetupArtifact,
+        )
+    except JudgingProvenanceError as exc:
+        raise ManualJudgeError("manual judge setup is unavailable for review update") from exc
+    if resolved_input != setup_input:
+        raise ManualJudgeError("manual judge setup manifest differs from review state")
+    committed: list[ManualJudgeReviewState] = []
+
+    def update(current: JsonValue | None) -> JsonObject:
+        """Apply the mutation to the state committed under the review lock.
+
+        Args:
+            current: Current complete review JSON value.
+
+        Returns:
+            Updated object preserving every unrelated key.
+
+        Raises:
+            ManualJudgeError: The review value or its manual judge state is invalid.
+        """
+        if current is None:
+            root: JsonObject = {}
+        elif isinstance(current, dict):
+            root = dict(current)
+        else:
+            raise ManualJudgeError("review.json must be an object")
+        state = _parse_review_state(root.get("manual_judge"))
+        if state is None:
+            raise ManualJudgeError(
+                "project has no judge setup; run wmo config judge setup PROJECT first"
+            )
+        if state.setup != setup_input:
+            raise ManualJudgeError("manual judge setup manifest differs from review state")
+        updated = mutate(state)
+        committed.append(updated)
+        root["manual_judge"] = updated.model_dump(mode="json")
+        return root
+
+    with coordinate_manual_judge_review(
+        store,
+        trace_dataset=setup.trace_dataset,
+        task_set=setup.task_set,
+    ):
+        store.update_review(update)
+    return committed[-1]
+
+
 def write_review_state(store: ProjectStore, state: ManualJudgeReviewState) -> None:
     """Update manual judge state only while its selected build remains current.
 
@@ -330,7 +401,21 @@ def read_review_state(store: ProjectStore) -> ManualJudgeReviewState | None:
         return None
     if not isinstance(review, dict):
         raise ManualJudgeError("review.json must be an object")
-    value = review.get("manual_judge")
+    return _parse_review_state(review.get("manual_judge"))
+
+
+def _parse_review_state(value: JsonValue | None) -> ManualJudgeReviewState | None:
+    """Validate the manual judge namespace of review state.
+
+    Args:
+        value: Stored manual judge namespace, or ``None`` before setup.
+
+    Returns:
+        Validated manual judge state, or ``None`` before setup.
+
+    Raises:
+        ManualJudgeError: The stored namespace is malformed.
+    """
     if value is None:
         return None
     try:

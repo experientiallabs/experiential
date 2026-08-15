@@ -473,9 +473,30 @@ class ManualJudgeReviewState(ContractModel):
     """Mutable review pointers for resumable setup, labels, audit, and explicit approval."""
 
     setup: ArtifactInput
-    label_draft: ManualJudgeLabelDraft | None = None
+    label_drafts: tuple[ManualJudgeLabelDraft, ...] = ()
     audit: ArtifactInput | None = None
     approved_calibration: ArtifactInput | None = None
+
+    @field_validator("label_drafts")
+    @classmethod
+    def _require_one_draft_per_sample(
+        cls, value: tuple[ManualJudgeLabelDraft, ...]
+    ) -> tuple[ManualJudgeLabelDraft, ...]:
+        """Keep at most one label draft per setup and frozen trace sample.
+
+        Args:
+            value: Persisted label drafts of one project.
+
+        Returns:
+            The same drafts when every sample appears once.
+
+        Raises:
+            ValueError: Two drafts claim the same setup and trace sample.
+        """
+        keys = tuple((draft.setup_id, draft.sample_sha256) for draft in value)
+        if len(set(keys)) != len(keys):
+            raise ValueError("review state must not hold two drafts for one calibration sample")
+        return value
 
 
 class ManualJudgeCalibrationResult(ContractModel):

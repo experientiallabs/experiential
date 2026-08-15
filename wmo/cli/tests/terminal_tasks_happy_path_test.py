@@ -297,7 +297,10 @@ def _drafted_labels(store: ProjectStore) -> tuple[dict[str, object], ...]:
     assert isinstance(review, dict)
     manual_judge = review["manual_judge"]
     assert isinstance(manual_judge, dict)
-    draft = manual_judge["label_draft"]
+    drafts = manual_judge["label_drafts"]
+    assert isinstance(drafts, list)
+    assert len(drafts) == 1
+    draft = drafts[0]
     assert isinstance(draft, dict)
     entries = draft["labels"]
     assert isinstance(entries, list)

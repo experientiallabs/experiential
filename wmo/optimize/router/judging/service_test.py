@@ -900,12 +900,14 @@ def test_calibration_refuses_before_resolution_write_or_model_call(tmp_path: Pat
     assert isinstance(review, dict)
     manual_judge = review["manual_judge"]
     assert isinstance(manual_judge, dict)
-    drafted = manual_judge["label_draft"]
+    drafts = cast(list[JsonValue], manual_judge["label_drafts"])
+    assert len(drafts) == 1
+    drafted = drafts[0]
     assert isinstance(drafted, dict)
     assert len(cast(list[JsonValue], drafted["labels"])) == len(labels)
     restored = {
         **review,
-        "manual_judge": {**manual_judge, "label_draft": None},
+        "manual_judge": {**manual_judge, "label_drafts": []},
     }
     assert restored == before_review
     assert store.artifacts.list_ids() == before_artifacts

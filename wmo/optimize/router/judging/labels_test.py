@@ -7,7 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from wmo.optimize.router.judging.contracts import ManualJudgeError
+from wmo.common.project import ProjectStore
+from wmo.optimize.router.judging import labels as labels_module
+from wmo.optimize.router.judging.artifacts import require_review_state, write_review_state
+from wmo.optimize.router.judging.contracts import ManualJudgeError, ManualJudgeReviewState
 from wmo.optimize.router.judging.labels import (
     calibration_sample_digest,
     read_label_draft,
@@ -40,6 +43,55 @@ def test_saved_labels_resume_only_for_the_same_frozen_sample(tmp_path: Path) -> 
     other = calibration_sample_digest(setup, calibration_sample(smaller))
     assert other != digest
     assert read_label_draft(store, setup, other) == ()
+
+
+def test_labeling_another_sample_keeps_the_earlier_ratings(tmp_path: Path) -> None:
+    """Switching trace samples adds a second draft instead of discarding entered ratings."""
+    store = _built_store(tmp_path)
+    setup = _setup(store)
+    first = prepare_manual_judge_calibration(store, sample_size=3)
+    second = prepare_manual_judge_calibration(store, sample_size=2)
+    first_digest = calibration_sample_digest(setup, calibration_sample(first))
+    second_digest = calibration_sample_digest(setup, calibration_sample(second))
+    labels = _labels(store)
+    save_label_draft(store, setup, first_digest, labels, _TIME)
+    save_label_draft(store, setup, second_digest, labels[:2], _TIME)
+
+    assert read_label_draft(store, setup, first_digest) == labels
+    assert read_label_draft(store, setup, second_digest) == labels[:2]
+
+
+def test_label_write_keeps_a_pointer_committed_after_its_state_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A label write merges the state committed under the lock, not the state it first read."""
+    store = _built_store(tmp_path)
+    setup = _setup(store)
+    plan = prepare_manual_judge_calibration(store, sample_size=3)
+    digest = calibration_sample_digest(setup, calibration_sample(plan))
+    labels = _labels(store)
+    read = labels_module.require_review_state
+
+    def stale_read(target: ProjectStore) -> ManualJudgeReviewState:
+        """Commit an unrelated pointer right after the caller reads review state.
+
+        Args:
+            target: Project-local review store.
+
+        Returns:
+            The state as it looked before the concurrent pointer landed.
+        """
+        state = read(target)
+        write_review_state(target, state.model_copy(update={"audit": state.setup}))
+        return state
+
+    monkeypatch.setattr(labels_module, "require_review_state", stale_read)
+    save_label_draft(store, setup, digest, labels, _TIME)
+
+    monkeypatch.undo()
+    committed = require_review_state(store)
+    assert committed.audit == committed.setup
+    assert read_label_draft(store, setup, digest) == labels
 
 
 def test_changed_label_fails_instead_of_replacing_a_persisted_score(tmp_path: Path) -> None:
