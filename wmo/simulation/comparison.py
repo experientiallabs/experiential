@@ -20,7 +20,7 @@ from wmo.common.core.artifacts import (
     StructuredFailure,
     canonical_json_bytes,
     sha256_json,
-    sorted_artifact_inputs,
+    sorted_unique_inputs,
     stable_id,
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
@@ -103,17 +103,15 @@ class SimulationComparisonSpec(ArtifactEnvelope):
     @model_validator(mode="after")
     def _require_exact_inputs(self) -> SimulationComparisonSpec:
         """Make every named immutable dependency a hash-bound envelope input."""
-        expected = sorted_artifact_inputs(
-            (
-                self.policy_lock_input,
-                self.task_set_input,
-                self.text_evaluation_plan_input,
-                self.sandbox_evaluation_plan_input,
-                self.text_simulation_spec_input,
-                self.sandbox_simulation_spec_input,
-                self.text_artifact_set_input,
-                self.sandbox_artifact_set_input,
-            )
+        expected = sorted_unique_inputs(
+            self.policy_lock_input,
+            self.task_set_input,
+            self.text_evaluation_plan_input,
+            self.sandbox_evaluation_plan_input,
+            self.text_simulation_spec_input,
+            self.sandbox_simulation_spec_input,
+            self.text_artifact_set_input,
+            self.sandbox_artifact_set_input,
         )
         if self.inputs != expected:
             raise ValueError("comparison spec inputs must exactly match every named artifact")
@@ -291,7 +289,7 @@ def compare_text_and_sandbox(
     return SimulationComparisonReport(
         schema_version=1,
         created_at=created_at,
-        inputs=sorted_artifact_inputs((resolved.comparison_spec_input, *spec.inputs)),
+        inputs=sorted_unique_inputs(resolved.comparison_spec_input, *spec.inputs),
         code_revision=code_revision,
         source=spec.source,
         report_id=report_id,

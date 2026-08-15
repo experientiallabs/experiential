@@ -33,12 +33,12 @@ from wmo.common.release_revision import installed_release_revision
 from wmo.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.models.providers.retry import RetryPolicy
 from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
-from wmo.simulation.ingest.otlp import (
-    OtlpTraceFormatError,
-    TraceNormalizationResult,
-    load_otlp_file,
+from wmo.simulation.ingest.otlp import TraceNormalizationResult
+from wmo.simulation.ingest.sources import (
+    CANONICAL_TRACE_SOURCES,
+    TraceSourceError,
+    load_trace_source,
 )
-from wmo.simulation.ingest.posthog import PostHogPullError, load_posthog_file
 from wmo.simulation.retrieval import (
     RAGEmbedderBinding,
     RAGLineageBinding,
@@ -50,19 +50,25 @@ from wmo.simulation.world_model.artifact import persist_grounded_world_model
 from wmo.simulation.world_model.runtime import load_grounded_world_model
 
 _console = Console()
-_CANONICAL_SOURCES = ("otlp", "posthog")
 _PROJECT_ARGUMENT = typer.Argument(..., metavar="PROJECT", help="Local project name.")
 _TRACE_FILE_ARGUMENT = typer.Argument(
     ...,
     metavar="TRACES",
-    help="OTLP JSON or JSONL, or a PostHog LLM-observability export.",
+    help=(
+        "Local trace export in the declared --source format, or the JSON source declaration "
+        "of a postgres table."
+    ),
 )
 
 
 def build(
     project: str = _PROJECT_ARGUMENT,
     trace_file: Path = _TRACE_FILE_ARGUMENT,
-    source: str = typer.Option("otlp", "--source", help="Trace format: otlp or posthog."),
+    source: str = typer.Option(
+        "otlp",
+        "--source",
+        help=f"Trace source format: {', '.join(CANONICAL_TRACE_SOURCES)}.",
+    ),
     root: Path = ROOT_OPTION,
     world_model: str | None = typer.Option(None, "--world-model", help="World-model alias."),
     judge: str | None = typer.Option(None, "--judge", help="Judge alias."),
@@ -90,7 +96,7 @@ def build(
     Args:
         project: Safe local project identifier below ``<root>/projects``.
         trace_file: Explicit local canonical trace export.
-        source: OTLP or PostHog local-export format.
+        source: Declared local-export format, or ``postgres`` for a table declaration.
         root: Local ``.wmo`` artifact root.
         world_model: Optional configured alias override for this project.
         judge: Optional configured alias override for this project.
@@ -126,7 +132,7 @@ def build(
         if not normalized.traces:
             raise ValueError(
                 "no valid canonical traces were produced; inspect the input and provide at least "
-                "one valid OTLP or PostHog trace"
+                f"one valid {source.strip().casefold()} trace"
             )
         store = _project_store(
             root,
@@ -557,16 +563,10 @@ def _load_canonical_traces(path: Path, source: str) -> TraceNormalizationResult:
     Raises:
         typer.BadParameter: The format is unsupported or normalization fails.
     """
-    normalized_source = source.strip().casefold()
     try:
-        if normalized_source == "otlp":
-            return load_otlp_file(path)
-        if normalized_source == "posthog":
-            return load_posthog_file(path)
-    except (OtlpTraceFormatError, PostHogPullError, ValueError) as exc:
-        raise typer.BadParameter(f"{normalized_source} trace normalization failed: {exc}") from None
-    choices = ", ".join(_CANONICAL_SOURCES)
-    raise typer.BadParameter(f"unsupported --source {source!r}; choose one of: {choices}")
+        return load_trace_source(source, path)
+    except TraceSourceError as exc:
+        raise typer.BadParameter(str(exc)) from None
 
 
 def _capture_local_build_telemetry(

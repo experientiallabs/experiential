@@ -22,6 +22,9 @@ your current agent:
 ```bash
 pip install world-model-optimizer
 
+# Collect secret-free provider connections, including azure and bedrock
+wmo config providers
+
 # Build simulation from your agent traces
 wmo build support-agent traces.otel.jsonl
 

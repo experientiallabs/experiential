@@ -6,7 +6,7 @@ from wmo.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     Sha256,
-    sorted_artifact_inputs,
+    sorted_unique_inputs,
     stable_id,
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationProtocol
@@ -116,8 +116,8 @@ def read_dispatch_reservation(
     receipt = JudgmentDispatchReceipt.model_validate_json(
         project.artifacts.read_bytes(dispatch_id, "dispatch.json")
     )
-    expected_inputs = sorted_artifact_inputs(
-        (plan_input, rollout_input, rubric_input, calibration_input)
+    expected_inputs = sorted_unique_inputs(
+        plan_input, rollout_input, rubric_input, calibration_input
     )
     if (
         receipt.dispatch_id != dispatch_id
@@ -127,7 +127,7 @@ def read_dispatch_reservation(
         or receipt.rubric != rubric_input
         or receipt.calibration != calibration_input
         or receipt.protocol_sha256 != protocol_sha256
-        or sorted_artifact_inputs(receipt.inputs) != expected_inputs
+        or sorted_unique_inputs(*receipt.inputs) != expected_inputs
     ):
         raise JudgmentBudgetError("judgment dispatch reservation binding has drifted")
     return receipt
@@ -164,7 +164,7 @@ def persist_dispatch_reservation(
     receipt = JudgmentDispatchReceipt(
         schema_version=1,
         created_at=plan.created_at,
-        inputs=sorted_artifact_inputs((plan_input, rollout_input, rubric_input, calibration_input)),
+        inputs=sorted_unique_inputs(plan_input, rollout_input, rubric_input, calibration_input),
         code_revision=plan.code_revision,
         dispatch_id=dispatch_id,
         plan=plan_input,
@@ -205,8 +205,8 @@ def _require_judgment(
         or judgment.judge_model != calibration.judge_model
         or judgment.judge_prompt_id != calibration.judge_prompt_id
         or judgment.judge_prompt_sha256 != calibration.judge_prompt_sha256
-        or sorted_artifact_inputs(judgment.inputs)
-        != sorted_artifact_inputs((rollout_input, rubric_input, calibration_input))
+        or sorted_unique_inputs(*judgment.inputs)
+        != sorted_unique_inputs(rollout_input, rubric_input, calibration_input)
     ):
         raise JudgmentBudgetError("persisted judgment differs from its exact plan review pins")
 

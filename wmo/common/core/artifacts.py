@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
@@ -126,27 +126,6 @@ class ArtifactInput(ContractModel):
     sha256: Sha256
 
 
-def sorted_artifact_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactInput, ...]:
-    """Deduplicate exact-equal artifact inputs and order them by artifact ID.
-
-    Args:
-        inputs: Immutable artifact input references, possibly repeated.
-
-    Returns:
-        One input per artifact ID in deterministic artifact-ID order.
-
-    Raises:
-        ValueError: One artifact ID appears with conflicting manifest digests.
-    """
-    by_id: dict[str, ArtifactInput] = {}
-    for item in inputs:
-        existing = by_id.get(item.artifact_id)
-        if existing is not None and existing != item:
-            raise ValueError(f"artifact input {item.artifact_id} has conflicting manifest digests")
-        by_id[item.artifact_id] = item
-    return tuple(by_id[artifact_id] for artifact_id in sorted(by_id))
-
-
 class ArtifactEnvelope(ContractModel):
     """Provenance shared by every completed immutable artifact.
 
@@ -200,6 +179,30 @@ def envelope_matches_manifest(envelope: ArtifactEnvelope, manifest: ArtifactEnve
         manifest.code_revision,
         manifest.source,
     )
+
+
+def sorted_unique_inputs(
+    *inputs: ArtifactInput, error_type: type[Exception] = ValueError
+) -> tuple[ArtifactInput, ...]:
+    """Canonicalize artifact inputs into the exact order and uniqueness an envelope requires.
+
+    Args:
+        *inputs: Manifest-derived references, in any order and with repeated equal references.
+        error_type: Domain error raised when one artifact ID carries conflicting digests.
+
+    Returns:
+        One input per artifact ID, ordered by artifact ID.
+
+    Raises:
+        Exception: `error_type` when an artifact ID appears with two different digests.
+    """
+    by_id: dict[str, ArtifactInput] = {}
+    for item in inputs:
+        previous = by_id.get(item.artifact_id)
+        if previous is not None and previous != item:
+            raise error_type(f"artifact input {item.artifact_id} has conflicting manifest digests")
+        by_id[item.artifact_id] = item
+    return tuple(by_id[artifact_id] for artifact_id in sorted(by_id))
 
 
 class SecretBoundaryError(ValueError):

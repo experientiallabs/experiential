@@ -12,7 +12,7 @@ from wmo.common.core.artifacts import (
     ContractModel,
     StructuredFailure,
     sha256_json,
-    sorted_artifact_inputs,
+    sorted_unique_inputs,
 )
 from wmo.common.evaluations.dataset import EvaluationProtocol, FidelityReport
 from wmo.common.evaluations.plan import EvaluationPlan, FidelityGate, FidelityThresholds
@@ -293,10 +293,7 @@ def sorted_evaluation_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactI
     Raises:
         EvaluationEvidenceError: One ID appears with conflicting digests.
     """
-    try:
-        return sorted_artifact_inputs(inputs)
-    except ValueError as exc:
-        raise EvaluationEvidenceError(str(exc)) from exc
+    return sorted_unique_inputs(*inputs, error_type=EvaluationEvidenceError)
 
 
 def _require_identity(actual: str, expected: str, label: str) -> None:

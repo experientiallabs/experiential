@@ -10,7 +10,7 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
     canonical_jsonl_bytes,
     sha256_bytes,
-    sorted_artifact_inputs,
+    sorted_unique_inputs,
     stable_id,
 )
 from wmo.common.project import ArtifactAlreadyExistsError, ArtifactCorruptionError, ArtifactStore
@@ -65,15 +65,13 @@ def persist_artifact_set(
     artifact_set = SimulationArtifactSet(
         schema_version=1,
         created_at=timestamp(clock),
-        inputs=sorted_artifact_inputs(
-            (
-                plan_input,
-                task_set_input,
-                fit_rag_input,
-                spec.world_model.grounded_world_model_input,
-                spec_input,
-                resolution_input,
-            )
+        inputs=sorted_unique_inputs(
+            plan_input,
+            task_set_input,
+            fit_rag_input,
+            spec.world_model.grounded_world_model_input,
+            spec_input,
+            resolution_input,
         ),
         code_revision=spec.code_revision,
         artifact_set_id=artifact_set_id,

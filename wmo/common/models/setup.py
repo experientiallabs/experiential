@@ -19,7 +19,9 @@ from wmo.common.models.catalog import (
 )
 from wmo.common.models.model import ModelCapabilities
 
-SETUP_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openai-compatible", "openrouter"})
+SETUP_PROVIDERS = frozenset(
+    {"anthropic", "azure", "bedrock", "gemini", "openai", "openai-compatible", "openrouter"}
+)
 EMPTY_CATALOG_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
@@ -32,8 +34,10 @@ class ProviderConnection(ContractModel):
 
     name: str = Field(min_length=1, max_length=128)
     provider: str = Field(min_length=1, max_length=128)
-    api_key_env: str = Field(min_length=1, max_length=256)
+    api_key_env: str | None = Field(default=None, max_length=256)
     base_url: str | None = Field(default=None, max_length=2_048)
+    api_version: str | None = Field(default=None, max_length=64)
+    region: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def _require_supported_connection_shape(self) -> ProviderConnection:
@@ -42,15 +46,40 @@ class ProviderConnection(ContractModel):
             raise ValueError(f"provider must be one of: {choices}")
         if self.provider == "openai-compatible" and self.base_url is None:
             raise ValueError("openai-compatible requires an explicit base_url")
-        if self.provider != "openai-compatible" and self.base_url is not None:
-            raise ValueError(
-                "base_url is only accepted for provider='openai-compatible'; native providers "
-                "use their official endpoint"
-            )
+        if self.provider == "azure":
+            if self.base_url is None:
+                raise ValueError("azure requires an explicit resource endpoint in base_url")
+            if self.api_key_env is None:
+                raise ValueError("azure requires api_key_env")
+            if self.api_version is None:
+                raise ValueError("azure requires an explicit api_version")
+        elif self.provider == "bedrock":
+            if self.api_key_env is not None:
+                raise ValueError(
+                    "bedrock authenticates through the AWS credential chain and rejects api_key_env"
+                )
+            if self.base_url is not None:
+                raise ValueError("bedrock does not accept base_url")
+            if self.api_version is not None:
+                raise ValueError("api_version is only accepted for provider='azure'")
+        else:
+            if self.api_key_env is None:
+                raise ValueError(f"{self.provider} requires api_key_env")
+            if self.base_url is not None and self.provider != "openai-compatible":
+                raise ValueError(
+                    "base_url is only accepted for provider='openai-compatible' or "
+                    "provider='azure'; other native providers use their official endpoint"
+                )
+            if self.api_version is not None:
+                raise ValueError("api_version is only accepted for provider='azure'")
+            if self.region is not None:
+                raise ValueError("region is only accepted for provider='bedrock'")
         ConnectionConfig(
             provider=self.provider,
             base_url=self.base_url,
             api_key_env=self.api_key_env,
+            api_version=self.api_version,
+            region=self.region,
         )
         return self
 
@@ -60,6 +89,8 @@ class ProviderConnection(ContractModel):
             provider=self.provider,
             base_url=self.base_url,
             api_key_env=self.api_key_env,
+            api_version=self.api_version,
+            region=self.region,
         )
 
 

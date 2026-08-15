@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
-from wmo.common.core.artifacts import sha256_json
+from wmo.common.core.artifacts import JsonObject, sha256_json
 from wmo.common.models import (
     EmbeddingClient,
     ModelCapabilities,
@@ -18,6 +18,8 @@ from wmo.common.models import (
 from wmo.runtime.models.credentials import read_connection_api_key
 from wmo.runtime.models.preflight import CapabilityRequirement, preflight_capabilities
 from wmo.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicClient
+from wmo.runtime.models.providers.azure import AzureClient, bind_azure_api_key
+from wmo.runtime.models.providers.bedrock import BedrockClient, BedrockRuntimeFactory
 from wmo.runtime.models.providers.gemini import GEMINI_BASE_URL, GeminiClient
 from wmo.runtime.models.providers.openai import OPENAI_BASE_URL, OpenAIClient
 from wmo.runtime.models.providers.openai_compatible import (
@@ -107,6 +109,7 @@ class RuntimeModelCatalog:
         environment: Mapping[str, str] | None = None,
         transport_factory: Callable[[], JsonHttpTransport] = HttpxJsonTransport,
         tinker_sampler_factory: TinkerSamplerFactory | None = None,
+        bedrock_runtime_factory: BedrockRuntimeFactory | None = None,
     ) -> None:
         """Create a local resolver without importing SDK registries or contacting providers.
 
@@ -116,11 +119,13 @@ class RuntimeModelCatalog:
             transport_factory: Explicit transport construction for HTTP-backed providers.
             tinker_sampler_factory: Optional deterministic test override for completed-handle
                 sampling. Omit it to use the runtime-owned Tinker SDK construction seam.
+            bedrock_runtime_factory: Optional deterministic Bedrock runtime factory used by tests.
         """
         self._catalog = catalog
         self._environment = os.environ if environment is None else environment
         self._transport_factory = transport_factory
         self._tinker_sampler_factory = tinker_sampler_factory
+        self._bedrock_runtime_factory = bedrock_runtime_factory
 
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
         """Resolve static identity and exact capability evidence without provider access.
@@ -176,20 +181,64 @@ class RuntimeModelCatalog:
         snapshot, capabilities = self.snapshot(alias)
         provenance = record.sft_provenance
         if provenance is not None:
-            current_connection_sha256 = sha256_json(
-                {
-                    "provider": connection.provider,
-                    "base_url": connection.base_url,
-                    "api_key_env": connection.api_key_env,
-                }
-            )
+            current_connection: JsonObject = {
+                "provider": connection.provider,
+                "base_url": connection.base_url,
+                "api_key_env": connection.api_key_env,
+            }
+            if connection.api_version is not None:
+                current_connection["api_version"] = connection.api_version
+            if connection.region is not None:
+                current_connection["region"] = connection.region
+            current_connection_sha256 = sha256_json(current_connection)
             if provenance.connection_config_sha256 != current_connection_sha256:
                 raise ModelConnectionError(
                     f"trained model alias {alias!r} connection metadata drifted from its "
                     "verified SFT provenance"
                 )
-        api_key = read_connection_api_key(connection, environment=self._environment)
         provider = connection.provider
+        if provider == "bedrock":
+            client = BedrockClient(
+                model=snapshot,
+                region=connection.region,
+                environment=self._environment,
+                runtime_factory=self._bedrock_runtime_factory,
+            )
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capabilities,
+                client,
+                client if capabilities.supports_embeddings else None,
+            )
+        api_key = read_connection_api_key(connection, environment=self._environment)
+        if provider == "azure":
+            if connection.base_url is None or connection.api_version is None:
+                raise ModelConnectionError(
+                    f"Azure alias {alias!r} needs connection.base_url and connection.api_version"
+                )
+            if connection.api_key_env is None:
+                raise ModelConnectionError(f"Azure alias {alias!r} needs connection.api_key_env")
+            api_key = bind_azure_api_key(
+                endpoint=connection.base_url,
+                api_key_env=connection.api_key_env,
+                api_key=api_key,
+                environment=self._environment,
+            )
+            client = AzureClient(
+                model=snapshot,
+                endpoint=connection.base_url,
+                api_key=api_key,
+                api_version=connection.api_version,
+                transport=self._transport_factory(),
+            )
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capabilities,
+                client,
+                client if capabilities.supports_embeddings else None,
+            )
         if provider == "tinker":
             sampler_factory = self._tinker_sampler_factory or _runtime_tinker_sampler
             try:
@@ -261,6 +310,7 @@ class RuntimeModelCatalog:
             environment=self._environment,
             transport_factory=self._transport_factory,
             tinker_sampler_factory=self._tinker_sampler_factory,
+            bedrock_runtime_factory=self._bedrock_runtime_factory,
         )
 
 
@@ -272,7 +322,7 @@ _HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
     "openrouter": (OpenRouterClient, OPENROUTER_BASE_URL),
 }
 
-_SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {"tinker"}
+_SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {"azure", "bedrock", "tinker"}
 
 
 def _runtime_tinker_sampler(

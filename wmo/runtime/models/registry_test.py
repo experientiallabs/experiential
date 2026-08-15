@@ -69,6 +69,9 @@ def _catalog(
     *,
     provider: str = "openai",
     base_url: str | None = None,
+    api_key_env: str | None = "FIXTURE_API_KEY",
+    api_version: str | None = None,
+    region: str | None = None,
     capabilities: ModelCapabilities | None = _DEFAULT_CAPABILITIES,
 ) -> ModelCatalog:
     """Build a minimum one-alias local catalog for deterministic resolution tests."""
@@ -77,7 +80,9 @@ def _catalog(
             "primary": ConnectionConfig(
                 provider=provider,
                 base_url=base_url,
-                api_key_env="FIXTURE_API_KEY",
+                api_key_env=api_key_env,
+                api_version=api_version,
+                region=region,
             )
         },
         models={
@@ -209,7 +214,7 @@ def test_resolution_requires_named_credential_without_exposing_its_value() -> No
 def test_resolution_rejects_unsupported_connection_and_incomplete_compatible_url() -> None:
     """The runtime allows only the focused provider set and explicit compatible endpoints."""
     unsupported = RuntimeModelCatalog(
-        _catalog(provider="bedrock"),
+        _catalog(provider="waterfall"),
         environment={"FIXTURE_API_KEY": "fixture-key"},
         transport_factory=_UnusedTransport,
     )

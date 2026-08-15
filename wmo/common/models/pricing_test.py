@@ -192,6 +192,36 @@ def test_larger_provider_cost_is_not_added_to_the_retry_ceiling_twice() -> None:
     assert economics.cost_usd.provenance == "estimated"
 
 
+def test_observed_cache_write_is_priced_without_double_counting() -> None:
+    """Exact cache-read and cache-write subsets keep fresh tokens on the ordinary input rate."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=1,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+    )
+
+    economics = reconcile_completion_economics(
+        reservation,
+        OperationEconomics(
+            usage=Usage(
+                input_tokens=100,
+                output_tokens=10,
+                cached_input_tokens=20,
+                cache_write_input_tokens=10,
+            )
+        ),
+    )
+
+    assert economics.cost_usd is not None
+    assert economics.cost_usd.value == pytest.approx(0.00014)
+    assert economics.cost_usd.provenance == "estimated"
+
+
 def _model() -> ModelSnapshot:
     """Return one exact completion model snapshot."""
     return ModelSnapshot(

@@ -181,7 +181,7 @@ class HumanScoreReview:
         selected: list[tuple[JsonObject, HumanScoreHistory]] = []
 
         def initialize(current: JsonValue | None) -> JsonObject:
-            root = _root_review_from_value(current)
+            root = root_review_object(current)
             history = _history_from_root(root)
             root["human_score_history"] = history.model_dump(mode="json")
             selected.append((root, history))
@@ -249,7 +249,7 @@ class HumanScoreReview:
         result: list[HumanScore] = []
 
         def update(current: JsonValue | None) -> JsonObject:
-            root = _root_review_from_value(current)
+            root = root_review_object(current)
             history = _history_from_root(root)
             submissions = _score_submissions_from_root(root)
             target = (rubric_id, rollout_id, lineage_id, dimension_id)
@@ -446,7 +446,7 @@ class HumanScoreReview:
         selected: list[tuple[JsonObject, HumanScoreHistory]] = []
 
         def update(current: JsonValue | None) -> JsonObject:
-            root = _root_review_from_value(current)
+            root = root_review_object(current)
             history = transition(_history_from_root(root))
             root["human_score_history"] = history.model_dump(mode="json")
             selected.append((root, history))
@@ -491,16 +491,29 @@ def _require_rubric_matches_selected_build(
         )
 
 
-def _root_review_from_value(review: JsonValue | None) -> JsonObject:
-    """Validate one locked review value as an object for namespace-preserving updates."""
+def root_review_object(
+    review: JsonValue | None, *, error_type: type[Exception] = ValueError
+) -> JsonObject:
+    """Validate one locked review value as an object for namespace-preserving updates.
+
+    Args:
+        review: Current `review.json` value held under the project write lock.
+        error_type: Domain error raised when the value is not a string-keyed object.
+
+    Returns:
+        The review namespace, empty when the file does not exist yet.
+
+    Raises:
+        Exception: `error_type` when the value is not an object with string field names.
+    """
     if review is None:
         return {}
     if not isinstance(review, dict):
-        raise ValueError("review.json must be a JSON object")
+        raise error_type("review.json must be a JSON object")
     root: JsonObject = {}
     for key, value in review.items():
         if not isinstance(key, str):
-            raise ValueError("review.json must use string field names")
+            raise error_type("review.json must use string field names")
         root[key] = value
     return root
 

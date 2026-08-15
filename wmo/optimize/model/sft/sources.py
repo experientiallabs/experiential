@@ -16,7 +16,7 @@ from wmo.common.core.artifacts import (
     Sha256,
     canonical_json_bytes,
     sha256_json,
-    sorted_artifact_inputs,
+    sorted_unique_inputs,
     stable_id,
 )
 from wmo.common.evaluations import FidelityReport
@@ -591,7 +591,4 @@ def _read_json[ModelT: BaseModel](
 
 def _sorted_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactInput, ...]:
     """Return exact unique authoritative artifact inputs in stable identity order."""
-    try:
-        return sorted_artifact_inputs(inputs)
-    except ValueError as exc:
-        raise SFTSourceVerificationError(str(exc)) from exc
+    return sorted_unique_inputs(*inputs, error_type=SFTSourceVerificationError)

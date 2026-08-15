@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -24,13 +25,20 @@ from wmo.optimize.router.judging.contracts import (
     ManualJudgeLabel,
     ManualJudgeSetupArtifact,
 )
+from wmo.optimize.router.judging.labels import (
+    calibration_sample_digest,
+    read_label_draft,
+    save_label_draft,
+)
 from wmo.optimize.router.judging.service import (
     DEFAULT_JUDGE_TEMPLATE,
     ManualJudgeError,
     ManualJudgeSetupPlan,
     calibrate_manual_judge,
+    calibration_sample,
     commit_manual_judge_setup,
     estimate_manual_judge_budget,
+    manual_judge_calibration_is_complete,
     prepare_manual_judge_calibration,
     prepare_manual_judge_setup,
 )
@@ -167,12 +175,37 @@ def judge_calibrate(
         plan = prepare_manual_judge_calibration(store, sample_size=sample_size)
         rubric = _load_setup_rubric(store, plan.setup)
         _render_calibration_previews(plan.previews)
-        labels = _collect_labels(
-            plan.setup,
-            rubric,
-            tuple(label or ()),
-            plan.previews,
-            non_interactive=non_interactive,
+        sample_sha256 = calibration_sample_digest(plan.setup, calibration_sample(plan))
+        drafted = read_label_draft(store, plan.setup, sample_sha256)
+        completed = manual_judge_calibration_is_complete(store)
+        if completed:
+            _console.print(
+                "Judge calibration is already complete; replaying its immutable evidence "
+                "without collecting labels."
+            )
+        elif drafted:
+            _console.print(f"Resuming {len(drafted)} saved human labels for this trace sample.")
+
+        def persist(collected: tuple[ManualJudgeLabel, ...]) -> None:
+            """Save human labels to durable review state before any judge provider work.
+
+            Args:
+                collected: Every human label known for the frozen trace sample so far.
+            """
+            save_label_draft(store, plan.setup, sample_sha256, collected, now)
+
+        labels = (
+            drafted
+            if completed
+            else _collect_labels(
+                plan.setup,
+                rubric,
+                tuple(label or ()),
+                plan.previews,
+                drafted,
+                persist,
+                non_interactive=non_interactive,
+            )
         )
         budget = estimate_manual_judge_budget(
             plan,
@@ -320,16 +353,23 @@ def _collect_labels(
     rubric: Rubric,
     supplied: tuple[str, ...],
     previews: tuple[JudgeTracePreview, ...],
+    drafted: tuple[ManualJudgeLabel, ...],
+    persist: Callable[[tuple[ManualJudgeLabel, ...]], None],
     *,
     non_interactive: bool,
 ) -> tuple[ManualJudgeLabel, ...]:
-    """Parse explicit labels or ask for every missing trace-dimension score.
+    """Resume saved labels, parse explicit ones, and ask only for missing scores.
+
+    Every label is handed to ``persist`` as soon as it exists, so an interrupted or failed
+    calibration never discards completed human ratings.
 
     Args:
         setup: Finalized setup used for stable prompt context.
         rubric: Verified finalized scoring rubric.
         supplied: Repeatable CLI label expressions.
         previews: Frozen ordered calibration trace previews.
+        drafted: Labels already persisted for this exact frozen trace sample.
+        persist: Durable writer for the labels collected so far.
         non_interactive: Whether all missing inputs must be reported without prompting.
 
     Returns:
@@ -339,12 +379,16 @@ def _collect_labels(
         ValueError: A label is malformed, duplicated, missing, or outside zero through five.
     """
     pairwise = setup.prompt_template.response_shape == "pairwise"
-    parsed: dict[tuple[str, str | None, str], int | str] = {}
+    parsed: dict[tuple[str, str | None, str], ManualJudgeLabel] = {
+        (item.trace_id, item.reference_trace_id, item.dimension_id): item for item in drafted
+    }
+    explicit: set[tuple[str, str | None, str]] = set()
     for item in supplied:
         key = _label_key(item, pairwise=pairwise)
-        if key in parsed:
+        if key in explicit:
             raise ValueError("duplicate label for " + ":".join(part or "-" for part in key))
-        parsed[key] = _label_value(item, pairwise=pairwise)
+        explicit.add(key)
+        parsed[key] = _label(key, _label_value(item, pairwise=pairwise), pairwise=pairwise)
     expected = tuple(
         (preview.trace_id, preview.reference_trace_id, dimension.dimension_id)
         for preview in previews
@@ -356,34 +400,54 @@ def _collect_labels(
             "unexpected labels: "
             + ", ".join(":".join(part or "-" for part in key) for key in unexpected)
         )
+    if explicit:
+        persist(tuple(parsed[key] for key in expected if key in parsed))
     missing = tuple(key for key in expected if key not in parsed)
     if missing and non_interactive:
         raise ValueError(
             "missing labels: " + ", ".join(":".join(part or "-" for part in key) for key in missing)
         )
-    for trace_id, reference_id, dimension_id in missing:
+    for key in missing:
+        trace_id, reference_id, dimension_id = key
         if pairwise:
-            winner = Prompt.ask(
+            value: int | str = Prompt.ask(
                 f"Winner for {trace_id} vs {reference_id} on {dimension_id}",
                 choices=["winner_a", "winner_b", "tie"],
             )
-            parsed[(trace_id, reference_id, dimension_id)] = winner
         else:
             score = IntPrompt.ask(f"Score {trace_id} on {dimension_id} (0-5)")
             if score not in range(6):
                 raise ValueError("judge labels must be integers from zero through five")
-            parsed[(trace_id, reference_id, dimension_id)] = score
-    return tuple(
-        ManualJudgeLabel.model_validate(
-            {
-                "trace_id": trace_id,
-                "reference_trace_id": reference_id,
-                "dimension_id": dimension_id,
-                **({"winner": parsed[key]} if pairwise else {"score": parsed[key]}),
-            }
-        )
-        for key in expected
-        for trace_id, reference_id, dimension_id in (key,)
+            value = score
+        parsed[key] = _label(key, value, pairwise=pairwise)
+        persist(tuple(parsed[item] for item in expected if item in parsed))
+    return tuple(parsed[key] for key in expected)
+
+
+def _label(
+    key: tuple[str, str | None, str],
+    value: int | str,
+    *,
+    pairwise: bool,
+) -> ManualJudgeLabel:
+    """Build one validated human label from its key and typed value.
+
+    Args:
+        key: Trace, optional reference trace, and dimension identifiers.
+        value: Zero-to-five score, or a typed pairwise winner.
+        pairwise: Whether the finalized setup requires a comparison label.
+
+    Returns:
+        Validated human label for the calibration sample.
+    """
+    trace_id, reference_id, dimension_id = key
+    return ManualJudgeLabel.model_validate(
+        {
+            "trace_id": trace_id,
+            "reference_trace_id": reference_id,
+            "dimension_id": dimension_id,
+            **({"winner": value} if pairwise else {"score": value}),
+        }
     )
 
 

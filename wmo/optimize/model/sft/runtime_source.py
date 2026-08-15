@@ -20,10 +20,10 @@ from wmo.optimize.model.sft.contracts import (
 )
 from wmo.optimize.model.sft.sources import PreparedSFTSource, SFTSourceVerificationError
 from wmo.runtime.router import (
-    RuntimeAcceptedEvent,
     RuntimeCompletedEvent,
     RuntimeTraceInteraction,
     load_runtime_trace_snapshot,
+    routed_task_text,
 )
 
 
@@ -142,7 +142,7 @@ def _prepared_interaction(
                 "source_lineage": accepted.identity.lineage_id,
             },
         ),
-        task=_task_text(accepted),
+        task=routed_task_text(accepted),
         transcript_events=transcript,
         example_source=RuntimeInteractionExampleSource(
             snapshot=snapshot,
@@ -274,21 +274,3 @@ def _message_action(message: ModelMessage) -> AssistantAction:
     raise SFTSourceVerificationError(
         "runtime SFT assistant message has conflicting text and structured action"
     )
-
-
-def _task_text(accepted: RuntimeAcceptedEvent) -> str:
-    """Choose the stable user-visible task for one routed request.
-
-    Args:
-        accepted: Accepted event containing the exact routed request.
-
-    Returns:
-        Last user text, first available message text, or a stable fallback.
-    """
-    for message in reversed(accepted.identity.request.messages):
-        if message.role == "user" and message.content:
-            return message.content
-    for message in accepted.identity.request.messages:
-        if message.content:
-            return message.content
-    return "Complete the routed model request."

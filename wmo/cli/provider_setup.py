@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,12 +23,14 @@ from wmo.common.models import (
     load_model_catalog,
 )
 
-_NATIVE_PROVIDERS = ("openai", "openrouter", "anthropic", "gemini")
+_NATIVE_PROVIDERS = ("openai", "openrouter", "anthropic", "gemini", "azure", "bedrock")
 _PROVIDER_LABELS = {
     "openai": "OpenAI",
     "openrouter": "OpenRouter",
     "anthropic": "Anthropic",
     "gemini": "Gemini",
+    "azure": "Azure",
+    "bedrock": "Bedrock",
     "openai-compatible": "OpenAI-compatible",
 }
 _CREDENTIAL_ENV_SUGGESTIONS = {
@@ -35,6 +38,7 @@ _CREDENTIAL_ENV_SUGGESTIONS = {
     "openrouter": "OPENROUTER_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "gemini": "GEMINI_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY",
     "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
 }
 
@@ -268,19 +272,35 @@ def _collect_provider_connections(
             if default_name is not None
             else Prompt.ask("Connection name", console=console)
         ).strip()
-        default_env = _CREDENTIAL_ENV_SUGGESTIONS[provider]
-        api_key_env = Prompt.ask(
-            "API key environment variable", default=default_env, console=console
-        ).strip()
+        api_key_env = None
         base_url = None
-        if provider == "openai-compatible":
-            base_url = Prompt.ask("Base URL", console=console).strip()
+        api_version = None
+        region = None
+        if provider == "bedrock":
+            region_default = os.environ.get("AWS_REGION")
+            region = (
+                Prompt.ask("AWS region", default=region_default, console=console)
+                if region_default
+                else Prompt.ask("AWS region", console=console)
+            ).strip()
+        else:
+            default_env = _CREDENTIAL_ENV_SUGGESTIONS[provider]
+            api_key_env = Prompt.ask(
+                "API key environment variable", default=default_env, console=console
+            ).strip()
+            if provider == "openai-compatible":
+                base_url = Prompt.ask("Base URL", console=console).strip()
+            elif provider == "azure":
+                base_url = Prompt.ask("Azure resource endpoint", console=console).strip()
+                api_version = Prompt.ask("Azure API version", default="v1", console=console).strip()
         connections.append(
             ProviderConnection(
                 name=name,
                 provider=provider,
                 api_key_env=api_key_env,
                 base_url=base_url,
+                api_version=api_version,
+                region=region or None,
             )
         )
         another = Confirm.ask(f"Add another {label} connection?", default=False, console=console)
@@ -476,11 +496,16 @@ def _render_summary(
     """
     console.print("[bold]Configuration summary[/bold]")
     for connection in connections:
-        endpoint = f", base_url={connection.base_url}" if connection.base_url else ""
-        console.print(
-            f"connection {connection.name}: {connection.provider}, "
-            f"api_key_env={connection.api_key_env}{endpoint}"
-        )
+        details = [connection.provider]
+        if connection.api_key_env is not None:
+            details.append(f"api_key_env={connection.api_key_env}")
+        if connection.base_url is not None:
+            details.append(f"endpoint={connection.base_url}")
+        if connection.api_version is not None:
+            details.append(f"api_version={connection.api_version}")
+        if connection.region is not None:
+            details.append(f"region={connection.region}")
+        console.print(f"connection {connection.name}: " + ", ".join(details))
     for model in models:
         caps = model.capabilities
         console.print(
@@ -511,9 +536,12 @@ def _existing_connections(existing: ModelCatalog | None) -> tuple[ProviderConnec
             provider=connection.provider,
             api_key_env=connection.api_key_env,
             base_url=connection.base_url,
+            api_version=connection.api_version,
+            region=connection.region,
         )
         for name, connection in sorted(existing.connections.items())
-        if connection.provider in _PROVIDER_LABELS and connection.api_key_env is not None
+        if connection.provider in _PROVIDER_LABELS
+        and (connection.provider == "bedrock" or connection.api_key_env is not None)
     )
 
 

@@ -1,6 +1,7 @@
 """Canonical simulation artifact and rollout contracts."""
 
 from wmo.common.rollouts.artifact import (
+    ProviderFreeSourceProvenance,
     RolloutArtifact,
     SandboxSimulationCellBinding,
     SimulationArtifact,
@@ -20,6 +21,7 @@ from wmo.common.rollouts.otel import (
 
 __all__ = [
     "ProductionSimulatorSnapshot",
+    "ProviderFreeSourceProvenance",
     "RolloutArtifact",
     "RolloutEventKind",
     "RolloutSpan",

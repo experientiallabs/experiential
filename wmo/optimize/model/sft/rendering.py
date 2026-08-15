@@ -25,14 +25,6 @@ from wmo.optimize.model.sft.contracts import (
 )
 
 
-class CanonicalSFTMessage(ContractModel):
-    """One canonical non-assistant message in a normalized SFT context."""
-
-    kind: Literal["message"] = "message"
-    role: Literal["system", "user", "observation"]
-    content: str
-
-
 class CanonicalSFTAssistantAction(ContractModel):
     """One canonical prior assistant action without source-only approval metadata."""
 
@@ -40,17 +32,8 @@ class CanonicalSFTAssistantAction(ContractModel):
     action: AssistantAction
 
 
-class CanonicalSFTToolEvent(ContractModel):
-    """One canonical tool result in a normalized SFT context."""
-
-    kind: Literal["tool"] = "tool"
-    tool_call_id: str
-    content: str
-    tool_name: str | None = None
-
-
 CanonicalSFTContextEvent = Annotated[
-    CanonicalSFTMessage | CanonicalSFTAssistantAction | CanonicalSFTToolEvent,
+    SFTMessage | CanonicalSFTAssistantAction | ToolEvent,
     Field(discriminator="kind"),
 ]
 
@@ -126,14 +109,8 @@ def _canonical_turn(
 
 def _canonical_event(event: SFTContextEvent) -> CanonicalSFTContextEvent:
     """Remove source-only approval metadata while preserving one context event exactly."""
-    if isinstance(event, SFTMessage):
-        return CanonicalSFTMessage(role=event.role, content=event.content)
+    if isinstance(event, SFTMessage | ToolEvent):
+        return event
     if isinstance(event, AssistantActionEvent):
         return CanonicalSFTAssistantAction(action=event.action)
-    if isinstance(event, ToolEvent):
-        return CanonicalSFTToolEvent(
-            tool_call_id=event.tool_call_id,
-            content=event.content,
-            tool_name=event.tool_name,
-        )
     raise ValueError("canonical SFT context cannot contain an infrastructure failure")

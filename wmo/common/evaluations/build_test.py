@@ -44,6 +44,7 @@ from wmo.common.models import (
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
 from wmo.common.rollouts import (
     ProductionSimulatorSnapshot,
+    ProviderFreeSourceProvenance,
     RolloutArtifact,
     RolloutEventKind,
     RolloutSpan,
@@ -97,6 +98,16 @@ def test_plan_observed_precedence_and_separate_fit_only_fidelity(tmp_path: Path)
         {cell.cell_id for cell in observed_a}
     )
     assert store.read(plan.plan_id).manifest.artifact_type == "evaluation-plan"
+
+
+def test_plan_rejects_provider_free_observed_rollout_before_write(tmp_path: Path) -> None:
+    """Observed candidate cells still require production rollouts with recorded identity.
+
+    Raises:
+        AssertionError: Planning accepts a rollout that proves no generator identity.
+    """
+    with pytest.raises(EvaluationEvidenceError, match="recorded model identity"):
+        _planned_fixture(tmp_path, provider_free=True)
 
 
 def test_plan_rejects_pricing_candidate_scope_before_write(tmp_path: Path) -> None:
@@ -391,8 +402,18 @@ def test_materialization_rejects_missing_or_plan_mismatched_pricing_before_write
 
 def _planned_fixture(
     root: Path,
+    *,
+    provider_free: bool = False,
 ) -> tuple[ArtifactStore, EvaluationPlan, dict[str, str]]:
-    """Persist ten observed fit lineages plus one sealed held-out lineage."""
+    """Persist ten observed fit lineages plus one sealed held-out lineage.
+
+    Args:
+        root: Isolated project directory.
+        provider_free: Whether observed production rollouts record no model identity.
+
+    Returns:
+        Store, frozen plan, and observed rollout IDs by task.
+    """
     store = _store(root)
     tasks = tuple(_task(f"task-fit-{index:02d}", partition="fit") for index in range(10)) + (
         _task("task-held-out", partition="held_out"),
@@ -413,6 +434,7 @@ def _planned_fixture(
                 cell_id=f"source-{task.task_id}",
                 task=task,
                 candidate=candidates[0].model,
+                provider_free=provider_free,
             ),
         )
         observed[task.task_id] = rollout_id
@@ -703,6 +725,7 @@ def _production_rollout(
     candidate_cost: float = 0.2,
     world_cost: float | None = None,
     orchestration_cost: float | None = None,
+    provider_free: bool = False,
 ) -> RolloutArtifact:
     """Build one imported production rollout with separately metered components."""
     span = RolloutSpan(
@@ -710,7 +733,7 @@ def _production_rollout(
         kind=RolloutEventKind.AGENT_MODEL_CALL,
         started_at=_TIME,
         ended_at=_TIME + timedelta(seconds=1),
-        model=candidate,
+        model=None if provider_free else candidate,
     )
     return RolloutArtifact(
         schema_version=1,
@@ -725,7 +748,10 @@ def _production_rollout(
         evidence_source="production",
         source_run_id=f"run-{rollout_id}",
         task_id=task.task_id,
-        candidate=candidate,
+        candidate=None if provider_free else candidate,
+        provider_free_source=(
+            ProviderFreeSourceProvenance(checked_span_count=1) if provider_free else None
+        ),
         agent_id="agent-a",
         simulator=ProductionSimulatorSnapshot(
             source=SourceIdentity(kind="production", source_id=f"source-{rollout_id}")

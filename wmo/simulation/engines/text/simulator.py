@@ -13,7 +13,7 @@ from wmo.common.core.artifacts import (
     FailureAttribution,
     FailureCode,
     StructuredFailure,
-    sorted_artifact_inputs,
+    sorted_unique_inputs,
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import OperationEconomics
@@ -960,15 +960,13 @@ class WorldModelSimulator:
         Raises:
             SimulationResumeError: Any stable ID, task, mode, RAG, input, or binding differs.
         """
-        expected_inputs = sorted_artifact_inputs(
-            (
-                self._plan_input,
-                self._task_set_input,
-                self._fit_rag_input,
-                binding.grounded_world_model_input,
-                binding.simulation_spec_input,
-                resolution_input,
-            )
+        expected_inputs = sorted_unique_inputs(
+            self._plan_input,
+            self._task_set_input,
+            self._fit_rag_input,
+            binding.grounded_world_model_input,
+            binding.simulation_spec_input,
+            resolution_input,
         )
         if (
             rollout.cell_id != cell.cell_id

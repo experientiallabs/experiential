@@ -10,7 +10,7 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     StructuredFailure,
     sha256_json,
-    sorted_artifact_inputs,
+    sorted_unique_inputs,
 )
 from wmo.common.evaluations import EvaluationCell
 from wmo.common.models import AssistantAction, OperationEconomics
@@ -95,15 +95,13 @@ class GroundedRolloutBuilder:
         return RolloutArtifact(
             schema_version=1,
             created_at=timestamp(self.clock),
-            inputs=sorted_artifact_inputs(
-                (
-                    self.plan_input,
-                    self.task_set_input,
-                    self.fit_rag_input,
-                    binding.grounded_world_model_input,
-                    binding.simulation_spec_input,
-                    resolution_input,
-                )
+            inputs=sorted_unique_inputs(
+                self.plan_input,
+                self.task_set_input,
+                self.fit_rag_input,
+                binding.grounded_world_model_input,
+                binding.simulation_spec_input,
+                resolution_input,
             ),
             code_revision=spec.code_revision,
             artifact_id=rollout_id,

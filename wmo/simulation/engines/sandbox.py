@@ -15,7 +15,7 @@ from wmo.common.core.artifacts import (
     StructuredFailure,
     canonical_json_bytes,
     canonical_jsonl_bytes,
-    sorted_artifact_inputs,
+    sorted_unique_inputs,
     stable_id,
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
@@ -671,13 +671,11 @@ class SandboxSimulator:
         return RolloutArtifact(
             schema_version=1,
             created_at=timestamp(self._clock),
-            inputs=sorted_artifact_inputs(
-                (
-                    self._plan_input,
-                    self._task_set_input,
-                    binding.simulation_spec_input,
-                    resolution_input,
-                )
+            inputs=sorted_unique_inputs(
+                self._plan_input,
+                self._task_set_input,
+                binding.simulation_spec_input,
+                resolution_input,
             ),
             code_revision=spec.code_revision,
             artifact_id=rollout_id,
@@ -756,13 +754,11 @@ class SandboxSimulator:
         resolution_input: ArtifactInput,
     ) -> None:
         """Require every resumed cell to match its exact task, model, environment, and inputs."""
-        expected_inputs = sorted_artifact_inputs(
-            (
-                self._plan_input,
-                self._task_set_input,
-                binding.simulation_spec_input,
-                resolution_input,
-            )
+        expected_inputs = sorted_unique_inputs(
+            self._plan_input,
+            self._task_set_input,
+            binding.simulation_spec_input,
+            resolution_input,
         )
         if (
             binding.cell_id != cell.cell_id
@@ -797,13 +793,11 @@ class SandboxSimulator:
         artifact_set = SimulationArtifactSet(
             schema_version=1,
             created_at=timestamp(self._clock),
-            inputs=sorted_artifact_inputs(
-                (
-                    self._plan_input,
-                    self._task_set_input,
-                    spec_input,
-                    resolution_input,
-                )
+            inputs=sorted_unique_inputs(
+                self._plan_input,
+                self._task_set_input,
+                spec_input,
+                resolution_input,
             ),
             code_revision=spec.code_revision,
             artifact_set_id=artifact_set_id,

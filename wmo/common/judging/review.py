@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import AwareDatetime, Field, JsonValue, field_validator, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, JsonObject, stable_id
+from wmo.common.judging.labels import root_review_object
 from wmo.common.judging.proposal import (
     RubricProposal,
     RubricProposalError,
@@ -149,7 +150,7 @@ class RubricReview:
         selected: list[RubricReviewDraft] = []
 
         def initialize(current: JsonValue | None) -> JsonObject:
-            root = _root_review_from_value(current)
+            root = root_review_object(current, error_type=RubricReviewError)
             saved = root.get("rubric_review")
             if saved is None:
                 draft = RubricReviewDraft(
@@ -572,7 +573,7 @@ class RubricReview:
         selected: list[RubricReviewDraft] = []
 
         def update(current: JsonValue | None) -> JsonObject:
-            root = _root_review_from_value(current)
+            root = root_review_object(current, error_type=RubricReviewError)
             saved = root.get("rubric_review")
             if saved is None:
                 raise RubricReviewError("rubric review draft disappeared before mutation")
@@ -629,20 +630,6 @@ class RubricReview:
         if value.tzinfo is None or value.utcoffset() is None:
             raise RubricReviewError("rubric review clock must return a timezone-aware time")
         return value
-
-
-def _root_review_from_value(review: JsonValue | None) -> JsonObject:
-    """Validate one locked review value as an object suitable for namespace updates."""
-    if review is None:
-        return {}
-    if not isinstance(review, dict):
-        raise RubricReviewError("review.json must be a JSON object")
-    root: JsonObject = {}
-    for key, value in review.items():
-        if not isinstance(key, str):
-            raise RubricReviewError("review.json must use string field names")
-        root[key] = value
-    return root
 
 
 def _validated_draft(

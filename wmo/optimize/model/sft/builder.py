@@ -17,7 +17,7 @@ from wmo.common.core.artifacts import (
     Sha256,
     canonical_json_bytes,
     sha256_json,
-    sorted_artifact_inputs,
+    sorted_unique_inputs,
     stable_id,
 )
 from wmo.common.project import (
@@ -190,7 +190,7 @@ def build_sft_dataset(
     rows = tuple(sorted(rows, key=_row_sort_key))
     exclusions = sorted(exclusions, key=_exclusion_sort_key)
 
-    all_inputs = sorted_artifact_inputs(
+    all_inputs = _sorted_inputs(
         input_item for source in prepared for input_item in source.direct_inputs
     )
     source_references = sorted(source_references, key=lambda item: (item.kind, item.source_id))
@@ -754,6 +754,11 @@ def _example_id(action: _ScannedAction) -> ArtifactId:
             }
         )
     return stable_id("sft-example", material)
+
+
+def _sorted_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactInput, ...]:
+    """Sort verified input identities and reject conflicting hashes for one artifact ID."""
+    return sorted_unique_inputs(*inputs, error_type=SFTBuildError)
 
 
 def _build_digest(

@@ -11,7 +11,7 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
     envelope_matches_manifest,
-    sorted_artifact_inputs,
+    sorted_unique_inputs,
 )
 from wmo.common.project import (
     ArtifactCorruptionError,
@@ -129,10 +129,7 @@ def sorted_verified_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactInp
     Raises:
         JudgingProvenanceError: One artifact ID is associated with conflicting manifest hashes.
     """
-    try:
-        return sorted_artifact_inputs(inputs)
-    except ValueError as exc:
-        raise JudgingProvenanceError(str(exc)) from exc
+    return sorted_unique_inputs(*inputs, error_type=JudgingProvenanceError)
 
 
 def _artifact_store(store: ProjectStore | ArtifactStore) -> ArtifactStore:

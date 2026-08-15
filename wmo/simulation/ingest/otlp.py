@@ -44,7 +44,6 @@ _OUTCOME_FAILURE_CODE_KEY = "wmo.outcome.failure.code"
 _OUTCOME_FAILURE_MESSAGE_KEY = "wmo.outcome.failure.message"
 _OUTCOME_FAILURE_RETRYABLE_KEY = "wmo.outcome.failure.retryable"
 _REQUEST_CONTEXT_KEY = "wmo.request.context"
-_REQUEST_TAGS_KEY = "wmo.request.tags"
 _CONVERSATION_KEYS = ("wmo.conversation.id", "gen_ai.conversation.id")
 
 
@@ -448,6 +447,22 @@ def _normalize_span(raw: JsonObject, attributes: JsonObject) -> TraceSpan:
         usage=usage,
         failure=failure,
     )
+
+
+def decode_otlp_attributes(raw: JsonValue, *, label: str = "OTLP attributes") -> JsonObject:
+    """Decode one OTLP key/value attribute array into a canonical attribute mapping.
+
+    Args:
+        raw: OTLP ``attributes`` array, or ``None`` for a span that declares none.
+        label: Source label used in validation messages.
+
+    Returns:
+        Decoded attribute mapping keyed by the exact source attribute names.
+
+    Raises:
+        OtlpTraceFormatError: The array, an entry, or an ``AnyValue`` is malformed.
+    """
+    return _decode_attributes(raw, label=label)
 
 
 def _decode_attributes(raw: JsonValue, *, label: str) -> JsonObject:
