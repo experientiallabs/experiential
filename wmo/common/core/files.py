@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 from pathlib import Path
 from uuid import uuid4
 
@@ -45,6 +46,8 @@ def write_bytes_atomic(path: Path, payload: bytes, *, follow_symlinks: bool = Tr
       about 0.1 s across a 200-step SFT run whose steps are minutes of paid work.
     - **The destination's mode is carried over.** `replace` installs a NEW inode, so without this
       a file an operator or an installer had restricted comes back as 0644 on the first write.
+      The mode is read without following symlinks and only from a regular file, so a destination
+      swapped for a symlink cannot choose the replacement file's permissions.
     - **A symlinked destination is written THROUGH, not replaced.** See `resolve_write_target`.
       Pass `follow_symlinks=False` for security-checked pointer files: the rename then replaces a
       swapped destination symlink itself instead of writing through it.
@@ -72,10 +75,17 @@ def write_bytes_atomic(path: Path, payload: bytes, *, follow_symlinks: bool = Tr
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        if path.exists():
+        try:
+            destination_stat = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            destination_stat = None
+        if destination_stat is not None and stat.S_ISREG(destination_stat.st_mode):
             # `replace` installs the staging inode, so the destination's mode has to be carried
-            # over explicitly or a restricted file silently widens to the umask default.
-            staging.chmod(path.stat().st_mode & 0o7777)
+            # over explicitly or a restricted file silently widens to the umask default. The
+            # no-follow stat matters under `follow_symlinks=False`: the rename replaces a swapped
+            # destination symlink itself, and copying the LINK TARGET's mode would let whoever
+            # planted the link pick the replacement file's permissions.
+            staging.chmod(destination_stat.st_mode & 0o7777)
         staging.replace(path)
     except BaseException:
         staging.unlink(missing_ok=True)  # never leave a stray staging file beside the real one

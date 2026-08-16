@@ -34,11 +34,7 @@ from wmo.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeMode
 from wmo.runtime.models.providers.retry import RetryPolicy
 from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
-from wmo.simulation.ingest.sources import (
-    CANONICAL_TRACE_SOURCES,
-    TraceSourceError,
-    load_trace_source,
-)
+from wmo.simulation.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source
 from wmo.simulation.retrieval import (
     RAGEmbedderBinding,
     RAGLineageBinding,
@@ -561,12 +557,10 @@ def _load_canonical_traces(path: Path, source: str) -> TraceNormalizationResult:
         Canonical normalized trace result.
 
     Raises:
-        typer.BadParameter: The format is unsupported or normalization fails.
+        TraceSourceError: The format is unsupported or normalization fails; the command's
+            `usage_error` boundary converts it (a `ValueError`) into `typer.BadParameter`.
     """
-    try:
-        return load_trace_source(source, path)
-    except TraceSourceError as exc:
-        raise typer.BadParameter(str(exc)) from None
+    return load_trace_source(source, path)
 
 
 def _capture_local_build_telemetry(

@@ -308,6 +308,7 @@ def test_anthropic_uses_native_tool_blocks_and_normalizes_cache_usage() -> None:
         input_tokens=10,
         output_tokens=4,
         cached_input_tokens=3,
+        cache_write_input_tokens=2,
     )
     url, headers, payload = transport.requests[0]
     assert url == "https://anthropic.fixture/v1/messages"

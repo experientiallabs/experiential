@@ -247,4 +247,5 @@ def _anthropic_usage(payload: JsonObject) -> Usage | None:
         input_tokens=input_tokens + cache_read + cache_write,
         output_tokens=require_integer(usage.get("output_tokens"), "Anthropic usage.output_tokens"),
         cached_input_tokens=cache_read,
+        cache_write_input_tokens=cache_write,
     )

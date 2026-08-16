@@ -34,7 +34,7 @@ from wmo.runtime.agents import AgentEpisode, AgentRuntime
 from wmo.runtime.agents.lifecycle import execute_agent_episode
 from wmo.runtime.environments import EnvironmentRuntime, EnvironmentSession, Observation
 from wmo.runtime.environments.harbor import HarborCleanupTimeoutError
-from wmo.simulation.engines.text.rollout_support import timestamp, utc_now
+from wmo.simulation.engines.clock import timestamp, utc_now
 
 
 class SandboxStepLimitError(RuntimeError):

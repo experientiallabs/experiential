@@ -348,6 +348,7 @@ _BOUNDED_OPTION_FIELDS = (
     "completion_maximum_attempts",
     "simulation_maximum_output_tokens",
     "maximum_judgments",
+    "maximum_concurrency",
 )
 
 

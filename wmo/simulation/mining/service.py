@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,10 +14,11 @@ from wmo.common.core.artifacts import (
     SourceIdentity,
     canonical_json_bytes,
     canonical_jsonl_bytes,
+    sha256_bytes,
     stable_id,
 )
-from wmo.common.project import ArtifactAlreadyExistsError, ArtifactStore, artifact_input
-from wmo.common.tasks import TaskCase, TaskSet, load_task_set
+from wmo.common.project import ArtifactStore, artifact_input
+from wmo.common.tasks import TaskCase, TaskSet
 from wmo.common.traces import Trace, load_trace_dataset
 from wmo.simulation.mining.bindings import (
     TaskSetLineageBindings,
@@ -257,20 +257,10 @@ def persist_task_set(
         task_set_id=task_set_id,
         task_ids=tuple(task.task_id for task in result.tasks),
         tasks_path="tasks.jsonl",
-        tasks_sha256=hashlib.sha256(task_payload).hexdigest(),
+        tasks_sha256=sha256_bytes(task_payload),
         coverage_path="coverage.json",
-        coverage_sha256=hashlib.sha256(coverage_payload).hexdigest(),
+        coverage_sha256=sha256_bytes(coverage_payload),
     )
-    destination = store.project_directory / "artifacts" / task_set_id
-    if destination.exists():
-        loaded = load_task_set(store, task_set_id)
-        replay = task_set.model_copy(update={"created_at": loaded.task_set.created_at})
-        if loaded.task_set != replay or loaded.tasks != result.tasks:
-            raise ValueError("existing task set differs from replayed mining evidence")
-        if store.read_bytes(task_set_id, "coverage.json") != coverage_payload:
-            raise ValueError("existing task-set coverage differs from replayed mining evidence")
-        _require_lineage_replay(store, task_set_id, lineage_payload)
-        return loaded.task_set
     files = {
         "tasks.jsonl": task_payload,
         "coverage.json": coverage_payload,
@@ -279,53 +269,17 @@ def persist_task_set(
     if lineage_payload is not None:
         files["lineage-bindings.json"] = lineage_payload
     try:
-        store.write(
+        stored, _ = store.write_or_replay(
             artifact_id=task_set_id,
             artifact_type="task-set",
             envelope=task_set,
+            envelope_path="task-set.json",
+            envelope_type=TaskSet,
             files=files,
         )
-    except ArtifactAlreadyExistsError:
-        loaded = load_task_set(store, task_set_id)
-        replay = task_set.model_copy(update={"created_at": loaded.task_set.created_at})
-        if loaded.task_set != replay or loaded.tasks != result.tasks:
-            raise ValueError("existing task set differs from replayed mining evidence") from None
-        if store.read_bytes(task_set_id, "coverage.json") != coverage_payload:
-            raise ValueError(
-                "existing task-set coverage differs from replayed mining evidence"
-            ) from None
-        _require_lineage_replay(store, task_set_id, lineage_payload)
-        return loaded.task_set
-    return task_set
-
-
-def _require_lineage_replay(
-    store: ArtifactStore,
-    task_set_id: str,
-    expected_payload: bytes | None,
-) -> None:
-    """Verify that replay preserves the complete optional lineage payload.
-
-    Args:
-        store: Project artifact store owning the existing task set.
-        task_set_id: Existing immutable task-set identity.
-        expected_payload: Canonical payload expected for a built task set, or None for legacy
-            source-free persistence.
-
-    Raises:
-        ValueError: Existing lineage evidence differs from the replay.
-    """
-    paths = {entry.path for entry in store.read(task_set_id).manifest.files}
-    has_payload = "lineage-bindings.json" in paths
-    if expected_payload is None:
-        if has_payload:
-            raise ValueError("existing task set unexpectedly contains lineage bindings")
-        return
-    if (
-        not has_payload
-        or store.read_bytes(task_set_id, "lineage-bindings.json") != expected_payload
-    ):
-        raise ValueError("existing task-set lineage bindings differ from replayed mining evidence")
+    except ValueError as exc:
+        raise ValueError("existing task set differs from replayed mining evidence") from exc
+    return stored
 
 
 def _require_complete_source_bindings(

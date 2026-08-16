@@ -15,8 +15,8 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.project import ArtifactAlreadyExistsError, ArtifactCorruptionError, ArtifactStore
 from wmo.common.rollouts import RolloutArtifact, SimulationArtifactSet
+from wmo.simulation.engines.clock import timestamp
 from wmo.simulation.engines.text.errors import SimulationResumeError
-from wmo.simulation.engines.text.rollout_support import timestamp
 from wmo.simulation.specs import SimulationSpec
 
 _ARTIFACT_SET_FILE = "artifact-set.json"

@@ -119,6 +119,22 @@ def test_envelope_matches_manifest_compares_the_five_shared_provenance_fields() 
     )
 
 
+def test_envelope_matches_manifest_covers_every_base_envelope_field() -> None:
+    """Growing `ArtifactEnvelope` must grow the predicate, or replay verification silently thins.
+
+    `envelope_matches_manifest` hand-enumerates the shared provenance fields, so a new base field
+    would be persisted and mirrored into manifests yet never compared. This pin turns that silent
+    gap into a failing test naming the function to extend.
+    """
+    assert set(ArtifactEnvelope.model_fields) == {
+        "schema_version",
+        "created_at",
+        "inputs",
+        "code_revision",
+        "source",
+    }, "ArtifactEnvelope grew a field: add it to envelope_matches_manifest and this pin"
+
+
 def test_source_identity_and_secret_boundary_round_trip() -> None:
     """Source provenance serializes, while credential values and references do not."""
     envelope = ArtifactEnvelope(

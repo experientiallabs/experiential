@@ -8,6 +8,7 @@ from openai.types.responses import (
     Response,
     ResponseFunctionToolCall,
     ResponseOutputMessage,
+    ResponseOutputRefusal,
     ResponseOutputText,
     ResponseReasoningItem,
     ResponseUsage,
@@ -118,10 +119,16 @@ def openai_responses_response(
     tool_calls: list[ToolCall] = []
     for index, item in enumerate(parsed.output):
         if isinstance(item, ResponseOutputMessage):
-            text_parts.extend(
-                part.text if isinstance(part, ResponseOutputText) else part.refusal
-                for part in item.content
-            )
+            for part in item.content:
+                if isinstance(part, ResponseOutputText):
+                    text_parts.append(part.text)
+                elif isinstance(part, ResponseOutputRefusal):
+                    text_parts.append(part.refusal)
+                else:
+                    raise ProviderResponseError(
+                        f"OpenAI Responses output[{index}] has unsupported content type "
+                        f"{type(part).__name__!r}"
+                    )
         elif isinstance(item, ResponseFunctionToolCall):
             tool_calls.append(_tool_call(item, index))
         elif isinstance(item, ResponseReasoningItem):

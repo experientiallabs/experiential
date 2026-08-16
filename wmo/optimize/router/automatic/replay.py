@@ -8,6 +8,7 @@ from typing import cast
 
 from wmo.common.core.artifacts import ArtifactId, ArtifactInput, envelope_matches_manifest
 from wmo.common.evaluations.evidence import read_evaluation_plan
+from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import (
     Embedding,
     ModelCapabilities,
@@ -466,11 +467,15 @@ def _load_policy(project: ProjectStore, artifact_id: ArtifactId) -> KnnRouterPol
     Raises:
         AutomaticRouterReplayError: Policy identity or envelope differs.
     """
-    stored = project.artifacts.read(artifact_id)
-    policy = KnnRouterPolicy.model_validate_json(
-        project.artifacts.read_bytes(artifact_id, "policy.json")
+    policy, _ = read_artifact_json(
+        project,
+        artifact_id=artifact_id,
+        expected_artifact_type="router-policy",
+        relative_path="policy.json",
+        model_type=KnnRouterPolicy,
+        error=AutomaticRouterReplayError,
     )
-    if policy.policy_id != artifact_id or not envelope_matches_manifest(policy, stored.manifest):
+    if policy.policy_id != artifact_id:
         raise AutomaticRouterReplayError("router replay policy differs from its manifest")
     return policy
 

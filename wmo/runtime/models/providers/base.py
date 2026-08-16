@@ -32,7 +32,6 @@ class ProviderHttpClient(abc.ABC):
         transport: JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-        extra_headers: Mapping[str, str] | None = None,
     ) -> None:
         """Create a client with a single explicit endpoint and credential.
 
@@ -43,7 +42,6 @@ class ProviderHttpClient(abc.ABC):
             transport: Optional deterministic transport used by tests.
             retry_policy: Bounded same-endpoint retry policy.
             timeout_seconds: Timeout for every transport attempt.
-            extra_headers: Provider-specific non-secret headers.
         """
         if not api_key:
             raise ValueError(f"{type(self).__name__} requires a non-empty API key")
@@ -55,7 +53,6 @@ class ProviderHttpClient(abc.ABC):
         self._transport = transport or HttpxJsonTransport()
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
-        self._extra_headers = {**self.default_headers, **dict(extra_headers or {})}
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one non-streaming request through the provider's completion route.
@@ -75,7 +72,7 @@ class ProviderHttpClient(abc.ABC):
         return {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
-            **self._extra_headers,
+            **self.default_headers,
         }
 
     def _post(self, path: str, payload: JsonObject) -> JsonObject:

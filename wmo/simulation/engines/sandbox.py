@@ -15,6 +15,7 @@ from wmo.common.core.artifacts import (
     StructuredFailure,
     canonical_json_bytes,
     canonical_jsonl_bytes,
+    sha256_bytes,
     sorted_unique_inputs,
     stable_id,
 )
@@ -39,6 +40,7 @@ from wmo.common.rollouts import (
 from wmo.common.tasks import LoadedTaskSet, load_task_set
 from wmo.runtime.agents import AgentEpisode, AgentRuntime
 from wmo.runtime.environments import EnvironmentRuntime
+from wmo.simulation.engines.clock import timestamp, utc_now
 from wmo.simulation.engines.sandbox_bindings import (
     SANDBOX_SIMULATOR_ID,
     CandidateBinding,
@@ -62,7 +64,6 @@ from wmo.simulation.engines.text.leases import (
     TextCellLeaseState,
     TextCellLeaseStore,
 )
-from wmo.simulation.engines.text.rollout_support import timestamp, utc_now
 from wmo.simulation.orchestration import require_implemented_mode
 from wmo.simulation.specs import SimulationSpec
 
@@ -676,6 +677,7 @@ class SandboxSimulator:
                 self._task_set_input,
                 binding.simulation_spec_input,
                 resolution_input,
+                error_type=SandboxSimulationError,
             ),
             code_revision=spec.code_revision,
             artifact_id=rollout_id,
@@ -759,6 +761,7 @@ class SandboxSimulator:
             self._task_set_input,
             binding.simulation_spec_input,
             resolution_input,
+            error_type=SandboxSimulationError,
         )
         if (
             binding.cell_id != cell.cell_id
@@ -798,41 +801,34 @@ class SandboxSimulator:
                 self._task_set_input,
                 spec_input,
                 resolution_input,
+                error_type=SandboxSimulationError,
             ),
             code_revision=spec.code_revision,
             artifact_set_id=artifact_set_id,
             simulation_id=spec.simulation_id,
             artifact_ids=artifact_ids,
             artifacts_path=_ARTIFACT_IDS_FILE,
-            artifacts_sha256=hashlib.sha256(payload).hexdigest(),
+            artifacts_sha256=sha256_bytes(payload),
         )
         try:
-            self._store.write(
+            existing, _ = self._store.write_or_replay(
                 artifact_id=artifact_set_id,
                 artifact_type="simulation-artifact-set",
                 envelope=artifact_set,
+                envelope_path=_ARTIFACT_SET_FILE,
+                envelope_type=SimulationArtifactSet,
                 files={
                     _ARTIFACT_SET_FILE: canonical_json_bytes(artifact_set),
                     _ARTIFACT_IDS_FILE: payload,
                 },
             )
-            return artifact_set
-        except ArtifactAlreadyExistsError as exc:
-            stored = self._store.read(artifact_set_id)
-            try:
-                existing = SimulationArtifactSet.model_validate_json(
-                    self._store.read_bytes(artifact_set_id, _ARTIFACT_SET_FILE)
-                )
-            except (ArtifactCorruptionError, ValueError) as error:
-                raise SandboxResumeError("sandbox artifact set is invalid") from error
-            same_content = (
-                existing.model_copy(update={"created_at": artifact_set.created_at}) == artifact_set
-            )
-            if stored.manifest.artifact_type != "simulation-artifact-set" or not same_content:
-                raise SandboxResumeError(
-                    f"artifact set ID {artifact_set_id!r} names different rollout evidence"
-                ) from exc
-            return existing
+        except ArtifactCorruptionError as error:
+            raise SandboxResumeError("sandbox artifact set is invalid") from error
+        except ValueError as exc:
+            raise SandboxResumeError(
+                f"artifact set ID {artifact_set_id!r} names different rollout evidence"
+            ) from exc
+        return existing
 
 
 def _terminal_state(

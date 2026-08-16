@@ -58,6 +58,10 @@ __all__ = [
 def __getattr__(name: str) -> object:
     """Resolve one Pi export without loading the router HTTP stack at package import.
 
+    The laziness is load-bearing, not a convenience: `wmo/cli/startup_test.py` pins the CLI
+    import to stay free of heavy third parties (fastapi arrives with the router endpoint that
+    the Pi adapter reuses), so the adapter loads on first attribute access instead.
+
     Args:
         name: Package attribute requested by Python.
 

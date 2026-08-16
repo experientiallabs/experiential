@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Literal
@@ -15,6 +14,7 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
     canonical_jsonl_bytes,
     envelope_matches_manifest,
+    sha256_bytes,
     stable_id,
 )
 from wmo.common.evaluations.dataset import (
@@ -164,7 +164,7 @@ def build_evaluation_dataset(
             "version": "evaluation-dataset-v1",
             "inputs": [item.model_dump(mode="json") for item in inputs],
             "plan": plan_input.model_dump(mode="json"),
-            "rows_sha256": hashlib.sha256(rows_payload).hexdigest(),
+            "rows_sha256": sha256_bytes(rows_payload),
             "protocols": [item.model_dump(mode="json") for item in ordered_protocols],
             "fidelity_reports": [
                 reports[report_id].model_dump(mode="json") for report_id in report_ids
@@ -186,7 +186,7 @@ def build_evaluation_dataset(
         protocols=ordered_protocols,
         fidelity_report_ids=report_ids,
         rows_path="rows.jsonl",
-        rows_sha256=hashlib.sha256(rows_payload).hexdigest(),
+        rows_sha256=sha256_bytes(rows_payload),
     )
     dataset = EvaluationDataset(manifest=manifest, rows=rows)
     destination = store.project_directory / "artifacts" / evaluation_id
@@ -234,7 +234,7 @@ def load_evaluation_dataset(store: ArtifactStore, evaluation_id: ArtifactId) -> 
                 "evaluation data envelope differs from its artifact manifest"
             )
         rows_payload = store.read_bytes(evaluation_id, manifest.rows_path)
-        if hashlib.sha256(rows_payload).hexdigest() != manifest.rows_sha256:
+        if sha256_bytes(rows_payload) != manifest.rows_sha256:
             raise EvaluationEvidenceError("evaluation rows digest does not match its manifest")
         rows = tuple(
             EvaluationRow.model_validate_json(line)

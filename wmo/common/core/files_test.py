@@ -295,6 +295,29 @@ def test_write_bytes_atomic_no_follow_replaces_a_swapped_destination_symlink(
     assert target.read_bytes() == b"original"
 
 
+def test_write_bytes_atomic_no_follow_ignores_the_swapped_link_targets_mode(
+    tmp_path: Path,
+) -> None:
+    """The mode carryover must not stat THROUGH a swapped link whose target mode is hostile.
+
+    Whoever plants the link picks the target, so copying the target's mode lets them pick the new
+    pointer file's permissions — a 0o000 target leaves the pointer written but unreadable, wedging
+    the immediate read-back every pointer writer performs. The link is not a regular file, so no
+    mode is carried over and the pointer keeps the staging file's default.
+    """
+    target = tmp_path / "victim.json"
+    target.write_bytes(b"original")
+    target.chmod(0o000)
+    pointer = tmp_path / "pointer.json"
+    pointer.symlink_to(target)
+
+    write_bytes_atomic(pointer, b"selection", follow_symlinks=False)
+
+    assert not pointer.is_symlink()
+    assert pointer.stat().st_mode & 0o777 != 0o000, "the link target's mode leaked onto the pointer"
+    assert pointer.read_bytes() == b"selection"
+
+
 def test_write_text_atomic_stages_beside_the_symlink_target_not_the_link(tmp_path: Path) -> None:
     """Atomicity depends on this: `replace` across filesystems fails with EXDEV.
 

@@ -65,22 +65,22 @@ def require_string(value: JsonValue | None, label: str) -> str:
     return value
 
 
-def require_integer(value: JsonValue | None, label: str, *, default: int = 0) -> int:
-    """Read an optional non-negative response integer or the documented omitted default.
+def require_integer(value: JsonValue | None, label: str) -> int:
+    """Read an optional non-negative response integer, counting an absent field as zero.
 
     Args:
         value: Decoded response value to validate.
         label: Provider-prefixed wire location used in the error message.
-        default: Value substituted when the field is absent.
 
     Returns:
-        The value when it is a non-negative integer, or the default when absent.
+        The value when it is a non-negative integer, or zero when absent, because providers
+        omit usage fields whose count is zero.
 
     Raises:
         ProviderResponseError: The value is present but not a non-negative integer.
     """
     if value is None:
-        return default
+        return 0
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ProviderResponseError(f"{label} must be a non-negative integer")
     return value

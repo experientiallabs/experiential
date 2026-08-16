@@ -12,12 +12,13 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     Sha256,
+    canonical_json_bytes,
     stable_id,
 )
 from wmo.common.judging.provenance import JudgingProvenanceError, resolve_artifact
 from wmo.common.judging.rubric import RubricDimension
 from wmo.common.models import ModelSnapshot
-from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
+from wmo.common.project import ArtifactCorruptionError, ProjectStore
 
 
 class RubricProposalError(ValueError):
@@ -195,39 +196,20 @@ def write_rubric_proposal_evidence(
         proposal=proposal,
     )
     try:
-        store.artifacts.write_json(
+        stored, _ = store.artifacts.write_or_replay(
             artifact_id=evidence.proposal_evidence_id,
             artifact_type="rubric-proposal-evidence",
             envelope=evidence,
-            files={"proposal.json": evidence},
+            envelope_path="proposal.json",
+            envelope_type=RubricProposalEvidence,
+            files={"proposal.json": canonical_json_bytes(evidence)},
         )
-    except ArtifactAlreadyExistsError:
-        try:
-            stored = RubricProposalEvidence.model_validate_json(
-                store.artifacts.read_bytes(evidence.proposal_evidence_id, "proposal.json")
-            )
-        except ValueError as exc:
-            raise RubricProposalError(
-                "existing rubric proposal evidence cannot be resumed safely"
-            ) from exc
-        if not _same_proposal_evidence_identity(stored, evidence):
-            raise RubricProposalError(
-                "existing rubric proposal evidence conflicts with this proposal"
-            ) from None
-        return stored
-    return evidence
-
-
-def _same_proposal_evidence_identity(
-    left: RubricProposalEvidence, right: RubricProposalEvidence
-) -> bool:
-    """Compare stable proposal evidence while permitting a retry at a later clock time."""
-    return (
-        left.schema_version == right.schema_version
-        and left.proposal_evidence_id == right.proposal_evidence_id
-        and left.source_task_set_id == right.source_task_set_id
-        and left.proposal == right.proposal
-        and left.inputs == right.inputs
-        and left.code_revision == right.code_revision
-        and left.source == right.source
-    )
+    except ArtifactCorruptionError as exc:
+        raise RubricProposalError(
+            "existing rubric proposal evidence cannot be resumed safely"
+        ) from exc
+    except ValueError as exc:
+        raise RubricProposalError(
+            "existing rubric proposal evidence conflicts with this proposal"
+        ) from exc
+    return stored

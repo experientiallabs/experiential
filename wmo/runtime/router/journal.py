@@ -239,7 +239,7 @@ class RuntimeInteractionJournal:
             raise ValueError("stale_after must be positive")
         with file_write_lock(self.path, what="the routed-interaction journal"):
             events = list(self._read_unlocked())
-            states = _validate_events(events)
+            states = validate_events(events)
             state = states.get(identity.interaction_id)
             if state is None:
                 if acceptance is None:
@@ -299,7 +299,7 @@ class RuntimeInteractionJournal:
         _require_timezone(failed_at)
         with file_write_lock(self.path, what="the routed-interaction journal"):
             events = list(self._read_unlocked())
-            state = _validate_events(events).get(accepted.interaction_id)
+            state = validate_events(events).get(accepted.interaction_id)
             if state is None or accepted not in events:
                 raise RuntimeJournalError(
                     "cannot fail an interaction attempt that was not accepted"
@@ -335,7 +335,7 @@ class RuntimeInteractionJournal:
         _require_timezone(completed_at)
         with file_write_lock(self.path, what="the routed-interaction journal"):
             events = list(self._read_unlocked())
-            state = _validate_events(events).get(accepted.interaction_id)
+            state = validate_events(events).get(accepted.interaction_id)
             if state is None or accepted not in events:
                 raise RuntimeJournalError(
                     "cannot complete an interaction attempt that was not accepted"
@@ -384,7 +384,7 @@ class RuntimeInteractionJournal:
                 raise RuntimeJournalError(
                     f"runtime journal has invalid interior line {index}"
                 ) from exc
-        _validate_events(events)
+        validate_events(events)
         return tuple(events)
 
     def _append_unlocked(self, event: RuntimeJournalEvent) -> None:
@@ -673,7 +673,7 @@ def _event_content_id(event: RuntimeJournalEvent) -> str:
     return stable_id("runtime-event", material)
 
 
-def _validate_events(
+def validate_events(
     events: list[RuntimeJournalEvent] | tuple[RuntimeJournalEvent, ...],
 ) -> dict[str, _InteractionState]:
     """Validate global order, content digests, and every interaction transition."""
@@ -724,7 +724,7 @@ def _validate_events(
                     raise RuntimeJournalError("accepted retry follows a permanent failure")
                 if event.attempt_ordinal != state.accepted.attempt_ordinal + 1:
                     raise RuntimeJournalError("interaction attempt ordinals are not contiguous")
-                if _acceptance_pins(event) != _acceptance_pins(state.accepted):
+                if acceptance_pins(event) != acceptance_pins(state.accepted):
                     raise RuntimeJournalError("retry drifted from the original accepted pins")
             states[event.interaction_id] = _InteractionState(event, None)
             accepted_attempts[(event.interaction_id, event.attempt_ordinal)] = event
@@ -764,7 +764,7 @@ def _validate_events(
     return states
 
 
-def _acceptance_pins(event: RuntimeAcceptedEvent) -> tuple[object, ...]:
+def acceptance_pins(event: RuntimeAcceptedEvent) -> tuple[object, ...]:
     """Return fields that retries must preserve exactly."""
     return (event.identity, event.acceptance, event.received_at)
 

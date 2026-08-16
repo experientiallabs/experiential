@@ -19,7 +19,7 @@ from tempfile import TemporaryDirectory
 from typing import cast
 from urllib.parse import unquote, urlparse
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ConfigDict, TypeAdapter, ValidationError, field_validator
 
 from wmo.common.core.artifacts import (
     FailureAttribution,
@@ -39,11 +39,68 @@ from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase, ToolSchema
 from wmo.runtime.agents.interface import AgentEpisode
 from wmo.runtime.environments import EnvironmentSession, Observation
-from wmo.runtime.router.endpoint import HttpMessage, chat_completion, model_messages
+from wmo.runtime.router.endpoint import (
+    HttpFunctionCall,
+    HttpMessage,
+    HttpTextPart,
+    HttpToolCall,
+    chat_completion,
+    model_messages,
+)
 from wmo.runtime.router.streaming import chat_stream
 
 _JSON_OBJECT = TypeAdapter(JsonObject)
-_HTTP_MESSAGES = TypeAdapter(tuple[HttpMessage, ...])
+
+
+class _PiToolFunction(HttpFunctionCall):
+    """Pi-tolerant function payload: unknown keys are ignored and absent arguments mean `{}`.
+
+    The installed Pi CLI is versioned independently, so the bridge accepts every OpenAI-legal
+    message the router's strict public schema would reject rather than aborting the episode.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    arguments: str = "{}"
+
+
+class _PiToolCall(HttpToolCall):
+    """Pi-tolerant assistant tool call carrying the tolerant function payload."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    function: _PiToolFunction
+
+
+class _PiTextPart(HttpTextPart):
+    """Pi-tolerant text content part: unknown keys are ignored."""
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class _PiMessage(HttpMessage):
+    """Pi-tolerant OpenAI message: unknown keys are ignored and a null tool_calls means none."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    content: str | tuple[_PiTextPart, ...] | None = None
+    tool_calls: tuple[_PiToolCall, ...] = ()
+
+    @field_validator("tool_calls", mode="before")
+    @classmethod
+    def _null_tool_calls_mean_none(cls, value: object) -> object:
+        """Treat an explicit `"tool_calls": null` exactly like an absent list.
+
+        Args:
+            value: Raw wire value for the tool_calls field.
+
+        Returns:
+            An empty tuple for null, otherwise the value unchanged.
+        """
+        return () if value is None else value
+
+
+_HTTP_MESSAGES = TypeAdapter(tuple[_PiMessage, ...])
 _DETERMINISTIC_EVENT_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _WMO_PI_PROVIDER = "wmo-injected"
 _WMO_PI_MODEL = "wmo-injected-model"
@@ -353,10 +410,16 @@ class _PiBridgeRequestHandler(BaseHTTPRequestHandler):
             body = "".join(chat_stream(completion)).encode("utf-8")
             self._write_body(HTTPStatus.OK, "text/event-stream", body)
             return
+        body_object = completion.model_dump(mode="json", exclude_none=True)
+        for choice in body_object.get("choices", ()):
+            if isinstance(choice, dict) and isinstance(choice.get("message"), dict):
+                # Real OpenAI completions always carry the content key, null for tool-call-only
+                # replies; a strict Pi-side parser must not lose it to exclude_none.
+                choice["message"].setdefault("content", None)
         self._write_body(
             HTTPStatus.OK,
             "application/json",
-            completion.model_dump_json(exclude_none=True).encode("utf-8"),
+            json.dumps(body_object, separators=(",", ":")).encode("utf-8"),
         )
 
     def _write_tool_result(self, tool_name: str, payload: JsonObject) -> None:

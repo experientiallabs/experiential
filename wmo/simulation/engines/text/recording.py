@@ -35,13 +35,13 @@ from wmo.common.models import (
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.models import ResolvedModel
+from wmo.simulation.engines.clock import timestamp
 from wmo.simulation.engines.text.prompt import (
     TextWorldModelProtocolError,
     TextWorldModelTransition,
     text_prompt_sha256,
 )
 from wmo.simulation.engines.text.redaction import redact_json
-from wmo.simulation.engines.text.rollout_support import timestamp
 from wmo.simulation.retrieval import RAGAction, RAGQuery
 
 if TYPE_CHECKING:

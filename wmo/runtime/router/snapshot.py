@@ -42,8 +42,8 @@ from wmo.runtime.router.journal import (
     RuntimeInteractionJournal,
     RuntimeJournalError,
     RuntimeJournalEvent,
-    _acceptance_pins,
-    _validate_events,
+    acceptance_pins,
+    validate_events,
 )
 
 _SNAPSHOT_ARTIFACT_TYPE = "runtime-trace-snapshot"
@@ -150,8 +150,8 @@ class RuntimeTraceInteraction(ContractModel):
         attempt_ordinals = tuple(event.attempt_ordinal for event in accepted)
         if attempt_ordinals != tuple(range(1, len(accepted) + 1)):
             raise ValueError("runtime interaction attempt ordinals must be contiguous")
-        original_pins = _acceptance_pins(accepted[0])
-        if any(_acceptance_pins(event) != original_pins for event in accepted[1:]):
+        original_pins = acceptance_pins(accepted[0])
+        if any(acceptance_pins(event) != original_pins for event in accepted[1:]):
             raise ValueError("runtime interaction retry pins differ from the original acceptance")
         completed_attempts = tuple(
             attempt
@@ -355,7 +355,7 @@ def seal_runtime_trace_snapshot(
         failed_attempt_count=failed_attempt_count,
     )
     traces = _derive_traces(interactions, snapshot)
-    loaded_snapshot = _persist_snapshot(store, snapshot, interactions_payload)
+    loaded_snapshot = _persist_snapshot(store, snapshot, interactions, interactions_payload)
     dataset, dataset_manifest = _persist_dataset(
         store,
         traces,
@@ -472,7 +472,7 @@ def _select_prefix(
             f"last_ordinal must be between 1 and {len(events)} inclusive"
         )
     prefix = events[:last_ordinal]
-    _validate_events(prefix)
+    validate_events(prefix)
     return prefix
 
 
@@ -687,24 +687,30 @@ def routed_task_text(accepted: RuntimeAcceptedEvent) -> str:
 def _persist_snapshot(
     store: ArtifactStore,
     snapshot: RuntimeTraceSnapshot,
+    interactions: tuple[RuntimeTraceInteraction, ...],
     interactions_payload: bytes,
 ) -> LoadedRuntimeTraceSnapshot:
-    """Write a new prefix snapshot or return its exact existing materialization.
+    """Write a new prefix snapshot or adopt its exact existing materialization.
+
+    `write_or_replay` proves the stored artifact holds exactly `interactions_payload` and this
+    envelope (modulo the adopted materialization time), so the caller's already-validated
+    interactions ARE the stored records and nothing needs to be reloaded or re-parsed.
 
     Args:
         store: Project artifact store receiving the snapshot.
         snapshot: Validated immutable snapshot envelope.
+        interactions: Validated interaction records serialized into `interactions_payload`.
         interactions_payload: Canonical serialized interaction records.
 
     Returns:
-        Fully reloaded and verified snapshot materialization.
+        The persisted or byte-verified existing snapshot materialization.
 
     Raises:
         RuntimeTraceSnapshotError: An existing snapshot differs from exact replay.
         ArtifactStoreError: A new artifact cannot be persisted safely.
     """
     try:
-        store.write_or_replay(
+        envelope, manifest = store.write_or_replay(
             artifact_id=snapshot.snapshot_id,
             artifact_type=_SNAPSHOT_ARTIFACT_TYPE,
             envelope=snapshot,
@@ -719,7 +725,9 @@ def _persist_snapshot(
         raise RuntimeTraceSnapshotError(
             f"existing runtime trace snapshot differs from the journal prefix replay: {exc}"
         ) from exc
-    return load_runtime_trace_snapshot(store, snapshot.snapshot_id)
+    return LoadedRuntimeTraceSnapshot(
+        snapshot=envelope, manifest=manifest, interactions=interactions
+    )
 
 
 def _persist_dataset(
@@ -848,7 +856,7 @@ def _events_from_interactions(
             events.append(attempt.accepted)
             events.extend(attempt.terminal_events)
     events.sort(key=lambda event: event.ordinal)
-    _validate_events(events)
+    validate_events(events)
     expected_interaction_ids = tuple(
         dict.fromkeys(
             event.interaction_id for event in events if isinstance(event, RuntimeAcceptedEvent)
