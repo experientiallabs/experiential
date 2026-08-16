@@ -12,6 +12,7 @@ permissions:
 jobs:
   gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -24,11 +25,29 @@ jobs:
       - name: ty check
         run: uv run ty check
       - name: non-live tests
-        run: uv run pytest -n 4 --dist worksteal -q -k "not live"
+        # Dedicated jobs below own the expensive release and W16 evidence cases.
+        run: >-
+          uv run pytest -n 4 --dist worksteal -q -k "not live"
+          --ignore=wmo/optimize/router/composition_evidence_test.py
+          --ignore=wmo/simulation/comparison_evidence_test.py
+          --deselect=wmo/release_test.py::test_installed_wheel_no_spend_release_evidence
+
+  installed-wheel-release-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
+      - name: Installed-wheel no-spend release evidence
+        run: >-
+          uv run pytest -q
+          wmo/release_test.py::test_installed_wheel_no_spend_release_evidence
 
   w16-darwin-evidence:
     runs-on: macos-latest
-    timeout-minutes: 15
+    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
