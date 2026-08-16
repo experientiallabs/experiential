@@ -219,6 +219,78 @@ def test_structured_input_rejects_openai_compatible_without_capabilities(tmp_pat
     assert not (tmp_path / ".wmo" / "models.toml").exists()
 
 
+def test_noninteractive_setup_accepts_azure_and_bedrock_connections(tmp_path: Path) -> None:
+    """Azure and Bedrock connections persist secret-free catalog fields only."""
+    root = tmp_path / ".wmo"
+    azure = json.dumps(
+        {
+            "name": "azure",
+            "provider": "azure",
+            "api_key_env": "AZURE_OPENAI_API_KEY",
+            "base_url": "https://resource.openai.azure.com",
+            "api_version": "v1",
+        }
+    )
+    bedrock = json.dumps({"name": "bedrock", "provider": "bedrock", "region": "us-east-1"})
+    completion = json.dumps(
+        {
+            "alias": "gpt",
+            "connection": "azure",
+            "model": "gpt-deployment",
+            "supports_completions": True,
+            "input_cost_per_million_tokens_usd": 0,
+            "output_cost_per_million_tokens_usd": 0,
+            "cached_input_cost_per_million_tokens_usd": 0,
+            "cache_write_cost_per_million_tokens_usd": 0,
+        }
+    )
+    embed = json.dumps(
+        {
+            "alias": "titan",
+            "connection": "bedrock",
+            "model": "amazon.titan-embed-text-v2:0",
+            "supports_embeddings": True,
+            "input_cost_per_million_tokens_usd": 0,
+        }
+    )
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(root),
+            "--non-interactive",
+            "--connection-json",
+            azure,
+            "--connection-json",
+            bedrock,
+            "--model-json",
+            completion,
+            "--model-json",
+            embed,
+            "--world-model",
+            "gpt",
+            "--judge",
+            "gpt",
+            "--embedder",
+            "titan",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    catalog = load_model_catalog(root / "models.toml")
+    assert catalog.connections["azure"].api_version == "v1"
+    assert catalog.connections["bedrock"].region == "us-east-1"
+    assert catalog.connections["bedrock"].api_key_env is None
+    assert catalog.models["gpt"].model == "gpt-deployment"
+    assert catalog.models["titan"].model == "amazon.titan-embed-text-v2:0"
+    text = (root / "models.toml").read_text(encoding="utf-8")
+    assert "AZURE_OPENAI_API_KEY" in text
+    assert "sk-" not in text
+
+
 def test_interactive_final_rejection_writes_no_catalog(tmp_path: Path) -> None:
     """All answers remain in memory until the user confirms the complete summary.
 
@@ -230,7 +302,7 @@ def test_interactive_final_rejection_writes_no_catalog(tmp_path: Path) -> None:
         app,
         ["config", "providers", "--root", str(root)],
         input=(
-            "y\n\n\nn\nn\nn\nn\nn\nopenai\nall\nmodel-id\nn\ny\ny\nn\nn\nn\n0\nn\nall\ny\nall\nn\n"
+            "y\n\n\nn\nn\nn\nn\nn\nn\nn\nopenai\nall\nmodel-id\nn\ny\ny\nn\nn\nn\n0\nn\nall\ny\nall\nn\n"
         ),
     )
 

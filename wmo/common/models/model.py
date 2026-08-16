@@ -37,11 +37,16 @@ class RoutedCandidateSnapshot(ContractModel):
 
 
 class Usage(ContractModel):
-    """Provider-neutral token accounting for one operation."""
+    """Provider-neutral token accounting for one operation.
+
+    Cache-read and cache-write counts are subsets of ``input_tokens`` when present. They never
+    replace the total input count and must not be added a second time by callers.
+    """
 
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
+    cache_write_input_tokens: int | None = Field(default=None, ge=0)
 
 
 class NumericMeasurement(ContractModel):

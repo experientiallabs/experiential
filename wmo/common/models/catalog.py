@@ -24,7 +24,10 @@ from wmo.common.core.files import write_text_atomic
 from wmo.common.models.model import ModelCapabilities, ModelSnapshot
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
+_AWS_REGION_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openrouter", "tinker"})
+_EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible"})
 
 
 def _normalize_base_url(value: str) -> str:
@@ -56,6 +59,8 @@ class ConnectionConfig(ContractModel):
     provider: str = Field(min_length=1, max_length=128)
     base_url: str | None = Field(default=None, max_length=2_048)
     api_key_env: str | None = Field(default=None, max_length=256)
+    api_version: str | None = Field(default=None, max_length=64)
+    region: str | None = Field(default=None, max_length=64)
 
     @field_validator("api_key_env")
     @classmethod
@@ -86,8 +91,48 @@ class ConnectionConfig(ContractModel):
                 f"native provider {self.provider!r} uses its built-in official endpoint; "
                 "use provider='openai-compatible' for a trusted custom endpoint"
             )
+        if self.provider == "azure":
+            if self.base_url is None:
+                raise ValueError("azure requires an explicit resource endpoint in base_url")
+            if self.api_key_env is None:
+                raise ValueError("azure requires api_key_env")
+            if self.api_version is None:
+                raise ValueError(
+                    "azure requires an explicit api_version such as 'v1' or a dated Azure "
+                    "OpenAI version"
+                )
+            if not _AZURE_API_VERSION.fullmatch(self.api_version):
+                raise ValueError(
+                    "azure api_version must be 'v1' or a dated Azure OpenAI version such as "
+                    "2024-10-21"
+                )
+            if self.region is not None:
+                raise ValueError("region is only accepted for provider='bedrock'")
+        elif self.provider == "bedrock":
+            if self.api_key_env is not None:
+                raise ValueError(
+                    "bedrock authenticates through the AWS credential chain and rejects api_key_env"
+                )
+            if self.base_url is not None:
+                raise ValueError("bedrock does not accept base_url")
+            if self.api_version is not None:
+                raise ValueError("api_version is only accepted for provider='azure'")
+            if self.region is not None and not _AWS_REGION_NAME.fullmatch(self.region):
+                raise ValueError("bedrock region must be an AWS region name")
+        else:
+            if self.api_version is not None:
+                raise ValueError("api_version is only accepted for provider='azure'")
+            if self.region is not None:
+                raise ValueError("region is only accepted for provider='bedrock'")
         try:
-            assert_secret_free({"provider": self.provider, "base_url": self.base_url})
+            assert_secret_free(
+                {
+                    "provider": self.provider,
+                    "base_url": self.base_url,
+                    "api_version": self.api_version,
+                    "region": self.region,
+                }
+            )
         except SecretBoundaryError as exc:
             raise ValueError("connection metadata must not contain credential values") from exc
         return self
@@ -96,13 +141,17 @@ class ConnectionConfig(ContractModel):
         """Return a deterministic digest of the secret-free provider endpoint identity.
 
         Returns:
-            A SHA-256 digest over the provider and normalized base URL. Credential values and
-            credential-environment metadata are deliberately excluded.
+            A SHA-256 digest over the provider, normalized endpoint, and any Azure API version or
+            Bedrock region. Credential values and credential-environment metadata are excluded.
         """
         identity: JsonObject = {
             "provider": self.provider,
             "base_url": None if self.base_url is None else _normalize_base_url(self.base_url),
         }
+        if self.api_version is not None:
+            identity["api_version"] = self.api_version
+        if self.region is not None:
+            identity["region"] = self.region
         return sha256_json(identity)
 
 
@@ -222,10 +271,13 @@ class ModelCatalog(ContractModel):
                     f"model alias {alias!r} names unknown connection {record.connection!r}"
                 )
             connection = self.connections[record.connection]
-            if connection.provider == "openai-compatible" and record.capabilities is None:
+            if (
+                connection.provider in _EXPLICIT_CAPABILITY_PROVIDERS
+                and record.capabilities is None
+            ):
                 raise ValueError(
-                    f"OpenAI-compatible model alias {alias!r} needs an explicit capabilities "
-                    "declaration because its endpoint cannot be discovered safely"
+                    f"{connection.provider} model alias {alias!r} needs an explicit capabilities "
+                    "declaration because provider names do not imply protocol support or prices"
                 )
         assigned_aliases = self.roles.candidates + tuple(
             alias
