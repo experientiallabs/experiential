@@ -8,13 +8,16 @@ line-based path remains available for scripted non-terminal sessions.
 
 from __future__ import annotations
 
+import os
 import select
 import sys
 import termios
 import tty
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 
 from rich.console import Console
 from rich.markup import escape
@@ -294,30 +297,64 @@ def interpret_key_bytes(data: bytes) -> PickerKey:
     return PickerKey.IGNORE
 
 
+def _read_terminal_key_from_fd(fd: int) -> PickerKey:
+    """Read one key sequence without passing through a buffered text stream.
+
+    Args:
+        fd: Raw terminal file descriptor already configured for immediate input.
+
+    Returns:
+        The decoded picker action for the next key press.
+    """
+    first = os.read(fd, 1)
+    if first != b"\x1b":
+        return interpret_key_bytes(first)
+    readable, _, _ = select.select([fd], [], [], 0.05)
+    if not readable:
+        return PickerKey.CANCEL
+    rest = os.read(fd, 1)
+    if rest in {b"[", b"O"}:
+        extra_ready, _, _ = select.select([fd], [], [], 0.05)
+        if extra_ready:
+            rest += os.read(fd, 1)
+    return interpret_key_bytes(first + rest)
+
+
+@contextmanager
+def _terminal_key_reader(
+    read_key: Callable[[], PickerKey] | None,
+) -> Iterator[Callable[[], PickerKey]]:
+    """Yield a scripted reader or hold the controlling terminal in raw input mode.
+
+    Args:
+        read_key: Optional injected reader that requires no terminal configuration.
+
+    Yields:
+        A zero-argument reader for one decoded keyboard event.
+    """
+    if read_key is not None:
+        yield read_key
+        return
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        raw = termios.tcgetattr(fd)
+        raw[1] = old[1]
+        termios.tcsetattr(fd, termios.TCSANOW, raw)
+        yield partial(_read_terminal_key_from_fd, fd)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def read_terminal_key() -> PickerKey:
     """Read one key from the controlling terminal in raw mode.
 
     Returns:
         The decoded picker action for the next key press.
     """
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        first = sys.stdin.read(1)
-        if first != "\x1b":
-            return interpret_key_bytes(first.encode())
-        readable, _, _ = select.select([sys.stdin], [], [], 0.05)
-        if not readable:
-            return PickerKey.CANCEL
-        rest = sys.stdin.read(1)
-        if rest in {"[", "O"}:
-            extra_ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if extra_ready:
-                rest += sys.stdin.read(1)
-        return interpret_key_bytes(("\x1b" + rest).encode())
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    with _terminal_key_reader(None) as reader:
+        return reader()
 
 
 def select_many_list(
@@ -354,38 +391,38 @@ def select_many_list(
     selected = [value for value in preselected if value in values]
     focus = 0
     complete_index = len(options)
-    reader = read_key if read_key is not None else read_terminal_key
-    console.print(f"[bold]{title}[/bold]")
-    while True:
-        _render_list(
-            console,
-            options,
-            selected=selected,
-            focus=focus,
-        )
-        key = reader()
-        if key is PickerKey.BACK:
-            return PickerResult(action=PickerAction.BACK)
-        if key is PickerKey.CANCEL:
-            return PickerResult(action=PickerAction.CANCEL)
-        if key is PickerKey.UP:
-            focus = (focus - 1) % (complete_index + 1)
-            continue
-        if key is PickerKey.DOWN:
-            focus = (focus + 1) % (complete_index + 1)
-            continue
-        if key is not PickerKey.ENTER:
-            continue
-        if focus == complete_index:
-            if len(selected) >= minimum:
-                return PickerResult(values=tuple(selected))
-            console.print(f"[yellow]Select at least {minimum}.[/yellow]")
-            continue
-        value = options[focus].value
-        if value in selected:
-            selected.remove(value)
-        else:
-            selected.append(value)
+    with _terminal_key_reader(read_key) as reader:
+        console.print(f"[bold]{title}[/bold]")
+        while True:
+            _render_list(
+                console,
+                options,
+                selected=selected,
+                focus=focus,
+            )
+            key = reader()
+            if key is PickerKey.BACK:
+                return PickerResult(action=PickerAction.BACK)
+            if key is PickerKey.CANCEL:
+                return PickerResult(action=PickerAction.CANCEL)
+            if key is PickerKey.UP:
+                focus = (focus - 1) % (complete_index + 1)
+                continue
+            if key is PickerKey.DOWN:
+                focus = (focus + 1) % (complete_index + 1)
+                continue
+            if key is not PickerKey.ENTER:
+                continue
+            if focus == complete_index:
+                if len(selected) >= minimum:
+                    return PickerResult(values=tuple(selected))
+                console.print(f"[yellow]Select at least {minimum}.[/yellow]")
+                continue
+            value = options[focus].value
+            if value in selected:
+                selected.remove(value)
+            else:
+                selected.append(value)
 
 
 def _render_list(

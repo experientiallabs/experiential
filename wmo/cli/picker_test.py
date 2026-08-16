@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import io
+import os
+import pty
+import select
+import subprocess
+import sys
+import time
 from collections.abc import Callable
 
 import pytest
@@ -236,6 +243,64 @@ def _keys(*actions: PickerKey) -> Callable[[], PickerKey]:
     return lambda: next(iterator)
 
 
+def _run_keyboard_picker_pty(*, ready_marker: str) -> str:
+    """Drive a real terminal picker with one immediate batched key sequence.
+
+    Args:
+        ready_marker: Output proving how far the child rendered before input is sent.
+
+    Returns:
+        Complete decoded terminal output from the child process.
+    """
+    script = """
+from rich.console import Console
+from wmo.cli.picker import PickerOption, select_many_list
+
+result = select_many_list(
+    Console(force_terminal=True),
+    title="Providers",
+    options=(PickerOption("a", "A"), PickerOption("b", "B")),
+)
+print("RESULT:" + ",".join(result.values), flush=True)
+"""
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+    )
+    os.close(slave)
+    output = bytearray()
+    sent = False
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if readable:
+                try:
+                    output.extend(os.read(master, 65_536))
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    break
+            if not sent and ready_marker.encode() in output:
+                os.write(master, b"\x1b[B\r\x1b[B\r")
+                sent = True
+            if process.poll() is not None:
+                break
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=2)
+    finally:
+        os.close(master)
+    transcript = output.decode(errors="replace")
+    assert sent, f"picker never rendered {ready_marker!r}:\n{transcript}"
+    assert process.returncode == 0, f"picker exited {process.returncode}:\n{transcript}"
+    return transcript
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -261,6 +326,19 @@ def test_interpret_key_bytes_maps_terminal_events(raw: bytes, expected: PickerKe
         expected: Decoded picker action.
     """
     assert interpret_key_bytes(raw) is expected
+
+
+@pytest.mark.parametrize("ready_marker", ["Providers", "q cancels."])
+def test_keyboard_list_accepts_batched_keys_from_a_real_terminal(ready_marker: str) -> None:
+    """Terminal readiness and unbuffered reads preserve an immediate arrow-key batch.
+
+    Args:
+        ready_marker: Early or fully rendered output that triggers the key batch.
+    """
+    transcript = _run_keyboard_picker_pty(ready_marker=ready_marker)
+
+    assert "RESULT:b" in transcript
+    assert "^[[B" not in transcript
 
 
 def test_keyboard_list_moves_focus_toggles_selection_and_submits_from_complete() -> None:
