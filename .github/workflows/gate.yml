@@ -24,7 +24,7 @@ jobs:
       - name: ty check
         run: uv run ty check
       - name: non-live tests
-        run: uv run pytest -q -k "not live"
+        run: uv run pytest -n 4 --dist worksteal -q -k "not live"
 
   w16-darwin-evidence:
     runs-on: macos-latest

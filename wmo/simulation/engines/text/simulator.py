@@ -938,7 +938,8 @@ class WorldModelSimulator:
 
     def _load_optional_rollout(self, rollout_id: ArtifactId) -> RolloutArtifact | None:
         """Load an existing rollout while distinguishing absence from immutable corruption."""
-        if rollout_id not in self._store.list_ids():
+        destination = self._store.project_directory / "artifacts" / rollout_id
+        if not destination.exists():
             return None
         return self._load_rollout(rollout_id)
 
