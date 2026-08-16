@@ -43,6 +43,7 @@ from wmo.common.models import (
     ProviderModelSelection,
     ProviderSetup,
     RouterCandidateSelection,
+    SetupRole,
     catalog_state_sha256,
     configure_provider_catalog,
     configure_router_candidates,
@@ -108,6 +109,7 @@ def run_provider_setup(
         existing_connection_providers=_existing_connection_providers(existing),
         existing_catalog_models={} if existing is None else existing.models,
         existing_models=_existing_models(existing),
+        retainable_roles=_retained_setup_roles(existing),
         role_inputs=_role_inputs(options, existing=existing),
         console=console,
         lister=lister if lister is not None else HttpProviderModelLister(),
@@ -124,6 +126,7 @@ def _interactive_setup(
     existing_connection_providers: Mapping[str, str],
     existing_catalog_models: Mapping[str, ModelRecord],
     existing_models: tuple[ProviderModelSelection, ...],
+    retainable_roles: Mapping[str, frozenset[SetupRole]],
     role_inputs: SetupRoleInputs,
     console: Console,
     lister: ProviderModelLister,
@@ -136,6 +139,7 @@ def _interactive_setup(
         existing_connection_providers: Exact provider kind for every persisted connection.
         existing_catalog_models: Exact record for every persisted model alias.
         existing_models: Model aliases already configured in the catalog.
+        retainable_roles: Exact prior roles each incomplete alias may retain.
         role_inputs: Role values supplied by flags or already persisted.
         console: Terminal used for every screen.
         lister: Provider listing seam, injected by tests so no live request is made.
@@ -149,6 +153,7 @@ def _interactive_setup(
     configured = configured_models(
         existing_catalog_models,
         connection_providers=existing_connection_providers,
+        retainable_roles=retainable_roles,
     )
     session = SetupSession(selected=tuple(model.alias for model in configured))
     try:
@@ -269,6 +274,11 @@ def _commit(
         expected_state_sha256=expected_state_sha256,
     )
     if not result.candidates or result.incumbent is None:
+        return catalog
+    if (
+        result.candidates == catalog.roles.candidates
+        and result.incumbent == catalog.roles.incumbent
+    ):
         return catalog
     return configure_router_candidates(
         path,
@@ -465,6 +475,31 @@ def _existing_connection_providers(existing: ModelCatalog | None) -> dict[str, s
     if existing is None:
         return {}
     return {name: connection.provider for name, connection in sorted(existing.connections.items())}
+
+
+def _retained_setup_roles(existing: ModelCatalog | None) -> dict[str, frozenset[SetupRole]]:
+    """Map persisted setup roles to the aliases allowed to retain them without metadata.
+
+    Args:
+        existing: Existing catalog, or ``None`` on first setup.
+
+    Returns:
+        Exact retain-only roles keyed by their currently assigned aliases.
+    """
+    if existing is None:
+        return {}
+    retained: dict[str, set[SetupRole]] = {}
+    assignments = (
+        (existing.roles.world_model, SetupRole.WORLD_MODEL),
+        (existing.roles.judge, SetupRole.JUDGE),
+        (existing.roles.embedder, SetupRole.EMBEDDER),
+    )
+    for alias, role in assignments:
+        if alias is not None:
+            retained.setdefault(alias, set()).add(role)
+    for alias in existing.roles.candidates:
+        retained.setdefault(alias, set()).add(SetupRole.ROUTER_CANDIDATE)
+    return {alias: frozenset(roles) for alias, roles in sorted(retained.items())}
 
 
 def _existing_role(existing: ModelCatalog | None, role: str) -> str | None:

@@ -363,6 +363,7 @@ def test_discovered_metadata_and_roles_come_from_the_maintained_table() -> None:
     _, models = prepared
     chat, embedder = models
     assert chat.pricing_source is PricingSource.WMO_CATALOG
+    assert chat.capabilities is not None
     assert chat.capabilities.supports_structured_output
     assert chat.capabilities.context_window_tokens == 1_050_000
     assert SetupRole.EMBEDDER.value in embedder.detail()

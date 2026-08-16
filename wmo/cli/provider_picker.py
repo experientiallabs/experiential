@@ -22,6 +22,7 @@ from wmo.common.models import (
     PricingSource,
     ProviderConnection,
     ProviderSetup,
+    SetupRole,
     derive_connection_name,
     derive_model_alias,
     resolve_discovered_model,
@@ -95,9 +96,10 @@ class AvailableModel:
     connection: str
     provider: str
     model: str
-    capabilities: ModelCapabilities
+    capabilities: ModelCapabilities | None
     pricing_source: PricingSource
     configured: bool
+    retainable_roles: frozenset[SetupRole] = frozenset()
 
     def label(self) -> str:
         """Describe this model as one picker row."""
@@ -105,8 +107,17 @@ class AvailableModel:
 
     def detail(self) -> str:
         """Summarize the roles and price provenance behind this model."""
-        roles = ", ".join(role.value for role in served_roles(self.capabilities))
-        return f"roles: {roles or 'none'}; pricing: {self.pricing_source.value}"
+        verified = (
+            frozenset(served_roles(self.capabilities))
+            if self.capabilities is not None
+            else frozenset()
+        )
+        roles = ", ".join(role.value for role in SetupRole if role in verified)
+        retain_only = ", ".join(
+            role.value for role in SetupRole if role in self.retainable_roles - verified
+        )
+        retained = f"; retain only: {retain_only}" if retain_only else ""
+        return f"roles: {roles or 'unverified'}{retained}; pricing: {self.pricing_source.value}"
 
 
 @dataclass(frozen=True)
