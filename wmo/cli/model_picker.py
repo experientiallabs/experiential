@@ -487,9 +487,10 @@ def render_summary(
     for endpoint in endpoints:
         connection = endpoint.connection
         endpoint_text = f", base_url={connection.base_url}" if connection.base_url else ""
+        credential = connection.api_key_env or "AWS credential chain"
         console.print(
             f"provider {connection.provider}: connection {connection.name}, "
-            f"credential {connection.api_key_env}{endpoint_text}"
+            f"credential {credential}{endpoint_text}"
         )
     for item in chosen:
         capabilities = item.capabilities

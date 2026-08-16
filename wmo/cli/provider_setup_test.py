@@ -536,6 +536,38 @@ def test_rerunning_setup_preserves_unrelated_models_and_router_state(
     assert saved.roles.world_model == "gpt-5-6-luna"
 
 
+def test_setup_preserves_entries_owned_by_providers_it_does_not_configure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Connections and aliases outside the setup provider set survive a session untouched.
+
+    Args:
+        tmp_path: Temporary WMO root containing a registered SFT sampling handle.
+        monkeypatch: Patch fixture supplying the canonical credential.
+    """
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    write_model_catalog(
+        root / "models.toml",
+        ModelCatalog(
+            connections={
+                "tinker": ConnectionConfig(provider="tinker", api_key_env="TINKER_API_KEY")
+            },
+            models={"sft-run": ModelRecord(connection="tinker", model="tinker://sampling/run")},
+        ),
+    )
+
+    console, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\ny\n", monkeypatch=monkeypatch)
+
+    assert catalog is not None
+    saved = load_model_catalog(root / "models.toml")
+    assert saved.connections["tinker"].api_key_env == "TINKER_API_KEY"
+    assert saved.models["sft-run"].model == "tinker://sampling/run"
+    assert saved.roles.world_model == "gpt-5-6-luna"
+    assert "sft-run" not in unstyle(console.output)
+
+
 def test_a_completed_setup_is_not_repeated_on_replay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

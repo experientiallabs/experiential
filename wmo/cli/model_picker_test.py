@@ -324,6 +324,33 @@ def test_summary_states_providers_models_roles_prices_and_credential_behavior() 
     assert "secret-key" not in printed
 
 
+def test_summary_names_the_aws_credential_chain_for_bedrock() -> None:
+    """A Bedrock connection has no credential variable, so the summary names its chain."""
+    console = ScriptedConsole("")
+    bedrock = ProviderConnection(name="bedrock", provider="bedrock", region="us-east-1")
+    chosen = (_CHAT, _EMBEDDER)
+    roles = assign_roles(
+        chosen, role_inputs=SetupRoleInputs(), console=ScriptedConsole("1\n1\n1\n\n")
+    )
+
+    assert roles is not None
+    result = build_result(
+        chosen,
+        roles=roles,
+        endpoints=(_endpoint(), _endpoint(bedrock)),
+        existing_connections=(),
+        existing_models=(),
+    )
+    render_summary(
+        result,
+        chosen=chosen,
+        endpoints=(_endpoint(), _endpoint(bedrock)),
+        console=console,
+    )
+
+    assert "provider bedrock: connection bedrock, credential AWS credential chain" in console.output
+
+
 def test_summary_names_confirmed_router_candidates() -> None:
     """A confirmed router role is shown in the same single summary."""
     console = ScriptedConsole("")
