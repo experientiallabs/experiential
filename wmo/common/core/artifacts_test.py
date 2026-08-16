@@ -21,7 +21,7 @@ from wmo.common.core.artifacts import (
     envelope_matches_manifest,
     sha256_bytes,
     sha256_json,
-    sorted_artifact_inputs,
+    sorted_unique_inputs,
     stable_id,
     validate_artifact_file_path,
 )
@@ -85,17 +85,17 @@ def test_envelope_requires_timezone_and_sorted_unique_inputs() -> None:
         )
 
 
-def test_sorted_artifact_inputs_dedupes_sorts_and_rejects_conflicting_digests() -> None:
+def test_sorted_unique_inputs_dedupes_sorts_and_raises_the_domain_error() -> None:
     """The canonical input normalizer dedupes exact repeats and rejects digest drift."""
     first = ArtifactInput(artifact_id="trace-a", sha256=_DIGEST_A)
     second = ArtifactInput(artifact_id="trace-b", sha256=_DIGEST_B)
 
-    assert sorted_artifact_inputs((second, first, second)) == (first, second)
-    assert sorted_artifact_inputs(()) == ()
+    assert sorted_unique_inputs(second, first, second) == (first, second)
+    assert sorted_unique_inputs() == ()
 
     conflicting = ArtifactInput(artifact_id="trace-a", sha256=_DIGEST_B)
-    with pytest.raises(ValueError, match="conflicting manifest digests"):
-        sorted_artifact_inputs((first, conflicting))
+    with pytest.raises(KeyError, match="conflicting manifest digests"):
+        sorted_unique_inputs(first, conflicting, error_type=KeyError)
 
 
 def test_envelope_matches_manifest_compares_the_five_shared_provenance_fields() -> None:
