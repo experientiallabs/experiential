@@ -23,6 +23,7 @@ from wmo.common.models import ModelSnapshot, Usage
 from wmo.common.tasks import ToolSchema
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.simulation.ingest.environment_capture import canonicalize_environment_capture_payloads
+from wmo.simulation.ingest.json_strict import DuplicateJsonKeyError, reject_duplicate_json_keys
 from wmo.simulation.ingest.model_identity import (
     TraceModelIdentityEvidence,
     normalized_capabilities_sha256,
@@ -49,10 +50,6 @@ _CONVERSATION_KEYS = ("wmo.conversation.id", "gen_ai.conversation.id")
 
 class OtlpTraceFormatError(ValueError):
     """Raised when a trace upload cannot be decoded as OpenTelemetry JSON."""
-
-
-class _DuplicateJsonKeyError(ValueError):
-    """Raised when profile-eligibility parsing finds an ambiguous JSON object."""
 
 
 @dataclass(frozen=True)
@@ -280,8 +277,8 @@ def _normalize_jsonl(
             continue
         payloads.append(payload)
         try:
-            profile_payloads.append(json.loads(line, object_pairs_hook=_reject_duplicate_json_keys))
-        except _DuplicateJsonKeyError:
+            profile_payloads.append(json.loads(line, object_pairs_hook=reject_duplicate_json_keys))
+        except DuplicateJsonKeyError:
             profile_eligible = False
     if not payloads and not issues:
         raise OtlpTraceFormatError("OTLP JSONL file contains no records")
@@ -295,26 +292,6 @@ def _normalize_jsonl(
         semantic_convention_version=semantic_convention_version,
         initial_issues=issues,
     )
-
-
-def _reject_duplicate_json_keys(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
-    """Decode one JSON object while rejecting repeated keys.
-
-    Args:
-        pairs: Object members in their original source order.
-
-    Returns:
-        Decoded JSON object with unique keys.
-
-    Raises:
-        _DuplicateJsonKeyError: A key occurs more than once in the object.
-    """
-    result: JsonObject = {}
-    for key, value in pairs:
-        if key in result:
-            raise _DuplicateJsonKeyError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
 
 
 def _extract_raw_spans(payload: JsonValue, ordinal: int) -> list[_RawSpan]:

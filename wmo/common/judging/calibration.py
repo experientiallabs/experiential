@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Literal
 
 from wmo.common.core.artifacts import ArtifactId, ArtifactInput, Sha256, stable_id
@@ -960,8 +960,3 @@ def _require_timezone(value: datetime) -> None:
     """Reject naive timestamps before they become immutable calibration provenance."""
     if value.tzinfo is None or value.utcoffset() is None:
         raise CalibrationError("calibration timestamps must include a timezone")
-
-
-def utc_now() -> datetime:
-    """Return a UTC timestamp for callers that do not inject artifact creation time."""
-    return datetime.now(UTC)

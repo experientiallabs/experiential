@@ -20,6 +20,7 @@ from wmo.common.core.artifacts import (
     sorted_unique_inputs,
     stable_id,
 )
+from wmo.common.core.union_find import UnionFind
 from wmo.common.project import (
     ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
@@ -74,32 +75,6 @@ class _ScannedAction:
     history: tuple[SFTContextEvent, ...]
     fingerprint: Sha256
     target: AssistantActionEvent
-
-
-class _UnionFind:
-    """A deterministic disjoint-set structure for leakage-component construction."""
-
-    def __init__(self, values: Iterable[ArtifactId]) -> None:
-        self._parent = {value: value for value in values}
-
-    def find(self, value: ArtifactId) -> ArtifactId:
-        """Return the canonical root of one leakage group."""
-        parent = self._parent[value]
-        if parent != value:
-            parent = self.find(parent)
-            self._parent[value] = parent
-        return parent
-
-    def union(self, left: ArtifactId, right: ArtifactId) -> None:
-        """Join two groups while retaining the lexically stable root."""
-        left_root = self.find(left)
-        right_root = self.find(right)
-        if left_root == right_root:
-            return
-        if left_root < right_root:
-            self._parent[right_root] = left_root
-        else:
-            self._parent[left_root] = right_root
 
 
 def build_sft_dataset(
@@ -580,7 +555,7 @@ def _build_partitions(
     group_ids = tuple(sorted({action.source.leakage_group_id for action in scanned_actions}))
     if not group_ids:
         return {}, ()
-    groups = _UnionFind(group_ids)
+    groups = UnionFind(group_ids)
     first_group_by_fingerprint: dict[Sha256, ArtifactId] = {}
     for action in scanned_actions:
         first_group = first_group_by_fingerprint.setdefault(

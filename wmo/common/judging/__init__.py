@@ -4,7 +4,6 @@ from wmo.common.judging.calibration import (
     CalibrationDatum,
     CalibrationError,
     JudgeCalibrationService,
-    utc_now,
 )
 from wmo.common.judging.calibration_contracts import (
     CalibrationReport,
@@ -99,5 +98,4 @@ __all__ = [
     "write_rubric_proposal_evidence",
     "verify_persisted_calibration",
     "judge_response_schema",
-    "utc_now",
 ]

@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 import wmo.cli.build_cmd as build_command
 import wmo.simulation.build as simulation_build
 from wmo.cli.app import app
+from wmo.cli.provider_setup_test import _FakeLister as _SetupLister
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     ConnectionConfig,
@@ -27,6 +28,7 @@ from wmo.common.models import (
     ModelResponse,
     ModelRoles,
     ModelSnapshot,
+    load_model_catalog,
     write_model_catalog,
 )
 from wmo.common.project import ArtifactCorruptionError, ProjectStore, ProjectStoreError
@@ -267,7 +269,7 @@ class _RuntimeCatalog:
         Returns:
             Deterministic resolved fixture model.
         """
-        if alias == "embed":
+        if "embed" in alias:
             capabilities = ModelCapabilities(
                 supports_embeddings=True,
                 input_cost_per_million_tokens_usd=0,
@@ -338,6 +340,46 @@ def _fake_runtime_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr("wmo.cli.build_cmd.RuntimeModelCatalog", _RuntimeCatalog)
     monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
+
+
+def test_first_build_configures_providers_and_models_through_the_picker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A clean checkout reaches a completed build through provider, model, and role screens.
+
+    Args:
+        monkeypatch: Pytest patch fixture supplying a terminal, credential, and listing seam.
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    lister = _SetupLister()
+    monkeypatch.setattr("wmo.cli.build_cmd.can_prompt", lambda _console: True)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setattr("wmo.cli.provider_setup.HttpProviderModelLister", lambda: lister)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", str(source), "--root", str(root)],
+        input="1\n\n1,3\n\n1\n1\n1\ny\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert lister.requests == ["openai"]
+    printed = unstyle(result.output)
+    assert "Select the providers you want to use" in printed
+    assert "openai-secret" not in printed
+    saved = load_model_catalog(root / "models.toml")
+    assert saved.connections["openai"].api_key_env == "OPENAI_API_KEY"
+    assert saved.roles.world_model == "gpt-5-6-luna"
+    assert saved.roles.embedder == "text-embedding-3-small"
+
+    replay = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+
+    assert replay.exit_code == 0, replay.output
+    assert lister.requests == ["openai"]
+    assert "Select the providers you want to use" not in unstyle(replay.output)
 
 
 def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(

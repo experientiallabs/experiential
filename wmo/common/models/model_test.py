@@ -190,3 +190,27 @@ def test_embeddings_require_nonempty_finite_vectors() -> None:
         Embedding(values=(float("nan"),))
     with pytest.raises(ValidationError, match="unit norm"):
         Embedding(values=(0.1, -0.2))
+
+
+def test_combine_economics_sums_present_usage_and_complete_measurements() -> None:
+    """Usage sums when present. Cost and latency stay unknown unless every call reports them."""
+    observed = NumericMeasurement(value=0.4, provenance="observed")
+    estimated = NumericMeasurement(value=0.1, provenance="estimated")
+    combined = combine_economics(
+        (
+            OperationEconomics(
+                usage=Usage(input_tokens=3, output_tokens=1, cached_input_tokens=1),
+                cost_usd=observed,
+                latency_seconds=observed,
+            ),
+            OperationEconomics(
+                usage=Usage(input_tokens=2, output_tokens=4),
+                cost_usd=estimated,
+            ),
+        )
+    )
+
+    assert combined.usage == Usage(input_tokens=5, output_tokens=5, cached_input_tokens=None)
+    assert combined.cost_usd == NumericMeasurement(value=0.5, provenance="estimated")
+    assert combined.latency_seconds is None
+    assert combine_economics(()) == OperationEconomics()

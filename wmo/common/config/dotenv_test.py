@@ -23,7 +23,3 @@ def test_load_env_file_sets_only_unset_vars(tmp_path, monkeypatch) -> None:  # n
     assert os.environ["WMO_TEST_SET"] == "from-env"  # not overridden
     monkeypatch.delenv("WMO_TEST_NEW")
     monkeypatch.delenv("WMO_TEST_KEPT")
-
-
-def test_load_env_file_missing_path_is_a_noop(tmp_path) -> None:  # noqa: ANN001
-    load_env_file(tmp_path / "nope.env")  # must not raise

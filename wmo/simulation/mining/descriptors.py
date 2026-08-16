@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -13,6 +12,7 @@ from typing import Protocol
 from pydantic import JsonValue
 
 from wmo.common.core.artifacts import JsonObject
+from wmo.common.core.hashing import signed_token_embedding
 from wmo.common.core.text import normalize_durable_text
 from wmo.common.routing.features import (
     RouterFeatureExtractor,
@@ -20,8 +20,6 @@ from wmo.common.routing.features import (
 )
 from wmo.common.tasks import ToolSchema
 from wmo.common.traces import Trace
-
-_TOKEN_PATTERN = re.compile(r"[\w]+", re.UNICODE)
 
 
 class DescriptorEmbedder(Protocol):
@@ -138,21 +136,7 @@ class HashingDescriptorEmbedder:
         Returns:
             Unit-normalized signed hashing vectors in input order.
         """
-        return tuple(self._embed_one(text) for text in texts)
-
-    def _embed_one(self, text: str) -> tuple[float, ...]:
-        """Hash normalized content tokens into one fixed-width unit vector."""
-        vector = [0.0] * self.dimensions
-        tokens = _TOKEN_PATTERN.findall(text.casefold())
-        if not tokens:
-            tokens = ["empty"]
-        for token in tokens:
-            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-            index = int.from_bytes(digest[:4], "big") % self.dimensions
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vector[index] += sign
-        norm = math.sqrt(sum(value * value for value in vector))
-        return tuple(value / norm for value in vector)
+        return tuple(signed_token_embedding(text, self.dimensions) for text in texts)
 
 
 def routing_descriptor(trace: Trace) -> RoutingDescriptor:
