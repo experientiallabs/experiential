@@ -189,6 +189,125 @@ def test_noninteractive_setup_accepts_azure_and_bedrock_connections(tmp_path: Pa
     assert "sk-" not in text
 
 
+def test_noninteractive_provider_flags_validate_without_prompts_or_writes(tmp_path: Path) -> None:
+    """Repeatable --provider values are checked before any catalog write or prompt.
+
+    Args:
+        tmp_path: Temporary WMO root without provider configuration.
+    """
+    root = tmp_path / ".wmo"
+    result = _RUNNER.invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(root),
+            "--non-interactive",
+            "--provider",
+            "bedrock",
+            "--provider",
+            "openai",
+            "--provider",
+            "not-a-provider",
+            "--provider",
+            "openai",
+        ],
+    )
+
+    assert result.exit_code == 2
+    output = unstyle(result.output)
+    assert "unsupported --provider value 'not-a-provider'" in output
+    assert "duplicate --provider value 'openai'" in output
+    assert (
+        "choose from: openai, anthropic, gemini, openrouter, openai-compatible, azure, bedrock"
+        in output
+    )
+    assert "Select the providers you want to use" not in output
+    assert not (root / "models.toml").exists()
+
+
+def test_noninteractive_valid_providers_still_require_structured_collections(
+    tmp_path: Path,
+) -> None:
+    """Accepted --provider flags do not invent connections or start a prompt.
+
+    Args:
+        tmp_path: Temporary WMO root without provider configuration.
+    """
+    result = _RUNNER.invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--non-interactive",
+            "--provider",
+            "anthropic",
+            "--provider",
+            "openai",
+        ],
+    )
+
+    assert result.exit_code == 2
+    output = unstyle(result.output)
+    assert "at least one --connection-json" in output
+    assert "Select the providers you want to use" not in output
+    assert not (tmp_path / ".wmo" / "models.toml").exists()
+
+
+def test_explicit_providers_skip_the_opening_list_and_still_discover_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Named providers enter the existing setup session without the opening list.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the saved catalog.
+        monkeypatch: Patch fixture supplying the canonical credential.
+    """
+    root = tmp_path / ".wmo"
+    options = ProviderSetupOptions(providers=("openai",))
+
+    console, catalog = _setup(
+        root,
+        "1,3\n\n1\n1\n1\ny\n",
+        monkeypatch=monkeypatch,
+        options=options,
+    )
+
+    assert catalog is not None
+    assert "Select the providers you want to use" not in unstyle(console.output)
+    saved = load_model_catalog(root / "models.toml")
+    assert set(saved.connections) == {"openai"}
+    assert saved.roles.embedder == "text-embedding-3-small"
+
+
+def test_cancelling_after_explicit_providers_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel after --provider still leaves the catalog untouched.
+
+    Args:
+        tmp_path: Temporary WMO root used to prove no catalog write occurs.
+        monkeypatch: Patch fixture supplying the canonical credential.
+    """
+    root = tmp_path / ".wmo"
+
+    console, catalog = _setup(
+        root,
+        "q\n",
+        monkeypatch=monkeypatch,
+        options=ProviderSetupOptions(providers=("openai",)),
+    )
+
+    assert catalog is None
+    assert "Setup cancelled. Nothing was written." in console.output
+    assert not (root / "models.toml").exists()
+
+
 def test_noninteractive_setup_reports_every_missing_collection_and_role(tmp_path: Path) -> None:
     """One failure lists the complete remediation instead of serial missing prompts.
 

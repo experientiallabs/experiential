@@ -1,16 +1,20 @@
-"""Line-based selection prompt tests."""
+"""Selection prompt tests for line-based screens and the keyboard multi-select list."""
 
 from __future__ import annotations
 
 import io
+from collections.abc import Callable
 
 import pytest
 from rich.console import Console
 
 from wmo.cli.picker import (
     PickerAction,
+    PickerKey,
     PickerOption,
+    interpret_key_bytes,
     select_many,
+    select_many_list,
     select_one,
 )
 
@@ -18,17 +22,18 @@ from wmo.cli.picker import (
 class ScriptedConsole(Console):
     """One console that answers every prompt from a script and records its output."""
 
-    def __init__(self, answers: str) -> None:
+    def __init__(self, answers: str, *, width: int = 100) -> None:
         """Build a console reading scripted lines into an in-memory transcript.
 
         Args:
             answers: Newline-separated answers the screens read in order.
+            width: Reported terminal width used for wrapping and narrow-list layout.
         """
         self._transcript = io.StringIO()
         super().__init__(
             file=self._transcript,
             force_terminal=False,
-            width=100,
+            width=width,
             no_color=True,
             highlight=False,
         )
@@ -216,3 +221,134 @@ def test_a_screen_without_rows_is_a_programming_error() -> None:
 
     with pytest.raises(ValueError, match="has no available choices"):
         select_many(console, title="Models", options=())
+
+
+def _keys(*actions: PickerKey) -> Callable[[], PickerKey]:
+    """Return a key source that yields the scripted keyboard events in order.
+
+    Args:
+        actions: Decoded keys the list should consume.
+
+    Returns:
+        Zero-argument reader used by ``select_many_list``.
+    """
+    iterator = iter(actions)
+    return lambda: next(iterator)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (b"\x1b[A", PickerKey.UP),
+        (b"\x1bOA", PickerKey.UP),
+        (b"\x1b[B", PickerKey.DOWN),
+        (b"\x1bOB", PickerKey.DOWN),
+        (b"\r", PickerKey.ENTER),
+        (b"\n", PickerKey.ENTER),
+        (b"b", PickerKey.BACK),
+        (b"B", PickerKey.BACK),
+        (b"q", PickerKey.CANCEL),
+        (b"\x03", PickerKey.CANCEL),
+        (b"\x1b", PickerKey.CANCEL),
+        (b"x", PickerKey.IGNORE),
+    ],
+)
+def test_interpret_key_bytes_maps_terminal_events(raw: bytes, expected: PickerKey) -> None:
+    """Each raw key sequence used by the list becomes one stable action.
+
+    Args:
+        raw: Bytes a terminal emits for one key press.
+        expected: Decoded picker action.
+    """
+    assert interpret_key_bytes(raw) is expected
+
+
+def test_keyboard_list_moves_focus_toggles_selection_and_submits_from_complete() -> None:
+    """Enter toggles the focused row; only Complete submits the current selection."""
+    console = _console("")
+
+    result = select_many_list(
+        console,
+        title="Providers",
+        options=_options(3),
+        read_key=_keys(
+            PickerKey.ENTER,
+            PickerKey.DOWN,
+            PickerKey.DOWN,
+            PickerKey.ENTER,
+            PickerKey.ENTER,
+            PickerKey.DOWN,
+            PickerKey.ENTER,
+        ),
+    )
+
+    assert result.action is None
+    assert result.values == ("model-1",)
+    assert "> [x] model-1" in console.output
+    assert "> [ ] model-3" in console.output
+    assert "> Complete" in console.output
+
+
+def test_keyboard_list_keeps_preselected_rows_and_back_cancel_keys() -> None:
+    """Reentering the list keeps current marks, and b or q still navigate away."""
+    console = _console("")
+
+    result = select_many_list(
+        console,
+        title="Providers",
+        options=_options(2),
+        preselected=("model-2",),
+        read_key=_keys(PickerKey.BACK),
+    )
+
+    assert result.action is PickerAction.BACK
+    assert "[x] model-2" in console.output
+
+    cancelled = select_many_list(
+        console,
+        title="Providers",
+        options=_options(2),
+        read_key=_keys(PickerKey.CANCEL),
+    )
+    assert cancelled.action is PickerAction.CANCEL
+
+
+def test_keyboard_list_refuses_complete_until_the_minimum_is_met() -> None:
+    """Complete does nothing useful until the required number of rows is selected."""
+    console = _console("")
+
+    result = select_many_list(
+        console,
+        title="Providers",
+        options=_options(2),
+        read_key=_keys(
+            PickerKey.DOWN,
+            PickerKey.DOWN,
+            PickerKey.ENTER,
+            PickerKey.UP,
+            PickerKey.UP,
+            PickerKey.ENTER,
+            PickerKey.DOWN,
+            PickerKey.DOWN,
+            PickerKey.ENTER,
+        ),
+    )
+
+    assert result.values == ("model-1",)
+    assert "Select at least 1." in console.output
+
+
+def test_keyboard_list_keeps_details_readable_on_a_narrow_terminal() -> None:
+    """Details sit on their own line so a narrow terminal does not collide with labels."""
+    console = ScriptedConsole("", width=40)
+
+    result = select_many_list(
+        console,
+        title="Providers",
+        options=_options(1),
+        read_key=_keys(PickerKey.ENTER, PickerKey.DOWN, PickerKey.ENTER),
+    )
+
+    assert result.values == ("model-1",)
+    assert "      detail 1" in console.output
+    assert "Activate Complete to submit." in console.output

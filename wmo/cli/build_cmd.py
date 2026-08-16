@@ -10,6 +10,7 @@ import typer
 from rich.console import Console
 
 from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.provider_picker import resolve_setup_providers
 from wmo.cli.provider_setup import (
     ProviderSetupOptions,
     provider_setup_json_examples,
@@ -60,6 +61,15 @@ _TRACE_FILE_ARGUMENT = typer.Argument(
     ),
 )
 _ROOT_OPTION = typer.Option(Path(ARTIFACT_DIR), "--root", help="Local .wmo artifact root.")
+_PROVIDER_OPTION = typer.Option(
+    None,
+    "--provider",
+    help=(
+        "Repeatable provider to configure during first-build setup. "
+        "Supported values: openai, anthropic, gemini, openrouter, openai-compatible, "
+        "azure, bedrock."
+    ),
+)
 
 
 def build(
@@ -87,6 +97,7 @@ def build(
         "--no-interactive",
         help="Never prompt for missing model setup.",
     ),
+    provider: list[str] | None = _PROVIDER_OPTION,
 ) -> None:
     """Build a reusable grounded world model and immutable fit evidence.
 
@@ -106,6 +117,7 @@ def build(
         maximum_build_cost_usd: Strict ceiling for provider embedding calls.
         yes: Explicit noninteractive or advance spend consent.
         no_interactive: Disable inline setup even when a terminal is available.
+        provider: Repeatable provider names that skip the opening list during setup.
 
     Raises:
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
@@ -114,7 +126,11 @@ def build(
     try:
         code_revision = installed_release_revision()
         ProjectStore(root, project)
-        catalog = _load_or_setup_catalog(root, no_interactive=no_interactive)
+        catalog = _load_or_setup_catalog(
+            root,
+            no_interactive=no_interactive,
+            providers=tuple(provider or ()),
+        )
         selected = _selected_roles(
             catalog,
             world_model=world_model,
@@ -192,12 +208,18 @@ def build(
     _render_completed_build(completed, built=built, estimate=estimate)
 
 
-def _load_or_setup_catalog(root: Path, *, no_interactive: bool) -> ModelCatalog:
+def _load_or_setup_catalog(
+    root: Path,
+    *,
+    no_interactive: bool,
+    providers: tuple[str, ...] = (),
+) -> ModelCatalog:
     """Load complete build roles or run inline setup only for a real terminal.
 
     Args:
         root: Local WMO root containing the shared model catalog.
         no_interactive: Whether inline provider setup is forbidden.
+        providers: Repeatable ``--provider`` values that skip the opening list.
 
     Returns:
         A complete model catalog with all required build roles.
@@ -205,17 +227,19 @@ def _load_or_setup_catalog(root: Path, *, no_interactive: bool) -> ModelCatalog:
     Raises:
         ValueError: Required configuration is missing outside an interactive terminal.
     """
+    resolved_providers = resolve_setup_providers(providers)
     path = root / "models.toml"
     catalog = load_model_catalog(path) if path.exists() else None
     missing = _missing_build_configuration(catalog)
     if not missing:
         assert catalog is not None
         return catalog
+    options = ProviderSetupOptions(providers=resolved_providers)
     if not no_interactive and can_prompt(_console):
         _console.print(f"Model setup is required: {', '.join(missing)}.")
         return run_provider_setup(
             root,
-            ProviderSetupOptions(),
+            options,
             non_interactive=False,
             replace=False,
             console=_console,
