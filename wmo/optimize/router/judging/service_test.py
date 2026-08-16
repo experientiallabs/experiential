@@ -42,6 +42,7 @@ from wmo.common.models import (
     ModelRoles,
     ModelSnapshot,
     OperationEconomics,
+    PricingSource,
 )
 from wmo.common.project import (
     ProjectBuildArtifacts,
@@ -851,6 +852,70 @@ def test_build_replacement_serializes_human_score_writer_and_removes_stale_state
             score=4,
             submission_id="submission-b",
             created_at=_TIME + timedelta(seconds=2),
+        )
+
+
+def test_estimate_uses_catalog_prices_and_records_provenance(tmp_path: Path) -> None:
+    """Catalog-resolved prices stay on the budget before any credential lookup."""
+    store = _built_store(tmp_path)
+    _setup(store)
+    plan = prepare_manual_judge_calibration(store, sample_size=3)
+    catalog = _catalog().model_copy(
+        update={
+            "models": {
+                "judge-main": ModelRecord(
+                    connection="openai-main",
+                    model="judge-model",
+                    capabilities=ModelCapabilities(
+                        input_cost_per_million_tokens_usd=1.0,
+                        output_cost_per_million_tokens_usd=2.0,
+                    ),
+                )
+            }
+        }
+    )
+
+    budget = estimate_manual_judge_budget(
+        plan,
+        catalog=catalog,
+        maximum_input_tokens_per_call=4_096,
+        maximum_cost_usd=1.0,
+    )
+
+    assert budget.input_usd_per_million_tokens == 1.0
+    assert budget.output_usd_per_million_tokens == 2.0
+    assert budget.pricing_source is PricingSource.CONFIGURED
+    assert budget.call_count == 3
+    assert budget.estimated_cost_usd == pytest.approx(0.110592)
+
+
+def test_estimate_fails_when_the_ceiling_cannot_admit_the_sample(tmp_path: Path) -> None:
+    """A conservative estimate that exceeds the operator ceiling fails closed."""
+    store = _built_store(tmp_path)
+    _setup(store)
+    plan = prepare_manual_judge_calibration(store, sample_size=3)
+
+    with pytest.raises(ValueError, match="exceeds --maximum-cost-usd"):
+        estimate_manual_judge_budget(
+            plan,
+            input_usd_per_million_tokens=1.0,
+            output_usd_per_million_tokens=2.0,
+            maximum_input_tokens_per_call=4_096,
+            maximum_cost_usd=0.000001,
+        )
+
+
+def test_estimate_requires_catalog_or_both_overrides(tmp_path: Path) -> None:
+    """A budget cannot be invented from a sample count alone."""
+    store = _built_store(tmp_path)
+    _setup(store)
+    plan = prepare_manual_judge_calibration(store, sample_size=3)
+
+    with pytest.raises(ManualJudgeError, match="project model catalog"):
+        estimate_manual_judge_budget(
+            plan,
+            maximum_input_tokens_per_call=4_096,
+            maximum_cost_usd=1.0,
         )
 
 

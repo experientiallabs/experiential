@@ -20,7 +20,7 @@ from wmo.common.judging import (
     CalibrationReport,
     PromptDefinition,
 )
-from wmo.common.models import ModelSnapshot, OperationEconomics
+from wmo.common.models import ModelSnapshot, OperationEconomics, PricingSource
 
 
 class ManualJudgeError(ValueError):
@@ -204,6 +204,7 @@ class JudgeCalibrationBudget(ContractModel):
 
     input_usd_per_million_tokens: float = Field(ge=0)
     output_usd_per_million_tokens: float = Field(ge=0)
+    pricing_source: PricingSource
     maximum_input_tokens_per_call: int = Field(gt=0)
     maximum_output_tokens_per_call: Literal[4096] = 4096
     maximum_attempts_per_call: int = Field(gt=0)

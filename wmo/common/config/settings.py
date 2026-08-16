@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import math
 import tomllib
 import uuid
 from pathlib import Path
 
 import tomli_w
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from wmo.common.config.paths import ARTIFACT_DIR
 from wmo.common.core.files import write_text_atomic
 from wmo.common.core.locks import file_write_lock
 
 SETTINGS_FILENAME = "settings.toml"
+DEFAULT_COMMAND_BUDGET_USD = 10.0
 
 
 class TelemetrySettings(BaseModel):
@@ -28,10 +30,25 @@ class TelemetrySettings(BaseModel):
     )
 
 
+class CommandBudgetSettings(BaseModel):
+    """Shared spend ceiling used by paid CLI commands when they omit an explicit flag."""
+
+    maximum_cost_usd: float | None = Field(default=None, gt=0)
+
+    @field_validator("maximum_cost_usd")
+    @classmethod
+    def _require_finite(cls, value: float | None) -> float | None:
+        """Reject a non-finite shared command-budget ceiling."""
+        if value is not None and not math.isfinite(value):
+            raise ValueError("command budget must be finite")
+        return value
+
+
 class ProjectSettings(BaseModel):
-    """Anonymous product-telemetry settings local to one project root."""
+    """Local telemetry preference and optional shared command-budget ceiling."""
 
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
+    commands: CommandBudgetSettings = Field(default_factory=CommandBudgetSettings)
 
 
 def settings_path(root: str | Path = ARTIFACT_DIR) -> Path:
@@ -124,3 +141,19 @@ def ensure_telemetry_anonymous_id(root: str | Path = ARTIFACT_DIR) -> str:
             save_settings(settings, root)
     assert settings.telemetry.anonymous_id is not None
     return settings.telemetry.anonymous_id
+
+
+def resolve_command_budget_usd(root: str | Path, explicit: float | None) -> float:
+    """Return the explicit ceiling, the shared command-budget setting, or the default.
+
+    Args:
+        root: Directory that owns the settings file.
+        explicit: Caller-supplied ceiling, or ``None`` to use the shared setting.
+
+    Returns:
+        Finite positive spend ceiling in US dollars.
+    """
+    if explicit is not None:
+        return explicit
+    configured = load_settings(root).commands.maximum_cost_usd
+    return DEFAULT_COMMAND_BUDGET_USD if configured is None else configured

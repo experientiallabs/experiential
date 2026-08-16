@@ -12,12 +12,15 @@ from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.common.config import resolve_command_budget_usd
 from wmo.common.judging import Rubric, RubricDimension
 from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import load_model_catalog
 from wmo.common.project import ProjectStore
 from wmo.common.release_revision import installed_release_revision
+from wmo.optimize.router.judging.artifacts import read_audit, require_review_state
 from wmo.optimize.router.judging.contracts import (
+    JudgeCalibrationBudget,
     JudgePromptTemplate,
     JudgeTracePreview,
     ManualJudgeCalibrationResult,
@@ -31,6 +34,7 @@ from wmo.optimize.router.judging.labels import (
 )
 from wmo.optimize.router.judging.service import (
     DEFAULT_JUDGE_TEMPLATE,
+    ManualJudgeCalibrationPlan,
     ManualJudgeError,
     ManualJudgeSetupPlan,
     calibrate_manual_judge,
@@ -136,10 +140,27 @@ def judge_calibrate(
     root: Path = _ROOT_OPTION,
     sample_size: int = typer.Option(10, "--sample-size", min=1),
     label: list[str] | None = _LABEL_OPTION,
-    input_price: float = typer.Option(..., "--input-usd-per-million", min=0),
-    output_price: float = typer.Option(..., "--output-usd-per-million", min=0),
+    input_price: float | None = typer.Option(
+        None,
+        "--input-usd-per-million",
+        min=0,
+        rich_help_panel="Advanced",
+        help="Advanced override for judge input price when catalog pricing is unavailable.",
+    ),
+    output_price: float | None = typer.Option(
+        None,
+        "--output-usd-per-million",
+        min=0,
+        rich_help_panel="Advanced",
+        help="Advanced override for judge output price when catalog pricing is unavailable.",
+    ),
     maximum_input_tokens: int = typer.Option(32_768, "--maximum-input-tokens", min=1),
-    maximum_cost_usd: float = typer.Option(10.0, "--maximum-cost-usd", min=0.000001),
+    maximum_cost_usd: float | None = typer.Option(
+        None,
+        "--maximum-cost-usd",
+        min=0.000001,
+        help="Calibration spend ceiling. Defaults to the shared command-budget setting, then $10.",
+    ),
     yes: bool = typer.Option(False, "--yes", help="Consent to the displayed judge spend."),
     approve: bool = typer.Option(
         False, "--approve", help="Approve the report after it is displayed."
@@ -158,10 +179,10 @@ def judge_calibrate(
         root: Local project root containing ``models.toml``.
         sample_size: Maximum number of distinct fit lineages to calibrate.
         label: Repeatable explicit human score inputs.
-        input_price: Explicit judge input price per million tokens.
-        output_price: Explicit judge output price per million tokens.
+        input_price: Optional advanced input-price override.
+        output_price: Optional advanced output-price override.
         maximum_input_tokens: Conservative input bound for every call attempt.
-        maximum_cost_usd: Total calibration spend ceiling.
+        maximum_cost_usd: Optional spend ceiling; otherwise the shared command-budget setting.
         yes: Explicit spend consent only.
         approve: Separate approval of the displayed completed report.
         accept_insufficient_labels: Explicit risk acceptance below ten labeled rollouts.
@@ -176,16 +197,30 @@ def judge_calibrate(
         now = datetime.now(UTC)
         plan = prepare_manual_judge_calibration(store, sample_size=sample_size)
         rubric = _load_setup_rubric(store, plan.setup)
-        _render_calibration_previews(plan.previews)
-        sample_sha256 = calibration_sample_digest(plan.setup, calibration_sample(plan))
-        drafted = read_label_draft(store, plan.setup, sample_sha256)
         completed = manual_judge_calibration_is_complete(store)
         if completed:
+            state = require_review_state(store)
+            assert state.audit is not None
+            budget = read_audit(store, state.audit).budget
             _console.print(
                 "Judge calibration is already complete; replaying its immutable evidence "
                 "without collecting labels."
             )
-        elif drafted:
+        else:
+            catalog = load_model_catalog(store.model_catalog_path)
+            budget = estimate_manual_judge_budget(
+                plan,
+                catalog=catalog,
+                input_usd_per_million_tokens=input_price,
+                output_usd_per_million_tokens=output_price,
+                maximum_input_tokens_per_call=maximum_input_tokens,
+                maximum_cost_usd=resolve_command_budget_usd(root, maximum_cost_usd),
+            )
+        _render_calibration_previews(plan.previews)
+        _render_budget_breakdown(plan, budget)
+        sample_sha256 = calibration_sample_digest(plan.setup, calibration_sample(plan))
+        drafted = read_label_draft(store, plan.setup, sample_sha256)
+        if drafted and not completed:
             _console.print(f"Resuming {len(drafted)} saved human labels for this trace sample.")
 
         def persist(collected: tuple[ManualJudgeLabel, ...]) -> None:
@@ -208,13 +243,6 @@ def judge_calibrate(
                 persist,
                 non_interactive=non_interactive,
             )
-        )
-        budget = estimate_manual_judge_budget(
-            plan,
-            input_usd_per_million_tokens=input_price,
-            output_usd_per_million_tokens=output_price,
-            maximum_input_tokens_per_call=maximum_input_tokens,
-            maximum_cost_usd=maximum_cost_usd,
         )
     except (OSError, ValueError, ManualJudgeError) as exc:
         raise typer.BadParameter(str(exc)) from None
@@ -352,6 +380,29 @@ def _render_calibration_previews(previews: tuple[JudgeTracePreview, ...]) -> Non
             f"  {preview.trace_id}{comparison} [{preview.outcome}] {preview.task} "
             f"spans={', '.join(preview.span_names)}"
         )
+
+
+def _render_budget_breakdown(
+    plan: ManualJudgeCalibrationPlan, budget: JudgeCalibrationBudget
+) -> None:
+    """Display the conservative calibration estimate before consent or credentials.
+
+    Args:
+        plan: Frozen real-trace calibration plan.
+        budget: Catalog-resolved or stored conservative spend reservation.
+    """
+    model = plan.setup.judge_model
+    _console.print(f"Judge: {plan.setup.judge_alias} ({model.provider}/{model.model_id})")
+    _console.print(f"Pricing: {budget.pricing_source.value}")
+    _console.print(
+        f"Calls: {budget.call_count} (up to {budget.maximum_attempts_per_call} attempts each)"
+    )
+    _console.print(
+        f"Tokens: up to {budget.maximum_input_tokens_per_call} input and "
+        f"{budget.maximum_output_tokens_per_call} output per attempt"
+    )
+    _console.print(f"Estimated maximum: ${budget.estimated_cost_usd:.4f}")
+    _console.print(f"Budget: ${budget.maximum_cost_usd:.4f}")
 
 
 def _collect_labels(
