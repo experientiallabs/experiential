@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +38,7 @@ from wmo.cli.provider_picker import (
 )
 from wmo.common.models import (
     ModelCatalog,
+    ModelRecord,
     ProviderConnection,
     ProviderModelSelection,
     ProviderSetup,
@@ -104,6 +105,8 @@ def run_provider_setup(
         )
     result = _interactive_setup(
         existing_connections=_existing_connections(existing),
+        existing_connection_providers=_existing_connection_providers(existing),
+        existing_catalog_models={} if existing is None else existing.models,
         existing_models=_existing_models(existing),
         role_inputs=_role_inputs(options, existing=existing),
         console=console,
@@ -118,6 +121,8 @@ def run_provider_setup(
 def _interactive_setup(
     *,
     existing_connections: tuple[ProviderConnection, ...],
+    existing_connection_providers: Mapping[str, str],
+    existing_catalog_models: Mapping[str, ModelRecord],
     existing_models: tuple[ProviderModelSelection, ...],
     role_inputs: SetupRoleInputs,
     console: Console,
@@ -128,6 +133,8 @@ def _interactive_setup(
 
     Args:
         existing_connections: Secret-free connections already configured in the catalog.
+        existing_connection_providers: Exact provider kind for every persisted connection.
+        existing_catalog_models: Exact record for every persisted model alias.
         existing_models: Model aliases already configured in the catalog.
         role_inputs: Role values supplied by flags or already persisted.
         console: Terminal used for every screen.
@@ -139,7 +146,10 @@ def _interactive_setup(
     """
     console.print("[bold]Model setup[/bold]")
     console.print(f"[dim]{CREDENTIAL_NOTE}[/dim]")
-    configured = configured_models(existing_models, existing_connections=existing_connections)
+    configured = configured_models(
+        existing_catalog_models,
+        connection_providers=existing_connection_providers,
+    )
     session = SetupSession(selected=tuple(model.alias for model in configured))
     try:
         while True:
@@ -158,7 +168,7 @@ def _interactive_setup(
                 prepared = prepare_providers(
                     session,
                     existing_connections=existing_connections,
-                    existing_aliases=tuple(model.alias for model in existing_models),
+                    existing_aliases=tuple(sorted(existing_catalog_models)),
                     console=console,
                     lister=lister,
                     environment=environment,
@@ -170,6 +180,8 @@ def _interactive_setup(
             result = _collect_models_and_roles(
                 session,
                 existing_connections=existing_connections,
+                known_existing_connections=tuple(sorted(existing_connection_providers)),
+                known_existing_aliases=tuple(sorted(existing_catalog_models)),
                 existing_models=existing_models,
                 role_inputs=role_inputs,
                 console=console,
@@ -185,6 +197,8 @@ def _collect_models_and_roles(
     session: SetupSession,
     *,
     existing_connections: tuple[ProviderConnection, ...],
+    known_existing_connections: tuple[str, ...],
+    known_existing_aliases: tuple[str, ...],
     existing_models: tuple[ProviderModelSelection, ...],
     role_inputs: SetupRoleInputs,
     console: Console,
@@ -194,6 +208,8 @@ def _collect_models_and_roles(
     Args:
         session: Answers already collected in this setup session.
         existing_connections: Connections already configured in the catalog.
+        known_existing_connections: Every connection name in the persisted catalog.
+        known_existing_aliases: Every model alias in the persisted catalog.
         existing_models: Model aliases already configured in the catalog.
         role_inputs: Role values supplied by flags or already persisted.
         console: Terminal used for every screen.
@@ -219,6 +235,8 @@ def _collect_models_and_roles(
             endpoints=session.endpoints,
             existing_connections=existing_connections,
             existing_models=existing_models,
+            known_existing_connections=known_existing_connections,
+            known_existing_aliases=known_existing_aliases,
         )
         render_summary(result, chosen=chosen, endpoints=session.endpoints, console=console)
         if not Confirm.ask("Save this configuration?", default=True, console=console):
@@ -317,10 +335,10 @@ def _noninteractive_setup(
         "--judge": options.judge or _existing_role(existing, "judge"),
         "--embedder": options.embedder or _existing_role(existing, "embedder"),
     }
-    existing_connections = _existing_connections(existing)
-    existing_models = _existing_models(existing)
-    available_connections = (*existing_connections, *connections)
-    available_models = (*existing_models, *models)
+    existing_connection_names = tuple(sorted(_existing_connection_providers(existing)))
+    existing_model_aliases = _existing_model_aliases(existing)
+    available_connections = (*existing_connection_names, *(item.name for item in connections))
+    available_models = (*existing_model_aliases, *(item.alias for item in models))
     missing = []
     if not available_connections:
         missing.append("at least one --connection-json")
@@ -338,8 +356,8 @@ def _noninteractive_setup(
     return ProviderSetup(
         connections=_deduplicate_connections(connections),
         models=_deduplicate_models(models),
-        known_existing_connections=tuple(item.name for item in existing_connections),
-        known_existing_aliases=tuple(model.alias for model in existing_models),
+        known_existing_connections=existing_connection_names,
+        known_existing_aliases=existing_model_aliases,
         world_model=roles["--world-model"],
         judge=roles["--judge"],
         embedder=roles["--embedder"],
@@ -373,7 +391,7 @@ def _existing_connections(existing: ModelCatalog | None) -> tuple[ProviderConnec
 
 
 def _existing_models(existing: ModelCatalog | None) -> tuple[ProviderModelSelection, ...]:
-    """Convert supported existing model aliases into setup input records.
+    """Convert setup-compatible existing model aliases into input records.
 
     Args:
         existing: Existing catalog, or ``None`` on first setup.
@@ -419,6 +437,34 @@ def _existing_models(existing: ModelCatalog | None) -> tuple[ProviderModelSelect
             )
         )
     return tuple(records)
+
+
+def _existing_model_aliases(existing: ModelCatalog | None) -> tuple[str, ...]:
+    """Return every persisted model alias in deterministic order.
+
+    Args:
+        existing: Existing catalog, or ``None`` on first setup.
+
+    Returns:
+        Every exact alias already owned by the catalog.
+    """
+    if existing is None:
+        return ()
+    return tuple(sorted(existing.models))
+
+
+def _existing_connection_providers(existing: ModelCatalog | None) -> dict[str, str]:
+    """Return every persisted connection name and its exact provider kind.
+
+    Args:
+        existing: Existing catalog, or ``None`` on first setup.
+
+    Returns:
+        Provider kinds keyed by connection name in deterministic order.
+    """
+    if existing is None:
+        return {}
+    return {name: connection.provider for name, connection in sorted(existing.connections.items())}
 
 
 def _existing_role(existing: ModelCatalog | None, role: str) -> str | None:

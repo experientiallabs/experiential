@@ -631,6 +631,65 @@ def test_configured_models_are_reassignable_without_any_provider_request(
     assert "Keep the models already configured" in unstyle(console.output)
 
 
+def test_offline_roles_include_models_on_tinker_without_provider_requests(tmp_path: Path) -> None:
+    """Configured-only editing does not discard Tinker aliases outside the setup picker.
+
+    Args:
+        tmp_path: Temporary WMO root containing a complete custom-provider catalog.
+    """
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    chat = ModelCapabilities(
+        supports_completions=True,
+        supports_structured_output=True,
+        input_cost_per_million_tokens_usd=1.0,
+        output_cost_per_million_tokens_usd=4.0,
+    )
+    embedding = ModelCapabilities(
+        supports_embeddings=True,
+        input_cost_per_million_tokens_usd=0.02,
+    )
+    write_model_catalog(
+        root / "models.toml",
+        ModelCatalog(
+            connections={
+                "custom": ConnectionConfig(
+                    provider="tinker",
+                    api_key_env="TINKER_API_KEY",
+                ),
+                "openai": ConnectionConfig(
+                    provider="openai",
+                    api_key_env="OPENAI_API_KEY",
+                ),
+            },
+            models={
+                "chat": ModelRecord(connection="custom", model="chat-id", capabilities=chat),
+                "embed": ModelRecord(
+                    connection="openai",
+                    model="embed-id",
+                    capabilities=embedding,
+                ),
+            },
+            roles=ModelRoles(world_model="chat", judge="chat", embedder="embed"),
+        ),
+    )
+    console = ScriptedConsole("1\n\n\n1\n1\n1\n\ny\n")
+
+    catalog = run_provider_setup(
+        root,
+        ProviderSetupOptions(),
+        non_interactive=False,
+        replace=False,
+        console=console,
+        lister=_UnavailableLister(),
+    )
+
+    assert catalog.roles == ModelRoles(world_model="chat", judge="chat", embedder="embed")
+    assert set(catalog.connections) == {"custom", "openai"}
+    assert set(catalog.models) == {"chat", "embed"}
+    assert "tinker/chat-id" in unstyle(console.output)
+
+
 def test_role_flags_preselect_the_roles_the_picker_offers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

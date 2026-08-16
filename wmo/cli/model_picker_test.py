@@ -261,21 +261,8 @@ def test_configured_catalog_entries_become_selectable_rows() -> None:
     unusable = ModelRecord(connection="openai", model="unknown-model")
 
     rows = configured_models(
-        (
-            ProviderModelSelection(
-                alias="luna",
-                connection="openai",
-                model="gpt-5.6-luna",
-                supports_completions=True,
-                supports_structured_output=True,
-                input_cost_per_million_tokens_usd=1.0,
-                output_cost_per_million_tokens_usd=6.0,
-                cached_input_cost_per_million_tokens_usd=0.1,
-                cache_write_cost_per_million_tokens_usd=1.25,
-            ),
-            ProviderModelSelection(alias="mystery", connection="openai", model="unknown-model"),
-        ),
-        existing_connections=(_OPENAI,),
+        {"luna": record, "mystery": unusable},
+        connection_providers={"openai": "openai"},
     )
 
     assert record.capabilities is not None

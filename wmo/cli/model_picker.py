@@ -7,6 +7,7 @@ verified metadata can serve it, and render the single summary shown before setup
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from rich.console import Console
@@ -27,6 +28,7 @@ from wmo.cli.provider_picker import (
 )
 from wmo.common.models import (
     ModelCapabilities,
+    ModelRecord,
     PricingSource,
     ProviderConnection,
     ProviderModelSelection,
@@ -358,6 +360,8 @@ def build_result(
     endpoints: tuple[PreparedEndpoint, ...],
     existing_connections: tuple[ProviderConnection, ...],
     existing_models: tuple[ProviderModelSelection, ...],
+    known_existing_connections: tuple[str, ...] | None = None,
+    known_existing_aliases: tuple[str, ...] | None = None,
 ) -> ProviderSetupResult:
     """Build the catalog update from confirmed models and roles.
 
@@ -367,11 +371,19 @@ def build_result(
         endpoints: Prepared provider endpoints.
         existing_connections: Connections already configured in the catalog.
         existing_models: Model aliases already configured in the catalog.
+        known_existing_connections: Every connection name in the persisted catalog. When omitted,
+            the setup-compatible connection records supply the names.
+        known_existing_aliases: Every model alias in the persisted catalog. When omitted, the
+            setup-compatible model selections supply the aliases.
 
     Returns:
         The setup to merge plus any router roles to assign after it.
     """
-    configured_aliases = {model.alias for model in existing_models}
+    configured_aliases = set(
+        (model.alias for model in existing_models)
+        if known_existing_aliases is None
+        else known_existing_aliases
+    )
     used_connections = {item.connection for item in chosen}
     setup = ProviderSetup(
         connections=tuple(
@@ -382,7 +394,11 @@ def build_result(
         models=tuple(
             model_selection(item) for item in chosen if item.alias not in configured_aliases
         ),
-        known_existing_connections=tuple(item.name for item in existing_connections),
+        known_existing_connections=(
+            tuple(item.name for item in existing_connections)
+            if known_existing_connections is None
+            else known_existing_connections
+        ),
         known_existing_aliases=tuple(sorted(configured_aliases)),
         world_model=roles.world_model,
         judge=roles.judge,
@@ -420,30 +436,29 @@ def model_selection(item: AvailableModel) -> ProviderModelSelection:
 
 
 def configured_models(
-    existing_models: tuple[ProviderModelSelection, ...],
+    existing_models: Mapping[str, ModelRecord],
     *,
-    existing_connections: tuple[ProviderConnection, ...],
+    connection_providers: Mapping[str, str],
 ) -> tuple[AvailableModel, ...]:
     """Present already-configured catalog aliases as selectable models.
 
     Args:
-        existing_models: Model aliases already configured in the catalog.
-        existing_connections: Connections already configured in the catalog.
+        existing_models: Exact model records keyed by every persisted alias.
+        connection_providers: Exact provider kind keyed by every persisted connection name.
 
     Returns:
         Configurable records for every configured alias with usable metadata.
     """
-    providers = {connection.name: connection.provider for connection in existing_connections}
     records = []
-    for model in existing_models:
-        capabilities = model.catalog_record().capabilities
+    for alias, model in sorted(existing_models.items()):
+        capabilities = model.capabilities
         if capabilities is None or not served_roles(capabilities):
             continue
         records.append(
             AvailableModel(
-                alias=model.alias,
+                alias=alias,
                 connection=model.connection,
-                provider=providers.get(model.connection, model.connection),
+                provider=connection_providers[model.connection],
                 model=model.model,
                 capabilities=capabilities,
                 pricing_source=PricingSource.CONFIGURED,
