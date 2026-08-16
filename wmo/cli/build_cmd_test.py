@@ -418,7 +418,7 @@ def test_first_build_rejects_bad_provider_flags_before_any_write(tmp_path: Path)
     )
 
     assert result.exit_code == 2
-    output = unstyle(result.output)
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
     assert "unsupported --provider value 'not-a-provider'" in output
     assert "duplicate --provider value 'openai'" in output
     assert not root.exists()

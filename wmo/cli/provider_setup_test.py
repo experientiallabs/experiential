@@ -216,7 +216,7 @@ def test_noninteractive_provider_flags_validate_without_prompts_or_writes(tmp_pa
     )
 
     assert result.exit_code == 2
-    output = unstyle(result.output)
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
     assert "unsupported --provider value 'not-a-provider'" in output
     assert "duplicate --provider value 'openai'" in output
     assert (
@@ -251,7 +251,7 @@ def test_noninteractive_valid_providers_still_require_structured_collections(
     )
 
     assert result.exit_code == 2
-    output = unstyle(result.output)
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
     assert "at least one --connection-json" in output
     assert "Select the providers you want to use" not in output
     assert not (tmp_path / ".wmo" / "models.toml").exists()
