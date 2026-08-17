@@ -9,6 +9,9 @@ from datetime import datetime
 from wmo.common.core.artifacts import stable_id
 from wmo.common.evaluations import EvaluationPlan, EvaluationProtocol
 from wmo.common.models import (
+    ProviderSetup,
+    catalog_state_sha256,
+    configure_provider_catalog,
     configure_router_candidates,
     verify_router_candidate_catalog_state,
 )
@@ -132,11 +135,14 @@ def optimize_project_router(
     resolved_catalog = runtime_catalog.with_catalog(candidate_plan.prospective_catalog)
     agent_factory = _resolve_agent_factory(preflight, options)
     resolved = _resolve_all_models(preflight, resolved_catalog, options)
+    candidate_catalog_sha256 = _persist_candidate_provider_setup(project, candidate_plan)
     configured = configure_router_candidates(
         project.model_catalog_path,
         candidate_plan.selection,
-        candidate_models=candidate_plan.candidate_models,
-        expected_state_sha256=candidate_plan.expected_catalog_sha256,
+        candidate_models=(
+            () if candidate_plan.candidate_connections else candidate_plan.candidate_models
+        ),
+        expected_state_sha256=candidate_catalog_sha256,
     )
     if configured != candidate_plan.prospective_catalog:
         raise AutomaticRouterError("persisted router candidate catalog differs from confirmation")
@@ -188,6 +194,59 @@ def optimize_project_router(
         artifacts=artifacts,
         composition=composition,
     )
+
+
+def _persist_candidate_provider_setup(
+    project: ProjectStore,
+    candidate_plan: RouterCandidateSetupPlan,
+) -> str:
+    """Persist newly discovered provider records after consent and before role assignment.
+
+    Args:
+        project: Project whose shared model catalog was confirmed during collection.
+        candidate_plan: Confirmed candidate selection and prospective catalog.
+
+    Returns:
+        Catalog digest to use for the following atomic candidate-role write.
+
+    Raises:
+        AutomaticRouterError: The build roles cannot support a provider catalog update.
+    """
+    if not candidate_plan.candidate_connections:
+        return candidate_plan.expected_catalog_sha256
+    roles = candidate_plan.prospective_catalog.roles
+    if roles.world_model is None or roles.judge is None or roles.embedder is None:
+        raise AutomaticRouterError(
+            "discovered router candidates require an existing world model, judge, and embedder"
+        )
+    new_connection_names = {connection.name for connection in candidate_plan.candidate_connections}
+    new_aliases = {model.alias for model in candidate_plan.candidate_models}
+    setup = ProviderSetup(
+        connections=candidate_plan.candidate_connections,
+        models=candidate_plan.candidate_models,
+        known_existing_connections=tuple(
+            sorted(
+                set(candidate_plan.prospective_catalog.connections).difference(new_connection_names)
+            )
+        ),
+        known_existing_aliases=tuple(
+            sorted(set(candidate_plan.prospective_catalog.models).difference(new_aliases))
+        ),
+        world_model=roles.world_model,
+        judge=roles.judge,
+        embedder=roles.embedder,
+    )
+    try:
+        configure_provider_catalog(
+            project.model_catalog_path,
+            setup,
+            expected_state_sha256=candidate_plan.expected_catalog_sha256,
+        )
+    except ValueError as exc:
+        raise AutomaticRouterError(
+            f"discovered router provider setup could not be saved: {exc}"
+        ) from exc
+    return catalog_state_sha256(project.model_catalog_path)
 
 
 def _resolve_all_models(

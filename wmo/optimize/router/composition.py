@@ -37,6 +37,7 @@ from wmo.common.evaluations.evidence import (
 from wmo.common.judging import Judge, Judgment
 from wmo.common.models import (
     ModelCatalog,
+    ProviderConnection,
     ProviderModelSelection,
     RoutedCandidateSnapshot,
     RouterCandidateSelection,
@@ -107,6 +108,7 @@ class RouterCandidateSetupPlan:
     candidate_models: tuple[ProviderModelSelection, ...]
     prospective_catalog: ModelCatalog
     expected_catalog_sha256: str
+    candidate_connections: tuple[ProviderConnection, ...] = ()
 
 
 class ApprovedRouterReview(ContractModel):

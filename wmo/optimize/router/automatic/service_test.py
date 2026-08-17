@@ -36,7 +36,13 @@ from wmo.common.models import (
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
+    ProviderConnection,
+    ProviderModelSelection,
+    RouterCandidateSelection,
     Usage,
+    catalog_state_sha256,
+    configure_router_candidates,
+    load_model_catalog,
     write_model_catalog,
 )
 from wmo.common.project import (
@@ -63,8 +69,10 @@ from wmo.optimize.router.automatic.preflight import (
 from wmo.optimize.router.automatic.replay import find_completed_automatic_router_replay
 from wmo.optimize.router.automatic.service import (
     AutomaticRouterError,
+    _persist_candidate_provider_setup,
     optimize_project_router,
 )
+from wmo.optimize.router.composition import RouterCandidateSetupPlan
 from wmo.optimize.router.judging.artifacts import read_audit, write_audit, write_review_state
 from wmo.optimize.router.judging.contracts import ManualJudgeLabel, ManualJudgeReviewState
 from wmo.optimize.router.judging.service import (
@@ -511,6 +519,69 @@ def test_automatic_router_refuses_spend_before_credentials_calls_or_writes(
     assert store.artifacts.list_ids() == before_artifacts
     assert store.model_catalog_path.read_bytes() == before_catalog
     assert store.read_review() == before_review
+
+
+def test_discovered_candidate_provider_records_persist_before_role_assignment(
+    tmp_path: Path,
+) -> None:
+    """Persist newly discovered candidate metadata before the atomic router-role write.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+    """
+    catalog = _catalog()
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    path = root / "models.toml"
+    write_model_catalog(path, catalog)
+    project = ProjectStore(root, "support")
+    connection = ProviderConnection(
+        name="discovered",
+        provider="openai",
+        api_key_env="DISCOVERED_API_KEY",
+    )
+    capabilities = catalog.models["candidate-a"].capabilities
+    assert capabilities is not None
+    model = ProviderModelSelection(
+        alias="candidate-new",
+        connection=connection.name,
+        model="candidate-new",
+        capabilities=capabilities,
+    )
+    prospective = catalog.model_copy(
+        update={
+            "connections": {
+                **catalog.connections,
+                connection.name: connection.catalog_config(),
+            },
+            "models": {**catalog.models, model.alias: model.catalog_record()},
+            "roles": catalog.roles.model_copy(
+                update={"candidates": ("candidate-a", model.alias), "incumbent": "candidate-a"}
+            ),
+        }
+    )
+    plan = RouterCandidateSetupPlan(
+        selection=RouterCandidateSelection(
+            candidates=("candidate-a", model.alias), incumbent="candidate-a"
+        ),
+        candidate_models=(model,),
+        prospective_catalog=prospective,
+        expected_catalog_sha256=catalog_state_sha256(path),
+        candidate_connections=(connection,),
+    )
+
+    digest = _persist_candidate_provider_setup(project, plan)
+    saved = load_model_catalog(path)
+    assert saved.connections[connection.name].provider == "openai"
+    assert saved.models[model.alias] == model.catalog_record()
+    assert saved.roles.candidates == ()
+
+    configured = configure_router_candidates(
+        path,
+        plan.selection,
+        expected_state_sha256=digest,
+    )
+    assert configured.roles.candidates == ("candidate-a", model.alias)
 
 
 def test_provider_model_only_telemetry_composes_with_inferred_unique_attribution(

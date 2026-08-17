@@ -12,7 +12,11 @@ from typer.testing import CliRunner
 
 from wmo.cli.app import app
 from wmo.cli.picker_test import ScriptedConsole
-from wmo.cli.provider_setup import ProviderSetupOptions, run_provider_setup
+from wmo.cli.provider_setup import (
+    ProviderSetupOptions,
+    run_provider_setup,
+    run_router_candidate_picker,
+)
 from wmo.common.models import (
     ConnectionConfig,
     DiscoveredModel,
@@ -20,6 +24,7 @@ from wmo.common.models import (
     ModelCatalog,
     ModelRecord,
     ModelRoles,
+    ProviderConnection,
     load_model_catalog,
     write_model_catalog,
 )
@@ -470,6 +475,42 @@ class _FakeLister:
         """
         self.requests.append(endpoint.provider)
         return self._catalogs[endpoint.provider]
+
+
+def test_router_candidate_picker_discovers_only_eligible_completion_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The router flow reuses provider discovery and hides embedding/unverified rows.
+
+    Args:
+        monkeypatch: Patch fixture supplying the configured provider credential.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    connection = ConnectionConfig(provider="tinker", api_key_env="TINKER_API_KEY")
+    catalog = ModelCatalog(
+        connections={"custom": connection},
+        models={"world": ModelRecord(connection="custom", model="world")},
+        roles=ModelRoles(world_model="world"),
+    )
+
+    picked = run_router_candidate_picker(
+        catalog,
+        console=ScriptedConsole("1\n\n1,2\n\n1\n"),
+        lister=_FakeLister(),
+        environment={"OPENAI_API_KEY": "openai-secret"},
+    )
+
+    assert picked is not None
+    assert picked.selection.candidates == ("gpt-5-6-luna", "gpt-5-6-terra")
+    assert picked.selection.incumbent == "gpt-5-6-luna"
+    assert tuple(model.alias for model in picked.candidate_models) == (
+        "gpt-5-6-luna",
+        "gpt-5-6-terra",
+    )
+    assert all(model.capabilities.supports_completions for model in picked.candidate_models)
+    assert picked.connections == (
+        ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),
+    )
 
 
 def test_interactive_setup_saves_providers_models_and_roles_it_derived(
