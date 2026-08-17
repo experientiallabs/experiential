@@ -24,6 +24,7 @@ from wmo.common.models import (
     Embedding,
     EmbeddingCostReservation,
     ModelCapabilities,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -246,8 +247,9 @@ def _complete(
     key: str,
     conversation: str,
     request: ModelRequest,
-    output: str,
+    output: str | AssistantAction,
     now: datetime,
+    finish_reason: ModelFinishReason = ModelFinishReason.COMPLETED,
 ) -> RuntimeAcceptedEvent:
     """Accept and complete one deterministic routed interaction.
 
@@ -256,8 +258,9 @@ def _complete(
         key: Stable idempotency key.
         conversation: Caller conversation identity.
         request: Complete visible request.
-        output: Assistant response text.
+        output: Assistant response text or complete assistant action.
         now: Acceptance timestamp.
+        finish_reason: Provider-reported terminal reason preserved in provenance.
 
     Returns:
         Accepted event named by the completion.
@@ -269,9 +272,17 @@ def _complete(
         request=request,
         now=now,
     )
+    action = output if isinstance(output, AssistantAction) else AssistantAction(content=output)
     journal.record_completed(
         accepted,
-        _response(output),
+        ModelResponse(
+            output=action,
+            model=_model(),
+            economics=OperationEconomics(
+                usage=Usage(input_tokens=8, output_tokens=3, cached_input_tokens=0)
+            ),
+            finish_reason=finish_reason,
+        ),
         completed_at=now + timedelta(seconds=1),
     )
     return accepted
@@ -487,7 +498,7 @@ def test_two_turn_refresh_indexes_observed_turn_and_excludes_terminal_output(
     assert result.retrieval.index.transition_count == 1
     transition = result.retrieval.transitions[0]
     assert transition.trace_id == first.interaction_id
-    assert transition.lineage_id == first.lineage_id
+    assert transition.lineage_id == first.identity.lineage_id
     assert transition.action.content == "First answer"
     assert transition.observation.content == "Second question"
     assert "Second answer" not in tuple(
@@ -636,8 +647,8 @@ def test_interleaved_conversations_stitch_only_within_each_lineage(tmp_path: Pat
     }
 
     assert observed == {
-        first_a.interaction_id: (first_a.lineage_id, "A2"),
-        first_b.interaction_id: (first_b.lineage_id, "B2"),
+        first_a.interaction_id: (first_a.identity.lineage_id, "A2"),
+        first_b.interaction_id: (first_b.identity.lineage_id, "B2"),
     }
 
 
@@ -828,7 +839,7 @@ def test_own_lineage_query_exclusion_removes_runtime_demonstration(tmp_path: Pat
             task=transition.task,
             initial_context=transition.initial_context,
             action=RAGAction(kind="message", content="First answer"),
-            excluded_lineage_ids=(first.lineage_id,),
+            excluded_lineage_ids=(first.identity.lineage_id,),
         )
     )
 
@@ -981,7 +992,7 @@ def test_real_import_and_runtime_snapshot_build_one_new_union_and_index(tmp_path
         (transition.trace_id, transition.lineage_id) for transition in result.retrieval.transitions
     } == {
         (imported.traces[0].trace_id, imported_bindings[0].lineage_id),
-        (first.interaction_id, first.lineage_id),
+        (first.interaction_id, first.identity.lineage_id),
     }
 
 

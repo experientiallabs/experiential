@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Self
 from uuid import uuid4
 
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import AwareDatetime, Field, ValidationError, field_validator, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, Sha256, canonical_json_bytes
 from wmo.common.core.files import fsync_directory_best_effort
@@ -63,19 +63,11 @@ class TextCellLease(ContractModel):
     reserved_cost_usd: float | None = Field(default=None, gt=0)
     owner_id: str = Field(min_length=1, max_length=128)
     owner_pid: int = Field(gt=0)
-    claimed_at: datetime
-    expires_at: datetime
+    claimed_at: AwareDatetime
+    expires_at: AwareDatetime
     status: TextCellLeaseStatus = TextCellLeaseStatus.ACTIVE
     unknown_spend_blocks_budget: bool = False
     dispatch_intent_recorded: bool = False
-
-    @field_validator("claimed_at", "expires_at")
-    @classmethod
-    def _require_aware_timestamp(cls, value: datetime) -> datetime:
-        """Reject a lease timestamp that cannot be compared across process boundaries."""
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("text-cell lease timestamps must include a timezone")
-        return value
 
     @field_validator("reserved_cost_usd")
     @classmethod

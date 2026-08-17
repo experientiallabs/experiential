@@ -18,7 +18,8 @@ from wmo.common.judging import (
     ScoreAnchor,
 )
 from wmo.common.models import ModelSnapshot
-from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
+from wmo.common.project import ProjectStore, artifact_input
+from wmo.common.project.store_test import _store
 
 _DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 11, tzinfo=UTC)
@@ -75,12 +76,6 @@ def _proposal() -> RubricProposal:
         source_lineage_ids=("lineage-fit-success", "lineage-fit-failed"),
         excluded_router_held_out_lineage_ids=("lineage-held-out",),
     )
-
-
-def _store(tmp_path: Path) -> ProjectStore:
-    store = ProjectStore(tmp_path / ".wmo", "support-project")
-    store.initialize(ProjectConfig(project_id="support-project"))
-    return store
 
 
 def _write_task_set(store: ProjectStore) -> None:

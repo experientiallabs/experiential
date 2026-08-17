@@ -43,7 +43,8 @@ from wmo.common.models import (
     ModelSnapshot,
     OperationEconomics,
 )
-from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
+from wmo.common.project import ProjectStore, artifact_input
+from wmo.common.project.store_test import _store
 from wmo.common.rollouts import (
     RolloutArtifact,
     RolloutEventKind,
@@ -127,13 +128,6 @@ class _TeacherFixture:
     fidelity_input: ArtifactInput
     rule_input: ArtifactInput
     transcript: SFTTranscript
-
-
-def _store(tmp_path: Path, project_id: str = "sft-project") -> ProjectStore:
-    """Create one initialized project-local immutable store."""
-    store = ProjectStore(tmp_path / ".wmo", project_id)
-    store.initialize(ProjectConfig(project_id=project_id))
-    return store
 
 
 def _inputs(*values: ArtifactInput) -> tuple[ArtifactInput, ...]:

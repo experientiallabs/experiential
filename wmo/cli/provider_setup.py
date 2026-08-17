@@ -40,6 +40,7 @@ from wmo.cli.provider_picker import (
     select_providers,
 )
 from wmo.common.models import (
+    ModelCapabilities,
     ModelCatalog,
     ModelRecord,
     ProviderConnection,
@@ -437,34 +438,12 @@ def _existing_models(existing: ModelCatalog | None) -> tuple[ProviderModelSelect
     for alias, model in sorted(existing.models.items()):
         if model.connection not in supported_connections:
             continue
-        capabilities = model.capabilities
         records.append(
             ProviderModelSelection(
                 alias=alias,
                 connection=model.connection,
                 model=model.model,
-                supports_tools=capabilities.supports_tools if capabilities else False,
-                supports_embeddings=capabilities.supports_embeddings if capabilities else False,
-                supports_structured_output=(
-                    capabilities.supports_structured_output if capabilities else False
-                ),
-                supports_completions=(capabilities.supports_completions if capabilities else None),
-                context_window_tokens=capabilities.context_window_tokens if capabilities else None,
-                maximum_output_tokens=(
-                    capabilities.maximum_output_tokens if capabilities else None
-                ),
-                input_cost_per_million_tokens_usd=(
-                    capabilities.input_cost_per_million_tokens_usd if capabilities else None
-                ),
-                output_cost_per_million_tokens_usd=(
-                    capabilities.output_cost_per_million_tokens_usd if capabilities else None
-                ),
-                cached_input_cost_per_million_tokens_usd=(
-                    capabilities.cached_input_cost_per_million_tokens_usd if capabilities else None
-                ),
-                cache_write_cost_per_million_tokens_usd=(
-                    capabilities.cache_write_cost_per_million_tokens_usd if capabilities else None
-                ),
+                capabilities=model.capabilities or ModelCapabilities(),
             )
         )
     return tuple(records)
@@ -600,13 +579,15 @@ def provider_setup_json_examples() -> tuple[str, str]:
             "alias": "model",
             "connection": "openai",
             "model": "your-model-id",
-            "supports_embeddings": True,
-            "supports_structured_output": True,
-            "supports_completions": True,
-            "input_cost_per_million_tokens_usd": 0,
-            "output_cost_per_million_tokens_usd": 0,
-            "cached_input_cost_per_million_tokens_usd": 0,
-            "cache_write_cost_per_million_tokens_usd": 0,
+            "capabilities": {
+                "supports_embeddings": True,
+                "supports_structured_output": True,
+                "supports_completions": True,
+                "input_cost_per_million_tokens_usd": 0,
+                "output_cost_per_million_tokens_usd": 0,
+                "cached_input_cost_per_million_tokens_usd": 0,
+                "cache_write_cost_per_million_tokens_usd": 0,
+            },
         },
         separators=(",", ":"),
     )

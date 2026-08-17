@@ -14,6 +14,7 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     Sha256,
+    envelope_matches_manifest,
     stable_id,
 )
 from wmo.common.models import CompletionCostReservation, ModelSnapshot
@@ -316,19 +317,7 @@ def load_router_execution_contract(
     )
     if value.execution_contract_id != artifact_id:
         raise ValueError("router execution contract identity differs from its artifact")
-    if (
-        value.schema_version,
-        value.created_at,
-        value.inputs,
-        value.code_revision,
-        value.source,
-    ) != (
-        stored.manifest.schema_version,
-        stored.manifest.created_at,
-        stored.manifest.inputs,
-        stored.manifest.code_revision,
-        stored.manifest.source,
-    ):
+    if not envelope_matches_manifest(value, stored.manifest):
         raise ValueError("router execution contract differs from its manifest")
     embedding_set = load_frozen_embedding_set(store, value.router_embedding_input.artifact_id)
     if (

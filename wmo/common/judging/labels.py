@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime
 
-from pydantic import Field, JsonValue, field_validator, model_validator
+from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -32,15 +32,8 @@ class HumanScore(ContractModel):
     lineage_id: ArtifactId
     dimension_id: ArtifactId
     score: int = Field(ge=0)
-    created_at: datetime
+    created_at: AwareDatetime
     supersedes_label_id: ArtifactId | None = None
-
-    @field_validator("created_at")
-    @classmethod
-    def _require_timezone(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("human score timestamps must include a timezone")
-        return value
 
 
 class HumanScoreHistory(ContractModel):

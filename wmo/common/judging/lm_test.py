@@ -36,7 +36,8 @@ from wmo.common.models import (
     OperationEconomics,
     ToolCall,
 )
-from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
+from wmo.common.project import ProjectStore, artifact_input
+from wmo.common.project.store_test import _store
 from wmo.common.rollouts import (
     ProductionSimulatorSnapshot,
     RolloutArtifact,
@@ -170,13 +171,6 @@ def _valid_output(span_id: str = "span-1") -> str:
             ]
         }
     )
-
-
-def _store(tmp_path: Path) -> ProjectStore:
-    """Create an isolated local artifact store for final-judgment persistence coverage."""
-    store = ProjectStore(tmp_path / ".wmo", "support-project")
-    store.initialize(ProjectConfig(project_id="support-project"))
-    return store
 
 
 def _write_bootstrap_sources(

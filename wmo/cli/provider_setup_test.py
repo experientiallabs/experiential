@@ -66,8 +66,10 @@ def _model_json(
             "alias": alias,
             "connection": connection,
             "model": model,
-            "supports_embeddings": embeddings,
-            "input_cost_per_million_tokens_usd": 0.1 if embeddings else None,
+            "capabilities": {
+                "supports_embeddings": embeddings,
+                "input_cost_per_million_tokens_usd": 0.1 if embeddings else None,
+            },
         }
     )
 
@@ -135,11 +137,13 @@ def test_noninteractive_setup_accepts_azure_and_bedrock_connections(tmp_path: Pa
             "alias": "gpt",
             "connection": "azure",
             "model": "gpt-deployment",
-            "supports_completions": True,
-            "input_cost_per_million_tokens_usd": 0,
-            "output_cost_per_million_tokens_usd": 0,
-            "cached_input_cost_per_million_tokens_usd": 0,
-            "cache_write_cost_per_million_tokens_usd": 0,
+            "capabilities": {
+                "supports_completions": True,
+                "input_cost_per_million_tokens_usd": 0,
+                "output_cost_per_million_tokens_usd": 0,
+                "cached_input_cost_per_million_tokens_usd": 0,
+                "cache_write_cost_per_million_tokens_usd": 0,
+            },
         }
     )
     embed = json.dumps(
@@ -147,8 +151,10 @@ def test_noninteractive_setup_accepts_azure_and_bedrock_connections(tmp_path: Pa
             "alias": "titan",
             "connection": "bedrock",
             "model": "amazon.titan-embed-text-v2:0",
-            "supports_embeddings": True,
-            "input_cost_per_million_tokens_usd": 0,
+            "capabilities": {
+                "supports_embeddings": True,
+                "input_cost_per_million_tokens_usd": 0,
+            },
         }
     )
 

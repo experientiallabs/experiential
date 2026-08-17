@@ -22,8 +22,11 @@ from wmo.runtime.models.providers.azure import AzureClient, bind_azure_api_key
 from wmo.runtime.models.providers.bedrock import BedrockClient, BedrockRuntimeFactory
 from wmo.runtime.models.providers.gemini import GEMINI_BASE_URL, GeminiClient
 from wmo.runtime.models.providers.openai import OPENAI_BASE_URL, OpenAIClient
-from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleClient
-from wmo.runtime.models.providers.openrouter import OPENROUTER_BASE_URL, OpenRouterClient
+from wmo.runtime.models.providers.openai_compatible import (
+    OPENROUTER_BASE_URL,
+    OpenAICompatibleClient,
+    OpenRouterClient,
+)
 from wmo.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
     TinkerSampler,
@@ -55,6 +58,31 @@ class TinkerSamplerFactory(Protocol):
 
         Returns:
             A completed-handle sampler with no training lifecycle behavior.
+        """
+        ...
+
+
+class _HttpClientFactory(Protocol):
+    """Constructs one HTTP-backed provider client from explicit connection metadata."""
+
+    def __call__(
+        self,
+        *,
+        model: ModelSnapshot,
+        api_key: str,
+        base_url: str,
+        transport: JsonHttpTransport,
+    ) -> ModelClient:
+        """Return a focused completion client for one resolved connection.
+
+        Args:
+            model: Resolved model identity for the connection.
+            api_key: Credential read from the connection's named environment variable.
+            base_url: Endpoint root the client posts to.
+            transport: Explicit JSON transport for every request.
+
+        Returns:
+            A focused non-streaming completion client.
         """
         ...
 
@@ -184,74 +212,6 @@ class RuntimeModelCatalog:
                 client if capabilities.supports_embeddings else None,
             )
         api_key = read_connection_api_key(connection, environment=self._environment)
-        if provider == "openai":
-            client = OpenAIClient(
-                model=snapshot,
-                api_key=api_key,
-                base_url=connection.base_url or OPENAI_BASE_URL,
-                transport=self._transport_factory(),
-            )
-            return ResolvedModel(
-                alias,
-                snapshot,
-                capabilities,
-                client,
-                client if capabilities.supports_embeddings else None,
-            )
-        if provider == "openrouter":
-            client = OpenRouterClient(
-                model=snapshot,
-                api_key=api_key,
-                base_url=connection.base_url or OPENROUTER_BASE_URL,
-                transport=self._transport_factory(),
-            )
-            return ResolvedModel(
-                alias,
-                snapshot,
-                capabilities,
-                client,
-                client if capabilities.supports_embeddings else None,
-            )
-        if provider == "openai-compatible":
-            if connection.base_url is None:
-                raise ModelConnectionError(
-                    f"OpenAI-compatible alias {alias!r} needs connection.base_url"
-                )
-            client = OpenAICompatibleClient(
-                model=snapshot,
-                api_key=api_key,
-                base_url=connection.base_url,
-                transport=self._transport_factory(),
-            )
-            return ResolvedModel(
-                alias,
-                snapshot,
-                capabilities,
-                client,
-                client if capabilities.supports_embeddings else None,
-            )
-        if provider == "anthropic":
-            client = AnthropicClient(
-                model=snapshot,
-                api_key=api_key,
-                base_url=connection.base_url or ANTHROPIC_BASE_URL,
-                transport=self._transport_factory(),
-            )
-            return ResolvedModel(alias, snapshot, capabilities, client, None)
-        if provider == "gemini":
-            client = GeminiClient(
-                model=snapshot,
-                api_key=api_key,
-                base_url=connection.base_url or GEMINI_BASE_URL,
-                transport=self._transport_factory(),
-            )
-            return ResolvedModel(
-                alias,
-                snapshot,
-                capabilities,
-                client,
-                client if capabilities.supports_embeddings else None,
-            )
         if provider == "azure":
             if connection.base_url is None or connection.api_version is None:
                 raise ModelConnectionError(
@@ -292,7 +252,27 @@ class RuntimeModelCatalog:
                 sampler=sampler,
             )
             return ResolvedModel(alias, snapshot, capabilities, client, None)
-        raise ModelConnectionError(f"unsupported provider {provider!r}")
+        entry = _HTTP_PROVIDERS.get(provider)
+        if entry is None:
+            raise ModelConnectionError(f"unsupported provider {provider!r}")
+        factory, default_base_url = entry
+        base_url = connection.base_url or default_base_url
+        if base_url is None:
+            raise ModelConnectionError(
+                f"OpenAI-compatible alias {alias!r} needs connection.base_url"
+            )
+        http_client = factory(
+            model=snapshot,
+            api_key=api_key,
+            base_url=base_url,
+            transport=self._transport_factory(),
+        )
+        embedding_client = (
+            http_client
+            if capabilities.supports_embeddings and isinstance(http_client, EmbeddingClient)
+            else None
+        )
+        return ResolvedModel(alias, snapshot, capabilities, http_client, embedding_client)
 
     def preflight(
         self,
@@ -334,18 +314,15 @@ class RuntimeModelCatalog:
         )
 
 
-_SUPPORTED_PROVIDERS = frozenset(
-    {
-        "anthropic",
-        "azure",
-        "bedrock",
-        "gemini",
-        "openai",
-        "openai-compatible",
-        "openrouter",
-        "tinker",
-    }
-)
+_HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
+    "anthropic": (AnthropicClient, ANTHROPIC_BASE_URL),
+    "gemini": (GeminiClient, GEMINI_BASE_URL),
+    "openai": (OpenAIClient, OPENAI_BASE_URL),
+    "openai-compatible": (OpenAICompatibleClient, None),
+    "openrouter": (OpenRouterClient, OPENROUTER_BASE_URL),
+}
+
+_SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {"azure", "bedrock", "tinker"}
 
 
 def _runtime_tinker_sampler(

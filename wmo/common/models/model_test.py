@@ -10,8 +10,10 @@ from wmo.common.models import (
     AssistantAction,
     Embedding,
     ModelCapabilities,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
+    ModelResponse,
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
@@ -31,6 +33,39 @@ def test_actions_need_payload_and_measurements_are_finite() -> None:
         AssistantAction()
     with pytest.raises(ValidationError, match="finite"):
         NumericMeasurement(value=float("inf"), provenance="observed")
+
+
+def test_completed_factory_prefers_served_identity_and_maps_the_length_limit() -> None:
+    """The shared factory keeps served identity, observed latency, and the finish reason."""
+    configured = ModelSnapshot(
+        provider="openai",
+        model_id="configured-model",
+        capabilities_sha256=_CAPABILITIES_DIGEST,
+        connection_sha256="b" * 64,
+    )
+    action = AssistantAction(content="Done.")
+
+    served = ModelResponse.completed(
+        output=action,
+        configured_model=configured,
+        served_model_id="served-model",
+        usage=None,
+        latency_seconds=0.25,
+        hit_length_limit=True,
+    )
+    kept = ModelResponse.completed(
+        output=action,
+        configured_model=configured,
+        served_model_id="",
+        usage=None,
+        latency_seconds=0.25,
+    )
+
+    assert served.model.model_id == "served-model"
+    assert served.finish_reason is ModelFinishReason.LENGTH
+    assert kept.model.model_id == "configured-model"
+    assert kept.finish_reason is ModelFinishReason.COMPLETED
+    assert kept.economics.latency_seconds == NumericMeasurement(value=0.25, provenance="observed")
 
 
 def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> None:
@@ -117,6 +152,33 @@ def test_model_messages_reject_tool_and_assistant_fields_on_the_wrong_roles() ->
         ModelMessage(role="user", assistant_action=AssistantAction(content="wrong"))
     with pytest.raises(ValidationError, match="tool messages require tool_call_id"):
         ModelMessage(role="tool", content="missing linkage")
+
+
+def test_combine_economics_reports_partial_totals_only_when_asked() -> None:
+    """Aggregation never presents a partial usage, cost, or provenance as complete."""
+    priced = OperationEconomics(
+        usage=Usage(input_tokens=10, output_tokens=2, cached_input_tokens=4),
+        cost_usd=NumericMeasurement(value=0.5, provenance="observed"),
+        latency_seconds=NumericMeasurement(value=1.0, provenance="observed"),
+    )
+    estimated = OperationEconomics(
+        usage=Usage(input_tokens=5, output_tokens=1),
+        cost_usd=NumericMeasurement(value=0.25, provenance="estimated"),
+    )
+    unmetered = OperationEconomics()
+
+    complete = combine_economics((priced, estimated))
+    partial = combine_economics((priced, unmetered), require_complete_usage=False)
+    strict = combine_economics((priced, unmetered))
+
+    assert combine_economics(()) == OperationEconomics()
+    assert complete.usage == Usage(input_tokens=15, output_tokens=3, cached_input_tokens=None)
+    assert complete.cost_usd == NumericMeasurement(value=0.75, provenance="estimated")
+    assert complete.latency_seconds is None
+    assert partial.usage == priced.usage
+    assert partial.cost_usd is None
+    assert strict.usage is None
+    assert combine_economics((unmetered,), require_complete_usage=False).usage is None
 
 
 def test_embeddings_require_nonempty_finite_vectors() -> None:

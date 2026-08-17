@@ -35,6 +35,7 @@ from wmo.common.models import (
 from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.models import ResolvedModel
+from wmo.simulation.engines.clock import timestamp
 from wmo.simulation.engines.text.prompt import (
     TextWorldModelProtocolError,
     TextWorldModelTransition,
@@ -224,12 +225,17 @@ class RecordingCandidateClient:
             candidate_spans=tuple(self._candidate_spans),
             world_model_spans=tuple(self._world_model_spans),
             candidate_economics=combine_economics(
-                tuple(response.economics for response in self._candidate_responses)
+                tuple(response.economics for response in self._candidate_responses),
+                require_complete_usage=False,
             ),
             world_model_economics=combine_economics(
-                tuple(response.economics for response in self._world_model_responses)
+                tuple(response.economics for response in self._world_model_responses),
+                require_complete_usage=False,
             ),
-            retrieval_economics=combine_economics(tuple(self._retrieval_economics)),
+            retrieval_economics=combine_economics(
+                tuple(self._retrieval_economics),
+                require_complete_usage=False,
+            ),
             transitions=tuple(self._transitions),
             retrieved_transition_ids=tuple(self._retrieved_transition_ids),
         )
@@ -325,7 +331,7 @@ class RecordingCandidateClient:
                 prior_retrieval=tuple(self._retrieval_economics),
                 maximum_cost_usd=self._maximum_cost_usd,
             )
-        candidate_started_at = _timestamp(self._clock)
+        candidate_started_at = timestamp(self._clock)
         self._provider_dispatch_unknown_spend = True
         candidate_response = self._candidate.client.complete(candidate_request)
         if self._candidate_request is not None:
@@ -337,7 +343,7 @@ class RecordingCandidateClient:
                     )
                 }
             )
-        candidate_ended_at = _timestamp(self._clock, not_before=candidate_started_at)
+        candidate_ended_at = timestamp(self._clock, not_before=candidate_started_at)
         self._candidate_responses.append(candidate_response)
         self._candidate_spans.append(
             _model_span(
@@ -409,7 +415,7 @@ class RecordingCandidateClient:
                 prior_retrieval=tuple(self._retrieval_economics),
                 maximum_cost_usd=self._maximum_cost_usd,
             )
-        world_started_at = _timestamp(self._clock, not_before=candidate_ended_at)
+        world_started_at = timestamp(self._clock, not_before=candidate_ended_at)
         self._provider_dispatch_unknown_spend = True
         dispatched = self._grounded_world_model.complete_turn(prepared)
         world_request = dispatched.request
@@ -424,7 +430,7 @@ class RecordingCandidateClient:
                 }
             )
             dispatched = replace(dispatched, response=world_response)
-        world_ended_at = _timestamp(self._clock, not_before=world_started_at)
+        world_ended_at = timestamp(self._clock, not_before=world_started_at)
         self._retrieved_transition_ids.append(
             tuple(match.transition.transition_id for match in dispatched.matches)
         )
@@ -826,13 +832,3 @@ def _text_failure(
             details={"phase": phase},
         ),
     )
-
-
-def _timestamp(clock: Callable[[], datetime], *, not_before: datetime | None = None) -> datetime:
-    """Read a timezone-aware timestamp, never ordering a span backwards in a deterministic fake."""
-    timestamp = clock()
-    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-        raise ValueError("text simulation clock must return timezone-aware datetimes")
-    if not_before is not None and timestamp < not_before:
-        return not_before
-    return timestamp

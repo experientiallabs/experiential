@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import AwareDatetime, Field, model_validator
 
 from wmo.common.core.artifacts import (
     ContractModel,
@@ -35,8 +34,8 @@ class RolloutSpan(ContractModel):
     span_id: str = Field(min_length=1, max_length=256)
     parent_span_id: str | None = Field(default=None, min_length=1, max_length=256)
     kind: RolloutEventKind
-    started_at: datetime
-    ended_at: datetime
+    started_at: AwareDatetime
+    ended_at: AwareDatetime
     payload: JsonObject = Field(default_factory=dict)
     model: ModelSnapshot | None = None
     tool_name: str | None = Field(default=None, max_length=256)
@@ -45,8 +44,6 @@ class RolloutSpan(ContractModel):
 
     @model_validator(mode="after")
     def _require_valid_timestamps(self) -> RolloutSpan:
-        if self.started_at.tzinfo is None or self.ended_at.tzinfo is None:
-            raise ValueError("rollout span timestamps must include timezones")
         if self.ended_at < self.started_at:
             raise ValueError("rollout span ended_at cannot be before started_at")
         return self

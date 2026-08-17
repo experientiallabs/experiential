@@ -66,11 +66,11 @@ class SandboxCreated(BaseModel):
     """The external trial name that owns the sandbox, when the caller supplies one."""
 
     pid: int
-    """The process that created the sandbox, probed for liveness when reaping."""
+    """The process that created the sandbox."""
 
 
 class SandboxReleased(BaseModel):
-    """Proof that a recorded sandbox was killed, so no reaper needs to consider it."""
+    """Proof that a recorded sandbox was killed."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -78,7 +78,7 @@ class SandboxReleased(BaseModel):
     sandbox_id: str
     released_at: datetime
     pid: int
-    """The process that observed the release (the owner, or a reaper)."""
+    """The process that observed the release."""
 
 
 LedgerRecord = Annotated[SandboxCreated | SandboxReleased, Field(discriminator="event")]
@@ -86,21 +86,15 @@ _RECORD_ADAPTER: TypeAdapter[SandboxCreated | SandboxReleased] = TypeAdapter(Led
 
 
 class LedgerFile(BaseModel):
-    """One owning process's ledger: where it lives, whose it is, and what it still holds."""
+    """One owning process's ledger: where it lives and what it still holds."""
 
     model_config = ConfigDict(frozen=True)
 
     path: Path
-    owner_pid: int
     held: tuple[SandboxCreated, ...]
     """Recorded sandboxes with no matching release record."""
 
     released_ids: tuple[str, ...]
-
-    @property
-    def fully_released(self) -> bool:
-        """Whether every sandbox this file recorded has a release record."""
-        return not self.held and bool(self.released_ids)
 
 
 def read_ledger_files(state_directory: Path) -> tuple[LedgerFile, ...]:
@@ -136,7 +130,6 @@ def _read_one(path: Path) -> LedgerFile | None:
         return None
     created: dict[str, SandboxCreated] = {}
     released: dict[str, None] = {}
-    record_pid: int | None = None
     for line in text.splitlines():
         if not line.strip():
             continue
@@ -145,25 +138,15 @@ def _read_one(path: Path) -> LedgerFile | None:
         except ValidationError:
             logger.debug("skipping an unparseable E2B ledger line in %s", path)
             continue
-        record_pid = record_pid if record_pid is not None else record.pid
         if isinstance(record, SandboxCreated):
             created[record.sandbox_id] = record
         else:
             released[record.sandbox_id] = None
     return LedgerFile(
         path=path,
-        owner_pid=_owner_pid(path, record_pid),
         held=tuple(record for key, record in created.items() if key not in released),
         released_ids=tuple(released),
     )
-
-
-def _owner_pid(path: Path, record_pid: int | None) -> int:
-    """The owning pid, read from the `<pid>-<stamp>.jsonl` name and falling back to a record."""
-    head = path.name.split("-", 1)[0]
-    if head.isdigit():
-        return int(head)
-    return record_pid if record_pid is not None else 0
 
 
 class SandboxLedger:

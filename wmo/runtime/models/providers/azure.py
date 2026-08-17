@@ -14,9 +14,8 @@ from wmo.common.models import (
     ModelSnapshot,
 )
 from wmo.runtime.models.credentials import ModelCredentialError
+from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
 from wmo.runtime.models.providers.openai_compatible import (
-    DEFAULT_RETRY_POLICY,
-    DEFAULT_TIMEOUT_SECONDS,
     openai_compatible_request,
     openai_compatible_response,
     openai_embedding_request,

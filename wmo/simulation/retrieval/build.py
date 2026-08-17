@@ -12,11 +12,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
-
-from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactInput,
+    canonical_json_bytes,
+    canonical_jsonl_bytes,
+    stable_id,
+)
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
     ArtifactManifest,
     ArtifactStore,
     artifact_input,
@@ -40,7 +42,6 @@ from wmo.simulation.retrieval.embedding import (
     default_rag_embedder,
     embed_rag_texts,
 )
-from wmo.simulation.retrieval.store import load_rag_index
 from wmo.simulation.retrieval.transitions import extract_real_transitions
 
 
@@ -115,8 +116,8 @@ def persist_trace_rag(
         for transition, values in zip(transitions, embedded, strict=True)
     )
     dimensions = len(vectors[0].values)
-    transitions_payload = _jsonl_bytes(transitions)
-    vectors_payload = _jsonl_bytes(vectors)
+    transitions_payload = canonical_jsonl_bytes(transitions)
+    vectors_payload = canonical_jsonl_bytes(vectors)
     fit_lineages = tuple(
         sorted({binding.lineage_id for binding in lineage_bindings if binding.partition == "fit"})
     )
@@ -174,19 +175,15 @@ def persist_trace_rag(
         RAG_TRANSITIONS_PATH: transitions_payload,
         RAG_VECTORS_PATH: vectors_payload,
     }
-    destination = store.project_directory / "artifacts" / index.rag_id
-    if destination.exists():
-        return _load_exact_replay(store, index, transitions, vectors, files)
-    try:
-        manifest = store.write(
-            artifact_id=index.rag_id,
-            artifact_type=RAG_ARTIFACT_TYPE,
-            envelope=index,
-            files=files,
-        )
-    except ArtifactAlreadyExistsError:
-        return _load_exact_replay(store, index, transitions, vectors, files)
-    return PersistedRAGIndex(index, manifest, transitions, vectors)
+    existing, manifest = store.write_or_replay(
+        artifact_id=index.rag_id,
+        artifact_type=RAG_ARTIFACT_TYPE,
+        envelope=index,
+        envelope_path=RAG_INDEX_PATH,
+        envelope_type=RAGIndex,
+        files=files,
+    )
+    return PersistedRAGIndex(existing, manifest, transitions, vectors)
 
 
 def _load_real_sources(
@@ -260,31 +257,3 @@ def _load_real_sources(
         )
         traces.extend(loaded.traces)
     return tuple(sources), tuple(traces)
-
-
-def _jsonl_bytes(records: Sequence[BaseModel]) -> bytes:
-    """Serialize Pydantic records as deterministic newline-terminated JSONL."""
-    payloads = [canonical_json_bytes(record) for record in records]
-    return b"\n".join(payloads) + b"\n"
-
-
-def _load_exact_replay(
-    store: ArtifactStore,
-    expected: RAGIndex,
-    transitions: tuple[RAGTransition, ...],
-    vectors: tuple[RAGVector, ...],
-    files: dict[str, bytes],
-) -> PersistedRAGIndex:
-    """Reuse a content-identical immutable index after complete verification."""
-    loaded = load_rag_index(store, expected.rag_id)
-    replay = expected.model_copy(update={"created_at": loaded.index.created_at})
-    if loaded.index != replay:
-        raise ValueError("existing RAG index differs from replayed real-trace evidence")
-    if loaded.transitions != transitions or loaded.vectors != vectors:
-        raise ValueError("existing RAG records differ from replayed real-trace evidence")
-    for path, payload in files.items():
-        if path == RAG_INDEX_PATH:
-            continue
-        if store.read_bytes(expected.rag_id, path) != payload:
-            raise ValueError(f"existing RAG payload {path} differs from replayed evidence")
-    return PersistedRAGIndex(loaded.index, loaded.manifest, transitions, vectors)

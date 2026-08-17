@@ -366,13 +366,14 @@ def _persist_lock(store: ArtifactStore) -> ArtifactInput:
 def _persist_tasks(
     store: ArtifactStore,
     tasks: tuple[TaskCase, ...],
+    revision: str = "fixture-revision",
 ) -> tuple[TaskSet, ArtifactInput]:
     """Persist canonical tasks and return their digest-bearing set."""
     payload = b"\n".join(canonical_json_bytes(task) for task in tasks) + b"\n"
     task_set = TaskSet(
         schema_version=1,
         created_at=_BEFORE_LOCK,
-        code_revision="fixture-revision",
+        code_revision=revision,
         task_set_id="task-set-1",
         task_ids=tuple(task.task_id for task in tasks),
         tasks_path="tasks.jsonl",
@@ -392,6 +393,7 @@ def _persist_plan(
     tasks: tuple[TaskCase, ...],
     task_input: ArtifactInput,
     label: Literal["text", "sandbox"],
+    revision: str = "fixture-revision",
 ) -> tuple[EvaluationPlan, ArtifactInput]:
     """Persist one mode-specific plan over the same held-out task coordinates."""
     cells = tuple(
@@ -409,7 +411,7 @@ def _persist_plan(
         schema_version=2,
         created_at=_BEFORE_LOCK,
         inputs=(task_input,),
-        code_revision="fixture-revision",
+        code_revision=revision,
         plan_id=f"{label}-plan-1",
         task_set_id="task-set-1",
         candidate_snapshots=(RoutedCandidateSnapshot(alias="candidate-a", model=_candidate()),),
@@ -695,7 +697,7 @@ def _persist_artifact_set(
     return artifact_input(manifest)
 
 
-def _task(task_id: str, partition: Literal["fit", "held_out"]) -> TaskCase:
+def _task(task_id: str, partition: Literal["fit", "held_out"] = "held_out") -> TaskCase:
     """Create one comparison task with fixed lineage and text."""
     return TaskCase(
         task_id=task_id,

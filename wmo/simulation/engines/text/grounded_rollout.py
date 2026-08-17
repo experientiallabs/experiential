@@ -23,12 +23,12 @@ from wmo.common.rollouts import (
     WorldModelSimulatorSnapshot,
 )
 from wmo.runtime.models import ResolvedModel
+from wmo.simulation.engines.clock import timestamp
 from wmo.simulation.engines.text.bindings import rollout_id_for_binding
 from wmo.simulation.engines.text.prompt import (
     WORLD_MODEL_TEXT_PROMPT_ID,
 )
 from wmo.simulation.engines.text.redaction import redact_action, redact_failure
-from wmo.simulation.engines.text.rollout_support import timestamp
 from wmo.simulation.specs import SimulationSpec
 
 TEXT_WORLD_MODEL_SIMULATOR_ID = "text-world-model-v1"

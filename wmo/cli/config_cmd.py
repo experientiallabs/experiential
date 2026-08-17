@@ -8,6 +8,7 @@ import typer
 from rich.console import Console
 
 from wmo.cli.defer import add_deferred_typer
+from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.cli.provider_setup import ProviderSetupOptions, run_provider_setup
 from wmo.common.config import (
     ARTIFACT_DIR,
@@ -27,7 +28,6 @@ add_deferred_typer(
     known_names=("setup", "calibrate"),
 )
 _console = Console()
-_PROVIDER_ROOT_OPTION = typer.Option(Path(ARTIFACT_DIR), "--root", help="Local .wmo root.")
 _CONNECTION_JSON_OPTION = typer.Option(
     None,
     "--connection-json",
@@ -69,10 +69,8 @@ def config_telemetry(
     # Read through the guarded loader first: `set_telemetry_enabled` reads the same file to
     # preserve the rest of it, so a corrupt settings.toml must fail here as a usage error naming
     # the file rather than as a tomllib traceback from inside the write.
-    try:
+    with usage_error(ValueError):
         settings = load_settings(root)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from None
     if normalized != "status":
         settings = set_telemetry_enabled(normalized == "enable", root)
     state = "enabled" if settings.telemetry.enabled else "disabled"
@@ -81,7 +79,7 @@ def config_telemetry(
 
 @config_app.command("providers", help="Configure model providers and build-time model roles.")
 def config_providers(
-    root: Path = _PROVIDER_ROOT_OPTION,
+    root: Path = ROOT_OPTION,
     provider: list[str] | None = _PROVIDER_OPTION,
     connection_json: list[str] | None = _CONNECTION_JSON_OPTION,
     model_json: list[str] | None = _MODEL_JSON_OPTION,
@@ -117,7 +115,7 @@ def config_providers(
         judge=judge,
         embedder=embedder,
     )
-    try:
+    with usage_error(ValueError, FileLockTimeout):
         catalog = run_provider_setup(
             root,
             options,
@@ -125,8 +123,6 @@ def config_providers(
             replace=replace,
             console=_console,
         )
-    except (ValueError, FileLockTimeout) as exc:
-        raise typer.BadParameter(str(exc)) from None
     roles = catalog.roles
     _console.print(
         f"configured providers at {root / 'models.toml'} "

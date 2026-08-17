@@ -421,20 +421,7 @@ def model_selection(item: AvailableModel) -> ProviderModelSelection:
         alias=item.alias,
         connection=item.connection,
         model=item.model,
-        supports_tools=capabilities.supports_tools,
-        supports_embeddings=capabilities.supports_embeddings,
-        supports_structured_output=capabilities.supports_structured_output,
-        supports_completions=capabilities.supports_completions,
-        context_window_tokens=capabilities.context_window_tokens,
-        maximum_output_tokens=capabilities.maximum_output_tokens,
-        input_cost_per_million_tokens_usd=capabilities.input_cost_per_million_tokens_usd,
-        output_cost_per_million_tokens_usd=capabilities.output_cost_per_million_tokens_usd,
-        cached_input_cost_per_million_tokens_usd=(
-            capabilities.cached_input_cost_per_million_tokens_usd
-        ),
-        cache_write_cost_per_million_tokens_usd=(
-            capabilities.cache_write_cost_per_million_tokens_usd
-        ),
+        capabilities=capabilities,
     )
 
 

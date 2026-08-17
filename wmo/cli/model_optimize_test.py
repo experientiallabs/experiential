@@ -198,7 +198,7 @@ def test_cli_first_run_builds_runtime_w12_and_config_without_bootstrap(
     command = importlib.import_module("wmo.cli.model_optimize")
     backend = _FakeBackend(conservative_cost_per_batch=0.10)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "automatic-cli-test")
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "automatic-cli-test")
 
     result = CliRunner().invoke(
         app,
@@ -448,7 +448,7 @@ def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(
     command = importlib.import_module("wmo.cli.model_optimize")
     first_backend = _FakeBackend(conservative_cost_per_batch=0.10)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: first_backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "w14m-test")
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "w14m-test")
     attempts = []
     emitted = []
     receipts: set[str] = set()
@@ -536,7 +536,7 @@ def test_cli_crash_after_sft_receipt_replays_without_duplicate_event_or_dispatch
     command = importlib.import_module("wmo.cli.model_optimize")
     first_backend = _FakeBackend(conservative_cost_per_batch=0.10)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: first_backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "w14m-test")
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "w14m-test")
     attempts = []
     emitted = []
     receipts: set[str] = set()
@@ -601,7 +601,7 @@ def test_cli_yes_does_not_bypass_the_unsupported_budget_estimate_gate(
     command = importlib.import_module("wmo.cli.model_optimize")
     backend = _FakeBackend(conservative_cost_per_batch=None)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "w14m-test")
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "w14m-test")
 
     result = CliRunner().invoke(
         app,
@@ -704,7 +704,7 @@ def test_declined_spend_consent_does_not_resolve_credentials_or_construct_sdk(
 
     monkeypatch.setattr(command, "_compose_tinker_backend", forbidden_backend)
     monkeypatch.setattr(command, "require_spend_consent", lambda *args, **kwargs: False)
-    monkeypatch.setattr(command, "_current_revision", lambda: "declined-consent-test")
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "declined-consent-test")
 
     result = CliRunner().invoke(
         app,
@@ -783,7 +783,7 @@ def test_completion_before_consent_refreshes_the_schedule_and_trains_once(
     monkeypatch.setattr(command, "preflight_sft_model_optimization", preflight_then_complete)
     monkeypatch.setattr(command, "require_spend_consent", approve_refreshed_schedule)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "pre-consent-refresh-test")
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "pre-consent-refresh-test")
 
     result = CliRunner().invoke(
         app,
@@ -851,7 +851,7 @@ def test_completion_during_consent_fails_before_run_acceptance_and_reconsents(
 
     monkeypatch.setattr(command, "require_spend_consent", consent_then_complete)
     monkeypatch.setattr(command, "_compose_tinker_backend", forbidden_backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "consent-race-test")
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "consent-race-test")
     arguments = [
         "optimize",
         "model",
@@ -950,7 +950,9 @@ def test_accepted_prefix_resumes_after_crash_and_defers_later_completion(
 
     monkeypatch.setattr(command, "require_spend_consent", approve_initial)
     monkeypatch.setattr(command, "_compose_tinker_backend", crash_before_backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "accepted-prefix-resume-test")
+    monkeypatch.setattr(
+        command, "installed_release_revision", lambda: "accepted-prefix-resume-test"
+    )
 
     crashed = runner.invoke(app, arguments)
 
@@ -1098,7 +1100,7 @@ def test_connection_drift_after_consent_fails_before_credential_or_sdk(
     monkeypatch.setattr(command, "require_spend_consent", consent_with_connection_drift)
     monkeypatch.setattr(command, "read_connection_api_key", forbidden_credential_read)
     monkeypatch.setattr(tinker, "ServiceClient", forbidden_service_client)
-    monkeypatch.setattr(command, "_current_revision", lambda: "post-consent-drift-test")
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "post-consent-drift-test")
 
     result = CliRunner().invoke(
         app,
@@ -1146,7 +1148,7 @@ def test_first_run_explicit_zero_training_price_is_preserved(
     command = importlib.import_module("wmo.cli.model_optimize")
     backend = _FakeBackend(cost_per_batch=0.0, conservative_cost_per_batch=0.0)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "explicit-zero-price-test")
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "explicit-zero-price-test")
 
     result = CliRunner().invoke(
         app,
@@ -1216,7 +1218,7 @@ def test_schedule_ceiling_refuses_before_tinker_backend_construction(
         raise AssertionError("Tinker backend must not be constructed")
 
     monkeypatch.setattr(command, "_compose_tinker_backend", forbidden_backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "local-price-ceiling-test")
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "local-price-ceiling-test")
 
     result = CliRunner().invoke(
         app,

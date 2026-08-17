@@ -17,7 +17,8 @@ from wmo.common.judging import (
     RubricDimension,
     ScoreAnchor,
 )
-from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
+from wmo.common.project import ProjectStore, artifact_input
+from wmo.common.project.store_test import _store
 
 _TIME = datetime(2026, 8, 11, tzinfo=UTC)
 
@@ -41,12 +42,6 @@ def _score(
         created_at=_TIME,
         supersedes_label_id=supersedes_label_id,
     )
-
-
-def _store(tmp_path: Path) -> ProjectStore:
-    store = ProjectStore(tmp_path / ".wmo", "support-project")
-    store.initialize(ProjectConfig(project_id="support-project"))
-    return store
 
 
 def _write_rubric(store: ProjectStore) -> Rubric:

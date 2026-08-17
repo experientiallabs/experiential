@@ -207,11 +207,11 @@ def test_the_setup_written_from_confirmed_answers_carries_verified_metadata() ->
     assert [model.alias for model in setup.models] == ["luna", "embedder"]
     chat = setup.models[0]
     assert chat.model == "gpt-5.6-luna"
-    assert chat.supports_tools
-    assert chat.supports_structured_output
-    assert chat.context_window_tokens == 1_050_000
-    assert chat.input_cost_per_million_tokens_usd == 1.0
-    assert chat.cache_write_cost_per_million_tokens_usd == 1.25
+    assert chat.capabilities.supports_tools
+    assert chat.capabilities.supports_structured_output
+    assert chat.capabilities.context_window_tokens == 1_050_000
+    assert chat.capabilities.input_cost_per_million_tokens_usd == 1.0
+    assert chat.capabilities.cache_write_cost_per_million_tokens_usd == 1.25
     assert (setup.world_model, setup.judge, setup.embedder) == ("luna", "luna", "embedder")
 
 

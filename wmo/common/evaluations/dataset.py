@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -170,7 +169,7 @@ class FidelityReport(ArtifactEnvelope):
     gate_id: ArtifactId
     gate_sha256: Sha256
     status: Literal["approved", "rejected", "insufficient"]
-    approved_at: datetime | None = None
+    approved_at: AwareDatetime | None = None
 
     @field_validator("overlap_cell_ids")
     @classmethod
@@ -211,10 +210,6 @@ class FidelityReport(ArtifactEnvelope):
             raise ValueError("approved fidelity reports require approved_at")
         if self.status != "approved" and self.approved_at is not None:
             raise ValueError("only approved fidelity reports may set approved_at")
-        if self.approved_at is not None and (
-            self.approved_at.tzinfo is None or self.approved_at.utcoffset() is None
-        ):
-            raise ValueError("fidelity approval times must include a timezone")
         return self
 
 

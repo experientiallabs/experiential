@@ -57,13 +57,13 @@ from wmo.optimize.router.automatic.attribution import (
     persist_router_observed_attribution_set,
 )
 from wmo.optimize.router.automatic.preflight import (
+    AutomaticRouterOptions,
     AutomaticRouterPreflightError,
     preflight_automatic_router,
 )
 from wmo.optimize.router.automatic.replay import find_completed_automatic_router_replay
 from wmo.optimize.router.automatic.service import (
     AutomaticRouterError,
-    AutomaticRouterOptions,
     optimize_project_router,
 )
 from wmo.optimize.router.composition import FidelityApprovalDecision, RouterCompositionBudget
@@ -392,15 +392,7 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         store,
         plan.selection,
         catalog_override=plan.prospective_catalog,
-        maximum_model_calls=options.maximum_model_calls,
-        preferred_fidelity_overlaps=2,
-        maximum_router_feature_tokens=options.maximum_router_feature_tokens,
-        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-        router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
-        completion_maximum_attempts=options.completion_maximum_attempts,
-        simulation_maximum_output_tokens=options.simulation_maximum_output_tokens,
-        maximum_judgments=options.maximum_judgments,
-        maximum_simulation_cost_usd=options.maximum_provider_cost_usd,
+        options=replace(options, preferred_fidelity_overlaps=2),
     )
     assert expanded_fidelity.fidelity_overlap_count == 2
     assert (
@@ -466,15 +458,7 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         store,
         plan.selection,
         catalog_override=plan.prospective_catalog,
-        maximum_model_calls=options.maximum_model_calls,
-        preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
-        maximum_router_feature_tokens=options.maximum_router_feature_tokens,
-        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-        router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
-        completion_maximum_attempts=options.completion_maximum_attempts,
-        simulation_maximum_output_tokens=options.simulation_maximum_output_tokens,
-        maximum_judgments=options.maximum_judgments,
-        maximum_simulation_cost_usd=options.maximum_provider_cost_usd,
+        options=options,
     )
     assert (
         redacted_preflight.simulation_configuration_sha256
@@ -503,15 +487,7 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         store,
         plan.selection,
         catalog_override=plan.prospective_catalog,
-        maximum_model_calls=options.maximum_model_calls,
-        preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
-        maximum_router_feature_tokens=options.maximum_router_feature_tokens,
-        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-        router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
-        completion_maximum_attempts=options.completion_maximum_attempts,
-        simulation_maximum_output_tokens=options.simulation_maximum_output_tokens,
-        maximum_judgments=options.maximum_judgments,
-        maximum_simulation_cost_usd=options.maximum_provider_cost_usd,
+        options=options,
     )
     assert custom_agent.agent_factory_sha256 != result.preflight.agent_factory_sha256
     assert (
@@ -539,15 +515,7 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         store,
         plan.selection,
         catalog_override=plan.prospective_catalog,
-        maximum_model_calls=options.maximum_model_calls,
-        preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
-        maximum_router_feature_tokens=options.maximum_router_feature_tokens,
-        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-        router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
-        completion_maximum_attempts=options.completion_maximum_attempts,
-        simulation_maximum_output_tokens=options.simulation_maximum_output_tokens,
-        maximum_judgments=options.maximum_judgments,
-        maximum_simulation_cost_usd=options.maximum_provider_cost_usd,
+        options=options,
     )
     assert revised_agent.agent_factory_sha256 != custom_agent.agent_factory_sha256
     assert (
@@ -1024,15 +992,15 @@ def test_automatic_router_rejects_substituted_manual_judge_audit_before_calls(
             store,
             plan.selection,
             catalog_override=plan.prospective_catalog,
-            maximum_model_calls=1,
-            preferred_fidelity_overlaps=1,
-            maximum_router_feature_tokens=8_192,
-            maximum_retrieval_query_tokens=32_768,
-            router_embedding_maximum_attempts=1,
-            completion_maximum_attempts=1,
-            simulation_maximum_output_tokens=8_000,
-            maximum_judgments=20,
-            maximum_simulation_cost_usd=25.0,
+            options=AutomaticRouterOptions(
+                maximum_provider_cost_usd=25.0,
+                maximum_judgments=20,
+                preferred_fidelity_overlaps=1,
+                maximum_model_calls=1,
+                router_embedding_maximum_attempts=1,
+                completion_maximum_attempts=1,
+                simulation_maximum_output_tokens=8_000,
+            ),
         )
 
     assert state.credential_resolutions == before_credentials
