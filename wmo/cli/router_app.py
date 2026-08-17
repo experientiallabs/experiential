@@ -84,14 +84,6 @@ def router(
         "--approve-fidelity",
         help="Approve passing measured fidelity; required for noninteractive execution.",
     ),
-    waive_fidelity: bool = typer.Option(
-        False,
-        "--waive-fidelity",
-        help=(
-            "Explicitly waive real fidelity-overlap evidence when no trace carries model "
-            "identity; the waiver is recorded in the immutable optimization artifacts."
-        ),
-    ),
     non_interactive: bool = typer.Option(False, "--non-interactive"),
 ) -> None:
     """Optimize a router automatically from the project's completed grounded build.
@@ -112,8 +104,6 @@ def router(
         maximum_concurrency: Maximum simulation workers.
         yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
         approve_fidelity: Explicit approval for passing measured fidelity evidence.
-        waive_fidelity: Explicit auditable waiver of real fidelity-overlap evidence for
-            datasets whose traces carry no model identity.
         non_interactive: Refuse prompts and require complete repeatable inputs.
 
     Raises:
@@ -131,7 +121,6 @@ def router(
         maximum_retrieval_query_tokens=maximum_retrieval_query_tokens,
         simulation_maximum_output_tokens=simulation_maximum_output_tokens,
         maximum_concurrency=maximum_concurrency,
-        waive_fidelity_evidence=waive_fidelity,
     )
     effective_noninteractive = non_interactive or not can_prompt(_console)
     with usage_error(OSError, ValueError):
@@ -163,7 +152,12 @@ def router(
             options=options,
             code_revision=producer_revision,
         )
-        if replay is None and effective_noninteractive and not approve_fidelity:
+        if (
+            replay is None
+            and effective_noninteractive
+            and not approve_fidelity
+            and not preflight.fidelity_evidence_waived
+        ):
             raise ValueError("noninteractive router optimization requires --approve-fidelity")
 
     if replay is not None:
@@ -257,7 +251,7 @@ class _CliFidelityApproval:
             non_interactive: Whether prompting is forbidden.
             preferred_overlaps: Preferred denominator used for the low-evidence warning.
             approved_at: Approval time retained in immutable evidence.
-            waived: Whether the operator explicitly waived real overlap evidence.
+            waived: Whether real overlap evidence is waived for a model-free dataset.
         """
         self._approve = approve
         self._non_interactive = non_interactive
@@ -324,32 +318,18 @@ class _CliFidelityApproval:
         )
 
     def _acknowledge_waiver(self) -> FidelityApprovalDecision:
-        """Acknowledge the explicitly waived zero-overlap fidelity scope.
+        """Record the automatic zero-overlap waiver for a model-free dataset.
 
         Returns:
-            Immutable actor evidence recording the waiver acknowledgment.
-
-        Raises:
-            ValueError: The operator declined the waiver acknowledgment.
+            Immutable actor evidence recording the waiver.
         """
         _console.print(
             "[yellow]Fidelity evidence is waived: no real trace carries model identity, "
             "so router fitting relies on simulated candidate evidence only.[/yellow]"
         )
-        acknowledged = self._approve
-        if not acknowledged:
-            if self._non_interactive:
-                raise ValueError("the fidelity waiver requires --approve-fidelity")
-            acknowledged = Confirm.ask(
-                "Acknowledge the waived fidelity evidence?",
-                default=False,
-                console=_console,
-            )
-        if not acknowledged:
-            raise ValueError("router optimization stopped without the waiver acknowledgment")
         return FidelityApprovalDecision(
             actor_id="cli-operator",
-            evidence="Acknowledged the explicitly waived zero-overlap fidelity scope.",
+            evidence="Waived zero-overlap fidelity scope for a model-free trace dataset.",
             approved_at=self._approved_at,
         )
 
@@ -368,6 +348,6 @@ def _render_preflight(
     _console.print(f"provider ceiling: ${options.maximum_provider_cost_usd:.4f}")
     _console.print(f"fidelity overlaps: {preflight.fidelity_overlap_count}")
     if preflight.fidelity_evidence_waived:
-        _console.print("[yellow]Fidelity evidence is explicitly waived.[/yellow]")
+        _console.print("[yellow]Fidelity evidence is waived: the dataset is model-free.[/yellow]")
     if preflight.low_fidelity_evidence:
         _console.print("[yellow]Fidelity evidence is below the preferred target.[/yellow]")

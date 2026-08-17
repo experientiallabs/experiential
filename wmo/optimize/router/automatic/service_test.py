@@ -653,10 +653,10 @@ def test_provider_model_only_telemetry_composes_with_inferred_unique_attribution
     assert result.artifacts.attribution_input in result.composition.plan.inputs
 
 
-def test_model_free_traces_fail_closed_by_default_and_compose_with_explicit_waiver(
+def test_model_free_traces_compose_by_default_with_recorded_waiver(
     tmp_path: Path,
 ) -> None:
-    """Model-free telemetry fails closed by default and composes only via the explicit waiver.
+    """Model-free telemetry composes without flags and records the automatic waiver.
 
     Args:
         tmp_path: Isolated local WMO root.
@@ -677,29 +677,13 @@ def test_model_free_traces_fail_closed_by_default_and_compose_with_explicit_waiv
         maximum_model_calls=1,
         simulation_maximum_output_tokens=8_000,
     )
-    before_artifacts = store.artifacts.list_ids()
-
-    with pytest.raises(AutomaticRouterPreflightError, match="has no model span"):
-        optimize_project_router(
-            store,
-            plan,
-            cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
-            options=options,
-            provider_spend_consented=True,
-            fidelity_approval=_FidelityApproval(),
-            created_at=_TIME + timedelta(hours=1),
-            code_revision=_REVISION,
-        )
-
-    assert store.artifacts.list_ids() == before_artifacts
-    waived_options = replace(options, waive_fidelity_evidence=True)
     approval = _WaivedFidelityApproval()
 
     result = optimize_project_router(
         store,
         plan,
         cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
-        options=waived_options,
+        options=options,
         provider_spend_consented=True,
         fidelity_approval=approval,
         created_at=_TIME + timedelta(hours=1),
@@ -733,7 +717,7 @@ def test_model_free_traces_fail_closed_by_default_and_compose_with_explicit_waiv
     replay = find_completed_automatic_router_replay(
         store,
         result.preflight,
-        options=waived_options,
+        options=options,
         code_revision=_REVISION,
     )
 
@@ -768,7 +752,6 @@ def test_model_free_traces_fail_closed_by_default_and_compose_with_explicit_waiv
             "1",
             "--simulation-maximum-output-tokens",
             "8000",
-            "--waive-fidelity",
             "--non-interactive",
         ],
         env={"WMO_RELEASE_REVISION": _REVISION},
@@ -823,29 +806,6 @@ def test_ambiguous_inferred_telemetry_fails_before_stateful_boundaries(tmp_path:
                 preferred_fidelity_overlaps=1,
                 maximum_model_calls=1,
                 simulation_maximum_output_tokens=8_000,
-            ),
-            provider_spend_consented=True,
-            fidelity_approval=_FidelityApproval(),
-            created_at=_TIME + timedelta(hours=1),
-            code_revision=_REVISION,
-        )
-
-    assert store.artifacts.list_ids() == before_artifacts
-    assert store.model_catalog_path.read_bytes() == before_catalog
-    assert tuple(state.completion_calls) == before_completion
-    assert tuple(state.embedding_calls) == before_embedding
-
-    with pytest.raises(AutomaticRouterPreflightError, match="waiver is rejected"):
-        optimize_project_router(
-            store,
-            plan,
-            cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
-            options=AutomaticRouterOptions(
-                maximum_judgments=20,
-                preferred_fidelity_overlaps=1,
-                maximum_model_calls=1,
-                simulation_maximum_output_tokens=8_000,
-                waive_fidelity_evidence=True,
             ),
             provider_spend_consented=True,
             fidelity_approval=_FidelityApproval(),

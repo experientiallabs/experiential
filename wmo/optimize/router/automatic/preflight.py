@@ -89,7 +89,6 @@ class AutomaticRouterOptions:
     simulation_maximum_output_tokens: int = 16_000
     maximum_concurrency: int = 1
     seed: int = 0
-    waive_fidelity_evidence: bool = False
 
 
 @dataclass(frozen=True)
@@ -208,21 +207,19 @@ def preflight_automatic_router(
         judge,
     )
     tasks, traces, identity_evidence = _build_evidence(problems, project, completed)
-    observed = _observed_traces(
+    observed, fidelity_waived = _observed_traces(
         problems,
         tasks,
         traces,
         identity_evidence,
         candidates,
         options.preferred_fidelity_overlaps,
-        waive_fidelity_evidence=options.waive_fidelity_evidence,
     )
     fidelity_overlap_count = len(observed)
-    if not observed and not options.waive_fidelity_evidence:
+    if not observed and not fidelity_waived:
         problems.append(
             "fidelity evidence: no real fit trace matches an exact selected candidate model; "
-            "include the production incumbent, collect a matching trace, or explicitly waive "
-            "fidelity evidence with --waive-fidelity"
+            "include the production incumbent or collect a matching trace"
         )
     try:
         agent_identity = agent_factory_sha256(
@@ -344,7 +341,7 @@ def preflight_automatic_router(
                 "redacted_field_names": list(config.redacted_field_names),
             }
         ),
-        fidelity_evidence_waived=options.waive_fidelity_evidence,
+        fidelity_evidence_waived=fidelity_waived,
     )
 
 
@@ -777,10 +774,14 @@ def _observed_traces(
     identity_evidence: TraceModelIdentityEvidenceSet | None,
     candidates: tuple[RoutedCandidateSnapshot, ...],
     preferred_overlap_limit: int,
-    *,
-    waive_fidelity_evidence: bool = False,
-) -> tuple[ObservedRouterTrace, ...]:
+) -> tuple[tuple[ObservedRouterTrace, ...], bool]:
     """Resolve real fit lineages through verified declared or unique inferred identity.
+
+    A dataset that carries no model identity at all (no trace span records a model snapshot
+    and no identity-evidence records exist) automatically waives real overlap evidence, so
+    router fitting relies on simulated candidate evidence only. Traces with model spans or
+    identity evidence never waive: identity conflicts, ambiguity, and unselected incumbents
+    surface as preflight failures, and structurally invalid attribution inputs fail closed.
 
     Args:
         problems: Mutable aggregate preflight failures.
@@ -789,17 +790,13 @@ def _observed_traces(
         identity_evidence: Verified model-span digest provenance, if the dataset carries it.
         candidates: Exact selected candidate identities.
         preferred_overlap_limit: Maximum fidelity overlaps admitted to evaluation.
-        waive_fidelity_evidence: Whether the operator explicitly waived real overlap evidence.
-            The waiver only applies when the dataset carries no model identity at all; traces
-            with model spans or identity evidence reject the waiver so identity conflicts,
-            ambiguity, and unselected incumbents surface instead of being silently discarded.
-            Structurally invalid attribution inputs also stay fail-closed under the waiver.
 
     Returns:
-        One deterministic attributed trace per admitted fit lineage.
+        One deterministic attributed trace per admitted fit lineage, plus whether real
+        overlap evidence is waived for a verifiably model-free dataset.
     """
     if not tasks or not traces or not candidates:
-        return ()
+        return (), False
     try:
         attributions = resolve_router_observed_attributions(
             tasks,
@@ -808,25 +805,17 @@ def _observed_traces(
             candidates,
             preferred_overlap_limit=preferred_overlap_limit,
         )
+    except RouterAttributionPreconditionError as exc:
+        problems.append(f"fidelity identity attribution: {exc}")
+        return (), False
     except RouterAttributionError as exc:
-        if not waive_fidelity_evidence or isinstance(exc, RouterAttributionPreconditionError):
-            problems.append(f"fidelity identity attribution: {exc}")
-            return ()
         has_model_identity = any(
             span.model is not None for trace in traces for span in trace.spans
         ) or bool(identity_evidence is not None and identity_evidence.records)
         if has_model_identity:
-            problems.append(
-                "fidelity waiver: traces carry model identity, so the waiver is rejected; "
-                f"resolve the attribution failure instead: {exc}"
-            )
-        return ()
-    if waive_fidelity_evidence:
-        problems.append(
-            "fidelity waiver: real fit traces attribute to selected candidates; "
-            "run without --waive-fidelity to use the measured overlap evidence"
-        )
-        return ()
+            problems.append(f"fidelity identity attribution: {exc}")
+            return (), False
+        return (), True
     tasks_by_id = {task.task_id: task for task in tasks}
     traces_by_id = {trace.trace_id: trace for trace in traces}
     return tuple(
@@ -837,7 +826,7 @@ def _observed_traces(
             attribution=item,
         )
         for item in attributions
-    )
+    ), False
 
 
 def _preflight_error(problems: list[str]) -> AutomaticRouterPreflightError:
