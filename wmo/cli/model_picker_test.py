@@ -208,8 +208,8 @@ def test_the_setup_written_from_confirmed_answers_carries_verified_metadata() ->
     assert chat.capabilities.supports_tools
     assert chat.capabilities.supports_structured_output
     assert chat.capabilities.context_window_tokens == 1_050_000
-    assert chat.capabilities.input_cost_per_million_tokens_usd == 1.0
-    assert chat.capabilities.cache_write_cost_per_million_tokens_usd == 1.25
+    assert chat.capabilities.input_cost_per_million_tokens_usd == 0.2
+    assert chat.capabilities.cache_write_cost_per_million_tokens_usd == 0.25
     assert (setup.world_model, setup.judge, setup.embedder) == ("luna", "luna", "embedder")
 
 

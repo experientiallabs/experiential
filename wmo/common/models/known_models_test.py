@@ -43,21 +43,105 @@ def test_documented_chat_model_carries_verified_capabilities_and_prices() -> Non
     assert not known.supports_embeddings
     assert known.context_window_tokens == 1_050_000
     assert known.maximum_output_tokens == 128_000
-    assert known.input_cost_per_million_tokens_usd == 2.5
-    assert known.output_cost_per_million_tokens_usd == 15.0
-    assert known.cached_input_cost_per_million_tokens_usd == 0.25
-    assert known.cache_write_cost_per_million_tokens_usd == 3.125
+    assert known.input_cost_per_million_tokens_usd == 2.0
+    assert known.output_cost_per_million_tokens_usd == 12.0
+    assert known.cached_input_cost_per_million_tokens_usd == 0.2
+    assert known.cache_write_cost_per_million_tokens_usd == 2.5
+    assert known.supports_temperature is False
 
 
-def test_documented_embedding_model_serves_embeddings_only() -> None:
-    """An embedding entry prices input tokens and never claims completion support."""
-    known = known_model_metadata("openai", "text-embedding-3-small")
+@pytest.mark.parametrize(
+    (
+        "model",
+        "context_window_tokens",
+        "maximum_output_tokens",
+        "input_usd",
+        "output_usd",
+        "cached_input_usd",
+        "cache_write_usd",
+        "supports_structured_output",
+    ),
+    [
+        ("gpt-5.6-sol", 1_050_000, 128_000, 5.0, 30.0, 0.5, 6.25, True),
+        ("gpt-5.6-terra", 1_050_000, 128_000, 2.0, 12.0, 0.2, 2.5, True),
+        ("gpt-5.6-luna", 1_050_000, 128_000, 0.2, 1.2, 0.02, 0.25, True),
+        ("gpt-5.5", 1_050_000, 128_000, 5.0, 30.0, 0.5, 0.0, True),
+        ("gpt-5.5-pro", 1_050_000, 128_000, 30.0, 180.0, None, 0.0, True),
+        ("gpt-5.4", 1_050_000, 128_000, 2.5, 15.0, 0.25, 0.0, True),
+        ("gpt-5.4-mini", 400_000, 128_000, 0.75, 4.5, 0.075, 0.0, True),
+        ("gpt-5.4-nano", 400_000, 128_000, 0.2, 1.25, 0.02, 0.0, True),
+        ("gpt-5.4-pro", 1_050_000, 128_000, 30.0, 180.0, None, 0.0, False),
+        ("gpt-5.2", 400_000, 128_000, 1.75, 14.0, 0.175, 0.0, True),
+        ("gpt-5.2-pro", 400_000, 128_000, 21.0, 168.0, None, 0.0, False),
+        ("gpt-5.1", 400_000, 128_000, 1.25, 10.0, 0.125, 0.0, True),
+        ("gpt-5", 400_000, 128_000, 1.25, 10.0, 0.125, 0.0, True),
+        ("gpt-5-mini", 400_000, 128_000, 0.25, 2.0, 0.025, 0.0, True),
+        ("gpt-5-nano", 400_000, 128_000, 0.05, 0.4, 0.005, 0.0, True),
+        ("gpt-5-pro", 400_000, 272_000, 15.0, 120.0, None, 0.0, True),
+    ],
+)
+def test_every_openai_chat_entry_has_complete_verified_metadata(
+    model: str,
+    context_window_tokens: int,
+    maximum_output_tokens: int,
+    input_usd: float,
+    output_usd: float,
+    cached_input_usd: float | None,
+    cache_write_usd: float,
+    supports_structured_output: bool,
+) -> None:
+    """Every advertised OpenAI chat role has verified limits, prices, and request shaping.
+
+    Args:
+        model: Canonical OpenAI model identifier.
+        context_window_tokens: Documented input context ceiling.
+        maximum_output_tokens: Documented output ceiling.
+        input_usd: Documented input price per million tokens.
+        output_usd: Documented output price per million tokens.
+        cached_input_usd: Documented cache-hit price, or ``None`` when no discount exists.
+        cache_write_usd: Documented cache-write price.
+        supports_structured_output: Whether the model supports structured outputs.
+    """
+    known = known_model_metadata("openai", model)
+
+    assert known is not None
+    assert known.supports_completions
+    assert known.supports_tools
+    assert known.supports_temperature is False
+    assert known.context_window_tokens == context_window_tokens
+    assert known.maximum_output_tokens == maximum_output_tokens
+    assert known.input_cost_per_million_tokens_usd == input_usd
+    assert known.output_cost_per_million_tokens_usd == output_usd
+    assert known.cached_input_cost_per_million_tokens_usd == cached_input_usd
+    assert known.cache_write_cost_per_million_tokens_usd == cache_write_usd
+    assert known.supports_structured_output is supports_structured_output
+
+
+@pytest.mark.parametrize(
+    ("model", "input_usd"),
+    [
+        ("text-embedding-3-small", 0.02),
+        ("text-embedding-3-large", 0.13),
+        ("text-embedding-ada-002", 0.1),
+    ],
+)
+def test_documented_embedding_models_serve_embeddings_only(model: str, input_usd: float) -> None:
+    """Every maintained OpenAI embedding entry has its verified input price and limit.
+
+    Args:
+        model: Canonical OpenAI embedding model identifier.
+        input_usd: Documented input price per million tokens.
+    """
+    known = known_model_metadata("openai", model)
 
     assert known is not None
     assert known.supports_embeddings
     assert not known.supports_completions
-    assert known.input_cost_per_million_tokens_usd == 0.02
+    assert known.context_window_tokens == 8_192
+    assert known.input_cost_per_million_tokens_usd == input_usd
     assert known.output_cost_per_million_tokens_usd is None
+    assert known.cached_input_cost_per_million_tokens_usd is None
+    assert known.cache_write_cost_per_million_tokens_usd is None
 
 
 def test_documented_anthropic_model_prices_both_cache_operations() -> None:

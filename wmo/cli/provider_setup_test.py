@@ -500,7 +500,7 @@ def test_interactive_setup_saves_providers_models_and_roles_it_derived(
     assert luna is not None
     assert luna.supports_tools
     assert luna.context_window_tokens == 1_050_000
-    assert luna.input_cost_per_million_tokens_usd == 1.0
+    assert luna.input_cost_per_million_tokens_usd == 0.2
     assert "internal-preview-model" not in {model.model for model in saved.models.values()}
     persisted = (root / "models.toml").read_text(encoding="utf-8")
     assert "OPENAI_API_KEY" in persisted
