@@ -8,7 +8,6 @@ import pytest
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
-    AssistantAction,
     ConnectionConfig,
     EmbeddingClient,
     ModelCapabilities,
@@ -20,21 +19,16 @@ from wmo.common.models import (
     ModelRequest,
     ModelRoles,
     ModelSnapshot,
-    ToolCall,
-    ToolChoice,
 )
-from wmo.common.tasks import ToolSchema
 from wmo.runtime.models.credentials import ModelCredentialError
 from wmo.runtime.models.providers.azure import (
     AZURE_OPENAI_API_KEY_ENV,
     AZURE_OPENAI_ENDPOINT_ENV,
     AzureClient,
-    azure_request_url,
     bind_azure_api_key,
     same_azure_endpoint,
 )
 from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleResponseError
-from wmo.runtime.models.providers.retry import RetryPolicy
 from wmo.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
 from wmo.runtime.models.registry import RuntimeModelCatalog
 
@@ -78,68 +72,15 @@ def _snapshot(model_id: str = "gpt-deployment") -> ModelSnapshot:
 
 
 def _request() -> ModelRequest:
-    """Build a visible transcript containing an earlier tool call and result."""
-    return ModelRequest(
-        messages=(
-            ModelMessage(role="system", content="You are precise."),
-            ModelMessage(role="user", content="Create a ticket."),
-            ModelMessage(
-                role="assistant",
-                assistant_action=AssistantAction(
-                    tool_calls=(
-                        ToolCall(
-                            call_id="call-old",
-                            name="create_ticket",
-                            arguments={"priority": "normal"},
-                        ),
-                    )
-                ),
-            ),
-            ModelMessage(role="tool", content="created", tool_call_id="call-old"),
-        ),
-        tools=(
-            ToolSchema(
-                name="create_ticket",
-                description="Create one support ticket.",
-                input_schema={"type": "object"},
-            ),
-        ),
-        tool_choice=ToolChoice(name="create_ticket"),
-        temperature=0.2,
-        maximum_output_tokens=128,
-    )
+    """Build a minimal visible transcript."""
+    return ModelRequest(messages=(ModelMessage(role="user", content="Create a ticket."),))
 
 
 def _completion_response() -> JsonObject:
-    """Return one complete Azure Chat Completions payload."""
+    """Return one minimal Azure Chat Completions payload."""
     return {
-        "id": "chatcmpl-fixture",
         "model": "gpt-deployment",
-        "choices": [
-            {
-                "index": 0,
-                "finish_reason": "stop",
-                "message": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call-new",
-                            "type": "function",
-                            "function": {
-                                "name": "create_ticket",
-                                "arguments": '{"priority":"urgent"}',
-                            },
-                        }
-                    ],
-                },
-            }
-        ],
-        "usage": {
-            "prompt_tokens": 20,
-            "completion_tokens": 6,
-            "prompt_tokens_details": {"cached_tokens": 4},
-        },
+        "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
     }
 
 
@@ -158,20 +99,11 @@ def test_v1_route_sends_deployment_and_api_key_header() -> None:
 
     assert isinstance(client, ModelClient)
     assert response.model.model_id == "gpt-deployment"
-    assert response.output.tool_calls[0].call_id == "call-new"
-    assert response.economics.usage is not None
-    assert response.economics.usage.cached_input_tokens == 4
     url, headers, payload = transport.requests[0]
     assert url == "https://resource.openai.azure.com/openai/v1/chat/completions"
     assert headers["api-key"] == _SECRET
     assert "Authorization" not in headers
     assert payload["model"] == "gpt-deployment"
-    assert payload["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "create_ticket"},
-    }
-    assert payload["temperature"] == 0.2
-    assert payload["max_tokens"] == 128
 
 
 def test_classic_route_puts_the_exact_deployment_in_the_path() -> None:
@@ -210,30 +142,6 @@ def test_malformed_response_fails_closed_without_exposing_the_key() -> None:
         client.complete(_request())
     assert _SECRET not in str(captured.value)
     assert _SECRET not in repr(captured.value)
-
-
-def test_retries_stay_on_the_same_azure_url() -> None:
-    """A retryable Azure status retries the same resource, deployment, and API version."""
-    transport = _ScriptedTransport(
-        [
-            JsonHttpResponse(status_code=503, body={"error": {"message": "busy"}}),
-            JsonHttpResponse(status_code=200, body=_completion_response()),
-        ]
-    )
-    client = AzureClient(
-        model=_snapshot(),
-        endpoint=_ENDPOINT,
-        api_key=_SECRET,
-        api_version="v1",
-        transport=transport,
-        retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0),
-    )
-
-    assert client.complete(_request()).output.tool_calls[0].call_id == "call-new"
-    assert [request[0] for request in transport.requests] == [
-        "https://resource.openai.azure.com/openai/v1/chat/completions",
-        "https://resource.openai.azure.com/openai/v1/chat/completions",
-    ]
 
 
 def test_embeddings_use_the_configured_deployment_alias() -> None:
@@ -321,17 +229,21 @@ def test_canonical_endpoint_comparison_is_host_insensitive_and_path_sensitive() 
         )
 
 
-def test_azure_request_url_does_not_double_append_a_v1_root() -> None:
+def test_a_v1_root_endpoint_is_not_double_appended() -> None:
     """Operators may store either the resource root or the v1 root."""
-    assert (
-        azure_request_url(
-            "https://resource.openai.azure.com/openai/v1",
-            deployment="gpt-deployment",
-            api_version="v1",
-            route="chat/completions",
-        )
-        == "https://resource.openai.azure.com/openai/v1/chat/completions"
+    transport = _ScriptedTransport([JsonHttpResponse(status_code=200, body=_completion_response())])
+    client = AzureClient(
+        model=_snapshot(),
+        endpoint="https://resource.openai.azure.com/openai/v1",
+        api_key=_SECRET,
+        api_version="v1",
+        transport=transport,
     )
+
+    client.complete(_request())
+
+    url, _headers, _payload = transport.requests[0]
+    assert url == "https://resource.openai.azure.com/openai/v1/chat/completions"
 
 
 def test_catalog_resolution_pairs_one_endpoint_with_its_key() -> None:

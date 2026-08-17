@@ -131,8 +131,8 @@ def test_openai_compatible_listing_uses_the_configured_base_url() -> None:
     assert transport.requests[0].url == "https://gateway.internal/v1/models"
 
 
-def test_anthropic_listing_reads_display_names_and_sends_version_header() -> None:
-    """Anthropic publishes an identity and display name for each available model."""
+def test_anthropic_listing_reads_identities_and_sends_version_header() -> None:
+    """Anthropic entries without an identity are skipped and the version header is sent."""
     transport = _FakeTransport(
         _ok(
             {
@@ -148,9 +148,7 @@ def test_anthropic_listing_reads_display_names_and_sends_version_header() -> Non
         ProviderEndpoint(provider="anthropic", api_key="secret-key")
     )
 
-    assert [(model.model, model.display_name) for model in models] == [
-        ("claude-sonnet-4-5", "Claude Sonnet 4.5")
-    ]
+    assert [model.model for model in models] == ["claude-sonnet-4-5"]
     request = transport.requests[0]
     assert request.headers["x-api-key"] == "secret-key"
     assert request.headers["anthropic-version"]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Literal, cast
+from typing import Literal
 
 from pydantic import Field, field_validator
 
@@ -13,7 +13,6 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
     ContractModel,
-    JsonObject,
     stable_id,
 )
 from wmo.common.judging.calibration import CalibrationError
@@ -80,15 +79,6 @@ class JudgeProbe(ContractModel):
     model: ModelSnapshot
     dimensions: tuple[DimensionJudgment, ...]
     economics: OperationEconomics
-
-
-def judge_response_schema() -> JsonObject:
-    """Return the strict JSON schema accepted from every configured LM judge.
-
-    Returns:
-        Pydantic-derived object schema for the dimension judgment response.
-    """
-    return cast(JsonObject, RawJudgment.model_json_schema())
 
 
 class LMJudge:

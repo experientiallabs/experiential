@@ -1,4 +1,4 @@
-"""Canonical trace ingestion for OTLP, PostHog, vendor exports, and Postgres tables."""
+"""Canonical trace ingestion for OTLP, PostHog, and vendor exports."""
 
 from wmo.simulation.ingest.braintrust import load_braintrust_file, normalize_braintrust_payloads
 from wmo.simulation.ingest.chat_json import load_chat_json_file, normalize_chat_json_payloads
@@ -19,17 +19,6 @@ from wmo.simulation.ingest.otlp import (
     normalize_otlp_payload,
 )
 from wmo.simulation.ingest.phoenix import load_phoenix_file, normalize_phoenix_payloads
-from wmo.simulation.ingest.postgres import (
-    PostgresPayloadFormat,
-    PostgresRow,
-    PostgresRowReader,
-    PostgresRowShape,
-    PostgresSourceConfig,
-    PostgresSourceError,
-    load_postgres_source,
-    normalize_postgres_rows,
-    read_postgres_source_file,
-)
 from wmo.simulation.ingest.posthog import (
     PostHogPullError,
     PostHogPullRequest,
@@ -51,12 +40,6 @@ __all__ = [
     "PersistedTraceDataset",
     "PostHogPullError",
     "PostHogPullRequest",
-    "PostgresPayloadFormat",
-    "PostgresRow",
-    "PostgresRowReader",
-    "PostgresRowShape",
-    "PostgresSourceConfig",
-    "PostgresSourceError",
     "TraceNormalizationIssue",
     "TraceNormalizationResult",
     "TraceSourceError",
@@ -69,7 +52,6 @@ __all__ = [
     "load_otel_genai_file",
     "load_otlp_file",
     "load_phoenix_file",
-    "load_postgres_source",
     "load_posthog_file",
     "load_trace_source",
     "normalize_braintrust_payloads",
@@ -80,9 +62,7 @@ __all__ = [
     "normalize_otel_genai_payloads",
     "normalize_otlp_payload",
     "normalize_phoenix_payloads",
-    "normalize_postgres_rows",
     "normalize_posthog_payload",
     "persist_trace_dataset",
     "pull_posthog_traces",
-    "read_postgres_source_file",
 ]

@@ -1371,28 +1371,4 @@ def test_build_rejects_an_undeclared_trace_source(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "unsupported trace source 'helicone'" in unstyle(result.output)
-    assert "postgres" in unstyle(result.output)
-
-
-def test_build_reports_an_invalid_postgres_source_declaration(tmp_path: Path) -> None:
-    """The postgres source reads a validated local table declaration.
-
-    Args:
-        tmp_path: Temporary project and trace root.
-    """
-    declaration = tmp_path / "postgres.json"
-    declaration.write_text(
-        json.dumps({"table": "traces; drop table users", "payload_format": "chat-json"}),
-        encoding="utf-8",
-    )
-    root = tmp_path / ".wmo"
-    root.mkdir()
-    _catalog(root)
-
-    result = _RUNNER.invoke(
-        app,
-        ["build", "support", str(declaration), "--source", "postgres", "--root", str(root)],
-    )
-
-    assert result.exit_code == 2
-    assert "postgres normalization failed" in unstyle(result.output)
+    assert "posthog" in unstyle(result.output)

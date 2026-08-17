@@ -50,7 +50,6 @@ def test_declared_sources_are_the_supported_set() -> None:
         "otel-genai",
         "otlp",
         "phoenix",
-        "postgres",
         "posthog",
     )
 
@@ -81,12 +80,3 @@ def test_load_trace_source_reports_the_source_that_failed(tmp_path: Path) -> Non
     """A source-specific failure is raised as one seam error naming the declared source."""
     with pytest.raises(TraceSourceError, match="chat-json normalization failed"):
         load_trace_source("chat-json", tmp_path / "absent.json")
-
-
-def test_load_trace_source_reads_a_postgres_declaration(tmp_path: Path) -> None:
-    """The postgres source reads a table declaration rather than a trace export."""
-    declaration = tmp_path / "source.json"
-    declaration.write_text(json.dumps({"table": "agent_traces"}), encoding="utf-8")
-
-    with pytest.raises(TraceSourceError, match="postgres normalization failed"):
-        load_trace_source("postgres", declaration)

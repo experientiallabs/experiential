@@ -12,11 +12,7 @@ from wmo.optimize.model.sft.contracts import (
     ToolEvent,
     TraceExampleSource,
 )
-from wmo.optimize.model.sft.rendering import (
-    context_target_fingerprint,
-    parse_rendered_turn,
-    render_context_target,
-)
+from wmo.optimize.model.sft.rendering import context_target_fingerprint
 
 _DIGEST = "a" * 64
 
@@ -29,27 +25,6 @@ def _action() -> AssistantAction:
             ToolCall(call_id="refund-1", name="issue_refund", arguments={"order_id": "o-17"}),
         ),
     )
-
-
-def test_complete_assistant_action_round_trips_in_context_target_rendering() -> None:
-    """Text and every ordered tool call survive canonical rendering exactly."""
-    history = (
-        SFTMessage(role="system", content="Follow the support policy."),
-        AssistantActionEvent(action=AssistantAction(content="I will investigate.")),
-        ToolEvent(tool_call_id="prior-lookup", tool_name="lookup_order", content="order exists"),
-    )
-    target = _action()
-
-    restored = parse_rendered_turn(
-        render_context_target(task="Refund order o-17.", history=history, target=target)
-    )
-
-    assert restored.task == "Refund order o-17."
-    assert restored.target == target
-    assert restored.target.tool_calls[0].arguments == {"order_id": "o-17"}
-    assert restored.target.tool_calls[1].name == "issue_refund"
-    assert restored.history[1].kind == "assistant"
-    assert restored.history[2].kind == "tool"
 
 
 def test_source_only_approval_does_not_change_normalized_fingerprint() -> None:

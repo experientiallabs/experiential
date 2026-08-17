@@ -8,8 +8,8 @@ not declare fails closed.
     result = load_trace_source("langfuse", Path("export.jsonl"))
 
 Every loader returns the same ``TraceNormalizationResult``, and every failure that is specific to a
-source (unreadable bytes, malformed payloads, an invalid Postgres declaration) is raised as
-``TraceSourceError`` so a caller does not have to know which vendor errors exist.
+source (unreadable bytes, malformed payloads) is raised as ``TraceSourceError`` so a caller does
+not have to know which vendor errors exist.
 """
 
 from __future__ import annotations
@@ -29,31 +29,12 @@ from wmo.simulation.ingest.otlp import (
     load_otlp_file,
 )
 from wmo.simulation.ingest.phoenix import load_phoenix_file
-from wmo.simulation.ingest.postgres import (
-    PostgresSourceError,
-    load_postgres_source,
-    read_postgres_source_file,
-)
 from wmo.simulation.ingest.posthog import PostHogPullError, load_posthog_file
 from wmo.simulation.ingest.vendor_records import VendorTraceFormatError
-
-POSTGRES_SOURCE = "postgres"
 
 
 class TraceSourceError(ValueError):
     """Raised when a source name is unsupported or its declared corpus cannot be normalized."""
-
-
-def _load_postgres_declaration(path: Path) -> TraceNormalizationResult:
-    """Read one Postgres table declared by a local JSON file.
-
-    Args:
-        path: Local Postgres source declaration.
-
-    Returns:
-        Canonical traces and every retained validation exclusion.
-    """
-    return load_postgres_source(read_postgres_source_file(path))
 
 
 _LOADERS: dict[str, Callable[[Path], TraceNormalizationResult]] = {
@@ -65,7 +46,6 @@ _LOADERS: dict[str, Callable[[Path], TraceNormalizationResult]] = {
     "otel-genai": load_otel_genai_file,
     "otlp": load_otlp_file,
     "phoenix": load_phoenix_file,
-    POSTGRES_SOURCE: _load_postgres_declaration,
     "posthog": load_posthog_file,
 }
 CANONICAL_TRACE_SOURCES: tuple[str, ...] = tuple(sorted(_LOADERS))
@@ -76,7 +56,7 @@ def load_trace_source(source: str, path: Path) -> TraceNormalizationResult:
 
     Args:
         source: Declared source name, matched case-insensitively after trimming.
-        path: Local trace export, or the JSON table declaration of the Postgres source.
+        path: Local trace export.
 
     Returns:
         Canonical traces and every retained validation exclusion.
@@ -93,7 +73,6 @@ def load_trace_source(source: str, path: Path) -> TraceNormalizationResult:
     except (
         OtlpTraceFormatError,
         PostHogPullError,
-        PostgresSourceError,
         VendorTraceFormatError,
         ValueError,
     ) as exc:
