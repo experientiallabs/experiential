@@ -67,7 +67,8 @@ Keep these exact. If a pin is unavailable, stop and report which one failed.
   (`claude-haiku-4-5-20251001`)
 - Shared command budget: `$25` via `wmo config budget` (covers the optimize estimate)
 - Build ceiling: `$5`
-- Judge calibration sample: `10` labels via `--label-all 1`
+- Judge calibration sample: `10` lineages. The current CLI is judge-first: accept each
+  proposed score (the prompt default) after the configured judge responds.
 - Router ceiling: `$25`
 - Refresh ceiling: `$5`
 - Loopback: `127.0.0.1:8000` with durable journaling (do not pass `--ghost`)
@@ -137,16 +138,19 @@ test -f "$WMO_HAPPY_PATH_TRACES"
 ## 3. Configure build providers
 
 Write only secret-free catalog names. Expand the OpenAI-compatible origin from the environment so
-the catalog stores the URL, not a credential.
+the catalog stores the URL, not a credential. `openai-compatible` requires `base_url` on
+`--connection-json`. Fail if the origin contains a double quote.
 
 ```bash
+case "$WMO_ENDPOINT_BASE_URL" in *\"*) echo "WMO_ENDPOINT_BASE_URL cannot contain double quotes" >&2; exit 1 ;; esac
+HOSTED_WM_JSON="{\"name\":\"hosted-wm\",\"provider\":\"openai-compatible\",\"api_key_env\":\"WMO_ENDPOINT_API_KEY\",\"base_url\":\"$WMO_ENDPOINT_BASE_URL\"}"
 bench config-providers uv run wmo config providers \
   --root "$ROOT" \
   --non-interactive \
   --connection-json '{"name":"openai","provider":"openai","api_key_env":"OPENAI_API_KEY"}' \
-  --connection-json '{"name":"hosted-wm","provider":"openai-compatible","api_key_env":"WMO_ENDPOINT_API_KEY","base_url_env":"WMO_ENDPOINT_BASE_URL"}' \
+  --connection-json "$HOSTED_WM_JSON" \
   --model-json '{"alias":"deepseek-v4-flash","connection":"hosted-wm","model":"deepseek-v4-flash","capabilities":{"supports_completions":true,"supports_tools":true,"supports_structured_output":false,"supports_embeddings":false,"input_cost_per_million_tokens_usd":0,"output_cost_per_million_tokens_usd":0,"cached_input_cost_per_million_tokens_usd":0,"cache_write_cost_per_million_tokens_usd":0}}' \
-  --model-json '{"alias":"gpt-5-6-luna","connection":"openai","model":"gpt-5.6-luna","capabilities":{"supports_completions":true,"supports_tools":true,"supports_structured_output":true,"supports_embeddings":false,"context_window_tokens":1050000,"maximum_output_tokens":128000,"input_cost_per_million_tokens_usd":1.0,"output_cost_per_million_tokens_usd":6.0,"cached_input_cost_per_million_tokens_usd":0.1,"cache_write_cost_per_million_tokens_usd":1.25}}' \
+  --model-json '{"alias":"gpt-5-6-luna","connection":"openai","model":"gpt-5.6-luna","capabilities":{"supports_completions":true,"supports_temperature":false,"reasoning_effort":"xhigh","supports_tools":true,"supports_structured_output":true,"supports_embeddings":false,"context_window_tokens":1050000,"maximum_output_tokens":128000,"input_cost_per_million_tokens_usd":1.0,"output_cost_per_million_tokens_usd":6.0,"cached_input_cost_per_million_tokens_usd":0.1,"cache_write_cost_per_million_tokens_usd":1.25}}' \
   --model-json '{"alias":"text-embedding-3-small","connection":"openai","model":"text-embedding-3-small","capabilities":{"supports_completions":false,"supports_embeddings":true,"input_cost_per_million_tokens_usd":0.02,"context_window_tokens":8192}}' \
   --world-model deepseek-v4-flash \
   --judge gpt-5-6-luna \
@@ -186,13 +190,17 @@ bench judge-setup uv run wmo config judge setup "$WMO_HAPPY_PATH_PROJECT" \
   --root "$ROOT" \
   --approve \
   --non-interactive
-bench judge-calibrate uv run wmo config judge calibrate "$WMO_HAPPY_PATH_PROJECT" \
-  --root "$ROOT" \
-  --sample-size 10 \
-  --label-all 1 \
-  --yes \
-  --approve \
-  --non-interactive
+```
+
+Calibration is judge-first. The configured judge proposes, then the operator accepts or corrects
+each axis. For this path-exercise, accept every proposal (the prompt default). Do not pass
+`--non-interactive`; that flag requires one `--label` per sample axis and there is no CLI that
+emits those trace IDs. Allocate a TTY if the environment does not have one, and accept the
+defaults. `--yes` authorizes the remaining judge-call estimate. `--approve` approves the report.
+
+```bash
+bench judge-calibrate bash -c \
+  'yes "" | script -qefc "uv run wmo config judge calibrate \"$WMO_HAPPY_PATH_PROJECT\" --root \"$ROOT\" --sample-size 10 --yes --approve" /dev/null'
 ```
 
 Catalog prices supply the judge cost. Success prints an approved calibration artifact ID.
