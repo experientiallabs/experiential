@@ -64,7 +64,6 @@ from wmo.optimize.model.sft.builder import (
     load_sft_dataset,
     write_sft_dataset,
 )
-from wmo.optimize.model.sft.builder_fidelity_fixture_test import approved_fidelity_report
 from wmo.optimize.model.sft.contracts import (
     AssistantActionEvent,
     HumanApproval,
@@ -124,7 +123,6 @@ class _TeacherFixture:
     task_set_input: ArtifactInput
     judgment_input: ArtifactInput
     calibration_input: ArtifactInput
-    fidelity_input: ArtifactInput
     rule_input: ArtifactInput
     transcript: SFTTranscript
 
@@ -439,10 +437,8 @@ def _rollout(
     )
 
 
-def _write_teacher_source(
-    store: ProjectStore, *, bind_fidelity_to_teacher_rollout: bool = True
-) -> _TeacherFixture:
-    """Persist a complete W5, W6, rollout, fidelity, and acceptance chain for one teacher row."""
+def _write_teacher_source(store: ProjectStore) -> _TeacherFixture:
+    """Persist a complete W5, W6, rollout, judgment, and acceptance chain."""
     task, task_set, task_set_input = _task_set(store)
     rubric = _rubric(task_set_input)
     store.artifacts.write_json(
@@ -576,9 +572,6 @@ def _write_teacher_source(
             files={"rollout.json": final_rollout},
         )
     )
-    fidelity_rollout_input = (
-        rollout_input if bind_fidelity_to_teacher_rollout else rollout_inputs[0]
-    )
     final_judgment = LMJudge(
         _FakeJudgeClient(
             model,
@@ -594,19 +587,6 @@ def _write_teacher_source(
         calibration_artifact_id=calibration.calibration_id,
     )
     judgment_input = artifact_input(store.artifacts.read(final_judgment.judgment_id).manifest)
-    fidelity = approved_fidelity_report(
-        inputs=_inputs(task_set_input, fidelity_rollout_input),
-        created_at=_TIME,
-        digest=_DIGEST,
-    )
-    fidelity_input = artifact_input(
-        store.artifacts.write_json(
-            artifact_id=fidelity.fidelity_report_id,
-            artifact_type="fidelity-report",
-            envelope=fidelity,
-            files={"fidelity-report.json": fidelity},
-        )
-    )
     rule = TeacherAcceptanceRule(
         schema_version=1,
         created_at=_TIME,
@@ -634,7 +614,6 @@ def _write_teacher_source(
             task_set_input,
             judgment_input,
             calibration_input,
-            fidelity_input,
             rule_input,
         ),
         code_revision="w12-test",
@@ -647,7 +626,6 @@ def _write_teacher_source(
         task_sha256=sha256_json(task),
         judgment=judgment_input,
         calibration=calibration_input,
-        fidelity_report=fidelity_input,
         acceptance_rule=rule_input,
         transcript_path="transcript.json",
         transcript_sha256=hashlib.sha256(transcript_payload).hexdigest(),
@@ -669,7 +647,6 @@ def _write_teacher_source(
         task_set_input=task_set_input,
         judgment_input=judgment_input,
         calibration_input=calibration_input,
-        fidelity_input=fidelity_input,
         rule_input=rule_input,
         transcript=transcript,
     )
@@ -690,6 +667,12 @@ def _build(
         created_at=_TIME,
         code_revision="w12-test",
     )
+
+
+def test_teacher_acceptance_contract_has_no_fidelity_prerequisite() -> None:
+    """Teacher selection depends on its own evidence and never on fidelity measurement."""
+    assert "fidelity_report" not in TeacherAcceptanceEvidence.model_fields
+    assert "require_approved_fidelity" not in TeacherAcceptanceRule.model_fields
 
 
 def test_default_build_spec_reloads_and_rebuilds_without_identity_drift(tmp_path: Path) -> None:
@@ -820,7 +803,6 @@ def test_teacher_rejects_forged_score_and_recursively_unverifiable_calibration(
                 fixture.task_set_input,
                 forged_judgment_input,
                 fixture.calibration_input,
-                fixture.fidelity_input,
                 fixture.rule_input,
             ),
             "judgment": forged_judgment_input,
@@ -885,7 +867,6 @@ def test_teacher_rejects_forged_score_and_recursively_unverifiable_calibration(
                 fixture.task_set_input,
                 fixture.judgment_input,
                 forged_calibration_input,
-                fixture.fidelity_input,
                 forged_rule_input,
             ),
             "calibration": forged_calibration_input,
@@ -910,15 +891,6 @@ def test_teacher_rejects_forged_score_and_recursively_unverifiable_calibration(
                 ),
             ),
         )
-
-
-def test_teacher_rejects_fidelity_report_bound_to_another_rollout(tmp_path: Path) -> None:
-    """Teacher evidence cannot reuse an approved fidelity report from another rollout."""
-    store = _store(tmp_path)
-    fixture = _write_teacher_source(store, bind_fidelity_to_teacher_rollout=False)
-
-    with pytest.raises(SFTBuildError, match="fidelity report does not bind the stored rollout"):
-        _build(store, teacher=(fixture.source,))
 
 
 def test_teacher_rejects_corrupt_full_task_case_and_preserves_task_set_lineage(

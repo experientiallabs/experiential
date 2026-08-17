@@ -31,6 +31,9 @@ def test_router_help_requires_only_project_and_never_exposes_config() -> None:
     assert "--config" not in output
     assert "--candidate" in output
     assert "--maximum-provider-co" in output
+    assert "--approve-fidelity" not in output
+    assert "--preferred-fidelity" not in output
+    assert "fidelity" not in output.lower()
 
 
 def test_missing_project_aggregates_before_catalog_write_or_credential_read(
@@ -62,7 +65,6 @@ def test_missing_project_aggregates_before_catalog_write_or_credential_read(
             "candidate-a",
             "--non-interactive",
             "--yes",
-            "--approve-fidelity",
         ],
     )
 
@@ -118,7 +120,6 @@ def test_missing_package_revision_fails_before_spend_consent(
             "candidate-a",
             "--non-interactive",
             "--yes",
-            "--approve-fidelity",
         ],
     )
 

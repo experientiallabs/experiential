@@ -23,11 +23,8 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.evaluations import (
     EvaluationDataset,
-    EvaluationProtocol,
     EvaluationRow,
-    FidelityReport,
 )
-from wmo.common.evaluations.build import world_model_protocol_is_eligible
 from wmo.common.evaluations.evidence import sorted_evaluation_inputs
 from wmo.common.models import EmbeddingClient, ModelAlias, NumericMeasurement
 from wmo.common.project import ArtifactStore
@@ -225,7 +222,6 @@ def build_held_out_report(
     dataset: EvaluationDataset,
     evaluation_input: ArtifactInput,
     tasks: Sequence[TaskCase],
-    reports: Mapping[str, FidelityReport],
     policy: KnnRouterPolicy,
     policy_input: ArtifactInput,
     bank_manifest: KnnBankManifest,
@@ -242,7 +238,6 @@ def build_held_out_report(
         dataset: Evaluation rows whose fit partition already produced the locked policy.
         evaluation_input: Verified manifest digest for ``dataset``.
         tasks: Exact task cases named by the evaluation task set.
-        reports: Fidelity evidence used to exclude unapproved world-model rows.
         policy: Policy already persisted before held-out rows are inspected.
         policy_input: Verified immutable policy manifest digest.
         bank_manifest: Verified fit-only bank manifest pinned by the policy.
@@ -274,7 +269,7 @@ def build_held_out_report(
         )
         for task, feature, embedding in zip(held_out_tasks, features, embeddings, strict=True)
     )
-    evidence = _held_out_evidence(dataset, reports)
+    evidence = _held_out_evidence(dataset)
     task_weights = {task.task_id: task.workload_weight for task in held_out_tasks}
     assignments = {
         task.task_id: decision.selected_alias
@@ -310,7 +305,7 @@ def build_held_out_report(
     )
     fallback_count = sum(decision.fallback_reason is not None for decision in decisions)
     run_spend = _run_spend(dataset)
-    coverage = _held_out_coverage(dataset, reports)
+    coverage = _held_out_coverage(dataset)
     report_inputs = sorted_evaluation_inputs((evaluation_input, policy_input))
     content = {
         "policy_id": policy.policy_id,
@@ -359,12 +354,8 @@ def build_held_out_report(
     return report
 
 
-def _held_out_coverage(
-    dataset: EvaluationDataset,
-    reports: Mapping[str, FidelityReport],
-) -> HeldOutCoverage:
+def _held_out_coverage(dataset: EvaluationDataset) -> HeldOutCoverage:
     """Count every held-out row status and explicit missing or exclusion reason."""
-    protocols = {item.protocol_id: item for item in dataset.manifest.protocols}
     rows = tuple(row for row in dataset.rows if row.purpose == "held_out")
     reason_counts: dict[str, int] = {}
     for row in rows:
@@ -373,8 +364,6 @@ def _held_out_coverage(
             reason = f"failed:{row.error.code if row.error is not None else 'unknown'}"
         elif row.status == "not_run":
             reason = "not_run"
-        elif not _eligible_row(row, protocols, reports, dataset):
-            reason = "fidelity_not_approved"
         elif row.score is None:
             reason = "missing_score"
         elif row.candidate_cost_usd is None:
@@ -399,24 +388,6 @@ def _held_out_coverage(
     )
 
 
-def _eligible_row(
-    row: EvaluationRow,
-    protocols: Mapping[str, EvaluationProtocol],
-    reports: Mapping[str, FidelityReport],
-    dataset: EvaluationDataset,
-) -> bool:
-    """Return whether one completed held-out row is admissible evidence."""
-    protocol = protocols[row.protocol_id]
-    if protocol.evidence_source != "world_model":
-        return True
-    return world_model_protocol_is_eligible(
-        protocol,
-        dict(reports),
-        evaluation_plan_id=dataset.manifest.evaluation_plan_id,
-        evaluation_plan_sha256=dataset.manifest.evaluation_plan_sha256,
-    )
-
-
 def _held_out_tasks(dataset: EvaluationDataset, tasks: Sequence[TaskCase]) -> tuple[TaskCase, ...]:
     """Resolve the exact ordered held-out task denominator without a fit lineage."""
     tasks_by_id = {task.task_id: task for task in tasks}
@@ -433,7 +404,6 @@ def _held_out_tasks(dataset: EvaluationDataset, tasks: Sequence[TaskCase]) -> tu
 
 def _held_out_evidence(
     dataset: EvaluationDataset,
-    reports: Mapping[str, FidelityReport],
 ) -> dict[tuple[str, str], _TaskCandidateEvidence]:
     """Aggregate eligible completed repeats without turning missing values into zero."""
     protocols = {item.protocol_id: item for item in dataset.manifest.protocols}
@@ -442,13 +412,6 @@ def _held_out_evidence(
         if row.purpose != "held_out" or row.status not in {"observed", "completed"}:
             continue
         protocol = protocols[row.protocol_id]
-        if protocol.evidence_source == "world_model" and not world_model_protocol_is_eligible(
-            protocol,
-            dict(reports),
-            evaluation_plan_id=dataset.manifest.evaluation_plan_id,
-            evaluation_plan_sha256=dataset.manifest.evaluation_plan_sha256,
-        ):
-            continue
         grouped.setdefault((row.task_id, row.candidate_alias), []).append(
             (
                 protocol.evidence_source,

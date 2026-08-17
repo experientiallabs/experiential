@@ -195,7 +195,6 @@ def _install_integrated_runtime(
         return AutomaticRouterOptions(
             maximum_provider_cost_usd=maximum_provider_cost_usd,
             maximum_judgments=30,
-            preferred_fidelity_overlaps=1,
             maximum_model_calls=1,
             maximum_router_feature_tokens=4_096,
             maximum_retrieval_query_tokens=4_096,
@@ -1077,7 +1076,11 @@ def test_refused_named_consent_stops_before_paid_provider_stages(
     monkeypatch.setattr(wizard, "_completed_replay", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(wizard, "_completed_build_plan", lambda *_args, **_kwargs: _plan(catalog))
     monkeypatch.setattr(wizard, "_ensure_router_defaults", lambda *_args, **_kwargs: catalog)
-    monkeypatch.setattr(wizard, "_wizard_fidelity_overlap_count", lambda *_args: 10)
+    monkeypatch.setattr(
+        wizard,
+        "_wizard_observed_candidate_aliases",
+        lambda *_args: ("world",) * 5 + ("candidate",) * 5,
+    )
 
     def refuse(*_args: object, **kwargs: object) -> bool:
         """Capture the exact named command and ceiling, then refuse authorization."""
@@ -1135,7 +1138,6 @@ def test_completed_replay_skips_every_prompt_and_provider_stage(
         policy_id="policy-a",
         report_id="report-a",
         execution_contract_id="execution-a",
-        fidelity_approval_id="approval-a",
         policy_lock_id="lock-a",
         judgment_status="provisional",
     )
@@ -1149,7 +1151,11 @@ def test_completed_replay_skips_every_prompt_and_provider_stage(
     monkeypatch.setattr(wizard.Prompt, "ask", unexpected)
     monkeypatch.setattr(wizard, "_completed_build_plan", lambda *_args, **_kwargs: _plan(catalog))
     monkeypatch.setattr(wizard, "_ensure_router_defaults", lambda *_args, **_kwargs: catalog)
-    monkeypatch.setattr(wizard, "_wizard_fidelity_overlap_count", lambda *_args: 10)
+    monkeypatch.setattr(
+        wizard,
+        "_wizard_observed_candidate_aliases",
+        lambda *_args: ("world",) * 5 + ("candidate",) * 5,
+    )
     output = StringIO()
 
     wizard.run_build_wizard(

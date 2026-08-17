@@ -271,24 +271,16 @@ def run_build_wizard(
             "automatic router cost plan changed after the grounded build; rerun the wizard"
         )
     console.print(
-        f"  {len(preflight.candidates)} candidates, {preflight.fidelity_overlap_count} "
-        f"real overlaps, ${options.maximum_provider_cost_usd:.4f} ceiling"
+        f"  {len(preflight.candidates)} candidates, {len(preflight.observed_traces)} "
+        f"reusable historical cells, ${options.maximum_provider_cost_usd:.4f} ceiling"
     )
     console.print("[bold]4/4 Router optimization[/bold]")
-    from wmo.cli.router_app import _CliFidelityApproval
-
     result = optimize_project_router(
         store,
         candidate_plan,
         RuntimeModelCatalog(catalog),
         options=options,
         provider_spend_consented=True,
-        fidelity_approval=_CliFidelityApproval(
-            approve=True,
-            non_interactive=True,
-            preferred_overlaps=options.preferred_fidelity_overlaps,
-            approved_at=datetime.now(UTC),
-        ),
         created_at=datetime.now(UTC),
         code_revision=code_revision,
     )
@@ -769,7 +761,7 @@ def _wizard_cost_plan(
         judge_response_shape=response_shape,
         judge_audit=audit,
         provisional_judge=provisional,
-        fidelity_overlap_count=_wizard_fidelity_overlap_count(
+        observed_candidate_aliases=_wizard_observed_candidate_aliases(
             store,
             plan,
             catalog,
@@ -779,13 +771,13 @@ def _wizard_cost_plan(
     )
 
 
-def _wizard_fidelity_overlap_count(
+def _wizard_observed_candidate_aliases(
     store: ProjectStore,
     plan: WizardBuildPlan,
     catalog: ModelCatalog,
     selection: RouterCandidateSelection,
-) -> int:
-    """Return the exact pre-consent real-overlap count without provider access.
+) -> tuple[str, ...]:
+    """Return exact pre-consent reusable candidate cells without provider access.
 
     Args:
         store: Project-local artifact store.
@@ -794,7 +786,7 @@ def _wizard_fidelity_overlap_count(
         selection: Exact router candidate selection.
 
     Returns:
-        Number of admitted exact historical candidate overlaps, possibly zero.
+        Candidate aliases for admitted exact historical cells, possibly empty.
     """
     if plan.completed is not None:
         trace_dataset_id = plan.completed.artifacts.trace_dataset.dataset.dataset_id
@@ -806,7 +798,7 @@ def _wizard_fidelity_overlap_count(
     loaded = load_trace_dataset(store.artifacts, trace_dataset_id)
     evidence = read_trace_model_identity_evidence(store.artifacts, loaded)
     if evidence is None:
-        return 0
+        return ()
     resolver = RuntimeModelCatalog(catalog, environment={})
     candidates = tuple(
         RoutedCandidateSnapshot(alias=alias, model=resolver.snapshot(alias)[0])
@@ -817,9 +809,8 @@ def _wizard_fidelity_overlap_count(
         loaded.traces,
         evidence,
         candidates,
-        preferred_overlap_limit=AutomaticRouterOptions().preferred_fidelity_overlaps,
     )
-    return len(records)
+    return tuple(record.candidate_alias for record in records)
 
 
 def _candidate_plan(root: Path, catalog: ModelCatalog) -> RouterCandidateSetupPlan:

@@ -414,12 +414,9 @@ def test_live_openai_pipeline_covers_every_locked_cli_path(
             _ROUTER_CEILING_USD,
             "--maximum-judgments",
             _ROUTER_JUDGMENTS,
-            "--preferred-fidelity-overlaps",
-            "3",
             "--maximum-model-calls",
             "8",
             "--yes",
-            "--approve-fidelity",
             "--non-interactive",
         ],
     )

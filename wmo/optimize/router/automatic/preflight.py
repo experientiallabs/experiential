@@ -127,8 +127,6 @@ class AutomaticRouterPreflight:
     traces: tuple[Trace, ...]
     trace_identity_evidence: TraceModelIdentityEvidenceSet | None
     observed_traces: tuple[ObservedRouterTrace, ...]
-    fidelity_overlap_count: int
-    preferred_fidelity_overlaps: int
     cost_plan: AutomaticRouterCostPlan
     router_embedding_reservation: RouterEmbeddingReservation
     retrieval_embedding_reservation: EmbeddingCostReservation
@@ -140,11 +138,6 @@ class AutomaticRouterPreflight:
     remaining_simulation_cost_usd: float
     agent_factory_sha256: Sha256
     simulation_configuration_sha256: Sha256
-
-    @property
-    def low_fidelity_evidence(self) -> bool:
-        """Return whether explicit approval must acknowledge a sub-preferred denominator."""
-        return self.fidelity_overlap_count < self.preferred_fidelity_overlaps
 
     @property
     def calibration_id(self) -> str:
@@ -237,9 +230,7 @@ def preflight_automatic_router(
         traces,
         identity_evidence,
         candidates,
-        options.preferred_fidelity_overlaps,
     )
-    fidelity_overlap_count = len(observed)
     try:
         agent_identity = agent_factory_sha256(
             config.agent,
@@ -304,11 +295,10 @@ def preflight_automatic_router(
                     else None
                 ),
                 provisional_judge=isinstance(judge_provenance, ProvisionalAutomaticJudge),
-                fidelity_overlap_count=fidelity_overlap_count,
+                observed_candidate_aliases=tuple(item.candidate_alias for item in observed),
                 options=AutomaticRouterOptions(
                     maximum_provider_cost_usd=options.maximum_provider_cost_usd,
                     maximum_judgments=options.maximum_judgments,
-                    preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
                     maximum_model_calls=options.maximum_model_calls,
                     maximum_router_feature_tokens=options.maximum_router_feature_tokens,
                     maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
@@ -325,7 +315,7 @@ def preflight_automatic_router(
         if options.maximum_judgments < cost_plan.maximum_judgments:
             problems.append(
                 f"maximum_judgments must be at least {cost_plan.maximum_judgments} for the "
-                "complete task-candidate and fidelity schedule"
+                "complete task-candidate evaluation schedule"
             )
         if options.maximum_provider_cost_usd < cost_plan.required_provider_cost_usd:
             problems.append(
@@ -389,8 +379,6 @@ def preflight_automatic_router(
         traces=traces,
         trace_identity_evidence=identity_evidence,
         observed_traces=observed,
-        fidelity_overlap_count=fidelity_overlap_count,
-        preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
         cost_plan=cost_plan,
         router_embedding_reservation=reservation,
         retrieval_embedding_reservation=query_reservation,
@@ -413,7 +401,6 @@ def preflight_automatic_router(
 
 _BOUNDED_OPTION_FIELDS = (
     "maximum_model_calls",
-    "preferred_fidelity_overlaps",
     "maximum_router_feature_tokens",
     "maximum_retrieval_query_tokens",
     "router_embedding_maximum_attempts",
@@ -850,7 +837,6 @@ def _observed_traces(
     traces: tuple[Trace, ...],
     identity_evidence: TraceModelIdentityEvidenceSet | None,
     candidates: tuple[RoutedCandidateSnapshot, ...],
-    preferred_overlap_limit: int,
 ) -> tuple[ObservedRouterTrace, ...]:
     """Resolve real fit lineages through verified declared or unique inferred identity.
 
@@ -860,10 +846,8 @@ def _observed_traces(
         traces: Verified normalized production traces.
         identity_evidence: Verified model-span digest provenance, if the dataset carries it.
         candidates: Exact selected candidate identities.
-        preferred_overlap_limit: Maximum fidelity overlaps admitted to evaluation.
-
     Returns:
-        Deterministic attributed traces.
+        One deterministic exact-match trace per attributable fit lineage.
     """
     if not tasks or not traces or not candidates:
         return ()
@@ -875,10 +859,9 @@ def _observed_traces(
             traces,
             identity_evidence,
             candidates,
-            preferred_overlap_limit=preferred_overlap_limit,
         )
     except RouterAttributionError as exc:
-        problems.append(f"fidelity identity attribution: {exc}")
+        problems.append(f"observed fit attribution: {exc}")
         return ()
     tasks_by_id = {task.task_id: task for task in tasks}
     traces_by_id = {trace.trace_id: trace for trace in traces}

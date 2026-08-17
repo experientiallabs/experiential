@@ -30,7 +30,7 @@ from wmo.optimize.router.automatic.preflight import (
     AutomaticRouterOptions,
     AutomaticRouterPreflight,
 )
-from wmo.optimize.router.composition import FidelityApprovalReceipt, RouterPolicyLock
+from wmo.optimize.router.composition import RouterPolicyLock
 from wmo.optimize.router.fit.report import HeldOutRouterReport
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.simulation.specs import SimulationSpec
@@ -47,7 +47,6 @@ class AutomaticRouterReplay:
     policy_id: ArtifactId
     report_id: ArtifactId
     execution_contract_id: ArtifactId
-    fidelity_approval_id: ArtifactId | None
     policy_lock_id: ArtifactId
     judgment_status: Literal["provisional", "human_calibrated"]
 
@@ -167,7 +166,6 @@ def find_completed_automatic_router_replay(
             continue
         if not _simulation_specs_match(project, plan.plan_id, preflight, options, code_revision):
             continue
-        approval_id = _matching_approval(project, policy)
         lock_id = _matching_policy_lock(project, policy)
         report_id = _matching_router_report(project, policy)
         replay_catalog = cast(
@@ -185,7 +183,6 @@ def find_completed_automatic_router_replay(
                 policy_id=policy.policy_id,
                 report_id=report_id,
                 execution_contract_id=execution.execution_contract_id,
-                fidelity_approval_id=approval_id,
                 policy_lock_id=lock_id,
                 judgment_status=policy.judgment_status,
             )
@@ -267,7 +264,6 @@ def find_persisted_automatic_router_replay(
                 policy_id=policy.policy_id,
                 report_id=_matching_router_report(project, policy),
                 execution_contract_id=execution.execution_contract_id,
-                fidelity_approval_id=_matching_approval(project, policy),
                 policy_lock_id=_matching_policy_lock(project, policy),
                 judgment_status=policy.judgment_status,
             )
@@ -323,8 +319,8 @@ def _persisted_execution_matches(
         if project.artifacts.read(item.artifact_id).manifest.artifact_type
         == "router-observed-attribution"
     )
-    if not attribution_inputs and execution.fidelity_planned_overlaps == 0:
-        return not policy.fidelity_report_ids
+    if not attribution_inputs:
+        return True
     if len(attribution_inputs) != 1:
         if attribution_inputs:
             raise AutomaticRouterReplayError("automatic router execution has ambiguous attribution")
@@ -374,7 +370,7 @@ def _attribution_matches(
         == "router-observed-attribution"
     )
     if not attribution_inputs:
-        return not preflight.observed_traces and execution.fidelity_planned_overlaps == 0
+        return not preflight.observed_traces
     if len(attribution_inputs) != 1:
         raise AutomaticRouterReplayError("automatic router execution has ambiguous attribution")
     attribution_input = attribution_inputs[0]
@@ -392,7 +388,6 @@ def _attribution_matches(
         and attribution.catalog_sha256 == preflight.catalog_sha256
         and attribution.candidates
         == tuple(sorted(preflight.candidates, key=lambda item: item.alias))
-        and attribution.preferred_overlap_limit == preflight.preferred_fidelity_overlaps
         and attribution.records == tuple(item.attribution for item in preflight.observed_traces)
     )
 
@@ -455,9 +450,6 @@ def _execution_matches(
         and execution.incumbent_alias == preflight.incumbent_alias
         and execution.agent_factory_sha256 == preflight.agent_factory_sha256
         and execution.simulation_configuration_sha256 == preflight.simulation_configuration_sha256
-        and execution.preferred_fidelity_overlaps == preflight.preferred_fidelity_overlaps
-        and execution.fidelity_planned_overlaps == preflight.fidelity_overlap_count
-        and execution.fidelity_minimum_usable_overlaps == min(8, preflight.fidelity_overlap_count)
         and execution.world_model_alias == preflight.world_model_alias
         and execution.world_model == preflight.world_model
         and execution.world_model_request == preflight.world_model_completion_reservation
@@ -514,43 +506,6 @@ def _simulation_specs_match(
         and spec.maximum_cost_usd <= preflight.remaining_simulation_cost_usd
         for spec in specs
     )
-
-
-def _matching_approval(project: ProjectStore, policy: KnnRouterPolicy) -> ArtifactId | None:
-    """Return the unique approval receipt for the policy's exact plan and report.
-
-    Args:
-        project: Project-local immutable artifact store.
-        policy: Matching frozen policy.
-
-    Returns:
-        Unique fidelity approval identity, or ``None`` when no history was reusable.
-
-    Raises:
-        AutomaticRouterReplayError: The approval is missing, ambiguous, or manifest-inconsistent.
-    """
-    if not policy.fidelity_report_ids:
-        return None
-    matches = []
-    for artifact_id in _artifact_ids(project, "fidelity-approval"):
-        stored = project.artifacts.read(artifact_id)
-        receipt = FidelityApprovalReceipt.model_validate_json(
-            project.artifacts.read_bytes(artifact_id, "approval.json")
-        )
-        pointers = (receipt.plan, receipt.gate, receipt.report)
-        if (
-            receipt.approval_id == artifact_id
-            and receipt.plan.artifact_id == policy.evaluation_plan_id
-            and receipt.report.artifact_id in policy.fidelity_report_ids
-            and envelope_matches_manifest(receipt, stored.manifest)
-            and all(
-                artifact_input(project.artifacts.read(item.artifact_id).manifest) == item
-                for item in pointers
-            )
-            and set(receipt.inputs) == set(pointers)
-        ):
-            matches.append(artifact_id)
-    return _one(matches, "fidelity approval")
 
 
 def _matching_policy_lock(project: ProjectStore, policy: KnnRouterPolicy) -> ArtifactId:

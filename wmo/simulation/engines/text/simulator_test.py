@@ -288,9 +288,6 @@ def _plan(cells: tuple[EvaluationCell, ...]) -> EvaluationPlan:
         candidate_snapshots=(candidate,),
         pricing_snapshot_id="pricing-1",
         pricing_snapshot_sha256="d" * 64,
-        fidelity_thresholds_id="fidelity-thresholds",
-        fidelity_thresholds_sha256="c" * 64,
-        fidelity_protocol_sha256="e" * 64,
         cells=cells,
     )
 

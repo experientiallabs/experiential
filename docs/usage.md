@@ -36,3 +36,8 @@ and later approval plus another build creates an immutable human-calibrated succ
 endpoint records traffic by default so a later optimization can use newly attributed outcomes.
 Explicit trace automation can still stop after the grounded build, then use
 [`router-optimization.json`](reference/router_optimization_config.md) with `wmo optimize router`.
+Router fitting never invokes world-model fidelity testing. Applications that need a world-model
+quality measurement can call the separate `build_fidelity_evaluation_plan` and
+`build_fidelity_report` APIs; those results never enter router fitting or activation. Fidelity
+reports contain measurements only, never an approval or denial. See the
+[router contracts](reference/router_optimization_config.md).

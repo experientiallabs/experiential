@@ -12,7 +12,7 @@ from wmo.optimize.router.automatic.service_test import _catalog
 
 
 def test_cost_plan_reserves_exact_small_schedule_without_io() -> None:
-    """The pure planner reserves all 24 episodes and 30 judgments without mutation."""
+    """The pure planner reuses six cells and reserves the remaining 18 episodes."""
     catalog = _catalog()
     original = catalog.model_dump(mode="json")
     plan = plan_automatic_router_cost(
@@ -28,14 +28,14 @@ def test_cost_plan_reserves_exact_small_schedule_without_io() -> None:
         judge_response_shape="scalar",
         judge_audit=None,
         provisional_judge=True,
-        fidelity_overlap_count=6,
+        observed_candidate_aliases=("candidate-a",) * 3 + ("candidate-b",) * 3,
         options=AutomaticRouterOptions(),
     )
 
-    assert plan.maximum_judgments == 30
-    assert plan.maximum_judge_provider_calls == 30
-    assert plan.simulated_episode_count == 24
-    assert tuple(item.episode_count for item in plan.candidate_episodes) == (12, 12)
+    assert plan.maximum_judgments == 24
+    assert plan.maximum_judge_provider_calls == 24
+    assert plan.simulated_episode_count == 18
+    assert tuple(item.episode_count for item in plan.candidate_episodes) == (9, 9)
     assert plan.required_provider_cost_usd == (
         plan.router_embedding_cost_usd + plan.judgment_cost_usd + plan.simulation_cost_usd
     )
@@ -43,7 +43,7 @@ def test_cost_plan_reserves_exact_small_schedule_without_io() -> None:
 
 
 def test_cost_plan_reserves_full_default_corpus_and_pairwise_calls() -> None:
-    """The 50/20 corpus reserves 140 episodes and 150 counterbalanced judgments."""
+    """The 50/20 corpus reuses ten cells and reserves 130 fresh episodes."""
     catalog = _catalog()
     plan = plan_automatic_router_cost(
         _tasks(70),
@@ -58,13 +58,13 @@ def test_cost_plan_reserves_full_default_corpus_and_pairwise_calls() -> None:
         judge_response_shape="pairwise",
         judge_audit=None,
         provisional_judge=True,
-        fidelity_overlap_count=10,
+        observed_candidate_aliases=("candidate-a",) * 5 + ("candidate-b",) * 5,
         options=AutomaticRouterOptions(),
     )
 
-    assert plan.maximum_judgments == 150
-    assert plan.maximum_judge_provider_calls == 300
-    assert plan.simulated_episode_count == 140
+    assert plan.maximum_judgments == 140
+    assert plan.maximum_judge_provider_calls == 280
+    assert plan.simulated_episode_count == 130
     assert plan.judge_calls_per_judgment == 2
 
 
@@ -86,7 +86,7 @@ def test_cost_plan_digest_changes_with_the_full_schedule() -> None:
         judge_response_shape="scalar",
         judge_audit=None,
         provisional_judge=True,
-        fidelity_overlap_count=0,
+        observed_candidate_aliases=(),
         options=AutomaticRouterOptions(),
     )
     second = plan_automatic_router_cost(
@@ -99,7 +99,7 @@ def test_cost_plan_digest_changes_with_the_full_schedule() -> None:
         judge_response_shape="scalar",
         judge_audit=None,
         provisional_judge=True,
-        fidelity_overlap_count=0,
+        observed_candidate_aliases=(),
         options=AutomaticRouterOptions(),
     )
 

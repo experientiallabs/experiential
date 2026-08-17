@@ -6,12 +6,16 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from wmo.common.evaluations import FidelityReport as FidelityReport
+    from wmo.common.evaluations import (
+        build_fidelity_evaluation_plan as build_fidelity_evaluation_plan,
+    )
+    from wmo.common.evaluations import build_fidelity_report as build_fidelity_report
     from wmo.optimize.router.activation import load_project_router as load_project_router
     from wmo.optimize.router.activation import load_router as load_router
     from wmo.optimize.router.composition import (
         ApprovedRouterReview as ApprovedRouterReview,
     )
-    from wmo.optimize.router.composition import FidelityApprovalDecision as FidelityApprovalDecision
     from wmo.optimize.router.composition import (
         RouterCompositionBudget as RouterCompositionBudget,
     )
@@ -76,6 +80,9 @@ _EXPORT_MODULES = {
     "WorldModelSessionError": "wmo.simulation.world_model.application",
     "WorldModelSessionLimits": "wmo.simulation.world_model.application",
     "load_world_model": "wmo.simulation.world_model.application",
+    "FidelityReport": "wmo.common.evaluations",
+    "build_fidelity_evaluation_plan": "wmo.common.evaluations",
+    "build_fidelity_report": "wmo.common.evaluations",
     "EvaluationInputs": "wmo.optimize.router.fit.workflow",
     "RouterFitConfig": "wmo.optimize.router.fit.workflow",
     "RouterFitWorkflowResult": "wmo.optimize.router.fit.workflow",
@@ -90,7 +97,6 @@ _EXPORT_MODULES = {
     "load_project_router": "wmo.optimize.router.activation",
     "load_router": "wmo.optimize.router.activation",
     "ApprovedRouterReview": "wmo.optimize.router.composition",
-    "FidelityApprovalDecision": "wmo.optimize.router.composition",
     "RouterCompositionBudget": "wmo.optimize.router.composition",
     "RouterCompositionResult": "wmo.optimize.router.composition",
     "RouterEvaluationSetup": "wmo.optimize.router.composition",

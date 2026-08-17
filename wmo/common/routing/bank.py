@@ -6,7 +6,7 @@ import hashlib
 import io
 import math
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,8 +20,7 @@ from wmo.common.core.artifacts import (
     envelope_matches_manifest,
     validate_artifact_file_path,
 )
-from wmo.common.evaluations import EvaluationDataset, EvaluationProtocol, FidelityReport
-from wmo.common.evaluations.build import world_model_protocol_is_eligible
+from wmo.common.evaluations import EvaluationDataset
 from wmo.common.models import EmbeddingClient, ModelAlias, ModelSnapshot
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore
 from wmo.common.routing.features import RouterFeatureExtractor
@@ -48,7 +47,6 @@ class KnnBankManifest(ArtifactEnvelope):
     task_ids: tuple[ArtifactId, ...]
     candidate_aliases: tuple[ModelAlias, ...]
     evaluation_protocols_sha256: Sha256
-    fidelity_report_ids: tuple[ArtifactId, ...] = ()
     embedder_alias: ModelAlias
     embedder: ModelSnapshot
     feature_extractor_id: ArtifactId
@@ -188,21 +186,17 @@ class KnnEvidenceBank:
 def build_knn_bank(
     dataset: EvaluationDataset,
     tasks: Sequence[TaskCase],
-    reports: Mapping[str, FidelityReport],
     *,
     embedder: EmbeddingClient,
     feature_extractor: RouterFeatureExtractor,
-    world_model_fidelity_required: bool = True,
 ) -> KnnEvidenceBank:
     """Build a normalized bank using eligible fit rows and request-visible task features.
 
     Args:
         dataset: Immutable sparse evaluation with explicit missing and failed rows.
         tasks: Canonical task cases named by the evaluation manifest.
-        reports: Fidelity reports used to admit or reject world-model evidence.
         embedder: Exact fit-time embedding client named by the optimization spec.
         feature_extractor: Frozen request-visible feature implementation.
-        world_model_fidelity_required: Whether simulated rows need a measured fidelity report.
 
     Returns:
         In-memory deterministic bank containing no held-out task.
@@ -225,7 +219,6 @@ def build_knn_bank(
     cost_values: list[list[list[float]]] = [
         [[] for _candidate in candidate_aliases] for _task in task_ids
     ]
-    protocols = {protocol.protocol_id: protocol for protocol in dataset.manifest.protocols}
     seen_cells: set[tuple[str, str, int]] = set()
     for row in dataset.rows:
         if row.purpose != "fit":
@@ -234,14 +227,6 @@ def build_knn_bank(
         if key in seen_cells:
             raise ValueError("evaluation repeats a fit task, candidate, and repeat cell")
         seen_cells.add(key)
-        protocol = protocols[row.protocol_id]
-        if not _protocol_is_eligible(
-            protocol,
-            reports,
-            dataset,
-            world_model_fidelity_required=world_model_fidelity_required,
-        ):
-            continue
         if row.status not in {"observed", "completed"}:
             continue
         target_row = row_of[row.task_id]
@@ -377,36 +362,6 @@ def load_knn_bank(
     if bank.embeddings.shape[1] != manifest.embedding_dimension:
         raise ArtifactCorruptionError("kNN bank embedding dimension differs from its manifest")
     return manifest, bank
-
-
-def _protocol_is_eligible(
-    protocol: EvaluationProtocol,
-    reports: Mapping[str, FidelityReport],
-    dataset: EvaluationDataset,
-    *,
-    world_model_fidelity_required: bool,
-) -> bool:
-    """Admit direct or completed world-model evidence under the plan's fidelity requirement.
-
-    Args:
-        protocol: Evidence protocol used by one completed fit row.
-        reports: Verified measured-fidelity reports available to the dataset.
-        dataset: Exact evaluation scope owning the completed row.
-        world_model_fidelity_required: Whether simulated evidence needs a measured report.
-
-    Returns:
-        Whether the row may contribute to the fitted evidence bank.
-    """
-    if protocol.evidence_source in {"production", "sandbox"}:
-        return True
-    if not world_model_fidelity_required:
-        return protocol.evidence_source == "world_model" and protocol.fidelity_report_id is None
-    return world_model_protocol_is_eligible(
-        protocol,
-        dict(reports),
-        evaluation_plan_id=dataset.manifest.evaluation_plan_id,
-        evaluation_plan_sha256=dataset.manifest.evaluation_plan_sha256,
-    )
 
 
 def _novelty_floor(embeddings: np.ndarray) -> float:

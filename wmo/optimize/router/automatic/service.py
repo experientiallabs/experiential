@@ -28,7 +28,6 @@ from wmo.optimize.router.automatic.preflight import (
 from wmo.optimize.router.automatic.reservations import AutomaticRouterOptions
 from wmo.optimize.router.composition import (
     ApprovedRouterReview,
-    FidelityApproval,
     ProvisionalRouterReview,
     RouterCandidateSetupPlan,
     RouterCompositionBudget,
@@ -85,7 +84,6 @@ def optimize_project_router(
     *,
     options: AutomaticRouterOptions,
     provider_spend_consented: bool,
-    fidelity_approval: FidelityApproval,
     created_at: datetime,
     code_revision: str,
     phase_hook: Callable[[str], None] | None = None,
@@ -98,7 +96,6 @@ def optimize_project_router(
         runtime_catalog: Resolver retaining the caller's credential and transport seams.
         options: Bounded provider, evidence, retry, and concurrency controls.
         provider_spend_consented: Explicit approval of the displayed shared provider ceiling.
-        fidelity_approval: Separate explicit approval boundary for measured simulation fidelity.
         created_at: Materialization time for new immutable artifacts.
         code_revision: Exact producer revision.
         phase_hook: Optional local phase-order observer.
@@ -132,7 +129,6 @@ def optimize_project_router(
             task_set=preflight.completed_build.task_set,
             catalog_sha256=preflight.catalog_sha256,
             candidates=preflight.candidates,
-            preferred_overlap_limit=preflight.preferred_fidelity_overlaps,
             records=tuple(item.attribution for item in preflight.observed_traces),
             created_at=created_at,
             code_revision=code_revision,
@@ -168,7 +164,6 @@ def optimize_project_router(
         resolved_catalog,
         judge,
         agent_factory,
-        fidelity_approval,
         options,
     )
     composition = compose_router(
@@ -356,7 +351,6 @@ def _workflow_services(
     runtime_catalog: RuntimeModelCatalog,
     judge: AutomaticRouterJudge,
     agent_factory: AgentFactory,
-    fidelity_approval: FidelityApproval,
     options: AutomaticRouterOptions,
 ) -> RouterWorkflowServices:
     """Bind the generic composition interfaces to verified automatic project inputs.
@@ -369,7 +363,6 @@ def _workflow_services(
         runtime_catalog: Resolver used by the final online router runtime.
         judge: Approved saved-contract judge awaiting its exact plan.
         agent_factory: Post-consent validated fresh-runtime constructor.
-        fidelity_approval: Explicit measured-fidelity approval boundary.
         options: Active simulation controls.
 
     Returns:
@@ -451,8 +444,6 @@ def _workflow_services(
                 maximum_output_tokens=options.simulation_maximum_output_tokens,
             ),
             simulation_completion_input=artifacts.simulation_completion_input,
-            fidelity_planned_overlaps=preflight.fidelity_overlap_count,
-            fidelity_minimum_usable_overlaps=min(8, preflight.fidelity_overlap_count),
             agent_id=preflight.project_config.project_id,
             seed=options.seed,
             maximum_steps=options.maximum_model_calls,
@@ -520,7 +511,6 @@ def _workflow_services(
         setup_supplier=setup_supplier,
         simulator_factory=simulator_factory,
         judge=judge,
-        fidelity_approval=fidelity_approval,
         runtime_catalog=runtime_catalog,
         evaluation_plan_inputs=(
             *((artifacts.attribution_input,) if artifacts.attribution_input is not None else ()),

@@ -68,9 +68,6 @@ class RouterExecutionContract(ArtifactEnvelope):
     incumbent_alias: ArtifactId
     agent_factory_sha256: Sha256
     simulation_configuration_sha256: Sha256
-    preferred_fidelity_overlaps: int = Field(gt=0)
-    fidelity_planned_overlaps: int = Field(ge=0)
-    fidelity_minimum_usable_overlaps: int = Field(ge=0)
     world_model_alias: ArtifactId
     world_model: ModelSnapshot
     world_model_request: CompletionCostReservation
@@ -126,12 +123,6 @@ class RouterExecutionContract(ArtifactEnvelope):
         planned_aliases = tuple(item.candidate_alias for item in self.cost_plan.candidate_episodes)
         if set(planned_aliases) != set(aliases):
             raise ValueError("automatic cost plan differs from the execution candidates")
-        if self.fidelity_planned_overlaps > self.preferred_fidelity_overlaps:
-            raise ValueError("planned fidelity overlaps exceed the preferred bound")
-        if self.fidelity_minimum_usable_overlaps > self.fidelity_planned_overlaps:
-            raise ValueError("minimum usable fidelity overlaps exceed the planned denominator")
-        if (self.fidelity_planned_overlaps == 0) != (self.fidelity_minimum_usable_overlaps == 0):
-            raise ValueError("zero reusable overlaps require a zero fidelity denominator")
         if self.world_model_request.model != self.world_model:
             raise ValueError("world-model request reservation differs from its model")
         if self.judge_request.model != self.judge_model:
@@ -199,9 +190,6 @@ def persist_router_execution_contract(
     incumbent_alias: ArtifactId,
     agent_factory_sha256: Sha256,
     simulation_configuration_sha256: Sha256,
-    preferred_fidelity_overlaps: int,
-    fidelity_planned_overlaps: int,
-    fidelity_minimum_usable_overlaps: int,
     world_model_alias: ArtifactId,
     world_model: ModelSnapshot,
     world_model_request: CompletionCostReservation,
@@ -227,9 +215,6 @@ def persist_router_execution_contract(
         incumbent_alias: Exact quality baseline selected for fitting and fallback.
         agent_factory_sha256: Exact effective built-in or custom agent configuration digest.
         simulation_configuration_sha256: Exact agent and data-redaction simulation digest.
-        preferred_fidelity_overlaps: Operator-selected upper bound on real overlap cells.
-        fidelity_planned_overlaps: Exact real overlap denominator admitted to the plan.
-        fidelity_minimum_usable_overlaps: Exact passing denominator bound for the fidelity gate.
         world_model_alias: Build-frozen world-model alias.
         world_model: Exact world-model identity.
         world_model_request: World-model call reservation.
@@ -267,9 +252,6 @@ def persist_router_execution_contract(
         "incumbent_alias": incumbent_alias,
         "agent_factory_sha256": agent_factory_sha256,
         "simulation_configuration_sha256": simulation_configuration_sha256,
-        "preferred_fidelity_overlaps": preferred_fidelity_overlaps,
-        "fidelity_planned_overlaps": fidelity_planned_overlaps,
-        "fidelity_minimum_usable_overlaps": fidelity_minimum_usable_overlaps,
         "world_model_alias": world_model_alias,
         "world_model": world_model.model_dump(mode="json"),
         "world_model_request": world_model_request.model_dump(mode="json"),
@@ -296,9 +278,6 @@ def persist_router_execution_contract(
         incumbent_alias=incumbent_alias,
         agent_factory_sha256=agent_factory_sha256,
         simulation_configuration_sha256=simulation_configuration_sha256,
-        preferred_fidelity_overlaps=preferred_fidelity_overlaps,
-        fidelity_planned_overlaps=fidelity_planned_overlaps,
-        fidelity_minimum_usable_overlaps=fidelity_minimum_usable_overlaps,
         world_model_alias=world_model_alias,
         world_model=world_model,
         world_model_request=world_model_request,
@@ -418,9 +397,6 @@ def load_router_execution_contract(
             "incumbent_alias": value.incumbent_alias,
             "agent_factory_sha256": value.agent_factory_sha256,
             "simulation_configuration_sha256": value.simulation_configuration_sha256,
-            "preferred_fidelity_overlaps": value.preferred_fidelity_overlaps,
-            "fidelity_planned_overlaps": value.fidelity_planned_overlaps,
-            "fidelity_minimum_usable_overlaps": value.fidelity_minimum_usable_overlaps,
             "world_model_alias": value.world_model_alias,
             "world_model": value.world_model.model_dump(mode="json"),
             "world_model_request": value.world_model_request.model_dump(mode="json"),

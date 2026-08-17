@@ -37,7 +37,6 @@ class AutomaticRouterOptions:
 
     maximum_provider_cost_usd: float = 25.0
     maximum_judgments: int = 100
-    preferred_fidelity_overlaps: int = 10
     maximum_model_calls: int = 8
     maximum_router_feature_tokens: int = 8_192
     maximum_retrieval_query_tokens: int = 32_768
@@ -52,7 +51,7 @@ class CandidateEpisodeCostPlan(ContractModel):
     """One candidate's complete retry-bound simulation schedule."""
 
     candidate_alias: str = Field(min_length=1)
-    episode_count: int = Field(gt=0)
+    episode_count: int = Field(ge=0)
     maximum_steps_per_episode: int = Field(gt=0)
     query_cost_per_step_usd: float = Field(ge=0)
     candidate_cost_per_step_usd: float = Field(ge=0)
@@ -91,8 +90,7 @@ class AutomaticRouterCostPlan(ContractModel):
     schema_version: Literal[1] = 1
     task_count: int = Field(gt=0)
     candidate_count: int = Field(ge=2)
-    preferred_fidelity_overlaps: int = Field(gt=0)
-    fidelity_overlap_count: int = Field(ge=0)
+    reusable_observed_count: int = Field(ge=0)
     maximum_judgments: int = Field(gt=0)
     judge_calls_per_judgment: Literal[1, 2]
     maximum_judge_provider_calls: int = Field(gt=0)
@@ -118,23 +116,25 @@ class AutomaticRouterCostPlan(ContractModel):
         Raises:
             ValueError: Counts, candidate schedules, or the total reservation are incomplete.
         """
-        if self.maximum_judgments != (
-            self.task_count * self.candidate_count + self.fidelity_overlap_count
-        ):
-            raise ValueError("maximum judgments differ from tasks, candidates, and overlaps")
-        if self.fidelity_overlap_count > self.preferred_fidelity_overlaps:
-            raise ValueError("admitted fidelity overlaps exceed the preferred limit")
+        complete_cell_count = self.task_count * self.candidate_count
+        if self.maximum_judgments != complete_cell_count:
+            raise ValueError("maximum judgments differ from the complete evaluation grid")
+        if self.reusable_observed_count > complete_cell_count:
+            raise ValueError("reusable observations exceed the complete evaluation grid")
         if self.maximum_judge_provider_calls != (
             self.maximum_judgments * self.judge_calls_per_judgment
         ):
             raise ValueError("judge provider calls differ from the exact judgment schedule")
-        if self.simulated_episode_count != self.task_count * self.candidate_count:
-            raise ValueError("simulated episodes differ from the complete task-candidate grid")
+        if self.simulated_episode_count != complete_cell_count - self.reusable_observed_count:
+            raise ValueError("simulated episodes do not fill the unobserved evaluation cells")
         aliases = tuple(item.candidate_alias for item in self.candidate_episodes)
         if len(aliases) != self.candidate_count or len(set(aliases)) != len(aliases):
             raise ValueError("candidate episode schedules must cover each candidate exactly once")
-        if any(item.episode_count != self.task_count for item in self.candidate_episodes):
-            raise ValueError("each candidate schedule must reserve every task episode")
+        if any(item.episode_count > self.task_count for item in self.candidate_episodes):
+            raise ValueError("a candidate schedule exceeds the complete task grid")
+        scheduled_episodes = sum(item.episode_count for item in self.candidate_episodes)
+        if scheduled_episodes != self.simulated_episode_count:
+            raise ValueError("candidate schedules differ from the simulated episode count")
         expected_simulation = math.fsum(item.schedule_cost_usd for item in self.candidate_episodes)
         if not math.isclose(
             self.simulation_cost_usd,
@@ -467,7 +467,7 @@ def plan_automatic_router_cost(
     judge_response_shape: Literal["scalar", "boolean", "categorical", "pairwise"],
     judge_audit: ManualJudgeCalibrationAudit | None,
     provisional_judge: bool,
-    fidelity_overlap_count: int,
+    observed_candidate_aliases: tuple[str, ...],
     options: AutomaticRouterOptions,
 ) -> AutomaticRouterCostPlan:
     """Plan every possible automatic-router provider call without I/O.
@@ -482,7 +482,7 @@ def plan_automatic_router_cost(
         judge_response_shape: Finalized judge response protocol.
         judge_audit: Human-approved request bounds, when selected.
         provisional_judge: Whether conservative zero-label judge bounds apply.
-        fidelity_overlap_count: Exact real overlap count admitted to fidelity validation.
+        observed_candidate_aliases: Candidate aliases for exact reusable historical cells.
         options: Quality, retry, token, and episode ceilings.
 
     Returns:
@@ -571,7 +571,16 @@ def plan_automatic_router_cost(
         raise ValueError("automatic router query reservation has no cost")
     task_count = len(tasks)
     candidate_count = len(selection.candidates)
-    maximum_judgments = task_count * candidate_count + fidelity_overlap_count
+    unknown_observed = sorted(set(observed_candidate_aliases) - set(selection.candidates))
+    if unknown_observed:
+        raise ValueError(f"observed cells name unselected candidates: {unknown_observed}")
+    observed_counts = {
+        alias: observed_candidate_aliases.count(alias) for alias in selection.candidates
+    }
+    if any(count > task_count for count in observed_counts.values()):
+        raise ValueError("observed cells exceed the task schedule for one candidate")
+    reusable_observed_count = len(observed_candidate_aliases)
+    maximum_judgments = task_count * candidate_count
     calls_per_judgment: Literal[1, 2] = 2 if judge_response_shape == "pairwise" else 1
     maximum_judge_provider_calls = maximum_judgments * calls_per_judgment
     judgment_cost = judge_request.estimated_maximum_call_cost_usd * maximum_judge_provider_calls
@@ -579,13 +588,13 @@ def plan_automatic_router_cost(
     episode_plans = tuple(
         CandidateEpisodeCostPlan(
             candidate_alias=alias,
-            episode_count=task_count,
+            episode_count=task_count - observed_counts[alias],
             maximum_steps_per_episode=options.maximum_model_calls,
             query_cost_per_step_usd=query_economics.value,
             candidate_cost_per_step_usd=by_alias[alias].estimated_maximum_call_cost_usd,
             world_cost_per_step_usd=world_request.estimated_maximum_call_cost_usd,
             schedule_cost_usd=(
-                task_count
+                (task_count - observed_counts[alias])
                 * options.maximum_model_calls
                 * math.fsum(
                     (
@@ -602,12 +611,11 @@ def plan_automatic_router_cost(
     return AutomaticRouterCostPlan(
         task_count=task_count,
         candidate_count=candidate_count,
-        preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
-        fidelity_overlap_count=fidelity_overlap_count,
+        reusable_observed_count=reusable_observed_count,
         maximum_judgments=maximum_judgments,
         judge_calls_per_judgment=calls_per_judgment,
         maximum_judge_provider_calls=maximum_judge_provider_calls,
-        simulated_episode_count=task_count * candidate_count,
+        simulated_episode_count=task_count * candidate_count - reusable_observed_count,
         router_embedding_cost_usd=router.estimated_cost_usd,
         judgment_cost_usd=judgment_cost,
         candidate_episodes=episode_plans,

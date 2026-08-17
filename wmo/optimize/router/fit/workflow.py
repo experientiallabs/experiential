@@ -16,8 +16,7 @@ from wmo.common.evaluations import (
     build_evaluation_dataset,
     load_evaluation_dataset,
 )
-from wmo.common.evaluations.evidence import read_evaluation_plan, read_fidelity_gate
-from wmo.common.evaluations.planning import plan_bound_fidelity_gate_id
+from wmo.common.evaluations.evidence import read_evaluation_plan
 from wmo.common.models import load_pricing_snapshot
 from wmo.common.project import ArtifactStore, ArtifactStoreError
 from wmo.common.rollouts import SimulationArtifactSet
@@ -35,13 +34,12 @@ class RouterWorkflowError(ValueError):
 
 
 class EvaluationInputs(ContractModel):
-    """Completed plan, rollout sets, judgments, protocols, and fidelity references."""
+    """Completed plan, rollout sets, judgments, and protocols for one router partition."""
 
     evaluation_plan_id: ArtifactId
     rollout_set_ids: tuple[ArtifactId, ...] = ()
     protocols: tuple[EvaluationProtocol, ...]
     cell_evidence: tuple[EvaluationCellEvidence, ...]
-    fidelity_report_ids: tuple[ArtifactId, ...] = ()
 
 
 class RouterOptimizationConfig(ContractModel):
@@ -188,7 +186,6 @@ def fit_router(store: ArtifactStore, config: RouterFitConfig) -> RouterFitWorkfl
             cell_evidence=tuple(
                 item for item in config.fit.cell_evidence if item.cell_id in fit_cells
             ),
-            fidelity_report_ids=config.fit.fidelity_report_ids,
             purposes=("fit",),
             created_at=config.created_at,
             code_revision=config.code_revision,
@@ -255,7 +252,6 @@ def report_router(
             cell_evidence=tuple(
                 item for item in config.held_out.cell_evidence if item.cell_id in held_out_cells
             ),
-            fidelity_report_ids=config.held_out.fidelity_report_ids,
             purposes=("held_out",),
             created_at=config.created_at,
             code_revision=config.code_revision,
@@ -284,16 +280,12 @@ def _verify_completed_inputs(
     *,
     required_purpose: Literal["fit", "held_out"],
 ) -> None:
-    """Verify partition isolation, rollout-set membership, and the plan-bound gate."""
-    plan, plan_input = read_evaluation_plan(store, value.evaluation_plan_id)
+    """Verify partition isolation and completed rollout-set membership."""
+    plan, _plan_input = read_evaluation_plan(store, value.evaluation_plan_id)
     purposes = {cell.purpose for cell in plan.cells}
     if "fit" not in purposes or "held_out" not in purposes:
         raise RouterWorkflowError("router optimization needs one combined fit and held-out plan")
-    expected = (
-        ({"fit", "fidelity"} if "fidelity" in purposes else {"fit"})
-        if required_purpose == "fit"
-        else {"held_out"}
-    )
+    expected = {required_purpose}
     cells_by_id = {cell.cell_id: cell for cell in plan.cells}
     unknown = sorted(
         item.cell_id for item in value.cell_evidence if item.cell_id not in cells_by_id
@@ -305,14 +297,6 @@ def _verify_completed_inputs(
         raise RouterWorkflowError(
             f"{required_purpose} evidence must contain only {sorted(expected)} cells"
         )
-    if required_purpose == "fit":
-        gate_id = plan_bound_fidelity_gate_id(plan_input.sha256, plan.fidelity_protocol_sha256)
-        gate, _gate_input = read_fidelity_gate(store, gate_id)
-        if (
-            gate.evaluation_plan_id != plan.plan_id
-            or gate.evaluation_plan_sha256 != plan_input.sha256
-        ):
-            raise RouterWorkflowError("fidelity gate is not bound to the evaluation plan")
     rollout_ids: set[str] = set()
     for artifact_set_id in value.rollout_set_ids:
         stored = store.read(artifact_set_id)

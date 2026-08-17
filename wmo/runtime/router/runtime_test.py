@@ -19,10 +19,6 @@ from wmo.common.evaluations import (
     EvaluationDatasetManifest,
     EvaluationPlan,
     EvaluationProtocol,
-    FidelityGate,
-    FidelityPair,
-    FidelityReport,
-    FidelityThresholds,
 )
 from wmo.common.models import (
     AssistantAction,
@@ -224,7 +220,6 @@ def test_artifact_mutation_and_pricing_or_alias_drift_block_activation() -> None
         ("task_set_id", "tasks-b", "task set"),
         ("task_set_sha256", "f" * 64, "task-set digest"),
         ("evaluation_protocols_sha256", "f" * 64, "evaluation protocol scope"),
-        ("fidelity_report_ids", ("fidelity-b",), "fidelity scope"),
         ("embedder_alias", "embedder-b", "embedder alias"),
         ("feature_extractor_id", "request-visible-v3", "feature extractor"),
         ("feature_schema_sha256", "f" * 64, "feature schema"),
@@ -329,7 +324,6 @@ def test_store_backed_load_verifies_artifacts_and_normalizes_failures(tmp_path: 
         "omit-bank:plan-a",
         "omit-bank:tasks-a",
         "omit-bank:pricing-a",
-        "omit-bank:fidelity-a",
         "wrong-bank:plan-a",
         "extra-bank",
     ],
@@ -780,21 +774,6 @@ def _persist_runtime_fixture(
         files={"pricing.json": pricing},
     )
     pricing_input = artifact_input(pricing_manifest)
-    thresholds = FidelityThresholds(
-        schema_version=1,
-        created_at=_TIME,
-        code_revision="test",
-        fidelity_thresholds_id="thresholds-a",
-        planned_overlaps=1,
-        minimum_usable_overlaps=1,
-    )
-    thresholds_manifest = store.write_json(
-        artifact_id=thresholds.fidelity_thresholds_id,
-        artifact_type="fidelity-thresholds",
-        envelope=thresholds,
-        files={"thresholds.json": thresholds},
-    )
-    thresholds_input = artifact_input(thresholds_manifest)
     tasks = tuple(
         TaskCase(
             task_id=task_id,
@@ -828,7 +807,7 @@ def _persist_runtime_fixture(
         created_at=_TIME,
         inputs=tuple(
             sorted(
-                (pricing_input, task_input, thresholds_input),
+                (pricing_input, task_input),
                 key=lambda item: item.artifact_id,
             )
         ),
@@ -838,9 +817,6 @@ def _persist_runtime_fixture(
         candidate_snapshots=policy.candidates,
         pricing_snapshot_id=pricing.pricing_snapshot_id,
         pricing_snapshot_sha256=pricing_input.sha256,
-        fidelity_thresholds_id="thresholds-a",
-        fidelity_thresholds_sha256=thresholds_input.sha256,
-        fidelity_protocol_sha256=_DIGEST,
         cells=tuple(
             EvaluationCell(
                 cell_id=f"cell-{task.task_id}-{alias}",
@@ -862,67 +838,6 @@ def _persist_runtime_fixture(
         files={"plan.json": plan},
     )
     plan_input = artifact_input(plan_manifest)
-    gate = FidelityGate(
-        schema_version=1,
-        created_at=_TIME,
-        inputs=tuple(sorted((plan_input, thresholds_input), key=lambda item: item.artifact_id)),
-        code_revision="test",
-        fidelity_gate_id="gate-a",
-        fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
-        fidelity_thresholds_sha256=thresholds_input.sha256,
-        evaluation_plan_id=plan.plan_id,
-        evaluation_plan_sha256=plan_input.sha256,
-        protocol_sha256=_DIGEST,
-        task_model_scope_sha256=_DIGEST,
-        overlap_cell_ids=("fidelity-cell-a",),
-        planned_overlaps=1,
-        minimum_usable_overlaps=1,
-    )
-    gate_manifest = store.write_json(
-        artifact_id=gate.fidelity_gate_id,
-        artifact_type="fidelity-gate",
-        envelope=gate,
-        files={"gate.json": gate},
-    )
-    gate_input = artifact_input(gate_manifest)
-    fidelity_report = FidelityReport(
-        schema_version=1,
-        created_at=_TIME,
-        inputs=(gate_input,),
-        code_revision="test",
-        fidelity_report_id="fidelity-a",
-        evaluation_plan_id=plan.plan_id,
-        evaluation_plan_sha256=plan_input.sha256,
-        protocol_sha256=_DIGEST,
-        overlap_cell_ids=("fidelity-cell-a",),
-        planned_overlap_count=1,
-        usable_overlap_count=1,
-        failed_overlap_count=0,
-        score_mae=0.0,
-        pairs=(
-            FidelityPair(
-                fidelity_cell_id="fidelity-cell-a",
-                observed_cell_id="observed-cell-a",
-                observed_rollout_id="observed-rollout-a",
-                simulated_rollout_id="simulated-rollout-a",
-                observed_score=0.5,
-                simulated_score=0.5,
-                absolute_error=0.0,
-                status="usable",
-            ),
-        ),
-        gate_id="gate-a",
-        gate_sha256=gate_input.sha256,
-        status="approved",
-        approved_at=_TIME,
-    )
-    fidelity_manifest = store.write_json(
-        artifact_id=fidelity_report.fidelity_report_id,
-        artifact_type="fidelity-report",
-        envelope=fidelity_report,
-        files={"report.json": fidelity_report},
-    )
-    fidelity_input = artifact_input(fidelity_manifest)
     protocol = EvaluationProtocol(
         protocol_id="protocol-a",
         evidence_source="production",
@@ -934,7 +849,7 @@ def _persist_runtime_fixture(
     )
     evaluation_inputs = tuple(
         sorted(
-            (fidelity_input, plan_input, pricing_input, task_input),
+            (plan_input, pricing_input, task_input),
             key=lambda item: item.artifact_id,
         )
     )
@@ -952,7 +867,6 @@ def _persist_runtime_fixture(
         held_out_task_ids=(),
         candidate_snapshots=policy.candidates,
         protocols=(protocol,),
-        fidelity_report_ids=(fidelity_report.fidelity_report_id,),
         rows_path="rows.jsonl",
         rows_sha256=hashlib.sha256(rows_payload).hexdigest(),
     )
@@ -966,15 +880,10 @@ def _persist_runtime_fixture(
         },
     )
     evaluation_input = artifact_input(evaluation_record)
-    protocol_scope = sha256_json(
-        {
-            "protocols": [protocol.model_dump(mode="json")],
-            "fidelity_report_ids": [fidelity_report.fidelity_report_id],
-        }
-    )
+    protocol_scope = sha256_json([protocol.model_dump(mode="json")])
     bank_inputs = tuple(
         sorted(
-            (evaluation_input, fidelity_input, plan_input, pricing_input, task_input),
+            (evaluation_input, plan_input, pricing_input, task_input),
             key=lambda item: item.artifact_id,
         )
     )
@@ -1010,7 +919,6 @@ def _persist_runtime_fixture(
             "evaluation_plan_sha256": plan_input.sha256,
             "task_set_sha256": task_input.sha256,
             "evaluation_protocols_sha256": protocol_scope,
-            "fidelity_report_ids": (fidelity_report.fidelity_report_id,),
             "pricing_snapshot_sha256": pricing_input.sha256,
         }
     )
@@ -1035,7 +943,6 @@ def _persist_runtime_fixture(
             "evaluation_plan_sha256": plan_input.sha256,
             "task_set_sha256": task_input.sha256,
             "evaluation_protocols_sha256": protocol_scope,
-            "fidelity_report_ids": (fidelity_report.fidelity_report_id,),
             "pricing_snapshot_sha256": pricing_input.sha256,
         }
     )

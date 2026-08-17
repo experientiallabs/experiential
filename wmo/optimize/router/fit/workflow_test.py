@@ -9,13 +9,11 @@ from typing import cast
 
 import pytest
 
-from wmo.common.core.artifacts import ArtifactInput, FailureCode, StructuredFailure
+from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.evaluations import (
     EvaluationProtocol,
     ObservedProductionCell,
     build_evaluation_plan,
-    default_fidelity_thresholds,
-    persist_fidelity_thresholds,
 )
 from wmo.common.evaluations.build_test import (
     _persist_calibration,
@@ -26,7 +24,6 @@ from wmo.common.evaluations.build_test import (
 )
 from wmo.common.evaluations.evidence import (
     EvaluationCellEvidence,
-    evaluation_protocol_digest,
     read_calibration,
 )
 from wmo.common.judging import DimensionJudgment, Judgment
@@ -200,19 +197,6 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
             judgment_artifact_id=judgment.judgment_id,
             source_run_id=rollout.source_run_id,
         )
-    thresholds = default_fidelity_thresholds(created_at=_TIME, code_revision="test-revision")
-    persist_fidelity_thresholds(store, thresholds)
-    world_protocol = EvaluationProtocol(
-        protocol_id="protocol-world",
-        evidence_source="world_model",
-        agent_id="agent-a",
-        simulator_id="world-simulator-v1",
-        world_model=_snapshot("world-model"),
-        simulator_prompt_id="world-prompt-v1",
-        rubric_id="rubric-a",
-        judge_calibration_id="calibration-a",
-        pricing_snapshot_id="pricing-a",
-    )
     _persist_pricing(store)
     plan = build_evaluation_plan(
         store,
@@ -220,8 +204,6 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
         candidate_snapshots=(candidate,),
         pricing_snapshot_id="pricing-a",
         observed_cells=observed,
-        fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
-        fidelity_protocol_sha256=evaluation_protocol_digest(world_protocol),
         created_at=_TIME,
         code_revision="test-revision",
     )
@@ -237,32 +219,18 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
     main_evidence = tuple(
         evidence_by_task[cell.task_id].model_copy(update={"cell_id": cell.cell_id})
         for cell in plan.cells
-        if cell.purpose != "fidelity"
-    )
-    fidelity_evidence = tuple(
-        EvaluationCellEvidence(
-            cell_id=cell.cell_id,
-            protocol_id=world_protocol.protocol_id,
-            source_run_id=f"not-run-{cell.cell_id}",
-            failure=StructuredFailure(
-                code=FailureCode.CANCELLED,
-                message="provider-free workflow fixture does not execute simulation",
-            ),
-        )
-        for cell in plan.cells
-        if cell.purpose == "fidelity"
     )
     _persist_embeddings(store, tasks)
-    protocols = (production_protocol, world_protocol)
+    protocols = (production_protocol,)
     return project, RouterOptimizationConfig(
         fit=EvaluationInputs(
             evaluation_plan_id=plan.plan_id,
             protocols=protocols,
             cell_evidence=tuple(
                 item
-                for item in (*main_evidence, *fidelity_evidence)
+                for item in main_evidence
                 if next(cell for cell in plan.cells if cell.cell_id == item.cell_id).purpose
-                in {"fit", "fidelity"}
+                == "fit"
             ),
         ),
         held_out=EvaluationInputs(
