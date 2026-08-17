@@ -12,7 +12,10 @@ from rich.prompt import Confirm
 
 from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.options import ROOT_OPTION, usage_error
-from wmo.cli.provider_failures import exit_provider_failure
+from wmo.cli.provider_failures import (
+    exit_provider_failure,
+    router_optimization_retry_command,
+)
 from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.evaluations import EvaluationCellEvidence, EvaluationPlan
 from wmo.common.models import ProviderModelSelection, load_model_catalog
@@ -203,7 +206,25 @@ def router(
                 "completed router artifacts were kept and will be replayed",
                 "the failed provider attempt was not recorded as completed evidence",
             ),
-            retry_command=f"wmo optimize router {project} --root {root} --yes",
+            retry_command=router_optimization_retry_command(
+                project,
+                root=str(root),
+                candidates=candidate_plan.selection.candidates,
+                candidate_models=tuple(
+                    model.model_dump_json() for model in candidate_plan.candidate_models
+                ),
+                incumbent=candidate_plan.selection.incumbent,
+                maximum_provider_cost_usd=options.maximum_provider_cost_usd,
+                maximum_judgments=options.maximum_judgments,
+                preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
+                maximum_model_calls=options.maximum_model_calls,
+                maximum_router_feature_tokens=options.maximum_router_feature_tokens,
+                maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+                simulation_maximum_output_tokens=options.simulation_maximum_output_tokens,
+                maximum_concurrency=options.maximum_concurrency,
+                approve_fidelity=approve_fidelity or effective_noninteractive,
+                non_interactive=effective_noninteractive,
+            ),
         )
     capture_completion_once(
         "wmo router completed",

@@ -33,7 +33,7 @@ from wmo.runtime.models.providers.bedrock import (
     create_bedrock_runtime_client,
     resolve_bedrock_region,
 )
-from wmo.runtime.models.providers.errors import ProviderResponseError
+from wmo.runtime.models.providers.errors import ProviderError, ProviderResponseError
 from wmo.runtime.models.providers.transport import (
     JsonHttpResponse,
     JsonHttpTransport,
@@ -67,6 +67,7 @@ class _FakeBedrockRuntime:
         converse_response: Mapping[str, object] | None = None,
         invoke_bodies: list[Mapping[str, object]] | None = None,
         converse_error: Exception | None = None,
+        invoke_error: Exception | None = None,
     ) -> None:
         self.converse_calls: list[Mapping[str, object]] = []
         self.invoke_calls: list[Mapping[str, object]] = []
@@ -82,6 +83,7 @@ class _FakeBedrockRuntime:
         }
         self._invoke_bodies = list(invoke_bodies or [{"embedding": [3.0, 4.0]}])
         self._converse_error = converse_error
+        self._invoke_error = invoke_error
 
     def converse(self, request: Mapping[str, object]) -> Mapping[str, object]:
         """Record one Converse request and return the frozen response."""
@@ -93,6 +95,8 @@ class _FakeBedrockRuntime:
     def invoke_model(self, request: Mapping[str, object]) -> Mapping[str, object]:
         """Record one InvokeModel request and return the next embedding body."""
         self.invoke_calls.append(request)
+        if self._invoke_error is not None:
+            raise self._invoke_error
         if not self._invoke_bodies:
             raise AssertionError("test made an unexpected embedding request")
         return {"body": json.dumps(self._invoke_bodies.pop(0))}
@@ -166,6 +170,35 @@ def test_embeddings_validate_count_dimensions_and_normalization() -> None:
     )
     with pytest.raises(ProviderResponseError, match="dimensions"):
         bad.embed(["a", "b"])
+
+
+def test_embedding_failures_name_invoke_model_not_converse() -> None:
+    """InvokeModel errors keep the embedding endpoint class in the sanitized diagnostic."""
+
+    class _BotoClientError(Exception):
+        """Minimal boto-shaped failure with a documented Bedrock envelope."""
+
+        def __init__(self) -> None:
+            self.response = {
+                "Error": {"Code": "ValidationException", "Message": "embedding rejected"},
+                "ResponseMetadata": {"HTTPStatusCode": 400, "RequestId": "embed-req-1"},
+            }
+
+    runtime = _FakeBedrockRuntime(invoke_error=_BotoClientError())
+    client = BedrockClient(
+        model=_snapshot("amazon.titan-embed-text-v2:0"),
+        region="us-east-1",
+        environment={},
+        runtime_factory=lambda *, region_name: runtime,
+    )
+
+    with pytest.raises(ProviderError, match="embedding rejected") as raised:
+        client.embed(["hello"])
+
+    assert raised.value.provider == "bedrock"
+    assert raised.value.endpoint_class == "invoke_model"
+    assert raised.value.status_code == 400
+    assert raised.value.error_code == "ValidationException"
 
 
 def test_region_precedence_is_catalog_then_aws_region_then_session() -> None:

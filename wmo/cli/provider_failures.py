@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import traceback
 from collections.abc import Sequence
 from typing import NoReturn
@@ -160,3 +161,81 @@ def judge_calibration_retry_command(
     if accept_insufficient_labels:
         command += " --accept-insufficient-labels"
     return command
+
+
+def router_optimization_retry_command(
+    project: str,
+    *,
+    root: str,
+    candidates: tuple[str, ...],
+    candidate_models: tuple[str, ...],
+    incumbent: str | None,
+    maximum_provider_cost_usd: float,
+    maximum_judgments: int,
+    preferred_fidelity_overlaps: int,
+    maximum_model_calls: int,
+    maximum_router_feature_tokens: int,
+    maximum_retrieval_query_tokens: int,
+    simulation_maximum_output_tokens: int,
+    maximum_concurrency: int,
+    approve_fidelity: bool,
+    non_interactive: bool,
+) -> str:
+    """Return the exact command that resumes router optimization after a provider failure.
+
+    Args:
+        project: Local project ID.
+        root: Local project root.
+        candidates: Confirmed completion aliases from the failed run.
+        candidate_models: JSON ``ProviderModelSelection`` objects supplied for new aliases.
+        incumbent: Confirmed quality baseline alias, when one was selected.
+        maximum_provider_cost_usd: Shared provider-spend ceiling.
+        maximum_judgments: Judgment-call ceiling.
+        preferred_fidelity_overlaps: Preferred real-overlap denominator.
+        maximum_model_calls: Candidate turns admitted per simulation episode.
+        maximum_router_feature_tokens: Input ceiling for each router feature embedding.
+        maximum_retrieval_query_tokens: Input ceiling for each grounded retrieval query.
+        simulation_maximum_output_tokens: Candidate and world-model output ceiling per turn.
+        maximum_concurrency: Maximum simulation workers.
+        approve_fidelity: Whether the original run approved measured fidelity.
+        non_interactive: Whether the original run forbade prompts.
+
+    Returns:
+        A copy-paste command that reuses completed artifacts and the same preflight inputs.
+    """
+    command = [
+        "wmo",
+        "optimize",
+        "router",
+        project,
+        "--root",
+        root,
+        "--maximum-provider-cost-usd",
+        f"{maximum_provider_cost_usd:.6f}".rstrip("0").rstrip("."),
+        "--maximum-judgments",
+        str(maximum_judgments),
+        "--preferred-fidelity-overlaps",
+        str(preferred_fidelity_overlaps),
+        "--maximum-model-calls",
+        str(maximum_model_calls),
+        "--maximum-router-feature-tokens",
+        str(maximum_router_feature_tokens),
+        "--maximum-retrieval-query-tokens",
+        str(maximum_retrieval_query_tokens),
+        "--simulation-maximum-output-tokens",
+        str(simulation_maximum_output_tokens),
+        "--maximum-concurrency",
+        str(maximum_concurrency),
+        "--yes",
+    ]
+    for alias in candidates:
+        command.extend(["--candidate", alias])
+    for definition in candidate_models:
+        command.extend(["--candidate-model", definition])
+    if incumbent is not None:
+        command.extend(["--incumbent", incumbent])
+    if approve_fidelity:
+        command.append("--approve-fidelity")
+    if non_interactive:
+        command.append("--non-interactive")
+    return shlex.join(command)

@@ -8,6 +8,7 @@ from rich.console import Console
 from wmo.cli.provider_failures import (
     judge_calibration_retry_command,
     render_provider_failure,
+    router_optimization_retry_command,
     sanitized_stack,
 )
 from wmo.runtime.models.providers.errors import ProviderError
@@ -107,4 +108,35 @@ def test_judge_retry_command_omits_optional_catalog_price_overrides() -> None:
     assert command == (
         "wmo config judge calibrate support --root /tmp/.wmo --sample-size 10 "
         "--maximum-input-tokens 32768 --yes"
+    )
+
+
+def test_router_retry_command_preserves_candidates_limits_and_fidelity_approval() -> None:
+    """A failed optimize run reprints the same preflight inputs, not a bare --yes."""
+    command = router_optimization_retry_command(
+        "support",
+        root="/tmp/.wmo",
+        candidates=("candidate-a", "candidate-b"),
+        candidate_models=('{"alias":"candidate-c","provider":"openai","model":"gpt"}',),
+        incumbent="candidate-a",
+        maximum_provider_cost_usd=12.5,
+        maximum_judgments=40,
+        preferred_fidelity_overlaps=6,
+        maximum_model_calls=4,
+        maximum_router_feature_tokens=4096,
+        maximum_retrieval_query_tokens=16384,
+        simulation_maximum_output_tokens=8000,
+        maximum_concurrency=2,
+        approve_fidelity=True,
+        non_interactive=True,
+    )
+
+    assert command == (
+        "wmo optimize router support --root /tmp/.wmo --maximum-provider-cost-usd 12.5 "
+        "--maximum-judgments 40 --preferred-fidelity-overlaps 6 --maximum-model-calls 4 "
+        "--maximum-router-feature-tokens 4096 --maximum-retrieval-query-tokens 16384 "
+        "--simulation-maximum-output-tokens 8000 --maximum-concurrency 2 --yes "
+        "--candidate candidate-a --candidate candidate-b "
+        '--candidate-model \'{"alias":"candidate-c","provider":"openai","model":"gpt"}\' '
+        "--incumbent candidate-a --approve-fidelity --non-interactive"
     )

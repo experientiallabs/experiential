@@ -21,6 +21,7 @@ from wmo.common.models import (
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY
 from wmo.runtime.models.providers.bedrock_converse import converse_request, converse_response
 from wmo.runtime.models.providers.errors import (
+    ProviderEndpointClass,
     ProviderError,
     ProviderResponseError,
     parse_provider_envelope,
@@ -199,7 +200,10 @@ class BedrockClient:
         """
         started_at = time.monotonic()
         payload = converse_request(self._model.model_id, request, self._capabilities)
-        response = self._call_with_retry(lambda: self._runtime().converse(payload))
+        response = self._call_with_retry(
+            lambda: self._runtime().converse(payload),
+            endpoint_class="converse",
+        )
         return converse_response(
             response,
             configured_model=self._model,
@@ -229,7 +233,8 @@ class BedrockClient:
                         "contentType": "application/json",
                         "accept": "application/json",
                     }
-                )
+                ),
+                endpoint_class="invoke_model",
             )
             embedding = _embedding_values(_read_invoke_body(raw))
             if expected_dimensions is None:
@@ -271,8 +276,18 @@ class BedrockClient:
     def _call_with_retry(
         self,
         operation: Callable[[], Mapping[str, object]],
+        *,
+        endpoint_class: ProviderEndpointClass,
     ) -> Mapping[str, object]:
-        """Retry one Bedrock call on the same region and model without botocore multiplication."""
+        """Retry one Bedrock call on the same region and model without botocore multiplication.
+
+        Args:
+            operation: One Converse or InvokeModel attempt.
+            endpoint_class: Documented Bedrock operation that issued the call.
+
+        Returns:
+            The successful Bedrock response mapping.
+        """
 
         def send() -> Mapping[str, object]:
             """Run one attempt and translate provider failures into transport errors."""
@@ -285,7 +300,7 @@ class BedrockClient:
             except BedrockRegionError:
                 raise
             except Exception as exc:
-                raise _as_transport_error(exc) from exc
+                raise _as_transport_error(exc, endpoint_class=endpoint_class) from exc
 
         return run_with_retry(send, policy=self._retry_policy)
 
@@ -335,8 +350,20 @@ def _import_botocore_config() -> type[object]:
     return Config
 
 
-def _as_transport_error(exc: Exception) -> ProviderError:
-    """Convert a boto failure into a secret-free retry classification boundary."""
+def _as_transport_error(
+    exc: Exception,
+    *,
+    endpoint_class: ProviderEndpointClass,
+) -> ProviderError:
+    """Convert a boto failure into a secret-free retry classification boundary.
+
+    Args:
+        exc: Raw boto or runtime exception from one Bedrock attempt.
+        endpoint_class: Documented Bedrock operation that issued the call.
+
+    Returns:
+        A typed sanitized failure labeled with the originating Bedrock operation.
+    """
     name = type(exc).__name__
     if name in {
         "ReadTimeoutError",
@@ -347,7 +374,7 @@ def _as_transport_error(exc: Exception) -> ProviderError:
         return provider_error_from_transport(
             "Bedrock request timed out",
             provider="bedrock",
-            endpoint_class="converse",
+            endpoint_class=endpoint_class,
         )
     response = getattr(exc, "response", None)
     if isinstance(response, dict):
@@ -359,7 +386,7 @@ def _as_transport_error(exc: Exception) -> ProviderError:
         return ProviderError(
             parsed.message or "Bedrock request failed",
             provider="bedrock",
-            endpoint_class="converse",
+            endpoint_class=endpoint_class,
             status_code=status_code or (503 if retryable else None),
             error_code=parsed.error_code,
             error_type=parsed.error_type,
@@ -370,7 +397,7 @@ def _as_transport_error(exc: Exception) -> ProviderError:
     return provider_error_from_transport(
         "Bedrock request failed",
         provider="bedrock",
-        endpoint_class="converse",
+        endpoint_class=endpoint_class,
         retryable=True,
     )
 
