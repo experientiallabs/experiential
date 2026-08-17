@@ -50,6 +50,11 @@ _RUNNER = CliRunner()
 _REVISION = "a" * 40
 
 
+def _compact_terminal_text(value: str) -> str:
+    """Return ANSI-free terminal text without presentation-only whitespace."""
+    return "".join(unstyle(value).split())
+
+
 class _WizardCompletionClient:
     """Return candidate, world, or judge fixture responses from request-visible protocol text."""
 
@@ -828,7 +833,7 @@ def test_trace_discovery_defaults_single_and_lists_multiple(
     )
     assert (selected_source, selected_path) == ("otlp", first)
     assert "traces Using" in unstyle(output.getvalue())
-    assert first.name in unstyle(output.getvalue())
+    assert first.name in _compact_terminal_text(output.getvalue())
 
     second = tmp_path / "other.jsonl"
     second.write_text("{}\n")
@@ -840,8 +845,9 @@ def test_trace_discovery_defaults_single_and_lists_multiple(
     )
     assert selected_path in {first, second}
     assert "Discovered trace files" in unstyle(output.getvalue())
-    assert first.name in unstyle(output.getvalue())
-    assert second.name in unstyle(output.getvalue())
+    compact_output = _compact_terminal_text(output.getvalue())
+    assert first.name in compact_output
+    assert second.name in compact_output
 
 
 def test_invalid_traces_fail_before_provider_discovery(
