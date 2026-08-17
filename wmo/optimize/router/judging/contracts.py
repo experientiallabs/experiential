@@ -20,6 +20,7 @@ from wmo.common.judging import (
     CalibrationReport,
     PromptDefinition,
 )
+from wmo.common.judging.lm import PORTABLE_RATIONALE_JSON_SCHEMA
 from wmo.common.models import ModelSnapshot, OperationEconomics, PricingSource
 
 
@@ -75,7 +76,7 @@ class JudgePromptTemplate(ContractModel):
     """Versioned prompt, variable mapping, and strict response schema."""
 
     template_id: Literal["wmo-judge-evidence-json"] = "wmo-judge-evidence-json"
-    template_version: Literal["1"] = "1"
+    template_version: Literal["2"] = "2"
     response_shape: Literal["scalar", "boolean", "categorical", "pairwise"] = "scalar"
     prompt: PromptDefinition
     variable_mapping: JsonObject
@@ -318,55 +319,30 @@ def judge_feedback_schema(
     """
     dimension_properties: JsonObject = {
         "dimension_id": {"type": "string"},
-        "feedback": {"type": "string", "minLength": 1},
+        "rationale": PORTABLE_RATIONALE_JSON_SCHEMA,
     }
-    required = ["dimension_id", "feedback"]
+    required = ["dimension_id"]
     if shape == "scalar":
         dimension_properties["raw_score"] = {
             "type": "integer",
             "minimum": 0,
             "maximum": 5,
         }
-        dimension_properties["evidence_span_ids"] = {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-            "uniqueItems": True,
-        }
-        required.extend(("raw_score", "evidence_span_ids"))
+        required.append("raw_score")
     elif shape == "boolean":
         dimension_properties["passed"] = {"type": "boolean"}
-        dimension_properties["evidence_span_ids"] = {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-            "uniqueItems": True,
-        }
-        required.extend(("passed", "evidence_span_ids"))
+        required.append("passed")
     elif shape == "categorical":
         if not categories:
             raise ValueError("categorical judge feedback requires at least one saved category")
         dimension_properties["category"] = {"type": "string", "enum": list(categories)}
-        dimension_properties["evidence_span_ids"] = {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-            "uniqueItems": True,
-        }
-        required.extend(("category", "evidence_span_ids"))
+        required.append("category")
     else:
         dimension_properties["winner"] = {
             "type": "string",
             "enum": ["winner_a", "winner_b", "tie"],
         }
-        for key in ("evidence_span_ids_a", "evidence_span_ids_b"):
-            dimension_properties[key] = {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 1,
-                "uniqueItems": True,
-            }
-        required.extend(("winner", "evidence_span_ids_a", "evidence_span_ids_b"))
+        required.append("winner")
     return {
         "type": "object",
         "additionalProperties": False,

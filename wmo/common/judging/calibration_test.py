@@ -85,7 +85,6 @@ class _Entry:
     prompt: PromptDefinition | None = None
     label_lineage_id: str | None = None
     judgment_rubric_id: str | None = None
-    citation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -279,8 +278,7 @@ def _write_graph(
                             if dimension_id in entries_by_dimension
                             else 0
                         ),
-                        "evidence_span_ids": [span_id],
-                        "feedback": f"Score for {dimension_id}.",
+                        "rationale": f"Score for {dimension_id}.",
                     }
                     for dimension_id in dimension_ids
                 ]
@@ -305,13 +303,7 @@ def _write_graph(
             ),
             rubric.rubric_id,
         )
-        malformed_dimensions = tuple(
-            dimension.model_copy(update={"evidence_span_ids": (entry.citation_id,)})
-            if (entry := entries_by_dimension.get(dimension.dimension_id)) is not None
-            and entry.citation_id is not None
-            else dimension
-            for dimension in judgment.dimensions
-        )
+        malformed_dimensions = judgment.dimensions
         if malformed_rubric != rubric.rubric_id or malformed_dimensions != judgment.dimensions:
             judgment = judgment.model_copy(
                 update={
@@ -335,7 +327,6 @@ def _write_graph(
                 source_rollout=rollout_input,
                 dimension_id=entry.dimension_id,
                 raw_score=entry.raw_score,
-                evidence_span_ids=(entry.citation_id or span_id,),
             )
             for entry in rollout_entries
         )
@@ -671,20 +662,13 @@ def test_two_label_human_calibration_requires_persisted_risk_acceptance(tmp_path
     verified, _verified_input = verify_persisted_calibration(graph.store, stored.calibration_id)
     assert verified == stored
 
-    rollout = RolloutArtifact.model_validate_json(
-        graph.store.artifacts.read_bytes(
-            source_observation.source_rollout.artifact_id,
-            "rollout.json",
-        )
-    )
     output = json.dumps(
         {
             "dimensions": [
                 {
                     "dimension_id": "task-success",
                     "raw_score": 4,
-                    "evidence_span_ids": [rollout.spans[0].span_id],
-                    "feedback": "The rollout has sufficient evidence.",
+                    "rationale": "The rollout has sufficient evidence.",
                 }
             ]
         }
@@ -809,7 +793,7 @@ def test_same_raw_scores_cannot_be_reattributed_to_another_model_or_prompt(
         _build(graph)
 
 
-def test_mismatched_judgment_rollout_rubric_dimension_lineage_and_citation_fail_closed(
+def test_mismatched_judgment_rollout_rubric_dimension_and_lineage_fail_closed(
     tmp_path: Path,
 ) -> None:
     graph = _write_graph(tmp_path / "base", _entries())
@@ -861,12 +845,6 @@ def test_mismatched_judgment_rollout_rubric_dimension_lineage_and_citation_fail_
     )
     with pytest.raises(CalibrationError, match="lineage"):
         _build(wrong_lineage)
-    wrong_citation = _write_graph(
-        tmp_path / "wrong-citation",
-        (_Entry("rollout-01", "lineage-01", "task-success", 1, 3, citation_id="invented-span"),),
-    )
-    with pytest.raises(CalibrationError, match="absent from its source rollout"):
-        _build(wrong_citation)
 
 
 def test_missing_hash_mismatched_wrong_type_and_altered_inputs_fail_closed(tmp_path: Path) -> None:

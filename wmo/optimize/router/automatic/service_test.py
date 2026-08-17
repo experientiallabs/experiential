@@ -168,8 +168,7 @@ class _CompletionClient:
                         {
                             "dimension_id": "task-success",
                             "raw_score": 4,
-                            "evidence_span_ids": [span_ids[0]],
-                            "feedback": "The visible response resolves the task.",
+                            "rationale": "The visible response resolves the task.",
                         }
                     ]
                 }

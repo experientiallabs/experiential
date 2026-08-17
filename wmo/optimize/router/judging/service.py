@@ -77,10 +77,10 @@ from wmo.simulation.build import BuildReviewReadiness
 
 _PROMPT_TEXT = (
     "Evaluate the supplied rollout against every rubric dimension. Use only evidence in the "
-    "rollout. Return strict JSON matching the supplied schema, with one zero-to-five score, "
-    "specific cited span IDs, and concise feedback for every dimension."
+    "rollout. Return strict JSON matching the supplied schema, with one required zero-to-five "
+    "score and an optional nullable rationale for every dimension."
 )
-DEFAULT_JUDGE_PROMPT = PromptDefinition.from_text("wmo-judge-evidence-json-v1", _PROMPT_TEXT)
+DEFAULT_JUDGE_PROMPT = PromptDefinition.from_text("wmo-judge-evidence-json-v2", _PROMPT_TEXT)
 DEFAULT_JUDGE_TEMPLATE = JudgePromptTemplate(
     prompt=DEFAULT_JUDGE_PROMPT,
     variable_mapping={"rubric": "RUBRIC", "rollout": "ROLLOUT"},
@@ -654,7 +654,6 @@ def calibrate_manual_judge(
                 source_rollout=rollout_input,
                 dimension_id=dimension.dimension_id,
                 raw_score=dimension.raw_score,
-                evidence_span_ids=dimension.evidence_span_ids,
             )
             for dimension in judgment.dimensions
         )

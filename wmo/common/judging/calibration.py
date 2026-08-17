@@ -509,7 +509,7 @@ def _resolve_observations(
     split: RouterLineageSplit,
     observations: Sequence[JudgeScoreObservation],
 ) -> tuple[_VerifiedObservation, ...]:
-    """Resolve every observation and prove its raw score and citations match source artifacts."""
+    """Resolve every observation and prove its raw score matches source artifacts."""
     if not observations:
         raise CalibrationError(
             "calibration requires uncalibrated judgment evidence to bind judge model and prompt"
@@ -565,13 +565,6 @@ def _resolve_observations(
             raise CalibrationError("observation dimension is absent from its uncalibrated judgment")
         if dimension.raw_score != observation.raw_score:
             raise CalibrationError("observation raw score does not match its uncalibrated judgment")
-        if dimension.evidence_span_ids != observation.evidence_span_ids:
-            raise CalibrationError("observation citations do not match its uncalibrated judgment")
-        known_spans = {span.span_id for span in rollout.spans}
-        if not set(observation.evidence_span_ids).issubset(known_spans):
-            raise CalibrationError(
-                "calibration observation cites spans absent from its source rollout"
-            )
         try:
             lineage_id = split.lineage_for_rollout(rollout.rollout_id)
         except ValueError as exc:

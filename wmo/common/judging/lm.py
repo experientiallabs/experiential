@@ -5,9 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Literal, cast
-
-from pydantic import Field, field_validator
+from typing import Literal
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -49,17 +47,7 @@ class RawDimensionJudgment(ContractModel):
 
     dimension_id: ArtifactId
     raw_score: Literal[0, 1, 2, 3, 4, 5]
-    evidence_span_ids: tuple[str, ...]
-    feedback: str = Field(min_length=1)
-
-    @field_validator("evidence_span_ids")
-    @classmethod
-    def _require_nonempty_unique_evidence(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value:
-            raise ValueError("judge dimensions require at least one cited rollout span")
-        if len(set(value)) != len(value):
-            raise ValueError("judge dimension evidence spans must not repeat")
-        return value
+    rationale: str | None = None
 
 
 class RawJudgment(ContractModel):
@@ -82,13 +70,40 @@ class JudgeProbe(ContractModel):
     economics: OperationEconomics
 
 
+PORTABLE_RATIONALE_JSON_SCHEMA: JsonObject = {"type": ["string", "null"]}
+
+
 def judge_response_schema() -> JsonObject:
-    """Return the strict JSON schema accepted from every configured LM judge.
+    """Return the provider-portable JSON schema accepted from every configured LM judge.
+
+    The schema uses only draft-07 constructs that OpenAI, Anthropic, Gemini, and
+    OpenAI-compatible APIs accept. Rationale is optional and nullable, with no length
+    constraint, so a missing key and an explicit ``null`` both parse.
 
     Returns:
-        Pydantic-derived object schema for the dimension judgment response.
+        Object schema for the dimension judgment response.
     """
-    return cast(JsonObject, RawJudgment.model_json_schema())
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "dimensions": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "dimension_id": {"type": "string"},
+                        "raw_score": {"type": "integer", "minimum": 0, "maximum": 5},
+                        "rationale": PORTABLE_RATIONALE_JSON_SCHEMA,
+                    },
+                    "required": ["dimension_id", "raw_score"],
+                },
+            }
+        },
+        "required": ["dimensions"],
+    }
 
 
 class LMJudge:
@@ -130,7 +145,7 @@ class LMJudge:
                 authoritative judging.
 
         Returns:
-            An unwritten judgment with manifest-verified inputs and cited rollout spans.
+            An unwritten judgment with manifest-verified inputs.
 
         Raises:
             JudgmentError: A source is absent, calibration is ineligible, or model output is
@@ -205,7 +220,7 @@ class LMJudge:
             Canonically ordered validated dimensions and provider economics.
 
         Raises:
-            JudgmentError: Prompt bindings, response identity, JSON, scores, or citations fail.
+            JudgmentError: Prompt bindings, response identity, JSON, or scores fail.
         """
         _validate_bindings(rubric, calibration, self._prompt)
         response = self._model.complete(
@@ -226,7 +241,7 @@ class LMJudge:
                 "judge response model identity does not match the frozen calibration"
             )
         raw = _parse_response(response.output.content, response.output.tool_calls)
-        dimensions = _build_dimensions(raw, rollout, rubric, calibration)
+        dimensions = _build_dimensions(raw, rubric, calibration)
         return JudgeProbe(
             model=response.model,
             dimensions=dimensions,
@@ -448,35 +463,26 @@ def _parse_response(content: str | None, tool_calls: tuple[ToolCall, ...]) -> Ra
 
 def _build_dimensions(
     raw: RawJudgment,
-    rollout: RolloutArtifact,
     rubric: Rubric,
     calibration: JudgeCalibration,
 ) -> tuple[DimensionJudgment, ...]:
-    """Validate raw scores and citations, then apply the frozen monotonic maps."""
+    """Validate raw scores, then apply the frozen monotonic maps."""
     raw_by_dimension = {item.dimension_id: item for item in raw.dimensions}
     if len(raw_by_dimension) != len(raw.dimensions):
         raise JudgmentError("LM judge returned duplicate rubric dimensions")
     rubric_dimension_ids = tuple(dimension.dimension_id for dimension in rubric.dimensions)
     if set(raw_by_dimension) != set(rubric_dimension_ids):
         raise JudgmentError("LM judge must score every rubric dimension exactly once")
-    known_span_ids = {span.span_id for span in rollout.spans}
     maps_by_dimension = {score_map.dimension_id: score_map for score_map in calibration.score_maps}
     dimensions = []
     for dimension_id in rubric_dimension_ids:
         raw_dimension = raw_by_dimension[dimension_id]
-        unknown_spans = set(raw_dimension.evidence_span_ids) - known_span_ids
-        if unknown_spans:
-            raise JudgmentError(
-                "LM judge cited rollout spans that do not exist: "
-                + ", ".join(sorted(unknown_spans))
-            )
         dimensions.append(
             DimensionJudgment(
                 dimension_id=dimension_id,
                 raw_score=raw_dimension.raw_score,
                 calibrated_score=maps_by_dimension[dimension_id].apply(raw_dimension.raw_score),
-                evidence_span_ids=raw_dimension.evidence_span_ids,
-                feedback=raw_dimension.feedback,
+                rationale=raw_dimension.rationale,
             )
         )
     return tuple(dimensions)
@@ -521,8 +527,8 @@ def _render_judgment_request(rollout: RolloutArtifact, rubric: Rubric) -> str:
     }
     return (
         "Score the rollout against every rubric dimension. Return only JSON with a dimensions "
-        "array. Each item must contain dimension_id, raw_score from zero through five, "
-        "evidence_span_ids, and feedback. Cite only span IDs present in the rollout.\n\n"
+        "array. Each item must contain dimension_id and raw_score from zero through five. "
+        "Rationale is optional and may be omitted or null.\n\n"
         "RUBRIC:\n"
         + json.dumps(rubric_payload, ensure_ascii=False, sort_keys=True)
         + "\n\nROLLOUT:\n"

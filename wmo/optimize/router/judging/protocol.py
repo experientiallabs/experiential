@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 from typing import Literal, cast
 
-from pydantic import Field, field_validator
+from pydantic import Field
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -34,39 +34,20 @@ from wmo.optimize.router.judging.contracts import (
 )
 
 
-class _EvidenceDimension(ContractModel):
-    """Shared identity, evidence citations, and feedback for one structured dimension."""
+class _ScoredDimension(ContractModel):
+    """Shared identity and optional rationale for one structured dimension."""
 
     dimension_id: ArtifactId
-    evidence_span_ids: tuple[str, ...] = Field(min_length=1)
-    feedback: str = Field(min_length=1)
-
-    @field_validator("evidence_span_ids")
-    @classmethod
-    def _require_unique_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Reject repeated evidence citations.
-
-        Args:
-            value: Provider-returned span identifiers.
-
-        Returns:
-            Unique span identifiers in provider order.
-
-        Raises:
-            ValueError: A span identifier repeats.
-        """
-        if len(set(value)) != len(value):
-            raise ValueError("judge evidence span IDs must not repeat")
-        return value
+    rationale: str | None = None
 
 
-class _BooleanDimension(_EvidenceDimension):
+class _BooleanDimension(_ScoredDimension):
     """One boolean structured-feedback dimension."""
 
     passed: bool
 
 
-class _CategoricalDimension(_EvidenceDimension):
+class _CategoricalDimension(_ScoredDimension):
     """One categorical structured-feedback dimension."""
 
     category: str = Field(min_length=1)
@@ -77,27 +58,7 @@ class _PairwiseDimension(ContractModel):
 
     dimension_id: ArtifactId
     winner: Literal["winner_a", "winner_b", "tie"]
-    evidence_span_ids_a: tuple[str, ...] = Field(min_length=1)
-    evidence_span_ids_b: tuple[str, ...] = Field(min_length=1)
-    feedback: str = Field(min_length=1)
-
-    @field_validator("evidence_span_ids_a", "evidence_span_ids_b")
-    @classmethod
-    def _require_unique_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Reject repeated evidence citations within either candidate.
-
-        Args:
-            value: Provider-returned span identifiers for one candidate.
-
-        Returns:
-            Unique span identifiers in provider order.
-
-        Raises:
-            ValueError: A span identifier repeats.
-        """
-        if len(set(value)) != len(value):
-            raise ValueError("pairwise judge evidence span IDs must not repeat")
-        return value
+    rationale: str | None = None
 
 
 class _BooleanResponse(ContractModel):
@@ -197,7 +158,7 @@ class TemplateJudgeClient:
             Scalar response projected under the finalized versioned mapping.
 
         Raises:
-            ManualJudgeError: Provider output violates the finalized schema or evidence binding.
+            ManualJudgeError: Provider output violates the finalized schema or score projection.
         """
         if request.messages[0].content != self._template.prompt.text:
             raise ManualJudgeError("calibration prompt differs from finalized judge setup")
@@ -320,7 +281,7 @@ class TemplateJudgeClient:
             Equivalent scalar response accepted by the shared LMJudge boundary.
 
         Raises:
-            ManualJudgeError: Dimensions, categories, or evidence citations are invalid.
+            ManualJudgeError: Dimensions or categories are invalid.
         """
         raw = _raw_response(response)
         shape = self._template.response_shape
@@ -335,8 +296,7 @@ class TemplateJudgeClient:
                 {
                     "dimension_id": item.dimension_id,
                     "raw_score": mapping["true" if item.passed else "false"],
-                    "evidence_span_ids": list(item.evidence_span_ids),
-                    "feedback": item.feedback,
+                    "rationale": item.rationale,
                 }
                 for item in parsed
             )
@@ -352,14 +312,13 @@ class TemplateJudgeClient:
                 {
                     "dimension_id": item.dimension_id,
                     "raw_score": mapping[item.category],
-                    "evidence_span_ids": list(item.evidence_span_ids),
-                    "feedback": item.feedback,
+                    "rationale": item.rationale,
                 }
                 for item in parsed
             )
         else:
             raise ManualJudgeError("pairwise feedback requires counterbalanced execution")
-        _validate_normalized_dimensions(normalized, self._rubric, self._rollout)
+        _validate_normalized_dimensions(normalized, self._rubric)
         return response.model_copy(
             update={"output": AssistantAction(content=json.dumps({"dimensions": normalized}))}
         )
@@ -379,7 +338,7 @@ class TemplateJudgeClient:
             Scalar response with rounded-mean projection and combined economics.
 
         Raises:
-            ManualJudgeError: Pairwise dimensions or citations violate the saved contract.
+            ManualJudgeError: Pairwise dimensions violate the saved contract.
         """
         assert self._reference is not None
         first = _PairwiseResponse.model_validate(_raw_response(forward)).dimensions
@@ -403,18 +362,13 @@ class TemplateJudgeClient:
         for dimension in self._rubric.dimensions:
             left = first_by_id[dimension.dimension_id]
             right = second_by_id[dimension.dimension_id]
-            _validate_pairwise_spans(left, self._rollout, self._reference)
-            _validate_pairwise_spans(right, self._reference, self._rollout)
             right_target = _reverse_winner(right.winner)
             score = (mapping[left.winner] + mapping[right_target] + 1) // 2
             normalized.append(
                 {
                     "dimension_id": dimension.dimension_id,
                     "raw_score": score,
-                    "evidence_span_ids": list(
-                        dict.fromkeys((*left.evidence_span_ids_a, *right.evidence_span_ids_b))
-                    ),
-                    "feedback": f"forward: {left.feedback} reverse: {right.feedback}",
+                    "rationale": _combine_rationales(left.rationale, right.rationale),
                 }
             )
         return ModelResponse(
@@ -621,54 +575,40 @@ def _rollout_payload(rollout: RolloutArtifact) -> JsonObject:
     }
 
 
-def _validate_normalized_dimensions(
-    dimensions: list[JsonObject], rubric: Rubric, rollout: RolloutArtifact
-) -> None:
-    """Validate normalized dimensions and citations before shared LMJudge parsing.
+def _validate_normalized_dimensions(dimensions: list[JsonObject], rubric: Rubric) -> None:
+    """Validate normalized dimensions before shared LMJudge parsing.
 
     Args:
         dimensions: Projected scalar dimensions.
         rubric: Finalized rubric defining expected dimensions.
-        rollout: Target rollout defining valid evidence span IDs.
 
     Raises:
-        ManualJudgeError: Dimensions repeat, are missing, or cite unknown spans.
+        ManualJudgeError: Dimensions repeat or are missing.
     """
     identifiers = [item.get("dimension_id") for item in dimensions]
     expected = {item.dimension_id for item in rubric.dimensions}
     if len(set(identifiers)) != len(identifiers) or set(identifiers) != expected:
         raise ManualJudgeError("judge must evaluate every rubric dimension exactly once")
-    known = {span.span_id for span in rollout.spans}
-    cited = {
-        span_id
-        for item in dimensions
-        for span_id in cast(list[str], item.get("evidence_span_ids", []))
-    }
-    if not cited or not cited.issubset(known):
-        raise ManualJudgeError("judge cited evidence outside the target rollout")
 
 
-def _validate_pairwise_spans(
-    dimension: _PairwiseDimension,
-    candidate_a: RolloutArtifact,
-    candidate_b: RolloutArtifact,
-) -> None:
-    """Require pairwise citations to belong to their visible candidate.
+def _combine_rationales(forward: str | None, reverse: str | None) -> str | None:
+    """Join counterbalanced pairwise rationales when either side supplied one.
 
     Args:
-        dimension: Parsed pairwise dimension.
-        candidate_a: Candidate displayed in the A position.
-        candidate_b: Candidate displayed in the B position.
+        forward: Rationale from the target-as-A probe.
+        reverse: Rationale from the target-as-B probe.
 
-    Raises:
-        ManualJudgeError: A citation belongs to neither corresponding candidate.
+    Returns:
+        Combined rationale text, or ``None`` when both sides omitted one.
     """
-    known_a = {span.span_id for span in candidate_a.spans}
-    known_b = {span.span_id for span in candidate_b.spans}
-    if not set(dimension.evidence_span_ids_a).issubset(known_a) or not set(
-        dimension.evidence_span_ids_b
-    ).issubset(known_b):
-        raise ManualJudgeError("pairwise judge cited evidence under the wrong candidate order")
+    parts = []
+    if forward is not None:
+        parts.append(f"forward: {forward}")
+    if reverse is not None:
+        parts.append(f"reverse: {reverse}")
+    if not parts:
+        return None
+    return " ".join(parts)
 
 
 def _reverse_winner(

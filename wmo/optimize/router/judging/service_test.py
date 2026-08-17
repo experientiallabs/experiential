@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -80,7 +79,7 @@ _FeedbackShape = Literal["scalar", "boolean", "categorical", "pairwise"]
 
 
 class _JudgeClient:
-    """Return deterministic cited scalar scores while recording every provider call."""
+    """Return deterministic scalar scores while recording every provider call."""
 
     def __init__(self, model: ModelSnapshot) -> None:
         """Bind the exact configured model identity for deterministic responses.
@@ -92,7 +91,7 @@ class _JudgeClient:
         self.requests: list[ModelRequest] = []
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Return one schema-valid score citing a span present in the request.
+        """Return one schema-valid score for the request.
 
         Args:
             request: Structured LM judge request.
@@ -101,9 +100,6 @@ class _JudgeClient:
             Deterministic model response with no observed provider cost.
         """
         self.requests.append(request)
-        content = request.messages[1].content or ""
-        match = re.search(r'"span_id":\s*"([^"]+)"', content)
-        assert match is not None
         return ModelResponse(
             output=AssistantAction(
                 content=json.dumps(
@@ -112,8 +108,7 @@ class _JudgeClient:
                             {
                                 "dimension_id": "task-success",
                                 "raw_score": 4,
-                                "evidence_span_ids": [match.group(1)],
-                                "feedback": "The trace shows the task was handled.",
+                                "rationale": "The trace shows the task was handled.",
                             }
                         ]
                     }
@@ -187,27 +182,18 @@ class _StructuredJudgeClient:
         if self.fail_after is not None and len(self.requests) >= self.fail_after:
             raise RuntimeError("simulated provider interruption")
         self.requests.append(request)
-        content = request.messages[1].content or ""
-        span_ids = re.findall(r'"span_id":\s*"([^"]+)"', content)
-        assert span_ids
         common = {
             "dimension_id": "task-success",
-            "feedback": "Structured evidence supports the verdict.",
+            "rationale": "Structured evidence supports the verdict.",
         }
         if self.shape == "scalar":
-            dimension = {**common, "raw_score": 4, "evidence_span_ids": [span_ids[0]]}
+            dimension = {**common, "raw_score": 4}
         elif self.shape == "boolean":
-            dimension = {**common, "passed": True, "evidence_span_ids": [span_ids[0]]}
+            dimension = {**common, "passed": True}
         elif self.shape == "categorical":
-            dimension = {**common, "category": "good", "evidence_span_ids": [span_ids[0]]}
+            dimension = {**common, "category": "good"}
         else:
-            assert len(span_ids) >= 2
-            dimension = {
-                **common,
-                "winner": "winner_a",
-                "evidence_span_ids_a": [span_ids[0]],
-                "evidence_span_ids_b": [span_ids[1]],
-            }
+            dimension = {**common, "winner": "winner_a"}
         return ModelResponse(
             output=AssistantAction(content=json.dumps({"dimensions": [dimension]})),
             model=self.model,

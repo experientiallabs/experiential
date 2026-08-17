@@ -93,8 +93,7 @@ class _JudgeClient:
                             {
                                 "dimension_id": "task-success",
                                 "raw_score": 4,
-                                "evidence_span_ids": [match.group(1)],
-                                "feedback": "The trace shows the requested task was handled.",
+                                "rationale": "The trace shows the requested task was handled.",
                             }
                         ]
                     }

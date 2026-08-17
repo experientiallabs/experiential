@@ -14,7 +14,6 @@ from wmo.common.judging.calibration_test import (
     _prompt,
     _write_graph,
 )
-from wmo.common.rollouts import RolloutArtifact
 
 
 def test_store_backed_lm_judge_permits_fully_calibrated_evidence(tmp_path: Path) -> None:
@@ -37,12 +36,6 @@ def test_store_backed_lm_judge_permits_fully_calibrated_evidence(tmp_path: Path)
         calibration=service.approve(graph.store, report, approved_at=_TIME),
     )
     source_observation = graph.observations[0]
-    rollout = RolloutArtifact.model_validate_json(
-        graph.store.artifacts.read_bytes(
-            source_observation.source_rollout.artifact_id,
-            "rollout.json",
-        )
-    )
     client = _FakeJudgeClient(
         _model(),
         json.dumps(
@@ -51,8 +44,7 @@ def test_store_backed_lm_judge_permits_fully_calibrated_evidence(tmp_path: Path)
                     {
                         "dimension_id": "task-success",
                         "raw_score": 4,
-                        "evidence_span_ids": [rollout.spans[0].span_id],
-                        "feedback": "The rollout has sufficient evidence.",
+                        "rationale": "The rollout has sufficient evidence.",
                     }
                 ]
             }

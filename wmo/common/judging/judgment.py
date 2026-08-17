@@ -17,19 +17,7 @@ class DimensionJudgment(ContractModel):
     dimension_id: ArtifactId
     raw_score: Literal[0, 1, 2, 3, 4, 5]
     calibrated_score: float = Field(ge=0, le=5)
-    evidence_span_ids: tuple[str, ...]
-    feedback: str = Field(min_length=1)
-
-    @field_validator("evidence_span_ids")
-    @classmethod
-    def _require_unique_evidence_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value:
-            raise ValueError("dimension judgments require at least one cited evidence span")
-        if any(not span_id for span_id in value):
-            raise ValueError("dimension judgment evidence span IDs must be non-empty")
-        if len(set(value)) != len(value):
-            raise ValueError("dimension judgment evidence span IDs must not repeat")
-        return value
+    rationale: str | None = None
 
     @field_validator("calibrated_score")
     @classmethod

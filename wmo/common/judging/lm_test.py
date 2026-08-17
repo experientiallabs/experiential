@@ -1,4 +1,4 @@
-"""Tests for strict structured LM judgment over cited rollout spans."""
+"""Tests for strict structured LM judgment over optional nullable rationales."""
 
 from __future__ import annotations
 
@@ -6,10 +6,17 @@ import json
 from datetime import UTC, datetime
 from inspect import signature
 from pathlib import Path
+from typing import cast
 
 import pytest
 
-from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactInput, SourceIdentity
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactInput,
+    JsonObject,
+    JsonValue,
+    SourceIdentity,
+)
 from wmo.common.judging import (
     HumanScoreReview,
     Judge,
@@ -18,14 +25,17 @@ from wmo.common.judging import (
     JudgmentError,
     LMJudge,
     PromptDefinition,
+    RawDimensionJudgment,
     RouterLineageAssignment,
     RouterLineageSplit,
     Rubric,
     RubricDimension,
     ScoreAnchor,
     calibration_provenance,
+    judge_response_schema,
     write_router_lineage_split,
 )
+from wmo.common.judging.lm import PORTABLE_RATIONALE_JSON_SCHEMA
 from wmo.common.models import (
     AssistantAction,
     ModelClient,
@@ -150,19 +160,14 @@ def _rollout() -> RolloutArtifact:
     )
 
 
-def _valid_output(span_id: str = "span-1") -> str:
-    return json.dumps(
-        {
-            "dimensions": [
-                {
-                    "dimension_id": "task-success",
-                    "raw_score": 4,
-                    "evidence_span_ids": [span_id],
-                    "feedback": "The rollout completed the requested refund.",
-                }
-            ]
-        }
-    )
+def _valid_output(*, rationale: str | None = "The rollout completed the requested refund.") -> str:
+    dimension: dict[str, object] = {
+        "dimension_id": "task-success",
+        "raw_score": 4,
+    }
+    if rationale is not None:
+        dimension["rationale"] = rationale
+    return json.dumps({"dimensions": [dimension]})
 
 
 def _write_bootstrap_sources(
@@ -233,7 +238,7 @@ def _write_bootstrap_sources(
     return rollout, rubric, calibration, prompt
 
 
-def test_lm_judge_requires_store_backed_persisted_inputs_and_cited_rollout_evidence(
+def test_lm_judge_requires_store_backed_persisted_inputs_and_accepts_optional_rationale(
     tmp_path: Path,
 ) -> None:
     """Only a store-backed provisional calibration can invoke the LM judge."""
@@ -262,7 +267,9 @@ def test_lm_judge_requires_store_backed_persisted_inputs_and_cited_rollout_evide
     assert judgment.code_revision == "judging-revision"
     request_content = client.requests[0].messages[1].content
     assert request_content is not None
-    assert "span-1" in request_content
+    assert judgment.dimensions[0].rationale == "The rollout completed the requested refund."
+    assert "Rationale is optional" in request_content
+    assert "evidence_span_ids" not in request_content
 
 
 def test_lm_judge_has_no_caller_mintable_or_mutable_calibration_entry_point() -> None:
@@ -275,10 +282,10 @@ def test_lm_judge_has_no_caller_mintable_or_mutable_calibration_entry_point() ->
     assert "calibration_artifact_id" in parameters
 
 
-def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs(
+def test_lm_judge_fails_closed_for_malformed_and_unsupported_outputs(
     tmp_path: Path,
 ) -> None:
-    """Malformed JSON, tool outputs, and invented span citations are actionable errors."""
+    """Malformed JSON and tool outputs are actionable errors."""
     store = _store(tmp_path)
     rollout, rubric, calibration, prompt = _write_bootstrap_sources(store)
     source_ids = {
@@ -300,13 +307,6 @@ def test_lm_judge_fails_closed_for_malformed_unsupported_and_uncited_outputs(
                 "{}",
                 tool_calls=(ToolCall(call_id="call-1", name="score", arguments={}),),
             ),
-            prompt,
-            code_revision="judging-revision",
-            clock=lambda: _TIME,
-        ).judge_persisted(store, **source_ids)
-    with pytest.raises(JudgmentError, match="do not exist"):
-        LMJudge(
-            _FakeJudgeClient(_valid_output("invented-span")),
             prompt,
             code_revision="judging-revision",
             clock=lambda: _TIME,
@@ -375,4 +375,82 @@ def test_persisted_bootstrap_creates_final_judgment_with_verified_artifact_input
             calibration_artifact_id=calibration.calibration_id,
         )
         == judgment
+    )
+
+
+def test_lm_judge_parses_missing_and_null_rationale_from_supported_providers(
+    tmp_path: Path,
+) -> None:
+    """OpenAI-style omitted keys and Anthropic-style explicit nulls both persist as None."""
+    store = _store(tmp_path)
+    rollout, rubric, calibration, prompt = _write_bootstrap_sources(store)
+    source_ids = {
+        "rollout_artifact_id": rollout.artifact_id,
+        "rubric_artifact_id": rubric.rubric_id,
+        "calibration_artifact_id": calibration.calibration_id,
+    }
+    omitted = json.dumps({"dimensions": [{"dimension_id": "task-success", "raw_score": 4}]})
+    explicit_null = json.dumps(
+        {"dimensions": [{"dimension_id": "task-success", "raw_score": 4, "rationale": None}]}
+    )
+
+    omitted_judgment = LMJudge(
+        _FakeJudgeClient(omitted),
+        prompt,
+        code_revision="judging-revision",
+        clock=lambda: _TIME,
+    ).judge_and_write(store, **source_ids)
+    null_judgment = LMJudge(
+        _FakeJudgeClient(explicit_null),
+        prompt,
+        code_revision="judging-revision-null",
+        clock=lambda: _TIME,
+    ).judge_persisted(store, **source_ids)
+
+    assert omitted_judgment.dimensions[0].rationale is None
+    assert null_judgment.dimensions[0].rationale is None
+    stored = json.loads(store.artifacts.read_bytes(omitted_judgment.judgment_id, "judgment.json"))
+    assert stored["dimensions"][0]["rationale"] is None
+
+
+def _axis_schema(schema: JsonObject) -> tuple[JsonObject, list[JsonValue]]:
+    """Return dimension properties and required keys from a judge response schema."""
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    dimensions = properties["dimensions"]
+    assert isinstance(dimensions, dict)
+    items = dimensions["items"]
+    assert isinstance(items, dict)
+    axis_properties = items["properties"]
+    required = items["required"]
+    assert isinstance(axis_properties, dict)
+    assert isinstance(required, list)
+    return cast(JsonObject, axis_properties), required
+
+
+def test_judge_response_schema_is_portable_and_has_no_citation_or_length_constraints() -> None:
+    """The shared schema stays provider-portable: nullable rationale, no span citations."""
+    schema = judge_response_schema()
+    properties, required = _axis_schema(schema)
+
+    rationale = properties["rationale"]
+    assert isinstance(rationale, dict)
+    assert rationale == PORTABLE_RATIONALE_JSON_SCHEMA
+    assert "evidence_span_ids" not in properties
+    assert "minLength" not in rationale
+    assert "maxLength" not in rationale
+    assert "dimension_id" in required
+    assert "raw_score" in required
+    assert "rationale" not in required
+    assert (
+        RawDimensionJudgment.model_validate(
+            {"dimension_id": "task-success", "raw_score": 3}
+        ).rationale
+        is None
+    )
+    assert (
+        RawDimensionJudgment.model_validate(
+            {"dimension_id": "task-success", "raw_score": 3, "rationale": None}
+        ).rationale
+        is None
     )
