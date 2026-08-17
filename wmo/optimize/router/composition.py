@@ -52,7 +52,6 @@ from wmo.common.project import (
 from wmo.common.rollouts import (
     RolloutArtifact,
     SimulationArtifactSet,
-    retryable_dispatch_failure,
     unknown_spend_failure,
 )
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
@@ -92,6 +91,7 @@ from wmo.simulation.engines.text.grounding import (
     load_completion_contract,
     unknown_dispatch_worst_case_usd,
 )
+from wmo.simulation.engines.text.resume import reexecutable_dispatch_failure
 from wmo.simulation.engines.text.rollout_support import rollout_spend
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
@@ -502,7 +502,7 @@ def _run_or_load_simulation(
             raise RouterCompositionError(
                 "completed simulation artifact set differs from phase spec"
             )
-        if any(retryable_dispatch_failure(rollout.failure) for rollout in rollouts):
+        if any(reexecutable_dispatch_failure(rollout) for rollout in rollouts):
             continue
         matches.append(artifact_set)
     if len(matches) > 1:

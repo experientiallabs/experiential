@@ -411,9 +411,9 @@ class RecordingCandidateClient:
                 excluded_lineage_ids=(self._task.lineage_group_id,),
                 maximum_output_tokens=self._maximum_output_tokens,
             ),
-            reserved_cost_usd=(
-                query_economics.cost_usd.value if query_economics.cost_usd is not None else None
-            ),
+            # The retained retrieval estimate above already covers this dispatch's worst case
+            # in every reconciliation path, so the window's incremental reservation is zero.
+            reserved_cost_usd=0.0,
         )
         self._clear_unknown_dispatch()
         _preflight_context(

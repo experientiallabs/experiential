@@ -60,6 +60,8 @@ from wmo.simulation.engines.text.bindings import (
     rollout_id_for_binding,
 )
 from wmo.simulation.engines.text.leases import TextCellLeaseStore
+from wmo.simulation.engines.text.resume import MAXIMUM_CELL_ATTEMPTS
+from wmo.simulation.engines.text.rollout_support import rollout_spend
 from wmo.simulation.engines.text.simulator import (
     SimulationConfigurationError,
     SimulationContentionError,
@@ -1388,6 +1390,118 @@ def test_resume_reexecutes_retryable_transport_failure_as_new_immutable_attempt(
     assert simulator._load_rollout(first.artifact_id) == first
     assert replay == resumed_set
     assert len(candidate_client.requests) == 2
+
+
+def test_persistent_transport_failure_stops_at_the_attempt_cap_and_replays(
+    tmp_path: Path,
+) -> None:
+    """Retry generations are bounded, and the final permitted attempt replays exactly.
+
+    Args:
+        tmp_path: Isolated project root for durable capped-attempt evidence.
+    """
+    cells = (_cell("cell-a", "task-a"),)
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _TimeoutClient()
+    world_client = _ScriptedClient([])
+    completion_input = _persist_completion_contract(store)
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        completion_contract_input=completion_input,
+    )
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a",),
+        completion_contract_input=completion_input,
+        maximum_cost_usd=10.0,
+    )
+
+    artifact_sets = [simulator.run(spec) for _ in range(MAXIMUM_CELL_ATTEMPTS + 1)]
+    final = simulator._load_rollout(artifact_sets[-1].artifact_ids[0])
+
+    assert final.retry_attempt == MAXIMUM_CELL_ATTEMPTS - 1
+    assert final.stop_reason == StopReason.FAILURE
+    assert final.failure is not None
+    assert final.failure.retryable is True
+    assert artifact_sets[-1] == artifact_sets[-2]
+    assert len(candidate_client.requests) == MAXIMUM_CELL_ATTEMPTS
+
+
+def test_retrieval_dispatch_failure_persists_a_zero_incremental_reservation(
+    tmp_path: Path,
+) -> None:
+    """A failed grounded retrieval reserves zero because its estimate is already retained.
+
+    Args:
+        tmp_path: Isolated project root for durable retrieval-failure evidence.
+    """
+
+    @dataclass
+    class _FailingRetrieveRetriever(_FitRetriever):
+        """Fit retriever whose retrieval dispatch always fails at the transport level."""
+
+        def retrieve(self, query: RAGQuery) -> tuple[RAGMatch, ...]:
+            """Fail the retrieval dispatch after its estimate has been retained.
+
+            Args:
+                query: Canonical retrieval query dispatched by the simulator.
+
+            Raises:
+                ConnectionResetError: Every dispatch, leaving retrieval spend unknown.
+            """
+            raise ConnectionResetError("retrieval connection reset")
+
+    cells = (_cell("cell-a", "task-a"),)
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient(
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)]
+    )
+    world_client = _ScriptedClient([])
+    completion_input = _persist_completion_contract(store)
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        fit_retriever=_FailingRetrieveRetriever(_fit_rag_input()),
+        completion_contract_input=completion_input,
+    )
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a",),
+        completion_contract_input=completion_input,
+        maximum_cost_usd=10.0,
+    )
+
+    artifact_set = simulator.run(spec)
+    rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
+
+    assert rollout.stop_reason == StopReason.FAILURE
+    assert rollout.failure is not None
+    assert rollout.failure.details["provider_dispatch_unknown_spend"] is True
+    assert rollout.failure.details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] == 0.0
+    retrieval = rollout.retrieval_economics
+    candidate = rollout.candidate_economics
+    assert retrieval is not None and retrieval.cost_usd is not None
+    assert candidate is not None and candidate.cost_usd is not None
+    assert rollout_spend(rollout) == pytest.approx(
+        candidate.cost_usd.value + retrieval.cost_usd.value
+    )
 
 
 def test_prior_attempt_reservation_charges_the_ceiling_before_retry(tmp_path: Path) -> None:

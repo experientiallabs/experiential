@@ -21,6 +21,28 @@ from wmo.simulation.engines.text.errors import (
 
 ROLLOUT_FILE = "rollout.json"
 
+MAXIMUM_CELL_ATTEMPTS = 3
+"""Hard ceiling on immutable re-execution generations per bound simulation cell."""
+
+
+def reexecutable_dispatch_failure(rollout: RolloutArtifact) -> bool:
+    """Return whether resume would supersede this rollout with another attempt.
+
+    A retryable-class dispatch failure is re-executed only while the cell has generations
+    left under ``MAXIMUM_CELL_ATTEMPTS``; the final permitted attempt replays exactly so a
+    persistently failing provider converges instead of accumulating artifacts forever.
+
+    Args:
+        rollout: Persisted final-attempt rollout for one bound cell.
+
+    Returns:
+        ``True`` when the rollout is a superseded retryable failure below the attempt cap.
+    """
+    return (
+        retryable_dispatch_failure(rollout.failure)
+        and rollout.retry_attempt + 1 < MAXIMUM_CELL_ATTEMPTS
+    )
+
 
 @dataclass(frozen=True)
 class ResumePins:
@@ -148,8 +170,9 @@ def resolve_cell_attempt(
     Every persisted attempt is validated against the exact immutable binding. A persisted
     retryable-class dispatch failure is superseded evidence, not a final result: the next
     attempt number becomes the active identity so resume can deliberately re-execute the
-    cell as a new immutable artifact under fresh budget. Completed rollouts and
-    non-retryable failures replay exactly.
+    cell as a new immutable artifact under fresh budget. Completed rollouts, non-retryable
+    failures, and the last permitted generation under ``MAXIMUM_CELL_ATTEMPTS`` replay
+    exactly.
 
     Args:
         store: Project artifact store owning persisted rollouts.
@@ -170,7 +193,7 @@ def resolve_cell_attempt(
         if rollout is None:
             return attempt, None
         validate_resume_rollout(rollout, cell, binding, pins, attempt=attempt)
-        if not retryable_dispatch_failure(rollout.failure):
+        if not reexecutable_dispatch_failure(rollout):
             return attempt, rollout
         attempt += 1
 
