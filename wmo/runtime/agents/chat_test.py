@@ -20,6 +20,7 @@ from wmo.common.models import (
 from wmo.common.rollouts import RolloutEventKind, StopReason
 from wmo.common.tasks import TaskCase, ToolSchema
 from wmo.runtime.agents.chat import ChatAgentRuntime
+from wmo.runtime.agents.factory import agent_factory_sha256
 from wmo.runtime.environments import Observation
 
 
@@ -117,6 +118,36 @@ def test_chat_agent_omits_tool_choice_when_task_has_no_tools() -> None:
 
     assert model.requests[0].tools == ()
     assert model.requests[0].tool_choice is None
+
+
+def test_chat_agent_applies_normalized_system_prompt_before_user_task() -> None:
+    """Hosted setup instructions are the first message in every candidate request."""
+    model = _Model((_response(AssistantAction(content="done")),))
+
+    ChatAgentRuntime(system_prompt="  Follow the support policy.  ").run(
+        _task(), model=model, environment=_Environment()
+    )
+
+    request = model.requests[0]
+    assert request.messages[0].role == "system"
+    assert request.messages[0].content == "Follow the support policy."
+    assert request.messages[1].role == "user"
+
+
+def test_chat_system_prompt_changes_immutable_agent_identity() -> None:
+    """A changed hosted system prompt invalidates simulation replay identity."""
+    first = agent_factory_sha256(
+        None,
+        maximum_model_calls=8,
+        system_prompt="Follow policy A.",
+    )
+    second = agent_factory_sha256(
+        None,
+        maximum_model_calls=8,
+        system_prompt="Follow policy B.",
+    )
+
+    assert first != second
 
 
 class _Model:

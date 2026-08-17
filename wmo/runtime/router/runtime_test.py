@@ -603,6 +603,67 @@ def test_complete_validates_one_prior_decision_without_selecting_again() -> None
         runtime.complete(_request(tool_name="write"), episode_id="episode-a", decision=decision)
 
 
+def test_routed_completion_reconciles_alias_free_embedding_and_candidate_economics() -> None:
+    """Return typed request economics without placing the selected private alias in that record."""
+    policy, manifest, bank, snapshots, client = _fixture()
+    embedding_capabilities = ModelCapabilities(
+        supports_embeddings=True,
+        input_cost_per_million_tokens_usd=0.1,
+    )
+    embedder = snapshots["embedder"].model_copy(
+        update={"capabilities_sha256": embedding_capabilities.identity_sha256()}
+    )
+    policy = policy.model_copy(update={"embedder": embedder})
+    manifest = manifest.model_copy(update={"embedder": embedder})
+
+    class _PricedCatalog(_Catalog):
+        def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+            if alias == "embedder":
+                return embedder, embedding_capabilities
+            return super().snapshot(alias)
+
+    prices = tuple(
+        CandidateTokenPrice(
+            candidate_alias=alias,
+            input_usd_per_million_tokens=1.0,
+            output_usd_per_million_tokens=2.0,
+            cached_input_usd_per_million_tokens=0.5,
+            cache_write_usd_per_million_tokens=1.5,
+        )
+        for alias in bank.candidate_aliases
+    )
+    runtime = RouterRuntime(
+        policy,
+        manifest,
+        bank,
+        cast(RuntimeModelCatalog, _PricedCatalog(snapshots, client)),
+        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_sha256=_DIGEST,
+        pricing_candidate_aliases=bank.candidate_aliases,
+        pricing_candidate_prices=prices,
+    )
+    request = _request(tool_name="read")
+    decision = runtime.select(request, episode_id="episode-a")
+    routed = runtime.complete(request, episode_id="episode-a", decision=decision)
+
+    economics = routed.economics
+    assert economics.router_embedding.usage is not None
+    assert economics.router_embedding.usage.input_tokens > 0
+    assert economics.router_embedding.cost_usd is not None
+    assert economics.selected_candidate.usage == Usage(
+        input_tokens=7,
+        output_tokens=3,
+        cached_input_tokens=2,
+    )
+    assert economics.selected_candidate.cost_usd is not None
+    assert economics.selected_candidate.cost_usd.value == pytest.approx(14.5 / 1_000_000)
+    assert economics.total.cost_usd is not None
+    assert economics.total.cost_usd.value == pytest.approx(
+        economics.router_embedding.cost_usd.value + economics.selected_candidate.cost_usd.value
+    )
+    assert decision.selected_alias not in economics.model_dump_json()
+
+
 def _request(*, tool_name: str | None = None) -> ModelRequest:
     from wmo.common.tasks import ToolSchema
 

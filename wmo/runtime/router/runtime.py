@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable
 
 import numpy as np
+from pydantic import Field, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -17,9 +18,24 @@ from wmo.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
-from wmo.common.models import IdempotentModelClient, ModelAlias, ModelRequest, ModelResponse
+from wmo.common.models import (
+    CandidateTokenPrice,
+    IdempotentModelClient,
+    ModelAlias,
+    ModelRequest,
+    ModelResponse,
+    NumericMeasurement,
+    OperationEconomics,
+    Usage,
+    combine_economics,
+)
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore
-from wmo.common.routing import KnnRouterPolicy, RouterFeatureExtractor, RoutingDecision
+from wmo.common.routing import (
+    KnnRouterPolicy,
+    RouterFeatureExtractor,
+    RoutingDecision,
+    router_feature_token_upper_bound,
+)
 from wmo.common.routing.bank import KnnBankManifest, KnnEvidenceBank, bank_bytes, load_knn_bank
 from wmo.common.routing.decision import policy_content_sha256, select_from_bank
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
@@ -37,11 +53,28 @@ class RouterModelCapabilityError(ValueError):
     """The selected frozen model cannot preserve the requested OpenAI capability."""
 
 
+class RoutedCompletionEconomics(ContractModel):
+    """Alias-free economics for routing and the selected candidate completion."""
+
+    router_embedding: OperationEconomics = Field(default_factory=OperationEconomics)
+    selected_candidate: OperationEconomics = Field(default_factory=OperationEconomics)
+    total: OperationEconomics = Field(default_factory=OperationEconomics)
+
+    @model_validator(mode="after")
+    def _require_complete_total(self) -> RoutedCompletionEconomics:
+        """Require the total to be the strict sum of both customer-visible components."""
+        expected = combine_economics((self.router_embedding, self.selected_candidate))
+        if self.total != expected:
+            raise ValueError("routed completion total differs from its component economics")
+        return self
+
+
 class RoutedModelResponse(ContractModel):
     """One exact routing decision and the response produced by its selected model."""
 
     decision: RoutingDecision
     response: ModelResponse
+    economics: RoutedCompletionEconomics = Field(default_factory=RoutedCompletionEconomics)
 
 
 DecisionSink = Callable[[RoutingDecision], None]
@@ -60,6 +93,7 @@ class RouterRuntime:
         pricing_snapshot_id: ArtifactId,
         pricing_snapshot_sha256: Sha256,
         pricing_candidate_aliases: tuple[ModelAlias, ...],
+        pricing_candidate_prices: tuple[CandidateTokenPrice, ...] | None = None,
         decision_sink: DecisionSink | None = None,
     ) -> None:
         self.policy = policy
@@ -70,6 +104,7 @@ class RouterRuntime:
         self._decision_sink = decision_sink
         self._episode_decisions: dict[str, RoutingDecision] = {}
         self._request_decisions: dict[tuple[Sha256, Sha256], RoutingDecision] = {}
+        self._request_embedding_economics: dict[tuple[Sha256, Sha256], OperationEconomics] = {}
         self._episode_lock = threading.Lock()
         self._resolved: dict[str, ResolvedModel] = {}
         self._expected_models = {
@@ -85,6 +120,13 @@ class RouterRuntime:
         self._require_activation_identity(
             pricing_snapshot_id, pricing_snapshot_sha256, pricing_candidate_aliases
         )
+        self._candidate_prices = {
+            item.candidate_alias: item for item in pricing_candidate_prices or ()
+        }
+        if self._candidate_prices and tuple(self._candidate_prices) != pricing_candidate_aliases:
+            raise RouterRuntimeIntegrityError(
+                "runtime candidate prices differ from fit-time candidate order"
+            )
         try:
             for candidate in policy.candidates:
                 self._resolve(candidate.alias)
@@ -96,6 +138,7 @@ class RouterRuntime:
         if embedder.embedding_client is None or not embedder.capabilities.supports_embeddings:
             raise RouterRuntimeIntegrityError("frozen router embedder lacks embedding capability")
         self._embedder = embedder.embedding_client
+        self._embedder_input_price = embedder.capabilities.input_cost_per_million_tokens_usd
 
     @property
     def records_decisions(self) -> bool:
@@ -208,6 +251,7 @@ class RouterRuntime:
             pricing_candidate_aliases=tuple(
                 item.candidate_alias for item in pricing.candidate_prices
             ),
+            pricing_candidate_prices=pricing.candidate_prices,
             decision_sink=decision_sink,
         )
 
@@ -238,11 +282,16 @@ class RouterRuntime:
             if existing is not None:
                 return existing
             episode_decision = self._episode_decisions.get(identity_sha256)
+            embedding_economics = _zero_operation_economics()
             if episode_decision is not None:
                 decision = self._sticky_decision(episode_decision, request_sha256)
             else:
                 try:
                     embedded = self._embedder.embed((feature,))
+                    embedding_economics = _embedding_economics(
+                        feature,
+                        input_usd_per_million_tokens=self._embedder_input_price,
+                    )
                     if len(embedded) != 1:
                         raise ValueError("embedder returned a non-singleton result")
                     vector = np.asarray(embedded[0].values, dtype=np.float64)
@@ -275,8 +324,10 @@ class RouterRuntime:
                     )
                     for stale_key in stale_request_keys:
                         del self._request_decisions[stale_key]
+                        self._request_embedding_economics.pop(stale_key, None)
                 self._episode_decisions[identity_sha256] = decision
             self._request_decisions[request_key] = decision
+            self._request_embedding_economics[request_key] = embedding_economics
             return decision
 
     def complete(
@@ -338,9 +389,13 @@ class RouterRuntime:
                 if episode_decision is None:
                     self._episode_decisions[expected_episode_sha256] = selected
                 self._request_decisions[request_key] = selected
+                self._request_embedding_economics[request_key] = _zero_operation_economics()
                 cached = selected
             if cached != selected:
                 raise ValueError("routing decision is not the exact cached episode decision")
+            embedding_economics = self._request_embedding_economics.get(
+                request_key, _zero_operation_economics()
+            )
         resolved = self._resolve(selected.selected_alias)
         if _requires_tool_protocol(request) and not resolved.capabilities.supports_tools:
             raise RouterModelCapabilityError(
@@ -359,7 +414,19 @@ class RouterRuntime:
             response = client.complete_idempotent(request, idempotency_key=provider_idempotency_key)
         else:
             response = client.complete(request)
-        return RoutedModelResponse(decision=selected, response=response)
+        candidate_economics = _candidate_completion_economics(
+            response.economics,
+            self._candidate_prices.get(selected.selected_alias),
+        )
+        return RoutedModelResponse(
+            decision=selected,
+            response=response,
+            economics=RoutedCompletionEconomics(
+                router_embedding=embedding_economics,
+                selected_candidate=candidate_economics,
+                total=combine_economics((embedding_economics, candidate_economics)),
+            ),
+        )
 
     def _require_activation_identity(
         self,
@@ -549,6 +616,125 @@ class RouterRuntime:
         if self._decision_sink is not None:
             self._decision_sink(decision)
         return decision
+
+
+def _zero_operation_economics() -> OperationEconomics:
+    """Return explicit alias-free evidence that no provider operation was incurred."""
+    return OperationEconomics(
+        usage=Usage(input_tokens=0, output_tokens=0),
+        cost_usd=NumericMeasurement(value=0.0, provenance="estimated"),
+    )
+
+
+def _embedding_economics(
+    feature: str,
+    *,
+    input_usd_per_million_tokens: float | None,
+) -> OperationEconomics:
+    """Estimate one successful online router embedding from its request-visible feature.
+
+    Args:
+        feature: Exact provider input rendered by the router feature extractor.
+        input_usd_per_million_tokens: Active explicit embedding price when declared.
+
+    Returns:
+        Conservative usage and locally priced cost without a model alias.
+    """
+    tokens = router_feature_token_upper_bound(feature)
+    cost = (
+        None
+        if input_usd_per_million_tokens is None
+        else NumericMeasurement(
+            value=tokens * input_usd_per_million_tokens / 1_000_000,
+            provenance="estimated",
+        )
+    )
+    return OperationEconomics(
+        usage=Usage(input_tokens=tokens, output_tokens=0),
+        cost_usd=cost,
+    )
+
+
+def _candidate_completion_economics(
+    economics: OperationEconomics,
+    price: CandidateTokenPrice | None,
+) -> OperationEconomics:
+    """Retain measured candidate cost or locally price its observed token usage.
+
+    Args:
+        economics: Provider response economics.
+        price: Fit-time selected-candidate price, kept private from the result.
+
+    Returns:
+        Reconciled alias-free candidate economics.
+
+    Raises:
+        ValueError: Provider cache counters exceed the reported input total.
+    """
+    usage = economics.usage
+    if economics.cost_usd is not None or usage is None or price is None:
+        return economics
+    cached = usage.cached_input_tokens
+    written = usage.cache_write_input_tokens
+    if cached is not None and cached > usage.input_tokens:
+        raise ValueError("candidate cached input exceeds total input usage")
+    if written is not None and written > usage.input_tokens:
+        raise ValueError("candidate cache-write input exceeds total input usage")
+    if cached is not None and written is not None and cached + written > usage.input_tokens:
+        raise ValueError("candidate cache counters overlap beyond total input usage")
+    input_cost = _candidate_input_cost_usd(price, usage)
+    output_cost = usage.output_tokens * price.output_usd_per_million_tokens / 1_000_000
+    return economics.model_copy(
+        update={
+            "cost_usd": NumericMeasurement(
+                value=input_cost + output_cost,
+                provenance="estimated",
+            )
+        }
+    )
+
+
+def _candidate_input_cost_usd(price: CandidateTokenPrice, usage: Usage) -> float:
+    """Conservatively price mutually exclusive ordinary, cached, and cache-write input.
+
+    Args:
+        price: Frozen candidate price units.
+        usage: Provider-reported input and cache token counts.
+
+    Returns:
+        Locally priced input cost in USD.
+    """
+    base = price.input_usd_per_million_tokens
+    cached_price = price.cached_input_usd_per_million_tokens
+    write_price = price.cache_write_usd_per_million_tokens
+    cached = usage.cached_input_tokens
+    written = usage.cache_write_input_tokens
+    if cached is not None and written is not None:
+        ordinary = usage.input_tokens - cached - written
+        total = (
+            ordinary * base
+            + cached * (cached_price if cached_price is not None else base)
+            + written * (write_price if write_price is not None else base)
+        )
+    elif cached is not None:
+        ordinary_price = max(base, write_price if write_price is not None else base)
+        total = (
+            cached * (cached_price if cached_price is not None else base)
+            + (usage.input_tokens - cached) * ordinary_price
+        )
+    elif written is not None:
+        ordinary_price = max(base, cached_price if cached_price is not None else base)
+        total = (
+            written * (write_price if write_price is not None else base)
+            + (usage.input_tokens - written) * ordinary_price
+        )
+    else:
+        total = usage.input_tokens * max(
+            base,
+            cached_price if cached_price is not None else base,
+            write_price if write_price is not None else base,
+        )
+    return total / 1_000_000
 
 
 def _requires_tool_protocol(request: ModelRequest) -> bool:

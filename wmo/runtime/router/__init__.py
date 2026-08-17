@@ -37,6 +37,7 @@ from wmo.runtime.router.journal import (
     RuntimeJournalEvent,
 )
 from wmo.runtime.router.runtime import (
+    RoutedCompletionEconomics,
     RoutedModelResponse,
     RouterEpisodeConflictError,
     RouterModelCapabilityError,
@@ -63,6 +64,7 @@ _SERVER_EXPORT_MODULES = {
 }
 
 __all__ = [
+    "RoutedCompletionEconomics",
     "RoutedModelResponse",
     "JournaledRouterRuntime",
     "JournaledRouterCompletionService",

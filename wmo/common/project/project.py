@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import tomllib
+from decimal import Decimal
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Literal
 from urllib.parse import urlsplit
 
 import tomli_w
@@ -17,6 +19,7 @@ from wmo.common.core.artifacts import (
     assert_secret_free,
 )
 from wmo.common.core.files import write_text_atomic
+from wmo.common.core.money import exact_usd
 
 
 def _exclude_absent(value: object) -> bool:
@@ -86,6 +89,35 @@ class ProjectModelConfiguration(ContractModel):
     judge: ArtifactId
     embedder: ArtifactId
     candidates: tuple[ArtifactId, ...] = ()
+    incumbent: ArtifactId | None = None
+
+    @model_validator(mode="after")
+    def _require_coherent_router_roles(self) -> ProjectModelConfiguration:
+        """Require unique candidates and an incumbent drawn from that candidate set."""
+        if len(set(self.candidates)) != len(self.candidates):
+            raise ValueError("project candidate aliases must not repeat")
+        if self.incumbent is not None and self.incumbent not in self.candidates:
+            raise ValueError("project incumbent must also be a selected candidate")
+        return self
+
+
+class ProjectSystemConfiguration(ContractModel):
+    """Bounded built-in system supported by the hosted Project workflow."""
+
+    kind: Literal["builtin_chat"] = "builtin_chat"
+    system_prompt: str = Field(min_length=1, max_length=20_000)
+    maximum_model_calls: int = Field(default=8, ge=1, le=64)
+
+    @field_validator("system_prompt", mode="before")
+    @classmethod
+    def _normalize_system_prompt(cls, value: object) -> str:
+        """Trim the required prompt and reject non-text or whitespace-only values."""
+        if not isinstance(value, str):
+            raise ValueError("built-in chat system_prompt must be text")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("built-in chat system_prompt must not be blank")
+        return normalized
 
 
 class ProjectRetrievalConfiguration(ContractModel):
@@ -97,7 +129,39 @@ class ProjectRetrievalConfiguration(ContractModel):
 class ProjectBudgetConfiguration(ContractModel):
     """Finite spend limits applied to future project workflow calls."""
 
-    maximum_build_cost_usd: float = Field(default=5.0, gt=0)
+    maximum_build_cost_usd: Decimal = Field(default=Decimal("5.000000"), gt=0)
+    maximum_provider_cost_usd: Decimal | None = Field(default=None, gt=0)
+
+    @field_validator(
+        "maximum_build_cost_usd",
+        "maximum_provider_cost_usd",
+        mode="before",
+    )
+    @classmethod
+    def _require_exact_budget(cls, value: object) -> Decimal | None:
+        """Return one canonical numeric(20,6) budget value or reject it."""
+        return None if value is None else exact_usd(value)
+
+
+class ProjectHostedSetup(ContractModel):
+    """One late secret-free setup mutation for a prepared hosted Project."""
+
+    system: ProjectSystemConfiguration
+    models: ProjectModelConfiguration
+    model_catalog: ArtifactInput
+    retrieval: ProjectRetrievalConfiguration
+    budgets: ProjectBudgetConfiguration
+
+    @model_validator(mode="after")
+    def _require_complete_hosted_roles(self) -> ProjectHostedSetup:
+        """Require the first hosted workflow's baseline and candidate shape."""
+        if len(self.models.candidates) < 2:
+            raise ValueError("hosted Project setup requires at least two router candidates")
+        if self.models.incumbent is None:
+            raise ValueError("hosted Project setup requires a baseline incumbent")
+        if self.budgets.maximum_provider_cost_usd is None:
+            raise ValueError("hosted Project setup requires one finite provider-spend ceiling")
+        return self
 
 
 class ProjectTracePreparationSettings(ContractModel):
@@ -167,14 +231,60 @@ class ProjectBuildArtifacts(ContractModel):
         return self
 
 
+class ProjectHostedJudgeEvidence(ContractModel):
+    """Machine-only judge setup and calibration selected for hosted routing."""
+
+    setup: ArtifactInput
+    calibration: ArtifactInput
+    status: Literal["provisional"] = "provisional"
+
+    @model_validator(mode="after")
+    def _require_distinct_evidence(self) -> ProjectHostedJudgeEvidence:
+        """Require setup and calibration to remain separate immutable artifacts."""
+        if self.setup.artifact_id == self.calibration.artifact_id:
+            raise ValueError("hosted judge setup and calibration artifacts must be distinct")
+        return self
+
+
+class ProjectRouterPolicyArtifacts(ContractModel):
+    """Exact frozen fit-only policy selection completed before held-out reporting."""
+
+    policy_lock: ArtifactInput
+    policy: ArtifactInput
+    spend_ledger: ArtifactInput
+
+    @model_validator(mode="after")
+    def _require_distinct_policy_artifacts(self) -> ProjectRouterPolicyArtifacts:
+        """Require policy, lock, and spend evidence to use distinct artifact identities."""
+        values = (self.policy_lock, self.policy, self.spend_ledger)
+        if len({item.artifact_id for item in values}) != len(values):
+            raise ValueError("router policy selection artifacts must be distinct")
+        return self
+
+
+class ProjectRouterReportArtifacts(ContractModel):
+    """Exact held-out report and final spend selection after the policy lock."""
+
+    report: ArtifactInput
+    spend_ledger: ArtifactInput
+
+    @model_validator(mode="after")
+    def _require_distinct_report_artifacts(self) -> ProjectRouterReportArtifacts:
+        """Require report and final spend evidence to use distinct artifact identities."""
+        if self.report.artifact_id == self.spend_ledger.artifact_id:
+            raise ValueError("router report and final spend artifacts must be distinct")
+        return self
+
+
 class ProjectConfig(ContractModel):
     """Project-local configuration that names no provider credentials or secret references."""
 
-    schema_version: int = Field(default=3, ge=1)
+    schema_version: int = Field(default=4, ge=1)
     project_id: ArtifactId
     trace_source: str | None = Field(default=None, max_length=64)
     trace_preparation: ProjectTracePreparationSettings | None = None
     provider_free_stage: ProjectProviderFreeStage | None = None
+    system: ProjectSystemConfiguration | None = None
     models: ProjectModelConfiguration | None = None
     model_catalog: ArtifactInput | None = None
     retrieval: ProjectRetrievalConfiguration | None = Field(
@@ -182,6 +292,10 @@ class ProjectConfig(ContractModel):
     )
     budgets: ProjectBudgetConfiguration | None = Field(default_factory=ProjectBudgetConfiguration)
     build: ProjectBuildArtifacts | None = None
+    build_spend_ledger: ArtifactInput | None = None
+    hosted_judge: ProjectHostedJudgeEvidence | None = None
+    router_policy: ProjectRouterPolicyArtifacts | None = None
+    router_report: ProjectRouterReportArtifacts | None = None
     agent: AgentConfiguration | None = None
     model_optimization_config: ArtifactInput | None = None
     redacted_field_names: tuple[str, ...] = ()
@@ -202,6 +316,25 @@ class ProjectConfig(ContractModel):
         """Require Project-owned preparation settings before selecting provider-free evidence."""
         if self.provider_free_stage is not None and self.trace_preparation is None:
             raise ValueError("provider-free stage requires Project trace preparation settings")
+        hosted_setup = (
+            self.system,
+            self.models,
+            self.model_catalog,
+            self.retrieval,
+            self.budgets,
+        )
+        if self.system is not None and any(value is None for value in hosted_setup):
+            raise ValueError("hosted system selection requires one complete late setup")
+        if self.build_spend_ledger is not None and self.system is None:
+            raise ValueError("hosted build spend evidence requires a bound hosted setup")
+        if self.build_spend_ledger is not None and self.build is None:
+            raise ValueError("build spend evidence requires a completed build")
+        if self.hosted_judge is not None and self.build is None:
+            raise ValueError("hosted judge evidence requires a completed build")
+        if self.router_policy is not None and self.hosted_judge is None:
+            raise ValueError("router policy selection requires hosted judge evidence")
+        if self.router_report is not None and self.router_policy is None:
+            raise ValueError("router report selection requires a frozen router policy")
         return self
 
 

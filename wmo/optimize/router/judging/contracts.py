@@ -162,8 +162,8 @@ class JudgeTracePreview(ContractModel):
     reference_rollout_id: ArtifactId | None = None
 
 
-class ManualJudgeSetupArtifact(ArtifactEnvelope):
-    """Frozen judge contract approved before any calibration work or model call."""
+class JudgeSetupArtifact(ArtifactEnvelope):
+    """Frozen executable judge contract shared by manual and hosted setup modes."""
 
     setup_id: ArtifactId
     project_id: ArtifactId
@@ -176,7 +176,7 @@ class ManualJudgeSetupArtifact(ArtifactEnvelope):
     previews: tuple[JudgeTracePreview, ...]
 
     @model_validator(mode="after")
-    def _require_complete_inputs(self) -> ManualJudgeSetupArtifact:
+    def _require_complete_inputs(self) -> JudgeSetupArtifact:
         """Require every setup source to appear exactly once in envelope inputs.
 
         Returns:
@@ -191,12 +191,22 @@ class ManualJudgeSetupArtifact(ArtifactEnvelope):
             )
         )
         if len({item.artifact_id for item in expected}) != len(expected):
-            raise ValueError("manual judge setup inputs must have unique artifact IDs")
+            raise ValueError("judge setup inputs must have unique artifact IDs")
         if self.inputs != expected:
-            raise ValueError("manual judge setup must hash its complete canonical input graph")
+            raise ValueError("judge setup must hash its complete canonical input graph")
         if not self.previews:
-            raise ValueError("manual judge setup requires at least one rendered real-trace preview")
+            raise ValueError("judge setup requires at least one rendered real-trace preview")
         return self
+
+
+class ManualJudgeSetupArtifact(JudgeSetupArtifact):
+    """Frozen judge contract approved through the optional local manual setup mode."""
+
+
+class ProvisionalJudgeSetupArtifact(JudgeSetupArtifact):
+    """Machine-only hosted judge contract that carries no human approval semantics."""
+
+    status: Literal["provisional"] = "provisional"
 
 
 class JudgeCalibrationBudget(ContractModel):

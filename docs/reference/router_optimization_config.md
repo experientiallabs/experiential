@@ -11,6 +11,32 @@ cells and fidelity reports are not router inputs. The supported sequence is:
 confirmed candidates, approved manual judge calibration, and one bounded provider budget. It does
 not run world-model fidelity evaluation before fitting.
 
+Hosted applications use `wmo.run_hosted_router_workflow` instead. That noninteractive service
+starts from a restored Project with prepared trace/task evidence, applies one late secret-free
+`HostedRouterWorkflowSetup`, constructs the grounded build, records automatic judge setup only as
+`provisional` machine evidence, and runs the same automatic router composition without a human or
+fidelity gate. Provider clients remain transient injected dependencies; each newly completed build,
+policy, and report selection returns a typed stage event and verified Project bundle, while the
+terminal result includes a versioned component spend ledger under one finite ceiling.
+
+The hosted setup fixes these values before the first provider dispatch:
+
+- a `builtin_chat` system with a required trimmed `system_prompt` of 1–20,000 characters and
+  `maximum_model_calls` from 1–64 (default 8);
+- a secret-free catalog plus the world-model, judge, embedder, incumbent, and at least two unique
+  candidate aliases;
+- retrieval `top_k`; and
+- one positive `numeric(20,6)` provider ceiling represented as exact `Decimal` text, never binary
+  floating-point authorization.
+
+Applications inject a `HostedAttemptAuthorityStore` that durably binds one random write-once
+authority to the Project, attempt, and exact ceiling. It records every paid-operation reservation
+before dispatch and keeps ambiguous spend closed across worker loss. A completed provider stage is
+visible only after the caller atomically acknowledges the exact verified bundle digest, selected
+`ProviderSpendLedger`, and exact ledger total; the workflow emits the completed stage event only
+after that acknowledgment. Restarts use `restore_hosted_project_bundle` with the externally
+committed digest and can resume only from that latest committed provider stage.
+
 Python applications can use `wmo.compose_router` to run the same sequence with injected review and
 setup suppliers, simulator, judge, runtime catalog, and finite budgets. Provider-free callers with
 already completed evidence can use `fit_router`, `report_router`, or `optimize_router` directly.

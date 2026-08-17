@@ -56,6 +56,7 @@ from wmo.common.project.manifests import ArtifactManifest, artifact_input
 from wmo.common.project.paths import ProjectPaths, validate_local_id
 from wmo.common.project.project import (
     ProjectConfig,
+    ProjectHostedSetup,
     require_durable_source_id,
 )
 from wmo.common.project.store import ProjectStore
@@ -66,7 +67,7 @@ _MAX_BUNDLE_MEMBERS = 20_000
 _MAX_EXPANDED_BYTES = 1_073_741_824
 _MAX_ARCHIVE_BYTES = 2 * _MAX_EXPANDED_BYTES
 _READ_CHUNK_BYTES = 1024 * 1024
-_SUPPORTED_PROJECT_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+_SUPPORTED_PROJECT_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
 _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 _SHA256_ADAPTER = TypeAdapter(Sha256)
 _STAGE_ORDER = {
@@ -279,6 +280,7 @@ def restore_project_bundle(
     *,
     root: Path,
     expected_sha256: str,
+    verify_project: Callable[[ProjectStore], None] | None = None,
 ) -> ProjectStore:
     """Verify and atomically restore one Project into an absent scoped destination.
 
@@ -286,6 +288,7 @@ def restore_project_bundle(
         bundle_path: Downloaded canonical bundle file.
         root: Local WMO root that will own ``projects/<project_id>``.
         expected_sha256: Content address supplied by the bundle storage owner.
+        verify_project: Optional application-owned semantic verifier run before visibility.
 
     Returns:
         Project store addressing the newly visible restored state.
@@ -320,6 +323,8 @@ def restore_project_bundle(
     try:
         _materialize_loaded_bundle(staged, loaded)
         _verify_restored_project(staged, loaded)
+        if verify_project is not None:
+            verify_project(staged)
         os.rename(staged.paths.project_directory, destination)
         fsync_directory_best_effort(paths.projects_directory)
     except ProjectBundleError:
@@ -649,6 +654,10 @@ def _completed_stages(project: ProjectConfig) -> tuple[ProjectStage, ...]:
         stages.append(ProjectStage.PREPARING_TRACES)
     if project.build is not None:
         stages.append(ProjectStage.BUILDING_WORLD_MODEL)
+    if project.router_policy is not None:
+        stages.append(ProjectStage.OPTIMIZING_ROUTER)
+    if project.router_report is not None:
+        stages.append(ProjectStage.COMPLETING_REPORT)
     return tuple(stages)
 
 
@@ -735,6 +744,8 @@ def _validate_catalog_roles(project: ProjectConfig, catalog: ProjectModelCatalog
         models.embedder,
         *models.candidates,
     }
+    if models.incumbent is not None:
+        required.add(models.incumbent)
     missing = sorted(required - available)
     if missing:
         raise ProjectBundleError(f"Project catalog is missing selected model aliases: {missing}")
@@ -773,7 +784,36 @@ def _verify_restored_project(store: ProjectStore, loaded: _LoadedBundle) -> None
     if project.provider_free_stage is not None:
         store.bind_provider_free_stage(project.provider_free_stage)
     if project.build is not None:
-        store.bind_completed_build(project.build)
+        if project.build_spend_ledger is None:
+            store.bind_completed_build(project.build)
+        else:
+            if (
+                project.system is None
+                or project.models is None
+                or project.model_catalog is None
+                or project.retrieval is None
+                or project.budgets is None
+            ):
+                raise ProjectBundleError("hosted build bundle has no complete late setup")
+            store.bind_hosted_setup(
+                ProjectHostedSetup(
+                    system=project.system,
+                    models=project.models,
+                    model_catalog=project.model_catalog,
+                    retrieval=project.retrieval,
+                    budgets=project.budgets,
+                )
+            )
+            store.bind_hosted_completed_build(
+                project.build,
+                spend_ledger=project.build_spend_ledger,
+            )
+    if project.hosted_judge is not None:
+        store.bind_hosted_judge_evidence(project.hosted_judge)
+    if project.router_policy is not None:
+        store.bind_router_policy(project.router_policy)
+    if project.router_report is not None:
+        store.bind_router_report(project.router_report)
 
     def resolve(artifact_id: str) -> ArtifactManifest:
         """Resolve one fully verified staged artifact manifest."""
