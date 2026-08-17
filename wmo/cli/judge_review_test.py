@@ -275,8 +275,7 @@ def test_axis_markup_is_rendered_and_prompted_as_literal_text(
                         raw_score=proposed.raw_score,
                         min_score=proposed.min_score,
                         max_score=proposed.max_score,
-                        feedback=proposed.feedback,
-                        evidence_span_ids=proposed.evidence_span_ids,
+                        rationale=proposed.rationale,
                     ),
                 )
             ),
@@ -530,8 +529,7 @@ def _proposal(
             raw_score=1,
             min_score=task_success.min_score,
             max_score=task_success.max_score,
-            feedback="The response completed the requested account lookup.",
-            evidence_span_ids=(f"{trace.trace_id}-assistant",),
+            rationale="The response completed the requested account lookup.",
         )
     ]
     if multi_axis:
@@ -541,8 +539,7 @@ def _proposal(
                 raw_score=1,
                 min_score=policy.min_score,
                 max_score=policy.max_score,
-                feedback="The response followed the policy.",
-                evidence_span_ids=(f"{trace.trace_id}-tool-result",),
+                rationale="The response followed the policy.",
             )
         )
     rubric = cast(Rubric, _RubricView(dimensions))
@@ -551,7 +548,9 @@ def _proposal(
         tuple(
             (
                 item.dimension_id,
-                item.evidence_span_ids,
+                (f"{trace.trace_id}-assistant",)
+                if item.dimension_id == "task-success"
+                else (f"{trace.trace_id}-tool-result",),
                 (f"{reference.trace_id}-assistant",)
                 if item.dimension_id == "task-success"
                 else (f"{reference.trace_id}-tool-result",),

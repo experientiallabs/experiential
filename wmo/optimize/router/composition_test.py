@@ -453,10 +453,7 @@ class _Judge:
                     dimension_id="dimension-a",
                     raw_score=4,
                     calibrated_score=4.0,
-                    evidence_span_ids=(
-                        read_rollout(store.artifacts, rollout_artifact_id)[0].spans[0].span_id,
-                    ),
-                    feedback="Deterministic workflow score.",
+                    rationale="Deterministic workflow score.",
                 ),
             ),
             overall_score=0.8,

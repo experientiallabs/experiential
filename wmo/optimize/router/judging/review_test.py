@@ -122,7 +122,7 @@ def test_trace_review_separates_judge_human_final_and_provenance_fields(
     axis = review.axes[0]
     assert axis.judge_proposal.proposed_score == 1
     assert axis.judge_proposal.proposed_judgment == "Structured evidence supports the verdict."
-    assert axis.judge_proposal.cited_trace_evidence == (plan.traces[0].spans[0].span_id,)
+    assert axis.judge_proposal.cited_trace_evidence == ()
     assert axis.human_correction is not None
     assert axis.human_correction.corrected_score == 0
     assert axis.human_correction.corrected_judgment == (
@@ -144,13 +144,12 @@ def test_trace_review_separates_judge_human_final_and_provenance_fields(
             {
                 "dimension_id": "task-success",
                 "raw_score": 1,
-                "evidence_span_ids": [plan.traces[0].spans[0].span_id],
-                "feedback": "Structured evidence supports the verdict.",
+                "rationale": "Structured evidence supports the verdict.",
             }
         ]
     }
     assert probe.model == review.judge_model
-    assert judgment.dimensions[0].feedback == axis.judge_proposal.proposed_judgment
+    assert judgment.dimensions[0].rationale == axis.judge_proposal.proposed_judgment
     assert len(client.requests) == 1
 
 

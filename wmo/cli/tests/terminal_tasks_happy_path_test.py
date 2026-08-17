@@ -80,7 +80,7 @@ class _JudgeClient:
         self.calls = 0
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Return a schema-valid score citing one span visible in the request."""
+        """Return a schema-valid score after confirming the request includes a rollout span."""
         if self.fail_after is not None and self.calls >= self.fail_after:
             raise RuntimeError("simulated judge provider interruption")
         self.calls += 1
@@ -95,8 +95,7 @@ class _JudgeClient:
                             {
                                 "dimension_id": "task-success",
                                 "raw_score": 1,
-                                "evidence_span_ids": [match.group(1)],
-                                "feedback": "The trace shows the requested task was handled.",
+                                "rationale": "The trace shows the requested task was handled.",
                             }
                         ]
                     }
@@ -319,7 +318,6 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     assert "Configured judge proposals" in interrupted.output
     assert "Proposed score: 1" in interrupted.output
     assert "Proposed judgment:" in interrupted.output
-    assert "Cited trace evidence:" in interrupted.output
     assert "0: The agent did not complete the requested task." in interrupted.output
     assert "1: The agent successfully completed the requested task." in interrupted.output
     assert len(_trace_reviews(store)) == 1

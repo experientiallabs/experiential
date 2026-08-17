@@ -24,22 +24,12 @@ from wmo.common.models import ModelSnapshot
 
 
 class JudgeScoreObservation(ContractModel):
-    """Raw dimension evidence bound to a stored judgment and rollout."""
+    """Raw dimension score bound to a stored judgment and rollout."""
 
     judgment: ArtifactInput
     source_rollout: ArtifactInput
     dimension_id: ArtifactId
     raw_score: int = Field(ge=0)
-    evidence_span_ids: tuple[str, ...]
-
-    @field_validator("evidence_span_ids")
-    @classmethod
-    def _require_unique_evidence_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value:
-            raise ValueError("calibration observations require cited rollout spans")
-        if len(set(value)) != len(value):
-            raise ValueError("calibration observation citations must not repeat")
-        return value
 
 
 class InsufficientCalibrationRiskAcceptance(ArtifactEnvelope):

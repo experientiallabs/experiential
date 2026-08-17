@@ -406,17 +406,12 @@ def _build_trace_review(
         raise ManualJudgeError("pairwise review citations do not match judge dimensions")
     axes: list[ManualJudgeAxisReview] = []
     for dimension in judgment.dimensions:
-        target_evidence, reference_evidence = citation_by_id.get(
-            dimension.dimension_id,
-            (dimension.evidence_span_ids, ()),
-        )
-        if target_evidence != dimension.evidence_span_ids:
-            raise ManualJudgeError("pairwise target citations differ from normalized judgment")
+        target_evidence, reference_evidence = citation_by_id.get(dimension.dimension_id, ((), ()))
         proposal = JudgeAxisProposal(
             dimension_id=dimension.dimension_id,
             proposed_score=dimension.raw_score,
-            proposed_judgment=dimension.feedback,
-            cited_trace_evidence=dimension.evidence_span_ids,
+            proposed_judgment=dimension.rationale or "",
+            cited_trace_evidence=target_evidence,
             cited_reference_trace_evidence=reference_evidence,
         )
         correction = decision_by_id[dimension.dimension_id].correction
@@ -776,18 +771,13 @@ def read_review_judgment(store: ProjectStore, review: ManualJudgeTraceReviewArti
             raise ManualJudgeError("pairwise probe citations differ from normalized judgment")
     proposals: list[JudgeAxisProposal] = []
     for item in judgment.dimensions:
-        target_evidence, reference_evidence = citation_by_id.get(
-            item.dimension_id,
-            (item.evidence_span_ids, ()),
-        )
-        if target_evidence != item.evidence_span_ids:
-            raise ManualJudgeError("pairwise target citations differ from normalized judgment")
+        target_evidence, reference_evidence = citation_by_id.get(item.dimension_id, ((), ()))
         proposals.append(
             JudgeAxisProposal(
                 dimension_id=item.dimension_id,
                 proposed_score=item.raw_score,
-                proposed_judgment=item.feedback,
-                cited_trace_evidence=item.evidence_span_ids,
+                proposed_judgment=item.rationale or "",
+                cited_trace_evidence=target_evidence,
                 cited_reference_trace_evidence=reference_evidence,
             )
         )

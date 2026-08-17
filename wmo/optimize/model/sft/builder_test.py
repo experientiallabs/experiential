@@ -86,13 +86,12 @@ _DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 
 
-def _judge_content(span_id: str, feedback: str) -> str:
+def _judge_content(feedback: str) -> str:
     """Build one deterministic fake-judge response."""
     dimension = {
         "dimension_id": "quality",
         "raw_score": 5,
-        "evidence_span_ids": [span_id],
-        "feedback": feedback,
+        "rationale": feedback,
     }
     return json.dumps({"dimensions": [dimension]})
 
@@ -508,11 +507,10 @@ def _write_teacher_source(
     )
     observations: list[JudgeScoreObservation] = []
     for index, rollout in enumerate(rollouts):
-        span_id = rollout.spans[0].span_id
         judgment = LMJudge(
             _FakeJudgeClient(
                 model,
-                _judge_content(span_id, "The rollout resolved the request."),
+                _judge_content("The rollout resolved the request."),
             ),
             prompt,
             code_revision="w12-test",
@@ -530,7 +528,6 @@ def _write_teacher_source(
                 source_rollout=rollout_inputs[index],
                 dimension_id="quality",
                 raw_score=5,
-                evidence_span_ids=(span_id,),
             )
         )
         review.append(
@@ -585,7 +582,7 @@ def _write_teacher_source(
     final_judgment = LMJudge(
         _FakeJudgeClient(
             model,
-            _judge_content(final_rollout.spans[0].span_id, "The teacher resolved the request."),
+            _judge_content("The teacher resolved the request."),
         ),
         prompt,
         code_revision="w12-test",

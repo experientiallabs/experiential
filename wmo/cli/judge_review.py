@@ -119,7 +119,7 @@ def build_manual_judge_reviewer(
                         key,
                         axis=axis,
                         proposed_score=proposed.raw_score,
-                        proposed_judgment=proposed.feedback,
+                        proposed_judgment=proposed.rationale or "",
                         score=score,
                         corrected_judgment=corrected_judgment,
                         non_interactive=non_interactive,
@@ -209,8 +209,9 @@ def _render_axis_proposals(
         console: Rich console receiving review output.
     """
     dimensions = {item.dimension_id: item for item in proposal.rubric.dimensions}
-    reference_citations = {
-        dimension_id: reference for dimension_id, _target, reference in proposal.pairwise_citations
+    citation_by_id = {
+        dimension_id: (target, reference)
+        for dimension_id, target, reference in proposal.pairwise_citations
     }
     console.print(
         f"\nConfigured judge proposals (rubric revision {proposal.rubric.rubric_id})",
@@ -237,11 +238,13 @@ def _render_axis_proposals(
         render_field(
             console,
             "Proposed judgment",
-            proposed.feedback,
+            proposed.rationale or "",
             character_limit=character_limit,
         )
-        console.print("Cited trace evidence:", style="bold")
-        for span_id in proposed.evidence_span_ids:
+        target_citations, cited_reference = citation_by_id.get(proposed.dimension_id, ((), ()))
+        if target_citations:
+            console.print("Cited trace evidence:", style="bold")
+        for span_id in target_citations:
             source, span = _find_evidence_span(proposal, span_id, reference=False)
             console.print(f"  {span_id} ({source}; {span.name})", markup=False)
             render_field(
@@ -250,7 +253,6 @@ def _render_axis_proposals(
                 span_evidence_text(span),
                 character_limit=character_limit,
             )
-        cited_reference = reference_citations.get(proposed.dimension_id, ())
         if cited_reference:
             console.print("Cited reference trace evidence:", style="bold")
             for span_id in cited_reference:

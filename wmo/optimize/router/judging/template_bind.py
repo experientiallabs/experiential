@@ -9,9 +9,9 @@ from wmo.optimize.router.judging.contracts import JudgePromptTemplate, judge_fee
 _PROMPT_TEXT = (
     "Evaluate the supplied rollout against every rubric axis. Use only evidence in the "
     "rollout. Return strict JSON matching the supplied schema, with one integer score inside "
-    "each axis inclusive range, specific cited span IDs, and concise feedback for every axis."
+    "each axis inclusive range and an optional nullable rationale for every axis."
 )
-DEFAULT_JUDGE_PROMPT = PromptDefinition.from_text("wmo-judge-evidence-json-v2", _PROMPT_TEXT)
+DEFAULT_JUDGE_PROMPT = PromptDefinition.from_text("wmo-judge-evidence-json-v3", _PROMPT_TEXT)
 
 
 def default_judge_dimensions() -> tuple[RubricDimension, ...]:

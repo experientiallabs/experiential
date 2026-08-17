@@ -33,6 +33,7 @@ from wmo.common.judging.lm import (
     LMJudge,
     RawDimensionJudgment,
     RawJudgment,
+    judge_response_schema,
 )
 from wmo.common.judging.prompts import PromptDefinition
 from wmo.common.judging.proposal import (
@@ -88,6 +89,7 @@ __all__ = [
     "ProposedRubricDimension",
     "RawDimensionJudgment",
     "RawJudgment",
+    "judge_response_schema",
     "Rubric",
     "RubricProposal",
     "RubricProposalEvidence",

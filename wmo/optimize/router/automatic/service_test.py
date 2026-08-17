@@ -153,7 +153,7 @@ class _CompletionClient:
             request: Exact provider-neutral request.
 
         Returns:
-            Candidate text, terminal world transition, or cited judge JSON.
+            Candidate text, terminal world transition, or structured judge JSON.
         """
         self._state.completion_calls.append((self._alias, request))
         if self._alias == "world":
@@ -168,8 +168,7 @@ class _CompletionClient:
                         {
                             "dimension_id": "task-success",
                             "raw_score": 1,
-                            "evidence_span_ids": [span_ids[0]],
-                            "feedback": "The visible response resolves the task.",
+                            "rationale": "The visible response resolves the task.",
                         }
                     ]
                 }

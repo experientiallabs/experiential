@@ -502,7 +502,7 @@ def _installed_release_driver() -> None:
             """Serve deterministic embeddings and chat completions on loopback only.
 
             Raises:
-                AssertionError: A structured judge request contains no real evidence span.
+                AssertionError: A structured judge request is missing required score fields.
             """
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length))
@@ -537,27 +537,16 @@ def _installed_release_driver() -> None:
             else:
                 prompt = json.dumps(payload, sort_keys=True)
                 model = str(payload.get("model"))
-                if model == "core-model" and "evidence_span_ids" in prompt:
-                    messages = payload.get("messages")
-                    assert isinstance(messages, list) and messages, prompt
-                    user_content = messages[-1].get("content")
-                    assert isinstance(user_content, str), prompt
-                    rollout_text = user_content.partition("ROLLOUT:\n")[2].partition(
-                        "\n\nRUBRIC:\n"
-                    )[0]
-                    rollout = json.loads(rollout_text)
-                    spans = rollout.get("spans")
-                    assert isinstance(spans, list) and spans, prompt
-                    span_id = spans[0].get("span_id")
-                    assert isinstance(span_id, str) and span_id, prompt
+                if model == "core-model" and (
+                    "optional nullable rationale" in prompt or "Rationale is optional" in prompt
+                ):
                     content = json.dumps(
                         {
                             "dimensions": [
                                 {
                                     "dimension_id": "task-success",
                                     "raw_score": 1,
-                                    "evidence_span_ids": [span_id],
-                                    "feedback": "Deterministic loopback evidence.",
+                                    "rationale": "Deterministic loopback evidence.",
                                 }
                             ]
                         }
@@ -997,7 +986,6 @@ def _installed_release_driver() -> None:
         assert "Numeric range: 0 to 1" in calibration_result.stdout
         assert "Proposed score: 1" in calibration_result.stdout
         assert "Proposed judgment:" in calibration_result.stdout
-        assert "Cited trace evidence:" in calibration_result.stdout
         assert sum(state.counts().values()) - setup_call_count == len(calibration_plan.previews)
         review = support_store.read_review()
         assert isinstance(review, dict)

@@ -633,7 +633,6 @@ def calibrate_manual_judge(
                 source_rollout=review.trace_evidence,
                 dimension_id=dimension.dimension_id,
                 raw_score=dimension.raw_score,
-                evidence_span_ids=dimension.evidence_span_ids,
             )
             for dimension in judgment.dimensions
         )

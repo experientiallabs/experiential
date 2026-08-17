@@ -20,6 +20,7 @@ from wmo.common.judging import (
     CalibrationReport,
     PromptDefinition,
 )
+from wmo.common.judging.lm import PORTABLE_RATIONALE_JSON_SCHEMA
 from wmo.common.models import ModelSnapshot, OperationEconomics, PricingSource
 
 
@@ -71,7 +72,7 @@ class JudgePromptTemplate(ContractModel):
     """Versioned prompt, variable mapping, and strict response schema."""
 
     template_id: Literal["wmo-judge-evidence-json"] = "wmo-judge-evidence-json"
-    template_version: Literal["1"] = "1"
+    template_version: Literal["2"] = "2"
     response_shape: Literal["scalar", "boolean", "categorical", "pairwise"] = "scalar"
     prompt: PromptDefinition
     variable_mapping: JsonObject
@@ -270,26 +271,24 @@ class JudgeAxisProposal(ContractModel):
 
     dimension_id: ArtifactId
     proposed_score: int = Field(ge=0, le=10)
-    proposed_judgment: str = Field(min_length=1)
-    cited_trace_evidence: tuple[str, ...]
+    proposed_judgment: str = ""
+    cited_trace_evidence: tuple[str, ...] = ()
     cited_reference_trace_evidence: tuple[str, ...] = ()
 
     @field_validator("cited_trace_evidence")
     @classmethod
     def _require_unique_evidence(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Require at least one unique cited trace span for the proposal.
+        """Allow empty citations and reject empty or repeated span IDs.
 
         Args:
-            value: Configured-judge cited span identities.
+            value: Optional configured-judge cited span identities.
 
         Returns:
             The ordered citations unchanged.
 
         Raises:
-            ValueError: Citations are absent, empty, or repeated.
+            ValueError: A citation is empty or repeated.
         """
-        if not value:
-            raise ValueError("judge proposals require cited trace evidence")
         if any(not item for item in value) or len(set(value)) != len(value):
             raise ValueError("judge proposal evidence IDs must be nonempty and unique")
         return value
@@ -324,8 +323,8 @@ class FinalAcceptedJudgeLabel(ContractModel):
     """The label authorized by a human after reviewing a judge proposal."""
 
     score: int = Field(ge=0, le=10)
-    judgment: str = Field(min_length=1)
-    cited_trace_evidence: tuple[str, ...]
+    judgment: str = ""
+    cited_trace_evidence: tuple[str, ...] = ()
     cited_reference_trace_evidence: tuple[str, ...] = ()
     score_source: Literal["configured_judge", "human_correction"]
     judgment_source: Literal["configured_judge", "human_correction"]
@@ -333,19 +332,17 @@ class FinalAcceptedJudgeLabel(ContractModel):
     @field_validator("cited_trace_evidence")
     @classmethod
     def _require_unique_evidence(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Require the accepted label to retain concrete trace evidence.
+        """Allow empty accepted citations and reject empty or repeated span IDs.
 
         Args:
-            value: Trace span identities retained with the accepted label.
+            value: Optional trace span identities retained with the accepted label.
 
         Returns:
             The ordered citations unchanged.
 
         Raises:
-            ValueError: Citations are absent, empty, or repeated.
+            ValueError: A citation is empty or repeated.
         """
-        if not value:
-            raise ValueError("accepted judge labels require cited trace evidence")
         if any(not item for item in value) or len(set(value)) != len(value):
             raise ValueError("accepted label evidence IDs must be nonempty and unique")
         return value
@@ -591,10 +588,6 @@ class ManualJudgeTraceReviewArtifact(ArtifactEnvelope):
         )
         if self.reference_trace_evidence is None and any(reference_citations):
             raise ValueError("scalar trace reviews cannot cite reference trace evidence")
-        if self.reference_trace_evidence is not None and any(
-            not citations for citations in reference_citations
-        ):
-            raise ValueError("pairwise trace reviews must cite reference trace evidence")
         expected = tuple(
             sorted(
                 (
@@ -713,55 +706,30 @@ def judge_feedback_schema(
     """
     dimension_properties: JsonObject = {
         "dimension_id": {"type": "string"},
-        "feedback": {"type": "string", "minLength": 1},
+        "rationale": PORTABLE_RATIONALE_JSON_SCHEMA,
     }
-    required = ["dimension_id", "feedback"]
+    required = ["dimension_id"]
     if shape == "scalar":
         dimension_properties["raw_score"] = {
             "type": "integer",
             "minimum": min_score,
             "maximum": max_score,
         }
-        dimension_properties["evidence_span_ids"] = {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-            "uniqueItems": True,
-        }
-        required.extend(("raw_score", "evidence_span_ids"))
+        required.append("raw_score")
     elif shape == "boolean":
         dimension_properties["passed"] = {"type": "boolean"}
-        dimension_properties["evidence_span_ids"] = {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-            "uniqueItems": True,
-        }
-        required.extend(("passed", "evidence_span_ids"))
+        required.append("passed")
     elif shape == "categorical":
         if not categories:
             raise ValueError("categorical judge feedback requires at least one saved category")
         dimension_properties["category"] = {"type": "string", "enum": list(categories)}
-        dimension_properties["evidence_span_ids"] = {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-            "uniqueItems": True,
-        }
-        required.extend(("category", "evidence_span_ids"))
+        required.append("category")
     else:
         dimension_properties["winner"] = {
             "type": "string",
             "enum": ["winner_a", "winner_b", "tie"],
         }
-        for key in ("evidence_span_ids_a", "evidence_span_ids_b"):
-            dimension_properties[key] = {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 1,
-                "uniqueItems": True,
-            }
-        required.extend(("winner", "evidence_span_ids_a", "evidence_span_ids_b"))
+        required.append("winner")
     return {
         "type": "object",
         "additionalProperties": False,
