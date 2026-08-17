@@ -59,6 +59,28 @@ def _provider_free_settings(
     )
 
 
+def _source_for_stage(
+    root: Path,
+    project: str,
+    stage: ProjectProviderFreeStage,
+) -> SourceIdentity:
+    """Return the manifest-derived immutable source behind one selected stage.
+
+    Args:
+        root: WMO root containing the Project.
+        project: Project identifier owning the stage.
+        stage: Exact trace and task pointers selected by the Project.
+
+    Returns:
+        Source identity stored by the verified trace manifest.
+    """
+    source = (
+        ProjectStore(root, project).artifacts.read(stage.trace_dataset.artifact_id).manifest.source
+    )
+    assert source is not None
+    return source
+
+
 def _chat_export(
     path: Path,
     *,
@@ -148,10 +170,16 @@ def test_package_root_prepares_and_reopens_exact_provider_free_project_stage(
     assert isinstance(first, ProjectProviderFreeStage)
     assert replay == first
     assert reopened == first
-    assert first.source.source_id == "platform-trace-source:source-123"
-    assert first.code_revision == _PROVIDER_FREE_REVISION
     store = ProjectStore(root, "support-project")
     config = store.load_project()
+    trace_manifest = store.artifacts.read(first.trace_dataset.artifact_id).manifest
+    task_manifest = store.artifacts.read(first.task_set.artifact_id).manifest
+    assert set(first.model_dump()) == {"schema_version", "trace_dataset", "task_set"}
+    assert trace_manifest.source is not None
+    assert trace_manifest.source.source_id == "platform-trace-source:source-123"
+    assert trace_manifest.code_revision == _PROVIDER_FREE_REVISION
+    assert task_manifest.code_revision == trace_manifest.code_revision
+    assert task_manifest.inputs == (first.trace_dataset,)
     assert config.trace_preparation == settings
     assert config.provider_free_stage == first
     assert config.models is None
@@ -208,11 +236,15 @@ def test_provider_free_source_label_and_bytes_are_immutable_identity_inputs(
         settings=settings,
     )
 
-    assert changed_label.source.sha256 == baseline.source.sha256
-    assert changed_label.source.source_id != baseline.source.source_id
+    baseline_source = _source_for_stage(root, "baseline", baseline)
+    changed_label_source = _source_for_stage(root, "changed-label", changed_label)
+    changed_bytes_source = _source_for_stage(root, "changed-bytes", changed_bytes)
+
+    assert changed_label_source.sha256 == baseline_source.sha256
+    assert changed_label_source.source_id != baseline_source.source_id
     assert changed_label.trace_dataset != baseline.trace_dataset
-    assert changed_bytes.source.source_id == baseline.source.source_id
-    assert changed_bytes.source.sha256 != baseline.source.sha256
+    assert changed_bytes_source.source_id == baseline_source.source_id
+    assert changed_bytes_source.sha256 != baseline_source.sha256
     assert changed_bytes.trace_dataset != baseline.trace_dataset
 
 

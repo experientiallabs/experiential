@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import tomllib
-from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Literal
+from pathlib import Path
 
 import tomli_w
 from pydantic import Field, field_validator, model_validator
@@ -14,7 +13,6 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     SecretBoundaryError,
-    SourceIdentity,
     assert_secret_free,
 )
 from wmo.common.core.files import write_text_atomic
@@ -73,8 +71,6 @@ class ProjectTracePreparationSettings(ContractModel):
     """Provider-free settings fixed before canonical trace preparation starts."""
 
     source_kind: str = Field(min_length=1, max_length=64)
-    minimum_trace_count: Literal[100] = 100
-    maximum_trace_count: Literal[1000] = 1000
     fit_task_budget: int = Field(default=50, ge=0)
     held_out_task_budget: int = Field(default=20, ge=0)
     descriptor_dimensions: int = Field(default=64, ge=8)
@@ -90,31 +86,17 @@ class ProjectTracePreparationSettings(ContractModel):
 
 
 class ProjectProviderFreeStage(ContractModel):
-    """Exact immutable trace and task evidence selected before provider-backed work."""
+    """Exact immutable trace and task pointers selected before provider-backed work."""
 
     schema_version: int = 1
-    settings: ProjectTracePreparationSettings
-    source: SourceIdentity
     trace_dataset: ArtifactInput
     task_set: ArtifactInput
-    code_revision: str = Field(min_length=1, max_length=256)
 
     @model_validator(mode="after")
-    def _require_portable_complete_stage(self) -> ProjectProviderFreeStage:
-        """Reject incomplete stages and temporary filesystem source identities."""
+    def _require_distinct_artifacts(self) -> ProjectProviderFreeStage:
+        """Reject a stage that reuses one artifact for both semantic outputs."""
         if self.trace_dataset.artifact_id == self.task_set.artifact_id:
             raise ValueError("provider-free stage trace and task artifacts must be distinct")
-        if self.source.sha256 is None:
-            raise ValueError("provider-free stage source identity requires a byte digest")
-        source_id = self.source.source_id
-        if (
-            PurePosixPath(source_id).is_absolute()
-            or PureWindowsPath(source_id).is_absolute()
-            or source_id.casefold().startswith("file:")
-        ):
-            raise ValueError(
-                "provider-free stage source_id must be a durable label, not a filesystem path"
-            )
         return self
 
 
@@ -182,15 +164,10 @@ class ProjectConfig(ContractModel):
         return updated
 
     @model_validator(mode="after")
-    def _require_provider_free_settings_match_stage(self) -> ProjectConfig:
-        """Keep the mutable Project settings aligned with its selected immutable stage."""
-        if (
-            self.provider_free_stage is not None
-            and self.trace_preparation != self.provider_free_stage.settings
-        ):
-            raise ValueError(
-                "provider-free stage settings must match the Project trace preparation settings"
-            )
+    def _require_trace_preparation_for_provider_free_stage(self) -> ProjectConfig:
+        """Require Project-owned preparation settings before selecting provider-free evidence."""
+        if self.provider_free_stage is not None and self.trace_preparation is None:
+            raise ValueError("provider-free stage requires Project trace preparation settings")
         return self
 
 

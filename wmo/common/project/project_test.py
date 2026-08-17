@@ -6,14 +6,18 @@ from pathlib import Path
 
 import pytest
 
+from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.project import (
     AgentConfiguration,
     ProjectConfig,
     ProjectConfigError,
+    ProjectProviderFreeStage,
     ProjectTracePreparationSettings,
     load_project_config,
     write_project_config,
 )
+
+_DIGEST = "a" * 64
 
 
 def test_trace_first_config_omits_late_setup_without_changing_existing_defaults(
@@ -37,6 +41,27 @@ def test_trace_first_config_omits_late_setup_without_changing_existing_defaults(
     payload = path.read_text(encoding="utf-8")
     assert "retrieval" not in payload
     assert "budgets" not in payload
+
+
+def test_provider_free_contract_keeps_settings_and_stage_ownership_minimal() -> None:
+    """Project owns preparation settings while the selected stage stores only exact pointers."""
+    trace = ArtifactInput(artifact_id="trace-dataset", sha256=_DIGEST)
+    task = ArtifactInput(artifact_id="task-set", sha256=_DIGEST)
+    stage = ProjectProviderFreeStage(trace_dataset=trace, task_set=task)
+
+    assert set(ProjectTracePreparationSettings.model_fields) == {
+        "source_kind",
+        "fit_task_budget",
+        "held_out_task_budget",
+        "descriptor_dimensions",
+    }
+    assert stage.model_dump(mode="json") == {
+        "schema_version": 1,
+        "trace_dataset": trace.model_dump(mode="json"),
+        "task_set": task.model_dump(mode="json"),
+    }
+    with pytest.raises(ValueError, match="trace preparation settings"):
+        ProjectConfig(project_id="missing-settings", provider_free_stage=stage)
 
 
 def test_project_config_round_trip_preserves_safe_local_metadata(tmp_path: Path) -> None:
