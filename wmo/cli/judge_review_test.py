@@ -170,6 +170,7 @@ def test_one_trace_view_separates_conversation_and_truthfully_truncates() -> Non
         proposal,
         character_limit=40,
         page=False,
+        non_interactive=False,
         console=console,
     )
 
@@ -202,6 +203,56 @@ def test_one_trace_view_separates_conversation_and_truthfully_truncates() -> Non
     assert "Evidence content:" in output
     assert "truncated 40 characters" in output
     assert "use --page for the full transcript" in flattened
+
+
+@pytest.mark.parametrize(
+    ("page", "non_interactive", "expect_viewer"),
+    [
+        (False, False, True),
+        (True, False, False),
+        (False, True, False),
+    ],
+)
+def test_full_screen_viewer_runs_only_for_interactive_unpaged_reviews(
+    monkeypatch: pytest.MonkeyPatch,
+    page: bool,
+    non_interactive: bool,
+    expect_viewer: bool,
+) -> None:
+    """The viewer never intercepts paged or fully flag-driven reviews on a TTY.
+
+    Args:
+        monkeypatch: Scoped TTY detection and viewer replacement.
+        page: Whether the explicit pager mode is selected.
+        non_interactive: Whether every decision comes from explicit flags.
+        expect_viewer: Whether the full-screen viewer must own the display.
+    """
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=100, color_system=None, force_terminal=True)
+    monkeypatch.setattr(
+        review_module,
+        "_interactive_viewer_available",
+        lambda _console: True,
+    )
+    viewed: list[str] = []
+    monkeypatch.setattr(
+        review_module,
+        "view_trace_proposal",
+        lambda proposal, *, console: viewed.append(proposal.trace.trace_id),
+    )
+    proposal = _proposal(_trace("trace-a", completion="Done.", failed=False))
+
+    review_module.render_trace_proposal(
+        proposal,
+        character_limit=1_200,
+        page=page,
+        non_interactive=non_interactive,
+        console=console,
+    )
+
+    assert viewed == (["trace-a"] if expect_viewer else [])
+    if not expect_viewer and not page:
+        assert "Original user request:" in buffer.getvalue()
 
 
 def test_acceptance_prompts_only_after_every_axis_proposal_is_visible(
@@ -437,6 +488,7 @@ def test_page_expands_only_the_current_full_transcript() -> None:
         proposal,
         character_limit=40,
         page=True,
+        non_interactive=False,
         console=console,
     )
 

@@ -103,6 +103,7 @@ def build_manual_judge_reviewer(
             proposal,
             character_limit=character_limit,
             page=page,
+            non_interactive=non_interactive,
             console=console,
         )
         reference_id = (
@@ -164,6 +165,7 @@ def render_trace_proposal(
     *,
     character_limit: int,
     page: bool,
+    non_interactive: bool,
     console: Console,
 ) -> None:
     """Display one conversation and every configured-judge axis proposal.
@@ -172,10 +174,11 @@ def render_trace_proposal(
         proposal: Immutable configured-judge result and its source trace.
         character_limit: Maximum characters per field outside full paging.
         page: Whether to page the complete transcript.
+        non_interactive: Whether the review runs entirely from explicit flags.
         console: Rich console used for review output.
     """
     limit = None if page else character_limit
-    if _interactive_viewer_available(console):
+    if not page and not non_interactive and _interactive_viewer_available(console):
         view_trace_proposal(proposal, console=console)
         console.print(
             f"\n[bold]Trace {proposal.position} of {proposal.total}[/bold] reviewed in the "
