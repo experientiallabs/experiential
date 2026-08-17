@@ -43,7 +43,7 @@ from wmo.common.routing import (
     KnnGuard,
     RouterFeatureExtractor,
 )
-from wmo.optimize.router.activation import _load_project_router_for_composition
+from wmo.optimize.router.activation import load_project_router
 from wmo.optimize.router.fit.workflow import (
     EvaluationInputs,
     RouterOptimizationConfig,
@@ -101,7 +101,7 @@ def test_single_workflow_freezes_before_held_out_and_resumes_exactly(
         "task-held-01",
     )
     client = _Client()
-    runtime = _load_project_router_for_composition(
+    runtime = load_project_router(
         "project-a",
         tmp_path,
         policy_id=first.optimization.policy.policy_id,

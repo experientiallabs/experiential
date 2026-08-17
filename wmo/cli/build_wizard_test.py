@@ -43,7 +43,6 @@ from wmo.optimize.router.automatic.service_test import (
     _ProviderState,
 )
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
-from wmo.runtime.router.application import RouterApplicationError
 from wmo.simulation.build import ProjectBuild
 
 _RUNNER = CliRunner()
@@ -340,8 +339,18 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     assert printed.count("Setup mode") == 1
     assert printed.count("Authorize wmo build support") == 1
     assert "Judge syllabus" in printed
-    assert "Calibration is provisional" in printed
-    for label in ("RAG", "world model", "syllabus", "calibration", "router", "report"):
+    assert "Human calibration is optional" in printed
+    assert "next            wmo run support" in printed
+    assert "optional        wmo config judge calibrate support" in printed
+    for label in (
+        "serving RAG",
+        "fit RAG",
+        "simulation",
+        "syllabus",
+        "calibration",
+        "router",
+        "report",
+    ):
         assert label in printed
     assert "openai-secret" not in printed
     assert "openai-secret" not in (root / "models.toml").read_text(encoding="utf-8")
@@ -368,16 +377,76 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     assert policy.judgment_status == "provisional"
     assert state.embedding_calls
     assert state.completion_calls
-    with pytest.raises(RouterApplicationError, match="cannot be promoted or activated"):
-        load_project_router(
-            "support",
-            root,
-            policy_id=policy.policy_id,
-            runtime_catalog=cast(
-                RuntimeModelCatalog,
-                _WizardRuntimeCatalog(wizard.load_model_catalog(root / "models.toml"), state),
-            ),
+    runtime = load_project_router(
+        "support",
+        root,
+        policy_id=policy.policy_id,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _WizardRuntimeCatalog(wizard.load_model_catalog(root / "models.toml"), state),
+        ),
+    )
+    assert runtime.policy.judgment_status == "provisional"
+    provisional_policy_bytes = store.artifacts.read_bytes(policy.policy_id, "policy.json")
+    served: list[tuple[str, int]] = []
+    with monkeypatch.context() as run_patches:
+        run_patches.setattr(
+            "wmo.optimize.router.activation.load_project_router",
+            lambda *_args, **_kwargs: runtime,
         )
+        run_patches.setattr(
+            "uvicorn.run",
+            lambda _app, *, host, port: served.append((host, port)),
+        )
+        run_result = _RUNNER.invoke(
+            app,
+            ["run", "support", "--root", str(root), "--port", "8123"],
+        )
+    assert run_result.exit_code == 0, run_result.output
+    assert "provisional judgment" in run_result.output
+    assert "http://127.0.0.1:8123/v1" in run_result.output
+    assert served == [("127.0.0.1", 8123)]
+
+    current_catalog = wizard.load_model_catalog(root / "models.toml")
+    _approve_manual_judge(
+        store,
+        current_catalog,
+        state,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _WizardRuntimeCatalog(current_catalog, state),
+        ),
+    )
+    successor = _RUNNER.invoke(
+        app,
+        ["build", "support", "--root", str(root)],
+        input="y\n",
+        env={"OPENAI_API_KEY": "openai-secret", "WMO_RELEASE_REVISION": _REVISION},
+    )
+    assert successor.exit_code == 0, successor.output
+    successor_policies = tuple(
+        KnnRouterPolicy.model_validate_json(store.artifacts.read_bytes(item, "policy.json"))
+        for item in store.artifacts.list_ids()
+        if store.artifacts.read(item).manifest.artifact_type == "router-policy"
+    )
+    assert {item.judgment_status for item in successor_policies} == {
+        "provisional",
+        "human_calibrated",
+    }
+    assert store.artifacts.read_bytes(policy.policy_id, "policy.json") == provisional_policy_bytes
+    approved_policy = next(
+        item for item in successor_policies if item.judgment_status == "human_calibrated"
+    )
+    approved_runtime = load_project_router(
+        "support",
+        root,
+        policy_id=approved_policy.policy_id,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _WizardRuntimeCatalog(wizard.load_model_catalog(root / "models.toml"), state),
+        ),
+    )
+    assert approved_runtime.policy.judgment_status == "human_calibrated"
     completed_credentials = state.credential_resolutions
     completed_embeddings = tuple(state.embedding_calls)
     completed_completions = tuple(state.completion_calls)
@@ -401,7 +470,8 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     )
     assert replay.exit_code == 0, replay.output
     assert "Reused every verified project artifact" in unstyle(replay.output)
-    assert "wmo config judge calibrate support" in unstyle(replay.output)
+    assert "next    wmo run support" in unstyle(replay.output)
+    assert "wmo config judge calibrate support" not in unstyle(replay.output)
     assert lister.requests == ["openai"]
     assert state.credential_resolutions == completed_credentials
     assert tuple(state.embedding_calls) == completed_embeddings
@@ -1100,8 +1170,9 @@ def test_completed_replay_skips_every_prompt_and_provider_stage(
     assert "Reused every verified project artifact" in printed
     assert "policy-a" in printed
     assert "report-a" in printed
+    assert "next    wmo run support" in printed
     assert "wmo config judge calibrate support" in printed
-    assert "wmo build support" in printed
+    assert "after approval wmo build support" in printed
 
 
 def test_completed_replay_rejects_role_override_before_replay_probe(

@@ -68,7 +68,12 @@ from wmo.optimize.router.automatic.service import (
     optimize_project_router,
 )
 from wmo.optimize.router.composition import FidelityApprovalDecision, RouterCompositionBudget
-from wmo.optimize.router.judging.artifacts import read_audit, write_audit, write_review_state
+from wmo.optimize.router.judging.artifacts import (
+    read_audit,
+    read_review_state,
+    write_audit,
+    write_review_state,
+)
 from wmo.optimize.router.judging.contracts import ManualJudgeLabel, ManualJudgeReviewState
 from wmo.optimize.router.judging.provisional import bootstrap_provisional_judge
 from wmo.optimize.router.judging.service import (
@@ -95,10 +100,10 @@ _RUNNER = CliRunner()
 _CUSTOM_AGENT_CONSTRUCTIONS = 0
 
 
-def test_provisional_router_runs_replays_and_cannot_be_promoted(
+def test_provisional_router_runs_and_human_calibration_creates_successor(
     tmp_path: Path,
 ) -> None:
-    """Typed zero-label provenance completes optimization but remains non-promotable.
+    """Provisional routing is runnable and later approval creates an immutable successor.
 
     Args:
         tmp_path: Isolated local WMO root.
@@ -149,13 +154,14 @@ def test_provisional_router_runs_replays_and_cannot_be_promoted(
     assert result.preflight.judgment_status == "provisional"
     assert result.preflight.calibration_id == provisional.calibration_id
     assert policy.judgment_status == "provisional"
-    with pytest.raises(RouterApplicationError, match="cannot be promoted or activated"):
-        load_project_router(
-            "support",
-            store.paths.root,
-            policy_id=policy.policy_id,
-            runtime_catalog=cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
-        )
+    runtime = load_project_router(
+        "support",
+        store.paths.root,
+        policy_id=policy.policy_id,
+        runtime_catalog=cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+    )
+    assert runtime.policy.policy_id == policy.policy_id
+    provisional_policy_bytes = store.artifacts.read_bytes(policy.policy_id, "policy.json")
 
     before_credentials = state.credential_resolutions
     before_embeddings = tuple(state.embedding_calls)
@@ -195,9 +201,17 @@ def test_provisional_router_runs_replays_and_cannot_be_promoted(
 
     assert approved.preflight.judgment_status == "human_calibrated"
     assert approved.preflight.calibration_id != provisional.calibration_id
-    assert approved.composition.optimization.optimization.policy.judgment_status == (
-        "human_calibrated"
+    approved_policy = approved.composition.optimization.optimization.policy
+    assert approved_policy.judgment_status == "human_calibrated"
+    assert approved_policy.policy_id != policy.policy_id
+    assert store.artifacts.read_bytes(policy.policy_id, "policy.json") == provisional_policy_bytes
+    old_runtime = load_project_router(
+        "support",
+        store.paths.root,
+        policy_id=policy.policy_id,
+        runtime_catalog=cast(RuntimeModelCatalog, _RuntimeCatalog(approved_catalog, state)),
     )
+    assert old_runtime.policy.judgment_status == "provisional"
 
 
 def test_identity_free_history_runs_full_fresh_candidate_schedule(
@@ -1371,6 +1385,8 @@ def _approve_manual_judge(
     store: ProjectStore,
     catalog: ModelCatalog,
     state: _ProviderState,
+    *,
+    runtime_catalog: RuntimeModelCatalog | None = None,
 ) -> None:
     """Persist one explicitly approved real-trace judge calibration.
 
@@ -1378,15 +1394,17 @@ def _approve_manual_judge(
         store: Completed project store.
         catalog: Exact build-time catalog.
         state: Shared provider counters.
+        runtime_catalog: Optional resolver matching alternate catalog aliases.
     """
-    setup_plan = prepare_manual_judge_setup(
-        store,
-        catalog,
-        preview_count=1,
-        created_at=_TIME,
-        code_revision=_REVISION,
-    )
-    commit_manual_judge_setup(store, setup_plan, confirmed=True)
+    if read_review_state(store) is None:
+        setup_plan = prepare_manual_judge_setup(
+            store,
+            catalog,
+            preview_count=1,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+        commit_manual_judge_setup(store, setup_plan, confirmed=True)
     plan = prepare_manual_judge_calibration(store, sample_size=2)
     labels = tuple(
         ManualJudgeLabel(
@@ -1396,14 +1414,24 @@ def _approve_manual_judge(
         )
         for trace in plan.traces
     )
+    judge_alias = catalog.roles.judge
+    assert judge_alias is not None
+    capabilities = catalog.models[judge_alias].capabilities
+    assert capabilities is not None
+    assert capabilities.input_cost_per_million_tokens_usd is not None
+    assert capabilities.output_cost_per_million_tokens_usd is not None
+    assert capabilities.context_window_tokens is not None
     budget = estimate_manual_judge_budget(
         plan,
-        input_usd_per_million_tokens=1.0,
-        output_usd_per_million_tokens=2.0,
-        maximum_input_tokens_per_call=32_768,
-        maximum_cost_usd=1.0,
+        input_usd_per_million_tokens=capabilities.input_cost_per_million_tokens_usd,
+        output_usd_per_million_tokens=capabilities.output_cost_per_million_tokens_usd,
+        maximum_input_tokens_per_call=min(
+            32_768,
+            capabilities.context_window_tokens - 4_096,
+        ),
+        maximum_cost_usd=100.0,
     )
-    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    runtime = runtime_catalog or cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
     calibrate_manual_judge(
         store,
         runtime,

@@ -52,9 +52,10 @@ uv run pytest -q
   simulation-dollar and judgment-call ceilings. Preserve its phase boundary: held-out evidence
   opens only after fit evidence, approval, policy locking, and remaining-budget checks pass.
 - `wmo optimize router PROJECT --root ROOT` discovers the completed build, fit-only RAG, grounded
-  world model, approved manual judge calibration, and confirmed router candidates from the
-  project. It freezes one shared provider ceiling before calls, simulates and judges missing
-  evidence, locks the fit policy before held-out execution, and exactly replays completed work.
+  world model, judge syllabus and provenance, and confirmed router candidates from the project.
+  Human calibration is recommended but optional. The command freezes one shared provider ceiling
+  before calls, simulates and judges missing evidence, locks the fit policy before held-out
+  execution, and exactly replays completed work.
 - `wmo run PROJECT --root ROOT --port PORT [--ghost]` loads one frozen policy and exposes OpenAI Chat
   Completions, Responses, and Models routes on loopback. Public request and response types come
   from the official OpenAI SDK. Chat retries use the standard `Idempotency-Key`; Responses

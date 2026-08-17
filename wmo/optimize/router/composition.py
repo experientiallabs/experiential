@@ -58,7 +58,7 @@ from wmo.common.project import (
 from wmo.common.rollouts import SimulationArtifactSet
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import KnnBankManifest
-from wmo.optimize.router.activation import _load_project_router_for_composition
+from wmo.optimize.router.activation import load_project_router
 from wmo.optimize.router.errors import RouterCompositionError
 from wmo.optimize.router.evaluation.build import (
     completed_project_build,
@@ -521,7 +521,7 @@ def compose_router(
         root=project.paths.root,
     )
     _phase(phase_hook, "report_complete")
-    runtime = _load_project_router_for_composition(
+    runtime = load_project_router(
         project.paths.project_id,
         project.paths.root,
         policy_id=optimized.optimization.policy.policy_id,

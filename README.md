@@ -2,8 +2,8 @@
 
 WMO optimizes agent workflows from traces through a three-step process:
 
-1. Build a simulation using text world models grounded on your traces.
-2. Fit a router that determines which model every request should be sent to.
+1. Build a simulation and two RAG indexes from your traces: one for serving and one for router fit.
+2. Evaluate real candidate models in closed loop, then fit a router for each request.
 3. Train custom open source models just for your agent.
 
 ![Your traces flow through simulation into routing and training optimization](https://raw.githubusercontent.com/experientiallabs/world-model-optimizer/main/assets/wmo-workflow.png)
@@ -22,14 +22,8 @@ your current agent:
 ```bash
 pip install world-model-optimizer
 
-# Collect secret-free provider connections, including azure and bedrock
-wmo config providers
-
-# Build simulation from your agent traces
-wmo build support-agent traces.otel.jsonl
-
-# Optimize a router against the simulation to use the best model for every task
-wmo optimize router support-agent
+# Build simulation, both RAG indexes, the syllabus, evaluations, and router
+wmo build support-agent --traces traces.otel.jsonl
 
 # Run your router as an OpenAI compatible endpoint
 wmo run support-agent
@@ -47,8 +41,13 @@ and pass it to the same command without a source adapter or conversion step:
 ```bash
 curl -L -o traces.otel.jsonl \
   https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl
-wmo build terminal-tasks traces.otel.jsonl
+wmo build terminal-tasks --traces traces.otel.jsonl
 ```
+
+The default build keeps judge provenance truthful and can run before human calibration. To add
+human-approved examples later, run `wmo config judge calibrate PROJECT`, then rerun
+`wmo build PROJECT` to create an immutable human-calibrated successor. Endpoint traffic is saved
+by default and can supply new evidence for later router optimization.
 
 After collecting traces from your router, fine-tune an open source model you own using
 [Tinker](https://tinker.thinkingmachines.ai/).

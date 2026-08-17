@@ -220,7 +220,7 @@ def run_build_wizard(
         return
 
     if not plan.build_reused:
-        console.print("[bold]1/4 RAG and world model[/bold]")
+        console.print("[bold]1/4 Simulation and RAG indexes[/bold]")
         from wmo.cli.build_cmd import _complete_grounded_build, _validated_role_snapshots
 
         assert plan.completed is not None
@@ -242,7 +242,7 @@ def run_build_wizard(
             provider_spend_authorized=True,
         )
     else:
-        console.print("[bold]1/4 RAG and world model[/bold] [green]reused[/green]")
+        console.print("[bold]1/4 Simulation and RAG indexes[/bold] [green]reused[/green]")
 
     store = ProjectStore(root, project)
     console.print("[bold]2/4 Judge syllabus[/bold]")
@@ -253,8 +253,8 @@ def run_build_wizard(
         code_revision=code_revision,
     )
     console.print(
-        "  Calibration is provisional until a human approves examples; the router and report "
-        "will be marked provisional."
+        "  Human calibration is optional. This build keeps provisional judgment provenance "
+        "until examples are approved."
     )
 
     console.print("[bold]3/4 Router plan[/bold]")
@@ -297,17 +297,17 @@ def run_build_wizard(
     console.print("[green]Complete[/green]")
     selected_build = store.load_project().build
     assert selected_build is not None
-    console.print(f"  RAG             {selected_build.serving_rag.artifact_id}")
-    console.print(f"  world model     {selected_build.world_model.artifact_id}")
+    console.print(f"  serving RAG     {selected_build.serving_rag.artifact_id}")
+    console.print(f"  fit RAG         {selected_build.fit_rag.artifact_id}")
+    console.print(f"  simulation      {selected_build.world_model.artifact_id}")
     console.print(f"  syllabus        {preflight.setup.rubric.artifact_id}")
     console.print(f"  calibration     {preflight.calibration_id} ({preflight.judgment_status})")
     console.print(f"  router          {policy.policy_id} ({policy.judgment_status})")
     console.print(f"  report          {report.report_id}")
+    console.print(f"  next            wmo run {project}")
     if preflight.judgment_status == "provisional":
-        console.print(f"  next            wmo config judge calibrate {project}")
-        console.print(f"  then            wmo build {project}")
-    else:
-        console.print(f"  next            wmo run {project}")
+        console.print(f"  optional        wmo config judge calibrate {project}")
+        console.print(f"  after approval  wmo build {project}")
 
 
 def _ensure_judge_calibration(
@@ -378,8 +378,18 @@ def _completed_replay(
     store = ProjectStore(root, project)
     if not store.paths.project_toml.exists():
         return None
+    state = read_review_state(store)
+    if state is None:
+        return None
+    if state.approved_calibration is not None:
+        judgment_status = "human_calibrated"
+    elif state.provisional_calibration is not None:
+        judgment_status = "provisional"
+    else:
+        return None
     return find_persisted_automatic_router_replay(
         store,
+        judgment_status=judgment_status,
         code_revision=code_revision,
     )
 
@@ -442,11 +452,10 @@ def _render_completed_replay(
     console.print("[green]Complete[/green] Reused every verified project artifact.")
     console.print(f"  router  {replay.policy_id}")
     console.print(f"  report  {replay.report_id}")
+    console.print(f"  next    wmo run {project}")
     if replay.judgment_status == "provisional":
-        console.print(f"  next    wmo config judge calibrate {project}")
-        console.print(f"  then    wmo build {project}")
-    else:
-        console.print(f"  next    wmo run {project}")
+        console.print(f"  optional wmo config judge calibrate {project}")
+        console.print(f"  after approval wmo build {project}")
 
 
 def _select_trace(initial_source: str, *, console: Console) -> tuple[str, Path]:
@@ -876,7 +885,7 @@ def _render_plan(
     )
     console.print("  RAG          serving and fit indexes")
     console.print("  syllabus     task-success rubric and evaluation instructions")
-    console.print("  calibration  provisional; human approval is recommended before activation")
+    console.print("  calibration  provisional; optional human approval creates a successor")
     console.print(
         f"  build spend  estimate ${plan.build_estimate_usd:.6f}; ceiling ${build_ceiling:.4f}"
     )

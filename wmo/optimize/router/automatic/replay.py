@@ -20,7 +20,7 @@ from wmo.common.models import (
 )
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.routing import KnnRouterPolicy
-from wmo.optimize.router.activation import _load_project_router_for_composition
+from wmo.optimize.router.activation import load_project_router
 from wmo.optimize.router.automatic.attribution import load_router_observed_attribution_set
 from wmo.optimize.router.automatic.execution_contract import (
     RouterExecutionContract,
@@ -174,7 +174,7 @@ def find_completed_automatic_router_replay(
             RuntimeModelCatalog,
             _ReadOnlyReplayCatalog(preflight.catalog),
         )
-        _load_project_router_for_composition(
+        load_project_router(
             project.paths.project_id,
             project.paths.root,
             policy_id=policy.policy_id,
@@ -200,12 +200,14 @@ def find_completed_automatic_router_replay(
 def find_persisted_automatic_router_replay(
     project: ProjectStore,
     *,
+    judgment_status: Literal["provisional", "human_calibrated"],
     code_revision: str,
 ) -> AutomaticRouterReplay | None:
     """Find one recursively verified completed chain without replanning current prices.
 
     Args:
         project: Existing project whose selected build and immutable router chain are verified.
+        judgment_status: Current authoritative judge status required for the replayed policy.
         code_revision: Current package-owned producer identity.
 
     Returns:
@@ -220,7 +222,7 @@ def find_persisted_automatic_router_replay(
     matches = []
     for policy_id in _artifact_ids(project, "router-policy"):
         policy = _load_policy(project, policy_id)
-        if policy.code_revision != code_revision:
+        if policy.code_revision != code_revision or policy.judgment_status != judgment_status:
             continue
         plan, plan_input = read_evaluation_plan(project.artifacts, policy.evaluation_plan_id)
         if (
