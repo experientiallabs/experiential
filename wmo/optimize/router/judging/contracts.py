@@ -72,7 +72,7 @@ class JudgePromptTemplate(ContractModel):
     """Versioned prompt, variable mapping, and strict response schema."""
 
     template_id: Literal["wmo-judge-evidence-json"] = "wmo-judge-evidence-json"
-    template_version: Literal["2"] = "2"
+    template_version: Literal["1", "2"] = "2"
     response_shape: Literal["scalar", "boolean", "categorical", "pairwise"] = "scalar"
     prompt: PromptDefinition
     variable_mapping: JsonObject
@@ -89,6 +89,11 @@ class JudgePromptTemplate(ContractModel):
         Raises:
             ValueError: The schema, variables, or projection cannot be executed exactly.
         """
+        if self.template_version == "1":
+            raise ValueError(
+                "manual judge setup template_version 1 used the retired citation contract; "
+                "re-run wmo config judge setup to finalize template_version 2"
+            )
         required = (
             {"rubric", "candidate_a", "candidate_b"}
             if self.response_shape == "pairwise"

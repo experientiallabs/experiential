@@ -98,3 +98,23 @@ def test_dimension_judgment_accepts_missing_null_and_unbounded_rationale() -> No
     assert missing.rationale is None
     assert explicit_null.rationale is None
     assert unbounded.rationale == long_rationale
+
+
+def test_dimension_judgment_loads_retired_citation_fields() -> None:
+    """Citation-era judgments keep their score and map feedback onto rationale."""
+    loaded = DimensionJudgment.model_validate(
+        {
+            "dimension_id": "task-success",
+            "raw_score": 4,
+            "calibrated_score": 3.8,
+            "min_score": 0,
+            "max_score": 5,
+            "evidence_span_ids": ["span-1"],
+            "feedback": "The refund request includes the order and reason.",
+        }
+    )
+    dumped = loaded.model_dump(mode="json")
+
+    assert loaded.rationale == "The refund request includes the order and reason."
+    assert "evidence_span_ids" not in dumped
+    assert "feedback" not in dumped

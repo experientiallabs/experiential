@@ -141,6 +141,19 @@ def test_structured_shapes_parse_missing_and_null_rationale() -> None:
     assert categorical.dimensions[0].rationale is None
     assert pairwise.dimensions[0].rationale is None
     assert scalar.dimensions[0].rationale is None
+    legacy = _BooleanResponse.model_validate(
+        {
+            "dimensions": [
+                {
+                    "dimension_id": "task-success",
+                    "passed": True,
+                    "evidence_span_ids": ["span-1"],
+                    "feedback": "Legacy citation-era feedback.",
+                }
+            ]
+        }
+    )
+    assert legacy.dimensions[0].rationale == "Legacy citation-era feedback."
     assert (
         RawDimensionJudgment.model_validate(
             {"dimension_id": "task-success", "raw_score": 5, "rationale": "x" * 8_192}
