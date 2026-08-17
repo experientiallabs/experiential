@@ -710,9 +710,7 @@ def _installed_release_driver() -> None:
             trace_ids.append(trace_id)
             model = "core-model" if index % 2 == 0 else "candidate-b-model"
             capabilities_sha256 = (
-                core_capabilities_sha256
-                if model == "core-model"
-                else candidate_capabilities_sha256
+                core_capabilities_sha256 if model == "core-model" else candidate_capabilities_sha256
             )
             base = 1_760_000_000_000_000_000 + index * 10_000_000_000
             common = [
@@ -919,9 +917,8 @@ def _installed_release_driver() -> None:
         ),
         ("Azure OpenAI base URL", azure_endpoint),
         ("Azure OpenAI API version", ""),
-        ("Select the models to configure", "1"),
-        ("cancels.", ""),
-        ("Connection for the declared model", "1"),
+        ("Select the models to configure", space + down + enter),
+        ("Connection for the declared model", enter),
         ("Provider model ID", "core-model"),
         ("Supports chat completions?", "y"),
         ("Supports embeddings?", "y"),
