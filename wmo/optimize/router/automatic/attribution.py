@@ -186,6 +186,9 @@ def resolve_router_observed_attributions(
     Raises:
         RouterAttributionError: No fit lineage resolves, or any unresolved lineage is zero-match,
             ambiguous, conflicting, or crosses candidate aliases.
+        RouterAttributionPreconditionError: The overlap limit, identity evidence, candidate
+            set, trace IDs, or fit-task partition is structurally invalid before any trace
+            identity is examined.
     """
     if preferred_overlap_limit <= 0:
         raise RouterAttributionPreconditionError("preferred overlap limit must be positive")
@@ -206,6 +209,10 @@ def resolve_router_observed_attributions(
     traces_by_id = {trace.trace_id: trace for trace in traces}
     if len(traces_by_id) != len(traces):
         raise RouterAttributionPreconditionError("candidate attribution traces repeat trace IDs")
+    if not any(task.partition == "fit" for task in tasks):
+        raise RouterAttributionPreconditionError(
+            "candidate attribution needs at least one fit task"
+        )
     evidence_by_key = (
         None
         if evidence is None

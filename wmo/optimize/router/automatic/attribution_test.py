@@ -239,7 +239,8 @@ def test_trace_without_model_and_missing_evidence_are_typed_failures() -> None:
 
 
 def test_structural_precondition_failures_are_typed_distinctly_from_identity_gaps() -> None:
-    """Invalid limits, candidate sets, or repeated traces never read as missing identity."""
+    """Invalid limits, candidate sets, repeated traces, or a missing fit partition never read
+    as missing identity."""
     trace = _trace((None,))
     candidates = _candidates(
         _model("openai", "gpt-a", None, "a", "b"),
@@ -266,6 +267,15 @@ def test_structural_precondition_failures_are_typed_distinctly_from_identity_gap
         resolve_router_observed_attributions(
             (_task(trace),),
             (trace, trace),
+            None,
+            candidates,
+            preferred_overlap_limit=1,
+        )
+    held_out = _task(trace).model_copy(update={"partition": "held_out"})
+    with pytest.raises(RouterAttributionPreconditionError, match="at least one fit task"):
+        resolve_router_observed_attributions(
+            (held_out,),
+            (trace,),
             None,
             candidates,
             preferred_overlap_limit=1,
