@@ -372,7 +372,6 @@ class RecordingCandidateClient:
             candidate_responses=tuple(self._candidate_responses),
             world_model_responses=tuple(self._world_model_responses),
             prior_retrieval=tuple(self._retrieval_economics),
-            query=query_economics,
             maximum_cost_usd=self._maximum_cost_usd,
         )
         self._retrieval_economics.append(query_economics)
@@ -468,26 +467,26 @@ def _require_query_budget(
     candidate_responses: Sequence[ModelResponse],
     world_model_responses: Sequence[ModelResponse],
     prior_retrieval: Sequence[OperationEconomics],
-    query: OperationEconomics,
     maximum_cost_usd: float,
 ) -> None:
-    """Refuse an embedding call unless known spend and its reservation fit.
+    """Refuse an embedding call once reconciled prior spend reaches the ceiling.
+
+    A pending query's conservative economics never gate dispatch: only accumulated actual
+    spend does, so a large estimate cannot end an episode that still has real budget.
 
     Args:
         candidate_responses: Completed candidate calls in this cell.
         world_model_responses: Completed world-model calls in this cell.
         prior_retrieval: Estimated query-embedding costs already dispatched in this cell.
-        query: Conservative economics for the pending exact query.
         maximum_cost_usd: Remaining provider-spend ceiling assigned to this cell.
 
     Raises:
-        TextSimulationError: Prior spend is unknown or the pending query would exceed the ceiling.
+        TextSimulationError: Prior spend is unknown or has reached the ceiling.
     """
     costs = [
         *(response.economics.cost_usd for response in candidate_responses),
         *(response.economics.cost_usd for response in world_model_responses),
         *(economics.cost_usd for economics in prior_retrieval),
-        query.cost_usd,
     ]
     if any(cost is None for cost in costs):
         raise _text_failure(
@@ -497,11 +496,11 @@ def _require_query_budget(
             phase="query_embedding_budget",
         )
     total = math.fsum(cast(NumericMeasurement, cost).value for cost in costs)
-    if total > maximum_cost_usd:
+    if total >= maximum_cost_usd:
         raise _text_failure(
             StopReason.MAXIMUM_COST,
             FailureCode.BUDGET,
-            "query embedding reservation exceeds the remaining simulation spend ceiling",
+            "reconciled provider spend reached the simulation ceiling before the query",
             phase="query_embedding_budget",
         )
 
@@ -517,7 +516,11 @@ def _require_completion_budget(
     prior_retrieval: Sequence[OperationEconomics],
     maximum_cost_usd: float,
 ) -> None:
-    """Refuse one completion unless known prior spend plus its ceiling fits.
+    """Refuse one completion on a hard request bound or exhausted reconciled spend.
+
+    The pending request must fit the model's real context-derived ceilings, and dispatch is
+    blocked once accumulated actual spend reaches the cell ceiling. The priced pending cost is
+    a planning value only and never gates dispatch on its own.
 
     Args:
         role: Candidate or world-model label for safe diagnostics.
@@ -530,7 +533,8 @@ def _require_completion_budget(
         maximum_cost_usd: Provider-spend ceiling assigned to the cell.
 
     Raises:
-        TextSimulationError: Prior spend is unknown, bounds drifted, or the call exceeds budget.
+        TextSimulationError: Prior spend is unknown, a hard request bound fails, or spend
+            reached the ceiling.
     """
     output_tokens = request.maximum_output_tokens
     if output_tokens is None:
@@ -541,7 +545,7 @@ def _require_completion_budget(
             phase=f"{role.replace(' ', '_')}_budget",
         )
     try:
-        pending = completion_request_cost_usd(
+        completion_request_cost_usd(
             reservation,
             input_tokens=token_counter.count(request),
             output_tokens=output_tokens,
@@ -565,12 +569,12 @@ def _require_completion_budget(
             f"{role} call is blocked because prior provider spend is unknown",
             phase=f"{role.replace(' ', '_')}_budget",
         )
-    total = math.fsum((*(cast(NumericMeasurement, cost).value for cost in costs), pending))
-    if total > maximum_cost_usd:
+    total = math.fsum(cast(NumericMeasurement, cost).value for cost in costs)
+    if total >= maximum_cost_usd:
         raise _text_failure(
             StopReason.MAXIMUM_COST,
             FailureCode.BUDGET,
-            f"{role} reservation exceeds the remaining simulation spend ceiling",
+            f"reconciled provider spend reached the simulation ceiling before the {role} call",
             phase=f"{role.replace(' ', '_')}_budget",
         )
 

@@ -95,11 +95,10 @@ _ROLLOUT_FILE = "rollout.json"
 class WorldModelSimulator:
     """Execute a text-only customer agent against a remote world-model provider.
 
-    The simulator deliberately owns only one concrete mode. It invokes an independently resolved
-    candidate client and world-model client, gives the agent an execute-only no-tools environment,
-    and persists one immutable rollout per selected evaluation cell. It never exposes a mutable
-    world-model session, sends no tools to the world model, and records candidate economics apart
-    from simulator operating cost.
+    The simulator deliberately owns only one concrete mode. It invokes independently resolved
+    candidate and world-model clients, gives the agent an execute-only no-tools environment,
+    persists one immutable rollout per selected cell, never exposes a mutable world-model session,
+    sends no tools to the world model, and records candidate economics apart from simulator cost.
 
     Args:
         store: Immutable local artifact store receiving specifications and rollout artifacts.
@@ -693,8 +692,6 @@ class WorldModelSimulator:
         reservation_failure = episode_reservation_failure(
             settings,
             completion_contract=self._completion_contract,
-            candidate_alias=cell.candidate_alias,
-            maximum_steps=spec.maximum_steps,
             remaining_cost_usd=maximum_cell_cost_usd,
         )
         if reservation_failure is not None:

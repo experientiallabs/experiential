@@ -91,14 +91,34 @@ def test_router_embedding_reservation_is_admitted_before_other_provider_work() -
         problems,
         maximum_provider_cost_usd=1,
         router_reservation=reservation,
-        judge_reservation_cost_usd=0,
     )
 
     assert remaining == 0
     assert problems == [
-        "router embedding and judge reservations consume the entire provider spend ceiling; "
+        "the router embedding reservation consumes the entire provider spend ceiling; "
         "increase --maximum-simulation-cost-usd or lower a request/retry ceiling"
     ]
+
+
+def test_shared_remainder_excludes_only_the_router_embedding_reservation() -> None:
+    """Judge planning estimates take no upfront carve-out from the shared spend pool."""
+    reservation = router_embedding_reservation(
+        model=_catalog_model_snapshot(),
+        input_usd_per_million_tokens=1,
+        maximum_attempts_per_feature=1,
+        maximum_input_tokens_per_feature=1_000,
+        feature_count=1,
+    )
+    problems: list[str] = []
+
+    remaining = remaining_simulation_budget(
+        problems,
+        maximum_provider_cost_usd=50,
+        router_reservation=reservation,
+    )
+
+    assert problems == []
+    assert remaining == 50 - reservation.estimated_cost_usd
 
 
 def _catalog() -> ModelCatalog:

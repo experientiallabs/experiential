@@ -87,7 +87,11 @@ from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_
 
 
 class RouterCompositionBudget(ContractModel):
-    """Finite dispatch ceilings required by the composed customer workflow."""
+    """Finite dispatch ceilings required by the composed customer workflow.
+
+    ``maximum_simulation_cost_usd`` is one shared provider-spend pool: simulation and judging
+    both draw from it as reconciled actual cost, with no estimate-based carve-outs.
+    """
 
     maximum_simulation_cost_usd: float = Field(gt=0)
     maximum_judgments: int = Field(gt=0)
@@ -302,14 +306,7 @@ def compose_router(
     fit_spend = _verified_simulation_spend(project, fit_set)
     if fit_spend > budget.maximum_simulation_cost_usd:
         raise RouterCompositionError("verified fit simulation spend exceeds the total budget")
-    remaining_cost_usd = max(0.0, budget.maximum_simulation_cost_usd - fit_spend)
-    if remaining_cost_usd <= 0 and any(
-        cell.purpose == "held_out" and cell.execution == "simulate" for cell in plan.cells
-    ):
-        raise RouterCompositionError(
-            "fit simulation consumed the total budget; held-out dispatch is blocked"
-        )
-    fit_evidence, fit_consumed = _complete_cell_evidence(
+    fit_evidence, fit_consumed, fit_judge_spend = _complete_cell_evidence(
         project,
         plan_input,
         fit_cells,
@@ -318,9 +315,19 @@ def compose_router(
         review,
         services.judge,
         budget.maximum_judgments,
+        remaining_cost_usd=budget.maximum_simulation_cost_usd - fit_spend,
         progress=progress,
         progress_detail="fit",
     )
+    remaining_cost_usd = max(
+        0.0, budget.maximum_simulation_cost_usd - math.fsum((fit_spend, fit_judge_spend))
+    )
+    if remaining_cost_usd <= 0 and any(
+        cell.purpose == "held_out" and cell.execution == "simulate" for cell in plan.cells
+    ):
+        raise RouterCompositionError(
+            "fit simulation and judging consumed the total budget; held-out dispatch is blocked"
+        )
     fit_config = RouterFitConfig(
         fit=EvaluationInputs(
             evaluation_plan_id=plan.plan_id,
@@ -370,7 +377,7 @@ def compose_router(
     held_out_spend = _verified_simulation_spend(project, held_set)
     if math.fsum((fit_spend, held_out_spend)) > budget.maximum_simulation_cost_usd:
         raise RouterCompositionError("verified composed simulation spend exceeds the total budget")
-    held_evidence, _held_dispatched = _complete_cell_evidence(
+    held_evidence, _held_dispatched, _held_judge_spend = _complete_cell_evidence(
         project,
         plan_input,
         held_cells,
@@ -379,6 +386,8 @@ def compose_router(
         review,
         services.judge,
         budget.maximum_judgments - fit_consumed,
+        remaining_cost_usd=budget.maximum_simulation_cost_usd
+        - math.fsum((fit_spend, fit_judge_spend, held_out_spend)),
         progress=progress,
         progress_detail="held-out",
     )
@@ -660,14 +669,20 @@ def _complete_cell_evidence(
     judge: Judge,
     maximum_judgments: int,
     *,
+    remaining_cost_usd: float,
     progress: ProgressHook | None = None,
     progress_detail: str | None = None,
-) -> tuple[tuple[EvaluationCellEvidence, ...], int]:
+) -> tuple[tuple[EvaluationCellEvidence, ...], int, float]:
     """Verify evidence and reserve each bounded judgment dispatch durably before calling it.
 
     A persisted reservation without a completed judgment marks an interrupted dispatch; the
     judgment is dispatched again under that same consumed reservation, so a judge failure never
     strands the project and never widens the finite judgment budget.
+
+    Judgments draw from the shared provider pool as reconciled actual spend: a new dispatch is
+    admitted while accumulated judge spend stays under ``remaining_cost_usd`` and blocked once
+    real spend reaches it, never on a planning estimate. The returned total covers every
+    judgment bound to the evidence so later phases subtract actual, not estimated, judge cost.
     """
     rollouts_by_cell = {}
     for rollout_id in simulated_rollout_ids:
@@ -723,6 +738,9 @@ def _complete_cell_evidence(
 
     evidence = []
     consumed = 0
+    judge_spend_usd = math.fsum(
+        _known_judgment_spend(judgment) for judgment in judgments_by_rollout.values()
+    )
     report(progress, "judgments", completed=0, total=len(bound_cells), detail=progress_detail)
     for cell, rollout_id, protocol in bound_cells:
         rollout = rollouts_by_id[rollout_id]
@@ -758,6 +776,7 @@ def _complete_cell_evidence(
                 )
                 if judgment is not None:
                     judgments_by_rollout[rollout_id] = judgment
+                    judge_spend_usd = math.fsum((judge_spend_usd, _known_judgment_spend(judgment)))
         except JudgmentBudgetError as exc:
             raise RouterCompositionError(str(exc)) from exc
         if judgment is not None or receipt is not None:
@@ -765,6 +784,11 @@ def _complete_cell_evidence(
         if consumed > maximum_judgments:
             raise RouterCompositionError("judgment dispatch budget exhausted")
         if judgment is None:
+            if judge_spend_usd >= remaining_cost_usd:
+                raise RouterCompositionError(
+                    "reconciled provider spend reached the shared ceiling before judgment "
+                    "dispatch; increase --maximum-simulation-cost-usd and rerun to resume"
+                )
             if receipt is None:
                 if consumed >= maximum_judgments:
                     raise RouterCompositionError("judgment dispatch budget exhausted")
@@ -789,6 +813,7 @@ def _complete_cell_evidence(
             )
             _persist_judgment(project, judgment)
             judgments_by_rollout[rollout_id] = judgment
+            judge_spend_usd = math.fsum((judge_spend_usd, _known_judgment_spend(judgment)))
         evidence.append(
             EvaluationCellEvidence(
                 cell_id=cell.cell_id,
@@ -805,7 +830,22 @@ def _complete_cell_evidence(
             total=len(bound_cells),
             detail=progress_detail,
         )
-    return tuple(evidence), consumed
+    return tuple(evidence), consumed, judge_spend_usd
+
+
+def _known_judgment_spend(judgment: Judgment) -> float:
+    """Return one judgment's reconciled judge dispatch cost.
+
+    Args:
+        judgment: Persisted or freshly dispatched judgment.
+
+    Returns:
+        Known judge spend in USD, or zero when the judge reported no economics.
+    """
+    economics = judgment.judge_economics
+    if economics is None or economics.cost_usd is None:
+        return 0.0
+    return economics.cost_usd.value
 
 
 def _rollout_failed(rollout: RolloutArtifact) -> bool:

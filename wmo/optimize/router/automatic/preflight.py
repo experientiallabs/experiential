@@ -277,7 +277,6 @@ def preflight_automatic_router(
         problems,
         maximum_provider_cost_usd=options.maximum_provider_cost_usd,
         router_reservation=reservation,
-        judge_reservation_cost_usd=judge_reservation_cost_usd,
     )
     if problems:
         raise _preflight_error(problems)

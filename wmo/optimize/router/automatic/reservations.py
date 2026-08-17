@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 from wmo.common.core.artifacts import canonical_json_bytes
 from wmo.common.models import (
     CompletionCostReservation,
@@ -394,27 +392,26 @@ def remaining_simulation_budget(
     *,
     maximum_provider_cost_usd: float,
     router_reservation: RouterEmbeddingReservation | None,
-    judge_reservation_cost_usd: float,
 ) -> float:
-    """Subtract non-simulation reservations from one provider-spend ceiling.
+    """Subtract the router-embedding reservation from one provider-spend ceiling.
+
+    Judge calls take no upfront carve-out: judgments draw from this same shared remainder as
+    reconciled actual spend, so a large judge planning estimate never starves simulation.
 
     Args:
         problems: Mutable aggregate problem list.
         maximum_provider_cost_usd: User-approved total provider ceiling.
         router_reservation: Conservative router-feature embedding reservation.
-        judge_reservation_cost_usd: Full maximum judgment-set reservation.
 
     Returns:
-        Positive ceiling remaining for candidate, retrieval, and world-model calls.
+        Positive shared ceiling remaining for simulation and judging provider calls.
     """
     if router_reservation is None or maximum_provider_cost_usd <= 0:
         return 0.0
-    remaining = maximum_provider_cost_usd - math.fsum(
-        (router_reservation.estimated_cost_usd, judge_reservation_cost_usd)
-    )
+    remaining = maximum_provider_cost_usd - router_reservation.estimated_cost_usd
     if remaining <= 0:
         problems.append(
-            "router embedding and judge reservations consume the entire provider spend ceiling; "
+            "the router embedding reservation consumes the entire provider spend ceiling; "
             "increase --maximum-simulation-cost-usd or lower a request/retry ceiling"
         )
         return 0.0

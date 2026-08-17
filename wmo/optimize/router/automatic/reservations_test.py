@@ -300,8 +300,8 @@ def _world_settings() -> WorldModelSettings:
     )
 
 
-def test_large_context_model_admits_episodes_under_a_modest_ceiling() -> None:
-    """Trace-sized reservations admit full episodes where full-context sizing was rejected."""
+def test_episode_admission_ignores_estimates_and_gates_on_actual_spend() -> None:
+    """An oversized planning estimate never rejects an episode with real spend remaining."""
     traces = tuple(_trace(f"t-{index}", "x" * 4_000) for index in range(5))
     estimate = simulation_input_token_estimate(
         traces,
@@ -314,8 +314,6 @@ def test_large_context_model_admits_episodes_under_a_modest_ceiling() -> None:
     admitted = episode_reservation_failure(
         _world_settings(),
         completion_contract=_completion_contract(estimate),
-        candidate_alias="candidate",
-        maximum_steps=8,
         remaining_cost_usd=30.0,
     )
 
@@ -331,16 +329,22 @@ def test_large_context_model_admits_episodes_under_a_modest_ceiling() -> None:
         maximum_input_tokens=_LARGE_CONTEXT_TOKENS - _OUTPUT_TOKENS,
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
-    rejected = episode_reservation_failure(
+    expensive_estimate = episode_reservation_failure(
         _world_settings(),
         completion_contract=_completion_contract(estimate).model_copy(
             update={"world_model_request": full_context_world}
         ),
-        candidate_alias="candidate",
-        maximum_steps=8,
-        remaining_cost_usd=30.0,
+        remaining_cost_usd=0.01,
     )
 
-    assert rejected is not None
-    assert rejected.details is not None
-    assert rejected.details["phase"] == "episode_provider_reservation"
+    assert expensive_estimate is None
+
+    exhausted = episode_reservation_failure(
+        _world_settings(),
+        completion_contract=_completion_contract(estimate),
+        remaining_cost_usd=0.0,
+    )
+
+    assert exhausted is not None
+    assert exhausted.details is not None
+    assert exhausted.details["phase"] == "episode_provider_spend"

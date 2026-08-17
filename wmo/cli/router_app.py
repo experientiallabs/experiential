@@ -173,10 +173,10 @@ def router(
                 f"${preflight.router_embedding_reservation.estimated_cost_usd:.4f} router "
                 "embedding reservation"
             ),
-            f"${preflight.judge_reservation_cost_usd:.4f} judge reservation",
+            f"${preflight.judge_reservation_cost_usd:.4f} estimated judge spend",
             (
-                f"${preflight.remaining_simulation_cost_usd:.4f} candidate, retrieval, and "
-                "world-model simulation allocation"
+                f"${preflight.remaining_simulation_cost_usd:.4f} shared simulation and "
+                "judging spend ceiling"
             ),
         ),
         non_interactive=effective_noninteractive,

@@ -198,14 +198,17 @@ def query_reservation_failure(
     reservation: EmbeddingCostReservation,
     remaining_cost_usd: float,
 ) -> StructuredFailure | None:
-    """Reject a query reservation that cannot fit before any provider dispatch.
+    """Reject retrieval dispatch only once reconciled spend exhausts the remainder.
+
+    The worst-case query reservation is a planning value and never gates dispatch on its own:
+    an episode with real budget remaining always admits its next query.
 
     Args:
         reservation: Persisted worst-case query-embedding reservation.
         remaining_cost_usd: Reconciled provider budget available to the cell.
 
     Returns:
-        Structured budget failure when the reservation exceeds the remainder, otherwise ``None``.
+        Structured budget failure when no reconciled spend remains, otherwise ``None``.
 
     Raises:
         SimulationConfigurationError: The reservation unexpectedly has no estimated cost.
@@ -214,15 +217,14 @@ def query_reservation_failure(
     cost = economics.cost_usd
     if cost is None:  # pragma: no cover - maximum_query_reservation always prices the call
         raise SimulationConfigurationError("query-embedding reservation has unknown cost")
-    if cost.value <= remaining_cost_usd:
+    if remaining_cost_usd > 0:
         return None
     return StructuredFailure(
         code=FailureCode.BUDGET,
-        message="query-embedding reservation exceeds remaining simulation spend",
+        message="reconciled provider spend has exhausted the remaining retrieval ceiling",
         attribution=FailureAttribution.MODEL,
         details={
             "phase": "query_embedding_reservation",
-            "reserved_cost_usd": cost.value,
             "remaining_cost_usd": remaining_cost_usd,
         },
     )
@@ -285,21 +287,22 @@ def episode_reservation_failure(
     settings: WorldModelSettings,
     *,
     completion_contract: SimulationCompletionContract | None,
-    candidate_alias: str,
-    maximum_steps: int,
     remaining_cost_usd: float,
 ) -> StructuredFailure | None:
-    """Admit all possible candidate, retrieval, and world calls before an episode starts.
+    """Admit an episode whenever reconciled provider spend remains under the ceiling.
+
+    Frozen completion reservations carry planning estimates only, so an episode is never
+    rejected because an estimated full run looks too expensive. Every actual request is still
+    checked against the model's real context capacity and the reconciled spend remainder
+    immediately before dispatch.
 
     Args:
         settings: Frozen retrieval and completion reservations.
         completion_contract: Frozen completion reservations, or ``None`` for v1 callers.
-        candidate_alias: Evaluation cell candidate alias.
-        maximum_steps: Maximum possible candidate/world turn pairs.
         remaining_cost_usd: Reconciled cell budget remaining under the durable lease.
 
     Returns:
-        Structured zero-dispatch failure when the full episode ceiling cannot fit.
+        Structured zero-dispatch failure when no reconciled spend remains.
 
     Raises:
         SimulationConfigurationError: A configured reservation is missing or unpriced.
@@ -309,29 +312,14 @@ def episode_reservation_failure(
         raise SimulationConfigurationError("query-embedding reservation is missing")
     if completion_contract is None:
         return query_reservation_failure(query, remaining_cost_usd)
-    query_cost = maximum_query_reservation(query).cost_usd
-    if query_cost is None:  # pragma: no cover - maximum query reservation always prices
-        raise SimulationConfigurationError("query-embedding reservation has unknown cost")
-    turn_cost = query_cost.value
-    candidates = {
-        item.candidate_alias: item.request for item in completion_contract.candidate_requests
-    }
-    candidate = candidates.get(candidate_alias)
-    world = completion_contract.world_model_request
-    if candidate is None:
-        raise SimulationConfigurationError("completion cost reservations are incomplete")
-    turn_cost += candidate.estimated_maximum_call_cost_usd
-    turn_cost += world.estimated_maximum_call_cost_usd
-    reserved = turn_cost * maximum_steps
-    if reserved <= remaining_cost_usd:
+    if remaining_cost_usd > 0:
         return None
     return StructuredFailure(
         code=FailureCode.BUDGET,
-        message="full episode provider reservation exceeds remaining simulation spend",
+        message="reconciled provider spend has exhausted the remaining simulation ceiling",
         attribution=FailureAttribution.MODEL,
         details={
-            "phase": "episode_provider_reservation",
-            "reserved_cost_usd": reserved,
+            "phase": "episode_provider_spend",
             "remaining_cost_usd": remaining_cost_usd,
         },
     )

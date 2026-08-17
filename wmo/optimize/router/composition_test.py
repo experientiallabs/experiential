@@ -816,7 +816,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         return 1.0
 
     monkeypatch.setattr(workflow_module, "_verified_simulation_spend", exact_cap_spend)
-    with pytest.raises(RouterCompositionError, match="consumed the total budget"):
+    with pytest.raises(RouterCompositionError, match="reached the shared ceiling"):
         compose_router(
             project,
             normalized,
@@ -921,8 +921,6 @@ def test_failed_rollouts_skip_judging_and_rerun_replays_after_partial_failure(
         settings: WorldModelSettings,
         *,
         completion_contract: SimulationCompletionContract | None,
-        candidate_alias: str,
-        maximum_steps: int,
         remaining_cost_usd: float,
     ) -> StructuredFailure | None:
         """Reject the first two held-out episode admissions before any provider dispatch."""
@@ -935,15 +933,13 @@ def test_failed_rollouts_skip_judging_and_rerun_replays_after_partial_failure(
         if locked and admissions["count"] <= 2:
             return StructuredFailure(
                 code=FailureCode.BUDGET,
-                message="full episode provider reservation exceeds remaining simulation spend",
+                message="reconciled provider spend has exhausted the remaining simulation ceiling",
                 attribution=FailureAttribution.MODEL,
-                details={"phase": "episode_provider_reservation"},
+                details={"phase": "episode_provider_spend"},
             )
         return real_admission(
             settings,
             completion_contract=completion_contract,
-            candidate_alias=candidate_alias,
-            maximum_steps=maximum_steps,
             remaining_cost_usd=remaining_cost_usd,
         )
 

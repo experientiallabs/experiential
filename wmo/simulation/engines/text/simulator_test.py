@@ -868,21 +868,31 @@ def test_persisted_fit_rag_grounds_active_simulation_and_replay_has_zero_dispatc
     assert store.read_bytes(persisted.index.rag_id, "rag-index.json") == rag_before
 
 
-def test_query_reservation_exceeding_remaining_budget_blocks_every_dispatch(
+def test_worst_case_query_reservation_never_blocks_an_episode_with_spend_remaining(
     tmp_path: Path,
 ) -> None:
-    """Reject a query reservation that exceeds the remaining cell budget.
+    """Complete an episode whose worst-case query reservation exceeds the cell budget.
 
     Args:
-        tmp_path: Isolated project root used to verify zero provider dispatch.
+        tmp_path: Isolated project root used to verify real dispatch under a modest ceiling.
     """
     cell = _cell("cell-a", "task-a")
     plan = _plan((cell,))
     store = _store(tmp_path)
     plan_input = _persist_plan(store, plan)
     task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
-    candidate_client = _ScriptedClient([])
-    world_client = _ScriptedClient([])
+    candidate_client = _ScriptedClient(
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.01)]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Thanks.","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+                cost=0.01,
+            )
+        ]
+    )
     retriever = _FitRetriever(_fit_rag_input(), input_usd_per_million_tokens=100.0)
     simulator = _simulator(
         store,
@@ -911,29 +921,30 @@ def test_query_reservation_exceeding_remaining_budget_blocks_every_dispatch(
     )
     rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
 
-    assert rollout.stop_reason == StopReason.MAXIMUM_COST
-    assert rollout.failure is not None
-    assert rollout.failure.details["phase"] == "query_embedding_reservation"
-    assert candidate_client.requests == []
-    assert world_client.requests == []
-    assert retriever.estimate_calls == 0
-    assert retriever.queries == []
+    assert rollout.stop_reason == StopReason.COMPLETED
+    assert rollout.failure is None
+    assert len(candidate_client.requests) == 1
+    assert len(world_client.requests) == 1
+    assert retriever.estimate_calls == 1
+    assert len(retriever.queries) == 1
 
 
-def test_full_episode_reservation_blocks_candidate_retrieval_and_world_dispatch(
+def test_expensive_episode_estimate_dispatches_until_actual_spend_reaches_the_ceiling(
     tmp_path: Path,
 ) -> None:
-    """Reserve every possible turn before the first candidate or retrieval call.
+    """Dispatch under an oversized episode estimate and stop only on reconciled spend.
 
     Args:
-        tmp_path: Isolated project root used to verify zero provider dispatch.
+        tmp_path: Isolated project root used to verify one real dispatch then a spend stop.
     """
     cell = _cell("cell-a", "task-a")
     plan = _plan((cell,))
     store = _store(tmp_path)
     plan_input = _persist_plan(store, plan)
     task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
-    candidate_client = _ScriptedClient([])
+    candidate_client = _ScriptedClient(
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.12)]
+    )
     world_client = _ScriptedClient([])
     retriever = _FitRetriever(_fit_rag_input())
     _contract, completion_input = persist_simulation_completion_contract(
@@ -986,10 +997,9 @@ def test_full_episode_reservation_blocks_candidate_retrieval_and_world_dispatch(
 
     assert rollout.stop_reason == StopReason.MAXIMUM_COST
     assert rollout.failure is not None
-    assert rollout.failure.details["phase"] == "episode_provider_reservation"
-    assert candidate_client.requests == []
+    assert rollout.failure.details["phase"] == "query_embedding_budget"
+    assert len(candidate_client.requests) == 1
     assert world_client.requests == []
-    assert retriever.estimate_calls == 0
     assert retriever.queries == []
 
 
