@@ -17,6 +17,7 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import OperationEconomics
+from wmo.common.progress import ProgressHook, report
 from wmo.common.project import (
     ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
@@ -115,6 +116,7 @@ class WorldModelSimulator:
         clock: Time source for artifact and span timestamps.
         monotonic: Monotonic time source for orchestration latency measurements.
         token_counter: Optional full-request preflight counter. The default never truncates input.
+        progress: Optional observer of exact per-cell completion counts.
     """
 
     def __init__(
@@ -135,6 +137,7 @@ class WorldModelSimulator:
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         token_counter: TokenCounter | None = None,
+        progress: ProgressHook | None = None,
     ) -> None:
         """Bind one immutable plan and all explicit runtime dependencies.
 
@@ -154,6 +157,7 @@ class WorldModelSimulator:
             clock: Time source, injectable for deterministic tests.
             monotonic: Duration source, injectable for deterministic tests.
             token_counter: Full-request counter used before each provider call.
+            progress: Optional observer of exact per-cell completion counts.
 
         Raises:
             SimulationConfigurationError: The supplied plan input does not name this plan.
@@ -182,6 +186,7 @@ class WorldModelSimulator:
         self._clock = clock or utc_now
         self._monotonic = monotonic
         self._token_counter = token_counter or Utf8UpperBoundTokenCounter()
+        self._progress = progress
         self._rollout_builder = GroundedRolloutBuilder(
             plan_input=self._plan_input,
             task_set_input=self._task_set_input,
@@ -250,22 +255,19 @@ class WorldModelSimulator:
         completed = self._load_completed_rollouts(cells, bindings, resolution_input)
         pending = tuple(cell for cell in cells if cell.cell_id not in completed)
 
-        if pending:
-            completed.update(
-                {
-                    cell.cell_id: self._execute_and_persist_cell(
-                        spec,
-                        cell,
-                        world_model,
-                        grounded_world_model,
-                        spec_input,
-                        resolution,
-                        resolution_input,
-                        bindings,
-                    )
-                    for cell in pending
-                }
+        report(self._progress, "evaluation cells", completed=len(completed), total=len(cells))
+        for cell in pending:
+            completed[cell.cell_id] = self._execute_and_persist_cell(
+                spec,
+                cell,
+                world_model,
+                grounded_world_model,
+                spec_input,
+                resolution,
+                resolution_input,
+                bindings,
             )
+            report(self._progress, "evaluation cells", completed=len(completed), total=len(cells))
         ordered_rollouts = tuple(completed[cell.cell_id] for cell in cells)
         return persist_artifact_set(
             store=self._store,

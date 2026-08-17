@@ -11,6 +11,7 @@ from rich.console import Console
 
 from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.cli.progress import progress_display, qualified
 from wmo.cli.provider_picker import resolve_setup_providers
 from wmo.cli.provider_setup import (
     ProviderSetupOptions,
@@ -25,6 +26,7 @@ from wmo.common.models import (
     load_model_catalog,
 )
 from wmo.common.observability.telemetry import BuildTelemetryStats, capture_build_completed
+from wmo.common.progress import ProgressHook, report
 from wmo.common.project import (
     ArtifactStoreError,
     ProjectBudgetConfiguration,
@@ -164,28 +166,49 @@ def build(
             selected,
         )
         path = _resolve_trace_file(trace_file)
-        normalized = _load_canonical_traces(path, source)
-        if not normalized.traces:
-            raise ValueError(
-                "no valid canonical traces were produced; inspect the input and provide at least "
-                f"one valid {source.strip().casefold()} trace"
+        with progress_display(_console) as progress:
+            report(progress, "normalization")
+            normalized = _load_canonical_traces(path, source)
+            if not normalized.traces:
+                raise ValueError(
+                    "no valid canonical traces were produced; inspect the input and provide at "
+                    f"least one valid {source.strip().casefold()} trace"
+                )
+            record_count = len(normalized.traces) + len(normalized.issues)
+            report(
+                progress,
+                "normalization",
+                completed=len(normalized.traces),
+                total=record_count,
+                detail="valid traces",
             )
-        store = _project_store(
-            root,
-            ProjectConfig(
-                project_id=project,
-                trace_source=source.strip().casefold(),
-                models=selected,
-                retrieval=ProjectRetrievalConfiguration(top_k=top_k),
-                budgets=ProjectBudgetConfiguration(maximum_build_cost_usd=maximum_build_cost_usd),
-            ),
-        )
-        completed = build_project(
-            normalized,
-            store,
-            created_at=datetime.now(UTC),
-            code_revision=code_revision,
-        )
+            store = _project_store(
+                root,
+                ProjectConfig(
+                    project_id=project,
+                    trace_source=source.strip().casefold(),
+                    models=selected,
+                    retrieval=ProjectRetrievalConfiguration(top_k=top_k),
+                    budgets=ProjectBudgetConfiguration(
+                        maximum_build_cost_usd=maximum_build_cost_usd
+                    ),
+                ),
+            )
+            report(progress, "task construction")
+            completed = build_project(
+                normalized,
+                store,
+                created_at=datetime.now(UTC),
+                code_revision=code_revision,
+            )
+            task_count = len(completed.artifacts.mining.tasks)
+            report(
+                progress,
+                "task construction",
+                completed=task_count,
+                total=task_count,
+                detail="representative tasks",
+            )
         built = _reuse_completed_grounded_artifacts(
             store,
             completed,
@@ -230,22 +253,25 @@ def build(
             selected.embedder,
             CapabilityRequirement(requires_embeddings=True),
         )
-        if built is None:
-            built = _build_grounded_artifacts(
-                store,
-                completed,
-                resolved_world=resolved_world,
-                resolved_embedder=resolved_embedder,
-                top_k=top_k,
-            )
-        else:
-            _validate_reused_grounded_artifacts(
-                store,
-                built,
-                resolved_world=resolved_world,
-                resolved_embedder=resolved_embedder,
-            )
-        select_completed_build(store, built, completed.review)
+        with progress_display(_console) as progress:
+            if built is None:
+                built = _build_grounded_artifacts(
+                    store,
+                    completed,
+                    resolved_world=resolved_world,
+                    resolved_embedder=resolved_embedder,
+                    top_k=top_k,
+                    progress=progress,
+                )
+            else:
+                _validate_reused_grounded_artifacts(
+                    store,
+                    built,
+                    resolved_world=resolved_world,
+                    resolved_embedder=resolved_embedder,
+                )
+            report(progress, "finalization")
+            select_completed_build(store, built, completed.review)
     _capture_local_build_telemetry(
         completed.artifacts,
         root=root,
@@ -476,6 +502,7 @@ def _build_grounded_artifacts(
     resolved_world: ResolvedModel,
     resolved_embedder: ResolvedModel,
     top_k: int,
+    progress: ProgressHook | None = None,
 ) -> ProjectBuildArtifacts:
     """Build serving and fit-only RAG plus the executable world-model binding.
 
@@ -485,6 +512,7 @@ def _build_grounded_artifacts(
         resolved_world: Exact world-model runtime binding.
         resolved_embedder: Exact provider embedding binding.
         top_k: Default number of retrieved transitions.
+        progress: Optional observer of embedding, RAG, and grounded-model stages.
 
     Returns:
         Exact manifest pointers for every completed build output.
@@ -518,6 +546,7 @@ def _build_grounded_artifacts(
         embedder=rag_embedder,
         default_top_k=top_k,
         included_partitions=frozenset({"fit", "held_out"}),
+        progress=qualified(progress, "serving index"),
     )
     fit = persist_trace_rag(
         store.artifacts,
@@ -528,7 +557,9 @@ def _build_grounded_artifacts(
         embedder=rag_embedder,
         default_top_k=top_k,
         included_partitions=frozenset({"fit"}),
+        progress=qualified(progress, "fit-only index"),
     )
+    report(progress, "grounded model")
     world = persist_grounded_world_model(
         store.artifacts,
         artifact_input(serving.manifest),

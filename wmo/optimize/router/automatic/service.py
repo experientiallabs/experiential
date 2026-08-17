@@ -12,6 +12,7 @@ from wmo.common.models import (
     configure_router_candidates,
     verify_router_candidate_catalog_state,
 )
+from wmo.common.progress import ProgressHook, report
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.routing import KnnGuard
 from wmo.optimize.router.automatic.artifacts import (
@@ -85,6 +86,7 @@ def optimize_project_router(
     created_at: datetime,
     code_revision: str,
     phase_hook: Callable[[str], None] | None = None,
+    progress: ProgressHook | None = None,
 ) -> AutomaticRouterResult:
     """Optimize a router from one completed project with no workflow config file.
 
@@ -97,6 +99,7 @@ def optimize_project_router(
         created_at: Materialization time for new immutable artifacts.
         code_revision: Exact producer revision.
         phase_hook: Optional local phase-order observer.
+        progress: Optional observer of truthful stage names and exact unit counts.
 
     Returns:
         Complete preflight, execution contract, optimized policy, report, and runtime.
@@ -105,6 +108,7 @@ def optimize_project_router(
         AutomaticRouterError: Consent, credentials, catalog state, or runtime binding differs.
         AutomaticRouterPreflightError: Aggregate prerequisites are incomplete.
     """
+    report(progress, "preflight")
     preflight = preflight_automatic_router(
         project,
         candidate_plan.selection,
@@ -161,6 +165,7 @@ def optimize_project_router(
         judge,
         agent_factory,
         options,
+        progress=progress,
     )
     composition = compose_router(
         project,
@@ -182,6 +187,7 @@ def optimize_project_router(
         created_at=created_at,
         code_revision=code_revision,
         phase_hook=phase_hook,
+        progress=progress,
     )
     return AutomaticRouterResult(
         preflight=preflight,
@@ -348,6 +354,7 @@ def _workflow_services(
     judge: AutomaticRouterJudge,
     agent_factory: AgentFactory,
     options: AutomaticRouterOptions,
+    progress: ProgressHook | None = None,
 ) -> RouterWorkflowServices:
     """Bind the generic composition interfaces to verified automatic project inputs.
 
@@ -360,6 +367,7 @@ def _workflow_services(
         judge: Approved saved-contract judge awaiting its exact plan.
         agent_factory: Post-consent validated fresh-runtime constructor.
         options: Active simulation controls.
+        progress: Optional observer forwarded to each constructed simulator.
 
     Returns:
         Complete service bundle for the existing router composition.
@@ -490,6 +498,7 @@ def _workflow_services(
             agent_factory=agent_factory,
             completion_contract_input=artifacts.simulation_completion_input,
             redacted_field_names=preflight.project_config.redacted_field_names,
+            progress=progress,
         )
 
     return RouterWorkflowServices(

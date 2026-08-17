@@ -11,6 +11,7 @@ from rich.console import Console
 
 from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.cli.progress import progress_display
 from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.models import ProviderModelSelection, load_model_catalog
 from wmo.common.observability.telemetry import capture_completion_once
@@ -172,7 +173,7 @@ def router(
     ):
         _console.print("Router optimization was not started.")
         return
-    with usage_error(OSError, ValueError):
+    with usage_error(OSError, ValueError), progress_display(_console) as progress:
         result = optimize_project_router(
             store,
             candidate_plan,
@@ -181,6 +182,7 @@ def router(
             provider_spend_consented=True,
             created_at=now,
             code_revision=producer_revision,
+            progress=progress,
         )
     capture_completion_once(
         "wmo router completed",
