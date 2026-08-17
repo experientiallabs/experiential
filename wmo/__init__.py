@@ -11,10 +11,13 @@ if TYPE_CHECKING:
         build_fidelity_evaluation_plan as build_fidelity_evaluation_plan,
     )
     from wmo.common.evaluations import build_fidelity_report as build_fidelity_report
+    from wmo.common.project import ExportedProjectBundle as ExportedProjectBundle
     from wmo.common.project import ProjectProviderFreeStage as ProjectProviderFreeStage
     from wmo.common.project import (
         ProjectTracePreparationSettings as ProjectTracePreparationSettings,
     )
+    from wmo.common.project import export_project_bundle as export_project_bundle
+    from wmo.common.project import restore_project_bundle as restore_project_bundle
     from wmo.optimize.router.activation import load_project_router as load_project_router
     from wmo.optimize.router.activation import load_router as load_router
     from wmo.optimize.router.composition import (
@@ -76,6 +79,9 @@ if TYPE_CHECKING:
     from wmo.simulation.world_model.application import load_world_model as load_world_model
 
 _EXPORT_MODULES = {
+    "ExportedProjectBundle": "wmo.common.project",
+    "export_project_bundle": "wmo.common.project",
+    "restore_project_bundle": "wmo.common.project",
     "ProjectProviderFreeStage": "wmo.common.project",
     "ProjectTracePreparationSettings": "wmo.common.project",
     "BuildReviewReadiness": "wmo.simulation.build",

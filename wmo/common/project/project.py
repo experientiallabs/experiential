@@ -170,12 +170,13 @@ class ProjectBuildArtifacts(ContractModel):
 class ProjectConfig(ContractModel):
     """Project-local configuration that names no provider credentials or secret references."""
 
-    schema_version: int = Field(default=2, ge=1)
+    schema_version: int = Field(default=3, ge=1)
     project_id: ArtifactId
     trace_source: str | None = Field(default=None, max_length=64)
     trace_preparation: ProjectTracePreparationSettings | None = None
     provider_free_stage: ProjectProviderFreeStage | None = None
     models: ProjectModelConfiguration | None = None
+    model_catalog: ArtifactInput | None = None
     retrieval: ProjectRetrievalConfiguration | None = Field(
         default_factory=ProjectRetrievalConfiguration
     )

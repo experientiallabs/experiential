@@ -14,7 +14,13 @@ from wmo.common.evaluations import (
     build_fidelity_evaluation_plan,
     build_fidelity_report,
 )
-from wmo.common.project import ProjectProviderFreeStage, ProjectTracePreparationSettings
+from wmo.common.project import (
+    ExportedProjectBundle,
+    ProjectProviderFreeStage,
+    ProjectTracePreparationSettings,
+    export_project_bundle,
+    restore_project_bundle,
+)
 from wmo.optimize.router.activation import load_project_router, load_router
 from wmo.optimize.router.automatic import service as automatic_router
 from wmo.optimize.router.composition import compose_router
@@ -50,6 +56,21 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.load_project_provider_free_stage is load_project_provider_free_stage
     assert wmo.ProjectProviderFreeStage is ProjectProviderFreeStage
     assert wmo.ProjectTracePreparationSettings is ProjectTracePreparationSettings
+    assert wmo.export_project_bundle is export_project_bundle
+    assert wmo.restore_project_bundle is restore_project_bundle
+    assert wmo.ExportedProjectBundle is ExportedProjectBundle
+    assert {
+        "export_project_bundle",
+        "restore_project_bundle",
+        "ExportedProjectBundle",
+    }.issubset(wmo.__all__)
+    assert not {
+        "ProjectBundleManifest",
+        "ProjectBundleMember",
+        "ProjectBundleError",
+        "ProjectStageEvent",
+        "ProjectModelCatalog",
+    }.intersection(wmo.__all__)
     assert wmo.optimize_router is optimize_router
     assert wmo.fit_router is fit_router
     assert wmo.report_router is report_router
