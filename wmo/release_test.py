@@ -1496,7 +1496,11 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     )
     wheel = tuple(distribution.glob("*.whl"))
     assert len(wheel) == 1
-    _run_checked([uv, "venv", str(virtual_environment)], cwd=execution, environment=environment)
+    _run_checked(
+        [uv, "venv", "--python", sys.executable, str(virtual_environment)],
+        cwd=execution,
+        environment=environment,
+    )
     installed_python = virtual_environment / "bin" / "python"
     _run_checked(
         [uv, "pip", "install", "--python", str(installed_python), str(wheel[0])],

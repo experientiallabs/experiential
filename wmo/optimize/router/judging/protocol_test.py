@@ -6,12 +6,16 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
+from wmo.common.core.artifacts import sha256_json
 from wmo.common.judging import RawDimensionJudgment, RawJudgment, Rubric
 from wmo.common.judging.lm import PORTABLE_RATIONALE_JSON_SCHEMA
 from wmo.common.judging.lm_test import _axis_schema
 from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import (
     AssistantAction,
+    ModelCapabilities,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -21,13 +25,14 @@ from wmo.common.models import (
 from wmo.common.project import artifact_input
 from wmo.common.rollouts import RolloutArtifact
 from wmo.optimize.router.judging.artifacts import write_production_rollout
-from wmo.optimize.router.judging.contracts import judge_feedback_schema
+from wmo.optimize.router.judging.contracts import ManualJudgeError, judge_feedback_schema
 from wmo.optimize.router.judging.protocol import (
     TemplateJudgeClient,
     _BooleanResponse,
     _CategoricalResponse,
     _combine_rationales,
     _PairwiseResponse,
+    _raw_response,
 )
 from wmo.optimize.router.judging.service import (
     commit_manual_judge_setup,
@@ -35,6 +40,40 @@ from wmo.optimize.router.judging.service import (
     prepare_manual_judge_setup,
 )
 from wmo.optimize.router.judging.service_test import _TIME, _built_store, _catalog, _template
+
+
+def _response(content: str) -> ModelResponse:
+    """Wrap one visible judge text body in a provider response.
+
+    Args:
+        content: Visible assistant text returned by the judge.
+
+    Returns:
+        Response carrying the text under a fixed configured model identity.
+    """
+    return ModelResponse(
+        output=AssistantAction(content=content),
+        model=ModelSnapshot(
+            provider="bedrock",
+            model_id="judge-model",
+            capabilities_sha256=sha256_json(ModelCapabilities()),
+            connection_sha256=sha256_json({"provider": "bedrock"}),
+        ),
+        economics=OperationEconomics(),
+    )
+
+
+def test_fenced_judge_json_is_accepted_and_unfenced_prose_is_rejected() -> None:
+    """Providers that fence schema-valid judge JSON remain usable for calibration."""
+    fenced = '```json\n{"dimensions": [{"dimension_id": "task-success"}]}\n```'
+    explained = 'The agent failed the task.\n\n```json\n{"dimensions": []}\n```'
+
+    assert _raw_response(_response(fenced)) == {"dimensions": [{"dimension_id": "task-success"}]}
+    assert _raw_response(_response(explained)) == {"dimensions": []}
+    with pytest.raises(ManualJudgeError, match="malformed structured JSON"):
+        _raw_response(_response('My verdict is {"dimensions": []} overall.'))
+    with pytest.raises(ManualJudgeError, match="must be a JSON object"):
+        _raw_response(_response("[1, 2]"))
 
 
 class _NullRationaleClient:

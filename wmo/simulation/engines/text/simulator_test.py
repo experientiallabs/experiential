@@ -14,7 +14,12 @@ from typing import cast
 
 import pytest
 
-from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes
+from wmo.common.core.artifacts import (
+    SECRET_REDACTION_PLACEHOLDER,
+    ArtifactInput,
+    assert_secret_free,
+    canonical_json_bytes,
+)
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.evaluations.build_test import _snapshot, _store
 from wmo.common.models import (
@@ -688,6 +693,53 @@ def test_text_simulation_persists_separate_economics_and_resumes_without_duplica
     assert retriever.estimate_calls == 1
     assert len(retriever.queries) == 1
     assert resumed.artifact_ids == artifact_set.artifact_ids
+
+
+def test_persisted_rollout_redacts_generated_secrets_and_records_audit_count(
+    tmp_path: Path,
+) -> None:
+    """Redact credential-shaped simulated output at persistence and record the count.
+
+    Args:
+        tmp_path: Isolated project root for immutable simulator artifacts.
+    """
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient(
+        [_response(f"export KEY={secret}", snapshot=_snapshot("candidate-a"), cost=0.2)]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Done.","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+                cost=0.8,
+            )
+        ]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        fit_retriever=_FitRetriever(_fit_rag_input()),
+    )
+    spec = _spec(plan_input, task_set_input, ("cell-a",))
+
+    artifact_set = simulator.run(spec)
+    rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
+
+    assert rollout.secret_redaction_count >= 1
+    assert secret not in rollout.model_dump_json()
+    assert rollout.final_output is not None
+    assert rollout.final_output.content == f"export KEY={SECRET_REDACTION_PLACEHOLDER}"
+    assert_secret_free(rollout)
 
 
 def test_persisted_fit_rag_grounds_active_simulation_and_replay_has_zero_dispatch(

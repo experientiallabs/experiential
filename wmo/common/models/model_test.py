@@ -91,6 +91,8 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "supports_embeddings": False,
         "supports_structured_output": False,
         "supports_completions": None,
+        "supports_temperature": True,
+        "reasoning_effort": None,
         "context_window_tokens": None,
         "maximum_output_tokens": None,
         "input_cost_per_million_tokens_usd": None,
@@ -120,6 +122,8 @@ def test_completion_support_preserves_provider_identity_for_existing_traces() ->
     assert unknown.identity_sha256() == sha256_json(legacy_payload)
     assert supported.identity_sha256() == unsupported.identity_sha256()
     assert supported.identity_sha256() == unknown.identity_sha256()
+    pinned_sampling = ModelCapabilities(supports_temperature=False, reasoning_effort="xhigh")
+    assert pinned_sampling.identity_sha256() == unknown.identity_sha256()
     with pytest.raises(ValidationError, match="required tool_choice"):
         ModelRequest(
             messages=(ModelMessage(role="user", content="Please help."),),
