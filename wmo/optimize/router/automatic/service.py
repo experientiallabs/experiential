@@ -9,9 +9,13 @@ from datetime import datetime
 from wmo.common.core.artifacts import stable_id
 from wmo.common.evaluations import EvaluationPlan, EvaluationProtocol
 from wmo.common.models import (
+    ModelCatalog,
+    ProviderSetup,
+    configure_provider_catalog_with_router_candidates,
     configure_router_candidates,
     verify_router_candidate_catalog_state,
 )
+from wmo.common.progress import ProgressHook, report
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.routing import KnnGuard
 from wmo.optimize.router.automatic.artifacts import (
@@ -87,6 +91,7 @@ def optimize_project_router(
     created_at: datetime,
     code_revision: str,
     phase_hook: Callable[[str], None] | None = None,
+    progress: ProgressHook | None = None,
 ) -> AutomaticRouterResult:
     """Optimize a router from one completed project with no workflow config file.
 
@@ -99,6 +104,7 @@ def optimize_project_router(
         created_at: Materialization time for new immutable artifacts.
         code_revision: Exact producer revision.
         phase_hook: Optional local phase-order observer.
+        progress: Optional observer of truthful stage names and exact unit counts.
 
     Returns:
         Complete preflight, execution contract, optimized policy, report, and runtime.
@@ -107,6 +113,7 @@ def optimize_project_router(
         AutomaticRouterError: Consent, credentials, catalog state, or runtime binding differs.
         AutomaticRouterPreflightError: Aggregate prerequisites are incomplete.
     """
+    report(progress, "preflight")
     preflight = preflight_automatic_router(
         project,
         candidate_plan.selection,
@@ -121,6 +128,12 @@ def optimize_project_router(
         project.model_catalog_path,
         candidate_plan.expected_catalog_sha256,
     )
+    resolved_catalog = runtime_catalog.with_catalog(candidate_plan.prospective_catalog)
+    agent_factory = _resolve_agent_factory(preflight, options)
+    resolved = _resolve_all_models(preflight, resolved_catalog, options)
+    configured = persist_router_candidate_setup(project, candidate_plan)
+    if configured != candidate_plan.prospective_catalog:
+        raise AutomaticRouterError("persisted router candidate catalog differs from confirmation")
     attribution_input = None
     if preflight.observed_traces:
         _attribution, attribution_input = persist_router_observed_attribution_set(
@@ -133,17 +146,6 @@ def optimize_project_router(
             created_at=created_at,
             code_revision=code_revision,
         )
-    resolved_catalog = runtime_catalog.with_catalog(candidate_plan.prospective_catalog)
-    agent_factory = _resolve_agent_factory(preflight, options)
-    resolved = _resolve_all_models(preflight, resolved_catalog, options)
-    configured = configure_router_candidates(
-        project.model_catalog_path,
-        candidate_plan.selection,
-        candidate_models=candidate_plan.candidate_models,
-        expected_state_sha256=candidate_plan.expected_catalog_sha256,
-    )
-    if configured != candidate_plan.prospective_catalog:
-        raise AutomaticRouterError("persisted router candidate catalog differs from confirmation")
     artifacts = materialize_automatic_router_artifacts(
         project,
         preflight,
@@ -165,6 +167,7 @@ def optimize_project_router(
         judge,
         agent_factory,
         options,
+        progress=progress,
     )
     composition = compose_router(
         project,
@@ -186,12 +189,76 @@ def optimize_project_router(
         created_at=created_at,
         code_revision=code_revision,
         phase_hook=phase_hook,
+        progress=progress,
     )
     return AutomaticRouterResult(
         preflight=preflight,
         artifacts=artifacts,
         composition=composition,
     )
+
+
+def persist_router_candidate_setup(
+    project: ProjectStore,
+    candidate_plan: RouterCandidateSetupPlan,
+) -> ModelCatalog:
+    """Persist candidate provider records and router roles in one catalog transaction.
+
+    Args:
+        project: Project whose shared model catalog was confirmed during collection.
+        candidate_plan: Confirmed candidate selection and prospective catalog.
+
+    Returns:
+        Complete catalog after the selected provider records and roles are committed.
+
+    Raises:
+        AutomaticRouterError: The confirmed catalog cannot be persisted atomically.
+    """
+    try:
+        if not candidate_plan.candidate_connections and not candidate_plan.candidate_models:
+            return configure_router_candidates(
+                project.model_catalog_path,
+                candidate_plan.selection,
+                expected_state_sha256=candidate_plan.expected_catalog_sha256,
+            )
+
+        roles = candidate_plan.prospective_catalog.roles
+        world_model, judge, embedder = roles.world_model, roles.judge, roles.embedder
+        if world_model is None or judge is None or embedder is None:
+            raise AutomaticRouterError(
+                "discovered router candidates require an existing world model, judge, and embedder"
+            )
+        new_connection_names = {
+            connection.name for connection in candidate_plan.candidate_connections
+        }
+        new_aliases = {model.alias for model in candidate_plan.candidate_models}
+        setup = ProviderSetup(
+            connections=candidate_plan.candidate_connections,
+            models=candidate_plan.candidate_models,
+            known_existing_connections=tuple(
+                sorted(
+                    set(candidate_plan.prospective_catalog.connections).difference(
+                        new_connection_names
+                    )
+                )
+            ),
+            known_existing_aliases=tuple(
+                sorted(set(candidate_plan.prospective_catalog.models).difference(new_aliases))
+            ),
+            world_model=world_model,
+            judge=judge,
+            embedder=embedder,
+        )
+        return configure_provider_catalog_with_router_candidates(
+            project.model_catalog_path,
+            setup,
+            candidate_plan.selection,
+            expected_state_sha256=candidate_plan.expected_catalog_sha256,
+        )
+    except AutomaticRouterError:
+        raise
+    except ValueError as exc:
+        raise AutomaticRouterError(f"router candidate setup could not be saved: {exc}") from exc
 
 
 def _resolve_all_models(
@@ -340,6 +407,7 @@ def _automatic_judge(
         preflight.setup,
         created_at=created_at,
         code_revision=code_revision,
+        maximum_input_tokens=preflight.judge_completion_reservation.maximum_input_tokens,
     )
 
 
@@ -352,6 +420,7 @@ def _workflow_services(
     judge: AutomaticRouterJudge,
     agent_factory: AgentFactory,
     options: AutomaticRouterOptions,
+    progress: ProgressHook | None = None,
 ) -> RouterWorkflowServices:
     """Bind the generic composition interfaces to verified automatic project inputs.
 
@@ -364,6 +433,7 @@ def _workflow_services(
         judge: Approved saved-contract judge awaiting its exact plan.
         agent_factory: Post-consent validated fresh-runtime constructor.
         options: Active simulation controls.
+        progress: Optional observer forwarded to each constructed simulator.
 
     Returns:
         Complete service bundle for the existing router composition.
@@ -504,6 +574,7 @@ def _workflow_services(
             agent_factory=agent_factory,
             completion_contract_input=artifacts.simulation_completion_input,
             redacted_field_names=preflight.project_config.redacted_field_names,
+            progress=progress,
         )
 
     return RouterWorkflowServices(

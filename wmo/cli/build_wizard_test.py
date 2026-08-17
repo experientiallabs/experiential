@@ -323,7 +323,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     state = _ProviderState()
     lister = _install_integrated_runtime(monkeypatch, state)
     root = tmp_path / ".wmo"
-    set_maximum_command_cost_usd(20.0, root)
+    set_maximum_command_cost_usd(12.0, root)
 
     result = _RUNNER.invoke(
         app,
@@ -496,7 +496,7 @@ def test_fresh_wizard_refusal_after_discovery_makes_no_paid_calls_or_selected_bu
     state = _ProviderState()
     lister = _install_integrated_runtime(monkeypatch, state)
     root = tmp_path / ".wmo"
-    set_maximum_command_cost_usd(20.0, root)
+    set_maximum_command_cost_usd(12.0, root)
 
     result = _RUNNER.invoke(
         app,
@@ -573,7 +573,7 @@ def test_explicit_router_cap_above_required_consents_only_to_exact_plan(
     state = _ProviderState()
     _install_integrated_runtime(monkeypatch, state)
     root = tmp_path / ".wmo"
-    set_maximum_command_cost_usd(20.0, root)
+    set_maximum_command_cost_usd(12.0, root)
     result = _RUNNER.invoke(
         app,
         [
@@ -626,6 +626,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
         estimate: float,
         maximum_build_cost_usd: float,
         provider_spend_authorized: bool,
+        progress: build_command.ProgressHook | None = None,
     ) -> build_command.GroundedBuildCompletion:
         """Record both adapters using the shared typed execution seam.
 
@@ -640,6 +641,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
             estimate: Conservative embedding estimate.
             maximum_build_cost_usd: Strict embedding ceiling.
             provider_spend_authorized: Whether paid embedding work is authorized.
+            progress: Optional stage observer forwarded unchanged.
 
         Returns:
             The real typed grounded-build completion.
@@ -656,6 +658,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
             estimate=estimate,
             maximum_build_cost_usd=maximum_build_cost_usd,
             provider_spend_authorized=provider_spend_authorized,
+            progress=progress,
         )
 
     monkeypatch.setattr(build_command, "_complete_grounded_build", record_grounded_build)

@@ -28,7 +28,7 @@ class KnownModel:
     supports_embeddings: bool = False
     supports_tools: bool = False
     supports_structured_output: bool = False
-    supports_temperature: bool = True
+    supports_temperature: bool | None = None
     reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
     context_window_tokens: int | None = None
     maximum_output_tokens: int | None = None
@@ -46,10 +46,11 @@ def _chat(
     cache_write_usd: float | None = None,
     context_window_tokens: int | None = None,
     maximum_output_tokens: int | None = None,
-    supports_temperature: bool = True,
+    supports_temperature: bool | None = True,
+    supports_structured_output: bool = True,
     reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None,
 ) -> KnownModel:
-    """Describe one documented chat model that supports tools and structured output.
+    """Describe one documented chat model with its verified protocol capabilities.
 
     Args:
         input_usd: Documented input price per million tokens.
@@ -58,8 +59,8 @@ def _chat(
         cache_write_usd: Documented cache-write price, when the provider publishes one.
         context_window_tokens: Documented context window, when the provider publishes one.
         maximum_output_tokens: Documented output ceiling, when the provider publishes one.
-        supports_temperature: Whether the model accepts an explicit sampling temperature;
-            reasoning models pin their sampling and reject the parameter.
+        supports_temperature: Whether the model accepts an explicit temperature parameter.
+        supports_structured_output: Whether the model supports structured outputs.
         reasoning_effort: Documented reasoning-effort level to pin, when the provider
             publishes one for the model.
 
@@ -69,7 +70,7 @@ def _chat(
     return KnownModel(
         supports_completions=True,
         supports_tools=True,
-        supports_structured_output=True,
+        supports_structured_output=supports_structured_output,
         supports_temperature=supports_temperature,
         reasoning_effort=reasoning_effort,
         context_window_tokens=context_window_tokens,
@@ -111,20 +112,20 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         reasoning_effort="xhigh",
     ),
     "gpt-5.6-terra": _chat(
-        input_usd=2.5,
-        cached_input_usd=0.25,
-        cache_write_usd=3.125,
-        output_usd=15.0,
+        input_usd=2.0,
+        cached_input_usd=0.2,
+        cache_write_usd=2.5,
+        output_usd=12.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
         reasoning_effort="xhigh",
     ),
     "gpt-5.6-luna": _chat(
-        input_usd=1.0,
-        cached_input_usd=0.1,
-        cache_write_usd=1.25,
-        output_usd=6.0,
+        input_usd=0.2,
+        cached_input_usd=0.02,
+        cache_write_usd=0.25,
+        output_usd=1.2,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
@@ -135,16 +136,25 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         cached_input_usd=0.5,
         cache_write_usd=0.0,
         output_usd=30.0,
+        context_window_tokens=1_050_000,
+        maximum_output_tokens=128_000,
         supports_temperature=False,
     ),
     "gpt-5.5-pro": _chat(
-        input_usd=30.0, cache_write_usd=0.0, output_usd=180.0, supports_temperature=False
+        input_usd=30.0,
+        cache_write_usd=0.0,
+        output_usd=180.0,
+        context_window_tokens=1_050_000,
+        maximum_output_tokens=128_000,
+        supports_temperature=False,
     ),
     "gpt-5.4": _chat(
         input_usd=2.5,
         cached_input_usd=0.25,
         cache_write_usd=0.0,
         output_usd=15.0,
+        context_window_tokens=1_050_000,
+        maximum_output_tokens=128_000,
         supports_temperature=False,
     ),
     "gpt-5.4-mini": _chat(
@@ -153,7 +163,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         cache_write_usd=0.0,
         output_usd=4.5,
         context_window_tokens=400_000,
-        maximum_output_tokens=64_000,
+        maximum_output_tokens=128_000,
         supports_temperature=False,
     ),
     "gpt-5.4-nano": _chat(
@@ -162,27 +172,43 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         cache_write_usd=0.0,
         output_usd=1.25,
         context_window_tokens=400_000,
-        maximum_output_tokens=64_000,
+        maximum_output_tokens=128_000,
         supports_temperature=False,
     ),
     "gpt-5.4-pro": _chat(
-        input_usd=30.0, cache_write_usd=0.0, output_usd=180.0, supports_temperature=False
+        input_usd=30.0,
+        cache_write_usd=0.0,
+        output_usd=180.0,
+        supports_structured_output=False,
+        context_window_tokens=1_050_000,
+        maximum_output_tokens=128_000,
+        supports_temperature=False,
     ),
     "gpt-5.2": _chat(
         input_usd=1.75,
         cached_input_usd=0.175,
         cache_write_usd=0.0,
         output_usd=14.0,
+        context_window_tokens=400_000,
+        maximum_output_tokens=128_000,
         supports_temperature=False,
     ),
     "gpt-5.2-pro": _chat(
-        input_usd=21.0, cache_write_usd=0.0, output_usd=168.0, supports_temperature=False
+        input_usd=21.0,
+        cache_write_usd=0.0,
+        output_usd=168.0,
+        supports_structured_output=False,
+        context_window_tokens=400_000,
+        maximum_output_tokens=128_000,
+        supports_temperature=False,
     ),
     "gpt-5.1": _chat(
         input_usd=1.25,
         cached_input_usd=0.125,
         cache_write_usd=0.0,
         output_usd=10.0,
+        context_window_tokens=400_000,
+        maximum_output_tokens=128_000,
         supports_temperature=False,
     ),
     "gpt-5": _chat(
@@ -190,6 +216,8 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         cached_input_usd=0.125,
         cache_write_usd=0.0,
         output_usd=10.0,
+        context_window_tokens=400_000,
+        maximum_output_tokens=128_000,
         supports_temperature=False,
     ),
     "gpt-5-mini": _chat(
@@ -197,6 +225,8 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         cached_input_usd=0.025,
         cache_write_usd=0.0,
         output_usd=2.0,
+        context_window_tokens=400_000,
+        maximum_output_tokens=128_000,
         supports_temperature=False,
     ),
     "gpt-5-nano": _chat(
@@ -204,10 +234,17 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         cached_input_usd=0.005,
         cache_write_usd=0.0,
         output_usd=0.4,
+        context_window_tokens=400_000,
+        maximum_output_tokens=128_000,
         supports_temperature=False,
     ),
     "gpt-5-pro": _chat(
-        input_usd=15.0, cache_write_usd=0.0, output_usd=120.0, supports_temperature=False
+        input_usd=15.0,
+        cache_write_usd=0.0,
+        output_usd=120.0,
+        context_window_tokens=400_000,
+        maximum_output_tokens=272_000,
+        supports_temperature=False,
     ),
     "text-embedding-3-small": _embedding(input_usd=0.02, context_window_tokens=8_192),
     "text-embedding-3-large": _embedding(input_usd=0.13, context_window_tokens=8_192),
@@ -288,38 +325,6 @@ _KNOWN_MODELS: dict[str, dict[str, KnownModel]] = {
     "openai": _OPENAI_MODELS,
 }
 
-_RECOMMENDED_MODELS: dict[
-    str,
-    dict[Literal["world_model", "judge", "embedder", "router_candidate"], tuple[str, ...]],
-] = {
-    "openai": {
-        "world_model": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
-        "judge": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
-        "embedder": (
-            "text-embedding-3-large",
-            "text-embedding-3-small",
-            "text-embedding-ada-002",
-        ),
-        "router_candidate": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
-    },
-    "anthropic": {
-        "world_model": ("claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"),
-        "judge": ("claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"),
-        "embedder": (),
-        "router_candidate": ("claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"),
-    },
-    "gemini": {
-        "world_model": ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"),
-        "judge": ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"),
-        "embedder": ("gemini-embedding-001",),
-        "router_candidate": (
-            "gemini-3.6-flash",
-            "gemini-3.5-flash",
-            "gemini-3.5-flash-lite",
-        ),
-    },
-}
-
 
 def canonical_model_id(provider: str, model: str) -> str:
     """Normalize one provider model ID to the identity this table indexes.
@@ -355,6 +360,39 @@ def known_model_metadata(provider: str, model: str) -> KnownModel | None:
     if models is None:
         return None
     return models.get(canonical_model_id(provider, model))
+
+
+_RECOMMENDED_MODELS: dict[
+    str,
+    dict[Literal["world_model", "judge", "embedder", "router_candidate"], tuple[str, ...]],
+] = {
+    "openai": {
+        "world_model": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
+        "judge": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
+        "embedder": (
+            "text-embedding-3-large",
+            "text-embedding-3-small",
+            "text-embedding-ada-002",
+        ),
+        "router_candidate": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
+    },
+    "anthropic": {
+        "world_model": ("claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"),
+        "judge": ("claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"),
+        "embedder": (),
+        "router_candidate": ("claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"),
+    },
+    "gemini": {
+        "world_model": ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"),
+        "judge": ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"),
+        "embedder": ("gemini-embedding-001",),
+        "router_candidate": (
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+        ),
+    },
+}
 
 
 def recommended_model_rank(

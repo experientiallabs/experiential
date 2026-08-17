@@ -18,6 +18,7 @@ from wmo.common.core.artifacts import (
     canonical_jsonl_bytes,
     stable_id,
 )
+from wmo.common.progress import ProgressHook, report
 from wmo.common.project import (
     ArtifactManifest,
     ArtifactStore,
@@ -66,6 +67,7 @@ def persist_trace_rag(
     rag_id: str | None = None,
     default_top_k: int = 5,
     included_partitions: frozenset[Literal["fit", "held_out"]] = frozenset({"fit"}),
+    progress: ProgressHook | None = None,
 ) -> PersistedRAGIndex:
     """Build a read-only index from selected partitions of real imported traces.
 
@@ -84,6 +86,7 @@ def persist_trace_rag(
         default_top_k: Default number of matches returned by the loaded retriever.
         included_partitions: Frozen lineage partitions eligible for this index. Fit-only indexes
             use ``{"fit"}``; serving indexes use both real-evidence partitions.
+        progress: Optional observer of embedding and index-persistence stages.
 
     Returns:
         The immutable envelope, manifest, observed transitions, and persisted vectors.
@@ -110,7 +113,10 @@ def persist_trace_rag(
             "verified included traces contain no real action-to-subsequent-observation transitions"
         )
     binding = embedder or default_rag_embedder()
+    report(progress, "embeddings", completed=0, total=len(transitions))
     embedded = embed_rag_texts(binding, tuple(item.key_text for item in transitions))
+    report(progress, "embeddings", completed=len(transitions), total=len(transitions))
+    report(progress, "RAG")
     vectors = tuple(
         RAGVector(transition_id=transition.transition_id, values=values)
         for transition, values in zip(transitions, embedded, strict=True)

@@ -1,7 +1,8 @@
-"""Interactive and structured collection of router candidates without provider calls."""
+"""Interactive and structured collection of router candidates with provider discovery."""
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from pathlib import Path
 
 import typer
@@ -10,9 +11,12 @@ from rich.prompt import Confirm, Prompt
 
 from wmo.cli.options import usage_error
 from wmo.cli.picker import PickerAction, PickerOption, choose_many, choose_one
+from wmo.cli.provider_picker import SetupCancelled
+from wmo.cli.provider_setup import run_router_candidate_picker
 from wmo.common.models import (
     ModelCapabilities,
     ModelCatalog,
+    ProviderConnection,
     ProviderModelSelection,
     RouterCandidateSelection,
     catalog_state_sha256,
@@ -20,6 +24,7 @@ from wmo.common.models import (
     validate_router_candidate_selection,
 )
 from wmo.optimize.router.composition import RouterCandidateSetupPlan
+from wmo.runtime.models.providers import ProviderModelLister
 
 
 def collect_router_candidate_setup(
@@ -31,6 +36,9 @@ def collect_router_candidate_setup(
     incumbent: str | None,
     non_interactive: bool,
     console: Console,
+    provider_lister: ProviderModelLister | None = None,
+    environment: MutableMapping[str, str] | None = None,
+    interactive_command: str | None = None,
 ) -> RouterCandidateSetupPlan:
     """Collect and validate candidate roles without mutating the shared catalog.
 
@@ -42,6 +50,9 @@ def collect_router_candidate_setup(
         incumbent: Optional explicit quality incumbent.
         non_interactive: Whether absent values must be reported instead of prompted.
         console: Rich terminal used for prompts and the final summary.
+        provider_lister: Provider listing seam used by the configured-provider picker.
+        environment: Mutable environment used by provider credential discovery.
+        interactive_command: One complete command printed for missing non-interactive input.
 
     Returns:
         Confirmed selection and exact catalog digest for a later atomic write.
@@ -52,13 +63,45 @@ def collect_router_candidate_setup(
     """
     state_sha256 = catalog_state_sha256(path)
     collected_models = candidate_models
-    if not non_interactive:
+    candidate_connections: tuple[ProviderConnection, ...] = ()
+    selection: RouterCandidateSelection | None = None
+    if (
+        not non_interactive
+        and not candidate_models
+        and len(completion_candidate_aliases(catalog)) < 2
+    ):
+        try:
+            picked = run_router_candidate_picker(
+                catalog,
+                candidates=candidates,
+                incumbent=incumbent,
+                console=console,
+                lister=provider_lister,
+                environment=environment,
+            )
+        except SetupCancelled:
+            raise typer.Abort() from None
+        if picked is None:
+            raise typer.Abort()
+        selection = picked.selection
+        collected_models = picked.candidate_models
+        candidate_connections = picked.connections
+    elif not non_interactive:
         collected_models = _interactive_candidate_models(catalog, candidate_models, console=console)
-    prospective = _catalog_with_candidate_models(catalog, collected_models)
+    prospective = _catalog_with_candidate_models(
+        catalog,
+        collected_models,
+        candidate_connections=candidate_connections,
+    )
     if non_interactive:
         selected = candidates or tuple(item.alias for item in collected_models)
-        selection = _noninteractive_selection(prospective, selected, incumbent)
-    else:
+        selection = _noninteractive_selection(
+            prospective,
+            selected,
+            incumbent,
+            interactive_command=interactive_command,
+        )
+    elif selection is None:
         selection = _interactive_selection(prospective, candidates, incumbent, console=console)
     problems = validate_router_candidate_selection(prospective, selection)
     if problems:
@@ -83,12 +126,13 @@ def collect_router_candidate_setup(
             f"context {caps.context_window_tokens}, output {caps.maximum_output_tokens}"
         )
     if not non_interactive and not Confirm.ask(
-        "Save these router candidates?", default=False, console=console
+        "Save these router candidates?", default=True, console=console
     ):
         raise typer.Abort()
     return RouterCandidateSetupPlan(
         selection=selection,
         candidate_models=collected_models,
+        candidate_connections=candidate_connections,
         prospective_catalog=prospective,
         expected_catalog_sha256=state_sha256,
     )
@@ -97,12 +141,15 @@ def collect_router_candidate_setup(
 def _catalog_with_candidate_models(
     catalog: ModelCatalog,
     candidate_models: tuple[ProviderModelSelection, ...],
+    *,
+    candidate_connections: tuple[ProviderConnection, ...] = (),
 ) -> ModelCatalog:
     """Merge explicit candidate definitions into an in-memory catalog.
 
     Args:
         catalog: Current catalog that remains unchanged on disk.
         candidate_models: Complete candidate definitions collected for this optimize run.
+        candidate_connections: New provider connections selected for those definitions.
 
     Returns:
         Prospective catalog used for aggregate validation.
@@ -113,8 +160,18 @@ def _catalog_with_candidate_models(
     aliases = tuple(item.alias for item in candidate_models)
     if len(set(aliases)) != len(aliases):
         raise typer.BadParameter("candidate model definitions must use unique aliases")
+    connections = dict(catalog.connections)
+    for connection in candidate_connections:
+        configured = connection.catalog_config()
+        existing = connections.get(connection.name)
+        if existing is not None and existing != configured:
+            raise typer.BadParameter(
+                f"provider connection {connection.name!r} already names different settings; "
+                "choose another provider connection"
+            )
+        connections[connection.name] = configured
     unknown_connections = sorted(
-        {item.connection for item in candidate_models}.difference(catalog.connections)
+        {item.connection for item in candidate_models}.difference(connections)
     )
     if unknown_connections:
         raise typer.BadParameter(
@@ -130,7 +187,7 @@ def _catalog_with_candidate_models(
                 "use a new alias"
             )
         models[item.alias] = candidate_record
-    return catalog.model_copy(update={"models": models})
+    return catalog.model_copy(update={"connections": connections, "models": models})
 
 
 def _interactive_candidate_models(
@@ -198,6 +255,8 @@ def _noninteractive_selection(
     catalog: ModelCatalog,
     candidates: tuple[str, ...],
     incumbent: str | None,
+    *,
+    interactive_command: str | None = None,
 ) -> RouterCandidateSelection:
     """Resolve repeatable structured input or one complete persisted selection.
 
@@ -205,6 +264,7 @@ def _noninteractive_selection(
         catalog: Current local catalog.
         candidates: Explicit repeatable aliases, possibly empty.
         incumbent: Explicit incumbent, possibly absent.
+        interactive_command: Complete interactive command for repairing missing input.
 
     Returns:
         Unambiguous selected roles.
@@ -222,7 +282,10 @@ def _noninteractive_selection(
     if selected_incumbent is None:
         missing.append("--incumbent ALIAS")
     if missing:
-        raise typer.BadParameter("noninteractive router setup is missing: " + "; ".join(missing))
+        message = "noninteractive router setup is missing: " + "; ".join(missing)
+        if interactive_command:
+            message += f". Run `{interactive_command}` to choose candidates interactively"
+        raise typer.BadParameter(message)
     if selected_incumbent is None:
         raise AssertionError("validated noninteractive selection has an incumbent")
     with usage_error(ValueError):

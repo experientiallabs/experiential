@@ -704,7 +704,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
             normalized,
             services=services,
             budget=budget,
-            created_at=_TIME + timedelta(days=1),
+            created_at=_TIME + timedelta(hours=1),
             code_revision="test-revision",
             phase_hook=crash_after_lock,
         )
@@ -714,7 +714,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         normalized,
         services=services,
         budget=budget,
-        created_at=_TIME + timedelta(days=2),
+        created_at=_TIME + timedelta(hours=2),
         code_revision="test-revision",
         phase_hook=crash_after_lock,
     )
@@ -729,7 +729,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         normalized,
         services=services,
         budget=budget,
-        created_at=_TIME + timedelta(days=3),
+        created_at=_TIME + timedelta(hours=3),
         code_revision="test-revision",
     )
 

@@ -729,9 +729,9 @@ def test_configured_budget_rejects_build_before_provider_resolution(
     )
 
     assert result.exit_code == 2
-    output = unstyle(result.output)
-    assert "estimated cost: $1.00" in output
-    assert "configured budget: $0.50 per command" in output
+    output = " ".join(unstyle(result.output).split())
+    assert "estimated cost $1.00" in output
+    assert "of the $0.50 per-command budget" in output
     assert "wmo config budget 1.00" in output
     assert "--yes cannot override" in output
     assert provider_resolutions == []
@@ -1209,9 +1209,9 @@ def test_build_preflight_auto_runs_without_proceed(tmp_path: Path) -> None:
     assert "embedding    at most $" in output
     assert "ceiling      $5.000000" in output
     assert "Proceed?" not in output
-    assert "Build serving index with embed-id" in output
-    assert "Build fit-only index" in output
-    assert "Ground world model world-id" in output
+    assert "serving index" in output
+    assert "fit-only index" in output
+    assert "grounded model" in output
     assert "next: wmo optimize router support" in output
     assert _RESOLVE_CALLS == ["embed"]
 

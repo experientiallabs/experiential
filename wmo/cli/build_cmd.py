@@ -13,6 +13,7 @@ from rich.console import Console
 from wmo.cli.build_cost import over_ceiling_message
 from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.cli.progress import progress_display, qualified
 from wmo.cli.provider_picker import resolve_setup_providers
 from wmo.cli.provider_setup import (
     ProviderSetupOptions,
@@ -28,6 +29,7 @@ from wmo.common.models import (
     load_model_catalog,
 )
 from wmo.common.observability.telemetry import BuildTelemetryStats, capture_build_completed
+from wmo.common.progress import ProgressHook, report
 from wmo.common.project import (
     ArtifactStoreError,
     ProjectBudgetConfiguration,
@@ -237,28 +239,49 @@ def build(
         )
         _console.print("[dim]loading[/dim] Normalize trace evidence")
         path = _resolve_trace_file(trace_file)
-        normalized = _load_canonical_traces(path, source)
-        if not normalized.traces:
-            raise ValueError(
-                "no valid canonical traces were produced; inspect the input and provide at least "
-                f"one valid {source.strip().casefold()} trace"
+        with progress_display(_console) as progress:
+            report(progress, "normalization")
+            normalized = _load_canonical_traces(path, source)
+            if not normalized.traces:
+                raise ValueError(
+                    "no valid canonical traces were produced; inspect the input and provide at "
+                    f"least one valid {source.strip().casefold()} trace"
+                )
+            record_count = len(normalized.traces) + len(normalized.issues)
+            report(
+                progress,
+                "normalization",
+                completed=len(normalized.traces),
+                total=record_count,
+                detail="valid traces",
             )
-        store = _project_store(
-            root,
-            ProjectConfig(
-                project_id=project,
-                trace_source=source.strip().casefold(),
-                models=selected,
-                retrieval=ProjectRetrievalConfiguration(top_k=top_k),
-                budgets=ProjectBudgetConfiguration(maximum_build_cost_usd=maximum_build_cost_usd),
-            ),
-        )
-        completed = build_project(
-            normalized,
-            store,
-            created_at=datetime.now(UTC),
-            code_revision=code_revision,
-        )
+            store = _project_store(
+                root,
+                ProjectConfig(
+                    project_id=project,
+                    trace_source=source.strip().casefold(),
+                    models=selected,
+                    retrieval=ProjectRetrievalConfiguration(top_k=top_k),
+                    budgets=ProjectBudgetConfiguration(
+                        maximum_build_cost_usd=maximum_build_cost_usd
+                    ),
+                ),
+            )
+            report(progress, "task construction")
+            completed = build_project(
+                normalized,
+                store,
+                created_at=datetime.now(UTC),
+                code_revision=code_revision,
+            )
+            task_count = len(completed.artifacts.mining.tasks)
+            report(
+                progress,
+                "task construction",
+                completed=task_count,
+                total=task_count,
+                detail="representative tasks",
+            )
         tasks = completed.artifacts.mining.tasks
         fit_count = sum(task.partition == "fit" for task in tasks)
         held_out_count = sum(task.partition == "held_out" for task in tasks)
@@ -326,18 +349,20 @@ def build(
             non_interactive=no_interactive,
         ):
             return
-        completion = _complete_grounded_build(
-            store,
-            completed,
-            selected=selected,
-            runtime_catalog=runtime_catalog,
-            world_snapshot=world_snapshot,
-            embedder_snapshot=embedder_snapshot,
-            top_k=top_k,
-            estimate=estimate,
-            maximum_build_cost_usd=maximum_build_cost_usd,
-            provider_spend_authorized=True,
-        )
+        with progress_display(_console) as progress:
+            completion = _complete_grounded_build(
+                store,
+                completed,
+                selected=selected,
+                runtime_catalog=runtime_catalog,
+                world_snapshot=world_snapshot,
+                embedder_snapshot=embedder_snapshot,
+                top_k=top_k,
+                estimate=estimate,
+                maximum_build_cost_usd=maximum_build_cost_usd,
+                provider_spend_authorized=True,
+                progress=progress,
+            )
         built = completion.artifacts
         reused = completion.reused
     _capture_local_build_telemetry(
@@ -428,40 +453,6 @@ def _missing_build_configuration(catalog: ModelCatalog | None) -> tuple[str, ...
         if getattr(catalog.roles, role) is None:
             missing.append(role)
     return tuple(missing)
-
-
-def _validated_role_snapshots(
-    runtime_catalog: RuntimeModelCatalog,
-    selected: ProjectModelConfiguration,
-) -> tuple[ModelSnapshot, ModelSnapshot, ModelCapabilities]:
-    """Validate build roles from catalog metadata without reading credentials.
-
-    Args:
-        runtime_catalog: Local catalog resolver used only for static snapshots.
-        selected: Frozen world-model, judge, and embedder aliases.
-
-    Returns:
-        World-model snapshot, embedder snapshot, and embedder capabilities.
-
-    Raises:
-        ModelCapabilityError: The embedder cannot prove embedding support.
-        ModelConnectionError: A selected alias is unknown or uses an unsupported provider.
-        ValueError: The embedder omits explicit input pricing.
-    """
-    world_snapshot, _world_capabilities = runtime_catalog.snapshot(selected.world_model)
-    runtime_catalog.snapshot(selected.judge)
-    embedder_snapshot, embedder_capabilities = runtime_catalog.snapshot(selected.embedder)
-    preflight_capabilities(
-        selected.embedder,
-        embedder_capabilities,
-        CapabilityRequirement(requires_embeddings=True),
-    )
-    if embedder_capabilities.input_cost_per_million_tokens_usd is None:
-        raise ValueError(
-            f"embedder alias {selected.embedder!r} has no input_cost_per_million_tokens_usd; "
-            "record explicit pricing before a provider-backed build"
-        )
-    return world_snapshot, embedder_snapshot, embedder_capabilities
 
 
 def _selected_roles(
@@ -610,6 +601,7 @@ def _build_grounded_artifacts(
     world_snapshot: ModelSnapshot,
     resolved_embedder: ResolvedModel,
     top_k: int,
+    progress: ProgressHook | None = None,
 ) -> ProjectBuildArtifacts:
     """Build serving and fit-only RAG plus the executable world-model binding.
 
@@ -620,6 +612,7 @@ def _build_grounded_artifacts(
         world_snapshot: Secret-free world-model identity.
         resolved_embedder: Exact provider embedding binding.
         top_k: Default number of retrieved transitions.
+        progress: Optional observer of embedding, RAG, and grounded-model stages.
 
     Returns:
         Exact manifest pointers for every completed build output.
@@ -644,9 +637,6 @@ def _build_grounded_artifacts(
         maximum_attempts=RetryPolicy().maximum_attempts,
         input_usd_per_million_tokens=embedding_price,
     )
-    _console.print(
-        f"[dim]embedding[/dim] Build serving index with {resolved_embedder.snapshot.model_id}"
-    )
     serving = persist_trace_rag(
         store.artifacts,
         (trace_input,),
@@ -656,8 +646,8 @@ def _build_grounded_artifacts(
         embedder=rag_embedder,
         default_top_k=top_k,
         included_partitions=frozenset({"fit", "held_out"}),
+        progress=qualified(progress, "serving index"),
     )
-    _console.print("[dim]embedding[/dim] Build fit-only index")
     fit = persist_trace_rag(
         store.artifacts,
         (trace_input,),
@@ -667,8 +657,9 @@ def _build_grounded_artifacts(
         embedder=rag_embedder,
         default_top_k=top_k,
         included_partitions=frozenset({"fit"}),
+        progress=qualified(progress, "fit-only index"),
     )
-    _console.print(f"[dim]binding[/dim] Ground world model {world_snapshot.model_id}")
+    report(progress, "grounded model")
     world = persist_grounded_world_model(
         store.artifacts,
         artifact_input(serving.manifest),
@@ -699,6 +690,7 @@ def _complete_grounded_build(
     estimate: float,
     maximum_build_cost_usd: float,
     provider_spend_authorized: bool,
+    progress: ProgressHook | None = None,
 ) -> GroundedBuildCompletion:
     """Select matching grounded artifacts or execute their bounded embedding work.
 
@@ -713,6 +705,7 @@ def _complete_grounded_build(
         estimate: Conservative retry-inclusive embedding cost.
         maximum_build_cost_usd: Strict grounded-build provider ceiling.
         provider_spend_authorized: Whether new embedding calls are authorized.
+        progress: Optional observer of embedding, RAG, and finalization stages.
 
     Returns:
         Exact selected build artifacts and whether they were replayed.
@@ -748,7 +741,9 @@ def _complete_grounded_build(
             world_snapshot=world_snapshot,
             resolved_embedder=resolved_embedder,
             top_k=top_k,
+            progress=progress,
         )
+    report(progress, "finalization")
     select_completed_build(store, built, completed.review)
     return GroundedBuildCompletion(artifacts=built, reused=reused)
 

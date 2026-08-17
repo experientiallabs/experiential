@@ -29,6 +29,7 @@ from wmo.optimize.router.judging.contracts import ManualJudgeError, judge_feedba
 from wmo.optimize.router.judging.protocol import (
     TemplateJudgeClient,
     _BooleanResponse,
+    _bounded_judge_request,
     _CategoricalResponse,
     _combine_rationales,
     _PairwiseResponse,
@@ -40,6 +41,7 @@ from wmo.optimize.router.judging.service import (
     prepare_manual_judge_setup,
 )
 from wmo.optimize.router.judging.service_test import _TIME, _built_store, _catalog, _template
+from wmo.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
 
 
 def _response(content: str) -> ModelResponse:
@@ -269,3 +271,166 @@ def test_null_rationale_probe_persists_and_replays(tmp_path: Path) -> None:
     assert len(client.requests) == 1
     assert replay_client.requests == []
     assert replay.provider_calls_made == 0
+
+
+def _oversized_rollout(rollout: RolloutArtifact) -> RolloutArtifact:
+    """Return a copy of one rollout whose first span payload is far above 32k tokens.
+
+    Args:
+        rollout: Verified fixture rollout.
+
+    Returns:
+        Rollout copy carrying one deterministic oversized span payload.
+    """
+    first = rollout.spans[0].model_copy(
+        update={"payload": {"observation": "x" * 200_000, "step": 1}}
+    )
+    return rollout.model_copy(update={"spans": (first, *rollout.spans[1:])})
+
+
+def test_long_transcript_judge_request_is_elided_to_fit_the_reserved_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A transcript above the reserved input ceiling dispatches within the ceiling.
+
+    Args:
+        tmp_path: Isolated project root.
+    """
+    store = _built_store(tmp_path)
+    setup = commit_manual_judge_setup(
+        store,
+        prepare_manual_judge_setup(
+            store,
+            _catalog(),
+            prompt_template=_template("scalar"),
+            created_at=_TIME,
+            code_revision="test-revision",
+        ),
+        confirmed=True,
+    )
+    plan = prepare_manual_judge_calibration(store, sample_size=1)
+    rollout_input = write_production_rollout(
+        store,
+        setup,
+        plan.tasks[0],
+        plan.traces[0],
+        _TIME,
+        "test-revision",
+    )
+    rollout, _loaded = read_artifact_json(
+        store,
+        artifact_id=rollout_input.artifact_id,
+        expected_artifact_type="rollout",
+        relative_path="rollout.json",
+        model_type=RolloutArtifact,
+    )
+    rubric, _rubric_input = read_artifact_json(
+        store,
+        artifact_id=setup.rubric.artifact_id,
+        expected_artifact_type="rubric",
+        relative_path="rubric.json",
+        model_type=Rubric,
+    )
+    oversized = _oversized_rollout(rollout)
+    counter = Utf8UpperBoundTokenCounter()
+    unbounded = _bounded_judge_request(
+        setup.prompt_template,
+        rubric,
+        oversized,
+        None,
+        maximum_input_tokens=None,
+    )
+    assert counter.count(unbounded) > 32_768
+
+    bounded = _bounded_judge_request(
+        setup.prompt_template,
+        rubric,
+        oversized,
+        None,
+        maximum_input_tokens=32_768,
+    )
+    replayed = _bounded_judge_request(
+        setup.prompt_template,
+        rubric,
+        oversized,
+        None,
+        maximum_input_tokens=32_768,
+    )
+
+    assert counter.count(bounded) <= 32_768
+    assert bounded == replayed
+    body = bounded.messages[1].content or ""
+    assert '"payload_elided": true' in body or '"payload_elided":true' in body
+    assert '"payload_sha256"' in body
+    assert oversized.spans[0].span_id in body
+    with pytest.raises(ManualJudgeError, match="every span"):
+        _bounded_judge_request(
+            setup.prompt_template,
+            rubric,
+            oversized,
+            None,
+            maximum_input_tokens=16,
+        )
+
+
+def test_template_client_dispatch_respects_the_reserved_input_ceiling(
+    tmp_path: Path,
+) -> None:
+    """The adapter's dispatched provider request stays within the configured reservation.
+
+    Args:
+        tmp_path: Isolated project root.
+    """
+    store = _built_store(tmp_path)
+    setup = commit_manual_judge_setup(
+        store,
+        prepare_manual_judge_setup(
+            store,
+            _catalog(),
+            prompt_template=_template("scalar"),
+            created_at=_TIME,
+            code_revision="test-revision",
+        ),
+        confirmed=True,
+    )
+    plan = prepare_manual_judge_calibration(store, sample_size=1)
+    rollout_input = write_production_rollout(
+        store,
+        setup,
+        plan.tasks[0],
+        plan.traces[0],
+        _TIME,
+        "test-revision",
+    )
+    rollout, _loaded = read_artifact_json(
+        store,
+        artifact_id=rollout_input.artifact_id,
+        expected_artifact_type="rollout",
+        relative_path="rollout.json",
+        model_type=RolloutArtifact,
+    )
+    rubric, _rubric_input = read_artifact_json(
+        store,
+        artifact_id=setup.rubric.artifact_id,
+        expected_artifact_type="rubric",
+        relative_path="rubric.json",
+        model_type=Rubric,
+    )
+    setup_input = artifact_input(store.artifacts.read(setup.setup_id).manifest)
+    client = _NullRationaleClient(setup.judge_model)
+    TemplateJudgeClient(
+        client,
+        setup.prompt_template,
+        _oversized_rollout(rollout),
+        rubric,
+        store=store,
+        setup_input=setup_input,
+        rollout_input=rollout_input,
+        reference_input=None,
+        created_at=_TIME,
+        code_revision="test-revision",
+        maximum_input_tokens=32_768,
+    ).complete(_scalar_request(setup.prompt_template.prompt.text))
+
+    assert len(client.requests) == 1
+    assert Utf8UpperBoundTokenCounter().count(client.requests[0]) <= 32_768

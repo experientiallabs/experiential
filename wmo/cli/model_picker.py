@@ -35,6 +35,7 @@ from wmo.common.models import (
     PricingSource,
     ProviderModelSelection,
     ProviderSetup,
+    RouterCandidateSelection,
     SetupRole,
     derive_model_alias,
     served_roles,
@@ -315,40 +316,154 @@ def _assign_candidates(
     Raises:
         SetupCancelled: The user cancelled setup.
     """
+    return _assign_router_candidates(
+        chosen,
+        preselected=role_inputs.candidates,
+        incumbent=role_inputs.incumbent,
+        console=console,
+        required=False,
+    )
+
+
+def select_router_candidates(
+    models: tuple[AvailableModel, ...],
+    *,
+    preselected: tuple[str, ...] = (),
+    incumbent: str | None = None,
+    console: Console,
+) -> RouterCandidateSelection | None:
+    """Choose at least two eligible completion models and one incumbent.
+
+    Args:
+        models: Configured and newly discovered models offered by provider setup.
+        preselected: Candidate aliases to retain in the multi-select screen.
+        incumbent: Explicit incumbent that skips the incumbent screen.
+        console: Terminal used for the screens.
+
+    Returns:
+        A confirmed candidate selection, or ``None`` when the caller should return to its
+        previous setup screen.
+
+    Raises:
+        SetupCancelled: The user cancelled interactive setup.
+        ValueError: An explicit candidate or incumbent is not eligible.
+    """
+    picked = _assign_router_candidates(
+        models,
+        preselected=preselected,
+        incumbent=incumbent,
+        console=console,
+        required=True,
+    )
+    if picked is None or picked[1] is None:
+        return None
+    return RouterCandidateSelection(candidates=picked[0], incumbent=picked[1])
+
+
+def _assign_router_candidates(
+    chosen: tuple[AvailableModel, ...],
+    *,
+    preselected: tuple[str, ...],
+    incumbent: str | None,
+    console: Console,
+    required: bool,
+) -> tuple[tuple[str, ...], str | None] | None:
+    """Share router-candidate selection between optional setup and required router setup.
+
+    Args:
+        chosen: Models currently visible to the picker.
+        preselected: Candidate aliases to preselect.
+        incumbent: Explicit incumbent, or ``None`` to show the incumbent screen.
+        console: Terminal used for the screens.
+        required: Whether fewer than two selected candidates is an error instead of a skip.
+
+    Returns:
+        Candidate aliases and incumbent, or ``None`` when the caller should go back.
+
+    Raises:
+        SetupCancelled: The user cancelled interactive setup.
+        ValueError: An explicit candidate or incumbent is not eligible.
+    """
     eligible = tuple(
-        item for item in chosen if _serves_or_retains(item, SetupRole.ROUTER_CANDIDATE)
+        item
+        for item in chosen
+        if (
+            item.capabilities is not None
+            and serves_role(item.capabilities, SetupRole.ROUTER_CANDIDATE)
+        )
+        or (not required and SetupRole.ROUTER_CANDIDATE in item.retainable_roles)
     )
     if len(eligible) < 2:
+        if required:
+            console.print(
+                "[yellow]Router optimization needs at least two eligible completion models. "
+                "Choose another configured provider.[/yellow]"
+            )
+            return None
         console.print(
             "[dim]Router candidates need two priced models with explicit token limits. "
             "Skipping that role for now.[/dim]"
         )
         return (), None
+    eligible_aliases = {item.alias for item in eligible}
+    unknown = tuple(alias for alias in preselected if alias not in eligible_aliases)
+    if unknown:
+        raise ValueError(
+            "router candidate aliases are not eligible completion models: "
+            + ", ".join(sorted(set(unknown)))
+        )
     result = choose_many(
         console,
-        title="Router candidates (optional, Complete with none skips)",
-        options=[_option(item) for item in eligible],
-        preselected=role_inputs.candidates,
-        minimum=0,
+        title=(
+            "Router candidates (select at least two)"
+            if required
+            else "Router candidates (optional, Complete with none skips)"
+        ),
+        options=[_candidate_option(item) if required else _option(item) for item in eligible],
+        preselected=preselected,
+        minimum=2 if required else 0,
     )
     if result.action is PickerAction.CANCEL:
         raise SetupCancelled
     if result.action is PickerAction.BACK:
         return None
     if len(result.values) < 2:
+        if required:
+            console.print("[yellow]Router candidates need at least two models.[/yellow]")
+            return None
         console.print("[dim]Router candidates need at least two models. Skipping that role.[/dim]")
         return (), None
-    incumbent = choose_one(
+    if incumbent is not None:
+        if incumbent not in result.values:
+            raise ValueError("router incumbent must also be a selected candidate")
+        return result.values, incumbent
+    incumbent_result = choose_one(
         console,
         title="Router incumbent among the candidates",
-        options=[PickerOption(value=alias, label=alias) for alias in result.values],
-        default=role_inputs.incumbent,
+        options=(
+            [_candidate_option(item) for item in eligible if item.alias in result.values]
+            if required
+            else [PickerOption(value=alias, label=alias) for alias in result.values]
+        ),
+        default=incumbent,
     )
-    if incumbent.action is PickerAction.CANCEL:
+    if incumbent_result.action is PickerAction.CANCEL:
         raise SetupCancelled
-    if incumbent.action is PickerAction.BACK:
+    if incumbent_result.action is PickerAction.BACK:
         return None
-    return result.values, incumbent.values[0]
+    return result.values, incumbent_result.values[0]
+
+
+def _candidate_option(item: AvailableModel) -> PickerOption:
+    """Present one strict router-candidate option with provider identity and capabilities.
+
+    Args:
+        item: Eligible model discovered or retained by provider setup.
+
+    Returns:
+        Picker row carrying the alias, provider/model identity, and role metadata.
+    """
+    return PickerOption(value=item.alias, label=item.label(), detail=item.detail())
 
 
 def build_result(

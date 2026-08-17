@@ -241,6 +241,7 @@ def collect_trace_reviews(
             reference_input=reference_input,
             created_at=created_at,
             code_revision=code_revision,
+            maximum_input_tokens=budget.maximum_input_tokens_per_call,
         )
         judge = LMJudge(
             adapter,

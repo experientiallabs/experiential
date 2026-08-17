@@ -10,6 +10,7 @@ from rich.console import Console
 
 from wmo.cli.picker import (
     PickerAction,
+    PickerEvent,
     PickerKey,
     PickerOption,
     interpret_key_bytes,
@@ -230,17 +231,29 @@ def test_a_screen_without_rows_is_a_programming_error() -> None:
         select_many(console, title="Models", options=())
 
 
-def _keys(*actions: PickerKey) -> Callable[[], PickerKey]:
+def _keys(*actions: PickerKey | PickerEvent) -> Callable[[], PickerKey | PickerEvent]:
     """Return a key source that yields the scripted keyboard events in order.
 
     Args:
-        actions: Decoded keys the list should consume.
+        actions: Decoded keys or full events the list should consume.
 
     Returns:
         Zero-argument reader used by ``select_many_list``.
     """
     iterator = iter(actions)
     return lambda: next(iterator)
+
+
+def _typed(text: str) -> tuple[PickerEvent, ...]:
+    """Return one text event per character, as a terminal emits them while typing.
+
+    Args:
+        text: Characters typed in order.
+
+    Returns:
+        The decoded events carrying each character.
+    """
+    return tuple(PickerEvent(PickerKey.TEXT, char) for char in text)
 
 
 def _picker_script(body: str) -> str:
@@ -300,28 +313,35 @@ def _assert_single_region(run: TerminalRun, *, title: str, rows: tuple[str, ...]
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        (b"\x1b[A", PickerKey.UP),
-        (b"\x1bOA", PickerKey.UP),
-        (b"\x1b[B", PickerKey.DOWN),
-        (b"\x1bOB", PickerKey.DOWN),
-        (b"\r", PickerKey.ENTER),
-        (b"\n", PickerKey.ENTER),
-        (b"b", PickerKey.BACK),
-        (b"B", PickerKey.BACK),
-        (b"q", PickerKey.CANCEL),
-        (b"\x03", PickerKey.CANCEL),
-        (b"\x1b", PickerKey.CANCEL),
-        (b"x", PickerKey.IGNORE),
+        (b"\x1b[A", PickerEvent(PickerKey.UP)),
+        (b"\x1bOA", PickerEvent(PickerKey.UP)),
+        (b"\x1b[B", PickerEvent(PickerKey.DOWN)),
+        (b"\x1bOB", PickerEvent(PickerKey.DOWN)),
+        (b"\r", PickerEvent(PickerKey.ENTER)),
+        (b"\n", PickerEvent(PickerKey.ENTER)),
+        (b" ", PickerEvent(PickerKey.SPACE, " ")),
+        (b"\x7f", PickerEvent(PickerKey.BACKSPACE)),
+        (b"\x08", PickerEvent(PickerKey.BACKSPACE)),
+        (b"\x03", PickerEvent(PickerKey.CANCEL)),
+        (b"\x1b", PickerEvent(PickerKey.ESCAPE)),
+        (b"b", PickerEvent(PickerKey.TEXT, "b")),
+        (b"q", PickerEvent(PickerKey.TEXT, "q")),
+        (b"/", PickerEvent(PickerKey.TEXT, "/")),
+        (b"x", PickerEvent(PickerKey.TEXT, "x")),
+        ("\u00e9".encode(), PickerEvent(PickerKey.TEXT, "\u00e9")),
+        ("\u4e16".encode(), PickerEvent(PickerKey.TEXT, "\u4e16")),
+        (b"\x00", PickerEvent(PickerKey.IGNORE)),
+        (b"\xff", PickerEvent(PickerKey.IGNORE)),
     ],
 )
-def test_interpret_key_bytes_maps_terminal_events(raw: bytes, expected: PickerKey) -> None:
-    """Each raw key sequence used by the list becomes one stable action.
+def test_interpret_key_bytes_maps_terminal_events(raw: bytes, expected: PickerEvent) -> None:
+    """Each raw key sequence used by the list becomes one stable event.
 
     Args:
         raw: Bytes a terminal emits for one key press.
-        expected: Decoded picker action.
+        expected: Decoded picker event, carrying the typed character when there is one.
     """
-    assert interpret_key_bytes(raw) is expected
+    assert interpret_key_bytes(raw) == expected
 
 
 @pytest.mark.parametrize("ready_marker", ["Providers", "q cancels."])
@@ -482,6 +502,92 @@ def test_a_narrow_terminal_keeps_the_hint_and_metadata_readable(
     assert text.count("Providers") == 1
     assert "Activate Complete to submit." in text
     assert "roles: judge, world_model; pricing:" in text
+
+
+def test_a_single_select_search_narrows_a_huge_catalog_on_a_terminal(
+    python_terminal_child: Callable[..., TerminalRun],
+) -> None:
+    """Typing a search on a real terminal narrows a large catalog and Enter confirms the match.
+
+    Args:
+        python_terminal_child: Runner for one inline script under a pseudo-terminal.
+    """
+    script = _picker_script(
+        "result = choose_one(\n"
+        "    console,\n"
+        '    title="Judge model",\n'
+        f"    options={_model_options(40)},\n"
+        ")"
+    )
+
+    run = python_terminal_child(
+        script,
+        steps=[("Judge model", "/gpt-39"), (None, _ENTER)],
+        size=(16, 100),
+    )
+
+    assert "RESULT:model-39|None" in run.transcript
+    assert "Search: gpt-39_" in run.transcript
+    assert "Enter confirms the focused match" in run.transcript
+
+
+def test_a_search_accepts_multibyte_characters_on_a_terminal(
+    python_terminal_child: Callable[..., TerminalRun],
+) -> None:
+    """A typed non-ASCII character reaches the query and narrows the rows.
+
+    Args:
+        python_terminal_child: Runner for one inline script under a pseudo-terminal.
+    """
+    script = _picker_script(
+        "result = choose_one(\n"
+        "    console,\n"
+        '    title="Judge model",\n'
+        "    options=(\n"
+        '        PickerOption(value="modele", label="mod\\u00e8le (openrouter/mod\\u00e8le)"),\n'
+        '        PickerOption(value="plain", label="plain (openai/gpt-4)"),\n'
+        "    ),\n"
+        ")"
+    )
+
+    run = python_terminal_child(
+        script,
+        steps=[("Judge model", "/mod\u00e8le"), (None, _ENTER)],
+    )
+
+    assert "RESULT:modele|None" in run.transcript
+    assert "Search: mod\u00e8le_" in run.transcript
+
+
+def test_a_multi_select_search_selects_a_match_and_submits_on_a_terminal(
+    python_terminal_child: Callable[..., TerminalRun],
+) -> None:
+    """A candidate screen narrows by search, keeps the match, and submits from Complete.
+
+    Args:
+        python_terminal_child: Runner for one inline script under a pseudo-terminal.
+    """
+    script = _picker_script(
+        "result = choose_many(\n"
+        "    console,\n"
+        '    title="Router candidates",\n'
+        f"    options={_model_options(30)},\n"
+        ")"
+    )
+
+    run = python_terminal_child(
+        script,
+        steps=[
+            ("Router candidates", "/gpt-27"),
+            (None, _ENTER),
+            (None, _SPACE),
+            (None, _DOWN + _ENTER),
+        ],
+        size=(16, 100),
+    )
+
+    assert "RESULT:model-27|None" in run.transcript
+    assert "Search: gpt-27_" in run.transcript
 
 
 def test_cancelling_a_screen_restores_the_terminal(
@@ -667,6 +773,132 @@ def test_keyboard_list_refuses_complete_until_the_minimum_is_met() -> None:
 
     assert result.values == ("model-1",)
     assert "Select at least 1." in console.output
+
+
+def test_keyboard_multi_select_search_narrows_and_keeps_hidden_selections() -> None:
+    """Slash search narrows a long list while selections hidden by the query survive."""
+    console = _console("")
+
+    result = select_many_list(
+        console,
+        title="Router candidates",
+        options=_options(20),
+        preselected=("model-3",),
+        read_key=_keys(
+            *_typed("/"),
+            *_typed("model-12"),
+            PickerEvent(PickerKey.ENTER),
+            PickerEvent(PickerKey.ENTER),
+            PickerEvent(PickerKey.DOWN),
+            PickerEvent(PickerKey.ENTER),
+        ),
+    )
+
+    assert result.values == ("model-3", "model-12")
+    assert "Search: model-12_" in console.output
+    assert "Filter: model-12" in console.output
+
+
+def test_keyboard_multi_select_escape_clears_the_search_and_restores_the_list() -> None:
+    """A query without matches is explained, and Esc returns to the full list."""
+    console = _console("")
+
+    result = select_many_list(
+        console,
+        title="Router candidates",
+        options=_options(5),
+        read_key=_keys(
+            *_typed("/"),
+            *_typed("zz"),
+            PickerEvent(PickerKey.ESCAPE),
+            PickerEvent(PickerKey.ENTER),
+            PickerEvent(PickerKey.UP),
+            PickerEvent(PickerKey.ENTER),
+        ),
+    )
+
+    assert result.values == ("model-1",)
+    assert "No row matches 'zz'." in console.output
+
+
+def test_keyboard_multi_select_backspace_reopens_a_retained_filter() -> None:
+    """Backspace on a closed filter reopens the search line with the last character removed."""
+    console = _console("")
+
+    result = select_many_list(
+        console,
+        title="Router candidates",
+        options=_options(12),
+        read_key=_keys(
+            *_typed("/"),
+            *_typed("model-12"),
+            PickerEvent(PickerKey.ENTER),
+            PickerEvent(PickerKey.BACKSPACE),
+            PickerEvent(PickerKey.ESCAPE),
+            PickerEvent(PickerKey.TEXT, "b"),
+        ),
+    )
+
+    assert result.action is PickerAction.BACK
+    assert "Filter: model-12" in console.output
+    assert "Search: model-1_" in console.output
+
+
+def test_keyboard_single_select_search_confirms_the_focused_match() -> None:
+    """Enter while searching confirms the focused match directly."""
+    console = _console("")
+
+    result = select_one_list(
+        console,
+        title="Judge",
+        options=_options(40),
+        read_key=_keys(
+            *_typed("/"),
+            *_typed("model-39"),
+            PickerEvent(PickerKey.ENTER),
+        ),
+    )
+
+    assert result.values == ("model-39",)
+    assert "Search: model-39_" in console.output
+
+
+def test_keyboard_single_select_search_backspace_edits_and_arrows_move_the_focus() -> None:
+    """Backspace edits the open query, and arrows keep moving focus through the matches."""
+    console = _console("")
+
+    result = select_one_list(
+        console,
+        title="Judge",
+        options=_options(15),
+        read_key=_keys(
+            *_typed("/"),
+            *_typed("model-15"),
+            PickerEvent(PickerKey.BACKSPACE),
+            PickerEvent(PickerKey.DOWN),
+            PickerEvent(PickerKey.ENTER),
+        ),
+    )
+
+    assert result.values == ("model-10",)
+
+
+def test_keyboard_search_still_cancels_on_ctrl_c() -> None:
+    """Ctrl-C cancels the whole screen even while the search line is open."""
+    console = _console("")
+
+    result = select_many_list(
+        console,
+        title="Router candidates",
+        options=_options(3),
+        read_key=_keys(
+            *_typed("/"),
+            *_typed("mod"),
+            PickerEvent(PickerKey.CANCEL),
+        ),
+    )
+
+    assert result.action is PickerAction.CANCEL
 
 
 def test_keyboard_list_keeps_details_readable_on_a_narrow_terminal() -> None:
