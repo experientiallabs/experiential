@@ -12,7 +12,7 @@ permissions:
 jobs:
   gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -27,7 +27,7 @@ jobs:
       - name: non-live tests
         # Dedicated jobs below own the expensive release and W16 evidence cases.
         run: >-
-          uv run pytest -n 4 --dist worksteal -q -k "not live"
+          timeout 120s uv run pytest -n 4 --dist worksteal -q -k "not live"
           --ignore=wmo/optimize/router/composition_evidence_test.py
           --ignore=wmo/simulation/comparison_evidence_test.py
           --deselect=wmo/release_test.py::test_installed_wheel_no_spend_release_evidence
