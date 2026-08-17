@@ -43,7 +43,7 @@ class AutomaticRouterOptions:
     router_embedding_maximum_attempts: int = 3
     completion_maximum_attempts: int = 3
     simulation_maximum_input_tokens: int = 32_768
-    simulation_maximum_output_tokens: int = 16_000
+    simulation_maximum_output_tokens: int = 2_000
     maximum_concurrency: int = 1
     seed: int = 0
 

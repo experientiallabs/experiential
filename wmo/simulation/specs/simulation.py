@@ -34,7 +34,7 @@ class WorldModelSettings(ContractModel):
     grounded_world_model_input: ArtifactInput
     prompt_version: str = Field(min_length=1, max_length=256)
     query_embedding: EmbeddingCostReservation | None = None
-    maximum_output_tokens: int = Field(default=16_000, ge=8_000)
+    maximum_output_tokens: int = Field(default=16_000, ge=256)
     allow_tools: Literal[False] = False
 
 

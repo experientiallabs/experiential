@@ -60,7 +60,7 @@ def router(
         32_768, "--maximum-retrieval-query-tokens", min=1
     ),
     simulation_maximum_output_tokens: int = typer.Option(
-        16_000, "--simulation-maximum-output-tokens", min=8_000
+        2_000, "--simulation-maximum-output-tokens", min=256
     ),
     maximum_concurrency: int = typer.Option(1, "--maximum-concurrency", min=1),
     yes: bool = typer.Option(

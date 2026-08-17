@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from wmo.common.models import RoutedCandidateSnapshot, RouterCandidateSelection
 from wmo.common.tasks import TaskCase
 from wmo.optimize.router.automatic.reservations import (
@@ -38,8 +40,8 @@ def test_cost_plan_reserves_exact_small_schedule_without_io() -> None:
     assert plan.maximum_judge_provider_calls == 24
     assert plan.simulated_episode_count == 18
     assert tuple(item.episode_count for item in plan.candidate_episodes) == (9, 9)
-    assert plan.required_provider_cost_usd == (
-        plan.router_embedding_cost_usd + plan.judgment_cost_usd + plan.simulation_cost_usd
+    assert plan.required_provider_cost_usd == math.fsum(
+        (plan.router_embedding_cost_usd, plan.judgment_cost_usd, plan.simulation_cost_usd)
     )
     assert catalog.model_dump(mode="json") == original
 
