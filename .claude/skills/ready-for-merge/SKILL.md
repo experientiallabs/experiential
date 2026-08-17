@@ -8,6 +8,9 @@ description: Mandatory pre-merge gate for every PR. Runs /code-review --fix at a
 This is the **mandatory gate before merging any PR** in this repository. Do not tell the user
 a PR is ready to merge until every step below has been completed and passes.
 
+**Always mark PRs ready for review.** When you create or update a PR, set it ready for
+review (`draft=false`). Do not leave PRs as drafts.
+
 **Address Greptile as soon as a PR exists.** When you open or update a PR, run Step 2 in the
 same turn: fetch Greptile comments, fix valid findings, reply, and resolve threads. Do not
 leave Greptile feedback for a later merge pass.
