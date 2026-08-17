@@ -571,6 +571,13 @@ def _verify_attribution_inputs(
         )
     except RouterAttributionError as exc:
         if value.fidelity_evidence == "waived":
+            has_model_identity = any(
+                span.model is not None for trace in loaded_traces.traces for span in trace.spans
+            ) or bool(evidence is not None and evidence.records)
+            if has_model_identity:
+                raise ArtifactCorruptionError(
+                    "waived router attribution conflicts with model-identity-bearing traces"
+                ) from exc
             return
         raise ArtifactCorruptionError("router attribution cannot be recomputed") from exc
     if value.fidelity_evidence == "waived":

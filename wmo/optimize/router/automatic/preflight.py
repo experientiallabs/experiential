@@ -789,8 +789,9 @@ def _observed_traces(
         candidates: Exact selected candidate identities.
         preferred_overlap_limit: Maximum fidelity overlaps admitted to evaluation.
         waive_fidelity_evidence: Whether the operator explicitly waived real overlap evidence.
-            The waiver only applies when no fit trace attributes to a selected candidate;
-            resolvable attribution rejects the waiver so real evidence is never discarded.
+            The waiver only applies when the dataset carries no model identity at all; traces
+            with model spans or identity evidence reject the waiver so identity conflicts,
+            ambiguity, and unselected incumbents surface instead of being silently discarded.
 
     Returns:
         One deterministic attributed trace per admitted fit lineage.
@@ -808,6 +809,15 @@ def _observed_traces(
     except RouterAttributionError as exc:
         if not waive_fidelity_evidence:
             problems.append(f"fidelity identity attribution: {exc}")
+            return ()
+        has_model_identity = any(
+            span.model is not None for trace in traces for span in trace.spans
+        ) or bool(identity_evidence is not None and identity_evidence.records)
+        if has_model_identity:
+            problems.append(
+                "fidelity waiver: traces carry model identity, so the waiver is rejected; "
+                f"resolve the attribution failure instead: {exc}"
+            )
         return ()
     if waive_fidelity_evidence:
         problems.append(

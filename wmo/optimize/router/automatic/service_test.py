@@ -834,6 +834,29 @@ def test_ambiguous_inferred_telemetry_fails_before_stateful_boundaries(tmp_path:
     assert store.model_catalog_path.read_bytes() == before_catalog
     assert tuple(state.completion_calls) == before_completion
     assert tuple(state.embedding_calls) == before_embedding
+
+    with pytest.raises(AutomaticRouterPreflightError, match="waiver is rejected"):
+        optimize_project_router(
+            store,
+            plan,
+            cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+            options=AutomaticRouterOptions(
+                maximum_judgments=20,
+                preferred_fidelity_overlaps=1,
+                maximum_model_calls=1,
+                simulation_maximum_output_tokens=8_000,
+                waive_fidelity_evidence=True,
+            ),
+            provider_spend_consented=True,
+            fidelity_approval=_FidelityApproval(),
+            created_at=_TIME + timedelta(hours=1),
+            code_revision=_REVISION,
+        )
+
+    assert store.artifacts.list_ids() == before_artifacts
+    assert store.model_catalog_path.read_bytes() == before_catalog
+    assert tuple(state.completion_calls) == before_completion
+    assert tuple(state.embedding_calls) == before_embedding
     assert state.credential_resolutions == before_credentials
 
 
