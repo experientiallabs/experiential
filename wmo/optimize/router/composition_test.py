@@ -11,7 +11,6 @@ import pytest
 from wmo.cli.build_cmd import _lineage_bindings
 from wmo.common.core.artifacts import ArtifactInput, stable_id
 from wmo.common.evaluations import (
-    EvaluationCellEvidence,
     EvaluationPlan,
     EvaluationProtocol,
     ObservedProductionCell,
@@ -48,7 +47,6 @@ from wmo.common.routing import KnnGuard
 from wmo.common.tasks import load_task_set
 from wmo.optimize.router.composition import (
     ApprovedRouterReview,
-    FidelityApprovalDecision,
     RouterCompositionBudget,
     RouterCompositionError,
     RouterEvaluationSetup,
@@ -552,33 +550,6 @@ class _LoggingSimulator:
         return self.simulator.run(spec)
 
 
-class _FidelityApproval:
-    """Assert the callback sees only fidelity cells and return auditable actor evidence."""
-
-    def __init__(self) -> None:
-        """Initialize the fidelity-approval call counter."""
-        self.calls = 0
-
-    def __call__(
-        self,
-        project: ProjectStore,
-        plan: EvaluationPlan,
-        evidence: tuple[EvaluationCellEvidence, ...],
-        budget: RouterCompositionBudget,
-    ) -> FidelityApprovalDecision:
-        """Approve measured fidelity evidence and record the callback."""
-        del project, budget
-        self.calls += 1
-        cells = {cell.cell_id: cell for cell in plan.cells}
-        assert evidence
-        assert {cells[item.cell_id].purpose for item in evidence} == {"fidelity"}
-        return FidelityApprovalDecision(
-            actor_id="reviewer-fixture",
-            evidence="Reviewed all ten plan-bound fidelity pairs.",
-            approved_at=_TIME,
-        )
-
-
 def test_composition_rejects_fit_rag_outside_completed_build_before_simulation(
     tmp_path: Path,
 ) -> None:
@@ -595,13 +566,11 @@ def test_composition_rejects_fit_rag_outside_completed_build_before_simulation(
     _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     judge = _Judge()
-    approval = _FidelityApproval()
     services = RouterWorkflowServices(
         review_supplier=_ReviewSupplier(),
         setup_supplier=_MismatchedSetupSupplier(),
         simulator_factory=simulator,
         judge=judge,
-        fidelity_approval=approval,
         runtime_catalog=cast(
             RuntimeModelCatalog,
             _Catalog(
@@ -638,7 +607,6 @@ def test_composition_rejects_fit_rag_outside_completed_build_before_simulation(
     assert simulator.candidate.requests == []
     assert simulator.world.requests == []
     assert judge.calls == 0
-    assert approval.calls == 0
 
 
 def test_public_composition_runs_and_resumes_complete_frozen_router(
@@ -659,7 +627,6 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     completed_build = _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     judge = _Judge()
-    approval = _FidelityApproval()
     runtime_client = _Client()
     runtime_catalog = cast(
         RuntimeModelCatalog,
@@ -677,7 +644,6 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         setup_supplier=_SetupSupplier(),
         simulator_factory=simulator,
         judge=judge,
-        fidelity_approval=approval,
         runtime_catalog=runtime_catalog,
     )
     budget = RouterCompositionBudget(
@@ -724,7 +690,6 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
             code_revision="test-revision",
             phase_hook=crash_after_lock,
         )
-    assert approval.calls == 1
     from wmo.optimize.router import composition as workflow_module
 
     monkeypatch.setattr(
@@ -757,7 +722,6 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         len(simulator.candidate.requests),
         len(simulator.world.requests),
         judge.calls,
-        approval.calls,
     )
     second = compose_router(
         project,
@@ -772,10 +736,10 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     assert completed_build.fit_rag in first.simulation_spec.inputs
     assert completed_build.fit_rag in first.held_out_simulation_spec.inputs
     assert first.held_out_simulation_spec.maximum_cost_usd == pytest.approx(
-        budget.maximum_simulation_cost_usd - first.phase_a_simulation_spend_usd
+        budget.maximum_simulation_cost_usd - first.fit_simulation_spend_usd
     )
     assert first.total_simulation_spend_usd == pytest.approx(
-        first.phase_a_simulation_spend_usd + first.held_out_simulation_spend_usd
+        first.fit_simulation_spend_usd + first.held_out_simulation_spend_usd
     )
     assert first.total_simulation_spend_usd <= budget.maximum_simulation_cost_usd
     assert (
@@ -783,9 +747,8 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         len(simulator.candidate.requests),
         len(simulator.world.requests),
         judge.calls,
-        approval.calls,
     ) == dispatched
-    assert phases.index("fidelity_fit_started") < phases.index("policy_locked")
+    assert phases.index("fit_started") < phases.index("policy_locked")
     assert phases.index("policy_locked") < phases.index("heldout_opened")
     assert phases.index("heldout_opened") < phases.index("report_complete")
     assert len(attempts) == 3
@@ -809,7 +772,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     )
     purposes = {cell.cell_id: cell.purpose for cell in first.plan.cells}
     assert all(
-        locked or all(purposes[cell_id] in {"fit", "fidelity"} for cell_id in cell_ids)
+        locked or all(purposes[cell_id] == "fit" for cell_id in cell_ids)
         for cell_ids, locked in simulator.log
     )
     assert all(locked or purposes.get(cell_id) != "held_out" for cell_id, locked in judge.log)
@@ -829,7 +792,6 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         setup_supplier=services.setup_supplier,
         simulator_factory=near_cap_simulator,
         judge=judge,
-        fidelity_approval=approval,
         runtime_catalog=runtime_catalog,
     )
     calls_before_near_cap = judge.calls
@@ -843,7 +805,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         return 1.0
 
     monkeypatch.setattr(workflow_module, "_verified_simulation_spend", exact_cap_spend)
-    with pytest.raises(RouterCompositionError, match="consumed the total simulation budget"):
+    with pytest.raises(RouterCompositionError, match="consumed the total budget"):
         compose_router(
             project,
             normalized,
@@ -857,9 +819,8 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         )
     assert len(near_cap_simulator.log) == 1
     assert judge.calls == calls_before_near_cap
-    assert approval.calls == 1
 
-    phase_a_set = next(
+    fit_set = next(
         SimulationArtifactSet.model_validate_json(
             project.artifacts.read_bytes(artifact_id, "artifact-set.json")
         )
@@ -870,7 +831,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         ).simulation_id
         == first.simulation_spec.simulation_id
     )
-    rollout = read_rollout(project.artifacts, phase_a_set.artifact_ids[0])[0]
+    rollout = read_rollout(project.artifacts, fit_set.artifact_ids[0])[0]
     unknown = rollout.model_copy(update={"candidate_economics": OperationEconomics()})
     with pytest.raises(RouterCompositionError, match="not fully observed"):
         observed_rollout_spend(unknown)

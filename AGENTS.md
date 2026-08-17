@@ -49,11 +49,14 @@ uv run pytest -q
   judgment, fitting, held-out verification, reporting, and runtime loading. Callers inject the
   approved review and setup suppliers, simulator factory, judge, runtime catalog, and finite
   simulation-dollar and judgment-call ceilings. Preserve its phase boundary: held-out evidence
-  opens only after fit evidence, approval, policy locking, and remaining-budget checks pass.
+  opens only after fit evidence, policy locking, and remaining-budget checks pass. Router fitting
+  never runs or consumes world-model fidelity evaluation.
 - `wmo optimize router PROJECT --root ROOT` discovers the completed build, fit-only RAG, grounded
   world model, approved manual judge calibration, and confirmed router candidates from the
   project. It freezes one shared provider ceiling before calls, simulates and judges missing
-  evidence, locks the fit policy before held-out execution, and exactly replays completed work.
+  fit evidence, locks the fit policy before held-out execution, and exactly replays completed work.
+  World-model fidelity testing is a separately invoked common-evaluation mode with no authority
+  over router fitting or runtime activation.
 - `wmo run PROJECT --root ROOT --port PORT [--ghost]` loads one frozen policy and exposes OpenAI Chat
   Completions, Responses, and Models routes on loopback. Public request and response types come
   from the official OpenAI SDK. Chat retries use the standard `Idempotency-Key`; Responses

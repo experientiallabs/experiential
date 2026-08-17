@@ -30,7 +30,7 @@ from wmo.runtime.models import RuntimeModelCatalog
 def test_preflight_aggregates_missing_inputs_before_credentials_or_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One read-only failure lists build, review, evidence, and role prerequisites.
+    """One read-only failure lists build, review, and role prerequisites.
 
     Args:
         tmp_path: Temporary initialized project root.
@@ -69,7 +69,7 @@ def test_preflight_aggregates_missing_inputs_before_credentials_or_writes(
     assert "completed build" in message
     assert "frozen model roles" in message
     assert "manual judge" in message
-    assert "fidelity evidence" in message
+    assert "fidelity" not in message
     assert project.paths.project_toml.read_bytes() == before_project
     assert project.model_catalog_path.read_bytes() == before_catalog
     assert project.artifacts.list_ids() == before_artifacts

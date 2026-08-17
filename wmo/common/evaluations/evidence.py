@@ -55,15 +55,15 @@ class EvaluationCellEvidence(ContractModel):
 
 
 def evaluation_protocol_digest(protocol: EvaluationProtocol) -> str:
-    """Return the non-circular digest used to bind a fidelity report to its protocol.
+    """Return the canonical digest used to bind a fidelity report to its protocol.
 
     Args:
         protocol: Evaluation protocol whose optional report reference must not hash itself.
 
     Returns:
-        SHA-256 digest of the protocol with ``fidelity_report_id`` unset.
+        SHA-256 digest of the complete protocol.
     """
-    return sha256_json(protocol.model_copy(update={"fidelity_report_id": None}))
+    return sha256_json(protocol)
 
 
 def read_evaluation_plan(

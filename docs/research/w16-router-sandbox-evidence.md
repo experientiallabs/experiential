@@ -17,12 +17,12 @@ the real text `WorldModelSimulator`, W10 fit lock and held-out report, and W11 H
 
 The exact deterministic run retains these denominators:
 
-- 150 planned candidate-task cells, with 10 observed fidelity cells and 140 simulated cells
+- 140 planned candidate-task cells, with 10 observed fit cells and 130 simulated cells
 - 40 held-out report rows, with zero failed, not-run, or missing-cost rows
-- 150 persisted judgments under one workflow ceiling of 200
+- 140 persisted judgments under one workflow ceiling of 200
 - one shared simulation ceiling of $2.00 and exactly $0.00 observed fake-client spend
 
-Exact replay adds no model, world-model, judge, approval, or telemetry delivery; crash-and-resume at
+Exact replay adds no model, world-model, judge, or telemetry delivery; crash-and-resume at
 both durable phase boundaries is pinned by wmo/optimize/router/composition_test.py. Two HTTP turns
 with one episode ID retain one hashed episode identity and one sticky routed alias without exposing
 the raw episode ID.

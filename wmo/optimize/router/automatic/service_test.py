@@ -22,7 +22,6 @@ from wmo.cli.app import app
 from wmo.cli.build_cmd import _build_grounded_artifacts
 from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.core.artifacts import SourceIdentity, canonical_json_bytes
-from wmo.common.evaluations import EvaluationCellEvidence, EvaluationPlan
 from wmo.common.models import (
     AssistantAction,
     ConnectionConfig,
@@ -66,7 +65,6 @@ from wmo.optimize.router.automatic.service import (
     AutomaticRouterError,
     optimize_project_router,
 )
-from wmo.optimize.router.composition import FidelityApprovalDecision, RouterCompositionBudget
 from wmo.optimize.router.judging.artifacts import read_audit, write_audit, write_review_state
 from wmo.optimize.router.judging.contracts import ManualJudgeLabel, ManualJudgeReviewState
 from wmo.optimize.router.judging.service import (
@@ -250,40 +248,6 @@ class _RuntimeCatalog:
         return _RuntimeCatalog(catalog, self._state)
 
 
-@dataclass
-class _FidelityApproval:
-    """Count and approve the one explicit measured fidelity boundary."""
-
-    calls: int = 0
-
-    def __call__(
-        self,
-        project: ProjectStore,
-        plan: EvaluationPlan,
-        evidence: tuple[EvaluationCellEvidence, ...],
-        budget: RouterCompositionBudget,
-    ) -> FidelityApprovalDecision:
-        """Approve nonempty measured evidence and record one callback.
-
-        Args:
-            project: Project-local store.
-            plan: Frozen current evaluation plan.
-            evidence: Completed fidelity evidence.
-            budget: Finite composition budget.
-
-        Returns:
-            Explicit immutable approval actor evidence.
-        """
-        del project, plan, budget
-        assert evidence
-        self.calls += 1
-        return FidelityApprovalDecision(
-            actor_id="test-operator",
-            evidence=f"approved {len(evidence)} exact overlaps",
-            approved_at=_TIME,
-        )
-
-
 @pytest.mark.parametrize(
     "candidate_order",
     [
@@ -311,11 +275,9 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         non_interactive=True,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    approval = _FidelityApproval()
     options = AutomaticRouterOptions(
         maximum_provider_cost_usd=25.0,
         maximum_judgments=20,
-        preferred_fidelity_overlaps=1,
         maximum_model_calls=1,
         maximum_router_feature_tokens=8_192,
         maximum_retrieval_query_tokens=32_768,
@@ -330,7 +292,6 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
         options=options,
         provider_spend_consented=True,
-        fidelity_approval=approval,
         created_at=_TIME + timedelta(hours=1),
         code_revision=_REVISION,
     )
@@ -359,7 +320,6 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
     assert result.artifacts.attribution_input in result.composition.plan.inputs
     assert result.preflight.observed_traces[0].attribution.match_kind == "strict_snapshot"
     assert result.composition.plan.inputs
-    assert approval.calls == 1
     assert len(state.completion_calls) > before_completion
     assert len(state.embedding_calls) > before_embedding
     completed_completion = tuple(state.completion_calls)
@@ -387,26 +347,6 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         )
         is None
     )
-    expanded_fidelity = preflight_automatic_router(
-        store,
-        plan.selection,
-        catalog_override=plan.prospective_catalog,
-        options=replace(options, preferred_fidelity_overlaps=2),
-    )
-    assert expanded_fidelity.fidelity_overlap_count == 2
-    assert (
-        find_completed_automatic_router_replay(
-            store,
-            expanded_fidelity,
-            options=replace(options, preferred_fidelity_overlaps=2),
-            code_revision=_REVISION,
-        )
-        is None
-    )
-    assert tuple(state.completion_calls) == completed_completion
-    assert tuple(state.embedding_calls) == completed_embedding
-    assert state.credential_resolutions == completed_credentials
-
     catalog_drift = replace(result.preflight, catalog_sha256="0" * 64)
     assert (
         find_completed_automatic_router_replay(
@@ -431,8 +371,6 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
             str(store.paths.root),
             "--maximum-judgments",
             "20",
-            "--preferred-fidelity-overlaps",
-            "1",
             "--maximum-model-calls",
             "1",
             "--simulation-maximum-output-tokens",
@@ -559,12 +497,10 @@ def test_automatic_router_refuses_spend_before_credentials_calls_or_writes(
             plan,
             cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
             options=AutomaticRouterOptions(
-                preferred_fidelity_overlaps=1,
                 maximum_model_calls=1,
                 simulation_maximum_output_tokens=8_000,
             ),
             provider_spend_consented=False,
-            fidelity_approval=_FidelityApproval(),
             created_at=_TIME + timedelta(hours=1),
             code_revision=_REVISION,
         )
@@ -602,12 +538,10 @@ def test_provider_model_only_telemetry_composes_with_inferred_unique_attribution
         cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
         options=AutomaticRouterOptions(
             maximum_judgments=20,
-            preferred_fidelity_overlaps=1,
             maximum_model_calls=1,
             simulation_maximum_output_tokens=8_000,
         ),
         provider_spend_consented=True,
-        fidelity_approval=_FidelityApproval(),
         created_at=_TIME + timedelta(hours=1),
         code_revision=_REVISION,
     )
@@ -618,8 +552,8 @@ def test_provider_model_only_telemetry_composes_with_inferred_unique_attribution
     assert result.artifacts.attribution_input in result.composition.plan.inputs
 
 
-def test_ambiguous_inferred_telemetry_fails_before_stateful_boundaries(tmp_path: Path) -> None:
-    """Candidate ambiguity is aggregated before writes, credentials, factories, or providers.
+def test_duplicate_candidate_identities_fail_before_stateful_boundaries(tmp_path: Path) -> None:
+    """Duplicate selected identities fail before writes, credentials, or providers.
 
     Args:
         tmp_path: Isolated local WMO root.
@@ -650,19 +584,17 @@ def test_ambiguous_inferred_telemetry_fails_before_stateful_boundaries(tmp_path:
     before_embedding = tuple(state.embedding_calls)
     before_credentials = state.credential_resolutions
 
-    with pytest.raises(AutomaticRouterPreflightError, match="ambiguous"):
+    with pytest.raises(AutomaticRouterPreflightError, match="distinct exact model identities"):
         optimize_project_router(
             store,
             plan,
             cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
             options=AutomaticRouterOptions(
                 maximum_judgments=20,
-                preferred_fidelity_overlaps=1,
                 maximum_model_calls=1,
                 simulation_maximum_output_tokens=8_000,
             ),
             provider_spend_consented=True,
-            fidelity_approval=_FidelityApproval(),
             created_at=_TIME + timedelta(hours=1),
             code_revision=_REVISION,
         )
@@ -697,7 +629,6 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
     )
     options = AutomaticRouterOptions(
         maximum_judgments=20,
-        preferred_fidelity_overlaps=1,
         maximum_model_calls=1,
         simulation_maximum_output_tokens=8_000,
     )
@@ -707,7 +638,6 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
         cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
         options=options,
         provider_spend_consented=True,
-        fidelity_approval=_FidelityApproval(),
         created_at=_TIME + timedelta(hours=1),
         code_revision=_REVISION,
     )
@@ -723,7 +653,6 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
                 task_set=result.preflight.completed_build.task_set,
                 catalog_sha256=result.preflight.catalog_sha256,
                 candidates=result.preflight.candidates,
-                preferred_overlap_limit=1,
                 records=(record,),
                 created_at=_TIME + timedelta(hours=2),
                 code_revision=_REVISION,
@@ -815,7 +744,6 @@ def test_completed_custom_agent_replay_does_not_import_or_construct_factory(
     options = AutomaticRouterOptions(
         maximum_provider_cost_usd=25.0,
         maximum_judgments=20,
-        preferred_fidelity_overlaps=1,
         maximum_model_calls=1,
         simulation_maximum_output_tokens=8_000,
     )
@@ -825,7 +753,6 @@ def test_completed_custom_agent_replay_does_not_import_or_construct_factory(
         cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
         options=options,
         provider_spend_consented=True,
-        fidelity_approval=_FidelityApproval(),
         created_at=_TIME + timedelta(hours=1),
         code_revision=_REVISION,
     )
@@ -842,8 +769,6 @@ def test_completed_custom_agent_replay_does_not_import_or_construct_factory(
             str(store.paths.root),
             "--maximum-judgments",
             "20",
-            "--preferred-fidelity-overlaps",
-            "1",
             "--maximum-model-calls",
             "1",
             "--simulation-maximum-output-tokens",
@@ -900,12 +825,10 @@ def test_automatic_router_rejects_confirmed_catalog_drift_before_credentials(
             plan,
             cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
             options=AutomaticRouterOptions(
-                preferred_fidelity_overlaps=1,
                 maximum_model_calls=1,
                 simulation_maximum_output_tokens=8_000,
             ),
             provider_spend_consented=True,
-            fidelity_approval=_FidelityApproval(),
             created_at=_TIME + timedelta(hours=1),
             code_revision=_REVISION,
         )
@@ -995,7 +918,6 @@ def test_automatic_router_rejects_substituted_manual_judge_audit_before_calls(
             options=AutomaticRouterOptions(
                 maximum_provider_cost_usd=25.0,
                 maximum_judgments=20,
-                preferred_fidelity_overlaps=1,
                 maximum_model_calls=1,
                 router_embedding_maximum_attempts=1,
                 completion_maximum_attempts=1,
@@ -1036,12 +958,10 @@ def test_runtime_activation_rejects_automatic_contract_tamper_before_credentials
         cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
         options=AutomaticRouterOptions(
             maximum_judgments=20,
-            preferred_fidelity_overlaps=1,
             maximum_model_calls=1,
             simulation_maximum_output_tokens=8_000,
         ),
         provider_spend_consented=True,
-        fidelity_approval=_FidelityApproval(),
         created_at=_TIME + timedelta(hours=1),
         code_revision=_REVISION,
     )

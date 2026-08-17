@@ -30,20 +30,14 @@ class EvaluationProtocol(ContractModel):
     rubric_id: ArtifactId
     judge_calibration_id: ArtifactId
     pricing_snapshot_id: ArtifactId
-    fidelity_report_id: ArtifactId | None = None
 
     @model_validator(mode="after")
     def _require_source_specific_identity(self) -> EvaluationProtocol:
         if self.evidence_source == "world_model":
             if self.world_model is None or self.simulator_prompt_id is None:
                 raise ValueError("world-model protocols require world-model and prompt identities")
-        elif any(
-            value is not None
-            for value in (self.world_model, self.simulator_prompt_id, self.fidelity_report_id)
-        ):
-            raise ValueError(
-                "sandbox and production protocols must not name world-model or fidelity evidence"
-            )
+        elif self.world_model is not None or self.simulator_prompt_id is not None:
+            raise ValueError("sandbox and production protocols must not name world-model identity")
         return self
 
 
@@ -224,7 +218,6 @@ class EvaluationDatasetManifest(ArtifactEnvelope):
     held_out_task_ids: tuple[ArtifactId, ...]
     candidate_snapshots: tuple[RoutedCandidateSnapshot, ...]
     protocols: tuple[EvaluationProtocol, ...]
-    fidelity_report_ids: tuple[ArtifactId, ...] = ()
     rows_path: str = Field(min_length=1)
     rows_sha256: Sha256
 
@@ -249,8 +242,6 @@ class EvaluationDatasetManifest(ArtifactEnvelope):
         protocol_ids = tuple(protocol.protocol_id for protocol in self.protocols)
         if not protocol_ids or len(set(protocol_ids)) != len(protocol_ids):
             raise ValueError("evaluation manifest protocol IDs must be non-empty and unique")
-        if len(set(self.fidelity_report_ids)) != len(self.fidelity_report_ids):
-            raise ValueError("evaluation manifest fidelity report IDs must not repeat")
         return self
 
 

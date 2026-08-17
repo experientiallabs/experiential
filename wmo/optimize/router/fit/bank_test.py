@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,12 +17,8 @@ from wmo.common.evaluations import (
     EvaluationDatasetManifest,
     EvaluationProtocol,
     EvaluationRow,
-    FidelityFailure,
-    FidelityPair,
-    FidelityReport,
 )
 from wmo.common.evaluations.build_test import _candidate, _money, _snapshot, _task
-from wmo.common.evaluations.evidence import evaluation_protocol_digest
 from wmo.common.models import Embedding
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore, ProjectPaths
 from wmo.common.routing import RouterFeatureExtractor
@@ -37,7 +32,7 @@ from wmo.common.routing.bank import (
     load_knn_bank,
 )
 from wmo.common.tasks import TaskCase
-from wmo.optimize.router.fit.optimizer import RouterOptimizationError, choose_baseline
+from wmo.optimize.router.fit.optimizer import choose_baseline
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
@@ -67,13 +62,12 @@ class _DeterministicEmbedder:
         return tuple(vectors)
 
 
-def test_bank_excludes_failed_fidelity_and_uses_only_candidate_cost() -> None:
-    """Rejected simulation and failed rows stay out, while direct sandbox evidence remains."""
+def test_bank_admits_world_model_fit_rows_without_fidelity_and_uses_candidate_cost() -> None:
+    """Completed fit rows need no fidelity report while failed rows stay out."""
     tasks = (_task("task-fit-0", partition="fit"), _task("task-fit-1", partition="fit"))
     production = _protocol("protocol-production", "production")
     sandbox = _protocol("protocol-sandbox", "sandbox")
     world = _world_protocol()
-    report = _insufficient_report(world)
     rows = (
         _row(tasks[0], "candidate-a", production, score=0.8, candidate_cost=0.5),
         _row(tasks[1], "candidate-a", production, score=0.8, candidate_cost=0.5),
@@ -111,7 +105,6 @@ def test_bank_excludes_failed_fidelity_and_uses_only_candidate_cost() -> None:
     bank = build_knn_bank(
         dataset,
         tasks,
-        {report.fidelity_report_id: report},
         embedder=_DeterministicEmbedder(),
         feature_extractor=RouterFeatureExtractor(),
     )
@@ -121,15 +114,14 @@ def test_bank_excludes_failed_fidelity_and_uses_only_candidate_cost() -> None:
             candidate_alias="candidate-a", scored_task_count=2, costed_task_count=2
         ),
         CandidateEvidenceCount(
-            candidate_alias="candidate-b", scored_task_count=1, costed_task_count=1
+            candidate_alias="candidate-b", scored_task_count=2, costed_task_count=2
         ),
     )
     assert bank.candidate_costs[0, 1] == pytest.approx(0.1)
-    assert math.isnan(float(bank.candidate_costs[1, 1]))
-    assert math.isnan(float(bank.scores[1, 1]))
-    assert choose_baseline(bank, incumbent_alias=None) == "candidate-a"
-    with pytest.raises(RouterOptimizationError, match="lacks score evidence"):
-        choose_baseline(bank, incumbent_alias="candidate-b")
+    assert bank.candidate_costs[1, 1] == pytest.approx(0.01)
+    assert bank.scores[1, 1] == pytest.approx(1.0)
+    assert choose_baseline(bank, incumbent_alias=None) == "candidate-b"
+    assert choose_baseline(bank, incumbent_alias="candidate-b") == "candidate-b"
 
 
 def test_fifty_fit_tasks_are_bank_only_and_twenty_held_out_rows_cannot_change_it() -> None:
@@ -161,14 +153,12 @@ def test_fifty_fit_tasks_are_bank_only_and_twenty_held_out_rows_cannot_change_it
     first = build_knn_bank(
         first_dataset,
         tasks,
-        {},
         embedder=first_embedder,
         feature_extractor=RouterFeatureExtractor(),
     )
     changed = build_knn_bank(
         changed_dataset,
         tasks,
-        {},
         embedder=changed_embedder,
         feature_extractor=RouterFeatureExtractor(),
     )
@@ -256,13 +246,6 @@ def _dataset(
         held_out_task_ids=tuple(task.task_id for task in tasks if task.partition == "held_out"),
         candidate_snapshots=(_candidate("candidate-a"), _candidate("candidate-b")),
         protocols=protocols,
-        fidelity_report_ids=tuple(
-            sorted(
-                protocol.fidelity_report_id
-                for protocol in protocols
-                if protocol.fidelity_report_id is not None
-            )
-        ),
         rows_path="rows.jsonl",
         rows_sha256=_DIGEST,
     )
@@ -314,7 +297,7 @@ def _protocol(protocol_id: str, source: Literal["sandbox", "production"]) -> Eva
 
 
 def _world_protocol() -> EvaluationProtocol:
-    """Create a world-model protocol linked to insufficient fidelity evidence."""
+    """Create a world-model protocol that is ordinary fit evidence."""
     return EvaluationProtocol(
         protocol_id="protocol-world",
         evidence_source="world_model",
@@ -325,49 +308,4 @@ def _world_protocol() -> EvaluationProtocol:
         rubric_id="rubric-a",
         judge_calibration_id="calibration-a",
         pricing_snapshot_id="pricing-a",
-        fidelity_report_id="fidelity-insufficient",
-    )
-
-
-def _insufficient_report(protocol: EvaluationProtocol) -> FidelityReport:
-    """Create a seven-of-ten fidelity report that cannot authorize fit rows."""
-    overlap_ids = tuple(f"cell-overlap-{index}" for index in range(10))
-    failures = tuple(
-        FidelityFailure(
-            cell_id=overlap_ids[index],
-            failure=StructuredFailure(code=FailureCode.TIMEOUT, message="overlap failed"),
-        )
-        for index in range(7, 10)
-    )
-    return FidelityReport(
-        schema_version=1,
-        created_at=_TIME,
-        code_revision="test-revision",
-        fidelity_report_id="fidelity-insufficient",
-        evaluation_plan_id="plan-a",
-        evaluation_plan_sha256=_DIGEST,
-        protocol_sha256=evaluation_protocol_digest(protocol),
-        overlap_cell_ids=overlap_ids,
-        planned_overlap_count=10,
-        usable_overlap_count=7,
-        failed_overlap_count=3,
-        score_mae=0.01,
-        failures=failures,
-        pairs=tuple(
-            FidelityPair(
-                fidelity_cell_id=cell_id,
-                observed_cell_id=f"observed-{cell_id}",
-                observed_rollout_id=f"observed-rollout-{index}",
-                simulated_rollout_id=(f"simulated-rollout-{index}" if index < 7 else None),
-                observed_score=0.8 if index < 7 else None,
-                simulated_score=0.8 if index < 7 else None,
-                absolute_error=0.0 if index < 7 else None,
-                status="usable" if index < 7 else "failed",
-                error=None if index < 7 else failures[index - 7].failure,
-            )
-            for index, cell_id in enumerate(overlap_ids)
-        ),
-        gate_id="fidelity-gate-a",
-        gate_sha256=_DIGEST,
-        status="insufficient",
     )

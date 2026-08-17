@@ -10,8 +10,8 @@ on the exact release checkout.
   exactly `router` and `model`.
 - Public Python exposes provider-free build, explicit router composition, frozen router load and
   HTTP application, structural text-versus-sandbox comparison, and managed SFT composition.
-- W16 router evidence uses 100 normalized traces, 50 fit tasks, 20 held-out tasks, 150 planned
-  cells, 140 deterministic text simulations, and 150 deterministic judgments under one finite
+- W16 router evidence uses 100 normalized traces, 50 fit tasks, 20 held-out tasks, 140 planned
+  cells, 130 deterministic text simulations, and 140 deterministic judgments under one finite
   simulation and judgment budget. Observed hosted-service spend is exactly $0.00.
 - W16 sandbox evidence compares two exact post-lock text and Darwin local-process pairs. It retains
   one malformed sandbox failure in the denominator and claims structural terminal agreement only.

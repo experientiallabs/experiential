@@ -23,6 +23,7 @@ from wmo.common.evaluations import (
     ObservedProductionCell,
     build_evaluation_dataset,
     build_evaluation_plan,
+    build_fidelity_evaluation_plan,
     default_fidelity_thresholds,
     persist_fidelity_thresholds,
 )
@@ -72,8 +73,8 @@ def _world_protocol() -> EvaluationProtocol:
 
 
 def test_plan_observed_precedence_and_separate_fit_only_fidelity(tmp_path: Path) -> None:
-    """Observed main cells win, only gaps simulate, and overlaps remain fidelity-only."""
-    store, plan, _observed = _planned_fixture(tmp_path)
+    """Router planning omits fidelity while explicit fidelity planning retains overlaps."""
+    store, plan, observed = _planned_fixture(tmp_path)
 
     main = tuple(cell for cell in plan.cells if cell.purpose != "fidelity")
     overlaps = tuple(cell for cell in plan.cells if cell.purpose == "fidelity")
@@ -98,6 +99,29 @@ def test_plan_observed_precedence_and_separate_fit_only_fidelity(tmp_path: Path)
         {cell.cell_id for cell in observed_a}
     )
     assert store.read(plan.plan_id).manifest.artifact_type == "evaluation-plan"
+
+    router_plan = build_evaluation_plan(
+        store,
+        task_set_id=plan.task_set_id,
+        candidate_snapshots=plan.candidate_snapshots,
+        pricing_snapshot_id=plan.pricing_snapshot_id,
+        observed_cells=tuple(
+            ObservedProductionCell(
+                task_id=task_id,
+                candidate_alias="candidate-a",
+                repeat=0,
+                rollout_artifact_id=rollout_id,
+            )
+            for task_id, rollout_id in observed.items()
+        ),
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+
+    assert all(cell.purpose != "fidelity" for cell in router_plan.cells)
+    assert router_plan.fidelity_thresholds_id is None
+    assert router_plan.fidelity_thresholds_sha256 is None
+    assert router_plan.fidelity_protocol_sha256 is None
 
 
 def test_plan_rejects_provider_free_observed_rollout_before_write(tmp_path: Path) -> None:
@@ -152,10 +176,12 @@ def test_plan_rejects_pricing_candidate_scope_before_write(tmp_path: Path) -> No
         files={"pricing.json": reversed_pricing},
     )
     artifact_ids_before = store.list_ids()
+    assert plan.fidelity_thresholds_id is not None
+    assert plan.fidelity_protocol_sha256 is not None
 
     for pricing_snapshot_id in (pricing.pricing_snapshot_id, reversed_pricing.pricing_snapshot_id):
         with pytest.raises(EvaluationEvidenceError, match="pricing snapshot candidates"):
-            build_evaluation_plan(
+            build_fidelity_evaluation_plan(
                 store,
                 task_set_id=plan.task_set_id,
                 candidate_snapshots=plan.candidate_snapshots,
@@ -446,7 +472,7 @@ def _planned_fixture(
                 rollout_artifact_id=rollout_id,
             )
         )
-    plan = build_evaluation_plan(
+    plan = build_fidelity_evaluation_plan(
         store,
         task_set_id="task-set-plan",
         candidate_snapshots=candidates,

@@ -94,9 +94,6 @@ def test_evaluation_cells_reject_implicit_or_inconsistent_evidence() -> None:
             candidate_snapshots=(_candidate(),),
             pricing_snapshot_id="pricing-v1",
             pricing_snapshot_sha256=_DIGEST,
-            fidelity_thresholds_id="fidelity-thresholds-v1",
-            fidelity_thresholds_sha256=_DIGEST,
-            fidelity_protocol_sha256=_DIGEST,
             cells=(
                 EvaluationCell(
                     cell_id="cell-unknown-candidate",

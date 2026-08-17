@@ -27,21 +27,13 @@ from wmo.common.evaluations import (
     EvaluationCellEvidence,
     EvaluationPlan,
     EvaluationProtocol,
-    FidelityReport,
     ObservedProductionCell,
     build_evaluation_plan,
-    build_fidelity_report,
-    default_fidelity_thresholds,
-    persist_fidelity_thresholds,
 )
 from wmo.common.evaluations.evidence import (
-    read_evaluation_plan,
-    read_fidelity_gate,
-    read_fidelity_report,
     read_judgment,
     read_rollout,
 )
-from wmo.common.evaluations.planning import plan_bound_fidelity_gate_id
 from wmo.common.judging import Judge, Judgment
 from wmo.common.models import (
     ModelCatalog,
@@ -139,8 +131,6 @@ class RouterEvaluationSetup(ContractModel):
     judgment_status: Literal["provisional", "human_calibrated"]
     world_model_settings: WorldModelSettings
     simulation_completion_input: ArtifactInput | None = None
-    fidelity_planned_overlaps: int = Field(default=10, gt=0)
-    fidelity_minimum_usable_overlaps: int = Field(default=8, gt=0)
     agent_id: str = Field(min_length=1, max_length=256)
     seed: int
     maximum_steps: int = Field(gt=0)
@@ -179,40 +169,6 @@ class SimulatorFactory(Protocol):
         """Return a simulator bound to the exact persisted plan."""
 
 
-class FidelityApproval(Protocol):
-    """Owns the explicit human or application approval boundary for passing fidelity."""
-
-    def __call__(
-        self,
-        project: ProjectStore,
-        plan: EvaluationPlan,
-        evidence: tuple[EvaluationCellEvidence, ...],
-        budget: RouterCompositionBudget,
-    ) -> FidelityApprovalDecision:
-        """Return explicit approval actor, evidence, and time for reviewed fidelity evidence."""
-
-
-class FidelityApprovalDecision(ContractModel):
-    """Non-secret actor evidence returned by one explicit fidelity approval callback."""
-
-    actor_id: str = Field(min_length=1, max_length=256)
-    evidence: str = Field(min_length=1, max_length=2_000)
-    approved_at: datetime
-
-
-class FidelityApprovalReceipt(ArtifactEnvelope):
-    """Immutable exact plan, gate, report, actor, and approval-evidence binding."""
-
-    approval_id: ArtifactId
-    plan: ArtifactInput
-    gate: ArtifactInput
-    report: ArtifactInput
-    protocol_sha256: Sha256
-    actor_id: str = Field(min_length=1, max_length=256)
-    evidence: str = Field(min_length=1, max_length=2_000)
-    approved_at: datetime
-
-
 class RouterPolicyLock(ArtifactEnvelope):
     """Immutable proof that fit-only evaluation froze a verified bank and policy."""
 
@@ -232,7 +188,6 @@ class RouterWorkflowServices:
     setup_supplier: EvaluationSetupSupplier
     simulator_factory: SimulatorFactory
     judge: Judge
-    fidelity_approval: FidelityApproval
     runtime_catalog: RuntimeModelCatalog
     evaluation_plan_inputs: tuple[ArtifactInput, ...] = ()
 
@@ -246,10 +201,8 @@ class RouterCompositionResult:
     plan: EvaluationPlan
     simulation_spec: SimulationSpec
     held_out_simulation_spec: SimulationSpec
-    fidelity_approval_id: ArtifactId
     policy_lock_id: ArtifactId
-    fidelity_report_id: ArtifactId
-    phase_a_simulation_spend_usd: float
+    fit_simulation_spend_usd: float
     held_out_simulation_spend_usd: float
     total_simulation_spend_usd: float
     optimization: RouterWorkflowResult
@@ -305,31 +258,20 @@ def compose_router(
         calibration_id=review.calibration_id,
     )
 
-    thresholds = default_fidelity_thresholds(
-        created_at=created_at,
-        code_revision=code_revision,
-        planned_overlaps=setup.fidelity_planned_overlaps,
-        minimum_usable_overlaps=setup.fidelity_minimum_usable_overlaps,
-    )
-    persist_fidelity_thresholds(project.artifacts, thresholds)
     plan = build_evaluation_plan(
         project.artifacts,
         task_set_id=built.artifacts.task_set.task_set_id,
         candidate_snapshots=setup.candidates,
         pricing_snapshot_id=setup.pricing_snapshot_id,
         observed_cells=setup.observed_cells,
-        fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
-        fidelity_protocol_sha256=_protocol_digest(setup.simulation_protocol),
         additional_inputs=services.evaluation_plan_inputs,
         created_at=created_at,
         code_revision=code_revision,
     )
     plan_input = artifact_input(project.artifacts.read(plan.plan_id).manifest)
     task_input = built.review.task_set
-    cells_by_id = {cell.cell_id: cell for cell in plan.cells}
-
-    _phase(phase_hook, "fidelity_fit_started")
-    phase_a_cells = tuple(cell for cell in plan.cells if cell.purpose in {"fit", "fidelity"})
+    _phase(phase_hook, "fit_started")
+    fit_cells = tuple(cell for cell in plan.cells if cell.purpose == "fit")
     spec = build_router_simulation_spec(
         plan,
         plan_input,
@@ -338,54 +280,36 @@ def compose_router(
         budget.maximum_simulation_cost_usd,
         created_at,
         code_revision,
-        phase_a_cells,
-        phase="fidelity-fit",
+        fit_cells,
+        phase="fit",
     )
-    phase_a_set = _run_or_load_simulation(project, plan, spec, services.simulator_factory)
-    phase_a_spend = _verified_simulation_spend(project, phase_a_set)
-    if phase_a_spend > budget.maximum_simulation_cost_usd:
-        raise RouterCompositionError("verified Phase A simulation spend exceeds the total budget")
-    remaining_cost_usd = max(0.0, budget.maximum_simulation_cost_usd - phase_a_spend)
+    fit_set = _run_or_load_simulation(project, plan, spec, services.simulator_factory)
+    fit_spend = _verified_simulation_spend(project, fit_set)
+    if fit_spend > budget.maximum_simulation_cost_usd:
+        raise RouterCompositionError("verified fit simulation spend exceeds the total budget")
+    remaining_cost_usd = max(0.0, budget.maximum_simulation_cost_usd - fit_spend)
     if remaining_cost_usd <= 0 and any(
         cell.purpose == "held_out" and cell.execution == "simulate" for cell in plan.cells
     ):
         raise RouterCompositionError(
-            "Phase A consumed the total simulation budget; held-out dispatch is blocked"
+            "fit simulation consumed the total budget; held-out dispatch is blocked"
         )
-    phase_a_evidence, phase_a_consumed = _complete_cell_evidence(
+    fit_evidence, fit_consumed = _complete_cell_evidence(
         project,
         plan_input,
-        phase_a_cells,
-        phase_a_set.artifact_ids,
+        fit_cells,
+        fit_set.artifact_ids,
         setup,
         review,
         services.judge,
         budget.maximum_judgments,
     )
-    fidelity_evidence = tuple(
-        item for item in phase_a_evidence if cells_by_id[item.cell_id].purpose == "fidelity"
-    )
-    fidelity, approval = _approve_fidelity_once(
-        project,
-        plan,
-        setup.simulation_protocol,
-        phase_a_evidence,
-        fidelity_evidence,
-        services.fidelity_approval,
-        budget,
-        created_at,
-        code_revision,
-    )
-    approved_protocol = setup.simulation_protocol.model_copy(
-        update={"fidelity_report_id": fidelity.fidelity_report_id}
-    )
     fit_config = RouterFitConfig(
         fit=EvaluationInputs(
             evaluation_plan_id=plan.plan_id,
-            rollout_set_ids=(phase_a_set.artifact_set_id,),
-            protocols=(setup.production_protocol, approved_protocol),
-            cell_evidence=phase_a_evidence,
-            fidelity_report_ids=(fidelity.fidelity_report_id,),
+            rollout_set_ids=(fit_set.artifact_set_id,),
+            protocols=(setup.production_protocol, setup.simulation_protocol),
+            cell_evidence=fit_evidence,
         ),
         embedding_set_id=setup.embedding_set_id,
         incumbent_alias=setup.incumbent_alias,
@@ -419,7 +343,7 @@ def compose_router(
     )
     held_set = _run_or_load_simulation(project, plan, held_spec, services.simulator_factory)
     held_out_spend = _verified_simulation_spend(project, held_set)
-    if math.fsum((phase_a_spend, held_out_spend)) > budget.maximum_simulation_cost_usd:
+    if math.fsum((fit_spend, held_out_spend)) > budget.maximum_simulation_cost_usd:
         raise RouterCompositionError("verified composed simulation spend exceeds the total budget")
     held_evidence, _held_dispatched = _complete_cell_evidence(
         project,
@@ -429,7 +353,7 @@ def compose_router(
         setup,
         review,
         services.judge,
-        budget.maximum_judgments - phase_a_consumed,
+        budget.maximum_judgments - fit_consumed,
     )
     optimized = report_router(
         project.artifacts,
@@ -438,23 +362,22 @@ def compose_router(
             held_out=EvaluationInputs(
                 evaluation_plan_id=plan.plan_id,
                 rollout_set_ids=(held_set.artifact_set_id,),
-                protocols=(setup.production_protocol, approved_protocol),
+                protocols=(setup.production_protocol, setup.simulation_protocol),
                 cell_evidence=held_evidence,
-                fidelity_report_ids=(fidelity.fidelity_report_id,),
             ),
             embedding_set_id=setup.embedding_set_id,
             created_at=created_at,
             code_revision=code_revision,
         ),
     )
-    total_spend = math.fsum((phase_a_spend, held_out_spend))
+    total_spend = math.fsum((fit_spend, held_out_spend))
     completion_id = optimized.optimization.report.report_id
     capture_completion_once(
         "wmo simulation completed",
         completion_id,
         {
             "success": True,
-            "rollout_count": len(phase_a_set.artifact_ids) + len(held_set.artifact_ids),
+            "rollout_count": len(fit_set.artifact_ids) + len(held_set.artifact_ids),
             "duration_seconds": max(time.monotonic() - started, 0.0),
             "cost_usd": total_spend,
         },
@@ -473,10 +396,8 @@ def compose_router(
         plan=plan,
         simulation_spec=spec,
         held_out_simulation_spec=held_spec,
-        fidelity_approval_id=approval.approval_id,
         policy_lock_id=policy_lock.lock_id,
-        fidelity_report_id=fidelity.fidelity_report_id,
-        phase_a_simulation_spend_usd=phase_a_spend,
+        fit_simulation_spend_usd=fit_spend,
         held_out_simulation_spend_usd=held_out_spend,
         total_simulation_spend_usd=total_spend,
         optimization=optimized,
@@ -567,94 +488,6 @@ def _verified_simulation_spend(
         for rollout_id in artifact_set.artifact_ids
     )
     return math.fsum(values)
-
-
-def _approve_fidelity_once(
-    project: ProjectStore,
-    plan: EvaluationPlan,
-    protocol: EvaluationProtocol,
-    phase_a_evidence: tuple[EvaluationCellEvidence, ...],
-    fidelity_evidence: tuple[EvaluationCellEvidence, ...],
-    approval_service: FidelityApproval,
-    budget: RouterCompositionBudget,
-    created_at: datetime,
-    code_revision: str,
-) -> tuple[FidelityReport, FidelityApprovalReceipt]:
-    """Call approval exactly once, persist its exact receipt, and verify every replay."""
-    plan_value, plan_input = read_evaluation_plan(project.artifacts, plan.plan_id)
-    protocol_sha256 = _protocol_digest(protocol)
-    gate_id = plan_bound_fidelity_gate_id(plan_input.sha256, protocol_sha256)
-    _gate, gate_input = read_fidelity_gate(project.artifacts, gate_id)
-    approval_id = stable_id(
-        "fidelity-approval",
-        {
-            "plan": plan_input.model_dump(mode="json"),
-            "gate": gate_input.model_dump(mode="json"),
-            "protocol_sha256": protocol_sha256,
-        },
-    )
-    destination = project.artifacts.project_directory / "artifacts" / approval_id
-    if destination.exists():
-        if project.artifacts.read(approval_id).manifest.artifact_type != "fidelity-approval":
-            raise RouterCompositionError("fidelity approval identity has the wrong artifact type")
-        receipt = FidelityApprovalReceipt.model_validate_json(
-            project.artifacts.read_bytes(approval_id, "approval.json")
-        )
-        report, report_input = read_fidelity_report(project.artifacts, receipt.report.artifact_id)
-        if (
-            plan_value != plan
-            or receipt.plan != plan_input
-            or receipt.gate != gate_input
-            or receipt.report != report_input
-            or receipt.protocol_sha256 != protocol_sha256
-            or sorted_unique_inputs(*receipt.inputs)
-            != sorted_unique_inputs(plan_input, gate_input, report_input)
-        ):
-            raise RouterCompositionError("fidelity approval receipt binding has drifted")
-        replay = build_fidelity_report(
-            project.artifacts,
-            evaluation_plan_id=plan.plan_id,
-            protocol=protocol,
-            cell_evidence=phase_a_evidence,
-            created_at=created_at,
-            code_revision=code_revision,
-            approved_at=receipt.approved_at,
-        )
-        if replay != report:
-            raise RouterCompositionError("approved fidelity report differs from exact replay")
-        return report, receipt
-    decision = approval_service(project, plan, fidelity_evidence, budget)
-    report = build_fidelity_report(
-        project.artifacts,
-        evaluation_plan_id=plan.plan_id,
-        protocol=protocol,
-        cell_evidence=phase_a_evidence,
-        created_at=created_at,
-        code_revision=code_revision,
-        approved_at=decision.approved_at,
-    )
-    report_input = artifact_input(project.artifacts.read(report.fidelity_report_id).manifest)
-    receipt = FidelityApprovalReceipt(
-        schema_version=1,
-        created_at=created_at,
-        inputs=sorted_unique_inputs(plan_input, gate_input, report_input),
-        code_revision=code_revision,
-        approval_id=approval_id,
-        plan=plan_input,
-        gate=gate_input,
-        report=report_input,
-        protocol_sha256=protocol_sha256,
-        actor_id=decision.actor_id,
-        evidence=decision.evidence,
-        approved_at=decision.approved_at,
-    )
-    project.artifacts.write_json(
-        artifact_id=approval_id,
-        artifact_type="fidelity-approval",
-        envelope=receipt,
-        files={"approval.json": receipt},
-    )
-    return report, receipt
 
 
 def _fit_and_lock_once(
@@ -749,7 +582,6 @@ def _preflight(
             services.setup_supplier,
             services.simulator_factory,
             services.judge,
-            services.fidelity_approval,
             services.runtime_catalog,
         )
     ):
@@ -905,13 +737,6 @@ def _persist_judgment(project: ProjectStore, judgment: Judgment) -> None:
             raise RouterCompositionError(
                 "existing judgment differs from injected judge result"
             ) from None
-
-
-def _protocol_digest(protocol: EvaluationProtocol) -> str:
-    """Return the canonical fidelity digest without a circular report identity."""
-    from wmo.common.evaluations.evidence import evaluation_protocol_digest
-
-    return evaluation_protocol_digest(protocol)
 
 
 def _phase(hook: Callable[[str], None] | None, phase: str) -> None:

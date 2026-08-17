@@ -89,7 +89,6 @@ class KnnRouterPolicy(ArtifactEnvelope):
     task_set_id: ArtifactId
     task_set_sha256: Sha256
     evaluation_protocols_sha256: Sha256
-    fidelity_report_ids: tuple[ArtifactId, ...] = ()
     judgment_status: Literal["provisional", "human_calibrated"]
 
     @model_validator(mode="after")

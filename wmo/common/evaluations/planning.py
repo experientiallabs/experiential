@@ -129,6 +129,49 @@ def build_evaluation_plan(
     candidate_snapshots: Sequence[RoutedCandidateSnapshot],
     pricing_snapshot_id: ArtifactId,
     observed_cells: Sequence[ObservedProductionCell],
+    additional_inputs: Sequence[ArtifactInput] = (),
+    repeats: Sequence[int] = (0,),
+    created_at: datetime,
+    code_revision: str,
+) -> EvaluationPlan:
+    """Build a router-only fit and held-out plan with no fidelity scope.
+
+    Args:
+        store: Project-local immutable artifact store containing tasks and rollouts.
+        task_set_id: Frozen representative task-set artifact.
+        candidate_snapshots: Exact aliases and model identities to evaluate.
+        pricing_snapshot_id: Exact candidate-pricing artifact bound to the plan.
+        observed_cells: Production rollout assignments that already fill matrix cells.
+        additional_inputs: Optional manifest-bound workflow contracts to freeze into the plan.
+        repeats: Nonnegative repeat indexes planned for every task and candidate.
+        created_at: Time the plan is completed.
+        code_revision: Exact WMO revision creating the plan.
+
+    Returns:
+        Persisted router evaluation plan containing only fit and held-out cells.
+    """
+    return _build_evaluation_plan(
+        store,
+        task_set_id=task_set_id,
+        candidate_snapshots=candidate_snapshots,
+        pricing_snapshot_id=pricing_snapshot_id,
+        observed_cells=observed_cells,
+        fidelity_thresholds_id=None,
+        fidelity_protocol_sha256=None,
+        additional_inputs=additional_inputs,
+        repeats=repeats,
+        created_at=created_at,
+        code_revision=code_revision,
+    )
+
+
+def build_fidelity_evaluation_plan(
+    store: ArtifactStore,
+    *,
+    task_set_id: ArtifactId,
+    candidate_snapshots: Sequence[RoutedCandidateSnapshot],
+    pricing_snapshot_id: ArtifactId,
+    observed_cells: Sequence[ObservedProductionCell],
     fidelity_thresholds_id: ArtifactId,
     fidelity_protocol_sha256: Sha256,
     additional_inputs: Sequence[ArtifactInput] = (),
@@ -136,19 +179,67 @@ def build_evaluation_plan(
     created_at: datetime,
     code_revision: str,
 ) -> EvaluationPlan:
-    """Build and persist a complete sparse plan from observed and missing cells.
-
-    Observed production evidence takes the main fit or held-out cell. Every other requested
-    candidate cell is explicitly marked for simulation. The frozen threshold denominator selects
-    that many distinct observed fit lineages for separate fidelity-only simulation cells.
+    """Build a separately invoked world-model fidelity measurement plan.
 
     Args:
-        store: Project-local immutable artifact store containing tasks, gate, and rollouts.
+        store: Project-local immutable artifact store containing tasks, thresholds, and rollouts.
+        task_set_id: Frozen representative task-set artifact.
+        candidate_snapshots: Exact aliases and model identities to evaluate.
+        pricing_snapshot_id: Exact candidate-pricing artifact bound to the plan.
+        observed_cells: Production rollout assignments used as fidelity comparisons.
+        fidelity_thresholds_id: Precommitted world-model fidelity thresholds artifact.
+        fidelity_protocol_sha256: Exact world-model measurement protocol digest.
+        additional_inputs: Optional manifest-bound measurement contracts.
+        repeats: Nonnegative repeat indexes planned for every task and candidate.
+        created_at: Time the plan is completed.
+        code_revision: Exact WMO revision creating the plan.
+
+    Returns:
+        Persisted plan with explicit observed comparisons and fidelity cells.
+    """
+    return _build_evaluation_plan(
+        store,
+        task_set_id=task_set_id,
+        candidate_snapshots=candidate_snapshots,
+        pricing_snapshot_id=pricing_snapshot_id,
+        observed_cells=observed_cells,
+        fidelity_thresholds_id=fidelity_thresholds_id,
+        fidelity_protocol_sha256=fidelity_protocol_sha256,
+        additional_inputs=additional_inputs,
+        repeats=repeats,
+        created_at=created_at,
+        code_revision=code_revision,
+    )
+
+
+def _build_evaluation_plan(
+    store: ArtifactStore,
+    *,
+    task_set_id: ArtifactId,
+    candidate_snapshots: Sequence[RoutedCandidateSnapshot],
+    pricing_snapshot_id: ArtifactId,
+    observed_cells: Sequence[ObservedProductionCell],
+    fidelity_thresholds_id: ArtifactId | None,
+    fidelity_protocol_sha256: Sha256 | None,
+    additional_inputs: Sequence[ArtifactInput],
+    repeats: Sequence[int],
+    created_at: datetime,
+    code_revision: str,
+) -> EvaluationPlan:
+    """Build and persist either router cells or an explicit fidelity measurement plan.
+
+    Observed production evidence takes the main fit or held-out cell. Every other requested
+    candidate cell is explicitly marked for simulation. Explicit fidelity mode also selects a
+    frozen observed-fit denominator for separate fidelity-only simulation cells.
+
+    Args:
+        store: Project-local immutable artifact store containing tasks and rollouts.
         task_set_id: Frozen representative task-set artifact.
         candidate_snapshots: Exact aliases and model identities to evaluate.
         pricing_snapshot_id: Exact candidate-pricing artifact bound to the plan.
         observed_cells: Production rollout assignments that already fill matrix cells.
-        fidelity_thresholds_id: Precommitted world-model fidelity thresholds artifact.
+        fidelity_thresholds_id: Optional precommitted world-model fidelity thresholds artifact.
+        fidelity_protocol_sha256: Optional world-model measurement protocol digest.
         additional_inputs: Optional manifest-bound workflow contracts to freeze into the plan.
         repeats: Nonnegative repeat indexes planned for every task and candidate.
         created_at: Time the plan is completed.
@@ -158,13 +249,19 @@ def build_evaluation_plan(
         The persisted immutable evaluation plan.
 
     Raises:
-        EvaluationEvidenceError: Inputs conflict, held-out state leaks, or the exact planned fit
-            overlap denominator is unavailable.
+        EvaluationEvidenceError: Inputs conflict or explicit fidelity scope is incomplete.
     """
     loaded_tasks = load_task_set(store, task_set_id)
     task_manifest = store.read(task_set_id).manifest
     task_input = artifact_input(task_manifest)
-    thresholds, thresholds_input = read_fidelity_thresholds(store, fidelity_thresholds_id)
+    if (fidelity_thresholds_id is None) != (fidelity_protocol_sha256 is None):
+        raise EvaluationEvidenceError(
+            "fidelity planning requires both thresholds and protocol identity"
+        )
+    thresholds = None
+    thresholds_input = None
+    if fidelity_thresholds_id is not None:
+        thresholds, thresholds_input = read_fidelity_thresholds(store, fidelity_thresholds_id)
     candidates = tuple(sorted(candidate_snapshots, key=lambda item: item.alias))
     _require_unique_candidates(candidates)
     for item in additional_inputs:
@@ -228,18 +325,23 @@ def build_evaluation_plan(
         for candidate in candidates
         for repeat in repeat_ids
     )
-    fidelity_cells = _fidelity_cells(
-        main_cells,
-        tasks_by_id,
-        task_set_input=task_input,
-        planned_overlaps=thresholds.planned_overlaps,
+    fidelity_cells = (
+        ()
+        if thresholds is None
+        else _fidelity_cells(
+            main_cells,
+            tasks_by_id,
+            task_set_input=task_input,
+            planned_overlaps=thresholds.planned_overlaps,
+        )
     )
     cells = (*main_cells, *fidelity_cells)
+    fidelity_inputs = () if thresholds_input is None else (thresholds_input,)
     plan_inputs = sorted_evaluation_inputs(
         (
             task_input,
             pricing_input,
-            thresholds_input,
+            *fidelity_inputs,
             *observed_inputs,
             *additional_inputs,
         )
@@ -247,18 +349,21 @@ def build_evaluation_plan(
     plan_id = stable_id(
         "evaluation-plan",
         {
-            "version": "sparse-evaluation-plan-v2",
+            "version": "sparse-evaluation-plan-v3",
+            "mode": "fidelity" if thresholds is not None else "router",
             "inputs": [item.model_dump(mode="json") for item in plan_inputs],
             "task_set": task_input.model_dump(mode="json"),
             "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
             "pricing_snapshot": pricing_input.model_dump(mode="json"),
-            "fidelity_thresholds": thresholds_input.model_dump(mode="json"),
+            "fidelity_thresholds": (
+                None if thresholds_input is None else thresholds_input.model_dump(mode="json")
+            ),
             "fidelity_protocol_sha256": fidelity_protocol_sha256,
             "cells": [cell.model_dump(mode="json") for cell in cells],
         },
     )
     plan = EvaluationPlan(
-        schema_version=2,
+        schema_version=3,
         created_at=created_at,
         inputs=plan_inputs,
         code_revision=code_revision,
@@ -267,8 +372,8 @@ def build_evaluation_plan(
         candidate_snapshots=candidates,
         pricing_snapshot_id=pricing_snapshot_id,
         pricing_snapshot_sha256=pricing_sha256,
-        fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
-        fidelity_thresholds_sha256=thresholds_input.sha256,
+        fidelity_thresholds_id=(None if thresholds is None else thresholds.fidelity_thresholds_id),
+        fidelity_thresholds_sha256=(None if thresholds_input is None else thresholds_input.sha256),
         fidelity_protocol_sha256=fidelity_protocol_sha256,
         cells=cells,
     )
@@ -288,6 +393,8 @@ def build_evaluation_plan(
             envelope=plan,
             files={"evaluation-plan.json": plan, "plan.json": plan},
         )
+    if thresholds is None or thresholds_input is None or fidelity_protocol_sha256 is None:
+        return plan
     plan_input = artifact_input(store.read(plan.plan_id).manifest)
     overlap_ids = tuple(cell.cell_id for cell in fidelity_cells)
     scope_sha256 = sha256_json(

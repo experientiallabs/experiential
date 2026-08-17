@@ -841,9 +841,6 @@ def _persist_plan(
         ),
         pricing_snapshot_id=pricing_input.artifact_id,
         pricing_snapshot_sha256=pricing_input.sha256,
-        fidelity_thresholds_id="fidelity-thresholds-a",
-        fidelity_thresholds_sha256=_DIGEST,
-        fidelity_protocol_sha256=_DIGEST,
         cells=cells,
     )
     manifest = store.write_json(

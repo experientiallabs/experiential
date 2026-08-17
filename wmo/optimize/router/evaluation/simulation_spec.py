@@ -24,7 +24,7 @@ def build_router_simulation_spec(
     code_revision: str,
     cells: tuple[EvaluationCell, ...],
     *,
-    phase: Literal["fidelity-fit", "heldout"],
+    phase: Literal["fit", "heldout"],
 ) -> SimulationSpec:
     """Create one phase-scoped simulation spec over the exact fit-only RAG.
 
@@ -37,7 +37,7 @@ def build_router_simulation_spec(
         created_at: Immutable specification timestamp.
         code_revision: Exact source revision bound to generated artifacts.
         cells: Phase-specific plan cells eligible for simulation.
-        phase: Fidelity-fit or held-out phase label used in stable identity.
+        phase: Fit or held-out phase label used in stable identity.
 
     Returns:
         Sparse immutable specification that binds the same fit RAG in either phase.

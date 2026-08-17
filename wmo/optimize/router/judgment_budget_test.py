@@ -19,7 +19,6 @@ from wmo.optimize.router.composition_test import (
     _TIME,
     _bind_completed_build,
     _Catalog,
-    _FidelityApproval,
     _Judge,
     _ReviewSupplier,
     _SetupSupplier,
@@ -54,7 +53,6 @@ def test_judgment_budget_reservation_blocks_partial_retry_dispatch(
         setup_supplier=_SetupSupplier(),
         simulator_factory=_SimulatorFactory(),
         judge=judge,
-        fidelity_approval=_FidelityApproval(),
         runtime_catalog=cast(
             RuntimeModelCatalog,
             _Catalog(

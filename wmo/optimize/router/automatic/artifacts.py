@@ -175,9 +175,6 @@ def materialize_automatic_router_artifacts(
         incumbent_alias=preflight.incumbent_alias,
         agent_factory_sha256=preflight.agent_factory_sha256,
         simulation_configuration_sha256=preflight.simulation_configuration_sha256,
-        preferred_fidelity_overlaps=preflight.preferred_fidelity_overlaps,
-        fidelity_planned_overlaps=preflight.fidelity_overlap_count,
-        fidelity_minimum_usable_overlaps=min(8, preflight.fidelity_overlap_count),
         world_model_alias=preflight.world_model_alias,
         world_model=preflight.world_model,
         world_model_request=preflight.world_model_completion_reservation,
@@ -248,7 +245,7 @@ def _persist_observed_cells(
         Deterministic observed-cell bindings for evaluation planning.
     """
     cells = []
-    for item in preflight.observed_traces[: preflight.fidelity_overlap_count]:
+    for item in preflight.observed_traces:
         rollout_input = write_production_rollout(
             project,
             preflight.setup,

@@ -5,7 +5,7 @@ The root surface is deliberately small:
 | Command | Purpose | Local result |
 |---|---|---|
 | `wmo build PROJECT TRACES --source SOURCE --root ROOT [--provider NAME ...]` | Normalize 100 through 1000 local traces from one [declared source](reference/ingest.md) and mine representative tasks. First-build setup uses a keyboard provider list, or exact `--provider` flags. | Manifest-bound `TraceDataset`, `TaskSet`, and `proposals_pending` review state. |
-| `wmo optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
+| `wmo optimize router PROJECT --root ROOT [--yes]` | Complete bounded fit simulation and judgment, lock a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `wmo optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `wmo run PROJECT --root ROOT [--ghost]` | Load a frozen policy and expose it on development-only loopback. | Local OpenAI-compatible endpoint with durable journaling by default or no saved traffic in ghost mode. |
 | `wmo config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. | Local `.wmo/models.toml`. |
@@ -26,6 +26,8 @@ An HTTP completion or direct `RouterRuntime.complete` call is the explicit onlin
 boundary. The router remains frozen for the process lifetime. `run --ghost` still permits provider
 calls but disables durable interaction, replay, RAG, and SFT state for that process.
 
-Build stops at review readiness. Simulation, judgment, fidelity, embedding, and pricing artifacts
-must be completed through a separately authorized workflow before creating the exact
-[`router-optimization.json`](reference/router_optimization_config.md) input.
+Build stops at review readiness. `wmo optimize router` creates the bounded fit and held-out
+evaluation chain after candidate and manual judge setup. It never invokes world-model fidelity
+testing. Applications that need a world-model quality measurement can call the separate
+`build_fidelity_evaluation_plan` and `build_fidelity_report` APIs; those results never enter router
+fitting or activation. See the [router contracts](reference/router_optimization_config.md).

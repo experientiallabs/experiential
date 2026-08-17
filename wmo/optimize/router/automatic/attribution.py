@@ -1,4 +1,4 @@
-"""Verified candidate attribution for real router fidelity overlaps."""
+"""Verified candidate attribution for optional real router fit evidence."""
 
 from __future__ import annotations
 
@@ -98,8 +98,7 @@ class RouterObservedAttributionSet(ArtifactEnvelope):
     task_set: ArtifactInput
     catalog_sha256: Sha256
     candidates: tuple[RoutedCandidateSnapshot, ...] = Field(min_length=2)
-    preferred_overlap_limit: int = Field(gt=0)
-    records: tuple[RouterObservedAttribution, ...] = Field(min_length=1)
+    records: tuple[RouterObservedAttribution, ...] = ()
 
     @field_validator("candidates")
     @classmethod
@@ -133,10 +132,8 @@ class RouterObservedAttributionSet(ArtifactEnvelope):
             The unchanged validated artifact.
 
         Raises:
-            ValueError: Records repeat a task, trace, or leakage lineage or exceed the limit.
+            ValueError: Records repeat a task, trace, or leakage lineage.
         """
-        if len(self.records) > self.preferred_overlap_limit:
-            raise ValueError("router attribution records exceed the preferred overlap limit")
         for label, values in (
             ("task", tuple(item.task_id for item in self.records)),
             ("trace", tuple(item.trace_id for item in self.records)),
@@ -155,8 +152,6 @@ def resolve_router_observed_attributions(
     traces: Sequence[Trace],
     evidence: TraceModelIdentityEvidenceSet | None,
     candidates: Sequence[RoutedCandidateSnapshot],
-    *,
-    preferred_overlap_limit: int,
 ) -> tuple[RouterObservedAttribution, ...]:
     """Resolve one real fit trace per leakage lineage without guessing model identity.
 
@@ -165,17 +160,12 @@ def resolve_router_observed_attributions(
         traces: Exact completed normalized traces.
         evidence: Verified per-model-span provenance, or ``None`` when the dataset has none.
         candidates: Explicit selected candidate snapshots.
-        preferred_overlap_limit: Positive maximum admitted fidelity-overlap count.
-
     Returns:
-        Deterministic admitted real-overlap attributions.
+        Deterministic exact-match real fit attributions. Unmatched traces are omitted.
 
     Raises:
-        RouterAttributionError: No fit lineage resolves, or any unresolved lineage is zero-match,
-            ambiguous, conflicting, or crosses candidate aliases.
+        RouterAttributionError: Candidate scope or model identity evidence is inconsistent.
     """
-    if preferred_overlap_limit <= 0:
-        raise RouterAttributionError("preferred overlap limit must be positive")
     if evidence is not None:
         try:
             require_model_identity_evidence_matches_traces(traces, evidence)
@@ -195,35 +185,25 @@ def resolve_router_observed_attributions(
         else {(item.trace_id, item.span_id): item for item in evidence.records}
     )
     selected: list[RouterObservedAttribution] = []
-    failures: list[str] = []
     admitted_lineages: set[str] = set()
     for task in tasks:
         if task.partition != "fit" or task.lineage_group_id in admitted_lineages:
             continue
         resolved = None
-        trace_failures = []
         for trace_id in task.source_trace_ids:
             trace = traces_by_id.get(trace_id)
             if trace is None:
-                trace_failures.append(f"trace {trace_id!r} is absent from the completed dataset")
                 continue
             try:
                 resolved = _resolve_trace(task, trace, evidence_by_key, ordered_candidates)
-            except RouterAttributionError as exc:
-                trace_failures.append(str(exc))
+            except RouterAttributionError:
                 continue
             break
         if resolved is None:
-            details = "; ".join(trace_failures) or "task has no source trace IDs"
-            failures.append(f"fit lineage {task.lineage_group_id!r}: {details}")
             continue
         selected.append(resolved)
         admitted_lineages.add(task.lineage_group_id)
-    if failures or not selected:
-        if not selected:
-            failures.append("no real fit lineage resolved to a selected candidate")
-        raise RouterAttributionError("candidate attribution failed:\n- " + "\n- ".join(failures))
-    return tuple(selected[:preferred_overlap_limit])
+    return tuple(selected)
 
 
 def persist_router_observed_attribution_set(
@@ -233,7 +213,6 @@ def persist_router_observed_attribution_set(
     task_set: ArtifactInput,
     catalog_sha256: Sha256,
     candidates: Sequence[RoutedCandidateSnapshot],
-    preferred_overlap_limit: int,
     records: Sequence[RouterObservedAttribution],
     created_at: datetime,
     code_revision: str,
@@ -246,7 +225,6 @@ def persist_router_observed_attribution_set(
         task_set: Exact completed task-set manifest input.
         catalog_sha256: Digest of the complete confirmed secret-free model catalog.
         candidates: Selected candidate snapshots.
-        preferred_overlap_limit: Positive admission bound used by matching.
         records: Exact preflight-resolved real overlaps.
         created_at: Artifact materialization time.
         code_revision: Exact producer revision.
@@ -266,7 +244,6 @@ def persist_router_observed_attribution_set(
         task_set=task_set,
         catalog_sha256=catalog_sha256,
         candidates=ordered_candidates,
-        preferred_overlap_limit=preferred_overlap_limit,
         records=resolved_records,
         code_revision=code_revision,
     )
@@ -281,7 +258,6 @@ def persist_router_observed_attribution_set(
         task_set=task_set,
         catalog_sha256=catalog_sha256,
         candidates=ordered_candidates,
-        preferred_overlap_limit=preferred_overlap_limit,
         records=resolved_records,
     )
     _verify_attribution_inputs(store, value)
@@ -348,7 +324,6 @@ def load_router_observed_attribution_set(
             task_set=value.task_set,
             catalog_sha256=value.catalog_sha256,
             candidates=value.candidates,
-            preferred_overlap_limit=value.preferred_overlap_limit,
             records=value.records,
             code_revision=value.code_revision,
         ),
@@ -547,7 +522,6 @@ def _verify_attribution_inputs(
             loaded_traces.traces,
             evidence,
             value.candidates,
-            preferred_overlap_limit=value.preferred_overlap_limit,
         )
     except RouterAttributionError as exc:
         raise ArtifactCorruptionError("router attribution cannot be recomputed") from exc
@@ -562,7 +536,6 @@ def _attribution_semantic(
     task_set: ArtifactInput,
     catalog_sha256: Sha256,
     candidates: tuple[RoutedCandidateSnapshot, ...],
-    preferred_overlap_limit: int,
     records: tuple[RouterObservedAttribution, ...],
     code_revision: str,
 ) -> dict[str, object]:
@@ -574,7 +547,6 @@ def _attribution_semantic(
         task_set: Exact completed task-set input.
         catalog_sha256: Complete confirmed catalog digest.
         candidates: Sorted selected candidate snapshots.
-        preferred_overlap_limit: Exact admitted-overlap ceiling.
         records: Exact admitted attribution records.
         code_revision: Exact producer revision.
 
@@ -588,7 +560,6 @@ def _attribution_semantic(
         "task_set": task_set.model_dump(mode="json"),
         "catalog_sha256": catalog_sha256,
         "candidates": [item.model_dump(mode="json") for item in candidates],
-        "preferred_overlap_limit": preferred_overlap_limit,
         "records": [item.model_dump(mode="json") for item in records],
         "code_revision": code_revision,
     }

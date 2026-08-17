@@ -10,12 +10,6 @@ if TYPE_CHECKING:
     from wmo.optimize.router.activation import load_router as load_router
     from wmo.optimize.router.composition import ApprovedRouterReview as ApprovedRouterReview
     from wmo.optimize.router.composition import (
-        FidelityApprovalDecision as FidelityApprovalDecision,
-    )
-    from wmo.optimize.router.composition import (
-        FidelityApprovalReceipt as FidelityApprovalReceipt,
-    )
-    from wmo.optimize.router.composition import (
         RouterCandidateSetupPlan as RouterCandidateSetupPlan,
     )
     from wmo.optimize.router.composition import (
@@ -66,8 +60,6 @@ _EXPORT_MODULES = {
     "fit_router": "wmo.optimize.router.fit.workflow",
     "report_router": "wmo.optimize.router.fit.workflow",
     "ApprovedRouterReview": "wmo.optimize.router.composition",
-    "FidelityApprovalDecision": "wmo.optimize.router.composition",
-    "FidelityApprovalReceipt": "wmo.optimize.router.composition",
     "RouterCandidateSetupPlan": "wmo.optimize.router.composition",
     "RouterCompositionBudget": "wmo.optimize.router.composition",
     "RouterCompositionResult": "wmo.optimize.router.composition",

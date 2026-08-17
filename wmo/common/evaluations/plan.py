@@ -60,7 +60,7 @@ class FidelityThresholds(ArtifactEnvelope):
 
 
 class FidelityGate(ArtifactEnvelope):
-    """Plan-bound approval gate that cannot be replayed across evaluation scopes."""
+    """Plan-bound measurement gate that cannot be replayed across evaluation scopes."""
 
     fidelity_gate_id: ArtifactId
     fidelity_thresholds_id: ArtifactId
@@ -97,9 +97,9 @@ class EvaluationPlan(ArtifactEnvelope):
     candidate_snapshots: tuple[RoutedCandidateSnapshot, ...]
     pricing_snapshot_id: ArtifactId
     pricing_snapshot_sha256: Sha256
-    fidelity_thresholds_id: ArtifactId
-    fidelity_thresholds_sha256: Sha256
-    fidelity_protocol_sha256: Sha256
+    fidelity_thresholds_id: ArtifactId | None = None
+    fidelity_thresholds_sha256: Sha256 | None = None
+    fidelity_protocol_sha256: Sha256 | None = None
     cells: tuple[EvaluationCell, ...]
 
     @field_validator("candidate_snapshots")
@@ -126,6 +126,20 @@ class EvaluationPlan(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_consistent_cell_references(self) -> EvaluationPlan:
+        fidelity_scope = (
+            self.fidelity_thresholds_id,
+            self.fidelity_thresholds_sha256,
+            self.fidelity_protocol_sha256,
+        )
+        fidelity_cells = tuple(cell for cell in self.cells if cell.purpose == "fidelity")
+        if any(value is not None for value in fidelity_scope) != all(
+            value is not None for value in fidelity_scope
+        ):
+            raise ValueError("fidelity plans require complete threshold and protocol identity")
+        if bool(fidelity_cells) != all(value is not None for value in fidelity_scope):
+            raise ValueError(
+                "fidelity scope and fidelity cells must either both be present or both be absent"
+            )
         candidate_aliases = {candidate.alias for candidate in self.candidate_snapshots}
         cells_by_id = {cell.cell_id: cell for cell in self.cells}
         planned_cell_keys: set[tuple[ArtifactId, ModelAlias, int, str]] = set()

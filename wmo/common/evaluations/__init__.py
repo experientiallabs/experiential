@@ -3,7 +3,6 @@
 from wmo.common.evaluations.build import (
     build_evaluation_dataset,
     load_evaluation_dataset,
-    world_model_protocol_is_eligible,
 )
 from wmo.common.evaluations.dataset import (
     EvaluationDataset,
@@ -28,6 +27,7 @@ from wmo.common.evaluations.plan import (
 from wmo.common.evaluations.planning import (
     ObservedProductionCell,
     build_evaluation_plan,
+    build_fidelity_evaluation_plan,
     default_fidelity_thresholds,
     persist_fidelity_thresholds,
 )
@@ -49,9 +49,9 @@ __all__ = [
     "ObservedProductionCell",
     "build_evaluation_dataset",
     "build_evaluation_plan",
+    "build_fidelity_evaluation_plan",
     "build_fidelity_report",
     "default_fidelity_thresholds",
     "load_evaluation_dataset",
     "persist_fidelity_thresholds",
-    "world_model_protocol_is_eligible",
 ]

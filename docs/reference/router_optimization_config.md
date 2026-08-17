@@ -1,118 +1,90 @@
-# Router optimization configuration
+# Router optimization contracts
 
-`wmo build` stops with `proposals_pending`. It does not create simulation, judgment, fidelity,
-embedding, or pricing artifacts. The completed-evidence CLI path requires these inputs. A Python
-application may instead use `wmo.compose_router` with explicit suppliers, simulator, judge, runtime
-catalog, and finite budgets to have WMO create and verify the remaining artifact chain. Before
-either path, the application must provide these approved inputs with explicit user consent:
+Router optimization consumes one combined plan containing only fit and held-out cells. Fidelity
+cells, fidelity reports, and approval artifacts are not router inputs. The supported sequence is:
 
-- One combined evaluation plan containing fit, fidelity, and held-out cells.
-- Completed rollout sets and judgments for every referenced cell.
-- Completed fidelity reports that satisfy the plan-bound fidelity gate.
-- One frozen embedding set covering every task used for fitting and reporting.
-- One pricing snapshot covering every candidate in the evaluation plan.
+1. Complete fit evidence.
+2. Fit and lock the bank and policy.
+3. Open held-out evidence and write the report.
 
-Review those artifacts before creating the config. `wmo optimize router` verifies them but does not
-produce or repair them.
+`wmo optimize router PROJECT --root ROOT` assembles this sequence from the completed project build,
+confirmed candidates, approved manual judge calibration, and one bounded provider budget. It does
+not run world-model fidelity evaluation before fitting.
 
-## Exact fields
+Python applications can use `wmo.compose_router` to run the same sequence with injected review and
+setup suppliers, simulator, judge, runtime catalog, and finite budgets. Provider-free callers with
+already completed evidence can use `fit_router`, `report_router`, or `optimize_router` directly.
 
-The JSON root is `RouterOptimizationConfig`:
+## Router-only plan
+
+Create the plan with `build_evaluation_plan`. Its public signature has no fidelity threshold,
+protocol, report, or approval argument. The resulting `EvaluationPlan` has:
+
+- fit and held-out cells only;
+- `fidelity_thresholds_id=None`;
+- `fidelity_thresholds_sha256=None`;
+- `fidelity_protocol_sha256=None`.
+
+The router fitter rejects any plan containing a fidelity cell. This keeps world-model quality
+measurement outside the policy authorization chain.
+
+## Completed-evidence configuration
+
+`RouterOptimizationConfig` is the provider-free Python contract for already completed evidence:
 
 | Field | Required content |
 |---|---|
-| `fit` | `EvaluationInputs` for fit and fidelity cells only. |
-| `held_out` | `EvaluationInputs` for held-out cells only, naming the same plan as `fit`. |
-| `embedding_set_id` | Artifact ID of the completed frozen embedding set. |
-| `incumbent_alias` | Optional candidate alias to use as the conservative baseline. |
-| `pricing_snapshot_id` | Artifact ID of the completed pricing snapshot. |
-| `guard` | All five `KnnGuard` thresholds: `maximum_neighbors`, `minimum_paired_observations`, `relative_similarity_threshold`, `uncertainty_multiplier`, and `quality_tolerance`. |
+| `fit` | `EvaluationInputs` containing fit cells only. |
+| `held_out` | `EvaluationInputs` containing held-out cells only and naming the same plan. |
+| `embedding_set_id` | Frozen embedding-set artifact covering the plan tasks. |
+| `incumbent_alias` | Optional selected candidate used as the conservative baseline. |
+| `pricing_snapshot_id` | Pricing artifact covering every plan candidate. |
+| `guard` | Complete `KnnGuard` thresholds. |
 | `judgment_status` | Exactly `provisional` or `human_calibrated`. |
-| `created_at` | Timezone-aware timestamp used for newly frozen router artifacts. |
-| `code_revision` | Exact source revision producing those artifacts. |
+| `created_at` | Timezone-aware artifact timestamp. |
+| `code_revision` | Exact source revision producing the artifacts. |
 
-Each `EvaluationInputs` object contains:
+Each `EvaluationInputs` object contains only:
 
 | Field | Required content |
 |---|---|
-| `evaluation_plan_id` | The same completed combined plan ID in both partitions. |
-| `rollout_set_ids` | Completed rollout-set artifact IDs consumed by that partition. |
-| `protocols` | Complete serialized `EvaluationProtocol` contracts referenced by its cells. |
-| `cell_evidence` | Complete serialized `EvaluationCellEvidence` contracts for its allowed cells. |
-| `fidelity_report_ids` | Completed fidelity-report IDs required by the fit-side gate, or an empty list when none are required by the plan. |
+| `evaluation_plan_id` | Router-only combined plan ID. |
+| `rollout_set_ids` | Completed rollout-set IDs consumed by this partition. |
+| `protocols` | Serialized `EvaluationProtocol` values referenced by the cells. |
+| `cell_evidence` | Serialized `EvaluationCellEvidence` values for the named partition. |
 
-Generate the exact JSON Schema from the installed package when integrating another system:
+There is no `fidelity_report_ids` field. Generate the exact schema from the installed package:
 
 ```bash
-uv run python -c 'import json; from wmo.optimize.router import RouterOptimizationConfig; print(json.dumps(RouterOptimizationConfig.model_json_schema(), indent=2))' > router-optimization.schema.json
+uv run python -c 'import json; from wmo.optimize.router import RouterOptimizationConfig; print(json.dumps(RouterOptimizationConfig.model_json_schema(), indent=2))'
 ```
 
-## Create the config from completed typed outputs
-
-The following function writes the accepted file. Every argument comes from a completed artifact or
-reviewed evaluation result produced by the separately authorized workflow. No placeholder IDs or
-live clients are involved.
+The direct Python boundary is:
 
 ```python
-from datetime import datetime
-from pathlib import Path
-from typing import Literal
+from wmo import fit_router, report_router
 
-from wmo.common.evaluations import EvaluationCellEvidence, EvaluationProtocol
-from wmo.common.routing import KnnGuard
-from wmo.optimize.router import EvaluationInputs, RouterOptimizationConfig
-
-
-def write_router_config(
-    *,
-    destination: Path,
-    evaluation_plan_id: str,
-    fit_rollout_set_ids: tuple[str, ...],
-    fit_protocols: tuple[EvaluationProtocol, ...],
-    fit_cell_evidence: tuple[EvaluationCellEvidence, ...],
-    fidelity_report_ids: tuple[str, ...],
-    held_out_rollout_set_ids: tuple[str, ...],
-    held_out_protocols: tuple[EvaluationProtocol, ...],
-    held_out_cell_evidence: tuple[EvaluationCellEvidence, ...],
-    embedding_set_id: str,
-    pricing_snapshot_id: str,
-    guard: KnnGuard,
-    judgment_status: Literal["provisional", "human_calibrated"],
-    created_at: datetime,
-    code_revision: str,
-    incumbent_alias: str | None = None,
-) -> None:
-    """Write one validated router workflow config from completed evidence."""
-    config = RouterOptimizationConfig(
-        fit=EvaluationInputs(
-            evaluation_plan_id=evaluation_plan_id,
-            rollout_set_ids=fit_rollout_set_ids,
-            protocols=fit_protocols,
-            cell_evidence=fit_cell_evidence,
-            fidelity_report_ids=fidelity_report_ids,
-        ),
-        held_out=EvaluationInputs(
-            evaluation_plan_id=evaluation_plan_id,
-            rollout_set_ids=held_out_rollout_set_ids,
-            protocols=held_out_protocols,
-            cell_evidence=held_out_cell_evidence,
-        ),
-        embedding_set_id=embedding_set_id,
-        incumbent_alias=incumbent_alias,
-        pricing_snapshot_id=pricing_snapshot_id,
-        guard=guard,
-        judgment_status=judgment_status,
-        created_at=created_at,
-        code_revision=code_revision,
-    )
-    destination.write_text(config.model_dump_json(indent=2) + "\n", encoding="utf-8")
+fit = fit_router(store, fit_config)
+result = report_router(store, fit, report_config)
 ```
 
-Run optimization only after this function validates and writes the reviewed completed inputs:
+`fit_router` locks the policy before `report_router` reads held-out evidence. `optimize_router`
+performs both calls in that order for a complete `RouterOptimizationConfig`.
 
-```bash
-wmo optimize router support-agent --config router-optimization.json --root .wmo
+## Separate world-model fidelity measurement
+
+Fidelity testing is an explicit common-evaluation workflow. Call
+`build_fidelity_evaluation_plan` with frozen thresholds, observed comparison cells, and the exact
+world-model protocol digest. Execute its fidelity cells, then call `build_fidelity_report` to
+measure agreement.
+
+```python
+from wmo.common.evaluations import (
+    build_fidelity_evaluation_plan,
+    build_fidelity_report,
+)
 ```
 
-The command opens fit and fidelity evidence first, freezes the bank and policy, and only then opens
-held-out evidence. It makes no provider, simulator, environment, or judge calls.
+The resulting plan and report remain world-model quality artifacts. They are not accepted by
+`EvaluationInputs`, are not loaded by the router fitter or runtime, and cannot authorize, block,
+or alter policy fitting.

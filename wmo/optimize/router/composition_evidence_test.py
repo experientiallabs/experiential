@@ -48,7 +48,6 @@ from wmo.optimize.router.composition import (
 from wmo.optimize.router.composition_test import (
     _bind_completed_build,
     _capabilities,
-    _FidelityApproval,
     _Judge,
     _resolved,
     _snapshot,
@@ -417,14 +416,12 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     completed_build = _bind_completed_build(project, normalized, revision=revision)
     simulator = _EvidenceSimulatorFactory()
     judge = _EvidenceJudge(revision)
-    approval = _FidelityApproval()
     runtime_catalog = _RuntimeCatalog()
     services = RouterWorkflowServices(
         review_supplier=_EvidenceReviewSupplier(revision),
         setup_supplier=_EvidenceSetupSupplier(revision),
         simulator_factory=simulator,
         judge=judge,
-        fidelity_approval=approval,
         runtime_catalog=cast(RuntimeModelCatalog, runtime_catalog),
     )
     budget = RouterCompositionBudget(
@@ -452,7 +449,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
         created_at=_TIME,
         code_revision=revision,
     )
-    dispatches_after_completion = _dispatch_counts(simulator, judge, approval)
+    dispatches_after_completion = _dispatch_counts(simulator, judge)
     replay = wmo.compose_router(
         project,
         normalized,
@@ -469,7 +466,6 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert result.build.review.status == "proposals_pending"
     assert result.review.rubric_id == "rubric-a"
     assert result.review.calibration_id == "calibration-a"
-    assert result.fidelity_approval_id
     assert result.policy_lock_id
     report = result.optimization.optimization.report
     assert len(report.held_out_task_ids) == 20
@@ -478,7 +474,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert report.coverage.not_run_row_count == 0
     assert report.source_strata
     assert result.build.review.paid_calls_made == 0
-    assert result.phase_a_simulation_spend_usd == 0.0
+    assert result.fit_simulation_spend_usd == 0.0
     assert result.held_out_simulation_spend_usd == 0.0
     assert result.total_simulation_spend_usd == 0.0
     assert result.held_out_simulation_spec.maximum_cost_usd == (budget.maximum_simulation_cost_usd)
@@ -491,14 +487,14 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert report.run_spend.world_model.missing_row_count == 0
     assert report.run_spend.judge.missing_row_count == 0
     assert replay.optimization == result.optimization
-    assert _dispatch_counts(simulator, judge, approval) == dispatches_after_completion
+    assert _dispatch_counts(simulator, judge) == dispatches_after_completion
     planned_phase_cells = len(result.simulation_spec.cell_ids) + len(
         result.held_out_simulation_spec.cell_ids
     )
-    assert planned_phase_cells == 140
+    assert planned_phase_cells == 130
     assert dispatches_after_completion[:2] == (
-        140,
-        140,
+        130,
+        130,
     )
     reservations = tuple(
         JudgmentDispatchReceipt.model_validate_json(
@@ -507,7 +503,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
         for artifact_id in project.artifacts.list_ids()
         if project.artifacts.read(artifact_id).manifest.artifact_type == "judgment-dispatch"
     )
-    assert len(reservations) == judge.calls == len(result.plan.cells) == 150
+    assert len(reservations) == judge.calls == len(result.plan.cells) == 140
     assert judge.calls <= budget.maximum_judgments
     assert len(telemetry_delivered) == 1
     assert len(telemetry_attempts) == 2
@@ -543,9 +539,9 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
             "normalized_trace_count": 100,
             "fit_task_count": 50,
             "held_out_task_count": 20,
-            "planned_cell_count": 150,
-            "simulated_cell_count": 140,
-            "judgment_count": 150,
+            "planned_cell_count": 140,
+            "simulated_cell_count": 130,
+            "judgment_count": 140,
             "maximum_judgments": 200,
             "maximum_simulation_cost_usd": 2.0,
             "observed_spend_usd": 0.0,
@@ -668,8 +664,7 @@ def _persist_release_embeddings(project: ProjectStore, tasks, revision: str) -> 
 def _dispatch_counts(
     simulator: _EvidenceSimulatorFactory,
     judge: _Judge,
-    approval: _FidelityApproval,
-) -> tuple[int, int, int, int]:
-    """Return model, world-model, judge, and approval dispatch totals."""
+) -> tuple[int, int, int]:
+    """Return candidate, world-model, and judge dispatch totals."""
     candidate_calls = sum(len(client.requests) for client in simulator.candidates.values())
-    return candidate_calls, len(simulator.world.requests), judge.calls, approval.calls
+    return candidate_calls, len(simulator.world.requests), judge.calls
