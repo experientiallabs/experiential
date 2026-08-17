@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +11,7 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm, FloatPrompt, Prompt
 
-from wmo.cli.consent import require_spend_consent
+from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.common.core.artifacts import Sha256, sha256_json
 from wmo.common.core.locks import file_write_lock
@@ -73,7 +72,7 @@ def optimize_model(
     yes: bool = typer.Option(
         False,
         "--yes",
-        help="Confirm managed Tinker execution after all validation and risk gates pass.",
+        help="Confirm an in-budget estimate when the shared policy requires it.",
     ),
     tinker_connection: str | None = typer.Option(
         None,
@@ -107,19 +106,24 @@ def optimize_model(
         min=0,
         help="Explicit Tinker training price used for conservative local reservation.",
     ),
+    non_interactive: bool = typer.Option(
+        False,
+        "--non-interactive",
+        help="Require complete flags and never ask setup or cost questions.",
+    ),
 ) -> None:
     """Build routed interactions into W12 and run bounded W13 SFT automatically.
 
     The command seals the current validated runtime journal prefix, reuses or creates its
     immutable W12 dataset and bounded config, then validates the complete local input graph before
-    consent. Failed and disconnected interactions never become training targets. A trained alias
-    is registered only after recursively verifying W13's completed result and opaque sampling
-    handle.
+    cost authorization. Failed and disconnected interactions never become training targets. A
+    trained alias is registered only after recursively verifying W13's completed result and
+    opaque sampling handle.
 
     Args:
         project: Local project ID below ``<root>/projects``.
         root: Local ``.wmo`` root containing the project and ``models.toml``.
-        yes: Explicit consent for managed execution only, never a validation or risk bypass.
+        yes: Explicit confirmation for an in-budget estimate, never a validation or risk bypass.
         tinker_connection: Native Tinker connection name used for first-run setup.
         tinker_api_key_env: Environment-variable name used by training and later sampling.
         base_model_alias: Local alias for the exact first-run Tinker base model.
@@ -127,6 +131,7 @@ def optimize_model(
         maximum_cost_usd: Optional first-run or consistency-checked managed-training cost cap.
         training_usd_per_million_tokens: Explicit model-specific training price. Zero is accepted
             only when supplied by the user or entered during interactive setup.
+        non_interactive: Require complete flags and refuse every prompt.
 
     Raises:
         typer.BadParameter: Local configuration, preflight, W13, or registration is unsafe.
@@ -146,6 +151,7 @@ def optimize_model(
             base_model=base_model,
             maximum_cost_usd=maximum_cost_usd,
             training_usd_per_million_tokens=training_usd_per_million_tokens,
+            non_interactive=non_interactive,
         )
         preparation = prepare_runtime_sft_model_optimization(
             store,
@@ -178,22 +184,35 @@ def optimize_model(
         backend: TrainerBackend = _LocalPreflightBackend()
         preflight = local_preflight
 
-    if preflight.completed_result is None and not preparation.accepted:
-        assert config.training.maximum_cost_usd is not None
+    if preflight.completed_result is None:
         assert preflight.conservative_schedule_cost_usd is not None
-        spend = (
-            "the managed Tinker SFT run bounded by immutable maximum_cost_usd "
-            f"${config.training.maximum_cost_usd:.2f} with a full-schedule conservative "
-            f"upper bound of ${preflight.conservative_schedule_cost_usd.value:.2f}"
+        assert config.training.maximum_datum_tokens is not None
+        assert config.training.training_usd_per_million_tokens is not None
+        estimate = preflight.conservative_schedule_cost_usd.value
+        assumptions = (
+            f"{len(preflight.planned_batch_counts)} frozen managed batches",
+            f"up to {config.training.maximum_datum_tokens} tokens per training datum",
+            (f"${config.training.training_usd_per_million_tokens:.6f} per million training tokens"),
         )
-        if not require_spend_consent(
-            _console,
-            yes=yes,
-            spend=spend,
-            command="wmo optimize model",
-        ):
-            _console.print("Managed Tinker SFT was not started.")
-            return
+    else:
+        estimate = 0.0
+        assumptions = (
+            "verified immutable completed SFT replay",
+            "zero new managed training calls",
+        )
+    if not require_spend_consent(
+        _console,
+        root=root,
+        yes=yes,
+        estimated_cost_usd=estimate,
+        command=f"wmo optimize model {project}",
+        assumptions=assumptions,
+        non_interactive=non_interactive,
+        previously_confirmed=preparation.accepted and preflight.completed_result is None,
+    ):
+        _console.print("Managed Tinker SFT was not started.")
+        return
+    if preflight.completed_result is None and not preparation.accepted:
         with usage_error(AutomaticSFTPreparationError):
             accept_runtime_sft_model_optimization(
                 store,
@@ -257,6 +276,7 @@ def _initial_settings(
     base_model: str | None,
     maximum_cost_usd: float | None,
     training_usd_per_million_tokens: float | None,
+    non_interactive: bool,
 ) -> InitialSFTModelOptimizationSettings | None:
     """Collect and persist only missing first-run Tinker catalog selections.
 
@@ -267,8 +287,9 @@ def _initial_settings(
         tinker_api_key_env: Optional environment-variable name for the Tinker credential.
         base_model_alias: Optional explicit local base-model alias from the CLI.
         base_model: Optional exact Tinker model ID for a new alias.
-        maximum_cost_usd: Optional finite immutable training cap shown before provider consent.
+        maximum_cost_usd: Optional finite immutable training cap shown before cost authorization.
         training_usd_per_million_tokens: Optional explicit model-specific training price.
+        non_interactive: Whether setup questions are forbidden.
 
     Returns:
         Confirmed first-run settings, or ``None`` when an immutable selection already exists.
@@ -291,7 +312,7 @@ def _initial_settings(
         return None
     catalog = load_model_catalog(store.model_catalog_path)
     catalog_sha256 = sha256_json(catalog)
-    interactive = sys.stdin.isatty()
+    interactive = not non_interactive and can_prompt(_console)
     connection_name = tinker_connection
     alias = base_model_alias
     if interactive:

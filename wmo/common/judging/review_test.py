@@ -30,6 +30,8 @@ def _dimension(dimension_id: str, name: str) -> RubricDimension:
         dimension_id=dimension_id,
         name=name,
         description=f"How well the rollout meets {name.lower()}.",
+        min_score=0,
+        max_score=5,
         anchors=(
             ScoreAnchor(score=0, description=f"{name} anchor 0."),
             ScoreAnchor(score=1, description=f"{name} anchor 1."),

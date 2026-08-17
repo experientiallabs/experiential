@@ -77,7 +77,7 @@ def router(
     yes: bool = typer.Option(
         False,
         "--yes",
-        help="Consent to the displayed shared provider-spend ceiling.",
+        help="Confirm an in-budget estimate when the shared policy requires it.",
     ),
     approve_fidelity: bool = typer.Option(
         False,
@@ -102,12 +102,13 @@ def router(
         maximum_retrieval_query_tokens: Input ceiling for each grounded retrieval query.
         simulation_maximum_output_tokens: Candidate and world-model output ceiling per turn.
         maximum_concurrency: Maximum simulation workers.
-        yes: Explicit shared provider-spend consent.
+        yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
         approve_fidelity: Explicit approval for passing measured fidelity evidence.
         non_interactive: Refuse prompts and require complete repeatable inputs.
 
     Raises:
-        typer.BadParameter: Candidate, build, judge, budget, consent, or artifact input is invalid.
+        typer.BadParameter: Candidate, build, judge, budget, authorization, or artifact input is
+            invalid.
     """
     started = time.monotonic()
     now = datetime.now(UTC)
@@ -155,23 +156,41 @@ def router(
             raise ValueError("noninteractive router optimization requires --approve-fidelity")
 
     if replay is not None:
+        require_spend_consent(
+            _console,
+            root=root,
+            yes=yes,
+            estimated_cost_usd=0.0,
+            command=f"wmo optimize router {project}",
+            assumptions=(
+                "verified immutable optimization replay",
+                "zero new provider calls",
+            ),
+            non_interactive=effective_noninteractive,
+        )
         _console.print("replay: verified completed optimization")
         _console.print(f"policy: {replay.policy_id}")
         _console.print(f"report: {replay.report_id}")
         return
     _render_preflight(preflight, options)
-    spend = (
-        f"at most ${options.maximum_provider_cost_usd:.4f}, including "
-        f"${preflight.router_embedding_reservation.estimated_cost_usd:.4f} for router "
-        f"embeddings, ${preflight.judge_reservation_cost_usd:.4f} for all judge calls, and "
-        f"${preflight.remaining_simulation_cost_usd:.4f} for candidate, retrieval, and "
-        "world-model simulation"
-    )
     if not require_spend_consent(
         _console,
+        root=root,
         yes=yes,
-        spend=spend,
-        command="wmo optimize router",
+        estimated_cost_usd=options.maximum_provider_cost_usd,
+        command=f"wmo optimize router {project}",
+        assumptions=(
+            (
+                f"${preflight.router_embedding_reservation.estimated_cost_usd:.4f} router "
+                "embedding reservation"
+            ),
+            f"${preflight.judge_reservation_cost_usd:.4f} judge reservation",
+            (
+                f"${preflight.remaining_simulation_cost_usd:.4f} candidate, retrieval, and "
+                "world-model simulation allocation"
+            ),
+        ),
+        non_interactive=effective_noninteractive,
     ):
         _console.print("Router optimization was not started.")
         return

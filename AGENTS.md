@@ -95,16 +95,20 @@ uv run pytest -q
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
 - The root CLI is locked to `build`, `optimize`, `run`, and `config`. The optimize group is locked
-  to `router` and `model`; the config group is locked to `telemetry` and `providers`. Widening any
-  of those three sets, whether with a command, an alias, or a flag, is a deliberate change to the
-  locked surface and needs the same scrutiny as a public API change.
+  to `router` and `model`; the config group is locked to `budget`, `judge`, `providers`, and
+  `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
+  deliberate change to the locked surface and needs the same scrutiny as a public API change.
+- Every paid CLI command uses `wmo.cli.consent.require_spend_consent` after a credential-free
+  conservative estimate and before credential or provider-client construction. The setting in
+  `.wmo/settings.toml` is a hard per-command ceiling. Estimates at or below half run automatically,
+  higher in-budget estimates need explicit confirmation, and `--yes` never overrides the ceiling.
 - `wmo optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
   It never builds a dataset, creates teacher rollouts, changes routing roles, or launches a
   simulator. The config freezes the W12 manifest, native Tinker base-model snapshot, capability
   digest, and credential-reference digest without persisting any secret. A finite cap requires a
-  conservative estimate for every exact scheduled batch before consent; `--yes` confirms only
-  after those checks. Completed W13 artifacts are recursively verified before an opaque sampling
-  handle is atomically registered in `models.toml`.
+  conservative estimate for every exact scheduled batch before shared cost authorization;
+  `--yes` confirms only an in-budget estimate after those checks. Completed W13 artifacts are
+  recursively verified before an opaque sampling handle is atomically registered in `models.toml`.
 - Changes to this composition seam require focused persisted-dataset, resume, budget, immutable
   pointer, drift, and catalog-provenance coverage. The seam composes a persisted dataset into an
   SFT run and stops there; training-objective, promotion, and route-registration concerns belong to
@@ -123,6 +127,8 @@ uv run pytest -q
 
 ## Writing
 
+- Do not modify `README.md` without explicit user approval for that file. A request to implement,
+  document, publish, or open a PR does not imply approval to change the README; ask first.
 - No em dashes in any NEW writing: code, comments, docstrings, docs, UI copy, commit messages, or
   PR descriptions. Use a comma, a colon, parentheses, a period, or a plain hyphen instead, or
   restructure the sentence. The rule applies to a diff's added lines and is checked in review
@@ -255,7 +261,9 @@ uv run pytest -q
     `ready-for-merge` skill (`.claude/skills/ready-for-merge/SKILL.md`) has been run and passes:
     `/code-review --fix` at an effort level scaled to the PR's breadth (see the skill), every
     review comment (Cursor, Greptile, humans) resolved, and a full AGENTS.md compliance audit
-    of the diff.
+    of the diff. When opening or updating a PR, fetch Greptile review comments in the same
+    turn and address them immediately: fix valid findings, reply on the thread, and resolve
+    it. Do not wait for `/ready-for-merge` to start that loop.
 
 14. **All visuals follow the brand system.** Research figures, README/docs images, frontends, and
     any UI must look clean and minimal — Vercel/Notion/Apple-like: white background, generous

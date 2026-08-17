@@ -68,6 +68,8 @@ def _write_rubric(store: ProjectStore) -> Rubric:
                 dimension_id="task-success",
                 name="Task success",
                 description="Whether the customer received the requested outcome.",
+                min_score=0,
+                max_score=5,
                 anchors=(
                     ScoreAnchor(score=0, description="Task-success score 0."),
                     ScoreAnchor(score=1, description="Task-success score 1."),
@@ -132,6 +134,7 @@ def test_human_score_review_persists_history_without_overwriting_other_review_st
 def test_human_score_review_upsert_is_idempotent_for_duplicate_delivery(tmp_path: Path) -> None:
     """A retried score submission returns its original label without recording a correction."""
     store = _store(tmp_path)
+    _write_rubric(store)
     first = HumanScoreReview.open(store).upsert(
         rubric_id="rubric-1",
         rollout_id="rollout-1",
@@ -163,6 +166,7 @@ def test_human_score_review_keeps_a_delayed_retry_from_reverting_a_correction(
 ) -> None:
     """A repeated delivery returns its original label after a newer correction is active."""
     store = _store(tmp_path)
+    _write_rubric(store)
     first = HumanScoreReview.open(store).upsert(
         rubric_id="rubric-1",
         rollout_id="rollout-1",

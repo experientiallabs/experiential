@@ -1,76 +1,42 @@
-"""The one spend boundary every `wmo` command that can cost money passes through.
-
-The rule: consent to spend is SAID, never inferred. It is said by `--yes`, or by answering the
-prompt at a terminal. The absence of an interactive session (CI, cron, a pipe, `| tee`, a
-redirected `< /dev/null` or heredoc stdin) is not consent, it is the absence of anyone to ask,
-so a spending run refuses there instead of starting. Nor is a blank line or an EOF an answer:
-the safe direction is refusal, so neither can authorize spend.
-
-"Interactive" means BOTH streams. Prompting reads stdin while the console reports on stdout, so a
-terminal stdout paired with a redirected stdin does not count: taking it for interactive lets the
-prompt read whatever the redirect supplies and a blank line pass as approval.
-
-This lives in one place because a per-command copy of the rule is a per-command chance to miss a
-site, and a missed site spends a scripted caller's real money. Every spend gate calls
-`require_spend_consent`, so there is one behaviour to read and one place a new spend surface has
-to reach for.
-"""
+"""Shared cost preflight and authorization for every paid WMO command."""
 
 from __future__ import annotations
 
+import math
+import shlex
 import sys
+from collections.abc import Sequence
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from pathlib import Path
 from typing import NoReturn
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.prompt import Confirm
 
-# Exit code for "a spending run could not ask for consent". Distinct from the decline path
-# (0, the user said no and nothing happened) and from a run failure (1), so a CI job can tell
-# "you forgot --yes" apart from "the run broke".
-NO_CONSENT_EXIT_CODE = 2
+from wmo.common.config import ARTIFACT_DIR, resolve_command_budget_usd
 
-# The two ways there turns out to be nobody to ask. Both open the same refusal, so a caller
-# reads one shape of message and always learns the flag that authorizes the spend.
-_NO_ONE_TO_ASK = (
-    "non-interactive session: cannot ask for spend consent, and consent is never inferred "
-    "from the absence of someone to ask. A prompt needs a terminal on stdin as well as "
-    "stdout, so a redirected or piped input refuses here too."
-)
-_NO_ANSWER = (
-    "input ended before the spend question was answered: cannot ask for spend consent, and "
-    "consent is never inferred from an unanswered prompt."
-)
+NO_CONSENT_EXIT_CODE = 2
 
 
 def _stdin_is_terminal() -> bool:
-    """Whether the INPUT stream is a terminal.
-
-    Its own function so a test can force the input side the way rich's `force_terminal` forces
-    the output side: `click.testing.CliRunner` installs its own non-terminal `sys.stdin` for the
-    duration of an `invoke`, so a CLI test cannot fake this by replacing `sys.stdin` itself.
-    """
+    """Return whether the input stream is an open terminal."""
     stdin = sys.stdin
     try:
         return stdin is not None and stdin.isatty()
     except ValueError:
-        # A closed stdin. Nobody to ask, which is the same answer as a redirected one.
         return False
 
 
 def can_prompt(console: Console) -> bool:
-    """Whether there is an interactive human to ask, on BOTH ends of this session.
-
-    `console.is_terminal` answers only for the OUTPUT stream. A prompt reads the INPUT one, so
-    checking the console alone let `wmo ... < /dev/null`, a heredoc, or `printf y | wmo ...`
-    through with a terminal stdout and no human behind stdin. A prompt is only honest when both
-    streams belong to the same person, so both have to be a TTY.
+    """Return whether both input and output belong to an interactive terminal.
 
     Args:
-        console: The console the command prints to, owned by the calling CLI module.
+        console: Command-owned output console.
 
     Returns:
-        True only when stdout and stdin are both a terminal.
+        True only when both terminal streams can reach the same operator.
     """
     return console.is_terminal and _stdin_is_terminal()
 
@@ -78,66 +44,202 @@ def can_prompt(console: Console) -> bool:
 def require_spend_consent(
     console: Console,
     *,
+    root: str | Path = ARTIFACT_DIR,
     yes: bool,
-    spend: str,
+    estimated_cost_usd: float,
     command: str,
-    alternative: str | None = None,
-    question: str = "Proceed?",
+    assumptions: Sequence[str],
+    non_interactive: bool = False,
+    previously_confirmed: bool = False,
 ) -> bool:
-    """Get explicit consent before the first paid call, or refuse to start.
+    """Render one cost preflight and enforce the configured authorization policy.
+
+    Estimates at or below half of the configured budget run automatically. Higher estimates up
+    to the budget require ``--yes``, a prior immutable confirmation, or an explicit terminal
+    answer. An estimate above the budget always fails before credentials or provider clients.
 
     Args:
-        console: The console the command prints to. It is passed in rather than imported
-            because each CLI module owns its own `Console`, and tests drive this through a
-            non-terminal one. Whether there is anyone to ask is `can_prompt`'s decision, which
-            reads this console's stdout state AND stdin.
-        yes: The command's `--yes` flag. Consent, already said.
-        spend: What this run would spend, in whatever unit the command can honestly quote (a
-            projected dollar figure, or the rollout/episode counts when the work is unpriced).
-            Printed in the refusal, so a scripted caller learns the size of what it just
-            declined to authorize instead of only that something was skipped.
-        command: The command being run, e.g. `wmo optimize model`, named in the refusal
-            so the message says what to re-run.
-        alternative: An optional second way out, phrased as a flag plus what it does, e.g.
-            "--dry-run to see the plan without spending".
-        question: Named confirmation question shown after the caller's spend preflight.
+        console: Command-owned output console.
+        root: WMO root that owns ``settings.toml``.
+        yes: Explicit invocation confirmation for an in-budget estimate.
+        estimated_cost_usd: Conservative upper-bound estimate for this invocation.
+        command: Complete command identity shown to the operator.
+        assumptions: Major bounded inputs used to derive the estimate.
+        non_interactive: Whether this invocation forbids terminal questions.
+        previously_confirmed: Whether immutable command state records an earlier confirmation.
 
     Returns:
-        True when consent was given, False when the user declined at a terminal. Callers exit
-        on False rather than treating it as an error: nothing was run and nothing was spent.
+        True when execution is authorized, or False after an interactive decline.
 
     Raises:
-        typer.Exit: Code 2 when `--yes` was not passed and either there was no interactive
-            session to ask at, or the prompt reached EOF instead of an answer.
+        typer.BadParameter: Settings or cost arithmetic are invalid, or the estimate exceeds the
+            configured budget.
+        typer.Exit: No explicit confirmation is available in a noninteractive session.
     """
-    if yes:
-        return True
-    if not can_prompt(console):
-        _refuse(console, _NO_ONE_TO_ASK, spend=spend, command=command, alternative=alternative)
+    estimate = _cost_decimal(estimated_cost_usd, label="estimated command cost")
+    if not assumptions:
+        raise typer.BadParameter("cost preflight requires at least one major cost assumption")
     try:
-        # `default=False`: pressing Enter, and anything else that arrives as a blank line, is a
-        # refusal. Defaulting to True made the cheapest possible input authorize the spend.
-        return Confirm.ask(f"\n{question}", default=False)
+        configured = resolve_command_budget_usd(root, None)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    budget = _cost_decimal(configured, label="configured command budget")
+    _render_preflight(
+        console,
+        command=command,
+        estimate=estimate,
+        budget=budget,
+        assumptions=assumptions,
+    )
+    if estimate > budget:
+        raise typer.BadParameter(_over_budget_message(root, estimate, budget))
+    if estimate <= budget / Decimal(2):
+        console.print("authorization: automatic (estimate is at most 50% of budget)")
+        return True
+    if yes:
+        console.print("authorization: confirmed by --yes")
+        return True
+    if previously_confirmed:
+        console.print("authorization: reused immutable prior confirmation")
+        return True
+    if non_interactive or not can_prompt(console):
+        _refuse_noninteractive(console, command=command, estimate=estimate, budget=budget)
+    prompt = (
+        f"Authorize {command} to spend up to {_format_usd(estimate)} against the "
+        f"{_format_usd(budget)} per-command budget?"
+    )
+    try:
+        return Confirm.ask(prompt, default=False, console=console)
     except EOFError:
-        # Both streams claimed to be a terminal and then the input ended anyway (Ctrl-D, or a
-        # pty that closed under us). Nobody answered, so this is the "could not ask" refusal
-        # rather than a considered no, and it exits 2 instead of leaking a traceback.
-        _refuse(console, _NO_ANSWER, spend=spend, command=command, alternative=alternative)
+        _refuse_unanswered(console, command=command, estimate=estimate, budget=budget)
 
 
-def _refuse(
+def _cost_decimal(value: float, *, label: str) -> Decimal:
+    """Convert one finite nonnegative float into stable decimal policy arithmetic.
+
+    Args:
+        value: Numeric USD value.
+        label: Field name used in failures.
+
+    Returns:
+        Exact decimal representation of the supplied float string.
+
+    Raises:
+        typer.BadParameter: The value is negative or non-finite.
+    """
+    if not math.isfinite(value) or value < 0:
+        raise typer.BadParameter(f"{label} must be finite and nonnegative")
+    try:
+        return Decimal(str(value))
+    except InvalidOperation as exc:
+        raise typer.BadParameter(f"{label} must be finite and nonnegative") from exc
+
+
+def _render_preflight(
     console: Console,
-    lead: str,
     *,
-    spend: str,
     command: str,
-    alternative: str | None,
+    estimate: Decimal,
+    budget: Decimal,
+    assumptions: Sequence[str],
+) -> None:
+    """Print the concise cost contract before making an authorization decision.
+
+    Args:
+        console: Command-owned output console.
+        command: Complete command identity.
+        estimate: Conservative invocation estimate.
+        budget: Configured per-command ceiling.
+        assumptions: Major bounded cost inputs.
+    """
+    console.print("[bold]Cost preflight[/bold]")
+    console.print(f"command: {escape(command)}")
+    console.print(f"estimated cost: {_format_usd(estimate)} (conservative maximum)")
+    console.print(f"configured budget: {_format_usd(budget)} per command")
+    console.print("assumptions: " + escape("; ".join(assumptions)))
+
+
+def _format_usd(value: Decimal) -> str:
+    """Format USD compactly while preserving sub-cent boundary evidence.
+
+    Args:
+        value: Nonnegative finite decimal USD value.
+
+    Returns:
+        Dollar-prefixed value with at least two and at most six decimal places.
+    """
+    rounded = value.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
+    rendered = f"{rounded:.6f}".rstrip("0").rstrip(".")
+    whole, separator, fraction = rendered.partition(".")
+    if not separator:
+        fraction = "00"
+    elif len(fraction) < 2:
+        fraction = fraction.ljust(2, "0")
+    return f"${whole}.{fraction}"
+
+
+def _over_budget_message(root: str | Path, estimate: Decimal, budget: Decimal) -> str:
+    """Return actionable remediation for a hard ceiling rejection.
+
+    Args:
+        root: WMO settings root.
+        estimate: Rejected conservative estimate.
+        budget: Configured ceiling.
+
+    Returns:
+        Error text naming both safe ways to proceed.
+    """
+    sufficient = estimate.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
+    amount = _format_usd(sufficient).removeprefix("$")
+    command = f"wmo config budget {amount} --root {shlex.quote(str(root))}"
+    return (
+        f"conservative estimate {_format_usd(estimate)} exceeds the configured per-command "
+        f"budget {_format_usd(budget)}. Increase the limit to at least the estimate with "
+        f"`{command}`, or reduce this command's cost inputs. --yes cannot override the ceiling"
+    )
+
+
+def _refuse_noninteractive(
+    console: Console,
+    *,
+    command: str,
+    estimate: Decimal,
+    budget: Decimal,
 ) -> NoReturn:
-    """Print what would have been spent, what would have spent it, and the flag that allows it."""
-    tail = f", or with {alternative}" if alternative else ""
+    """Exit when an above-half estimate has no deterministic confirmation.
+
+    Args:
+        console: Command-owned output console.
+        command: Complete command identity.
+        estimate: Conservative invocation estimate.
+        budget: Configured per-command ceiling.
+    """
     console.print(
-        f"\n{lead}\n"
-        f"  [bold]{command}[/bold] would spend {spend} here.\n"
-        f"Re-run the same command with --yes to consent explicitly{tail}."
+        "authorization: this estimate requires explicit confirmation because it exceeds 50% "
+        "of the configured budget. This session cannot prompt; re-run with --yes after "
+        f"reviewing {escape(command)} ({_format_usd(estimate)} of {_format_usd(budget)})."
+    )
+    raise typer.Exit(NO_CONSENT_EXIT_CODE)
+
+
+def _refuse_unanswered(
+    console: Console,
+    *,
+    command: str,
+    estimate: Decimal,
+    budget: Decimal,
+) -> NoReturn:
+    """Exit when terminal input ends before confirmation.
+
+    Args:
+        console: Command-owned output console.
+        command: Complete command identity.
+        estimate: Conservative invocation estimate.
+        budget: Configured per-command ceiling.
+    """
+    console.print(
+        "authorization: input ended before confirmation. No spend was authorized. Re-run "
+        f"{escape(command)} with --yes after reviewing {_format_usd(estimate)} of the "
+        f"{_format_usd(budget)} budget."
     )
     raise typer.Exit(NO_CONSENT_EXIT_CODE)

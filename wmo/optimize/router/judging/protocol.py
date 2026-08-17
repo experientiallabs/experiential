@@ -527,7 +527,7 @@ def _render_request(
         Deterministic request body containing every mapped variable and schema.
     """
     values: dict[str, object] = {
-        "rubric": [item.model_dump(mode="json") for item in rubric.dimensions],
+        "rubric": [item.prompt_payload() for item in rubric.dimensions],
     }
     if candidate_b is None:
         values["rollout"] = _rollout_payload(candidate_a)
@@ -583,12 +583,22 @@ def _validate_normalized_dimensions(dimensions: list[JsonObject], rubric: Rubric
         rubric: Finalized rubric defining expected dimensions.
 
     Raises:
-        ManualJudgeError: Dimensions repeat or are missing.
+        ManualJudgeError: Dimensions repeat, are missing, or fall outside an axis range.
     """
     identifiers = [item.get("dimension_id") for item in dimensions]
     expected = {item.dimension_id for item in rubric.dimensions}
     if len(set(identifiers)) != len(identifiers) or set(identifiers) != expected:
         raise ManualJudgeError("judge must evaluate every rubric dimension exactly once")
+    axes = {item.dimension_id: item for item in rubric.dimensions}
+    for item in dimensions:
+        dimension_id = cast(str, item.get("dimension_id"))
+        raw_score = item.get("raw_score")
+        axis = axes[dimension_id]
+        if not isinstance(raw_score, int) or not axis.contains_score(raw_score):
+            raise ManualJudgeError(
+                f"judge raw_score for {dimension_id} must be an integer from "
+                f"{axis.min_score} through {axis.max_score}"
+            )
 
 
 def _combine_rationales(forward: str | None, reverse: str | None) -> str | None:

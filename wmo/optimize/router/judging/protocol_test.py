@@ -66,7 +66,7 @@ class _NullRationaleClient:
                         "dimensions": [
                             {
                                 "dimension_id": "task-success",
-                                "raw_score": 4,
+                                "raw_score": 1,
                                 "rationale": None,
                             }
                         ]

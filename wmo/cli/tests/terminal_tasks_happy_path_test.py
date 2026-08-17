@@ -23,6 +23,7 @@ from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
+from wmo.common.config.settings import set_maximum_command_cost_usd
 from wmo.common.models import (
     AssistantAction,
     ConnectionConfig,
@@ -78,7 +79,7 @@ class _JudgeClient:
         self.calls = 0
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Return a schema-valid score citing one span visible in the request."""
+        """Return a schema-valid score after confirming the request includes a rollout span."""
         if self.fail_after is not None and self.calls >= self.fail_after:
             raise RuntimeError("simulated judge provider interruption")
         self.calls += 1
@@ -92,7 +93,7 @@ class _JudgeClient:
                         "dimensions": [
                             {
                                 "dimension_id": "task-success",
-                                "raw_score": 4,
+                                "raw_score": 1,
                                 "rationale": "The trace shows the requested task was handled.",
                             }
                         ]
@@ -114,6 +115,17 @@ class _RuntimeCatalog:
         """Wrap the real catalog so every snapshot stays exactly as configured."""
         self._real = RuntimeModelCatalog(catalog)
         self._embedding = _EmbeddingClient()
+
+    def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+        """Return one credential-free static model identity.
+
+        Args:
+            alias: Configured local model alias.
+
+        Returns:
+            Exact model snapshot and capability declaration.
+        """
+        return self._real.snapshot(alias)
 
     def preflight(self, alias: str, requirement: object | None = None) -> ResolvedModel:
         """Return a deterministic resolved model for one configured alias."""
@@ -253,39 +265,49 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     labels = [
         argument
         for trace in plan.traces
-        for argument in ("--label", f"{trace.trace_id}:task-success=4")
+        for argument in ("--label", f"{trace.trace_id}:task-success=1")
     ]
 
     before_preflight = store.read_review()
-    without_consent = [
-        argument for argument in _calibrate_arguments(root, ()) if argument != "--yes"
+    set_maximum_command_cost_usd(0.5, root)
+    over_budget = [
+        *_calibrate_arguments(root, ()),
+        "--input-usd-per-million",
+        "1",
+        "--output-usd-per-million",
+        "1",
     ]
-    refused = runner.invoke(app, without_consent)
+    _RuntimeCatalog.judge_clients = []
+    refused = runner.invoke(app, over_budget)
     assert refused.exit_code == 2
-    assert "Spend preflight: manual judge calibration" in refused.output
-    assert "Judge name: judge" in refused.output
-    assert "Exact model: openai/judge-id" in refused.output
-    assert "Judge calls authorized: 10" in refused.output
-    assert "Maximum estimated cost: $0.0000" in refused.output
-    assert "Hard spend ceiling: $10.0000" in refused.output
-    assert "missing labels" not in refused.output
+    refused_text = " ".join(unstyle(refused.output).replace("│", " ").split())
+    assert "Cost preflight" in refused_text
+    assert "command: wmo config judge calibrate terminal-tasks" in refused_text
+    assert "estimated cost: $1.10592" in refused_text
+    assert "configured budget: $0.50 per command" in refused_text
+    assert "judge judge: openai/judge-id" in refused_text
+    assert "10 judge calls with up to 3 attempts each" in refused_text
+    assert "--yes cannot override" in refused_text
+    assert "missing labels" not in refused_text
+    assert _RuntimeCatalog.judge_clients == []
     assert store.read_review() == before_preflight
+    set_maximum_command_cost_usd(25.0, root)
 
     _RuntimeCatalog.judge_fail_after = 0
     interrupted = runner.invoke(app, _calibrate_arguments(root, labels))
     assert interrupted.exit_code != 0
-    assert "ZERO-TO-FIVE CALIBRATION" in interrupted.output
+    assert "INTEGER 0-1 CALIBRATION" in interrupted.output
     assert "User / task:" in interrupted.output
     assert "Tool call:" in interrupted.output
     assert "Tool arguments:" in interrupted.output
     assert "Tool result:" in interrupted.output
     assert "Tool output:" in interrupted.output
     assert "Final outcome:" in interrupted.output
-    assert "0: The agent did not address the task." in interrupted.output
-    assert "5: The agent fully and correctly addressed the task." in interrupted.output
+    assert "0: The agent did not complete the requested task." in interrupted.output
+    assert "1: The agent successfully completed the requested task." in interrupted.output
     drafted = _drafted_labels(store)
     assert len(drafted) == _SAMPLE_SIZE
-    assert {item["score"] for item in drafted} == {4}
+    assert {item["score"] for item in drafted} == {1}
 
     _RuntimeCatalog.judge_fail_after = None
     _RuntimeCatalog.judge_clients = []
@@ -341,6 +363,9 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
         ],
     )
     assert replay.exit_code == 0, replay.output
+    assert "estimated cost: $0.00" in replay.output
+    assert "authorization: automatic" in replay.output
+    assert "Proceed?" not in replay.output
     assert "Approved judge calibration" in replay.output
     assert "Spend preflight" not in replay.output
     assert _RuntimeCatalog.judge_clients == []

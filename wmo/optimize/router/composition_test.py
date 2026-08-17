@@ -229,6 +229,8 @@ class _ReviewSupplier:
                         dimension_id="dimension-a",
                         name="Task success",
                         description="Whether the task was completed.",
+                        min_score=0,
+                        max_score=5,
                         anchors=(
                             ScoreAnchor(score=0, description="Score 0 outcome."),
                             ScoreAnchor(score=1, description="Score 1 outcome."),

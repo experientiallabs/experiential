@@ -16,8 +16,9 @@ from typer.testing import CliRunner
 
 from wmo.cli import judge_config as judge_config_module
 from wmo.cli.app import app
+from wmo.cli.judge_config import _label_value
 from wmo.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
-from wmo.common.judging import Rubric
+from wmo.common.judging import Rubric, default_task_success_axis
 from wmo.common.models import (
     ModelCapabilities,
     ModelCatalog,
@@ -27,7 +28,6 @@ from wmo.common.models import (
 )
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.optimize.router.judging.contracts import (
-    JudgeCalibrationBudget,
     JudgeTracePreview,
     ManualJudgeLabel,
     ManualJudgeSetupArtifact,
@@ -54,7 +54,7 @@ class _PairwiseAnswer:
 
 
 class _ScalarAnswer:
-    """Return score four while retaining the exact human-facing prompt."""
+    """Return the default-axis success score while retaining the prompt."""
 
     prompt = ""
 
@@ -62,7 +62,7 @@ class _ScalarAnswer:
     def ask(cls, prompt: str) -> int:
         """Record one prompt and return a valid scalar score."""
         cls.prompt = prompt
-        return 4
+        return 1
 
 
 @pytest.mark.parametrize(
@@ -106,6 +106,8 @@ def test_judge_commands_render_as_nested_config_commands() -> None:
     setup_output = unstyle(setup.output)
     calibrate_output = unstyle(calibrate.output)
     assert "--approve" in setup_output
+    assert "zero-to-five" not in setup_output
+    assert "rubric axes" in setup_output
     assert "--yes" in calibrate_output
     assert "--approve" in calibrate_output
     assert "Advanced" in calibrate_output
@@ -146,6 +148,10 @@ def test_calibrate_prints_catalog_pricing_breakdown_before_labels(tmp_path: Path
     store = _built_store(tmp_path)
     _setup(store)
     _write_catalog(store.paths.root, _priced_catalog())
+    (store.paths.root / "settings.toml").write_text(
+        "[commands]\nmaximum_cost_usd = 0.5\n",
+        encoding="utf-8",
+    )
 
     result = CliRunner().invoke(
         app,
@@ -162,15 +168,17 @@ def test_calibrate_prints_catalog_pricing_breakdown_before_labels(tmp_path: Path
         ],
     )
 
-    output = unstyle(result.output)
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
     assert result.exit_code == 2
-    assert "Judge name: judge-main" in output
-    assert "Exact model: openai/judge-model" in output
-    assert "Pricing: configured" in output
-    assert "Judge calls authorized: 3" in output
-    assert "Tokens: up to 32768 input and 4096 output per attempt" in output
-    assert "Maximum estimated cost:" in output
-    assert "Hard spend ceiling: $10.0000" in output
+    assert "Cost preflight" in output
+    assert "command: wmo config judge calibrate support" in output
+    assert "estimated cost: $0.368641 (conservative maximum)" in output
+    assert "configured budget: $0.50 per command" in output
+    assert "judge judge-main: openai/judge-model" in output
+    assert "3 judge calls with up to 3 attempts each" in output
+    assert "32768 input and 4096 output tokens per attempt" in output
+    assert "$1.000000 input and $2.000000 output per million tokens" in output
+    assert "re-run with --yes" in output
     assert "missing labels" not in output
 
 
@@ -193,7 +201,7 @@ def test_calibrate_fails_closed_when_catalog_pricing_is_missing(tmp_path: Path) 
         ],
     )
 
-    output = unstyle(result.output)
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
     assert result.exit_code == 2
     assert "no trustworthy input/output" in output
     assert "missing labels" not in output
@@ -225,10 +233,21 @@ def test_calibrate_uses_shared_command_budget_when_flag_is_omitted(tmp_path: Pat
         ],
     )
 
-    output = unstyle(result.output)
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
     assert result.exit_code == 2
-    assert "exceeds --maximum-cost-usd" in output
+    assert "exceeds the configured per-command" in output
+    assert "wmo config budget 0.368641" in output
+    assert "--yes cannot override" in output
     assert "missing labels" not in output
+
+
+def test_scalar_label_values_follow_the_axis_range() -> None:
+    """CLI label parsing accepts 0-1 default scores and rejects out-of-range values."""
+    axis = default_task_success_axis()
+
+    assert _label_value("trace-1:task-success=1", pairwise=False, axis=axis) == 1
+    with pytest.raises(ValueError, match="from 0 through 1"):
+        _label_value("trace-1:task-success=4", pairwise=False, axis=axis)
 
 
 def test_setup_output_is_plain_language_and_hides_execution_internals(
@@ -258,11 +277,13 @@ def test_setup_output_is_plain_language_and_hides_execution_internals(
     judge_config_module._render_setup(plan)
 
     output = buffer.getvalue()
+    compact = " ".join(output.split())
     assert "Judge name: review-judge" in output
     assert "Exact model: openai/judge-model" in output
+    assert "Integer scoring from 0 to 1" in compact
     assert "Task success" in output
-    assert "0: The agent did not address the task." in output
-    assert "5: The agent fully and correctly" in output
+    assert "Range: 0-1" in output
+    assert "did not complete the requested task" in compact
     assert "Summarize the customer issue." in output
     assert "Find the failed command." in output
     assert "Prompt:" not in output
@@ -270,38 +291,6 @@ def test_setup_output_is_plain_language_and_hides_execution_internals(
     assert "response schema" not in output.lower()
     assert "Score projection" not in output
     assert "0000000000000000" not in output
-
-
-def test_spend_preflight_preserves_a_small_positive_bound(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A small admitted estimate and ceiling never display as zero."""
-    buffer = io.StringIO()
-    monkeypatch.setattr(
-        judge_config_module,
-        "_console",
-        Console(file=buffer, width=80, color_system=None),
-    )
-    plan = cast(
-        ManualJudgeCalibrationPlan,
-        SimpleNamespace(setup=SimpleNamespace(judge_alias="judge", judge_model=_model())),
-    )
-    budget = JudgeCalibrationBudget(
-        input_usd_per_million_tokens=0,
-        output_usd_per_million_tokens=0,
-        maximum_input_tokens_per_call=1,
-        maximum_attempts_per_call=1,
-        call_count=1,
-        estimated_cost_usd=0.000049,
-        maximum_cost_usd=0.000049,
-    )
-
-    judge_config_module._render_spend_preflight(plan, budget)
-
-    output = buffer.getvalue()
-    assert "Maximum estimated cost: $0.000049" in output
-    assert "Hard spend ceiling: $0.000049" in output
-    assert "$0.0000\n" not in output
 
 
 def test_pairwise_calibration_renders_roles_and_truthful_truncation(
@@ -392,8 +381,8 @@ def test_pairwise_prompt_keeps_anchors_adjacent_and_uses_plain_a_b_labels(
     assert "choose candidate A, candidate B, or tie" in _PairwiseAnswer.prompt
     output = buffer.getvalue()
     assert "Score prompt: Task success" in output
-    assert "0: The agent did not address the task." in output
-    assert "5: The agent fully and correctly addressed the task." in output
+    assert "0: The agent did not complete the requested task." in output
+    assert "1: The agent successfully completed the requested task." in output
 
 
 @pytest.mark.parametrize(

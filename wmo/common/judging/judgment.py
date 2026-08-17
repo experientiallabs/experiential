@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -12,11 +11,13 @@ from wmo.common.models import ModelSnapshot, OperationEconomics
 
 
 class DimensionJudgment(ContractModel):
-    """A judge's raw and calibrated assessment of one rubric dimension."""
+    """A judge's raw and calibrated assessment of one rubric axis."""
 
     dimension_id: ArtifactId
-    raw_score: Literal[0, 1, 2, 3, 4, 5]
-    calibrated_score: float = Field(ge=0, le=5)
+    raw_score: int = Field(ge=0)
+    calibrated_score: float = Field(ge=0)
+    min_score: int = Field(default=0, ge=0)
+    max_score: int = Field(default=5, ge=0)
     rationale: str | None = None
 
     @field_validator("calibrated_score")
@@ -25,6 +26,20 @@ class DimensionJudgment(ContractModel):
         if not math.isfinite(value):
             raise ValueError("calibrated_score must be finite")
         return value
+
+    @model_validator(mode="after")
+    def _require_score_inside_axis_range(self) -> DimensionJudgment:
+        if self.min_score >= self.max_score:
+            raise ValueError("dimension judgment range must have min_score below max_score")
+        if self.raw_score < self.min_score or self.raw_score > self.max_score:
+            raise ValueError("raw_score must be an integer inside the axis range")
+        if self.calibrated_score < self.min_score or self.calibrated_score > self.max_score:
+            raise ValueError("calibrated_score must stay inside the axis range")
+        return self
+
+    def normalize_score(self) -> float:
+        """Map the calibrated axis score onto the unit interval."""
+        return (self.calibrated_score - self.min_score) / (self.max_score - self.min_score)
 
 
 class Judgment(ArtifactEnvelope):
@@ -47,10 +62,10 @@ class Judgment(ArtifactEnvelope):
         cls, value: tuple[DimensionJudgment, ...]
     ) -> tuple[DimensionJudgment, ...]:
         if not value:
-            raise ValueError("a judgment must score at least one rubric dimension")
+            raise ValueError("a judgment must score at least one rubric axis")
         dimension_ids = tuple(dimension.dimension_id for dimension in value)
         if len(set(dimension_ids)) != len(dimension_ids):
-            raise ValueError("judgments must not repeat a rubric dimension")
+            raise ValueError("judgments must not repeat a rubric axis")
         return value
 
     @field_validator("overall_score")
@@ -62,9 +77,9 @@ class Judgment(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_equal_weight_overall_score(self) -> Judgment:
-        expected_score = sum(dimension.calibrated_score / 5 for dimension in self.dimensions) / len(
+        expected_score = sum(dimension.normalize_score() for dimension in self.dimensions) / len(
             self.dimensions
         )
         if not math.isclose(self.overall_score, expected_score, rel_tol=1e-12, abs_tol=1e-12):
-            raise ValueError("overall_score must equal the equal-weight calibrated dimension mean")
+            raise ValueError("overall_score must equal the equal-weight calibrated axis mean")
         return self

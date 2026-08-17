@@ -32,6 +32,7 @@ from wmo.common.judging import (
     RubricDimension,
     ScoreAnchor,
     calibration_provenance,
+    default_task_success_axis,
     judge_response_schema,
     write_router_lineage_split,
 )
@@ -93,7 +94,28 @@ def _model() -> ModelSnapshot:
     )
 
 
-def _rubric(*, task_set_input: ArtifactInput | None = None) -> Rubric:
+def _rubric(
+    *,
+    task_set_input: ArtifactInput | None = None,
+    dimensions: tuple[RubricDimension, ...] | None = None,
+) -> Rubric:
+    selected = dimensions or (
+        RubricDimension(
+            dimension_id="task-success",
+            name="Task success",
+            description="Whether the task outcome was achieved.",
+            min_score=0,
+            max_score=5,
+            anchors=(
+                ScoreAnchor(score=0, description="Anchor 0."),
+                ScoreAnchor(score=1, description="Anchor 1."),
+                ScoreAnchor(score=2, description="Anchor 2."),
+                ScoreAnchor(score=3, description="Anchor 3."),
+                ScoreAnchor(score=4, description="Anchor 4."),
+                ScoreAnchor(score=5, description="Anchor 5."),
+            ),
+        ),
+    )
     return Rubric(
         schema_version=1,
         created_at=_TIME,
@@ -104,21 +126,7 @@ def _rubric(*, task_set_input: ArtifactInput | None = None) -> Rubric:
         ),
         code_revision="w6-test",
         rubric_id="rubric-1",
-        dimensions=(
-            RubricDimension(
-                dimension_id="task-success",
-                name="Task success",
-                description="Whether the task outcome was achieved.",
-                anchors=(
-                    ScoreAnchor(score=0, description="Anchor 0."),
-                    ScoreAnchor(score=1, description="Anchor 1."),
-                    ScoreAnchor(score=2, description="Anchor 2."),
-                    ScoreAnchor(score=3, description="Anchor 3."),
-                    ScoreAnchor(score=4, description="Anchor 4."),
-                    ScoreAnchor(score=5, description="Anchor 5."),
-                ),
-            ),
-        ),
+        dimensions=selected,
         source_task_set_id="task-set-1",
         status="human_approved",
         approved_at=_TIME,
@@ -172,8 +180,18 @@ def _valid_output(*, rationale: str | None = "The rollout completed the requeste
 
 def _write_bootstrap_sources(
     store: ProjectStore,
+    *,
+    dimensions: tuple[RubricDimension, ...] | None = None,
 ) -> tuple[RolloutArtifact, Rubric, JudgeCalibration, PromptDefinition]:
-    """Write upstream fixtures and bootstrap the supported provisional calibration."""
+    """Write upstream fixtures and bootstrap the supported provisional calibration.
+
+    Args:
+        store: Isolated project store.
+        dimensions: Optional rubric axes. Defaults to a complete 0-5 task-success axis.
+
+    Returns:
+        Persisted rollout, rubric, provisional calibration, and prompt fixtures.
+    """
     task_set_input = artifact_input(
         store.artifacts.write_json(
             artifact_id="task-set-1",
@@ -186,7 +204,7 @@ def _write_bootstrap_sources(
             files={"task-set.json": {"task_set_id": "task-set-1"}},
         )
     )
-    rubric = _rubric(task_set_input=task_set_input)
+    rubric = _rubric(task_set_input=task_set_input, dimensions=dimensions)
     store.artifacts.write_json(
         artifact_id=rubric.rubric_id,
         artifact_type="rubric",
@@ -270,6 +288,58 @@ def test_lm_judge_requires_store_backed_persisted_inputs_and_accepts_optional_ra
     assert judgment.dimensions[0].rationale == "The rollout completed the requested refund."
     assert "Rationale is optional" in request_content
     assert "evidence_span_ids" not in request_content
+    assert "span-1" in request_content
+    payload = json.loads(request_content.partition("RUBRIC:\n")[2].partition("\n\nROLLOUT:\n")[0])
+    assert payload[0]["dimension_id"] == "task-success"
+    assert payload[0]["min_score"] == 0
+    assert payload[0]["max_score"] == 5
+    assert payload[0]["anchors"][4]["description"] == "Anchor 4."
+
+
+def test_lm_judge_prompt_includes_default_axis_range_and_meaning(tmp_path: Path) -> None:
+    """Generated judge requests carry the same axis contract used for scoring."""
+    store = _store(tmp_path)
+    default_axis = default_task_success_axis()
+    rollout, rubric, calibration, prompt = _write_bootstrap_sources(
+        store,
+        dimensions=(default_axis,),
+    )
+    client = _FakeJudgeClient(
+        json.dumps(
+            {
+                "dimensions": [
+                    {
+                        "dimension_id": "task-success",
+                        "raw_score": 1,
+                        "rationale": "The rollout completed the requested refund.",
+                    }
+                ]
+            }
+        )
+    )
+
+    judgment = LMJudge(
+        client,
+        prompt,
+        code_revision="judging-revision",
+        clock=lambda: _TIME,
+    ).judge_persisted(
+        store,
+        rollout_artifact_id=rollout.artifact_id,
+        rubric_artifact_id=rubric.rubric_id,
+        calibration_artifact_id=calibration.calibration_id,
+    )
+
+    request_content = client.requests[0].messages[1].content
+    assert request_content is not None
+    payload = json.loads(request_content.partition("RUBRIC:\n")[2].partition("\n\nROLLOUT:\n")[0])
+    assert payload[0]["min_score"] == 0
+    assert payload[0]["max_score"] == 1
+    assert payload[0]["description"] == default_axis.description
+    assert payload[0]["anchors"][0]["description"] == default_axis.anchors[0].description
+    assert judgment.dimensions[0].raw_score == 1
+    assert judgment.overall_score == 1.0
+    assert judgment.dimensions[0].rationale == "The rollout completed the requested refund."
 
 
 def test_lm_judge_has_no_caller_mintable_or_mutable_calibration_entry_point() -> None:

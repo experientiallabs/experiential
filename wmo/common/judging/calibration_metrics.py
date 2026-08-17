@@ -11,14 +11,14 @@ from pydantic import Field, field_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel
 from wmo.common.judging.labels import HumanScore
-from wmo.common.judging.rubric import DimensionScoreMap, Rubric
+from wmo.common.judging.rubric import DimensionScoreMap, Rubric, identity_score_map
 
 
 class CalibrationDatum(ContractModel):
     """One active human score joined to one verified raw judge observation."""
 
     human_score: HumanScore
-    raw_score: Literal[0, 1, 2, 3, 4, 5]
+    raw_score: int = Field(ge=0)
 
 
 class OutOfFoldPrediction(ContractModel):
@@ -29,9 +29,9 @@ class OutOfFoldPrediction(ContractModel):
     lineage_id: ArtifactId
     dimension_id: ArtifactId
     fold_index: int = Field(ge=0)
-    raw_score: Literal[0, 1, 2, 3, 4, 5]
-    human_score: Literal[0, 1, 2, 3, 4, 5]
-    calibrated_score: float = Field(ge=0, le=5)
+    raw_score: int = Field(ge=0)
+    human_score: int = Field(ge=0)
+    calibrated_score: float = Field(ge=0)
     absolute_error: float = Field(ge=0)
     optimistic_error: float = Field(ge=0)
 
@@ -72,12 +72,20 @@ class WorstDisagreement(ContractModel):
     direction: Literal["optimistic", "pessimistic", "exact"]
 
 
-def fit_score_map(dimension_id: ArtifactId, data: Sequence[CalibrationDatum]) -> DimensionScoreMap:
+def fit_score_map(
+    dimension_id: ArtifactId,
+    data: Sequence[CalibrationDatum],
+    *,
+    min_score: int = 0,
+    max_score: int = 5,
+) -> DimensionScoreMap:
     """Fit a monotonic score map with deterministic interpolation for absent raw scores.
 
     Args:
-        dimension_id: Rubric dimension represented by the calibration observations.
+        dimension_id: Rubric axis represented by the calibration observations.
         data: Active human scores paired with verified raw judge scores.
+        min_score: Inclusive lower bound of the axis being fitted.
+        max_score: Inclusive upper bound of the axis being fitted.
 
     Returns:
         Monotonic mapping from each raw score to a calibrated human-equivalent score.
@@ -86,10 +94,7 @@ def fit_score_map(dimension_id: ArtifactId, data: Sequence[CalibrationDatum]) ->
     for item in data:
         by_raw_score[item.raw_score].append(item.human_score.score)
     if not by_raw_score:
-        return DimensionScoreMap(
-            dimension_id=dimension_id,
-            calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
-        )
+        return identity_score_map(dimension_id, min_score, max_score)
     blocks = [
         _IsotonicBlock(
             start=raw_score,
@@ -121,13 +126,10 @@ def fit_score_map(dimension_id: ArtifactId, data: Sequence[CalibrationDatum]) ->
     }
     return DimensionScoreMap(
         dimension_id=dimension_id,
-        calibrated_scores=(
-            _interpolate_score(0, observed),
-            _interpolate_score(1, observed),
-            _interpolate_score(2, observed),
-            _interpolate_score(3, observed),
-            _interpolate_score(4, observed),
-            _interpolate_score(5, observed),
+        min_score=min_score,
+        max_score=max_score,
+        calibrated_scores=tuple(
+            _interpolate_score(score, observed) for score in range(min_score, max_score + 1)
         ),
     )
 
@@ -155,6 +157,8 @@ def grouped_predictions_and_metrics(
             dimension_id=dimension.dimension_id,
             data=dimension_data,
             lineages=lineages,
+            min_score=dimension.min_score,
+            max_score=dimension.max_score,
         )
         predictions.extend(dimension_predictions)
         metrics.append(
@@ -247,6 +251,8 @@ def _dimension_predictions(
     dimension_id: ArtifactId,
     data: Sequence[CalibrationDatum],
     lineages: tuple[ArtifactId, ...],
+    min_score: int,
+    max_score: int,
 ) -> tuple[tuple[OutOfFoldPrediction, ...], int]:
     """Generate predictions only for folds with nonempty train and held-out partitions."""
     if len(lineages) < 2:
@@ -267,7 +273,7 @@ def _dimension_predictions(
         if not held_out or not training:
             continue
         emitted_fold_count += 1
-        score_map = fit_score_map(dimension_id, training)
+        score_map = fit_score_map(dimension_id, training, min_score=min_score, max_score=max_score)
         for datum in held_out:
             calibrated_score = score_map.apply(datum.raw_score)
             error = calibrated_score - datum.human_score.score

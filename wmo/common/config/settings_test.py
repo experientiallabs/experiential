@@ -12,6 +12,7 @@ from wmo.common.config.settings import (
     ensure_telemetry_anonymous_id,
     load_settings,
     resolve_command_budget_usd,
+    set_maximum_command_cost_usd,
     set_telemetry_enabled,
     settings_path,
 )
@@ -23,6 +24,36 @@ def test_missing_settings_defaults_to_telemetry_enabled(tmp_path: Path) -> None:
     assert settings.telemetry.anonymous_id is None
     assert settings.commands.maximum_cost_usd is None
     assert resolve_command_budget_usd(tmp_path / ".wmo", None) == DEFAULT_COMMAND_BUDGET_USD
+
+
+def test_set_maximum_command_cost_persists_with_telemetry(tmp_path: Path) -> None:
+    """The command ceiling shares the settings owner without replacing telemetry state."""
+    root = tmp_path / ".wmo"
+    set_telemetry_enabled(False, root)
+
+    updated = set_maximum_command_cost_usd(12.5, root)
+
+    assert updated.commands.maximum_cost_usd == 12.5
+    reloaded = load_settings(root)
+    assert reloaded.commands.maximum_cost_usd == 12.5
+    assert reloaded.telemetry.enabled is False
+    persisted = settings_path(root).read_text(encoding="utf-8")
+    assert "[commands]" in persisted
+    assert "maximum_cost_usd = 12.5" in persisted
+
+    set_telemetry_enabled(True, root)
+    assert load_settings(root).commands.maximum_cost_usd == 12.5
+
+
+@pytest.mark.parametrize("value", [-0.01, float("inf"), float("nan")])
+def test_set_maximum_command_cost_rejects_unsafe_values(tmp_path: Path, value: float) -> None:
+    """Negative and non-finite limits cannot become durable spend authorization."""
+    root = tmp_path / ".wmo"
+
+    with pytest.raises(ValueError):
+        set_maximum_command_cost_usd(value, root)
+
+    assert not settings_path(root).exists()
 
 
 def test_set_telemetry_enabled_writes_project_settings(tmp_path: Path) -> None:
@@ -85,7 +116,7 @@ def test_refused_settings_name_the_path_and_the_repair(
     message = str(excinfo.value)
     assert expected in message
     assert str(settings_path(root)) in message
-    assert "delete it and rerun `wmo config telemetry status`" in message
+    assert "delete it and rerun the command" in message
 
 
 def test_non_utf8_settings_name_the_path_and_the_repair(tmp_path: Path) -> None:
@@ -97,7 +128,7 @@ def test_non_utf8_settings_name_the_path_and_the_repair(tmp_path: Path) -> None:
     message = str(excinfo.value)
     assert "not valid TOML" in message
     assert str(settings_path(root)) in message
-    assert "delete it and rerun `wmo config telemetry status`" in message
+    assert "delete it and rerun the command" in message
 
 
 def test_telemetry_write_drops_unknown_model_role_settings(tmp_path: Path) -> None:
