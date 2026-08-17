@@ -28,7 +28,6 @@ from wmo.common.models import (
 )
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.optimize.router.judging.contracts import (
-    JudgeCalibrationBudget,
     JudgeTracePreview,
     ManualJudgeLabel,
     ManualJudgeSetupArtifact,
@@ -284,38 +283,6 @@ def test_setup_output_is_plain_language_and_hides_execution_internals(
     assert "response schema" not in output.lower()
     assert "Score projection" not in output
     assert "0000000000000000" not in output
-
-
-def test_spend_preflight_preserves_a_small_positive_bound(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A small admitted estimate and ceiling never display as zero."""
-    buffer = io.StringIO()
-    monkeypatch.setattr(
-        judge_config_module,
-        "_console",
-        Console(file=buffer, width=80, color_system=None),
-    )
-    plan = cast(
-        ManualJudgeCalibrationPlan,
-        SimpleNamespace(setup=SimpleNamespace(judge_alias="judge", judge_model=_model())),
-    )
-    budget = JudgeCalibrationBudget(
-        input_usd_per_million_tokens=0,
-        output_usd_per_million_tokens=0,
-        maximum_input_tokens_per_call=1,
-        maximum_attempts_per_call=1,
-        call_count=1,
-        estimated_cost_usd=0.000049,
-        maximum_cost_usd=0.000049,
-    )
-
-    judge_config_module._render_spend_preflight(plan, budget)
-
-    output = buffer.getvalue()
-    assert "Maximum estimated cost: $0.000049" in output
-    assert "Hard spend ceiling: $0.000049" in output
-    assert "$0.0000\n" not in output
 
 
 def test_pairwise_calibration_renders_roles_and_truthful_truncation(

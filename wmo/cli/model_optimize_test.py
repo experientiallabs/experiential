@@ -13,6 +13,7 @@ from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
+from wmo.common.config.settings import set_maximum_command_cost_usd
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     AssistantAction,
@@ -398,14 +399,7 @@ def test_first_run_setup_cancellation_writes_no_catalog_or_training_state(
         now=_TIME,
     )
 
-    class _TTY:
-        """Minimal stdin contract used only to select interactive setup behavior."""
-
-        def isatty(self) -> bool:
-            """Report that setup may prompt interactively."""
-            return True
-
-    monkeypatch.setattr(command.sys, "stdin", _TTY())
+    monkeypatch.setattr(command, "can_prompt", lambda _console: True)
     monkeypatch.setattr(command.Prompt, "ask", lambda *args, **kwargs: next(answers))
     monkeypatch.setattr(command.Confirm, "ask", lambda *args, **kwargs: False)
 
@@ -432,6 +426,7 @@ def test_first_run_setup_cancellation_writes_no_catalog_or_training_state(
             base_model=None,
             maximum_cost_usd=25.0,
             training_usd_per_million_tokens=100.0,
+            non_interactive=False,
         )
 
     assert fixture.store.model_catalog_path.read_bytes() == catalog_bytes
@@ -901,7 +896,7 @@ def test_completion_during_consent_fails_before_run_acceptance_and_reconsents(
 def test_accepted_prefix_resumes_after_crash_and_defers_later_completion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Resume one accepted prefix without reconsent and train later appends next.
+    """Resume one accepted prefix without a repeat prompt and train later appends next.
 
     Args:
         tmp_path: Pytest-owned project directory.
@@ -980,18 +975,23 @@ def test_accepted_prefix_resumes_after_crash_and_defers_later_completion(
         now=_TIME,
     )
 
-    def reject_repeat_consent(*args: object, **kwargs: object) -> Never:
-        """Fail if recovery asks again for consent already bound to the accepted prefix.
+    def verify_prior_confirmation(*args: object, **kwargs: object) -> bool:
+        """Verify recovery presents its accepted prefix to the shared budget policy.
 
         Args:
-            args: Unexpected consent positional inputs.
-            kwargs: Unexpected consent keyword inputs.
+            args: Shared preflight positional inputs accepted without inspection.
+            kwargs: Shared preflight fields including immutable confirmation evidence.
+
+        Returns:
+            ``True`` after proving the prior confirmation is retained.
         """
-        del args, kwargs
-        raise AssertionError("accepted incomplete W13 run must resume without new consent")
+        del args
+        assert kwargs["previously_confirmed"] is True
+        consent_calls.append("accepted-resume")
+        return True
 
     resumed_backend = _FakeBackend(conservative_cost_per_batch=0.10)
-    monkeypatch.setattr(command, "require_spend_consent", reject_repeat_consent)
+    monkeypatch.setattr(command, "require_spend_consent", verify_prior_confirmation)
     monkeypatch.setattr(
         command,
         "_compose_tinker_backend",
@@ -1001,6 +1001,7 @@ def test_accepted_prefix_resumes_after_crash_and_defers_later_completion(
     resumed = runner.invoke(app, arguments)
 
     assert resumed.exit_code == 0, resumed.output
+    assert consent_calls == ["initial", "accepted-resume"]
     assert compose_calls == ["crash", "resume"]
     assert len(resumed_backend.trained_example_ids) == 1
     assert load_latest_sft_model_optimization(configured.store) == latest_before_append
@@ -1246,6 +1247,59 @@ def test_schedule_ceiling_refuses_before_tinker_backend_construction(
 
     assert result.exit_code == 2
     assert "exceedsmaximum_cost_usd" in _flat_cli_output(result.output)
+    assert backend_calls == []
+
+
+def test_command_budget_rejects_sft_before_credentials_even_with_yes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared ceiling rejects a priced schedule before Tinker construction.
+
+    Args:
+        tmp_path: Pytest-owned project and settings directory.
+        monkeypatch: Backend and revision replacements proving zero remote setup.
+    """
+    configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
+    set_maximum_command_cost_usd(0.01, configured.store.paths.root)
+    command = importlib.import_module("wmo.cli.model_optimize")
+    backend_calls: list[bool] = []
+
+    def forbidden_backend(*args: object) -> Never:
+        """Fail if the rejected command reads credentials or constructs Tinker.
+
+        Args:
+            args: Unexpected project and connection inputs.
+
+        Raises:
+            AssertionError: Always, because the shared ceiling must reject first.
+        """
+        del args
+        backend_calls.append(True)
+        raise AssertionError("Tinker construction must follow command budget authorization")
+
+    monkeypatch.setattr(command, "_compose_tinker_backend", forbidden_backend)
+    monkeypatch.setattr(command, "_current_revision", lambda: "command-budget-test")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "optimize",
+            "model",
+            configured.store.paths.project_id,
+            "--root",
+            str(configured.store.paths.root),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 2
+    output = unstyle(result.output)
+    assert "Cost preflight" in output
+    assert "configured budget: $0.01 per command" in output
+    flattened = _flat_cli_output(result.output)
+    assert "exceedstheconfiguredper-commandbudget" in flattened
+    assert "--yescannotoverride" in flattened
     assert backend_calls == []
 
 

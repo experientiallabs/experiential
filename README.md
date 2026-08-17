@@ -78,6 +78,21 @@ result = router.complete(
 )
 ```
 
+## Command budgets
+
+Paid commands share one cost preflight and a user-owned per-command ceiling. The default is
+`$10.00`; change or inspect it without prompting:
+
+```bash
+wmo config budget
+wmo config budget 50
+```
+
+Every preflight names the command, conservative estimate, configured budget, and major bounded
+assumptions. Estimates at or below 50% of the budget run automatically. Higher in-budget estimates
+require a clear terminal confirmation or `--yes`. Estimates above the budget fail before
+credentials or provider clients, and `--yes` cannot override that ceiling.
+
 ## Telemetry
 
 Anonymous aggregate PostHog product telemetry is enabled by default. It never includes prompts,
@@ -89,7 +104,7 @@ wmo config telemetry disable
 wmo config telemetry enable
 ```
 
-The preference is stored locally in `.wmo/settings.toml`.
+The command budget and telemetry preference are stored locally in `.wmo/settings.toml`.
 
 ## Development
 
