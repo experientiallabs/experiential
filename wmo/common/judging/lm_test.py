@@ -524,13 +524,3 @@ def test_judge_response_schema_is_portable_and_has_no_citation_or_length_constra
         ).rationale
         is None
     )
-    legacy = RawDimensionJudgment.model_validate(
-        {
-            "dimension_id": "task-success",
-            "raw_score": 3,
-            "evidence_span_ids": ["span-1"],
-            "feedback": "Legacy citation-era feedback.",
-        }
-    )
-    assert legacy.rationale == "Legacy citation-era feedback."
-    assert "evidence_span_ids" not in legacy.model_dump(mode="json")

@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from pydantic import Field, model_validator
+from pydantic import Field
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -19,11 +19,7 @@ from wmo.common.judging.calibration import CalibrationError
 from wmo.common.judging.calibration_provenance import (
     _load_authoritative_persisted_calibration,
 )
-from wmo.common.judging.judgment import (
-    DimensionJudgment,
-    Judgment,
-    accept_legacy_judge_output_fields,
-)
+from wmo.common.judging.judgment import DimensionJudgment, Judgment
 from wmo.common.judging.prompts import PromptDefinition
 from wmo.common.judging.provenance import (
     JudgingProvenanceError,
@@ -53,12 +49,6 @@ class RawDimensionJudgment(ContractModel):
     dimension_id: ArtifactId
     raw_score: int = Field(ge=0)
     rationale: str | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _accept_legacy_citation_fields(cls, value: object) -> object:
-        """Load retired citation payloads from persisted probes and older providers."""
-        return accept_legacy_judge_output_fields(value, map_feedback_to_rationale=True)
 
 
 class RawJudgment(ContractModel):

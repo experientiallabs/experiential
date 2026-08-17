@@ -18,7 +18,6 @@ from wmo.common.judging.calibration_metrics import (
     OutOfFoldPrediction,
     WorstDisagreement,
 )
-from wmo.common.judging.judgment import accept_legacy_judge_output_fields
 from wmo.common.judging.lineage import RouterLineageSplit
 from wmo.common.judging.rubric import DimensionScoreMap, JudgeCalibration
 from wmo.common.models import ModelSnapshot
@@ -31,12 +30,6 @@ class JudgeScoreObservation(ContractModel):
     source_rollout: ArtifactInput
     dimension_id: ArtifactId
     raw_score: int = Field(ge=0)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _accept_legacy_citation_fields(cls, value: object) -> object:
-        """Load retired observation citations without storing them on the new contract."""
-        return accept_legacy_judge_output_fields(value)
 
 
 class InsufficientCalibrationRiskAcceptance(ArtifactEnvelope):

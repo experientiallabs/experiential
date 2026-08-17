@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 from typing import Literal, cast
 
-from pydantic import Field, model_validator
+from pydantic import Field
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -16,7 +16,6 @@ from wmo.common.core.artifacts import (
     stable_id,
 )
 from wmo.common.judging import RawJudgment, Rubric
-from wmo.common.judging.judgment import accept_legacy_judge_output_fields
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.models import (
     AssistantAction,
@@ -43,12 +42,6 @@ class _ScoredDimension(ContractModel):
     dimension_id: ArtifactId
     rationale: str | None = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def _accept_legacy_citation_fields(cls, value: object) -> object:
-        """Load retired citation payloads from persisted structured probes."""
-        return accept_legacy_judge_output_fields(value, map_feedback_to_rationale=True)
-
 
 class _BooleanDimension(_ScoredDimension):
     """One boolean structured-feedback dimension."""
@@ -68,12 +61,6 @@ class _PairwiseDimension(ContractModel):
     dimension_id: ArtifactId
     winner: Literal["winner_a", "winner_b", "tie"]
     rationale: str | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _accept_legacy_citation_fields(cls, value: object) -> object:
-        """Load retired pairwise citation payloads from persisted probes."""
-        return accept_legacy_judge_output_fields(value, map_feedback_to_rationale=True)
 
 
 class _BooleanResponse(ContractModel):

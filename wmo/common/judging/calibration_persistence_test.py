@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from wmo.common.judging import CalibrationError, JudgeCalibrationService
-from wmo.common.judging.calibration_contracts import JudgeScoreObservation
 from wmo.common.judging.calibration_test import _TIME, _build, _entries, _write_graph
 from wmo.common.judging.judgment import Judgment
 
@@ -51,19 +50,3 @@ def test_persisted_observations_and_judgments_omit_citation_fields(tmp_path: Pat
     assert "evidence_span_ids" not in dumped
     assert dumped["raw_score"] == judgment.dimensions[0].raw_score
     assert "evidence_span_ids" not in judgment.dimensions[0].model_dump(mode="json")
-
-
-def test_score_observation_loads_retired_citation_fields() -> None:
-    """Citation-era calibration observations keep the raw score and drop span IDs."""
-    loaded = JudgeScoreObservation.model_validate(
-        {
-            "judgment": {"artifact_id": "judgment-1", "sha256": "a" * 64},
-            "source_rollout": {"artifact_id": "rollout-1", "sha256": "a" * 64},
-            "dimension_id": "task-success",
-            "raw_score": 1,
-            "evidence_span_ids": ["span-1"],
-        }
-    )
-
-    assert loaded.raw_score == 1
-    assert "evidence_span_ids" not in loaded.model_dump(mode="json")

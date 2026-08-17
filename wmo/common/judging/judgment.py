@@ -10,31 +10,6 @@ from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractMode
 from wmo.common.models import ModelSnapshot, OperationEconomics
 
 
-def accept_legacy_judge_output_fields(
-    value: object, *, map_feedback_to_rationale: bool = False
-) -> object:
-    """Drop retired citation keys and optionally map feedback onto rationale.
-
-    Args:
-        value: Candidate model payload.
-        map_feedback_to_rationale: When true, copy a string ``feedback`` value onto
-            ``rationale`` if rationale is absent.
-
-    Returns:
-        The original payload, or a shallow copy without retired citation keys.
-    """
-    if not isinstance(value, dict):
-        return value
-    payload = dict(value)
-    feedback = payload.pop("feedback", None)
-    payload.pop("evidence_span_ids", None)
-    payload.pop("evidence_span_ids_a", None)
-    payload.pop("evidence_span_ids_b", None)
-    if map_feedback_to_rationale and "rationale" not in payload and isinstance(feedback, str):
-        payload["rationale"] = feedback
-    return payload
-
-
 class DimensionJudgment(ContractModel):
     """A judge's raw and calibrated assessment of one rubric axis."""
 
@@ -44,12 +19,6 @@ class DimensionJudgment(ContractModel):
     min_score: int = Field(default=0, ge=0)
     max_score: int = Field(default=5, ge=0)
     rationale: str | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _accept_legacy_citation_fields(cls, value: object) -> object:
-        """Load retired citation payloads without treating them as current output."""
-        return accept_legacy_judge_output_fields(value, map_feedback_to_rationale=True)
 
     @field_validator("calibrated_score")
     @classmethod
