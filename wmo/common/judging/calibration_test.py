@@ -117,6 +117,8 @@ def _dimension(dimension_id: str) -> RubricDimension:
         dimension_id=dimension_id,
         name=dimension_id.replace("-", " ").title(),
         description=f"How well the rollout meets {dimension_id}.",
+        min_score=0,
+        max_score=5,
         anchors=(
             ScoreAnchor(score=0, description=f"{dimension_id} anchor 0."),
             ScoreAnchor(score=1, description=f"{dimension_id} anchor 1."),

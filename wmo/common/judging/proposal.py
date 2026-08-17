@@ -160,7 +160,7 @@ class _RawProposal(ContractModel):
 
 
 class LMRubricProposer:
-    """Propose diverse zero-to-five rubric cards from representative fit rollouts."""
+    """Propose diverse rubric axes from representative fit rollouts."""
 
     def __init__(self, model: ModelClient, prompt: PromptDefinition) -> None:
         """Bind one injected model client and immutable proposer prompt."""
@@ -422,10 +422,11 @@ def _render_representatives(representatives: Sequence[RepresentativeRollout]) ->
             }
         )
     return (
-        "Propose deliberately diverse zero-to-five rubric dimensions. Return only a JSON object "
+        "Propose deliberately diverse rubric axes. Return only a JSON object "
         "with a dimensions array. Each item must include dimension {dimension_id, name, "
-        "description, anchors}, source_rollout_ids, evidence_span_ids, and "
-        "overlap_with_dimension_ids. Each dimension needs exactly anchors zero through five. "
-        "Cite both successful and failed evidence across the proposal.\n\n"
-        + json.dumps(rendered, ensure_ascii=False, sort_keys=True)
+        "description, min_score, max_score, anchors}, source_rollout_ids, evidence_span_ids, and "
+        "overlap_with_dimension_ids. Each axis needs a valid inclusive integer range and "
+        "anchors that include both endpoints. Interior score meanings are optional when the "
+        "endpoints make the scale clear. Cite both successful and failed evidence across the "
+        "proposal.\n\n" + json.dumps(rendered, ensure_ascii=False, sort_keys=True)
     )

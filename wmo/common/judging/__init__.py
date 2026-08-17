@@ -18,6 +18,7 @@ from wmo.common.judging.calibration_metrics import (
 from wmo.common.judging.calibration_provenance import (
     verify_persisted_calibration,
 )
+from wmo.common.judging.display import render_rubric_table
 from wmo.common.judging.interface import Judge
 from wmo.common.judging.judgment import DimensionJudgment, Judgment
 from wmo.common.judging.labels import HumanLabelSet, HumanScore, HumanScoreHistory, HumanScoreReview
@@ -49,16 +50,22 @@ from wmo.common.judging.rubric import (
     Rubric,
     RubricDimension,
     ScoreAnchor,
+    default_task_success_axis,
+    identity_score_map,
+    score_bounds,
+    scored_axis,
 )
 
 __all__ = [
     "CalibrationDatum",
     "CalibrationError",
     "CalibrationReport",
+    "default_task_success_axis",
     "DimensionCalibrationMetrics",
     "DimensionJudgment",
     "DimensionScoreMap",
     "HumanLabelSet",
+    "identity_score_map",
     "HumanScore",
     "HumanScoreHistory",
     "HumanScoreReview",
@@ -74,6 +81,7 @@ __all__ = [
     "LMRubricProposer",
     "OutOfFoldPrediction",
     "PromptDefinition",
+    "render_rubric_table",
     "ProposedRubricDimension",
     "RepresentativeRollout",
     "Rubric",
@@ -87,7 +95,9 @@ __all__ = [
     "RubricReviewEvent",
     "RouterLineageSplit",
     "RouterLineageAssignment",
+    "score_bounds",
     "ScoreAnchor",
+    "scored_axis",
     "WorstDisagreement",
     "write_router_lineage_split",
     "write_rubric_proposal_evidence",

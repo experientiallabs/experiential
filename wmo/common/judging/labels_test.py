@@ -73,6 +73,8 @@ def _write_rubric(store: ProjectStore) -> Rubric:
                 dimension_id="task-success",
                 name="Task success",
                 description="Whether the customer received the requested outcome.",
+                min_score=0,
+                max_score=5,
                 anchors=(
                     ScoreAnchor(score=0, description="Task-success score 0."),
                     ScoreAnchor(score=1, description="Task-success score 1."),

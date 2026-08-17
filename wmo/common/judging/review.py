@@ -253,6 +253,8 @@ class RubricReview:
         *,
         name: str | None = None,
         description: str | None = None,
+        min_score: int | None = None,
+        max_score: int | None = None,
         anchors: tuple[ScoreAnchor, ...] | None = None,
     ) -> None:
         """Edit one rubric card in a locked review transaction.
@@ -261,13 +263,17 @@ class RubricReview:
             dimension_id: Active or proposed rubric card to change.
             name: Optional replacement display name.
             description: Optional replacement customer-facing definition.
-            anchors: Optional complete ordered zero-to-five anchor replacement.
+            min_score: Optional replacement inclusive lower bound.
+            max_score: Optional replacement inclusive upper bound.
+            anchors: Optional ordered score-meaning replacement.
         """
         self._mutate(
             lambda review: review._edit(
                 dimension_id,
                 name=name,
                 description=description,
+                min_score=min_score,
+                max_score=max_score,
                 anchors=anchors,
             )
         )
@@ -278,15 +284,19 @@ class RubricReview:
         *,
         name: str | None = None,
         description: str | None = None,
+        min_score: int | None = None,
+        max_score: int | None = None,
         anchors: tuple[ScoreAnchor, ...] | None = None,
     ) -> None:
-        """Edit one active or proposed rubric card, validating all zero-to-five anchors.
+        """Edit one active or proposed rubric card, validating its range and anchors.
 
         Args:
             dimension_id: Existing accepted card or a proposal to accept and edit.
             name: Optional replacement display name.
             description: Optional replacement customer-facing definition.
-            anchors: Optional complete ordered zero-to-five anchor replacement.
+            min_score: Optional replacement inclusive lower bound.
+            max_score: Optional replacement inclusive upper bound.
+            anchors: Optional ordered score-meaning replacement.
 
         Raises:
             RubricReviewError: The card is rejected, unknown, unchanged, or finalized.
@@ -307,12 +317,22 @@ class RubricReview:
             dimensions.append(self._candidate(dimension_id))
             position = len(dimensions) - 1
         current = dimensions[position]
-        if name is None and description is None and anchors is None:
-            raise RubricReviewError("rubric edits must change a name, description, or anchors")
+        if (
+            name is None
+            and description is None
+            and min_score is None
+            and max_score is None
+            and anchors is None
+        ):
+            raise RubricReviewError(
+                "rubric edits must change a name, description, range, or anchors"
+            )
         dimensions[position] = RubricDimension(
             dimension_id=current.dimension_id,
             name=current.name if name is None else name,
             description=current.description if description is None else description,
+            min_score=current.min_score if min_score is None else min_score,
+            max_score=current.max_score if max_score is None else max_score,
             anchors=current.anchors if anchors is None else anchors,
         )
         self._replace(
@@ -325,15 +345,15 @@ class RubricReview:
         """Add one human-authored scale in a locked review transaction.
 
         Args:
-            dimension: Complete zero-to-five rubric dimension to append.
+            dimension: Complete rubric axis to append.
         """
         self._mutate(lambda review: review._add(dimension))
 
     def _add(self, dimension: RubricDimension) -> None:
-        """Add one human-authored zero-to-five rubric dimension.
+        """Add one human-authored rubric axis.
 
         Args:
-            dimension: Complete dimension with explicit score anchors.
+            dimension: Complete axis with an inclusive range and score meanings.
 
         Raises:
             RubricReviewError: The ID already exists in the editable review or it is finalized.
@@ -368,7 +388,7 @@ class RubricReview:
         self._ensure_editable()
         replacement = tuple(dimensions)
         if not replacement:
-            raise RubricReviewError("a rubric review needs at least one dimension")
+            raise RubricReviewError("a rubric review needs at least one axis")
         if len({item.dimension_id for item in replacement}) != len(replacement):
             raise RubricReviewError("replacement rubric dimensions must have unique IDs")
         self._replace(

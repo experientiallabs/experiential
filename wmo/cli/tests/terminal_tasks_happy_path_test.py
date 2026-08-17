@@ -91,7 +91,7 @@ class _JudgeClient:
                         "dimensions": [
                             {
                                 "dimension_id": "task-success",
-                                "raw_score": 4,
+                                "raw_score": 1,
                                 "evidence_span_ids": [match.group(1)],
                                 "feedback": "The trace shows the requested task was handled.",
                             }
@@ -250,7 +250,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     labels = [
         argument
         for trace in plan.traces
-        for argument in ("--label", f"{trace.trace_id}:task-success=4")
+        for argument in ("--label", f"{trace.trace_id}:task-success=1")
     ]
 
     _RuntimeCatalog.judge_fail_after = 0
@@ -258,7 +258,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     assert interrupted.exit_code != 0
     drafted = _drafted_labels(store)
     assert len(drafted) == _SAMPLE_SIZE
-    assert {item["score"] for item in drafted} == {4}
+    assert {item["score"] for item in drafted} == {1}
 
     _RuntimeCatalog.judge_fail_after = None
     _RuntimeCatalog.judge_clients = []

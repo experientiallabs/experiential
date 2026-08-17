@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
 
 from wmo.common.core.artifacts import ArtifactInput, stable_id
 from wmo.common.judging import (
@@ -20,7 +19,8 @@ from wmo.common.judging import (
     Rubric,
     RubricDimension,
     RubricReview,
-    ScoreAnchor,
+    default_task_success_axis,
+    score_bounds,
     write_router_lineage_split,
 )
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
@@ -74,16 +74,35 @@ from wmo.runtime.models.registry import RuntimeModelCatalog
 from wmo.simulation.build import BuildReviewReadiness
 
 _PROMPT_TEXT = (
-    "Evaluate the supplied rollout against every rubric dimension. Use only evidence in the "
-    "rollout. Return strict JSON matching the supplied schema, with one zero-to-five score, "
-    "specific cited span IDs, and concise feedback for every dimension."
+    "Evaluate the supplied rollout against every rubric axis. Use only evidence in the "
+    "rollout. Return strict JSON matching the supplied schema, with one integer score inside "
+    "each axis inclusive range, specific cited span IDs, and concise feedback for every axis."
 )
-DEFAULT_JUDGE_PROMPT = PromptDefinition.from_text("wmo-judge-evidence-json-v1", _PROMPT_TEXT)
-DEFAULT_JUDGE_TEMPLATE = JudgePromptTemplate(
-    prompt=DEFAULT_JUDGE_PROMPT,
-    variable_mapping={"rubric": "RUBRIC", "rollout": "ROLLOUT"},
-    response_schema=judge_feedback_schema("scalar"),
-)
+DEFAULT_JUDGE_PROMPT = PromptDefinition.from_text("wmo-judge-evidence-json-v2", _PROMPT_TEXT)
+
+
+def default_judge_template(
+    dimensions: tuple[RubricDimension, ...] | None = None,
+) -> JudgePromptTemplate:
+    """Return the built-in scalar prompt contract bound to one rubric's score bounds.
+
+    Args:
+        dimensions: Axes whose inclusive ranges set the scalar schema. Defaults to the
+            built-in task-success axis.
+
+    Returns:
+        Versioned prompt, mapping, and response schema for those axes.
+    """
+    selected = dimensions or default_judge_dimensions()
+    lowest, highest = score_bounds(selected)
+    return JudgePromptTemplate(
+        prompt=DEFAULT_JUDGE_PROMPT,
+        variable_mapping={"rubric": "RUBRIC", "rollout": "ROLLOUT"},
+        response_schema=judge_feedback_schema("scalar", min_score=lowest, max_score=highest),
+    )
+
+
+DEFAULT_JUDGE_TEMPLATE = default_judge_template()
 
 
 @dataclass(frozen=True)
@@ -133,38 +152,12 @@ class ManualJudgeCalibrationPlan:
 
 
 def default_judge_dimensions() -> tuple[RubricDimension, ...]:
-    """Return the editable default task-success scale for first setup.
+    """Return the editable default task-success axis for first setup.
 
     Returns:
-        One complete zero-to-five dimension with plain-language anchors.
+        One 0-1 axis whose meaning is completion of the original user prompt.
     """
-    return (
-        RubricDimension(
-            dimension_id="task-success",
-            name="Task success",
-            description="How completely and correctly the agent addressed the requested task.",
-            anchors=(
-                ScoreAnchor(score=0, description="The agent did not address the task."),
-                ScoreAnchor(score=1, description="The agent made little useful progress."),
-                ScoreAnchor(
-                    score=2,
-                    description="The agent partially addressed the task with major gaps.",
-                ),
-                ScoreAnchor(
-                    score=3,
-                    description="The agent mostly addressed the task with meaningful gaps.",
-                ),
-                ScoreAnchor(
-                    score=4,
-                    description="The agent addressed the task with only minor gaps.",
-                ),
-                ScoreAnchor(
-                    score=5,
-                    description="The agent fully and correctly addressed the task.",
-                ),
-            ),
-        ),
-    )
+    return (default_task_success_axis(),)
 
 
 def prepare_manual_judge_setup(
@@ -213,7 +206,9 @@ def prepare_manual_judge_setup(
         raise ManualJudgeError(str(exc)) from exc
     selected_dimensions = tuple(dimensions or default_judge_dimensions())
     if not selected_dimensions:
-        raise ManualJudgeError("judge setup requires at least one rubric dimension")
+        raise ManualJudgeError("judge setup requires at least one rubric axis")
+    if prompt_template.prompt.prompt_id == DEFAULT_JUDGE_PROMPT.prompt_id:
+        prompt_template = default_judge_template(selected_dimensions)
     _require_exact_build_inputs(store, build)
     tasks = load_task_set(store.artifacts, build.task_set.artifact_id).tasks
     traces = load_trace_dataset(store.artifacts, build.trace_dataset.artifact_id).traces
@@ -798,8 +793,18 @@ def _validate_labels(
     supplied = [(label.trace_id, label.reference_trace_id, label.dimension_id) for label in labels]
     if any((label.winner is not None) != pairwise for label in labels):
         raise ManualJudgeError(
-            "pairwise setups require typed winner labels; other setups require zero-to-five scores"
+            "pairwise setups require typed winner labels; other setups require axis-range scores"
         )
+    axes = {item.dimension_id: item for item in rubric.dimensions}
+    for label in labels:
+        if label.score is None:
+            continue
+        axis = axes[label.dimension_id]
+        if not axis.contains_score(label.score):
+            raise ManualJudgeError(
+                f"human scores for {label.dimension_id} must be integers from "
+                f"{axis.min_score} through {axis.max_score}"
+            )
     if len(set(supplied)) != len(supplied):
         raise ManualJudgeError("judge calibration labels must not repeat a trace dimension")
     missing = sorted(expected.difference(supplied))
@@ -951,9 +956,7 @@ def _write_labels(
     )
 
 
-def _label_score(
-    setup: ManualJudgeSetupArtifact, label: ManualJudgeLabel
-) -> Literal[0, 1, 2, 3, 4, 5]:
+def _label_score(setup: ManualJudgeSetupArtifact, label: ManualJudgeLabel) -> int:
     """Project one human label under the exact saved response contract.
 
     Args:
@@ -961,7 +964,7 @@ def _label_score(
         label: Validated scalar score or typed pairwise preference.
 
     Returns:
-        Integer zero-to-five human score used by grouped calibration.
+        Integer human score on the finalized axis range.
 
     Raises:
         ManualJudgeError: Label shape differs from the finalized setup.
@@ -971,5 +974,5 @@ def _label_score(
             raise ManualJudgeError("pairwise human labels require winner_a, winner_b, or tie")
         return setup.prompt_template.score_projection.pairwise_scores[label.winner]
     if label.score is None:
-        raise ManualJudgeError("non-pairwise human labels require a zero-to-five score")
+        raise ManualJudgeError("non-pairwise human labels require an integer axis score")
     return label.score

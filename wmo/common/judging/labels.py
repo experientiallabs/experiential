@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Literal
 
-from pydantic import JsonValue, field_validator, model_validator
+from pydantic import Field, JsonValue, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -32,7 +31,7 @@ class HumanScore(ContractModel):
     rollout_id: ArtifactId
     lineage_id: ArtifactId
     dimension_id: ArtifactId
-    score: Literal[0, 1, 2, 3, 4, 5]
+    score: int = Field(ge=0)
     created_at: datetime
     supersedes_label_id: ArtifactId | None = None
 
@@ -227,7 +226,7 @@ class HumanScoreReview:
         rollout_id: ArtifactId,
         lineage_id: ArtifactId,
         dimension_id: ArtifactId,
-        score: Literal[0, 1, 2, 3, 4, 5],
+        score: int,
         submission_id: str,
         created_at: datetime,
     ) -> HumanScore:
@@ -237,8 +236,8 @@ class HumanScoreReview:
             rubric_id: Immutable finalized rubric that owns the score.
             rollout_id: Persisted rollout receiving the score.
             lineage_id: Frozen task lineage retained for calibration.
-            dimension_id: Rubric dimension receiving the zero-to-five score.
-            score: Human score on the finalized dimension scale.
+            dimension_id: Rubric axis receiving the score.
+            score: Human score on the finalized axis range.
             submission_id: Stable identifier for this one UI submission and all of its retries.
             created_at: Time at which the local human decision is recorded.
 
@@ -324,6 +323,12 @@ class HumanScoreReview:
         selected: list[tuple[JsonObject, HumanScoreHistory]] = []
         with coordinate_completed_build_selection(self._store):
             _require_rubric_matches_selected_build(self._store, rubric_id)
+            _require_score_on_rubric_axis(
+                self._store,
+                rubric_id=rubric_id,
+                dimension_id=dimension_id,
+                score=score,
+            )
             self._store.update_review(update)
         self._root_review, self._history = selected[0]
         return result[0]
@@ -495,6 +500,42 @@ def _require_rubric_matches_selected_build(
         raise ValueError(
             "human score rubric differs from the selected completed build; reopen labels from "
             "the current project build"
+        )
+
+
+def _require_score_on_rubric_axis(
+    store: ProjectStore,
+    *,
+    rubric_id: ArtifactId,
+    dimension_id: ArtifactId,
+    score: int,
+) -> None:
+    """Reject a human score that is not an integer on the named rubric axis.
+
+    Args:
+        store: Project whose finalized rubric is already selected.
+        rubric_id: Immutable rubric that owns the axis.
+        dimension_id: Axis receiving the score.
+        score: Proposed human score.
+
+    Raises:
+        ValueError: The axis is missing or the score is outside its inclusive range.
+    """
+    try:
+        rubric, _rubric_input = read_artifact_json(
+            store,
+            artifact_id=rubric_id,
+            expected_artifact_type="rubric",
+            relative_path="rubric.json",
+            model_type=Rubric,
+        )
+    except JudgingProvenanceError as exc:
+        raise ValueError("human scores require a completed immutable finalized rubric") from exc
+    axis = rubric.axis(dimension_id)
+    if not axis.contains_score(score):
+        raise ValueError(
+            f"human scores for {dimension_id} must be integers from {axis.min_score} through "
+            f"{axis.max_score}"
         )
 
 
