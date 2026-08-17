@@ -714,9 +714,9 @@ def test_configured_budget_rejects_build_before_provider_resolution(
     )
 
     assert result.exit_code == 2
-    output = unstyle(result.output)
-    assert "estimated cost: $1.00" in output
-    assert "configured budget: $0.50 per command" in output
+    output = " ".join(unstyle(result.output).split())
+    assert "estimated cost $1.00" in output
+    assert "of the $0.50 per-command budget" in output
     assert "wmo config budget 1.00" in output
     assert "--yes cannot override" in output
     assert provider_resolutions == []

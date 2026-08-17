@@ -94,13 +94,19 @@ def require_spend_consent(
     if estimate > budget:
         raise typer.BadParameter(_over_budget_message(root, estimate, budget))
     if estimate <= budget / Decimal(2):
-        console.print("authorization: automatic (estimate is at most 50% of budget)")
+        console.print(
+            "[green]authorization:[/green] automatic (estimate is at most 50% of budget)",
+            highlight=False,
+        )
         return True
     if yes:
-        console.print("authorization: confirmed by --yes")
+        console.print("[green]authorization:[/green] confirmed by --yes", highlight=False)
         return True
     if previously_confirmed:
-        console.print("authorization: reused immutable prior confirmation")
+        console.print(
+            "[green]authorization:[/green] reused immutable prior confirmation",
+            highlight=False,
+        )
         return True
     if non_interactive or not can_prompt(console):
         _refuse_noninteractive(console, command=command, estimate=estimate, budget=budget)
@@ -152,11 +158,17 @@ def _render_preflight(
         budget: Configured per-command ceiling.
         assumptions: Major bounded cost inputs.
     """
-    console.print("[bold]Cost preflight[/bold]")
-    console.print(f"command: {escape(command)}")
-    console.print(f"estimated cost: {_format_usd(estimate)} (conservative maximum)")
-    console.print(f"configured budget: {_format_usd(budget)} per command")
-    console.print("assumptions: " + escape("; ".join(assumptions)))
+    console.print(
+        f"[bold]Cost preflight[/bold] [cyan]{escape(command)}[/cyan]"
+        f"  estimated cost [bold yellow]{_format_usd(estimate)}[/bold yellow]"
+        " (conservative maximum)"
+        f" of the [green]{_format_usd(budget)}[/green] per-command budget",
+        highlight=False,
+    )
+    console.print(
+        "[dim]assumptions: " + escape("; ".join(assumptions)) + "[/dim]",
+        highlight=False,
+    )
 
 
 def _format_usd(value: Decimal) -> str:

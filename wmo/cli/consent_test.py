@@ -129,10 +129,9 @@ def test_estimate_at_exactly_half_the_budget_runs_automatically(
     assert _authorize(console, root, estimate=10.0)
     assert answer.asked == []
     rendered = _flat(buffer)
-    assert "Cost preflight" in rendered
-    assert "command: wmo optimize model support" in rendered
-    assert "estimated cost: $10.00" in rendered
-    assert "configured budget: $20.00 per command" in rendered
+    assert "Cost preflight wmo optimize model support" in rendered
+    assert "estimated cost $10.00" in rendered
+    assert "of the $20.00 per-command budget" in rendered
     assert "full frozen schedule; one retry per managed batch" in rendered
     assert "automatic" in rendered
 
@@ -194,7 +193,7 @@ def test_estimate_above_budget_fails_even_with_yes(
     assert "wmo config budget 20.000001 --root" in message
     assert "wmo root" in message
     assert "--yes cannot override" in message
-    assert "estimated cost: $20.000001" in _flat(buffer)
+    assert "estimated cost $20.000001" in _flat(buffer)
 
 
 def test_sub_microdollar_estimates_are_displayed_conservatively(tmp_path: Path) -> None:
@@ -205,7 +204,7 @@ def test_sub_microdollar_estimates_are_displayed_conservatively(tmp_path: Path) 
 
     assert _authorize(console, root, estimate=0.0000001)
 
-    assert "estimated cost: $0.000001" in _flat(buffer)
+    assert "estimated cost $0.000001" in _flat(buffer)
 
 
 def test_noninteractive_above_half_requires_yes(
