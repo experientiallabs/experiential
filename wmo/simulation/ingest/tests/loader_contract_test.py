@@ -1,9 +1,10 @@
 """Shared loader contract parametrized over the vendor ingest suites.
 
 Each vendor test module keeps its fixture builders and vendor-specific quirks.
-The four contracts here pin the behavior every file loader must share: tool-call
+The contracts here pin the behavior every file loader must share: tool-call
 pairing, model-name evidence without resolved identity, declared-error mapping,
-and explicit exclusion of invalid records.
+explicit exclusion of invalid records, retention of malformed JSONL lines
+through the load seam, and multi-turn history normalization.
 """
 
 from __future__ import annotations
@@ -14,8 +15,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from pydantic import JsonValue
 
 from wmo.common.core.artifacts import JsonObject
+from wmo.common.traces import TraceSpan
 from wmo.simulation.ingest.braintrust import BRAINTRUST_SOURCE
 from wmo.simulation.ingest.braintrust_test import _rows as _braintrust_rows
 from wmo.simulation.ingest.chat_json import CHAT_JSON_SOURCE
@@ -44,6 +47,9 @@ _LOADERS: dict[str, Callable[[Path], TraceNormalizationResult]] = {
     "otel_genai": load_otel_genai_file,
     "phoenix": PHOENIX_SOURCE.load,
 }
+
+# Vendors whose loader is VendorSource.load; otel_genai registers its own loader.
+_VENDOR_SOURCE_VENDORS = ("braintrust", "chat_json", "langfuse", "langsmith", "mastra", "phoenix")
 
 
 def _written(tmp_path: Path, document: object, *, jsonl: bool = False) -> Path:
@@ -355,3 +361,200 @@ def test_contract_excludes_records_missing_required_fields(
 
     assert tuple(issue.source_record for issue in result.issues) == case.issues
     assert result.traces == ()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [case for case in _PAIRING_CASES if case.vendor in _VENDOR_SOURCE_VENDORS],
+    ids=lambda case: case.vendor,
+)
+def test_contract_load_retains_malformed_jsonl_line_exclusions(
+    case: _PairingCase, tmp_path: Path
+) -> None:
+    """A malformed JSONL line survives load as a line exclusion beside the valid trace."""
+    path = tmp_path / "export.jsonl"
+    path.write_text(json.dumps(case.document()) + "\n{not json\n", encoding="utf-8")
+
+    result = _LOADERS[case.vendor](path)
+
+    assert len(result.traces) == 1
+    assert result.traces[0].task == case.task
+    assert [issue.source_record for issue in result.issues] == ["line-2"]
+    assert result.issues[0].message.startswith("invalid JSONL record")
+
+
+_TURNS = (
+    ("Support request", "What account email?"),
+    ("customer@example.test", "Reset instructions sent."),
+)
+
+
+def _history(turn: int) -> list[JsonValue]:
+    """Return the cumulative visible message history observed by one conversation turn.
+
+    Args:
+        turn: Zero-based turn index.
+
+    Returns:
+        Messages the model saw for that turn.
+    """
+    messages: list[JsonValue] = []
+    for request, completion in _TURNS[:turn]:
+        messages.append({"role": "user", "content": request})
+        messages.append({"role": "assistant", "content": completion})
+    return [*messages, {"role": "user", "content": _TURNS[turn][0]}]
+
+
+_HISTORY_EXPORTS: dict[str, Callable[[], object]] = {
+    "braintrust": lambda: [
+        {
+            "id": f"row-{turn}",
+            "span_id": f"span-{turn}",
+            "root_span_id": "root-1",
+            "span_attributes": {"type": "llm", "name": "chat"},
+            "metrics": {"start": 1_772_000_000.0 + turn * 2, "end": 1_772_000_001.0 + turn * 2},
+            "metadata": {"provider": "openai", "model": "gpt-test"},
+            "input": _history(turn),
+            "output": {"role": "assistant", "content": _TURNS[turn][1]},
+        }
+        for turn in range(len(_TURNS))
+    ],
+    "chat_json": lambda: {
+        "trace_id": "conversation-1",
+        "provider": "openai",
+        "model": "gpt-test",
+        "messages": [
+            message
+            for request, completion in _TURNS
+            for message in (
+                {"role": "user", "content": request},
+                {"role": "assistant", "content": completion},
+            )
+        ],
+    },
+    "langfuse": lambda: {
+        "id": "trace-1",
+        "timestamp": "2026-02-01T00:00:00Z",
+        "input": {"messages": [{"role": "user", "content": _TURNS[0][0]}]},
+        "metadata": {"provider": "openai"},
+        "observations": [
+            {
+                "id": f"obs-{turn}",
+                "traceId": "trace-1",
+                "type": "GENERATION",
+                "name": "answer",
+                "startTime": f"2026-02-01T00:00:0{turn * 2}Z",
+                "endTime": f"2026-02-01T00:00:0{turn * 2 + 1}Z",
+                "model": "gpt-test",
+                "input": _history(turn),
+                "output": {"role": "assistant", "content": _TURNS[turn][1]},
+            }
+            for turn in range(len(_TURNS))
+        ],
+    },
+    "langsmith": lambda: [
+        {
+            "id": f"run-{turn}",
+            "trace_id": "trace-1",
+            "run_type": "llm",
+            "name": "ChatOpenAI",
+            "start_time": f"2026-03-01T00:00:0{turn * 2}Z",
+            "end_time": f"2026-03-01T00:00:0{turn * 2 + 1}Z",
+            "inputs": {"messages": _history(turn)},
+            "outputs": {"generations": [[{"text": _TURNS[turn][1]}]]},
+            "extra": {"metadata": {"ls_provider": "openai", "ls_model_name": "gpt-test"}},
+        }
+        for turn in range(len(_TURNS))
+    ],
+    "mastra": lambda: {
+        "spans": [
+            {
+                "traceId": "trace-1",
+                "id": f"span-{turn}",
+                "type": "model_generation",
+                "name": "generate",
+                "startTime": f"2026-04-01T00:00:0{turn * 2}Z",
+                "endTime": f"2026-04-01T00:00:0{turn * 2 + 1}Z",
+                "attributes": {"provider": "openai", "model": "gpt-test"},
+                "input": {"messages": _history(turn)},
+                "output": {"text": _TURNS[turn][1]},
+            }
+            for turn in range(len(_TURNS))
+        ]
+    },
+    "otel_genai": lambda: [
+        {
+            "trace_id": "9" * 32,
+            "span_id": f"{turn + 1:016x}",
+            "name": "agent.model_call",
+            "start_time": f"2026-06-01T00:00:0{turn * 2}Z",
+            "end_time": f"2026-06-01T00:00:0{turn * 2 + 1}Z",
+            "attributes": {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.provider.name": "openai",
+                "gen_ai.request.model": "gpt-test",
+                "gen_ai.input.messages": json.dumps(_history(turn)),
+                "gen_ai.output.messages": json.dumps(
+                    [{"role": "assistant", "content": _TURNS[turn][1]}]
+                ),
+            },
+        }
+        for turn in range(len(_TURNS))
+    ],
+    "phoenix": lambda: [
+        {
+            "context": {"trace_id": "trace-1", "span_id": f"span-{turn}"},
+            "name": "ChatCompletion",
+            "start_time": f"2026-05-01T00:00:0{turn * 2}Z",
+            "end_time": f"2026-05-01T00:00:0{turn * 2 + 1}Z",
+            "attributes": {
+                "openinference": {"span": {"kind": "LLM"}},
+                "llm": {
+                    "provider": "openai",
+                    "model_name": "gpt-test",
+                    "input_messages": [{"message": message} for message in _history(turn)],
+                    "output_messages": [
+                        {"message": {"role": "assistant", "content": _TURNS[turn][1]}}
+                    ],
+                },
+            },
+        }
+        for turn in range(len(_TURNS))
+    ],
+}
+
+
+def _span_completion(span: TraceSpan) -> str:
+    """Read the assistant completion text one canonical model span carries.
+
+    Args:
+        span: Canonical model-call span.
+
+    Returns:
+        Completion text from ``gen_ai.completion``, or from the retained
+        ``gen_ai.output.messages`` evidence when the loader keeps raw messages.
+    """
+    completion = span.attributes.get("gen_ai.completion")
+    if isinstance(completion, str):
+        return completion
+    output = span.attributes["gen_ai.output.messages"]
+    assert isinstance(output, str)
+    messages = json.loads(output)
+    content = messages[0]["content"]
+    assert isinstance(content, str)
+    return content
+
+
+@pytest.mark.parametrize("vendor", sorted(_HISTORY_EXPORTS))
+def test_contract_normalizes_two_turns_with_cumulative_history(vendor: str, tmp_path: Path) -> None:
+    """A second turn carrying the cumulative visible history stays one two-span trace."""
+    result = _LOADERS[vendor](_written(tmp_path, _HISTORY_EXPORTS[vendor]()))
+
+    assert result.issues == ()
+    assert len(result.traces) == 1
+    trace = result.traces[0]
+    assert trace.task == _TURNS[0][0]
+    assert tuple(span.name for span in trace.spans) == ("agent.model_call", "agent.model_call")
+    assert tuple(_span_completion(span) for span in trace.spans) == tuple(
+        completion for _, completion in _TURNS
+    )

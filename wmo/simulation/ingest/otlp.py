@@ -383,7 +383,12 @@ def _normalize_trace_group(
         (initial_attributes,), REQUEST_CONTEXT_KEY, error_type=OtlpTraceFormatError
     )
     conversation_id = consistent_text(
-        all_attributes, CONVERSATION_ID_KEYS, error_type=OtlpTraceFormatError
+        # Lenient: foreign exporters populate identity attributes with non-text values, so an
+        # invalid conversation id is ignored instead of excluding the trace.
+        all_attributes,
+        CONVERSATION_ID_KEYS,
+        error_type=OtlpTraceFormatError,
+        lenient=True,
     )
     tools = collect_tools(
         (initial_attributes,),

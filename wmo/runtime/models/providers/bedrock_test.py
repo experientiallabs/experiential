@@ -309,6 +309,7 @@ def test_retries_stay_on_the_same_region_and_model() -> None:
             self.attempts = 0
 
         def converse(self, **request: object) -> Mapping[str, object]:
+            """Raise one retryable throttle error, then delegate to the recording fake."""
             self.attempts += 1
             if self.attempts == 1:
                 raise ProviderTransportError(

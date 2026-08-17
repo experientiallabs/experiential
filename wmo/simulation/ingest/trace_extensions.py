@@ -6,6 +6,9 @@ one visible tool list, and one terminal outcome. This module owns the single cop
 those sources share: a fact declared on several spans must agree exactly, a declared value must
 be well formed, and an invalid declaration excludes the trace instead of being repaired. Every
 reader raises the caller's source-specific error type so exclusions keep their source labels.
+The one exception is the lenient text mode that the OTLP conversation-id read opts into: foreign
+exporters populate identity attributes with non-text values, so those are ignored rather than
+excluding the trace.
 """
 
 from __future__ import annotations
@@ -78,34 +81,69 @@ def consistent_text(
     keys: Sequence[str],
     *,
     error_type: type[ValueError],
+    lenient: bool = False,
 ) -> str | None:
     """Return one repeated text extension across a trace or reject ambiguity.
 
     Args:
         attributes_by_span: Canonical span attributes in trace order.
-        keys: Ordered candidate attribute keys; the first non-null key wins per span.
+        keys: Ordered candidate attribute keys; the first declared key wins per span.
         error_type: Source-specific validation exception type.
+        lenient: Whether a declared non-text or blank value is skipped, falling through to
+            the next candidate key, instead of excluding the trace. Only the OTLP
+            conversation-id read opts in; every other extension read stays strict.
 
     Returns:
         The single declared value, or ``None`` when no span declares one.
 
     Raises:
-        ValueError: The declared ``error_type`` when a declared value is blank or not text,
-            or when spans disagree.
+        ValueError: The declared ``error_type`` when a strictly read declared value is blank,
+            not text, or an explicit null, or when spans disagree.
     """
     values: list[str] = []
     for attributes in attributes_by_span:
-        for key in keys:
-            value = attributes.get(key)
-            if value is None:
-                continue
-            values.append(required_text(value, key, error_type=error_type))
-            break
+        value = _span_text(attributes, keys, error_type=error_type, lenient=lenient)
+        if value is not None:
+            values.append(value)
     if not values:
         return None
     if any(value != values[0] for value in values[1:]):
         raise error_type(f"{keys[0]} differs across spans in one trace")
     return values[0]
+
+
+def _span_text(
+    attributes: JsonObject,
+    keys: Sequence[str],
+    *,
+    error_type: type[ValueError],
+    lenient: bool,
+) -> str | None:
+    """Read one span's declared text value from an ordered candidate key list.
+
+    Args:
+        attributes: Canonical attributes of one span.
+        keys: Ordered candidate attribute keys.
+        error_type: Source-specific validation exception type.
+        lenient: Whether a declared non-text or blank value is skipped instead of raising.
+
+    Returns:
+        The first valid declared text, or ``None`` when the span declares none.
+
+    Raises:
+        ValueError: The declared ``error_type`` when a strictly read declared value is not
+            non-empty text. Strict reads treat a present key as a declaration, so an explicit
+            null is rejected rather than read as undeclared.
+    """
+    for key in keys:
+        if key not in attributes:
+            continue
+        value = attributes[key]
+        if not lenient:
+            return required_text(value, key, error_type=error_type)
+        if isinstance(value, str) and value.strip():
+            return normalize_durable_text(value.strip())
+    return None
 
 
 def consistent_bool(

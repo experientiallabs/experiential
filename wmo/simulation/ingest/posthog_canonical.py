@@ -24,7 +24,15 @@ from wmo.simulation.ingest.otlp import (
     TraceNormalizationIssue,
     TraceNormalizationResult,
 )
-from wmo.simulation.ingest.trace_extensions import REQUEST_CONTEXT_KEY, REQUEST_TOOLS_KEY
+from wmo.simulation.ingest.trace_extensions import (
+    OUTCOME_FAILURE_CODE_KEY,
+    OUTCOME_FAILURE_MESSAGE_KEY,
+    OUTCOME_FAILURE_RETRYABLE_KEY,
+    OUTCOME_NAME_KEY,
+    OUTCOME_STATUS_KEY,
+    REQUEST_CONTEXT_KEY,
+    REQUEST_TOOLS_KEY,
+)
 from wmo.simulation.ingest.vendor_observations import (
     VendorModelIdentity,
     VendorObservation,
@@ -45,6 +53,18 @@ from wmo.simulation.ingest.vendor_trace import approved_extensions, build_vendor
 VENDOR = "posthog"
 
 _REQUEST_VISIBLE_KEYS = (REQUEST_CONTEXT_KEY, "wmo.request.tags", REQUEST_TOOLS_KEY)
+
+_TRACE_LEVEL_KEYS = (
+    "wmo.customer.id",
+    "wmo.conversation.id",
+    *_REQUEST_VISIBLE_KEYS,
+    "wmo.outcome.escalated",
+    OUTCOME_STATUS_KEY,
+    OUTCOME_NAME_KEY,
+    OUTCOME_FAILURE_CODE_KEY,
+    OUTCOME_FAILURE_MESSAGE_KEY,
+    OUTCOME_FAILURE_RETRYABLE_KEY,
+)
 
 
 class PostHogPullError(VendorTraceFormatError):
@@ -188,6 +208,11 @@ def _trace_observations(
 ) -> tuple[VendorObservation, ...]:
     """Declare ordered vendor observations for one PostHog trace.
 
+    PostHog producers may declare trace-level WMO facts, such as the outcome, conversation, or
+    customer identity, on events that emit no span evidence, such as ``$ai_metric`` or
+    ``$ai_feedback``. Those facts are collected from every event and folded onto the first
+    emitted observation so the shared canonical conversion still sees and cross-checks them.
+
     Args:
         source_trace_id: PostHog trace key shared by these events.
         events: Source events of this trace, in export order.
@@ -196,7 +221,8 @@ def _trace_observations(
         Declared observations in canonical order, with the request text on the first.
 
     Raises:
-        VendorTraceFormatError: An event is invalid or the trace declares no user request.
+        VendorTraceFormatError: An event is invalid, the trace declares no user request, or a
+            trace-level extension fact disagrees across events.
     """
     ordered = sorted(
         events,
@@ -207,6 +233,7 @@ def _trace_observations(
         raise PostHogPullError("PostHog trace has no initial user message or root task text")
     task, initial_event = initial_request
     observations: list[VendorObservation] = []
+    folded: JsonObject = {}
     for event in ordered:
         observation = _event_observation(
             source_trace_id,
@@ -215,11 +242,55 @@ def _trace_observations(
             initial=event is initial_event,
         )
         if observation is None:
+            extensions = _event_extensions(_properties(event.event), initial=event is initial_event)
+            _fold_trace_level_extensions(folded, extensions)
             continue
         if not observations:
             observation = replace(observation, request_text=task)
         observations.append(observation)
+    if folded and observations:
+        first = observations[0]
+        _fold_trace_level_extensions(folded, first.extensions)
+        observations[0] = replace(first, extensions={**first.extensions, **folded})
     return tuple(observations)
+
+
+def _event_extensions(properties: JsonObject, *, initial: bool) -> JsonObject:
+    """Collect approved WMO extensions from one event with PostHog's null leniency.
+
+    Args:
+        properties: PostHog event properties.
+        initial: Whether this event carries the trace's initial request and may keep
+            request-visible extensions.
+
+    Returns:
+        Approved extension attributes with null-valued keys dropped.
+    """
+    extensions: JsonObject = {
+        key: value for key, value in approved_extensions(properties).items() if value is not None
+    }
+    if not initial:
+        for key in _REQUEST_VISIBLE_KEYS:
+            extensions.pop(key, None)
+    return extensions
+
+
+def _fold_trace_level_extensions(target: JsonObject, extensions: JsonObject) -> None:
+    """Fold one event's trace-level extension facts, rejecting cross-event disagreement.
+
+    Args:
+        target: Accumulated trace-level extension facts, updated in place.
+        extensions: One event's approved extensions.
+
+    Raises:
+        PostHogPullError: A trace-level fact differs from an earlier event's declaration.
+    """
+    for key in _TRACE_LEVEL_KEYS:
+        if key not in extensions:
+            continue
+        if key in target and target[key] != extensions[key]:
+            raise PostHogPullError(f"{key} differs across events in one PostHog trace")
+        target[key] = extensions[key]
 
 
 def _event_observation(
@@ -247,10 +318,7 @@ def _event_observation(
     event_name = _event_name(event.event)
     properties = _properties(event.event)
     timestamp = _event_timestamp(event.event)
-    extensions = approved_extensions(properties)
-    if not initial:
-        for key in _REQUEST_VISIBLE_KEYS:
-            extensions.pop(key, None)
+    extensions = _event_extensions(properties, initial=initial)
     if event_name == "$ai_generation":
         choices = properties.get("$ai_output_choices")
         tool_calls = declared_tool_calls(choices)

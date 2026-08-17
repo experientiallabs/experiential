@@ -163,9 +163,22 @@ def test_build_vendor_traces_strict_pairing_rejects_unpaired_calls_and_results()
 
 
 def test_approved_extensions_copies_only_approved_keys() -> None:
-    """Vendor metadata reaches canonical spans only through approved WMO extensions."""
+    """Vendor metadata reaches canonical spans only through approved WMO extensions.
+
+    ``wmo.outcome.escalated`` and ``wmo.trace.metadata`` are deliberately approved for every
+    vendor source sharing this collector.
+    """
     extensions = approved_extensions(
-        {"wmo.conversation.id": "thread-1", "vendor.internal": "drop me"}
+        {
+            "wmo.conversation.id": "thread-1",
+            "wmo.outcome.escalated": True,
+            "wmo.trace.metadata": {"team": "support"},
+            "vendor.internal": "drop me",
+        }
     )
 
-    assert extensions == {"wmo.conversation.id": "thread-1"}
+    assert extensions == {
+        "wmo.conversation.id": "thread-1",
+        "wmo.outcome.escalated": True,
+        "wmo.trace.metadata": {"team": "support"},
+    }

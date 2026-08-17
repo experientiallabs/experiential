@@ -501,6 +501,44 @@ def test_posthog_ignores_late_request_visible_extensions() -> None:
     assert routing_descriptor(trace).tags == ("domain:travel",)
 
 
+def test_posthog_retains_trace_facts_declared_on_non_span_events() -> None:
+    """Outcome and conversation facts on an $ai_metric event survive, with null keys skipped."""
+    events: list[dict[str, JsonValue]] = [
+        {
+            "event": "$ai_generation",
+            "timestamp": "2025-10-09T08:53:20Z",
+            "properties": {
+                "$ai_trace_id": _TRACE_ID,
+                "$ai_span_id": "generation-1",
+                "$ai_provider": "openai",
+                "$ai_model": "gpt-test",
+                "$ai_input": [{"role": "user", "content": "Cancel reservation R-17"}],
+                "$ai_output_choices": [{"role": "assistant", "content": "Done."}],
+                "wmo.outcome.name": "reservation_cancelled",
+            },
+        },
+        {
+            "event": "$ai_metric",
+            "timestamp": "2025-10-09T08:53:21Z",
+            "properties": {
+                "$ai_trace_id": _TRACE_ID,
+                "wmo.outcome.status": "success",
+                "wmo.conversation.id": "conversation-9",
+                "wmo.outcome.name": None,
+            },
+        },
+    ]
+
+    result = normalize_posthog_payload(events, source=_source())
+
+    assert result.issues == ()
+    trace = result.traces[0]
+    assert trace.conversation_id == "conversation-9"
+    assert trace.outcome is not None
+    assert trace.outcome.status == "success"
+    assert trace.outcome.outcome_name == "reservation_cancelled"
+
+
 class _FakeResponse:
     """Deterministic successful HTTP response for the authorized pull seam."""
 
