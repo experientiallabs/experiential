@@ -104,6 +104,42 @@ def test_rubric_rejects_empty_axes_duplicate_ids_and_invalid_ranges() -> None:
         )
 
 
+def test_legacy_zero_to_five_payload_loads_without_range_fields() -> None:
+    """Pre-range rubric cards keep their 0-5 meaning when min_score and max_score are absent."""
+    axis = RubricDimension.model_validate(
+        {
+            "dimension_id": "task-success",
+            "name": "Task success",
+            "description": "Whether the customer received a correct outcome.",
+            "anchors": [
+                {"score": score, "description": f"Score {score} outcome."} for score in range(6)
+            ],
+        }
+    )
+
+    assert axis.min_score == 0
+    assert axis.max_score == 5
+    assert axis.permitted_scores() == (0, 1, 2, 3, 4, 5)
+
+
+def test_rubric_rejects_axes_that_do_not_share_one_range() -> None:
+    """A shared schema cannot describe mixed inclusive ranges in one rubric."""
+    with pytest.raises(ValidationError, match="same inclusive score range"):
+        Rubric(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            inputs=(ArtifactInput(artifact_id="task-set-v1", sha256=_DIGEST),),
+            code_revision="e7aad17",
+            rubric_id="support-rubric-v1",
+            dimensions=(
+                _axis(min_score=0, max_score=1),
+                _axis("quality", min_score=0, max_score=4),
+            ),
+            source_task_set_id="task-set-v1",
+            status="provisional",
+        )
+
+
 def test_zero_to_four_axis_allows_meaningful_interior_anchors() -> None:
     """A 0-4 axis may omit interior scores when endpoints and anchors stay valid."""
     axis = RubricDimension(

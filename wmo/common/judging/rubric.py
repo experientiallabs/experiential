@@ -34,8 +34,8 @@ class RubricDimension(ContractModel):
     dimension_id: ArtifactId
     name: str = Field(min_length=1, max_length=256)
     description: str = Field(min_length=1)
-    min_score: int = Field(ge=0, le=_MAX_AXIS_SCORE)
-    max_score: int = Field(ge=0, le=_MAX_AXIS_SCORE)
+    min_score: int = Field(default=0, ge=0, le=_MAX_AXIS_SCORE)
+    max_score: int = Field(default=5, ge=0, le=_MAX_AXIS_SCORE)
     anchors: tuple[ScoreAnchor, ...]
 
     @model_validator(mode="after")
@@ -149,23 +149,23 @@ def default_task_success_axis() -> RubricDimension:
 
 
 def score_bounds(dimensions: tuple[RubricDimension, ...]) -> tuple[int, int]:
-    """Return the union of inclusive axis ranges.
+    """Return the shared inclusive axis range.
 
     Args:
         dimensions: Non-empty ordered rubric axes.
 
     Returns:
-        Lowest min_score and highest max_score across the rubric.
+        The inclusive ``(min_score, max_score)`` shared by every axis.
 
     Raises:
-        ValueError: The rubric has no axes.
+        ValueError: The rubric has no axes, or axes use different ranges.
     """
     if not dimensions:
         raise ValueError("a rubric must contain at least one axis")
-    return (
-        min(item.min_score for item in dimensions),
-        max(item.max_score for item in dimensions),
-    )
+    ranges = {(item.min_score, item.max_score) for item in dimensions}
+    if len(ranges) != 1:
+        raise ValueError("every rubric axis must share the same inclusive score range")
+    return next(iter(ranges))
 
 
 class Rubric(ArtifactEnvelope):
@@ -188,6 +188,7 @@ class Rubric(ArtifactEnvelope):
         dimension_ids = tuple(dimension.dimension_id for dimension in value)
         if len(set(dimension_ids)) != len(dimension_ids):
             raise ValueError("rubric axes must have unique IDs")
+        score_bounds(value)
         return value
 
     @field_validator("accepted_proposal_evidence_ids")

@@ -8,7 +8,13 @@ from dataclasses import replace
 from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
-from wmo.common.judging import RubricDimension, ScoreAnchor, render_rubric_table
+from wmo.common.judging import (
+    RubricDimension,
+    ScoreAnchor,
+    render_rubric_table,
+    score_bounds,
+)
+from wmo.optimize.router.judging.contracts import JudgePromptTemplate, judge_feedback_schema
 from wmo.optimize.router.judging.service import (
     DEFAULT_JUDGE_PROMPT,
     ManualJudgeSetupPlan,
@@ -54,10 +60,41 @@ def replace_setup_axes(
     """
     if not dimensions:
         raise ValueError("a rubric must contain at least one axis")
-    template = plan.prompt_template
-    if template.prompt.prompt_id == DEFAULT_JUDGE_PROMPT.prompt_id:
-        template = default_judge_template(dimensions)
+    template = rebind_prompt_template(plan.prompt_template, dimensions)
     return replace(plan, dimensions=dimensions, prompt_template=template)
+
+
+def rebind_prompt_template(
+    template: JudgePromptTemplate,
+    dimensions: tuple[RubricDimension, ...],
+) -> JudgePromptTemplate:
+    """Bind a scalar response schema to the shared inclusive axis range.
+
+    Args:
+        template: Current prompt contract.
+        dimensions: Replacement ordered axes.
+
+    Returns:
+        The default template when the built-in prompt is in use, otherwise the
+        same custom contract with scalar bounds updated to the selected range.
+
+    Raises:
+        ValueError: The axes are empty or do not share one range.
+    """
+    lowest, highest = score_bounds(dimensions)
+    if template.response_shape != "scalar":
+        return template
+    if template.prompt.prompt_id == DEFAULT_JUDGE_PROMPT.prompt_id:
+        return default_judge_template(dimensions)
+    return template.model_copy(
+        update={
+            "response_schema": judge_feedback_schema(
+                "scalar",
+                min_score=lowest,
+                max_score=highest,
+            )
+        }
+    )
 
 
 def maybe_edit_setup_plan(plan: ManualJudgeSetupPlan, *, console: Console) -> ManualJudgeSetupPlan:
@@ -108,9 +145,9 @@ def edit_rubric_axes(
             default="d",
         )
         if action == "d":
-            if not current:
-                raise ValueError("a rubric must contain at least one axis")
-            return tuple(current)
+            selected = tuple(current)
+            score_bounds(selected)
+            return selected
         if action == "a":
             current.append(_prompt_axis(console, ask=ask, ask_int=ask_int))
             ids = [item.dimension_id for item in current]

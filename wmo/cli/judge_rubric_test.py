@@ -12,9 +12,11 @@ from wmo.cli.judge_rubric import (
     axis_score_choices,
     build_axis,
     edit_rubric_axes,
+    rebind_prompt_template,
 )
 from wmo.common.core.artifacts import JsonObject
-from wmo.common.judging import default_task_success_axis
+from wmo.common.judging import PromptDefinition, default_task_success_axis
+from wmo.optimize.router.judging.contracts import JudgePromptTemplate, judge_feedback_schema
 from wmo.optimize.router.judging.service import default_judge_template
 
 
@@ -83,6 +85,15 @@ def test_default_template_schema_follows_selected_axis_bounds() -> None:
     )
     wide_schema = default_judge_template((wide,)).response_schema
     assert _raw_score_bounds(wide_schema) == (0, 4)
+
+    custom = JudgePromptTemplate(
+        prompt=PromptDefinition.from_text("custom-judge-v1", "Follow the saved contract exactly."),
+        variable_mapping={"rubric": "RULES_CUSTOM", "rollout": "TRACE_CUSTOM"},
+        response_schema=judge_feedback_schema("scalar", min_score=0, max_score=1),
+    )
+    rebound = rebind_prompt_template(custom, (wide,))
+    assert rebound.prompt.prompt_id == "custom-judge-v1"
+    assert _raw_score_bounds(rebound.response_schema) == (0, 4)
 
 
 def test_edit_done_keeps_the_current_axes() -> None:
