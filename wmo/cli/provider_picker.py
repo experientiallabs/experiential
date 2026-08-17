@@ -9,19 +9,29 @@ into a questionnaire. Manual declaration stays available as an explicit advanced
 
 from __future__ import annotations
 
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from getpass import getpass
 
 from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
-from wmo.cli.picker import PickerAction, PickerOption, select_many, select_one
+from wmo.cli.picker import (
+    PickerAction,
+    PickerKey,
+    PickerOption,
+    PickerResult,
+    select_many,
+    select_many_list,
+    select_one,
+    uses_keyboard_list,
+)
 from wmo.common.models import (
     ModelCapabilities,
     PricingSource,
     ProviderConnection,
     ProviderSetup,
+    SetupRole,
     derive_connection_name,
     derive_model_alias,
     resolve_discovered_model,
@@ -95,9 +105,10 @@ class AvailableModel:
     connection: str
     provider: str
     model: str
-    capabilities: ModelCapabilities
+    capabilities: ModelCapabilities | None
     pricing_source: PricingSource
     configured: bool
+    retainable_roles: frozenset[SetupRole] = frozenset()
 
     def label(self) -> str:
         """Describe this model as one picker row."""
@@ -105,8 +116,17 @@ class AvailableModel:
 
     def detail(self) -> str:
         """Summarize the roles and price provenance behind this model."""
-        roles = ", ".join(role.value for role in served_roles(self.capabilities))
-        return f"roles: {roles or 'none'}; pricing: {self.pricing_source.value}"
+        verified = (
+            frozenset(served_roles(self.capabilities))
+            if self.capabilities is not None
+            else frozenset()
+        )
+        roles = ", ".join(role.value for role in SetupRole if role in verified)
+        retain_only = ", ".join(
+            role.value for role in SetupRole if role in self.retainable_roles - verified
+        )
+        retained = f"; retain only: {retain_only}" if retain_only else ""
+        return f"roles: {roles or 'unverified'}{retained}; pricing: {self.pricing_source.value}"
 
 
 @dataclass(frozen=True)
@@ -131,12 +151,78 @@ class SetupSession:
     manual: list[AvailableModel] = field(default_factory=list)
 
 
+def resolve_setup_providers(values: Sequence[str]) -> tuple[str, ...]:
+    """Validate explicit provider names and return them in catalog order.
+
+    Args:
+        values: Provider names supplied on the command line, in flag order.
+
+    Returns:
+        Distinct supported providers in ``SETUP_PROVIDER_LABELS`` order.
+
+    Raises:
+        ValueError: A value is unsupported or repeated.
+    """
+    if not values:
+        return ()
+    supported = tuple(SETUP_PROVIDER_LABELS)
+    supported_lookup = {name: name for name in supported}
+    unknown: list[str] = []
+    duplicates: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        name = raw.strip().casefold()
+        canonical = supported_lookup.get(name)
+        if canonical is None:
+            unknown.append(raw.strip() or raw)
+            continue
+        if canonical in seen:
+            duplicates.append(canonical)
+            continue
+        seen.add(canonical)
+    errors: list[str] = []
+    if unknown:
+        listed = ", ".join(repr(item) for item in unknown)
+        noun = "values" if len(unknown) != 1 else "value"
+        errors.append(
+            f"unsupported --provider {noun} {listed}; choose from: {', '.join(supported)}"
+        )
+    if duplicates:
+        listed = ", ".join(repr(item) for item in dict.fromkeys(duplicates))
+        noun = "values" if len(duplicates) != 1 else "value"
+        errors.append(f"duplicate --provider {noun} {listed}")
+    if errors:
+        raise ValueError("; ".join(errors))
+    return tuple(name for name in supported if name in seen)
+
+
+def explicit_provider_selection(
+    providers: Sequence[str],
+) -> tuple[tuple[str, ...], bool, bool]:
+    """Turn validated provider names into the same selection the picker returns.
+
+    Args:
+        providers: Already validated provider names in catalog order.
+
+    Returns:
+        Providers plus advanced-credential and advanced-model flags. Azure and Bedrock
+        still require manual model declaration.
+    """
+    selected = tuple(providers)
+    return (
+        selected,
+        False,
+        any(provider in _MANUAL_MODEL_PROVIDERS for provider in selected),
+    )
+
+
 def select_providers(
     session: SetupSession,
     *,
     console: Console,
     environment: MutableMapping[str, str],
     configured: bool = False,
+    read_key: Callable[[], PickerKey] | None = None,
 ) -> tuple[tuple[str, ...], bool, bool] | None:
     """Show the one provider screen that opens setup.
 
@@ -146,6 +232,7 @@ def select_providers(
         environment: Process environment used to annotate credential availability.
         configured: Whether the catalog already holds usable models, which makes provider
             selection optional so roles can be edited offline.
+        read_key: Optional keyboard source used by tests instead of the controlling terminal.
 
     Returns:
         Selected providers with both advanced flags, or ``None`` when the user cancelled.
@@ -185,11 +272,11 @@ def select_providers(
     if session.advanced_models:
         preselected.append(_ADVANCED_MANUAL_MODEL)
     while True:
-        result = select_many(
+        result = _select_provider_rows(
             console,
-            title="Select the providers you want to use",
             options=options,
             preselected=preselected,
+            read_key=read_key,
         )
         if result.action is PickerAction.CANCEL:
             return None
@@ -207,6 +294,41 @@ def select_providers(
             _ADVANCED_MANUAL_MODEL in result.values
             or any(provider in _MANUAL_MODEL_PROVIDERS for provider in providers),
         )
+
+
+def _select_provider_rows(
+    console: Console,
+    *,
+    options: Sequence[PickerOption],
+    preselected: Sequence[str],
+    read_key: Callable[[], PickerKey] | None,
+) -> PickerResult:
+    """Show the provider list as a keyboard screen on a TTY, otherwise as typed rows.
+
+    Args:
+        console: Terminal used for the screen.
+        options: Provider and advanced rows in presentation order.
+        preselected: Values already chosen, kept when the screen is shown again.
+        read_key: Optional keyboard source used by tests instead of the controlling terminal.
+
+    Returns:
+        The chosen rows, or the requested back or cancel navigation.
+    """
+    title = "Select the providers you want to use"
+    if read_key is not None or uses_keyboard_list(console):
+        return select_many_list(
+            console,
+            title=title,
+            options=options,
+            preselected=preselected,
+            read_key=read_key,
+        )
+    return select_many(
+        console,
+        title=title,
+        options=options,
+        preselected=preselected,
+    )
 
 
 def credential_hint(provider: str, *, environment: MutableMapping[str, str]) -> str:

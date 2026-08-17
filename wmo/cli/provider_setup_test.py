@@ -189,6 +189,125 @@ def test_noninteractive_setup_accepts_azure_and_bedrock_connections(tmp_path: Pa
     assert "sk-" not in text
 
 
+def test_noninteractive_provider_flags_validate_without_prompts_or_writes(tmp_path: Path) -> None:
+    """Repeatable --provider values are checked before any catalog write or prompt.
+
+    Args:
+        tmp_path: Temporary WMO root without provider configuration.
+    """
+    root = tmp_path / ".wmo"
+    result = _RUNNER.invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(root),
+            "--non-interactive",
+            "--provider",
+            "bedrock",
+            "--provider",
+            "openai",
+            "--provider",
+            "not-a-provider",
+            "--provider",
+            "openai",
+        ],
+    )
+
+    assert result.exit_code == 2
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert "unsupported --provider value 'not-a-provider'" in output
+    assert "duplicate --provider value 'openai'" in output
+    assert (
+        "choose from: openai, anthropic, gemini, openrouter, openai-compatible, azure, bedrock"
+        in output
+    )
+    assert "Select the providers you want to use" not in output
+    assert not (root / "models.toml").exists()
+
+
+def test_noninteractive_valid_providers_still_require_structured_collections(
+    tmp_path: Path,
+) -> None:
+    """Accepted --provider flags do not invent connections or start a prompt.
+
+    Args:
+        tmp_path: Temporary WMO root without provider configuration.
+    """
+    result = _RUNNER.invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--non-interactive",
+            "--provider",
+            "anthropic",
+            "--provider",
+            "openai",
+        ],
+    )
+
+    assert result.exit_code == 2
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert "at least one --connection-json" in output
+    assert "Select the providers you want to use" not in output
+    assert not (tmp_path / ".wmo" / "models.toml").exists()
+
+
+def test_explicit_providers_skip_the_opening_list_and_still_discover_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Named providers enter the existing setup session without the opening list.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the saved catalog.
+        monkeypatch: Patch fixture supplying the canonical credential.
+    """
+    root = tmp_path / ".wmo"
+    options = ProviderSetupOptions(providers=("openai",))
+
+    console, catalog = _setup(
+        root,
+        "1,3\n\n1\n1\n1\ny\n",
+        monkeypatch=monkeypatch,
+        options=options,
+    )
+
+    assert catalog is not None
+    assert "Select the providers you want to use" not in unstyle(console.output)
+    saved = load_model_catalog(root / "models.toml")
+    assert set(saved.connections) == {"openai"}
+    assert saved.roles.embedder == "text-embedding-3-small"
+
+
+def test_cancelling_after_explicit_providers_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel after --provider still leaves the catalog untouched.
+
+    Args:
+        tmp_path: Temporary WMO root used to prove no catalog write occurs.
+        monkeypatch: Patch fixture supplying the canonical credential.
+    """
+    root = tmp_path / ".wmo"
+
+    console, catalog = _setup(
+        root,
+        "q\n",
+        monkeypatch=monkeypatch,
+        options=ProviderSetupOptions(providers=("openai",)),
+    )
+
+    assert catalog is None
+    assert "Setup cancelled. Nothing was written." in console.output
+    assert not (root / "models.toml").exists()
+
+
 def test_noninteractive_setup_reports_every_missing_collection_and_role(tmp_path: Path) -> None:
     """One failure lists the complete remediation instead of serial missing prompts.
 
@@ -525,7 +644,7 @@ def test_rerunning_setup_preserves_unrelated_models_and_router_state(
         ),
     )
 
-    _, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\ny\n", monkeypatch=monkeypatch)
+    _, catalog = _setup(root, "2\n\n2,4\n\n1\n1\n1\n\ny\n", monkeypatch=monkeypatch)
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -720,6 +839,113 @@ def test_offline_roles_include_models_on_tinker_without_provider_requests(tmp_pa
     assert set(catalog.connections) == {"custom", "openai"}
     assert set(catalog.models) == {"chat", "embed"}
     assert "tinker/chat-id" in unstyle(console.output)
+
+
+def test_offline_roles_retain_assigned_tinker_alias_without_capabilities(tmp_path: Path) -> None:
+    """A current role may retain an unverified alias without provider access or record changes.
+
+    Args:
+        tmp_path: Temporary WMO root containing an assigned legacy Tinker alias.
+    """
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    embedding = ModelCapabilities(
+        supports_embeddings=True,
+        input_cost_per_million_tokens_usd=0.02,
+    )
+    original = ModelCatalog(
+        connections={
+            "tinker": ConnectionConfig(provider="tinker", api_key_env="TINKER_API_KEY"),
+            "openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY"),
+        },
+        models={
+            "legacy": ModelRecord(connection="tinker", model="tinker://sampling/run"),
+            "embed": ModelRecord(
+                connection="openai",
+                model="embed-id",
+                capabilities=embedding,
+            ),
+        },
+        roles=ModelRoles(world_model="legacy", judge="legacy", embedder="embed"),
+    )
+    write_model_catalog(root / "models.toml", original)
+    console = ScriptedConsole("1\n\n\n\n\n\n\ny\n")
+
+    saved = run_provider_setup(
+        root,
+        ProviderSetupOptions(),
+        non_interactive=False,
+        replace=False,
+        console=console,
+        lister=_UnavailableLister(),
+    )
+
+    assert saved == original
+    assert load_model_catalog(root / "models.toml") == original
+    printed = unstyle(console.output)
+    assert "tinker/tinker://sampling/run" in printed
+    assert "retain only: world_model, judge" in printed
+    assert "capabilities=unverified" in printed
+
+
+def test_offline_setup_preserves_exact_unverified_router_roles_without_revalidation(
+    tmp_path: Path,
+) -> None:
+    """Exact retained candidates persist without partial writes or capability invention.
+
+    Args:
+        tmp_path: Temporary WMO root containing complete build roles and legacy candidates.
+    """
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    chat = ModelCapabilities(
+        supports_completions=True,
+        supports_structured_output=True,
+        input_cost_per_million_tokens_usd=1.0,
+        output_cost_per_million_tokens_usd=4.0,
+        cached_input_cost_per_million_tokens_usd=0.0,
+        cache_write_cost_per_million_tokens_usd=0.0,
+    )
+    embedding = ModelCapabilities(
+        supports_embeddings=True,
+        input_cost_per_million_tokens_usd=0.02,
+    )
+    original = ModelCatalog(
+        connections={
+            "tinker": ConnectionConfig(provider="tinker", api_key_env="TINKER_API_KEY"),
+            "openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY"),
+        },
+        models={
+            "legacy-a": ModelRecord(connection="tinker", model="tinker://sampling/a"),
+            "legacy-b": ModelRecord(connection="tinker", model="tinker://sampling/b"),
+            "chat": ModelRecord(connection="openai", model="chat-id", capabilities=chat),
+            "embed": ModelRecord(
+                connection="openai",
+                model="embed-id",
+                capabilities=embedding,
+            ),
+        },
+        roles=ModelRoles(
+            candidates=("legacy-a", "legacy-b"),
+            incumbent="legacy-a",
+            world_model="chat",
+            judge="chat",
+            embedder="embed",
+        ),
+    )
+    write_model_catalog(root / "models.toml", original)
+
+    saved = run_provider_setup(
+        root,
+        ProviderSetupOptions(),
+        non_interactive=False,
+        replace=False,
+        console=ScriptedConsole("1\n\n\n\n\n\n\n\n\ny\n"),
+        lister=_UnavailableLister(),
+    )
+
+    assert saved == original
+    assert load_model_catalog(root / "models.toml") == original
 
 
 def test_role_flags_preselect_the_roles_the_picker_offers(

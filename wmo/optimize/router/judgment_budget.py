@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
@@ -58,23 +60,60 @@ def find_verified_judgment(
     Raises:
         JudgmentBudgetError: Matching evidence is duplicated or differs from frozen pins.
     """
-    matches = []
+    return find_verified_judgments(
+        project,
+        protocols_by_rollout={rollout_id: protocol},
+        rubric_id=rubric_id,
+        calibration_id=calibration_id,
+    ).get(rollout_id)
+
+
+def find_verified_judgments(
+    project: ProjectStore,
+    *,
+    protocols_by_rollout: Mapping[str, EvaluationProtocol],
+    rubric_id: str,
+    calibration_id: str,
+) -> dict[str, Judgment]:
+    """Index fully verified judgments for a set of exact plan-bound rollouts.
+
+    Args:
+        project: Project whose immutable evidence is being resumed.
+        protocols_by_rollout: Frozen protocol for each relevant rollout identity.
+        rubric_id: Approved rubric identity for the workflow.
+        calibration_id: Approved calibration identity for the workflow.
+
+    Returns:
+        Unique exact judgments keyed by relevant rollout identity.
+
+    Raises:
+        JudgmentBudgetError: Matching evidence is duplicated or differs from frozen pins.
+    """
+    matches: dict[str, Judgment] = {}
     for artifact_id in project.artifacts.list_ids():
         stored = project.artifacts.read(artifact_id)
         if stored.manifest.artifact_type != "judgment":
             continue
         judgment, _input = read_judgment(project.artifacts, artifact_id)
+        protocol = protocols_by_rollout.get(judgment.rollout_id)
         if (
-            judgment.rollout_id != rollout_id
+            protocol is None
             or judgment.rubric_id != rubric_id
             or judgment.calibration_id != calibration_id
         ):
             continue
-        _require_judgment(project, judgment, rollout_id, rubric_id, calibration_id, protocol)
-        matches.append(judgment)
-    if len(matches) > 1:
-        raise JudgmentBudgetError("multiple judgments bind the same rollout and review")
-    return matches[0] if matches else None
+        _require_judgment(
+            project,
+            judgment,
+            judgment.rollout_id,
+            rubric_id,
+            calibration_id,
+            protocol,
+        )
+        if judgment.rollout_id in matches:
+            raise JudgmentBudgetError("multiple judgments bind the same rollout and review")
+        matches[judgment.rollout_id] = judgment
+    return matches
 
 
 def read_dispatch_reservation(

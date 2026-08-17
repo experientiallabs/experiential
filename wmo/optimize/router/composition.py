@@ -80,6 +80,7 @@ from wmo.optimize.router.fit.workflow import (
 from wmo.optimize.router.judgment_budget import (
     JudgmentBudgetError,
     find_verified_judgment,
+    find_verified_judgments,
     persist_dispatch_reservation,
     read_dispatch_reservation,
 )
@@ -798,8 +799,8 @@ def _complete_cell_evidence(
         (item.task_id, item.candidate_alias, item.repeat): item.rollout_artifact_id
         for item in setup.observed_cells
     }
-    evidence = []
-    consumed = 0
+    bound_cells = []
+    protocols_by_rollout: dict[str, EvaluationProtocol] = {}
     for cell in cells:
         rollout_id = (
             cell.observed_rollout_id
@@ -818,14 +819,25 @@ def _complete_cell_evidence(
         protocol = (
             setup.production_protocol if cell.execution == "observed" else setup.simulation_protocol
         )
+        existing_protocol = protocols_by_rollout.setdefault(rollout_id, protocol)
+        if existing_protocol != protocol:
+            raise RouterCompositionError("one rollout is bound to conflicting evaluation protocols")
+        bound_cells.append((cell, rollout_id, protocol))
+    try:
+        judgments_by_rollout = find_verified_judgments(
+            project,
+            protocols_by_rollout=protocols_by_rollout,
+            rubric_id=review.rubric_id,
+            calibration_id=review.calibration_id,
+        )
+    except JudgmentBudgetError as exc:
+        raise RouterCompositionError(str(exc)) from exc
+
+    evidence = []
+    consumed = 0
+    for cell, rollout_id, protocol in bound_cells:
         try:
-            judgment = find_verified_judgment(
-                project,
-                rollout_id,
-                review.rubric_id,
-                review.calibration_id,
-                protocol,
-            )
+            judgment = judgments_by_rollout.get(rollout_id)
             receipt = read_dispatch_reservation(
                 project,
                 plan_input,
@@ -835,6 +847,16 @@ def _complete_cell_evidence(
                 review.calibration_id,
                 protocol,
             )
+            if judgment is None and receipt is not None:
+                judgment = find_verified_judgment(
+                    project,
+                    rollout_id,
+                    review.rubric_id,
+                    review.calibration_id,
+                    protocol,
+                )
+                if judgment is not None:
+                    judgments_by_rollout[rollout_id] = judgment
         except JudgmentBudgetError as exc:
             raise RouterCompositionError(str(exc)) from exc
         if judgment is not None or receipt is not None:
@@ -868,6 +890,7 @@ def _complete_cell_evidence(
                 calibration_artifact_id=review.calibration_id,
             )
             _persist_judgment(project, judgment)
+            judgments_by_rollout[rollout_id] = judgment
         rollout, _input = read_rollout(project.artifacts, rollout_id)
         evidence.append(
             EvaluationCellEvidence(

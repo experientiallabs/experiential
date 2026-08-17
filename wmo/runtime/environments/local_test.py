@@ -53,7 +53,7 @@ def test_local_process_environment_times_out_and_cleans_up(tmp_path: Path) -> No
     runtime = _runtime(
         tmp_path,
         limits=LocalProcessLimits(
-            request_timeout_seconds=0.05,
+            request_timeout_seconds=0.5,
             session_timeout_seconds=1.0,
             cleanup_timeout_seconds=1.0,
         ),
