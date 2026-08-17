@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -56,6 +56,7 @@ from wmo.simulation.engines.text.leases import TextCellLeaseStore
 from wmo.simulation.engines.text.simulator import (
     SimulationConfigurationError,
     SimulationContentionError,
+    SimulationResumeError,
     WorldModelSimulator,
 )
 from wmo.simulation.retrieval import (
@@ -658,7 +659,7 @@ def test_text_simulation_persists_separate_economics_and_resumes_without_duplica
     artifact_set = simulator.run(spec)
     rollout_id = artifact_set.artifact_ids[0]
     rollout = simulator._load_rollout(rollout_id)
-    resumed = simulator.run(spec)
+    resumed = simulator.run(spec.model_copy(update={"created_at": _TIME + timedelta(hours=1)}))
 
     assert rollout.candidate_economics.cost_usd == NumericMeasurement(
         value=0.2,
@@ -690,6 +691,34 @@ def test_text_simulation_persists_separate_economics_and_resumes_without_duplica
     assert retriever.estimate_calls == 1
     assert len(retriever.queries) == 1
     assert resumed.artifact_ids == artifact_set.artifact_ids
+    persisted_spec = SimulationSpec.model_validate_json(
+        store.read_bytes(spec.simulation_id, "simulation-spec.json")
+    )
+    assert persisted_spec.created_at == spec.created_at
+    assert persisted_spec == spec
+    assert persisted_spec != spec.model_copy(update={"created_at": _TIME + timedelta(hours=1)})
+
+    assert spec.world_model is not None
+    drifted_specs = (
+        spec.model_copy(update={"evaluation_plan_id": "different-plan"}),
+        spec.model_copy(update={"cell_ids": ("cell-b",)}),
+        spec.model_copy(
+            update={
+                "world_model": spec.world_model.model_copy(update={"prompt_version": "changed"})
+            }
+        ),
+        spec.model_copy(update={"maximum_steps": 3}),
+        spec.model_copy(update={"maximum_concurrency": 2}),
+        spec.model_copy(update={"maximum_cost_usd": 9.0}),
+        spec.model_copy(update={"code_revision": "changed-revision"}),
+    )
+    for drifted in drifted_specs:
+        with pytest.raises((SimulationConfigurationError, SimulationResumeError)):
+            simulator.run(drifted)
+    assert len(candidate_client.requests) == 1
+    assert len(world_client.requests) == 1
+    assert retriever.estimate_calls == 1
+    assert len(retriever.queries) == 1
 
 
 def test_persisted_rollout_redacts_generated_secrets_and_records_audit_count(
@@ -1318,9 +1347,9 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
     )
     spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
     selected, world_model, grounded_world_model = recovery._validate_spec_and_bindings(spec)
-    spec_input = recovery._persist_specification(spec)
+    canonical_spec, spec_input = recovery._persist_specification(spec)
     resolution, resolution_input, bindings = recovery._persist_resolution(
-        spec, spec_input, selected, world_model, grounded_world_model
+        canonical_spec, spec_input, selected, world_model, grounded_world_model
     )
     first_binding = bindings["cell-a"]
     holder = TextCellLeaseStore(store.project_directory, clock=lambda: _TIME)
@@ -1541,9 +1570,9 @@ def test_text_simulation_live_hung_claim_times_out_without_calls_or_result_artif
     )
     spec = _spec(plan_input, task_set_input, ("cell-a",), maximum_cost_usd=1.0)
     cells, world_model, grounded_world_model = simulator._validate_spec_and_bindings(spec)
-    spec_input = simulator._persist_specification(spec)
+    canonical_spec, spec_input = simulator._persist_specification(spec)
     resolution, resolution_input, bindings = simulator._persist_resolution(
-        spec, spec_input, cells, world_model, grounded_world_model
+        canonical_spec, spec_input, cells, world_model, grounded_world_model
     )
     binding = bindings[cell.cell_id]
     rollout_id = rollout_id_for_binding(binding)

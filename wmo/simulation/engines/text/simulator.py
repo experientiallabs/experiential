@@ -239,7 +239,7 @@ class WorldModelSimulator:
         """
         require_implemented_mode(spec, SimulationMode.WORLD_MODEL)
         cells, world_model, grounded_world_model = self._validate_spec_and_bindings(spec)
-        spec_input = self._persist_specification(spec)
+        spec, spec_input = self._persist_specification(spec)
         resolution, resolution_input, bindings = self._persist_resolution(
             spec,
             spec_input,
@@ -390,8 +390,18 @@ class WorldModelSimulator:
             cells.append(cell)
         return tuple(cells), world_model, grounded_world_model
 
-    def _persist_specification(self, spec: SimulationSpec) -> ArtifactInput:
-        """Atomically write or verify the immutable specification before rollout execution."""
+    def _persist_specification(self, spec: SimulationSpec) -> tuple[SimulationSpec, ArtifactInput]:
+        """Persist or adopt the canonical specification for timestamp-stable retries.
+
+        Args:
+            spec: Requested sparse simulation specification.
+
+        Returns:
+            Canonical specification and its manifest input.
+
+        Raises:
+            SimulationResumeError: Existing specification differs semantically.
+        """
         try:
             manifest = self._store.write_json(
                 artifact_id=spec.simulation_id,
@@ -399,7 +409,7 @@ class WorldModelSimulator:
                 envelope=spec,
                 files={_SPEC_FILE: spec},
             )
-            return artifact_input(manifest)
+            return spec, artifact_input(manifest)
         except ArtifactAlreadyExistsError as exc:
             stored = self._store.read(spec.simulation_id)
             if stored.manifest.artifact_type != "simulation-spec":
@@ -414,11 +424,11 @@ class WorldModelSimulator:
                 raise SimulationResumeError(
                     f"simulation specification {spec.simulation_id!r} cannot be read safely"
                 ) from exc
-            if persisted != spec:
+            if persisted.model_copy(update={"created_at": spec.created_at}) != spec:
                 raise SimulationResumeError(
                     f"simulation ID {spec.simulation_id!r} already names a different immutable spec"
                 ) from exc
-            return artifact_input(stored.manifest)
+            return persisted, artifact_input(stored.manifest)
 
     def _persist_resolution(
         self,
