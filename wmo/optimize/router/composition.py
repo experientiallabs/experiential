@@ -609,7 +609,12 @@ def _complete_cell_evidence(
     judge: Judge,
     maximum_judgments: int,
 ) -> tuple[tuple[EvaluationCellEvidence, ...], int]:
-    """Verify evidence and reserve each bounded judgment dispatch durably before calling it."""
+    """Verify evidence and reserve each bounded judgment dispatch durably before calling it.
+
+    A persisted reservation without a completed judgment marks an interrupted dispatch; the
+    judgment is dispatched again under that same consumed reservation, so a judge failure never
+    strands the project and never widens the finite judgment budget.
+    """
     rollouts_by_cell = {}
     for rollout_id in simulated_rollout_ids:
         rollout, _input = read_rollout(project.artifacts, rollout_id)
@@ -705,25 +710,22 @@ def _complete_cell_evidence(
         if consumed > maximum_judgments:
             raise RouterCompositionError("judgment dispatch budget exhausted")
         if judgment is None:
-            if receipt is not None:
-                raise RouterCompositionError(
-                    "reserved judgment dispatch has no completed judgment; retry is blocked"
-                )
-            if consumed >= maximum_judgments:
-                raise RouterCompositionError("judgment dispatch budget exhausted")
-            try:
-                persist_dispatch_reservation(
-                    project,
-                    plan_input,
-                    cell,
-                    rollout_id,
-                    review.rubric_id,
-                    review.calibration_id,
-                    protocol,
-                )
-            except JudgmentBudgetError as exc:
-                raise RouterCompositionError(str(exc)) from exc
-            consumed += 1
+            if receipt is None:
+                if consumed >= maximum_judgments:
+                    raise RouterCompositionError("judgment dispatch budget exhausted")
+                try:
+                    persist_dispatch_reservation(
+                        project,
+                        plan_input,
+                        cell,
+                        rollout_id,
+                        review.rubric_id,
+                        review.calibration_id,
+                        protocol,
+                    )
+                except JudgmentBudgetError as exc:
+                    raise RouterCompositionError(str(exc)) from exc
+                consumed += 1
             judgment = judge.judge_persisted(
                 project,
                 rollout_artifact_id=rollout_id,

@@ -1036,3 +1036,87 @@ def test_failed_rollouts_skip_judging_and_rerun_replays_after_partial_failure(
         len(simulator.world.requests),
         judge.calls,
     ) == dispatched
+
+
+def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
+    tmp_path: Path,
+) -> None:
+    """A crash between dispatch reservation and judgment persistence resumes on rerun.
+
+    Args:
+        tmp_path: Isolated project root for composed router artifacts.
+    """
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
+    _bind_completed_build(project, normalized, revision="test-revision")
+    simulator = _SimulatorFactory()
+    judge = _Judge()
+    judge.fail_on_call = 1
+    services = RouterWorkflowServices(
+        review_supplier=_ReviewSupplier(),
+        setup_supplier=_SetupSupplier(),
+        simulator_factory=simulator,
+        judge=judge,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _Catalog(
+                {
+                    "candidate-a": _snapshot("candidate-a"),
+                    "embedder": _snapshot("embedder"),
+                },
+                _Client(),
+            ),
+        ),
+    )
+    budget = RouterCompositionBudget(
+        maximum_simulation_cost_usd=10.0,
+        maximum_judgments=100,
+    )
+    with pytest.raises(RuntimeError, match="simulated judgment dispatch interruption"):
+        compose_router(
+            project,
+            normalized,
+            services=services,
+            budget=budget,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+
+    def _artifact_ids(artifact_type: str) -> tuple[str, ...]:
+        """Return persisted artifact IDs of one exact manifest type.
+
+        Args:
+            artifact_type: Exact immutable manifest artifact type.
+
+        Returns:
+            Matching persisted artifact identifiers.
+        """
+        return tuple(
+            artifact_id
+            for artifact_id in project.artifacts.list_ids()
+            if project.artifacts.read(artifact_id).manifest.artifact_type == artifact_type
+        )
+
+    orphaned = _artifact_ids("judgment-dispatch")
+    assert len(orphaned) == 1
+    assert not _artifact_ids("judgment")
+
+    judge.fail_on_call = None
+    result = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=datetime(2026, 8, 14, tzinfo=UTC),
+        code_revision="test-revision",
+    )
+
+    scored_cells = tuple(cell for cell in result.plan.cells if cell.purpose in {"fit", "held_out"})
+    receipts = _artifact_ids("judgment-dispatch")
+    assert set(orphaned) <= set(receipts)
+    assert len(receipts) == len(scored_cells)
+    assert len(_artifact_ids("judgment")) == len(scored_cells)
+    assert judge.calls == len(scored_cells) + 1
