@@ -255,7 +255,14 @@ class WorldModelSimulator:
         completed = self._load_completed_rollouts(cells, bindings, resolution_input)
         pending = tuple(cell for cell in cells if cell.cell_id not in completed)
 
-        report(self._progress, "evaluation cells", completed=len(completed), total=len(cells))
+        detail = _purpose_detail(cells)
+        report(
+            self._progress,
+            "evaluation cells",
+            completed=len(completed),
+            total=len(cells),
+            detail=detail,
+        )
         for cell in pending:
             completed[cell.cell_id] = self._execute_and_persist_cell(
                 spec,
@@ -267,7 +274,13 @@ class WorldModelSimulator:
                 resolution_input,
                 bindings,
             )
-            report(self._progress, "evaluation cells", completed=len(completed), total=len(cells))
+            report(
+                self._progress,
+                "evaluation cells",
+                completed=len(completed),
+                total=len(cells),
+                detail=detail,
+            )
         ordered_rollouts = tuple(completed[cell.cell_id] for cell in cells)
         return persist_artifact_set(
             store=self._store,
@@ -988,3 +1001,18 @@ class WorldModelSimulator:
                 f"stored rollout {rollout.artifact_id!r} does not match the requested "
                 "simulation cell"
             )
+
+
+def _purpose_detail(cells: Sequence[EvaluationCell]) -> str | None:
+    """Name the one evaluation purpose shared by every selected cell.
+
+    Args:
+        cells: Exact evaluation-plan cells selected by the running specification.
+
+    Returns:
+        The shared purpose with underscores spelled as hyphens, or ``None`` when purposes differ.
+    """
+    purposes = {cell.purpose for cell in cells}
+    if len(purposes) != 1:
+        return None
+    return purposes.pop().replace("_", "-")

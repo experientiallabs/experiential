@@ -51,6 +51,17 @@ class ProgressDisplay:
         if self._live is not None:
             self._live.stop()
 
+    def abort(self) -> None:
+        """Print the interrupted stage as unfinished and release the in-place line."""
+        if self._current is not None:
+            if self._live is not None:
+                self._live.console.print(
+                    Text(f"{_ROW_INDENT}[ ] {_label(self._current)}", style="red")
+                )
+            self._current = None
+        if self._live is not None:
+            self._live.stop()
+
     def observe(self, event: ProgressEvent) -> None:
         """Render one truthful stage update.
 
@@ -90,8 +101,10 @@ def progress_display(console: Console) -> Iterator[ProgressHook]:
     display.start()
     try:
         yield display.observe
-    finally:
-        display.stop()
+    except BaseException:
+        display.abort()
+        raise
+    display.stop()
 
 
 def qualified(hook: ProgressHook | None, detail: str) -> ProgressHook | None:

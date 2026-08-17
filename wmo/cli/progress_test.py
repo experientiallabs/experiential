@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 
+import pytest
 from rich.console import Console
 
 from wmo.cli.progress import progress_display, qualified
@@ -57,6 +58,30 @@ def test_interactive_repeated_stage_updates_stay_on_one_row() -> None:
         observe(ProgressEvent(stage="judgments", completed=3, total=3, detail="fit"))
     output = buffer.getvalue()
     assert output.count("[x] judgments (fit)") == 1
+
+
+def test_interactive_failure_never_marks_the_active_stage_finished() -> None:
+    """A raising command leaves its interrupted stage marked unfinished, not completed."""
+    console, buffer = _plain_console(interactive=True)
+    with pytest.raises(RuntimeError, match="boom"):
+        with progress_display(console) as observe:
+            observe(ProgressEvent(stage="embeddings", completed=4, total=4))
+            observe(ProgressEvent(stage="grounded model"))
+            raise RuntimeError("boom")
+    output = buffer.getvalue()
+    assert "[x] embeddings 4/4" in output
+    assert "[ ] grounded model" in output
+    assert "[x] grounded model" not in output
+
+
+def test_noninteractive_failure_adds_no_extra_lines() -> None:
+    """A raising command leaves the appended stream exactly as already written."""
+    console, buffer = _plain_console(interactive=False)
+    with pytest.raises(RuntimeError, match="boom"):
+        with progress_display(console) as observe:
+            observe(ProgressEvent(stage="grounded model"))
+            raise RuntimeError("boom")
+    assert buffer.getvalue() == "  . grounded model\n"
 
 
 def test_qualified_attaches_a_detail_and_preserves_counts() -> None:

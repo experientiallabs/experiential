@@ -293,6 +293,7 @@ def compose_router(
         spec,
         services.simulator_factory,
         progress=progress,
+        progress_detail="fit",
     )
     fit_spend = _verified_simulation_spend(project, fit_set)
     if fit_spend > budget.maximum_simulation_cost_usd:
@@ -360,6 +361,7 @@ def compose_router(
         held_spec,
         services.simulator_factory,
         progress=progress,
+        progress_detail="held-out",
     )
     held_out_spend = _verified_simulation_spend(project, held_set)
     if math.fsum((fit_spend, held_out_spend)) > budget.maximum_simulation_cost_usd:
@@ -434,8 +436,24 @@ def _run_or_load_simulation(
     simulator_factory: SimulatorFactory,
     *,
     progress: ProgressHook | None = None,
+    progress_detail: str | None = None,
 ) -> SimulationArtifactSet:
-    """Load an exactly completed simulation set without invoking its simulator again."""
+    """Load an exactly completed simulation set without invoking its simulator again.
+
+    Args:
+        project: Project store holding completed simulation artifacts.
+        plan: Frozen evaluation plan bound to the injected simulator.
+        spec: Phase-scoped simulation specification to load or run.
+        simulator_factory: Injected constructor invoked only when no completed set exists.
+        progress: Optional observer of exact replayed evaluation-cell counts.
+        progress_detail: Phase qualifier attached to replayed evaluation-cell counts.
+
+    Returns:
+        Immutable index of one rollout artifact for every selected cell.
+
+    Raises:
+        RouterCompositionError: A stored artifact set is ambiguous, drifted, or mismatched.
+    """
     matches = []
     for artifact_id in project.artifacts.list_ids():
         stored = project.artifacts.read(artifact_id)
@@ -475,7 +493,13 @@ def _run_or_load_simulation(
         raise RouterCompositionError("multiple completed artifact sets name one simulation phase")
     if matches:
         cell_count = len(matches[0].artifact_ids)
-        report(progress, "evaluation cells", completed=cell_count, total=cell_count)
+        report(
+            progress,
+            "evaluation cells",
+            completed=cell_count,
+            total=cell_count,
+            detail=progress_detail,
+        )
         return matches[0]
     return simulator_factory(project, plan).run(spec)
 
