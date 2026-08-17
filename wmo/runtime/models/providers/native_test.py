@@ -133,7 +133,7 @@ def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity()
 
 def test_openai_reasoning_model_declarations_shape_the_wire_payload() -> None:
     """A no-temperature declaration drops the parameter and a pinned effort is sent verbatim."""
-    transport = _ScriptedTransport(
+    transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,

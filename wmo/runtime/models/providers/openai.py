@@ -28,8 +28,7 @@ from wmo.common.models import (
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
 from wmo.runtime.models.providers.errors import ProviderResponseError
 from wmo.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
-from wmo.runtime.models.providers.retry import RetryPolicy
-from wmo.runtime.models.providers.transport import JsonHttpTransport
+from wmo.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
