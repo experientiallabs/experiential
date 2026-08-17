@@ -11,7 +11,11 @@ from wmo.common.models import ModelSnapshot, OperationEconomics
 
 
 class DimensionJudgment(ContractModel):
-    """A judge's raw and calibrated assessment of one rubric axis."""
+    """A judge's raw and calibrated assessment of one rubric axis.
+
+    Retired citation-era fields such as ``feedback`` and ``evidence_span_ids``
+    are rejected. Rebuild the judgment under the current rationale-only contract.
+    """
 
     dimension_id: ArtifactId
     raw_score: int = Field(ge=0)

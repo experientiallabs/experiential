@@ -98,6 +98,10 @@ def test_dimension_judgment_accepts_missing_null_and_unbounded_rationale() -> No
     assert missing.rationale is None
     assert explicit_null.rationale is None
     assert unbounded.rationale == long_rationale
+
+
+def test_dimension_judgment_rejects_citation_era_fields() -> None:
+    """Retired feedback and evidence_span_ids fail closed. Rebuild the judgment."""
     with pytest.raises(ValidationError, match="extra"):
         DimensionJudgment.model_validate(
             {

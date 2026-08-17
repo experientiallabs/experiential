@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -524,3 +525,16 @@ def test_judge_response_schema_is_portable_and_has_no_citation_or_length_constra
         ).rationale
         is None
     )
+
+
+def test_raw_dimension_judgment_rejects_citation_era_fields() -> None:
+    """Retired feedback and evidence_span_ids fail closed on provider output."""
+    with pytest.raises(ValidationError, match="extra"):
+        RawDimensionJudgment.model_validate(
+            {
+                "dimension_id": "task-success",
+                "raw_score": 3,
+                "feedback": "Retired citation-era field.",
+                "evidence_span_ids": ["span-1"],
+            }
+        )

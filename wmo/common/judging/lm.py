@@ -44,7 +44,11 @@ class JudgmentError(ValueError):
 
 
 class RawDimensionJudgment(ContractModel):
-    """Strict structured score emitted for one rubric dimension by an LM judge."""
+    """Strict structured score emitted for one rubric dimension by an LM judge.
+
+    Retired citation-era fields such as ``feedback`` and ``evidence_span_ids``
+    are rejected. Rebuild or re-run the judge under the current schema.
+    """
 
     dimension_id: ArtifactId
     raw_score: int = Field(ge=0)
