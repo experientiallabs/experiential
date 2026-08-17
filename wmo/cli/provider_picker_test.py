@@ -67,7 +67,6 @@ def _prepare(
     environment: dict[str, str],
     existing_connections: tuple[ProviderConnection, ...] = (),
     existing_aliases: tuple[str, ...] = (),
-    advanced_credentials: bool = False,
 ) -> (
     tuple[tuple[provider_picker.PreparedEndpoint, ...], tuple[provider_picker.AvailableModel, ...]]
     | None
@@ -81,12 +80,11 @@ def _prepare(
         environment: Mutable process environment consulted for credentials.
         existing_connections: Connections already configured in the catalog.
         existing_aliases: Aliases already configured in the catalog.
-        advanced_credentials: Whether the advanced credential path is active.
 
     Returns:
         The prepared endpoints and configurable models, or ``None`` to reselect providers.
     """
-    session = SetupSession(providers=providers, advanced_credentials=advanced_credentials)
+    session = SetupSession(providers=providers)
     return prepare_providers(
         session,
         existing_connections=existing_connections,
@@ -115,28 +113,7 @@ def test_provider_screen_selects_several_providers_in_one_session() -> None:
         SetupSession(), console=console, environment={"OPENAI_API_KEY": "secret-key"}
     )
 
-    assert selection == (("openai", "anthropic", "openrouter"), False, False)
-
-
-def test_provider_screen_keeps_prior_answers_and_reports_advanced_choices() -> None:
-    """Reentering the screen preselects prior providers and both advanced paths."""
-    console = ScriptedConsole("8,9\n\n")
-    session = SetupSession(providers=("openai",))
-
-    selection = select_providers(session, console=console, environment={})
-
-    assert selection == (("openai",), True, True)
-    assert "OPENAI_API_KEY needs a value" in console.output
-
-
-def test_provider_screen_refuses_an_advanced_only_selection() -> None:
-    """Advanced rows configure providers, so at least one provider is still required."""
-    console = ScriptedConsole("8\n\n1\n\n")
-
-    selection = select_providers(SetupSession(), console=console, environment={})
-
-    assert selection == (("openai",), True, False)
-    assert "Select at least one provider." in console.output
+    assert selection == (("openai", "anthropic", "openrouter"), False)
 
 
 def test_cancelling_the_provider_screen_returns_no_selection() -> None:
@@ -151,7 +128,7 @@ def test_keyboard_provider_list_selects_without_typed_numbers() -> None:
             PickerKey.ENTER,
             PickerKey.DOWN,
             PickerKey.ENTER,
-            *(PickerKey.DOWN for _ in range(8)),
+            *(PickerKey.DOWN for _ in range(6)),
             PickerKey.ENTER,
         )
     )
@@ -164,7 +141,7 @@ def test_keyboard_provider_list_selects_without_typed_numbers() -> None:
         read_key=lambda: next(keys),
     )
 
-    assert selection == (("openai", "anthropic"), False, False)
+    assert selection == (("openai", "anthropic"), False)
     assert "> [x] OpenAI" in console.output
     assert "Complete" in console.output
     assert "Numbers or ranges" not in console.output
@@ -173,7 +150,7 @@ def test_keyboard_provider_list_selects_without_typed_numbers() -> None:
 def test_keyboard_provider_list_preserves_current_selection_and_cancel() -> None:
     """Reentering the keyboard list keeps prior marks, and q still cancels."""
     console = ScriptedConsole("")
-    session = SetupSession(providers=("openai",), advanced_credentials=True)
+    session = SetupSession(providers=("openai",))
 
     cancelled = select_providers(
         session,
@@ -184,7 +161,6 @@ def test_keyboard_provider_list_preserves_current_selection_and_cancel() -> None
 
     assert cancelled is None
     assert "[x] OpenAI" in console.output
-    assert "[x] Advanced: choose credential environment-variable names" in console.output
 
 
 def test_resolve_setup_providers_orders_and_rejects_bad_values() -> None:
@@ -204,10 +180,9 @@ def test_explicit_azure_and_bedrock_keep_manual_model_declaration() -> None:
     """Named Azure and Bedrock selections still require hand-declared model IDs."""
     assert explicit_provider_selection(("azure", "bedrock")) == (
         ("azure", "bedrock"),
-        False,
         True,
     )
-    assert explicit_provider_selection(("openai",)) == (("openai",), False, False)
+    assert explicit_provider_selection(("openai",)) == (("openai",), False)
 
 
 def test_canonical_environment_credential_is_used_without_any_prompt() -> None:
@@ -486,25 +461,6 @@ def test_an_identical_configured_connection_is_reused_instead_of_duplicated() ->
     assert models[0].connection == "primary"
 
 
-def test_advanced_path_can_name_the_credential_environment_variable() -> None:
-    """The advanced path still allows an explicit credential variable name."""
-    console = ScriptedConsole("TEAM_OPENAI_API_KEY\n")
-    lister = _FakeLister({"openai": [(_LUNA,)]})
-
-    prepared = _prepare(
-        console,
-        providers=("openai",),
-        lister=lister,
-        environment={"TEAM_OPENAI_API_KEY": "team-secret"},
-        advanced_credentials=True,
-    )
-
-    assert prepared is not None
-    endpoints, _ = prepared
-    assert endpoints[0].connection.api_key_env == "TEAM_OPENAI_API_KEY"
-    assert lister.requests[0].api_key == "team-secret"
-
-
 def test_openai_compatible_endpoint_asks_only_for_its_base_url() -> None:
     """A compatible endpoint needs an explicit base URL and nothing else by hand."""
     console = ScriptedConsole("https://models.example.test/v1\n")
@@ -596,7 +552,7 @@ def test_azure_and_bedrock_force_explicit_manual_model_declaration() -> None:
 
     selection = select_providers(SetupSession(), console=console, environment={})
 
-    assert selection == (("azure", "bedrock"), False, True)
+    assert selection == (("azure", "bedrock"), True)
     assert "deployment IDs are declared manually" in console.output
     assert "AWS credential chain" in console.output
 
