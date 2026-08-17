@@ -361,6 +361,43 @@ def _event(raw: PickerKey | PickerEvent) -> PickerEvent:
     return raw if isinstance(raw, PickerEvent) else PickerEvent(raw)
 
 
+def _utf8_length(lead: int) -> int:
+    """Return the byte length of one UTF-8 sequence, judged from its lead byte.
+
+    Args:
+        lead: First byte of the sequence.
+
+    Returns:
+        The total sequence length, or 1 for ASCII and invalid lead bytes.
+    """
+    if lead & 0b1110_0000 == 0b1100_0000:
+        return 2
+    if lead & 0b1111_0000 == 0b1110_0000:
+        return 3
+    if lead & 0b1111_1000 == 0b1111_0000:
+        return 4
+    return 1
+
+
+def _completed_utf8(fd: int, first: bytes) -> bytes:
+    """Read the continuation bytes of one UTF-8 sequence so typed text survives decoding.
+
+    Args:
+        fd: Raw terminal file descriptor already configured for immediate input.
+        first: Lead byte already read from the terminal.
+
+    Returns:
+        The whole sequence, or what arrived in time when the terminal stops early.
+    """
+    data = first
+    for _ in range(_utf8_length(first[0]) - 1):
+        readable, _, _ = select.select([fd], [], [], 0.05)
+        if not readable:
+            break
+        data += os.read(fd, 1)
+    return data
+
+
 def _read_terminal_key_from_fd(fd: int) -> PickerEvent:
     """Read one key sequence without passing through a buffered text stream.
 
@@ -372,7 +409,7 @@ def _read_terminal_key_from_fd(fd: int) -> PickerEvent:
     """
     first = os.read(fd, 1)
     if first != b"\x1b":
-        return interpret_key_bytes(first)
+        return interpret_key_bytes(_completed_utf8(fd, first))
     readable, _, _ = select.select([fd], [], [], 0.05)
     if not readable:
         return PickerEvent(PickerKey.ESCAPE)

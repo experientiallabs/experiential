@@ -328,6 +328,8 @@ def _assert_single_region(run: TerminalRun, *, title: str, rows: tuple[str, ...]
         (b"q", PickerEvent(PickerKey.TEXT, "q")),
         (b"/", PickerEvent(PickerKey.TEXT, "/")),
         (b"x", PickerEvent(PickerKey.TEXT, "x")),
+        ("\u00e9".encode(), PickerEvent(PickerKey.TEXT, "\u00e9")),
+        ("\u4e16".encode(), PickerEvent(PickerKey.TEXT, "\u4e16")),
         (b"\x00", PickerEvent(PickerKey.IGNORE)),
         (b"\xff", PickerEvent(PickerKey.IGNORE)),
     ],
@@ -527,6 +529,34 @@ def test_a_single_select_search_narrows_a_huge_catalog_on_a_terminal(
     assert "RESULT:model-39|None" in run.transcript
     assert "Search: gpt-39_" in run.transcript
     assert "Enter confirms the focused match" in run.transcript
+
+
+def test_a_search_accepts_multibyte_characters_on_a_terminal(
+    python_terminal_child: Callable[..., TerminalRun],
+) -> None:
+    """A typed non-ASCII character reaches the query and narrows the rows.
+
+    Args:
+        python_terminal_child: Runner for one inline script under a pseudo-terminal.
+    """
+    script = _picker_script(
+        "result = choose_one(\n"
+        "    console,\n"
+        '    title="Judge model",\n'
+        "    options=(\n"
+        '        PickerOption(value="modele", label="mod\\u00e8le (openrouter/mod\\u00e8le)"),\n'
+        '        PickerOption(value="plain", label="plain (openai/gpt-4)"),\n'
+        "    ),\n"
+        ")"
+    )
+
+    run = python_terminal_child(
+        script,
+        steps=[("Judge model", "/mod\u00e8le"), (None, _ENTER)],
+    )
+
+    assert "RESULT:modele|None" in run.transcript
+    assert "Search: mod\u00e8le_" in run.transcript
 
 
 def test_a_multi_select_search_selects_a_match_and_submits_on_a_terminal(
