@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable
 
-from wmo.common.core.artifacts import Sha256, canonical_json_bytes
+from wmo.common.core.artifacts import Sha256, canonical_jsonl_bytes, sha256_bytes
 from wmo.common.core.locks import file_write_lock
-from wmo.runtime.router.journal import (
-    RuntimeInteractionJournal,
-    RuntimeJournalError,
-    RuntimeJournalEvent,
-)
+from wmo.runtime.router.journal import RuntimeInteractionJournal, RuntimeJournalError
 
 
 def commit_runtime_journal_prefix[ResultT](
@@ -44,24 +39,9 @@ def commit_runtime_journal_prefix[ResultT](
         if (
             not events
             or events[-1].ordinal != last_ordinal
-            or _events_sha256(events) != prefix_sha256
+            or sha256_bytes(canonical_jsonl_bytes(events)) != prefix_sha256
         ):
             raise RuntimeJournalError(
                 "runtime journal changed before the approved prefix was accepted"
             )
         return commit()
-
-
-def _events_sha256(events: tuple[RuntimeJournalEvent, ...]) -> str:
-    """Return the canonical newline-framed digest of validated journal events.
-
-    Args:
-        events: Ordered journal events read under the append lock.
-
-    Returns:
-        SHA-256 digest matching the runtime snapshot prefix contract.
-    """
-    payload = b"\n".join(canonical_json_bytes(event) for event in events)
-    if payload:
-        payload += b"\n"
-    return hashlib.sha256(payload, usedforsecurity=False).hexdigest()

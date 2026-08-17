@@ -16,7 +16,7 @@ from wmo.common.models.discovery import DiscoveredModel
 from wmo.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, ANTHROPIC_VERSION
 from wmo.runtime.models.providers.gemini import GEMINI_BASE_URL
 from wmo.runtime.models.providers.openai import OPENAI_BASE_URL
-from wmo.runtime.models.providers.openrouter import (
+from wmo.runtime.models.providers.openai_compatible import (
     OPENROUTER_BASE_URL,
     OPENROUTER_REFERER,
     OPENROUTER_TITLE,

@@ -12,8 +12,10 @@ from wmo.runtime.models.providers.listing import (
     ProviderModelLister,
 )
 from wmo.runtime.models.providers.openai import OpenAIClient
-from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleClient
-from wmo.runtime.models.providers.openrouter import OpenRouterClient
+from wmo.runtime.models.providers.openai_compatible import (
+    OpenAICompatibleClient,
+    OpenRouterClient,
+)
 from wmo.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
     TinkerSample,

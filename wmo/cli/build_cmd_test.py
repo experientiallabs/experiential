@@ -342,6 +342,88 @@ def _fake_runtime_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
 
 
+def test_first_build_accepts_repeatable_provider_flags_and_replays_without_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exact --provider values skip the opening list and a replay does not reopen setup.
+
+    Args:
+        monkeypatch: Pytest patch fixture supplying a terminal, credential, and listing seam.
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    lister = _SetupLister()
+    monkeypatch.setattr("wmo.cli.build_cmd.can_prompt", lambda _console: True)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setattr("wmo.cli.provider_setup.HttpProviderModelLister", lambda: lister)
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            str(source),
+            "--root",
+            str(root),
+            "--provider",
+            "openai",
+        ],
+        input="1,3\n\n1\n1\n1\ny\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert lister.requests == ["openai"]
+    printed = unstyle(result.output)
+    assert "Select the providers you want to use" not in printed
+    assert "openai-secret" not in printed
+    saved = load_model_catalog(root / "models.toml")
+    assert saved.connections["openai"].api_key_env == "OPENAI_API_KEY"
+    assert saved.roles.world_model == "gpt-5-6-luna"
+
+    replay = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+
+    assert replay.exit_code == 0, replay.output
+    assert lister.requests == ["openai"]
+    assert "Select the providers you want to use" not in unstyle(replay.output)
+    assert "Model setup is required" not in unstyle(replay.output)
+
+
+def test_first_build_rejects_bad_provider_flags_before_any_write(tmp_path: Path) -> None:
+    """Unsupported or duplicate --provider values fail before project or catalog writes.
+
+    Args:
+        tmp_path: Temporary root without model configuration.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            str(source),
+            "--root",
+            str(root),
+            "--no-interactive",
+            "--provider",
+            "openai",
+            "--provider",
+            "not-a-provider",
+            "--provider",
+            "openai",
+        ],
+    )
+
+    assert result.exit_code == 2
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert "unsupported --provider value 'not-a-provider'" in output
+    assert "duplicate --provider value 'openai'" in output
+    assert not root.exists()
+
+
 def test_first_build_configures_providers_and_models_through_the_picker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -983,6 +1065,7 @@ def test_build_help_describes_the_completed_grounded_artifact() -> None:
     assert "Build a reusable grounded world model from local trace evidence." in unstyle(
         result.output
     )
+    assert "--provider" in unstyle(result.output)
 
 
 _TURNS = (

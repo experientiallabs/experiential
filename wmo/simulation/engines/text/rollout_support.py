@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from collections.abc import Sequence
+from datetime import datetime
 from typing import cast
 
 from wmo.common.core.artifacts import (
     FailureAttribution,
     FailureCode,
     StructuredFailure,
-    canonical_json_bytes,
 )
 from wmo.common.models import NumericMeasurement, OperationEconomics
 from wmo.common.rollouts import RolloutArtifact, RolloutEventKind, RolloutSpan
@@ -154,44 +153,3 @@ def orchestration_economics(duration_seconds: float) -> OperationEconomics:
     return OperationEconomics(
         latency_seconds=NumericMeasurement(value=duration_seconds, provenance="observed")
     )
-
-
-def timestamp(clock: Callable[[], datetime], *, not_before: datetime | None = None) -> datetime:
-    """Return an aware timestamp and prevent a deterministic test clock from moving backwards.
-
-    Args:
-        clock: Time source expected to return an aware UTC-comparable datetime.
-        not_before: Optional prior event time this timestamp may not precede.
-
-    Returns:
-        The current clock value, or ``not_before`` when the clock moved backwards.
-
-    Raises:
-        ValueError: The clock returns a naive datetime.
-    """
-    value = clock()
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("text simulation clock must return timezone-aware datetimes")
-    if not_before is not None and value < not_before:
-        return not_before
-    return value
-
-
-def utc_now() -> datetime:
-    """Return a timezone-aware default timestamp without importing provider state."""
-    return datetime.now(UTC)
-
-
-def jsonl_bytes(records: Sequence[Mapping[str, object]]) -> bytes:
-    """Render a deterministic JSONL file from small internal artifact-index records.
-
-    Args:
-        records: JSON-safe records in their persisted artifact-index order.
-
-    Returns:
-        UTF-8 JSONL bytes, including a trailing newline when records are present.
-    """
-    payload = b"\n".join(
-        canonical_json_bytes(cast(dict[str, object], record)) for record in records
-    )
-    return payload + (b"\n" if payload else b"")

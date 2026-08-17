@@ -14,8 +14,6 @@ from wmo.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
-    NumericMeasurement,
-    OperationEconomics,
     ToolCall,
     Usage,
 )
@@ -204,21 +202,12 @@ class TinkerSamplingClient:
         """
         started_at = time.monotonic()
         sample = self._sampler.sample(request)
-        model = (
-            self._model.model_copy(update={"model_id": sample.served_model_id})
-            if sample.served_model_id
-            else self._model
-        )
-        return ModelResponse(
+        return ModelResponse.completed(
             output=sample.output,
-            model=model,
-            economics=OperationEconomics(
-                usage=sample.usage,
-                latency_seconds=NumericMeasurement(
-                    value=time.monotonic() - started_at,
-                    provenance="observed",
-                ),
-            ),
+            configured_model=self._model,
+            served_model_id=sample.served_model_id,
+            usage=sample.usage,
+            latency_seconds=time.monotonic() - started_at,
         )
 
 

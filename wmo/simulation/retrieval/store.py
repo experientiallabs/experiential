@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from wmo.common.core.artifacts import JsonValue, stable_id
+from wmo.common.core.artifacts import JsonValue, envelope_matches_manifest, stable_id
 from wmo.common.project import (
     ArtifactCorruptionError,
     ArtifactManifest,
@@ -61,21 +61,7 @@ def load_rag_index(store: ArtifactStore, rag_id: str) -> LoadedRAGIndex:
         raise ArtifactCorruptionError(
             f"RAG envelope ID {index.rag_id} does not match artifact {rag_id}"
         )
-    manifest_identity = (
-        stored.manifest.schema_version,
-        stored.manifest.created_at,
-        stored.manifest.inputs,
-        stored.manifest.code_revision,
-        stored.manifest.source,
-    )
-    envelope_identity = (
-        index.schema_version,
-        index.created_at,
-        index.inputs,
-        index.code_revision,
-        index.source,
-    )
-    if manifest_identity != envelope_identity:
+    if not envelope_matches_manifest(index, stored.manifest):
         raise ArtifactCorruptionError(f"RAG index {rag_id} differs from its artifact manifest")
     transitions_payload = store.read_bytes(rag_id, index.transitions_path)
     vectors_payload = store.read_bytes(rag_id, index.vectors_path)

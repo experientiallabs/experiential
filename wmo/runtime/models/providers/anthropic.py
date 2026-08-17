@@ -2,39 +2,35 @@
 
 from __future__ import annotations
 
-import time
 from typing import Literal
-
-from pydantic import JsonValue
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     ModelCapabilities,
-    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
-    NumericMeasurement,
-    OperationEconomics,
     ToolCall,
     ToolChoice,
     Usage,
 )
-from wmo.runtime.models.providers.errors import ProviderResponseError
-from wmo.runtime.models.providers.openai_compatible import (
-    DEFAULT_RETRY_POLICY,
-    DEFAULT_TIMEOUT_SECONDS,
+from wmo.runtime.models.providers.base import (
+    DEFAULT_MAXIMUM_OUTPUT_TOKENS,
+    ProviderHttpClient,
 )
-from wmo.runtime.models.providers.request import post_json
-from wmo.runtime.models.providers.retry import RetryPolicy
+from wmo.runtime.models.providers.errors import (
+    ProviderResponseError,
+    require_array,
+    require_integer,
+    require_object,
+    require_string,
+)
 from wmo.runtime.models.providers.sampling import include_temperature
-from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_MAXIMUM_OUTPUT_TOKENS = 4096
 
 
 def anthropic_messages_request(
@@ -109,8 +105,8 @@ def anthropic_messages_response(
     """
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
-    for index, value in enumerate(_array(payload.get("content"), "content")):
-        block = _object(value, f"content[{index}]")
+    for index, value in enumerate(require_array(payload.get("content"), "Anthropic content")):
+        block = require_object(value, f"Anthropic content[{index}]")
         block_type = block.get("type")
         if block_type == "text":
             text = block.get("text")
@@ -128,82 +124,42 @@ def anthropic_messages_response(
         output = AssistantAction(content=content, tool_calls=tuple(tool_calls))
     except ValueError as exc:
         raise ProviderResponseError("Anthropic response has no text or tool call") from exc
-    model_id = payload.get("model")
-    model = (
-        configured_model.model_copy(update={"model_id": model_id})
-        if isinstance(model_id, str) and model_id
-        else configured_model
-    )
-    return ModelResponse(
+    return ModelResponse.completed(
         output=output,
-        model=model,
-        economics=OperationEconomics(
-            usage=_anthropic_usage(payload),
-            latency_seconds=NumericMeasurement(value=latency_seconds, provenance="observed"),
-        ),
-        finish_reason=(
-            ModelFinishReason.LENGTH
-            if payload.get("stop_reason") == "max_tokens"
-            else ModelFinishReason.COMPLETED
-        ),
+        configured_model=configured_model,
+        served_model_id=payload.get("model"),
+        usage=_anthropic_usage(payload),
+        latency_seconds=latency_seconds,
+        hit_length_limit=payload.get("stop_reason") == "max_tokens",
     )
 
 
-class AnthropicClient:
+class AnthropicClient(ProviderHttpClient):
     """Calls one Anthropic Messages model, which intentionally has no embedding method."""
 
-    def __init__(
-        self,
-        *,
-        model: ModelSnapshot,
-        api_key: str,
-        transport: JsonHttpTransport | None = None,
-        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
-        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-        base_url: str = ANTHROPIC_BASE_URL,
-        capabilities: ModelCapabilities | None = None,
-    ) -> None:
-        """Build one explicit Anthropic Messages connection."""
-        if not api_key:
-            raise ValueError("Anthropic clients require a non-empty API key")
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
-        self._model = model
-        self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
-        self._transport = transport or HttpxJsonTransport()
-        self._retry_policy = retry_policy
-        self._timeout_seconds = timeout_seconds
-        self._capabilities = capabilities
+    provider = "anthropic"
+    endpoint_class = "messages"
 
-    def complete(self, request: ModelRequest) -> ModelResponse:
-        """Complete one native Messages request without OpenAI conversion.
+    def _headers(self) -> dict[str, str]:
+        """Build native Anthropic Messages headers with the versioned API key scheme."""
+        return {
+            "x-api-key": self._api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
 
-        Args:
-            request: Visible messages, tool schemas, and sampling controls to send.
+    def _completion_path(self) -> str:
+        """Return the native Messages route."""
+        return "messages"
 
-        Returns:
-            The typed non-streaming model response with observed request economics.
-        """
-        started_at = time.monotonic()
-        response = post_json(
-            self._transport,
-            f"{self._base_url}/messages",
-            headers={
-                "x-api-key": self._api_key,
-                "anthropic-version": ANTHROPIC_VERSION,
-                "content-type": "application/json",
-            },
-            payload=anthropic_messages_request(self._model.model_id, request, self._capabilities),
-            timeout_seconds=self._timeout_seconds,
-            retry_policy=self._retry_policy,
-            provider="anthropic",
-            endpoint_class="messages",
-        )
+    def _build_request(self, request: ModelRequest) -> JsonObject:
+        """Convert one typed request into a native Messages payload."""
+        return anthropic_messages_request(self._model.model_id, request, self._capabilities)
+
+    def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
+        """Convert one completed Messages payload into the shared response contract."""
         return anthropic_messages_response(
-            response,
-            configured_model=self._model,
-            latency_seconds=time.monotonic() - started_at,
+            payload, configured_model=self._model, latency_seconds=latency_seconds
         )
 
 
@@ -276,8 +232,8 @@ def _anthropic_tool_choice(
 
 def _anthropic_tool_call(block: JsonObject, index: int) -> ToolCall:
     """Validate one native Anthropic tool-use block."""
-    call_id = _string(block.get("id"), f"content[{index}].id")
-    name = _string(block.get("name"), f"content[{index}].name")
+    call_id = require_string(block.get("id"), f"Anthropic content[{index}].id")
+    name = require_string(block.get("name"), f"Anthropic content[{index}].name")
     arguments = block.get("input")
     if not isinstance(arguments, dict):
         raise ProviderResponseError(f"Anthropic content[{index}].input must be an object")
@@ -289,44 +245,17 @@ def _anthropic_usage(payload: JsonObject) -> Usage | None:
     raw = payload.get("usage")
     if raw is None:
         return None
-    usage = _object(raw, "usage")
-    input_tokens = _integer(usage.get("input_tokens"), "usage.input_tokens")
-    cache_read = _integer(usage.get("cache_read_input_tokens"), "usage.cache_read_input_tokens")
-    cache_write = _integer(
-        usage.get("cache_creation_input_tokens"), "usage.cache_creation_input_tokens"
+    usage = require_object(raw, "Anthropic usage")
+    input_tokens = require_integer(usage.get("input_tokens"), "Anthropic usage.input_tokens")
+    cache_read = require_integer(
+        usage.get("cache_read_input_tokens"), "Anthropic usage.cache_read_input_tokens"
+    )
+    cache_write = require_integer(
+        usage.get("cache_creation_input_tokens"), "Anthropic usage.cache_creation_input_tokens"
     )
     return Usage(
         input_tokens=input_tokens + cache_read + cache_write,
-        output_tokens=_integer(usage.get("output_tokens"), "usage.output_tokens"),
+        output_tokens=require_integer(usage.get("output_tokens"), "Anthropic usage.output_tokens"),
         cached_input_tokens=cache_read,
+        cache_write_input_tokens=cache_write,
     )
-
-
-def _array(value: JsonValue | None, label: str) -> list[JsonValue]:
-    """Return one native array or raise a focused response error."""
-    if not isinstance(value, list):
-        raise ProviderResponseError(f"Anthropic {label} must be an array")
-    return value
-
-
-def _object(value: JsonValue | None, label: str) -> JsonObject:
-    """Return one native object or raise a focused response error."""
-    if not isinstance(value, dict):
-        raise ProviderResponseError(f"Anthropic {label} must be an object")
-    return value
-
-
-def _string(value: JsonValue | None, label: str) -> str:
-    """Return one required non-empty native string."""
-    if not isinstance(value, str) or not value:
-        raise ProviderResponseError(f"Anthropic {label} must be a non-empty string")
-    return value
-
-
-def _integer(value: JsonValue | None, label: str) -> int:
-    """Read an optional non-negative native usage integer."""
-    if value is None:
-        return 0
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ProviderResponseError(f"Anthropic {label} must be a non-negative integer")
-    return value

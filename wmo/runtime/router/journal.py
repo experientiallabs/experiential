@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, TypeAdapter, ValidationError, field_validator, model_validator
+from pydantic import AwareDatetime, Field, TypeAdapter, ValidationError, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactInput,
@@ -112,39 +112,21 @@ class RuntimeAcceptedEvent(ContractModel):
     event_id: str = Field(pattern=r"^runtime-event-[0-9a-f]{20}$")
     ordinal: int = Field(gt=0)
     attempt_ordinal: int = Field(gt=0)
-    interaction_id: str = Field(pattern=r"^interaction-[0-9a-f]{20}$")
-    project_id: str = Field(pattern=r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
-    idempotency_key_sha256: Sha256
-    request: ModelRequest
-    request_sha256: Sha256
-    lineage_id: str = Field(pattern=r"^lineage-[0-9a-f]{20}$")
-    decision: RoutingDecision
-    selected_alias: str = Field(min_length=1, max_length=128)
-    selected_model: ModelSnapshot
-    policy_input: ArtifactInput
-    received_at: datetime
-    attempt_started_at: datetime
-
-    @field_validator("received_at", "attempt_started_at")
-    @classmethod
-    def _require_timezone(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("runtime journal timestamps must include a timezone")
-        return value
+    identity: RuntimeInteractionIdentity
+    acceptance: RuntimeAcceptance
+    received_at: AwareDatetime
+    attempt_started_at: AwareDatetime
 
     @model_validator(mode="after")
     def _require_matching_pins(self) -> RuntimeAcceptedEvent:
-        if self.request_sha256 != sha256_json(self.request):
-            raise ValueError("accepted request digest differs from canonical request")
         if self.attempt_started_at < self.received_at:
             raise ValueError("accepted attempt start precedes request receipt")
-        RuntimeAcceptance(
-            decision=self.decision,
-            selected_alias=self.selected_alias,
-            selected_model=self.selected_model,
-            policy_input=self.policy_input,
-        )
         return self
+
+    @property
+    def interaction_id(self) -> str:
+        """Content identity of the logical interaction this attempt belongs to."""
+        return self.identity.interaction_id
 
 
 class RuntimeAttemptFailedEvent(ContractModel):
@@ -157,15 +139,8 @@ class RuntimeAttemptFailedEvent(ContractModel):
     interaction_id: str = Field(pattern=r"^interaction-[0-9a-f]{20}$")
     failure: StructuredFailure
     retryable: bool
-    attempt_started_at: datetime
-    failed_at: datetime
-
-    @field_validator("attempt_started_at", "failed_at")
-    @classmethod
-    def _require_timezone(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("runtime journal timestamps must include a timezone")
-        return value
+    attempt_started_at: AwareDatetime
+    failed_at: AwareDatetime
 
     @model_validator(mode="after")
     def _require_matching_failure(self) -> RuntimeAttemptFailedEvent:
@@ -186,14 +161,7 @@ class RuntimeCompletedEvent(ContractModel):
     interaction_id: str = Field(pattern=r"^interaction-[0-9a-f]{20}$")
     response: ModelResponse
     response_sha256: Sha256
-    completed_at: datetime
-
-    @field_validator("completed_at")
-    @classmethod
-    def _require_timezone(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("runtime journal timestamps must include a timezone")
-        return value
+    completed_at: AwareDatetime
 
     @model_validator(mode="after")
     def _require_response_digest(self) -> RuntimeCompletedEvent:
@@ -271,7 +239,7 @@ class RuntimeInteractionJournal:
             raise ValueError("stale_after must be positive")
         with file_write_lock(self.path, what="the routed-interaction journal"):
             events = list(self._read_unlocked())
-            states = _validate_events(events)
+            states = validate_events(events)
             state = states.get(identity.interaction_id)
             if state is None:
                 if acceptance is None:
@@ -311,12 +279,7 @@ class RuntimeInteractionJournal:
                 events.append(failed)
             accepted = _accepted_event(
                 identity,
-                RuntimeAcceptance(
-                    decision=state.accepted.decision,
-                    selected_alias=state.accepted.selected_alias,
-                    selected_model=state.accepted.selected_model,
-                    policy_input=state.accepted.policy_input,
-                ),
+                state.accepted.acceptance,
                 ordinal=len(events) + 1,
                 attempt_ordinal=state.accepted.attempt_ordinal + 1,
                 received_at=state.accepted.received_at,
@@ -336,7 +299,7 @@ class RuntimeInteractionJournal:
         _require_timezone(failed_at)
         with file_write_lock(self.path, what="the routed-interaction journal"):
             events = list(self._read_unlocked())
-            state = _validate_events(events).get(accepted.interaction_id)
+            state = validate_events(events).get(accepted.interaction_id)
             if state is None or accepted not in events:
                 raise RuntimeJournalError(
                     "cannot fail an interaction attempt that was not accepted"
@@ -372,7 +335,7 @@ class RuntimeInteractionJournal:
         _require_timezone(completed_at)
         with file_write_lock(self.path, what="the routed-interaction journal"):
             events = list(self._read_unlocked())
-            state = _validate_events(events).get(accepted.interaction_id)
+            state = validate_events(events).get(accepted.interaction_id)
             if state is None or accepted not in events:
                 raise RuntimeJournalError(
                     "cannot complete an interaction attempt that was not accepted"
@@ -421,7 +384,7 @@ class RuntimeInteractionJournal:
                 raise RuntimeJournalError(
                     f"runtime journal has invalid interior line {index}"
                 ) from exc
-        _validate_events(events)
+        validate_events(events)
         return tuple(events)
 
     def _append_unlocked(self, event: RuntimeJournalEvent) -> None:
@@ -551,7 +514,7 @@ class JournaledRouterRuntime:
                 if claim.accepted is None or claim.completed is None:
                     raise RuntimeJournalError("completed journal claim omitted its records")
                 return RoutedModelResponse(
-                    decision=claim.accepted.decision,
+                    decision=claim.accepted.acceptance.decision,
                     response=claim.completed.response,
                 )
             if claim.status == "failed":
@@ -575,8 +538,8 @@ class JournaledRouterRuntime:
         try:
             routed = self.runtime.complete(
                 request,
-                episode_id=accepted.lineage_id,
-                decision=accepted.decision,
+                episode_id=accepted.identity.lineage_id,
+                decision=accepted.acceptance.decision,
                 provider_idempotency_key=idempotency_key,
             )
         except Exception as exc:
@@ -584,7 +547,7 @@ class JournaledRouterRuntime:
             terminal = self.journal.record_failure(accepted, failure, failed_at=self._clock())
             if isinstance(terminal, RuntimeCompletedEvent):
                 return RoutedModelResponse(
-                    decision=accepted.decision,
+                    decision=accepted.acceptance.decision,
                     response=terminal.response,
                 )
             raise
@@ -596,7 +559,7 @@ class JournaledRouterRuntime:
         if isinstance(completed, RuntimeAttemptFailedEvent):
             raise RuntimeInteractionFailedError(completed.failure)
         return RoutedModelResponse(
-            decision=accepted.decision,
+            decision=accepted.acceptance.decision,
             response=completed.response,
         )
 
@@ -654,16 +617,8 @@ def _accepted_event(
         event_id="runtime-event-00000000000000000000",
         ordinal=ordinal,
         attempt_ordinal=attempt_ordinal,
-        interaction_id=identity.interaction_id,
-        project_id=identity.project_id,
-        idempotency_key_sha256=identity.idempotency_key_sha256,
-        request=identity.request,
-        request_sha256=identity.request_sha256,
-        lineage_id=identity.lineage_id,
-        decision=acceptance.decision,
-        selected_alias=acceptance.selected_alias,
-        selected_model=acceptance.selected_model,
-        policy_input=acceptance.policy_input,
+        identity=identity,
+        acceptance=acceptance,
         received_at=received_at,
         attempt_started_at=attempt_started_at,
     )
@@ -718,7 +673,7 @@ def _event_content_id(event: RuntimeJournalEvent) -> str:
     return stable_id("runtime-event", material)
 
 
-def _validate_events(
+def validate_events(
     events: list[RuntimeJournalEvent] | tuple[RuntimeJournalEvent, ...],
 ) -> dict[str, _InteractionState]:
     """Validate global order, content digests, and every interaction transition."""
@@ -737,23 +692,25 @@ def _validate_events(
         seen_event_ids.add(event.event_id)
         state = states.get(event.interaction_id)
         if isinstance(event, RuntimeAcceptedEvent):
+            identity = event.identity
+            decision = event.acceptance.decision
             expected_interaction_id = stable_id(
                 "interaction",
                 {
-                    "project_id": event.project_id,
-                    "idempotency_key_sha256": event.idempotency_key_sha256,
+                    "project_id": identity.project_id,
+                    "idempotency_key_sha256": identity.idempotency_key_sha256,
                 },
             )
             if event.interaction_id != expected_interaction_id:
                 raise RuntimeJournalError("interaction ID differs from project and key digest")
             expected_episode_sha256 = hashlib.sha256(
-                event.lineage_id.encode("utf-8"), usedforsecurity=False
+                identity.lineage_id.encode("utf-8"), usedforsecurity=False
             ).hexdigest()
-            if event.decision.episode_id_sha256 != expected_episode_sha256:
+            if decision.episode_id_sha256 != expected_episode_sha256:
                 raise RuntimeJournalError("routing decision differs from accepted lineage")
-            if event.decision.decision_id != _routing_decision_content_id(event.decision):
+            if decision.decision_id != _routing_decision_content_id(decision):
                 raise RuntimeJournalError("routing decision ID differs from its canonical content")
-            key = (event.project_id, event.idempotency_key_sha256)
+            key = (identity.project_id, identity.idempotency_key_sha256)
             owner = key_owners.setdefault(key, event.interaction_id)
             if owner != event.interaction_id:
                 raise RuntimeJournalError("idempotency key digest maps to multiple interactions")
@@ -767,7 +724,7 @@ def _validate_events(
                     raise RuntimeJournalError("accepted retry follows a permanent failure")
                 if event.attempt_ordinal != state.accepted.attempt_ordinal + 1:
                     raise RuntimeJournalError("interaction attempt ordinals are not contiguous")
-                if _acceptance_pins(event) != _acceptance_pins(state.accepted):
+                if acceptance_pins(event) != acceptance_pins(state.accepted):
                     raise RuntimeJournalError("retry drifted from the original accepted pins")
             states[event.interaction_id] = _InteractionState(event, None)
             accepted_attempts[(event.interaction_id, event.attempt_ordinal)] = event
@@ -807,42 +764,14 @@ def _validate_events(
     return states
 
 
-def _acceptance_pins(event: RuntimeAcceptedEvent) -> tuple[object, ...]:
+def acceptance_pins(event: RuntimeAcceptedEvent) -> tuple[object, ...]:
     """Return fields that retries must preserve exactly."""
-    return (
-        event.interaction_id,
-        event.project_id,
-        event.idempotency_key_sha256,
-        event.request,
-        event.request_sha256,
-        event.lineage_id,
-        event.decision,
-        event.selected_alias,
-        event.selected_model,
-        event.policy_input,
-        event.received_at,
-    )
+    return (event.identity, event.acceptance, event.received_at)
 
 
 def _require_identity(accepted: RuntimeAcceptedEvent, identity: RuntimeInteractionIdentity) -> None:
     """Reject reuse of one key with a different request, project, or lineage."""
-    actual = (
-        accepted.interaction_id,
-        accepted.project_id,
-        accepted.idempotency_key_sha256,
-        accepted.request,
-        accepted.request_sha256,
-        accepted.lineage_id,
-    )
-    expected = (
-        identity.interaction_id,
-        identity.project_id,
-        identity.idempotency_key_sha256,
-        identity.request,
-        identity.request_sha256,
-        identity.lineage_id,
-    )
-    if actual != expected:
+    if accepted.identity != identity:
         raise RuntimeIdempotencyConflictError(
             "idempotency key was already used for different request or conversation content"
         )

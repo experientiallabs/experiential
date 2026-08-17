@@ -1,8 +1,9 @@
 """Provider and model setup shared by configuration and first build.
 
 Interactive setup runs the provider and model picker in ``provider_picker``: providers, missing
-credentials, models, roles, and one confirmation. Automation supplies the same catalog update as
-repeatable JSON. Both paths end in one conflict-checked atomic ``models.toml`` write.
+credentials, models, roles, and one confirmation. Repeatable ``--provider`` flags skip the opening
+list and feed the same session. Automation supplies the same catalog update as repeatable JSON.
+Both paths end in one conflict-checked atomic ``models.toml`` write.
 """
 
 from __future__ import annotations
@@ -33,16 +34,20 @@ from wmo.cli.provider_picker import (
     SetupCancelled,
     SetupRoleInputs,
     SetupSession,
+    explicit_provider_selection,
     prepare_providers,
+    resolve_setup_providers,
     select_providers,
 )
 from wmo.common.models import (
+    ModelCapabilities,
     ModelCatalog,
     ModelRecord,
     ProviderConnection,
     ProviderModelSelection,
     ProviderSetup,
     RouterCandidateSelection,
+    SetupRole,
     catalog_state_sha256,
     configure_provider_catalog,
     configure_router_candidates,
@@ -56,6 +61,7 @@ from wmo.runtime.models.providers import HttpProviderModelLister, ProviderModelL
 class ProviderSetupOptions:
     """Structured automation values or optional role choices for setup."""
 
+    providers: tuple[str, ...] = ()
     connection_json: tuple[str, ...] = ()
     model_json: tuple[str, ...] = ()
     world_model: str | None = None
@@ -92,6 +98,10 @@ def run_provider_setup(
     path = root / "models.toml"
     starting_digest = catalog_state_sha256(path)
     existing = load_model_catalog(path) if path.exists() else None
+    try:
+        explicit_providers = resolve_setup_providers(options.providers)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
     if non_interactive:
         try:
             setup = _noninteractive_setup(options, existing=existing)
@@ -108,7 +118,9 @@ def run_provider_setup(
         existing_connection_providers=_existing_connection_providers(existing),
         existing_catalog_models={} if existing is None else existing.models,
         existing_models=_existing_models(existing),
+        retainable_roles=_retained_setup_roles(existing),
         role_inputs=_role_inputs(options, existing=existing),
+        explicit_providers=explicit_providers,
         console=console,
         lister=lister if lister is not None else HttpProviderModelLister(),
         environment=os.environ,
@@ -124,7 +136,9 @@ def _interactive_setup(
     existing_connection_providers: Mapping[str, str],
     existing_catalog_models: Mapping[str, ModelRecord],
     existing_models: tuple[ProviderModelSelection, ...],
+    retainable_roles: Mapping[str, frozenset[SetupRole]],
     role_inputs: SetupRoleInputs,
+    explicit_providers: tuple[str, ...],
     console: Console,
     lister: ProviderModelLister,
     environment: MutableMapping[str, str],
@@ -136,7 +150,9 @@ def _interactive_setup(
         existing_connection_providers: Exact provider kind for every persisted connection.
         existing_catalog_models: Exact record for every persisted model alias.
         existing_models: Model aliases already configured in the catalog.
+        retainable_roles: Exact prior roles each incomplete alias may retain.
         role_inputs: Role values supplied by flags or already persisted.
+        explicit_providers: Validated ``--provider`` values that skip the opening list once.
         console: Terminal used for every screen.
         lister: Provider listing seam, injected by tests so no live request is made.
         environment: Process environment consulted and updated for pasted credentials.
@@ -149,19 +165,30 @@ def _interactive_setup(
     configured = configured_models(
         existing_catalog_models,
         connection_providers=existing_connection_providers,
+        retainable_roles=retainable_roles,
     )
     session = SetupSession(selected=tuple(model.alias for model in configured))
+    skip_opening_list = bool(explicit_providers)
+    if explicit_providers:
+        (
+            session.providers,
+            session.advanced_credentials,
+            session.advanced_models,
+        ) = explicit_provider_selection(explicit_providers)
     try:
         while True:
-            selection = select_providers(
-                session,
-                console=console,
-                environment=environment,
-                configured=bool(configured),
-            )
-            if selection is None:
-                return None
-            session.providers, session.advanced_credentials, session.advanced_models = selection
+            if skip_opening_list:
+                skip_opening_list = False
+            else:
+                selection = select_providers(
+                    session,
+                    console=console,
+                    environment=environment,
+                    configured=bool(configured),
+                )
+                if selection is None:
+                    return None
+                session.providers, session.advanced_credentials, session.advanced_models = selection
             discovered: tuple[AvailableModel, ...] = ()
             session.endpoints = ()
             if session.providers:
@@ -269,6 +296,11 @@ def _commit(
         expected_state_sha256=expected_state_sha256,
     )
     if not result.candidates or result.incumbent is None:
+        return catalog
+    if (
+        result.candidates == catalog.roles.candidates
+        and result.incumbent == catalog.roles.incumbent
+    ):
         return catalog
     return configure_router_candidates(
         path,
@@ -406,35 +438,12 @@ def _existing_models(existing: ModelCatalog | None) -> tuple[ProviderModelSelect
     for alias, model in sorted(existing.models.items()):
         if model.connection not in supported_connections:
             continue
-        capabilities = model.capabilities
         records.append(
             ProviderModelSelection(
                 alias=alias,
                 connection=model.connection,
                 model=model.model,
-                supports_tools=capabilities.supports_tools if capabilities else False,
-                supports_embeddings=capabilities.supports_embeddings if capabilities else False,
-                supports_structured_output=(
-                    capabilities.supports_structured_output if capabilities else False
-                ),
-                supports_completions=(capabilities.supports_completions if capabilities else None),
-                supports_temperature=(capabilities.supports_temperature if capabilities else None),
-                context_window_tokens=capabilities.context_window_tokens if capabilities else None,
-                maximum_output_tokens=(
-                    capabilities.maximum_output_tokens if capabilities else None
-                ),
-                input_cost_per_million_tokens_usd=(
-                    capabilities.input_cost_per_million_tokens_usd if capabilities else None
-                ),
-                output_cost_per_million_tokens_usd=(
-                    capabilities.output_cost_per_million_tokens_usd if capabilities else None
-                ),
-                cached_input_cost_per_million_tokens_usd=(
-                    capabilities.cached_input_cost_per_million_tokens_usd if capabilities else None
-                ),
-                cache_write_cost_per_million_tokens_usd=(
-                    capabilities.cache_write_cost_per_million_tokens_usd if capabilities else None
-                ),
+                capabilities=model.capabilities or ModelCapabilities(),
             )
         )
     return tuple(records)
@@ -466,6 +475,31 @@ def _existing_connection_providers(existing: ModelCatalog | None) -> dict[str, s
     if existing is None:
         return {}
     return {name: connection.provider for name, connection in sorted(existing.connections.items())}
+
+
+def _retained_setup_roles(existing: ModelCatalog | None) -> dict[str, frozenset[SetupRole]]:
+    """Map persisted setup roles to the aliases allowed to retain them without metadata.
+
+    Args:
+        existing: Existing catalog, or ``None`` on first setup.
+
+    Returns:
+        Exact retain-only roles keyed by their currently assigned aliases.
+    """
+    if existing is None:
+        return {}
+    retained: dict[str, set[SetupRole]] = {}
+    assignments = (
+        (existing.roles.world_model, SetupRole.WORLD_MODEL),
+        (existing.roles.judge, SetupRole.JUDGE),
+        (existing.roles.embedder, SetupRole.EMBEDDER),
+    )
+    for alias, role in assignments:
+        if alias is not None:
+            retained.setdefault(alias, set()).add(role)
+    for alias in existing.roles.candidates:
+        retained.setdefault(alias, set()).add(SetupRole.ROUTER_CANDIDATE)
+    return {alias: frozenset(roles) for alias, roles in sorted(retained.items())}
 
 
 def _existing_role(existing: ModelCatalog | None, role: str) -> str | None:
@@ -545,13 +579,15 @@ def provider_setup_json_examples() -> tuple[str, str]:
             "alias": "model",
             "connection": "openai",
             "model": "your-model-id",
-            "supports_embeddings": True,
-            "supports_structured_output": True,
-            "supports_completions": True,
-            "input_cost_per_million_tokens_usd": 0,
-            "output_cost_per_million_tokens_usd": 0,
-            "cached_input_cost_per_million_tokens_usd": 0,
-            "cache_write_cost_per_million_tokens_usd": 0,
+            "capabilities": {
+                "supports_embeddings": True,
+                "supports_structured_output": True,
+                "supports_completions": True,
+                "input_cost_per_million_tokens_usd": 0,
+                "output_cost_per_million_tokens_usd": 0,
+                "cached_input_cost_per_million_tokens_usd": 0,
+                "cache_write_cost_per_million_tokens_usd": 0,
+            },
         },
         separators=(",", ":"),
     )

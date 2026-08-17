@@ -6,8 +6,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
 
-from wmo.common.core.artifacts import ArtifactId, ArtifactInput
+from wmo.common.core.artifacts import ArtifactId, ArtifactInput, envelope_matches_manifest
 from wmo.common.evaluations.evidence import read_evaluation_plan
+from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import (
     Embedding,
     ModelCapabilities,
@@ -25,8 +26,10 @@ from wmo.optimize.router.automatic.execution_contract import (
     RouterExecutionContract,
     load_router_execution_contract,
 )
-from wmo.optimize.router.automatic.preflight import AutomaticRouterPreflight
-from wmo.optimize.router.automatic.service import AutomaticRouterOptions
+from wmo.optimize.router.automatic.preflight import (
+    AutomaticRouterOptions,
+    AutomaticRouterPreflight,
+)
 from wmo.optimize.router.composition import FidelityApprovalReceipt, RouterPolicyLock
 from wmo.optimize.router.fit.report import HeldOutRouterReport
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
@@ -383,26 +386,12 @@ def _matching_approval(project: ProjectStore, policy: KnnRouterPolicy) -> Artifa
         receipt = FidelityApprovalReceipt.model_validate_json(
             project.artifacts.read_bytes(artifact_id, "approval.json")
         )
-        envelope = (
-            receipt.schema_version,
-            receipt.created_at,
-            receipt.inputs,
-            receipt.code_revision,
-            receipt.source,
-        )
-        manifest = (
-            stored.manifest.schema_version,
-            stored.manifest.created_at,
-            stored.manifest.inputs,
-            stored.manifest.code_revision,
-            stored.manifest.source,
-        )
         pointers = (receipt.plan, receipt.gate, receipt.report)
         if (
             receipt.approval_id == artifact_id
             and receipt.plan.artifact_id == policy.evaluation_plan_id
             and receipt.report.artifact_id in policy.fidelity_report_ids
-            and envelope == manifest
+            and envelope_matches_manifest(receipt, stored.manifest)
             and all(
                 artifact_input(project.artifacts.read(item.artifact_id).manifest) == item
                 for item in pointers
@@ -432,20 +421,7 @@ def _matching_policy_lock(project: ProjectStore, policy: KnnRouterPolicy) -> Art
         if (
             lock.lock_id == artifact_id
             and lock.policy.artifact_id == policy.policy_id
-            and (
-                lock.schema_version,
-                lock.created_at,
-                lock.inputs,
-                lock.code_revision,
-                lock.source,
-            )
-            == (
-                stored.manifest.schema_version,
-                stored.manifest.created_at,
-                stored.manifest.inputs,
-                stored.manifest.code_revision,
-                stored.manifest.source,
-            )
+            and envelope_matches_manifest(lock, stored.manifest)
             and artifact_input(project.artifacts.read(lock.policy.artifact_id).manifest)
             == lock.policy
         ):
@@ -472,20 +448,7 @@ def _matching_router_report(project: ProjectStore, policy: KnnRouterPolicy) -> A
         if (
             report.report_id == artifact_id
             and report.policy_id == policy.policy_id
-            and (
-                report.schema_version,
-                report.created_at,
-                report.inputs,
-                report.code_revision,
-                report.source,
-            )
-            == (
-                stored.manifest.schema_version,
-                stored.manifest.created_at,
-                stored.manifest.inputs,
-                stored.manifest.code_revision,
-                stored.manifest.source,
-            )
+            and envelope_matches_manifest(report, stored.manifest)
         ):
             matches.append(artifact_id)
     return _one(matches, "router report")
@@ -504,23 +467,15 @@ def _load_policy(project: ProjectStore, artifact_id: ArtifactId) -> KnnRouterPol
     Raises:
         AutomaticRouterReplayError: Policy identity or envelope differs.
     """
-    stored = project.artifacts.read(artifact_id)
-    policy = KnnRouterPolicy.model_validate_json(
-        project.artifacts.read_bytes(artifact_id, "policy.json")
+    policy, _ = read_artifact_json(
+        project,
+        artifact_id=artifact_id,
+        expected_artifact_type="router-policy",
+        relative_path="policy.json",
+        model_type=KnnRouterPolicy,
+        error=AutomaticRouterReplayError,
     )
-    if policy.policy_id != artifact_id or (
-        policy.schema_version,
-        policy.created_at,
-        policy.inputs,
-        policy.code_revision,
-        policy.source,
-    ) != (
-        stored.manifest.schema_version,
-        stored.manifest.created_at,
-        stored.manifest.inputs,
-        stored.manifest.code_revision,
-        stored.manifest.source,
-    ):
+    if policy.policy_id != artifact_id:
         raise AutomaticRouterReplayError("router replay policy differs from its manifest")
     return policy
 

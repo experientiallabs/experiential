@@ -133,18 +133,29 @@ def _openai_payload(
         Schema-valid completed Responses payload.
     """
     return {
+        "id": "resp_fixture",
+        "object": "response",
+        "created_at": 1.0,
         "status": "completed",
         "model": model,
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
         "output": [
             {
                 "type": "message",
-                "content": [{"type": "output_text", "text": content}],
+                "id": "msg_fixture",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": content, "annotations": []}],
             }
         ],
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "input_tokens_details": {"cached_tokens": cached_tokens},
+            "total_tokens": input_tokens + output_tokens,
+            "input_tokens_details": {"cached_tokens": cached_tokens, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
         },
     }
 
@@ -391,12 +402,21 @@ def test_candidate_unknown_usage_retains_unknown_spend_after_dispatch() -> None:
     """Mark a paid candidate response unknown when its usage cannot be priced."""
     candidate = openai_responses_response(
         {
+            "id": "resp_no_usage",
+            "object": "response",
+            "created_at": 1.0,
             "status": "completed",
             "model": "candidate-a",
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
             "output": [
                 {
                     "type": "message",
-                    "content": [{"type": "output_text", "text": "I can help."}],
+                    "id": "msg_no_usage",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "I can help.", "annotations": []}],
                 }
             ],
         },

@@ -22,13 +22,9 @@ from wmo.common.evaluations import (
     FidelityPair,
     FidelityReport,
 )
+from wmo.common.evaluations.build_test import _candidate, _money, _snapshot, _task
 from wmo.common.evaluations.evidence import evaluation_protocol_digest
-from wmo.common.models import (
-    Embedding,
-    ModelSnapshot,
-    NumericMeasurement,
-    RoutedCandidateSnapshot,
-)
+from wmo.common.models import Embedding
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore, ProjectPaths
 from wmo.common.routing import RouterFeatureExtractor
 from wmo.common.routing.bank import (
@@ -73,7 +69,7 @@ class _DeterministicEmbedder:
 
 def test_bank_excludes_failed_fidelity_and_uses_only_candidate_cost() -> None:
     """Rejected simulation and failed rows stay out, while direct sandbox evidence remains."""
-    tasks = (_task("task-fit-0", "fit"), _task("task-fit-1", "fit"))
+    tasks = (_task("task-fit-0", partition="fit"), _task("task-fit-1", partition="fit"))
     production = _protocol("protocol-production", "production")
     sandbox = _protocol("protocol-sandbox", "sandbox")
     world = _world_protocol()
@@ -138,8 +134,8 @@ def test_bank_excludes_failed_fidelity_and_uses_only_candidate_cost() -> None:
 
 def test_fifty_fit_tasks_are_bank_only_and_twenty_held_out_rows_cannot_change_it() -> None:
     """The default 50/20 split is sealed at embedding and bank serialization boundaries."""
-    fit = tuple(_task(f"task-fit-{index:02d}", "fit") for index in range(50))
-    held_out = tuple(_task(f"task-held-{index:02d}", "held_out") for index in range(20))
+    fit = tuple(_task(f"task-fit-{index:02d}", partition="fit") for index in range(50))
+    held_out = tuple(_task(f"task-held-{index:02d}", partition="held_out") for index in range(20))
     tasks = (*fit, *held_out)
     protocol = _protocol("protocol-production", "production")
     rows = tuple(
@@ -304,34 +300,6 @@ def _row(
     )
 
 
-def _task(task_id: str, partition: Literal["fit", "held_out"]) -> TaskCase:
-    """Create one task whose lineage is unique to its partition."""
-    return TaskCase(
-        task_id=task_id,
-        lineage_group_id=f"lineage-{task_id}",
-        partition=partition,
-        instruction=f"Resolve {task_id}.",
-        workload_weight=1.0,
-        source_trace_ids=(f"trace-{task_id}",),
-    )
-
-
-def _candidate(alias: str) -> RoutedCandidateSnapshot:
-    """Create one exact candidate snapshot."""
-    return RoutedCandidateSnapshot(alias=alias, model=_snapshot(alias))
-
-
-def _snapshot(alias: str) -> ModelSnapshot:
-    """Create one secret-free model snapshot."""
-    return ModelSnapshot(
-        provider="test",
-        model_id=alias,
-        revision="fixture",
-        capabilities_sha256=_DIGEST,
-        connection_sha256="b" * 64,
-    )
-
-
 def _protocol(protocol_id: str, source: Literal["sandbox", "production"]) -> EvaluationProtocol:
     """Create one compatible direct-execution protocol."""
     return EvaluationProtocol(
@@ -403,8 +371,3 @@ def _insufficient_report(protocol: EvaluationProtocol) -> FidelityReport:
         gate_sha256=_DIGEST,
         status="insufficient",
     )
-
-
-def _money(value: float) -> NumericMeasurement:
-    """Create one observed cost measurement."""
-    return NumericMeasurement(value=value, provenance="observed")

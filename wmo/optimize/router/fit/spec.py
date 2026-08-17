@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import AwareDatetime, Field, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, Sha256
 from wmo.common.models import ModelAlias, ModelSnapshot
@@ -43,18 +42,18 @@ class RouterOptimizationSpec(ContractModel):
     pricing_snapshot_sha256: Sha256
     guard: KnnGuard = Field(default_factory=_default_guard)
     judgment_status: Literal["provisional", "human_calibrated"]
-    created_at: datetime
+    created_at: AwareDatetime
     code_revision: str = Field(min_length=1, max_length=256)
 
     @model_validator(mode="after")
     def _require_current_conservative_rules(self) -> RouterOptimizationSpec:
-        """Require the supported feature contract, guard direction, and timestamp.
+        """Require the supported feature contract and guard direction.
 
         Returns:
             The validated router optimization specification.
 
         Raises:
-            ValueError: If features, guards, or timestamps violate the fitting contract.
+            ValueError: If features or guards violate the fitting contract.
         """
         if self.feature_extractor_id != ROUTER_FEATURE_EXTRACTOR_ID:
             raise ValueError("router fitting supports only the request-visible v2 extractor")
@@ -62,8 +61,6 @@ class RouterOptimizationSpec(ContractModel):
             raise ValueError("router feature schema digest does not match the v1 extractor")
         if self.guard.quality_tolerance < 0:
             raise ValueError("router quality tolerance is an allowed loss and cannot be negative")
-        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
-            raise ValueError("router optimization created_at must include a timezone")
         return self
 
 

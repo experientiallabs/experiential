@@ -26,12 +26,17 @@ from wmo.common.judging.lineage import (
     RouterLineageSplit,
     write_router_lineage_split,
 )
-from wmo.common.judging.lm import JudgeProbe, JudgmentError, LMJudge
+from wmo.common.judging.lm import (
+    JudgeProbe,
+    JudgmentError,
+    LMJudge,
+    RawDimensionJudgment,
+    RawJudgment,
+    judge_response_schema,
+)
 from wmo.common.judging.prompts import PromptDefinition
 from wmo.common.judging.proposal import (
-    LMRubricProposer,
     ProposedRubricDimension,
-    RepresentativeRollout,
     RubricProposal,
     RubricProposalError,
     RubricProposalEvidence,
@@ -71,11 +76,11 @@ __all__ = [
     "JudgmentError",
     "Judgment",
     "LMJudge",
-    "LMRubricProposer",
     "OutOfFoldPrediction",
     "PromptDefinition",
     "ProposedRubricDimension",
-    "RepresentativeRollout",
+    "RawDimensionJudgment",
+    "RawJudgment",
     "Rubric",
     "RubricProposal",
     "RubricProposalEvidence",
@@ -92,4 +97,5 @@ __all__ = [
     "write_router_lineage_split",
     "write_rubric_proposal_evidence",
     "verify_persisted_calibration",
+    "judge_response_schema",
 ]

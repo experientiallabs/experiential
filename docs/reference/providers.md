@@ -4,8 +4,15 @@ WMO resolves models from a secret-free `.wmo/models.toml` catalog. `RuntimeModel
 only construction service. Provider names do not imply capabilities or prices. Every completion or
 embedding alias must declare the protocol features and token prices it uses.
 
-Configure connections with `wmo config providers`. Setup stores configuration only. It makes no
-provider request and never prints a secret value.
+Configure connections with `wmo config providers` or the first `wmo build` on a clean checkout.
+An interactive terminal opens a provider list: Up and Down move focus, Enter selects or deselects
+the focused provider, and the Complete row submits the selection. Agents skip that list with
+repeatable `--provider` flags (`openai`, `anthropic`, `gemini`, `openrouter`,
+`openai-compatible`, `azure`, `bedrock`). Unsupported or duplicate values fail before any catalog
+write. Azure and Bedrock still require manual model IDs. Other selected providers use account
+model discovery when credentials are available.
+
+Setup writes only secret-free catalog fields and never prints a credential value.
 
 ## Supported providers
 

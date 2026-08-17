@@ -8,8 +8,6 @@ from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
-from pydantic import BaseModel
-
 from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
@@ -18,13 +16,14 @@ from wmo.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
-from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
 from wmo.common.models import NumericMeasurement
 from wmo.common.project import ProjectStore
 from wmo.optimize.model.sft.contracts import SFTBuildSpec, SFTDatasetArtifact
 from wmo.optimize.model.sft.provider_resources import validate_provider_resource_id
 from wmo.optimize.model.sft.run_manifest import (
+    _read_model,
+    _write_new_json,
     load_or_create_manifest,
     validate_run_inputs,
     verified_training_inputs,
@@ -873,19 +872,3 @@ def _read_last_event(output_dir: Path) -> TinkerSFTEvent:
     if not events:
         raise TinkerSFTResumeError("Tinker SFT resume event was not persisted")
     return events[-1]
-
-
-def _write_new_json(path: Path, value: BaseModel, label: str) -> None:
-    if path.exists():
-        raise TinkerSFTResumeError(
-            f"{label} already exists at {path}; append-only runs do not replace it"
-        )
-    assert_secret_free(value)
-    write_bytes_atomic(path, canonical_json_bytes(value) + b"\n")
-
-
-def _read_model[ModelT: BaseModel](path: Path, model_type: type[ModelT], label: str) -> ModelT:
-    try:
-        return model_type.model_validate_json(path.read_bytes())
-    except (OSError, ValueError) as exc:
-        raise TinkerSFTResumeError(f"cannot read {label} at {path}: {exc}") from exc

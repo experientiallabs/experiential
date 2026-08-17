@@ -17,6 +17,7 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ContractModel,
     Sha256,
+    envelope_matches_manifest,
     validate_artifact_file_path,
 )
 from wmo.common.evaluations import EvaluationDataset, EvaluationProtocol, FidelityReport
@@ -324,19 +325,7 @@ def load_knn_bank(
         )
         if manifest.bank_artifact_id != bank_artifact_id:
             raise ValueError("kNN bank record does not match its artifact identity")
-        if (
-            manifest.schema_version,
-            manifest.created_at,
-            manifest.inputs,
-            manifest.code_revision,
-            manifest.source,
-        ) != (
-            stored.manifest.schema_version,
-            stored.manifest.created_at,
-            stored.manifest.inputs,
-            stored.manifest.code_revision,
-            stored.manifest.source,
-        ):
+        if not envelope_matches_manifest(manifest, stored.manifest):
             raise ValueError("kNN bank data envelope differs from its artifact manifest")
         payload = store.read_bytes(bank_artifact_id, manifest.bank_path)
         digest = hashlib.sha256(payload).hexdigest()
