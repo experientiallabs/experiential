@@ -35,9 +35,7 @@ jobs:
           wmo/cli
           wmo/common
           wmo/runtime
-          wmo/simulation
           --deselect=wmo/release_test.py::test_installed_wheel_no_spend_release_evidence
-          --ignore=wmo/simulation/comparison_evidence_test.py
 
   non-live-optimization:
     runs-on: ubuntu-latest
@@ -52,6 +50,20 @@ jobs:
           uv run pytest -n 4 --dist worksteal -q -k "not live"
           wmo/optimize
           --ignore=wmo/optimize/router/composition_evidence_test.py
+
+  non-live-simulation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
+      - name: non-live simulation tests
+        run: >-
+          uv run pytest -n 4 --dist worksteal -q -k "not live"
+          wmo/simulation
+          --ignore=wmo/simulation/comparison_evidence_test.py
 
   installed-wheel-release-evidence:
     runs-on: ubuntu-latest
