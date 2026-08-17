@@ -68,6 +68,8 @@ _SECRET_REFERENCE_PATTERN = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+SECRET_REDACTION_PLACEHOLDER = "[REDACTED]"
+_SECRET_REDACTION_PATTERNS = (*_SECRET_VALUE_PATTERNS, _SECRET_ENVIRONMENT_NAME_PATTERN)
 
 
 class ContractModel(BaseModel):
@@ -314,6 +316,55 @@ def assert_text_secret_free(value: str) -> None:
         raise SecretBoundaryError("immutable artifacts cannot contain credential references")
     if any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS):
         raise SecretBoundaryError("immutable artifacts cannot contain secret-like values")
+
+
+def redact_secret_text(value: str) -> tuple[str, int]:
+    """Replace secret-like values and credential environment names with a fixed placeholder.
+
+    Args:
+        value: Text that may contain generated credential-shaped substrings.
+
+    Returns:
+        The redacted text and the number of substrings replaced. The deterministic
+        placeholder never trips the immutable-artifact secret boundary itself.
+    """
+    redacted = value
+    total = 0
+    for pattern in _SECRET_REDACTION_PATTERNS:
+        redacted, count = pattern.subn(SECRET_REDACTION_PLACEHOLDER, redacted)
+        total += count
+    return redacted, total
+
+
+def redact_secret_json(value: JsonValue) -> tuple[JsonValue, int]:
+    """Recursively replace secret-like substrings in JSON-safe content.
+
+    Args:
+        value: JSON-safe content about to enter an immutable artifact.
+
+    Returns:
+        A structurally equivalent value whose string leaves are redacted with
+        :func:`redact_secret_text`, and the total number of replaced substrings.
+    """
+    if isinstance(value, dict):
+        redacted_object: JsonObject = {}
+        object_total = 0
+        for key, item in value.items():
+            redacted_item, count = redact_secret_json(item)
+            redacted_object[key] = redacted_item
+            object_total += count
+        return redacted_object, object_total
+    if isinstance(value, list):
+        redacted_items: list[JsonValue] = []
+        list_total = 0
+        for item in value:
+            redacted_item, count = redact_secret_json(item)
+            redacted_items.append(redacted_item)
+            list_total += count
+        return redacted_items, list_total
+    if isinstance(value, str):
+        return redact_secret_text(value)
+    return value, 0
 
 
 def _assert_json_value_secret_free(value: JsonValue, *, path: str) -> None:
