@@ -212,6 +212,22 @@ class RuntimeModelCatalog:
                 client if capabilities.supports_embeddings else None,
             )
         api_key = read_connection_api_key(connection, environment=self._environment)
+        if provider == "openai":
+            openai_client = OpenAIClient(
+                model=snapshot,
+                api_key=api_key,
+                base_url=connection.base_url or OPENAI_BASE_URL,
+                transport=self._transport_factory(),
+                supports_temperature=capabilities.supports_temperature,
+                reasoning_effort=capabilities.reasoning_effort,
+            )
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capabilities,
+                openai_client,
+                openai_client if capabilities.supports_embeddings else None,
+            )
         if provider == "azure":
             if connection.base_url is None or connection.api_version is None:
                 raise ModelConnectionError(
@@ -317,12 +333,11 @@ class RuntimeModelCatalog:
 _HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
     "anthropic": (AnthropicClient, ANTHROPIC_BASE_URL),
     "gemini": (GeminiClient, GEMINI_BASE_URL),
-    "openai": (OpenAIClient, OPENAI_BASE_URL),
     "openai-compatible": (OpenAICompatibleClient, None),
     "openrouter": (OpenRouterClient, OPENROUTER_BASE_URL),
 }
 
-_SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {"azure", "bedrock", "tinker"}
+_SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {"azure", "bedrock", "openai", "tinker"}
 
 
 def _runtime_tinker_sampler(

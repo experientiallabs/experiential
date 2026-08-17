@@ -207,6 +207,50 @@ def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity()
     }
 
 
+def test_openai_reasoning_model_declarations_shape_the_wire_payload() -> None:
+    """A no-temperature declaration drops the parameter and a pinned effort is sent verbatim."""
+    transport = _ScriptedTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "id": "resp_reasoning",
+                    "object": "response",
+                    "created_at": 1.0,
+                    "status": "completed",
+                    "model": "gpt-5.6-luna",
+                    "parallel_tool_calls": True,
+                    "tool_choice": "auto",
+                    "tools": [],
+                    "output": [
+                        {
+                            "type": "message",
+                            "id": "msg_reasoning",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+                        }
+                    ],
+                },
+            )
+        ]
+    )
+    client = OpenAIClient(
+        model=_snapshot("openai", "gpt-5.6-luna"),
+        api_key="fixture-openai-key",
+        base_url="https://openai.fixture/v1",
+        transport=transport,
+        supports_temperature=False,
+        reasoning_effort="xhigh",
+    )
+
+    client.complete(_request())
+
+    payload = transport.requests[0][2]
+    assert "temperature" not in payload
+    assert payload["reasoning"] == {"effort": "xhigh"}
+
+
 def test_openai_embeddings_use_the_shared_normalized_response_contract() -> None:
     """Direct OpenAI reuses only the common non-streaming embedding conversion."""
     transport = _ScriptedTransport(

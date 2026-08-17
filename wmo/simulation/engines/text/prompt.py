@@ -8,7 +8,12 @@ from collections.abc import Sequence
 from pydantic import ValidationError
 
 from wmo.common.core.artifacts import ContractModel, JsonObject, sha256_json
-from wmo.common.models import AssistantAction, ModelMessage, ModelRequest
+from wmo.common.models import (
+    AssistantAction,
+    ModelMessage,
+    ModelRequest,
+    structured_json_text,
+)
 from wmo.common.tasks import TaskCase
 from wmo.simulation.retrieval import RAGMatch
 from wmo.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
@@ -114,6 +119,10 @@ def build_world_model_request(
 def parse_world_model_transition(output: AssistantAction) -> TextWorldModelTransition:
     """Parse a strict visible transition and reject tools, prose, or hidden-output stand-ins.
 
+    The prompt forbids Markdown fences, and one fence around an otherwise valid transition is
+    unwrapped before parsing because supported providers still add it. Prose and extra keys stay
+    invalid.
+
     Args:
         output: Provider-normalized visible assistant action from the world model.
 
@@ -128,7 +137,7 @@ def parse_world_model_transition(output: AssistantAction) -> TextWorldModelTrans
             "text world models must return one JSON transition without tool calls"
         )
     try:
-        value = json.loads(output.content)
+        value = json.loads(structured_json_text(output.content))
     except json.JSONDecodeError as exc:
         raise TextWorldModelProtocolError(
             "text world model must return the pinned JSON transition without surrounding prose"
