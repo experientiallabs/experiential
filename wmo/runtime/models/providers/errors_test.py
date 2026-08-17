@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from wmo.common.core.artifacts import JsonObject
 from wmo.runtime.models.providers.errors import (
     ProviderError,
     parse_provider_envelope,
@@ -13,7 +14,7 @@ from wmo.runtime.models.providers.transport import request_id_from_headers
 _SECRET = "sk-secret-live-key-1234567890"
 _PROMPT = "Score this trace: the user asked to delete production."
 _TOOL_ARGS = '{"command": "rm -rf /"}'
-_OPENAI_UNSUPPORTED_TEMPERATURE = {
+_OPENAI_UNSUPPORTED_TEMPERATURE: JsonObject = {
     "error": {
         "message": "Unsupported parameter: 'temperature' is not supported with this model.",
         "type": "invalid_request_error",

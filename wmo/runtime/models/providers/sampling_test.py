@@ -53,11 +53,15 @@ def test_compatible_anthropic_gemini_and_bedrock_omit_unsupported_temperature() 
     gemini = gemini_generate_request("gemini-3.5-flash", _REQUEST, _LUNA_CAPABILITIES)
     bedrock = converse_request("anthropic.claude-sonnet-5", _REQUEST, _LUNA_CAPABILITIES)
 
+    gemini_config = gemini.get("generationConfig")
+    bedrock_config = bedrock.get("inferenceConfig")
+    assert isinstance(gemini_config, dict)
+    assert isinstance(bedrock_config, dict)
     assert "temperature" not in compatible
     assert "temperature" not in anthropic
-    assert "temperature" not in gemini["generationConfig"]
-    assert "temperature" not in bedrock.get("inferenceConfig", {})
+    assert "temperature" not in gemini_config
+    assert "temperature" not in bedrock_config
     assert compatible["max_tokens"] == 128
     assert anthropic["max_tokens"] == 128
-    assert gemini["generationConfig"]["maxOutputTokens"] == 128
-    assert bedrock["inferenceConfig"]["maxTokens"] == 128
+    assert gemini_config["maxOutputTokens"] == 128
+    assert bedrock_config["maxTokens"] == 128
