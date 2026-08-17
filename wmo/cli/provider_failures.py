@@ -125,10 +125,10 @@ def judge_calibration_retry_command(
     *,
     root: str,
     sample_size: int,
-    input_price: float,
-    output_price: float,
+    input_price: float | None,
+    output_price: float | None,
     maximum_input_tokens: int,
-    maximum_cost_usd: float,
+    maximum_cost_usd: float | None,
     accept_insufficient_labels: bool,
 ) -> str:
     """Return the exact command that resumes judge calibration after a provider failure.
@@ -137,10 +137,10 @@ def judge_calibration_retry_command(
         project: Local project ID.
         root: Local project root.
         sample_size: Frozen calibration sample size.
-        input_price: Judge input price per million tokens.
-        output_price: Judge output price per million tokens.
+        input_price: Advanced input-price override, or ``None`` to keep catalog pricing.
+        output_price: Advanced output-price override, or ``None`` to keep catalog pricing.
         maximum_input_tokens: Conservative input bound for every call attempt.
-        maximum_cost_usd: Total calibration spend ceiling.
+        maximum_cost_usd: Explicit spend ceiling, or ``None`` to keep the shared command budget.
         accept_insufficient_labels: Whether the original run accepted fewer than ten labels.
 
     Returns:
@@ -148,11 +148,15 @@ def judge_calibration_retry_command(
     """
     command = (
         f"wmo config judge calibrate {project} --root {root} "
-        f"--sample-size {sample_size} --input-usd-per-million {input_price} "
-        f"--output-usd-per-million {output_price} "
-        f"--maximum-input-tokens {maximum_input_tokens} "
-        f"--maximum-cost-usd {maximum_cost_usd} --yes"
+        f"--sample-size {sample_size} --maximum-input-tokens {maximum_input_tokens}"
     )
+    if input_price is not None:
+        command += f" --input-usd-per-million {input_price}"
+    if output_price is not None:
+        command += f" --output-usd-per-million {output_price}"
+    if maximum_cost_usd is not None:
+        command += f" --maximum-cost-usd {maximum_cost_usd}"
+    command += " --yes"
     if accept_insufficient_labels:
         command += " --accept-insufficient-labels"
     return command

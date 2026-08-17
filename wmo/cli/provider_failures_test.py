@@ -85,7 +85,26 @@ def test_judge_retry_command_reuses_saved_labels_without_recollecting_them() -> 
 
     assert command == (
         "wmo config judge calibrate support --root /tmp/.wmo --sample-size 10 "
-        "--input-usd-per-million 1.0 --output-usd-per-million 2.0 "
-        "--maximum-input-tokens 4096 --maximum-cost-usd 5.0 --yes "
+        "--maximum-input-tokens 4096 --input-usd-per-million 1.0 "
+        "--output-usd-per-million 2.0 --maximum-cost-usd 5.0 --yes "
         "--accept-insufficient-labels"
+    )
+
+
+def test_judge_retry_command_omits_optional_catalog_price_overrides() -> None:
+    """Catalog-priced runs retry without inventing advanced price or ceiling flags."""
+    command = judge_calibration_retry_command(
+        "support",
+        root="/tmp/.wmo",
+        sample_size=10,
+        input_price=None,
+        output_price=None,
+        maximum_input_tokens=32768,
+        maximum_cost_usd=None,
+        accept_insufficient_labels=False,
+    )
+
+    assert command == (
+        "wmo config judge calibrate support --root /tmp/.wmo --sample-size 10 "
+        "--maximum-input-tokens 32768 --yes"
     )

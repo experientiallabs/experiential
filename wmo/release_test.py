@@ -977,10 +977,6 @@ def _installed_release_driver() -> None:
             calibration_arguments.extend(["--label", f"{preview.trace_id}:task-success=5"])
         calibration_arguments.extend(
             [
-                "--input-usd-per-million",
-                "0",
-                "--output-usd-per-million",
-                "0",
                 "--maximum-cost-usd",
                 "0.000001",
                 "--yes",

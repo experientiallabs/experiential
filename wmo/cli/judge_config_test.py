@@ -18,7 +18,13 @@ from wmo.cli import judge_config as judge_config_module
 from wmo.cli.app import app
 from wmo.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
 from wmo.common.judging import Rubric
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import (
+    ModelCapabilities,
+    ModelCatalog,
+    ModelRecord,
+    ModelSnapshot,
+    write_model_catalog,
+)
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.optimize.router.judging.contracts import (
     JudgeCalibrationBudget,
@@ -31,6 +37,7 @@ from wmo.optimize.router.judging.service import (
     ManualJudgeSetupPlan,
     default_judge_dimensions,
 )
+from wmo.optimize.router.judging.service_test import _built_store, _catalog, _setup
 from wmo.runtime.models.providers.errors import ProviderError
 
 
@@ -63,16 +70,7 @@ class _ScalarAnswer:
     "arguments",
     [
         ["config", "judge", "setup", "support"],
-        [
-            "config",
-            "judge",
-            "calibrate",
-            "support",
-            "--input-usd-per-million",
-            "0",
-            "--output-usd-per-million",
-            "0",
-        ],
+        ["config", "judge", "calibrate", "support"],
     ],
 )
 def test_malformed_release_revision_fails_before_judge_state(
@@ -113,6 +111,127 @@ def test_judge_commands_render_as_nested_config_commands() -> None:
     assert "--approve" in calibrate_output
     assert "--debug" in calibrate_output
     assert "--page" in calibrate_output
+    assert "Advanced" in calibrate_output
+    assert "--input-usd-per-million" in calibrate_output
+    assert "--output-usd-per-million" in calibrate_output
+    assert "--maximum-cost-usd" in calibrate_output
+    assert "command-budget" in calibrate_output
+
+
+def _write_catalog(root: Path, catalog: ModelCatalog) -> None:
+    """Persist one secret-free catalog at the project root."""
+    write_model_catalog(root / "models.toml", catalog)
+
+
+def _priced_catalog() -> ModelCatalog:
+    """Return the fixture catalog with explicit persisted judge prices."""
+    catalog = _catalog()
+    record = catalog.models["judge-main"]
+    return catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                "judge-main": ModelRecord(
+                    connection=record.connection,
+                    model=record.model,
+                    capabilities=ModelCapabilities(
+                        input_cost_per_million_tokens_usd=1.0,
+                        output_cost_per_million_tokens_usd=2.0,
+                    ),
+                ),
+            }
+        }
+    )
+
+
+def test_calibrate_prints_catalog_pricing_breakdown_before_labels(tmp_path: Path) -> None:
+    """Known catalog prices produce a spend preflight before consent or labels."""
+    store = _built_store(tmp_path)
+    _setup(store)
+    _write_catalog(store.paths.root, _priced_catalog())
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "judge",
+            "calibrate",
+            "support",
+            "--root",
+            str(store.paths.root),
+            "--sample-size",
+            "3",
+            "--non-interactive",
+        ],
+    )
+
+    output = unstyle(result.output)
+    assert result.exit_code == 2
+    assert "Judge name: judge-main" in output
+    assert "Exact model: openai/judge-model" in output
+    assert "Pricing: configured" in output
+    assert "Judge calls authorized: 3" in output
+    assert "Tokens: up to 32768 input and 4096 output per attempt" in output
+    assert "Maximum estimated cost:" in output
+    assert "Hard spend ceiling: $10.0000" in output
+    assert "missing labels" not in output
+
+
+def test_calibrate_fails_closed_when_catalog_pricing_is_missing(tmp_path: Path) -> None:
+    """Missing catalog and known-model prices fail before labels or credentials."""
+    store = _built_store(tmp_path)
+    _setup(store)
+    _write_catalog(store.paths.root, _catalog())
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "judge",
+            "calibrate",
+            "support",
+            "--root",
+            str(store.paths.root),
+            "--non-interactive",
+        ],
+    )
+
+    output = unstyle(result.output)
+    assert result.exit_code == 2
+    assert "no trustworthy input/output" in output
+    assert "missing labels" not in output
+
+
+def test_calibrate_uses_shared_command_budget_when_flag_is_omitted(tmp_path: Path) -> None:
+    """The shared command-budget setting becomes the calibration ceiling."""
+    store = _built_store(tmp_path)
+    _setup(store)
+    root = store.paths.root
+    _write_catalog(root, _priced_catalog())
+    (root / "settings.toml").write_text(
+        "[commands]\nmaximum_cost_usd = 0.000001\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "judge",
+            "calibrate",
+            "support",
+            "--root",
+            str(root),
+            "--sample-size",
+            "3",
+            "--non-interactive",
+        ],
+    )
+
+    output = unstyle(result.output)
+    assert result.exit_code == 2
+    assert "exceeds --maximum-cost-usd" in output
+    assert "missing labels" not in output
 
 
 def test_calibrate_renders_provider_error_without_traceback(
