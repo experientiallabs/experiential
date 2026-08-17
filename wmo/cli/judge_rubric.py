@@ -79,9 +79,10 @@ def rebind_prompt_template(
         same custom contract with scalar bounds updated to the selected range.
 
     Raises:
-        ValueError: The axes are empty or do not share one range.
+        ValueError: The axes are empty, mixed, or a custom projection leaves the range.
     """
     lowest, highest = score_bounds(dimensions)
+    _require_projection_in_range(template, lowest, highest)
     if template.response_shape != "scalar":
         return template
     if template.prompt.prompt_id == DEFAULT_JUDGE_PROMPT.prompt_id:
@@ -95,6 +96,37 @@ def rebind_prompt_template(
             )
         }
     )
+
+
+def _require_projection_in_range(
+    template: JudgePromptTemplate,
+    min_score: int,
+    max_score: int,
+) -> None:
+    """Reject custom projections that fall outside the edited axis range.
+
+    Args:
+        template: Current prompt contract.
+        min_score: Inclusive lower bound of the selected axes.
+        max_score: Inclusive upper bound of the selected axes.
+
+    Raises:
+        ValueError: A projected score is outside the shared axis range.
+    """
+    projection = template.score_projection
+    if template.response_shape == "boolean":
+        values = tuple(projection.boolean_scores.values())
+    elif template.response_shape == "categorical":
+        values = tuple(projection.categorical_scores.values())
+    elif template.response_shape == "pairwise":
+        values = tuple(projection.pairwise_scores.values())
+    else:
+        return
+    if any(value < min_score or value > max_score for value in values):
+        raise ValueError(
+            f"custom {template.response_shape} score projections must stay inside "
+            f"{min_score} through {max_score}"
+        )
 
 
 def maybe_edit_setup_plan(plan: ManualJudgeSetupPlan, *, console: Console) -> ManualJudgeSetupPlan:

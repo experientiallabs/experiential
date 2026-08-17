@@ -16,7 +16,11 @@ from wmo.cli.judge_rubric import (
 )
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.judging import PromptDefinition, default_task_success_axis
-from wmo.optimize.router.judging.contracts import JudgePromptTemplate, judge_feedback_schema
+from wmo.optimize.router.judging.contracts import (
+    JudgePromptTemplate,
+    JudgeScoreProjection,
+    judge_feedback_schema,
+)
 from wmo.optimize.router.judging.service import default_judge_template
 
 
@@ -94,6 +98,17 @@ def test_default_template_schema_follows_selected_axis_bounds() -> None:
     rebound = rebind_prompt_template(custom, (wide,))
     assert rebound.prompt.prompt_id == "custom-judge-v1"
     assert _raw_score_bounds(rebound.response_schema) == (0, 4)
+
+    boolean = JudgePromptTemplate(
+        prompt=PromptDefinition.from_text("custom-bool-v1", "Return passed."),
+        response_shape="boolean",
+        variable_mapping={"rubric": "RULES_CUSTOM", "rollout": "TRACE_CUSTOM"},
+        response_schema=judge_feedback_schema("boolean"),
+        score_projection=JudgeScoreProjection(boolean_scores={"false": 1, "true": 4}),
+    )
+    with pytest.raises(ValueError, match="boolean score projections"):
+        rebind_prompt_template(boolean, (default_task_success_axis(),))
+    assert rebind_prompt_template(boolean, (wide,)) is boolean
 
 
 def test_edit_done_keeps_the_current_axes() -> None:
