@@ -59,6 +59,7 @@ from wmo.simulation.engines.text.simulator import (
     SimulationResumeError,
     WorldModelSimulator,
 )
+from wmo.simulation.engines.text.spec_persistence import persist_canonical_specification
 from wmo.simulation.retrieval import (
     RAGEmbedderBinding,
     RAGLineageBinding,
@@ -1347,7 +1348,7 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
     )
     spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
     selected, world_model, grounded_world_model = recovery._validate_spec_and_bindings(spec)
-    canonical_spec, spec_input = recovery._persist_specification(spec)
+    canonical_spec, spec_input = persist_canonical_specification(store, spec)
     resolution, resolution_input, bindings = recovery._persist_resolution(
         canonical_spec, spec_input, selected, world_model, grounded_world_model
     )
@@ -1570,7 +1571,7 @@ def test_text_simulation_live_hung_claim_times_out_without_calls_or_result_artif
     )
     spec = _spec(plan_input, task_set_input, ("cell-a",), maximum_cost_usd=1.0)
     cells, world_model, grounded_world_model = simulator._validate_spec_and_bindings(spec)
-    canonical_spec, spec_input = simulator._persist_specification(spec)
+    canonical_spec, spec_input = persist_canonical_specification(store, spec)
     resolution, resolution_input, bindings = simulator._persist_resolution(
         canonical_spec, spec_input, cells, world_model, grounded_world_model
     )

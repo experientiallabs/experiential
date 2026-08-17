@@ -81,6 +81,7 @@ from wmo.simulation.engines.text.rollout_support import (
     normalize_text_tool_failure,
     orchestration_economics,
 )
+from wmo.simulation.engines.text.spec_persistence import persist_canonical_specification
 from wmo.simulation.orchestration import require_implemented_mode
 from wmo.simulation.retrieval import TraceRAGRetriever
 from wmo.simulation.specs import SimulationSpec
@@ -88,7 +89,6 @@ from wmo.simulation.specs import SimulationSpec
 if TYPE_CHECKING:
     from wmo.simulation.world_model import GroundedWorldModel
 
-_SPEC_FILE = "simulation-spec.json"
 _ROLLOUT_FILE = "rollout.json"
 
 
@@ -245,7 +245,7 @@ class WorldModelSimulator:
         """
         require_implemented_mode(spec, SimulationMode.WORLD_MODEL)
         cells, world_model, grounded_world_model = self._validate_spec_and_bindings(spec)
-        spec, spec_input = self._persist_specification(spec)
+        spec, spec_input = persist_canonical_specification(self._store, spec)
         resolution, resolution_input, bindings = self._persist_resolution(
             spec,
             spec_input,
@@ -393,46 +393,6 @@ class WorldModelSimulator:
             )
             cells.append(cell)
         return tuple(cells), world_model, grounded_world_model
-
-    def _persist_specification(self, spec: SimulationSpec) -> tuple[SimulationSpec, ArtifactInput]:
-        """Persist or adopt the canonical specification for timestamp-stable retries.
-
-        Args:
-            spec: Requested sparse simulation specification.
-
-        Returns:
-            Canonical specification and its manifest input.
-
-        Raises:
-            SimulationResumeError: Existing specification differs semantically.
-        """
-        try:
-            manifest = self._store.write_json(
-                artifact_id=spec.simulation_id,
-                artifact_type="simulation-spec",
-                envelope=spec,
-                files={_SPEC_FILE: spec},
-            )
-            return spec, artifact_input(manifest)
-        except ArtifactAlreadyExistsError as exc:
-            stored = self._store.read(spec.simulation_id)
-            if stored.manifest.artifact_type != "simulation-spec":
-                raise SimulationResumeError(
-                    f"artifact {spec.simulation_id!r} exists but is not a simulation specification"
-                ) from exc
-            try:
-                persisted = SimulationSpec.model_validate_json(
-                    self._store.read_bytes(spec.simulation_id, _SPEC_FILE)
-                )
-            except (ArtifactCorruptionError, ValueError) as exc:
-                raise SimulationResumeError(
-                    f"simulation specification {spec.simulation_id!r} cannot be read safely"
-                ) from exc
-            if persisted.model_copy(update={"created_at": spec.created_at}) != spec:
-                raise SimulationResumeError(
-                    f"simulation ID {spec.simulation_id!r} already names a different immutable spec"
-                ) from exc
-            return persisted, artifact_input(stored.manifest)
 
     def _persist_resolution(
         self,
