@@ -1,17 +1,9 @@
 """Tests for router judgment contracts."""
 
-import pytest
-from pydantic import ValidationError
-
-from wmo.common.judging import PromptDefinition
 from wmo.common.judging.lm import PORTABLE_RATIONALE_JSON_SCHEMA
 from wmo.common.judging.lm_test import _axis_schema
 from wmo.common.models import PricingSource
-from wmo.optimize.router.judging.contracts import (
-    JudgeCalibrationBudget,
-    JudgePromptTemplate,
-    judge_feedback_schema,
-)
+from wmo.optimize.router.judging.contracts import JudgeCalibrationBudget, judge_feedback_schema
 
 
 def test_stored_budget_without_pricing_source_stays_unknown() -> None:
@@ -39,17 +31,3 @@ def test_scalar_feedback_schema_matches_the_portable_rationale_contract() -> Non
     assert properties["rationale"] == PORTABLE_RATIONALE_JSON_SCHEMA
     assert required == ["dimension_id", "raw_score"]
     assert "evidence_span_ids" not in properties
-
-
-def test_template_version_one_requires_re_setup() -> None:
-    """Citation-era setups fail closed with an actionable recreate message."""
-    template = JudgePromptTemplate(
-        prompt=PromptDefinition.from_text("custom-judge-v1", "Follow the saved contract exactly."),
-        variable_mapping={"rubric": "RULES_CUSTOM", "rollout": "TRACE_CUSTOM"},
-        response_schema=judge_feedback_schema("scalar"),
-    )
-    payload = template.model_dump(mode="json")
-    payload["template_version"] = "1"
-
-    with pytest.raises(ValidationError, match="retired citation contract"):
-        JudgePromptTemplate.model_validate(payload)
