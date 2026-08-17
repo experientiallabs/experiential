@@ -16,8 +16,36 @@ from wmo.common.project import (
     load_project_config,
     write_project_config,
 )
+from wmo.common.project.project import require_durable_source_id
 
 _DIGEST = "a" * 64
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    [
+        "/tmp/upload.json",
+        "tmp/upload.json",
+        r"C:\tmp\upload.json",
+        "C:upload.json",
+        "file:///tmp/upload.json",
+        r"tmp\upload.json",
+        "tmp/path://upload",
+    ],
+)
+def test_durable_source_id_rejects_worker_local_path_forms(source_id: str) -> None:
+    """POSIX, Windows, drive-relative, and disguised path forms all fail closed."""
+    with pytest.raises(ValueError, match="worker-local"):
+        require_durable_source_id(source_id)
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    ["platform-source:upload-123", "upload-123", "s3://bucket/traces/upload.json"],
+)
+def test_durable_source_id_accepts_opaque_labels_and_uri_sources(source_id: str) -> None:
+    """Caller-owned opaque labels and explicit non-file URIs remain valid provenance."""
+    assert require_durable_source_id(source_id) == source_id
 
 
 def test_trace_first_config_omits_late_setup_without_changing_existing_defaults(

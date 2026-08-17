@@ -254,6 +254,7 @@ def test_provider_free_source_label_and_bytes_are_immutable_identity_inputs(
         ("", "chat-json", 100, None, "source_id must be"),
         ("/tmp/worker-upload.json", "chat-json", 100, None, "worker-local"),
         ("tmp/worker-upload.json", "chat-json", 100, None, "worker-local"),
+        ("C:worker-upload.json", "chat-json", 100, None, "worker-local"),
         ("platform-source:one", "weave", 100, None, "unsupported trace source"),
         ("platform-source:one", "chat-json", 99, None, "100 to 1000"),
         ("platform-source:one", "chat-json", 1_001, None, "100 to 1000"),

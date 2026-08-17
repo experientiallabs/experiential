@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from urllib.parse import urlsplit
 
 import tomli_w
 from pydantic import Field, field_validator, model_validator
@@ -32,6 +33,38 @@ def _exclude_absent(value: object) -> bool:
 
 class ProjectConfigError(ValueError):
     """A project configuration file was absent, malformed, or violated its local contract."""
+
+
+def require_durable_source_id(source_id: str) -> str:
+    """Require a stable acquisition label rather than a worker-local path.
+
+    Args:
+        source_id: Caller-owned source label to persist in immutable provenance.
+
+    Returns:
+        The unchanged durable source label.
+
+    Raises:
+        ValueError: The label is blank, padded, or path-shaped without a URI scheme.
+    """
+    if not source_id or source_id != source_id.strip():
+        raise ValueError(
+            "source_id must be a nonblank durable acquisition label without surrounding spaces"
+        )
+    windows_path = PureWindowsPath(source_id)
+    uri_scheme = urlsplit(source_id).scheme
+    if (
+        PurePosixPath(source_id).is_absolute()
+        or windows_path.is_absolute()
+        or bool(windows_path.drive)
+        or source_id.casefold().startswith("file:")
+        or "\\" in source_id
+        or ("/" in source_id and not uri_scheme)
+    ):
+        raise ValueError(
+            "source_id must be a durable acquisition label, not a worker-local filesystem path"
+        )
+    return source_id
 
 
 class AgentConfiguration(ContractModel):

@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
@@ -36,6 +36,7 @@ from wmo.common.project.project import (
     ProjectConfig,
     ProjectProviderFreeStage,
     load_project_config,
+    require_durable_source_id,
     write_project_config,
 )
 
@@ -603,14 +604,7 @@ class ProjectStore:
         source = trace.source
         if source is None or source.sha256 is None:
             raise ValueError("provider-free trace manifest source requires a byte digest")
-        source_id = source.source_id
-        if (
-            PurePosixPath(source_id).is_absolute()
-            or PureWindowsPath(source_id).is_absolute()
-            or source_id.casefold().startswith("file:")
-            or (("/" in source_id or "\\" in source_id) and "://" not in source_id)
-        ):
-            raise ValueError("provider-free trace source must be durable, not a worker-local path")
+        require_durable_source_id(source.source_id)
         if task.code_revision != trace.code_revision:
             raise ValueError("provider-free trace and task manifest revisions differ")
 

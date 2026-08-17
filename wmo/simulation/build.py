@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, JsonValue, model_validator
@@ -30,6 +30,7 @@ from wmo.common.project import (
     artifact_input,
     coordinate_completed_build_selection,
 )
+from wmo.common.project.project import require_durable_source_id
 from wmo.common.release_revision import installed_release_revision
 from wmo.common.tasks import TaskSet
 from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
@@ -129,7 +130,7 @@ def prepare_project_traces(
         ValueError: The source label, source kind, normalized trace count, or evidence is invalid.
         ProjectStoreError: Existing Project settings or a selected stage conflict with this request.
     """
-    durable_source_id = _require_durable_source_id(source_id)
+    durable_source_id = require_durable_source_id(source_id)
     normalized = load_trace_source(
         settings.source_kind,
         Path(trace_file),
@@ -197,34 +198,6 @@ def load_project_provider_free_stage(
         )
     store.bind_provider_free_stage(stage)
     return stage
-
-
-def _require_durable_source_id(source_id: str) -> str:
-    """Validate a stable source label before the worker-local file is opened.
-
-    Args:
-        source_id: Caller-supplied source label.
-
-    Returns:
-        The unchanged durable source label.
-
-    Raises:
-        ValueError: The label is blank, padded, or a local filesystem path.
-    """
-    if not source_id or source_id != source_id.strip():
-        raise ValueError(
-            "source_id must be a nonblank durable acquisition label without surrounding spaces"
-        )
-    if (
-        PurePosixPath(source_id).is_absolute()
-        or PureWindowsPath(source_id).is_absolute()
-        or source_id.casefold().startswith("file:")
-        or (("/" in source_id or "\\" in source_id) and "://" not in source_id)
-    ):
-        raise ValueError(
-            "source_id must be a durable acquisition label, not a worker-local filesystem path"
-        )
-    return source_id
 
 
 def _initialize_provider_free_project(
