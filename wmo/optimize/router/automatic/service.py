@@ -122,16 +122,6 @@ def optimize_project_router(
         project.model_catalog_path,
         candidate_plan.expected_catalog_sha256,
     )
-    _attribution, attribution_input = persist_router_observed_attribution_set(
-        project.artifacts,
-        trace_dataset=preflight.completed_build.trace_dataset,
-        task_set=preflight.completed_build.task_set,
-        catalog_sha256=preflight.catalog_sha256,
-        candidates=preflight.candidates,
-        records=tuple(item.attribution for item in preflight.observed_traces),
-        created_at=created_at,
-        code_revision=code_revision,
-    )
     resolved_catalog = runtime_catalog.with_catalog(candidate_plan.prospective_catalog)
     agent_factory = _resolve_agent_factory(preflight, options)
     resolved = _resolve_all_models(preflight, resolved_catalog, options)
@@ -146,6 +136,16 @@ def optimize_project_router(
     )
     if configured != candidate_plan.prospective_catalog:
         raise AutomaticRouterError("persisted router candidate catalog differs from confirmation")
+    _attribution, attribution_input = persist_router_observed_attribution_set(
+        project.artifacts,
+        trace_dataset=preflight.completed_build.trace_dataset,
+        task_set=preflight.completed_build.task_set,
+        catalog_sha256=preflight.catalog_sha256,
+        candidates=preflight.candidates,
+        records=tuple(item.attribution for item in preflight.observed_traces),
+        created_at=created_at,
+        code_revision=code_revision,
+    )
     artifacts = materialize_automatic_router_artifacts(
         project,
         preflight,

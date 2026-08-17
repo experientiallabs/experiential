@@ -455,7 +455,14 @@ def _assign_router_candidates(
 
 
 def _candidate_option(item: AvailableModel) -> PickerOption:
-    """Present one strict router-candidate option with provider identity and capabilities."""
+    """Present one strict router-candidate option with provider identity and capabilities.
+
+    Args:
+        item: Eligible model discovered or retained by provider setup.
+
+    Returns:
+        Picker row carrying the alias, provider/model identity, and role metadata.
+    """
     return PickerOption(value=item.alias, label=item.label(), detail=item.detail())
 
 

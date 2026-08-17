@@ -167,16 +167,14 @@ def run_router_candidate_picker(
         if selection is None:
             continue
         selected_models = tuple(item for item in available if item.alias in selection.candidates)
-        selected_aliases = {item.alias for item in selected_models}
+        used_connections = {item.connection for item in selected_models}
         candidate_models = tuple(
             model_selection(item) for item in selected_models if not item.configured
         )
         connections = tuple(
             endpoint.connection
             for endpoint in session.endpoints
-            if not endpoint.configured
-            and endpoint.connection.name
-            in {item.connection for item in selected_models if item.alias in selected_aliases}
+            if not endpoint.configured and endpoint.connection.name in used_connections
         )
         return RouterCandidatePickerResult(
             selection=selection,

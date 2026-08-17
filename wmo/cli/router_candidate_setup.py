@@ -1,4 +1,4 @@
-"""Interactive and structured collection of router candidates without provider calls."""
+"""Interactive and structured collection of router candidates with provider discovery."""
 
 from __future__ import annotations
 
