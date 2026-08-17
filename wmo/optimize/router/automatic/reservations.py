@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+from wmo.common.core.artifacts import canonical_json_bytes
 from wmo.common.models import (
     CompletionCostReservation,
     EmbeddingCostReservation,
@@ -19,8 +20,67 @@ from wmo.common.routing import (
     router_feature_token_upper_bound,
 )
 from wmo.common.tasks import TaskCase
+from wmo.common.traces import Trace
 from wmo.optimize.router.judging.contracts import ManualJudgeCalibrationAudit
 from wmo.simulation.specs import CandidateCompletionReservation
+
+_PROMPT_FRAMING_TOKEN_BUDGET = 4_096
+"""Fixed conservative allowance for the frozen system prompt and message framing."""
+
+
+def median_trace_token_estimate(traces: tuple[Trace, ...]) -> int | None:
+    """Return the lower-median conservative token estimate over frozen build traces.
+
+    One trace is measured as the UTF-8 byte length of its canonical serialization. This matches
+    the provider-neutral byte-per-token upper bound used by simulation request admission, so a
+    reservation sized from this estimate compares directly against counted request tokens.
+
+    Args:
+        traces: Verified traces persisted by the completed build.
+
+    Returns:
+        Deterministic lower-median byte-length token estimate, or ``None`` without traces.
+    """
+    if not traces:
+        return None
+    sizes = sorted(len(canonical_json_bytes(trace)) for trace in traces)
+    return sizes[(len(sizes) - 1) // 2]
+
+
+def simulation_input_token_estimate(
+    traces: tuple[Trace, ...],
+    *,
+    maximum_retrieval_query_tokens: int,
+    maximum_output_tokens: int,
+) -> int | None:
+    """Size one realistic per-call input reservation from the frozen build traces.
+
+    The estimate sums explicit deterministic components instead of a model's full context
+    window: one median-length trace for the visible episode transcript, one median-length trace
+    bounding the retrieved fit-RAG transitions rendered into the prompt, the explicit retrieval
+    query token budget, one full output turn echoed back into the next request, and a fixed
+    prompt-framing allowance.
+
+    Args:
+        traces: Verified traces persisted by the completed build.
+        maximum_retrieval_query_tokens: Explicit rendered RAG query token budget.
+        maximum_output_tokens: Per-turn completion output ceiling echoed into later prompts.
+
+    Returns:
+        Deterministic per-call input token reservation, or ``None`` without traces.
+    """
+    median = median_trace_token_estimate(traces)
+    if median is None:
+        return None
+    transcript_tokens = median
+    retrieved_transition_tokens = median
+    return (
+        transcript_tokens
+        + retrieved_transition_tokens
+        + maximum_retrieval_query_tokens
+        + maximum_output_tokens
+        + _PROMPT_FRAMING_TOKEN_BUDGET
+    )
 
 
 def router_feature_reservation(
@@ -83,6 +143,7 @@ def simulation_completion_reservations(
     world_alias: str | None,
     world: ModelSnapshot | None,
     maximum_attempts: int,
+    maximum_input_tokens: int,
     maximum_output_tokens: int,
 ) -> tuple[tuple[CandidateCompletionReservation, ...], CompletionCostReservation | None]:
     """Freeze candidate and world call ceilings from exact catalog declarations.
@@ -94,6 +155,7 @@ def simulation_completion_reservations(
         world_alias: Build-frozen world-model alias.
         world: Exact world-model snapshot.
         maximum_attempts: Active completion retry ceiling.
+        maximum_input_tokens: Trace-derived per-call input reservation.
         maximum_output_tokens: Per-turn candidate and world output ceiling.
 
     Returns:
@@ -108,6 +170,7 @@ def simulation_completion_reservations(
             model=candidate.model,
             label="candidate",
             maximum_attempts=maximum_attempts,
+            maximum_input_tokens=maximum_input_tokens,
             maximum_output_tokens=maximum_output_tokens,
         )
         if request is not None:
@@ -125,6 +188,7 @@ def simulation_completion_reservations(
             model=world,
             label="world model",
             maximum_attempts=maximum_attempts,
+            maximum_input_tokens=maximum_input_tokens,
             maximum_output_tokens=maximum_output_tokens,
         )
         if world_alias is not None and world is not None
@@ -180,6 +244,7 @@ def completion_reservation_from_catalog(
     model: ModelSnapshot,
     label: str,
     maximum_attempts: int,
+    maximum_input_tokens: int,
     maximum_output_tokens: int,
 ) -> CompletionCostReservation | None:
     """Create one completion reservation from exact capacity and pricing metadata.
@@ -191,6 +256,7 @@ def completion_reservation_from_catalog(
         model: Frozen provider model identity.
         label: Candidate, world-model, or judge diagnostic role.
         maximum_attempts: Active provider request-attempt ceiling.
+        maximum_input_tokens: Explicit trace-derived per-request input reservation.
         maximum_output_tokens: Per-request output ceiling.
 
     Returns:
@@ -209,6 +275,12 @@ def completion_reservation_from_catalog(
         problems.append(
             f"{label} alias {alias!r} cannot reserve {maximum_output_tokens} output tokens "
             "inside its explicit capacity"
+        )
+        return None
+    if maximum_input_tokens <= 0 or maximum_input_tokens + maximum_output_tokens > context:
+        problems.append(
+            f"{label} alias {alias!r} cannot fit the estimated {maximum_input_tokens} input plus "
+            f"{maximum_output_tokens} output tokens inside its {context}-token context window"
         )
         return None
     prices = (
@@ -230,7 +302,7 @@ def completion_reservation_from_catalog(
             cached_input_usd_per_million_tokens=cached_input_price,
             cache_write_usd_per_million_tokens=cache_write_price,
             maximum_attempts=maximum_attempts,
-            maximum_input_tokens=context - maximum_output_tokens,
+            maximum_input_tokens=maximum_input_tokens,
             maximum_output_tokens=maximum_output_tokens,
         )
     except ValueError as exc:

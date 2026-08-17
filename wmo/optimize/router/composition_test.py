@@ -9,7 +9,13 @@ from typing import cast
 import pytest
 
 from wmo.cli.build_cmd import _lineage_bindings
-from wmo.common.core.artifacts import ArtifactInput, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactInput,
+    FailureAttribution,
+    FailureCode,
+    StructuredFailure,
+    stable_id,
+)
 from wmo.common.evaluations import (
     EvaluationPlan,
     EvaluationProtocol,
@@ -59,6 +65,7 @@ from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.runtime_test import _Client, _request
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
+from wmo.simulation.engines.text import simulator as text_simulator_module
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
     _OneTurnAgent,
@@ -73,7 +80,11 @@ from wmo.simulation.retrieval import (
     persist_trace_rag,
 )
 from wmo.simulation.retrieval.retrieval_test import _message_trace as _trace
-from wmo.simulation.specs import SimulationSpec, WorldModelSettings
+from wmo.simulation.specs import (
+    SimulationCompletionContract,
+    SimulationSpec,
+    WorldModelSettings,
+)
 from wmo.simulation.world_model import bind_fit_grounded_world_model, persist_grounded_world_model
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
@@ -863,3 +874,165 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     decision = first.runtime.select(_request(), episode_id="customer-episode")
     assert first.runtime.select(_request(), episode_id="customer-episode") == decision
     assert first.plan.cells
+
+
+def test_failed_rollouts_skip_judging_and_rerun_replays_after_partial_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed rollouts stay unjudged and a later-clock rerun resumes without redispatch.
+
+    Args:
+        tmp_path: Isolated project root for composed router artifacts.
+        monkeypatch: Patch fixture used to inject admission failures and one crash.
+    """
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
+    _bind_completed_build(project, normalized, revision="test-revision")
+    simulator = _SimulatorFactory()
+    judge = _Judge()
+    services = RouterWorkflowServices(
+        review_supplier=_ReviewSupplier(),
+        setup_supplier=_SetupSupplier(),
+        simulator_factory=simulator,
+        judge=judge,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _Catalog(
+                {
+                    "candidate-a": _snapshot("candidate-a"),
+                    "embedder": _snapshot("embedder"),
+                },
+                _Client(),
+            ),
+        ),
+    )
+    budget = RouterCompositionBudget(
+        maximum_simulation_cost_usd=10.0,
+        maximum_judgments=100,
+    )
+    real_admission = text_simulator_module.episode_reservation_failure
+    admissions = {"count": 0}
+
+    def failing_admission(
+        settings: WorldModelSettings,
+        *,
+        completion_contract: SimulationCompletionContract | None,
+        candidate_alias: str,
+        maximum_steps: int,
+        remaining_cost_usd: float,
+    ) -> StructuredFailure | None:
+        """Reject the first two held-out episode admissions before any provider dispatch."""
+        locked = any(
+            artifact_id.startswith("router-policy-lock-")
+            for artifact_id in project.artifacts.list_ids()
+        )
+        if locked:
+            admissions["count"] += 1
+        if locked and admissions["count"] <= 2:
+            return StructuredFailure(
+                code=FailureCode.BUDGET,
+                message="full episode provider reservation exceeds remaining simulation spend",
+                attribution=FailureAttribution.MODEL,
+                details={"phase": "episode_provider_reservation"},
+            )
+        return real_admission(
+            settings,
+            completion_contract=completion_contract,
+            candidate_alias=candidate_alias,
+            maximum_steps=maximum_steps,
+            remaining_cost_usd=remaining_cost_usd,
+        )
+
+    monkeypatch.setattr(text_simulator_module, "episode_reservation_failure", failing_admission)
+    real_persist_set = text_simulator_module.persist_artifact_set
+
+    def crash_before_artifact_set(*args: object, **kwargs: object) -> SimulationArtifactSet:
+        """Simulate one crash after rollouts persist but before their set persists."""
+        del args, kwargs
+        raise RuntimeError("simulated crash before artifact-set persistence")
+
+    monkeypatch.setattr(text_simulator_module, "persist_artifact_set", crash_before_artifact_set)
+    with pytest.raises(RuntimeError, match="before artifact-set persistence"):
+        compose_router(
+            project,
+            normalized,
+            services=services,
+            budget=budget,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+    monkeypatch.setattr(text_simulator_module, "persist_artifact_set", real_persist_set)
+
+    first = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=datetime(2026, 8, 13, tzinfo=UTC),
+        code_revision="test-revision",
+    )
+
+    simulated_cells = tuple(
+        cell
+        for cell in first.plan.cells
+        if cell.execution == "simulate" and cell.purpose in {"fit", "held_out"}
+    )
+    assert len(simulator.candidate.requests) == len(simulated_cells) - 2
+    assert len(simulator.world.requests) == len(simulated_cells) - 2
+    held_set = next(
+        SimulationArtifactSet.model_validate_json(
+            project.artifacts.read_bytes(artifact_id, "artifact-set.json")
+        )
+        for artifact_id in project.artifacts.list_ids()
+        if project.artifacts.read(artifact_id).manifest.artifact_type == "simulation-artifact-set"
+        and SimulationArtifactSet.model_validate_json(
+            project.artifacts.read_bytes(artifact_id, "artifact-set.json")
+        ).simulation_id
+        == first.held_out_simulation_spec.simulation_id
+    )
+    failed_cells = {
+        rollout.cell_id
+        for rollout in (
+            read_rollout(project.artifacts, rollout_id)[0] for rollout_id in held_set.artifact_ids
+        )
+        if rollout.failure is not None
+    }
+    assert len(failed_cells) == 2
+    judged_cells = {cell_id for cell_id, _locked in judge.log}
+    assert failed_cells.isdisjoint(judged_cells)
+    dispatches = tuple(
+        JudgmentDispatchReceipt.model_validate_json(
+            project.artifacts.read_bytes(artifact_id, "dispatch.json")
+        )
+        for artifact_id in project.artifacts.list_ids()
+        if project.artifacts.read(artifact_id).manifest.artifact_type == "judgment-dispatch"
+    )
+    assert failed_cells.isdisjoint({item.cell_id for item in dispatches})
+    scored_cells = tuple(cell for cell in first.plan.cells if cell.purpose in {"fit", "held_out"})
+    assert judge.calls == len(dispatches) == len(scored_cells) - 2
+
+    dispatched = (
+        len(simulator.log),
+        len(simulator.candidate.requests),
+        len(simulator.world.requests),
+        judge.calls,
+    )
+    second = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=datetime(2026, 8, 14, tzinfo=UTC),
+        code_revision="test-revision",
+    )
+    assert second.optimization == first.optimization
+    assert (
+        len(simulator.log),
+        len(simulator.candidate.requests),
+        len(simulator.world.requests),
+        judge.calls,
+    ) == dispatched

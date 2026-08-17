@@ -47,7 +47,7 @@ from wmo.common.project import (
     ProjectStore,
     artifact_input,
 )
-from wmo.common.rollouts import SimulationArtifactSet
+from wmo.common.rollouts import RolloutArtifact, SimulationArtifactSet, StopReason
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import KnnBankManifest
 from wmo.optimize.router.activation import load_project_router
@@ -226,7 +226,9 @@ def compose_router(
         trace_source: Canonical normalized traces used to build task evidence.
         services: Review, simulation, judging, and runtime dependencies. None are auto-resolved.
         budget: Finite simulation spend and judgment-call ceilings.
-        created_at: Timezone-aware artifact completion time.
+        created_at: Timezone-aware artifact completion time. Once the evaluation plan is
+            persisted, every later phase artifact adopts the plan's completion time so a rerun
+            replays completed simulation, fit, and report work deterministically.
         code_revision: Exact code revision for every new artifact.
         phase_hook: Optional local observer used to audit phase ordering.
 
@@ -269,6 +271,7 @@ def compose_router(
         code_revision=code_revision,
     )
     plan_input = artifact_input(project.artifacts.read(plan.plan_id).manifest)
+    phase_created_at = plan.created_at
     task_input = built.review.task_set
     _phase(phase_hook, "fit_started")
     fit_cells = tuple(cell for cell in plan.cells if cell.purpose == "fit")
@@ -278,7 +281,7 @@ def compose_router(
         task_input,
         setup,
         budget.maximum_simulation_cost_usd,
-        created_at,
+        phase_created_at,
         code_revision,
         fit_cells,
         phase="fit",
@@ -316,14 +319,14 @@ def compose_router(
         pricing_snapshot_id=setup.pricing_snapshot_id,
         guard=setup.guard,
         judgment_status=setup.judgment_status,
-        created_at=created_at,
+        created_at=phase_created_at,
         code_revision=code_revision,
     )
     fit, policy_lock = _fit_and_lock_once(
         project,
         plan_input,
         fit_config,
-        created_at,
+        phase_created_at,
         code_revision,
     )
     _phase(phase_hook, "policy_locked")
@@ -336,7 +339,7 @@ def compose_router(
         task_input,
         setup,
         remaining_cost_usd,
-        created_at,
+        phase_created_at,
         code_revision,
         held_cells,
         phase="heldout",
@@ -366,7 +369,7 @@ def compose_router(
                 cell_evidence=held_evidence,
             ),
             embedding_set_id=setup.embedding_set_id,
-            created_at=created_at,
+            created_at=phase_created_at,
             code_revision=code_revision,
         ),
     )
@@ -619,6 +622,7 @@ def _complete_cell_evidence(
     }
     bound_cells = []
     protocols_by_rollout: dict[str, EvaluationProtocol] = {}
+    rollouts_by_id: dict[str, RolloutArtifact] = {}
     for cell in cells:
         rollout_id = (
             cell.observed_rollout_id
@@ -640,11 +644,18 @@ def _complete_cell_evidence(
         existing_protocol = protocols_by_rollout.setdefault(rollout_id, protocol)
         if existing_protocol != protocol:
             raise RouterCompositionError("one rollout is bound to conflicting evaluation protocols")
+        if rollout_id not in rollouts_by_id:
+            rollouts_by_id[rollout_id] = read_rollout(project.artifacts, rollout_id)[0]
         bound_cells.append((cell, rollout_id, protocol))
+    judgeable_protocols = {
+        rollout_id: protocol
+        for rollout_id, protocol in protocols_by_rollout.items()
+        if not _rollout_failed(rollouts_by_id[rollout_id])
+    }
     try:
         judgments_by_rollout = find_verified_judgments(
             project,
-            protocols_by_rollout=protocols_by_rollout,
+            protocols_by_rollout=judgeable_protocols,
             rubric_id=review.rubric_id,
             calibration_id=review.calibration_id,
         )
@@ -654,6 +665,18 @@ def _complete_cell_evidence(
     evidence = []
     consumed = 0
     for cell, rollout_id, protocol in bound_cells:
+        rollout = rollouts_by_id[rollout_id]
+        if _rollout_failed(rollout):
+            evidence.append(
+                EvaluationCellEvidence(
+                    cell_id=cell.cell_id,
+                    protocol_id=protocol.protocol_id,
+                    rollout_artifact_id=rollout_id,
+                    judgment_artifact_id=None,
+                    source_run_id=rollout.source_run_id,
+                )
+            )
+            continue
         try:
             judgment = judgments_by_rollout.get(rollout_id)
             receipt = read_dispatch_reservation(
@@ -709,7 +732,6 @@ def _complete_cell_evidence(
             )
             _persist_judgment(project, judgment)
             judgments_by_rollout[rollout_id] = judgment
-        rollout, _input = read_rollout(project.artifacts, rollout_id)
         evidence.append(
             EvaluationCellEvidence(
                 cell_id=cell.cell_id,
@@ -720,6 +742,22 @@ def _complete_cell_evidence(
             )
         )
     return tuple(evidence), consumed
+
+
+def _rollout_failed(rollout: RolloutArtifact) -> bool:
+    """Return whether one persisted rollout terminated as failed evidence.
+
+    Failed rollouts never receive a judgment: the evaluation builder scores them as failed rows
+    directly and rejects any judgment bound to them, so dispatching a judge call against one
+    would waste real spend on an episode that produced no gradable output.
+
+    Args:
+        rollout: Verified persisted rollout evidence.
+
+    Returns:
+        True when the rollout carries a structured failure or a failed stop reason.
+    """
+    return rollout.failure is not None or rollout.stop_reason == StopReason.FAILURE
 
 
 def _persist_judgment(project: ProjectStore, judgment: Judgment) -> None:

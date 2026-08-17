@@ -42,6 +42,7 @@ from wmo.optimize.router.automatic.reservations import (
     retrieval_embedding_reservation,
     router_feature_reservation,
     simulation_completion_reservations,
+    simulation_input_token_estimate,
 )
 from wmo.optimize.router.judging.artifacts import read_audit
 from wmo.optimize.router.judging.contracts import (
@@ -226,15 +227,29 @@ def preflight_automatic_router(
         options.maximum_retrieval_query_tokens,
         options.router_embedding_maximum_attempts,
     )
-    candidate_requests, world_request = simulation_completion_reservations(
-        problems,
-        catalog=catalog,
-        candidates=candidates,
-        world_alias=world_alias,
-        world=world,
-        maximum_attempts=options.completion_maximum_attempts,
+    estimated_input_tokens = simulation_input_token_estimate(
+        traces,
+        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
         maximum_output_tokens=options.simulation_maximum_output_tokens,
     )
+    if estimated_input_tokens is None:
+        problems.append(
+            "simulation completion reservations: the completed build has no persisted traces "
+            "to size the per-call input reservation"
+        )
+        candidate_requests: tuple[CandidateCompletionReservation, ...] = ()
+        world_request = None
+    else:
+        candidate_requests, world_request = simulation_completion_reservations(
+            problems,
+            catalog=catalog,
+            candidates=candidates,
+            world_alias=world_alias,
+            world=world,
+            maximum_attempts=options.completion_maximum_attempts,
+            maximum_input_tokens=estimated_input_tokens,
+            maximum_output_tokens=options.simulation_maximum_output_tokens,
+        )
     judge_request = judge_completion_reservation(
         problems,
         catalog=catalog,
