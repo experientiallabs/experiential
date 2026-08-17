@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Literal, cast
+from typing import cast
 
 from pydantic import Field, field_validator
 
@@ -48,7 +48,7 @@ class RawDimensionJudgment(ContractModel):
     """Strict structured score emitted for one rubric dimension by an LM judge."""
 
     dimension_id: ArtifactId
-    raw_score: Literal[0, 1, 2, 3, 4, 5]
+    raw_score: int = Field(ge=0)
     evidence_span_ids: tuple[str, ...]
     feedback: str = Field(min_length=1)
 
@@ -262,7 +262,7 @@ class LMJudge:
         created_at = self._clock()
         if created_at.tzinfo is None or created_at.utcoffset() is None:
             raise JudgmentError("judge clock must return a timezone-aware time")
-        overall_score = sum(item.calibrated_score / 5 for item in probe.dimensions) / len(
+        overall_score = sum(item.normalize_score() for item in probe.dimensions) / len(
             probe.dimensions
         )
         inputs = sorted_verified_inputs((rollout_input, rubric_input, calibration_input))
@@ -470,11 +470,19 @@ def _build_dimensions(
                 "LM judge cited rollout spans that do not exist: "
                 + ", ".join(sorted(unknown_spans))
             )
+        axis = next(item for item in rubric.dimensions if item.dimension_id == dimension_id)
+        if not axis.contains_score(raw_dimension.raw_score):
+            raise JudgmentError(
+                f"LM judge raw_score for {dimension_id} must be an integer from "
+                f"{axis.min_score} through {axis.max_score}"
+            )
         dimensions.append(
             DimensionJudgment(
                 dimension_id=dimension_id,
                 raw_score=raw_dimension.raw_score,
                 calibrated_score=maps_by_dimension[dimension_id].apply(raw_dimension.raw_score),
+                min_score=axis.min_score,
+                max_score=axis.max_score,
                 evidence_span_ids=raw_dimension.evidence_span_ids,
                 feedback=raw_dimension.feedback,
             )
@@ -491,15 +499,7 @@ def _render_judgment_request(rollout: RolloutArtifact, rubric: Rubric) -> str:
     Returns:
         Deterministic JSON-grounded user request for the structured judge.
     """
-    rubric_payload = [
-        {
-            "dimension_id": dimension.dimension_id,
-            "name": dimension.name,
-            "description": dimension.description,
-            "anchors": [anchor.model_dump(mode="json") for anchor in dimension.anchors],
-        }
-        for dimension in rubric.dimensions
-    ]
+    rubric_payload = [dimension.prompt_payload() for dimension in rubric.dimensions]
     rollout_payload = {
         "rollout_id": rollout.rollout_id,
         "task_id": rollout.task_id,
@@ -520,9 +520,9 @@ def _render_judgment_request(rollout: RolloutArtifact, rubric: Rubric) -> str:
         ],
     }
     return (
-        "Score the rollout against every rubric dimension. Return only JSON with a dimensions "
-        "array. Each item must contain dimension_id, raw_score from zero through five, "
-        "evidence_span_ids, and feedback. Cite only span IDs present in the rollout.\n\n"
+        "Score the rollout against every rubric axis. Return only JSON with a dimensions "
+        "array. Each item must contain dimension_id, raw_score inside that axis inclusive "
+        "range, evidence_span_ids, and feedback. Cite only span IDs present in the rollout.\n\n"
         "RUBRIC:\n"
         + json.dumps(rubric_payload, ensure_ascii=False, sort_keys=True)
         + "\n\nROLLOUT:\n"

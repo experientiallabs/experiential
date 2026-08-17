@@ -33,7 +33,7 @@ class ManualJudgeLabel(ContractModel):
     trace_id: str = Field(min_length=1, max_length=512)
     reference_trace_id: str | None = Field(default=None, min_length=1, max_length=512)
     dimension_id: ArtifactId
-    score: Literal[0, 1, 2, 3, 4, 5] | None = None
+    score: int | None = Field(default=None, ge=0)
     winner: Literal["winner_a", "winner_b", "tie"] | None = None
 
     @model_validator(mode="after")
@@ -61,13 +61,9 @@ class JudgeScoreProjection(ContractModel):
     """Versioned explicit projection from structured feedback to router scores."""
 
     projection_version: Literal["1"] = "1"
-    boolean_scores: dict[Literal["false", "true"], Literal[0, 1, 2, 3, 4, 5]] = Field(
-        default_factory=dict
-    )
-    categorical_scores: dict[str, Literal[0, 1, 2, 3, 4, 5]] = Field(default_factory=dict)
-    pairwise_scores: dict[Literal["winner_a", "winner_b", "tie"], Literal[0, 1, 2, 3, 4, 5]] = (
-        Field(default_factory=dict)
-    )
+    boolean_scores: dict[Literal["false", "true"], int] = Field(default_factory=dict)
+    categorical_scores: dict[str, int] = Field(default_factory=dict)
+    pairwise_scores: dict[Literal["winner_a", "winner_b", "tie"], int] = Field(default_factory=dict)
     pairwise_aggregation: Literal["rounded_mean"] | None = None
 
 
@@ -139,9 +135,12 @@ class JudgePromptTemplate(ContractModel):
             raise ValueError(
                 f"judge {self.response_shape} response shape requires its exact saved score map"
             )
+        lowest, highest = _scalar_schema_bounds(self.response_schema)
         expected_schema = judge_feedback_schema(
             self.response_shape,
             categories=tuple(sorted(projection.categorical_scores)),
+            min_score=lowest,
+            max_score=highest,
         )
         if self.response_schema != expected_schema:
             raise ValueError("judge response schema is not the supported canonical schema")
@@ -299,16 +298,51 @@ class JudgeProtocolProbeArtifact(ArtifactEnvelope):
         return self
 
 
+def _scalar_schema_bounds(schema: JsonObject) -> tuple[int, int]:
+    """Read inclusive scalar score bounds from a stored judge response schema.
+
+    Args:
+        schema: Persisted structured-feedback schema.
+
+    Returns:
+        Inclusive minimum and maximum, or the default 0-1 axis when absent.
+    """
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return 0, 1
+    items = properties.get("dimensions")
+    if not isinstance(items, dict):
+        return 0, 1
+    item_schema = items.get("items")
+    if not isinstance(item_schema, dict):
+        return 0, 1
+    item_properties = item_schema.get("properties")
+    if not isinstance(item_properties, dict):
+        return 0, 1
+    raw_score = item_properties.get("raw_score")
+    if not isinstance(raw_score, dict):
+        return 0, 1
+    minimum = raw_score.get("minimum", 0)
+    maximum = raw_score.get("maximum", 1)
+    if not isinstance(minimum, int) or not isinstance(maximum, int):
+        return 0, 1
+    return minimum, maximum
+
+
 def judge_feedback_schema(
     shape: Literal["scalar", "boolean", "categorical", "pairwise"],
     *,
     categories: tuple[str, ...] = (),
+    min_score: int = 0,
+    max_score: int = 1,
 ) -> JsonObject:
     """Build the exact supported structured-feedback schema for one response shape.
 
     Args:
         shape: Supported structured feedback shape.
         categories: Saved categorical values when ``shape`` is categorical.
+        min_score: Inclusive lower bound for scalar raw scores.
+        max_score: Inclusive upper bound for scalar raw scores.
 
     Returns:
         Canonical strict JSON schema persisted in judge setup.
@@ -324,8 +358,8 @@ def judge_feedback_schema(
     if shape == "scalar":
         dimension_properties["raw_score"] = {
             "type": "integer",
-            "minimum": 0,
-            "maximum": 5,
+            "minimum": min_score,
+            "maximum": max_score,
         }
         dimension_properties["evidence_span_ids"] = {
             "type": "array",

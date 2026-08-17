@@ -29,7 +29,7 @@ class JudgeScoreObservation(ContractModel):
     judgment: ArtifactInput
     source_rollout: ArtifactInput
     dimension_id: ArtifactId
-    raw_score: Literal[0, 1, 2, 3, 4, 5]
+    raw_score: int = Field(ge=0)
     evidence_span_ids: tuple[str, ...]
 
     @field_validator("evidence_span_ids")
@@ -151,7 +151,6 @@ class CalibrationReport(ArtifactEnvelope):
 
     def _require_provisional_shape(self) -> None:
         """Reject provisional records that claim evidence or a learned score map."""
-        identity = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
         if self.observations or self.eligible_label_count or self.eligible_rollout_count:
             raise ValueError("provisional calibration reports require zero eligible labels")
         if self.eligible_lineage_ids or self.eligible_lineage_count:
@@ -162,7 +161,7 @@ class CalibrationReport(ArtifactEnvelope):
             raise ValueError("provisional calibration reports require zero held-out lineages")
         if self.out_of_fold_predictions or self.worst_disagreements:
             raise ValueError("provisional calibration reports cannot claim OOF evidence")
-        if any(score_map.calibrated_scores != identity for score_map in self.score_maps):
+        if any(not score_map.is_identity() for score_map in self.score_maps):
             raise ValueError("provisional calibration reports require identity score maps")
         if any(
             metric.label_count

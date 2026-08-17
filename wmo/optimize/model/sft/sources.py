@@ -528,8 +528,9 @@ def _recompute_calibrated_score(
             raise SFTSourceVerificationError(
                 "teacher judgment calibrated dimension does not match stored score map"
             )
-        calibrated_scores.append(expected)
-    overall = sum(score / 5 for score in calibrated_scores) / len(calibrated_scores)
+        axis = next(item for item in rubric.dimensions if item.dimension_id == dimension_id)
+        calibrated_scores.append(axis.normalize_score(expected))
+    overall = sum(calibrated_scores) / len(calibrated_scores)
     if not math.isclose(judgment.overall_score, overall, rel_tol=1e-12, abs_tol=1e-12):
         raise SFTSourceVerificationError(
             "teacher judgment overall score does not match authoritative calibrated dimensions"

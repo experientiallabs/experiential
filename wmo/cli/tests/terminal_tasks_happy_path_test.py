@@ -92,7 +92,7 @@ class _JudgeClient:
                         "dimensions": [
                             {
                                 "dimension_id": "task-success",
-                                "raw_score": 4,
+                                "raw_score": 1,
                                 "evidence_span_ids": [match.group(1)],
                                 "feedback": "The trace shows the requested task was handled.",
                             }
@@ -254,7 +254,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     labels = [
         argument
         for trace in plan.traces
-        for argument in ("--label", f"{trace.trace_id}:task-success=4")
+        for argument in ("--label", f"{trace.trace_id}:task-success=1")
     ]
 
     before_preflight = store.read_review()
@@ -275,18 +275,18 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     _RuntimeCatalog.judge_fail_after = 0
     interrupted = runner.invoke(app, _calibrate_arguments(root, labels))
     assert interrupted.exit_code != 0
-    assert "ZERO-TO-FIVE CALIBRATION" in interrupted.output
+    assert "INTEGER 0-1 CALIBRATION" in interrupted.output
     assert "User / task:" in interrupted.output
     assert "Tool call:" in interrupted.output
     assert "Tool arguments:" in interrupted.output
     assert "Tool result:" in interrupted.output
     assert "Tool output:" in interrupted.output
     assert "Final outcome:" in interrupted.output
-    assert "0: The agent did not address the task." in interrupted.output
-    assert "5: The agent fully and correctly addressed the task." in interrupted.output
+    assert "0: The agent did not complete the requested task." in interrupted.output
+    assert "1: The agent successfully completed the requested task." in interrupted.output
     drafted = _drafted_labels(store)
     assert len(drafted) == _SAMPLE_SIZE
-    assert {item["score"] for item in drafted} == {4}
+    assert {item["score"] for item in drafted} == {1}
 
     _RuntimeCatalog.judge_fail_after = None
     _RuntimeCatalog.judge_clients = []

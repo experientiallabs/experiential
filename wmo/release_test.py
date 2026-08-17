@@ -550,7 +550,7 @@ def _installed_release_driver() -> None:
                             "dimensions": [
                                 {
                                     "dimension_id": "task-success",
-                                    "raw_score": 5,
+                                    "raw_score": 1,
                                     "evidence_span_ids": [span_id],
                                     "feedback": "Deterministic loopback evidence.",
                                 }
@@ -974,7 +974,7 @@ def _installed_release_driver() -> None:
             "10",
         ]
         for preview in calibration_plan.previews:
-            calibration_arguments.extend(["--label", f"{preview.trace_id}:task-success=5"])
+            calibration_arguments.extend(["--label", f"{preview.trace_id}:task-success=1"])
         calibration_arguments.extend(
             [
                 "--maximum-cost-usd",

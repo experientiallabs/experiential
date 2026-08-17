@@ -584,6 +584,8 @@ class _EvidenceReviewSupplier:
                         dimension_id="dimension-a",
                         name="Task success",
                         description="Whether the task was completed.",
+                        min_score=0,
+                        max_score=5,
                         anchors=tuple(
                             ScoreAnchor(score=score, description=f"Score {score} outcome.")
                             for score in (0, 1, 2, 3, 4, 5)

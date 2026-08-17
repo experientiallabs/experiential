@@ -14,14 +14,15 @@ from rich.markup import escape
 from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.cli.consent import can_prompt, require_spend_consent
-from wmo.cli.judge_render import model_name, render_trace
+from wmo.cli.judge_rubric import maybe_edit_setup_plan
+from wmo.cli.judge_transcript import model_display_name, render_trace
 from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.cli.provider_failures import (
     exit_provider_failure,
     judge_calibration_retry_command,
 )
 from wmo.common.config import resolve_command_budget_usd
-from wmo.common.judging import Rubric, RubricDimension
+from wmo.common.judging import Rubric, RubricDimension, render_rubric_table, score_bounds
 from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import load_model_catalog
 from wmo.common.project import ProjectStore
@@ -59,7 +60,7 @@ from wmo.runtime.models.registry import RuntimeModelCatalog
 judge_app = typer.Typer(help="Set up and manually calibrate a project judge.", no_args_is_help=True)
 _console = Console()
 _RUBRIC_FILE_OPTION = typer.Option(
-    None, "--rubric-file", help="JSON array of complete zero-to-five rubric dimensions."
+    None, "--rubric-file", help="JSON array of rubric axes with IDs, ranges, and score meanings."
 )
 _TEMPLATE_FILE_OPTION = typer.Option(
     None,
@@ -78,7 +79,7 @@ _LABEL_OPTION = typer.Option(
 
 @judge_app.command(
     "setup",
-    help="Preview real traces and save a confirmed judge rubric and prompt contract.",
+    help="Preview a human-readable rubric and save a confirmed judge contract.",
 )
 def judge_setup(
     project: str = typer.Argument(..., metavar="PROJECT", help="Configured local project ID."),
@@ -102,7 +103,7 @@ def judge_setup(
         judge_alias: Optional configured judge alias override.
         rubric_file: Optional complete human-authored rubric JSON file.
         template_file: Optional versioned prompt contract JSON file.
-        preview_count: Maximum number of real fit traces to render.
+        preview_count: Maximum number of distinct fit-lineage traces bound into the plan.
         approve: Explicit setup confirmation.
         non_interactive: Refuse prompts and require explicit confirmation flags.
 
@@ -125,6 +126,8 @@ def judge_setup(
             code_revision=revision,
         )
         _render_setup(plan)
+        if not approve and not non_interactive:
+            plan = maybe_edit_setup_plan(plan, console=_console)
         confirmed = approve or _confirm(
             "Save this judge setup and finalize its rubric?",
             non_interactive=non_interactive,
@@ -220,6 +223,7 @@ def judge_calibrate(
         now = datetime.now(UTC)
         plan = prepare_manual_judge_calibration(store, sample_size=sample_size)
         rubric = _load_setup_rubric(store, plan.setup)
+        _console.print(render_rubric_table(rubric, width=_console.width))
         sample_sha256 = calibration_sample_digest(plan.setup, calibration_sample(plan))
         drafted = read_label_draft(store, plan.setup, sample_sha256)
         completed = manual_judge_calibration_is_complete(store)
@@ -390,21 +394,22 @@ def _load_prompt_template(path: Path | None) -> JudgePromptTemplate:
 
 
 def _render_setup(plan: ManualJudgeSetupPlan) -> None:
-    """Display the judge, plain-language rubric, and representative tasks.
+    """Display the judge, human-readable rubric table, and representative tasks.
 
     Args:
         plan: Read-only setup plan awaiting confirmation.
     """
     _console.print("\n[bold]Judge setup[/bold]")
     _console.print(f"Judge name: {plan.judge_alias}", markup=False)
-    _console.print(f"Exact model: {model_name(plan.judge_model)}", markup=False)
-    mode = (
-        "A/B pairwise comparison"
-        if plan.prompt_template.response_shape == "pairwise"
-        else "Zero-to-five scoring"
-    )
+    _console.print(f"Exact model: {model_display_name(plan.judge_model)}", markup=False)
+    if plan.prompt_template.response_shape == "pairwise":
+        mode = "A/B pairwise comparison"
+    else:
+        lowest, highest = score_bounds(plan.dimensions)
+        mode = f"Integer scoring from {lowest} to {highest}"
     _console.print(f"Calibration mode: {mode}", markup=False)
-    _render_rubric(plan.dimensions)
+    _console.print()
+    _console.print(render_rubric_table(plan.dimensions, width=_console.width), markup=False)
     _console.print("\n[bold]Representative tasks[/bold]")
     for index, preview in enumerate(plan.previews, start=1):
         _console.print(f"{index}. {preview.task}", markup=False)
@@ -423,7 +428,7 @@ def _render_spend_preflight(
     """
     _console.print("\n[bold]Spend preflight: manual judge calibration[/bold]")
     _console.print(f"Judge name: {plan.setup.judge_alias}", markup=False)
-    _console.print(f"Exact model: {model_name(plan.setup.judge_model)}", markup=False)
+    _console.print(f"Exact model: {model_display_name(plan.setup.judge_model)}", markup=False)
     _console.print(f"Pricing: {budget.pricing_source.value}", markup=False)
     _console.print(f"Judge calls authorized: {budget.call_count}", markup=False)
     _console.print(
@@ -464,7 +469,7 @@ def _render_calibration_review(
 
     Args:
         plan: Frozen traces and optional same-task references in display order.
-        rubric: Finalized plain-language zero-to-five rubric.
+        rubric: Finalized plain-language scoring rubric.
         character_limit: Per-field limit, or ``None`` for full transcript text.
         page: Whether to send the full review through Rich's terminal pager.
     """
@@ -472,7 +477,11 @@ def _render_calibration_review(
     def render() -> None:
         """Write the complete review into the active console or pager buffer."""
         pairwise = plan.setup.prompt_template.response_shape == "pairwise"
-        heading = "PAIRWISE A/B CALIBRATION" if pairwise else "ZERO-TO-FIVE CALIBRATION"
+        if pairwise:
+            heading = "PAIRWISE A/B CALIBRATION"
+        else:
+            lowest, highest = score_bounds(rubric.dimensions)
+            heading = f"INTEGER {lowest}-{highest} CALIBRATION"
         _console.print(f"\n[bold]{heading}[/bold]")
         _render_rubric(rubric.dimensions)
         for index, (trace, reference) in enumerate(
@@ -497,7 +506,7 @@ def _render_calibration_review(
 
 
 def _render_rubric(dimensions: tuple[RubricDimension, ...]) -> None:
-    """Render complete plain-language rubric dimensions and zero-to-five anchors.
+    """Render complete plain-language rubric axes and score meanings.
 
     Args:
         dimensions: Finalized rubric dimensions in scoring order.
@@ -538,7 +547,7 @@ def _collect_labels(
         Complete ordered human label set.
 
     Raises:
-        ValueError: A label is malformed, duplicated, missing, or outside zero through five.
+        ValueError: A label is malformed, duplicated, missing, or outside the axis range.
     """
     pairwise = setup.prompt_template.response_shape == "pairwise"
     parsed: dict[tuple[str, str | None, str], ManualJudgeLabel] = {
@@ -550,7 +559,12 @@ def _collect_labels(
         if key in explicit:
             raise ValueError("duplicate label for " + ":".join(part or "-" for part in key))
         explicit.add(key)
-        parsed[key] = _label(key, _label_value(item, pairwise=pairwise), pairwise=pairwise)
+        axis = None if pairwise else rubric.axis(key[2])
+        parsed[key] = _label(
+            key,
+            _label_value(item, pairwise=pairwise, axis=axis),
+            pairwise=pairwise,
+        )
     expected = tuple(
         (preview.trace_id, preview.reference_trace_id, dimension.dimension_id)
         for preview in previews
@@ -588,9 +602,15 @@ def _collect_labels(
             )
             value: int | str = {"A": "winner_a", "B": "winner_b", "tie": "tie"}[choice]
         else:
-            score = IntPrompt.ask(f"Trace {position}: score {escape(dimension.name)} from 0 to 5")
-            if score not in range(6):
-                raise ValueError("judge labels must be integers from zero through five")
+            score = IntPrompt.ask(
+                f"Trace {position}: score {escape(dimension.name)} from "
+                f"{dimension.min_score} to {dimension.max_score}"
+            )
+            if not dimension.contains_score(score):
+                raise ValueError(
+                    f"judge labels for {dimension_id} must be integers from "
+                    f"{dimension.min_score} through {dimension.max_score}"
+                )
             value = score
         parsed[key] = _label(key, value, pairwise=pairwise)
         persist(tuple(parsed[item] for item in expected if item in parsed))
@@ -620,7 +640,7 @@ def _label(
 
     Args:
         key: Trace, optional reference trace, and dimension identifiers.
-        value: Zero-to-five score, or a typed pairwise winner.
+        value: Integer axis score, or a typed pairwise winner.
         pairwise: Whether the finalized setup requires a comparison label.
 
     Returns:
@@ -665,18 +685,24 @@ def _label_key(value: str, *, pairwise: bool) -> tuple[str, str | None, str]:
     return parts[0], None, parts[1]
 
 
-def _label_value(value: str, *, pairwise: bool) -> int | str:
-    """Parse and validate the zero-to-five score from one CLI expression.
+def _label_value(
+    value: str,
+    *,
+    pairwise: bool,
+    axis: RubricDimension | None = None,
+) -> int | str:
+    """Parse and validate one CLI label value.
 
     Args:
         value: Scalar or pairwise CLI label expression.
         pairwise: Whether the finalized setup requires a typed winner.
+        axis: Axis that bounds a scalar score.
 
     Returns:
         Integer score or typed pairwise winner.
 
     Raises:
-        ValueError: The score is not an integer from zero through five.
+        ValueError: The score is not an integer inside the axis range.
     """
     raw = value.rpartition("=")[2]
     if pairwise:
@@ -687,8 +713,11 @@ def _label_value(value: str, *, pairwise: bool) -> int | str:
         score = int(raw)
     except ValueError as exc:
         raise ValueError("judge labels must use an integer score") from exc
-    if score not in range(6):
-        raise ValueError("judge labels must be integers from zero through five")
+    if axis is not None and not axis.contains_score(score):
+        raise ValueError(
+            f"judge labels for {axis.dimension_id} must be integers from "
+            f"{axis.min_score} through {axis.max_score}"
+        )
     return score
 
 

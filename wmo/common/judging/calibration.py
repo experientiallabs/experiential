@@ -118,6 +118,8 @@ class JudgeCalibrationService:
                 tuple(
                     item for item in data if item.human_score.dimension_id == dimension.dimension_id
                 ),
+                min_score=dimension.min_score,
+                max_score=dimension.max_score,
             )
             for dimension in rubric.dimensions
         )
@@ -786,7 +788,15 @@ def _build_provisional_report(
     if label_set.history.scores:
         raise CalibrationError("provisional bootstrap requires a finalized zero-label set")
     inputs = sorted_verified_inputs((rubric_input, label_set_input, split_input))
-    score_maps = tuple(fit_score_map(dimension.dimension_id, ()) for dimension in rubric.dimensions)
+    score_maps = tuple(
+        fit_score_map(
+            dimension.dimension_id,
+            (),
+            min_score=dimension.min_score,
+            max_score=dimension.max_score,
+        )
+        for dimension in rubric.dimensions
+    )
     predictions, metrics = grouped_predictions_and_metrics(rubric, ())
     report_id = stable_id(
         "judge-calibration-report",

@@ -573,7 +573,7 @@ def _render_request(
         Deterministic request body containing every mapped variable and schema.
     """
     values: dict[str, object] = {
-        "rubric": [item.model_dump(mode="json") for item in rubric.dimensions],
+        "rubric": [item.prompt_payload() for item in rubric.dimensions],
     }
     if candidate_b is None:
         values["rollout"] = _rollout_payload(candidate_a)
@@ -646,6 +646,16 @@ def _validate_normalized_dimensions(
     }
     if not cited or not cited.issubset(known):
         raise ManualJudgeError("judge cited evidence outside the target rollout")
+    axes = {item.dimension_id: item for item in rubric.dimensions}
+    for item in dimensions:
+        dimension_id = cast(str, item.get("dimension_id"))
+        raw_score = item.get("raw_score")
+        axis = axes[dimension_id]
+        if not isinstance(raw_score, int) or not axis.contains_score(raw_score):
+            raise ManualJudgeError(
+                f"judge raw_score for {dimension_id} must be an integer from "
+                f"{axis.min_score} through {axis.max_score}"
+            )
 
 
 def _validate_pairwise_spans(

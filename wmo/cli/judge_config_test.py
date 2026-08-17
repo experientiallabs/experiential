@@ -16,8 +16,9 @@ from typer.testing import CliRunner
 
 from wmo.cli import judge_config as judge_config_module
 from wmo.cli.app import app
+from wmo.cli.judge_config import _label_value
 from wmo.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
-from wmo.common.judging import Rubric
+from wmo.common.judging import Rubric, default_task_success_axis
 from wmo.common.models import (
     ModelCapabilities,
     ModelCatalog,
@@ -55,7 +56,7 @@ class _PairwiseAnswer:
 
 
 class _ScalarAnswer:
-    """Return score four while retaining the exact human-facing prompt."""
+    """Return the default-axis success score while retaining the prompt."""
 
     prompt = ""
 
@@ -63,7 +64,7 @@ class _ScalarAnswer:
     def ask(cls, prompt: str) -> int:
         """Record one prompt and return a valid scalar score."""
         cls.prompt = prompt
-        return 4
+        return 1
 
 
 @pytest.mark.parametrize(
@@ -107,6 +108,8 @@ def test_judge_commands_render_as_nested_config_commands() -> None:
     setup_output = unstyle(setup.output)
     calibrate_output = unstyle(calibrate.output)
     assert "--approve" in setup_output
+    assert "zero-to-five" not in setup_output
+    assert "rubric axes" in setup_output
     assert "--yes" in calibrate_output
     assert "--approve" in calibrate_output
     assert "--debug" in calibrate_output
@@ -245,7 +248,7 @@ def test_calibrate_renders_provider_error_without_traceback(
         tmp_path: Isolated local project root passed through the retry command.
     """
     secret = "sk-secret-live-key-1234567890"
-    labels = (ManualJudgeLabel(trace_id="trace-1", dimension_id="task-success", score=4),)
+    labels = (ManualJudgeLabel(trace_id="trace-1", dimension_id="task-success", score=1),)
     budget = JudgeCalibrationBudget(
         input_usd_per_million_tokens=1.0,
         output_usd_per_million_tokens=2.0,
@@ -278,6 +281,7 @@ def test_calibrate_renders_provider_error_without_traceback(
         lambda store, sample_size: SimpleNamespace(setup=object(), previews=()),
     )
     monkeypatch.setattr(judge_config_module, "_load_setup_rubric", lambda store, setup: object())
+    monkeypatch.setattr(judge_config_module, "render_rubric_table", lambda *args, **kwargs: "")
     monkeypatch.setattr(
         judge_config_module, "_render_spend_preflight", lambda *args, **kwargs: None
     )
@@ -346,6 +350,15 @@ def test_calibrate_renders_provider_error_without_traceback(
     assert isinstance(result.exception, SystemExit)
 
 
+def test_scalar_label_values_follow_the_axis_range() -> None:
+    """CLI label parsing accepts 0-1 default scores and rejects out-of-range values."""
+    axis = default_task_success_axis()
+
+    assert _label_value("trace-1:task-success=1", pairwise=False, axis=axis) == 1
+    with pytest.raises(ValueError, match="from 0 through 1"):
+        _label_value("trace-1:task-success=4", pairwise=False, axis=axis)
+
+
 def test_setup_output_is_plain_language_and_hides_execution_internals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -373,11 +386,13 @@ def test_setup_output_is_plain_language_and_hides_execution_internals(
     judge_config_module._render_setup(plan)
 
     output = buffer.getvalue()
+    compact = " ".join(output.split())
     assert "Judge name: review-judge" in output
     assert "Exact model: openai/judge-model" in output
+    assert "Integer scoring from 0 to 1" in compact
     assert "Task success" in output
-    assert "0: The agent did not address the task." in output
-    assert "5: The agent fully and correctly" in output
+    assert "Range: 0-1" in output
+    assert "did not complete the requested task" in compact
     assert "Summarize the customer issue." in output
     assert "Find the failed command." in output
     assert "Prompt:" not in output
@@ -507,8 +522,8 @@ def test_pairwise_prompt_keeps_anchors_adjacent_and_uses_plain_a_b_labels(
     assert "choose candidate A, candidate B, or tie" in _PairwiseAnswer.prompt
     output = buffer.getvalue()
     assert "Score prompt: Task success" in output
-    assert "0: The agent did not address the task." in output
-    assert "5: The agent fully and correctly addressed the task." in output
+    assert "0: The agent did not complete the requested task." in output
+    assert "1: The agent successfully completed the requested task." in output
 
 
 @pytest.mark.parametrize(
