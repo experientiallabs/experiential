@@ -10,6 +10,7 @@ from rich.console import Console
 from wmo.cli.defer import add_deferred_typer
 from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.cli.provider_setup import ProviderSetupOptions, run_provider_setup
+from wmo.cli.theme import WMO_THEME
 from wmo.common.config import (
     ARTIFACT_DIR,
     load_settings,
@@ -29,7 +30,7 @@ add_deferred_typer(
     help="Set up and manually calibrate a project judge.",
     known_names=("setup", "calibrate"),
 )
-_console = Console()
+_console = Console(theme=WMO_THEME)
 _CONNECTION_JSON_OPTION = typer.Option(
     None,
     "--connection-json",

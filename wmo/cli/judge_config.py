@@ -16,6 +16,7 @@ from wmo.cli.judge_review import build_manual_judge_reviewer
 from wmo.cli.judge_rubric import maybe_edit_setup_plan
 from wmo.cli.judge_transcript import model_display_name
 from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.cli.theme import WMO_THEME
 from wmo.common.config import resolve_command_budget_usd
 from wmo.common.judging import Rubric, RubricDimension, render_rubric_table, score_bounds
 from wmo.common.judging.provenance import read_artifact_json
@@ -53,7 +54,7 @@ from wmo.optimize.router.judging.service import (
 from wmo.runtime.models.registry import RuntimeModelCatalog
 
 judge_app = typer.Typer(help="Set up and manually calibrate a project judge.", no_args_is_help=True)
-_console = Console()
+_console = Console(theme=WMO_THEME)
 _RUBRIC_FILE_OPTION = typer.Option(
     None, "--rubric-file", help="JSON array of rubric axes with IDs, ranges, and score meanings."
 )

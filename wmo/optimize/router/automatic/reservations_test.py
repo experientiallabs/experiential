@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from wmo.common.models import RouterCandidateSelection
+from wmo.common.models import RoutedCandidateSnapshot, RouterCandidateSelection
 from wmo.common.tasks import TaskCase
 from wmo.optimize.router.automatic.reservations import (
     AutomaticRouterOptions,
     plan_automatic_router_cost,
+    simulation_completion_reservations,
 )
 from wmo.optimize.router.automatic.service_test import _catalog
+from wmo.runtime.models import RuntimeModelCatalog
 
 
 def test_cost_plan_reserves_exact_small_schedule_without_io() -> None:
@@ -104,6 +106,54 @@ def test_cost_plan_digest_changes_with_the_full_schedule() -> None:
     )
 
     assert first.cost_plan_sha256 != second.cost_plan_sha256
+
+
+def test_simulation_reservations_use_the_configured_input_bound() -> None:
+    """Simulation requests reserve the bounded rendered input, not the whole context."""
+    catalog = _catalog()
+    resolver = RuntimeModelCatalog(catalog, environment={})
+    candidate_model, _capabilities = resolver.snapshot("candidate-a")
+    world, _world_capabilities = resolver.snapshot("world")
+    problems: list[str] = []
+
+    candidates, world_request = simulation_completion_reservations(
+        problems,
+        catalog=catalog,
+        candidates=(RoutedCandidateSnapshot(alias="candidate-a", model=candidate_model),),
+        world_alias="world",
+        world=world,
+        maximum_attempts=3,
+        maximum_input_tokens=32_768,
+        maximum_output_tokens=16_000,
+    )
+
+    assert problems == []
+    assert world_request is not None
+    assert candidates[0].request.maximum_input_tokens == 32_768
+    assert world_request.maximum_input_tokens == 32_768
+
+
+def test_simulation_reservations_clamp_the_bound_to_remaining_context() -> None:
+    """An oversized configured bound never reserves past the model's context capacity."""
+    catalog = _catalog()
+    resolver = RuntimeModelCatalog(catalog, environment={})
+    candidate_model, _capabilities = resolver.snapshot("candidate-a")
+    problems: list[str] = []
+
+    candidates, world_request = simulation_completion_reservations(
+        problems,
+        catalog=catalog,
+        candidates=(RoutedCandidateSnapshot(alias="candidate-a", model=candidate_model),),
+        world_alias=None,
+        world=None,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000_000,
+        maximum_output_tokens=16_000,
+    )
+
+    assert problems == []
+    assert world_request is None
+    assert candidates[0].request.maximum_input_tokens == 128_000 - 16_000
 
 
 def _tasks(count: int) -> tuple[TaskCase, ...]:

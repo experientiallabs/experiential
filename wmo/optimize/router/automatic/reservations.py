@@ -42,6 +42,7 @@ class AutomaticRouterOptions:
     maximum_retrieval_query_tokens: int = 32_768
     router_embedding_maximum_attempts: int = 3
     completion_maximum_attempts: int = 3
+    simulation_maximum_input_tokens: int = 32_768
     simulation_maximum_output_tokens: int = 16_000
     maximum_concurrency: int = 1
     seed: int = 0
@@ -220,6 +221,7 @@ def simulation_completion_reservations(
     world_alias: str | None,
     world: ModelSnapshot | None,
     maximum_attempts: int,
+    maximum_input_tokens: int,
     maximum_output_tokens: int,
 ) -> tuple[tuple[CandidateCompletionReservation, ...], CompletionCostReservation | None]:
     """Freeze candidate and world call ceilings from exact catalog declarations.
@@ -231,6 +233,7 @@ def simulation_completion_reservations(
         world_alias: Build-frozen world-model alias.
         world: Exact world-model snapshot.
         maximum_attempts: Active completion retry ceiling.
+        maximum_input_tokens: Per-request rendered input ceiling.
         maximum_output_tokens: Per-turn candidate and world output ceiling.
 
     Returns:
@@ -245,6 +248,7 @@ def simulation_completion_reservations(
             model=candidate.model,
             label="candidate",
             maximum_attempts=maximum_attempts,
+            maximum_input_tokens=maximum_input_tokens,
             maximum_output_tokens=maximum_output_tokens,
         )
         if request is not None:
@@ -262,6 +266,7 @@ def simulation_completion_reservations(
             model=world,
             label="world model",
             maximum_attempts=maximum_attempts,
+            maximum_input_tokens=maximum_input_tokens,
             maximum_output_tokens=maximum_output_tokens,
         )
         if world_alias is not None and world is not None
@@ -317,9 +322,14 @@ def completion_reservation_from_catalog(
     model: ModelSnapshot,
     label: str,
     maximum_attempts: int,
+    maximum_input_tokens: int,
     maximum_output_tokens: int,
 ) -> CompletionCostReservation | None:
     """Create one completion reservation from exact capacity and pricing metadata.
+
+    The reserved input ceiling is the smaller of the configured per-request bound and the
+    model's remaining context after the output reservation, so a large context window never
+    inflates the conservative schedule beyond the workload's rendered prompts.
 
     Args:
         problems: Mutable aggregate problem list.
@@ -328,6 +338,7 @@ def completion_reservation_from_catalog(
         model: Frozen provider model identity.
         label: Candidate, world-model, or judge diagnostic role.
         maximum_attempts: Active provider request-attempt ceiling.
+        maximum_input_tokens: Configured per-request rendered input ceiling.
         maximum_output_tokens: Per-request output ceiling.
 
     Returns:
@@ -367,7 +378,7 @@ def completion_reservation_from_catalog(
             cached_input_usd_per_million_tokens=cached_input_price,
             cache_write_usd_per_million_tokens=cache_write_price,
             maximum_attempts=maximum_attempts,
-            maximum_input_tokens=context - maximum_output_tokens,
+            maximum_input_tokens=min(maximum_input_tokens, context - maximum_output_tokens),
             maximum_output_tokens=maximum_output_tokens,
         )
     except ValueError as exc:
@@ -545,6 +556,7 @@ def plan_automatic_router_cost(
         world_alias=world_model_alias,
         world=world,
         maximum_attempts=options.completion_maximum_attempts,
+        maximum_input_tokens=options.simulation_maximum_input_tokens,
         maximum_output_tokens=options.simulation_maximum_output_tokens,
     )
     judge_request = judge_completion_reservation(

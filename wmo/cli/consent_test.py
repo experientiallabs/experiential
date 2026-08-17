@@ -197,6 +197,69 @@ def test_estimate_above_budget_fails_even_with_yes(
     assert "estimated cost: $20.000001" in _flat(buffer)
 
 
+def test_over_budget_interactive_override_defaults_to_no(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interactive_stdin: None,
+) -> None:
+    """An interactive over-budget estimate warns and declines on a blank answer."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(False)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, buffer = _console(terminal=True)
+
+    assert not _authorize(console, root, estimate=35.0)
+
+    assert len(answer.asked) == 1
+    assert answer.defaults == [False]
+    prompt = answer.asked[0]
+    assert "Proceed anyway" in prompt
+    assert "$35.00" in prompt
+    rendered = _flat(buffer)
+    assert "warning" in rendered
+    assert "exceeds the configured $20.00 per-command budget" in rendered
+    assert "No spend was authorized." in rendered
+
+
+def test_over_budget_interactive_explicit_yes_authorizes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interactive_stdin: None,
+) -> None:
+    """Only an explicit terminal yes overrides the configured ceiling."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(True)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, buffer = _console(terminal=True)
+
+    assert _authorize(console, root, estimate=35.0)
+
+    assert len(answer.asked) == 1
+    assert answer.defaults == [False]
+    assert "over-budget estimate explicitly confirmed" in _flat(buffer)
+
+
+def test_over_budget_noninteractive_fails_even_with_yes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interactive_stdin: None,
+) -> None:
+    """The explicit noninteractive flag keeps the over-budget rejection fail-closed."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(True)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, _buffer = _console(terminal=True)
+
+    with pytest.raises(typer.BadParameter) as caught:
+        _authorize(console, root, estimate=35.0, yes=True, non_interactive=True)
+
+    assert answer.asked == []
+    assert "--yes cannot override" in str(caught.value)
+
+
 def test_sub_microdollar_estimates_are_displayed_conservatively(tmp_path: Path) -> None:
     """Visible estimates never round a positive conservative ceiling down to zero."""
     root = tmp_path / ".wmo"

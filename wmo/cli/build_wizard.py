@@ -115,7 +115,7 @@ def run_build_wizard(
         ValueError: Existing state or a selected wizard input is invalid.
     """
     code_revision = installed_release_revision()
-    console.print("[bold]WMO project wizard[/bold]")
+    console.print("[bold green]WMO project wizard[/bold green]")
     _require_replay_role_overrides(
         root,
         project,
@@ -862,35 +862,43 @@ def _render_plan(
     """
     build_ceiling = 0.0 if plan.build_reused else maximum_build_cost_usd
     console.print("[bold]Project plan[/bold]")
-    console.print(f"  project      {project}")
+    console.print(f"  [dim]project[/dim]      {project}")
     console.print(
-        f"  traces       {plan.accepted_traces} accepted, {plan.invalid_traces} invalid; "
-        f"{plan.fit_tasks} fit, {plan.held_out_tasks} held out"
+        f"  [dim]traces[/dim]       {plan.accepted_traces} accepted, {plan.invalid_traces} "
+        f"invalid; {plan.fit_tasks} fit, {plan.held_out_tasks} held out"
     )
     console.print(
-        f"  models       world={plan.selected.world_model}, judge={plan.selected.judge}, "
-        f"embedder={plan.selected.embedder}"
+        f"  [dim]models[/dim]       world={plan.selected.world_model}, "
+        f"judge={plan.selected.judge}, embedder={plan.selected.embedder}"
     )
     console.print(
-        f"  router       {', '.join(catalog.roles.candidates)}; incumbent={catalog.roles.incumbent}"
+        f"  [dim]router[/dim]       {', '.join(catalog.roles.candidates)}; "
+        f"incumbent={catalog.roles.incumbent}"
     )
-    console.print("  RAG          serving and fit indexes")
-    console.print("  syllabus     task-success rubric and evaluation instructions")
-    console.print("  calibration  provisional; optional human approval creates a successor")
+    console.print("  [dim]RAG[/dim]          serving and fit indexes")
+    console.print("  [dim]syllabus[/dim]     task-success rubric and evaluation instructions")
     console.print(
-        f"  build spend  estimate ${plan.build_estimate_usd:.6f}; ceiling ${build_ceiling:.4f}"
-    )
-    console.print(
-        f"  router spend embeddings ${cost_plan.router_embedding_cost_usd:.6f}; "
-        f"judgments ${cost_plan.judgment_cost_usd:.6f}; "
-        f"simulation ${cost_plan.simulation_cost_usd:.6f}"
+        "  [dim]calibration[/dim]  provisional; optional human approval creates a successor"
     )
     console.print(
-        f"  router scope {cost_plan.maximum_judgments} judgments, "
-        f"{cost_plan.simulated_episode_count} simulated episodes"
+        f"  [dim]build spend[/dim]  estimate ${plan.build_estimate_usd:.6f}; "
+        f"ceiling ${build_ceiling:.4f}"
     )
-    console.print(f"  router spend required ${cost_plan.required_provider_cost_usd:.6f}")
-    console.print(f"  router spend ceiling ${router_ceiling:.6f}")
+    console.print(f"  [dim]embeddings[/dim]   ${cost_plan.router_embedding_cost_usd:.6f}")
+    console.print(
+        f"  [dim]judgments[/dim]    ${cost_plan.judgment_cost_usd:.6f} "
+        f"({cost_plan.maximum_judgments} judge decisions)"
+    )
+    console.print(
+        f"  [dim]simulation[/dim]   ${cost_plan.simulation_cost_usd:.6f} "
+        f"({cost_plan.simulated_episode_count} episodes)"
+    )
+    console.print(
+        f"  [dim]router spend[/dim] required ${cost_plan.required_provider_cost_usd:.6f}; "
+        f"ceiling ${router_ceiling:.6f}"
+    )
     if supplied_router_cap is not None:
-        console.print(f"  supplied cap ${supplied_router_cap:.6f}")
-    console.print(f"  total ceiling ${math.fsum((build_ceiling, router_ceiling)):.4f}")
+        console.print(f"  [dim]supplied cap[/dim] ${supplied_router_cap:.6f}")
+    console.print(
+        f"  [dim]total[/dim]        ceiling ${math.fsum((build_ceiling, router_ceiling)):.4f}"
+    )

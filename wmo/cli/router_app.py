@@ -12,6 +12,7 @@ from rich.console import Console
 from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.cli.router_candidate_setup import collect_router_candidate_setup
+from wmo.cli.theme import WMO_THEME
 from wmo.common.models import ProviderModelSelection, load_model_catalog
 from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.project import ProjectStore
@@ -25,7 +26,7 @@ from wmo.optimize.router.automatic.replay import find_completed_automatic_router
 from wmo.optimize.router.automatic.service import optimize_project_router
 from wmo.runtime.models import RuntimeModelCatalog
 
-_console = Console()
+_console = Console(theme=WMO_THEME)
 _CANDIDATE_OPTION = typer.Option(
     None,
     "--candidate",

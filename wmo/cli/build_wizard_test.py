@@ -322,7 +322,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     state = _ProviderState()
     lister = _install_integrated_runtime(monkeypatch, state)
     root = tmp_path / ".wmo"
-    set_maximum_command_cost_usd(100.0, root)
+    set_maximum_command_cost_usd(20.0, root)
 
     result = _RUNNER.invoke(
         app,
@@ -492,7 +492,7 @@ def test_fresh_wizard_refusal_after_discovery_makes_no_paid_calls_or_selected_bu
     state = _ProviderState()
     lister = _install_integrated_runtime(monkeypatch, state)
     root = tmp_path / ".wmo"
-    set_maximum_command_cost_usd(100.0, root)
+    set_maximum_command_cost_usd(20.0, root)
 
     result = _RUNNER.invoke(
         app,
@@ -569,7 +569,7 @@ def test_explicit_router_cap_above_required_consents_only_to_exact_plan(
     state = _ProviderState()
     _install_integrated_runtime(monkeypatch, state)
     root = tmp_path / ".wmo"
-    set_maximum_command_cost_usd(100.0, root)
+    set_maximum_command_cost_usd(20.0, root)
     result = _RUNNER.invoke(
         app,
         [

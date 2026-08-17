@@ -263,6 +263,7 @@ def preflight_automatic_router(
         world_alias=world_alias,
         world=world,
         maximum_attempts=options.completion_maximum_attempts,
+        maximum_input_tokens=options.simulation_maximum_input_tokens,
         maximum_output_tokens=options.simulation_maximum_output_tokens,
     )
     judge_request = judge_completion_reservation(
@@ -304,6 +305,7 @@ def preflight_automatic_router(
                     maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
                     router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
                     completion_maximum_attempts=options.completion_maximum_attempts,
+                    simulation_maximum_input_tokens=options.simulation_maximum_input_tokens,
                     simulation_maximum_output_tokens=options.simulation_maximum_output_tokens,
                     maximum_concurrency=options.maximum_concurrency,
                     seed=options.seed,
@@ -405,6 +407,7 @@ _BOUNDED_OPTION_FIELDS = (
     "maximum_retrieval_query_tokens",
     "router_embedding_maximum_attempts",
     "completion_maximum_attempts",
+    "simulation_maximum_input_tokens",
     "simulation_maximum_output_tokens",
     "maximum_judgments",
     "maximum_concurrency",

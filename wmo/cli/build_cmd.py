@@ -19,6 +19,7 @@ from wmo.cli.provider_setup import (
     provider_setup_json_examples,
     run_provider_setup,
 )
+from wmo.cli.theme import WMO_THEME
 from wmo.common.models import (
     ModelCapabilities,
     ModelCatalog,
@@ -64,7 +65,7 @@ from wmo.simulation.world_model.artifact import (
     persist_grounded_world_model,
 )
 
-_console = Console()
+_console = Console(theme=WMO_THEME)
 _PROJECT_ARGUMENT = typer.Argument(..., metavar="PROJECT", help="Local project name.")
 _LEGACY_TRACE_ARGUMENT = typer.Argument(None, metavar="TRACES", hidden=True)
 _TRACE_FILE_OPTION = typer.Option(

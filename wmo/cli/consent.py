@@ -56,7 +56,9 @@ def require_spend_consent(
 
     Estimates at or below half of the configured budget run automatically. Higher estimates up
     to the budget require ``--yes``, a prior immutable confirmation, or an explicit terminal
-    answer. An estimate above the budget always fails before credentials or provider clients.
+    answer. An estimate above the budget is a warning that only an explicit interactive answer
+    can override, defaulting to no; without a terminal the invocation fails before credentials
+    or provider clients, and ``--yes`` never overrides the ceiling.
 
     Args:
         console: Command-owned output console.
@@ -73,7 +75,7 @@ def require_spend_consent(
 
     Raises:
         typer.BadParameter: Settings or cost arithmetic are invalid, or the estimate exceeds the
-            configured budget.
+            configured budget without a terminal able to override it.
         typer.Exit: No explicit confirmation is available in a noninteractive session.
     """
     estimate = _cost_decimal(estimated_cost_usd, label="estimated command cost")
@@ -92,7 +94,9 @@ def require_spend_consent(
         assumptions=assumptions,
     )
     if estimate > budget:
-        raise typer.BadParameter(_over_budget_message(root, estimate, budget))
+        if non_interactive or not can_prompt(console):
+            raise typer.BadParameter(_over_budget_message(root, estimate, budget))
+        return _confirm_over_budget(console, command=command, estimate=estimate, budget=budget)
     if estimate <= budget / Decimal(2):
         console.print("authorization: automatic (estimate is at most 50% of budget)")
         return True
@@ -112,6 +116,43 @@ def require_spend_consent(
         return Confirm.ask(prompt, default=False, console=console)
     except EOFError:
         _refuse_unanswered(console, command=command, estimate=estimate, budget=budget)
+
+
+def _confirm_over_budget(
+    console: Console,
+    *,
+    command: str,
+    estimate: Decimal,
+    budget: Decimal,
+) -> bool:
+    """Warn about an over-budget estimate and require an explicit terminal override.
+
+    Args:
+        console: Command-owned output console.
+        command: Complete command identity.
+        estimate: Conservative invocation estimate above the configured budget.
+        budget: Configured per-command ceiling.
+
+    Returns:
+        True only after an explicit yes; a blank answer or a decline authorizes nothing.
+
+    Raises:
+        typer.Exit: Terminal input ended before an answer.
+    """
+    console.print(
+        f"[yellow]warning[/yellow] the conservative estimate {_format_usd(estimate)} exceeds "
+        f"the configured {_format_usd(budget)} per-command budget."
+    )
+    prompt = f"Proceed anyway and authorize {command} to spend up to {_format_usd(estimate)}?"
+    try:
+        confirmed = Confirm.ask(prompt, default=False, console=console)
+    except EOFError:
+        _refuse_unanswered(console, command=command, estimate=estimate, budget=budget)
+    if confirmed:
+        console.print("authorization: over-budget estimate explicitly confirmed")
+        return True
+    console.print("No spend was authorized.")
+    return False
 
 
 def _cost_decimal(value: float, *, label: str) -> Decimal:
@@ -179,7 +220,7 @@ def _format_usd(value: Decimal) -> str:
 
 
 def _over_budget_message(root: str | Path, estimate: Decimal, budget: Decimal) -> str:
-    """Return actionable remediation for a hard ceiling rejection.
+    """Return actionable remediation for a noninteractive over-budget rejection.
 
     Args:
         root: WMO settings root.
@@ -187,15 +228,16 @@ def _over_budget_message(root: str | Path, estimate: Decimal, budget: Decimal) -
         budget: Configured ceiling.
 
     Returns:
-        Error text naming both safe ways to proceed.
+        Error text naming every safe way to proceed.
     """
     sufficient = estimate.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
     amount = _format_usd(sufficient).removeprefix("$")
     command = f"wmo config budget {amount} --root {shlex.quote(str(root))}"
     return (
         f"conservative estimate {_format_usd(estimate)} exceeds the configured per-command "
-        f"budget {_format_usd(budget)}. Increase the limit to at least the estimate with "
-        f"`{command}`, or reduce this command's cost inputs. --yes cannot override the ceiling"
+        f"budget {_format_usd(budget)}. Re-run in an interactive terminal to review and "
+        f"explicitly override, increase the limit with `{command}`, or reduce this command's "
+        "cost inputs. --yes cannot override the ceiling"
     )
 
 

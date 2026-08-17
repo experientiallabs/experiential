@@ -13,6 +13,7 @@ from rich.prompt import Confirm, FloatPrompt, Prompt
 
 from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.cli.theme import WMO_THEME
 from wmo.common.core.artifacts import Sha256, sha256_json
 from wmo.common.core.locks import file_write_lock
 from wmo.common.models import (
@@ -49,7 +50,7 @@ from wmo.optimize.model.sft.training_contracts import (
 )
 from wmo.runtime.models.credentials import ModelCredentialError, read_connection_api_key
 
-_console = Console()
+_console = Console(theme=WMO_THEME)
 _DEFAULT_LORA_RANK = 32
 _DEFAULT_LEARNING_RATE = 0.0001
 _DEFAULT_BATCH_SIZE = 4
