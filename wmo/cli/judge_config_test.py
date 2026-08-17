@@ -110,6 +110,62 @@ def _priced_catalog() -> ModelCatalog:
     )
 
 
+def test_interactive_judge_setup_accepts_enter_as_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blank response accepts the displayed judge setup and persists it."""
+    store = _built_store(tmp_path)
+    _write_catalog(store.paths.root, _catalog())
+    monkeypatch.setenv("WMO_RELEASE_REVISION", "a" * 40)
+    monkeypatch.setattr(judge_config_module, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(
+        judge_config_module,
+        "maybe_edit_setup_plan",
+        lambda plan, *, console: plan,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["config", "judge", "setup", "support", "--root", str(store.paths.root)],
+        input="\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Save this judge setup and finalize its rubric? [y/n] (y):" in result.output
+    assert "Saved judge setup" in result.output
+    review = store.read_review()
+    assert isinstance(review, dict)
+    assert "manual_judge" in review
+
+
+def test_interactive_judge_setup_preserves_explicit_n_decline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit ``n`` still declines the displayed judge setup."""
+    store = _built_store(tmp_path)
+    _write_catalog(store.paths.root, _catalog())
+    monkeypatch.setenv("WMO_RELEASE_REVISION", "a" * 40)
+    monkeypatch.setattr(judge_config_module, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(
+        judge_config_module,
+        "maybe_edit_setup_plan",
+        lambda plan, *, console: plan,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["config", "judge", "setup", "support", "--root", str(store.paths.root)],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Save this judge setup and finalize its rubric? [y/n] (y):" in result.output
+    assert "Judge setup was not saved." in result.output
+    review = store.read_review()
+    assert isinstance(review, dict)
+    assert "manual_judge" not in review
+
+
 def test_calibrate_prints_catalog_pricing_breakdown_before_labels(tmp_path: Path) -> None:
     """Known catalog prices produce a spend preflight before consent or labels."""
     store = _built_store(tmp_path)
