@@ -12,40 +12,163 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
     ContractModel,
+    JsonObject,
     Sha256,
 )
 from wmo.common.models import ModelSnapshot
 
+_MAX_AXIS_SCORE = 10
+
 
 class ScoreAnchor(ContractModel):
-    """Plain-language anchor for one integer rubric score."""
+    """Plain-language meaning for one integer score on a rubric axis."""
 
-    score: Literal[0, 1, 2, 3, 4, 5]
+    score: int = Field(ge=0, le=_MAX_AXIS_SCORE)
     description: str = Field(min_length=1)
 
 
 class RubricDimension(ContractModel):
-    """A zero-to-five quality dimension with complete scoring anchors."""
+    """One scored axis with an inclusive integer range and score meanings."""
 
     dimension_id: ArtifactId
     name: str = Field(min_length=1, max_length=256)
     description: str = Field(min_length=1)
+    min_score: int = Field(default=0, ge=0, le=_MAX_AXIS_SCORE)
+    max_score: int = Field(default=5, ge=0, le=_MAX_AXIS_SCORE)
     anchors: tuple[ScoreAnchor, ...]
 
-    @field_validator("anchors")
-    @classmethod
-    def _require_exact_score_anchors(
-        cls, value: tuple[ScoreAnchor, ...]
-    ) -> tuple[ScoreAnchor, ...]:
-        expected_scores = (0, 1, 2, 3, 4, 5)
-        scores = tuple(anchor.score for anchor in value)
-        if scores != expected_scores:
-            raise ValueError("rubric anchors must contain scores zero through five in order")
-        return value
+    @model_validator(mode="after")
+    def _require_valid_range_and_anchors(self) -> RubricDimension:
+        if self.min_score >= self.max_score:
+            raise ValueError("rubric axis range must be inclusive with min_score below max_score")
+        permitted = self.permitted_scores()
+        scores = tuple(anchor.score for anchor in self.anchors)
+        if not scores:
+            raise ValueError("a rubric axis needs at least one score meaning")
+        if len(set(scores)) != len(scores):
+            raise ValueError("rubric axis anchors must have unique scores")
+        if scores != tuple(sorted(scores)):
+            raise ValueError("rubric axis anchors must be ordered by increasing score")
+        unknown = tuple(score for score in scores if score not in permitted)
+        if unknown:
+            raise ValueError("rubric axis anchors must stay inside the inclusive score range")
+        if scores[0] != self.min_score or scores[-1] != self.max_score:
+            raise ValueError("rubric axis anchors must include the inclusive range endpoints")
+        return self
+
+    def permitted_scores(self) -> tuple[int, ...]:
+        """Return every integer score inside this inclusive axis range."""
+        return tuple(range(self.min_score, self.max_score + 1))
+
+    def contains_score(self, score: int) -> bool:
+        """Return whether ``score`` is an integer inside this inclusive range."""
+        return score in self.permitted_scores()
+
+    def normalize_score(self, score: float) -> float:
+        """Map one axis-unit score onto the unit interval.
+
+        Args:
+            score: Raw or calibrated value on this axis scale.
+
+        Returns:
+            ``(score - min_score) / (max_score - min_score)``.
+        """
+        return (score - self.min_score) / (self.max_score - self.min_score)
+
+    def prompt_payload(self) -> JsonObject:
+        """Return the single prompt-facing payload for this axis."""
+        return {
+            "dimension_id": self.dimension_id,
+            "name": self.name,
+            "description": self.description,
+            "min_score": self.min_score,
+            "max_score": self.max_score,
+            "anchors": [anchor.model_dump(mode="json") for anchor in self.anchors],
+        }
+
+    def identity_calibrated_scores(self) -> tuple[float, ...]:
+        """Return the identity map covering every permitted raw score."""
+        return tuple(float(score) for score in self.permitted_scores())
+
+
+def scored_axis(
+    dimension_id: ArtifactId,
+    name: str,
+    description: str,
+    *,
+    min_score: int = 0,
+    max_score: int = 5,
+    anchor_stem: str | None = None,
+) -> RubricDimension:
+    """Build one axis with a complete meaning for every permitted score.
+
+    Args:
+        dimension_id: Stable axis identity.
+        name: Human label shown in setup and calibration.
+        description: Plain-language meaning of the axis.
+        min_score: Inclusive lower bound.
+        max_score: Inclusive upper bound.
+        anchor_stem: Optional prefix for generated score meanings.
+
+    Returns:
+        A validated axis with one anchor per integer in the range.
+    """
+    stem = name if anchor_stem is None else anchor_stem
+    return RubricDimension(
+        dimension_id=dimension_id,
+        name=name,
+        description=description,
+        min_score=min_score,
+        max_score=max_score,
+        anchors=tuple(
+            ScoreAnchor(score=score, description=f"{stem} {score}.")
+            for score in range(min_score, max_score + 1)
+        ),
+    )
+
+
+def default_task_success_axis() -> RubricDimension:
+    """Return the default 0-1 task-success axis."""
+    return RubricDimension(
+        dimension_id="task-success",
+        name="Task success",
+        description=(
+            "The agent successfully completed the task requested in the original user prompt"
+        ),
+        min_score=0,
+        max_score=1,
+        anchors=(
+            ScoreAnchor(score=0, description="The agent did not complete the requested task."),
+            ScoreAnchor(
+                score=1,
+                description="The agent successfully completed the requested task.",
+            ),
+        ),
+    )
+
+
+def score_bounds(dimensions: tuple[RubricDimension, ...]) -> tuple[int, int]:
+    """Return the shared inclusive axis range.
+
+    Args:
+        dimensions: Non-empty ordered rubric axes.
+
+    Returns:
+        The inclusive ``(min_score, max_score)`` shared by every axis.
+
+    Raises:
+        ValueError: The rubric has no axes, or axes use different ranges.
+    """
+    if not dimensions:
+        raise ValueError("a rubric must contain at least one axis")
+    ranges = {(item.min_score, item.max_score) for item in dimensions}
+    if len(ranges) != 1:
+        raise ValueError("every rubric axis must share the same inclusive score range")
+    return next(iter(ranges))
 
 
 class Rubric(ArtifactEnvelope):
-    """An immutable, versioned set of equal-weight quality dimensions."""
+    """An immutable, versioned ordered list of equal-weight scoring axes."""
 
     rubric_id: ArtifactId
     dimensions: tuple[RubricDimension, ...]
@@ -60,10 +183,11 @@ class Rubric(ArtifactEnvelope):
         cls, value: tuple[RubricDimension, ...]
     ) -> tuple[RubricDimension, ...]:
         if not value:
-            raise ValueError("a rubric must contain at least one dimension")
+            raise ValueError("a rubric must contain at least one axis")
         dimension_ids = tuple(dimension.dimension_id for dimension in value)
         if len(set(dimension_ids)) != len(dimension_ids):
-            raise ValueError("rubric dimensions must have unique IDs")
+            raise ValueError("rubric axes must have unique IDs")
+        score_bounds(value)
         return value
 
     @field_validator("accepted_proposal_evidence_ids")
@@ -92,41 +216,92 @@ class Rubric(ArtifactEnvelope):
             raise ValueError("provisional rubrics must not set approved_at")
         return self
 
+    def axis(self, dimension_id: ArtifactId) -> RubricDimension:
+        """Return the axis with ``dimension_id``.
+
+        Args:
+            dimension_id: Stable axis identity.
+
+        Returns:
+            The matching axis.
+
+        Raises:
+            ValueError: The rubric does not contain that axis.
+        """
+        for dimension in self.dimensions:
+            if dimension.dimension_id == dimension_id:
+                return dimension
+        raise ValueError(f"rubric has no axis {dimension_id}")
+
 
 class DimensionScoreMap(ContractModel):
     """A monotonic mapping from raw judge scores to expected human scores."""
 
     dimension_id: ArtifactId
-    calibrated_scores: tuple[float, float, float, float, float, float]
+    min_score: int = Field(default=0, ge=0, le=_MAX_AXIS_SCORE)
+    max_score: int = Field(default=5, ge=0, le=_MAX_AXIS_SCORE)
+    calibrated_scores: tuple[float, ...]
 
-    @field_validator("calibrated_scores")
-    @classmethod
-    def _require_monotonic_finite_scores(
-        cls, value: tuple[float, float, float, float, float, float]
-    ) -> tuple[float, float, float, float, float, float]:
-        if any(not math.isfinite(score) or score < 0 or score > 5 for score in value):
-            raise ValueError(
-                "calibrated rubric scores must be finite values from zero through five"
-            )
-        if tuple(sorted(value)) != value:
+    @model_validator(mode="after")
+    def _require_monotonic_range_scores(self) -> DimensionScoreMap:
+        if self.min_score >= self.max_score:
+            raise ValueError("score-map range must be inclusive with min_score below max_score")
+        expected_length = self.max_score - self.min_score + 1
+        if len(self.calibrated_scores) != expected_length:
+            raise ValueError("calibrated rubric scores must cover every integer in the axis range")
+        if any(
+            not math.isfinite(score) or score < self.min_score or score > self.max_score
+            for score in self.calibrated_scores
+        ):
+            raise ValueError("calibrated rubric scores must be finite values inside the axis range")
+        if tuple(sorted(self.calibrated_scores)) != self.calibrated_scores:
             raise ValueError("calibrated rubric scores must be monotonic")
-        return value
+        return self
+
+    def identity_scores(self) -> tuple[float, ...]:
+        """Return the identity map for this score-map range."""
+        return tuple(float(score) for score in range(self.min_score, self.max_score + 1))
+
+    def is_identity(self) -> bool:
+        """Return whether this map leaves every raw score unchanged."""
+        return self.calibrated_scores == self.identity_scores()
 
     def apply(self, raw_score: int) -> float:
         """Return the calibrated value for one integer raw judge score.
 
         Args:
-            raw_score: Raw zero-to-five score emitted by the structured judge.
+            raw_score: Raw integer score emitted by the structured judge.
 
         Returns:
             The frozen monotonic calibrated score.
 
         Raises:
-            ValueError: The raw score is outside the supported zero-to-five range.
+            ValueError: The raw score is outside this map's inclusive range.
         """
-        if raw_score not in range(6):
-            raise ValueError("raw judge scores must be integers from zero through five")
-        return self.calibrated_scores[raw_score]
+        if raw_score < self.min_score or raw_score > self.max_score:
+            raise ValueError("raw judge scores must be integers inside the axis range")
+        return self.calibrated_scores[raw_score - self.min_score]
+
+
+def identity_score_map(
+    dimension_id: ArtifactId, min_score: int, max_score: int
+) -> DimensionScoreMap:
+    """Return the identity map for one axis range.
+
+    Args:
+        dimension_id: Axis receiving the map.
+        min_score: Inclusive lower bound.
+        max_score: Inclusive upper bound.
+
+    Returns:
+        A monotonic identity map covering every permitted raw score.
+    """
+    return DimensionScoreMap(
+        dimension_id=dimension_id,
+        min_score=min_score,
+        max_score=max_score,
+        calibrated_scores=tuple(float(score) for score in range(min_score, max_score + 1)),
+    )
 
 
 class JudgeCalibration(ArtifactEnvelope):
@@ -145,7 +320,7 @@ class JudgeCalibration(ArtifactEnvelope):
     out_of_fold_report_sha256: Sha256
     score_maps: tuple[DimensionScoreMap, ...]
     label_count: int = Field(default=0, ge=0)
-    recommended_label_count: Literal[10] = 10
+    recommended_label_count: Literal[5, 10] = 5
     status: Literal["provisional", "insufficient", "human_calibrated"] = "provisional"
     approved_at: AwareDatetime | None = None
     risk_acceptance: ArtifactInput | None = None
@@ -164,9 +339,9 @@ class JudgeCalibration(ArtifactEnvelope):
     ) -> tuple[DimensionScoreMap, ...]:
         dimension_ids = tuple(score_map.dimension_id for score_map in value)
         if not dimension_ids:
-            raise ValueError("judge calibration needs a score map for every rubric dimension")
+            raise ValueError("judge calibration needs a score map for every rubric axis")
         if len(set(dimension_ids)) != len(dimension_ids):
-            raise ValueError("judge calibration score maps must not repeat a dimension")
+            raise ValueError("judge calibration score maps must not repeat an axis")
         return value
 
     @model_validator(mode="after")
@@ -184,8 +359,7 @@ class JudgeCalibration(ArtifactEnvelope):
         if self.status == "provisional" and self.label_count != 0:
             raise ValueError("provisional judge calibrations require zero human labels")
         if self.status == "provisional" and any(
-            score_map.calibrated_scores != (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
-            for score_map in self.score_maps
+            not score_map.is_identity() for score_map in self.score_maps
         ):
             raise ValueError("provisional judge calibrations require identity score maps")
         if self.status == "insufficient" and self.label_count == 0:

@@ -17,7 +17,13 @@ from wmo.cli.provider_setup import (
     provider_setup_json_examples,
     run_provider_setup,
 )
-from wmo.common.models import ModelCatalog, ModelCatalogError, load_model_catalog
+from wmo.common.models import (
+    ModelCapabilities,
+    ModelCatalog,
+    ModelCatalogError,
+    ModelSnapshot,
+    load_model_catalog,
+)
 from wmo.common.observability.telemetry import BuildTelemetryStats, capture_build_completed
 from wmo.common.project import (
     ArtifactStoreError,
@@ -31,7 +37,14 @@ from wmo.common.project import (
     artifact_input,
 )
 from wmo.common.release_revision import installed_release_revision
-from wmo.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import (
+    CapabilityRequirement,
+    ModelCapabilityError,
+    ModelConnectionError,
+    ResolvedModel,
+    RuntimeModelCatalog,
+)
+from wmo.runtime.models.preflight import preflight_capabilities
 from wmo.runtime.models.providers.transport import RetryPolicy
 from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
@@ -43,7 +56,11 @@ from wmo.simulation.retrieval import (
     persist_trace_rag,
 )
 from wmo.simulation.retrieval.transitions import extract_real_transitions
-from wmo.simulation.world_model.artifact import persist_grounded_world_model
+from wmo.simulation.world_model.artifact import (
+    WORLD_MODEL_ARTIFACT_PATH,
+    GroundedWorldModelArtifact,
+    persist_grounded_world_model,
+)
 from wmo.simulation.world_model.runtime import load_grounded_world_model
 
 _console = Console()
@@ -83,11 +100,16 @@ def build(
         min=0.01,
         help="Strict embedding spend ceiling in USD.",
     ),
-    yes: bool = typer.Option(False, "--yes", help="Consent to the displayed embedding spend."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm an in-budget estimate when the shared policy requires it.",
+    ),
     no_interactive: bool = typer.Option(
         False,
+        "--non-interactive",
         "--no-interactive",
-        help="Never prompt for missing model setup.",
+        help="Require complete model flags and never ask setup or cost questions.",
     ),
     provider: list[str] | None = _PROVIDER_OPTION,
 ) -> None:
@@ -107,15 +129,22 @@ def build(
         embedder: Optional configured alias override for this project.
         top_k: Positive serving retrieval result limit.
         maximum_build_cost_usd: Strict ceiling for provider embedding calls.
-        yes: Explicit noninteractive or advance spend consent.
-        no_interactive: Disable inline setup even when a terminal is available.
+        yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
+        no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
 
     Raises:
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
     """
     started = time.monotonic()
-    with usage_error(ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError):
+    with usage_error(
+        ArtifactStoreError,
+        ModelCapabilityError,
+        ModelCatalogError,
+        ModelConnectionError,
+        ProjectStoreError,
+        ValueError,
+    ):
         code_revision = installed_release_revision()
         ProjectStore(root, project)
         catalog = _load_or_setup_catalog(
@@ -130,11 +159,9 @@ def build(
             embedder=embedder,
         )
         runtime_catalog = RuntimeModelCatalog(catalog)
-        resolved_world = runtime_catalog.resolve(selected.world_model)
-        runtime_catalog.resolve(selected.judge)
-        resolved_embedder = runtime_catalog.preflight(
-            selected.embedder,
-            CapabilityRequirement(requires_embeddings=True),
+        world_snapshot, embedder_snapshot, embedder_capabilities = _validated_role_snapshots(
+            runtime_catalog,
+            selected,
         )
         path = _resolve_trace_file(trace_file)
         normalized = _load_canonical_traces(path, source)
@@ -162,31 +189,61 @@ def build(
         built = _reuse_completed_grounded_artifacts(
             store,
             completed,
-            resolved_world=resolved_world,
-            resolved_embedder=resolved_embedder,
+            world_alias=selected.world_model,
+            world_snapshot=world_snapshot,
+            embedder_snapshot=embedder_snapshot,
             top_k=top_k,
         )
         estimate = 0.0
         if built is None:
-            estimate = _embedding_cost_ceiling(completed, resolved_embedder)
+            estimate = _embedding_cost_ceiling(completed, embedder_capabilities)
             if estimate > maximum_build_cost_usd:
                 raise ValueError(
                     f"conservative embedding estimate ${estimate:.6f} exceeds "
                     f"--max-build-cost-usd ${maximum_build_cost_usd:.6f}"
                 )
-            if estimate > 0 and not require_spend_consent(
-                _console,
-                yes=yes,
-                spend=f"at most ${estimate:.6f} for provider embeddings",
-                command=f"wmo build {project} {trace_file}",
-            ):
-                return
+        assumptions = (
+            (
+                "verified immutable grounded indexes are reused",
+                "zero new provider calls",
+            )
+            if built is not None
+            else (
+                "serving and fit-only RAG embeddings",
+                "UTF-8 bytes conservatively counted as input tokens",
+                f"up to {RetryPolicy().maximum_attempts} embedding attempts",
+            )
+        )
+        if not require_spend_consent(
+            _console,
+            root=root,
+            yes=yes,
+            estimated_cost_usd=estimate,
+            command=f"wmo build {project} {trace_file}",
+            assumptions=assumptions,
+            non_interactive=no_interactive,
+        ):
+            return
+        resolved_world = runtime_catalog.resolve(selected.world_model)
+        runtime_catalog.resolve(selected.judge)
+        resolved_embedder = runtime_catalog.preflight(
+            selected.embedder,
+            CapabilityRequirement(requires_embeddings=True),
+        )
+        if built is None:
             built = _build_grounded_artifacts(
                 store,
                 completed,
                 resolved_world=resolved_world,
                 resolved_embedder=resolved_embedder,
                 top_k=top_k,
+            )
+        else:
+            _validate_reused_grounded_artifacts(
+                store,
+                built,
+                resolved_world=resolved_world,
+                resolved_embedder=resolved_embedder,
             )
         select_completed_build(store, built, completed.review)
     _capture_local_build_telemetry(
@@ -316,15 +373,49 @@ def _selected_roles(
     )
 
 
+def _validated_role_snapshots(
+    runtime_catalog: RuntimeModelCatalog,
+    selected: ProjectModelConfiguration,
+) -> tuple[ModelSnapshot, ModelSnapshot, ModelCapabilities]:
+    """Validate build roles from catalog metadata without reading credentials.
+
+    Args:
+        runtime_catalog: Resolver used only for static model snapshots.
+        selected: Frozen world-model, judge, and embedder aliases.
+
+    Returns:
+        World-model snapshot, embedder snapshot, and embedder capabilities.
+
+    Raises:
+        ModelCapabilityError: The embedder cannot prove embedding support.
+        ModelConnectionError: A selected alias or provider is unsupported.
+        ValueError: The embedder has no explicit input price.
+    """
+    world_snapshot, _world_capabilities = runtime_catalog.snapshot(selected.world_model)
+    runtime_catalog.snapshot(selected.judge)
+    embedder_snapshot, embedder_capabilities = runtime_catalog.snapshot(selected.embedder)
+    preflight_capabilities(
+        selected.embedder,
+        embedder_capabilities,
+        CapabilityRequirement(requires_embeddings=True),
+    )
+    if embedder_capabilities.input_cost_per_million_tokens_usd is None:
+        raise ValueError(
+            f"embedder alias {selected.embedder!r} has no input_cost_per_million_tokens_usd; "
+            "record explicit pricing before a provider-backed build"
+        )
+    return world_snapshot, embedder_snapshot, embedder_capabilities
+
+
 def _embedding_cost_ceiling(
     completed: ProjectBuild,
-    embedder: ResolvedModel,
+    capabilities: ModelCapabilities,
 ) -> float:
     """Bound retry-inclusive embedding spend from the exact rendered retrieval inputs.
 
     Args:
         completed: Persisted trace and task build whose transitions will be embedded.
-        embedder: Exact resolved embedding model and price metadata.
+        capabilities: Static embedder capabilities and price metadata.
 
     Returns:
         Conservative USD ceiling across serving and fit-only index construction.
@@ -332,10 +423,10 @@ def _embedding_cost_ceiling(
     Raises:
         ValueError: The selected embedder omits explicit input pricing.
     """
-    price = embedder.capabilities.input_cost_per_million_tokens_usd
+    price = capabilities.input_cost_per_million_tokens_usd
     if price is None:
         raise ValueError(
-            f"embedder alias {embedder.alias!r} has no input_cost_per_million_tokens_usd; "
+            "embedder has no input_cost_per_million_tokens_usd; "
             "record explicit pricing before a provider-backed build"
         )
     bindings = _lineage_bindings(completed)
@@ -460,24 +551,24 @@ def _reuse_completed_grounded_artifacts(
     store: ProjectStore,
     completed: ProjectBuild,
     *,
-    resolved_world: ResolvedModel,
-    resolved_embedder: ResolvedModel,
+    world_alias: str,
+    world_snapshot: ModelSnapshot,
+    embedder_snapshot: ModelSnapshot,
     top_k: int,
 ) -> ProjectBuildArtifacts | None:
-    """Reuse a completely matching verified build without another provider embedding call.
+    """Reuse a completely matching verified build without credentials or provider calls.
 
     Args:
         store: Project artifact store containing a possible completed build.
         completed: Current persisted trace and task build.
-        resolved_world: Exact world-model runtime binding.
-        resolved_embedder: Exact provider embedding binding.
+        world_alias: Configured world-model alias required by the artifact.
+        world_snapshot: Secret-free world-model identity required by the artifact.
+        embedder_snapshot: Secret-free embedder identity required by both indexes.
         top_k: Requested retrieval result count.
 
     Returns:
         Verified existing build pointers, or ``None`` when any identity differs.
 
-    Raises:
-        ValueError: The selected embedder lacks an explicit catalog input price.
     """
     existing = store.load_project().build
     if existing is None:
@@ -490,19 +581,49 @@ def _reuse_completed_grounded_artifacts(
         return None
     serving = load_rag_index(store.artifacts, existing.serving_rag.artifact_id)
     fit = load_rag_index(store.artifacts, existing.fit_rag.artifact_id)
-    expected_embedder = resolved_embedder.snapshot
     if (
-        serving.index.embedder != expected_embedder
-        or fit.index.embedder != expected_embedder
+        serving.index.embedder != embedder_snapshot
+        or fit.index.embedder != embedder_snapshot
         or serving.index.default_top_k != top_k
         or fit.index.default_top_k != top_k
         or serving.index.included_partitions != ("fit", "held_out")
         or fit.index.included_partitions != ("fit",)
     ):
         return None
+    world = GroundedWorldModelArtifact.model_validate_json(
+        store.artifacts.read_bytes(existing.world_model.artifact_id, WORLD_MODEL_ARTIFACT_PATH)
+    )
+    if (
+        world.serving_rag != existing.serving_rag
+        or world.model_alias != world_alias
+        or world.model != world_snapshot
+        or world.top_k != top_k
+    ):
+        return None
+    return existing
+
+
+def _validate_reused_grounded_artifacts(
+    store: ProjectStore,
+    existing: ProjectBuildArtifacts,
+    *,
+    resolved_world: ResolvedModel,
+    resolved_embedder: ResolvedModel,
+) -> None:
+    """Preserve runtime validation for a statically matched zero-call replay.
+
+    Args:
+        store: Project artifact store containing the completed build.
+        existing: Exact build pointers matched before cost authorization.
+        resolved_world: Post-authorization world-model runtime binding.
+        resolved_embedder: Post-authorization embedding runtime binding.
+
+    Raises:
+        ValueError: Runtime pricing or immutable artifact identity is invalid.
+    """
     assert resolved_embedder.embedding_client is not None
     embedding_price = resolved_embedder.capabilities.input_cost_per_million_tokens_usd
-    if embedding_price is None:  # pragma: no cover - setup and capability preflight require it
+    if embedding_price is None:  # pragma: no cover - static capability validation requires it
         raise ValueError("the selected embedder has no explicit input price")
     runtime = load_grounded_world_model(
         store.artifacts,
@@ -518,10 +639,8 @@ def _reuse_completed_grounded_artifacts(
     if (
         runtime.artifact.model_alias != resolved_world.alias
         or runtime.artifact.model != resolved_world.snapshot
-        or runtime.artifact.top_k != top_k
     ):
-        return None
-    return existing
+        raise ValueError("completed grounded world model differs from the selected runtime model")
 
 
 def _lineage_bindings(completed: ProjectBuild) -> tuple[RAGLineageBinding, ...]:

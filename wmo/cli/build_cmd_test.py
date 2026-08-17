@@ -14,9 +14,11 @@ from pydantic import JsonValue
 from typer.testing import CliRunner
 
 import wmo.cli.build_cmd as build_command
+import wmo.cli.consent as consent_module
 import wmo.simulation.build as simulation_build
 from wmo.cli.app import app
 from wmo.cli.provider_setup_test import _FakeLister as _SetupLister
+from wmo.common.config.settings import set_maximum_command_cost_usd
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     ConnectionConfig,
@@ -198,12 +200,35 @@ class _RuntimeCatalog:
         self._embedding = _EmbeddingClient()
         self._completion = _CompletionClient()
 
+    def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+        """Return deterministic static identity without recording runtime construction.
+
+        Args:
+            alias: Configured fixture alias.
+
+        Returns:
+            Fixture model snapshot and capabilities.
+        """
+        resolved = self._resolved(alias)
+        return resolved.snapshot, resolved.capabilities
+
     def preflight(self, alias: str, _requirement: object | None = None) -> ResolvedModel:
         """Return exact static identities with alias-specific capabilities.
 
         Args:
             alias: Configured fixture model alias.
             _requirement: Unused requirement accepted by the runtime seam.
+
+        Returns:
+            Deterministic resolved fixture model.
+        """
+        return self._resolved(alias)
+
+    def _resolved(self, alias: str) -> ResolvedModel:
+        """Build one deterministic runtime binding for a fixture alias.
+
+        Args:
+            alias: Configured fixture alias.
 
         Returns:
             Deterministic resolved fixture model.
@@ -642,6 +667,169 @@ def test_build_package_upgrade_decline_preserves_selected_review(
     assert declined.exit_code == 0, declined.output
     assert store.load_project().build == first_build
     assert store.read_review() == first_review
+
+
+def test_configured_budget_rejects_build_before_provider_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An over-budget estimate performs zero credential or provider-client work.
+
+    Args:
+        tmp_path: Temporary trace, catalog, and settings root.
+        monkeypatch: Cost and provider-resolution boundary replacements.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+    set_maximum_command_cost_usd(0.5, root)
+    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 1.0)
+    provider_resolutions: list[str] = []
+
+    def forbidden_preflight(
+        self: _RuntimeCatalog,
+        alias: str,
+        requirement: object | None = None,
+    ) -> ResolvedModel:
+        """Fail if hard budget rejection reaches runtime model construction.
+
+        Args:
+            self: Runtime catalog instance.
+            alias: Unexpected model alias.
+            requirement: Unexpected capability requirement.
+
+        Raises:
+            AssertionError: Always, because provider resolution must not run.
+        """
+        del self, requirement
+        provider_resolutions.append(alias)
+        raise AssertionError("provider resolution must follow command budget authorization")
+
+    monkeypatch.setattr(_RuntimeCatalog, "preflight", forbidden_preflight)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", str(source), "--root", str(root), "--yes"],
+    )
+
+    assert result.exit_code == 2
+    output = unstyle(result.output)
+    assert "estimated cost: $1.00" in output
+    assert "configured budget: $0.50 per command" in output
+    assert "wmo config budget 1.00" in output
+    assert "--yes cannot override" in output
+    assert provider_resolutions == []
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is None
+    assert store.read_review() is None
+
+
+def test_noninteractive_build_above_half_requires_yes_before_provider_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag-declared noninteractive build receives deterministic remediation.
+
+    Args:
+        tmp_path: Temporary trace, catalog, and settings root.
+        monkeypatch: Cost and provider-work boundary replacements.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+    set_maximum_command_cost_usd(1.0, root)
+    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 0.75)
+    provider_calls: list[bool] = []
+
+    def forbidden_build(*_args: object, **_kwargs: object) -> None:
+        """Fail if missing confirmation reaches provider-backed artifact construction.
+
+        Raises:
+            AssertionError: Always, because ``--yes`` is absent.
+        """
+        provider_calls.append(True)
+        raise AssertionError("provider work requires shared cost authorization")
+
+    monkeypatch.setattr(build_command, "_build_grounded_artifacts", forbidden_build)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", str(source), "--root", str(root), "--no-interactive"],
+    )
+
+    assert result.exit_code == 2
+    assert "requires explicit confirmation" in unstyle(result.output)
+    assert "re-run with --yes" in unstyle(result.output)
+    assert provider_calls == []
+
+
+def test_noninteractive_build_yes_confirms_an_in_budget_estimate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag-complete agent invocation runs after the shared preflight.
+
+    Args:
+        tmp_path: Temporary trace, catalog, and settings root.
+        monkeypatch: Conservative estimate replacement.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+    set_maximum_command_cost_usd(1.0, root)
+    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 0.75)
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            str(source),
+            "--root",
+            str(root),
+            "--no-interactive",
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "authorization: confirmed by --yes" in unstyle(result.output)
+    assert ProjectStore(root, "support").load_project().build is not None
+
+
+def test_interactive_build_uses_the_cost_specific_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real CLI prompt names the command, estimate, and configured budget.
+
+    Args:
+        tmp_path: Temporary trace, catalog, and settings root.
+        monkeypatch: Interactive-session and conservative-estimate replacements.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+    set_maximum_command_cost_usd(1.0, root)
+    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 0.75)
+    monkeypatch.setattr(consent_module, "can_prompt", lambda _console: True)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", str(source), "--root", str(root)],
+        input="y\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    output = unstyle(result.output)
+    assert "Authorize wmo build support" in output
+    assert "$0.75" in output
+    assert "$1.00 per-command budget" in output
+    assert "Proceed?" not in output
 
 
 @pytest.mark.parametrize("failure_mode", ["cost", "decline", "grounded"])

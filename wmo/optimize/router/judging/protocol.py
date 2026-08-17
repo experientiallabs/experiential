@@ -33,6 +33,8 @@ from wmo.optimize.router.judging.contracts import (
     ManualJudgeError,
 )
 
+PairwiseCitationEvidence = tuple[tuple[ArtifactId, tuple[str, ...], tuple[str, ...]], ...]
+
 
 class _EvidenceDimension(ContractModel):
     """Shared identity, evidence citations, and feedback for one structured dimension."""
@@ -176,6 +178,7 @@ class TemplateJudgeClient:
         self._code_revision = code_revision
         self._probes: list[ArtifactInput] = []
         self._provider_calls_made = 0
+        self._pairwise_citation_evidence: PairwiseCitationEvidence = ()
 
     @property
     def probes(self) -> tuple[ArtifactInput, ...]:
@@ -186,6 +189,11 @@ class TemplateJudgeClient:
     def provider_calls_made(self) -> int:
         """Return provider dispatches made instead of replayed by this adapter."""
         return self._provider_calls_made
+
+    @property
+    def pairwise_citation_evidence(self) -> PairwiseCitationEvidence:
+        """Return target and reference citations retained from both pairwise orders."""
+        return self._pairwise_citation_evidence
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Execute the finalized schema and normalize its explicit projection.
@@ -400,6 +408,7 @@ class TemplateJudgeClient:
             )
         mapping = self._template.score_projection.pairwise_scores
         normalized: list[JsonObject] = []
+        citations: list[tuple[ArtifactId, tuple[str, ...], tuple[str, ...]]] = []
         for dimension in self._rubric.dimensions:
             left = first_by_id[dimension.dimension_id]
             right = second_by_id[dimension.dimension_id]
@@ -407,16 +416,22 @@ class TemplateJudgeClient:
             _validate_pairwise_spans(right, self._reference, self._rollout)
             right_target = _reverse_winner(right.winner)
             score = (mapping[left.winner] + mapping[right_target] + 1) // 2
+            target_evidence = tuple(
+                dict.fromkeys((*left.evidence_span_ids_a, *right.evidence_span_ids_b))
+            )
+            reference_evidence = tuple(
+                dict.fromkeys((*left.evidence_span_ids_b, *right.evidence_span_ids_a))
+            )
+            citations.append((dimension.dimension_id, target_evidence, reference_evidence))
             normalized.append(
                 {
                     "dimension_id": dimension.dimension_id,
                     "raw_score": score,
-                    "evidence_span_ids": list(
-                        dict.fromkeys((*left.evidence_span_ids_a, *right.evidence_span_ids_b))
-                    ),
+                    "evidence_span_ids": list(target_evidence),
                     "feedback": f"forward: {left.feedback} reverse: {right.feedback}",
                 }
             )
+        self._pairwise_citation_evidence = tuple(citations)
         return ModelResponse(
             output=AssistantAction(content=json.dumps({"dimensions": normalized})),
             model=forward.model,
@@ -452,6 +467,54 @@ def positional_bias_count(
         item.winner != _reverse_winner(second_by_id[item.dimension_id].winner) for item in first
     )
     return len(first), disagreements
+
+
+def pairwise_citation_evidence_from_probes(
+    store: ProjectStore,
+    probes: tuple[ArtifactInput, ...],
+    rollout: RolloutArtifact,
+    reference: RolloutArtifact,
+) -> PairwiseCitationEvidence:
+    """Recover target and reference citations from immutable counterbalanced probes.
+
+    Args:
+        store: Project-local immutable artifact store.
+        probes: Exact forward and reverse probe pointers.
+        rollout: Target rollout shown as candidate A in the forward probe.
+        reference: Reference rollout shown as candidate B in the forward probe.
+
+    Returns:
+        Rubric dimension IDs with separate target and reference citation tuples.
+
+    Raises:
+        ManualJudgeError: Probe order, dimensions, or citations are malformed.
+    """
+    loaded = tuple(_read_probe(store, item) for item in probes)
+    if len(loaded) != 2 or loaded[0].order != "forward" or loaded[1].order != "reverse":
+        raise ManualJudgeError("pairwise citations require forward and reverse probes")
+    first = _PairwiseResponse.model_validate(loaded[0].response).dimensions
+    second = _PairwiseResponse.model_validate(loaded[1].response).dimensions
+    first_by_id = {item.dimension_id: item for item in first}
+    second_by_id = {item.dimension_id: item for item in second}
+    if (
+        len(first_by_id) != len(first)
+        or len(second_by_id) != len(second)
+        or set(first_by_id) != set(second_by_id)
+    ):
+        raise ManualJudgeError("pairwise probes evaluated different rubric dimensions")
+    evidence: list[tuple[ArtifactId, tuple[str, ...], tuple[str, ...]]] = []
+    for dimension_id, left in first_by_id.items():
+        right = second_by_id[dimension_id]
+        _validate_pairwise_spans(left, rollout, reference)
+        _validate_pairwise_spans(right, reference, rollout)
+        evidence.append(
+            (
+                dimension_id,
+                tuple(dict.fromkeys((*left.evidence_span_ids_a, *right.evidence_span_ids_b))),
+                tuple(dict.fromkeys((*left.evidence_span_ids_b, *right.evidence_span_ids_a))),
+            )
+        )
+    return tuple(evidence)
 
 
 def _read_probe_if_present(store: ProjectStore, probe_id: str) -> JudgeProtocolProbeArtifact | None:
@@ -573,7 +636,7 @@ def _render_request(
         Deterministic request body containing every mapped variable and schema.
     """
     values: dict[str, object] = {
-        "rubric": [item.model_dump(mode="json") for item in rubric.dimensions],
+        "rubric": [item.prompt_payload() for item in rubric.dimensions],
     }
     if candidate_b is None:
         values["rollout"] = _rollout_payload(candidate_a)
@@ -646,6 +709,16 @@ def _validate_normalized_dimensions(
     }
     if not cited or not cited.issubset(known):
         raise ManualJudgeError("judge cited evidence outside the target rollout")
+    axes = {item.dimension_id: item for item in rubric.dimensions}
+    for item in dimensions:
+        dimension_id = cast(str, item.get("dimension_id"))
+        raw_score = item.get("raw_score")
+        axis = axes[dimension_id]
+        if not isinstance(raw_score, int) or not axis.contains_score(raw_score):
+            raise ManualJudgeError(
+                f"judge raw_score for {dimension_id} must be an integer from "
+                f"{axis.min_score} through {axis.max_score}"
+            )
 
 
 def _validate_pairwise_spans(

@@ -1,10 +1,11 @@
-"""The shared spend boundary: consent is said, never inferred from the absence of someone to ask."""
+"""Tests for the shared cost-aware paid-command authorization boundary."""
 
 from __future__ import annotations
 
 import io
 import re
 import sys
+from pathlib import Path
 
 import pytest
 import typer
@@ -12,237 +13,318 @@ from rich.console import Console
 
 from wmo.cli import consent as consent_module
 from wmo.cli.consent import NO_CONSENT_EXIT_CODE, can_prompt, require_spend_consent
+from wmo.common.config.settings import set_maximum_command_cost_usd
 
 
 class _TerminalStdin(io.StringIO):
-    """A stdin that claims to be a terminal, with `keystrokes` already queued for the prompt."""
+    """A stdin buffer that reports itself as an interactive terminal."""
 
     def isatty(self) -> bool:
+        """Report an interactive input stream."""
         return True
 
 
 class _Answer:
-    """A `rich.prompt.Confirm` stand-in recording what it was asked, and with what default."""
+    """Record one or more confirmation prompts and return a fixed answer."""
 
     def __init__(self, answer: bool) -> None:
+        """Configure the fixed confirmation answer.
+
+        Args:
+            answer: Boolean returned for every prompt.
+        """
         self._answer = answer
         self.asked: list[str] = []
         self.defaults: list[bool] = []
 
-    def ask(self, prompt: str, *, default: bool = True) -> bool:
+    def ask(
+        self,
+        prompt: str,
+        *,
+        default: bool = True,
+        console: Console | None = None,
+    ) -> bool:
+        """Record the prompt contract and return the configured answer.
+
+        Args:
+            prompt: User-facing confirmation question.
+            default: Answer selected by a blank line.
+            console: Console passed by the production boundary.
+
+        Returns:
+            The configured fixed answer.
+        """
+        del console
         self.asked.append(prompt)
         self.defaults.append(default)
         return self._answer
 
 
 def _console(*, terminal: bool) -> tuple[Console, io.StringIO]:
+    """Return a test console and its text buffer.
+
+    Args:
+        terminal: Whether the output side reports a TTY.
+
+    Returns:
+        Console and captured output buffer.
+    """
     buffer = io.StringIO()
     return Console(file=buffer, force_terminal=terminal, width=200), buffer
 
 
 def _flat(buffer: io.StringIO) -> str:
-    """The buffer as one line of plain text: a forced-terminal console also emits ANSI."""
+    """Return captured Rich output as one ANSI-free line."""
     return " ".join(_ANSI.sub("", buffer.getvalue()).split())
+
+
+def _authorize(
+    console: Console,
+    root: Path,
+    *,
+    estimate: float,
+    yes: bool = False,
+    non_interactive: bool = False,
+    previously_confirmed: bool = False,
+) -> bool:
+    """Invoke the shared boundary with one stable command fixture.
+
+    Args:
+        console: Capturing console.
+        root: WMO settings root.
+        estimate: Conservative command estimate.
+        yes: Explicit invocation confirmation.
+        non_interactive: Whether prompting is forbidden.
+        previously_confirmed: Whether immutable command state already records confirmation.
+
+    Returns:
+        Shared authorization decision.
+    """
+    return require_spend_consent(
+        console,
+        root=root,
+        yes=yes,
+        estimated_cost_usd=estimate,
+        command="wmo optimize model support",
+        assumptions=("full frozen schedule", "one retry per managed batch"),
+        non_interactive=non_interactive,
+        previously_confirmed=previously_confirmed,
+    )
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def test_yes_consents_without_asking_even_at_a_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_estimate_at_exactly_half_the_budget_runs_automatically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fifty percent belongs to the automatic side of the policy."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
     answer = _Answer(False)
     monkeypatch.setattr(consent_module, "Confirm", answer)
-    console, buffer = _console(terminal=True)
+    console, buffer = _console(terminal=False)
 
-    assert require_spend_consent(console, yes=True, spend="~$12.00", command="wmo optimize model")
+    assert _authorize(console, root, estimate=10.0)
     assert answer.asked == []
-    assert buffer.getvalue() == ""
+    rendered = _flat(buffer)
+    assert "Cost preflight" in rendered
+    assert "command: wmo optimize model support" in rendered
+    assert "estimated cost: $10.00" in rendered
+    assert "configured budget: $20.00 per command" in rendered
+    assert "full frozen schedule; one retry per managed batch" in rendered
+    assert "automatic" in rendered
 
 
-def test_a_terminal_is_asked_and_a_no_declines(
-    monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
+def test_estimate_just_above_half_requires_a_clear_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interactive_stdin: None,
 ) -> None:
-    answer = _Answer(False)
+    """The first value above fifty percent opens the explicit prompt."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(True)
     monkeypatch.setattr(consent_module, "Confirm", answer)
     console, _buffer = _console(terminal=True)
 
-    assert not require_spend_consent(
-        console, yes=False, spend="~$12.00", command="wmo optimize model"
-    )
+    assert _authorize(console, root, estimate=10.000001)
+    assert len(answer.asked) == 1
+    prompt = answer.asked[0]
+    assert "wmo optimize model support" in prompt
+    assert "$10.000001" in prompt
+    assert "$20.00 per-command budget" in prompt
+    assert answer.defaults == [False]
+
+
+def test_estimate_at_exactly_the_budget_requires_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interactive_stdin: None,
+) -> None:
+    """One hundred percent is allowed only with explicit confirmation."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(True)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, _buffer = _console(terminal=True)
+
+    assert _authorize(console, root, estimate=20.0)
     assert len(answer.asked) == 1
 
 
-def test_a_terminal_is_asked_and_a_yes_consents(
-    monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
-) -> None:
-    answer = _Answer(True)
-    monkeypatch.setattr(consent_module, "Confirm", answer)
-    console, _buffer = _console(terminal=True)
-
-    assert require_spend_consent(console, yes=False, spend="~$12.00", command="wmo optimize model")
-    assert len(answer.asked) == 1
-
-
-def test_a_caller_can_name_the_spend_question(
-    monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
-) -> None:
-    """A paid workflow can replace the generic prompt with its named operation."""
-    answer = _Answer(True)
-    monkeypatch.setattr(consent_module, "Confirm", answer)
-    console, _buffer = _console(terminal=True)
-
-    assert require_spend_consent(
-        console,
-        yes=False,
-        spend="at most $1.00",
-        command="wmo config judge calibrate",
-        question="Run this named judge calibration within the displayed ceiling?",
-    )
-
-    assert answer.asked == ["\nRun this named judge calibration within the displayed ceiling?"]
-
-
-def test_no_terminal_and_no_yes_refuses_naming_the_spend_and_the_flag(
+def test_estimate_above_budget_fails_even_with_yes(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A pipe, CI, or cron is not consent to spend: the run exits 2 instead of starting.
-
-    The refusal has to be actionable on its own, so it carries what would have been spent, the
-    command that would have spent it, and the flag that authorizes it.
-    """
+    """The invocation confirmation never overrides the configured ceiling."""
+    root = tmp_path / ".wmo root"
+    set_maximum_command_cost_usd(20.0, root)
     answer = _Answer(True)
     monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, buffer = _console(terminal=True)
+
+    with pytest.raises(typer.BadParameter) as caught:
+        _authorize(console, root, estimate=20.000001, yes=True)
+
+    assert answer.asked == []
+    message = str(caught.value)
+    assert "exceeds the configured per-command budget" in message
+    assert "wmo config budget 20.000001 --root" in message
+    assert "wmo root" in message
+    assert "--yes cannot override" in message
+    assert "estimated cost: $20.000001" in _flat(buffer)
+
+
+def test_sub_microdollar_estimates_are_displayed_conservatively(tmp_path: Path) -> None:
+    """Visible estimates never round a positive conservative ceiling down to zero."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(1.0, root)
     console, buffer = _console(terminal=False)
 
-    with pytest.raises(typer.Exit) as caught:
-        require_spend_consent(
-            console,
-            yes=False,
-            spend="~$12.00 across 240 cell(s)",
-            command="wmo optimize model",
-        )
+    assert _authorize(console, root, estimate=0.0000001)
 
-    assert caught.value.exit_code == NO_CONSENT_EXIT_CODE
-    assert answer.asked == []  # nothing was asked, because there was nobody to ask
-    flat = _flat(buffer)
-    assert "cannot ask for spend consent" in flat
-    assert "wmo optimize model would spend ~$12.00 across 240 cell(s) here" in flat
-    assert "Re-run the same command with --yes to consent explicitly." in flat
+    assert "estimated cost: $0.000001" in _flat(buffer)
 
 
-def test_the_refusal_names_a_second_way_out_when_the_command_has_one() -> None:
-    console, buffer = _console(terminal=False)
-
-    with pytest.raises(typer.Exit):
-        require_spend_consent(
-            console,
-            yes=False,
-            spend="~$1.65",
-            command="wmo optimize model",
-            alternative="--dry-run to see the plan without spending",
-        )
-
-    assert "or with --dry-run to see the plan without spending" in _flat(buffer)
-
-
-# -- the input stream is half of "interactive" --------------------------------------------------
-# Checking only the console asked the wrong stream: the console reports on stdout while the
-# prompt reads stdin, so `wmo optimize model < /dev/null` at a terminal passed the gate
-# and then had a redirect answer the money question for the absent human.
-
-
-def test_a_terminal_stdout_with_redirected_stdin_refuses(
+def test_noninteractive_above_half_requires_yes(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The hole: a TTY stdout is not a human if stdin comes from a file, a pipe, or a heredoc.
-
-    Under pytest `sys.stdin` is already a non-terminal stub, which is exactly the redirected
-    case, so only the console is forced here.
-    """
+    """Automation gets an exit-2 instruction instead of an implicit answer."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
     answer = _Answer(True)
     monkeypatch.setattr(consent_module, "Confirm", answer)
     console, buffer = _console(terminal=True)
 
     with pytest.raises(typer.Exit) as caught:
-        require_spend_consent(console, yes=False, spend="~$12.00", command="wmo optimize model")
+        _authorize(console, root, estimate=15.0, non_interactive=True)
 
     assert caught.value.exit_code == NO_CONSENT_EXIT_CODE
-    assert answer.asked == []  # never offered, so a redirect could not answer it
-    flat = _flat(buffer)
-    assert "cannot ask for spend consent" in flat
-    # The reader IS at a terminal, so the refusal has to name the stream that is not one.
-    assert "needs a terminal on stdin as well as stdout" in flat
+    assert answer.asked == []
+    rendered = _flat(buffer)
+    assert "requires explicit confirmation" in rendered
+    assert "re-run with --yes" in rendered
+    assert "$15.00" in rendered
+    assert "$20.00" in rendered
 
 
-def test_can_prompt_needs_both_streams(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Either stream alone is not an interactive session."""
+def test_noninteractive_yes_confirms_an_in_budget_estimate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete agent invocation can authorize an above-half estimate."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(False)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, buffer = _console(terminal=False)
+
+    assert _authorize(console, root, estimate=15.0, yes=True, non_interactive=True)
+    assert answer.asked == []
+    assert "confirmed by --yes" in _flat(buffer)
+
+
+def test_prior_immutable_confirmation_avoids_a_repeat_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A paid resume reuses its recorded confirmation while respecting the current ceiling."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(False)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, buffer = _console(terminal=False)
+
+    assert _authorize(console, root, estimate=15.0, previously_confirmed=True)
+    assert answer.asked == []
+    assert "immutable prior confirmation" in _flat(buffer)
+
+
+def test_interactive_decline_returns_false_without_authorizing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interactive_stdin: None,
+) -> None:
+    """A clearly worded prompt still permits an explicit refusal."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(False)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, _buffer = _console(terminal=True)
+
+    assert not _authorize(console, root, estimate=15.0)
+    assert len(answer.asked) == 1
+
+
+def test_zero_budget_allows_only_a_zero_cost_replay(tmp_path: Path) -> None:
+    """A zero ceiling disables paid work while preserving deterministic replay."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(0.0, root)
+    console, _buffer = _console(terminal=False)
+
+    assert _authorize(console, root, estimate=0.0)
+    with pytest.raises(typer.BadParameter):
+        _authorize(console, root, estimate=0.000001, yes=True)
+
+
+def test_can_prompt_requires_both_terminal_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Terminal output alone cannot make redirected input interactive."""
     terminal, _ = _console(terminal=True)
     piped, _ = _console(terminal=False)
 
     monkeypatch.setattr(sys, "stdin", _TerminalStdin())
     assert can_prompt(terminal)
-    assert not can_prompt(piped)  # terminal stdin, redirected stdout
+    assert not can_prompt(piped)
 
     monkeypatch.setattr(sys, "stdin", io.StringIO("y\n"))
-    assert not can_prompt(terminal)  # terminal stdout, redirected stdin
+    assert not can_prompt(terminal)
     assert not can_prompt(piped)
 
 
-def test_a_closed_stdin_is_not_an_interactive_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`isatty()` raises on a closed stream; that is nobody to ask, not a crash."""
-    closed = io.StringIO()
-    closed.close()  # a later isatty() raises ValueError
-    monkeypatch.setattr(sys, "stdin", closed)
-    console, _buffer = _console(terminal=True)
-
-    assert not can_prompt(console)
-
-
-def test_a_blank_answer_refuses_instead_of_authorizing_the_spend(
+def test_eof_at_confirmation_is_an_actionable_refusal(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The real `Confirm`, a real blank line: the cheapest possible input must not buy anything.
-
-    `default=True` made pressing Enter (and every blank line a redirect can supply) an approval.
-    The default is the answer given when nothing was said, so it has to be the refusal.
-    """
-    monkeypatch.setattr(sys, "stdin", _TerminalStdin("\n"))
-    console, _buffer = _console(terminal=True)
-
-    assert not require_spend_consent(
-        console, yes=False, spend="~$12.00", command="wmo optimize model"
-    )
-
-
-def test_eof_at_the_prompt_is_the_documented_refusal_not_a_traceback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An input that ends without answering exits 2 with the refusal, not an `EOFError`."""
-    monkeypatch.setattr(sys, "stdin", _TerminalStdin(""))  # readline() -> "" -> EOFError
+    """An unanswered interactive prompt exits cleanly without authorizing spend."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    monkeypatch.setattr(sys, "stdin", _TerminalStdin(""))
     console, buffer = _console(terminal=True)
 
     with pytest.raises(typer.Exit) as caught:
-        require_spend_consent(
-            console,
-            yes=False,
-            spend="~$12.00 across 240 cell(s)",
-            command="wmo optimize model",
-        )
+        _authorize(console, root, estimate=15.0)
 
     assert caught.value.exit_code == NO_CONSENT_EXIT_CODE
-    flat = _flat(buffer)
-    assert "cannot ask for spend consent" in flat
-    assert "wmo optimize model would spend ~$12.00 across 240 cell(s) here" in flat
-    assert "Re-run the same command with --yes to consent explicitly." in flat
+    assert "input ended before confirmation" in _flat(buffer)
 
 
-def test_the_prompt_defaults_to_refusing(
-    monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
-) -> None:
-    """Belt and braces on the default itself, in the units the stand-in tests are written in."""
-    answer = _Answer(False)
-    monkeypatch.setattr(consent_module, "Confirm", answer)
-    console, _buffer = _console(terminal=True)
+@pytest.mark.parametrize("estimate", [-0.01, float("inf"), float("nan")])
+def test_invalid_estimate_fails_closed(tmp_path: Path, estimate: float) -> None:
+    """Unsafe arithmetic cannot reach an automatic or confirmed decision."""
+    console, _buffer = _console(terminal=False)
 
-    require_spend_consent(console, yes=False, spend="~$12.00", command="wmo optimize model")
-
-    assert answer.defaults == [False]
+    with pytest.raises(typer.BadParameter, match="finite and nonnegative"):
+        _authorize(console, tmp_path / ".wmo", estimate=estimate, yes=True)

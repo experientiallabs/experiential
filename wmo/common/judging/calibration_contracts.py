@@ -29,7 +29,7 @@ class JudgeScoreObservation(ContractModel):
     judgment: ArtifactInput
     source_rollout: ArtifactInput
     dimension_id: ArtifactId
-    raw_score: Literal[0, 1, 2, 3, 4, 5]
+    raw_score: int = Field(ge=0)
     evidence_span_ids: tuple[str, ...]
 
     @field_validator("evidence_span_ids")
@@ -43,19 +43,21 @@ class JudgeScoreObservation(ContractModel):
 
 
 class InsufficientCalibrationRiskAcceptance(ArtifactEnvelope):
-    """Explicit human acceptance of the risk from fewer than ten eligible rollouts."""
+    """Explicit human acceptance of the risk from fewer than five eligible rollouts."""
 
     acceptance_id: ArtifactId
     report: ArtifactInput
     eligible_label_count: int = Field(ge=1)
     eligible_rollout_count: int = Field(ge=1, lt=10)
-    recommended_label_count: Literal[10] = 10
+    recommended_label_count: Literal[5, 10] = 5
     accepted_at: AwareDatetime
     risk_accepted: Literal[True] = True
 
     @model_validator(mode="after")
     def _require_report_bound_acceptance(self) -> InsufficientCalibrationRiskAcceptance:
         """Require this durable decision to hash exactly its accepted report."""
+        if self.eligible_rollout_count >= self.recommended_label_count:
+            raise ValueError("risk acceptance requires fewer than the recommended rollout count")
         if self.created_at != self.accepted_at:
             raise ValueError("risk acceptance created_at must equal accepted_at")
         if self.inputs != (self.report,):
@@ -84,7 +86,7 @@ class CalibrationReport(ArtifactEnvelope):
     excluded_held_out_rollout_count: int = Field(ge=0)
     excluded_held_out_lineage_ids: tuple[ArtifactId, ...]
     excluded_held_out_lineage_count: int = Field(ge=0)
-    recommended_label_count: Literal[10] = 10
+    recommended_label_count: Literal[5, 10] = 5
     status: Literal["provisional", "insufficient", "ready_for_approval"]
     score_maps: tuple[DimensionScoreMap, ...]
     dimension_metrics: tuple[DimensionCalibrationMetrics, ...]
@@ -151,7 +153,6 @@ class CalibrationReport(ArtifactEnvelope):
 
     def _require_provisional_shape(self) -> None:
         """Reject provisional records that claim evidence or a learned score map."""
-        identity = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
         if self.observations or self.eligible_label_count or self.eligible_rollout_count:
             raise ValueError("provisional calibration reports require zero eligible labels")
         if self.eligible_lineage_ids or self.eligible_lineage_count:
@@ -162,7 +163,7 @@ class CalibrationReport(ArtifactEnvelope):
             raise ValueError("provisional calibration reports require zero held-out lineages")
         if self.out_of_fold_predictions or self.worst_disagreements:
             raise ValueError("provisional calibration reports cannot claim OOF evidence")
-        if any(score_map.calibrated_scores != identity for score_map in self.score_maps):
+        if any(not score_map.is_identity() for score_map in self.score_maps):
             raise ValueError("provisional calibration reports require identity score maps")
         if any(
             metric.label_count

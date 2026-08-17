@@ -9,7 +9,7 @@ from typer.main import get_group
 from wmo.cli.app import app
 
 EXPECTED_SUBCOMMANDS = {
-    "config": {"judge", "providers", "telemetry"},
+    "config": {"budget", "judge", "providers", "telemetry"},
     "optimize": {"model", "router"},
 }
 

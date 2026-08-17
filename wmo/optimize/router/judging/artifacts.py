@@ -44,6 +44,7 @@ from wmo.optimize.router.judging.contracts import (
     ManualJudgeError,
     ManualJudgeReviewState,
     ManualJudgeSetupArtifact,
+    ManualJudgeTraceReviewArtifact,
 )
 from wmo.simulation.build import BuildReviewReadiness, coordinate_selected_build_review
 
@@ -718,6 +719,7 @@ def write_audit(
     report_input: ArtifactInput,
     budget: JudgeCalibrationBudget,
     judgments: tuple[JudgeRunEvidence, ...],
+    trace_reviews: tuple[ArtifactInput, ...],
     positional_bias: tuple[int, int] | None,
     created_at: datetime,
     code_revision: str,
@@ -733,6 +735,7 @@ def write_audit(
         report_input: Completed disagreement report pointer.
         budget: Consent-bound conservative spend reservation.
         judgments: Persisted rollout and structured judgment pairs.
+        trace_reviews: Immutable human decisions aligned with ``judgments``.
         positional_bias: Pairwise comparison and order-flip counts, otherwise ``None``.
         created_at: Artifact completion time.
         code_revision: Exact producer revision.
@@ -756,6 +759,7 @@ def write_audit(
                 ),
                 *(item.judgment for item in judgments),
                 *(probe for item in judgments for probe in item.probes),
+                *trace_reviews,
             ),
             key=lambda item: item.artifact_id,
         )
@@ -766,11 +770,12 @@ def write_audit(
             "inputs": [item.model_dump(mode="json") for item in inputs],
             "budget": budget.model_dump(mode="json"),
             "judgments": [item.model_dump(mode="json") for item in judgments],
+            "trace_reviews": [item.model_dump(mode="json") for item in trace_reviews],
             "positional_bias": positional_bias,
         },
     )
     audit = ManualJudgeCalibrationAudit(
-        schema_version=1,
+        schema_version=2,
         created_at=created_at,
         inputs=inputs,
         code_revision=code_revision,
@@ -782,6 +787,7 @@ def write_audit(
         report=report_input,
         budget=budget,
         judgments=judgments,
+        trace_reviews=trace_reviews,
         positional_bias_comparisons=(positional_bias[0] if positional_bias is not None else None),
         positional_bias_flips=(positional_bias[1] if positional_bias is not None else None),
     )
@@ -825,6 +831,26 @@ def read_audit(store: ProjectStore, expected: ArtifactInput) -> ManualJudgeCalib
         )
     except JudgingProvenanceError as exc:
         raise ManualJudgeError("completed judge calibration audit is unavailable") from exc
+    for review_input, evidence in zip(audit.trace_reviews, audit.judgments, strict=True):
+        try:
+            review, _ = read_artifact_json(
+                store,
+                artifact_id=review_input.artifact_id,
+                expected_artifact_type="manual-judge-trace-review",
+                relative_path="review.json",
+                model_type=ManualJudgeTraceReviewArtifact,
+                expected_input=review_input,
+            )
+        except JudgingProvenanceError as exc:
+            raise ManualJudgeError("completed judge trace review is unavailable") from exc
+        if (
+            review.setup != audit.setup
+            or review.trace_evidence != evidence.rollout
+            or review.reference_trace_evidence != evidence.reference_rollout
+            or review.normalized_judgment != evidence.judgment
+            or review.original_judge_response != evidence.probes
+        ):
+            raise ManualJudgeError("completed judge trace review differs from its audit evidence")
     return audit
 
 
@@ -870,7 +896,7 @@ def replay_or_approve(
         store: Project-local immutable artifact and review store.
         state: Review state naming a completed audit.
         approve: Separate explicit report approval decision.
-        accept_insufficient_labels: Explicit acceptance below ten eligible rollouts.
+        accept_insufficient_labels: Explicit acceptance below five eligible rollouts.
         approved_at: Time of the separate approval decision.
         provider_calls_made: Calls performed immediately before this replay step.
 
