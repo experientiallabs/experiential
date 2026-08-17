@@ -8,6 +8,7 @@ import pytest
 
 from wmo.common.judging import CalibrationError, JudgeCalibrationService
 from wmo.common.judging.calibration_test import _TIME, _build, _entries, _write_graph
+from wmo.common.judging.judgment import Judgment
 
 
 def test_unpersisted_report_cannot_produce_or_store_a_calibration(tmp_path: Path) -> None:
@@ -33,3 +34,19 @@ def test_unpersisted_report_cannot_produce_or_store_a_calibration(tmp_path: Path
             report=unpersisted_report,
             calibration=calibration,
         )
+
+
+def test_persisted_observations_and_judgments_omit_citation_fields(tmp_path: Path) -> None:
+    """Calibration reports store raw scores without span citations or required rationales."""
+    graph = _write_graph(tmp_path, _entries())
+    report = _build(graph)
+    observation = report.observations[0]
+    judgment = Judgment.model_validate_json(
+        graph.store.artifacts.read_bytes(observation.judgment.artifact_id, "judgment.json")
+    )
+
+    assert not hasattr(observation, "evidence_span_ids")
+    dumped = observation.model_dump(mode="json")
+    assert "evidence_span_ids" not in dumped
+    assert dumped["raw_score"] == judgment.dimensions[0].raw_score
+    assert "evidence_span_ids" not in judgment.dimensions[0].model_dump(mode="json")

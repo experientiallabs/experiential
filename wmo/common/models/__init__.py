@@ -71,6 +71,7 @@ from wmo.common.models.setup import (
     catalog_state_sha256,
     configure_provider_catalog,
 )
+from wmo.common.models.structured import structured_json_text
 
 __all__ = [
     "AssistantAction",
@@ -131,6 +132,7 @@ __all__ = [
     "router_candidate_prices",
     "served_roles",
     "serves_role",
+    "structured_json_text",
     "validate_router_candidate_selection",
     "verify_router_candidate_catalog_state",
     "verify_completion_reservation",

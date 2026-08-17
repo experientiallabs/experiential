@@ -60,6 +60,8 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "wmo/optimize/router/evaluation/setup.py",
         "wmo/optimize/router/fit/workflow.py",
         "wmo/optimize/router/judging/service.py",
+        "wmo/optimize/router/judging/review.py",
+        "wmo/cli/judge_review.py",
         "wmo/optimize/router/judgment_budget.py",
     }
 )
@@ -73,6 +75,8 @@ REQUIRED_SDIST_MEMBERS = frozenset(
         "wmo/optimize/router/evaluation/setup.py",
         "wmo/optimize/router/fit/workflow.py",
         "wmo/optimize/router/judging/service.py",
+        "wmo/optimize/router/judging/review.py",
+        "wmo/cli/judge_review.py",
         "wmo/optimize/router/judgment_budget.py",
     }
 )
@@ -413,6 +417,7 @@ def _installed_release_driver() -> None:
         prepare_runtime_sft_model_optimization,
     )
     from wmo.optimize.model.sft.selection import load_latest_sft_model_optimization
+    from wmo.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
     from wmo.optimize.router.judging.service import prepare_manual_judge_calibration
     from wmo.runtime.models import CapabilityRequirement, RuntimeModelCatalog
     from wmo.runtime.router import (
@@ -497,7 +502,7 @@ def _installed_release_driver() -> None:
             """Serve deterministic embeddings and chat completions on loopback only.
 
             Raises:
-                AssertionError: A structured judge request contains no real evidence span.
+                AssertionError: A structured judge request is missing required score fields.
             """
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length))
@@ -532,27 +537,16 @@ def _installed_release_driver() -> None:
             else:
                 prompt = json.dumps(payload, sort_keys=True)
                 model = str(payload.get("model"))
-                if model == "core-model" and "evidence_span_ids" in prompt:
-                    messages = payload.get("messages")
-                    assert isinstance(messages, list) and messages, prompt
-                    user_content = messages[-1].get("content")
-                    assert isinstance(user_content, str), prompt
-                    rollout_text = user_content.partition("ROLLOUT:\n")[2].partition(
-                        "\n\nRUBRIC:\n"
-                    )[0]
-                    rollout = json.loads(rollout_text)
-                    spans = rollout.get("spans")
-                    assert isinstance(spans, list) and spans, prompt
-                    span_id = spans[0].get("span_id")
-                    assert isinstance(span_id, str) and span_id, prompt
+                if model == "core-model" and (
+                    "optional nullable rationale" in prompt or "Rationale is optional" in prompt
+                ):
                     content = json.dumps(
                         {
                             "dimensions": [
                                 {
                                     "dimension_id": "task-success",
                                     "raw_score": 1,
-                                    "evidence_span_ids": [span_id],
-                                    "feedback": "Deterministic loopback evidence.",
+                                    "rationale": "Deterministic loopback evidence.",
                                 }
                             ]
                         }
@@ -961,7 +955,8 @@ def _installed_release_driver() -> None:
         )
         assert "Saved judge setup" in setup_result.stdout
         assert sum(state.counts().values()) == setup_call_count
-        calibration_plan = prepare_manual_judge_calibration(support_store, sample_size=10)
+        calibration_plan = prepare_manual_judge_calibration(support_store)
+        assert len(calibration_plan.previews) == 5
         assert len(calibration_plan.previews) >= 2
         calibration_arguments = [
             "config",
@@ -970,8 +965,6 @@ def _installed_release_driver() -> None:
             "support-agent",
             "--root",
             str(root),
-            "--sample-size",
-            "10",
         ]
         for preview in calibration_plan.previews:
             calibration_arguments.extend(["--label", f"{preview.trace_id}:task-success=1"])
@@ -981,18 +974,38 @@ def _installed_release_driver() -> None:
                 "0.000001",
                 "--yes",
                 "--approve",
-                "--accept-insufficient-labels",
                 "--non-interactive",
             ]
         )
         calibration_result = run_cli(*calibration_arguments)
         assert "Approved judge calibration" in calibration_result.stdout
+        assert "Trace 1 of 5" in calibration_result.stdout
+        assert "Original user request:" in calibration_result.stdout
+        assert "Configured judge proposals" in calibration_result.stdout
+        assert "Description: The agent successfully completed" in calibration_result.stdout
+        assert "Numeric range: 0 to 1" in calibration_result.stdout
+        assert "Proposed score: 1" in calibration_result.stdout
+        assert "Proposed judgment:" in calibration_result.stdout
         assert sum(state.counts().values()) - setup_call_count == len(calibration_plan.previews)
         review = support_store.read_review()
         assert isinstance(review, dict)
         manual_judge = review.get("manual_judge")
         assert isinstance(manual_judge, dict)
         assert manual_judge.get("approved_calibration") is not None
+        trace_review_pointers = manual_judge.get("trace_reviews")
+        assert isinstance(trace_review_pointers, list)
+        assert len(trace_review_pointers) == 5
+        for pointer in trace_review_pointers:
+            assert isinstance(pointer, dict)
+            review_id = pointer.get("artifact_id")
+            assert isinstance(review_id, str)
+            trace_review = ManualJudgeTraceReviewArtifact.model_validate_json(
+                support_store.artifacts.read_bytes(review_id, "review.json")
+            )
+            assert trace_review.provenance.proposal_author == "configured_judge"
+            assert trace_review.provenance.decision_author == "human"
+            assert trace_review.axes[0].human_correction is None
+            assert trace_review.axes[0].final_accepted_label.score_source == "configured_judge"
         optimize_arguments = [
             "optimize",
             "router",
@@ -1483,7 +1496,11 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     )
     wheel = tuple(distribution.glob("*.whl"))
     assert len(wheel) == 1
-    _run_checked([uv, "venv", str(virtual_environment)], cwd=execution, environment=environment)
+    _run_checked(
+        [uv, "venv", "--python", sys.executable, str(virtual_environment)],
+        cwd=execution,
+        environment=environment,
+    )
     installed_python = virtual_environment / "bin" / "python"
     _run_checked(
         [uv, "pip", "install", "--python", str(installed_python), str(wheel[0])],

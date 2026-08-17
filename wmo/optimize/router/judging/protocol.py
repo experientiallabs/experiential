@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 from typing import Literal, cast
 
-from pydantic import Field, field_validator
+from pydantic import Field
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -24,6 +24,7 @@ from wmo.common.models import (
     ModelRequest,
     ModelResponse,
     combine_economics,
+    structured_json_text,
 )
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact
@@ -33,40 +34,23 @@ from wmo.optimize.router.judging.contracts import (
     ManualJudgeError,
 )
 
+PairwiseCitationEvidence = tuple[tuple[ArtifactId, tuple[str, ...], tuple[str, ...]], ...]
 
-class _EvidenceDimension(ContractModel):
-    """Shared identity, evidence citations, and feedback for one structured dimension."""
+
+class _ScoredDimension(ContractModel):
+    """Shared identity and optional rationale for one structured dimension."""
 
     dimension_id: ArtifactId
-    evidence_span_ids: tuple[str, ...] = Field(min_length=1)
-    feedback: str = Field(min_length=1)
-
-    @field_validator("evidence_span_ids")
-    @classmethod
-    def _require_unique_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Reject repeated evidence citations.
-
-        Args:
-            value: Provider-returned span identifiers.
-
-        Returns:
-            Unique span identifiers in provider order.
-
-        Raises:
-            ValueError: A span identifier repeats.
-        """
-        if len(set(value)) != len(value):
-            raise ValueError("judge evidence span IDs must not repeat")
-        return value
+    rationale: str | None = None
 
 
-class _BooleanDimension(_EvidenceDimension):
+class _BooleanDimension(_ScoredDimension):
     """One boolean structured-feedback dimension."""
 
     passed: bool
 
 
-class _CategoricalDimension(_EvidenceDimension):
+class _CategoricalDimension(_ScoredDimension):
     """One categorical structured-feedback dimension."""
 
     category: str = Field(min_length=1)
@@ -77,27 +61,7 @@ class _PairwiseDimension(ContractModel):
 
     dimension_id: ArtifactId
     winner: Literal["winner_a", "winner_b", "tie"]
-    evidence_span_ids_a: tuple[str, ...] = Field(min_length=1)
-    evidence_span_ids_b: tuple[str, ...] = Field(min_length=1)
-    feedback: str = Field(min_length=1)
-
-    @field_validator("evidence_span_ids_a", "evidence_span_ids_b")
-    @classmethod
-    def _require_unique_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Reject repeated evidence citations within either candidate.
-
-        Args:
-            value: Provider-returned span identifiers for one candidate.
-
-        Returns:
-            Unique span identifiers in provider order.
-
-        Raises:
-            ValueError: A span identifier repeats.
-        """
-        if len(set(value)) != len(value):
-            raise ValueError("pairwise judge evidence span IDs must not repeat")
-        return value
+    rationale: str | None = None
 
 
 class _BooleanResponse(ContractModel):
@@ -176,6 +140,7 @@ class TemplateJudgeClient:
         self._code_revision = code_revision
         self._probes: list[ArtifactInput] = []
         self._provider_calls_made = 0
+        self._pairwise_citation_evidence: PairwiseCitationEvidence = ()
 
     @property
     def probes(self) -> tuple[ArtifactInput, ...]:
@@ -187,6 +152,11 @@ class TemplateJudgeClient:
         """Return provider dispatches made instead of replayed by this adapter."""
         return self._provider_calls_made
 
+    @property
+    def pairwise_citation_evidence(self) -> PairwiseCitationEvidence:
+        """Return target and reference citations retained from both pairwise orders."""
+        return self._pairwise_citation_evidence
+
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Execute the finalized schema and normalize its explicit projection.
 
@@ -197,7 +167,7 @@ class TemplateJudgeClient:
             Scalar response projected under the finalized versioned mapping.
 
         Raises:
-            ManualJudgeError: Provider output violates the finalized schema or evidence binding.
+            ManualJudgeError: Provider output violates the finalized schema or score projection.
         """
         if request.messages[0].content != self._template.prompt.text:
             raise ManualJudgeError("calibration prompt differs from finalized judge setup")
@@ -320,7 +290,7 @@ class TemplateJudgeClient:
             Equivalent scalar response accepted by the shared LMJudge boundary.
 
         Raises:
-            ManualJudgeError: Dimensions, categories, or evidence citations are invalid.
+            ManualJudgeError: Dimensions or categories are invalid.
         """
         raw = _raw_response(response)
         shape = self._template.response_shape
@@ -335,8 +305,7 @@ class TemplateJudgeClient:
                 {
                     "dimension_id": item.dimension_id,
                     "raw_score": mapping["true" if item.passed else "false"],
-                    "evidence_span_ids": list(item.evidence_span_ids),
-                    "feedback": item.feedback,
+                    "rationale": item.rationale,
                 }
                 for item in parsed
             )
@@ -352,14 +321,13 @@ class TemplateJudgeClient:
                 {
                     "dimension_id": item.dimension_id,
                     "raw_score": mapping[item.category],
-                    "evidence_span_ids": list(item.evidence_span_ids),
-                    "feedback": item.feedback,
+                    "rationale": item.rationale,
                 }
                 for item in parsed
             )
         else:
             raise ManualJudgeError("pairwise feedback requires counterbalanced execution")
-        _validate_normalized_dimensions(normalized, self._rubric, self._rollout)
+        _validate_normalized_dimensions(normalized, self._rubric)
         return response.model_copy(
             update={"output": AssistantAction(content=json.dumps({"dimensions": normalized}))}
         )
@@ -379,7 +347,7 @@ class TemplateJudgeClient:
             Scalar response with rounded-mean projection and combined economics.
 
         Raises:
-            ManualJudgeError: Pairwise dimensions or citations violate the saved contract.
+            ManualJudgeError: Pairwise dimensions violate the saved contract.
         """
         assert self._reference is not None
         first = _PairwiseResponse.model_validate(_raw_response(forward)).dimensions
@@ -400,23 +368,21 @@ class TemplateJudgeClient:
             )
         mapping = self._template.score_projection.pairwise_scores
         normalized: list[JsonObject] = []
+        citations: list[tuple[ArtifactId, tuple[str, ...], tuple[str, ...]]] = []
         for dimension in self._rubric.dimensions:
             left = first_by_id[dimension.dimension_id]
             right = second_by_id[dimension.dimension_id]
-            _validate_pairwise_spans(left, self._rollout, self._reference)
-            _validate_pairwise_spans(right, self._reference, self._rollout)
             right_target = _reverse_winner(right.winner)
             score = (mapping[left.winner] + mapping[right_target] + 1) // 2
+            citations.append((dimension.dimension_id, (), ()))
             normalized.append(
                 {
                     "dimension_id": dimension.dimension_id,
                     "raw_score": score,
-                    "evidence_span_ids": list(
-                        dict.fromkeys((*left.evidence_span_ids_a, *right.evidence_span_ids_b))
-                    ),
-                    "feedback": f"forward: {left.feedback} reverse: {right.feedback}",
+                    "rationale": _combine_rationales(left.rationale, right.rationale),
                 }
             )
+        self._pairwise_citation_evidence = tuple(citations)
         return ModelResponse(
             output=AssistantAction(content=json.dumps({"dimensions": normalized})),
             model=forward.model,
@@ -452,6 +418,47 @@ def positional_bias_count(
         item.winner != _reverse_winner(second_by_id[item.dimension_id].winner) for item in first
     )
     return len(first), disagreements
+
+
+def pairwise_citation_evidence_from_probes(
+    store: ProjectStore,
+    probes: tuple[ArtifactInput, ...],
+    rollout: RolloutArtifact,
+    reference: RolloutArtifact,
+) -> PairwiseCitationEvidence:
+    """Recover pairwise dimension IDs from immutable counterbalanced probes.
+
+    Judge output no longer carries span citations, so each recovered row keeps
+    empty target and reference citation tuples.
+
+    Args:
+        store: Project-local immutable artifact store.
+        probes: Exact forward and reverse probe pointers.
+        rollout: Target rollout shown as candidate A in the forward probe.
+        reference: Reference rollout shown as candidate B in the forward probe.
+
+    Returns:
+        Rubric dimension IDs with empty target and reference citation tuples.
+
+    Raises:
+        ManualJudgeError: Probe order, dimensions, or rollout identity is malformed.
+    """
+    loaded = tuple(_read_probe(store, item) for item in probes)
+    if len(loaded) != 2 or loaded[0].order != "forward" or loaded[1].order != "reverse":
+        raise ManualJudgeError("pairwise citations require forward and reverse probes")
+    first = _PairwiseResponse.model_validate(loaded[0].response).dimensions
+    second = _PairwiseResponse.model_validate(loaded[1].response).dimensions
+    first_by_id = {item.dimension_id: item for item in first}
+    second_by_id = {item.dimension_id: item for item in second}
+    if (
+        len(first_by_id) != len(first)
+        or len(second_by_id) != len(second)
+        or set(first_by_id) != set(second_by_id)
+    ):
+        raise ManualJudgeError("pairwise probes evaluated different rubric dimensions")
+    if rollout.rollout_id == reference.rollout_id:
+        raise ManualJudgeError("pairwise citations require distinct rollouts")
+    return tuple((dimension_id, (), ()) for dimension_id in first_by_id)
 
 
 def _read_probe_if_present(store: ProjectStore, probe_id: str) -> JudgeProtocolProbeArtifact | None:
@@ -535,6 +542,10 @@ def _verify_probe_binding(
 def _raw_response(response: ModelResponse) -> JsonObject:
     """Parse strict JSON text from one provider response.
 
+    A single Markdown code fence around the JSON body is unwrapped before parsing because
+    supported providers add one even under a JSON-only prompt and schema. Prose, several blocks,
+    and tool calls stay invalid.
+
     Args:
         response: Provider model response.
 
@@ -547,7 +558,7 @@ def _raw_response(response: ModelResponse) -> JsonObject:
     if response.output.tool_calls or response.output.content is None:
         raise ManualJudgeError("judge must return structured JSON text without tool calls")
     try:
-        value = json.loads(response.output.content)
+        value = json.loads(structured_json_text(response.output.content))
     except json.JSONDecodeError as exc:
         raise ManualJudgeError("judge returned malformed structured JSON") from exc
     if not isinstance(value, dict):
@@ -621,31 +632,20 @@ def _rollout_payload(rollout: RolloutArtifact) -> JsonObject:
     }
 
 
-def _validate_normalized_dimensions(
-    dimensions: list[JsonObject], rubric: Rubric, rollout: RolloutArtifact
-) -> None:
-    """Validate normalized dimensions and citations before shared LMJudge parsing.
+def _validate_normalized_dimensions(dimensions: list[JsonObject], rubric: Rubric) -> None:
+    """Validate normalized dimensions before shared LMJudge parsing.
 
     Args:
         dimensions: Projected scalar dimensions.
         rubric: Finalized rubric defining expected dimensions.
-        rollout: Target rollout defining valid evidence span IDs.
 
     Raises:
-        ManualJudgeError: Dimensions repeat, are missing, or cite unknown spans.
+        ManualJudgeError: Dimensions repeat, are missing, or fall outside an axis range.
     """
     identifiers = [item.get("dimension_id") for item in dimensions]
     expected = {item.dimension_id for item in rubric.dimensions}
     if len(set(identifiers)) != len(identifiers) or set(identifiers) != expected:
         raise ManualJudgeError("judge must evaluate every rubric dimension exactly once")
-    known = {span.span_id for span in rollout.spans}
-    cited = {
-        span_id
-        for item in dimensions
-        for span_id in cast(list[str], item.get("evidence_span_ids", []))
-    }
-    if not cited or not cited.issubset(known):
-        raise ManualJudgeError("judge cited evidence outside the target rollout")
     axes = {item.dimension_id: item for item in rubric.dimensions}
     for item in dimensions:
         dimension_id = cast(str, item.get("dimension_id"))
@@ -658,27 +658,24 @@ def _validate_normalized_dimensions(
             )
 
 
-def _validate_pairwise_spans(
-    dimension: _PairwiseDimension,
-    candidate_a: RolloutArtifact,
-    candidate_b: RolloutArtifact,
-) -> None:
-    """Require pairwise citations to belong to their visible candidate.
+def _combine_rationales(forward: str | None, reverse: str | None) -> str | None:
+    """Join counterbalanced pairwise rationales when either side supplied one.
 
     Args:
-        dimension: Parsed pairwise dimension.
-        candidate_a: Candidate displayed in the A position.
-        candidate_b: Candidate displayed in the B position.
+        forward: Rationale from the target-as-A probe.
+        reverse: Rationale from the target-as-B probe.
 
-    Raises:
-        ManualJudgeError: A citation belongs to neither corresponding candidate.
+    Returns:
+        Combined rationale text, or ``None`` when both sides omitted one.
     """
-    known_a = {span.span_id for span in candidate_a.spans}
-    known_b = {span.span_id for span in candidate_b.spans}
-    if not set(dimension.evidence_span_ids_a).issubset(known_a) or not set(
-        dimension.evidence_span_ids_b
-    ).issubset(known_b):
-        raise ManualJudgeError("pairwise judge cited evidence under the wrong candidate order")
+    parts = []
+    if forward is not None:
+        parts.append(f"forward: {forward}")
+    if reverse is not None:
+        parts.append(f"reverse: {reverse}")
+    if not parts:
+        return None
+    return " ".join(parts)
 
 
 def _reverse_winner(

@@ -19,43 +19,35 @@ from wmo.common.judging.calibration_metrics import (
     WorstDisagreement,
 )
 from wmo.common.judging.lineage import RouterLineageSplit
-from wmo.common.judging.rubric import DimensionScoreMap, JudgeCalibration
+from wmo.common.judging.rubric import DimensionScoreMap
 from wmo.common.models import ModelSnapshot
 
 
 class JudgeScoreObservation(ContractModel):
-    """Raw dimension evidence bound to a stored judgment and rollout."""
+    """Raw dimension score bound to a stored judgment and rollout."""
 
     judgment: ArtifactInput
     source_rollout: ArtifactInput
     dimension_id: ArtifactId
     raw_score: int = Field(ge=0)
-    evidence_span_ids: tuple[str, ...]
-
-    @field_validator("evidence_span_ids")
-    @classmethod
-    def _require_unique_evidence_spans(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value:
-            raise ValueError("calibration observations require cited rollout spans")
-        if len(set(value)) != len(value):
-            raise ValueError("calibration observation citations must not repeat")
-        return value
 
 
 class InsufficientCalibrationRiskAcceptance(ArtifactEnvelope):
-    """Explicit human acceptance of the risk from fewer than ten eligible rollouts."""
+    """Explicit human acceptance of the risk from fewer than five eligible rollouts."""
 
     acceptance_id: ArtifactId
     report: ArtifactInput
     eligible_label_count: int = Field(ge=1)
     eligible_rollout_count: int = Field(ge=1, lt=10)
-    recommended_label_count: Literal[10] = 10
+    recommended_label_count: Literal[5, 10] = 5
     accepted_at: AwareDatetime
     risk_accepted: Literal[True] = True
 
     @model_validator(mode="after")
     def _require_report_bound_acceptance(self) -> InsufficientCalibrationRiskAcceptance:
         """Require this durable decision to hash exactly its accepted report."""
+        if self.eligible_rollout_count >= self.recommended_label_count:
+            raise ValueError("risk acceptance requires fewer than the recommended rollout count")
         if self.created_at != self.accepted_at:
             raise ValueError("risk acceptance created_at must equal accepted_at")
         if self.inputs != (self.report,):
@@ -84,7 +76,7 @@ class CalibrationReport(ArtifactEnvelope):
     excluded_held_out_rollout_count: int = Field(ge=0)
     excluded_held_out_lineage_ids: tuple[ArtifactId, ...]
     excluded_held_out_lineage_count: int = Field(ge=0)
-    recommended_label_count: Literal[10] = 10
+    recommended_label_count: Literal[5, 10] = 5
     status: Literal["provisional", "insufficient", "ready_for_approval"]
     score_maps: tuple[DimensionScoreMap, ...]
     dimension_metrics: tuple[DimensionCalibrationMetrics, ...]
@@ -176,13 +168,3 @@ class CalibrationReport(ArtifactEnvelope):
             for metric in self.dimension_metrics
         ):
             raise ValueError("provisional calibration reports require zero metric denominators")
-
-
-def _same_report_identity(left: CalibrationReport, right: CalibrationReport) -> bool:
-    """Compare report evidence while permitting a safe retry with a later clock time."""
-    return left.model_dump(exclude={"created_at"}) == right.model_dump(exclude={"created_at"})
-
-
-def _same_calibration_identity(left: JudgeCalibration, right: JudgeCalibration) -> bool:
-    """Compare frozen calibration content without retry-time artifact timestamps."""
-    return left.model_dump(exclude={"created_at"}) == right.model_dump(exclude={"created_at"})

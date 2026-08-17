@@ -31,7 +31,6 @@ from wmo.common.models import (
     ModelCapabilities,
     ModelRecord,
     PricingSource,
-    ProviderConnection,
     ProviderModelSelection,
     ProviderSetup,
     SetupRole,
@@ -59,6 +58,11 @@ def available_models(session: SetupSession) -> tuple[AvailableModel, ...]:
     return (*session.available, *session.manual)
 
 
+def _option(item: AvailableModel) -> PickerOption:
+    """Present one configurable model as a selectable picker row."""
+    return PickerOption(value=item.alias, label=item.label(), detail=item.detail())
+
+
 def select_models(session: SetupSession, *, console: Console) -> tuple[str, ...] | None:
     """Show the searchable multi-select model screen across every prepared provider.
 
@@ -74,10 +78,7 @@ def select_models(session: SetupSession, *, console: Console) -> tuple[str, ...]
     """
     while True:
         available = available_models(session)
-        options = [
-            PickerOption(value=item.alias, label=item.label(), detail=item.detail())
-            for item in available
-        ]
+        options = [_option(item) for item in available]
         if session.advanced_models:
             options.append(
                 PickerOption(
@@ -283,10 +284,7 @@ def _assign_one_role(
     result = select_one(
         console,
         title=title,
-        options=[
-            PickerOption(value=item.alias, label=item.label(), detail=item.detail())
-            for item in eligible
-        ],
+        options=[_option(item) for item in eligible],
         default=default,
     )
     if result.action is PickerAction.CANCEL:
@@ -327,10 +325,7 @@ def _assign_candidates(
     result = select_many(
         console,
         title="Router candidates (optional, empty line skips)",
-        options=[
-            PickerOption(value=item.alias, label=item.label(), detail=item.detail())
-            for item in eligible
-        ],
+        options=[_option(item) for item in eligible],
         preselected=role_inputs.candidates,
         minimum=0,
     )
@@ -359,10 +354,8 @@ def build_result(
     *,
     roles: RoleAssignment,
     endpoints: tuple[PreparedEndpoint, ...],
-    existing_connections: tuple[ProviderConnection, ...],
-    existing_models: tuple[ProviderModelSelection, ...],
-    known_existing_connections: tuple[str, ...] | None = None,
-    known_existing_aliases: tuple[str, ...] | None = None,
+    known_existing_connections: tuple[str, ...],
+    known_existing_aliases: tuple[str, ...],
 ) -> ProviderSetupResult:
     """Build the catalog update from confirmed models and roles.
 
@@ -370,21 +363,13 @@ def build_result(
         chosen: Models the user selected.
         roles: Confirmed role assignments.
         endpoints: Prepared provider endpoints.
-        existing_connections: Connections already configured in the catalog.
-        existing_models: Model aliases already configured in the catalog.
-        known_existing_connections: Every connection name in the persisted catalog. When omitted,
-            the setup-compatible connection records supply the names.
-        known_existing_aliases: Every model alias in the persisted catalog. When omitted, the
-            setup-compatible model selections supply the aliases.
+        known_existing_connections: Every connection name in the persisted catalog.
+        known_existing_aliases: Every model alias in the persisted catalog.
 
     Returns:
         The setup to merge plus any router roles to assign after it.
     """
-    configured_aliases = set(
-        (model.alias for model in existing_models)
-        if known_existing_aliases is None
-        else known_existing_aliases
-    )
+    configured_aliases = set(known_existing_aliases)
     used_connections = {item.connection for item in chosen}
     setup = ProviderSetup(
         connections=tuple(
@@ -395,11 +380,7 @@ def build_result(
         models=tuple(
             model_selection(item) for item in chosen if item.alias not in configured_aliases
         ),
-        known_existing_connections=(
-            tuple(item.name for item in existing_connections)
-            if known_existing_connections is None
-            else known_existing_connections
-        ),
+        known_existing_connections=known_existing_connections,
         known_existing_aliases=tuple(sorted(configured_aliases)),
         world_model=roles.world_model,
         judge=roles.judge,

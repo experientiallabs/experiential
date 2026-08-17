@@ -7,7 +7,13 @@ from datetime import datetime
 
 from pydantic import Field, field_validator, model_validator
 
-from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactId,
+    ContractModel,
+    canonical_json_bytes,
+    stable_id,
+)
 from wmo.common.models.model import (
     ModelAlias,
     ModelCapabilities,
@@ -15,7 +21,7 @@ from wmo.common.models.model import (
     NumericMeasurement,
     OperationEconomics,
 )
-from wmo.common.project import ArtifactAlreadyExistsError, ArtifactStore, artifact_input
+from wmo.common.project import ArtifactStore, artifact_input
 
 
 class CandidateTokenPrice(ContractModel):
@@ -476,18 +482,14 @@ def persist_pricing_snapshot(
         candidate_prices=prices,
     )
     try:
-        store.write_json(
+        stored, _ = store.write_or_replay(
             artifact_id=pricing_snapshot_id,
             artifact_type="pricing-snapshot",
             envelope=snapshot,
-            files={"pricing.json": snapshot},
+            envelope_path="pricing.json",
+            envelope_type=PricingSnapshot,
+            files={"pricing.json": canonical_json_bytes(snapshot)},
         )
-    except ArtifactAlreadyExistsError:
-        existing, _manifest_sha256 = load_pricing_snapshot(store, pricing_snapshot_id)
-        replay = snapshot.model_copy(update={"created_at": existing.created_at})
-        if existing != replay:
-            raise ValueError(
-                "existing pricing snapshot differs from deterministic replay"
-            ) from None
-        return existing
-    return snapshot
+    except ValueError as exc:
+        raise ValueError("existing pricing snapshot differs from deterministic replay") from exc
+    return stored

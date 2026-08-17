@@ -25,6 +25,8 @@ from pydantic import JsonValue
 from wmo.common.core.artifacts import JsonObject, SourceIdentity, canonical_json_bytes
 from wmo.common.core.text import normalize_durable_text
 from wmo.simulation.ingest.otlp import TraceNormalizationIssue
+from wmo.simulation.ingest.trace_extensions import json_value as json_value
+from wmo.simulation.ingest.trace_extensions import required_text as _required_extension_text
 
 _TRACE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _SPAN_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
@@ -50,28 +52,37 @@ class VendorExport:
     issues: tuple[TraceNormalizationIssue, ...]
 
 
-def read_vendor_export(path: Path, *, vendor: str, source_id: str | None = None) -> VendorExport:
+def read_vendor_export(
+    path: Path,
+    *,
+    vendor: str,
+    source_id: str | None = None,
+    error_type: type[ValueError] = VendorTraceFormatError,
+) -> VendorExport:
     """Read one vendor JSON or JSONL export without repairing malformed records.
 
     Args:
         path: Local vendor export file.
         vendor: Vendor label used in source identity and error messages.
         source_id: Optional durable source label. The local path is used when omitted.
+        error_type: Error class raised for transport failures, for source families whose
+            callers catch their own error type.
 
     Returns:
         Decoded payloads, retained parse exclusions, and immutable source identity.
 
     Raises:
-        VendorTraceFormatError: The file cannot be read, is not UTF-8, or contains no records.
+        ValueError: The declared ``error_type`` when the file cannot be read, is not UTF-8,
+            or contains no records.
     """
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        raise VendorTraceFormatError(f"cannot read {vendor} export {path}: {exc}") from exc
+        raise error_type(f"cannot read {vendor} export {path}: {exc}") from exc
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise VendorTraceFormatError(f"{vendor} export is not UTF-8: {path}") from exc
+        raise error_type(f"{vendor} export is not UTF-8: {path}") from exc
     source = SourceIdentity(
         kind="file",
         source_id=source_id or f"{vendor}:{path}",
@@ -80,25 +91,27 @@ def read_vendor_export(path: Path, *, vendor: str, source_id: str | None = None)
     try:
         document: JsonValue = json.loads(text)
     except json.JSONDecodeError:
-        payloads, issues = _decode_jsonl(text, vendor=vendor)
+        payloads, issues = _decode_jsonl(text, vendor=vendor, error_type=error_type)
         return VendorExport(source=source, payloads=payloads, issues=issues)
     return VendorExport(source=source, payloads=(document,), issues=())
 
 
 def _decode_jsonl(
-    text: str, *, vendor: str
+    text: str, *, vendor: str, error_type: type[ValueError]
 ) -> tuple[tuple[JsonValue, ...], tuple[TraceNormalizationIssue, ...]]:
     """Decode JSONL records and retain every malformed line as an explicit exclusion.
 
     Args:
         text: UTF-8 JSONL source text.
         vendor: Vendor label used in the no-record error message.
+        error_type: Error class raised when the source declares no records.
 
     Returns:
         Decoded records in source order and retained parse exclusions.
 
     Raises:
-        VendorTraceFormatError: The source contains neither records nor parse issues.
+        ValueError: The declared ``error_type`` when the source contains neither records
+            nor parse issues.
     """
     payloads: list[JsonValue] = []
     issues: list[TraceNormalizationIssue] = []
@@ -112,7 +125,7 @@ def _decode_jsonl(
                 TraceNormalizationIssue(f"line-{line_number}", f"invalid JSONL record: {exc.msg}")
             )
     if not payloads and not issues:
-        raise VendorTraceFormatError(f"{vendor} export contains no records")
+        raise error_type(f"{vendor} export contains no records")
     return tuple(payloads), tuple(issues)
 
 
@@ -219,6 +232,30 @@ def vendor_w3c_id(value: str, *, vendor: str, kind: str, namespace: str) -> str:
     return digest[:width]
 
 
+def dotted_lookup(record: JsonObject, paths: Sequence[str]) -> JsonValue | None:
+    """Read the first declared value among dotted record paths.
+
+    Args:
+        record: Source record whose keys may be flat dotted names or nested objects.
+        paths: Dotted candidate paths in preference order.
+
+    Returns:
+        First declared value, or ``None`` when the record declares none.
+    """
+    for path in paths:
+        if path in record:
+            return record[path]
+        node: JsonValue | None = record
+        for part in path.split("."):
+            if not isinstance(node, dict) or part not in node:
+                node = None
+                break
+            node = node[part]
+        if node is not None:
+            return node
+    return None
+
+
 def required_text(value: JsonValue | None, label: str) -> str:
     """Require one non-empty durable source text value.
 
@@ -232,9 +269,7 @@ def required_text(value: JsonValue | None, label: str) -> str:
     Raises:
         VendorTraceFormatError: The value is absent, not text, or blank.
     """
-    if not isinstance(value, str) or not value.strip():
-        raise VendorTraceFormatError(f"{label} must be non-empty text")
-    return normalize_durable_text(value.strip())
+    return _required_extension_text(value, label, error_type=VendorTraceFormatError)
 
 
 def first_text(record: JsonObject, keys: Sequence[str]) -> str | None:
@@ -268,23 +303,6 @@ def json_text(value: JsonValue | None) -> str:
     if value is None:
         return ""
     return canonical_json_bytes(value).decode("utf-8")
-
-
-def json_value(value: JsonValue | None) -> JsonValue | None:
-    """Decode a JSON-encoded string while leaving native JSON and plain text unchanged.
-
-    Args:
-        value: Raw source value.
-
-    Returns:
-        Decoded JSON when the text parses, otherwise the original value.
-    """
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return value
 
 
 def message_text(value: JsonValue | None) -> str:
@@ -388,3 +406,29 @@ def source_timestamp(value: JsonValue | None, label: str) -> datetime:
         return datetime.fromtimestamp(seconds, UTC)
     except (OSError, OverflowError, ValueError) as exc:
         raise VendorTraceFormatError(f"{label} is outside the supported range") from exc
+
+
+def source_interval(
+    start: JsonValue | None,
+    end: JsonValue | None,
+    *,
+    start_label: str,
+    end_label: str,
+) -> tuple[datetime, datetime]:
+    """Read a declared source interval whose end instant is optional.
+
+    Args:
+        start: Declared start instant.
+        end: Declared end instant, when any.
+        start_label: Start field label used in the validation message.
+        end_label: End field label used in the validation message.
+
+    Returns:
+        Source start and end instants, equal when no end is declared.
+
+    Raises:
+        VendorTraceFormatError: The start is absent or either value is not a timestamp.
+    """
+    started_at = source_timestamp(start, start_label)
+    ended_at = source_timestamp(end, end_label) if end is not None else started_at
+    return started_at, ended_at

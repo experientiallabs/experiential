@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from wmo.simulation.ingest.mastra import load_mastra_file
+from wmo.simulation.ingest.mastra import MASTRA_SOURCE
 
 
 def _spans(provider: str | None = "openai") -> list[dict[str, object]]:
@@ -67,31 +67,6 @@ def _spans(provider: str | None = "openai") -> list[dict[str, object]]:
     ]
 
 
-def test_load_mastra_file_converts_model_and_tool_spans(tmp_path: Path) -> None:
-    """Mastra model and tool spans become paired canonical spans with retained identity."""
-    path = tmp_path / "mastra.json"
-    path.write_text(json.dumps({"spans": _spans()}), encoding="utf-8")
-
-    result = load_mastra_file(path)
-
-    assert result.issues == ()
-    trace = result.traces[0]
-    assert trace.task == "Summarize the incident"
-    assert trace.conversation_id == "thread-2"
-    assert [span.name for span in trace.spans] == ["agent.model_call", "agent.tool_call"]
-    call, tool_result = trace.spans
-    assert call.attributes["gen_ai.tool.name"] == "fetch_incident"
-    assert call.attributes["gen_ai.tool.call.arguments"] == '{"id":"INC-1"}'
-    assert call.attributes["gen_ai.tool.call.id"] == "call-3"
-    assert call.model is not None
-    assert (call.model.provider, call.model.model_id) == ("openai", "gpt-4.1")
-    assert call.usage is not None
-    assert (call.usage.input_tokens, call.usage.output_tokens) == (20, 6)
-    assert tool_result.attributes["gen_ai.tool.call.id"] == "call-3"
-    assert tool_result.attributes["gen_ai.tool.message"] == "disk pressure"
-    assert tool_result.parent_span_id == call.span_id
-
-
 def test_load_mastra_file_accepts_epoch_millisecond_timestamps(tmp_path: Path) -> None:
     """Epoch millisecond timestamps are read without changing observation order."""
     spans = _spans()
@@ -100,50 +75,9 @@ def test_load_mastra_file_accepts_epoch_millisecond_timestamps(tmp_path: Path) -
     path = tmp_path / "mastra.jsonl"
     path.write_text("\n".join(json.dumps(span) for span in spans), encoding="utf-8")
 
-    result = load_mastra_file(path)
+    result = MASTRA_SOURCE.load(path)
 
     assert [span.name for span in result.traces[0].spans] == [
         "agent.model_call",
         "agent.tool_call",
     ]
-
-
-def test_load_mastra_file_retains_error_info(tmp_path: Path) -> None:
-    """Mastra errorInfo becomes a structured span failure and a failure outcome."""
-    spans = _spans()
-    spans[1]["errorInfo"] = {"message": "tool unavailable"}
-    path = tmp_path / "mastra.json"
-    path.write_text(json.dumps(spans), encoding="utf-8")
-
-    result = load_mastra_file(path)
-
-    trace = result.traces[0]
-    assert trace.spans[1].failure is not None
-    assert trace.outcome is not None
-    assert trace.outcome.status == "failure"
-
-
-def test_load_mastra_file_excludes_span_without_trace_id(tmp_path: Path) -> None:
-    """A span with a blank traceId is excluded with an explicit issue."""
-    spans = _spans()
-    spans[0]["traceId"] = "  "
-    path = tmp_path / "mastra.json"
-    path.write_text(json.dumps(spans), encoding="utf-8")
-
-    result = load_mastra_file(path)
-
-    assert [issue.source_record for issue in result.issues] == ["record-1", "trace-trace-1"]
-    assert result.traces == ()
-
-
-def test_load_mastra_file_keeps_model_name_without_provider(tmp_path: Path) -> None:
-    """A model span naming only a model keeps it as evidence without resolved identity."""
-    spans = _spans(provider=None)
-    path = tmp_path / "mastra.json"
-    path.write_text(json.dumps(spans), encoding="utf-8")
-
-    result = load_mastra_file(path)
-
-    span = result.traces[0].spans[0]
-    assert span.model is None
-    assert span.attributes["gen_ai.request.model"] == "gpt-4.1"

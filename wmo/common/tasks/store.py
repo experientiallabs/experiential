@@ -66,35 +66,3 @@ def load_task_set(store: ArtifactStore, task_set_id: str) -> LoadedTaskSet:
             f"task set {task_set_id} task records do not match its ordered task IDs"
         )
     return LoadedTaskSet(task_set=task_set, tasks=tasks)
-
-
-def resolve_task_set(store: ArtifactStore, task_set_id: str | None = None) -> LoadedTaskSet:
-    """Load one named task set, or the only task set owned by a project.
-
-    Args:
-        store: Project-local immutable artifact store to inspect.
-        task_set_id: Optional exact immutable task-set identity.
-
-    Returns:
-        The requested task set, or the project's only completed task set.
-
-    Raises:
-        ArtifactCorruptionError: There is no unambiguous task set to consume, or the selected
-            artifact fails immutable verification.
-    """
-    if task_set_id is not None:
-        return load_task_set(store, task_set_id)
-    candidates = tuple(
-        artifact_id
-        for artifact_id in store.list_ids()
-        if store.read(artifact_id).manifest.artifact_type == "task-set"
-    )
-    if not candidates:
-        raise ArtifactCorruptionError(
-            "project has no immutable task set; run wmo build on a declared trace export first"
-        )
-    if len(candidates) > 1:
-        raise ArtifactCorruptionError(
-            "project has multiple task sets; pass --task-set with one of: " + ", ".join(candidates)
-        )
-    return load_task_set(store, candidates[0])

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from wmo.common.core.artifacts import ArtifactId, ArtifactInput, stable_id
+from wmo.common.core.artifacts import ArtifactId, ArtifactInput, canonical_json_bytes, stable_id
 from wmo.common.judging.calibration_contracts import (
     CalibrationReport,
     InsufficientCalibrationRiskAcceptance,
@@ -15,7 +15,7 @@ from wmo.common.judging.provenance import (
     sorted_verified_inputs,
 )
 from wmo.common.judging.rubric import JudgeCalibration
-from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
+from wmo.common.project import ArtifactCorruptionError, ProjectStore, artifact_input
 
 
 class RiskAcceptanceError(ValueError):
@@ -65,8 +65,8 @@ def require_calibration_risk_acceptance(
     if report.status == "insufficient" and calibration.status == "human_calibrated":
         if report.eligible_rollout_count >= report.recommended_label_count:
             raise RiskAcceptanceError(
-                "insufficient human calibration risk acceptance is limited to fewer than ten "
-                "eligible rollouts"
+                "insufficient human calibration risk acceptance is limited to fewer than "
+                f"{report.recommended_label_count} eligible rollouts"
             )
         if calibration.risk_acceptance is None:
             raise RiskAcceptanceError(
@@ -107,19 +107,20 @@ def write_insufficient_calibration_risk_acceptance(
     """
     acceptance = _acceptance_from_report(report, report_input, accepted_at)
     try:
-        manifest = store.artifacts.write_json(
+        _stored, manifest = store.artifacts.write_or_replay(
             artifact_id=acceptance.acceptance_id,
             artifact_type="insufficient-calibration-risk-acceptance",
             envelope=acceptance,
-            files={"acceptance.json": acceptance},
+            envelope_path="acceptance.json",
+            envelope_type=InsufficientCalibrationRiskAcceptance,
+            files={"acceptance.json": canonical_json_bytes(acceptance)},
         )
-    except ArtifactAlreadyExistsError:
-        stored, stored_input = _read_acceptance(store, acceptance.acceptance_id)
-        if stored != acceptance:
-            raise RiskAcceptanceError(
-                "existing insufficient calibration risk acceptance conflicts with this approval"
-            ) from None
-        return stored_input
+    except ArtifactCorruptionError as exc:
+        raise RiskAcceptanceError("risk acceptance artifact is unavailable or corrupt") from exc
+    except ValueError as exc:
+        raise RiskAcceptanceError(
+            "existing insufficient calibration risk acceptance conflicts with this approval"
+        ) from exc
     return artifact_input(manifest)
 
 
@@ -167,7 +168,10 @@ def _acceptance_from_report(
     if report.status != "insufficient":
         raise RiskAcceptanceError("risk acceptance requires an insufficient calibration report")
     if report.eligible_rollout_count >= report.recommended_label_count:
-        raise RiskAcceptanceError("risk acceptance requires fewer than ten eligible rollouts")
+        raise RiskAcceptanceError(
+            "risk acceptance requires fewer than "
+            f"{report.recommended_label_count} eligible rollouts"
+        )
     if report_input.artifact_id != report.report_id:
         raise RiskAcceptanceError("risk acceptance report manifest has the wrong artifact identity")
     acceptance_id = stable_id(
@@ -190,6 +194,7 @@ def _acceptance_from_report(
         report=report_input,
         eligible_label_count=report.eligible_label_count,
         eligible_rollout_count=report.eligible_rollout_count,
+        recommended_label_count=report.recommended_label_count,
         accepted_at=accepted_at,
     )
 

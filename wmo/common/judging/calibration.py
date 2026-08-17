@@ -7,14 +7,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from wmo.common.core.artifacts import ArtifactId, ArtifactInput, Sha256, stable_id
-from wmo.common.judging.calibration_assembly import calibration_from_report
-from wmo.common.judging.calibration_contracts import (
-    CalibrationReport,
-    JudgeScoreObservation,
-    _same_calibration_identity,
-    _same_report_identity,
+from wmo.common.core.artifacts import (
+    ArtifactId,
+    ArtifactInput,
+    Sha256,
+    canonical_json_bytes,
+    stable_id,
 )
+from wmo.common.judging.calibration_assembly import calibration_from_report
+from wmo.common.judging.calibration_contracts import CalibrationReport, JudgeScoreObservation
 from wmo.common.judging.calibration_metrics import (
     CalibrationDatum,
     DimensionCalibrationMetrics,
@@ -42,7 +43,7 @@ from wmo.common.judging.risk_acceptance import (
 )
 from wmo.common.judging.rubric import JudgeCalibration, Rubric
 from wmo.common.models import ModelSnapshot
-from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
+from wmo.common.project import ArtifactCorruptionError, ProjectStore
 from wmo.common.rollouts import RolloutArtifact
 
 
@@ -276,7 +277,7 @@ class JudgeCalibrationService:
             store: Project store containing the exact completed reviewed report artifact.
             report: Report whose persisted evidence is being approved.
             approved_at: Time the customer accepted the visible OOF evidence.
-            accept_insufficient_labels: Explicit risk acceptance below ten rollouts when
+            accept_insufficient_labels: Explicit risk acceptance below five rollouts when
                 per-dimension OOF evidence is valid.
 
         Returns:
@@ -331,20 +332,23 @@ class JudgeCalibrationService:
         """
         _verify_report_sources(store, report)
         try:
-            store.artifacts.write_json(
+            stored, _ = store.artifacts.write_or_replay(
                 artifact_id=report.report_id,
                 artifact_type="judge-calibration-report",
                 envelope=report,
-                files={"report.json": report},
+                envelope_path="report.json",
+                envelope_type=CalibrationReport,
+                files={"report.json": canonical_json_bytes(report)},
             )
-        except ArtifactAlreadyExistsError:
-            stored, _input = _load_report(store, report.report_id)
-            if not _same_report_identity(stored, report):
-                raise CalibrationError(
-                    "existing judge-calibration report artifact conflicts with this report"
-                ) from None
-            return stored
-        return report
+        except ArtifactCorruptionError as exc:
+            raise CalibrationError(
+                "existing judge-calibration report artifact cannot be resumed safely"
+            ) from exc
+        except ValueError as exc:
+            raise CalibrationError(
+                "existing judge-calibration report artifact conflicts with this report"
+            ) from exc
+        return stored
 
     def write_calibration(
         self,
@@ -369,31 +373,23 @@ class JudgeCalibrationService:
         stored_report, report_input = _require_persisted_report(store, report)
         _require_calibration_report_binding(store, stored_report, calibration, report_input)
         try:
-            store.artifacts.write_json(
+            stored, _ = store.artifacts.write_or_replay(
                 artifact_id=calibration.calibration_id,
                 artifact_type="judge-calibration",
                 envelope=calibration,
-                files={"calibration.json": calibration},
+                envelope_path="calibration.json",
+                envelope_type=JudgeCalibration,
+                files={"calibration.json": canonical_json_bytes(calibration)},
             )
-        except ArtifactAlreadyExistsError:
-            try:
-                stored, _input = read_artifact_json(
-                    store,
-                    artifact_id=calibration.calibration_id,
-                    expected_artifact_type="judge-calibration",
-                    relative_path="calibration.json",
-                    model_type=JudgeCalibration,
-                )
-            except JudgingProvenanceError as exc:
-                raise CalibrationError(
-                    "existing judge-calibration artifact cannot be resumed safely"
-                ) from exc
-            if not _same_calibration_identity(stored, calibration):
-                raise CalibrationError(
-                    "existing judge-calibration artifact conflicts with this calibration"
-                ) from None
-            return stored
-        return calibration
+        except ArtifactCorruptionError as exc:
+            raise CalibrationError(
+                "existing judge-calibration artifact cannot be resumed safely"
+            ) from exc
+        except ValueError as exc:
+            raise CalibrationError(
+                "existing judge-calibration artifact conflicts with this calibration"
+            ) from exc
+        return stored
 
 
 def _load_rubric(store: ProjectStore, rubric_id: ArtifactId) -> tuple[Rubric, ArtifactInput]:
@@ -511,7 +507,7 @@ def _resolve_observations(
     split: RouterLineageSplit,
     observations: Sequence[JudgeScoreObservation],
 ) -> tuple[_VerifiedObservation, ...]:
-    """Resolve every observation and prove its raw score and citations match source artifacts."""
+    """Resolve every observation and prove its raw score matches source artifacts."""
     if not observations:
         raise CalibrationError(
             "calibration requires uncalibrated judgment evidence to bind judge model and prompt"
@@ -567,13 +563,6 @@ def _resolve_observations(
             raise CalibrationError("observation dimension is absent from its uncalibrated judgment")
         if dimension.raw_score != observation.raw_score:
             raise CalibrationError("observation raw score does not match its uncalibrated judgment")
-        if dimension.evidence_span_ids != observation.evidence_span_ids:
-            raise CalibrationError("observation citations do not match its uncalibrated judgment")
-        known_spans = {span.span_id for span in rollout.spans}
-        if not set(observation.evidence_span_ids).issubset(known_spans):
-            raise CalibrationError(
-                "calibration observation cites spans absent from its source rollout"
-            )
         try:
             lineage_id = split.lineage_for_rollout(rollout.rollout_id)
         except ValueError as exc:
@@ -733,7 +722,7 @@ def _report_status(
         tuple(dimension.dimension_id for dimension in rubric.dimensions), metrics, predictions
     ):
         return "insufficient"
-    if len({item.human_score.rollout_id for item in data}) < 10:
+    if len({item.human_score.rollout_id for item in data}) < 5:
         return "insufficient"
     return "ready_for_approval"
 

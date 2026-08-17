@@ -68,3 +68,17 @@ def test_transition_parser_accepts_only_pinned_json_visible_turns() -> None:
         parse_world_model_transition(AssistantAction(content="Here is JSON: {}"))
     with pytest.raises(TextWorldModelProtocolError, match="nonterminal"):
         parse_world_model_transition(AssistantAction(content='{"message":"","terminal":false}'))
+
+
+def test_transition_parser_unwraps_one_provider_markdown_fence() -> None:
+    """Providers that fence the pinned transition still produce one usable visible turn."""
+    transition = parse_world_model_transition(
+        AssistantAction(content='```json\n{"message":"Anything else?","terminal":false}\n```')
+    )
+
+    assert transition.visible_message.content == "Anything else?"
+    assert transition.terminal is False
+    with pytest.raises(TextWorldModelProtocolError, match="JSON transition"):
+        parse_world_model_transition(
+            AssistantAction(content='Sure: {"message":"hi","terminal":false} is next.')
+        )

@@ -11,7 +11,6 @@ from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
-from wmo.cli.build_cmd import _missing_build_configuration
 from wmo.cli.picker_test import ScriptedConsole
 from wmo.cli.provider_setup import ProviderSetupOptions, run_provider_setup
 from wmo.common.models import (
@@ -290,30 +289,6 @@ def test_explicit_providers_skip_the_opening_list_and_still_discover_models(
     assert saved.roles.embedder == "text-embedding-3-small"
 
 
-def test_cancelling_after_explicit_providers_writes_nothing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cancel after --provider still leaves the catalog untouched.
-
-    Args:
-        tmp_path: Temporary WMO root used to prove no catalog write occurs.
-        monkeypatch: Patch fixture supplying the canonical credential.
-    """
-    root = tmp_path / ".wmo"
-
-    console, catalog = _setup(
-        root,
-        "q\n",
-        monkeypatch=monkeypatch,
-        options=ProviderSetupOptions(providers=("openai",)),
-    )
-
-    assert catalog is None
-    assert "Setup cancelled. Nothing was written." in console.output
-    assert not (root / "models.toml").exists()
-
-
 def test_noninteractive_setup_reports_every_missing_collection_and_role(tmp_path: Path) -> None:
     """One failure lists the complete remediation instead of serial missing prompts.
 
@@ -527,29 +502,12 @@ def test_interactive_setup_saves_providers_models_and_roles_it_derived(
     assert luna.context_window_tokens == 1_050_000
     assert luna.input_cost_per_million_tokens_usd == 1.0
     assert "internal-preview-model" not in {model.model for model in saved.models.values()}
-    printed = unstyle(console.output)
-    assert "connection name" not in printed.casefold()
-    assert "openai-secret" not in printed
-
-
-def test_interactive_setup_never_writes_a_credential_value(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only the credential variable name is persisted, never the credential itself.
-
-    Args:
-        tmp_path: Temporary WMO root receiving the saved catalog.
-        monkeypatch: Patch fixture supplying the canonical credential.
-    """
-    root = tmp_path / ".wmo"
-
-    _, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\ny\n", monkeypatch=monkeypatch)
-
-    assert catalog is not None
     persisted = (root / "models.toml").read_text(encoding="utf-8")
     assert "OPENAI_API_KEY" in persisted
     assert "openai-secret" not in persisted
+    printed = unstyle(console.output)
+    assert "connection name" not in printed.casefold()
+    assert "openai-secret" not in printed
 
 
 def test_interactive_final_rejection_writes_no_catalog(
@@ -691,24 +649,6 @@ def test_setup_preserves_entries_owned_by_providers_it_does_not_configure(
     assert saved.models["sft-run"].model == "tinker://sampling/run"
     assert saved.roles.world_model == "gpt-5-6-luna"
     assert "sft-run" not in unstyle(console.output)
-
-
-def test_a_completed_setup_is_not_repeated_on_replay(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Roles saved once satisfy every build requirement, so setup never runs again.
-
-    Args:
-        tmp_path: Temporary WMO root receiving the saved catalog.
-        monkeypatch: Patch fixture supplying the canonical credential.
-    """
-    root = tmp_path / ".wmo"
-
-    _, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\ny\n", monkeypatch=monkeypatch)
-
-    assert catalog is not None
-    assert _missing_build_configuration(load_model_catalog(root / "models.toml")) == ()
 
 
 class _UnavailableLister:

@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
 from rich.console import Console
-from rich.markup import escape
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import Confirm
 
 from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.judge_review import build_manual_judge_reviewer
 from wmo.cli.judge_rubric import maybe_edit_setup_plan
-from wmo.cli.judge_transcript import model_display_name, render_trace
+from wmo.cli.judge_transcript import model_display_name
 from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.common.config import resolve_command_budget_usd
 from wmo.common.judging import Rubric, RubricDimension, render_rubric_table, score_bounds
@@ -26,19 +25,21 @@ from wmo.common.release_revision import installed_release_revision
 from wmo.optimize.router.judging.artifacts import read_audit, require_review_state
 from wmo.optimize.router.judging.contracts import (
     JudgePromptTemplate,
-    JudgeTracePreview,
+    ManualJudgeAxisDecision,
     ManualJudgeCalibrationResult,
-    ManualJudgeLabel,
     ManualJudgeSetupArtifact,
 )
 from wmo.optimize.router.judging.labels import (
     calibration_sample_digest,
     read_label_draft,
-    save_label_draft,
+)
+from wmo.optimize.router.judging.review import (
+    ManualJudgeReviewer,
+    ManualJudgeTraceProposal,
+    completed_trace_review_count,
 )
 from wmo.optimize.router.judging.service import (
     DEFAULT_JUDGE_TEMPLATE,
-    ManualJudgeCalibrationPlan,
     ManualJudgeError,
     ManualJudgeSetupPlan,
     calibrate_manual_judge,
@@ -66,7 +67,18 @@ _LABEL_OPTION = typer.Option(
     "--label",
     help=(
         "Repeat TRACE_ID:DIMENSION_ID=SCORE, or "
-        "TRACE_ID:REFERENCE_TRACE_ID:DIMENSION_ID=winner_a|winner_b|tie for pairwise labels."
+        "TRACE_ID:REFERENCE_TRACE_ID:DIMENSION_ID=winner_a|winner_b|tie. "
+        "Use a JSON array target when trace IDs contain ambiguous delimiters. "
+        "A value matching the judge proposal accepts it; another value is a correction."
+    ),
+)
+_JUDGMENT_OPTION = typer.Option(
+    None,
+    "--judgment",
+    help=(
+        "Repeat TRACE_ID:DIMENSION_ID=TEXT, or include REFERENCE_TRACE_ID for pairwise. "
+        "Use a JSON array target when trace IDs contain ambiguous delimiters. "
+        "Required with a noninteractive corrected score."
     ),
 )
 
@@ -124,6 +136,7 @@ def judge_setup(
             plan = maybe_edit_setup_plan(plan, console=_console)
         confirmed = approve or _confirm(
             "Save this judge setup and finalize its rubric?",
+            default=True,
             non_interactive=non_interactive,
             required_flag="--approve",
         )
@@ -136,13 +149,19 @@ def judge_setup(
 
 @judge_app.command(
     "calibrate",
-    help="Label real traces, authorize bounded judge calls, and separately approve calibration.",
+    help="Judge and review real traces incrementally, then separately approve calibration.",
 )
 def judge_calibrate(
     project: str = typer.Argument(..., metavar="PROJECT", help="Configured local project ID."),
     root: Path = ROOT_OPTION,
-    sample_size: int = typer.Option(10, "--sample-size", min=1),
+    sample_size: int = typer.Option(
+        5,
+        "--sample-size",
+        min=1,
+        help="Distinct trace lineages to review; defaults to the normal sufficient count of five.",
+    ),
     label: list[str] | None = _LABEL_OPTION,
+    judgment: list[str] | None = _JUDGMENT_OPTION,
     input_price: float | None = typer.Option(
         None,
         "--input-usd-per-million",
@@ -175,41 +194,44 @@ def judge_calibrate(
     accept_insufficient_labels: bool = typer.Option(
         False,
         "--accept-insufficient-labels",
-        help="Accept valid grouped evidence from fewer than ten rollouts.",
+        help="Accept valid grouped evidence from fewer than five distinct trace lineages.",
     ),
     non_interactive: bool = typer.Option(False, "--non-interactive"),
     transcript_character_limit: int = typer.Option(
         1_200,
         "--transcript-character-limit",
         min=200,
-        help="Maximum characters shown for each transcript field before a truthful marker.",
+        help="Maximum characters per transcript field before an exact truncation marker.",
     ),
     page: bool = typer.Option(
         False,
         "--page",
-        help="Page full transcripts in an interactive terminal instead of truncating them.",
+        help=(
+            "Page the current full transcript; proposals and decisions remain one trace at a time."
+        ),
     ),
 ) -> None:
-    """Collect frozen labels, authorize bounded judge calls, and separately approve evidence.
+    """Run judge-first review, persist each trace, and separately approve evidence.
 
     Args:
         project: Local project ID below ``<root>/projects``.
         root: Local project root containing ``models.toml``.
-        sample_size: Maximum number of distinct fit lineages to calibrate.
-        label: Repeatable explicit human score inputs.
+        sample_size: Number of distinct fit lineages, with five as the sufficient default.
+        label: Optional explicit accepted or corrected score expressions.
+        judgment: Optional explicit human-authored corrected judgment expressions.
         input_price: Optional advanced input-price override.
         output_price: Optional advanced output-price override.
         maximum_input_tokens: Conservative input bound for every call attempt.
         maximum_cost_usd: Optional spend ceiling; otherwise the shared command-budget setting.
         yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
         approve: Separate approval of the displayed completed report.
-        accept_insufficient_labels: Explicit risk acceptance below ten labeled rollouts.
-        non_interactive: Refuse prompts and list missing explicit inputs.
+        accept_insufficient_labels: Explicit risk acceptance below five completed reviews.
+        non_interactive: Refuse prompts and require complete explicit decisions.
         transcript_character_limit: Maximum displayed characters per transcript field.
-        page: Page untruncated transcripts through the interactive terminal.
+        page: Page the untruncated current trace through an interactive terminal.
 
     Raises:
-        typer.BadParameter: Evidence, labels, budget, authorization, or approval is invalid.
+        typer.BadParameter: Evidence, review inputs, budget, consent, or approval is invalid.
     """
     with usage_error(OSError, ValueError, ManualJudgeError):
         revision = installed_release_revision()
@@ -221,14 +243,11 @@ def judge_calibrate(
         sample_sha256 = calibration_sample_digest(plan.setup, calibration_sample(plan))
         drafted = read_label_draft(store, plan.setup, sample_sha256)
         completed = manual_judge_calibration_is_complete(store)
+        reviewed = completed_trace_review_count(store, plan.setup, sample_sha256)
         if completed:
             state = require_review_state(store)
             assert state.audit is not None
             budget = read_audit(store, state.audit).budget
-            _console.print(
-                "Judge calibration is already complete; replaying its immutable evidence "
-                "without collecting labels."
-            )
         else:
             catalog = load_model_catalog(store.model_catalog_path)
             shared_ceiling = resolve_command_budget_usd(root, None)
@@ -244,34 +263,27 @@ def judge_calibrate(
                 output_usd_per_million_tokens=output_price,
                 maximum_input_tokens_per_call=maximum_input_tokens,
                 maximum_cost_usd=sys.float_info.max,
+                completed_review_count=reviewed,
             )
             if maximum_cost_usd is not None and budget.estimated_cost_usd > maximum_cost_usd:
                 raise ValueError(
                     "judge calibration estimate exceeds --maximum-cost-usd; raise the ceiling "
                     "or reduce the labeled sample"
                 )
-        if page and not completed and not can_prompt(_console):
+        if page and not completed and budget.call_count and not can_prompt(_console):
             raise ValueError("--page requires an interactive terminal; omit it for wrapped output")
-
-        def persist(collected: tuple[ManualJudgeLabel, ...]) -> None:
-            """Save human labels to durable review state before any judge provider work.
-
-            Args:
-                collected: Every human label known for the frozen trace sample so far.
-            """
-            save_label_draft(store, plan.setup, sample_sha256, collected, now)
-
-    estimate = 0.0 if completed else budget.estimated_cost_usd
-    assumptions = (
-        (
-            "verified immutable calibration replay",
-            "zero new judge calls",
+    if completed:
+        _console.print(
+            "Judge calibration is already complete; replaying immutable evidence with zero "
+            "provider calls and no review prompts."
         )
-        if completed
-        else (
+    elif budget.call_count:
+        assumptions = (
+            f"review progress: {reviewed}/{len(plan.traces)} distinct trace lineages complete",
             f"judge {plan.setup.judge_alias}: {model_display_name(plan.setup.judge_model)}",
+            f"pricing source: {budget.pricing_source.value}",
             (
-                f"{budget.call_count} judge calls with up to "
+                f"at most {budget.call_count} remaining judge calls with up to "
                 f"{budget.maximum_attempts_per_call} attempts each"
             ),
             (
@@ -283,19 +295,18 @@ def judge_calibrate(
                 f"${budget.output_usd_per_million_tokens:.6f} output per million tokens"
             ),
         )
-    )
-    if not require_spend_consent(
-        _console,
-        root=root,
-        yes=yes,
-        estimated_cost_usd=estimate,
-        command=f"wmo config judge calibrate {project}",
-        assumptions=assumptions,
-        non_interactive=non_interactive,
-    ):
-        _console.print("Judge calibration was not started. No labels or provider calls ran.")
-        return
-    if not completed:
+        if not require_spend_consent(
+            _console,
+            root=root,
+            yes=yes,
+            estimated_cost_usd=budget.estimated_cost_usd,
+            command=f"wmo config judge calibrate {project}",
+            assumptions=assumptions,
+            non_interactive=non_interactive,
+            previously_confirmed=False,
+        ):
+            _console.print("Judge calibration was not started. No provider calls or reviews ran.")
+            return
         with usage_error(OSError, ValueError, ManualJudgeError):
             budget = estimate_manual_judge_budget(
                 plan,
@@ -304,40 +315,48 @@ def judge_calibrate(
                 output_usd_per_million_tokens=output_price,
                 maximum_input_tokens_per_call=maximum_input_tokens,
                 maximum_cost_usd=max(calibration_ceiling, 0.000001),
+                completed_review_count=reviewed,
             )
         if drafted:
-            _console.print(f"Resuming {len(drafted)} saved human labels for this trace sample.")
-        _render_calibration_review(
-            plan,
-            rubric,
-            character_limit=None if page else transcript_character_limit,
-            page=page,
-        )
-        with usage_error(OSError, ValueError, ManualJudgeError):
-            labels = _collect_labels(
-                plan.setup,
-                rubric,
-                tuple(label or ()),
-                plan.previews,
-                drafted,
-                persist,
-                non_interactive=non_interactive,
+            _console.print(
+                f"Found {len(drafted)} saved human score inputs. They will be applied only "
+                "after the configured judge proposals are shown."
             )
     else:
-        labels = drafted
+        _console.print(
+            f"Review progress: {reviewed}/{len(plan.traces)} distinct trace lineages complete. "
+            "Finalizing from immutable reviews with zero provider calls."
+        )
     with usage_error(OSError, ValueError, ManualJudgeError):
+        reviewer: ManualJudgeReviewer = (
+            build_manual_judge_reviewer(
+                plan.setup,
+                rubric,
+                plan.previews,
+                drafted_labels=drafted,
+                supplied_labels=tuple(label or ()),
+                supplied_judgments=tuple(judgment or ()),
+                non_interactive=non_interactive,
+                character_limit=transcript_character_limit,
+                page=page,
+                console=_console,
+            )
+            if not completed and budget.call_count
+            else _unexpected_review
+        )
         runtime = RuntimeModelCatalog(load_model_catalog(store.model_catalog_path))
         result = calibrate_manual_judge(
             store,
             runtime,
             plan,
-            labels,
+            (),
             budget,
             spend_consented=True,
             approve=False,
             accept_insufficient_labels=accept_insufficient_labels,
             created_at=now,
             code_revision=revision,
+            reviewer=reviewer,
         )
         _render_report(result)
         should_approve = (
@@ -345,6 +364,7 @@ def judge_calibrate(
             or approve
             or _confirm(
                 "Approve this immutable judge calibration?",
+                default=True,
                 non_interactive=non_interactive,
                 required_flag="--approve",
             )
@@ -354,18 +374,33 @@ def judge_calibrate(
                 store,
                 runtime,
                 plan,
-                labels,
+                (),
                 budget,
                 spend_consented=True,
                 approve=True,
                 accept_insufficient_labels=accept_insufficient_labels,
                 created_at=now,
                 code_revision=revision,
+                reviewer=reviewer,
             )
     if result.approved_calibration is None:
         _console.print("Calibration evidence saved but not approved.")
     else:
         _console.print(f"Approved judge calibration {result.approved_calibration.artifact_id}.")
+
+
+def _unexpected_review(
+    _proposal: ManualJudgeTraceProposal,
+) -> tuple[ManualJudgeAxisDecision, ...]:
+    """Fail closed if completed review state requests another decision.
+
+    Args:
+        _proposal: Unexpected proposal supplied by the review workflow.
+
+    Raises:
+        ManualJudgeError: Always, because completed state cannot request review.
+    """
+    raise ManualJudgeError("completed calibration unexpectedly requested another human review")
 
 
 def _load_rubric_dimensions(path: Path | None) -> tuple[RubricDimension, ...] | None:
@@ -392,10 +427,10 @@ def _load_prompt_template(path: Path | None) -> JudgePromptTemplate:
     """Load an optional exact versioned prompt contract from JSON.
 
     Args:
-        path: Optional local JSON file.
+        path: Optional local prompt contract file.
 
     Returns:
-        Validated prompt contract, or the current built-in scalar contract.
+        Validated file content or the built-in scalar contract.
     """
     if path is None:
         return DEFAULT_JUDGE_TEMPLATE
@@ -406,7 +441,7 @@ def _render_setup(plan: ManualJudgeSetupPlan) -> None:
     """Display the judge, human-readable rubric table, and representative tasks.
 
     Args:
-        plan: Read-only setup plan awaiting confirmation.
+        plan: Read-only judge setup awaiting explicit confirmation.
     """
     _console.print("\n[bold]Judge setup[/bold]")
     _console.print(f"Judge name: {plan.judge_alias}", markup=False)
@@ -425,278 +460,15 @@ def _render_setup(plan: ManualJudgeSetupPlan) -> None:
         _console.print(f"   Recorded outcome: {preview.outcome}", markup=False)
 
 
-def _render_calibration_review(
-    plan: ManualJudgeCalibrationPlan,
-    rubric: Rubric,
-    *,
-    character_limit: int | None,
-    page: bool,
-) -> None:
-    """Render readable scalar or A/B transcripts after spend consent.
-
-    Args:
-        plan: Frozen traces and optional same-task references in display order.
-        rubric: Finalized plain-language scoring rubric.
-        character_limit: Per-field limit, or ``None`` for full transcript text.
-        page: Whether to send the full review through Rich's terminal pager.
-    """
-
-    def render() -> None:
-        """Write the complete review into the active console or pager buffer."""
-        pairwise = plan.setup.prompt_template.response_shape == "pairwise"
-        if pairwise:
-            heading = "PAIRWISE A/B CALIBRATION"
-        else:
-            lowest, highest = score_bounds(rubric.dimensions)
-            heading = f"INTEGER {lowest}-{highest} CALIBRATION"
-        _console.print(f"\n[bold]{heading}[/bold]")
-        _render_rubric(rubric.dimensions)
-        for index, (trace, reference) in enumerate(
-            zip(plan.traces, plan.reference_traces, strict=True), start=1
-        ):
-            if pairwise:
-                _console.print(f"\n[bold]Pair {index}, candidate A[/bold]")
-                render_trace(_console, trace, character_limit=character_limit)
-                if reference is None:
-                    raise ValueError("pairwise calibration preview is missing candidate B")
-                _console.print(f"\n[bold]Pair {index}, candidate B[/bold]")
-                render_trace(_console, reference, character_limit=character_limit)
-            else:
-                _console.print(f"\n[bold]Trace {index}[/bold]")
-                render_trace(_console, trace, character_limit=character_limit)
-
-    if page:
-        with _console.pager(styles=True):
-            render()
-    else:
-        render()
-
-
-def _render_rubric(dimensions: tuple[RubricDimension, ...]) -> None:
-    """Render complete plain-language rubric axes and score meanings.
-
-    Args:
-        dimensions: Finalized rubric dimensions in scoring order.
-    """
-    _console.print("\n[bold]Rubric[/bold]")
-    for dimension in dimensions:
-        _console.print(dimension.name, style="bold", markup=False)
-        _console.print(dimension.description, markup=False)
-        for anchor in dimension.anchors:
-            _console.print(f"  {anchor.score}: {anchor.description}", markup=False)
-
-
-def _collect_labels(
-    setup: ManualJudgeSetupArtifact,
-    rubric: Rubric,
-    supplied: tuple[str, ...],
-    previews: tuple[JudgeTracePreview, ...],
-    drafted: tuple[ManualJudgeLabel, ...],
-    persist: Callable[[tuple[ManualJudgeLabel, ...]], None],
-    *,
-    non_interactive: bool,
-) -> tuple[ManualJudgeLabel, ...]:
-    """Resume saved labels, parse explicit ones, and ask only for missing scores.
-
-    Every label is handed to ``persist`` as soon as it exists, so an interrupted or failed
-    calibration never discards completed human ratings.
-
-    Args:
-        setup: Finalized setup used for stable prompt context.
-        rubric: Verified finalized scoring rubric.
-        supplied: Repeatable CLI label expressions.
-        previews: Frozen ordered calibration trace previews.
-        drafted: Labels already persisted for this exact frozen trace sample.
-        persist: Durable writer for the labels collected so far.
-        non_interactive: Whether all missing inputs must be reported without prompting.
-
-    Returns:
-        Complete ordered human label set.
-
-    Raises:
-        ValueError: A label is malformed, duplicated, missing, or outside the axis range.
-    """
-    pairwise = setup.prompt_template.response_shape == "pairwise"
-    parsed: dict[tuple[str, str | None, str], ManualJudgeLabel] = {
-        (item.trace_id, item.reference_trace_id, item.dimension_id): item for item in drafted
-    }
-    explicit: set[tuple[str, str | None, str]] = set()
-    for item in supplied:
-        key = _label_key(item, pairwise=pairwise)
-        if key in explicit:
-            raise ValueError("duplicate label for " + ":".join(part or "-" for part in key))
-        explicit.add(key)
-        axis = None if pairwise else rubric.axis(key[2])
-        parsed[key] = _label(
-            key,
-            _label_value(item, pairwise=pairwise, axis=axis),
-            pairwise=pairwise,
-        )
-    expected = tuple(
-        (preview.trace_id, preview.reference_trace_id, dimension.dimension_id)
-        for preview in previews
-        for dimension in rubric.dimensions
-    )
-    unexpected = sorted(set(parsed).difference(expected))
-    if unexpected:
-        raise ValueError(
-            "unexpected labels: "
-            + ", ".join(":".join(part or "-" for part in key) for key in unexpected)
-        )
-    if explicit:
-        persist(tuple(parsed[key] for key in expected if key in parsed))
-    missing = tuple(key for key in expected if key not in parsed)
-    if missing and non_interactive:
-        raise ValueError(
-            "missing labels: " + ", ".join(":".join(part or "-" for part in key) for key in missing)
-        )
-    dimensions = {dimension.dimension_id: dimension for dimension in rubric.dimensions}
-    preview_positions = {
-        (preview.trace_id, preview.reference_trace_id): index
-        for index, preview in enumerate(previews, start=1)
-    }
-    for key in missing:
-        trace_id, reference_id, dimension_id = key
-        dimension = dimensions[dimension_id]
-        _render_score_prompt(dimension)
-        position = preview_positions[(trace_id, reference_id)]
-        if pairwise:
-            choice = Prompt.ask(
-                "Pair "
-                f"{position}: choose candidate A, candidate B, or tie for "
-                f"{escape(dimension.name)}",
-                choices=["A", "B", "tie"],
-            )
-            value: int | str = {"A": "winner_a", "B": "winner_b", "tie": "tie"}[choice]
-        else:
-            score = IntPrompt.ask(
-                f"Trace {position}: score {escape(dimension.name)} from "
-                f"{dimension.min_score} to {dimension.max_score}"
-            )
-            if not dimension.contains_score(score):
-                raise ValueError(
-                    f"judge labels for {dimension_id} must be integers from "
-                    f"{dimension.min_score} through {dimension.max_score}"
-                )
-            value = score
-        parsed[key] = _label(key, value, pairwise=pairwise)
-        persist(tuple(parsed[item] for item in expected if item in parsed))
-    return tuple(parsed[key] for key in expected)
-
-
-def _render_score_prompt(dimension: RubricDimension) -> None:
-    """Keep one score question adjacent to its complete plain-language anchors.
-
-    Args:
-        dimension: Rubric dimension the next prompt asks the operator to score.
-    """
-    _console.print()
-    _console.print(f"Score prompt: {dimension.name}", style="bold", markup=False)
-    _console.print(dimension.description, markup=False)
-    for anchor in dimension.anchors:
-        _console.print(f"  {anchor.score}: {anchor.description}", markup=False)
-
-
-def _label(
-    key: tuple[str, str | None, str],
-    value: int | str,
-    *,
-    pairwise: bool,
-) -> ManualJudgeLabel:
-    """Build one validated human label from its key and typed value.
-
-    Args:
-        key: Trace, optional reference trace, and dimension identifiers.
-        value: Integer axis score, or a typed pairwise winner.
-        pairwise: Whether the finalized setup requires a comparison label.
-
-    Returns:
-        Validated human label for the calibration sample.
-    """
-    trace_id, reference_id, dimension_id = key
-    return ManualJudgeLabel.model_validate(
-        {
-            "trace_id": trace_id,
-            "reference_trace_id": reference_id,
-            "dimension_id": dimension_id,
-            **({"winner": value} if pairwise else {"score": value}),
-        }
-    )
-
-
-def _label_key(value: str, *, pairwise: bool) -> tuple[str, str | None, str]:
-    """Parse the trace and dimension key from one CLI label expression.
-
-    Args:
-        value: Scalar or pairwise CLI label expression.
-        pairwise: Whether the finalized setup requires a comparison trace.
-
-    Returns:
-        Trace, optional reference trace, and dimension identifiers.
-
-    Raises:
-        ValueError: The expression does not have the required separators.
-    """
-    target, separator, _score = value.rpartition("=")
-    parts = target.split(":")
-    expected_parts = 3 if pairwise else 2
-    if not separator or len(parts) != expected_parts or any(not part for part in parts):
-        expected = (
-            "TRACE_ID:REFERENCE_TRACE_ID:DIMENSION_ID=winner_a|winner_b|tie"
-            if pairwise
-            else "TRACE_ID:DIMENSION_ID=SCORE"
-        )
-        raise ValueError(f"labels must use {expected}")
-    if pairwise:
-        return parts[0], parts[1], parts[2]
-    return parts[0], None, parts[1]
-
-
-def _label_value(
-    value: str,
-    *,
-    pairwise: bool,
-    axis: RubricDimension | None = None,
-) -> int | str:
-    """Parse and validate one CLI label value.
-
-    Args:
-        value: Scalar or pairwise CLI label expression.
-        pairwise: Whether the finalized setup requires a typed winner.
-        axis: Axis that bounds a scalar score.
-
-    Returns:
-        Integer score or typed pairwise winner.
-
-    Raises:
-        ValueError: The score is not an integer inside the axis range.
-    """
-    raw = value.rpartition("=")[2]
-    if pairwise:
-        if raw not in {"winner_a", "winner_b", "tie"}:
-            raise ValueError("pairwise judge labels must use winner_a, winner_b, or tie")
-        return raw
-    try:
-        score = int(raw)
-    except ValueError as exc:
-        raise ValueError("judge labels must use an integer score") from exc
-    if axis is not None and not axis.contains_score(score):
-        raise ValueError(
-            f"judge labels for {axis.dimension_id} must be integers from "
-            f"{axis.min_score} through {axis.max_score}"
-        )
-    return score
-
-
 def _load_setup_rubric(store: ProjectStore, setup: ManualJudgeSetupArtifact) -> Rubric:
     """Load and verify the finalized rubric named by setup.
 
     Args:
         store: Project-local immutable artifact store.
-        setup: Finalized manual judge setup.
+        setup: Finalized setup naming the exact rubric manifest.
 
     Returns:
-        Verified human-approved rubric.
+        Verified finalized rubric.
 
     Raises:
         ValueError: The rubric manifest differs from setup.
@@ -717,7 +489,7 @@ def _render_report(result: ManualJudgeCalibrationResult) -> None:
     """Display agreement, disagreement, and schema-appropriate positional bias.
 
     Args:
-        result: Completed immutable audit and calibration report.
+        result: Completed immutable calibration result.
     """
     report = result.report
     _console.print(
@@ -752,21 +524,28 @@ def _metric(value: float | None) -> str:
     """Format one optional calibration metric for concise CLI output.
 
     Args:
-        value: Optional finite report metric.
+        value: Optional finite calibration metric.
 
     Returns:
-        Three-decimal value or ``n/a`` when grouped evidence is unavailable.
+        Three-decimal text or ``n/a`` when evidence is unavailable.
     """
     return "n/a" if value is None else f"{value:.3f}"
 
 
-def _confirm(question: str, *, non_interactive: bool, required_flag: str) -> bool:
-    """Ask one non-spend confirmation or require its explicit noninteractive flag.
+def _confirm(
+    question: str,
+    *,
+    default: bool = False,
+    non_interactive: bool,
+    required_flag: str,
+) -> bool:
+    """Ask one non-spend confirmation or require its explicit flag.
 
     Args:
-        question: Human-readable decision prompt.
-        non_interactive: Whether prompting is forbidden.
-        required_flag: Flag that provides the explicit decision in scripts.
+        question: Human-readable confirmation prompt.
+        default: Answer selected by a blank response.
+        non_interactive: Whether terminal prompting is forbidden.
+        required_flag: Explicit flag required without a prompt.
 
     Returns:
         The operator's explicit answer.
@@ -776,4 +555,4 @@ def _confirm(question: str, *, non_interactive: bool, required_flag: str) -> boo
     """
     if non_interactive or not can_prompt(_console):
         raise ValueError(f"noninteractive judge review requires {required_flag}")
-    return Confirm.ask(question, default=False)
+    return Confirm.ask(question, default=default)

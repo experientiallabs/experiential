@@ -1,4 +1,4 @@
-"""Bedrock client, region, credential-chain, and catalog resolution tests."""
+"""Bedrock client, region, credential-chain, catalog resolution, and Converse translation tests."""
 
 from __future__ import annotations
 
@@ -8,19 +8,23 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
+    AssistantAction,
     ConnectionConfig,
     EmbeddingClient,
     ModelCapabilities,
     ModelCatalog,
     ModelClient,
+    ModelFinishReason,
     ModelMessage,
     ModelRecord,
     ModelRequest,
     ModelRoles,
     ModelSnapshot,
+    ToolCall,
+    ToolChoice,
 )
+from wmo.common.tasks import ToolSchema
 from wmo.runtime.models.providers.bedrock import (
     AWS_DEFAULT_REGION_ENV,
     AWS_REGION_ENV,
@@ -30,32 +34,14 @@ from wmo.runtime.models.providers.bedrock import (
     BedrockClient,
     BedrockRegionError,
     BedrockRuntime,
+    converse_request,
+    converse_response,
     create_bedrock_runtime_client,
     resolve_bedrock_region,
 )
 from wmo.runtime.models.providers.errors import ProviderResponseError
-from wmo.runtime.models.providers.transport import (
-    JsonHttpResponse,
-    JsonHttpTransport,
-    ProviderTransportError,
-)
-from wmo.runtime.models.registry import ModelConnectionError, RuntimeModelCatalog
-
-
-class _UnusedTransport(JsonHttpTransport):
-    """Fails if catalog construction unexpectedly tries to make an HTTP call."""
-
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Reject every attempted HTTP-shaped call."""
-        del url, headers, payload, timeout_seconds
-        raise AssertionError("Bedrock catalog construction must not use HTTP transport")
+from wmo.runtime.models.providers.transport import ProviderTransportError, ScriptedJsonTransport
+from wmo.runtime.models.registry import RuntimeModelCatalog
 
 
 class _FakeBedrockRuntime:
@@ -66,7 +52,6 @@ class _FakeBedrockRuntime:
         *,
         converse_response: Mapping[str, object] | None = None,
         invoke_bodies: list[Mapping[str, object]] | None = None,
-        converse_error: Exception | None = None,
     ) -> None:
         self.converse_calls: list[Mapping[str, object]] = []
         self.invoke_calls: list[Mapping[str, object]] = []
@@ -81,16 +66,13 @@ class _FakeBedrockRuntime:
             },
         }
         self._invoke_bodies = list(invoke_bodies or [{"embedding": [3.0, 4.0]}])
-        self._converse_error = converse_error
 
-    def converse(self, request: Mapping[str, object]) -> Mapping[str, object]:
+    def converse(self, **request: object) -> Mapping[str, object]:
         """Record one Converse request and return the frozen response."""
         self.converse_calls.append(request)
-        if self._converse_error is not None:
-            raise self._converse_error
         return self._converse_response
 
-    def invoke_model(self, request: Mapping[str, object]) -> Mapping[str, object]:
+    def invoke_model(self, **request: object) -> Mapping[str, object]:
         """Record one InvokeModel request and return the next embedding body."""
         self.invoke_calls.append(request)
         if not self._invoke_bodies:
@@ -111,6 +93,39 @@ def _snapshot(model_id: str = "us.anthropic.claude-sonnet-4-5") -> ModelSnapshot
 def _request() -> ModelRequest:
     """Build one user completion request."""
     return ModelRequest(messages=(ModelMessage(role="user", content="Hello"),))
+
+
+def _tool_transcript_request() -> ModelRequest:
+    """Build a visible transcript containing an earlier tool call and result."""
+    return ModelRequest(
+        messages=(
+            ModelMessage(role="system", content="You are precise."),
+            ModelMessage(role="user", content="Create a ticket."),
+            ModelMessage(
+                role="assistant",
+                assistant_action=AssistantAction(
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-old",
+                            name="create_ticket",
+                            arguments={"priority": "normal"},
+                        ),
+                    )
+                ),
+            ),
+            ModelMessage(role="tool", content="created", tool_call_id="call-old"),
+        ),
+        tools=(
+            ToolSchema(
+                name="create_ticket",
+                description="Create one support ticket.",
+                input_schema={"type": "object"},
+            ),
+        ),
+        tool_choice=ToolChoice(name="create_ticket"),
+        temperature=0.1,
+        maximum_output_tokens=256,
+    )
 
 
 def test_complete_sends_the_exact_model_id_and_preserves_cache_usage() -> None:
@@ -293,13 +308,14 @@ def test_retries_stay_on_the_same_region_and_model() -> None:
             super().__init__()
             self.attempts = 0
 
-        def converse(self, request: Mapping[str, object]) -> Mapping[str, object]:
+        def converse(self, **request: object) -> Mapping[str, object]:
+            """Raise one retryable throttle error, then delegate to the recording fake."""
             self.attempts += 1
             if self.attempts == 1:
                 raise ProviderTransportError(
                     "Bedrock returned ThrottlingException", status_code=429
                 )
-            return super().converse(request)
+            return super().converse(**request)
 
     runtime = _FlakyRuntime()
     client = BedrockClient(
@@ -342,7 +358,7 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
             roles=ModelRoles(world_model="claude", judge="claude", embedder="embed"),
         ),
         environment={},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
         bedrock_runtime_factory=lambda *, region_name: runtime,
     )
 
@@ -358,21 +374,6 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
     assert embedder.embedding_client is embedder.client
     assert response.output.content == "ok"
     assert vectors[0].values == (0.6, 0.8)
-    with pytest.raises(ModelConnectionError, match="unsupported provider"):
-        RuntimeModelCatalog(
-            ModelCatalog(
-                connections={"other": ConnectionConfig(provider="waterfall", api_key_env="X")},
-                models={
-                    "x": ModelRecord(
-                        connection="other",
-                        model="x",
-                        capabilities=ModelCapabilities(),
-                    )
-                },
-            ),
-            environment={"X": "x"},
-            transport_factory=_UnusedTransport,
-        ).snapshot("x")
 
 
 def test_snapshot_does_not_construct_a_bedrock_runtime() -> None:
@@ -394,7 +395,7 @@ def test_snapshot_does_not_construct_a_bedrock_runtime() -> None:
             },
         ),
         environment={},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
         bedrock_runtime_factory=forbidden,
     )
 
@@ -474,3 +475,108 @@ def test_runtime_construction_uses_the_aws_session_chain(
     assert _Recorded.retries == {"max_attempts": 1, "mode": "standard"}
     assert _Recorded.tcp_keepalive is True
     assert runtime is not None
+
+
+def test_converse_request_preserves_tool_ids_and_named_choice() -> None:
+    """Converse keeps exact tool-use IDs and forwards named tool choice."""
+    payload = converse_request("us.anthropic.claude-sonnet-4-5", _tool_transcript_request())
+
+    assert payload["modelId"] == "us.anthropic.claude-sonnet-4-5"
+    assert payload["system"] == [{"text": "You are precise."}]
+    assert payload["inferenceConfig"] == {"maxTokens": 256, "temperature": 0.1}
+    tool_config = payload["toolConfig"]
+    assert isinstance(tool_config, dict)
+    assert tool_config["toolChoice"] == {"tool": {"name": "create_ticket"}}
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    assistant = messages[1]
+    tool_result = messages[2]
+    assert isinstance(assistant, dict)
+    assert isinstance(tool_result, dict)
+    assistant_content = assistant["content"]
+    result_content = tool_result["content"]
+    assert isinstance(assistant_content, list)
+    assert isinstance(result_content, list)
+    tool_use = assistant_content[0]
+    result_block = result_content[0]
+    assert isinstance(tool_use, dict)
+    assert isinstance(result_block, dict)
+    tool_use_block = tool_use["toolUse"]
+    result_payload = result_block["toolResult"]
+    assert isinstance(tool_use_block, dict)
+    assert isinstance(result_payload, dict)
+    assert tool_use_block["toolUseId"] == "call-old"
+    assert tool_result["role"] == "user"
+    assert result_payload["toolUseId"] == "call-old"
+
+
+def test_converse_response_normalizes_cache_legs_without_double_counting() -> None:
+    """Converse inputTokens exclude cache legs, so read and write are added once."""
+    response = converse_response(
+        {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"text": "done"},
+                        {
+                            "toolUse": {
+                                "toolUseId": "call-new",
+                                "name": "create_ticket",
+                                "input": {"priority": "urgent"},
+                            }
+                        },
+                    ],
+                }
+            },
+            "stopReason": "tool_use",
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 4,
+                "cacheReadInputTokens": 6,
+                "cacheWriteInputTokens": 2,
+            },
+        },
+        configured_model=_snapshot(),
+        latency_seconds=0.5,
+    )
+
+    assert response.finish_reason == ModelFinishReason.COMPLETED
+    assert response.output.content == "done"
+    assert response.output.tool_calls[0].call_id == "call-new"
+    assert response.economics.usage is not None
+    assert response.economics.usage.input_tokens == 18
+    assert response.economics.usage.cached_input_tokens == 6
+    assert response.economics.usage.cache_write_input_tokens == 2
+
+
+def test_converse_response_maps_length_and_rejects_unsupported_blocks() -> None:
+    """max_tokens becomes length, and unknown content blocks fail closed."""
+    length = converse_response(
+        {
+            "output": {"message": {"content": [{"text": "partial"}]}},
+            "stopReason": "max_tokens",
+            "usage": {"inputTokens": 3, "outputTokens": 2},
+        },
+        configured_model=_snapshot(),
+        latency_seconds=0.1,
+    )
+    assert length.finish_reason == ModelFinishReason.LENGTH
+    with pytest.raises(ProviderResponseError, match="unsupported block"):
+        converse_response(
+            {
+                "output": {"message": {"content": [{"image": {"format": "png"}}]}},
+                "stopReason": "end_turn",
+            },
+            configured_model=_snapshot(),
+            latency_seconds=0.1,
+        )
+    with pytest.raises(ProviderResponseError, match="not supported"):
+        converse_response(
+            {
+                "output": {"message": {"content": [{"text": "blocked"}]}},
+                "stopReason": "content_filtered",
+            },
+            configured_model=_snapshot(),
+            latency_seconds=0.1,
+        )

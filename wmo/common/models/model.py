@@ -252,12 +252,19 @@ class ModelCapabilities(ContractModel):
 
     The runtime records a digest of this object in every resolved model identity. The fields
     describe protocol support, not a claim that a provider accepts every possible prompt.
+
+    ``supports_temperature`` declares whether the provider accepts an explicit sampling
+    temperature for this model; reasoning models that pin their sampling reject the parameter, so
+    clients omit it when this is ``False``. ``reasoning_effort`` pins an explicit reasoning-effort
+    level on providers whose wire protocol accepts one.
     """
 
     supports_tools: bool = False
     supports_embeddings: bool = False
     supports_structured_output: bool = False
     supports_completions: bool | None = None
+    supports_temperature: bool = True
+    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
@@ -291,15 +298,18 @@ class ModelCapabilities(ContractModel):
     def identity_sha256(self) -> Sha256:
         """Hash capabilities that identify the provider model protocol.
 
-        Workflow-only completion, structured-output, and pricing declarations are excluded from
-        provider model identity. Router evaluation freezes its exact execution declarations in a
-        separate candidate capability digest and freezes prices in the pricing snapshot.
+        Workflow-only completion, structured-output, sampling, and pricing declarations are
+        excluded from provider model identity. Router evaluation freezes its exact execution
+        declarations in a separate candidate capability digest and freezes prices in the pricing
+        snapshot.
 
         Returns:
             Stable digest of capability fields that identify the provider protocol boundary.
         """
         excluded = {
             "supports_structured_output",
+            "supports_temperature",
+            "reasoning_effort",
             "input_cost_per_million_tokens_usd",
             "output_cost_per_million_tokens_usd",
             "cached_input_cost_per_million_tokens_usd",
