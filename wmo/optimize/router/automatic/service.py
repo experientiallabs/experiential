@@ -572,7 +572,6 @@ def _workflow_services(
             artifacts.runtime_capability_input,
             artifacts.execution_contract_input,
         ),
-        plan_observer=judge.bind_plan,
     )
 
 

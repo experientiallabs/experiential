@@ -413,16 +413,6 @@ class _Judge:
         self.calls = 0
         self.log: list[tuple[str, bool]] = []
         self.fail_on_call: int | None = None
-        self.bound_plan_ids: list[str] = []
-        self.require_bound = False
-
-    def bind_plan(self, plan: EvaluationPlan) -> None:
-        """Record one observed frozen evaluation plan binding.
-
-        Args:
-            plan: Persisted current composition plan.
-        """
-        self.bound_plan_ids.append(plan.plan_id)
 
     def judge_persisted(
         self,
@@ -433,8 +423,6 @@ class _Judge:
         calibration_artifact_id: str,
     ) -> Judgment:
         """Persist one stable judgment unless the configured call must fail."""
-        if self.require_bound and not self.bound_plan_ids:
-            raise ValueError("automatic judge has not been bound to an evaluation plan")
         self.calls += 1
         if self.calls == self.fail_on_call:
             raise RuntimeError("simulated judgment dispatch interruption")
@@ -1055,8 +1043,8 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
 ) -> None:
     """A crash between dispatch reservation and judgment persistence resumes on rerun.
 
-    The rerun uses a fresh unbound plan-requiring judge, as a new process would, so it also
-    proves the plan observer binds the judge when fit simulation replays without a simulator.
+    The rerun uses a fresh judge, as a new process would, so it also proves judgment dispatch
+    works when fit simulation replays without a simulator.
 
     Args:
         tmp_path: Isolated project root for composed router artifacts.
@@ -1080,10 +1068,10 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
     )
 
     def _services(judge: _Judge) -> RouterWorkflowServices:
-        """Return workflow services with the judge bound through the plan observer.
+        """Return workflow services for one composition attempt.
 
         Args:
-            judge: Plan-requiring judge double for one composition attempt.
+            judge: Judge double for one composition attempt.
 
         Returns:
             Workflow services mirroring the automatic service wiring.
@@ -1094,11 +1082,9 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
             simulator_factory=simulator,
             judge=judge,
             runtime_catalog=catalog,
-            plan_observer=judge.bind_plan,
         )
 
     first_judge = _Judge()
-    first_judge.require_bound = True
     first_judge.fail_on_call = 1
     budget = RouterCompositionBudget(
         maximum_simulation_cost_usd=10.0,
@@ -1135,7 +1121,6 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
     assert first_judge.calls == 1
 
     second_judge = _Judge()
-    second_judge.require_bound = True
     result = compose_router(
         project,
         normalized,
@@ -1151,4 +1136,3 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
     assert len(receipts) == len(scored_cells)
     assert len(_artifact_ids("judgment")) == len(scored_cells)
     assert second_judge.calls == len(scored_cells)
-    assert second_judge.bound_plan_ids == [result.plan.plan_id]

@@ -1,4 +1,4 @@
-"""Plan-bound execution of the approved manual judge contract."""
+"""Execution of the approved manual judge contract against plan-bound rollouts."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from datetime import datetime
 
 from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.evaluations import EvaluationPlan
-from wmo.common.evaluations.evidence import read_rollout
+from wmo.common.evaluations.evidence import read_evaluation_plan, read_rollout
 from wmo.common.judging import Judgment, LMJudge, Rubric
 from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import (
@@ -127,20 +127,6 @@ class AutomaticRouterJudge:
         self._setup = setup
         self._created_at = created_at
         self._code_revision = code_revision
-        self._plan: EvaluationPlan | None = None
-
-    def bind_plan(self, plan: EvaluationPlan) -> None:
-        """Bind the one frozen evaluation plan whose rollouts may be judged.
-
-        Args:
-            plan: Persisted current composition plan.
-
-        Raises:
-            ValueError: A different plan was already bound.
-        """
-        if self._plan is not None and self._plan != plan:
-            raise ValueError("automatic judge is already bound to a different evaluation plan")
-        self._plan = plan
 
     def judge_persisted(
         self,
@@ -164,8 +150,6 @@ class AutomaticRouterJudge:
         Raises:
             ManualJudgeError: Plan, setup, rollout, or same-task pairwise evidence is invalid.
         """
-        if self._plan is None:
-            raise ManualJudgeError("automatic judge has not been bound to an evaluation plan")
         if rubric_artifact_id != self._setup.rubric.artifact_id:
             raise ManualJudgeError("router rubric differs from the finalized judge setup")
         rollout, rollout_input = read_rollout(store.artifacts, rollout_artifact_id)
@@ -221,10 +205,8 @@ class AutomaticRouterJudge:
         """
         if self._setup.prompt_template.response_shape != "pairwise":
             return None, None
-        assert self._plan is not None
-        allowed_cells = {
-            cell.cell_id for cell in self._plan.cells if cell.task_id == target.task_id
-        }
+        plan = self._target_plan(store, target)
+        allowed_cells = {cell.cell_id for cell in plan.cells if cell.task_id == target.task_id}
         candidates = []
         for artifact_id in store.artifacts.list_ids():
             try:
@@ -246,6 +228,33 @@ class AutomaticRouterJudge:
             )
         _rollout_id, reference, reference_input = min(candidates, key=lambda item: item[0])
         return reference, reference_input
+
+    def _target_plan(self, store: ProjectStore, target: RolloutArtifact) -> EvaluationPlan:
+        """Load the exact frozen evaluation plan the target rollout was simulated under.
+
+        Args:
+            store: Project-local artifact store.
+            target: Verified target rollout.
+
+        Returns:
+            Verified evaluation plan named by the rollout's immutable simulation binding.
+
+        Raises:
+            ManualJudgeError: The rollout carries no binding or the persisted plan drifted.
+        """
+        binding = target.simulation_binding
+        if binding is None:
+            raise ManualJudgeError(
+                "pairwise router judging needs a rollout with a simulation cell binding"
+            )
+        plan, plan_input = read_evaluation_plan(
+            store.artifacts, binding.evaluation_plan_input.artifact_id
+        )
+        if plan_input != binding.evaluation_plan_input:
+            raise ManualJudgeError(
+                "persisted evaluation plan differs from the rollout's immutable binding"
+            )
+        return plan
 
 
 def _setup_input(store: ProjectStore, setup: ManualJudgeSetupArtifact) -> ArtifactInput:
