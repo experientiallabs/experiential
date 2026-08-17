@@ -69,7 +69,7 @@ def test_preflight_aggregates_missing_inputs_before_credentials_or_writes(
     assert "completed build" in message
     assert "frozen model roles" in message
     assert "manual judge" in message
-    assert "fidelity evidence" in message
+    assert "fidelity evidence" not in message
     assert project.paths.project_toml.read_bytes() == before_project
     assert project.model_catalog_path.read_bytes() == before_catalog
     assert project.artifacts.list_ids() == before_artifacts

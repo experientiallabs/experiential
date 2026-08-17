@@ -6,20 +6,22 @@ online request.
 ## 1. Build deterministic task evidence
 
 ```bash
-wmo build traces.otel.jsonl --source otlp --project support-agent --root .wmo
+wmo build support-agent --traces traces.otel.jsonl --source otlp --root .wmo
 ```
 
 The command requires 100 through 1000 valid normalized traces. It reads the raw file once,
-persists normalized traces and representative fit and held-out tasks, then records a
-manifest-bound readiness state with rubric proposals pending. It makes zero model, provider, or
-judge paid calls. Anonymous aggregate PostHog product telemetry may send after persistence unless
-disabled. Repeating the command with identical source content and code revision verifies and
-reuses the exact artifact manifests and payloads.
+persists normalized traces and representative fit and held-out tasks, then shows the selected
+models, split, conservative embedding cost, and strict ceiling. Under that ceiling it builds the
+serving and fit-only RAG indexes without a confirmation prompt and binds the grounded world model.
+It does not call the selected world model or judge. Use `--dry-run` for the same preflight with no
+provider call or completed-build selection. Anonymous aggregate PostHog product telemetry may send
+after persistence unless disabled. Repeating the command with identical source content and code
+revision verifies and reuses the exact artifact manifests and payloads without provider calls.
 
 ## 2. Complete review and evaluation explicitly
 
-The CLI keeps provider consent out of `build`, so its next input remains a reviewed completed
-evidence config. Python applications can use `wmo.compose_router` for actual WMO composition. They
+The build ceiling authorizes only its bounded embedding work, so the next input remains a reviewed
+completed evidence config. Python applications can use `wmo.compose_router` for actual WMO composition. They
 inject an approved-review supplier, reviewed setup supplier, plan-bound simulator factory, judge,
 runtime catalog, finite simulation-dollar ceiling, and finite judgment-call ceiling. WMO creates
 the plan and phase-scoped simulation specs, runs only fidelity and fit cells, persists judgments

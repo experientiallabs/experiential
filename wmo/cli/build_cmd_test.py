@@ -6,17 +6,20 @@ import hashlib
 import json
 import math
 from collections.abc import Callable, Sequence
+from io import StringIO
 from pathlib import Path
 
 import pytest
 from click import unstyle
 from pydantic import JsonValue
+from rich.console import Console
 from typer.testing import CliRunner
 
 import wmo.cli.build_cmd as build_command
 import wmo.cli.consent as consent_module
 import wmo.simulation.build as simulation_build
 from wmo.cli.app import app
+from wmo.cli.build_wizard import _prepare_new_build
 from wmo.cli.provider_setup_test import _FakeLister as _SetupLister
 from wmo.common.config.settings import set_maximum_command_cost_usd
 from wmo.common.core.artifacts import sha256_json
@@ -41,6 +44,7 @@ from wmo.simulation.retrieval import load_rag_index
 from wmo.simulation.world_model import GroundedWorldModelArtifact
 
 _RUNNER = CliRunner()
+_RESOLVE_CALLS: list[str] = []
 
 
 def test_malformed_release_revision_fails_before_build_state(
@@ -58,7 +62,7 @@ def test_malformed_release_revision_fails_before_build_state(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(tmp_path / "missing.jsonl"), "--root", str(root)],
+        ["build", "support", "--traces", str(tmp_path / "missing.jsonl"), "--root", str(root)],
     )
 
     assert result.exit_code == 2
@@ -252,26 +256,38 @@ class _CompletionClient:
 class _RuntimeCatalog:
     """Resolve catalog aliases to deterministic no-network test clients."""
 
-    def __init__(self, _catalog: ModelCatalog) -> None:
+    def __init__(self, catalog: ModelCatalog) -> None:
         """Create deterministic embedding and completion clients.
 
         Args:
-            _catalog: Unused catalog accepted by the production constructor seam.
+            catalog: Parsed fixture catalog used for exact static identities.
         """
+        self._catalog = catalog
         self._embedding = _EmbeddingClient()
         self._completion = _CompletionClient()
 
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
-        """Return deterministic static identity without recording runtime construction.
+        """Return the fixture alias identity without constructing a provider client.
 
         Args:
-            alias: Configured fixture alias.
+            alias: Configured fixture model alias.
 
         Returns:
-            Fixture model snapshot and capabilities.
+            Secret-free model snapshot and static capabilities.
         """
-        resolved = self._resolved(alias)
-        return resolved.snapshot, resolved.capabilities
+        record = self._catalog.models[alias]
+        connection = self._catalog.connections[record.connection]
+        capabilities = record.capabilities or ModelCapabilities()
+        return (
+            ModelSnapshot(
+                provider=connection.provider,
+                model_id=record.model,
+                revision=record.revision,
+                capabilities_sha256=sha256_json(capabilities),
+                connection_sha256=connection.identity_sha256(),
+            ),
+            capabilities,
+        )
 
     def preflight(self, alias: str, _requirement: object | None = None) -> ResolvedModel:
         """Return exact static identities with alias-specific capabilities.
@@ -283,32 +299,9 @@ class _RuntimeCatalog:
         Returns:
             Deterministic resolved fixture model.
         """
-        return self._resolved(alias)
-
-    def _resolved(self, alias: str) -> ResolvedModel:
-        """Build one deterministic runtime binding for a fixture alias.
-
-        Args:
-            alias: Configured fixture alias.
-
-        Returns:
-            Deterministic resolved fixture model.
-        """
-        if "embed" in alias:
-            capabilities = ModelCapabilities(
-                supports_embeddings=True,
-                input_cost_per_million_tokens_usd=0,
-            )
-            embedding = self._embedding
-        else:
-            capabilities = ModelCapabilities(maximum_output_tokens=16_000)
-            embedding = None
-        snapshot = ModelSnapshot(
-            provider="fixture",
-            model_id=f"fixture-{alias}",
-            capabilities_sha256=sha256_json(capabilities),
-            connection_sha256=sha256_json({"connection": alias}),
-        )
+        _RESOLVE_CALLS.append(alias)
+        snapshot, capabilities = self.snapshot(alias)
+        embedding = self._embedding if capabilities.supports_embeddings else None
         return ResolvedModel(alias, snapshot, capabilities, self._completion, embedding)
 
     def resolve(self, alias: str) -> ResolvedModel:
@@ -320,14 +313,18 @@ class _RuntimeCatalog:
         Returns:
             Deterministic resolved fixture model.
         """
-        return self.preflight(alias)
+        _RESOLVE_CALLS.append(alias)
+        snapshot, capabilities = self.snapshot(alias)
+        embedding = self._embedding if capabilities.supports_embeddings else None
+        return ResolvedModel(alias, snapshot, capabilities, self._completion, embedding)
 
 
-def _catalog(root: Path) -> None:
+def _catalog(root: Path, *, embedder_input_usd_per_million: float = 0.0) -> None:
     """Write complete secret-free build roles while leaving router candidates empty.
 
     Args:
         root: Temporary WMO root receiving ``models.toml``.
+        embedder_input_usd_per_million: Explicit fixture embedding input price.
     """
     write_model_catalog(
         root / "models.toml",
@@ -347,7 +344,7 @@ def _catalog(root: Path) -> None:
                     model="embed-id",
                     capabilities=ModelCapabilities(
                         supports_embeddings=True,
-                        input_cost_per_million_tokens_usd=0,
+                        input_cost_per_million_tokens_usd=embedder_input_usd_per_million,
                     ),
                 ),
             },
@@ -365,6 +362,7 @@ def _fake_runtime_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr("wmo.cli.build_cmd.RuntimeModelCatalog", _RuntimeCatalog)
     monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
+    _RESOLVE_CALLS.clear()
 
 
 def test_first_build_accepts_repeatable_provider_flags_and_replays_without_setup(
@@ -389,6 +387,7 @@ def test_first_build_accepts_repeatable_provider_flags_and_replays_without_setup
         [
             "build",
             "support",
+            "--traces",
             str(source),
             "--root",
             str(root),
@@ -407,7 +406,10 @@ def test_first_build_accepts_repeatable_provider_flags_and_replays_without_setup
     assert saved.connections["openai"].api_key_env == "OPENAI_API_KEY"
     assert saved.roles.world_model == "gpt-5-6-luna"
 
-    replay = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+    replay = _RUNNER.invoke(
+        app,
+        ["build", "support", "--traces", str(source), "--root", str(root)],
+    )
 
     assert replay.exit_code == 0, replay.output
     assert lister.requests == ["openai"]
@@ -429,6 +431,7 @@ def test_first_build_rejects_bad_provider_flags_before_any_write(tmp_path: Path)
         [
             "build",
             "support",
+            "--traces",
             str(source),
             "--root",
             str(root),
@@ -468,7 +471,7 @@ def test_first_build_configures_providers_and_models_through_the_picker(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         input="1\n\n1,3\n\n1\n1\n1\ny\n",
     )
 
@@ -482,7 +485,10 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     assert saved.roles.world_model == "gpt-5-6-luna"
     assert saved.roles.embedder == "text-embedding-3-small"
 
-    replay = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+    replay = _RUNNER.invoke(
+        app,
+        ["build", "support", "--traces", str(source), "--root", str(root)],
+    )
 
     assert replay.exit_code == 0, replay.output
     assert lister.requests == ["openai"]
@@ -504,7 +510,7 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     root.mkdir()
     _catalog(root)
 
-    result = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+    result = _RUNNER.invoke(app, ["build", "support", "--traces", str(source), "--root", str(root)])
 
     assert result.exit_code == 0, result.output
     assert "100 to 1,000 traces is the usual starting range" in result.output
@@ -540,7 +546,7 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
         raise AssertionError("exact replay must not rebuild provider-backed RAG artifacts")
 
     monkeypatch.setattr("wmo.cli.build_cmd._build_grounded_artifacts", forbid_rebuild)
-    replay = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+    replay = _RUNNER.invoke(app, ["build", "support", "--traces", str(source), "--root", str(root)])
     assert replay.exit_code == 0, replay.output
     assert "embedding spend ceiling: $0.000000" in replay.output
 
@@ -568,7 +574,9 @@ def test_build_accepts_environment_capture_jsonl_through_default_otlp_source(
     root.mkdir()
     _catalog(root)
 
-    result = _RUNNER.invoke(app, ["build", "terminal", str(source), "--root", str(root)])
+    result = _RUNNER.invoke(
+        app, ["build", "terminal", "--traces", str(source), "--root", str(root)]
+    )
 
     assert result.exit_code == 0, result.output
     assert "built 1 accepted, 0 invalid" in result.output
@@ -602,7 +610,7 @@ def test_build_package_upgrade_creates_new_immutable_graph(
 
     first_result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "a" * 40},
     )
     assert first_result.exit_code == 0, first_result.output
@@ -634,7 +642,7 @@ def test_build_package_upgrade_creates_new_immutable_graph(
     monkeypatch.setattr(build_command, "_build_grounded_artifacts", fail_after_readiness)
     failed_result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "b" * 40},
     )
     assert failed_result.exit_code == 2
@@ -645,7 +653,7 @@ def test_build_package_upgrade_creates_new_immutable_graph(
     monkeypatch.setattr(build_command, "_build_grounded_artifacts", original_build_grounded)
     second_result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "b" * 40},
     )
 
@@ -681,7 +689,7 @@ def test_build_package_upgrade_creates_new_immutable_graph(
     monkeypatch.setattr("wmo.cli.build_cmd._build_grounded_artifacts", forbid_rebuild)
     replay_result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "b" * 40},
     )
     assert replay_result.exit_code == 0, replay_result.output
@@ -707,7 +715,7 @@ def test_build_package_upgrade_graphs_remain_independently_verified(
     _catalog(root)
     first_result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "a" * 40},
     )
     assert first_result.exit_code == 0, first_result.output
@@ -716,7 +724,7 @@ def test_build_package_upgrade_graphs_remain_independently_verified(
     assert first_build is not None
     second_result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "b" * 40},
     )
     assert second_result.exit_code == 0, second_result.output
@@ -731,15 +739,15 @@ def test_build_package_upgrade_graphs_remain_independently_verified(
         store.artifacts.read(selected.trace_dataset.artifact_id)
 
 
-def test_build_package_upgrade_decline_preserves_selected_review(
+def test_build_package_upgrade_over_ceiling_preserves_selected_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Declining replacement spend leaves the selected build and review handoff together.
+    """An over-ceiling replacement leaves the selected build and review handoff together.
 
     Args:
         tmp_path: Temporary trace, catalog, and project root.
-        monkeypatch: Pytest patch fixture forcing a paid-build decline.
+        monkeypatch: Pytest patch fixture forcing a paid-build ceiling failure.
     """
     source = _otlp_export(tmp_path)
     root = tmp_path / ".wmo"
@@ -747,7 +755,7 @@ def test_build_package_upgrade_decline_preserves_selected_review(
     _catalog(root)
     first_result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "a" * 40},
     )
     assert first_result.exit_code == 0, first_result.output
@@ -755,16 +763,18 @@ def test_build_package_upgrade_decline_preserves_selected_review(
     first_build = store.load_project().build
     first_review = store.read_review()
     assert first_build is not None
-    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 1.0)
-    monkeypatch.setattr(build_command, "require_spend_consent", lambda *_args, **_kwargs: False)
+    _RESOLVE_CALLS.clear()
+    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 6.0)
 
-    declined = _RUNNER.invoke(
+    blocked = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "b" * 40},
     )
 
-    assert declined.exit_code == 0, declined.output
+    assert blocked.exit_code == 2
+    assert "conservative embedding estimate $6.000000 exceeds" in unstyle(blocked.output)
+    assert _RESOLVE_CALLS == []
     assert store.load_project().build == first_build
     assert store.read_review() == first_review
 
@@ -810,7 +820,7 @@ def test_configured_budget_rejects_build_before_provider_resolution(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root), "--yes"],
+        ["build", "support", "--traces", str(source), "--root", str(root), "--yes"],
     )
 
     assert result.exit_code == 2
@@ -856,7 +866,15 @@ def test_noninteractive_build_above_half_requires_yes_before_provider_work(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root), "--no-interactive"],
+        [
+            "build",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+            "--no-interactive",
+        ],
     )
 
     assert result.exit_code == 2
@@ -887,6 +905,7 @@ def test_noninteractive_build_yes_confirms_an_in_budget_estimate(
         [
             "build",
             "support",
+            "--traces",
             str(source),
             "--root",
             str(root),
@@ -920,7 +939,7 @@ def test_interactive_build_uses_the_cost_specific_confirmation(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         input="y\n",
     )
 
@@ -932,7 +951,7 @@ def test_interactive_build_uses_the_cost_specific_confirmation(
     assert "Proceed?" not in output
 
 
-@pytest.mark.parametrize("failure_mode", ["cost", "decline", "grounded"])
+@pytest.mark.parametrize("failure_mode", ["cost", "grounded"])
 def test_first_build_failure_does_not_publish_review_readiness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -943,7 +962,7 @@ def test_first_build_failure_does_not_publish_review_readiness(
     Args:
         tmp_path: Temporary trace, catalog, and project root.
         monkeypatch: Pytest patch fixture selecting the pre-selection failure boundary.
-        failure_mode: Cost rejection, explicit spend decline, or grounded construction failure.
+        failure_mode: Cost rejection or grounded construction failure.
     """
     source = _otlp_export(tmp_path)
     root = tmp_path / ".wmo"
@@ -951,13 +970,6 @@ def test_first_build_failure_does_not_publish_review_readiness(
     _catalog(root)
     if failure_mode == "cost":
         monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 6.0)
-    elif failure_mode == "decline":
-        monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 1.0)
-        monkeypatch.setattr(
-            build_command,
-            "require_spend_consent",
-            lambda *_args, **_kwargs: False,
-        )
     else:
 
         def fail_grounded_build(*_args: object, **_kwargs: object) -> None:
@@ -972,14 +984,13 @@ def test_first_build_failure_does_not_publish_review_readiness(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "a" * 40},
     )
 
-    if failure_mode == "decline":
-        assert result.exit_code == 0, result.output
-    else:
-        assert result.exit_code == 2
+    assert result.exit_code == 2
+    if failure_mode == "cost":
+        assert _RESOLVE_CALLS == []
     store = ProjectStore(root, "support")
     assert store.load_project().build is None
     assert store.read_review() is None
@@ -1001,7 +1012,7 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     _catalog(root)
     first_result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "a" * 40},
     )
     assert first_result.exit_code == 0, first_result.output
@@ -1044,7 +1055,7 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     monkeypatch.setattr(simulation_build, "select_build_review", fail_review_selection)
     interrupted = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "b" * 40},
     )
     assert interrupted.exit_code == 2
@@ -1067,7 +1078,7 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     monkeypatch.setattr(build_command, "_build_grounded_artifacts", forbid_rebuild)
     recovered = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root)],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
         env={"WMO_RELEASE_REVISION": "b" * 40},
     )
 
@@ -1098,7 +1109,7 @@ def test_build_accepts_trace_counts_outside_or_inside_guidance(tmp_path: Path, c
     root.mkdir()
     _catalog(root)
 
-    result = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
+    result = _RUNNER.invoke(app, ["build", "support", "--traces", str(source), "--root", str(root)])
 
     assert result.exit_code == 0, result.output
     config = ProjectStore(root, "support").load_project()
@@ -1128,7 +1139,7 @@ def test_missing_config_noninteractive_fails_before_project_write(tmp_path: Path
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(source), "--root", str(root), "--no-interactive"],
+        ["build", "support", "--traces", str(source), "--root", str(root), "--no-interactive"],
     )
 
     assert result.exit_code == 2
@@ -1152,6 +1163,7 @@ def test_missing_config_is_reported_before_a_missing_trace_path(tmp_path: Path) 
         [
             "build",
             "support",
+            "--traces",
             str(tmp_path / "missing.jsonl"),
             "--root",
             str(root),
@@ -1219,7 +1231,7 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(tmp_path / "missing.jsonl"), "--root", str(root)],
+        ["build", "support", "--traces", str(tmp_path / "missing.jsonl"), "--root", str(root)],
     )
 
     assert result.exit_code == 2
@@ -1229,17 +1241,25 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
     assert not (root / "projects" / "support").exists()
 
 
-def test_build_rejects_old_project_option_shape(tmp_path: Path) -> None:
-    """The command has exactly PROJECT then TRACES as its positional happy path.
+def test_build_retains_active_positional_trace_consumer_but_rejects_project_option(
+    tmp_path: Path,
+) -> None:
+    """The hidden trace positional remains active while PROJECT stays positional.
 
     Args:
         tmp_path: Temporary project and trace root.
     """
     source = _otlp_export(tmp_path)
-    result = _RUNNER.invoke(app, ["build", str(source), "--project", "support"])
+    positional = _RUNNER.invoke(app, ["build", "support", str(source)])
+    project_option = _RUNNER.invoke(
+        app,
+        ["build", "--project", "support", "--traces", str(source)],
+    )
 
-    assert result.exit_code == 2
-    assert "No such option: --project" in unstyle(result.output)
+    assert positional.exit_code == 2
+    assert "model configuration is incomplete before build" in unstyle(positional.output).casefold()
+    assert project_option.exit_code == 2
+    assert "No such option: --project" in unstyle(project_option.output)
 
 
 def test_build_help_describes_the_completed_grounded_artifact() -> None:
@@ -1250,10 +1270,250 @@ def test_build_help_describes_the_completed_grounded_artifact() -> None:
     result = _RUNNER.invoke(app, ["build", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert "Build a reusable grounded world model from local trace evidence." in unstyle(
-        result.output
+    help_text = unstyle(result.output)
+    assert "Build a reusable grounded world model from local trace evidence." in help_text
+    assert "-t" in help_text
+    assert "--traces" in help_text
+    assert "--dry-run" in help_text
+    assert "--max-build-cost-usd" in help_text
+    assert "--yes" in help_text
+
+
+def test_build_preflight_auto_runs_without_proceed(tmp_path: Path) -> None:
+    """An under-ceiling build shows exact preflight and truthful progress without prompting.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1.0)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", "--traces", str(source), "--root", str(root)],
     )
-    assert "--provider" in unstyle(result.output)
+    assert result.exit_code == 0, result.output
+    output = unstyle(result.output)
+    assert "Build preflight" in output
+    assert "traces       1 accepted, 0 invalid" in output
+    assert "split        1 fit, 0 held out" in output
+    assert "world model  world (world-id)" in output
+    assert "embedder     embed (embed-id)" in output
+    assert "embedding    at most $" in output
+    assert "ceiling      $5.000000" in output
+    assert "Proceed?" not in output
+    assert "Build serving index with embed-id" in output
+    assert "Build fit-only index" in output
+    assert "Ground world model world-id" in output
+    assert "next: wmo optimize router support" in output
+    assert _RESOLVE_CALLS == ["embed"]
+
+
+def test_over_ceiling_build_fails_before_provider_construction(tmp_path: Path) -> None:
+    """An over-ceiling estimate fails before credentials or provider clients.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1_000_000.0)
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+            "--max-build-cost-usd",
+            "0.01",
+        ],
+    )
+
+    assert result.exit_code == 2
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert "conservative embedding estimate $" in output
+    assert "exceeds --max-build-cost-usd $0.010000" in output
+    assert "wmo build support --traces" in output
+    assert "Proceed?" not in output
+    assert _RESOLVE_CALLS == []
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is None
+    assert store.read_review() is None
+
+
+def test_dry_run_has_zero_calls_and_no_completed_selection(tmp_path: Path) -> None:
+    """``--dry-run`` shows preflight without provider construction or selection.
+
+    Args:
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1.0)
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    output = unstyle(result.output)
+    assert "Build preflight" in output
+    assert "embedding    at most $" in output
+    assert "dry run complete" in output
+    assert "Proceed?" not in output
+    assert _RESOLVE_CALLS == []
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is None
+    assert store.read_review() is None
+
+
+def test_wizard_preconsent_plan_persists_only_provider_free_unselected_evidence(
+    tmp_path: Path,
+) -> None:
+    """Planning may checkpoint deterministic evidence but never paid outputs or selection.
+
+    Args:
+        tmp_path: Temporary trace, project, and artifact root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+
+    plan = _prepare_new_build(
+        "support",
+        trace_path=source,
+        source="otlp",
+        root=root,
+        world_model=None,
+        judge=None,
+        embedder=None,
+        top_k=5,
+        maximum_build_cost_usd=5.0,
+        code_revision="a" * 40,
+        providers=(),
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    store = ProjectStore(root, "support")
+    artifact_types = {
+        store.artifacts.read(artifact_id).manifest.artifact_type
+        for artifact_id in store.artifacts.list_ids()
+    }
+    assert plan.build_reused is False
+    assert store.load_project().build is None
+    assert _RESOLVE_CALLS == []
+    assert "rag-index" not in artifact_types
+    assert "grounded-world-model" not in artifact_types
+
+
+def test_exact_replay_has_zero_calls_and_no_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exact replay verifies and reuses grounded artifacts without provider construction.
+
+    Args:
+        monkeypatch: Pytest patch fixture forbidding grounded reconstruction.
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1.0)
+    arguments = ["build", "support", "--traces", str(source), "--root", str(root)]
+    first = _RUNNER.invoke(app, arguments)
+    assert first.exit_code == 0, first.output
+    first_build = ProjectStore(root, "support").load_project().build
+    assert first_build is not None
+    _RESOLVE_CALLS.clear()
+
+    def forbid_rebuild(*_args: object, **_kwargs: object) -> None:
+        """Fail if an exact replay attempts provider-backed reconstruction.
+
+        Raises:
+            AssertionError: Always, because exact replay must reuse artifacts.
+        """
+        raise AssertionError("exact replay must not rebuild grounded artifacts")
+
+    monkeypatch.setattr(build_command, "_build_grounded_artifacts", forbid_rebuild)
+    replay = _RUNNER.invoke(app, arguments)
+
+    assert replay.exit_code == 0, replay.output
+    output = unstyle(replay.output)
+    assert "reuse exact completed indexes, $0.000000 new spend" in output
+    assert "embedding spend ceiling: $0.000000" in output
+    assert "Proceed?" not in output
+    assert _RESOLVE_CALLS == []
+    assert ProjectStore(root, "support").load_project().build == first_build
+
+
+def test_provider_failure_does_not_publish_build_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A provider embedding failure leaves the completed-build pointer empty.
+
+    Args:
+        monkeypatch: Pytest patch fixture injecting an embedding failure.
+        tmp_path: Temporary project and trace root.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root, embedder_input_usd_per_million=1.0)
+
+    def fail_embed(self: _EmbeddingClient, texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Fail at the first provider embedding dispatch.
+
+        Args:
+            texts: Canonical RAG key texts that would have been embedded.
+
+        Raises:
+            ValueError: Always, to simulate a provider failure.
+        """
+        del self, texts
+        raise ValueError("injected provider embedding failure")
+
+    monkeypatch.setattr(_EmbeddingClient, "embed", fail_embed)
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", "--traces", str(source), "--root", str(root)],
+    )
+
+    assert result.exit_code == 2
+    assert "injected provider embedding failure" in result.output
+    assert _RESOLVE_CALLS == ["embed"]
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is None
+    assert store.read_review() is None
+
+
+def test_other_spend_consent_commands_still_require_yes() -> None:
+    """Build authorization does not change other command spend gates."""
+    model_help = unstyle(_RUNNER.invoke(app, ["optimize", "model", "--help"]).output)
+    router_help = unstyle(_RUNNER.invoke(app, ["optimize", "router", "--help"]).output)
+
+    assert "--yes" in model_help
+    assert "--yes" in router_help
+    assert "--yes" in unstyle(_RUNNER.invoke(app, ["build", "--help"]).output)
 
 
 _TURNS = (
@@ -1528,7 +1788,7 @@ def test_build_accepts_every_declared_vendor_source(source: str, tmp_path: Path)
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(export), "--source", source, "--root", str(root)],
+        ["build", "support", "--traces", str(export), "--source", source, "--root", str(root)],
     )
 
     assert result.exit_code == 0, result.output
@@ -1554,7 +1814,7 @@ def test_build_rejects_an_undeclared_trace_source(tmp_path: Path) -> None:
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(export), "--source", "helicone", "--root", str(root)],
+        ["build", "support", "--traces", str(export), "--source", "helicone", "--root", str(root)],
     )
 
     assert result.exit_code == 2
@@ -1579,7 +1839,16 @@ def test_build_reports_an_invalid_postgres_source_declaration(tmp_path: Path) ->
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(declaration), "--source", "postgres", "--root", str(root)],
+        [
+            "build",
+            "support",
+            "--traces",
+            str(declaration),
+            "--source",
+            "postgres",
+            "--root",
+            str(root),
+        ],
     )
 
     assert result.exit_code == 2

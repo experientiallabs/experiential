@@ -264,7 +264,9 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     _write_catalog(root)
     runner = CliRunner()
 
-    build = runner.invoke(app, ["build", _PROJECT, str(pinned_traces), "--root", str(root)])
+    build = runner.invoke(
+        app, ["build", _PROJECT, "--traces", str(pinned_traces), "--root", str(root)]
+    )
     assert build.exit_code == 0, build.output
     setup = runner.invoke(
         app, ["config", "judge", "setup", _PROJECT, "--root", str(root), "--approve"]

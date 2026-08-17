@@ -9,6 +9,7 @@ Both paths end in one conflict-checked atomic ``models.toml`` write.
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
@@ -17,9 +18,10 @@ from pathlib import Path
 import typer
 from pydantic import ValidationError
 from rich.console import Console
-from rich.prompt import Confirm
+from rich.prompt import Confirm, Prompt
 
 from wmo.cli.model_picker import (
+    RoleAssignment,
     assign_roles,
     available_models,
     build_result,
@@ -52,7 +54,9 @@ from wmo.common.models import (
     configure_provider_catalog,
     configure_router_candidates,
     load_model_catalog,
+    serves_role,
 )
+from wmo.common.models.known_models import recommended_model_rank
 from wmo.common.models.setup import SETUP_PROVIDERS
 from wmo.runtime.models.providers import HttpProviderModelLister, ProviderModelLister
 
@@ -69,6 +73,16 @@ class ProviderSetupOptions:
     embedder: str | None = None
 
 
+@dataclass(frozen=True)
+class _RecommendationModel:
+    """Verified model fields needed by deterministic wizard recommendation policy."""
+
+    alias: str
+    provider: str
+    model: str
+    capabilities: ModelCapabilities
+
+
 def run_provider_setup(
     root: Path,
     options: ProviderSetupOptions,
@@ -77,6 +91,7 @@ def run_provider_setup(
     replace: bool,
     console: Console,
     lister: ProviderModelLister | None = None,
+    offer_recommended_defaults: bool = False,
 ) -> ModelCatalog:
     """Collect a complete catalog update before one conflict-checked atomic write.
 
@@ -87,6 +102,7 @@ def run_provider_setup(
         replace: Whether conflicting collected entries may replace unprotected catalog state.
         console: Rich console used for prompts, summaries, and guidance.
         lister: Provider listing seam, injected by tests so no live request is made.
+        offer_recommended_defaults: Whether verified discovery may fill every safe role at once.
 
     Returns:
         The complete catalog committed after final confirmation.
@@ -121,6 +137,7 @@ def run_provider_setup(
         retainable_roles=_retained_setup_roles(existing),
         role_inputs=_role_inputs(options, existing=existing),
         explicit_providers=explicit_providers,
+        offer_recommended_defaults=offer_recommended_defaults,
         console=console,
         lister=lister if lister is not None else HttpProviderModelLister(),
         environment=os.environ,
@@ -139,6 +156,7 @@ def _interactive_setup(
     retainable_roles: Mapping[str, frozenset[SetupRole]],
     role_inputs: SetupRoleInputs,
     explicit_providers: tuple[str, ...],
+    offer_recommended_defaults: bool,
     console: Console,
     lister: ProviderModelLister,
     environment: MutableMapping[str, str],
@@ -153,6 +171,7 @@ def _interactive_setup(
         retainable_roles: Exact prior roles each incomplete alias may retain.
         role_inputs: Role values supplied by flags or already persisted.
         explicit_providers: Validated ``--provider`` values that skip the opening list once.
+        offer_recommended_defaults: Whether to offer one verified default assignment.
         console: Terminal used for every screen.
         lister: Provider listing seam, injected by tests so no live request is made.
         environment: Process environment consulted and updated for pasted credentials.
@@ -204,6 +223,23 @@ def _interactive_setup(
                     continue
                 session.endpoints, discovered = prepared
             session.available = (*configured, *discovered)
+            if offer_recommended_defaults:
+                mode = Prompt.ask(
+                    "Setup mode",
+                    choices=["recommended", "custom"],
+                    default="recommended",
+                    console=console,
+                )
+                if mode == "recommended":
+                    result = _recommended_result(
+                        session,
+                        existing_connections=existing_connections,
+                        known_existing_connections=tuple(sorted(existing_connection_providers)),
+                        known_existing_aliases=tuple(sorted(existing_catalog_models)),
+                        existing_models=existing_models,
+                        console=console,
+                    )
+                    return result
             result = _collect_models_and_roles(
                 session,
                 existing_connections=existing_connections,
@@ -218,6 +254,197 @@ def _interactive_setup(
     except SetupCancelled:
         console.print("Setup cancelled. Nothing was written.")
         return None
+
+
+def _recommended_result(
+    session: SetupSession,
+    *,
+    existing_connections: tuple[ProviderConnection, ...],
+    known_existing_connections: tuple[str, ...],
+    known_existing_aliases: tuple[str, ...],
+    existing_models: tuple[ProviderModelSelection, ...],
+    console: Console,
+) -> ProviderSetupResult:
+    """Assign every wizard role from verified discovered model availability.
+
+    Args:
+        session: Provider endpoints and verified available models.
+        existing_connections: Secret-free connections already configured.
+        known_existing_connections: Every persisted connection name.
+        known_existing_aliases: Every persisted model alias.
+        existing_models: Existing configurable model selections.
+        console: Terminal receiving the deterministic summary.
+
+    Returns:
+        Complete setup result ready for the normal atomic catalog commit.
+
+    Raises:
+        ValueError: Verified availability cannot satisfy every required role.
+    """
+    available = tuple(item for item in available_models(session) if item.capabilities is not None)
+    recommendations = tuple(
+        _RecommendationModel(
+            alias=item.alias,
+            provider=item.provider,
+            model=item.model,
+            capabilities=item.capabilities,
+        )
+        for item in available
+        if item.capabilities is not None
+    )
+
+    def eligible(role: SetupRole) -> tuple[_RecommendationModel, ...]:
+        """Return verified models serving one role in deterministic alias order."""
+        return tuple(
+            sorted(
+                (item for item in recommendations if serves_role(item.capabilities, role)),
+                key=lambda item: _recommendation_key(item, role),
+            )
+        )
+
+    world = eligible(SetupRole.WORLD_MODEL)
+    judges = eligible(SetupRole.JUDGE)
+    embedders = eligible(SetupRole.EMBEDDER)
+    if not world or not judges or not embedders:
+        raise ValueError(
+            "recommended defaults need verified world, judge, embedder, and two distinct priced "
+            "router models; choose custom setup to fill the missing roles"
+        )
+    selection = _recommended_router_selection_from_models(
+        recommendations,
+        world_alias=world[0].alias,
+    )
+    aliases = {
+        world[0].alias,
+        judges[0].alias,
+        embedders[0].alias,
+        *selection.candidates,
+    }
+    chosen = tuple(item for item in available if item.alias in aliases)
+    result = build_result(
+        chosen,
+        roles=RoleAssignment(
+            world_model=world[0].alias,
+            judge=judges[0].alias,
+            embedder=embedders[0].alias,
+            candidates=selection.candidates,
+            incumbent=selection.incumbent,
+        ),
+        endpoints=session.endpoints,
+        existing_connections=existing_connections,
+        existing_models=existing_models,
+        known_existing_connections=known_existing_connections,
+        known_existing_aliases=known_existing_aliases,
+    )
+    render_summary(result, chosen=chosen, endpoints=session.endpoints, console=console)
+    return result
+
+
+def _recommendation_key(
+    item: _RecommendationModel,
+    role: SetupRole,
+) -> tuple[int, int, int, float, str, str]:
+    """Rank one verified model by maintained guidance, then capability and cost.
+
+    Args:
+        item: Verified provider-listed model.
+        role: Wizard role being filled.
+
+    Returns:
+        Stable sort key preferring maintained provider guidance before a cost fallback.
+    """
+    rank = recommended_model_rank(item.provider, item.model, role.value)
+    provider_rank = {"openai": 0, "anthropic": 1, "gemini": 2}.get(item.provider, 3)
+    capabilities = item.capabilities
+    assert capabilities is not None
+    if role is SetupRole.EMBEDDER:
+        cost = capabilities.input_cost_per_million_tokens_usd
+    else:
+        input_cost = capabilities.input_cost_per_million_tokens_usd
+        output_cost = capabilities.output_cost_per_million_tokens_usd
+        cost = None if input_cost is None or output_cost is None else input_cost + output_cost
+    return (
+        0 if rank is not None else 1,
+        provider_rank,
+        rank if rank is not None else 10_000,
+        cost if cost is not None else math.inf,
+        item.provider,
+        item.model,
+    )
+
+
+def _recommended_router_selection(catalog: ModelCatalog) -> RouterCandidateSelection:
+    """Choose existing-catalog router defaults through the shared recommendation policy.
+
+    Args:
+        catalog: Secret-free catalog with verified provider, model, and capability metadata.
+
+    Returns:
+        Two deterministic candidates and the eligible world model as incumbent when possible.
+
+    Raises:
+        ValueError: The catalog has fewer than two eligible completion candidates.
+    """
+    models = tuple(
+        _RecommendationModel(
+            alias=alias,
+            provider=catalog.connections[record.connection].provider,
+            model=record.model,
+            capabilities=record.capabilities,
+        )
+        for alias, record in catalog.models.items()
+        if record.capabilities is not None
+    )
+    return _recommended_router_selection_from_models(
+        models,
+        world_alias=catalog.roles.world_model,
+    )
+
+
+def _recommended_router_selection_from_models(
+    models: tuple[_RecommendationModel, ...],
+    *,
+    world_alias: str | None,
+) -> RouterCandidateSelection:
+    """Select an incumbent and provider-diverse alternative from verified models.
+
+    Args:
+        models: Exact verified models available to the current setup.
+        world_alias: Configured world alias preferred as the incumbent when eligible.
+
+    Returns:
+        Two candidates ordered incumbent first and one exact incumbent alias.
+
+    Raises:
+        ValueError: Fewer than two distinct eligible router models are available.
+    """
+    ranked = tuple(
+        sorted(
+            (item for item in models if serves_role(item.capabilities, SetupRole.ROUTER_CANDIDATE)),
+            key=lambda item: _recommendation_key(item, SetupRole.ROUTER_CANDIDATE),
+        )
+    )
+    unique = []
+    identities: set[tuple[str, str]] = set()
+    for item in ranked:
+        identity = (item.provider, item.model)
+        if identity in identities:
+            continue
+        identities.add(identity)
+        unique.append(item)
+    if len(unique) < 2:
+        raise ValueError(
+            "recommended defaults need two distinct priced router models with verified limits"
+        )
+    incumbent = next((item for item in unique if item.alias == world_alias), unique[0])
+    alternative = next(
+        (item for item in unique if item.provider != incumbent.provider),
+        None,
+    ) or next(item for item in unique if item.alias != incumbent.alias)
+    return RouterCandidateSelection(
+        candidates=(incumbent.alias, alternative.alias),
+        incumbent=incumbent.alias,
+    )
 
 
 def _collect_models_and_roles(

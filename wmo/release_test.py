@@ -901,7 +901,7 @@ def _installed_release_driver() -> None:
     try:
         assert not root.exists()
         build_output = run_tty(
-            ["build", "support-agent", str(traces), "--root", str(root)],
+            ["build", "support-agent", "--traces", str(traces), "--root", str(root)],
             setup_answers,
         )
         assert "Model setup is required" in build_output
@@ -917,6 +917,49 @@ def _installed_release_driver() -> None:
         build_counts = state.counts()
         assert build_counts["/v1/embeddings"] > 0
         assert build_counts["/v1/chat/completions"] == 0
+        for expected in (
+            "Build preflight",
+            "traces",
+            "split",
+            "world model  core-model (core-model)",
+            "embedder     core-model (core-model)",
+            "embedding    at most $0.000000",
+            "ceiling      $5.000000",
+        ):
+            assert expected in build_output, build_output
+        assert "Proceed?" not in build_output
+        provider_after_build = state.snapshot()
+        selected_build = support_project.build
+        replay_output = run_cli(
+            "build",
+            "support-agent",
+            "--traces",
+            str(traces),
+            "--root",
+            str(root),
+            "--no-interactive",
+        )
+        assert "reuse exact completed indexes, $0.000000 new spend" in replay_output.stdout
+        assert "Proceed?" not in replay_output.stdout
+        assert state.snapshot() == provider_after_build
+        assert support_store.load_project().build == selected_build
+        dry_run_output = run_cli(
+            "build",
+            "dry-run-agent",
+            "--traces",
+            str(traces),
+            "--root",
+            str(root),
+            "--dry-run",
+            "--no-interactive",
+        )
+        assert "Build preflight" in dry_run_output.stdout
+        assert "dry run complete" in dry_run_output.stdout
+        assert "Proceed?" not in dry_run_output.stdout
+        assert state.snapshot() == provider_after_build
+        dry_run_store = ProjectStore(root, "dry-run-agent")
+        assert dry_run_store.load_project().build is None
+        assert dry_run_store.read_review() is None
         world_model = wmo.load_world_model(
             "support-agent",
             root=root,
@@ -1402,6 +1445,7 @@ def _installed_release_driver() -> None:
         one_result = run_cli(
             "build",
             "one-trace",
+            "--traces",
             str(one_trace),
             "--root",
             str(root),

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
 from rich.console import Console
 
+from wmo.cli.build_cost import over_ceiling_message
 from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.cli.provider_picker import resolve_setup_providers
@@ -61,16 +63,19 @@ from wmo.simulation.world_model.artifact import (
     GroundedWorldModelArtifact,
     persist_grounded_world_model,
 )
-from wmo.simulation.world_model.runtime import load_grounded_world_model
 
 _console = Console()
 _PROJECT_ARGUMENT = typer.Argument(..., metavar="PROJECT", help="Local project name.")
-_TRACE_FILE_ARGUMENT = typer.Argument(
-    ...,
-    metavar="TRACES",
+_LEGACY_TRACE_ARGUMENT = typer.Argument(None, metavar="TRACES", hidden=True)
+_TRACE_FILE_OPTION = typer.Option(
+    None,
+    "--traces",
+    "-t",
+    metavar="PATH",
     help=(
         "Local trace export in the declared --source format, or the JSON source declaration "
-        "of a postgres table."
+        "of a postgres table. Omit it only when bare `wmo build PROJECT` should launch the "
+        "interactive wizard."
     ),
 )
 _PROVIDER_OPTION = typer.Option(
@@ -84,9 +89,18 @@ _PROVIDER_OPTION = typer.Option(
 )
 
 
+@dataclass(frozen=True)
+class GroundedBuildCompletion:
+    """One selected grounded build and whether provider work was replayed."""
+
+    artifacts: ProjectBuildArtifacts
+    reused: bool
+
+
 def build(
     project: str = _PROJECT_ARGUMENT,
-    trace_file: Path = _TRACE_FILE_ARGUMENT,
+    legacy_trace_file: Path | None = _LEGACY_TRACE_ARGUMENT,
+    trace_file: Path | None = _TRACE_FILE_OPTION,
     source: str = typer.Option(
         "otlp",
         "--source",
@@ -108,6 +122,20 @@ def build(
         "--yes",
         help="Confirm an in-budget estimate when the shared policy requires it.",
     ),
+    maximum_router_cost_usd: float | None = typer.Option(
+        None,
+        "--max-router-cost-usd",
+        min=0.01,
+        help=(
+            "Optional automatic-router ceiling for the wizard; omitted uses the exact "
+            "conservative schedule reservation."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show the complete preflight without credentials, provider calls, or selection.",
+    ),
     no_interactive: bool = typer.Option(
         False,
         "--non-interactive",
@@ -118,13 +146,16 @@ def build(
 ) -> None:
     """Build a reusable grounded world model and immutable fit evidence.
 
+    The explicit command and configured build-cost ceiling authorize provider embedding calls.
     Model setup runs first when required catalog state is absent and both terminal streams are
     interactive. The shared catalog commits before project creation. Noninteractive missing state
-    fails before any project or artifact write.
+    fails before any project or artifact write. Configured builds compute and display a complete
+    provider-free preflight before reading credentials or constructing provider clients.
 
     Args:
         project: Safe local project identifier below ``<root>/projects``.
-        trace_file: Explicit local canonical trace export.
+        legacy_trace_file: Active positional trace-path compatibility for packaged examples.
+        trace_file: Explicit local canonical trace export, or ``None`` for the interactive wizard.
         source: Declared local-export format, or ``postgres`` for a table declaration.
         root: Local ``.wmo`` artifact root.
         world_model: Optional configured alias override for this project.
@@ -133,12 +164,43 @@ def build(
         top_k: Positive serving retrieval result limit.
         maximum_build_cost_usd: Strict ceiling for provider embedding calls.
         yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
+        maximum_router_cost_usd: Optional strict wizard router ceiling, or automatic planning.
+        dry_run: Print the complete preflight and stop before credentials or selection.
         no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
 
     Raises:
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
     """
+    if legacy_trace_file is not None:
+        if trace_file is not None:
+            raise typer.BadParameter("provide traces once, using -t/--traces or the trace path")
+        trace_file = legacy_trace_file
+    if trace_file is None:
+        if dry_run or no_interactive or not can_prompt(_console):
+            raise typer.BadParameter(
+                "automation and dry runs require an explicit -t/--traces PATH; bare "
+                "`wmo build PROJECT` is the interactive end-to-end wizard"
+            )
+        from wmo.cli.build_wizard import run_build_wizard
+
+        try:
+            run_build_wizard(
+                project,
+                source=source,
+                root=root,
+                world_model=world_model,
+                judge=judge,
+                embedder=embedder,
+                top_k=top_k,
+                maximum_build_cost_usd=maximum_build_cost_usd,
+                maximum_router_cost_usd=maximum_router_cost_usd,
+                providers=tuple(provider or ()),
+                console=_console,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        return
     started = time.monotonic()
     with usage_error(
         ArtifactStoreError,
@@ -166,6 +228,7 @@ def build(
             runtime_catalog,
             selected,
         )
+        _console.print("[dim]loading[/dim] Normalize trace evidence")
         path = _resolve_trace_file(trace_file)
         normalized = _load_canonical_traces(path, source)
         if not normalized.traces:
@@ -189,6 +252,10 @@ def build(
             created_at=datetime.now(UTC),
             code_revision=code_revision,
         )
+        tasks = completed.artifacts.mining.tasks
+        fit_count = sum(task.partition == "fit" for task in tasks)
+        held_out_count = sum(task.partition == "held_out" for task in tasks)
+        estimate = _embedding_cost_ceiling(completed, embedder_capabilities)
         built = _reuse_completed_grounded_artifacts(
             store,
             completed,
@@ -197,13 +264,38 @@ def build(
             embedder_snapshot=embedder_snapshot,
             top_k=top_k,
         )
-        estimate = 0.0
+        reused = built is not None
+        _render_preflight(
+            accepted=len(completed.artifacts.trace_dataset.dataset.trace_ids),
+            invalid=completed.artifacts.trace_dataset.dataset.invalid_trace_count,
+            fit_count=fit_count,
+            held_out_count=held_out_count,
+            world_alias=selected.world_model,
+            world_model_id=world_snapshot.model_id,
+            embedder_alias=selected.embedder,
+            embedder_model_id=embedder_snapshot.model_id,
+            estimate=estimate,
+            ceiling=maximum_build_cost_usd,
+            reused=reused,
+        )
+        if dry_run:
+            _console.print("[green]dry run complete[/green] No provider calls or build selection.")
+            return
         if built is None:
-            estimate = _embedding_cost_ceiling(completed, embedder_capabilities)
             if estimate > maximum_build_cost_usd:
                 raise ValueError(
-                    f"conservative embedding estimate ${estimate:.6f} exceeds "
-                    f"--max-build-cost-usd ${maximum_build_cost_usd:.6f}"
+                    over_ceiling_message(
+                        estimate=estimate,
+                        ceiling=maximum_build_cost_usd,
+                        project=project,
+                        trace_file=trace_file,
+                        source=source,
+                        root=root,
+                        world_model=world_model,
+                        judge=judge,
+                        embedder=embedder,
+                        top_k=top_k,
+                    )
                 )
         assumptions = (
             (
@@ -227,35 +319,32 @@ def build(
             non_interactive=no_interactive,
         ):
             return
-        resolved_world = runtime_catalog.resolve(selected.world_model)
-        runtime_catalog.resolve(selected.judge)
-        resolved_embedder = runtime_catalog.preflight(
-            selected.embedder,
-            CapabilityRequirement(requires_embeddings=True),
+        completion = _complete_grounded_build(
+            store,
+            completed,
+            selected=selected,
+            runtime_catalog=runtime_catalog,
+            world_snapshot=world_snapshot,
+            embedder_snapshot=embedder_snapshot,
+            top_k=top_k,
+            estimate=estimate,
+            maximum_build_cost_usd=maximum_build_cost_usd,
+            provider_spend_authorized=True,
         )
-        if built is None:
-            built = _build_grounded_artifacts(
-                store,
-                completed,
-                resolved_world=resolved_world,
-                resolved_embedder=resolved_embedder,
-                top_k=top_k,
-            )
-        else:
-            _validate_reused_grounded_artifacts(
-                store,
-                built,
-                resolved_world=resolved_world,
-                resolved_embedder=resolved_embedder,
-            )
-        select_completed_build(store, built, completed.review)
+        built = completion.artifacts
+        reused = completion.reused
     _capture_local_build_telemetry(
         completed.artifacts,
         root=root,
         indexed_steps=_rag_transition_count(store, built.serving_rag.artifact_id),
         duration_seconds=time.monotonic() - started,
     )
-    _render_completed_build(completed, built=built, estimate=estimate)
+    _render_completed_build(
+        completed,
+        built=built,
+        estimate=0.0 if reused else estimate,
+        project=project,
+    )
 
 
 def _load_or_setup_catalog(
@@ -332,6 +421,40 @@ def _missing_build_configuration(catalog: ModelCatalog | None) -> tuple[str, ...
         if getattr(catalog.roles, role) is None:
             missing.append(role)
     return tuple(missing)
+
+
+def _validated_role_snapshots(
+    runtime_catalog: RuntimeModelCatalog,
+    selected: ProjectModelConfiguration,
+) -> tuple[ModelSnapshot, ModelSnapshot, ModelCapabilities]:
+    """Validate build roles from catalog metadata without reading credentials.
+
+    Args:
+        runtime_catalog: Local catalog resolver used only for static snapshots.
+        selected: Frozen world-model, judge, and embedder aliases.
+
+    Returns:
+        World-model snapshot, embedder snapshot, and embedder capabilities.
+
+    Raises:
+        ModelCapabilityError: The embedder cannot prove embedding support.
+        ModelConnectionError: A selected alias is unknown or uses an unsupported provider.
+        ValueError: The embedder omits explicit input pricing.
+    """
+    world_snapshot, _world_capabilities = runtime_catalog.snapshot(selected.world_model)
+    runtime_catalog.snapshot(selected.judge)
+    embedder_snapshot, embedder_capabilities = runtime_catalog.snapshot(selected.embedder)
+    preflight_capabilities(
+        selected.embedder,
+        embedder_capabilities,
+        CapabilityRequirement(requires_embeddings=True),
+    )
+    if embedder_capabilities.input_cost_per_million_tokens_usd is None:
+        raise ValueError(
+            f"embedder alias {selected.embedder!r} has no input_cost_per_million_tokens_usd; "
+            "record explicit pricing before a provider-backed build"
+        )
+    return world_snapshot, embedder_snapshot, embedder_capabilities
 
 
 def _selected_roles(
@@ -476,7 +599,8 @@ def _build_grounded_artifacts(
     store: ProjectStore,
     completed: ProjectBuild,
     *,
-    resolved_world: ResolvedModel,
+    world_alias: str,
+    world_snapshot: ModelSnapshot,
     resolved_embedder: ResolvedModel,
     top_k: int,
 ) -> ProjectBuildArtifacts:
@@ -485,7 +609,8 @@ def _build_grounded_artifacts(
     Args:
         store: Project artifact store receiving immutable outputs.
         completed: Persisted trace and task build.
-        resolved_world: Exact world-model runtime binding.
+        world_alias: Configured world-model alias persisted on the artifact.
+        world_snapshot: Secret-free world-model identity.
         resolved_embedder: Exact provider embedding binding.
         top_k: Default number of retrieved transitions.
 
@@ -512,6 +637,9 @@ def _build_grounded_artifacts(
         maximum_attempts=RetryPolicy().maximum_attempts,
         input_usd_per_million_tokens=embedding_price,
     )
+    _console.print(
+        f"[dim]embedding[/dim] Build serving index with {resolved_embedder.snapshot.model_id}"
+    )
     serving = persist_trace_rag(
         store.artifacts,
         (trace_input,),
@@ -522,6 +650,7 @@ def _build_grounded_artifacts(
         default_top_k=top_k,
         included_partitions=frozenset({"fit", "held_out"}),
     )
+    _console.print("[dim]embedding[/dim] Build fit-only index")
     fit = persist_trace_rag(
         store.artifacts,
         (trace_input,),
@@ -532,11 +661,12 @@ def _build_grounded_artifacts(
         default_top_k=top_k,
         included_partitions=frozenset({"fit"}),
     )
+    _console.print(f"[dim]binding[/dim] Ground world model {world_snapshot.model_id}")
     world = persist_grounded_world_model(
         store.artifacts,
         artifact_input(serving.manifest),
-        model_alias=resolved_world.alias,
-        model=resolved_world.snapshot,
+        model_alias=world_alias,
+        model=world_snapshot,
         created_at=created_at,
         code_revision=revision,
         top_k=top_k,
@@ -548,6 +678,72 @@ def _build_grounded_artifacts(
         fit_rag=artifact_input(fit.manifest),
         world_model=artifact_input(world.manifest),
     )
+
+
+def _complete_grounded_build(
+    store: ProjectStore,
+    completed: ProjectBuild,
+    *,
+    selected: ProjectModelConfiguration,
+    runtime_catalog: RuntimeModelCatalog,
+    world_snapshot: ModelSnapshot,
+    embedder_snapshot: ModelSnapshot,
+    top_k: int,
+    estimate: float,
+    maximum_build_cost_usd: float,
+    provider_spend_authorized: bool,
+) -> GroundedBuildCompletion:
+    """Select matching grounded artifacts or execute their bounded embedding work.
+
+    Args:
+        store: Project receiving or replaying the completed build selection.
+        completed: Deterministic trace and representative-task evidence.
+        selected: Exact project role aliases.
+        runtime_catalog: Catalog that can resolve the selected embedder after authorization.
+        world_snapshot: Exact provider-free world-model identity.
+        embedder_snapshot: Exact provider-free embedder identity.
+        top_k: Frozen retrieval result count.
+        estimate: Conservative retry-inclusive embedding cost.
+        maximum_build_cost_usd: Strict grounded-build provider ceiling.
+        provider_spend_authorized: Whether new embedding calls are authorized.
+
+    Returns:
+        Exact selected build artifacts and whether they were replayed.
+
+    Raises:
+        ValueError: New provider work is unapproved or exceeds its strict ceiling.
+    """
+    built = _reuse_completed_grounded_artifacts(
+        store,
+        completed,
+        world_alias=selected.world_model,
+        world_snapshot=world_snapshot,
+        embedder_snapshot=embedder_snapshot,
+        top_k=top_k,
+    )
+    reused = built is not None
+    if built is None and not provider_spend_authorized:
+        raise ValueError("grounded build provider work requires explicit authorization")
+    if built is None:
+        if estimate > maximum_build_cost_usd:
+            raise ValueError(
+                f"grounded build requires ${estimate:.6f}, above the configured "
+                f"${maximum_build_cost_usd:.6f} ceiling"
+            )
+        resolved_embedder = runtime_catalog.preflight(
+            selected.embedder,
+            CapabilityRequirement(requires_embeddings=True),
+        )
+        built = _build_grounded_artifacts(
+            store,
+            completed,
+            world_alias=selected.world_model,
+            world_snapshot=world_snapshot,
+            resolved_embedder=resolved_embedder,
+            top_k=top_k,
+        )
+    select_completed_build(store, built, completed.review)
+    return GroundedBuildCompletion(artifacts=built, reused=reused)
 
 
 def _reuse_completed_grounded_artifacts(
@@ -606,46 +802,6 @@ def _reuse_completed_grounded_artifacts(
     return existing
 
 
-def _validate_reused_grounded_artifacts(
-    store: ProjectStore,
-    existing: ProjectBuildArtifacts,
-    *,
-    resolved_world: ResolvedModel,
-    resolved_embedder: ResolvedModel,
-) -> None:
-    """Preserve runtime validation for a statically matched zero-call replay.
-
-    Args:
-        store: Project artifact store containing the completed build.
-        existing: Exact build pointers matched before cost authorization.
-        resolved_world: Post-authorization world-model runtime binding.
-        resolved_embedder: Post-authorization embedding runtime binding.
-
-    Raises:
-        ValueError: Runtime pricing or immutable artifact identity is invalid.
-    """
-    assert resolved_embedder.embedding_client is not None
-    embedding_price = resolved_embedder.capabilities.input_cost_per_million_tokens_usd
-    if embedding_price is None:  # pragma: no cover - static capability validation requires it
-        raise ValueError("the selected embedder has no explicit input price")
-    runtime = load_grounded_world_model(
-        store.artifacts,
-        existing.world_model.artifact_id,
-        client=resolved_world.client,
-        embedder=RAGEmbedderBinding(
-            client=resolved_embedder.embedding_client,
-            snapshot=resolved_embedder.snapshot,
-            maximum_attempts=RetryPolicy().maximum_attempts,
-            input_usd_per_million_tokens=embedding_price,
-        ),
-    )
-    if (
-        runtime.artifact.model_alias != resolved_world.alias
-        or runtime.artifact.model != resolved_world.snapshot
-    ):
-        raise ValueError("completed grounded world model differs from the selected runtime model")
-
-
 def _lineage_bindings(completed: ProjectBuild) -> tuple[RAGLineageBinding, ...]:
     """Convert frozen duplicate groups into complete RAG lineage partition bindings.
 
@@ -685,7 +841,9 @@ def _resolve_trace_file(trace_file: Path) -> Path:
     if not trace_file.exists():
         raise typer.BadParameter(f"trace file not found: {trace_file}")
     if not trace_file.is_file():
-        raise typer.BadParameter(f"TRACES must be a trace export, not a directory: {trace_file}")
+        raise typer.BadParameter(
+            f"--traces must name a trace export, not a directory: {trace_file}"
+        )
     return trace_file
 
 
@@ -750,11 +908,53 @@ def _rag_transition_count(store: ProjectStore, artifact_id: str) -> int:
     return load_rag_index(store.artifacts, artifact_id).index.transition_count
 
 
+def _render_preflight(
+    *,
+    accepted: int,
+    invalid: int,
+    fit_count: int,
+    held_out_count: int,
+    world_alias: str,
+    world_model_id: str,
+    embedder_alias: str,
+    embedder_model_id: str,
+    estimate: float,
+    ceiling: float,
+    reused: bool,
+) -> None:
+    """Print the complete build preflight before credentials or provider dispatch.
+
+    Args:
+        accepted: Count of valid normalized traces.
+        invalid: Count of rejected input traces.
+        fit_count: Representative fit-task count.
+        held_out_count: Representative held-out task count.
+        world_alias: Selected world-model catalog alias.
+        world_model_id: Provider model ID bound to that alias.
+        embedder_alias: Selected embedder catalog alias.
+        embedder_model_id: Provider embedding model ID bound to that alias.
+        estimate: Conservative maximum embedding cost in USD.
+        ceiling: Configured ``--max-build-cost-usd`` value.
+        reused: Whether an exact completed grounded build already exists.
+    """
+    _console.print("[bold]Build preflight[/bold]")
+    _console.print(f"  traces       {accepted} accepted, {invalid} invalid")
+    _console.print(f"  split        {fit_count} fit, {held_out_count} held out")
+    _console.print(f"  world model  {world_alias} ({world_model_id})")
+    _console.print(f"  embedder     {embedder_alias} ({embedder_model_id})")
+    if reused:
+        _console.print("  embedding    reuse exact completed indexes, $0.000000 new spend")
+    else:
+        _console.print(f"  embedding    at most ${estimate:.6f}")
+    _console.print(f"  ceiling      ${ceiling:.6f}")
+
+
 def _render_completed_build(
     completed: ProjectBuild,
     *,
     built: ProjectBuildArtifacts,
     estimate: float,
+    project: str,
 ) -> None:
     """Present exact accepted, excluded, split, and grounded artifact identities.
 
@@ -762,10 +962,12 @@ def _render_completed_build(
         completed: Persisted project build and mining results.
         built: Exact completed grounded-artifact pointers.
         estimate: Conservative provider embedding spend ceiling.
+        project: Local project identifier used in the next recommended command.
     """
     dataset = completed.artifacts.trace_dataset.dataset
     tasks = completed.artifacts.mining.tasks
     duplicate_count = len(dataset.trace_ids) - len(completed.artifacts.mining.analysis.candidates)
+    _console.print("[bold green]Build complete[/bold green]")
     _console.print(
         f"[green]built[/green] {len(dataset.trace_ids)} accepted, "
         f"{dataset.invalid_trace_count} invalid, {duplicate_count} duplicate"
@@ -781,3 +983,4 @@ def _render_completed_build(
         f"fit RAG {built.fit_rag.artifact_id}, world model {built.world_model.artifact_id}"
     )
     _console.print(f"embedding spend ceiling: ${estimate:.6f}")
+    _console.print(f"next: wmo optimize router {project}")

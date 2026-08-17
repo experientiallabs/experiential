@@ -64,10 +64,29 @@ class KnnBankManifest(ArtifactEnvelope):
     @field_validator("bank_path")
     @classmethod
     def _require_safe_bank_path(cls, value: str) -> str:
+        """Normalize a safe artifact-relative bank path.
+
+        Args:
+            value: Candidate artifact-relative path.
+
+        Returns:
+            The normalized POSIX path.
+
+        Raises:
+            ValueError: The path can escape the artifact directory.
+        """
         return validate_artifact_file_path(value).as_posix()
 
     @model_validator(mode="after")
     def _require_aligned_bank_scope(self) -> KnnBankManifest:
+        """Validate the bank task, candidate, and evidence-count axes.
+
+        Returns:
+            The validated bank manifest.
+
+        Raises:
+            ValueError: An axis is empty, duplicated, or misaligned.
+        """
         if not self.task_ids or len(set(self.task_ids)) != len(self.task_ids):
             raise ValueError("kNN bank task IDs must be non-empty and unique")
         if not self.candidate_aliases or len(set(self.candidate_aliases)) != len(
@@ -173,6 +192,7 @@ def build_knn_bank(
     *,
     embedder: EmbeddingClient,
     feature_extractor: RouterFeatureExtractor,
+    world_model_fidelity_required: bool = True,
 ) -> KnnEvidenceBank:
     """Build a normalized bank using eligible fit rows and request-visible task features.
 
@@ -182,6 +202,7 @@ def build_knn_bank(
         reports: Fidelity reports used to admit or reject world-model evidence.
         embedder: Exact fit-time embedding client named by the optimization spec.
         feature_extractor: Frozen request-visible feature implementation.
+        world_model_fidelity_required: Whether simulated rows need a measured fidelity report.
 
     Returns:
         In-memory deterministic bank containing no held-out task.
@@ -214,7 +235,12 @@ def build_knn_bank(
             raise ValueError("evaluation repeats a fit task, candidate, and repeat cell")
         seen_cells.add(key)
         protocol = protocols[row.protocol_id]
-        if not _protocol_is_eligible(protocol, reports, dataset):
+        if not _protocol_is_eligible(
+            protocol,
+            reports,
+            dataset,
+            world_model_fidelity_required=world_model_fidelity_required,
+        ):
             continue
         if row.status not in {"observed", "completed"}:
             continue
@@ -357,10 +383,24 @@ def _protocol_is_eligible(
     protocol: EvaluationProtocol,
     reports: Mapping[str, FidelityReport],
     dataset: EvaluationDataset,
+    *,
+    world_model_fidelity_required: bool,
 ) -> bool:
-    """Admit production and sandbox evidence, plus fidelity-approved world-model rows."""
+    """Admit direct or completed world-model evidence under the plan's fidelity requirement.
+
+    Args:
+        protocol: Evidence protocol used by one completed fit row.
+        reports: Verified measured-fidelity reports available to the dataset.
+        dataset: Exact evaluation scope owning the completed row.
+        world_model_fidelity_required: Whether simulated evidence needs a measured report.
+
+    Returns:
+        Whether the row may contribute to the fitted evidence bank.
+    """
     if protocol.evidence_source in {"production", "sandbox"}:
         return True
+    if not world_model_fidelity_required:
+        return protocol.evidence_source == "world_model" and protocol.fidelity_report_id is None
     return world_model_protocol_is_eligible(
         protocol,
         dict(reports),

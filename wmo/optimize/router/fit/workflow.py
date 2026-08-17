@@ -289,7 +289,11 @@ def _verify_completed_inputs(
     purposes = {cell.purpose for cell in plan.cells}
     if "fit" not in purposes or "held_out" not in purposes:
         raise RouterWorkflowError("router optimization needs one combined fit and held-out plan")
-    expected = {"fit", "fidelity"} if required_purpose == "fit" else {"held_out"}
+    expected = (
+        ({"fit", "fidelity"} if "fidelity" in purposes else {"fit"})
+        if required_purpose == "fit"
+        else {"held_out"}
+    )
     cells_by_id = {cell.cell_id: cell for cell in plan.cells}
     unknown = sorted(
         item.cell_id for item in value.cell_evidence if item.cell_id not in cells_by_id

@@ -29,6 +29,7 @@ from wmo.common.evaluations.evidence import (
     read_calibration,
     read_evaluation_plan,
     read_fidelity_report,
+    read_fidelity_thresholds,
     sorted_evaluation_inputs,
 )
 from wmo.common.models import (
@@ -148,7 +149,7 @@ class RouterOptimizer:
             pricing_aliases=tuple(item.candidate_alias for item in pricing.candidate_prices),
         )
         reports, report_inputs = _load_reports(self._store, dataset)
-        _require_protocol_compatibility(
+        zero_reusable_history = _require_protocol_compatibility(
             self._store,
             dataset,
             reports,
@@ -163,6 +164,7 @@ class RouterOptimizer:
             reports,
             embedder=self._embedder,
             feature_extractor=self._feature_extractor,
+            world_model_fidelity_required=not zero_reusable_history,
         )
         baseline = choose_baseline(bank, incumbent_alias=spec.incumbent_alias)
         bank_manifest, bank_input = _persist_bank(
@@ -708,15 +710,59 @@ def _require_protocol_compatibility(
     judgment_status: str,
     tasks: Sequence[TaskCase],
     evaluation_inputs: Sequence[ArtifactInput],
-) -> None:
-    """Require all usable fit evidence to share agent, rubric, judge, and pricing identity."""
+) -> bool:
+    """Require compatible fit evidence and return whether every main cell was simulated.
+
+    Args:
+        store: Project-local immutable artifact store.
+        dataset: Fit evaluation dataset under verification.
+        reports: Verified measured-fidelity reports available to the dataset.
+        pricing_snapshot_id: Exact frozen candidate pricing identity.
+        judgment_status: Required judge calibration status.
+        tasks: Exact task-set cases bound to the evaluation plan.
+        evaluation_inputs: Recursively verified evaluation artifact inputs.
+
+    Returns:
+        Whether the plan intentionally reused zero historical candidate cells.
+
+    Raises:
+        RouterOptimizationError: Eligible protocols or their immutable identities disagree.
+    """
     protocols = {item.protocol_id: item for item in dataset.manifest.protocols}
+    plan, _plan_input = read_evaluation_plan(store, dataset.manifest.evaluation_plan_id)
+    retained_thresholds_input = next(
+        (item for item in plan.inputs if item.artifact_id == plan.fidelity_thresholds_id),
+        None,
+    )
+    zero_reusable_history = (
+        not any(cell.purpose == "fidelity" for cell in plan.cells)
+        and retained_thresholds_input is not None
+    )
+    if zero_reusable_history:
+        thresholds, thresholds_input = read_fidelity_thresholds(
+            store,
+            plan.fidelity_thresholds_id,
+        )
+        if (
+            thresholds.planned_overlaps != 0
+            or thresholds.minimum_usable_overlaps != 0
+            or thresholds_input != retained_thresholds_input
+            or thresholds_input.sha256 != plan.fidelity_thresholds_sha256
+        ):
+            raise RouterOptimizationError(
+                "an evaluation plan without fidelity cells requires retained zero thresholds"
+            )
     used_protocol_ids = {
         row.protocol_id
         for row in dataset.rows
         if row.purpose == "fit"
         and row.status in {"observed", "completed"}
-        and _protocol_is_eligible(protocols[row.protocol_id], reports, dataset)
+        and _protocol_is_eligible(
+            protocols[row.protocol_id],
+            reports,
+            dataset,
+            zero_reusable_history=zero_reusable_history,
+        )
     }
     if not used_protocol_ids:
         raise RouterOptimizationError("evaluation has no eligible completed fit evidence")
@@ -756,20 +802,41 @@ def _require_protocol_compatibility(
             raise RouterOptimizationError(
                 "judge calibration does not seal every router-held-out lineage"
             )
+    return zero_reusable_history
 
 
 def _protocol_is_eligible(
     protocol: EvaluationProtocol,
     reports: Mapping[str, FidelityReport],
     dataset: EvaluationDataset,
+    *,
+    zero_reusable_history: bool,
 ) -> bool:
-    """Admit direct execution and only fidelity-approved world-model evidence."""
-    return protocol.evidence_source in {"production", "sandbox"} or (
-        world_model_protocol_is_eligible(
-            protocol,
-            dict(reports),
-            evaluation_plan_id=dataset.manifest.evaluation_plan_id,
-            evaluation_plan_sha256=dataset.manifest.evaluation_plan_sha256,
+    """Admit direct execution and complete planned world-model schedules.
+
+    Args:
+        protocol: Evidence protocol used by one completed fit row.
+        reports: Verified measured-fidelity reports available to the dataset.
+        dataset: Exact evaluation scope owning the completed row.
+        zero_reusable_history: Whether the plan intentionally simulated every main cell.
+
+    Returns:
+        Whether this protocol may contribute completed evidence to router fitting.
+    """
+    return (
+        protocol.evidence_source in {"production", "sandbox"}
+        or (
+            zero_reusable_history
+            and protocol.evidence_source == "world_model"
+            and protocol.fidelity_report_id is None
+        )
+        or (
+            world_model_protocol_is_eligible(
+                protocol,
+                dict(reports),
+                evaluation_plan_id=dataset.manifest.evaluation_plan_id,
+                evaluation_plan_sha256=dataset.manifest.evaluation_plan_sha256,
+            )
         )
     )
 

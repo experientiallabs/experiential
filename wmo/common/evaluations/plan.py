@@ -24,6 +24,14 @@ class EvaluationCell(ContractModel):
 
     @model_validator(mode="after")
     def _require_explicit_evidence_shape(self) -> EvaluationCell:
+        """Validate the evidence references required by this cell's execution mode.
+
+        Returns:
+            The validated evaluation cell.
+
+        Raises:
+            ValueError: The execution mode and evidence references disagree.
+        """
         if self.execution == "observed" and self.observed_rollout_id is None:
             raise ValueError("observed evaluation cells require observed_rollout_id")
         if self.execution == "simulate" and self.observed_rollout_id is not None:
@@ -40,8 +48,8 @@ class FidelityThresholds(ArtifactEnvelope):
     """Reusable numerical thresholds with no authority over any evaluation plan."""
 
     fidelity_thresholds_id: ArtifactId
-    planned_overlaps: int = Field(default=10, gt=0)
-    minimum_usable_overlaps: int = Field(default=8, gt=0)
+    planned_overlaps: int = Field(default=10, ge=0)
+    minimum_usable_overlaps: int = Field(default=8, ge=0)
     maximum_score_mae: float = Field(default=0.10, ge=0)
 
     @model_validator(mode="after")
@@ -56,6 +64,8 @@ class FidelityThresholds(ArtifactEnvelope):
         """
         if self.minimum_usable_overlaps > self.planned_overlaps:
             raise ValueError("minimum usable fidelity overlaps cannot exceed planned overlaps")
+        if (self.planned_overlaps == 0) != (self.minimum_usable_overlaps == 0):
+            raise ValueError("zero fidelity planning requires a zero usable denominator")
         return self
 
 
@@ -70,8 +80,8 @@ class FidelityGate(ArtifactEnvelope):
     protocol_sha256: Sha256
     task_model_scope_sha256: Sha256
     overlap_cell_ids: tuple[ArtifactId, ...]
-    planned_overlaps: int = Field(default=10, gt=0)
-    minimum_usable_overlaps: int = Field(default=8, gt=0)
+    planned_overlaps: int = Field(default=10, ge=0)
+    minimum_usable_overlaps: int = Field(default=8, ge=0)
     maximum_score_mae: float = Field(default=0.10, ge=0)
 
     @model_validator(mode="after")
@@ -86,6 +96,8 @@ class FidelityGate(ArtifactEnvelope):
         """
         if self.minimum_usable_overlaps > self.planned_overlaps:
             raise ValueError("minimum usable fidelity overlaps cannot exceed planned overlaps")
+        if (self.planned_overlaps == 0) != (self.minimum_usable_overlaps == 0):
+            raise ValueError("zero fidelity planning requires a zero usable denominator")
         return self
 
 
@@ -107,6 +119,17 @@ class EvaluationPlan(ArtifactEnvelope):
     def _require_unique_candidates(
         cls, value: tuple[RoutedCandidateSnapshot, ...]
     ) -> tuple[RoutedCandidateSnapshot, ...]:
+        """Require a nonempty candidate sequence with unique aliases.
+
+        Args:
+            value: Candidate snapshots in plan order.
+
+        Returns:
+            The validated candidate snapshots.
+
+        Raises:
+            ValueError: The sequence is empty or repeats an alias.
+        """
         aliases = tuple(candidate.alias for candidate in value)
         if not aliases:
             raise ValueError("an evaluation plan needs at least one candidate")
@@ -117,6 +140,17 @@ class EvaluationPlan(ArtifactEnvelope):
     @field_validator("cells")
     @classmethod
     def _require_unique_cells(cls, value: tuple[EvaluationCell, ...]) -> tuple[EvaluationCell, ...]:
+        """Require a nonempty cell sequence with unique cell identities.
+
+        Args:
+            value: Evaluation cells in plan order.
+
+        Returns:
+            The validated evaluation cells.
+
+        Raises:
+            ValueError: The sequence is empty or repeats a cell identity.
+        """
         cell_ids = tuple(cell.cell_id for cell in value)
         if not cell_ids:
             raise ValueError("an evaluation plan needs at least one cell")
@@ -126,6 +160,14 @@ class EvaluationPlan(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_consistent_cell_references(self) -> EvaluationPlan:
+        """Validate candidate scope, unique coordinates, and fidelity comparisons.
+
+        Returns:
+            The validated evaluation plan.
+
+        Raises:
+            ValueError: A cell falls outside the plan scope or has invalid references.
+        """
         candidate_aliases = {candidate.alias for candidate in self.candidate_snapshots}
         cells_by_id = {cell.cell_id: cell for cell in self.cells}
         planned_cell_keys: set[tuple[ArtifactId, ModelAlias, int, str]] = set()

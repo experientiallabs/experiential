@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from typing import Literal
 
+from pydantic import Field, model_validator
+
+from wmo.common.core.artifacts import ContractModel, Sha256, sha256_json
 from wmo.common.models import (
     CompletionCostReservation,
     EmbeddingCostReservation,
     ModelCatalog,
     ModelSnapshot,
     RoutedCandidateSnapshot,
+    RouterCandidateSelection,
     completion_cost_reservation,
 )
 from wmo.common.routing import (
@@ -20,7 +26,138 @@ from wmo.common.routing import (
 )
 from wmo.common.tasks import TaskCase
 from wmo.optimize.router.judging.contracts import ManualJudgeCalibrationAudit
+from wmo.runtime.models import RuntimeModelCatalog
+from wmo.simulation.engines.text.grounding import maximum_query_reservation
 from wmo.simulation.specs import CandidateCompletionReservation
+
+
+@dataclass(frozen=True)
+class AutomaticRouterOptions:
+    """Tasteful bounded controls for one automatic router optimization."""
+
+    maximum_provider_cost_usd: float = 25.0
+    maximum_judgments: int = 100
+    preferred_fidelity_overlaps: int = 10
+    maximum_model_calls: int = 8
+    maximum_router_feature_tokens: int = 8_192
+    maximum_retrieval_query_tokens: int = 32_768
+    router_embedding_maximum_attempts: int = 3
+    completion_maximum_attempts: int = 3
+    simulation_maximum_output_tokens: int = 16_000
+    maximum_concurrency: int = 1
+    seed: int = 0
+
+
+class CandidateEpisodeCostPlan(ContractModel):
+    """One candidate's complete retry-bound simulation schedule."""
+
+    candidate_alias: str = Field(min_length=1)
+    episode_count: int = Field(gt=0)
+    maximum_steps_per_episode: int = Field(gt=0)
+    query_cost_per_step_usd: float = Field(ge=0)
+    candidate_cost_per_step_usd: float = Field(ge=0)
+    world_cost_per_step_usd: float = Field(ge=0)
+    schedule_cost_usd: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _require_complete_schedule(self) -> CandidateEpisodeCostPlan:
+        """Verify the persisted candidate schedule includes every possible step.
+
+        Returns:
+            The unchanged validated candidate schedule.
+
+        Raises:
+            ValueError: The schedule total omits an episode, step, or provider reservation.
+        """
+        expected = (
+            self.episode_count
+            * self.maximum_steps_per_episode
+            * math.fsum(
+                (
+                    self.query_cost_per_step_usd,
+                    self.candidate_cost_per_step_usd,
+                    self.world_cost_per_step_usd,
+                )
+            )
+        )
+        if not math.isclose(self.schedule_cost_usd, expected, rel_tol=1e-12, abs_tol=1e-12):
+            raise ValueError("candidate episode schedule differs from its complete reservation")
+        return self
+
+
+class AutomaticRouterCostPlan(ContractModel):
+    """Pure conservative cost plan for one complete automatic-router schedule."""
+
+    schema_version: Literal[1] = 1
+    task_count: int = Field(gt=0)
+    candidate_count: int = Field(ge=2)
+    preferred_fidelity_overlaps: int = Field(gt=0)
+    fidelity_overlap_count: int = Field(ge=0)
+    maximum_judgments: int = Field(gt=0)
+    judge_calls_per_judgment: Literal[1, 2]
+    maximum_judge_provider_calls: int = Field(gt=0)
+    simulated_episode_count: int = Field(gt=0)
+    router_embedding_cost_usd: float = Field(ge=0)
+    judgment_cost_usd: float = Field(ge=0)
+    candidate_episodes: tuple[CandidateEpisodeCostPlan, ...] = Field(min_length=2)
+    simulation_cost_usd: float = Field(ge=0)
+    required_provider_cost_usd: float = Field(ge=0)
+
+    @property
+    def cost_plan_sha256(self) -> Sha256:
+        """Return the digest of every count and conservative reservation in this plan."""
+        return sha256_json(self.model_dump(mode="json"))
+
+    @model_validator(mode="after")
+    def _require_complete_plan(self) -> AutomaticRouterCostPlan:
+        """Verify exact counts and the full provider schedule arithmetic.
+
+        Returns:
+            The unchanged validated cost plan.
+
+        Raises:
+            ValueError: Counts, candidate schedules, or the total reservation are incomplete.
+        """
+        if self.maximum_judgments != (
+            self.task_count * self.candidate_count + self.fidelity_overlap_count
+        ):
+            raise ValueError("maximum judgments differ from tasks, candidates, and overlaps")
+        if self.fidelity_overlap_count > self.preferred_fidelity_overlaps:
+            raise ValueError("admitted fidelity overlaps exceed the preferred limit")
+        if self.maximum_judge_provider_calls != (
+            self.maximum_judgments * self.judge_calls_per_judgment
+        ):
+            raise ValueError("judge provider calls differ from the exact judgment schedule")
+        if self.simulated_episode_count != self.task_count * self.candidate_count:
+            raise ValueError("simulated episodes differ from the complete task-candidate grid")
+        aliases = tuple(item.candidate_alias for item in self.candidate_episodes)
+        if len(aliases) != self.candidate_count or len(set(aliases)) != len(aliases):
+            raise ValueError("candidate episode schedules must cover each candidate exactly once")
+        if any(item.episode_count != self.task_count for item in self.candidate_episodes):
+            raise ValueError("each candidate schedule must reserve every task episode")
+        expected_simulation = math.fsum(item.schedule_cost_usd for item in self.candidate_episodes)
+        if not math.isclose(
+            self.simulation_cost_usd,
+            expected_simulation,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("simulation total differs from the candidate schedules")
+        expected_total = math.fsum(
+            (
+                self.router_embedding_cost_usd,
+                self.judgment_cost_usd,
+                self.simulation_cost_usd,
+            )
+        )
+        if not math.isclose(
+            self.required_provider_cost_usd,
+            expected_total,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("provider total differs from the complete automatic schedule")
+        return self
 
 
 def router_feature_reservation(
@@ -245,8 +382,10 @@ def judge_completion_reservation(
     judge_alias: str | None,
     judge: ModelSnapshot | None,
     audit: ManualJudgeCalibrationAudit | None,
+    provisional: bool = False,
+    provisional_maximum_attempts: int = 3,
 ) -> CompletionCostReservation | None:
-    """Freeze production judge calls to the exact approved calibration budget.
+    """Freeze judge calls to approved bounds or a conservative provisional policy.
 
     Args:
         problems: Mutable aggregate problem list.
@@ -254,22 +393,42 @@ def judge_completion_reservation(
         judge_alias: Build-frozen judge alias.
         judge: Exact judge model snapshot.
         audit: Approved manual calibration audit with consented request bounds.
+        provisional: Whether a zero-label calibration may use current conservative bounds.
+        provisional_maximum_attempts: Retry ceiling for provisional judging.
 
     Returns:
         Exact production judge request reservation, or ``None`` when unavailable.
     """
-    if judge_alias is None or judge is None or audit is None:
+    if judge_alias is None or judge is None or (audit is None and not provisional):
         return None
     capabilities = catalog.models[judge_alias].capabilities
     if capabilities is None:
         return None
-    budget = audit.budget
-    if (
-        capabilities.input_cost_per_million_tokens_usd != budget.input_usd_per_million_tokens
-        or capabilities.output_cost_per_million_tokens_usd != budget.output_usd_per_million_tokens
-    ):
-        problems.append("approved judge calibration prices differ from the active catalog")
-        return None
+    if audit is not None:
+        budget = audit.budget
+        input_price = budget.input_usd_per_million_tokens
+        output_price = budget.output_usd_per_million_tokens
+        maximum_attempts = budget.maximum_attempts_per_call
+        maximum_input_tokens = budget.maximum_input_tokens_per_call
+        maximum_output_tokens = budget.maximum_output_tokens_per_call
+        if (
+            capabilities.input_cost_per_million_tokens_usd != input_price
+            or capabilities.output_cost_per_million_tokens_usd != output_price
+        ):
+            problems.append("approved judge calibration prices differ from the active catalog")
+            return None
+    else:
+        input_price = capabilities.input_cost_per_million_tokens_usd
+        output_price = capabilities.output_cost_per_million_tokens_usd
+        context = capabilities.context_window_tokens
+        maximum_output_tokens = min(capabilities.maximum_output_tokens or 4_096, 4_096)
+        if input_price is None or output_price is None or context is None:
+            return None
+        maximum_input_tokens = min(32_768, context - maximum_output_tokens)
+        maximum_attempts = provisional_maximum_attempts
+        if maximum_input_tokens <= 0 or maximum_attempts <= 0:
+            problems.append("provisional judge request bounds exceed active context capacity")
+            return None
     cached_input_price = capabilities.cached_input_cost_per_million_tokens_usd
     cache_write_price = capabilities.cache_write_cost_per_million_tokens_usd
     if cached_input_price is None or cache_write_price is None:
@@ -277,13 +436,13 @@ def judge_completion_reservation(
     try:
         reservation = completion_cost_reservation(
             model=judge,
-            input_usd_per_million_tokens=budget.input_usd_per_million_tokens,
-            output_usd_per_million_tokens=budget.output_usd_per_million_tokens,
+            input_usd_per_million_tokens=input_price,
+            output_usd_per_million_tokens=output_price,
             cached_input_usd_per_million_tokens=cached_input_price,
             cache_write_usd_per_million_tokens=cache_write_price,
-            maximum_attempts=budget.maximum_attempts_per_call,
-            maximum_input_tokens=budget.maximum_input_tokens_per_call,
-            maximum_output_tokens=budget.maximum_output_tokens_per_call,
+            maximum_attempts=maximum_attempts,
+            maximum_input_tokens=maximum_input_tokens,
+            maximum_output_tokens=maximum_output_tokens,
         )
     except ValueError as exc:
         problems.append(f"judge reservation: {exc}")
@@ -295,6 +454,168 @@ def judge_completion_reservation(
         problems.append("approved judge request reservation exceeds active context capacity")
         return None
     return reservation
+
+
+def plan_automatic_router_cost(
+    tasks: tuple[TaskCase, ...],
+    catalog: ModelCatalog,
+    selection: RouterCandidateSelection,
+    *,
+    world_model_alias: str,
+    judge_alias: str,
+    embedder_alias: str,
+    judge_response_shape: Literal["scalar", "boolean", "categorical", "pairwise"],
+    judge_audit: ManualJudgeCalibrationAudit | None,
+    provisional_judge: bool,
+    fidelity_overlap_count: int,
+    options: AutomaticRouterOptions,
+) -> AutomaticRouterCostPlan:
+    """Plan every possible automatic-router provider call without I/O.
+
+    Args:
+        tasks: Exact representative task schedule.
+        catalog: Static secret-free model catalog.
+        selection: Exact candidate set and incumbent.
+        world_model_alias: Build-selected world-model alias.
+        judge_alias: Build-selected judge alias.
+        embedder_alias: Build-selected embedding alias.
+        judge_response_shape: Finalized judge response protocol.
+        judge_audit: Human-approved request bounds, when selected.
+        provisional_judge: Whether conservative zero-label judge bounds apply.
+        fidelity_overlap_count: Exact real overlap count admitted to fidelity validation.
+        options: Quality, retry, token, and episode ceilings.
+
+    Returns:
+        Complete deterministic reservation for the task-candidate schedule.
+
+    Raises:
+        ValueError: Static identities, capacities, prices, or reservations are incomplete.
+    """
+    problems: list[str] = []
+    if not tasks:
+        problems.append("automatic cost plan requires at least one task")
+    resolver = RuntimeModelCatalog(catalog, environment={})
+
+    def snapshot(alias: str, label: str) -> ModelSnapshot | None:
+        """Resolve one static catalog identity and collect a labeled error.
+
+        Args:
+            alias: Stable local model alias.
+            label: User-facing role name for diagnostics.
+
+        Returns:
+            Static model identity, or ``None`` after recording a failure.
+        """
+        try:
+            value, _capabilities = resolver.snapshot(alias)
+        except ValueError as exc:
+            problems.append(f"{label}: {exc}")
+            return None
+        return value
+
+    candidate_snapshots = tuple(
+        RoutedCandidateSnapshot(alias=alias, model=model)
+        for alias in selection.candidates
+        if (model := snapshot(alias, f"candidate {alias!r}")) is not None
+    )
+    world = snapshot(world_model_alias, "world model")
+    judge = snapshot(judge_alias, "judge")
+    embedder = snapshot(embedder_alias, "embedder")
+    router = router_feature_reservation(
+        problems,
+        catalog,
+        embedder_alias,
+        embedder,
+        tasks,
+        options.maximum_router_feature_tokens,
+        options.router_embedding_maximum_attempts,
+    )
+    query = retrieval_embedding_reservation(
+        problems,
+        catalog,
+        embedder_alias,
+        embedder,
+        options.maximum_retrieval_query_tokens,
+        options.router_embedding_maximum_attempts,
+    )
+    candidates, world_request = simulation_completion_reservations(
+        problems,
+        catalog=catalog,
+        candidates=candidate_snapshots,
+        world_alias=world_model_alias,
+        world=world,
+        maximum_attempts=options.completion_maximum_attempts,
+        maximum_output_tokens=options.simulation_maximum_output_tokens,
+    )
+    judge_request = judge_completion_reservation(
+        problems,
+        catalog=catalog,
+        judge_alias=judge_alias,
+        judge=judge,
+        audit=judge_audit,
+        provisional=provisional_judge,
+        provisional_maximum_attempts=options.completion_maximum_attempts,
+    )
+    if len(candidate_snapshots) != len(selection.candidates):
+        problems.append("automatic cost plan could not resolve every selected candidate")
+    if len(candidates) != len(selection.candidates):
+        problems.append("automatic cost plan lacks a request reservation for a candidate")
+    if any(value is None for value in (router, query, world_request, judge_request)):
+        problems.append("automatic cost plan has incomplete provider reservations")
+    if problems:
+        raise ValueError("automatic router cost plan failed:\n- " + "\n- ".join(problems))
+    assert router is not None and query is not None
+    assert world_request is not None and judge_request is not None
+    query_economics = maximum_query_reservation(query).cost_usd
+    if query_economics is None:  # pragma: no cover - maximum query reservation is always priced
+        raise ValueError("automatic router query reservation has no cost")
+    task_count = len(tasks)
+    candidate_count = len(selection.candidates)
+    maximum_judgments = task_count * candidate_count + fidelity_overlap_count
+    calls_per_judgment: Literal[1, 2] = 2 if judge_response_shape == "pairwise" else 1
+    maximum_judge_provider_calls = maximum_judgments * calls_per_judgment
+    judgment_cost = judge_request.estimated_maximum_call_cost_usd * maximum_judge_provider_calls
+    by_alias = {item.candidate_alias: item.request for item in candidates}
+    episode_plans = tuple(
+        CandidateEpisodeCostPlan(
+            candidate_alias=alias,
+            episode_count=task_count,
+            maximum_steps_per_episode=options.maximum_model_calls,
+            query_cost_per_step_usd=query_economics.value,
+            candidate_cost_per_step_usd=by_alias[alias].estimated_maximum_call_cost_usd,
+            world_cost_per_step_usd=world_request.estimated_maximum_call_cost_usd,
+            schedule_cost_usd=(
+                task_count
+                * options.maximum_model_calls
+                * math.fsum(
+                    (
+                        query_economics.value,
+                        by_alias[alias].estimated_maximum_call_cost_usd,
+                        world_request.estimated_maximum_call_cost_usd,
+                    )
+                )
+            ),
+        )
+        for alias in selection.candidates
+    )
+    simulation_cost = math.fsum(item.schedule_cost_usd for item in episode_plans)
+    return AutomaticRouterCostPlan(
+        task_count=task_count,
+        candidate_count=candidate_count,
+        preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
+        fidelity_overlap_count=fidelity_overlap_count,
+        maximum_judgments=maximum_judgments,
+        judge_calls_per_judgment=calls_per_judgment,
+        maximum_judge_provider_calls=maximum_judge_provider_calls,
+        simulated_episode_count=task_count * candidate_count,
+        router_embedding_cost_usd=router.estimated_cost_usd,
+        judgment_cost_usd=judgment_cost,
+        candidate_episodes=episode_plans,
+        simulation_cost_usd=simulation_cost,
+        required_provider_cost_usd=math.fsum(
+            (router.estimated_cost_usd, judgment_cost, simulation_cost)
+        ),
+    )
 
 
 def remaining_simulation_budget(

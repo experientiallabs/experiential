@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -86,3 +87,12 @@ def test_public_activation_surfaces_inject_one_optimizer_verifier(
         activation.verify_automatic_router_policy,
     ]
     assert client_ghost_modes == [False, True]
+
+
+def test_public_project_loader_has_no_provisional_bypass_parameter() -> None:
+    """Production activation exposes no flag or alternate public provisional verifier."""
+    parameters = inspect.signature(activation.load_project_router).parameters
+
+    assert "allow_provisional" not in parameters
+    assert "policy_verifier" not in parameters
+    assert activation._load_project_router_for_composition.__name__.startswith("_")

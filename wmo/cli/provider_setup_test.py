@@ -435,6 +435,7 @@ def _setup(
     monkeypatch: pytest.MonkeyPatch,
     lister: _FakeLister | None = None,
     options: ProviderSetupOptions | None = None,
+    offer_recommended_defaults: bool = False,
 ) -> tuple[ScriptedConsole, ModelCatalog | None]:
     """Run one scripted interactive setup session against injected provider listings.
 
@@ -444,6 +445,7 @@ def _setup(
         monkeypatch: Patch fixture supplying canonical credentials.
         lister: Injected provider listing seam, defaulting to the OpenAI fixture.
         options: Optional role flags or automation values.
+        offer_recommended_defaults: Whether one verified default assignment is offered.
 
     Returns:
         The scripted console and the committed catalog, or ``None`` when setup aborted.
@@ -459,10 +461,132 @@ def _setup(
             replace=False,
             console=console,
             lister=lister or _FakeLister(),
+            offer_recommended_defaults=offer_recommended_defaults,
         )
     except typer.Abort:
         return console, None
     return console, catalog
+
+
+def test_wizard_recommended_setup_needs_only_provider_and_one_default_choice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verified discovery fills every role after the top-level recommended choice.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the secret-free catalog.
+        monkeypatch: Pytest patch fixture supplying an existing canonical credential.
+    """
+    root = tmp_path / ".wmo"
+    console, catalog = _setup(
+        root,
+        "1\n\n\n",
+        monkeypatch=monkeypatch,
+        offer_recommended_defaults=True,
+    )
+
+    assert catalog is not None
+    assert catalog.roles.world_model == "gpt-5-6-luna"
+    assert catalog.roles.judge == "gpt-5-6-luna"
+    assert catalog.roles.embedder == "text-embedding-3-large"
+    assert catalog.roles.candidates == ("gpt-5-6-luna", "gpt-5-6-terra")
+    assert catalog.roles.incumbent == "gpt-5-6-luna"
+    transcript = unstyle(console.output)
+    assert transcript.count("Setup mode") == 1
+    assert "Select the models to configure" not in transcript
+    assert "Save this configuration?" not in transcript
+    persisted = (root / "models.toml").read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY" in persisted
+    assert "openai-secret" not in transcript
+    assert "openai-secret" not in persisted
+
+
+def test_wizard_recommended_setup_prefers_provider_diversity_for_router_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified second provider supplies the alternative without displacing Luna defaults.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the selected multi-provider catalog.
+        monkeypatch: Pytest patch fixture supplying both canonical credentials.
+    """
+    lister = _FakeLister(
+        {
+            "openai": (
+                DiscoveredModel(provider="openai", model="gpt-5.6-luna"),
+                DiscoveredModel(provider="openai", model="gpt-5.6-terra"),
+                DiscoveredModel(provider="openai", model="text-embedding-3-large"),
+            ),
+            "anthropic": (DiscoveredModel(provider="anthropic", model="claude-sonnet-5"),),
+        }
+    )
+
+    console, catalog = _setup(
+        tmp_path / ".wmo",
+        "1,2\n\n\n",
+        monkeypatch=monkeypatch,
+        lister=lister,
+        offer_recommended_defaults=True,
+    )
+
+    assert catalog is not None
+    assert catalog.roles.world_model == "gpt-5-6-luna"
+    assert catalog.roles.judge == "gpt-5-6-luna"
+    assert catalog.roles.embedder == "text-embedding-3-large"
+    assert catalog.roles.candidates == ("gpt-5-6-luna", "claude-sonnet-5")
+    assert catalog.roles.incumbent == "gpt-5-6-luna"
+    summary = unstyle(console.output)
+    assert "gpt-5-6-luna" in summary
+    assert "claude-sonnet-5" in summary
+
+
+def test_wizard_recommended_setup_falls_back_by_verified_capability_and_cost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent ranked IDs use stable capability and price metadata from discovery.
+
+    Args:
+        tmp_path: Temporary WMO root receiving deterministic fallback choices.
+        monkeypatch: Pytest patch fixture supplying the canonical OpenAI credential.
+    """
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
+    lister = _FakeLister(
+        {
+            "anthropic": (
+                DiscoveredModel(
+                    provider="anthropic",
+                    model="claude-sonnet-4-6",
+                    context_window_tokens=200_000,
+                    maximum_output_tokens=32_000,
+                ),
+                DiscoveredModel(
+                    provider="anthropic",
+                    model="claude-opus-4-8",
+                    context_window_tokens=200_000,
+                    maximum_output_tokens=32_000,
+                ),
+            ),
+            "gemini": (DiscoveredModel(provider="gemini", model="gemini-embedding-001"),),
+        }
+    )
+
+    _console, catalog = _setup(
+        tmp_path / ".wmo",
+        "2,3\n\n\n",
+        monkeypatch=monkeypatch,
+        lister=lister,
+        offer_recommended_defaults=True,
+    )
+
+    assert catalog is not None
+    assert catalog.roles.world_model == "claude-sonnet-4-6"
+    assert catalog.roles.judge == "claude-sonnet-4-6"
+    assert catalog.roles.embedder == "gemini-embedding-001"
+    assert catalog.roles.candidates == ("claude-sonnet-4-6", "claude-opus-4-8")
+    assert catalog.roles.incumbent == "claude-sonnet-4-6"
 
 
 class _FakeLister:
@@ -479,6 +603,7 @@ class _FakeLister:
                 DiscoveredModel(provider="openai", model="gpt-5.6-luna"),
                 DiscoveredModel(provider="openai", model="gpt-5.6-terra"),
                 DiscoveredModel(provider="openai", model="text-embedding-3-small"),
+                DiscoveredModel(provider="openai", model="text-embedding-3-large"),
                 DiscoveredModel(provider="openai", model="internal-preview-model"),
             )
         }

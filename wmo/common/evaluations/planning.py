@@ -47,6 +47,17 @@ class ObservedProductionCell(ContractModel):
     @field_validator("repeat")
     @classmethod
     def _require_nonnegative_repeat(cls, value: int) -> int:
+        """Require a nonnegative observed-production repeat index.
+
+        Args:
+            value: Repeat index to validate.
+
+        Returns:
+            The validated repeat index.
+
+        Raises:
+            ValueError: The repeat index is negative.
+        """
         if value < 0:
             raise ValueError("observed production repeat must be nonnegative")
         return value
@@ -64,8 +75,8 @@ def default_fidelity_thresholds(
     Args:
         created_at: Time the immutable threshold record is created.
         code_revision: Exact WMO revision creating the gate.
-        planned_overlaps: Positive exact number of real fit overlaps frozen into the plan.
-        minimum_usable_overlaps: Positive numerical gate no larger than the denominator.
+        planned_overlaps: Nonnegative exact number of reusable real fit overlaps.
+        minimum_usable_overlaps: Nonnegative numerical gate no larger than the denominator.
 
     Returns:
         Exact-denominator 0.10-MAE fidelity thresholds.
@@ -448,6 +459,8 @@ def _fidelity_cells(
     planned_overlaps: int,
 ) -> tuple[EvaluationCell, ...]:
     """Select deterministic observed fit cells from distinct lineages for fidelity only."""
+    if planned_overlaps == 0:
+        return ()
     eligible = [
         cell for cell in main_cells if cell.purpose == "fit" and cell.execution == "observed"
     ]

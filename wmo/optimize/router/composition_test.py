@@ -52,6 +52,7 @@ from wmo.optimize.router.composition import (
     RouterCompositionBudget,
     RouterCompositionError,
     RouterEvaluationSetup,
+    RouterReviewProvenance,
     RouterWorkflowServices,
     compose_router,
 )
@@ -271,7 +272,7 @@ class _SetupSupplier:
         self,
         project: ProjectStore,
         build: ProjectBuild,
-        review: ApprovedRouterReview,
+        review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
         """Persist reviewed evaluation inputs bound to the selected completed build.
@@ -376,7 +377,7 @@ class _MismatchedSetupSupplier(_SetupSupplier):
         self,
         project: ProjectStore,
         build: ProjectBuild,
-        review: ApprovedRouterReview,
+        review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
         """Replace the valid setup fit pointer with an unrelated immutable pointer.

@@ -41,7 +41,7 @@ class AutomaticRouterArtifacts:
     """Immutable evidence, pricing, embeddings, and execution reservations."""
 
     observed_cells: tuple[ObservedProductionCell, ...]
-    attribution_input: ArtifactInput
+    attribution_input: ArtifactInput | None
     pricing: PricingSnapshot
     router_embeddings: ReservedFrozenEmbeddingSet
     router_embedding_input: ArtifactInput
@@ -58,7 +58,7 @@ def materialize_automatic_router_artifacts(
     preflight: AutomaticRouterPreflight,
     runtime_catalog: RuntimeModelCatalog,
     *,
-    attribution_input: ArtifactInput,
+    attribution_input: ArtifactInput | None,
     router_embedding_maximum_attempts: int,
     completion_maximum_attempts: int,
     maximum_provider_cost_usd: float,
@@ -71,7 +71,7 @@ def materialize_automatic_router_artifacts(
         project: Existing project whose completed build is being optimized.
         preflight: Aggregate read-only prerequisite and reservation result.
         runtime_catalog: Credential-capable resolver over the just-persisted catalog.
-        attribution_input: Immutable real-overlap attribution persisted after consent.
+        attribution_input: Immutable real-overlap attribution, when history is reusable.
         router_embedding_maximum_attempts: Active embedding retry ceiling.
         completion_maximum_attempts: Active completion retry ceiling.
         maximum_provider_cost_usd: Exact operator-approved shared provider ceiling.
@@ -156,9 +156,8 @@ def materialize_automatic_router_artifacts(
         preflight.completed_build.fit_rag,
         preflight.completed_build.world_model,
         preflight.setup_input,
-        preflight.judge_audit_input,
-        preflight.approved_calibration_input,
-        attribution_input,
+        *preflight.judge_provenance_inputs,
+        *((attribution_input,) if attribution_input is not None else ()),
         pricing_input,
         embedding_input,
         completion_input,
@@ -171,6 +170,7 @@ def materialize_automatic_router_artifacts(
         simulation_completion_input=completion_input,
         runtime_capability_input=runtime_capability_input,
         router_embedding_reservation=preflight.router_embedding_reservation,
+        cost_plan=preflight.cost_plan,
         candidates=_candidate_bindings(preflight),
         incumbent_alias=preflight.incumbent_alias,
         agent_factory_sha256=preflight.agent_factory_sha256,
@@ -231,7 +231,7 @@ def _canonical_candidate_prices(
 def _persist_observed_cells(
     project: ProjectStore,
     preflight: AutomaticRouterPreflight,
-    attribution_input: ArtifactInput,
+    attribution_input: ArtifactInput | None,
     created_at: datetime,
     code_revision: str,
 ) -> tuple[ObservedProductionCell, ...]:
@@ -240,13 +240,18 @@ def _persist_observed_cells(
     Args:
         project: Project-local artifact store.
         preflight: Verified real task and trace overlaps.
-        attribution_input: Exact immutable attribution authorizing selected candidate snapshots.
+        attribution_input: Exact attribution authorizing selected historical candidates.
         created_at: Artifact materialization time.
         code_revision: Exact producer revision.
 
     Returns:
         Deterministic observed-cell bindings for evaluation planning.
     """
+    if preflight.observed_traces and attribution_input is None:
+        raise ValueError("reusable historical cells require immutable candidate attribution")
+    if not preflight.observed_traces:
+        return ()
+    assert attribution_input is not None
     cells = []
     for item in preflight.observed_traces[: preflight.fidelity_overlap_count]:
         rollout_input = write_production_rollout(

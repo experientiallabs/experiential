@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 _SNAPSHOT_SUFFIX_PATTERN = re.compile(r"(?:[-@]\d{8}|-latest)$")
 _GEMINI_PREFIX = "models/"
@@ -205,6 +206,38 @@ _KNOWN_MODELS: dict[str, dict[str, KnownModel]] = {
     "openai": _OPENAI_MODELS,
 }
 
+_RECOMMENDED_MODELS: dict[
+    str,
+    dict[Literal["world_model", "judge", "embedder", "router_candidate"], tuple[str, ...]],
+] = {
+    "openai": {
+        "world_model": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
+        "judge": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
+        "embedder": (
+            "text-embedding-3-large",
+            "text-embedding-3-small",
+            "text-embedding-ada-002",
+        ),
+        "router_candidate": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
+    },
+    "anthropic": {
+        "world_model": ("claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"),
+        "judge": ("claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"),
+        "embedder": (),
+        "router_candidate": ("claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"),
+    },
+    "gemini": {
+        "world_model": ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"),
+        "judge": ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"),
+        "embedder": ("gemini-embedding-001",),
+        "router_candidate": (
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+        ),
+    },
+}
+
 
 def canonical_model_id(provider: str, model: str) -> str:
     """Normalize one provider model ID to the identity this table indexes.
@@ -240,3 +273,29 @@ def known_model_metadata(provider: str, model: str) -> KnownModel | None:
     if models is None:
         return None
     return models.get(canonical_model_id(provider, model))
+
+
+def recommended_model_rank(
+    provider: str,
+    model: str,
+    role: Literal["world_model", "judge", "embedder", "router_candidate"],
+) -> int | None:
+    """Return the maintained recommendation position for one verified available model.
+
+    Args:
+        provider: Canonical provider kind.
+        model: Exact provider-published model ID.
+        role: Wizard role being assigned.
+
+    Returns:
+        Zero-based maintained rank, or ``None`` when deterministic capability and cost fallback
+        should decide among otherwise eligible models.
+    """
+    provider_roles = _RECOMMENDED_MODELS.get(provider)
+    if provider_roles is None:
+        return None
+    identity = canonical_model_id(provider, model)
+    try:
+        return provider_roles[role].index(identity)
+    except ValueError:
+        return None

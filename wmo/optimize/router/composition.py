@@ -8,9 +8,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -42,7 +42,7 @@ from wmo.common.evaluations.evidence import (
     read_rollout,
 )
 from wmo.common.evaluations.planning import plan_bound_fidelity_gate_id
-from wmo.common.judging import Judge, Judgment
+from wmo.common.judging import Judge, Judgment, verify_persisted_calibration
 from wmo.common.models import (
     ModelCatalog,
     ProviderModelSelection,
@@ -58,7 +58,7 @@ from wmo.common.project import (
 from wmo.common.rollouts import SimulationArtifactSet
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import KnnBankManifest
-from wmo.optimize.router.activation import load_project_router
+from wmo.optimize.router.activation import _load_project_router_for_composition
 from wmo.optimize.router.errors import RouterCompositionError
 from wmo.optimize.router.evaluation.build import (
     completed_project_build,
@@ -120,8 +120,38 @@ class RouterCandidateSetupPlan:
 class ApprovedRouterReview(ContractModel):
     """Explicit approved rubric and eligible calibration artifact identities."""
 
+    judgment_status: Literal["human_calibrated"] = "human_calibrated"
     rubric_id: ArtifactId
     calibration_id: ArtifactId
+    calibration_input: ArtifactInput | None = None
+    audit_input: ArtifactInput | None = None
+
+    @property
+    def artifact_inputs(self) -> tuple[ArtifactInput, ...]:
+        """Return exact approved provenance inputs available to composition."""
+        return tuple(
+            item for item in (self.audit_input, self.calibration_input) if item is not None
+        )
+
+
+class ProvisionalRouterReview(ContractModel):
+    """Explicit zero-label calibration provenance eligible only for provisional routing."""
+
+    judgment_status: Literal["provisional"] = "provisional"
+    rubric_id: ArtifactId
+    calibration_id: ArtifactId
+    calibration_input: ArtifactInput
+
+    @property
+    def artifact_inputs(self) -> tuple[ArtifactInput, ...]:
+        """Return the exact provisional calibration input bound into evaluation evidence."""
+        return (self.calibration_input,)
+
+
+RouterReviewProvenance = Annotated[
+    ApprovedRouterReview | ProvisionalRouterReview,
+    Field(discriminator="judgment_status"),
+]
 
 
 class RouterEvaluationSetup(ContractModel):
@@ -139,12 +169,28 @@ class RouterEvaluationSetup(ContractModel):
     judgment_status: Literal["provisional", "human_calibrated"]
     world_model_settings: WorldModelSettings
     simulation_completion_input: ArtifactInput | None = None
-    fidelity_planned_overlaps: int = Field(default=10, gt=0)
-    fidelity_minimum_usable_overlaps: int = Field(default=8, gt=0)
+    fidelity_planned_overlaps: int = Field(default=10, ge=0)
+    fidelity_minimum_usable_overlaps: int = Field(default=8, ge=0)
     agent_id: str = Field(min_length=1, max_length=256)
     seed: int
     maximum_steps: int = Field(gt=0)
     maximum_concurrency: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _require_coherent_fidelity_denominator(self) -> RouterEvaluationSetup:
+        """Require zero or positive measured-overlap bounds to move together.
+
+        Returns:
+            The unchanged validated setup.
+
+        Raises:
+            ValueError: Only one measured-overlap bound is zero.
+        """
+        if (self.fidelity_planned_overlaps == 0) != (self.fidelity_minimum_usable_overlaps == 0):
+            raise ValueError("zero reusable overlaps require a zero fidelity denominator")
+        if self.fidelity_minimum_usable_overlaps > self.fidelity_planned_overlaps:
+            raise ValueError("minimum usable fidelity overlaps exceed planned overlaps")
+        return self
 
 
 class ReviewSupplier(Protocol):
@@ -155,7 +201,7 @@ class ReviewSupplier(Protocol):
         project: ProjectStore,
         build: ProjectBuild,
         budget: RouterCompositionBudget,
-    ) -> ApprovedRouterReview:
+    ) -> RouterReviewProvenance:
         """Return manifest-persisted review artifacts."""
 
 
@@ -166,7 +212,7 @@ class EvaluationSetupSupplier(Protocol):
         self,
         project: ProjectStore,
         build: ProjectBuild,
-        review: ApprovedRouterReview,
+        review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
         """Return explicit immutable planning inputs and finite simulation controls."""
@@ -242,13 +288,13 @@ class RouterCompositionResult:
     """Complete local artifact chain and loaded frozen online runtime."""
 
     build: ProjectBuild
-    review: ApprovedRouterReview
+    review: RouterReviewProvenance
     plan: EvaluationPlan
     simulation_spec: SimulationSpec
     held_out_simulation_spec: SimulationSpec
-    fidelity_approval_id: ArtifactId
+    fidelity_approval_id: ArtifactId | None
     policy_lock_id: ArtifactId
-    fidelity_report_id: ArtifactId
+    fidelity_report_id: ArtifactId | None
     phase_a_simulation_spend_usd: float
     held_out_simulation_spend_usd: float
     total_simulation_spend_usd: float
@@ -295,6 +341,10 @@ def compose_router(
     review = services.review_supplier(project, built, budget)
     _verify_review(project, review)
     setup = services.setup_supplier(project, built, review, budget)
+    if review.calibration_input is not None and setup.judgment_status != review.judgment_status:
+        raise RouterCompositionError(
+            "router evaluation judgment status differs from its calibration provenance"
+        )
     verify_router_evaluation_setup(
         completed=completed_build,
         fit_rag_input=setup.fit_rag_input,
@@ -320,7 +370,10 @@ def compose_router(
         observed_cells=setup.observed_cells,
         fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
         fidelity_protocol_sha256=_protocol_digest(setup.simulation_protocol),
-        additional_inputs=services.evaluation_plan_inputs,
+        additional_inputs=sorted_unique_inputs(
+            *services.evaluation_plan_inputs,
+            *review.artifact_inputs,
+        ),
         created_at=created_at,
         code_revision=code_revision,
     )
@@ -365,27 +418,34 @@ def compose_router(
     fidelity_evidence = tuple(
         item for item in phase_a_evidence if cells_by_id[item.cell_id].purpose == "fidelity"
     )
-    fidelity, approval = _approve_fidelity_once(
-        project,
-        plan,
-        setup.simulation_protocol,
-        phase_a_evidence,
-        fidelity_evidence,
-        services.fidelity_approval,
-        budget,
-        created_at,
-        code_revision,
-    )
-    approved_protocol = setup.simulation_protocol.model_copy(
-        update={"fidelity_report_id": fidelity.fidelity_report_id}
-    )
+    if setup.fidelity_planned_overlaps:
+        fidelity, approval = _approve_fidelity_once(
+            project,
+            plan,
+            setup.simulation_protocol,
+            phase_a_evidence,
+            fidelity_evidence,
+            services.fidelity_approval,
+            budget,
+            created_at,
+            code_revision,
+        )
+        approved_protocol = setup.simulation_protocol.model_copy(
+            update={"fidelity_report_id": fidelity.fidelity_report_id}
+        )
+        fidelity_report_ids = (fidelity.fidelity_report_id,)
+    else:
+        fidelity = None
+        approval = None
+        approved_protocol = setup.simulation_protocol
+        fidelity_report_ids = ()
     fit_config = RouterFitConfig(
         fit=EvaluationInputs(
             evaluation_plan_id=plan.plan_id,
             rollout_set_ids=(phase_a_set.artifact_set_id,),
             protocols=(setup.production_protocol, approved_protocol),
             cell_evidence=phase_a_evidence,
-            fidelity_report_ids=(fidelity.fidelity_report_id,),
+            fidelity_report_ids=fidelity_report_ids,
         ),
         embedding_set_id=setup.embedding_set_id,
         incumbent_alias=setup.incumbent_alias,
@@ -440,7 +500,7 @@ def compose_router(
                 rollout_set_ids=(held_set.artifact_set_id,),
                 protocols=(setup.production_protocol, approved_protocol),
                 cell_evidence=held_evidence,
-                fidelity_report_ids=(fidelity.fidelity_report_id,),
+                fidelity_report_ids=fidelity_report_ids,
             ),
             embedding_set_id=setup.embedding_set_id,
             created_at=created_at,
@@ -461,7 +521,7 @@ def compose_router(
         root=project.paths.root,
     )
     _phase(phase_hook, "report_complete")
-    runtime = load_project_router(
+    runtime = _load_project_router_for_composition(
         project.paths.project_id,
         project.paths.root,
         policy_id=optimized.optimization.policy.policy_id,
@@ -473,9 +533,9 @@ def compose_router(
         plan=plan,
         simulation_spec=spec,
         held_out_simulation_spec=held_spec,
-        fidelity_approval_id=approval.approval_id,
+        fidelity_approval_id=None if approval is None else approval.approval_id,
         policy_lock_id=policy_lock.lock_id,
-        fidelity_report_id=fidelity.fidelity_report_id,
+        fidelity_report_id=None if fidelity is None else fidelity.fidelity_report_id,
         phase_a_simulation_spend_usd=phase_a_spend,
         held_out_simulation_spend_usd=held_out_spend,
         total_simulation_spend_usd=total_spend,
@@ -756,12 +816,25 @@ def _preflight(
         raise RouterCompositionError("all workflow services must be injected explicitly")
 
 
-def _verify_review(project: ProjectStore, review: ApprovedRouterReview) -> None:
-    """Require exact persisted rubric and calibration artifact kinds before simulation."""
+def _verify_review(project: ProjectStore, review: RouterReviewProvenance) -> None:
+    """Require persisted artifacts and exact typed calibration eligibility before simulation."""
     expected = ((review.rubric_id, "rubric"), (review.calibration_id, "judge-calibration"))
     for artifact_id, artifact_type in expected:
         if project.artifacts.read(artifact_id).manifest.artifact_type != artifact_type:
             raise RouterCompositionError(f"{artifact_id} is not a completed {artifact_type}")
+    if review.calibration_input is None:
+        if review.judgment_status == "provisional":
+            raise RouterCompositionError("provisional review requires an exact calibration input")
+        return
+    calibration, calibration_input = verify_persisted_calibration(project, review.calibration_id)
+    if (
+        calibration_input != review.calibration_input
+        or calibration.status != review.judgment_status
+        or calibration.rubric_id != review.rubric_id
+    ):
+        raise RouterCompositionError(
+            "router review differs from its persisted calibration status or rubric"
+        )
 
 
 def _complete_cell_evidence(
@@ -770,7 +843,7 @@ def _complete_cell_evidence(
     cells: tuple[EvaluationCell, ...],
     simulated_rollout_ids: tuple[str, ...],
     setup: RouterEvaluationSetup,
-    review: ApprovedRouterReview,
+    review: RouterReviewProvenance,
     judge: Judge,
     maximum_judgments: int,
 ) -> tuple[tuple[EvaluationCellEvidence, ...], int]:

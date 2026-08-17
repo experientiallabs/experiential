@@ -4,7 +4,7 @@ The root surface is deliberately small:
 
 | Command | Purpose | Local result |
 |---|---|---|
-| `wmo build PROJECT TRACES --source SOURCE --root ROOT [--provider NAME ...]` | Normalize 100 through 1000 local traces from one [declared source](reference/ingest.md) and mine representative tasks. First-build setup uses a keyboard provider list, or exact `--provider` flags. | Manifest-bound `TraceDataset`, `TaskSet`, and `proposals_pending` review state. |
+| `wmo build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or normalize the explicit local source for automation. | Manifest-bound trace and task evidence, serving and fit-only RAG, grounded world model, judge review state, and automatic router artifacts. |
 | `wmo optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `wmo optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `wmo run PROJECT --root ROOT [--ghost]` | Load a frozen policy and expose it on development-only loopback. | Local OpenAI-compatible endpoint with durable journaling by default or no saved traffic in ghost mode. |
@@ -22,6 +22,9 @@ the ceiling. Exact completed replays report a zero-dollar estimate and do not pr
 
 Successful build, router, simulation, and SFT operations preserve anonymous aggregate PostHog
 product telemetry, which may send unless disabled. `run` makes no provider call at startup.
+`build --dry-run` and exact completed-build replay make zero paid provider calls. A new grounded
+build calls only the configured embedder; automatic router optimization separately executes the
+bounded candidate, world-model, and judge schedule shown in its cost preflight.
 An HTTP completion or direct `RouterRuntime.complete` call is the explicit online model-call
 boundary. The router remains frozen for the process lifetime. `run --ghost` still permits provider
 calls but disables durable interaction, replay, RAG, and SFT state for that process.

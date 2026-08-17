@@ -861,6 +861,7 @@ class ManualJudgeReviewState(ContractModel):
     setup: ArtifactInput
     label_drafts: tuple[ManualJudgeLabelDraft, ...] = ()
     trace_reviews: tuple[ArtifactInput, ...] = ()
+    provisional_calibration: ArtifactInput | None = None
     audit: ArtifactInput | None = None
     approved_calibration: ArtifactInput | None = None
 

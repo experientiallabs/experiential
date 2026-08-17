@@ -63,6 +63,36 @@ def load_project_router(
     )
 
 
+def _load_project_router_for_composition(
+    project: str,
+    root: Path,
+    *,
+    policy_id: ArtifactId,
+    runtime_catalog: RuntimeModelCatalog,
+) -> RouterRuntime:
+    """Load a provisional-capable runtime only as the scoped composition result.
+
+    Args:
+        project: Canonical local project identifier.
+        root: Local WMO root containing project artifacts.
+        policy_id: Exact policy just produced by composition.
+        runtime_catalog: Already bound composition resolver.
+
+    Returns:
+        Verified in-process runtime for the completed composition result.
+
+    Raises:
+        RouterApplicationError: Automatic inputs are missing, ambiguous, or drifted.
+    """
+    return load_runtime_project_router(
+        project,
+        root,
+        policy_id=policy_id,
+        runtime_catalog=runtime_catalog,
+        policy_verifier=verify_composable_automatic_router_policy,
+    )
+
+
 def load_router(
     project: str,
     root: Path = Path(".wmo"),
@@ -107,7 +137,30 @@ def verify_automatic_router_policy(
     policy: KnnRouterPolicy,
     catalog: RuntimeModelCatalog,
 ) -> None:
-    """Verify automatic execution and capability inputs before credential access.
+    """Verify an automatic policy is human-calibrated before production activation.
+
+    Args:
+        store: Project-local immutable artifact store.
+        policy: Selected frozen router policy.
+        catalog: Current credential-free runtime model catalog.
+
+    Raises:
+        RouterApplicationError: Automatic inputs are invalid or judgment is provisional.
+    """
+    verify_composable_automatic_router_policy(store, policy, catalog)
+    if policy.judgment_status != "human_calibrated":
+        raise RouterApplicationError(
+            "provisional router policy cannot be promoted or activated; complete judge "
+            "calibration and rebuild the router"
+        )
+
+
+def verify_composable_automatic_router_policy(
+    store: ArtifactStore,
+    policy: KnnRouterPolicy,
+    catalog: RuntimeModelCatalog,
+) -> None:
+    """Verify automatic execution inputs for an in-process composition result.
 
     Plans without automatic artifacts remain eligible for the provider-free offline path.
     Automatic plans must bind exactly one execution contract and one runtime capability contract,
