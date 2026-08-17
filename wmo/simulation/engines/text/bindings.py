@@ -187,35 +187,74 @@ def binding_digest(binding: SimulationCellBinding) -> Sha256:
     return sha256_json(binding)
 
 
-def rollout_id_for_binding(binding: SimulationCellBinding) -> ArtifactId:
+def rollout_id_for_binding(binding: SimulationCellBinding, *, attempt: int = 0) -> ArtifactId:
     """Return the deterministic immutable rollout ID for one full cell binding.
+
+    Attempt zero preserves the original binding-only identity. A positive attempt names one
+    deliberate re-execution of a retryable-class dispatch failure: the new attempt is a new
+    immutable artifact rather than a mutation of the failed one, so digest checks stay strict.
 
     Args:
         binding: Complete resolved cell identity.
+        attempt: Zero-based re-execution generation for this exact binding.
 
     Returns:
-        Stable rollout artifact ID that changes whenever any bound input or model changes.
+        Stable rollout artifact ID that changes whenever any bound input, model, or the
+        re-execution attempt changes.
+
+    Raises:
+        ValueError: The attempt is negative.
     """
-    return stable_id("rollout", {"binding_sha256": binding_digest(binding)})
+    return stable_id("rollout", _attempt_identity(binding, attempt))
 
 
 def lease_id_for_binding(
     resolution: SimulationResolution,
     binding: SimulationCellBinding,
+    *,
+    attempt: int = 0,
 ) -> ArtifactId:
     """Return the local durable paid-work claim ID for one resolved rollout cell.
 
     Args:
         resolution: Immutable resolution artifact that owns the binding.
         binding: Complete resolved cell identity.
+        attempt: Zero-based re-execution generation for this exact binding.
 
     Returns:
-        Stable lease filename identity scoped to this exact resolution and cell binding.
+        Stable lease filename identity scoped to this exact resolution, binding, and attempt.
+
+    Raises:
+        ValueError: The attempt is negative.
     """
     return stable_id(
         "text-cell-lease",
         {
             "resolution_id": resolution.resolution_id,
-            "binding_sha256": binding_digest(binding),
+            **_attempt_identity(binding, attempt),
         },
     )
+
+
+def _attempt_identity(binding: SimulationCellBinding, attempt: int) -> dict[str, JsonValue]:
+    """Return the stable identity payload for one binding at one re-execution attempt.
+
+    The zero attempt omits its key so every existing binding-only artifact identity is
+    preserved exactly.
+
+    Args:
+        binding: Complete resolved cell identity.
+        attempt: Zero-based re-execution generation for this exact binding.
+
+    Returns:
+        JSON-compatible identity payload.
+
+    Raises:
+        ValueError: The attempt is negative.
+    """
+    if attempt < 0:
+        raise ValueError("rollout re-execution attempt must be nonnegative")
+    payload: dict[str, JsonValue] = {"binding_sha256": binding_digest(binding)}
+    if attempt > 0:
+        payload["retry_attempt"] = attempt
+    return payload

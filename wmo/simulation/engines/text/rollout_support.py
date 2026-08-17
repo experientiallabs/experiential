@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import cast
 
@@ -12,7 +12,13 @@ from wmo.common.core.artifacts import (
     StructuredFailure,
 )
 from wmo.common.models import NumericMeasurement, OperationEconomics
-from wmo.common.rollouts import RolloutArtifact, RolloutEventKind, RolloutSpan
+from wmo.common.rollouts import (
+    RolloutArtifact,
+    RolloutEventKind,
+    RolloutSpan,
+    unknown_dispatch_reserved_cost_usd,
+    unknown_spend_failure,
+)
 from wmo.runtime.agents import AgentEpisode
 from wmo.simulation.engines.text.environment import TextOnlyToolUseError
 from wmo.simulation.engines.text.redaction import redact_span
@@ -95,41 +101,63 @@ def normalize_text_tool_failure(episode: AgentEpisode) -> StructuredFailure | No
     )
 
 
-def known_total_spend(rollouts: Sequence[RolloutArtifact]) -> float | None:
-    """Return total observed provider spend, or ``None`` if any completed episode is unpriced.
+def known_total_spend(
+    rollouts: Sequence[RolloutArtifact],
+    *,
+    unknown_dispatch_fallback_usd: Callable[[RolloutArtifact], float | None] | None = None,
+) -> float | None:
+    """Return total conservative provider spend, or ``None`` if any episode is unpriced.
 
     Args:
         rollouts: Completed text-simulation rollout artifacts to total.
+        unknown_dispatch_fallback_usd: Optional persisted worst-case charge for unknown-spend
+            evidence that predates per-failure reservation persistence.
 
     Returns:
-        The known provider spend, or ``None`` when any billed call is not priced.
+        The known conservative provider spend, or ``None`` when any billed call is not priced
+        and has no persisted worst-case reservation.
     """
-    values = tuple(rollout_spend(rollout) for rollout in rollouts)
+    values = tuple(
+        rollout_spend(rollout, unknown_dispatch_fallback_usd=unknown_dispatch_fallback_usd)
+        for rollout in rollouts
+    )
     if any(value is None for value in values):
         return None
     return sum(cast(float, value) for value in values)
 
 
-def rollout_spend(rollout: RolloutArtifact) -> float | None:
+def rollout_spend(
+    rollout: RolloutArtifact,
+    *,
+    unknown_dispatch_fallback_usd: Callable[[RolloutArtifact], float | None] | None = None,
+) -> float | None:
     """Return reconciled provider cost without treating unknown dispatches as free.
+
+    An unknown-spend failure is charged its persisted worst-case reservation instead of
+    poisoning the whole total, so one ambiguous dispatch stays conservatively inside the
+    ceiling while every other completed cell remains priced exactly.
 
     Args:
         rollout: Completed text-simulation rollout whose recorded calls are inspected.
+        unknown_dispatch_fallback_usd: Optional persisted worst-case charge for unknown-spend
+            evidence that predates per-failure reservation persistence.
 
     Returns:
-        Observed candidate and world-model cost plus conservative retrieval estimates, or ``None``
-        when any dispatched operation has unknown spend.
+        Observed candidate and world-model cost plus conservative retrieval and reservation
+        charges, or ``None`` when any dispatched operation has unpriceable spend.
     """
-    if rollout.failure is not None and (
-        rollout.failure.details.get("provider_dispatch_unknown_spend") is True
-        or rollout.failure.details.get("phase") == "paid_cell_stale_lease"
-    ):
-        return None
+    reserved: float | None = None
+    if unknown_spend_failure(rollout.failure):
+        reserved = unknown_dispatch_reserved_cost_usd(rollout.failure)
+        if reserved is None and unknown_dispatch_fallback_usd is not None:
+            reserved = unknown_dispatch_fallback_usd(rollout)
+        if reserved is None:
+            return None
     roles = (
         (rollout.candidate_economics, RolloutEventKind.AGENT_MODEL_CALL),
         (rollout.world_model_economics, RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL),
     )
-    total = 0.0
+    total = reserved if reserved is not None else 0.0
     for economics, span_kind in roles:
         made_call = any(span.kind == span_kind for span in rollout.spans)
         if not made_call:

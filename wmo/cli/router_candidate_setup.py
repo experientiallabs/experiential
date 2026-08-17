@@ -126,7 +126,7 @@ def collect_router_candidate_setup(
             f"context {caps.context_window_tokens}, output {caps.maximum_output_tokens}"
         )
     if not non_interactive and not Confirm.ask(
-        "Save these router candidates?", default=False, console=console
+        "Save these router candidates?", default=True, console=console
     ):
         raise typer.Abort()
     return RouterCandidateSetupPlan(

@@ -10,6 +10,12 @@ from wmo.common.rollouts.artifact import (
     SimulationMode,
     StopReason,
 )
+from wmo.common.rollouts.dispatch_failures import (
+    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
+    retryable_dispatch_failure,
+    unknown_dispatch_reserved_cost_usd,
+    unknown_spend_failure,
+)
 from wmo.common.rollouts.otel import (
     ProductionSimulatorSnapshot,
     RolloutEventKind,
@@ -20,6 +26,7 @@ from wmo.common.rollouts.otel import (
 )
 
 __all__ = [
+    "UNKNOWN_DISPATCH_RESERVED_COST_KEY",
     "ProductionSimulatorSnapshot",
     "ProviderFreeSourceProvenance",
     "RolloutArtifact",
@@ -34,4 +41,7 @@ __all__ = [
     "SimulatorSnapshot",
     "StopReason",
     "WorldModelSimulatorSnapshot",
+    "retryable_dispatch_failure",
+    "unknown_dispatch_reserved_cost_usd",
+    "unknown_spend_failure",
 ]

@@ -42,23 +42,33 @@ from wmo.common.models import (
     completion_cost_reservation,
 )
 from wmo.common.project import ArtifactStore, artifact_input
-from wmo.common.rollouts import RolloutArtifact, SimulationCellBinding, SimulationMode, StopReason
+from wmo.common.rollouts import (
+    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
+    RolloutArtifact,
+    SimulationCellBinding,
+    SimulationMode,
+    StopReason,
+)
 from wmo.common.tasks import TaskCase, TaskSet, ToolSchema
 from wmo.runtime.agents import AgentEpisode, AgentRuntime
 from wmo.runtime.environments import EnvironmentSession
 from wmo.runtime.models import ResolvedModel
+from wmo.runtime.models.providers.transport import ProviderTransportError
 from wmo.simulation.engines.text.bindings import (
     binding_digest,
     lease_id_for_binding,
     rollout_id_for_binding,
 )
 from wmo.simulation.engines.text.leases import TextCellLeaseStore
+from wmo.simulation.engines.text.resume import MAXIMUM_CELL_ATTEMPTS
+from wmo.simulation.engines.text.rollout_support import rollout_spend
 from wmo.simulation.engines.text.simulator import (
     SimulationConfigurationError,
     SimulationContentionError,
     SimulationResumeError,
     WorldModelSimulator,
 )
+from wmo.simulation.engines.text.spec_persistence import persist_canonical_specification
 from wmo.simulation.retrieval import (
     RAGEmbedderBinding,
     RAGLineageBinding,
@@ -119,6 +129,38 @@ class _TimeoutClient:
     def complete(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         raise TimeoutError("provider outcome is unknown")
+
+
+class _FlakyOnceClient:
+    """Raise one exhausted transport failure, then delegate to scripted responses."""
+
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        """Store the answers served after the single scripted transport failure.
+
+        Args:
+            responses: Responses returned in order once the transport recovers.
+        """
+        self._responses = list(responses)
+        self.requests: list[ModelRequest] = []
+        self._failed = False
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Fail the first dispatch at the transport level and answer afterwards.
+
+        Args:
+            request: Candidate request emitted by the recording boundary.
+
+        Returns:
+            The next scripted response after the transport recovers.
+
+        Raises:
+            ProviderTransportError: The first dispatch, mimicking exhausted bounded retries.
+        """
+        self.requests.append(request)
+        if not self._failed:
+            self._failed = True
+            raise ProviderTransportError("connection reset by provider")
+        return self._responses.pop(0)
 
 
 class _CountingEmbedder:
@@ -1218,11 +1260,11 @@ def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
 
 
 @pytest.mark.parametrize("invalid_role", ["candidate", "world_model"])
-def test_invalid_production_usage_poisons_later_paid_cells_and_exact_resume(
+def test_invalid_production_usage_charges_reservation_and_admits_later_paid_cells(
     tmp_path: Path,
     invalid_role: str,
 ) -> None:
-    """Persist unknown spend and prevent later or replayed provider dispatch.
+    """Persist a worst-case reservation for unknown spend without blocking later cells.
 
     Args:
         tmp_path: Isolated project root for durable failure evidence.
@@ -1240,11 +1282,12 @@ def test_invalid_production_usage_poisons_later_paid_cells_and_exact_resume(
         "I can help.", snapshot=_snapshot("candidate-a"), cost=None
     ).model_copy(update={"economics": OperationEconomics()})
     valid_candidate = _response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)
-    invalid_world = _response(
+    valid_world = _response(
         '{"message":"done","terminal":true}',
         snapshot=_snapshot("world-model-a"),
         cost=None,
-    ).model_copy(
+    )
+    invalid_world = valid_world.model_copy(
         update={
             "economics": OperationEconomics(
                 usage=Usage(input_tokens=8, output_tokens=4, cached_input_tokens=9)
@@ -1252,9 +1295,13 @@ def test_invalid_production_usage_poisons_later_paid_cells_and_exact_resume(
         }
     )
     candidate_client = _ScriptedClient(
-        [missing_usage if invalid_role == "candidate" else valid_candidate]
+        [missing_usage, valid_candidate]
+        if invalid_role == "candidate"
+        else [valid_candidate, valid_candidate]
     )
-    world_client = _ScriptedClient([invalid_world] if invalid_role == "world_model" else [])
+    world_client = _ScriptedClient(
+        [valid_world] if invalid_role == "candidate" else [invalid_world, valid_world]
+    )
     completion_input = _persist_completion_contract(store)
     simulator = _simulator(
         store,
@@ -1282,9 +1329,243 @@ def test_invalid_production_usage_poisons_later_paid_cells_and_exact_resume(
     assert first.stop_reason == StopReason.FAILURE
     assert first.failure is not None
     assert first.failure.details["provider_dispatch_unknown_spend"] is True
-    assert second.stop_reason == StopReason.MAXIMUM_COST
+    assert first.failure.retryable is False
+    reserved = first.failure.details[UNKNOWN_DISPATCH_RESERVED_COST_KEY]
+    assert isinstance(reserved, float) and reserved > 0
+    assert second.stop_reason == StopReason.COMPLETED
     assert replay == artifact_set
     assert (len(candidate_client.requests), len(world_client.requests)) == calls
+
+
+def test_resume_reexecutes_retryable_transport_failure_as_new_immutable_attempt(
+    tmp_path: Path,
+) -> None:
+    """A persisted transport failure is superseded on resume by a fresh-budget attempt.
+
+    Args:
+        tmp_path: Isolated project root for durable failure and retry evidence.
+    """
+    cells = (_cell("cell-a", "task-a"),)
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _FlakyOnceClient(
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"done","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+                cost=None,
+            )
+        ]
+    )
+    completion_input = _persist_completion_contract(store)
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        completion_contract_input=completion_input,
+    )
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a",),
+        completion_contract_input=completion_input,
+        maximum_cost_usd=1.0,
+    )
+
+    first_set = simulator.run(spec)
+    first = simulator._load_rollout(first_set.artifact_ids[0])
+    resumed_set = simulator.run(spec)
+    second = simulator._load_rollout(resumed_set.artifact_ids[0])
+    replay = simulator.run(spec)
+
+    assert first.stop_reason == StopReason.FAILURE
+    assert first.failure is not None
+    assert first.failure.retryable is True
+    assert first.failure.exception_type == "ProviderTransportError"
+    assert first.failure.details["provider_dispatch_unknown_spend"] is True
+    reserved = first.failure.details[UNKNOWN_DISPATCH_RESERVED_COST_KEY]
+    assert isinstance(reserved, float) and reserved > 0
+    assert first.retry_attempt == 0
+    assert second.retry_attempt == 1
+    assert second.rollout_id != first.rollout_id
+    assert second.stop_reason == StopReason.COMPLETED
+    assert simulator._load_rollout(first.artifact_id) == first
+    assert replay == resumed_set
+    assert len(candidate_client.requests) == 2
+
+
+def test_persistent_transport_failure_stops_at_the_attempt_cap_and_replays(
+    tmp_path: Path,
+) -> None:
+    """Retry generations are bounded, and the final permitted attempt replays exactly.
+
+    Args:
+        tmp_path: Isolated project root for durable capped-attempt evidence.
+    """
+    cells = (_cell("cell-a", "task-a"),)
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _TimeoutClient()
+    world_client = _ScriptedClient([])
+    completion_input = _persist_completion_contract(store)
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        completion_contract_input=completion_input,
+    )
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a",),
+        completion_contract_input=completion_input,
+        maximum_cost_usd=10.0,
+    )
+
+    artifact_sets = [simulator.run(spec) for _ in range(MAXIMUM_CELL_ATTEMPTS + 1)]
+    final = simulator._load_rollout(artifact_sets[-1].artifact_ids[0])
+
+    assert final.retry_attempt == MAXIMUM_CELL_ATTEMPTS - 1
+    assert final.stop_reason == StopReason.FAILURE
+    assert final.failure is not None
+    assert final.failure.retryable is True
+    assert artifact_sets[-1] == artifact_sets[-2]
+    assert len(candidate_client.requests) == MAXIMUM_CELL_ATTEMPTS
+
+
+def test_retrieval_dispatch_failure_persists_a_zero_incremental_reservation(
+    tmp_path: Path,
+) -> None:
+    """A failed grounded retrieval reserves zero because its estimate is already retained.
+
+    Args:
+        tmp_path: Isolated project root for durable retrieval-failure evidence.
+    """
+
+    @dataclass
+    class _FailingRetrieveRetriever(_FitRetriever):
+        """Fit retriever whose retrieval dispatch always fails at the transport level."""
+
+        def retrieve(self, query: RAGQuery) -> tuple[RAGMatch, ...]:
+            """Fail the retrieval dispatch after its estimate has been retained.
+
+            Args:
+                query: Canonical retrieval query dispatched by the simulator.
+
+            Raises:
+                ConnectionResetError: Every dispatch, leaving retrieval spend unknown.
+            """
+            raise ConnectionResetError("retrieval connection reset")
+
+    cells = (_cell("cell-a", "task-a"),)
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient(
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)]
+    )
+    world_client = _ScriptedClient([])
+    completion_input = _persist_completion_contract(store)
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        fit_retriever=_FailingRetrieveRetriever(_fit_rag_input()),
+        completion_contract_input=completion_input,
+    )
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a",),
+        completion_contract_input=completion_input,
+        maximum_cost_usd=10.0,
+    )
+
+    artifact_set = simulator.run(spec)
+    rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
+
+    assert rollout.stop_reason == StopReason.FAILURE
+    assert rollout.failure is not None
+    assert rollout.failure.details["provider_dispatch_unknown_spend"] is True
+    assert rollout.failure.details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] == 0.0
+    retrieval = rollout.retrieval_economics
+    candidate = rollout.candidate_economics
+    assert retrieval is not None and retrieval.cost_usd is not None
+    assert candidate is not None and candidate.cost_usd is not None
+    assert rollout_spend(rollout) == pytest.approx(
+        candidate.cost_usd.value + retrieval.cost_usd.value
+    )
+
+
+def test_prior_attempt_reservation_charges_the_ceiling_before_retry(tmp_path: Path) -> None:
+    """A superseded unknown-spend attempt keeps its worst-case charge on retry admission.
+
+    Args:
+        tmp_path: Isolated project root for durable reservation evidence.
+    """
+    cells = (_cell("cell-a", "task-a"),)
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _FlakyOnceClient(
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)]
+    )
+    world_client = _ScriptedClient([])
+    completion_input = _persist_completion_contract(store)
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        completion_contract_input=completion_input,
+    )
+    call_reservation = _completion_reservation("candidate-a").estimated_maximum_call_cost_usd
+    episode_reservation = 2 * (2 * call_reservation + 0.000001)
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a",),
+        completion_contract_input=completion_input,
+        maximum_cost_usd=episode_reservation + 0.4 * call_reservation,
+    )
+
+    first_set = simulator.run(spec)
+    first = simulator._load_rollout(first_set.artifact_ids[0])
+    resumed_set = simulator.run(spec)
+    second = simulator._load_rollout(resumed_set.artifact_ids[0])
+    replay = simulator.run(spec)
+
+    assert first.stop_reason == StopReason.FAILURE
+    assert first.failure is not None
+    assert first.failure.retryable is True
+    assert first.failure.details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] == pytest.approx(
+        call_reservation
+    )
+    assert second.retry_attempt == 1
+    assert second.stop_reason == StopReason.MAXIMUM_COST
+    assert replay == resumed_set
+    assert len(candidate_client.requests) == 1
+    assert world_client.requests == []
 
 
 def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: Path) -> None:
@@ -1357,7 +1638,7 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
     )
     spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
     selected, world_model, grounded_world_model = recovery._validate_spec_and_bindings(spec)
-    canonical_spec, spec_input = recovery._persist_specification(spec)
+    canonical_spec, spec_input = persist_canonical_specification(store, spec)
     resolution, resolution_input, bindings = recovery._persist_resolution(
         canonical_spec, spec_input, selected, world_model, grounded_world_model
     )
@@ -1396,13 +1677,15 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
         cell: EvaluationCell,
         binding: SimulationCellBinding,
         resolved_input: ArtifactInput,
+        *,
+        attempt: int = 0,
     ) -> RolloutArtifact:
         if rollout.failure is not None and rollout.failure.details.get("phase") == (
             "paid_cell_stale_lease"
         ):
             stale_persist_started.set()
             assert allow_stale_persist.wait(timeout=5)
-        return persist(rollout, cell, binding, resolved_input)
+        return persist(rollout, cell, binding, resolved_input, attempt=attempt)
 
     recovery.__dict__["_persist_rollout"] = pause_stale_persist
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -1629,7 +1912,7 @@ def test_text_simulation_live_hung_claim_times_out_without_calls_or_result_artif
     )
     spec = _spec(plan_input, task_set_input, ("cell-a",), maximum_cost_usd=1.0)
     cells, world_model, grounded_world_model = simulator._validate_spec_and_bindings(spec)
-    canonical_spec, spec_input = simulator._persist_specification(spec)
+    canonical_spec, spec_input = persist_canonical_specification(store, spec)
     resolution, resolution_input, bindings = simulator._persist_resolution(
         canonical_spec, spec_input, cells, world_model, grounded_world_model
     )

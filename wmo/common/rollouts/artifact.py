@@ -156,6 +156,7 @@ class RolloutArtifact(SimulationArtifact):
 
     artifact_kind: Literal["rollout"] = "rollout"
     rollout_id: ArtifactId
+    retry_attempt: int = Field(default=0, ge=0)
     trace_id: str = Field(min_length=1, max_length=512)
     evidence_source: Literal["production", "world_model", "sandbox"]
     source_run_id: str = Field(min_length=1, max_length=512)
