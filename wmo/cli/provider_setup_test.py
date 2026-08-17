@@ -386,6 +386,128 @@ def test_setup_preserves_router_candidates_and_unrelated_entries(tmp_path: Path)
     assert catalog.models["candidate"].model == "vendor/candidate"
 
 
+def test_connection_json_expands_base_url_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Compatible origins can be supplied as an environment name and stored as a URL.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the catalog.
+        monkeypatch: Scoped origin environment for the compatible connection.
+    """
+    monkeypatch.setenv("WMO_ENDPOINT_BASE_URL", "https://wm.example.test/v1")
+    connection = json.dumps(
+        {
+            "name": "private",
+            "provider": "openai-compatible",
+            "api_key_env": "WMO_ENDPOINT_API_KEY",
+            "base_url_env": "WMO_ENDPOINT_BASE_URL",
+        }
+    )
+    model = json.dumps(
+        {
+            "alias": "private",
+            "connection": "private",
+            "model": "private-model",
+            "capabilities": {
+                "supports_completions": True,
+                "supports_embeddings": True,
+                "input_cost_per_million_tokens_usd": 0,
+                "output_cost_per_million_tokens_usd": 0,
+                "cached_input_cost_per_million_tokens_usd": 0,
+                "cache_write_cost_per_million_tokens_usd": 0,
+            },
+        }
+    )
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--non-interactive",
+            "--connection-json",
+            connection,
+            "--model-json",
+            model,
+            "--world-model",
+            "private",
+            "--judge",
+            "private",
+            "--embedder",
+            "private",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    catalog = load_model_catalog(tmp_path / ".wmo" / "models.toml")
+    assert catalog.connections["private"].base_url == "https://wm.example.test/v1"
+    text = (tmp_path / ".wmo" / "models.toml").read_text(encoding="utf-8")
+    assert "sk-" not in text
+    assert "base_url_env" not in text
+
+
+def test_connection_json_rejects_base_url_and_base_url_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An origin must come from exactly one of a literal URL or an environment name.
+
+    Args:
+        tmp_path: Temporary WMO root that must stay unwritten.
+        monkeypatch: Scoped origin environment that must not be consulted.
+    """
+    monkeypatch.setenv("WMO_ENDPOINT_BASE_URL", "https://wm.example.test/v1")
+    connection = json.dumps(
+        {
+            "name": "private",
+            "provider": "openai-compatible",
+            "api_key_env": "WMO_ENDPOINT_API_KEY",
+            "base_url": "https://other.example.test/v1",
+            "base_url_env": "WMO_ENDPOINT_BASE_URL",
+        }
+    )
+    model = json.dumps(
+        {
+            "alias": "private",
+            "connection": "private",
+            "model": "private-model",
+            "capabilities": {
+                "supports_embeddings": True,
+                "input_cost_per_million_tokens_usd": 0,
+            },
+        }
+    )
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--non-interactive",
+            "--connection-json",
+            connection,
+            "--model-json",
+            model,
+            "--world-model",
+            "private",
+            "--judge",
+            "private",
+            "--embedder",
+            "private",
+        ],
+    )
+
+    assert result.exit_code == 2
+    output = unstyle(result.output)
+    assert "cannot set both base_url" in output
+    assert "base_url_env" in output
+    assert not (tmp_path / ".wmo" / "models.toml").exists()
+
+
 def test_structured_input_rejects_openai_compatible_without_capabilities(tmp_path: Path) -> None:
     """Private compatible endpoints cannot acquire provider-wide capability guesses.
 

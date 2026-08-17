@@ -19,6 +19,7 @@ from wmo.cli.app import app
         ["config", "providers", "--help"],
         ["config", "judge", "setup", "--help"],
         ["config", "judge", "calibrate", "--help"],
+        ["config", "rag", "refresh", "--help"],
         ["optimize", "router", "--help"],
         ["optimize", "model", "--help"],
         ["run", "--help"],
@@ -31,6 +32,7 @@ from wmo.cli.app import app
         "providers",
         "judge-setup",
         "judge-calibrate",
+        "rag-refresh",
         "router",
         "model",
         "run",
@@ -50,6 +52,7 @@ def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
     [
         ["build", "--help"],
         ["config", "judge", "calibrate", "--help"],
+        ["config", "rag", "refresh", "--help"],
         ["optimize", "router", "--help"],
         ["optimize", "model", "--help"],
     ],

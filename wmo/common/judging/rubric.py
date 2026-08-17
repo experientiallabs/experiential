@@ -17,13 +17,13 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.models import ModelSnapshot
 
-_MAX_AXIS_SCORE = 10
+MAX_AXIS_SCORE = 10
 
 
 class ScoreAnchor(ContractModel):
     """Plain-language meaning for one integer score on a rubric axis."""
 
-    score: int = Field(ge=0, le=_MAX_AXIS_SCORE)
+    score: int = Field(ge=0, le=MAX_AXIS_SCORE)
     description: str = Field(min_length=1)
 
 
@@ -33,8 +33,8 @@ class RubricDimension(ContractModel):
     dimension_id: ArtifactId
     name: str = Field(min_length=1, max_length=256)
     description: str = Field(min_length=1)
-    min_score: int = Field(default=0, ge=0, le=_MAX_AXIS_SCORE)
-    max_score: int = Field(default=5, ge=0, le=_MAX_AXIS_SCORE)
+    min_score: int = Field(default=0, ge=0, le=MAX_AXIS_SCORE)
+    max_score: int = Field(default=5, ge=0, le=MAX_AXIS_SCORE)
     anchors: tuple[ScoreAnchor, ...]
 
     @model_validator(mode="after")
@@ -238,8 +238,8 @@ class DimensionScoreMap(ContractModel):
     """A monotonic mapping from raw judge scores to expected human scores."""
 
     dimension_id: ArtifactId
-    min_score: int = Field(default=0, ge=0, le=_MAX_AXIS_SCORE)
-    max_score: int = Field(default=5, ge=0, le=_MAX_AXIS_SCORE)
+    min_score: int = Field(default=0, ge=0, le=MAX_AXIS_SCORE)
+    max_score: int = Field(default=5, ge=0, le=MAX_AXIS_SCORE)
     calibrated_scores: tuple[float, ...]
 
     @model_validator(mode="after")

@@ -63,6 +63,7 @@ from wmo.simulation.retrieval import (
     load_runtime_rag_refresh,
     refresh_runtime_trace_rag,
 )
+from wmo.simulation.retrieval.refresh import find_completed_runtime_rag_refresh
 
 _DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 14, tzinfo=UTC)
@@ -402,6 +403,50 @@ def _refresh(
         created_at=created_at,
         code_revision="test-revision",
     )
+
+
+def test_find_completed_runtime_rag_refresh_reopens_without_an_embedder(
+    tmp_path: Path,
+) -> None:
+    """Exact replay lookup reopens the receipt without an embedding client.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+    """
+    journal, store, _first = _two_turn_journal(tmp_path)
+    client = CountingEmbedder()
+    binding = _binding(client)
+    missing = find_completed_runtime_rag_refresh(
+        journal,
+        store,
+        (),
+        (),
+        embedding_reservation=_reservation(binding),
+        maximum_embedding_cost_usd=1.0,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="test-revision",
+    )
+    assert missing is None
+    assert client.calls == 0
+
+    first = _refresh(journal, store, binding)
+    assert client.calls == 1
+
+    found = find_completed_runtime_rag_refresh(
+        journal,
+        store,
+        (),
+        (),
+        embedding_reservation=_reservation(binding),
+        maximum_embedding_cost_usd=1.0,
+        created_at=_TIME + timedelta(days=1),
+        code_revision="test-revision",
+    )
+
+    assert found is not None
+    assert found.refresh.refresh_id == first.refresh.refresh_id
+    assert found.retrieval.index.rag_id == first.retrieval.index.rag_id
+    assert client.calls == 1
 
 
 def test_zero_cost_int_and_float_share_identity_and_replay_without_dispatch(

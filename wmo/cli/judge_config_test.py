@@ -18,7 +18,7 @@ from wmo.cli import judge_config as judge_config_module
 from wmo.cli.app import app
 from wmo.cli.judge_config import _label_value
 from wmo.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
-from wmo.common.judging import Rubric, default_task_success_axis
+from wmo.common.judging import Rubric, RubricDimension, ScoreAnchor, default_task_success_axis
 from wmo.common.models import (
     ModelCapabilities,
     ModelCatalog,
@@ -110,6 +110,7 @@ def test_judge_commands_render_as_nested_config_commands() -> None:
     assert "rubric axes" in setup_output
     assert "--yes" in calibrate_output
     assert "--approve" in calibrate_output
+    assert "--label-all" in calibrate_output
     assert "Advanced" in calibrate_output
     assert "--input-usd-per-million" in calibrate_output
     assert "--output-usd-per-million" in calibrate_output
@@ -383,6 +384,165 @@ def test_pairwise_prompt_keeps_anchors_adjacent_and_uses_plain_a_b_labels(
     assert "Score prompt: Task success" in output
     assert "0: The agent did not complete the requested task." in output
     assert "1: The agent successfully completed the requested task." in output
+
+
+def _scalar_rubric() -> SimpleNamespace:
+    """Return a rubric stub with the default task-success axis and axis lookup."""
+    dimensions = default_judge_dimensions()
+    by_id = {item.dimension_id: item for item in dimensions}
+    return SimpleNamespace(dimensions=dimensions, axis=by_id.__getitem__)
+
+
+def test_label_all_fills_unlabeled_scalar_dimensions() -> None:
+    """A uniform in-range score labels every remaining scalar sample without prompting."""
+    setup = cast(
+        ManualJudgeSetupArtifact,
+        SimpleNamespace(prompt_template=SimpleNamespace(response_shape="scalar")),
+    )
+    previews = (
+        cast(JudgeTracePreview, SimpleNamespace(trace_id="trace-a", reference_trace_id=None)),
+        cast(JudgeTracePreview, SimpleNamespace(trace_id="trace-b", reference_trace_id=None)),
+    )
+    persisted: list[tuple[ManualJudgeLabel, ...]] = []
+
+    def persist(labels: tuple[ManualJudgeLabel, ...]) -> None:
+        """Retain the uniform labels exactly as the command would save them."""
+        persisted.append(labels)
+
+    labels = judge_config_module._collect_labels(
+        setup,
+        cast(Rubric, _scalar_rubric()),
+        ("trace-a:task-success=0",),
+        previews,
+        (),
+        persist,
+        non_interactive=True,
+        label_all=1,
+    )
+
+    assert [item.trace_id for item in labels] == ["trace-a", "trace-b"]
+    assert [item.score for item in labels] == [0, 1]
+    assert persisted[-1] == labels
+
+
+def test_label_all_rejects_scores_outside_the_axis_range() -> None:
+    """A uniform score that the default 0-1 axis cannot hold fails before any draft."""
+    setup = cast(
+        ManualJudgeSetupArtifact,
+        SimpleNamespace(prompt_template=SimpleNamespace(response_shape="scalar")),
+    )
+    preview = cast(JudgeTracePreview, SimpleNamespace(trace_id="trace-a", reference_trace_id=None))
+
+    def persist(labels: tuple[ManualJudgeLabel, ...]) -> None:
+        """Out-of-range --label-all must fail before any draft is written."""
+        raise AssertionError(f"out-of-range --label-all must not persist {labels!r}")
+
+    with pytest.raises(ValueError, match="outside task-success range 0 through 1"):
+        judge_config_module._collect_labels(
+            setup,
+            cast(Rubric, _scalar_rubric()),
+            (),
+            (preview,),
+            (),
+            persist,
+            non_interactive=True,
+            label_all=4,
+        )
+
+
+def test_label_all_rejects_pairwise_calibration() -> None:
+    """Pairwise setups require an explicit winner and cannot take a uniform score."""
+    setup = cast(
+        ManualJudgeSetupArtifact,
+        SimpleNamespace(prompt_template=SimpleNamespace(response_shape="pairwise")),
+    )
+    preview = cast(
+        JudgeTracePreview,
+        SimpleNamespace(trace_id="trace-a", reference_trace_id="trace-b"),
+    )
+
+    def persist(labels: tuple[ManualJudgeLabel, ...]) -> None:
+        """Uniform pairwise labeling must fail before any draft is written."""
+        raise AssertionError(f"pairwise --label-all must not persist {labels!r}")
+
+    with pytest.raises(ValueError, match="--label-all applies only to scalar"):
+        judge_config_module._collect_labels(
+            setup,
+            cast(Rubric, _scalar_rubric()),
+            (),
+            (preview,),
+            (),
+            persist,
+            non_interactive=True,
+            label_all=1,
+        )
+
+
+def test_label_all_accepts_an_in_range_score_above_five() -> None:
+    """Typer must not reject a legal high-range axis score before axis validation."""
+    dimension = RubricDimension(
+        dimension_id="quality",
+        name="Quality",
+        description="Quality of the completed work.",
+        min_score=0,
+        max_score=10,
+        anchors=(
+            ScoreAnchor(score=0, description="Lowest quality."),
+            ScoreAnchor(score=10, description="Highest quality."),
+        ),
+    )
+    setup = cast(
+        ManualJudgeSetupArtifact,
+        SimpleNamespace(prompt_template=SimpleNamespace(response_shape="scalar")),
+    )
+    preview = cast(JudgeTracePreview, SimpleNamespace(trace_id="trace-a", reference_trace_id=None))
+    persisted: list[tuple[ManualJudgeLabel, ...]] = []
+
+    def persist(labels: tuple[ManualJudgeLabel, ...]) -> None:
+        """Retain the high-range uniform label."""
+        persisted.append(labels)
+
+    labels = judge_config_module._collect_labels(
+        setup,
+        cast(Rubric, SimpleNamespace(dimensions=(dimension,), axis=lambda key: dimension)),
+        (),
+        (preview,),
+        (),
+        persist,
+        non_interactive=True,
+        label_all=8,
+    )
+
+    assert [item.score for item in labels] == [8]
+    assert persisted[-1] == labels
+
+
+def test_label_all_cli_accepts_scores_through_the_rubric_maximum(tmp_path: Path) -> None:
+    """A score above five must pass Typer parsing and fail only on project or axis checks.
+
+    Args:
+        tmp_path: Isolated root with no project, so calibration fails after option parsing.
+    """
+    result = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "judge",
+            "calibrate",
+            "missing",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--label-all",
+            "8",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+
+    output = unstyle(result.output)
+    assert "8 is not in the range" not in output
+    assert "0<=x<=5" not in output
+    assert result.exit_code != 0
 
 
 @pytest.mark.parametrize(

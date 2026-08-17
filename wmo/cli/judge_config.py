@@ -20,6 +20,7 @@ from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.common.config import resolve_command_budget_usd
 from wmo.common.judging import Rubric, RubricDimension, render_rubric_table, score_bounds
 from wmo.common.judging.provenance import read_artifact_json
+from wmo.common.judging.rubric import MAX_AXIS_SCORE
 from wmo.common.models import load_model_catalog
 from wmo.common.project import ProjectStore
 from wmo.common.release_revision import installed_release_revision
@@ -68,6 +69,13 @@ _LABEL_OPTION = typer.Option(
         "Repeat TRACE_ID:DIMENSION_ID=SCORE, or "
         "TRACE_ID:REFERENCE_TRACE_ID:DIMENSION_ID=winner_a|winner_b|tie for pairwise labels."
     ),
+)
+_LABEL_ALL_OPTION = typer.Option(
+    None,
+    "--label-all",
+    min=0,
+    max=MAX_AXIS_SCORE,
+    help="Apply one integer score to every unlabeled scalar axis inside that axis range.",
 )
 
 
@@ -143,6 +151,7 @@ def judge_calibrate(
     root: Path = ROOT_OPTION,
     sample_size: int = typer.Option(10, "--sample-size", min=1),
     label: list[str] | None = _LABEL_OPTION,
+    label_all: int | None = _LABEL_ALL_OPTION,
     input_price: float | None = typer.Option(
         None,
         "--input-usd-per-million",
@@ -197,6 +206,7 @@ def judge_calibrate(
         root: Local project root containing ``models.toml``.
         sample_size: Maximum number of distinct fit lineages to calibrate.
         label: Repeatable explicit human score inputs.
+        label_all: Optional uniform integer score for remaining unlabeled scalar axes.
         input_price: Optional advanced input-price override.
         output_price: Optional advanced output-price override.
         maximum_input_tokens: Conservative input bound for every call attempt.
@@ -322,6 +332,7 @@ def judge_calibrate(
                 drafted,
                 persist,
                 non_interactive=non_interactive,
+                label_all=label_all,
             )
     else:
         labels = drafted
@@ -495,6 +506,7 @@ def _collect_labels(
     persist: Callable[[tuple[ManualJudgeLabel, ...]], None],
     *,
     non_interactive: bool,
+    label_all: int | None = None,
 ) -> tuple[ManualJudgeLabel, ...]:
     """Resume saved labels, parse explicit ones, and ask only for missing scores.
 
@@ -509,6 +521,7 @@ def _collect_labels(
         drafted: Labels already persisted for this exact frozen trace sample.
         persist: Durable writer for the labels collected so far.
         non_interactive: Whether all missing inputs must be reported without prompting.
+        label_all: Optional uniform integer score applied to remaining unlabeled scalar axes.
 
     Returns:
         Complete ordered human label set.
@@ -532,6 +545,18 @@ def _collect_labels(
             _label_value(item, pairwise=pairwise, axis=axis),
             pairwise=pairwise,
         )
+    if label_all is not None:
+        if pairwise:
+            raise ValueError("--label-all applies only to scalar calibration")
+        for preview in previews:
+            for dimension in rubric.dimensions:
+                if not dimension.contains_score(label_all):
+                    raise ValueError(
+                        f"--label-all {label_all} is outside {dimension.dimension_id} "
+                        f"range {dimension.min_score} through {dimension.max_score}"
+                    )
+                key = (preview.trace_id, preview.reference_trace_id, dimension.dimension_id)
+                parsed.setdefault(key, _label(key, label_all, pairwise=False))
     expected = tuple(
         (preview.trace_id, preview.reference_trace_id, dimension.dimension_id)
         for preview in previews
@@ -543,7 +568,7 @@ def _collect_labels(
             "unexpected labels: "
             + ", ".join(":".join(part or "-" for part in key) for key in unexpected)
         )
-    if explicit:
+    if explicit or label_all is not None:
         persist(tuple(parsed[key] for key in expected if key in parsed))
     missing = tuple(key for key in expected if key not in parsed)
     if missing and non_interactive:

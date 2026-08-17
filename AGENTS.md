@@ -95,9 +95,9 @@ uv run pytest -q
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
 - The root CLI is locked to `build`, `optimize`, `run`, and `config`. The optimize group is locked
-  to `router` and `model`; the config group is locked to `budget`, `judge`, `providers`, and
-  `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
-  deliberate change to the locked surface and needs the same scrutiny as a public API change.
+  to `router` and `model`; the config group is locked to `budget`, `judge`, `providers`, `rag`,
+  and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag,
+  is a deliberate change to the locked surface and needs the same scrutiny as a public API change.
 - Every paid CLI command uses `wmo.cli.consent.require_spend_consent` after a credential-free
   conservative estimate and before credential or provider-client construction. The setting in
   `.wmo/settings.toml` is a hard per-command ceiling. Estimates at or below half run automatically,

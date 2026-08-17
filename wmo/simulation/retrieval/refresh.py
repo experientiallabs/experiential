@@ -186,6 +186,186 @@ class PersistedRuntimeRAGRefresh:
     retrieval: PersistedRAGIndex
 
 
+@dataclass(frozen=True)
+class _PreparedRuntimeRAGRefresh:
+    """Sealed snapshot, union dataset, and replay identity before embedder dispatch."""
+
+    snapshot_export: PersistedRuntimeTraceExport
+    dataset: PersistedRuntimeRAGDataset
+    imports: tuple[ArtifactInput, ...]
+    bindings: tuple[RAGLineageBinding, ...]
+    transition_texts: tuple[str, ...]
+    refresh_id: str
+    maximum_embedding_cost_usd: float
+
+
+def _prepare_runtime_rag_refresh(
+    journal: RuntimeInteractionJournal,
+    store: ArtifactStore,
+    imported_trace_datasets: Sequence[ArtifactInput],
+    imported_lineage_bindings: Sequence[RAGLineageBinding],
+    *,
+    embedding_reservation: EmbeddingCostReservation,
+    maximum_embedding_cost_usd: float,
+    created_at: datetime,
+    code_revision: str,
+    last_ordinal: int | None = None,
+    default_top_k: int = 5,
+) -> _PreparedRuntimeRAGRefresh:
+    """Seal the current journal prefix and derive the exact refresh identity.
+
+    This step writes only the snapshot and union dataset. It does not construct an embedding
+    client or dispatch embeddings.
+
+    Args:
+        journal: Current project's validated append-only routed interaction journal.
+        store: Immutable artifact store for the same project.
+        imported_trace_datasets: Exact real trace-dataset pointers already imported by the project.
+        imported_lineage_bindings: Fit or held-out assignments covering imported traces exactly.
+        embedding_reservation: Explicit model, input ceiling, price, and retry-inclusive bound.
+        maximum_embedding_cost_usd: Finite total embedding-cost ceiling for this refresh.
+        created_at: Time new immutable artifacts are materialized.
+        code_revision: Exact WMO revision producing the artifacts.
+        last_ordinal: Optional inclusive journal prefix boundary.
+        default_top_k: Positive retrieval limit persisted in the new index.
+
+    Returns:
+        Sealed inputs and the deterministic refresh identity used for replay lookup.
+
+    Raises:
+        RuntimeRAGRefreshError: Source coverage or reservation inputs cannot be proven.
+        RuntimeTraceSnapshotError: The selected journal prefix cannot be sealed.
+    """
+    ceiling = _normalize_finite_nonnegative_cost(maximum_embedding_cost_usd)
+    imports = tuple(sorted(imported_trace_datasets, key=lambda item: item.artifact_id))
+    if len({item.artifact_id for item in imports}) != len(imports):
+        raise RuntimeRAGRefreshError("imported runtime RAG datasets must not repeat")
+    snapshot_export = seal_runtime_trace_snapshot(
+        journal,
+        store,
+        created_at=created_at,
+        code_revision=code_revision,
+        last_ordinal=last_ordinal,
+    )
+    runtime_dataset_input = artifact_input(snapshot_export.dataset_manifest)
+    snapshot_input = artifact_input(snapshot_export.snapshot_manifest)
+    if runtime_dataset_input in imports:
+        raise RuntimeRAGRefreshError(
+            "imported trace datasets must not repeat the current runtime snapshot dataset"
+        )
+    stitched = stitch_runtime_observations(snapshot_export)
+    dataset = persist_runtime_rag_dataset(
+        store,
+        (*imports, runtime_dataset_input),
+        runtime_dataset_input=runtime_dataset_input,
+        stitched_runtime_traces=stitched,
+        created_at=created_at,
+        code_revision=code_revision,
+    )
+    combined_input = artifact_input(dataset.manifest)
+    bindings = _combined_lineage_bindings(
+        store,
+        imports,
+        imported_lineage_bindings,
+        runtime_traces=stitched,
+    )
+    transitions = extract_fit_transitions(dataset.traces, bindings)
+    if not transitions:
+        raise RuntimeRAGRefreshError(
+            "runtime RAG refresh has no real observed fit transition after terminal exclusion"
+        )
+    refresh_id = _refresh_id(
+        project_id=journal.project_id,
+        snapshot=snapshot_input,
+        runtime_trace_dataset=runtime_dataset_input,
+        imported_trace_datasets=imports,
+        combined_trace_dataset=combined_input,
+        lineage_bindings=bindings,
+        embedding_reservation=embedding_reservation,
+        maximum_embedding_cost_usd=ceiling,
+        code_revision=code_revision,
+        default_top_k=default_top_k,
+    )
+    return _PreparedRuntimeRAGRefresh(
+        snapshot_export=snapshot_export,
+        dataset=dataset,
+        imports=imports,
+        bindings=bindings,
+        transition_texts=tuple(item.key_text for item in transitions),
+        refresh_id=refresh_id,
+        maximum_embedding_cost_usd=ceiling,
+    )
+
+
+def find_completed_runtime_rag_refresh(
+    journal: RuntimeInteractionJournal,
+    store: ArtifactStore,
+    imported_trace_datasets: Sequence[ArtifactInput],
+    imported_lineage_bindings: Sequence[RAGLineageBinding],
+    *,
+    embedding_reservation: EmbeddingCostReservation,
+    maximum_embedding_cost_usd: float,
+    created_at: datetime,
+    code_revision: str,
+    last_ordinal: int | None = None,
+    default_top_k: int = 5,
+) -> PersistedRuntimeRAGRefresh | None:
+    """Reopen a completed exact refresh without constructing an embedding client.
+
+    Args:
+        journal: Current project's validated append-only routed interaction journal.
+        store: Immutable artifact store for the same project.
+        imported_trace_datasets: Exact real trace-dataset pointers already imported by the project.
+        imported_lineage_bindings: Fit or held-out assignments covering imported traces exactly.
+        embedding_reservation: Explicit model, input ceiling, price, and retry-inclusive bound.
+        maximum_embedding_cost_usd: Finite total embedding-cost ceiling for this refresh.
+        created_at: Time new immutable artifacts are materialized.
+        code_revision: Exact WMO revision producing the artifacts.
+        last_ordinal: Optional inclusive journal prefix boundary.
+        default_top_k: Positive retrieval limit persisted in the requested index.
+
+    Returns:
+        The verified completed refresh, or ``None`` when this exact receipt has not been written.
+
+    Raises:
+        RuntimeRAGRefreshError: Source coverage, reservation, or a present receipt cannot be proven.
+        RuntimeTraceSnapshotError: The selected journal prefix cannot be sealed.
+    """
+    prepared = _prepare_runtime_rag_refresh(
+        journal,
+        store,
+        imported_trace_datasets,
+        imported_lineage_bindings,
+        embedding_reservation=embedding_reservation,
+        maximum_embedding_cost_usd=maximum_embedding_cost_usd,
+        created_at=created_at,
+        code_revision=code_revision,
+        last_ordinal=last_ordinal,
+        default_top_k=default_top_k,
+    )
+    destination = store.project_directory / "artifacts" / prepared.refresh_id
+    if not destination.exists():
+        return None
+    reserved_cost = _reservation_spend_usd(
+        prepared.transition_texts,
+        reservation=embedding_reservation,
+        maximum_cost_usd=prepared.maximum_embedding_cost_usd,
+    )
+    lock_target = store.project_directory / "runtime" / f"{prepared.refresh_id}.receipt"
+    with file_write_lock(lock_target, what="the runtime RAG refresh"):
+        if not destination.exists():
+            return None
+        return _load_exact_refresh(
+            store,
+            prepared.refresh_id,
+            snapshot_export=prepared.snapshot_export,
+            dataset=prepared.dataset,
+            expected_bindings=prepared.bindings,
+            expected_reservation=embedding_reservation,
+            expected_reserved_cost=reserved_cost,
+        )
+
+
 def refresh_runtime_trace_rag(
     journal: RuntimeInteractionJournal,
     store: ArtifactStore,
@@ -227,62 +407,27 @@ def refresh_runtime_trace_rag(
             cannot be proven before or after dispatch.
         RuntimeTraceSnapshotError: The selected journal prefix cannot be sealed.
     """
-    maximum_embedding_cost_usd = _normalize_finite_nonnegative_cost(maximum_embedding_cost_usd)
-    imports = tuple(sorted(imported_trace_datasets, key=lambda item: item.artifact_id))
-    if len({item.artifact_id for item in imports}) != len(imports):
-        raise RuntimeRAGRefreshError("imported runtime RAG datasets must not repeat")
-    snapshot_export = seal_runtime_trace_snapshot(
+    prepared = _prepare_runtime_rag_refresh(
         journal,
         store,
+        imported_trace_datasets,
+        imported_lineage_bindings,
+        embedding_reservation=embedding_reservation,
+        maximum_embedding_cost_usd=maximum_embedding_cost_usd,
         created_at=created_at,
         code_revision=code_revision,
         last_ordinal=last_ordinal,
-    )
-    runtime_dataset_input = artifact_input(snapshot_export.dataset_manifest)
-    snapshot_input = artifact_input(snapshot_export.snapshot_manifest)
-    if runtime_dataset_input in imports:
-        raise RuntimeRAGRefreshError(
-            "imported trace datasets must not repeat the current runtime snapshot dataset"
-        )
-    stitched = stitch_runtime_observations(snapshot_export)
-    dataset = persist_runtime_rag_dataset(
-        store,
-        (*imports, runtime_dataset_input),
-        runtime_dataset_input=runtime_dataset_input,
-        stitched_runtime_traces=stitched,
-        created_at=created_at,
-        code_revision=code_revision,
-    )
-    combined_input = artifact_input(dataset.manifest)
-    bindings = _combined_lineage_bindings(
-        store,
-        imports,
-        imported_lineage_bindings,
-        runtime_traces=stitched,
-    )
-    transitions = extract_fit_transitions(dataset.traces, bindings)
-    if not transitions:
-        raise RuntimeRAGRefreshError(
-            "runtime RAG refresh has no real observed fit transition after terminal exclusion"
-        )
-    reserved_cost = _reserved_embedding_cost(
-        tuple(item.key_text for item in transitions),
-        embedder=embedder,
-        reservation=embedding_reservation,
-        maximum_cost_usd=maximum_embedding_cost_usd,
-    )
-    refresh_id = _refresh_id(
-        project_id=journal.project_id,
-        snapshot=snapshot_input,
-        runtime_trace_dataset=runtime_dataset_input,
-        imported_trace_datasets=imports,
-        combined_trace_dataset=combined_input,
-        lineage_bindings=bindings,
-        embedding_reservation=embedding_reservation,
-        maximum_embedding_cost_usd=maximum_embedding_cost_usd,
-        code_revision=code_revision,
         default_top_k=default_top_k,
     )
+    reserved_cost = _reserved_embedding_cost(
+        prepared.transition_texts,
+        embedder=embedder,
+        reservation=embedding_reservation,
+        maximum_cost_usd=prepared.maximum_embedding_cost_usd,
+    )
+    snapshot_export = prepared.snapshot_export
+    dataset = prepared.dataset
+    refresh_id = prepared.refresh_id
     lock_target = store.project_directory / "runtime" / f"{refresh_id}.receipt"
     with file_write_lock(lock_target, what="the runtime RAG refresh"):
         destination = store.project_directory / "artifacts" / refresh_id
@@ -292,14 +437,14 @@ def refresh_runtime_trace_rag(
                 refresh_id,
                 snapshot_export=snapshot_export,
                 dataset=dataset,
-                expected_bindings=bindings,
+                expected_bindings=prepared.bindings,
                 expected_reservation=embedding_reservation,
                 expected_reserved_cost=reserved_cost,
             )
         retrieval = persist_trace_rag(
             store,
-            (combined_input,),
-            bindings,
+            (artifact_input(dataset.manifest),),
+            prepared.bindings,
             created_at=created_at,
             code_revision=code_revision,
             embedder=embedder,
@@ -308,14 +453,14 @@ def refresh_runtime_trace_rag(
         refresh = _refresh_envelope(
             refresh_id=refresh_id,
             project_id=journal.project_id,
-            snapshot=snapshot_input,
-            runtime_trace_dataset=runtime_dataset_input,
-            imported_trace_datasets=imports,
-            combined_trace_dataset=combined_input,
-            lineage_bindings=bindings,
+            snapshot=artifact_input(snapshot_export.snapshot_manifest),
+            runtime_trace_dataset=artifact_input(snapshot_export.dataset_manifest),
+            imported_trace_datasets=prepared.imports,
+            combined_trace_dataset=artifact_input(dataset.manifest),
+            lineage_bindings=prepared.bindings,
             retrieval_index=artifact_input(retrieval.manifest),
             embedding_reservation=embedding_reservation,
-            maximum_embedding_cost_usd=maximum_embedding_cost_usd,
+            maximum_embedding_cost_usd=prepared.maximum_embedding_cost_usd,
             reserved_embedding_cost_usd=reserved_cost,
             last_ordinal=snapshot_export.snapshot.last_ordinal,
             created_at=created_at,
@@ -335,7 +480,7 @@ def refresh_runtime_trace_rag(
                 refresh_id,
                 snapshot_export=snapshot_export,
                 dataset=dataset,
-                expected_bindings=bindings,
+                expected_bindings=prepared.bindings,
                 expected_reservation=embedding_reservation,
                 expected_reserved_cost=reserved_cost,
             )
@@ -533,6 +678,47 @@ def _combined_lineage_bindings(
     return tuple(by_trace[trace_id] for trace_id in sorted(by_trace))
 
 
+def _reservation_spend_usd(
+    texts: Sequence[str],
+    *,
+    reservation: EmbeddingCostReservation,
+    maximum_cost_usd: float,
+) -> float:
+    """Return the retry-inclusive reservation used for spend admission.
+
+    UTF-8 byte count is a conservative provider-independent input-token ceiling because every
+    nonempty token consumes at least one byte. The persisted reservation may be larger, but never
+    smaller, than this exact batch requirement.
+
+    Args:
+        texts: Exact canonical transition keys that will be embedded together.
+        reservation: Explicit model, price, retry, and input ceiling.
+        maximum_cost_usd: Finite total ceiling authorized for this refresh.
+
+    Returns:
+        Maximum retry-inclusive USD spend reserved for the dispatch.
+
+    Raises:
+        RuntimeRAGRefreshError: Input size or total-cost evidence is unknown or over the ceiling.
+    """
+    required_input_tokens = sum(len(text.encode("utf-8")) for text in texts)
+    if required_input_tokens > reservation.maximum_input_tokens:
+        raise RuntimeRAGRefreshError(
+            "embedding input exceeds the explicit provider-independent token reservation"
+        )
+    reserved = (
+        reservation.maximum_input_tokens
+        * reservation.maximum_attempts
+        * reservation.input_usd_per_million_tokens
+        / 1_000_000
+    )
+    if not math.isfinite(reserved) or reserved > maximum_cost_usd:
+        raise RuntimeRAGRefreshError(
+            "retry-inclusive embedding reservation exceeds the refresh cost ceiling"
+        )
+    return reserved
+
+
 def _reserved_embedding_cost(
     texts: Sequence[str],
     *,
@@ -541,10 +727,6 @@ def _reserved_embedding_cost(
     maximum_cost_usd: float,
 ) -> float:
     """Validate an exact retry-inclusive embedding reservation before dispatch.
-
-    UTF-8 byte count is a conservative provider-independent input-token ceiling because every
-    nonempty token consumes at least one byte. The persisted reservation may be larger, but never
-    smaller, than this exact batch requirement.
 
     Args:
         texts: Exact canonical transition keys that will be embedded together.
@@ -565,22 +747,11 @@ def _reserved_embedding_cost(
         raise RuntimeRAGRefreshError("embedding reservation retry bound differs from embedder")
     if reservation.input_usd_per_million_tokens != embedder.input_usd_per_million_tokens:
         raise RuntimeRAGRefreshError("embedding reservation price differs from configured embedder")
-    required_input_tokens = sum(len(text.encode("utf-8")) for text in texts)
-    if required_input_tokens > reservation.maximum_input_tokens:
-        raise RuntimeRAGRefreshError(
-            "embedding input exceeds the explicit provider-independent token reservation"
-        )
-    reserved = (
-        reservation.maximum_input_tokens
-        * reservation.maximum_attempts
-        * reservation.input_usd_per_million_tokens
-        / 1_000_000
+    return _reservation_spend_usd(
+        texts,
+        reservation=reservation,
+        maximum_cost_usd=maximum_cost_usd,
     )
-    if not math.isfinite(reserved) or reserved > maximum_cost_usd:
-        raise RuntimeRAGRefreshError(
-            "retry-inclusive embedding reservation exceeds the refresh cost ceiling"
-        )
-    return reserved
 
 
 def _refresh_id(

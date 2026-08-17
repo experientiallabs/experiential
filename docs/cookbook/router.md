@@ -76,8 +76,16 @@ Chat requests are stateless. Responses continuations preserve routing affinity t
 `previous_response_id` field. Request-time embedding failure falls back to the frozen conservative
 baseline. Neither path updates the policy or evidence bank.
 
-By default, completed traffic enters the durable project journal and can later feed runtime RAG and
-SFT preparation. Use ghost mode when traffic must not be saved:
+By default, completed traffic enters the durable project journal. After the server stops, seal that
+journal into a new retrieval index beside the frozen build:
+
+```bash
+wmo config rag refresh support-agent --root .wmo --yes
+```
+
+The command writes a new combined dataset and RAG index. It does not mutate the completed-build
+serving RAG, fit RAG, or world model. Repeating it on the same journal prefix reprints the receipt
+and makes no new embedding calls. Use ghost mode when traffic must not be saved:
 
 ```bash
 wmo run support-agent --root .wmo --ghost

@@ -354,9 +354,10 @@ def _noninteractive_setup(
     errors: list[str] = []
     for position, payload in enumerate(options.connection_json, start=1):
         try:
-            connections.append(ProviderConnection.model_validate_json(payload))
-        except ValidationError as exc:
-            errors.append(f"--connection-json #{position}: {exc.errors()[0]['msg']}")
+            connections.append(_connection_from_json(payload))
+        except (ValueError, ValidationError) as exc:
+            message = exc.errors()[0]["msg"] if isinstance(exc, ValidationError) else str(exc)
+            errors.append(f"--connection-json #{position}: {message}")
     for position, payload in enumerate(options.model_json, start=1):
         try:
             models.append(ProviderModelSelection.model_validate_json(payload))
@@ -394,6 +395,40 @@ def _noninteractive_setup(
         judge=roles["--judge"],
         embedder=roles["--embedder"],
     )
+
+
+def _connection_from_json(payload: str) -> ProviderConnection:
+    """Parse one connection record, expanding ``base_url_env`` before validation.
+
+    Args:
+        payload: JSON object accepted by ``--connection-json``.
+
+    Returns:
+        A validated secret-free connection with any env-backed origin already expanded.
+
+    Raises:
+        ValueError: JSON is malformed or ``base_url_env`` cannot be resolved.
+        ValidationError: The expanded record is not a supported connection.
+    """
+    try:
+        raw = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError("connection JSON must be a complete object") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("connection JSON must be a complete object")
+    env_name = raw.pop("base_url_env", None)
+    if env_name is not None:
+        if raw.get("base_url") is not None:
+            raise ValueError("connection JSON cannot set both base_url and base_url_env")
+        if not isinstance(env_name, str) or not env_name.strip():
+            raise ValueError("base_url_env must be a nonempty environment-variable name")
+        origin = os.environ.get(env_name, "").strip()
+        if not origin:
+            raise ValueError(
+                f"{env_name} is empty; set that origin before configuring this connection"
+            )
+        raw["base_url"] = origin
+    return ProviderConnection.model_validate(raw)
 
 
 def _existing_connections(existing: ModelCatalog | None) -> tuple[ProviderConnection, ...]:

@@ -9,6 +9,8 @@ The root surface is deliberately small:
 | `wmo optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `wmo run PROJECT --root ROOT [--ghost]` | Load a frozen policy and expose it on development-only loopback. | Local OpenAI-compatible endpoint with durable journaling by default or no saved traffic in ghost mode. |
 | `wmo config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. | Local `.wmo/models.toml`. |
+| `wmo config judge setup\|calibrate PROJECT` | Confirm a judge contract, then label and approve calibration on real fit traces. | Approved judge setup and calibration artifacts. |
+| `wmo config rag refresh PROJECT` | Seal durable routed traffic into a new retrieval index beside the completed build. | Runtime snapshot, combined trace dataset, and a new RAG index. Frozen build artifacts stay unchanged. |
 | `wmo config budget [USD] --root ROOT` | Read or set the maximum conservative estimate allowed for one paid command. | Local `.wmo/settings.toml`. |
 | `wmo config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.wmo/settings.toml`. |
 

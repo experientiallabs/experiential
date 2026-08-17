@@ -29,6 +29,14 @@ add_deferred_typer(
     help="Set up and manually calibrate a project judge.",
     known_names=("setup", "calibrate"),
 )
+add_deferred_typer(
+    config_app,
+    name="rag",
+    module="wmo.cli.rag_config",
+    attr="rag_app",
+    help="Refresh retrieval from durable routed traffic.",
+    known_names=("refresh",),
+)
 _console = Console()
 _CONNECTION_JSON_OPTION = typer.Option(
     None,
