@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
@@ -55,8 +56,9 @@ def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
 )
 def test_every_paid_command_exposes_deterministic_agent_flags(argv: list[str]) -> None:
     """Paid CLI surfaces expose explicit confirmation and noninteractive mode."""
-    result = CliRunner().invoke(app, argv)
+    result = CliRunner().invoke(app, argv, color=True)
+    help_text = unstyle(result.output)
 
     assert result.exit_code == 0, result.output
-    assert "--yes" in result.output
-    assert "--non-interactive" in result.output
+    assert "--yes" in help_text
+    assert "--non-interactive" in help_text
