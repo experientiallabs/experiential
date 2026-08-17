@@ -69,6 +69,7 @@ class GroundedRolloutBuilder:
         world_model_economics: OperationEconomics,
         retrieval_economics: OperationEconomics,
         orchestration_economics: OperationEconomics,
+        attempt: int = 0,
     ) -> RolloutArtifact:
         """Compose one canonical rollout from bound execution evidence.
 
@@ -87,11 +88,12 @@ class GroundedRolloutBuilder:
             world_model_economics: Combined world-model-call economics.
             retrieval_economics: Conservative query-embedding economics.
             orchestration_economics: Simulator-owned elapsed-time economics.
+            attempt: Zero-based deliberate re-execution generation for this binding.
 
         Returns:
             Fully bound world-model rollout ready for immutable persistence.
         """
-        rollout_id = rollout_id_for_binding(binding)
+        rollout_id = rollout_id_for_binding(binding, attempt=attempt)
         return RolloutArtifact(
             schema_version=1,
             created_at=timestamp(self.clock),
@@ -109,6 +111,7 @@ class GroundedRolloutBuilder:
             cell_id=cell.cell_id,
             mode=SimulationMode.WORLD_MODEL,
             rollout_id=rollout_id,
+            retry_attempt=attempt,
             trace_id=sha256_json({"binding": binding.model_dump(mode="json")}),
             evidence_source="world_model",
             source_run_id=spec.simulation_id,

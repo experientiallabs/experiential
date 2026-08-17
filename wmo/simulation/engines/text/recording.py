@@ -32,9 +32,15 @@ from wmo.common.models import (
     reconcile_completion_economics,
     verify_completion_reservation,
 )
-from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
+from wmo.common.rollouts import (
+    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
+    RolloutEventKind,
+    RolloutSpan,
+    StopReason,
+)
 from wmo.common.tasks import TaskCase
 from wmo.runtime.models import ResolvedModel
+from wmo.runtime.models.providers.transport import classify_retry
 from wmo.simulation.engines.clock import timestamp
 from wmo.simulation.engines.text.prompt import (
     TextWorldModelProtocolError,
@@ -166,6 +172,7 @@ class RecordingCandidateClient:
         self._terminal = False
         self._failure: TextSimulationError | None = None
         self._provider_dispatch_unknown_spend = False
+        self._unknown_dispatch_reserved_cost_usd: float | None = None
 
     @property
     def terminal_error(self) -> TextSimulationError | None:
@@ -259,12 +266,20 @@ class RecordingCandidateClient:
             self._failure = self._failure or exc
             raise
         except Exception as exc:  # noqa: BLE001 - provider exceptions become durable episode evidence
-            details: dict[str, JsonValue] = {"phase": "candidate_or_world_model"}
+            classification = classify_retry(exc)
+            details: dict[str, JsonValue] = {
+                "phase": "candidate_or_world_model",
+                "retry_classification": classification.reason,
+            }
             if self._provider_dispatch_unknown_spend:
                 details["provider_dispatch_unknown_spend"] = True
+                reserved = self._unknown_dispatch_reserved_cost_usd
+                if reserved is not None:
+                    details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] = reserved
             failure = StructuredFailure(
                 code=FailureCode.PROVIDER,
                 message=f"text simulation provider call failed with {type(exc).__name__}",
+                retryable=classification.retryable,
                 exception_type=type(exc).__name__,
                 attribution=FailureAttribution.MODEL,
                 details=details,
@@ -332,8 +347,14 @@ class RecordingCandidateClient:
                 maximum_cost_usd=self._maximum_cost_usd,
             )
         candidate_started_at = timestamp(self._clock)
-        self._provider_dispatch_unknown_spend = True
-        candidate_response = self._candidate.client.complete(candidate_request)
+        candidate_response = self._dispatch_provider(
+            lambda: self._candidate.client.complete(candidate_request),
+            reserved_cost_usd=(
+                self._candidate_request.estimated_maximum_call_cost_usd
+                if self._candidate_request is not None
+                else None
+            ),
+        )
         if self._candidate_request is not None:
             candidate_response = candidate_response.model_copy(
                 update={
@@ -357,7 +378,7 @@ class RecordingCandidateClient:
             )
         )
         _require_response_identity(candidate_response, self._candidate, role="candidate")
-        self._provider_dispatch_unknown_spend = False
+        self._clear_unknown_dispatch()
         _require_complete_response(candidate_response, role="candidate")
         _require_text_only_action(candidate_response.output, role="candidate")
         candidate_content = candidate_response.output.content
@@ -382,15 +403,19 @@ class RecordingCandidateClient:
             maximum_cost_usd=self._maximum_cost_usd,
         )
         self._retrieval_economics.append(query_economics)
-        self._provider_dispatch_unknown_spend = True
-        prepared = self._grounded_world_model.prepare_turn(
-            task=self._task,
-            visible_messages=candidate_request.messages,
-            candidate_response=candidate_response.output,
-            excluded_lineage_ids=(self._task.lineage_group_id,),
-            maximum_output_tokens=self._maximum_output_tokens,
+        prepared = self._dispatch_provider(
+            lambda: self._grounded_world_model.prepare_turn(
+                task=self._task,
+                visible_messages=candidate_request.messages,
+                candidate_response=candidate_response.output,
+                excluded_lineage_ids=(self._task.lineage_group_id,),
+                maximum_output_tokens=self._maximum_output_tokens,
+            ),
+            # The retained retrieval estimate above already covers this dispatch's worst case
+            # in every reconciliation path, so the window's incremental reservation is zero.
+            reserved_cost_usd=0.0,
         )
-        self._provider_dispatch_unknown_spend = False
+        self._clear_unknown_dispatch()
         _preflight_context(
             self._world_model.alias,
             self._world_model.capabilities,
@@ -416,8 +441,14 @@ class RecordingCandidateClient:
                 maximum_cost_usd=self._maximum_cost_usd,
             )
         world_started_at = timestamp(self._clock, not_before=candidate_ended_at)
-        self._provider_dispatch_unknown_spend = True
-        dispatched = self._grounded_world_model.complete_turn(prepared)
+        dispatched = self._dispatch_provider(
+            lambda: self._grounded_world_model.complete_turn(prepared),
+            reserved_cost_usd=(
+                self._world_model_request.estimated_maximum_call_cost_usd
+                if self._world_model_request is not None
+                else None
+            ),
+        )
         world_request = dispatched.request
         world_response = dispatched.response
         if self._world_model_request is not None:
@@ -447,7 +478,7 @@ class RecordingCandidateClient:
             )
         )
         _require_response_identity(world_response, self._world_model, role="world model")
-        self._provider_dispatch_unknown_spend = False
+        self._clear_unknown_dispatch()
         _require_complete_response(world_response, role="world model")
         try:
             transition = self._grounded_world_model.parse_turn(dispatched).transition
@@ -467,6 +498,39 @@ class RecordingCandidateClient:
         )
         self._terminal = transition.terminal
         return candidate_response
+
+    def _dispatch_provider[ResultT](
+        self,
+        operation: Callable[[], ResultT],
+        *,
+        reserved_cost_usd: float | None,
+    ) -> ResultT:
+        """Run one provider dispatch inside an explicit unknown-spend accounting window.
+
+        The executing client owns bounded transport retries inside the same retry-inclusive
+        reservation that admitted this dispatch, so this boundary never multiplies attempts.
+        While the dispatch is in flight its worst-case reservation is retained so a failure
+        that leaves spend unknown persists an exact conservative charge with its evidence
+        instead of an unpriceable hole.
+
+        Args:
+            operation: One provider dispatch whose spend is ambiguous until it returns.
+            reserved_cost_usd: Retry-inclusive worst-case charge admitted for this dispatch.
+
+        Returns:
+            The successful dispatch result.
+
+        Raises:
+            Exception: The active provider client failed after its own bounded retries.
+        """
+        self._provider_dispatch_unknown_spend = True
+        self._unknown_dispatch_reserved_cost_usd = reserved_cost_usd
+        return operation()
+
+    def _clear_unknown_dispatch(self) -> None:
+        """Mark the most recent provider dispatch as fully priced and recorded."""
+        self._provider_dispatch_unknown_spend = False
+        self._unknown_dispatch_reserved_cost_usd = None
 
 
 def _require_query_budget(
