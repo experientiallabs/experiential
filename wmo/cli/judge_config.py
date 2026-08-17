@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
-from decimal import Decimal
 from pathlib import Path
 
 import typer
@@ -29,7 +29,6 @@ from wmo.common.project import ProjectStore
 from wmo.common.release_revision import installed_release_revision
 from wmo.optimize.router.judging.artifacts import read_audit, require_review_state
 from wmo.optimize.router.judging.contracts import (
-    JudgeCalibrationBudget,
     JudgePromptTemplate,
     JudgeTracePreview,
     ManualJudgeCalibrationResult,
@@ -142,7 +141,7 @@ def judge_setup(
 
 @judge_app.command(
     "calibrate",
-    help="Label real traces, run consented judge calls, and separately approve calibration.",
+    help="Label real traces, authorize bounded judge calls, and separately approve calibration.",
 )
 def judge_calibrate(
     project: str = typer.Argument(..., metavar="PROJECT", help="Configured local project ID."),
@@ -170,7 +169,11 @@ def judge_calibrate(
         min=0.000001,
         help="Calibration spend ceiling. Defaults to the shared command-budget setting, then $10.",
     ),
-    yes: bool = typer.Option(False, "--yes", help="Consent to the displayed judge spend."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm an in-budget estimate when the shared policy requires it.",
+    ),
     approve: bool = typer.Option(
         False, "--approve", help="Approve the report after it is displayed."
     ),
@@ -195,7 +198,7 @@ def judge_calibrate(
         help="Page full transcripts in an interactive terminal instead of truncating them.",
     ),
 ) -> None:
-    """Collect frozen labels, run consented judge calls, and separately approve evidence.
+    """Collect frozen labels, authorize bounded judge calls, and separately approve evidence.
 
     Args:
         project: Local project ID below ``<root>/projects``.
@@ -206,7 +209,7 @@ def judge_calibrate(
         output_price: Optional advanced output-price override.
         maximum_input_tokens: Conservative input bound for every call attempt.
         maximum_cost_usd: Optional spend ceiling; otherwise the shared command-budget setting.
-        yes: Explicit spend consent only.
+        yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
         approve: Separate approval of the displayed completed report.
         accept_insufficient_labels: Explicit risk acceptance below ten labeled rollouts.
         non_interactive: Refuse prompts and list missing explicit inputs.
@@ -215,7 +218,7 @@ def judge_calibrate(
         page: Page untruncated transcripts through the interactive terminal.
 
     Raises:
-        typer.BadParameter: Evidence, labels, budget, consent, or approval is invalid.
+        typer.BadParameter: Evidence, labels, budget, authorization, or approval is invalid.
     """
     with usage_error(OSError, ValueError, ManualJudgeError):
         revision = installed_release_revision()
@@ -237,14 +240,25 @@ def judge_calibrate(
             )
         else:
             catalog = load_model_catalog(store.model_catalog_path)
+            shared_ceiling = resolve_command_budget_usd(root, None)
+            calibration_ceiling = (
+                shared_ceiling
+                if maximum_cost_usd is None
+                else min(shared_ceiling, maximum_cost_usd)
+            )
             budget = estimate_manual_judge_budget(
                 plan,
                 catalog=catalog,
                 input_usd_per_million_tokens=input_price,
                 output_usd_per_million_tokens=output_price,
                 maximum_input_tokens_per_call=maximum_input_tokens,
-                maximum_cost_usd=resolve_command_budget_usd(root, maximum_cost_usd),
+                maximum_cost_usd=sys.float_info.max,
             )
+            if maximum_cost_usd is not None and budget.estimated_cost_usd > maximum_cost_usd:
+                raise ValueError(
+                    "judge calibration estimate exceeds --maximum-cost-usd; raise the ceiling "
+                    "or reduce the labeled sample"
+                )
         if page and not completed and not can_prompt(_console):
             raise ValueError("--page requires an interactive terminal; omit it for wrapped output")
 
@@ -256,23 +270,50 @@ def judge_calibrate(
             """
             save_label_draft(store, plan.setup, sample_sha256, collected, now)
 
-    if not completed:
-        _render_spend_preflight(plan, budget)
-        spend = (
-            f"at most ${_format_usd(budget.estimated_cost_usd)} across "
-            f"{budget.call_count} judge calls "
-            f"with up to {budget.maximum_attempts_per_call} attempts each, inside the "
-            f"${_format_usd(budget.maximum_cost_usd)} ceiling"
+    estimate = 0.0 if completed else budget.estimated_cost_usd
+    assumptions = (
+        (
+            "verified immutable calibration replay",
+            "zero new judge calls",
         )
-        if not require_spend_consent(
-            _console,
-            yes=yes,
-            spend=spend,
-            command="wmo config judge calibrate",
-            question="Run this named judge calibration within the displayed ceiling?",
-        ):
-            _console.print("Judge calibration was not started. No labels or provider calls ran.")
-            return
+        if completed
+        else (
+            f"judge {plan.setup.judge_alias}: {model_display_name(plan.setup.judge_model)}",
+            (
+                f"{budget.call_count} judge calls with up to "
+                f"{budget.maximum_attempts_per_call} attempts each"
+            ),
+            (
+                f"{budget.maximum_input_tokens_per_call} input and "
+                f"{budget.maximum_output_tokens_per_call} output tokens per attempt"
+            ),
+            (
+                f"${budget.input_usd_per_million_tokens:.6f} input and "
+                f"${budget.output_usd_per_million_tokens:.6f} output per million tokens"
+            ),
+        )
+    )
+    if not require_spend_consent(
+        _console,
+        root=root,
+        yes=yes,
+        estimated_cost_usd=estimate,
+        command=f"wmo config judge calibrate {project}",
+        assumptions=assumptions,
+        non_interactive=non_interactive,
+    ):
+        _console.print("Judge calibration was not started. No labels or provider calls ran.")
+        return
+    if not completed:
+        with usage_error(OSError, ValueError, ManualJudgeError):
+            budget = estimate_manual_judge_budget(
+                plan,
+                catalog=catalog,
+                input_usd_per_million_tokens=input_price,
+                output_usd_per_million_tokens=output_price,
+                maximum_input_tokens_per_call=maximum_input_tokens,
+                maximum_cost_usd=max(calibration_ceiling, 0.000001),
+            )
         if drafted:
             _console.print(f"Resuming {len(drafted)} saved human labels for this trace sample.")
         _render_calibration_review(
@@ -414,48 +455,6 @@ def _render_setup(plan: ManualJudgeSetupPlan) -> None:
     for index, preview in enumerate(plan.previews, start=1):
         _console.print(f"{index}. {preview.task}", markup=False)
         _console.print(f"   Recorded outcome: {preview.outcome}", markup=False)
-
-
-def _render_spend_preflight(
-    plan: ManualJudgeCalibrationPlan,
-    budget: JudgeCalibrationBudget,
-) -> None:
-    """Display the exact judge identity and conservative spend admission.
-
-    Args:
-        plan: Frozen calibration plan naming the exact judge model.
-        budget: Conservative complete-call reservation already checked against its ceiling.
-    """
-    _console.print("\n[bold]Spend preflight: manual judge calibration[/bold]")
-    _console.print(f"Judge name: {plan.setup.judge_alias}", markup=False)
-    _console.print(f"Exact model: {model_display_name(plan.setup.judge_model)}", markup=False)
-    _console.print(f"Pricing: {budget.pricing_source.value}", markup=False)
-    _console.print(f"Judge calls authorized: {budget.call_count}", markup=False)
-    _console.print(
-        f"Tokens: up to {budget.maximum_input_tokens_per_call} input and "
-        f"{budget.maximum_output_tokens_per_call} output per attempt",
-        markup=False,
-    )
-    _console.print(
-        f"Maximum estimated cost: ${_format_usd(budget.estimated_cost_usd)}", markup=False
-    )
-    _console.print(f"Hard spend ceiling: ${_format_usd(budget.maximum_cost_usd)}", markup=False)
-    _console.print(f"Maximum attempts per call: {budget.maximum_attempts_per_call}", markup=False)
-
-
-def _format_usd(value: float) -> str:
-    """Format an admitted dollar bound without rounding a positive value to zero.
-
-    Args:
-        value: Finite nonnegative estimated cost or positive hard ceiling.
-
-    Returns:
-        Fixed-point decimal text preserving the float's round-trip value and at least four
-        fractional digits.
-    """
-    whole, separator, fraction = format(Decimal(str(value)), "f").partition(".")
-    significant_fraction = fraction.rstrip("0") if separator else ""
-    return f"{whole}.{significant_fraction.ljust(4, '0')}"
 
 
 def _render_calibration_review(

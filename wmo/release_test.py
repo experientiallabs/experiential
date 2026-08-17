@@ -1308,6 +1308,9 @@ def _installed_release_driver() -> None:
         assert replayed_refresh.retrieval.index.rag_id == refresh.retrieval.index.rag_id
         assert state.snapshot() == provider_after_refresh
         provider_before_model_optimization = state.snapshot()
+        budget_result = run_cli("config", "budget", "1", "--root", str(root))
+        assert "maximum command cost: $1.00" in budget_result.stdout
+        training_price = 750_000 / (len(completed) * 4_096)
         model_optimization_output = run_tty(
             [
                 "optimize",
@@ -1326,11 +1329,11 @@ def _installed_release_driver() -> None:
                 "--maximum-cost-usd",
                 "1",
                 "--training-usd-per-million-tokens",
-                "0",
+                str(training_price),
             ],
             [
                 ("Use Tinker connection 'tinker-local'", "y"),
-                ("Proceed?", "n"),
+                ("Authorize wmo optimize model support-agent to spend up to", "n"),
             ],
             completion_marker="Managed Tinker SFT was not started.",
         )

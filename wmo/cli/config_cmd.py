@@ -13,6 +13,8 @@ from wmo.cli.provider_setup import ProviderSetupOptions, run_provider_setup
 from wmo.common.config import (
     ARTIFACT_DIR,
     load_settings,
+    resolve_command_budget_usd,
+    set_maximum_command_cost_usd,
     set_telemetry_enabled,
     settings_path,
 )
@@ -47,6 +49,32 @@ _PROVIDER_OPTION = typer.Option(
         "azure, bedrock."
     ),
 )
+
+
+@config_app.command("budget", help="View or set the maximum cost allowed for one command.")
+def config_budget(
+    maximum_cost_usd: float | None = typer.Argument(
+        None,
+        min=0,
+        metavar="USD",
+        help="Finite nonnegative per-command ceiling. Omit to show the current value.",
+    ),
+    root: Path = ROOT_OPTION,
+) -> None:
+    """View or persist the user-owned per-command cost ceiling.
+
+    Args:
+        maximum_cost_usd: Optional finite nonnegative ceiling in USD.
+        root: WMO artifact root containing ``settings.toml``.
+
+    Raises:
+        typer.BadParameter: Stored settings or the requested ceiling are invalid.
+    """
+    with usage_error(ValueError):
+        if maximum_cost_usd is not None:
+            set_maximum_command_cost_usd(maximum_cost_usd, root)
+        configured = resolve_command_budget_usd(root, None)
+    _console.print(f"maximum command cost: ${configured:.2f} ({settings_path(root)})")
 
 
 @config_app.command("telemetry", help="View or change project-local usage telemetry settings.")
