@@ -14,8 +14,8 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
     JsonObject,
-    SourceIdentity,
     canonical_json_bytes,
+    envelope_matches_manifest,
     stable_id,
 )
 from wmo.common.core.locks import file_write_lock
@@ -372,7 +372,7 @@ def load_runtime_rag_refresh(
         ) from exc
     if refresh.refresh_id != refresh_id:
         raise RuntimeRAGRefreshError("runtime RAG refresh envelope ID differs from its artifact")
-    if _envelope_identity(refresh) != _envelope_identity(stored.manifest):
+    if not envelope_matches_manifest(refresh, stored.manifest):
         raise RuntimeRAGRefreshError("runtime RAG refresh differs from its artifact manifest")
     _require_input(store, refresh.snapshot, artifact_type="runtime-trace-snapshot")
     _require_input(store, refresh.runtime_trace_dataset, artifact_type="trace-dataset")
@@ -772,26 +772,6 @@ def _require_input(
         raise RuntimeRAGRefreshError(
             f"runtime RAG input {value.artifact_id} differs from its {artifact_type} pointer"
         )
-
-
-def _envelope_identity(
-    value: ArtifactEnvelope,
-) -> tuple[int, datetime, tuple[ArtifactInput, ...], str, SourceIdentity | None]:
-    """Return shared immutable envelope fields for manifest comparison.
-
-    Args:
-        value: Domain envelope or artifact manifest.
-
-    Returns:
-        Shared schema, time, input, revision, and source identity tuple.
-    """
-    return (
-        value.schema_version,
-        value.created_at,
-        value.inputs,
-        value.code_revision,
-        value.source,
-    )
 
 
 def _normalize_finite_nonnegative_cost(value: float) -> float:

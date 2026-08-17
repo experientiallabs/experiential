@@ -9,13 +9,10 @@ outlive a timed-out cleanup attempt.
 from __future__ import annotations
 
 import base64
-import hashlib
-import json
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Literal, Protocol, cast, runtime_checkable
@@ -27,11 +24,6 @@ from wmo.common.tasks import TaskCase
 from wmo.runtime.environments.interface import EnvironmentSession, Observation
 from wmo.runtime.environments.sandbox_ledger import SandboxLedger
 
-E2B_TEMPLATE_POLICY_VERSION = "1"
-"""Version pinned into E2B template resource identities."""
-
-E2B_DEFAULT_CPU_COUNT = 2
-E2B_DEFAULT_MEMORY_MB = 1024
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 240
 DEFAULT_RETRY_DELAYS_SECONDS = (0.25, 0.5, 1.0, 2.0, 4.0)
 DEFAULT_MAXIMUM_OBSERVATION_CHARACTERS = 20_000
@@ -42,10 +34,6 @@ _SANDBOX_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
 
 class HarborRetryableCommandError(RuntimeError):
     """A safe read-only Harbor command may be retried against the same environment."""
-
-
-class HarborTemplateStatusError(RuntimeError):
-    """A retryable template-status request did not succeed within its configured attempts."""
 
 
 class HarborCleanupUnprovenError(RuntimeError):
@@ -63,14 +51,6 @@ class HarborCleanupResult(ContractModel):
     released: bool
     timed_out: bool = False
     failure: str | None = None
-
-
-@dataclass(frozen=True)
-class E2BTemplateResources:
-    """Resource-qualified E2B template values used in the persistent template identity."""
-
-    cpu_count: int
-    memory_mb: int
 
 
 class HarborCommandResult(ContractModel):
@@ -496,192 +476,6 @@ class _HarborEnvironmentSession:
                     raise
                 time.sleep(self._retry_delays_seconds[attempt])
         raise AssertionError("Harbor command retry loop exhausted without a result")
-
-
-def resolve_e2b_template_resources(
-    *,
-    cpu_count: int | None,
-    memory_mb: int | None,
-) -> E2BTemplateResources:
-    """Resolve absent template resource settings to the frozen Harbor E2B defaults.
-
-    Args:
-        cpu_count: Requested CPU count, or ``None`` for the policy default.
-        memory_mb: Requested memory in MiB, or ``None`` for the policy default.
-
-    Returns:
-        Validated concrete resource settings.
-
-    Raises:
-        ValueError: A supplied value is not an integer or is below the policy minimum.
-    """
-    if any(
-        isinstance(value, bool) or not isinstance(value, int)
-        for value in (cpu_count, memory_mb)
-        if value is not None
-    ):
-        raise ValueError("E2B template CPU and memory values must be integers")
-    resolved_cpu = E2B_DEFAULT_CPU_COUNT if cpu_count is None else cpu_count
-    resolved_memory = E2B_DEFAULT_MEMORY_MB if memory_mb is None else memory_mb
-    if resolved_cpu < 1 or resolved_memory < 128:
-        raise ValueError("E2B template CPU must be positive and memory must be at least 128 MiB")
-    return E2BTemplateResources(cpu_count=resolved_cpu, memory_mb=resolved_memory)
-
-
-def e2b_template_resource_payload(
-    *,
-    environment_id: str,
-    build_source_kind: Literal["docker_image", "dockerfile"],
-    build_source_reference: str,
-    resources: E2BTemplateResources,
-    harbor_version: str,
-    e2b_sdk_version: str,
-) -> dict[str, int | str]:
-    """Return the frozen resource-complete payload used to identify one E2B template.
-
-    Args:
-        environment_id: Canonical Harbor environment identity.
-        build_source_kind: Whether the template is built from an image or Dockerfile.
-        build_source_reference: Immutable build source reference.
-        resources: Concrete CPU and memory allocation.
-        harbor_version: Harbor dependency version used for the build.
-        e2b_sdk_version: E2B SDK version used for the build.
-
-    Returns:
-        Canonical JSON-compatible identity payload.
-
-    Raises:
-        ValueError: A required identity or version value is empty.
-    """
-    if not environment_id:
-        raise ValueError("Harbor environment_id must be nonempty")
-    if not build_source_reference:
-        raise ValueError("E2B template build source must be nonempty")
-    if not harbor_version or not e2b_sdk_version:
-        raise ValueError("Harbor and E2B versions must be nonempty")
-    return {
-        "schema_version": E2B_TEMPLATE_POLICY_VERSION,
-        "harbor_environment_id": environment_id,
-        "build_source_kind": build_source_kind,
-        "build_source_reference": build_source_reference,
-        "cpu_count": resources.cpu_count,
-        "memory_mb": resources.memory_mb,
-        "harbor_version": harbor_version,
-        "e2b_sdk_version": e2b_sdk_version,
-    }
-
-
-def e2b_template_resource_digest(
-    *,
-    environment_id: str,
-    build_source_kind: Literal["docker_image", "dockerfile"],
-    build_source_reference: str,
-    resources: E2BTemplateResources,
-    harbor_version: str,
-    e2b_sdk_version: str,
-) -> str:
-    """Hash one canonical Harbor content, resources, and dependency-version identity.
-
-    Args:
-        environment_id: Canonical Harbor environment identity.
-        build_source_kind: Whether the template is built from an image or Dockerfile.
-        build_source_reference: Immutable build source reference.
-        resources: Concrete CPU and memory allocation.
-        harbor_version: Harbor dependency version used for the build.
-        e2b_sdk_version: E2B SDK version used for the build.
-
-    Returns:
-        Stable SHA-256 digest of the canonical identity payload.
-    """
-    payload = e2b_template_resource_payload(
-        environment_id=environment_id,
-        build_source_kind=build_source_kind,
-        build_source_reference=build_source_reference,
-        resources=resources,
-        harbor_version=harbor_version,
-        e2b_sdk_version=e2b_sdk_version,
-    )
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def qualify_harbor_e2b_template_name(
-    base_name: str,
-    *,
-    environment_id: str,
-    build_source_kind: Literal["docker_image", "dockerfile"],
-    build_source_reference: str,
-    resources: E2BTemplateResources,
-    harbor_version: str,
-    e2b_sdk_version: str,
-    snapshot_hash_length: int,
-) -> str:
-    """Derive the resource-qualified E2B alias without importing optional SDKs.
-
-    ``snapshot_hash_length`` comes from the optional Harbor integration, preserving its exact
-    native content-name validation without making ordinary local runs import Harbor.
-
-    Args:
-        base_name: Harbor's content-derived base template name.
-        environment_id: Canonical Harbor environment identity.
-        build_source_kind: Whether the template is built from an image or Dockerfile.
-        build_source_reference: Immutable build source reference.
-        resources: Concrete CPU and memory allocation.
-        harbor_version: Harbor dependency version used for the build.
-        e2b_sdk_version: E2B SDK version used for the build.
-        snapshot_hash_length: Harbor's validated environment-ID prefix length.
-
-    Returns:
-        Resource-qualified immutable E2B template alias.
-
-    Raises:
-        ValueError: The environment identity, prefix length, or base alias is invalid.
-    """
-    if len(environment_id) != 32 or any(
-        character not in "0123456789abcdef" for character in environment_id
-    ):
-        raise ValueError("Harbor environment_id must be 32 lowercase hexadecimal characters")
-    if snapshot_hash_length < 1:
-        raise ValueError("Harbor snapshot_hash_length must be positive")
-    if not base_name.endswith(environment_id[:snapshot_hash_length]):
-        raise ValueError("Harbor E2B template name does not match its environment_id")
-    digest = e2b_template_resource_digest(
-        environment_id=environment_id,
-        build_source_kind=build_source_kind,
-        build_source_reference=build_source_reference,
-        resources=resources,
-        harbor_version=harbor_version,
-        e2b_sdk_version=e2b_sdk_version,
-    )
-    return f"wmo-hb-v1-{digest}"
-
-
-def retry_template_status[T](
-    read_status: Callable[[], T],
-    *,
-    retry_delays_seconds: Sequence[float] = DEFAULT_RETRY_DELAYS_SECONDS,
-) -> T:
-    """Retry an idempotent template-status read without replaying a template submission.
-
-    Args:
-        read_status: Idempotent status read to retry after transient status errors.
-        retry_delays_seconds: Delays before each permitted retry.
-
-    Returns:
-        The first successful status result.
-
-    Raises:
-        HarborTemplateStatusError: The final permitted status read still fails.
-    """
-    delays = tuple(retry_delays_seconds)
-    for attempt in range(len(delays) + 1):
-        try:
-            return read_status()
-        except HarborTemplateStatusError:
-            if attempt == len(delays):
-                raise
-            time.sleep(delays[attempt])
-    raise AssertionError("Harbor template status retry loop exhausted without a result")
 
 
 def _string_argument(

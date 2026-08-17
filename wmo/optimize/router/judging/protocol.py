@@ -15,7 +15,7 @@ from wmo.common.core.artifacts import (
     JsonObject,
     stable_id,
 )
-from wmo.common.judging import Rubric
+from wmo.common.judging import RawJudgment, Rubric
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.models import (
     AssistantAction,
@@ -23,9 +23,7 @@ from wmo.common.models import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
-    NumericMeasurement,
-    OperationEconomics,
-    Usage,
+    combine_economics,
 )
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact
@@ -36,8 +34,8 @@ from wmo.optimize.router.judging.contracts import (
 )
 
 
-class _CitedDimension(ContractModel):
-    """Citation fields shared by every single-candidate structured-feedback dimension."""
+class _EvidenceDimension(ContractModel):
+    """Shared identity, evidence citations, and feedback for one structured dimension."""
 
     dimension_id: ArtifactId
     evidence_span_ids: tuple[str, ...] = Field(min_length=1)
@@ -62,19 +60,13 @@ class _CitedDimension(ContractModel):
         return value
 
 
-class _ScalarDimension(_CitedDimension):
-    """One scalar structured-feedback dimension."""
-
-    raw_score: Literal[0, 1, 2, 3, 4, 5]
-
-
-class _BooleanDimension(_CitedDimension):
+class _BooleanDimension(_EvidenceDimension):
     """One boolean structured-feedback dimension."""
 
     passed: bool
 
 
-class _CategoricalDimension(_CitedDimension):
+class _CategoricalDimension(_EvidenceDimension):
     """One categorical structured-feedback dimension."""
 
     category: str = Field(min_length=1)
@@ -106,12 +98,6 @@ class _PairwiseDimension(ContractModel):
         if len(set(value)) != len(value):
             raise ValueError("pairwise judge evidence span IDs must not repeat")
         return value
-
-
-class _ScalarResponse(ContractModel):
-    """Complete scalar structured-feedback response."""
-
-    dimensions: tuple[_ScalarDimension, ...] = Field(min_length=1)
 
 
 class _BooleanResponse(ContractModel):
@@ -340,7 +326,7 @@ class TemplateJudgeClient:
         shape = self._template.response_shape
         normalized: list[JsonObject] = []
         if shape == "scalar":
-            dimensions = _ScalarResponse.model_validate(raw).dimensions
+            dimensions = RawJudgment.model_validate(raw).dimensions
             normalized.extend(cast(JsonObject, item.model_dump(mode="json")) for item in dimensions)
         elif shape == "boolean":
             parsed = _BooleanResponse.model_validate(raw).dimensions
@@ -434,7 +420,7 @@ class TemplateJudgeClient:
         return ModelResponse(
             output=AssistantAction(content=json.dumps({"dimensions": normalized})),
             model=forward.model,
-            economics=_combine_economics(forward.economics, reverse.economics),
+            economics=combine_economics((forward.economics, reverse.economics)),
             finish_reason=forward.finish_reason,
         )
 
@@ -694,55 +680,3 @@ def _reverse_winner(
     if winner == "winner_b":
         return "winner_a"
     return "tie"
-
-
-def _combine_economics(left: OperationEconomics, right: OperationEconomics) -> OperationEconomics:
-    """Combine observed accounting from two counterbalanced provider requests.
-
-    Args:
-        left: Forward request economics.
-        right: Reverse request economics.
-
-    Returns:
-        Conservative aggregate usage, cost, and latency.
-    """
-    usage = None
-    if left.usage is not None and right.usage is not None:
-        cached = (
-            left.usage.cached_input_tokens,
-            right.usage.cached_input_tokens,
-        )
-        usage = Usage(
-            input_tokens=left.usage.input_tokens + right.usage.input_tokens,
-            output_tokens=left.usage.output_tokens + right.usage.output_tokens,
-            cached_input_tokens=(
-                sum(cast(tuple[int, int], cached)) if None not in cached else None
-            ),
-        )
-    return OperationEconomics(
-        usage=usage,
-        cost_usd=_sum_measurements(left.cost_usd, right.cost_usd),
-        latency_seconds=_sum_measurements(left.latency_seconds, right.latency_seconds),
-    )
-
-
-def _sum_measurements(
-    left: NumericMeasurement | None, right: NumericMeasurement | None
-) -> NumericMeasurement | None:
-    """Sum two complete measurements without inventing missing accounting.
-
-    Args:
-        left: First request measurement.
-        right: Second request measurement.
-
-    Returns:
-        Aggregate measurement, or ``None`` if either provider omitted it.
-    """
-    if left is None or right is None:
-        return None
-    return NumericMeasurement(
-        value=left.value + right.value,
-        provenance=(
-            "observed" if left.provenance == right.provenance == "observed" else "estimated"
-        ),
-    )

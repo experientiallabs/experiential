@@ -10,13 +10,13 @@ import typer
 from rich.console import Console
 
 from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.cli.provider_picker import resolve_setup_providers
 from wmo.cli.provider_setup import (
     ProviderSetupOptions,
     provider_setup_json_examples,
     run_provider_setup,
 )
-from wmo.common.config import ARTIFACT_DIR
 from wmo.common.models import ModelCatalog, ModelCatalogError, load_model_catalog
 from wmo.common.observability.telemetry import BuildTelemetryStats, capture_build_completed
 from wmo.common.project import (
@@ -35,11 +35,7 @@ from wmo.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeMode
 from wmo.runtime.models.providers.retry import RetryPolicy
 from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
-from wmo.simulation.ingest.sources import (
-    CANONICAL_TRACE_SOURCES,
-    TraceSourceError,
-    load_trace_source,
-)
+from wmo.simulation.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source
 from wmo.simulation.retrieval import (
     RAGEmbedderBinding,
     RAGLineageBinding,
@@ -60,7 +56,6 @@ _TRACE_FILE_ARGUMENT = typer.Argument(
         "of a postgres table."
     ),
 )
-_ROOT_OPTION = typer.Option(Path(ARTIFACT_DIR), "--root", help="Local .wmo artifact root.")
 _PROVIDER_OPTION = typer.Option(
     None,
     "--provider",
@@ -80,7 +75,7 @@ def build(
         "--source",
         help=f"Trace source format: {', '.join(CANONICAL_TRACE_SOURCES)}.",
     ),
-    root: Path = _ROOT_OPTION,
+    root: Path = ROOT_OPTION,
     world_model: str | None = typer.Option(None, "--world-model", help="World-model alias."),
     judge: str | None = typer.Option(None, "--judge", help="Judge alias."),
     embedder: str | None = typer.Option(None, "--embedder", help="Embedding-capable alias."),
@@ -123,7 +118,7 @@ def build(
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
     """
     started = time.monotonic()
-    try:
+    with usage_error(ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError):
         code_revision = installed_release_revision()
         ProjectStore(root, project)
         catalog = _load_or_setup_catalog(
@@ -197,8 +192,6 @@ def build(
                 top_k=top_k,
             )
         select_completed_build(store, built, completed.review)
-    except (ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError) as exc:
-        raise typer.BadParameter(str(exc)) from None
     _capture_local_build_telemetry(
         completed.artifacts,
         root=root,
@@ -588,12 +581,10 @@ def _load_canonical_traces(path: Path, source: str) -> TraceNormalizationResult:
         Canonical normalized trace result.
 
     Raises:
-        typer.BadParameter: The format is unsupported or normalization fails.
+        TraceSourceError: The format is unsupported or normalization fails; the command's
+            `usage_error` boundary converts it (a `ValueError`) into `typer.BadParameter`.
     """
-    try:
-        return load_trace_source(source, path)
-    except TraceSourceError as exc:
-        raise typer.BadParameter(str(exc)) from None
+    return load_trace_source(source, path)
 
 
 def _capture_local_build_telemetry(

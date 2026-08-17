@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from pydantic import BaseModel, model_validator
+from pydantic import model_validator
 
 from wmo.common.core.artifacts import (
-    ArtifactEnvelope,
     ArtifactId,
     ArtifactInput,
     ContractModel,
@@ -18,11 +17,8 @@ from wmo.common.core.artifacts import (
 from wmo.common.evaluations.dataset import EvaluationProtocol, FidelityReport
 from wmo.common.evaluations.plan import EvaluationPlan, FidelityGate, FidelityThresholds
 from wmo.common.judging import JudgeCalibration, Judgment
-from wmo.common.project import (
-    ArtifactCorruptionError,
-    ArtifactStore,
-    artifact_input,
-)
+from wmo.common.judging.provenance import read_artifact_json
+from wmo.common.project import ArtifactStore
 from wmo.common.rollouts import RolloutArtifact
 
 
@@ -85,12 +81,13 @@ def read_evaluation_plan(
     Raises:
         EvaluationEvidenceError: The artifact is unavailable, wrong-typed, or invalid.
     """
-    value, input_record = _read_json(
+    value, input_record = read_artifact_json(
         store,
         artifact_id=artifact_id,
-        artifact_type="evaluation-plan",
+        expected_artifact_type="evaluation-plan",
         relative_path="plan.json",
         model_type=EvaluationPlan,
+        error=EvaluationEvidenceError,
     )
     _require_identity(value.plan_id, artifact_id, "evaluation plan")
     return value, input_record
@@ -111,12 +108,13 @@ def read_fidelity_gate(
     Raises:
         EvaluationEvidenceError: The artifact is unavailable, wrong-typed, or invalid.
     """
-    value, input_record = _read_json(
+    value, input_record = read_artifact_json(
         store,
         artifact_id=artifact_id,
-        artifact_type="fidelity-gate",
+        expected_artifact_type="fidelity-gate",
         relative_path="gate.json",
         model_type=FidelityGate,
+        error=EvaluationEvidenceError,
     )
     _require_identity(value.fidelity_gate_id, artifact_id, "fidelity gate")
     return value, input_record
@@ -134,12 +132,13 @@ def read_fidelity_thresholds(
     Returns:
         Parsed thresholds and their exact manifest-derived input.
     """
-    value, input_record = _read_json(
+    value, input_record = read_artifact_json(
         store,
         artifact_id=artifact_id,
-        artifact_type="fidelity-thresholds",
+        expected_artifact_type="fidelity-thresholds",
         relative_path="thresholds.json",
         model_type=FidelityThresholds,
+        error=EvaluationEvidenceError,
     )
     _require_identity(value.fidelity_thresholds_id, artifact_id, "fidelity thresholds")
     return value, input_record
@@ -160,12 +159,13 @@ def read_fidelity_report(
     Raises:
         EvaluationEvidenceError: The artifact is unavailable, wrong-typed, or invalid.
     """
-    value, input_record = _read_json(
+    value, input_record = read_artifact_json(
         store,
         artifact_id=artifact_id,
-        artifact_type="fidelity-report",
+        expected_artifact_type="fidelity-report",
         relative_path="report.json",
         model_type=FidelityReport,
+        error=EvaluationEvidenceError,
     )
     _require_identity(value.fidelity_report_id, artifact_id, "fidelity report")
     gate, gate_input = read_fidelity_gate(store, value.gate_id)
@@ -216,12 +216,13 @@ def read_rollout(
     Raises:
         EvaluationEvidenceError: The artifact is unavailable, wrong-typed, or invalid.
     """
-    value, input_record = _read_json(
+    value, input_record = read_artifact_json(
         store,
         artifact_id=artifact_id,
-        artifact_type="rollout",
+        expected_artifact_type="rollout",
         relative_path="rollout.json",
         model_type=RolloutArtifact,
+        error=EvaluationEvidenceError,
     )
     _require_identity(value.artifact_id, artifact_id, "rollout")
     _require_identity(value.rollout_id, artifact_id, "rollout")
@@ -241,12 +242,13 @@ def read_judgment(store: ArtifactStore, artifact_id: ArtifactId) -> tuple[Judgme
     Raises:
         EvaluationEvidenceError: The artifact is unavailable, wrong-typed, or invalid.
     """
-    value, input_record = _read_json(
+    value, input_record = read_artifact_json(
         store,
         artifact_id=artifact_id,
-        artifact_type="judgment",
+        expected_artifact_type="judgment",
         relative_path="judgment.json",
         model_type=Judgment,
+        error=EvaluationEvidenceError,
     )
     _require_identity(value.judgment_id, artifact_id, "judgment")
     return value, input_record
@@ -267,12 +269,13 @@ def read_calibration(
     Raises:
         EvaluationEvidenceError: The artifact is unavailable, wrong-typed, or invalid.
     """
-    value, input_record = _read_json(
+    value, input_record = read_artifact_json(
         store,
         artifact_id=artifact_id,
-        artifact_type="judge-calibration",
+        expected_artifact_type="judge-calibration",
         relative_path="calibration.json",
         model_type=JudgeCalibration,
+        error=EvaluationEvidenceError,
     )
     _require_identity(value.calibration_id, artifact_id, "judge calibration")
     return value, input_record
@@ -291,51 +294,6 @@ def sorted_evaluation_inputs(inputs: Iterable[ArtifactInput]) -> tuple[ArtifactI
         EvaluationEvidenceError: One ID appears with conflicting digests.
     """
     return sorted_unique_inputs(*inputs, error_type=EvaluationEvidenceError)
-
-
-def _read_json[ModelT: BaseModel](
-    store: ArtifactStore,
-    *,
-    artifact_id: ArtifactId,
-    artifact_type: str,
-    relative_path: str,
-    model_type: type[ModelT],
-) -> tuple[ModelT, ArtifactInput]:
-    """Read one typed JSON record after verifying its complete artifact directory."""
-    try:
-        stored = store.read(artifact_id)
-        if stored.manifest.artifact_type != artifact_type:
-            raise EvaluationEvidenceError(
-                f"artifact {artifact_id} must be {artifact_type}, not "
-                f"{stored.manifest.artifact_type}"
-            )
-        value = model_type.model_validate_json(store.read_bytes(artifact_id, relative_path))
-        if isinstance(value, ArtifactEnvelope):
-            envelope_values = (
-                value.schema_version,
-                value.created_at,
-                value.inputs,
-                value.code_revision,
-                value.source,
-            )
-            manifest_values = (
-                stored.manifest.schema_version,
-                stored.manifest.created_at,
-                stored.manifest.inputs,
-                stored.manifest.code_revision,
-                stored.manifest.source,
-            )
-            if envelope_values != manifest_values:
-                raise EvaluationEvidenceError(
-                    f"artifact {artifact_id} data envelope differs from its manifest"
-                )
-    except (ArtifactCorruptionError, ValueError) as exc:
-        if isinstance(exc, EvaluationEvidenceError):
-            raise
-        raise EvaluationEvidenceError(
-            f"required {artifact_type} artifact is unavailable or invalid: {artifact_id}"
-        ) from exc
-    return value, artifact_input(stored.manifest)
 
 
 def _require_identity(actual: str, expected: str, label: str) -> None:

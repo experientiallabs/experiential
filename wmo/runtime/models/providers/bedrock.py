@@ -12,12 +12,10 @@ from pydantic import JsonValue
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import Embedding, ModelRequest, ModelResponse, ModelSnapshot
+from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY
 from wmo.runtime.models.providers.bedrock_converse import converse_request, converse_response
 from wmo.runtime.models.providers.errors import ProviderResponseError
-from wmo.runtime.models.providers.openai_compatible import (
-    DEFAULT_RETRY_POLICY,
-    normalize_embedding_vector,
-)
+from wmo.runtime.models.providers.openai_compatible import normalize_embedding_vector
 from wmo.runtime.models.providers.retry import RetryPolicy, run_with_retry
 from wmo.runtime.models.providers.transport import ProviderTransportError
 

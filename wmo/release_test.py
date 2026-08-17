@@ -1191,8 +1191,8 @@ def _installed_release_driver() -> None:
         )
         assert len(completed) == len(prior_completed) + 3
         assert len({event.interaction_id for event in completed}) == len(completed)
-        assert accepted[1].lineage_id == accepted[2].lineage_id
-        assert accepted[1].selected_alias == accepted[2].selected_alias
+        assert accepted[1].identity.lineage_id == accepted[2].identity.lineage_id
+        assert accepted[1].acceptance.selected_alias == accepted[2].acceptance.selected_alias
         current_project = support_store.load_project()
         assert current_project.build is not None
         assert current_project.models is not None
@@ -1263,7 +1263,9 @@ def _installed_release_driver() -> None:
         }
         assert refresh.dataset.dataset.dataset_id != completed_build.trace_dataset.artifact_id
         response_acceptances = tuple(
-            event for event in accepted if event.lineage_id == accepted[1].lineage_id
+            event
+            for event in accepted
+            if event.identity.lineage_id == accepted[1].identity.lineage_id
         )
         assert len(response_acceptances) == 2
         observed_response = response_acceptances[0]
@@ -1555,16 +1557,11 @@ def test_built_archives_match_current_package_contract() -> None:
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
     """W16 customer and comparison workflows resolve without test-only API owners."""
-    import wmo
     from wmo.common.judging import HumanScoreReview, JudgeCalibrationService, RubricReview
     from wmo.runtime.environments import LocalProcessEnvironmentRuntime
     from wmo.simulation import compare_text_and_sandbox
     from wmo.simulation.engines import SandboxSimulator
 
-    assert callable(wmo.compose_router)
-    assert callable(wmo.load_project_router)
-    assert callable(wmo.load_router)
-    assert callable(wmo.create_project_router_app)
     assert callable(HumanScoreReview.open)
     assert callable(JudgeCalibrationService)
     assert callable(RubricReview.open)

@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.prompt import Confirm
 
 from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.evaluations import EvaluationCellEvidence, EvaluationPlan
 from wmo.common.models import ProviderModelSelection, load_model_catalog
@@ -18,14 +19,12 @@ from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.project import ProjectStore
 from wmo.common.release_revision import installed_release_revision
 from wmo.optimize.router.automatic.preflight import (
+    AutomaticRouterOptions,
     AutomaticRouterPreflight,
     preflight_automatic_router,
 )
 from wmo.optimize.router.automatic.replay import find_completed_automatic_router_replay
-from wmo.optimize.router.automatic.service import (
-    AutomaticRouterOptions,
-    optimize_project_router,
-)
+from wmo.optimize.router.automatic.service import optimize_project_router
 from wmo.optimize.router.composition import (
     FidelityApprovalDecision,
     RouterCompositionBudget,
@@ -33,7 +32,6 @@ from wmo.optimize.router.composition import (
 from wmo.runtime.models import RuntimeModelCatalog
 
 _console = Console()
-_ROOT_OPTION = typer.Option(Path(".wmo"), "--root", help="Local .wmo project root.")
 _CANDIDATE_OPTION = typer.Option(
     None,
     "--candidate",
@@ -48,7 +46,7 @@ _CANDIDATE_MODEL_OPTION = typer.Option(
 
 def router(
     project: str = typer.Argument(..., metavar="PROJECT", help="Configured local project ID."),
-    root: Path = _ROOT_OPTION,
+    root: Path = ROOT_OPTION,
     candidate: list[str] | None = _CANDIDATE_OPTION,
     candidate_model: list[str] | None = _CANDIDATE_MODEL_OPTION,
     incumbent: str | None = typer.Option(None, "--incumbent", help="Quality baseline alias."),
@@ -124,7 +122,7 @@ def router(
         maximum_concurrency=maximum_concurrency,
     )
     effective_noninteractive = non_interactive or not can_prompt(_console)
-    try:
+    with usage_error(OSError, ValueError):
         producer_revision = installed_release_revision()
         store = ProjectStore(root, project)
         catalog = load_model_catalog(store.model_catalog_path)
@@ -145,15 +143,7 @@ def router(
             store,
             candidate_plan.selection,
             catalog_override=candidate_plan.prospective_catalog,
-            maximum_model_calls=options.maximum_model_calls,
-            preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
-            maximum_router_feature_tokens=options.maximum_router_feature_tokens,
-            maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-            router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
-            completion_maximum_attempts=options.completion_maximum_attempts,
-            simulation_maximum_output_tokens=options.simulation_maximum_output_tokens,
-            maximum_judgments=options.maximum_judgments,
-            maximum_simulation_cost_usd=options.maximum_provider_cost_usd,
+            options=options,
         )
         replay = find_completed_automatic_router_replay(
             store,
@@ -163,8 +153,6 @@ def router(
         )
         if replay is None and effective_noninteractive and not approve_fidelity:
             raise ValueError("noninteractive router optimization requires --approve-fidelity")
-    except (OSError, ValueError) as exc:
-        raise typer.BadParameter(str(exc)) from None
 
     if replay is not None:
         _console.print("replay: verified completed optimization")
@@ -193,7 +181,7 @@ def router(
         preferred_overlaps=options.preferred_fidelity_overlaps,
         approved_at=now,
     )
-    try:
+    with usage_error(OSError, ValueError):
         result = optimize_project_router(
             store,
             candidate_plan,
@@ -204,8 +192,6 @@ def router(
             created_at=now,
             code_revision=producer_revision,
         )
-    except (OSError, ValueError) as exc:
-        raise typer.BadParameter(str(exc)) from None
     capture_completion_once(
         "wmo router completed",
         result.composition.optimization.optimization.report.report_id,

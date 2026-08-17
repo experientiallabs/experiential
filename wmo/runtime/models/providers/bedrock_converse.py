@@ -15,13 +15,17 @@ from wmo.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
-    NumericMeasurement,
-    OperationEconomics,
     ToolCall,
     ToolChoice,
     Usage,
 )
-from wmo.runtime.models.providers.errors import ProviderResponseError
+from wmo.runtime.models.providers.errors import (
+    ProviderResponseError,
+    require_array,
+    require_integer,
+    require_object,
+    require_string,
+)
 
 _COMPLETED_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "tool_use"})
 _LENGTH_STOP_REASONS = frozenset({"max_tokens"})
@@ -109,13 +113,13 @@ def converse_response(
     Raises:
         ProviderResponseError: The response is malformed or uses an unsupported block or stop.
     """
-    output = _object(payload.get("output"), "output")
-    message = _object(output.get("message"), "output.message")
-    blocks = _array(message.get("content"), "output.message.content")
+    output = require_object(cast("JsonValue | None", payload.get("output")), "Bedrock output")
+    message = require_object(output.get("message"), "Bedrock output.message")
+    blocks = require_array(message.get("content"), "Bedrock output.message.content")
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
     for index, raw_block in enumerate(blocks):
-        block = _object(raw_block, f"output.message.content[{index}]")
+        block = require_object(raw_block, f"Bedrock output.message.content[{index}]")
         if "text" in block:
             text = block.get("text")
             if not isinstance(text, str):
@@ -137,14 +141,14 @@ def converse_response(
         raise ProviderResponseError(
             "Bedrock Converse response has neither text nor a complete tool call"
         ) from exc
-    return ModelResponse(
+    finish_reason = _finish_reason(payload.get("stopReason"))
+    return ModelResponse.completed(
         output=action,
-        model=configured_model,
-        economics=OperationEconomics(
-            usage=_usage(payload),
-            latency_seconds=NumericMeasurement(value=latency_seconds, provenance="observed"),
-        ),
-        finish_reason=_finish_reason(payload.get("stopReason")),
+        configured_model=configured_model,
+        served_model_id=None,
+        usage=_usage(payload),
+        latency_seconds=latency_seconds,
+        hit_length_limit=finish_reason is ModelFinishReason.LENGTH,
     )
 
 
@@ -210,9 +214,11 @@ def _tool_config(request: ModelRequest) -> JsonObject | None:
 
 def _tool_use(value: JsonValue, index: int) -> ToolCall:
     """Parse one Converse toolUse block while preserving the exact tool-use ID."""
-    item = _object(value, f"output.message.content[{index}].toolUse")
-    call_id = _string(item.get("toolUseId"), f"output.message.content[{index}].toolUse.toolUseId")
-    name = _string(item.get("name"), f"output.message.content[{index}].toolUse.name")
+    item = require_object(value, f"Bedrock output.message.content[{index}].toolUse")
+    call_id = require_string(
+        item.get("toolUseId"), f"Bedrock output.message.content[{index}].toolUse.toolUseId"
+    )
+    name = require_string(item.get("name"), f"Bedrock output.message.content[{index}].toolUse.name")
     arguments = item.get("input")
     if arguments is None:
         arguments = {}
@@ -241,47 +247,17 @@ def _usage(payload: Mapping[str, object]) -> Usage | None:
     raw = payload.get("usage")
     if raw is None:
         return None
-    usage = _object(raw, "usage")
-    fresh = _integer(usage.get("inputTokens"), "usage.inputTokens", default=0)
-    cache_read = _integer(
-        usage.get("cacheReadInputTokens"), "usage.cacheReadInputTokens", default=0
+    usage = require_object(cast("JsonValue | None", raw), "Bedrock usage")
+    fresh = require_integer(usage.get("inputTokens"), "Bedrock usage.inputTokens")
+    cache_read = require_integer(
+        usage.get("cacheReadInputTokens"), "Bedrock usage.cacheReadInputTokens"
     )
-    cache_write = _integer(
-        usage.get("cacheWriteInputTokens"), "usage.cacheWriteInputTokens", default=0
+    cache_write = require_integer(
+        usage.get("cacheWriteInputTokens"), "Bedrock usage.cacheWriteInputTokens"
     )
     return Usage(
         input_tokens=fresh + cache_read + cache_write,
-        output_tokens=_integer(usage.get("outputTokens"), "usage.outputTokens", default=0),
+        output_tokens=require_integer(usage.get("outputTokens"), "Bedrock usage.outputTokens"),
         cached_input_tokens=cache_read,
         cache_write_input_tokens=cache_write,
     )
-
-
-def _array(value: JsonValue | None, label: str) -> list[JsonValue]:
-    """Return a JSON array or raise a focused conversion error."""
-    if not isinstance(value, list):
-        raise ProviderResponseError(f"Bedrock {label} must be an array")
-    return value
-
-
-def _object(value: JsonValue | object | None, label: str) -> JsonObject:
-    """Return a JSON object or raise a focused conversion error."""
-    if not isinstance(value, dict):
-        raise ProviderResponseError(f"Bedrock {label} must be an object")
-    return cast("JsonObject", value)
-
-
-def _string(value: JsonValue | None, label: str) -> str:
-    """Return a non-empty JSON string or raise a focused conversion error."""
-    if not isinstance(value, str) or not value:
-        raise ProviderResponseError(f"Bedrock {label} must be a non-empty string")
-    return value
-
-
-def _integer(value: JsonValue | None, label: str, *, default: int) -> int:
-    """Read a non-negative JSON integer or the documented omitted default."""
-    if value is None:
-        return default
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ProviderResponseError(f"Bedrock {label} must be a non-negative integer")
-    return value

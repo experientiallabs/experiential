@@ -1,11 +1,8 @@
-"""Model-assisted, evidence-cited rubric proposal services."""
+"""Evidence-cited rubric proposal contracts and immutable persistence."""
 
 from __future__ import annotations
 
-import json
-from collections.abc import Sequence
 from datetime import datetime
-from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -15,26 +12,17 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     Sha256,
+    canonical_json_bytes,
     stable_id,
 )
-from wmo.common.judging.prompts import PromptDefinition
 from wmo.common.judging.provenance import JudgingProvenanceError, resolve_artifact
 from wmo.common.judging.rubric import RubricDimension
-from wmo.common.models import ModelClient, ModelMessage, ModelRequest, ModelSnapshot, ToolCall
-from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
-from wmo.common.rollouts import RolloutArtifact
+from wmo.common.models import ModelSnapshot
+from wmo.common.project import ArtifactCorruptionError, ProjectStore
 
 
 class RubricProposalError(ValueError):
-    """Raised when a rubric proposer returns unsafe or unsupported structured output."""
-
-
-class RepresentativeRollout(ContractModel):
-    """One fit-lineage rollout selected as successful or failed rubric evidence."""
-
-    rollout: RolloutArtifact
-    lineage_id: ArtifactId
-    outcome: Literal["successful", "failed"]
+    """Raised when rubric proposal evidence is unsafe to persist or resume."""
 
 
 class ProposedRubricDimension(ContractModel):
@@ -153,107 +141,6 @@ class RubricProposalEvidence(ArtifactEnvelope):
         return self
 
 
-class _RawProposal(ContractModel):
-    """Strict structured response accepted from the configured rubric proposer."""
-
-    dimensions: tuple[ProposedRubricDimension, ...]
-
-
-class LMRubricProposer:
-    """Propose diverse zero-to-five rubric cards from representative fit rollouts."""
-
-    def __init__(self, model: ModelClient, prompt: PromptDefinition) -> None:
-        """Bind one injected model client and immutable proposer prompt."""
-        self._model = model
-        self._prompt = prompt
-
-    def propose(
-        self,
-        *,
-        source_task_set_id: ArtifactId,
-        representatives: Sequence[RepresentativeRollout],
-        router_held_out_lineage_ids: Sequence[ArtifactId] = (),
-    ) -> RubricProposal:
-        """Propose rubric cards from successful and failed router-fit evidence.
-
-        Args:
-            source_task_set_id: Immutable representative task-set identifier.
-            representatives: Selected production rollouts with fit-lineage outcome labels.
-            router_held_out_lineage_ids: Frozen router-held-out lineages that must not contribute.
-
-        Returns:
-            Structured proposals that cite source rollouts and rollout spans.
-
-        Raises:
-            RubricProposalError: Input evidence or the model response is not safe to use.
-        """
-        held_out_lineages = set(router_held_out_lineage_ids)
-        if not representatives:
-            raise RubricProposalError("rubric proposal requires representative rollouts")
-        if any(item.lineage_id in held_out_lineages for item in representatives):
-            raise RubricProposalError(
-                "router-held-out lineages cannot contribute to rubric proposals"
-            )
-        successful = tuple(
-            sorted(
-                {
-                    item.rollout.rollout_id
-                    for item in representatives
-                    if item.outcome == "successful"
-                }
-            )
-        )
-        failed = tuple(
-            sorted(
-                {item.rollout.rollout_id for item in representatives if item.outcome == "failed"}
-            )
-        )
-        if not successful or not failed:
-            raise RubricProposalError(
-                "rubric proposal requires at least one successful and one failed rollout"
-            )
-        response = self._model.complete(
-            ModelRequest(
-                messages=(
-                    ModelMessage(role="system", content=self._prompt.text),
-                    ModelMessage(role="user", content=_render_representatives(representatives)),
-                ),
-                temperature=0.0,
-                maximum_output_tokens=4_096,
-            )
-        )
-        parsed = _parse_proposal_response(response.output.content, response.output.tool_calls)
-        _validate_proposal_citations(parsed, representatives)
-        _validate_proposal_overlap(parsed)
-        source_lineage_ids = tuple(sorted({item.lineage_id for item in representatives}))
-        excluded_lineage_ids = tuple(sorted(set(router_held_out_lineage_ids)))
-        return RubricProposal(
-            proposal_id=stable_id(
-                "rubric-proposal",
-                {
-                    "source_task_set_id": source_task_set_id,
-                    "proposer_model": response.model.model_dump(mode="json"),
-                    "prompt_id": self._prompt.prompt_id,
-                    "prompt_sha256": self._prompt.sha256,
-                    "dimensions": [item.model_dump(mode="json") for item in parsed.dimensions],
-                    "successful_rollout_ids": successful,
-                    "failed_rollout_ids": failed,
-                    "source_lineage_ids": source_lineage_ids,
-                    "excluded_router_held_out_lineage_ids": excluded_lineage_ids,
-                },
-            ),
-            source_task_set_id=source_task_set_id,
-            proposer_model=response.model,
-            prompt_id=self._prompt.prompt_id,
-            prompt_sha256=self._prompt.sha256,
-            dimensions=parsed.dimensions,
-            successful_rollout_ids=successful,
-            failed_rollout_ids=failed,
-            source_lineage_ids=source_lineage_ids,
-            excluded_router_held_out_lineage_ids=excluded_lineage_ids,
-        )
-
-
 def write_rubric_proposal_evidence(
     store: ProjectStore,
     *,
@@ -309,123 +196,20 @@ def write_rubric_proposal_evidence(
         proposal=proposal,
     )
     try:
-        store.artifacts.write_json(
+        stored, _ = store.artifacts.write_or_replay(
             artifact_id=evidence.proposal_evidence_id,
             artifact_type="rubric-proposal-evidence",
             envelope=evidence,
-            files={"proposal.json": evidence},
+            envelope_path="proposal.json",
+            envelope_type=RubricProposalEvidence,
+            files={"proposal.json": canonical_json_bytes(evidence)},
         )
-    except ArtifactAlreadyExistsError:
-        try:
-            stored = RubricProposalEvidence.model_validate_json(
-                store.artifacts.read_bytes(evidence.proposal_evidence_id, "proposal.json")
-            )
-        except ValueError as exc:
-            raise RubricProposalError(
-                "existing rubric proposal evidence cannot be resumed safely"
-            ) from exc
-        if not _same_proposal_evidence_identity(stored, evidence):
-            raise RubricProposalError(
-                "existing rubric proposal evidence conflicts with this proposal"
-            ) from None
-        return stored
-    return evidence
-
-
-def _same_proposal_evidence_identity(
-    left: RubricProposalEvidence, right: RubricProposalEvidence
-) -> bool:
-    """Compare stable proposal evidence while permitting a retry at a later clock time."""
-    return (
-        left.schema_version == right.schema_version
-        and left.proposal_evidence_id == right.proposal_evidence_id
-        and left.source_task_set_id == right.source_task_set_id
-        and left.proposal == right.proposal
-        and left.inputs == right.inputs
-        and left.code_revision == right.code_revision
-        and left.source == right.source
-    )
-
-
-def _parse_proposal_response(content: str | None, tool_calls: tuple[ToolCall, ...]) -> _RawProposal:
-    """Parse a strict JSON response without accepting unstructured model output."""
-    if tool_calls:
-        raise RubricProposalError("rubric proposer must return JSON text, not tool calls")
-    if content is None:
-        raise RubricProposalError("rubric proposer returned no structured JSON text")
-    try:
-        return _RawProposal.model_validate_json(content)
+    except ArtifactCorruptionError as exc:
+        raise RubricProposalError(
+            "existing rubric proposal evidence cannot be resumed safely"
+        ) from exc
     except ValueError as exc:
-        raise RubricProposalError("rubric proposer returned malformed structured output") from exc
-
-
-def _validate_proposal_citations(
-    proposal: _RawProposal, representatives: Sequence[RepresentativeRollout]
-) -> None:
-    """Require every cited rollout and span to exist in the supplied evidence."""
-    spans_by_rollout = {
-        item.rollout.rollout_id: {span.span_id for span in item.rollout.spans}
-        for item in representatives
-    }
-    for proposed_dimension in proposal.dimensions:
-        cited_rollouts = set(proposed_dimension.source_rollout_ids)
-        unknown_rollouts = cited_rollouts - set(spans_by_rollout)
-        if unknown_rollouts:
-            raise RubricProposalError(
-                "rubric proposer cited unknown rollout IDs: " + ", ".join(sorted(unknown_rollouts))
-            )
-        cited_spans = set().union(*(spans_by_rollout[item] for item in cited_rollouts))
-        unknown_spans = set(proposed_dimension.evidence_span_ids) - cited_spans
-        if unknown_spans:
-            raise RubricProposalError(
-                "rubric proposer cited unknown rollout span IDs: "
-                + ", ".join(sorted(unknown_spans))
-            )
-
-
-def _validate_proposal_overlap(proposal: _RawProposal) -> None:
-    """Require overlap references to point at another card in the same response."""
-    dimension_ids = {item.dimension.dimension_id for item in proposal.dimensions}
-    for proposed_dimension in proposal.dimensions:
-        unknown = set(proposed_dimension.overlap_with_dimension_ids) - dimension_ids
-        if unknown:
-            raise RubricProposalError(
-                "rubric proposer named unknown overlapping dimensions: "
-                + ", ".join(sorted(unknown))
-            )
-
-
-def _render_representatives(representatives: Sequence[RepresentativeRollout]) -> str:
-    """Render source rollout evidence in a structured, citation-friendly form."""
-    rendered = []
-    for item in representatives:
-        rendered.append(
-            {
-                "rollout_id": item.rollout.rollout_id,
-                "lineage_id": item.lineage_id,
-                "outcome": item.outcome,
-                "task_id": item.rollout.task_id,
-                "final_output": item.rollout.final_output.model_dump(mode="json")
-                if item.rollout.final_output is not None
-                else None,
-                "spans": [
-                    {
-                        "span_id": span.span_id,
-                        "kind": span.kind.value,
-                        "payload": span.payload,
-                        "failure": span.failure.model_dump(mode="json")
-                        if span.failure is not None
-                        else None,
-                    }
-                    for span in item.rollout.spans
-                ],
-            }
-        )
-    return (
-        "Propose deliberately diverse zero-to-five rubric dimensions. Return only a JSON object "
-        "with a dimensions array. Each item must include dimension {dimension_id, name, "
-        "description, anchors}, source_rollout_ids, evidence_span_ids, and "
-        "overlap_with_dimension_ids. Each dimension needs exactly anchors zero through five. "
-        "Cite both successful and failed evidence across the proposal.\n\n"
-        + json.dumps(rendered, ensure_ascii=False, sort_keys=True)
-    )
+        raise RubricProposalError(
+            "existing rubric proposal evidence conflicts with this proposal"
+        ) from exc
+    return stored

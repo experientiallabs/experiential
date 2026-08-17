@@ -29,6 +29,7 @@ from wmo.runtime.agents.pi import (
     PiRuntimePreflightError,
     PiTranscriptError,
     _episode_from_pi_events,
+    _model_messages_from_pi,
 )
 from wmo.runtime.environments import EnvironmentSession, Observation
 
@@ -558,3 +559,43 @@ def _write_sleeping_pi_fixture(tmp_path: Path) -> Path:
     )
     executable.chmod(executable.stat().st_mode | S_IXUSR)
     return executable
+
+
+def test_pi_bridge_messages_tolerate_openai_wire_variations() -> None:
+    """Pi's independently versioned wire may carry unknown keys and explicit nulls.
+
+    The strict served-router schema would reject these; the bridge must not abort the
+    episode on OpenAI-legal payload variations Pi is free to emit.
+    """
+    messages = _model_messages_from_pi(
+        {
+            "messages": [
+                {"role": "user", "content": "run the task", "name": "pi-user"},
+                {"role": "assistant", "content": "on it", "refusal": None},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{}"},
+                            "index": 0,
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "ok", "tool_call_id": "call-1"},
+                {"role": "user", "content": "finish up", "tool_calls": None},
+            ]
+        }
+    )
+
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert messages[2].assistant_action is not None
+    assert messages[2].assistant_action.tool_calls[0].call_id == "call-1"

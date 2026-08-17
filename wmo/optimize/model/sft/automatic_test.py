@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import threading
 from dataclasses import dataclass
@@ -707,7 +708,7 @@ def test_automatic_acceptance_pointer_replaces_a_symlink_swapped_at_write_bounda
     original_external_bytes = b"raced external pointer must remain unchanged"
     if target_exists:
         external_target.write_bytes(original_external_bytes)
-    real_replace = run_manifest_module.os.replace
+    real_replace = os.replace
 
     def swap_pointer_before_replace(source: str | Path, destination: str | Path) -> None:
         """Install the adversarial link immediately before the production replace.
@@ -720,7 +721,7 @@ def test_automatic_acceptance_pointer_replaces_a_symlink_swapped_at_write_bounda
             pointer_path.symlink_to(external_target)
         real_replace(source, destination)
 
-    monkeypatch.setattr(run_manifest_module.os, "replace", swap_pointer_before_replace)
+    monkeypatch.setattr(os, "replace", swap_pointer_before_replace)
     accept_runtime_sft_model_optimization(
         bootstrap.store,
         prepared,

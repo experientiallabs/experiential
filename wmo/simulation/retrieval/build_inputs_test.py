@@ -283,89 +283,54 @@ def test_binding_loader_rejects_rehashed_semantic_tamper(tmp_path: Path) -> None
         load_completed_build_rag_lineage_bindings(store, completed)
 
 
-def test_binding_loader_rejects_rehashed_task_set_coverage_digest(tmp_path: Path) -> None:
-    """Reject a canonical envelope rehash that lies about the verified coverage bytes.
+@pytest.mark.parametrize(
+    ("envelope_field", "message"),
+    [
+        ("coverage_sha256", "coverage digest"),
+        ("code_revision", "producer revision"),
+        ("schema_version", "unsupported schema version 2"),
+        ("created_at", "build timestamp"),
+    ],
+)
+def test_binding_loader_rejects_rehashed_task_set_envelope_field(
+    tmp_path: Path,
+    envelope_field: str,
+    message: str,
+) -> None:
+    """Reject a self-consistent canonical rehash of one lineage-bearing envelope field.
 
     Args:
         tmp_path: Pytest-owned project root.
+        envelope_field: TaskSet envelope field to rewrite.
+        message: Expected actionable loader error.
     """
     store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="support"))
     build = _build(store)
     task_set_id = build.task_set.task_set_id
     stored = store.read(task_set_id)
     envelope = TaskSet.model_validate_json(store.read_bytes(task_set_id, "task-set.json"))
-    tampered = envelope.model_copy(update={"coverage_sha256": "f" * 64})
+    values: dict[str, object] = {
+        "coverage_sha256": "f" * 64,
+        "code_revision": "different-revision",
+        "schema_version": 2,
+        "created_at": envelope.created_at + timedelta(days=1),
+    }
+    update = {envelope_field: values[envelope_field]}
+    manifest_update: dict[str, object] = {} if envelope_field == "coverage_sha256" else update
+    tampered = envelope.model_copy(update=update)
     tampered_bytes = canonical_json_bytes(tampered)
     (stored.directory / "task-set.json").write_bytes(tampered_bytes)
     files = tuple(
         file_digest(entry.path, tampered_bytes) if entry.path == "task-set.json" else entry
         for entry in stored.manifest.files
     )
-    tampered_manifest = stored.manifest.model_copy(update={"files": files})
+    tampered_manifest = stored.manifest.model_copy(update={**manifest_update, "files": files})
     (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
     completed = _completed(store, build).model_copy(
         update={"task_set": artifact_input(tampered_manifest)}
     )
 
-    with pytest.raises(ArtifactCorruptionError, match="coverage digest"):
-        load_completed_build_rag_lineage_bindings(store, completed)
-
-
-def test_binding_loader_rejects_rehashed_task_set_producer_revision(tmp_path: Path) -> None:
-    """Reject a dependent task set whose producer revision differs from its source dataset.
-
-    Args:
-        tmp_path: Pytest-owned project root.
-    """
-    store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="support"))
-    build = _build(store)
-    task_set_id = build.task_set.task_set_id
-    stored = store.read(task_set_id)
-    envelope = TaskSet.model_validate_json(store.read_bytes(task_set_id, "task-set.json"))
-    tampered = envelope.model_copy(update={"code_revision": "different-revision"})
-    tampered_bytes = canonical_json_bytes(tampered)
-    (stored.directory / "task-set.json").write_bytes(tampered_bytes)
-    files = tuple(
-        file_digest(entry.path, tampered_bytes) if entry.path == "task-set.json" else entry
-        for entry in stored.manifest.files
-    )
-    tampered_manifest = stored.manifest.model_copy(
-        update={"code_revision": "different-revision", "files": files}
-    )
-    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
-    completed = _completed(store, build).model_copy(
-        update={"task_set": artifact_input(tampered_manifest)}
-    )
-
-    with pytest.raises(ArtifactCorruptionError, match="producer revision"):
-        load_completed_build_rag_lineage_bindings(store, completed)
-
-
-def test_binding_loader_rejects_rehashed_unsupported_task_set_schema(tmp_path: Path) -> None:
-    """Reject a self-consistent envelope and manifest using an unsupported TaskSet schema.
-
-    Args:
-        tmp_path: Pytest-owned project root.
-    """
-    store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="support"))
-    build = _build(store)
-    task_set_id = build.task_set.task_set_id
-    stored = store.read(task_set_id)
-    envelope = TaskSet.model_validate_json(store.read_bytes(task_set_id, "task-set.json"))
-    tampered = envelope.model_copy(update={"schema_version": 2})
-    tampered_bytes = canonical_json_bytes(tampered)
-    (stored.directory / "task-set.json").write_bytes(tampered_bytes)
-    files = tuple(
-        file_digest(entry.path, tampered_bytes) if entry.path == "task-set.json" else entry
-        for entry in stored.manifest.files
-    )
-    tampered_manifest = stored.manifest.model_copy(update={"schema_version": 2, "files": files})
-    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
-    completed = _completed(store, build).model_copy(
-        update={"task_set": artifact_input(tampered_manifest)}
-    )
-
-    with pytest.raises(ArtifactCorruptionError, match="unsupported schema version 2"):
+    with pytest.raises(ArtifactCorruptionError, match=message):
         load_completed_build_rag_lineage_bindings(store, completed)
 
 
@@ -667,37 +632,6 @@ def test_binding_loader_rejects_noncanonical_task_set_payloads(
     )
 
     with pytest.raises(ArtifactCorruptionError, match="not canonical current-build"):
-        load_completed_build_rag_lineage_bindings(store, completed)
-
-
-def test_binding_loader_rejects_rehashed_task_set_build_timestamp(tmp_path: Path) -> None:
-    """Reject a task-set materialization time that differs from its source dataset.
-
-    Args:
-        tmp_path: Pytest-owned project root.
-    """
-    store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="support"))
-    build = _build(store)
-    task_set_id = build.task_set.task_set_id
-    stored = store.read(task_set_id)
-    envelope = TaskSet.model_validate_json(store.read_bytes(task_set_id, "task-set.json"))
-    changed_time = envelope.created_at + timedelta(days=1)
-    tampered = envelope.model_copy(update={"created_at": changed_time})
-    tampered_bytes = canonical_json_bytes(tampered)
-    (stored.directory / "task-set.json").write_bytes(tampered_bytes)
-    files = tuple(
-        file_digest(entry.path, tampered_bytes) if entry.path == "task-set.json" else entry
-        for entry in stored.manifest.files
-    )
-    tampered_manifest = stored.manifest.model_copy(
-        update={"created_at": changed_time, "files": files}
-    )
-    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
-    completed = _completed(store, build).model_copy(
-        update={"task_set": artifact_input(tampered_manifest)}
-    )
-
-    with pytest.raises(ArtifactCorruptionError, match="build timestamp"):
         load_completed_build_rag_lineage_bindings(store, completed)
 
 

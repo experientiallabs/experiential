@@ -48,18 +48,29 @@ def test_reserved_judge_prices_openai_usage_without_observed_cost() -> None:
     )
     response = openai_responses_response(
         {
+            "id": "resp_judge",
+            "object": "response",
+            "created_at": 1.0,
             "status": "completed",
             "model": "judge-model",
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
             "output": [
                 {
                     "type": "message",
-                    "content": [{"type": "output_text", "text": '{"score":4}'}],
+                    "id": "msg_judge",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": '{"score":4}', "annotations": []}],
                 }
             ],
             "usage": {
                 "input_tokens": 100,
                 "output_tokens": 10,
-                "input_tokens_details": {"cached_tokens": 25},
+                "total_tokens": 110,
+                "input_tokens_details": {"cached_tokens": 25, "cache_write_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0},
             },
         },
         configured_model=model,

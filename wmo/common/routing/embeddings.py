@@ -17,6 +17,7 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     canonical_json_bytes,
+    envelope_matches_manifest,
     stable_id,
 )
 from wmo.common.core.files import write_bytes_atomic
@@ -225,19 +226,7 @@ def load_frozen_embedding_set(
         raise ValueError("router embedding set schema version is unsupported")
     if value.embedding_set_id != artifact_id:
         raise ValueError("router embedding set identity differs from its artifact")
-    if (
-        value.schema_version,
-        value.created_at,
-        value.inputs,
-        value.code_revision,
-        value.source,
-    ) != (
-        stored.manifest.schema_version,
-        stored.manifest.created_at,
-        stored.manifest.inputs,
-        stored.manifest.code_revision,
-        stored.manifest.source,
-    ):
+    if not envelope_matches_manifest(value, stored.manifest):
         raise ValueError("router embedding payload differs from its artifact manifest")
     for item in value.embeddings:
         Embedding(values=item.values)

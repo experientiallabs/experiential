@@ -49,20 +49,22 @@ def _setup(*, judge_model: str = "judge-id") -> ProviderSetup:
                 alias="world",
                 connection="openai-main",
                 model="world-id",
-                supports_tools=True,
+                capabilities=ModelCapabilities(supports_tools=True),
             ),
             ProviderModelSelection(
                 alias="judge",
                 connection="openai-main",
                 model=judge_model,
-                supports_structured_output=True,
+                capabilities=ModelCapabilities(supports_structured_output=True),
             ),
             ProviderModelSelection(
                 alias="embed",
                 connection="gemini-embed",
                 model="embedding-id",
-                supports_embeddings=True,
-                input_cost_per_million_tokens_usd=0.25,
+                capabilities=ModelCapabilities(
+                    supports_embeddings=True,
+                    input_cost_per_million_tokens_usd=0.25,
+                ),
             ),
         ),
         world_model="world",
@@ -208,8 +210,9 @@ def test_embedder_role_requires_explicit_embedding_capability() -> None:
     The regression validates the complete setup model without writing catalog state.
     """
     setup = _setup()
+    replacement = ModelCapabilities(input_cost_per_million_tokens_usd=0.25)
     models = tuple(
-        model.model_copy(update={"supports_embeddings": False}) if model.alias == "embed" else model
+        model.model_copy(update={"capabilities": replacement}) if model.alias == "embed" else model
         for model in setup.models
     )
     with pytest.raises(ValueError, match="must declare embedding support"):
@@ -232,7 +235,7 @@ def test_embedding_model_requires_explicit_input_price() -> None:
             alias="embed",
             connection="gemini",
             model="embedding-id",
-            supports_embeddings=True,
+            capabilities=ModelCapabilities(supports_embeddings=True),
         )
 
 

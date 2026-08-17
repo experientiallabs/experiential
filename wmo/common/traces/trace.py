@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -48,8 +47,8 @@ class TraceSpan(ContractModel):
     span_id: str = Field(min_length=1, max_length=256)
     parent_span_id: str | None = Field(default=None, min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
-    started_at: datetime
-    ended_at: datetime
+    started_at: AwareDatetime
+    ended_at: AwareDatetime
     attributes: JsonObject = Field(default_factory=dict)
     model: ModelSnapshot | None = None
     usage: Usage | None = None
@@ -57,8 +56,6 @@ class TraceSpan(ContractModel):
 
     @model_validator(mode="after")
     def _require_ordered_timestamps(self) -> TraceSpan:
-        if self.started_at.tzinfo is None or self.ended_at.tzinfo is None:
-            raise ValueError("trace span timestamps must include timezones")
         if self.ended_at < self.started_at:
             raise ValueError("trace span ended_at cannot be before started_at")
         return self

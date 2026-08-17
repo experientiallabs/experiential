@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -18,13 +17,6 @@ from wmo.common.core.artifacts import (
     validate_artifact_file_path,
 )
 from wmo.common.models import AssistantAction
-
-
-def _require_timezone(value: datetime, *, label: str) -> datetime:
-    """Require one explicit timezone-aware immutable record timestamp."""
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError(f"{label} must include a timezone")
-    return value
 
 
 class SFTMessage(ContractModel):
@@ -155,12 +147,7 @@ class HumanApproval(ArtifactEnvelope):
     trace_dataset: ArtifactInput
     trace_id: str = Field(min_length=1, max_length=512)
     decision: Literal["approved"] = "approved"
-    approved_at: datetime
-
-    @field_validator("approved_at")
-    @classmethod
-    def _require_approved_at_timezone(cls, value: datetime) -> datetime:
-        return _require_timezone(value, label="human approval time")
+    approved_at: AwareDatetime
 
     @model_validator(mode="after")
     def _require_trace_dataset_binding(self) -> HumanApproval:
@@ -182,17 +169,12 @@ class ProductionAcceptanceEvidence(ArtifactEnvelope):
     human_approval: ArtifactInput | None = None
     transcript_path: str = Field(min_length=1)
     transcript_sha256: Sha256
-    accepted_at: datetime
+    accepted_at: AwareDatetime
 
     @field_validator("transcript_path")
     @classmethod
     def _require_safe_transcript_path(cls, value: str) -> str:
         return validate_artifact_file_path(value).as_posix()
-
-    @field_validator("accepted_at")
-    @classmethod
-    def _require_accepted_at_timezone(cls, value: datetime) -> datetime:
-        return _require_timezone(value, label="production acceptance time")
 
     @model_validator(mode="after")
     def _require_complete_evidence_branch(self) -> ProductionAcceptanceEvidence:
@@ -229,7 +211,7 @@ class TeacherAcceptanceEvidence(ArtifactEnvelope):
     acceptance_rule: ArtifactInput
     transcript_path: str = Field(min_length=1)
     transcript_sha256: Sha256
-    accepted_at: datetime
+    accepted_at: AwareDatetime
 
     @field_validator("task_set_inputs")
     @classmethod
@@ -246,11 +228,6 @@ class TeacherAcceptanceEvidence(ArtifactEnvelope):
     @classmethod
     def _require_safe_transcript_path(cls, value: str) -> str:
         return validate_artifact_file_path(value).as_posix()
-
-    @field_validator("accepted_at")
-    @classmethod
-    def _require_accepted_at_timezone(cls, value: datetime) -> datetime:
-        return _require_timezone(value, label="teacher acceptance time")
 
     @model_validator(mode="after")
     def _require_complete_references(self) -> TeacherAcceptanceEvidence:

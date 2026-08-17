@@ -13,10 +13,10 @@ from wmo.common.core.artifacts import (
     ContractModel,
     SourceIdentity,
     canonical_json_bytes,
+    canonical_jsonl_bytes,
     stable_id,
 )
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
     ArtifactManifest,
     ArtifactStore,
@@ -110,7 +110,7 @@ def persist_trace_dataset(
     """
     traces = _ordered_traces(result.traces)
     source, semantic_convention_version = _shared_source(traces)
-    traces_payload = _jsonl_bytes(traces)
+    traces_payload = canonical_jsonl_bytes(traces)
     issues_payload = _issues_bytes(result.issues)
     identity_evidence = (
         complete_model_identity_evidence(traces, result.identity_evidence)
@@ -148,40 +148,22 @@ def persist_trace_dataset(
         invalid_trace_count=result.invalid_trace_count,
         trace_ids=tuple(trace.trace_id for trace in traces),
     )
-    destination = store.project_directory / "artifacts" / dataset.dataset_id
-    if destination.exists():
-        return _load_exact_replay(
-            store,
-            dataset,
-            traces,
-            traces_payload=traces_payload,
-            issues_payload=issues_payload,
-            identity_payload=identity_payload,
-        )
-    try:
-        files = {
-            _TRACES_PATH: traces_payload,
-            _ISSUES_PATH: issues_payload,
-            _TRACE_DATASET_PATH: canonical_json_bytes(dataset),
-        }
-        if identity_payload is not None:
-            files[MODEL_IDENTITY_EVIDENCE_PATH] = identity_payload
-        manifest = store.write(
-            artifact_id=dataset.dataset_id,
-            artifact_type=_TRACE_DATASET_ARTIFACT_TYPE,
-            envelope=dataset,
-            files=files,
-        )
-    except ArtifactAlreadyExistsError:
-        return _load_exact_replay(
-            store,
-            dataset,
-            traces,
-            traces_payload=traces_payload,
-            issues_payload=issues_payload,
-            identity_payload=identity_payload,
-        )
-    return PersistedTraceDataset(dataset=dataset, manifest=manifest, traces=traces)
+    files = {
+        _TRACES_PATH: traces_payload,
+        _ISSUES_PATH: issues_payload,
+        _TRACE_DATASET_PATH: canonical_json_bytes(dataset),
+    }
+    if identity_payload is not None:
+        files[MODEL_IDENTITY_EVIDENCE_PATH] = identity_payload
+    existing, manifest = store.write_or_replay(
+        artifact_id=dataset.dataset_id,
+        artifact_type=_TRACE_DATASET_ARTIFACT_TYPE,
+        envelope=dataset,
+        envelope_path=_TRACE_DATASET_PATH,
+        envelope_type=TraceDataset,
+        files=files,
+    )
+    return PersistedTraceDataset(dataset=existing, manifest=manifest, traces=traces)
 
 
 def current_trace_dataset_id(
@@ -263,7 +245,7 @@ def verify_current_trace_dataset(
         raise ArtifactCorruptionError(
             f"trace dataset {dataset.dataset_id} envelope is not canonical current-build JSON"
         )
-    if traces_payload != _jsonl_bytes(loaded.traces):
+    if traces_payload != canonical_jsonl_bytes(loaded.traces):
         raise ArtifactCorruptionError(
             f"trace dataset {dataset.dataset_id} records are not canonical current-build JSONL"
         )
@@ -354,55 +336,6 @@ def read_trace_model_identity_evidence(
     return payload
 
 
-def _load_exact_replay(
-    store: ArtifactStore,
-    expected: TraceDataset,
-    traces: tuple[Trace, ...],
-    *,
-    traces_payload: bytes,
-    issues_payload: bytes,
-    identity_payload: bytes | None,
-) -> PersistedTraceDataset:
-    """Return an existing content-identical dataset for a safe build resume."""
-    stored = store.read(expected.dataset_id)
-    if stored.manifest.artifact_type != _TRACE_DATASET_ARTIFACT_TYPE:
-        raise ValueError(f"existing artifact {expected.dataset_id} is not a trace dataset")
-    existing = TraceDataset.model_validate_json(
-        store.read_bytes(expected.dataset_id, _TRACE_DATASET_PATH)
-    )
-    replay = expected.model_copy(update={"created_at": existing.created_at})
-    if existing != replay:
-        raise ValueError("existing trace dataset differs from replayed normalized evidence")
-    if store.read_bytes(expected.dataset_id, _TRACES_PATH) != traces_payload:
-        raise ValueError("existing trace dataset records differ from replayed evidence")
-    if store.read_bytes(expected.dataset_id, _ISSUES_PATH) != issues_payload:
-        raise ValueError("existing trace dataset issues differ from replayed evidence")
-    manifest_paths = {entry.path for entry in stored.manifest.files}
-    existing_identity = (
-        store.read_bytes(expected.dataset_id, MODEL_IDENTITY_EVIDENCE_PATH)
-        if MODEL_IDENTITY_EVIDENCE_PATH in manifest_paths
-        else None
-    )
-    if existing_identity != identity_payload:
-        raise ValueError("existing trace dataset model identity differs from replayed evidence")
-    manifest = stored.manifest
-    if (
-        manifest.schema_version,
-        manifest.created_at,
-        manifest.inputs,
-        manifest.code_revision,
-        manifest.source,
-    ) != (
-        existing.schema_version,
-        existing.created_at,
-        existing.inputs,
-        existing.code_revision,
-        existing.source,
-    ):
-        raise ValueError("existing trace dataset envelope differs from its manifest")
-    return PersistedTraceDataset(dataset=existing, manifest=manifest, traces=traces)
-
-
 def _ordered_traces(traces: Sequence[Trace]) -> tuple[Trace, ...]:
     """Return canonical trace order while rejecting an empty normalized result."""
     if not traces:
@@ -417,11 +350,6 @@ def _shared_source(traces: Sequence[Trace]) -> tuple[SourceIdentity, str]:
         if trace.source != first_source:
             raise ValueError("a trace dataset must contain exactly one trace source and convention")
     return first_source.identity, first_source.semantic_convention_version
-
-
-def _jsonl_bytes(traces: Sequence[Trace]) -> bytes:
-    """Serialize canonical trace contracts as deterministic newline-terminated JSONL."""
-    return b"\n".join(canonical_json_bytes(trace) for trace in traces) + b"\n"
 
 
 def _issues_bytes(issues: Sequence[TraceNormalizationIssue]) -> bytes:

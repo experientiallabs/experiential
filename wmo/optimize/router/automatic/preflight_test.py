@@ -19,6 +19,7 @@ from wmo.common.models import (
 from wmo.common.project import ProjectConfig, ProjectStore
 from wmo.common.routing import router_embedding_reservation
 from wmo.optimize.router.automatic.preflight import (
+    AutomaticRouterOptions,
     AutomaticRouterPreflightError,
     preflight_automatic_router,
 )
@@ -56,15 +57,12 @@ def test_preflight_aggregates_missing_inputs_before_credentials_or_writes(
             RouterCandidateSelection(
                 candidates=("candidate-a", "candidate-b"), incumbent="candidate-a"
             ),
-            maximum_model_calls=8,
-            preferred_fidelity_overlaps=10,
-            maximum_router_feature_tokens=2_048,
-            maximum_retrieval_query_tokens=8_192,
-            router_embedding_maximum_attempts=1,
-            completion_maximum_attempts=1,
-            simulation_maximum_output_tokens=16_000,
-            maximum_judgments=100,
-            maximum_simulation_cost_usd=25,
+            options=AutomaticRouterOptions(
+                maximum_router_feature_tokens=2_048,
+                maximum_retrieval_query_tokens=8_192,
+                router_embedding_maximum_attempts=1,
+                completion_maximum_attempts=1,
+            ),
         )
 
     message = str(error.value)
