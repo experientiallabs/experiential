@@ -49,7 +49,7 @@ from wmo.common.project import (
     ProjectStore,
     artifact_input,
 )
-from wmo.common.rollouts import SimulationArtifactSet
+from wmo.common.rollouts import SimulationArtifactSet, StopReason
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import KnnBankManifest
 from wmo.optimize.router.activation import load_project_router
@@ -763,6 +763,25 @@ def _complete_cell_evidence(
     consumed = 0
     report(progress, "judgments", completed=0, total=len(bound_cells), detail=progress_detail)
     for cell, rollout_id, protocol in bound_cells:
+        rollout, _input = read_rollout(project.artifacts, rollout_id)
+        if rollout.failure is not None or rollout.stop_reason == StopReason.FAILURE:
+            evidence.append(
+                EvaluationCellEvidence(
+                    cell_id=cell.cell_id,
+                    protocol_id=protocol.protocol_id,
+                    rollout_artifact_id=rollout_id,
+                    judgment_artifact_id=None,
+                    source_run_id=rollout.source_run_id,
+                )
+            )
+            report(
+                progress,
+                "judgments",
+                completed=len(evidence),
+                total=len(bound_cells),
+                detail=progress_detail,
+            )
+            continue
         try:
             judgment = judgments_by_rollout.get(rollout_id)
             receipt = read_dispatch_reservation(
@@ -818,7 +837,6 @@ def _complete_cell_evidence(
             )
             _persist_judgment(project, judgment)
             judgments_by_rollout[rollout_id] = judgment
-        rollout, _input = read_rollout(project.artifacts, rollout_id)
         evidence.append(
             EvaluationCellEvidence(
                 cell_id=cell.cell_id,

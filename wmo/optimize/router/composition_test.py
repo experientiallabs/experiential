@@ -866,3 +866,99 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     decision = first.runtime.select(_request(), episode_id="customer-episode")
     assert first.runtime.select(_request(), episode_id="customer-episode") == decision
     assert first.plan.cells
+
+
+def test_failed_rollouts_are_never_judged_and_leftover_judgments_do_not_block_resume(
+    tmp_path: Path,
+) -> None:
+    """Skip judgment dispatch for failed rollouts and resume past persisted leftovers.
+
+    Args:
+        tmp_path: Isolated project root for composed router artifacts.
+    """
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
+    _bind_completed_build(project, normalized, revision="test-revision")
+    simulator = _SimulatorFactory()
+    terminal = '{"message":"Done.","terminal":true}'
+    simulator.world = _ScriptedClient(
+        [_response("not-json", snapshot=_snapshot("world-model-a"), cost=0.01)]
+        + [_response(terminal, snapshot=_snapshot("world-model-a"), cost=0.01)] * 80
+    )
+    judge = _Judge()
+    services = RouterWorkflowServices(
+        review_supplier=_ReviewSupplier(),
+        setup_supplier=_SetupSupplier(),
+        simulator_factory=simulator,
+        judge=judge,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _Catalog(
+                {
+                    "candidate-a": _snapshot("candidate-a"),
+                    "embedder": _snapshot("embedder"),
+                },
+                _Client(),
+            ),
+        ),
+    )
+    budget = RouterCompositionBudget(
+        maximum_simulation_cost_usd=10.0,
+        maximum_judgments=100,
+    )
+
+    first = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+
+    failed = tuple(
+        read_rollout(project.artifacts, artifact_id)[0]
+        for artifact_id in project.artifacts.list_ids()
+        if project.artifacts.read(artifact_id).manifest.artifact_type == "rollout"
+    )
+    failed_ids = {rollout.rollout_id for rollout in failed if rollout.failure is not None}
+    assert failed_ids
+    failed_cells = {rollout.cell_id for rollout in failed if rollout.failure is not None}
+    assert failed_cells.isdisjoint({cell_id for cell_id, _locked in judge.log})
+    dispatches = tuple(
+        JudgmentDispatchReceipt.model_validate_json(
+            project.artifacts.read_bytes(artifact_id, "dispatch.json")
+        )
+        for artifact_id in project.artifacts.list_ids()
+        if project.artifacts.read(artifact_id).manifest.artifact_type == "judgment-dispatch"
+    )
+    assert all(item.rollout.artifact_id not in failed_ids for item in dispatches)
+    dispatched = judge.calls
+
+    leftover = _Judge().judge_persisted(
+        project,
+        rollout_artifact_id=sorted(failed_ids)[0],
+        rubric_artifact_id="rubric-a",
+        calibration_artifact_id="calibration-a",
+    )
+    project.artifacts.write_json(
+        artifact_id=leftover.judgment_id,
+        artifact_type="judgment",
+        envelope=leftover,
+        files={"judgment.json": leftover},
+    )
+
+    second = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="test-revision",
+    )
+
+    assert second.optimization == first.optimization
+    assert judge.calls == dispatched

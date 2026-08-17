@@ -192,6 +192,11 @@ def build_knn_bank(
 ) -> KnnEvidenceBank:
     """Build a normalized bank using eligible fit rows and request-visible task features.
 
+    Completed and observed rows contribute their judged scores. Failed rows are real
+    routing evidence too: a candidate that could not finish the task scores the floor
+    quality of zero, so the fitted policy routes away from unreliable candidates instead
+    of failing closed on missing coverage.
+
     Args:
         dataset: Immutable sparse evaluation with explicit missing and failed rows.
         tasks: Canonical task cases named by the evaluation manifest.
@@ -227,11 +232,13 @@ def build_knn_bank(
         if key in seen_cells:
             raise ValueError("evaluation repeats a fit task, candidate, and repeat cell")
         seen_cells.add(key)
-        if row.status not in {"observed", "completed"}:
+        if row.status not in {"observed", "completed", "failed"}:
             continue
         target_row = row_of[row.task_id]
         target_column = column_of[row.candidate_alias]
-        if row.score is not None:
+        if row.status == "failed":
+            score_values[target_row][target_column].append(0.0)
+        elif row.score is not None:
             score_values[target_row][target_column].append(row.score)
         if row.candidate_cost_usd is not None:
             if row.candidate_cost_usd.value < 0:
