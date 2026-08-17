@@ -58,8 +58,8 @@ def bind_prompt_template(
         dimensions: Replacement ordered axes.
 
     Returns:
-        The default template when the built-in prompt is in use, otherwise the
-        same custom contract with scalar bounds updated to the selected range.
+        The same contract with scalar bounds updated to the selected range, or
+        the unchanged non-scalar contract after projection checks.
 
     Raises:
         ValueError: The axes are empty, mixed, or a custom projection leaves the range.
@@ -68,8 +68,6 @@ def bind_prompt_template(
     _require_projection_in_range(template, lowest, highest)
     if template.response_shape != "scalar":
         return template
-    if template.prompt.prompt_id == DEFAULT_JUDGE_PROMPT.prompt_id:
-        return default_judge_template(dimensions)
     return template.model_copy(
         update={
             "response_schema": judge_feedback_schema(
