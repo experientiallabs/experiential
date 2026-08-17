@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import urllib.error
 import urllib.request
@@ -135,8 +136,13 @@ def _pinned_traces(request: pytest.FixtureRequest) -> Path:
     cache = Path(str(request.config.cache.mkdir("wmo-public-fixtures")))
     path = cache / "terminal-tasks-traces.otel.jsonl"
     if not path.is_file() or _sha256(path) != TRACES_SHA256:
+        headers = {}
+        token = os.environ.get("HF_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         try:
-            with urllib.request.urlopen(TRACES_URL, timeout=120) as response:
+            fetch = urllib.request.Request(TRACES_URL, headers=headers)
+            with urllib.request.urlopen(fetch, timeout=120) as response:
                 payload = response.read()
         except (urllib.error.URLError, TimeoutError) as exc:
             pytest.skip(f"pinned public terminal-tasks export is unavailable: {exc}")

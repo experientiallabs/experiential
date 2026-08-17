@@ -26,6 +26,7 @@ from wmo.common.models import (
     NumericMeasurement,
     OperationEconomics,
     Usage,
+    structured_json_text,
 )
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact
@@ -549,6 +550,10 @@ def _verify_probe_binding(
 def _raw_response(response: ModelResponse) -> JsonObject:
     """Parse strict JSON text from one provider response.
 
+    A single Markdown code fence around the JSON body is unwrapped before parsing because
+    supported providers add one even under a JSON-only prompt and schema. Prose, several blocks,
+    and tool calls stay invalid.
+
     Args:
         response: Provider model response.
 
@@ -561,7 +566,7 @@ def _raw_response(response: ModelResponse) -> JsonObject:
     if response.output.tool_calls or response.output.content is None:
         raise ManualJudgeError("judge must return structured JSON text without tool calls")
     try:
-        value = json.loads(response.output.content)
+        value = json.loads(structured_json_text(response.output.content))
     except json.JSONDecodeError as exc:
         raise ManualJudgeError("judge returned malformed structured JSON") from exc
     if not isinstance(value, dict):

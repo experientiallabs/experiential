@@ -190,6 +190,8 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 base_url=connection.base_url or OPENAI_BASE_URL,
                 transport=self._transport_factory(),
+                supports_temperature=capabilities.supports_temperature,
+                reasoning_effort=capabilities.reasoning_effort,
             )
             return ResolvedModel(
                 alias,

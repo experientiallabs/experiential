@@ -36,12 +36,22 @@ from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpT
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
-def openai_responses_request(model_id: str, request: ModelRequest) -> JsonObject:
+def openai_responses_request(
+    model_id: str,
+    request: ModelRequest,
+    *,
+    supports_temperature: bool = True,
+    reasoning_effort: str | None = None,
+) -> JsonObject:
     """Convert one WMO request into OpenAI's native Responses API shape.
 
     Args:
         model_id: OpenAI model identifier.
         request: Typed WMO request.
+        supports_temperature: Catalog declaration that the model accepts an explicit sampling
+            temperature. Reasoning models pin their sampling and reject the parameter, so a
+            ``False`` declaration omits any requested temperature from the wire payload.
+        reasoning_effort: Optional catalog-pinned reasoning-effort level sent verbatim.
 
     Returns:
         Non-streaming Responses API JSON with provider-side storage disabled.
@@ -82,8 +92,10 @@ def openai_responses_request(model_id: str, request: ModelRequest) -> JsonObject
             if not isinstance(request.tool_choice, str)
             else request.tool_choice
         )
-    if request.temperature is not None:
+    if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
+    if reasoning_effort is not None:
+        payload["reasoning"] = {"effort": reasoning_effort}
     if request.maximum_output_tokens is not None:
         payload["max_output_tokens"] = request.maximum_output_tokens
     return payload
@@ -171,8 +183,22 @@ class OpenAIClient:
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         base_url: str = OPENAI_BASE_URL,
+        supports_temperature: bool = True,
+        reasoning_effort: str | None = None,
     ) -> None:
-        """Create a direct OpenAI client with one explicitly resolved credential."""
+        """Create a direct OpenAI client with one explicitly resolved credential.
+
+        Args:
+            model: Resolved catalog identity for every request.
+            api_key: Non-empty provider credential.
+            transport: Optional injected JSON transport for deterministic tests.
+            retry_policy: Bounded retry behavior for transient transport failures.
+            timeout_seconds: Positive per-request timeout.
+            base_url: Provider endpoint root.
+            supports_temperature: Catalog declaration that the model accepts an explicit
+                sampling temperature; ``False`` omits requested temperatures from payloads.
+            reasoning_effort: Optional catalog-pinned reasoning-effort level.
+        """
         if not api_key:
             raise ValueError("OpenAI clients require a non-empty API key")
         if timeout_seconds <= 0:
@@ -183,6 +209,8 @@ class OpenAIClient:
         self._transport = transport or HttpxJsonTransport()
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
+        self._supports_temperature = supports_temperature
+        self._reasoning_effort = reasoning_effort
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one request through the native non-streaming Responses endpoint.
@@ -198,7 +226,12 @@ class OpenAIClient:
             self._transport,
             f"{self._base_url}/responses",
             headers=self._headers(),
-            payload=openai_responses_request(self._model.model_id, request),
+            payload=openai_responses_request(
+                self._model.model_id,
+                request,
+                supports_temperature=self._supports_temperature,
+                reasoning_effort=self._reasoning_effort,
+            ),
             timeout_seconds=self._timeout_seconds,
             retry_policy=self._retry_policy,
         )
