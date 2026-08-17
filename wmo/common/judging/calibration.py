@@ -118,6 +118,8 @@ class JudgeCalibrationService:
                 tuple(
                     item for item in data if item.human_score.dimension_id == dimension.dimension_id
                 ),
+                min_score=dimension.min_score,
+                max_score=dimension.max_score,
             )
             for dimension in rubric.dimensions
         )
@@ -274,7 +276,7 @@ class JudgeCalibrationService:
             store: Project store containing the exact completed reviewed report artifact.
             report: Report whose persisted evidence is being approved.
             approved_at: Time the customer accepted the visible OOF evidence.
-            accept_insufficient_labels: Explicit risk acceptance below ten rollouts when
+            accept_insufficient_labels: Explicit risk acceptance below five rollouts when
                 per-dimension OOF evidence is valid.
 
         Returns:
@@ -509,7 +511,7 @@ def _resolve_observations(
     split: RouterLineageSplit,
     observations: Sequence[JudgeScoreObservation],
 ) -> tuple[_VerifiedObservation, ...]:
-    """Resolve every observation and prove its raw score and citations match source artifacts."""
+    """Resolve every observation and prove its raw score matches source artifacts."""
     if not observations:
         raise CalibrationError(
             "calibration requires uncalibrated judgment evidence to bind judge model and prompt"
@@ -565,13 +567,6 @@ def _resolve_observations(
             raise CalibrationError("observation dimension is absent from its uncalibrated judgment")
         if dimension.raw_score != observation.raw_score:
             raise CalibrationError("observation raw score does not match its uncalibrated judgment")
-        if dimension.evidence_span_ids != observation.evidence_span_ids:
-            raise CalibrationError("observation citations do not match its uncalibrated judgment")
-        known_spans = {span.span_id for span in rollout.spans}
-        if not set(observation.evidence_span_ids).issubset(known_spans):
-            raise CalibrationError(
-                "calibration observation cites spans absent from its source rollout"
-            )
         try:
             lineage_id = split.lineage_for_rollout(rollout.rollout_id)
         except ValueError as exc:
@@ -731,7 +726,7 @@ def _report_status(
         tuple(dimension.dimension_id for dimension in rubric.dimensions), metrics, predictions
     ):
         return "insufficient"
-    if len({item.human_score.rollout_id for item in data}) < 10:
+    if len({item.human_score.rollout_id for item in data}) < 5:
         return "insufficient"
     return "ready_for_approval"
 
@@ -786,7 +781,15 @@ def _build_provisional_report(
     if label_set.history.scores:
         raise CalibrationError("provisional bootstrap requires a finalized zero-label set")
     inputs = sorted_verified_inputs((rubric_input, label_set_input, split_input))
-    score_maps = tuple(fit_score_map(dimension.dimension_id, ()) for dimension in rubric.dimensions)
+    score_maps = tuple(
+        fit_score_map(
+            dimension.dimension_id,
+            (),
+            min_score=dimension.min_score,
+            max_score=dimension.max_score,
+        )
+        for dimension in rubric.dimensions
+    )
     predictions, metrics = grouped_predictions_and_metrics(rubric, ())
     report_id = stable_id(
         "judge-calibration-report",

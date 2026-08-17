@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
 
 from wmo.common.core.artifacts import ArtifactInput, stable_id
 from wmo.common.judging import (
@@ -13,22 +12,15 @@ from wmo.common.judging import (
     HumanScoreReview,
     JudgeCalibrationService,
     JudgeScoreObservation,
-    LMJudge,
-    PromptDefinition,
     RouterLineageAssignment,
     RouterLineageSplit,
     Rubric,
     RubricDimension,
     RubricReview,
-    ScoreAnchor,
     write_router_lineage_split,
 )
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
-from wmo.common.models import (
-    ModelCatalog,
-    ModelSnapshot,
-    PricingSource,
-)
+from wmo.common.models import ModelCatalog, ModelSnapshot, PricingSource
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, load_trace_dataset
@@ -52,40 +44,42 @@ from wmo.optimize.router.judging.artifacts import (
 from wmo.optimize.router.judging.contracts import (
     JudgeCalibrationBudget,
     JudgePromptTemplate,
-    JudgeRunEvidence,
     JudgeTracePreview,
     ManualJudgeCalibrationResult,
     ManualJudgeError,
     ManualJudgeLabel,
     ManualJudgeReviewState,
     ManualJudgeSetupArtifact,
-    judge_feedback_schema,
 )
 from wmo.optimize.router.judging.labels import calibration_sample_digest, save_label_draft
 from wmo.optimize.router.judging.pricing import resolve_manual_judge_prices
-from wmo.optimize.router.judging.protocol import TemplateJudgeClient, positional_bias_count
+from wmo.optimize.router.judging.protocol import positional_bias_count
+from wmo.optimize.router.judging.review import (
+    ManualJudgeReviewCollection,
+    ManualJudgeReviewer,
+    collect_trace_reviews,
+    labels_from_reviews,
+    manual_label_score,
+    ordered_completed_reviews,
+    read_review_judgment,
+    read_trace_reviews,
+    review_evidence,
+    reviewer_from_labels,
+)
 from wmo.optimize.router.judging.selection import (
     pairwise_references,
-    read_rollout,
     representative_pairs,
     representative_pairwise_pairs,
     trace_preview,
 )
+from wmo.optimize.router.judging.template_bind import (
+    DEFAULT_JUDGE_TEMPLATE,
+    bind_prompt_template,
+    default_judge_dimensions,
+)
 from wmo.runtime.models.providers.retry import RetryPolicy
 from wmo.runtime.models.registry import RuntimeModelCatalog
 from wmo.simulation.build import BuildReviewReadiness
-
-_PROMPT_TEXT = (
-    "Evaluate the supplied rollout against every rubric dimension. Use only evidence in the "
-    "rollout. Return strict JSON matching the supplied schema, with one zero-to-five score, "
-    "specific cited span IDs, and concise feedback for every dimension."
-)
-DEFAULT_JUDGE_PROMPT = PromptDefinition.from_text("wmo-judge-evidence-json-v1", _PROMPT_TEXT)
-DEFAULT_JUDGE_TEMPLATE = JudgePromptTemplate(
-    prompt=DEFAULT_JUDGE_PROMPT,
-    variable_mapping={"rubric": "RUBRIC", "rollout": "ROLLOUT"},
-    response_schema=judge_feedback_schema("scalar"),
-)
 
 
 @dataclass(frozen=True)
@@ -134,41 +128,6 @@ class ManualJudgeCalibrationPlan:
     previews: tuple[JudgeTracePreview, ...]
 
 
-def default_judge_dimensions() -> tuple[RubricDimension, ...]:
-    """Return the editable default task-success scale for first setup.
-
-    Returns:
-        One complete zero-to-five dimension with plain-language anchors.
-    """
-    return (
-        RubricDimension(
-            dimension_id="task-success",
-            name="Task success",
-            description="How completely and correctly the agent addressed the requested task.",
-            anchors=(
-                ScoreAnchor(score=0, description="The agent did not address the task."),
-                ScoreAnchor(score=1, description="The agent made little useful progress."),
-                ScoreAnchor(
-                    score=2,
-                    description="The agent partially addressed the task with major gaps.",
-                ),
-                ScoreAnchor(
-                    score=3,
-                    description="The agent mostly addressed the task with meaningful gaps.",
-                ),
-                ScoreAnchor(
-                    score=4,
-                    description="The agent addressed the task with only minor gaps.",
-                ),
-                ScoreAnchor(
-                    score=5,
-                    description="The agent fully and correctly addressed the task.",
-                ),
-            ),
-        ),
-    )
-
-
 def prepare_manual_judge_setup(
     store: ProjectStore,
     catalog: ModelCatalog,
@@ -215,7 +174,11 @@ def prepare_manual_judge_setup(
         raise ManualJudgeError(str(exc)) from exc
     selected_dimensions = tuple(dimensions or default_judge_dimensions())
     if not selected_dimensions:
-        raise ManualJudgeError("judge setup requires at least one rubric dimension")
+        raise ManualJudgeError("judge setup requires at least one rubric axis")
+    try:
+        prompt_template = bind_prompt_template(prompt_template, selected_dimensions)
+    except ValueError as exc:
+        raise ManualJudgeError(str(exc)) from exc
     _require_exact_build_inputs(store, build)
     tasks = load_task_set(store.artifacts, build.task_set.artifact_id).tasks
     traces = load_trace_dataset(store.artifacts, build.trace_dataset.artifact_id).traces
@@ -336,7 +299,7 @@ def commit_manual_judge_setup(
 def prepare_manual_judge_calibration(
     store: ProjectStore,
     *,
-    sample_size: int = 10,
+    sample_size: int = 5,
 ) -> ManualJudgeCalibrationPlan:
     """Select representative real fit-lineage traces for labeling without writes.
 
@@ -399,9 +362,6 @@ def calibration_sample(
 def manual_judge_calibration_is_complete(store: ProjectStore) -> bool:
     """Report whether a completed audit already fixes this project's calibration.
 
-    A completed audit makes calibration replay its own immutable evidence, so callers must
-    not collect new human labels that the replay would ignore.
-
     Args:
         store: Project-local review store.
 
@@ -423,6 +383,7 @@ def estimate_manual_judge_budget(
     maximum_input_tokens_per_call: int,
     maximum_cost_usd: float,
     retry_policy: RetryPolicy | None = None,
+    completed_review_count: int = 0,
 ) -> JudgeCalibrationBudget:
     """Reserve worst-case judging spend before credentials or provider calls.
 
@@ -434,6 +395,7 @@ def estimate_manual_judge_budget(
         maximum_input_tokens_per_call: Conservative request-token ceiling.
         maximum_cost_usd: Operator's total calibration spend ceiling.
         retry_policy: Runtime retry bound used by provider clients.
+        completed_review_count: Immutable trace reviews that require no further provider calls.
 
     Returns:
         Finite conservative admission budget for one call per labeled rollout.
@@ -459,8 +421,10 @@ def estimate_manual_judge_budget(
             output_usd_per_million_tokens=output_usd_per_million_tokens,
         )
     resolved_retry = retry_policy or RetryPolicy()
+    if completed_review_count < 0 or completed_review_count > len(plan.traces):
+        raise ValueError("completed judge review count is outside the frozen trace sample")
     calls_per_trace = 2 if plan.setup.prompt_template.response_shape == "pairwise" else 1
-    call_count = len(plan.traces) * calls_per_trace
+    call_count = (len(plan.traces) - completed_review_count) * calls_per_trace
     per_attempt = (maximum_input_tokens_per_call * input_price + 4_096 * output_price) / 1_000_000
     return JudgeCalibrationBudget(
         input_usd_per_million_tokens=input_price,
@@ -487,20 +451,22 @@ def calibrate_manual_judge(
     accept_insufficient_labels: bool,
     created_at: datetime,
     code_revision: str,
+    reviewer: ManualJudgeReviewer | None = None,
 ) -> ManualJudgeCalibrationResult:
-    """Freeze labels, run scalar judge calls, report evidence, and optionally approve.
+    """Run judge-first trace reviews, report evidence, and optionally approve.
 
     Args:
         store: Project-local artifact and review store.
         runtime_catalog: Injected resolver for the configured judge alias.
         plan: Frozen representative real-trace calibration plan.
-        labels: Complete human scores for every selected trace and rubric dimension.
+        labels: Complete explicit human scores used when ``reviewer`` is not supplied.
         budget: Explicit conservative spend reservation shown before consent.
         spend_consented: Whether the operator accepted the displayed reservation.
         approve: Separate explicit approval of the completed calibration report.
-        accept_insufficient_labels: Explicit risk acceptance below ten labels.
+        accept_insufficient_labels: Explicit risk acceptance below five completed reviews.
         created_at: Time for newly completed artifacts and decisions.
         code_revision: Exact producer revision for new artifacts.
+        reviewer: Human decision supplier invoked after each immutable judge proposal.
 
     Returns:
         Calibration audit, report, optional approved calibration pointer, and call count.
@@ -520,24 +486,23 @@ def calibrate_manual_judge(
             accept_insufficient_labels=accept_insufficient_labels,
             approved_at=created_at,
         )
-    _validate_labels(store, plan, setup, labels)
-    save_label_draft(
-        store,
-        setup,
-        calibration_sample_digest(setup, calibration_sample(plan)),
-        labels,
-        created_at,
-    )
-    expected_calls = len(plan.traces) * (
-        2 if setup.prompt_template.response_shape == "pairwise" else 1
-    )
-    if budget.call_count != expected_calls:
-        raise ManualJudgeError("judge budget call count differs from the frozen trace sample")
-    if not spend_consented:
+    sample_sha256 = calibration_sample_digest(setup, calibration_sample(plan))
+    completed_reviews = read_trace_reviews(store, setup, sample_sha256)
+    supplied_labels = tuple(labels)
+    explicit_label_input = reviewer is None
+    if explicit_label_input:
+        _validate_labels(store, plan, setup, supplied_labels)
+        save_label_draft(store, setup, sample_sha256, supplied_labels, created_at)
+        reviewer = reviewer_from_labels(setup, supplied_labels)
+    elif supplied_labels:
+        raise ManualJudgeError("supply either a review callback or legacy labels, not both")
+    calls_per_trace = 2 if setup.prompt_template.response_shape == "pairwise" else 1
+    expected_calls = (len(plan.traces) - len(completed_reviews)) * (calls_per_trace)
+    total_calls = len(plan.traces) * calls_per_trace
+    if budget.call_count not in {expected_calls, total_calls}:
+        raise ManualJudgeError("judge budget call count differs from incomplete trace reviews")
+    if expected_calls and not spend_consented:
         raise ManualJudgeError("judge calibration requires explicit spend consent before writes")
-    resolved = runtime_catalog.preflight(setup.judge_alias)
-    if resolved.snapshot != setup.judge_model:
-        raise ManualJudgeError("configured judge identity changed after setup")
     rollout_inputs = tuple(
         write_production_rollout(
             store,
@@ -585,76 +550,89 @@ def calibrate_manual_judge(
             created_at=created_at,
             code_revision=code_revision,
         )
+    provisional_input = artifact_input(store.artifacts.read(provisional.calibration_id).manifest)
+    rubric, rubric_input = read_artifact_json(
+        store,
+        artifact_id=setup.rubric.artifact_id,
+        expected_artifact_type="rubric",
+        relative_path="rubric.json",
+        model_type=Rubric,
+    )
+    if rubric_input != setup.rubric:
+        raise ManualJudgeError("manual judge rubric manifest differs from setup")
+    if len(completed_reviews) < len(plan.traces):
+        resolved = runtime_catalog.preflight(setup.judge_alias)
+        if resolved.snapshot != setup.judge_model:
+            raise ManualJudgeError("configured judge identity changed after setup")
+        collection = collect_trace_reviews(
+            store,
+            resolved,
+            setup=setup,
+            setup_input=state.setup,
+            tasks=plan.tasks,
+            traces=plan.traces,
+            reference_traces=plan.reference_traces,
+            rollout_inputs=rollout_inputs,
+            reference_inputs=reference_inputs,
+            provisional_input=provisional_input,
+            rubric=rubric,
+            budget=budget,
+            sample_sha256=sample_sha256,
+            reviewer=reviewer,
+            created_at=created_at,
+            code_revision=code_revision,
+        )
+    else:
+        collection = ManualJudgeReviewCollection(
+            reviews=ordered_completed_reviews(
+                completed_reviews,
+                setup=setup,
+                setup_input=state.setup,
+                tasks=plan.tasks,
+                traces=plan.traces,
+                reference_traces=plan.reference_traces,
+                rollout_inputs=rollout_inputs,
+                reference_inputs=reference_inputs,
+                provisional_input=provisional_input,
+                rubric=rubric,
+            ),
+            provider_calls_made=0,
+        )
+    accepted_labels = labels_from_reviews(collection.reviews)
+    _validate_labels(store, plan, setup, accepted_labels)
+    if not explicit_label_input:
+        save_label_draft(
+            store,
+            setup,
+            sample_sha256,
+            accepted_labels,
+            created_at,
+        )
     human_labels = _write_labels(
         label_review,
         setup,
         plan,
         rollout_inputs,
-        labels,
+        accepted_labels,
         created_at,
         code_revision,
     )
-    evidence: list[JudgeRunEvidence] = []
+    evidence = review_evidence(collection.reviews)
     observations: list[JudgeScoreObservation] = []
-    provider_calls = 0
     positional_comparisons = 0
     positional_flips = 0
-    for rollout_input, reference_input in zip(rollout_inputs, reference_inputs, strict=True):
-        rollout = read_rollout(store, rollout_input)
-        reference = read_rollout(store, reference_input) if reference_input is not None else None
-        rubric, _rubric_input = read_artifact_json(
-            store,
-            artifact_id=setup.rubric.artifact_id,
-            expected_artifact_type="rubric",
-            relative_path="rubric.json",
-            model_type=Rubric,
-        )
-        adapter = TemplateJudgeClient(
-            resolved.client,
-            setup.prompt_template,
-            rollout,
-            rubric,
-            reference,
-            store=store,
-            setup_input=state.setup,
-            rollout_input=rollout_input,
-            reference_input=reference_input,
-            created_at=created_at,
-            code_revision=code_revision,
-        )
-        judge = LMJudge(
-            adapter,
-            setup.prompt_template.prompt,
-            code_revision=code_revision,
-            clock=lambda: created_at,
-        )
-        judgment = judge.judge_and_write(
-            store,
-            rollout_artifact_id=rollout_input.artifact_id,
-            rubric_artifact_id=setup.rubric.artifact_id,
-            calibration_artifact_id=provisional.calibration_id,
-        )
-        provider_calls += adapter.provider_calls_made
+    for review in collection.reviews:
+        judgment = read_review_judgment(store, review)
         if setup.prompt_template.response_shape == "pairwise":
-            comparisons, flips = positional_bias_count(store, adapter.probes)
+            comparisons, flips = positional_bias_count(store, review.original_judge_response)
             positional_comparisons += comparisons
             positional_flips += flips
-        judgment_input = artifact_input(store.artifacts.read(judgment.judgment_id).manifest)
-        evidence.append(
-            JudgeRunEvidence(
-                rollout=rollout_input,
-                reference_rollout=reference_input,
-                judgment=judgment_input,
-                probes=adapter.probes,
-            )
-        )
         observations.extend(
             JudgeScoreObservation(
-                judgment=judgment_input,
-                source_rollout=rollout_input,
+                judgment=review.normalized_judgment,
+                source_rollout=review.trace_evidence,
                 dimension_id=dimension.dimension_id,
                 raw_score=dimension.raw_score,
-                evidence_span_ids=dimension.evidence_span_ids,
             )
             for dimension in judgment.dimensions
         )
@@ -677,7 +655,11 @@ def calibrate_manual_judge(
         provisional_input=artifact_input(store.artifacts.read(provisional.calibration_id).manifest),
         report_input=artifact_input(store.artifacts.read(report.report_id).manifest),
         budget=budget,
-        judgments=tuple(evidence),
+        judgments=evidence,
+        trace_reviews=tuple(
+            artifact_input(store.artifacts.read(review.review_id).manifest)
+            for review in collection.reviews
+        ),
         positional_bias=(
             (positional_comparisons, positional_flips)
             if setup.prompt_template.response_shape == "pairwise"
@@ -687,7 +669,7 @@ def calibrate_manual_judge(
         code_revision=code_revision,
     )
     audit_input = artifact_input(store.artifacts.read(audit.audit_id).manifest)
-    next_state = state.model_copy(update={"audit": audit_input})
+    next_state = require_review_state(store).model_copy(update={"audit": audit_input})
     write_review_state(store, next_state)
     return replay_or_approve(
         store,
@@ -695,7 +677,7 @@ def calibrate_manual_judge(
         approve=approve,
         accept_insufficient_labels=accept_insufficient_labels,
         approved_at=created_at,
-        provider_calls_made=provider_calls,
+        provider_calls_made=collection.provider_calls_made,
     )
 
 
@@ -815,10 +797,22 @@ def _validate_labels(
         for dimension in rubric.dimensions
     }
     supplied = [(label.trace_id, label.reference_trace_id, label.dimension_id) for label in labels]
-    if any((label.winner is not None) != pairwise for label in labels):
-        raise ManualJudgeError(
-            "pairwise setups require typed winner labels; other setups require zero-to-five scores"
-        )
+    if pairwise and any(label.reference_trace_id is None for label in labels):
+        raise ManualJudgeError("pairwise labels must retain their reference trace")
+    if not pairwise and any(
+        label.reference_trace_id is not None or label.winner is not None for label in labels
+    ):
+        raise ManualJudgeError("non-pairwise setups require direct axis-range scores")
+    axes = {item.dimension_id: item for item in rubric.dimensions}
+    for label in labels:
+        if label.score is None:
+            continue
+        axis = axes[label.dimension_id]
+        if not axis.contains_score(label.score):
+            raise ManualJudgeError(
+                f"human scores for {label.dimension_id} must be integers from "
+                f"{axis.min_score} through {axis.max_score}"
+            )
     if len(set(supplied)) != len(supplied):
         raise ManualJudgeError("judge calibration labels must not repeat a trace dimension")
     missing = sorted(expected.difference(supplied))
@@ -929,7 +923,7 @@ def _write_labels(
         Immutable labeled human score set.
     """
     score_by_key = {
-        (item.trace_id, item.reference_trace_id, item.dimension_id): _label_score(setup, item)
+        (item.trace_id, item.reference_trace_id, item.dimension_id): manual_label_score(setup, item)
         for item in labels
     }
     for trace, reference, task, rollout in zip(
@@ -968,27 +962,3 @@ def _write_labels(
         code_revision=code_revision,
         created_at=created_at,
     )
-
-
-def _label_score(
-    setup: ManualJudgeSetupArtifact, label: ManualJudgeLabel
-) -> Literal[0, 1, 2, 3, 4, 5]:
-    """Project one human label under the exact saved response contract.
-
-    Args:
-        setup: Finalized setup containing the versioned projection.
-        label: Validated scalar score or typed pairwise preference.
-
-    Returns:
-        Integer zero-to-five human score used by grouped calibration.
-
-    Raises:
-        ManualJudgeError: Label shape differs from the finalized setup.
-    """
-    if setup.prompt_template.response_shape == "pairwise":
-        if label.winner is None:
-            raise ManualJudgeError("pairwise human labels require winner_a, winner_b, or tie")
-        return setup.prompt_template.score_projection.pairwise_scores[label.winner]
-    if label.score is None:
-        raise ManualJudgeError("non-pairwise human labels require a zero-to-five score")
-    return label.score

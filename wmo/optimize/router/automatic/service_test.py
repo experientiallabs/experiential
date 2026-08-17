@@ -153,7 +153,7 @@ class _CompletionClient:
             request: Exact provider-neutral request.
 
         Returns:
-            Candidate text, terminal world transition, or cited judge JSON.
+            Candidate text, terminal world transition, or structured judge JSON.
         """
         self._state.completion_calls.append((self._alias, request))
         if self._alias == "world":
@@ -167,9 +167,8 @@ class _CompletionClient:
                     "dimensions": [
                         {
                             "dimension_id": "task-success",
-                            "raw_score": 4,
-                            "evidence_span_ids": [span_ids[0]],
-                            "feedback": "The visible response resolves the task.",
+                            "raw_score": 1,
+                            "rationale": "The visible response resolves the task.",
                         }
                     ]
                 }
@@ -958,6 +957,7 @@ def test_automatic_router_rejects_substituted_manual_judge_audit_before_calls(
         report_input=audit.report,
         budget=substituted_budget,
         judgments=audit.judgments,
+        trace_reviews=audit.trace_reviews,
         positional_bias=(
             (audit.positional_bias_comparisons, audit.positional_bias_flips)
             if audit.positional_bias_comparisons is not None
@@ -1202,7 +1202,7 @@ def _approve_manual_judge(
         ManualJudgeLabel(
             trace_id=trace.trace_id,
             dimension_id="task-success",
-            score=4,
+            score=1,
         )
         for trace in plan.traces
     )

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,6 +28,7 @@ from wmo.common.judging import (
     PromptDefinition,
     RubricDimension,
     RubricReview,
+    scored_axis,
 )
 from wmo.common.judging.judgment import Judgment
 from wmo.common.models import (
@@ -60,6 +60,7 @@ from wmo.optimize.router.judging.contracts import (
     judge_feedback_schema,
 )
 from wmo.optimize.router.judging.labels import calibration_sample_digest, read_label_draft
+from wmo.optimize.router.judging.review import read_trace_reviews
 from wmo.optimize.router.judging.service import (
     ManualJudgeError,
     calibrate_manual_judge,
@@ -79,8 +80,19 @@ _DIGEST = "a" * 64
 _FeedbackShape = Literal["scalar", "boolean", "categorical", "pairwise"]
 
 
+def _wide_axes() -> tuple[RubricDimension, ...]:
+    """Return a 0-5 task-success axis for custom projection contracts."""
+    return (
+        scored_axis(
+            "task-success",
+            "Task success",
+            "Whether the customer received a correct outcome.",
+        ),
+    )
+
+
 class _JudgeClient:
-    """Return deterministic cited scalar scores while recording every provider call."""
+    """Return deterministic scalar scores while recording every provider call."""
 
     def __init__(self, model: ModelSnapshot) -> None:
         """Bind the exact configured model identity for deterministic responses.
@@ -92,7 +104,7 @@ class _JudgeClient:
         self.requests: list[ModelRequest] = []
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Return one schema-valid score citing a span present in the request.
+        """Return one schema-valid score for the request.
 
         Args:
             request: Structured LM judge request.
@@ -101,9 +113,6 @@ class _JudgeClient:
             Deterministic model response with no observed provider cost.
         """
         self.requests.append(request)
-        content = request.messages[1].content or ""
-        match = re.search(r'"span_id":\s*"([^"]+)"', content)
-        assert match is not None
         return ModelResponse(
             output=AssistantAction(
                 content=json.dumps(
@@ -111,9 +120,8 @@ class _JudgeClient:
                         "dimensions": [
                             {
                                 "dimension_id": "task-success",
-                                "raw_score": 4,
-                                "evidence_span_ids": [match.group(1)],
-                                "feedback": "The trace shows the task was handled.",
+                                "raw_score": 1,
+                                "rationale": "The trace shows the task was handled.",
                             }
                         ]
                     }
@@ -187,27 +195,18 @@ class _StructuredJudgeClient:
         if self.fail_after is not None and len(self.requests) >= self.fail_after:
             raise RuntimeError("simulated provider interruption")
         self.requests.append(request)
-        content = request.messages[1].content or ""
-        span_ids = re.findall(r'"span_id":\s*"([^"]+)"', content)
-        assert span_ids
         common = {
             "dimension_id": "task-success",
-            "feedback": "Structured evidence supports the verdict.",
+            "rationale": "Structured evidence supports the verdict.",
         }
         if self.shape == "scalar":
-            dimension = {**common, "raw_score": 4, "evidence_span_ids": [span_ids[0]]}
+            dimension = {**common, "raw_score": 1}
         elif self.shape == "boolean":
-            dimension = {**common, "passed": True, "evidence_span_ids": [span_ids[0]]}
+            dimension = {**common, "passed": True}
         elif self.shape == "categorical":
-            dimension = {**common, "category": "good", "evidence_span_ids": [span_ids[0]]}
+            dimension = {**common, "category": "good"}
         else:
-            assert len(span_ids) >= 2
-            dimension = {
-                **common,
-                "winner": "winner_a",
-                "evidence_span_ids_a": [span_ids[0]],
-                "evidence_span_ids_b": [span_ids[1]],
-            }
+            dimension = {**common, "winner": "winner_a"}
         return ModelResponse(
             output=AssistantAction(content=json.dumps({"dimensions": [dimension]})),
             model=self.model,
@@ -456,9 +455,9 @@ def _template(shape: _FeedbackShape) -> JudgePromptTemplate:
     """
     prompt = PromptDefinition.from_text("custom-judge-v1", "Follow the saved contract exactly.")
     if shape == "boolean":
-        projection = JudgeScoreProjection(boolean_scores={"false": 1, "true": 4})
+        projection = JudgeScoreProjection(boolean_scores={"false": 0, "true": 5})
     elif shape == "categorical":
-        projection = JudgeScoreProjection(categorical_scores={"bad": 1, "good": 4})
+        projection = JudgeScoreProjection(categorical_scores={"bad": 0, "good": 5})
     elif shape == "pairwise":
         projection = JudgeScoreProjection(
             pairwise_scores={"winner_a": 5, "winner_b": 0, "tie": 3},
@@ -497,7 +496,7 @@ def _labels(store: ProjectStore) -> tuple[ManualJudgeLabel, ...]:
         ManualJudgeLabel(
             trace_id=trace.trace_id,
             dimension_id="task-success",
-            score=4,
+            score=1,
         )
         for trace in plan.traces
     )
@@ -516,6 +515,12 @@ def test_setup_failure_is_read_only_and_setup_never_calls_a_model(tmp_path: Path
     )
 
     assert plan.previews
+    assert [item.dimension_id for item in plan.dimensions] == ["task-success"]
+    assert plan.dimensions[0].min_score == 0
+    assert plan.dimensions[0].max_score == 1
+    assert plan.dimensions[0].description == (
+        "The agent successfully completed the task requested in the original user prompt"
+    )
     assert store.read_review() == before_review
     assert store.artifacts.list_ids() == before_artifacts
     with pytest.raises(ManualJudgeError, match="explicit confirmation"):
@@ -808,7 +813,7 @@ def test_build_replacement_serializes_human_score_writer_and_removes_stale_state
                 rollout_id="rollout-a",
                 lineage_id="lineage-a",
                 dimension_id="task-success",
-                score=3,
+                score=1,
                 submission_id="submission-a",
                 created_at=_TIME,
             )
@@ -849,7 +854,7 @@ def test_build_replacement_serializes_human_score_writer_and_removes_stale_state
             rollout_id="rollout-a",
             lineage_id="lineage-a",
             dimension_id="task-success",
-            score=4,
+            score=1,
             submission_id="submission-b",
             created_at=_TIME + timedelta(seconds=2),
         )
@@ -1107,6 +1112,20 @@ def test_completed_audit_tamper_fails_before_replay_or_approval(tmp_path: Path) 
     assert len(client.requests) == 3
 
 
+def test_setup_rejects_stale_file_based_projection_without_editor(tmp_path: Path) -> None:
+    """Custom projections are bound during prepare, including --approve and --rubric-file."""
+    store = _built_store(tmp_path)
+
+    with pytest.raises(ManualJudgeError, match="boolean score projections"):
+        prepare_manual_judge_setup(
+            store,
+            _catalog(),
+            prompt_template=_template("boolean"),
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+
+
 def test_setup_replay_rejects_changed_contract_with_same_model(tmp_path: Path) -> None:
     """A saved alias and model cannot mask a changed prompt, mapping, schema, or projection."""
     store = _built_store(tmp_path)
@@ -1136,6 +1155,7 @@ def test_non_scalar_calibration_executes_saved_contract(
     setup_plan = prepare_manual_judge_setup(
         store,
         _catalog(),
+        dimensions=_wide_axes(),
         prompt_template=_template(shape),
         created_at=_TIME,
         code_revision="test-revision",
@@ -1190,7 +1210,7 @@ def test_non_scalar_calibration_executes_saved_contract(
     judgment = Judgment.model_validate_json(
         store.artifacts.read_bytes(result.audit.judgments[0].judgment.artifact_id, "judgment.json")
     )
-    assert judgment.dimensions[0].raw_score == 4
+    assert judgment.dimensions[0].raw_score == 5
     assert result.audit.positional_bias_comparisons is None
 
 
@@ -1200,6 +1220,7 @@ def test_pairwise_calibration_uses_same_task_and_counterbalances_order(tmp_path:
     setup_plan = prepare_manual_judge_setup(
         store,
         _catalog(),
+        dimensions=_wide_axes(),
         prompt_template=_template("pairwise"),
         created_at=_TIME,
         code_revision="test-revision",
@@ -1252,6 +1273,14 @@ def test_pairwise_calibration_uses_same_task_and_counterbalances_order(tmp_path:
     assert len(result.audit.judgments[0].probes) == 2
     assert result.audit.positional_bias_comparisons == 1
     assert result.audit.positional_bias_flips == 1
+    sample_sha256 = calibration_sample_digest(plan.setup, calibration_sample(plan))
+    review = read_trace_reviews(store, plan.setup, sample_sha256)[0]
+    proposal = review.axes[0].judge_proposal
+    accepted = review.axes[0].final_accepted_label
+    assert proposal.cited_trace_evidence == ()
+    assert proposal.cited_reference_trace_evidence == ()
+    assert accepted.cited_trace_evidence == proposal.cited_trace_evidence
+    assert accepted.cited_reference_trace_evidence == proposal.cited_reference_trace_evidence
     first = client.requests[0].messages[1].content or ""
     second = client.requests[1].messages[1].content or ""
     target_rollout = plan.previews[0].rollout_id
@@ -1269,6 +1298,7 @@ def test_pairwise_calibration_fails_before_labels_or_calls_without_same_task_pai
     setup_plan = prepare_manual_judge_setup(
         store,
         _catalog(),
+        dimensions=_wide_axes(),
         prompt_template=_template("pairwise"),
         created_at=_TIME,
         code_revision="test-revision",
@@ -1506,6 +1536,7 @@ def test_interrupted_pairwise_probe_reuses_forward_order(tmp_path: Path) -> None
     setup_plan = prepare_manual_judge_setup(
         store,
         _catalog(),
+        dimensions=_wide_axes(),
         prompt_template=_template("pairwise"),
         created_at=_TIME,
         code_revision="test-revision",

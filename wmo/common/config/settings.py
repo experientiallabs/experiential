@@ -31,14 +31,24 @@ class TelemetrySettings(BaseModel):
 
 
 class CommandBudgetSettings(BaseModel):
-    """Shared spend ceiling used by paid CLI commands when they omit an explicit flag."""
+    """User-owned authorization ceiling shared by every paid CLI command."""
 
-    maximum_cost_usd: float | None = Field(default=None, gt=0)
+    maximum_cost_usd: float | None = Field(default=None, ge=0)
 
     @field_validator("maximum_cost_usd")
     @classmethod
     def _require_finite(cls, value: float | None) -> float | None:
-        """Reject a non-finite shared command-budget ceiling."""
+        """Reject a non-finite shared command-budget ceiling.
+
+        Args:
+            value: Parsed optional USD ceiling.
+
+        Returns:
+            The finite optional USD ceiling.
+
+        Raises:
+            ValueError: The configured ceiling is not finite.
+        """
         if value is not None and not math.isfinite(value):
             raise ValueError("command budget must be finite")
         return value
@@ -52,17 +62,15 @@ class ProjectSettings(BaseModel):
 
 
 def settings_path(root: str | Path = ARTIFACT_DIR) -> Path:
-    """Return the project-local telemetry settings path."""
+    """Return the local WMO settings path."""
     return Path(root) / SETTINGS_FILENAME
 
 
-_SETTINGS_REPAIR = (
-    "fix the file, or delete it and rerun `wmo config telemetry status` to use defaults"
-)
+_SETTINGS_REPAIR = "fix the file, or delete it and rerun the command to use default settings"
 """How to recover a settings file this loader refuses. Every raise below names it.
 
-Telemetry commands read the file before changing it, so a malformed file must be repaired or
-removed before the local default can be used.
+Settings commands read the file before changing it, so a malformed file must be repaired or
+removed before local defaults can be used.
 """
 
 
@@ -95,7 +103,7 @@ def load_settings(root: str | Path = ARTIFACT_DIR) -> ProjectSettings:
 
 
 def save_settings(settings: ProjectSettings, root: str | Path = ARTIFACT_DIR) -> None:
-    """Atomically persist the project-local telemetry settings.
+    """Atomically persist the project-local WMO settings.
 
     Args:
         settings: Validated settings to persist.
@@ -104,6 +112,31 @@ def save_settings(settings: ProjectSettings, root: str | Path = ARTIFACT_DIR) ->
     path = settings_path(root)
     data = settings.model_dump(mode="json", exclude_none=True)
     write_text_atomic(path, tomli_w.dumps(data))
+
+
+def set_maximum_command_cost_usd(
+    maximum_cost_usd: float,
+    root: str | Path = ARTIFACT_DIR,
+) -> ProjectSettings:
+    """Persist the maximum conservative estimate allowed for one command.
+
+    Args:
+        maximum_cost_usd: Finite nonnegative per-command ceiling in USD.
+        root: Directory that owns the settings file.
+
+    Returns:
+        The updated settings.
+
+    Raises:
+        ValueError: The ceiling is negative or non-finite.
+    """
+    command_budget = CommandBudgetSettings(maximum_cost_usd=maximum_cost_usd)
+    path = settings_path(root)
+    with file_write_lock(path, what="command spending settings"):
+        settings = load_settings(root)
+        settings.commands = command_budget
+        save_settings(settings, root)
+    return settings
 
 
 def set_telemetry_enabled(enabled: bool, root: str | Path = ARTIFACT_DIR) -> ProjectSettings:
@@ -151,7 +184,7 @@ def resolve_command_budget_usd(root: str | Path, explicit: float | None) -> floa
         explicit: Caller-supplied ceiling, or ``None`` to use the shared setting.
 
     Returns:
-        Finite positive spend ceiling in US dollars.
+        Finite nonnegative spend ceiling in US dollars.
     """
     if explicit is not None:
         return explicit

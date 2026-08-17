@@ -476,7 +476,7 @@ def _verify_teacher_decision(
         raise SFTSourceVerificationError(
             "teacher judgment does not hash its rollout, rubric, and calibration artifacts"
         )
-    score = _recompute_calibrated_score(judgment, rubric, calibration, rollout)
+    score = _recompute_calibrated_score(judgment, rubric, calibration)
     if score < rule.minimum_overall_score:
         raise SFTSourceVerificationError("teacher judgment score does not meet acceptance policy")
     if evidence.inputs != tuple(
@@ -500,7 +500,6 @@ def _recompute_calibrated_score(
     judgment: Judgment,
     rubric: Rubric,
     calibration: JudgeCalibration,
-    rollout: RolloutArtifact,
 ) -> float:
     """Recompute one authoritative equal-weight score from persisted raw scores and maps."""
     rubric_ids = tuple(item.dimension_id for item in rubric.dimensions)
@@ -510,14 +509,9 @@ def _recompute_calibrated_score(
         raise SFTSourceVerificationError(
             "teacher judgment, rubric, and calibration must cover the same dimensions"
         )
-    known_span_ids = {span.span_id for span in rollout.spans}
     calibrated_scores: list[float] = []
     for dimension_id in rubric_ids:
         dimension = dimensions[dimension_id]
-        if not set(dimension.evidence_span_ids).issubset(known_span_ids):
-            raise SFTSourceVerificationError(
-                "teacher judgment cites a span absent from its rollout"
-            )
         expected = maps[dimension_id].apply(dimension.raw_score)
         if not math.isclose(
             dimension.calibrated_score,
@@ -528,8 +522,9 @@ def _recompute_calibrated_score(
             raise SFTSourceVerificationError(
                 "teacher judgment calibrated dimension does not match stored score map"
             )
-        calibrated_scores.append(expected)
-    overall = sum(score / 5 for score in calibrated_scores) / len(calibrated_scores)
+        axis = next(item for item in rubric.dimensions if item.dimension_id == dimension_id)
+        calibrated_scores.append(axis.normalize_score(expected))
+    overall = sum(calibrated_scores) / len(calibrated_scores)
     if not math.isclose(judgment.overall_score, overall, rel_tol=1e-12, abs_tol=1e-12):
         raise SFTSourceVerificationError(
             "teacher judgment overall score does not match authoritative calibrated dimensions"

@@ -1,4 +1,4 @@
-"""Tests for immutable zero-to-five rubric and calibration contracts."""
+"""Tests for the ordered-axis rubric contract and identity score maps."""
 
 from __future__ import annotations
 
@@ -14,37 +14,156 @@ from wmo.common.judging import (
     Rubric,
     RubricDimension,
     ScoreAnchor,
+    default_task_success_axis,
+    identity_score_map,
+    score_bounds,
+    scored_axis,
 )
 from wmo.common.models import ModelSnapshot
 
 _DIGEST = "a" * 64
 
 
-def _dimension() -> RubricDimension:
-    return RubricDimension(
-        dimension_id="task-success",
-        name="Task success",
-        description="Whether the customer received a correct outcome.",
-        anchors=(
-            ScoreAnchor(score=0, description="Score 0 outcome."),
-            ScoreAnchor(score=1, description="Score 1 outcome."),
-            ScoreAnchor(score=2, description="Score 2 outcome."),
-            ScoreAnchor(score=3, description="Score 3 outcome."),
-            ScoreAnchor(score=4, description="Score 4 outcome."),
-            ScoreAnchor(score=5, description="Score 5 outcome."),
-        ),
+def _axis(
+    dimension_id: str = "task-success",
+    *,
+    min_score: int = 0,
+    max_score: int = 1,
+) -> RubricDimension:
+    """Return one complete axis covering every integer in the requested range."""
+    return scored_axis(
+        dimension_id,
+        "Task success",
+        "Whether the customer received a correct outcome.",
+        min_score=min_score,
+        max_score=max_score,
     )
 
 
-def test_rubric_requires_ordered_complete_anchors_and_approval_time() -> None:
-    """Incomplete anchors and unrecorded human approval fail before persistence."""
-    with pytest.raises(ValidationError, match="zero through five"):
+def test_default_task_success_axis_uses_zero_one_and_required_description() -> None:
+    """The built-in rubric is one 0-1 task-success axis with the product meaning."""
+    axis = default_task_success_axis()
+
+    assert axis.dimension_id == "task-success"
+    assert axis.name == "Task success"
+    assert axis.description == (
+        "The agent successfully completed the task requested in the original user prompt"
+    )
+    assert axis.min_score == 0
+    assert axis.max_score == 1
+    assert axis.permitted_scores() == (0, 1)
+    assert axis.normalize_score(0) == 0.0
+    assert axis.normalize_score(1) == 1.0
+    payload = axis.prompt_payload()
+    assert payload["min_score"] == 0
+    assert payload["max_score"] == 1
+    assert payload["description"] == axis.description
+
+
+def test_rubric_rejects_empty_axes_duplicate_ids_and_invalid_ranges() -> None:
+    """A rubric needs unique IDs, a real inclusive range, and endpoint anchors."""
+    with pytest.raises(ValidationError, match="at least one axis"):
+        Rubric(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            inputs=(ArtifactInput(artifact_id="task-set-v1", sha256=_DIGEST),),
+            code_revision="e7aad17",
+            rubric_id="support-rubric-v1",
+            dimensions=(),
+            source_task_set_id="task-set-v1",
+            status="provisional",
+        )
+    with pytest.raises(ValidationError, match="unique IDs"):
+        Rubric(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            inputs=(ArtifactInput(artifact_id="task-set-v1", sha256=_DIGEST),),
+            code_revision="e7aad17",
+            rubric_id="support-rubric-v1",
+            dimensions=(_axis("task-success"), _axis("task-success")),
+            source_task_set_id="task-set-v1",
+            status="provisional",
+        )
+    with pytest.raises(ValidationError, match="min_score below max_score"):
         RubricDimension(
             dimension_id="task-success",
             name="Task success",
             description="Whether the customer received a correct outcome.",
-            anchors=(ScoreAnchor(score=0, description="Bad."),),
+            min_score=1,
+            max_score=1,
+            anchors=(ScoreAnchor(score=1, description="Only score."),),
         )
+    with pytest.raises(ValidationError, match="inclusive range endpoints"):
+        RubricDimension(
+            dimension_id="task-success",
+            name="Task success",
+            description="Whether the customer received a correct outcome.",
+            min_score=0,
+            max_score=4,
+            anchors=(ScoreAnchor(score=2, description="Middle only."),),
+        )
+
+
+def test_legacy_zero_to_five_payload_loads_without_range_fields() -> None:
+    """Pre-range rubric cards keep their 0-5 meaning when min_score and max_score are absent."""
+    axis = RubricDimension.model_validate(
+        {
+            "dimension_id": "task-success",
+            "name": "Task success",
+            "description": "Whether the customer received a correct outcome.",
+            "anchors": [
+                {"score": score, "description": f"Score {score} outcome."} for score in range(6)
+            ],
+        }
+    )
+
+    assert axis.min_score == 0
+    assert axis.max_score == 5
+    assert axis.permitted_scores() == (0, 1, 2, 3, 4, 5)
+
+
+def test_rubric_rejects_axes_that_do_not_share_one_range() -> None:
+    """A shared schema cannot describe mixed inclusive ranges in one rubric."""
+    with pytest.raises(ValidationError, match="same inclusive score range"):
+        Rubric(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            inputs=(ArtifactInput(artifact_id="task-set-v1", sha256=_DIGEST),),
+            code_revision="e7aad17",
+            rubric_id="support-rubric-v1",
+            dimensions=(
+                _axis(min_score=0, max_score=1),
+                _axis("quality", min_score=0, max_score=4),
+            ),
+            source_task_set_id="task-set-v1",
+            status="provisional",
+        )
+
+
+def test_zero_to_four_axis_allows_meaningful_interior_anchors() -> None:
+    """A 0-4 axis may omit interior scores when endpoints and anchors stay valid."""
+    axis = RubricDimension(
+        dimension_id="quality",
+        name="Quality",
+        description="How completely the agent solved the requested work.",
+        min_score=0,
+        max_score=4,
+        anchors=(
+            ScoreAnchor(score=0, description="No useful progress."),
+            ScoreAnchor(score=2, description="Partial completion with remaining gaps."),
+            ScoreAnchor(score=4, description="Complete and correct."),
+        ),
+    )
+
+    assert axis.permitted_scores() == (0, 1, 2, 3, 4)
+    assert axis.contains_score(3)
+    assert not axis.contains_score(5)
+    assert score_bounds((axis,)) == (0, 4)
+    assert identity_score_map(axis.dimension_id, 0, 4).is_identity()
+
+
+def test_rubric_requires_approval_time_and_calibration_excludes_held_out() -> None:
+    """Incomplete approval metadata and overlapping lineages fail before persistence."""
     with pytest.raises(ValidationError, match="require approved_at"):
         Rubric(
             schema_version=1,
@@ -52,7 +171,7 @@ def test_rubric_requires_ordered_complete_anchors_and_approval_time() -> None:
             inputs=(ArtifactInput(artifact_id="task-set-v1", sha256=_DIGEST),),
             code_revision="e7aad17",
             rubric_id="support-rubric-v1",
-            dimensions=(_dimension(),),
+            dimensions=(_axis(),),
             source_task_set_id="task-set-v1",
             status="human_approved",
         )
@@ -80,7 +199,9 @@ def test_rubric_requires_ordered_complete_anchors_and_approval_time() -> None:
             score_maps=(
                 DimensionScoreMap(
                     dimension_id="task-success",
-                    calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
+                    min_score=0,
+                    max_score=1,
+                    calibrated_scores=(0.0, 1.0),
                 ),
             ),
         )

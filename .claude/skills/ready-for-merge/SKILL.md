@@ -8,6 +8,10 @@ description: Mandatory pre-merge gate for every PR. Runs /code-review --fix at a
 This is the **mandatory gate before merging any PR** in this repository. Do not tell the user
 a PR is ready to merge until every step below has been completed and passes.
 
+**Address Greptile as soon as a PR exists.** When you open or update a PR, run Step 2 in the
+same turn: fetch Greptile comments, fix valid findings, reply, and resolve threads. Do not
+leave Greptile feedback for a later merge pass.
+
 **This skill never merges the PR.** Merging is the user's decision alone — do not run
 `gh pr merge` (or click-through equivalents) even if everything passes, and even if merging was
 approved earlier in the conversation. The skill ends by handing the PR back to the user.

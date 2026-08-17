@@ -27,8 +27,7 @@ def _dimension_judgment() -> DimensionJudgment:
         dimension_id="task-success",
         raw_score=4,
         calibrated_score=3.8,
-        evidence_span_ids=("span-1",),
-        feedback="The refund request includes the order and reason.",
+        rationale="The refund request includes the order and reason.",
     )
 
 
@@ -54,8 +53,7 @@ def test_judgment_rejects_duplicate_dimensions_and_nonfinite_scores() -> None:
             dimension_id="task-success",
             raw_score=4,
             calibrated_score=float("nan"),
-            evidence_span_ids=("span-1",),
-            feedback="Invalid score.",
+            rationale="Invalid score.",
         )
     with pytest.raises(ValidationError, match="equal-weight"):
         Judgment(
@@ -72,11 +70,45 @@ def test_judgment_rejects_duplicate_dimensions_and_nonfinite_scores() -> None:
             dimensions=(_dimension_judgment(),),
             overall_score=0.75,
         )
-    with pytest.raises(ValidationError, match="at least one cited"):
-        DimensionJudgment(
-            dimension_id="task-success",
-            raw_score=4,
-            calibrated_score=3.8,
-            evidence_span_ids=(),
-            feedback="The refund request includes the order and reason.",
+
+
+def test_dimension_judgment_accepts_missing_null_and_unbounded_rationale() -> None:
+    """A required score may omit rationale, store null, or keep an arbitrarily long string."""
+    missing = DimensionJudgment(
+        dimension_id="task-success",
+        raw_score=4,
+        calibrated_score=3.8,
+    )
+    explicit_null = DimensionJudgment.model_validate(
+        {
+            "dimension_id": "task-success",
+            "raw_score": 4,
+            "calibrated_score": 3.8,
+            "rationale": None,
+        }
+    )
+    long_rationale = "x" * 10_000
+    unbounded = DimensionJudgment(
+        dimension_id="task-success",
+        raw_score=4,
+        calibrated_score=3.8,
+        rationale=long_rationale,
+    )
+
+    assert missing.rationale is None
+    assert explicit_null.rationale is None
+    assert unbounded.rationale == long_rationale
+
+
+def test_dimension_judgment_rejects_citation_era_fields() -> None:
+    """Retired feedback and evidence_span_ids fail closed. Rebuild the judgment."""
+    with pytest.raises(ValidationError, match="extra"):
+        DimensionJudgment.model_validate(
+            {
+                "dimension_id": "task-success",
+                "raw_score": 4,
+                "calibrated_score": 3.8,
+                "evidence_span_ids": ["span-1"],
+                "feedback": "Retired citation-era field.",
+            }
         )
