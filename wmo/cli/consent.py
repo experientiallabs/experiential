@@ -82,6 +82,7 @@ def require_spend_consent(
     spend: str,
     command: str,
     alternative: str | None = None,
+    question: str = "Proceed?",
 ) -> bool:
     """Get explicit consent before the first paid call, or refuse to start.
 
@@ -99,6 +100,7 @@ def require_spend_consent(
             so the message says what to re-run.
         alternative: An optional second way out, phrased as a flag plus what it does, e.g.
             "--dry-run to see the plan without spending".
+        question: Named confirmation question shown after the caller's spend preflight.
 
     Returns:
         True when consent was given, False when the user declined at a terminal. Callers exit
@@ -115,7 +117,7 @@ def require_spend_consent(
     try:
         # `default=False`: pressing Enter, and anything else that arrives as a blank line, is a
         # refusal. Defaulting to True made the cheapest possible input authorize the spend.
-        return Confirm.ask("\nProceed?", default=False)
+        return Confirm.ask(f"\n{question}", default=False)
     except EOFError:
         # Both streams claimed to be a terminal and then the input ended anyway (Ctrl-D, or a
         # pty that closed under us). Nobody answered, so this is the "could not ask" refusal

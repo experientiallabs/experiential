@@ -1,15 +1,23 @@
-"""Line-based selection prompts shared by interactive CLI setup screens.
+"""Selection prompts shared by interactive CLI setup screens.
 
-Every prompt reads whole lines, so the same screens work in a terminal, in a pseudo-terminal test,
-and in a scripted session. A long list collapses to its first entries, typed text filters it, and
-each screen accepts back and cancel words so a flow can navigate without losing earlier answers.
+Provider setup uses a keyboard multi-select on a real terminal: Up and Down move focus, Enter
+selects or deselects the focused row, and a final Complete row submits. Other screens still read
+whole lines so a long list can filter, collapse, and accept back or cancel words. The same
+line-based path remains available for scripted non-terminal sessions.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import os
+import select
+import sys
+import termios
+import tty
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 
 from rich.console import Console
 from rich.markup import escape
@@ -20,6 +28,8 @@ _ALL_WORDS = frozenset({"a", "all"})
 _NONE_WORDS = frozenset({"none", "clear"})
 _MORE_WORDS = frozenset({"more", "m"})
 _COLLAPSED_LIMIT = 12
+_COMPLETE_LABEL = "Complete"
+_NARROW_WIDTH = 72
 
 
 class PickerAction(StrEnum):
@@ -27,6 +37,17 @@ class PickerAction(StrEnum):
 
     BACK = "back"
     CANCEL = "cancel"
+
+
+class PickerKey(StrEnum):
+    """One decoded key from a keyboard multi-select list."""
+
+    UP = "up"
+    DOWN = "down"
+    ENTER = "enter"
+    BACK = "back"
+    CANCEL = "cancel"
+    IGNORE = "ignore"
 
 
 @dataclass(frozen=True)
@@ -238,3 +259,205 @@ def _merged(selected: Sequence[str], additions: Sequence[str]) -> list[str]:
     merged = list(selected)
     merged.extend(value for value in additions if value not in merged)
     return merged
+
+
+def uses_keyboard_list(console: Console) -> bool:
+    """Return whether this console can drive the keyboard multi-select list.
+
+    Args:
+        console: Terminal used for the screen.
+
+    Returns:
+        True only when both stdout and stdin belong to an interactive terminal.
+    """
+    return console.is_terminal and _stdin_is_tty()
+
+
+def interpret_key_bytes(data: bytes) -> PickerKey:
+    """Map one raw terminal key sequence to a picker action.
+
+    Args:
+        data: Bytes read from the terminal for a single key press.
+
+    Returns:
+        The decoded action, or ``IGNORE`` for an unrecognized sequence.
+    """
+    if data in {b"\r", b"\n"}:
+        return PickerKey.ENTER
+    if data in {b"b", b"B"}:
+        return PickerKey.BACK
+    if data in {b"q", b"Q", b"\x03"}:
+        return PickerKey.CANCEL
+    if data in {b"\x1b", b"\x1b\x1b"}:
+        return PickerKey.CANCEL
+    if data in {b"\x1b[A", b"\x1bOA"}:
+        return PickerKey.UP
+    if data in {b"\x1b[B", b"\x1bOB"}:
+        return PickerKey.DOWN
+    return PickerKey.IGNORE
+
+
+def _read_terminal_key_from_fd(fd: int) -> PickerKey:
+    """Read one key sequence without passing through a buffered text stream.
+
+    Args:
+        fd: Raw terminal file descriptor already configured for immediate input.
+
+    Returns:
+        The decoded picker action for the next key press.
+    """
+    first = os.read(fd, 1)
+    if first != b"\x1b":
+        return interpret_key_bytes(first)
+    readable, _, _ = select.select([fd], [], [], 0.05)
+    if not readable:
+        return PickerKey.CANCEL
+    rest = os.read(fd, 1)
+    if rest in {b"[", b"O"}:
+        extra_ready, _, _ = select.select([fd], [], [], 0.05)
+        if extra_ready:
+            rest += os.read(fd, 1)
+    return interpret_key_bytes(first + rest)
+
+
+@contextmanager
+def _terminal_key_reader(
+    read_key: Callable[[], PickerKey] | None,
+) -> Iterator[Callable[[], PickerKey]]:
+    """Yield a scripted reader or hold the controlling terminal in raw input mode.
+
+    Args:
+        read_key: Optional injected reader that requires no terminal configuration.
+
+    Yields:
+        A zero-argument reader for one decoded keyboard event.
+    """
+    if read_key is not None:
+        yield read_key
+        return
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        raw = termios.tcgetattr(fd)
+        raw[1] = old[1]
+        termios.tcsetattr(fd, termios.TCSANOW, raw)
+        yield partial(_read_terminal_key_from_fd, fd)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def read_terminal_key() -> PickerKey:
+    """Read one key from the controlling terminal in raw mode.
+
+    Returns:
+        The decoded picker action for the next key press.
+    """
+    with _terminal_key_reader(None) as reader:
+        return reader()
+
+
+def select_many_list(
+    console: Console,
+    *,
+    title: str,
+    options: Sequence[PickerOption],
+    preselected: Sequence[str] = (),
+    minimum: int = 1,
+    read_key: Callable[[], PickerKey] | None = None,
+) -> PickerResult:
+    """Choose several rows from a keyboard-driven list with a Complete action.
+
+    Up and Down move focus. Enter selects or deselects the focused option. Enter on the
+    Complete row submits the current selection and does nothing on any other row.
+
+    Args:
+        console: Terminal used for the list.
+        title: Screen heading describing what is being chosen.
+        options: Every selectable row, in presentation order.
+        preselected: Values already chosen, kept when the screen is shown again.
+        minimum: Smallest accepted number of selected values.
+        read_key: Optional key source used by tests instead of the controlling terminal.
+
+    Returns:
+        The chosen values, or the requested back or cancel navigation.
+
+    Raises:
+        ValueError: The screen has no rows to choose from.
+    """
+    if not options:
+        raise ValueError(f"{title} has no available choices")
+    values = {option.value for option in options}
+    selected = [value for value in preselected if value in values]
+    focus = 0
+    complete_index = len(options)
+    with _terminal_key_reader(read_key) as reader:
+        console.print(f"[bold]{title}[/bold]")
+        while True:
+            _render_list(
+                console,
+                options,
+                selected=selected,
+                focus=focus,
+            )
+            key = reader()
+            if key is PickerKey.BACK:
+                return PickerResult(action=PickerAction.BACK)
+            if key is PickerKey.CANCEL:
+                return PickerResult(action=PickerAction.CANCEL)
+            if key is PickerKey.UP:
+                focus = (focus - 1) % (complete_index + 1)
+                continue
+            if key is PickerKey.DOWN:
+                focus = (focus + 1) % (complete_index + 1)
+                continue
+            if key is not PickerKey.ENTER:
+                continue
+            if focus == complete_index:
+                if len(selected) >= minimum:
+                    return PickerResult(values=tuple(selected))
+                console.print(f"[yellow]Select at least {minimum}.[/yellow]")
+                continue
+            value = options[focus].value
+            if value in selected:
+                selected.remove(value)
+            else:
+                selected.append(value)
+
+
+def _render_list(
+    console: Console,
+    options: Sequence[PickerOption],
+    *,
+    selected: Sequence[str],
+    focus: int,
+) -> None:
+    """Print the option rows, selection marks, focus marker, and Complete action."""
+    chosen = frozenset(selected)
+    width = console.width or 80
+    narrow = width < _NARROW_WIDTH
+    for index, option in enumerate(options):
+        pointer = ">" if index == focus else " "
+        mark = "[x]" if option.value in chosen else "[ ]"
+        console.print(f"  {pointer} {escape(mark)} {escape(option.label)}")
+        if option.detail:
+            console.print(f"      [dim]{escape(option.detail)}[/dim]")
+    pointer = ">" if focus == len(options) else " "
+    console.print(f"  {pointer} {_COMPLETE_LABEL}")
+    if narrow:
+        console.print("[dim]Up/Down moves focus. Enter selects or deselects.[/dim]")
+        console.print("[dim]Activate Complete to submit. b goes back, q cancels.[/dim]")
+        return
+    console.print(
+        "[dim]Up/Down moves focus, Enter selects or deselects, Complete submits, "
+        "b goes back, q cancels.[/dim]"
+    )
+
+
+def _stdin_is_tty() -> bool:
+    """Return whether the input stream is a terminal."""
+    stdin = sys.stdin
+    try:
+        return stdin is not None and stdin.isatty()
+    except ValueError:
+        return False

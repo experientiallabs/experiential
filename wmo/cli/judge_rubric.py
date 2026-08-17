@@ -14,12 +14,9 @@ from wmo.common.judging import (
     render_rubric_table,
     score_bounds,
 )
-from wmo.optimize.router.judging.contracts import JudgePromptTemplate, judge_feedback_schema
-from wmo.optimize.router.judging.service import (
-    DEFAULT_JUDGE_PROMPT,
-    ManualJudgeSetupPlan,
-    default_judge_template,
-)
+from wmo.optimize.router.judging.contracts import JudgePromptTemplate
+from wmo.optimize.router.judging.service import ManualJudgeSetupPlan
+from wmo.optimize.router.judging.template_bind import bind_prompt_template
 
 
 def render_setup_contract(plan: ManualJudgeSetupPlan, *, width: int = 80) -> str:
@@ -60,7 +57,7 @@ def replace_setup_axes(
     """
     if not dimensions:
         raise ValueError("a rubric must contain at least one axis")
-    template = rebind_prompt_template(plan.prompt_template, dimensions)
+    template = bind_prompt_template(plan.prompt_template, dimensions)
     return replace(plan, dimensions=dimensions, prompt_template=template)
 
 
@@ -68,67 +65,19 @@ def rebind_prompt_template(
     template: JudgePromptTemplate,
     dimensions: tuple[RubricDimension, ...],
 ) -> JudgePromptTemplate:
-    """Bind a scalar response schema to the shared inclusive axis range.
+    """Bind a prompt contract to the shared inclusive axis range.
 
     Args:
         template: Current prompt contract.
         dimensions: Replacement ordered axes.
 
     Returns:
-        The default template when the built-in prompt is in use, otherwise the
-        same custom contract with scalar bounds updated to the selected range.
+        The rebound prompt contract used by setup and the editor.
 
     Raises:
         ValueError: The axes are empty, mixed, or a custom projection leaves the range.
     """
-    lowest, highest = score_bounds(dimensions)
-    _require_projection_in_range(template, lowest, highest)
-    if template.response_shape != "scalar":
-        return template
-    if template.prompt.prompt_id == DEFAULT_JUDGE_PROMPT.prompt_id:
-        return default_judge_template(dimensions)
-    return template.model_copy(
-        update={
-            "response_schema": judge_feedback_schema(
-                "scalar",
-                min_score=lowest,
-                max_score=highest,
-            )
-        }
-    )
-
-
-def _require_projection_in_range(
-    template: JudgePromptTemplate,
-    min_score: int,
-    max_score: int,
-) -> None:
-    """Reject custom projections that fall outside the edited axis range.
-
-    Args:
-        template: Current prompt contract.
-        min_score: Inclusive lower bound of the selected axes.
-        max_score: Inclusive upper bound of the selected axes.
-
-    Raises:
-        ValueError: A projected score is outside the shared axis range.
-    """
-    projection = template.score_projection
-    if template.response_shape == "boolean":
-        values = tuple(projection.boolean_scores.values())
-    elif template.response_shape == "categorical":
-        values = tuple(projection.categorical_scores.values())
-    elif template.response_shape == "pairwise":
-        values = tuple(projection.pairwise_scores.values())
-    else:
-        return
-    if any(value < min_score or value > max_score for value in values) or (
-        values and (min(values) != min_score or max(values) != max_score)
-    ):
-        raise ValueError(
-            f"custom {template.response_shape} score projections must include "
-            f"{min_score} and {max_score} and stay inside that range"
-        )
+    return bind_prompt_template(template, dimensions)
 
 
 def maybe_edit_setup_plan(plan: ManualJudgeSetupPlan, *, console: Console) -> ManualJudgeSetupPlan:

@@ -419,7 +419,7 @@ class _Judge:
             raise RuntimeError("simulated judgment dispatch interruption")
         rollout_value = read_rollout(store.artifacts, rollout_artifact_id)[0]
         locked = any(
-            store.artifacts.read(artifact_id).manifest.artifact_type == "router-policy-lock"
+            artifact_id.startswith("router-policy-lock-")
             for artifact_id in store.artifacts.list_ids()
         )
         self.log.append((rollout_value.cell_id or "observed", locked))
@@ -548,7 +548,7 @@ class _LoggingSimulator:
     def run(self, spec: SimulationSpec) -> SimulationArtifactSet:
         """Record policy-lock state and delegate one simulation phase."""
         locked = any(
-            self.project.artifacts.read(artifact_id).manifest.artifact_type == "router-policy-lock"
+            artifact_id.startswith("router-policy-lock-")
             for artifact_id in self.project.artifacts.list_ids()
         )
         self.log.append((spec.cell_ids, locked))

@@ -4,11 +4,11 @@ The root surface is deliberately small:
 
 | Command | Purpose | Local result |
 |---|---|---|
-| `wmo build PROJECT TRACES --source SOURCE --root ROOT` | Normalize 100 through 1000 local traces from one [declared source](reference/ingest.md) and mine representative tasks. | Manifest-bound `TraceDataset`, `TaskSet`, and `proposals_pending` review state. |
+| `wmo build PROJECT TRACES --source SOURCE --root ROOT [--provider NAME ...]` | Normalize 100 through 1000 local traces from one [declared source](reference/ingest.md) and mine representative tasks. First-build setup uses a keyboard provider list, or exact `--provider` flags. | Manifest-bound `TraceDataset`, `TaskSet`, and `proposals_pending` review state. |
 | `wmo optimize router PROJECT --config FILE --root ROOT` | Fit, freeze, then report from explicit completed evidence. | Fit evaluation, bank, policy, held-out evaluation, and router report. |
 | `wmo optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `wmo run PROJECT --root ROOT [--ghost]` | Load a frozen policy and expose it on development-only loopback. | Local OpenAI-compatible endpoint with durable journaling by default or no saved traffic in ghost mode. |
-| `wmo config providers` | Collect secret-free provider connections, model aliases, and build roles. | Local `.wmo/models.toml`. |
+| `wmo config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. | Local `.wmo/models.toml`. |
 | `wmo config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.wmo/settings.toml`. |
 
 `build` makes zero model, provider, or judge paid calls. Successful build, router, simulation, and

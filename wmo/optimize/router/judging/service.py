@@ -13,14 +13,11 @@ from wmo.common.judging import (
     JudgeCalibrationService,
     JudgeScoreObservation,
     LMJudge,
-    PromptDefinition,
     RouterLineageAssignment,
     RouterLineageSplit,
     Rubric,
     RubricDimension,
     RubricReview,
-    default_task_success_axis,
-    score_bounds,
     write_router_lineage_split,
 )
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
@@ -58,7 +55,6 @@ from wmo.optimize.router.judging.contracts import (
     ManualJudgeLabel,
     ManualJudgeReviewState,
     ManualJudgeSetupArtifact,
-    judge_feedback_schema,
 )
 from wmo.optimize.router.judging.labels import calibration_sample_digest, save_label_draft
 from wmo.optimize.router.judging.protocol import TemplateJudgeClient, positional_bias_count
@@ -69,49 +65,14 @@ from wmo.optimize.router.judging.selection import (
     representative_pairwise_pairs,
     trace_preview,
 )
+from wmo.optimize.router.judging.template_bind import (
+    DEFAULT_JUDGE_TEMPLATE,
+    bind_prompt_template,
+    default_judge_dimensions,
+)
 from wmo.runtime.models.providers.retry import RetryPolicy
 from wmo.runtime.models.registry import RuntimeModelCatalog
 from wmo.simulation.build import BuildReviewReadiness
-
-_PROMPT_TEXT = (
-    "Evaluate the supplied rollout against every rubric axis. Use only evidence in the "
-    "rollout. Return strict JSON matching the supplied schema, with one integer score inside "
-    "each axis inclusive range, specific cited span IDs, and concise feedback for every axis."
-)
-DEFAULT_JUDGE_PROMPT = PromptDefinition.from_text("wmo-judge-evidence-json-v2", _PROMPT_TEXT)
-
-
-def default_judge_dimensions() -> tuple[RubricDimension, ...]:
-    """Return the editable default task-success axis for first setup.
-
-    Returns:
-        One 0-1 axis whose meaning is completion of the original user prompt.
-    """
-    return (default_task_success_axis(),)
-
-
-def default_judge_template(
-    dimensions: tuple[RubricDimension, ...] | None = None,
-) -> JudgePromptTemplate:
-    """Return the built-in scalar prompt contract bound to one rubric's score bounds.
-
-    Args:
-        dimensions: Axes whose inclusive ranges set the scalar schema. Defaults to the
-            built-in task-success axis.
-
-    Returns:
-        Versioned prompt, mapping, and response schema for those axes.
-    """
-    selected = dimensions or default_judge_dimensions()
-    lowest, highest = score_bounds(selected)
-    return JudgePromptTemplate(
-        prompt=DEFAULT_JUDGE_PROMPT,
-        variable_mapping={"rubric": "RUBRIC", "rollout": "ROLLOUT"},
-        response_schema=judge_feedback_schema("scalar", min_score=lowest, max_score=highest),
-    )
-
-
-DEFAULT_JUDGE_TEMPLATE = default_judge_template()
 
 
 @dataclass(frozen=True)
@@ -207,8 +168,10 @@ def prepare_manual_judge_setup(
     selected_dimensions = tuple(dimensions or default_judge_dimensions())
     if not selected_dimensions:
         raise ManualJudgeError("judge setup requires at least one rubric axis")
-    if prompt_template.prompt.prompt_id == DEFAULT_JUDGE_PROMPT.prompt_id:
-        prompt_template = default_judge_template(selected_dimensions)
+    try:
+        prompt_template = bind_prompt_template(prompt_template, selected_dimensions)
+    except ValueError as exc:
+        raise ManualJudgeError(str(exc)) from exc
     _require_exact_build_inputs(store, build)
     tasks = load_task_set(store.artifacts, build.task_set.artifact_id).tasks
     traces = load_trace_dataset(store.artifacts, build.trace_dataset.artifact_id).traces

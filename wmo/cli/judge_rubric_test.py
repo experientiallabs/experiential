@@ -21,7 +21,7 @@ from wmo.optimize.router.judging.contracts import (
     JudgeScoreProjection,
     judge_feedback_schema,
 )
-from wmo.optimize.router.judging.service import default_judge_template
+from wmo.optimize.router.judging.template_bind import default_judge_template
 
 
 def _raw_score_bounds(schema: JsonObject) -> tuple[int, int]:

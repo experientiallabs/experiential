@@ -467,9 +467,9 @@ def _template(shape: _FeedbackShape) -> JudgePromptTemplate:
     """
     prompt = PromptDefinition.from_text("custom-judge-v1", "Follow the saved contract exactly.")
     if shape == "boolean":
-        projection = JudgeScoreProjection(boolean_scores={"false": 1, "true": 4})
+        projection = JudgeScoreProjection(boolean_scores={"false": 0, "true": 5})
     elif shape == "categorical":
-        projection = JudgeScoreProjection(categorical_scores={"bad": 1, "good": 4})
+        projection = JudgeScoreProjection(categorical_scores={"bad": 0, "good": 5})
     elif shape == "pairwise":
         projection = JudgeScoreProjection(
             pairwise_scores={"winner_a": 5, "winner_b": 0, "tie": 3},
@@ -1060,6 +1060,20 @@ def test_completed_audit_tamper_fails_before_replay_or_approval(tmp_path: Path) 
     assert len(client.requests) == 3
 
 
+def test_setup_rejects_stale_file_based_projection_without_editor(tmp_path: Path) -> None:
+    """Custom projections are bound during prepare, including --approve and --rubric-file."""
+    store = _built_store(tmp_path)
+
+    with pytest.raises(ManualJudgeError, match="boolean score projections"):
+        prepare_manual_judge_setup(
+            store,
+            _catalog(),
+            prompt_template=_template("boolean"),
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+
+
 def test_setup_replay_rejects_changed_contract_with_same_model(tmp_path: Path) -> None:
     """A saved alias and model cannot mask a changed prompt, mapping, schema, or projection."""
     store = _built_store(tmp_path)
@@ -1144,7 +1158,7 @@ def test_non_scalar_calibration_executes_saved_contract(
     judgment = Judgment.model_validate_json(
         store.artifacts.read_bytes(result.audit.judgments[0].judgment.artifact_id, "judgment.json")
     )
-    assert judgment.dimensions[0].raw_score == 4
+    assert judgment.dimensions[0].raw_score == 5
     assert result.audit.positional_bias_comparisons is None
 
 
