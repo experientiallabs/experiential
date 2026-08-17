@@ -364,6 +364,7 @@ def judge_calibrate(
             or approve
             or _confirm(
                 "Approve this immutable judge calibration?",
+                default=True,
                 non_interactive=non_interactive,
                 required_flag="--approve",
             )
