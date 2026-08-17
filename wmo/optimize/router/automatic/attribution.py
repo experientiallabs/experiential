@@ -47,6 +47,10 @@ class RouterAttributionError(ValueError):
     """Candidate attribution is absent, ambiguous, conflicting, or internally inconsistent."""
 
 
+class RouterAttributionPreconditionError(RouterAttributionError):
+    """Attribution inputs are structurally invalid before any trace identity is examined."""
+
+
 class RouterAttributedSpan(ContractModel):
     """One contributing model span and the provenance used to resolve its candidate."""
 
@@ -184,20 +188,24 @@ def resolve_router_observed_attributions(
             ambiguous, conflicting, or crosses candidate aliases.
     """
     if preferred_overlap_limit <= 0:
-        raise RouterAttributionError("preferred overlap limit must be positive")
+        raise RouterAttributionPreconditionError("preferred overlap limit must be positive")
     if evidence is not None:
         try:
             require_model_identity_evidence_matches_traces(traces, evidence)
         except ValueError as exc:
-            raise RouterAttributionError(f"model identity evidence is inconsistent: {exc}") from exc
+            raise RouterAttributionPreconditionError(
+                f"model identity evidence is inconsistent: {exc}"
+            ) from exc
     ordered_candidates = tuple(sorted(candidates, key=lambda item: item.alias))
     if len(ordered_candidates) < 2 or len({item.alias for item in ordered_candidates}) != len(
         ordered_candidates
     ):
-        raise RouterAttributionError("candidate attribution needs at least two unique aliases")
+        raise RouterAttributionPreconditionError(
+            "candidate attribution needs at least two unique aliases"
+        )
     traces_by_id = {trace.trace_id: trace for trace in traces}
     if len(traces_by_id) != len(traces):
-        raise RouterAttributionError("candidate attribution traces repeat trace IDs")
+        raise RouterAttributionPreconditionError("candidate attribution traces repeat trace IDs")
     evidence_by_key = (
         None
         if evidence is None
@@ -571,6 +579,10 @@ def _verify_attribution_inputs(
         )
     except RouterAttributionError as exc:
         if value.fidelity_evidence == "waived":
+            if isinstance(exc, RouterAttributionPreconditionError):
+                raise ArtifactCorruptionError(
+                    "waived router attribution has structurally invalid inputs"
+                ) from exc
             has_model_identity = any(
                 span.model is not None for trace in loaded_traces.traces for span in trace.spans
             ) or bool(evidence is not None and evidence.records)

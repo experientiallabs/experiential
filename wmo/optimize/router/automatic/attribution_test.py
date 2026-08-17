@@ -12,6 +12,7 @@ from wmo.common.tasks import TaskCase
 from wmo.common.traces import Trace, TraceSource, TraceSpan
 from wmo.optimize.router.automatic.attribution import (
     RouterAttributionError,
+    RouterAttributionPreconditionError,
     resolve_router_observed_attributions,
 )
 from wmo.simulation.ingest.model_identity import (
@@ -235,6 +236,49 @@ def test_trace_without_model_and_missing_evidence_are_typed_failures() -> None:
             candidates,
             preferred_overlap_limit=1,
         )
+
+
+def test_structural_precondition_failures_are_typed_distinctly_from_identity_gaps() -> None:
+    """Invalid limits, candidate sets, or repeated traces never read as missing identity."""
+    trace = _trace((None,))
+    candidates = _candidates(
+        _model("openai", "gpt-a", None, "a", "b"),
+        _model("openai", "gpt-b", None, "c", "d"),
+    )
+
+    with pytest.raises(RouterAttributionPreconditionError, match="at least two unique aliases"):
+        resolve_router_observed_attributions(
+            (_task(trace),),
+            (trace,),
+            None,
+            candidates[:1],
+            preferred_overlap_limit=1,
+        )
+    with pytest.raises(RouterAttributionPreconditionError, match="must be positive"):
+        resolve_router_observed_attributions(
+            (_task(trace),),
+            (trace,),
+            None,
+            candidates,
+            preferred_overlap_limit=0,
+        )
+    with pytest.raises(RouterAttributionPreconditionError, match="repeat trace IDs"):
+        resolve_router_observed_attributions(
+            (_task(trace),),
+            (trace, trace),
+            None,
+            candidates,
+            preferred_overlap_limit=1,
+        )
+    with pytest.raises(RouterAttributionError, match="has no model span") as info:
+        resolve_router_observed_attributions(
+            (_task(trace),),
+            (trace,),
+            None,
+            candidates,
+            preferred_overlap_limit=1,
+        )
+    assert not isinstance(info.value, RouterAttributionPreconditionError)
 
 
 def _fallback_model(provider: str, model_id: str, revision: str | None) -> ModelSnapshot:

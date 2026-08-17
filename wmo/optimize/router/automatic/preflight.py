@@ -33,6 +33,7 @@ from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, load_trace_dataset
 from wmo.optimize.router.automatic.attribution import (
     RouterAttributionError,
+    RouterAttributionPreconditionError,
     RouterObservedAttribution,
     resolve_router_observed_attributions,
 )
@@ -792,6 +793,7 @@ def _observed_traces(
             The waiver only applies when the dataset carries no model identity at all; traces
             with model spans or identity evidence reject the waiver so identity conflicts,
             ambiguity, and unselected incumbents surface instead of being silently discarded.
+            Structurally invalid attribution inputs also stay fail-closed under the waiver.
 
     Returns:
         One deterministic attributed trace per admitted fit lineage.
@@ -807,7 +809,7 @@ def _observed_traces(
             preferred_overlap_limit=preferred_overlap_limit,
         )
     except RouterAttributionError as exc:
-        if not waive_fidelity_evidence:
+        if not waive_fidelity_evidence or isinstance(exc, RouterAttributionPreconditionError):
             problems.append(f"fidelity identity attribution: {exc}")
             return ()
         has_model_identity = any(
