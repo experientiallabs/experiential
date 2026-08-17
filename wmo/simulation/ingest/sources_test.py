@@ -194,6 +194,17 @@ def test_load_trace_source_normalizes_the_declared_name(tmp_path: Path) -> None:
     assert len(result.traces) == 1
 
 
+def test_load_trace_source_preserves_a_hosted_durable_source_label(tmp_path: Path) -> None:
+    """The canonical resolver passes a caller-owned label through instead of the local path."""
+    result = load_trace_source(
+        "chat-json",
+        _chat_json_export(tmp_path),
+        source_id="platform-trace-source:source-123",
+    )
+
+    assert result.traces[0].source.identity.source_id == "platform-trace-source:source-123"
+
+
 def test_load_trace_source_rejects_an_undeclared_source(tmp_path: Path) -> None:
     """An unsupported name fails closed and lists the supported names."""
     with pytest.raises(TraceSourceError, match="unsupported trace source 'weave'"):

@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Literal
 
 import tomli_w
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
     ContractModel,
     SecretBoundaryError,
+    SourceIdentity,
     assert_secret_free,
 )
 from wmo.common.core.files import write_text_atomic
@@ -67,6 +69,55 @@ class ProjectBudgetConfiguration(ContractModel):
     maximum_build_cost_usd: float = Field(default=5.0, gt=0)
 
 
+class ProjectTracePreparationSettings(ContractModel):
+    """Provider-free settings fixed before canonical trace preparation starts."""
+
+    source_kind: str = Field(min_length=1, max_length=64)
+    minimum_trace_count: Literal[100] = 100
+    maximum_trace_count: Literal[1000] = 1000
+    fit_task_budget: int = Field(default=50, ge=0)
+    held_out_task_budget: int = Field(default=20, ge=0)
+    descriptor_dimensions: int = Field(default=64, ge=8)
+
+    @field_validator("source_kind")
+    @classmethod
+    def _normalize_source_kind(cls, value: str) -> str:
+        """Return one canonical declared source name."""
+        normalized = value.strip().casefold()
+        if not normalized:
+            raise ValueError("trace source kind must not be blank")
+        return normalized
+
+
+class ProjectProviderFreeStage(ContractModel):
+    """Exact immutable trace and task evidence selected before provider-backed work."""
+
+    schema_version: int = 1
+    settings: ProjectTracePreparationSettings
+    source: SourceIdentity
+    trace_dataset: ArtifactInput
+    task_set: ArtifactInput
+    code_revision: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def _require_portable_complete_stage(self) -> ProjectProviderFreeStage:
+        """Reject incomplete stages and temporary filesystem source identities."""
+        if self.trace_dataset.artifact_id == self.task_set.artifact_id:
+            raise ValueError("provider-free stage trace and task artifacts must be distinct")
+        if self.source.sha256 is None:
+            raise ValueError("provider-free stage source identity requires a byte digest")
+        source_id = self.source.source_id
+        if (
+            PurePosixPath(source_id).is_absolute()
+            or PureWindowsPath(source_id).is_absolute()
+            or source_id.casefold().startswith("file:")
+        ):
+            raise ValueError(
+                "provider-free stage source_id must be a durable label, not a filesystem path"
+            )
+        return self
+
+
 class ProjectBuildArtifacts(ContractModel):
     """Exact immutable outputs selected as the project's current completed build."""
 
@@ -107,13 +158,40 @@ class ProjectConfig(ContractModel):
     schema_version: int = Field(default=2, ge=1)
     project_id: ArtifactId
     trace_source: str | None = Field(default=None, max_length=64)
+    trace_preparation: ProjectTracePreparationSettings | None = None
+    provider_free_stage: ProjectProviderFreeStage | None = None
     models: ProjectModelConfiguration | None = None
-    retrieval: ProjectRetrievalConfiguration = Field(default_factory=ProjectRetrievalConfiguration)
-    budgets: ProjectBudgetConfiguration = Field(default_factory=ProjectBudgetConfiguration)
+    retrieval: ProjectRetrievalConfiguration | None = Field(
+        default_factory=ProjectRetrievalConfiguration
+    )
+    budgets: ProjectBudgetConfiguration | None = Field(default_factory=ProjectBudgetConfiguration)
     build: ProjectBuildArtifacts | None = None
     agent: AgentConfiguration | None = None
     model_optimization_config: ArtifactInput | None = None
     redacted_field_names: tuple[str, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _keep_provider_free_bootstrap_minimal(cls, value: object) -> object:
+        """Omit late retrieval and spend setup only for trace-first Project configuration."""
+        if not isinstance(value, dict) or value.get("trace_preparation") is None:
+            return value
+        updated = dict(value)
+        updated.setdefault("retrieval", None)
+        updated.setdefault("budgets", None)
+        return updated
+
+    @model_validator(mode="after")
+    def _require_provider_free_settings_match_stage(self) -> ProjectConfig:
+        """Keep the mutable Project settings aligned with its selected immutable stage."""
+        if (
+            self.provider_free_stage is not None
+            and self.trace_preparation != self.provider_free_stage.settings
+        ):
+            raise ValueError(
+                "provider-free stage settings must match the Project trace preparation settings"
+            )
+        return self
 
 
 def load_project_config(path: Path) -> ProjectConfig:

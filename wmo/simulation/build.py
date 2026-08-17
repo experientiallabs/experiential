@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal
 
 from pydantic import Field, JsonValue, model_validator
@@ -18,17 +19,26 @@ from wmo.common.core.artifacts import (
     SourceIdentity,
     stable_id,
 )
+from wmo.common.core.locks import file_write_lock
 from wmo.common.project import (
     ArtifactStore,
+    ArtifactStoreError,
     ProjectBuildArtifacts,
     ProjectConfig,
+    ProjectProviderFreeStage,
     ProjectStore,
+    ProjectStoreError,
+    ProjectTracePreparationSettings,
     artifact_input,
     coordinate_completed_build_selection,
+    load_project_config,
+    write_project_config,
 )
+from wmo.common.release_revision import installed_release_revision
 from wmo.common.tasks import TaskSet
 from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
+from wmo.simulation.ingest.sources import load_trace_source
 from wmo.simulation.mining.bindings import (
     bindings_for_mining,
     task_set_content_id,
@@ -95,6 +105,239 @@ class ProjectBuild:
 
     artifacts: TaskSetBuild
     review: BuildReviewReadiness
+
+
+def prepare_project_traces(
+    project: str,
+    trace_file: Path,
+    *,
+    root: Path,
+    source_id: str,
+    settings: ProjectTracePreparationSettings,
+) -> ProjectProviderFreeStage:
+    """Prepare and select provider-free Project evidence from one acquired trace file.
+
+    Args:
+        project: Safe local Project identifier below ``root/projects``.
+        trace_file: Worker-local path to the immutable acquired source bytes.
+        root: Local WMO artifact root.
+        source_id: Stable caller-owned source label that remains valid after the worker exits.
+        settings: Declared source kind and deterministic representative-task controls.
+
+    Returns:
+        The exact selected trace and task manifest pointers for the completed provider-free stage.
+
+    Raises:
+        ValueError: The source label, source kind, normalized trace count, or evidence is invalid.
+        ProjectStoreError: Existing Project settings or a selected stage conflict with this request.
+    """
+    durable_source_id = _require_durable_source_id(source_id)
+    normalized = load_trace_source(
+        settings.source_kind,
+        Path(trace_file),
+        source_id=durable_source_id,
+    )
+    valid_trace_count = len(normalized.traces)
+    if not settings.minimum_trace_count <= valid_trace_count <= settings.maximum_trace_count:
+        raise ValueError(
+            "provider-free trace preparation requires "
+            f"{settings.minimum_trace_count} to {settings.maximum_trace_count} valid normalized "
+            f"traces; got {valid_trace_count} after excluding {len(normalized.issues)} records"
+        )
+    code_revision = installed_release_revision()
+    store = _initialize_provider_free_project(root, project, settings)
+    completed = build_project(
+        normalized,
+        store,
+        created_at=datetime.now(UTC),
+        code_revision=code_revision,
+        mining_spec=MiningSpec(
+            fit_task_budget=settings.fit_task_budget,
+            held_out_task_budget=settings.held_out_task_budget,
+        ),
+        embedder=HashingDescriptorEmbedder(dimensions=settings.descriptor_dimensions),
+    )
+    source = completed.artifacts.trace_dataset.dataset.source
+    if source is None:
+        raise ValueError("provider-free trace preparation produced no immutable source identity")
+    trace_dataset = artifact_input(completed.artifacts.trace_dataset.manifest)
+    task_set = artifact_input(
+        store.artifacts.read(completed.artifacts.task_set.task_set_id).manifest
+    )
+    stage = ProjectProviderFreeStage(
+        settings=settings,
+        source=source,
+        trace_dataset=trace_dataset,
+        task_set=task_set,
+        code_revision=code_revision,
+    )
+    _select_provider_free_stage(store, stage)
+    return load_project_provider_free_stage(project, root=root)
+
+
+def load_project_provider_free_stage(
+    project: str,
+    *,
+    root: Path,
+) -> ProjectProviderFreeStage:
+    """Load and verify a Project's selected provider-free stage after process restart.
+
+    Args:
+        project: Safe local Project identifier below ``root/projects``.
+        root: Local WMO artifact root.
+
+    Returns:
+        The selected provider-free stage with exact verified manifest pointers.
+
+    Raises:
+        ProjectStoreError: The Project has no selected stage or its pointer graph is invalid.
+    """
+    store = ProjectStore(root, project)
+    config = store.load_project()
+    stage = config.provider_free_stage
+    if stage is None:
+        raise ProjectStoreError(
+            "project has no completed provider-free stage; call prepare_project_traces first"
+        )
+    try:
+        _verify_provider_free_stage(store, stage)
+    except (ArtifactStoreError, ValueError) as exc:
+        raise ProjectStoreError(f"provider-free stage is invalid: {exc}") from exc
+    return stage
+
+
+def _require_durable_source_id(source_id: str) -> str:
+    """Validate a stable source label before the worker-local file is opened.
+
+    Args:
+        source_id: Caller-supplied source label.
+
+    Returns:
+        The unchanged durable source label.
+
+    Raises:
+        ValueError: The label is blank, padded, or a local filesystem path.
+    """
+    if not source_id or source_id != source_id.strip():
+        raise ValueError(
+            "source_id must be a nonblank durable acquisition label without surrounding spaces"
+        )
+    if (
+        PurePosixPath(source_id).is_absolute()
+        or PureWindowsPath(source_id).is_absolute()
+        or source_id.casefold().startswith("file:")
+    ):
+        raise ValueError(
+            "source_id must be a durable acquisition label, not a worker-local filesystem path"
+        )
+    return source_id
+
+
+def _initialize_provider_free_project(
+    root: Path,
+    project: str,
+    settings: ProjectTracePreparationSettings,
+) -> ProjectStore:
+    """Initialize a minimal Project or verify its immutable trace preparation settings.
+
+    Args:
+        root: Local WMO artifact root.
+        project: Safe local Project identifier.
+        settings: Provider-free settings selected before evidence construction.
+
+    Returns:
+        Project store containing the requested provider-free settings.
+
+    Raises:
+        ProjectStoreError: Existing trace preparation settings differ from the request.
+    """
+    store = ProjectStore(root, project)
+    proposed = ProjectConfig(
+        project_id=project,
+        trace_preparation=settings,
+        retrieval=None,
+        budgets=None,
+    )
+    if not store.paths.project_toml.exists():
+        try:
+            store.initialize(proposed)
+        except ProjectStoreError:
+            existing = store.load_project()
+            if existing.trace_preparation != settings:
+                raise
+    existing = store.load_project()
+    if existing.trace_preparation != settings:
+        raise ProjectStoreError(
+            "project already has different provider-free trace preparation settings"
+        )
+    return store
+
+
+def _select_provider_free_stage(
+    store: ProjectStore,
+    stage: ProjectProviderFreeStage,
+) -> None:
+    """Atomically select one exact provider-free stage or replay its existing selection.
+
+    Args:
+        store: Project store receiving the durable stage pointer.
+        stage: Verified trace and task graph to select.
+
+    Raises:
+        ProjectStoreError: Artifacts are invalid or another stage is already selected.
+    """
+    try:
+        _verify_provider_free_stage(store, stage)
+        with file_write_lock(store.paths.project_toml, what="provider-free project stage"):
+            _verify_provider_free_stage(store, stage)
+            config = load_project_config(store.paths.project_toml)
+            if config.trace_preparation != stage.settings:
+                raise ValueError(
+                    "selected stage settings differ from Project trace preparation settings"
+                )
+            if config.provider_free_stage == stage:
+                return
+            if config.provider_free_stage is not None:
+                raise ValueError("project already selects a different provider-free stage")
+            write_project_config(
+                store.paths.project_toml,
+                config.model_copy(update={"provider_free_stage": stage}),
+            )
+    except (ArtifactStoreError, ValueError) as exc:
+        raise ProjectStoreError(f"cannot select provider-free stage: {exc}") from exc
+
+
+def _verify_provider_free_stage(
+    store: ProjectStore,
+    stage: ProjectProviderFreeStage,
+) -> None:
+    """Verify exact trace and task manifests behind one provider-free stage pointer.
+
+    Args:
+        store: Project store containing both immutable artifacts.
+        stage: Pointer graph to verify.
+
+    Raises:
+        ValueError: A manifest type, digest, source, revision, or dependency differs.
+    """
+    trace = store.artifacts.read(stage.trace_dataset.artifact_id).manifest
+    task = store.artifacts.read(stage.task_set.artifact_id).manifest
+    if trace.artifact_type != "trace-dataset":
+        raise ValueError("provider-free trace pointer does not name a trace-dataset artifact")
+    if task.artifact_type != "task-set":
+        raise ValueError("provider-free task pointer does not name a task-set artifact")
+    if artifact_input(trace) != stage.trace_dataset:
+        raise ValueError("provider-free trace manifest digest changed")
+    if artifact_input(task) != stage.task_set:
+        raise ValueError("provider-free task manifest digest changed")
+    if trace.inputs:
+        raise ValueError("provider-free trace dataset must not have artifact inputs")
+    if task.inputs != (stage.trace_dataset,):
+        raise ValueError("provider-free task set does not bind the selected trace dataset")
+    if trace.source != stage.source:
+        raise ValueError("provider-free trace manifest source differs from the selected source")
+    if trace.code_revision != stage.code_revision or task.code_revision != stage.code_revision:
+        raise ValueError("provider-free artifact revision differs from the selected stage")
 
 
 def build_task_set(

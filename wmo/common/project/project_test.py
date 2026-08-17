@@ -10,9 +10,33 @@ from wmo.common.project import (
     AgentConfiguration,
     ProjectConfig,
     ProjectConfigError,
+    ProjectTracePreparationSettings,
     load_project_config,
     write_project_config,
 )
+
+
+def test_trace_first_config_omits_late_setup_without_changing_existing_defaults(
+    tmp_path: Path,
+) -> None:
+    """Trace-first Projects omit model-era setup while ordinary local configs keep defaults."""
+    existing_default = ProjectConfig(project_id="existing-project")
+    assert existing_default.retrieval is not None
+    assert existing_default.budgets is not None
+    path = tmp_path / "project.toml"
+    trace_first = ProjectConfig(
+        project_id="trace-first-project",
+        trace_preparation=ProjectTracePreparationSettings(source_kind="otlp"),
+        retrieval=None,
+        budgets=None,
+    )
+
+    write_project_config(path, trace_first)
+
+    assert load_project_config(path) == trace_first
+    payload = path.read_text(encoding="utf-8")
+    assert "retrieval" not in payload
+    assert "budgets" not in payload
 
 
 def test_project_config_round_trip_preserves_safe_local_metadata(tmp_path: Path) -> None:
