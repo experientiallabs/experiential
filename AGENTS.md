@@ -127,6 +127,8 @@ uv run pytest -q
 
 ## Writing
 
+- Do not modify `README.md` without explicit user approval for that file. A request to implement,
+  document, publish, or open a PR does not imply approval to change the README; ask first.
 - No em dashes in any NEW writing: code, comments, docstrings, docs, UI copy, commit messages, or
   PR descriptions. Use a comma, a colon, parentheses, a period, or a plain hyphen instead, or
   restructure the sentence. The rule applies to a diff's added lines and is checked in review
