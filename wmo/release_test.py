@@ -1065,25 +1065,35 @@ def _installed_release_driver() -> None:
             "8000",
             "--maximum-concurrency",
             "1",
+            "--candidate",
+            "candidate-b",
+            "--candidate",
+            "core-model",
+            "--incumbent",
+            "core-model",
+            "--candidate-model",
+            json.dumps(
+                {
+                    "alias": "candidate-b",
+                    "connection": "azure",
+                    "model": "candidate-b-model",
+                    "capabilities": {
+                        "supports_completions": True,
+                        "supports_tools": True,
+                        "context_window_tokens": 128_000,
+                        "maximum_output_tokens": 16_000,
+                        "input_cost_per_million_tokens_usd": 0,
+                        "output_cost_per_million_tokens_usd": 0,
+                        "cached_input_cost_per_million_tokens_usd": 0,
+                        "cache_write_cost_per_million_tokens_usd": 0,
+                    },
+                }
+            ),
             "--yes",
         ]
         optimization_output = run_tty(
             optimize_arguments,
-            [
-                ("Candidate alias", "candidate-b"),
-                ("Provider connection", "azure"),
-                ("Provider model ID", "candidate-b-model"),
-                ("Supports tools?", "y"),
-                ("Context window tokens", "128000"),
-                ("Maximum output tokens", "16000"),
-                ("Input USD per million tokens", "0"),
-                ("Output USD per million tokens", "0"),
-                ("Cached input USD per million tokens", "0"),
-                ("Cache write USD per million tokens", "0"),
-                ("Router candidates (select at least two)", space + down + space + down + enter),
-                ("Router incumbent among the candidates", down + enter),
-                ("Save these router candidates?", "y"),
-            ],
+            [("Save these router candidates?", "y")],
         )
         assert "candidates: candidate-b, core-model" in optimization_output
         assert "incumbent: core-model" in optimization_output

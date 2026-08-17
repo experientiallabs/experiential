@@ -81,7 +81,7 @@ class AutomaticRouterOptions:
 
     maximum_provider_cost_usd: float = 25.0
     maximum_judgments: int = 100
-    maximum_model_calls: int = 8
+    maximum_model_calls: int = 50
     maximum_router_feature_tokens: int = 8_192
     maximum_retrieval_query_tokens: int = 32_768
     router_embedding_maximum_attempts: int = 3

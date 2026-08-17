@@ -37,11 +37,13 @@ from wmo.common.evaluations.evidence import (
 from wmo.common.judging import Judge, Judgment
 from wmo.common.models import (
     ModelCatalog,
+    ProviderConnection,
     ProviderModelSelection,
     RoutedCandidateSnapshot,
     RouterCandidateSelection,
 )
 from wmo.common.observability.telemetry import capture_completion_once
+from wmo.common.progress import ProgressHook, report
 from wmo.common.project import (
     ArtifactAlreadyExistsError,
     ProjectStore,
@@ -107,6 +109,7 @@ class RouterCandidateSetupPlan:
     candidate_models: tuple[ProviderModelSelection, ...]
     prospective_catalog: ModelCatalog
     expected_catalog_sha256: str
+    candidate_connections: tuple[ProviderConnection, ...] = ()
 
 
 class ApprovedRouterReview(ContractModel):
@@ -224,6 +227,7 @@ def compose_router(
     created_at: datetime,
     code_revision: str,
     phase_hook: Callable[[str], None] | None = None,
+    progress: ProgressHook | None = None,
 ) -> RouterCompositionResult:
     """Build evidence, evaluate, freeze, report, and load one router with explicit services.
 
@@ -237,6 +241,7 @@ def compose_router(
             replays completed simulation, fit, and report work deterministically.
         code_revision: Exact code revision for every new artifact.
         phase_hook: Optional local observer used to audit phase ordering.
+        progress: Optional observer of truthful stage names and exact unit counts.
 
     Returns:
         The complete immutable artifact chain and W11 frozen runtime.
@@ -245,6 +250,7 @@ def compose_router(
         RouterCompositionError: A dependency, budget, artifact, or resume binding is invalid.
     """
     started = time.monotonic()
+    report(progress, "preflight")
     _preflight(project, services, budget, code_revision)
     completed_build = completed_project_build(project)
     built = reconstruct_completed_project_build(
@@ -279,7 +285,6 @@ def compose_router(
     plan_input = artifact_input(project.artifacts.read(plan.plan_id).manifest)
     if services.plan_observer is not None:
         services.plan_observer(plan)
-    phase_created_at = plan.created_at
     task_input = built.review.task_set
     _phase(phase_hook, "fit_started")
     fit_cells = tuple(cell for cell in plan.cells if cell.purpose == "fit")
@@ -289,12 +294,19 @@ def compose_router(
         task_input,
         setup,
         budget.maximum_simulation_cost_usd,
-        phase_created_at,
+        plan.created_at,
         code_revision,
         fit_cells,
         phase="fit",
     )
-    fit_set = _run_or_load_simulation(project, plan, spec, services.simulator_factory)
+    fit_set = _run_or_load_simulation(
+        project,
+        plan,
+        spec,
+        services.simulator_factory,
+        progress=progress,
+        progress_detail="fit",
+    )
     fit_spend = _verified_simulation_spend(project, fit_set)
     if fit_spend > budget.maximum_simulation_cost_usd:
         raise RouterCompositionError("verified fit simulation spend exceeds the total budget")
@@ -314,6 +326,8 @@ def compose_router(
         review,
         services.judge,
         budget.maximum_judgments,
+        progress=progress,
+        progress_detail="fit",
     )
     fit_config = RouterFitConfig(
         fit=EvaluationInputs(
@@ -327,14 +341,15 @@ def compose_router(
         pricing_snapshot_id=setup.pricing_snapshot_id,
         guard=setup.guard,
         judgment_status=setup.judgment_status,
-        created_at=phase_created_at,
+        created_at=plan.created_at,
         code_revision=code_revision,
     )
+    report(progress, "fitting")
     fit, policy_lock = _fit_and_lock_once(
         project,
         plan_input,
         fit_config,
-        phase_created_at,
+        plan.created_at,
         code_revision,
     )
     _phase(phase_hook, "policy_locked")
@@ -347,12 +362,19 @@ def compose_router(
         task_input,
         setup,
         remaining_cost_usd,
-        phase_created_at,
+        plan.created_at,
         code_revision,
         held_cells,
         phase="heldout",
     )
-    held_set = _run_or_load_simulation(project, plan, held_spec, services.simulator_factory)
+    held_set = _run_or_load_simulation(
+        project,
+        plan,
+        held_spec,
+        services.simulator_factory,
+        progress=progress,
+        progress_detail="held-out",
+    )
     held_out_spend = _verified_simulation_spend(project, held_set)
     if math.fsum((fit_spend, held_out_spend)) > budget.maximum_simulation_cost_usd:
         raise RouterCompositionError("verified composed simulation spend exceeds the total budget")
@@ -365,7 +387,10 @@ def compose_router(
         review,
         services.judge,
         budget.maximum_judgments - fit_consumed,
+        progress=progress,
+        progress_detail="held-out",
     )
+    report(progress, "artifact publication")
     optimized = report_router(
         project.artifacts,
         fit,
@@ -377,7 +402,7 @@ def compose_router(
                 cell_evidence=held_evidence,
             ),
             embedding_set_id=setup.embedding_set_id,
-            created_at=phase_created_at,
+            created_at=plan.created_at,
             code_revision=code_revision,
         ),
     )
@@ -421,8 +446,26 @@ def _run_or_load_simulation(
     plan: EvaluationPlan,
     spec: SimulationSpec,
     simulator_factory: SimulatorFactory,
+    *,
+    progress: ProgressHook | None = None,
+    progress_detail: str | None = None,
 ) -> SimulationArtifactSet:
-    """Load an exactly completed simulation set without invoking its simulator again."""
+    """Load an exactly completed simulation set without invoking its simulator again.
+
+    Args:
+        project: Project store holding completed simulation artifacts.
+        plan: Frozen evaluation plan bound to the injected simulator.
+        spec: Phase-scoped simulation specification to load or run.
+        simulator_factory: Injected constructor invoked only when no completed set exists.
+        progress: Optional observer of exact replayed evaluation-cell counts.
+        progress_detail: Phase qualifier attached to replayed evaluation-cell counts.
+
+    Returns:
+        Immutable index of one rollout artifact for every selected cell.
+
+    Raises:
+        RouterCompositionError: A stored artifact set is ambiguous, drifted, or mismatched.
+    """
     matches = []
     for artifact_id in project.artifacts.list_ids():
         stored = project.artifacts.read(artifact_id)
@@ -461,6 +504,14 @@ def _run_or_load_simulation(
     if len(matches) > 1:
         raise RouterCompositionError("multiple completed artifact sets name one simulation phase")
     if matches:
+        cell_count = len(matches[0].artifact_ids)
+        report(
+            progress,
+            "evaluation cells",
+            completed=cell_count,
+            total=cell_count,
+            detail=progress_detail,
+        )
         return matches[0]
     return simulator_factory(project, plan).run(spec)
 
@@ -616,6 +667,9 @@ def _complete_cell_evidence(
     review: ApprovedRouterReview,
     judge: Judge,
     maximum_judgments: int,
+    *,
+    progress: ProgressHook | None = None,
+    progress_detail: str | None = None,
 ) -> tuple[tuple[EvaluationCellEvidence, ...], int]:
     """Verify evidence and reserve each bounded judgment dispatch durably before calling it.
 
@@ -677,6 +731,7 @@ def _complete_cell_evidence(
 
     evidence = []
     consumed = 0
+    report(progress, "judgments", completed=0, total=len(bound_cells), detail=progress_detail)
     for cell, rollout_id, protocol in bound_cells:
         rollout = rollouts_by_id[rollout_id]
         if _rollout_failed(rollout):
@@ -750,6 +805,13 @@ def _complete_cell_evidence(
                 judgment_artifact_id=judgment.judgment_id,
                 source_run_id=rollout.source_run_id,
             )
+        )
+        report(
+            progress,
+            "judgments",
+            completed=len(evidence),
+            total=len(bound_cells),
+            detail=progress_detail,
         )
     return tuple(evidence), consumed
 

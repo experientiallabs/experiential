@@ -11,7 +11,7 @@ from wmo.common.tasks import TaskCase
 from wmo.runtime.agents.interface import AgentEpisode
 from wmo.runtime.environments import EnvironmentSession, Observation
 
-_DEFAULT_MAXIMUM_MODEL_CALLS = 8
+_DEFAULT_MAXIMUM_MODEL_CALLS = 50
 
 
 class ChatAgentRuntime:

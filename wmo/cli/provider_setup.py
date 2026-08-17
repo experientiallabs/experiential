@@ -24,8 +24,10 @@ from wmo.cli.model_picker import (
     available_models,
     build_result,
     configured_models,
+    model_selection,
     render_summary,
     select_models,
+    select_router_candidates,
 )
 from wmo.cli.provider_picker import (
     CREDENTIAL_NOTE,
@@ -51,6 +53,7 @@ from wmo.common.models import (
     configure_provider_catalog,
     configure_router_candidates,
     load_model_catalog,
+    serves_role,
 )
 from wmo.common.models.setup import SETUP_PROVIDERS
 from wmo.runtime.models.providers import HttpProviderModelLister, ProviderModelLister
@@ -66,6 +69,118 @@ class ProviderSetupOptions:
     world_model: str | None = None
     judge: str | None = None
     embedder: str | None = None
+
+
+@dataclass(frozen=True)
+class RouterCandidatePickerResult:
+    """Candidate roles plus newly discovered catalog records selected by the picker."""
+
+    selection: RouterCandidateSelection
+    candidate_models: tuple[ProviderModelSelection, ...] = ()
+    connections: tuple[ProviderConnection, ...] = ()
+
+
+def run_router_candidate_picker(
+    catalog: ModelCatalog,
+    *,
+    candidates: tuple[str, ...] = (),
+    incumbent: str | None = None,
+    console: Console,
+    lister: ProviderModelLister | None = None,
+    environment: MutableMapping[str, str] | None = None,
+) -> RouterCandidatePickerResult | None:
+    """Discover provider models and choose strict router candidates through existing setup UX.
+
+    Args:
+        catalog: Current secret-free catalog used for configured-only choices and conflict checks.
+        candidates: Candidate aliases to preselect when they are discovered or configured.
+        incumbent: Explicit incumbent alias, if supplied by the command.
+        console: Terminal used for provider discovery and candidate screens.
+        lister: Provider listing seam, injected by tests instead of making live requests.
+        environment: Mutable environment consulted for provider credentials.
+
+    Returns:
+        The confirmed candidate selection and any new provider records, or ``None`` when the user
+        cancels provider selection.
+
+    Raises:
+        SetupCancelled: The user cancels credential or recovery prompts.
+        ValueError: An explicit candidate or incumbent is not eligible after discovery.
+    """
+    configured = configured_models(
+        catalog.models,
+        connection_providers={
+            name: connection.provider for name, connection in catalog.connections.items()
+        },
+    )
+    session = SetupSession(selected=tuple(item.alias for item in configured))
+    provider_lister = lister if lister is not None else HttpProviderModelLister()
+    provider_environment = os.environ if environment is None else environment
+    existing_connections = _existing_connections(catalog)
+    existing_aliases = tuple(sorted(catalog.models))
+    preselected = candidates
+    while True:
+        provider_selection = select_providers(
+            session,
+            console=console,
+            environment=provider_environment,
+            configured=bool(configured),
+        )
+        if provider_selection is None:
+            return None
+        session.providers, session.advanced_models = provider_selection
+        session.endpoints = ()
+        discovered: tuple[AvailableModel, ...] = ()
+        if session.providers:
+            prepared = prepare_providers(
+                session,
+                existing_connections=existing_connections,
+                existing_aliases=existing_aliases,
+                console=console,
+                lister=provider_lister,
+                environment=provider_environment,
+            )
+            if prepared is None:
+                continue
+            session.endpoints, discovered = prepared
+        session.available = (*configured, *discovered)
+        available = available_models(session)
+        eligible = tuple(
+            item
+            for item in available
+            if item.capabilities is not None
+            and serves_role(item.capabilities, SetupRole.ROUTER_CANDIDATE)
+        )
+        if len(eligible) < 2:
+            console.print(
+                "[yellow]The selected providers exposed fewer than two eligible completion "
+                "models. Choose another provider or use the advanced --candidate-model "
+                "path.[/yellow]"
+            )
+            continue
+        selection = select_router_candidates(
+            available,
+            preselected=preselected,
+            incumbent=incumbent,
+            console=console,
+        )
+        if selection is None:
+            continue
+        selected_models = tuple(item for item in available if item.alias in selection.candidates)
+        used_connections = {item.connection for item in selected_models}
+        candidate_models = tuple(
+            model_selection(item) for item in selected_models if not item.configured
+        )
+        connections = tuple(
+            endpoint.connection
+            for endpoint in session.endpoints
+            if not endpoint.configured and endpoint.connection.name in used_connections
+        )
+        return RouterCandidatePickerResult(
+            selection=selection,
+            candidate_models=candidate_models,
+            connections=connections,
+        )
 
 
 def run_provider_setup(

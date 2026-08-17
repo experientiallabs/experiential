@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -726,7 +726,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
             normalized,
             services=services,
             budget=budget,
-            created_at=_TIME,
+            created_at=_TIME + timedelta(hours=1),
             code_revision="test-revision",
             phase_hook=crash_after_lock,
         )
@@ -736,7 +736,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         normalized,
         services=services,
         budget=budget,
-        created_at=_TIME,
+        created_at=_TIME + timedelta(hours=2),
         code_revision="test-revision",
         phase_hook=crash_after_lock,
     )
@@ -751,7 +751,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         normalized,
         services=services,
         budget=budget,
-        created_at=_TIME,
+        created_at=_TIME + timedelta(hours=3),
         code_revision="test-revision",
     )
 

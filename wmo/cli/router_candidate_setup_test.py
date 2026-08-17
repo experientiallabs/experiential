@@ -12,6 +12,7 @@ from rich.prompt import Confirm
 
 from wmo.cli import router_candidate_setup
 from wmo.cli.picker import PickerAction, PickerOption, PickerResult
+from wmo.cli.provider_setup import RouterCandidatePickerResult
 from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.models import (
     ConnectionConfig,
@@ -19,7 +20,9 @@ from wmo.common.models import (
     ModelCatalog,
     ModelRecord,
     ModelRoles,
+    ProviderConnection,
     ProviderModelSelection,
+    RouterCandidateSelection,
     configure_router_candidates,
     write_model_catalog,
 )
@@ -46,11 +49,13 @@ def test_noninteractive_requires_two_candidates_and_incumbent_without_writing(
             incumbent=None,
             non_interactive=True,
             console=_console(),
+            interactive_command="wmo optimize router support --root /tmp/.wmo",
         )
 
     message = str(error.value)
     assert "second distinct" in message
     assert "--incumbent" in message
+    assert "Run `wmo optimize router support --root /tmp/.wmo`" in message
     assert path.read_bytes() == before
 
 
@@ -218,6 +223,63 @@ def test_first_optimize_can_define_candidates_from_existing_connections(tmp_path
     assert configured.roles.candidates == ("candidate-a", "candidate-b")
     assert configured.roles.world_model == "world"
     assert configured.models["world"] == catalog.models["world"]
+
+
+def test_missing_candidates_use_configured_provider_picker_without_raw_prompts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing candidate role delegates discovery and selection to provider setup ownership.
+
+    Args:
+        tmp_path: Temporary root containing the shared catalog.
+        monkeypatch: Replace provider discovery with a deterministic picker result.
+    """
+    path = tmp_path / "models.toml"
+    catalog = _catalog().model_copy(
+        update={
+            "models": {
+                "candidate-a": _catalog().models["candidate-a"],
+                "world": _catalog().models["world"],
+            }
+        }
+    )
+    write_model_catalog(path, catalog)
+    new_connection = ProviderConnection(
+        name="new",
+        provider="openai",
+        api_key_env="OPENAI_API_KEY",
+    )
+    new_model = _candidate_model("candidate-b").model_copy(update={"connection": "new"})
+
+    def picker(*args: object, **kwargs: object) -> RouterCandidatePickerResult:
+        """Return one configured and one newly discovered candidate without prompts."""
+        del args
+        assert kwargs["candidates"] == ("candidate-a",)
+        return RouterCandidatePickerResult(
+            selection=RouterCandidateSelection(
+                candidates=("candidate-a", "candidate-b"), incumbent="candidate-a"
+            ),
+            candidate_models=(new_model,),
+            connections=(new_connection,),
+        )
+
+    monkeypatch.setattr(router_candidate_setup, "run_router_candidate_picker", picker)
+    monkeypatch.setattr(Confirm, "ask", lambda *args, **kwargs: True)
+
+    plan = collect_router_candidate_setup(
+        path,
+        catalog,
+        candidates=("candidate-a",),
+        incumbent=None,
+        non_interactive=False,
+        console=_console(),
+    )
+
+    assert plan.selection.candidates == ("candidate-a", "candidate-b")
+    assert plan.candidate_connections == (new_connection,)
+    assert plan.prospective_catalog.connections["new"].provider == "openai"
+    assert "candidate-b" in plan.prospective_catalog.models
 
 
 def test_interactive_confirmation_cannot_retarget_an_existing_alias(tmp_path: Path) -> None:
