@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import typer
 from rich.console import Console
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Confirm
 
 from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.models import (
@@ -86,16 +86,16 @@ def test_interactive_collection_requires_final_confirmation(
 
     Args:
         tmp_path: Temporary root containing an unchanged catalog.
-        monkeypatch: Patch prompt collection without a terminal.
+        monkeypatch: Patch selection input without a terminal.
     """
     path = tmp_path / "models.toml"
     catalog = _catalog()
     write_model_catalog(path, catalog)
     before = path.read_bytes()
-    answers = iter(("candidate-a,candidate-b", "candidate-b"))
+    answers = iter(("1,2", "", "2"))
 
-    def prompt_answer(*args: object, **kwargs: object) -> str:
-        """Return the next deterministic candidate prompt response."""
+    def picker_answer(*args: object, **kwargs: object) -> str:
+        """Return the next deterministic line answer for a non-terminal picker."""
         del args, kwargs
         return next(answers)
 
@@ -104,7 +104,7 @@ def test_interactive_collection_requires_final_confirmation(
         del args, kwargs
         return False
 
-    monkeypatch.setattr(Prompt, "ask", prompt_answer)
+    monkeypatch.setattr(Console, "input", picker_answer)
     monkeypatch.setattr(Confirm, "ask", reject_summary)
 
     with pytest.raises(typer.Abort):

@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
 from wmo.cli.options import usage_error
+from wmo.cli.picker import PickerAction, PickerOption, choose_many, choose_one
 from wmo.common.models import (
     ModelCapabilities,
     ModelCatalog,
@@ -228,6 +229,32 @@ def _noninteractive_selection(
         return RouterCandidateSelection(candidates=selected, incumbent=selected_incumbent)
 
 
+def _candidate_option(catalog: ModelCatalog, alias: str) -> PickerOption:
+    """Describe one eligible candidate alias with its identity and pricing.
+
+    Args:
+        catalog: Catalog holding the alias metadata.
+        alias: Eligible completion candidate alias.
+
+    Returns:
+        Picker option carrying the provider identity, token limits, and token prices.
+    """
+    record = catalog.models[alias]
+    caps = record.capabilities
+    details = [f"roles: router candidate; connection: {record.connection}"]
+    if caps is not None:
+        details.append(
+            f"context {caps.context_window_tokens}, output {caps.maximum_output_tokens}, "
+            f"pricing in/out USD per million {caps.input_cost_per_million_tokens_usd}/"
+            f"{caps.output_cost_per_million_tokens_usd}"
+        )
+    return PickerOption(
+        value=alias,
+        label=f"{alias} ({record.connection}/{record.model})",
+        detail="; ".join(details),
+    )
+
+
 def _interactive_selection(
     catalog: ModelCatalog,
     candidates: tuple[str, ...],
@@ -235,19 +262,21 @@ def _interactive_selection(
     *,
     console: Console,
 ) -> RouterCandidateSelection:
-    """Prompt for multiple eligible aliases and one incumbent with no inferred model choice.
+    """Choose multiple eligible aliases and one incumbent with no inferred model choice.
 
     Args:
         catalog: Current local catalog.
-        candidates: Optional explicit aliases that skip only the candidate prompt.
-        incumbent: Optional explicit incumbent that skips only the incumbent prompt.
+        candidates: Optional explicit aliases that skip only the candidate screen.
+        incumbent: Optional explicit incumbent that skips only the incumbent screen.
         console: Rich terminal used for choices.
 
     Returns:
         Explicit selection ready for summary confirmation.
 
     Raises:
-        typer.BadParameter: Fewer than two eligible aliases exist or entered aliases are invalid.
+        typer.Abort: The operator cancels a selection screen.
+        typer.BadParameter: Fewer than two eligible aliases exist or explicit aliases are
+            ineligible.
     """
     eligible = completion_candidate_aliases(catalog)
     if len(eligible) < 2:
@@ -256,37 +285,46 @@ def _interactive_selection(
             "supports_completions=true and complete input, output, cached input, and cache write "
             "pricing"
         )
-    selected = candidates
-    if not selected:
-        default = (
-            ",".join(catalog.roles.candidates)
-            if len(catalog.roles.candidates) >= 2
-            and set(catalog.roles.candidates).issubset(eligible)
-            else None
-        )
-        answer = (
-            Prompt.ask(
-                "Candidate aliases (comma separated)",
-                default=default,
-                console=console,
-            )
-            if default is not None
-            else Prompt.ask("Candidate aliases (comma separated)", console=console)
-        )
-        selected = tuple(item.strip() for item in answer.split(",") if item.strip())
-    unknown = tuple(alias for alias in selected if alias not in eligible)
-    if unknown:
-        raise typer.BadParameter(
-            "candidate aliases are not eligible: " + ", ".join(sorted(set(unknown)))
-        )
-    default_incumbent = catalog.roles.incumbent if catalog.roles.incumbent in selected else None
-    selected_incumbent = incumbent or Prompt.ask(
-        "Incumbent alias",
-        choices=list(selected),
-        default=default_incumbent,
-        console=console,
+    options = [_candidate_option(catalog, alias) for alias in eligible]
+    preselected = (
+        catalog.roles.candidates if set(catalog.roles.candidates).issubset(eligible) else ()
     )
-    if selected_incumbent is None:
-        raise AssertionError("interactive incumbent prompt returned no alias")
-    with usage_error(ValueError):
-        return RouterCandidateSelection(candidates=selected, incumbent=selected_incumbent)
+    while True:
+        selected = candidates
+        if not selected:
+            chosen = choose_many(
+                console,
+                title="Router candidates (select at least two)",
+                options=options,
+                preselected=preselected,
+                minimum=2,
+            )
+            if chosen.action is PickerAction.CANCEL:
+                raise typer.Abort()
+            if chosen.action is PickerAction.BACK:
+                continue
+            selected = chosen.values
+        unknown = tuple(alias for alias in selected if alias not in eligible)
+        if unknown:
+            raise typer.BadParameter(
+                "candidate aliases are not eligible: " + ", ".join(sorted(set(unknown)))
+            )
+        if incumbent is not None:
+            with usage_error(ValueError):
+                return RouterCandidateSelection(candidates=selected, incumbent=incumbent)
+        chosen_incumbent = choose_one(
+            console,
+            title="Router incumbent among the candidates",
+            options=[_candidate_option(catalog, alias) for alias in selected],
+            default=catalog.roles.incumbent if catalog.roles.incumbent in selected else None,
+        )
+        if chosen_incumbent.action is PickerAction.CANCEL:
+            raise typer.Abort()
+        if chosen_incumbent.action is PickerAction.BACK:
+            if candidates:
+                raise typer.Abort()
+            continue
+        with usage_error(ValueError):
+            return RouterCandidateSelection(
+                candidates=selected, incumbent=chosen_incumbent.values[0]
+            )

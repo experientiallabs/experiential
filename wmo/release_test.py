@@ -251,9 +251,9 @@ def _run_checked(
 def _tty_answer_bytes(answer: str) -> bytes:
     """Encode one scripted terminal answer.
 
-    Keyboard sequences that start with an escape, or a lone carriage return, are written
-    exactly so a raw-mode picker can read them. Line-oriented prompts still receive a
-    trailing newline.
+    A keyboard sequence, recognized by any escape or carriage return it contains, is written
+    exactly so a raw-mode picker reads only the intended keys. Line-oriented prompts still
+    receive a trailing newline.
 
     Args:
         answer: Scripted key sequence or line-oriented prompt answer.
@@ -261,7 +261,7 @@ def _tty_answer_bytes(answer: str) -> bytes:
     Returns:
         Bytes written to the child pseudo-terminal.
     """
-    if answer.startswith("\x1b") or answer == "\r":
+    if "\x1b" in answer or "\r" in answer:
         return answer.encode()
     return (answer + "\n").encode()
 
@@ -868,6 +868,7 @@ def _installed_release_driver() -> None:
 
     down = "\x1b[B"
     enter = "\r"
+    space = " "
     setup_answers = [
         (
             "Select the providers you want to use",
@@ -875,10 +876,9 @@ def _installed_release_driver() -> None:
         ),
         ("base URL", provider_url),
         ("credential environment variable", "P17_PROVIDER_KEY"),
-        ("Continue without this provider", "2"),
-        ("Select the models to configure", "1"),
-        ("cancels.", ""),
-        ("Connection for the declared model", "1"),
+        ("Continue without this provider", down + enter),
+        ("Select the models to configure", space + down + enter),
+        ("Connection for the declared model", enter),
         ("Provider model ID", "core-model"),
         ("Supports chat completions?", "y"),
         ("Supports embeddings?", "y"),
@@ -892,10 +892,10 @@ def _installed_release_driver() -> None:
         ("Output cost per million tokens in USD", "0"),
         ("Cached input cost per million tokens in USD", "0"),
         ("Cache write cost per million tokens in USD", "0"),
-        ("cancels.", ""),
-        ("World model", "1"),
-        ("Judge model", "1"),
-        ("Embedder model", "1"),
+        ("/core-model)", (down * 2) + enter),
+        ("World model", enter),
+        ("Judge model", enter),
+        ("Embedder model", enter),
         ("Save this configuration?", "y"),
     ]
     try:
@@ -906,6 +906,9 @@ def _installed_release_driver() -> None:
         )
         assert "Model setup is required" in build_output
         assert "Candidate aliases" not in build_output
+        assert "\x1b[2K" in build_output
+        assert "\x1b[1A" in build_output
+        assert "Complete" in build_output
         support_store = ProjectStore(root, "support-agent")
         support_project = support_store.load_project()
         assert support_project.build is not None
@@ -1040,12 +1043,13 @@ def _installed_release_driver() -> None:
                 ("Output USD per million tokens", "0"),
                 ("Cached input USD per million tokens", "0"),
                 ("Cache write USD per million tokens", "0"),
-                ("Candidate aliases (comma separated)", "core-model,candidate-b"),
-                ("Incumbent alias", "core-model"),
+                ("Router candidates (select at least two)", space + down + space + down + enter),
+                ("Router incumbent among the candidates", down + enter),
                 ("Save these router candidates?", "y"),
             ],
         )
-        assert optimization_output.count("Candidate aliases (comma separated)") == 1
+        assert "candidates: candidate-b, core-model" in optimization_output
+        assert "incumbent: core-model" in optimization_output
         assert "policy:" in optimization_output
         assert "report:" in optimization_output
         optimized_artifacts = directory_digest(support_store.paths.artifacts_directory)
@@ -1496,7 +1500,11 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     )
     wheel = tuple(distribution.glob("*.whl"))
     assert len(wheel) == 1
-    _run_checked([uv, "venv", str(virtual_environment)], cwd=execution, environment=environment)
+    _run_checked(
+        [uv, "venv", "--python", sys.executable, str(virtual_environment)],
+        cwd=execution,
+        environment=environment,
+    )
     installed_python = virtual_environment / "bin" / "python"
     _run_checked(
         [uv, "pip", "install", "--python", str(installed_python), str(wheel[0])],

@@ -1,7 +1,9 @@
 """Model selection, role assignment, and confirmation screens for provider setup.
 
-These screens run after every selected provider has been prepared. They present the discovered and
-already-configured models as one searchable list, filter new build-role assignments to models whose
+These screens run after every selected provider has been prepared. Every one of them uses the
+shared picker: the model screen and the router-candidate screen are multi-select, and a single build
+role and the router incumbent are single-select. Each row keeps its provider identity, served roles,
+and pricing provenance visible. The screens filter new build-role assignments to models whose
 verified metadata can serve them, preserve exact prior assignments as retain-only choices, and
 render the single summary shown before setup saves anything.
 """
@@ -14,7 +16,7 @@ from dataclasses import dataclass
 from rich.console import Console
 from rich.prompt import Confirm
 
-from wmo.cli.picker import PickerAction, PickerOption, select_many, select_one
+from wmo.cli.picker import PickerAction, PickerOption, choose_many, choose_one
 from wmo.cli.provider_picker import (
     CREDENTIAL_NOTE,
     AvailableModel,
@@ -60,7 +62,7 @@ def available_models(session: SetupSession) -> tuple[AvailableModel, ...]:
 
 
 def select_models(session: SetupSession, *, console: Console) -> tuple[str, ...] | None:
-    """Show the searchable multi-select model screen across every prepared provider.
+    """Show the multi-select model screen across every prepared provider.
 
     Args:
         session: Answers already collected in this setup session.
@@ -85,7 +87,7 @@ def select_models(session: SetupSession, *, console: Console) -> tuple[str, ...]
                     label="Advanced: declare another model by hand",
                 )
             )
-        result = select_many(
+        result = choose_many(
             console,
             title="Select the models to configure",
             options=options,
@@ -129,7 +131,7 @@ def declare_model(session: SetupSession, *, console: Console) -> AvailableModel 
         )
         for endpoint in session.endpoints
     ]
-    chosen = select_one(console, title="Connection for the declared model", options=connections)
+    chosen = choose_one(console, title="Connection for the declared model", options=connections)
     if chosen.action is PickerAction.CANCEL:
         raise SetupCancelled
     if chosen.action is PickerAction.BACK:
@@ -280,7 +282,7 @@ def _assign_one_role(
             "Select more models.[/yellow]"
         )
         return None
-    result = select_one(
+    result = choose_one(
         console,
         title=title,
         options=[
@@ -324,9 +326,9 @@ def _assign_candidates(
             "Skipping that role for now.[/dim]"
         )
         return (), None
-    result = select_many(
+    result = choose_many(
         console,
-        title="Router candidates (optional, empty line skips)",
+        title="Router candidates (optional, Complete with none skips)",
         options=[
             PickerOption(value=item.alias, label=item.label(), detail=item.detail())
             for item in eligible
@@ -341,7 +343,7 @@ def _assign_candidates(
     if len(result.values) < 2:
         console.print("[dim]Router candidates need at least two models. Skipping that role.[/dim]")
         return (), None
-    incumbent = select_one(
+    incumbent = choose_one(
         console,
         title="Router incumbent among the candidates",
         options=[PickerOption(value=alias, label=alias) for alias in result.values],
