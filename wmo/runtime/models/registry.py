@@ -72,6 +72,7 @@ class _HttpClientFactory(Protocol):
         api_key: str,
         base_url: str,
         transport: JsonHttpTransport,
+        capabilities: ModelCapabilities | None = None,
     ) -> ModelClient:
         """Return a focused completion client for one resolved connection.
 
@@ -80,6 +81,7 @@ class _HttpClientFactory(Protocol):
             api_key: Credential read from the connection's named environment variable.
             base_url: Endpoint root the client posts to.
             transport: Explicit JSON transport for every request.
+            capabilities: Catalog sampling support for this model, when known.
 
         Returns:
             A focused non-streaming completion client.
@@ -203,6 +205,7 @@ class RuntimeModelCatalog:
                 region=connection.region,
                 environment=self._environment,
                 runtime_factory=self._bedrock_runtime_factory,
+                capabilities=capabilities,
             )
             return ResolvedModel(
                 alias,
@@ -231,6 +234,7 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 api_version=connection.api_version,
                 transport=self._transport_factory(),
+                capabilities=capabilities,
             )
             return ResolvedModel(
                 alias,
@@ -240,9 +244,12 @@ class RuntimeModelCatalog:
                 client if capabilities.supports_embeddings else None,
             )
         if provider == "tinker":
-            sampler_factory = self._tinker_sampler_factory or _runtime_tinker_sampler
             try:
-                sampler = sampler_factory(snapshot, api_key, connection.base_url)
+                sampler = (
+                    _runtime_tinker_sampler(snapshot, api_key, connection.base_url, capabilities)
+                    if self._tinker_sampler_factory is None
+                    else self._tinker_sampler_factory(snapshot, api_key, connection.base_url)
+                )
             except TinkerOptionalDependencyError as exc:
                 raise ModelConnectionError(
                     f"Tinker alias {alias!r} cannot be constructed: {exc}"
@@ -266,6 +273,7 @@ class RuntimeModelCatalog:
             api_key=api_key,
             base_url=base_url,
             transport=self._transport_factory(),
+            capabilities=capabilities,
         )
         embedding_client = (
             http_client
@@ -329,6 +337,12 @@ def _runtime_tinker_sampler(
     model: ModelSnapshot,
     api_key: str,
     base_url: str | None,
+    capabilities: ModelCapabilities | None = None,
 ) -> TinkerSampler:
     """Build the runtime-owned sampling seam for one cataloged Tinker handle."""
-    return create_tinker_sampler(model=model, api_key=api_key, base_url=base_url)
+    return create_tinker_sampler(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        capabilities=capabilities,
+    )

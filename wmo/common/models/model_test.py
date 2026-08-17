@@ -18,6 +18,7 @@ from wmo.common.models import (
     NumericMeasurement,
     OperationEconomics,
     RoutedCandidateSnapshot,
+    SamplingSupport,
     ToolChoice,
     Usage,
     combine_economics,
@@ -91,6 +92,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "supports_embeddings": False,
         "supports_structured_output": False,
         "supports_completions": None,
+        "sampling": {"temperature": None},
         "context_window_tokens": None,
         "maximum_output_tokens": None,
         "input_cost_per_million_tokens_usd": None,
@@ -105,6 +107,17 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         )
 
 
+def test_sampling_support_include_sends_undeclared_named_fields_only() -> None:
+    """A named field is sent unless the catalog has declared it unsupported."""
+    undeclared = SamplingSupport()
+    forbidden = SamplingSupport(temperature=False)
+
+    assert undeclared.include("temperature", 0.0) is True
+    assert undeclared.include("temperature", None) is False
+    assert forbidden.include("temperature", 0.0) is False
+    assert SamplingSupport(temperature=True).include("temperature", 0.2) is True
+
+
 def test_completion_support_preserves_provider_identity_for_existing_traces() -> None:
     """Completion eligibility is frozen separately without orphaning old trace snapshots."""
     legacy_payload = {
@@ -116,10 +129,12 @@ def test_completion_support_preserves_provider_identity_for_existing_traces() ->
     unknown = ModelCapabilities()
     supported = ModelCapabilities(supports_completions=True)
     unsupported = ModelCapabilities(supports_completions=False)
+    sampling = ModelCapabilities(sampling=SamplingSupport(temperature=False))
 
     assert unknown.identity_sha256() == sha256_json(legacy_payload)
     assert supported.identity_sha256() == unsupported.identity_sha256()
     assert supported.identity_sha256() == unknown.identity_sha256()
+    assert sampling.identity_sha256() == unknown.identity_sha256()
     with pytest.raises(ValidationError, match="required tool_choice"):
         ModelRequest(
             messages=(ModelMessage(role="user", content="Please help."),),

@@ -247,17 +247,49 @@ class ModelResponse(ContractModel):
         )
 
 
+class SamplingSupport(ContractModel):
+    """Declared support for optional sampling fields on one catalog model.
+
+    ``None`` means the catalog has not declared a restriction, so request builders send the
+    field when the typed request names it. ``False`` omits the field even when the request
+    names it. ``True`` sends the field when the request names it. Adding a later sampling
+    field, such as ``top_p``, belongs here rather than as a one-off boolean on the parent
+    capabilities object.
+    """
+
+    temperature: bool | None = None
+
+    def include(self, field: Literal["temperature"], requested: object | None) -> bool:
+        """Return whether one requested sampling field may be serialized.
+
+        Args:
+            field: Sampling field declared on this object.
+            requested: Value named on the typed request, or ``None`` when omitted.
+
+        Returns:
+            ``True`` only when the request names the field and this declaration has not
+            marked it unsupported.
+        """
+        if requested is None:
+            return False
+        declared = getattr(self, field)
+        return True if declared is None else declared
+
+
 class ModelCapabilities(ContractModel):
     """Static capabilities known before a model request is sent.
 
     The runtime records a digest of this object in every resolved model identity. The fields
     describe protocol support, not a claim that a provider accepts every possible prompt.
+    Sampling-parameter support lives on ``sampling`` so provider and model request config
+    stays one nested declaration instead of a growing set of top-level booleans.
     """
 
     supports_tools: bool = False
     supports_embeddings: bool = False
     supports_structured_output: bool = False
     supports_completions: bool | None = None
+    sampling: SamplingSupport = Field(default_factory=SamplingSupport)
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
@@ -306,6 +338,7 @@ class ModelCapabilities(ContractModel):
             "cache_write_cost_per_million_tokens_usd",
         }
         excluded.add("supports_completions")
+        excluded.add("sampling")
         return sha256_json(self.model_dump(mode="json", exclude=excluded))
 
 

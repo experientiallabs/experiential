@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
+    ModelCapabilities,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -27,16 +28,22 @@ from wmo.common.models import (
 )
 from wmo.runtime.models.providers.errors import ProviderResponseError
 from wmo.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
+from wmo.runtime.models.providers.sampling import include_sampling_field
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
-def openai_responses_request(model_id: str, request: ModelRequest) -> JsonObject:
+def openai_responses_request(
+    model_id: str,
+    request: ModelRequest,
+    capabilities: ModelCapabilities | None = None,
+) -> JsonObject:
     """Convert one WMO request into OpenAI's native Responses API shape.
 
     Args:
         model_id: OpenAI model identifier.
         request: Typed WMO request.
+        capabilities: Catalog sampling support for this model, when known.
 
     Returns:
         Non-streaming Responses API JSON with provider-side storage disabled.
@@ -77,7 +84,7 @@ def openai_responses_request(model_id: str, request: ModelRequest) -> JsonObject
             if not isinstance(request.tool_choice, str)
             else request.tool_choice
         )
-    if request.temperature is not None:
+    if include_sampling_field(request, capabilities, "temperature"):
         payload["temperature"] = request.temperature
     if request.maximum_output_tokens is not None:
         payload["max_output_tokens"] = request.maximum_output_tokens
@@ -161,7 +168,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a native Responses payload."""
-        return openai_responses_request(self._model.model_id, request)
+        return openai_responses_request(self._model.model_id, request, self._capabilities)
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one completed Responses payload into the shared response contract."""

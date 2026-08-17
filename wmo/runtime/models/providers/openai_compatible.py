@@ -13,6 +13,7 @@ from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     Embedding,
+    ModelCapabilities,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -28,6 +29,7 @@ from wmo.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
+from wmo.runtime.models.providers.sampling import include_sampling_field
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_REFERER = "https://github.com/experientiallabs/world-model-optimizer"
@@ -38,12 +40,17 @@ class OpenAICompatibleResponseError(ProviderResponseError):
     """An OpenAI-compatible endpoint returned a response outside the typed contract."""
 
 
-def openai_compatible_request(model_id: str, request: ModelRequest) -> JsonObject:
+def openai_compatible_request(
+    model_id: str,
+    request: ModelRequest,
+    capabilities: ModelCapabilities | None = None,
+) -> JsonObject:
     """Convert a WMO request into one non-streaming Chat Completions payload.
 
     Args:
         model_id: Provider model identifier to place on the wire.
         request: Typed WMO request.
+        capabilities: Catalog sampling support for this model, when known.
 
     Returns:
         A JSON object for ``/chat/completions``.
@@ -77,7 +84,7 @@ def openai_compatible_request(model_id: str, request: ModelRequest) -> JsonObjec
             if not isinstance(request.tool_choice, str)
             else request.tool_choice
         )
-    if request.temperature is not None:
+    if include_sampling_field(request, capabilities, "temperature"):
         payload["temperature"] = request.temperature
     if request.maximum_output_tokens is not None:
         payload["max_tokens"] = request.maximum_output_tokens
@@ -195,7 +202,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a Chat Completions payload."""
-        return openai_compatible_request(self._model.model_id, request)
+        return openai_compatible_request(self._model.model_id, request, self._capabilities)
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one Chat Completions payload into the shared response contract."""

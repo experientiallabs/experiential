@@ -47,6 +47,21 @@ def test_documented_chat_model_carries_verified_capabilities_and_prices() -> Non
     assert known.output_cost_per_million_tokens_usd == 15.0
     assert known.cached_input_cost_per_million_tokens_usd == 0.25
     assert known.cache_write_cost_per_million_tokens_usd == 3.125
+    assert known.sampling.temperature is False
+
+
+def test_gpt_56_family_declares_temperature_unsupported_from_the_model_contract() -> None:
+    """The official gpt-5.6 Responses contract rejects temperature as a sampling field."""
+    luna = known_model_metadata("openai", "gpt-5.6-luna")
+    sol = known_model_metadata("openai", "gpt-5.6-sol")
+    supported = known_model_metadata("openai", "gpt-5.4")
+
+    assert luna is not None
+    assert sol is not None
+    assert supported is not None
+    assert luna.sampling.temperature is False
+    assert sol.sampling.temperature is False
+    assert supported.sampling.temperature is True
 
 
 def test_documented_embedding_model_serves_embeddings_only() -> None:

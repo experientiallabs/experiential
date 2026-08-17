@@ -10,6 +10,7 @@ from pydantic import JsonValue
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
+    ModelCapabilities,
     ModelFinishReason,
     ModelMessage,
     ModelRequest,
@@ -26,17 +27,23 @@ from wmo.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
+from wmo.runtime.models.providers.sampling import include_sampling_field
 
 _COMPLETED_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "tool_use"})
 _LENGTH_STOP_REASONS = frozenset({"max_tokens"})
 
 
-def converse_request(model_id: str, request: ModelRequest) -> JsonObject:
+def converse_request(
+    model_id: str,
+    request: ModelRequest,
+    capabilities: ModelCapabilities | None = None,
+) -> JsonObject:
     """Translate one WMO request into a Bedrock Converse payload.
 
     Args:
         model_id: Exact foundation-model or inference-profile ID sent on the wire.
         request: Typed WMO request.
+        capabilities: Catalog sampling support for this model, when known.
 
     Returns:
         Keyword arguments accepted by ``bedrock-runtime`` Converse.
@@ -83,7 +90,7 @@ def converse_request(model_id: str, request: ModelRequest) -> JsonObject:
         "modelId": model_id,
         "messages": messages,
     }
-    inference = _inference_config(request)
+    inference = _inference_config(request, capabilities)
     if inference:
         payload["inferenceConfig"] = inference
     if system:
@@ -179,12 +186,23 @@ def _message_blocks(message: ModelMessage) -> list[JsonObject]:
     return blocks
 
 
-def _inference_config(request: ModelRequest) -> JsonObject:
-    """Return Converse inference controls without inventing omitted sampling fields."""
+def _inference_config(
+    request: ModelRequest,
+    capabilities: ModelCapabilities | None,
+) -> JsonObject:
+    """Return Converse inference controls without inventing omitted sampling fields.
+
+    Args:
+        request: Typed WMO request.
+        capabilities: Catalog sampling support for this model, when known.
+
+    Returns:
+        Converse ``inferenceConfig`` fields that the catalog allows on the wire.
+    """
     inference: JsonObject = {}
     if request.maximum_output_tokens is not None:
         inference["maxTokens"] = request.maximum_output_tokens
-    if request.temperature is not None:
+    if include_sampling_field(request, capabilities, "temperature"):
         inference["temperature"] = request.temperature
     return inference
 

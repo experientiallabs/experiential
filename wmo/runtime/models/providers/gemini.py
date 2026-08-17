@@ -11,6 +11,7 @@ from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     Embedding,
+    ModelCapabilities,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -30,16 +31,22 @@ from wmo.runtime.models.providers.errors import (
     require_object,
 )
 from wmo.runtime.models.providers.openai_compatible import normalize_embedding_vector
+from wmo.runtime.models.providers.sampling import include_sampling_field
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 
-def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
+def gemini_generate_request(
+    model_id: str,
+    request: ModelRequest,
+    capabilities: ModelCapabilities | None = None,
+) -> JsonObject:
     """Convert a WMO request into Gemini's native generateContent payload.
 
     Args:
         model_id: Gemini model identifier selected by the catalog.
         request: Typed visible messages, tools, and sampling parameters.
+        capabilities: Catalog sampling support for this model, when known.
 
     Returns:
         A non-streaming native payload for the generateContent endpoint.
@@ -76,7 +83,7 @@ def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
     if request.tool_choice is not None:
         payload["toolConfig"] = {"functionCallingConfig": _gemini_tool_choice(request.tool_choice)}
     generation: JsonObject = {}
-    if request.temperature is not None:
+    if include_sampling_field(request, capabilities, "temperature"):
         generation["temperature"] = request.temperature
     if request.maximum_output_tokens is not None:
         generation["maxOutputTokens"] = request.maximum_output_tokens
@@ -151,7 +158,7 @@ class GeminiClient(ProviderHttpClient):
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a native generateContent payload."""
-        return gemini_generate_request(self._model.model_id, request)
+        return gemini_generate_request(self._model.model_id, request, self._capabilities)
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one completed generateContent payload into the shared response contract."""

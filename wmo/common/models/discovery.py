@@ -17,7 +17,7 @@ from pydantic import Field
 
 from wmo.common.core.artifacts import ContractModel
 from wmo.common.models.known_models import KnownModel, canonical_model_id, known_model_metadata
-from wmo.common.models.model import ModelCapabilities
+from wmo.common.models.model import ModelCapabilities, SamplingSupport
 
 _ALIAS_SEPARATOR_PATTERN = re.compile(r"[^a-z0-9]+")
 _MAXIMUM_ALIAS_LENGTH = 128
@@ -181,6 +181,7 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
             discovered.supports_completions,
             known.supports_completions if known else None,
         ),
+        sampling=known.sampling if known else SamplingSupport(),
         context_window_tokens=discovered.context_window_tokens
         or (known.context_window_tokens if known else None),
         maximum_output_tokens=discovered.maximum_output_tokens

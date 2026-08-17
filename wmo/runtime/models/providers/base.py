@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from typing import ClassVar
 
 from wmo.common.core.artifacts import JsonObject
-from wmo.common.models import ModelRequest, ModelResponse, ModelSnapshot
+from wmo.common.models import ModelCapabilities, ModelRequest, ModelResponse, ModelSnapshot
 from wmo.runtime.models.providers.request import post_json
 from wmo.runtime.models.providers.retry import RetryPolicy
 from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
@@ -32,6 +32,7 @@ class ProviderHttpClient(abc.ABC):
         transport: JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         """Create a client with a single explicit endpoint and credential.
 
@@ -42,6 +43,7 @@ class ProviderHttpClient(abc.ABC):
             transport: Optional deterministic transport used by tests.
             retry_policy: Bounded same-endpoint retry policy.
             timeout_seconds: Timeout for every transport attempt.
+            capabilities: Catalog sampling support for this model, when known.
         """
         if not api_key:
             raise ValueError(f"{type(self).__name__} requires a non-empty API key")
@@ -53,6 +55,7 @@ class ProviderHttpClient(abc.ABC):
         self._transport = transport or HttpxJsonTransport()
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
+        self._capabilities = capabilities
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one non-streaming request through the provider's completion route.

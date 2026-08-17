@@ -7,6 +7,7 @@ from typing import Literal
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
+    ModelCapabilities,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -26,17 +27,23 @@ from wmo.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
+from wmo.runtime.models.providers.sampling import include_sampling_field
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
 
 
-def anthropic_messages_request(model_id: str, request: ModelRequest) -> JsonObject:
+def anthropic_messages_request(
+    model_id: str,
+    request: ModelRequest,
+    capabilities: ModelCapabilities | None = None,
+) -> JsonObject:
     """Convert one WMO request into native Anthropic Messages JSON.
 
     Args:
         model_id: Anthropic model identifier.
         request: Typed WMO request.
+        capabilities: Catalog sampling support for this model, when known.
 
     Returns:
         Native Messages payload preserving tool-use and tool-result blocks.
@@ -72,7 +79,7 @@ def anthropic_messages_request(model_id: str, request: ModelRequest) -> JsonObje
         ]
     if request.tool_choice is not None:
         payload["tool_choice"] = _anthropic_tool_choice(request.tool_choice)
-    if request.temperature is not None:
+    if include_sampling_field(request, capabilities, "temperature"):
         payload["temperature"] = request.temperature
     return payload
 
@@ -144,7 +151,7 @@ class AnthropicClient(ProviderHttpClient):
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a native Messages payload."""
-        return anthropic_messages_request(self._model.model_id, request)
+        return anthropic_messages_request(self._model.model_id, request, self._capabilities)
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one completed Messages payload into the shared response contract."""

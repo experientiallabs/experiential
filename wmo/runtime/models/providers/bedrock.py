@@ -11,7 +11,13 @@ from typing import Protocol, cast
 from pydantic import JsonValue
 
 from wmo.common.core.artifacts import JsonObject
-from wmo.common.models import Embedding, ModelRequest, ModelResponse, ModelSnapshot
+from wmo.common.models import (
+    Embedding,
+    ModelCapabilities,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+)
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY
 from wmo.runtime.models.providers.bedrock_converse import converse_request, converse_response
 from wmo.runtime.models.providers.errors import ProviderResponseError
@@ -156,6 +162,7 @@ class BedrockClient:
         environment: Mapping[str, str],
         runtime_factory: BedrockRuntimeFactory | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         """Create a lazy Bedrock client that does not import boto or open a session.
 
@@ -165,12 +172,14 @@ class BedrockClient:
             environment: Process or injected environment mapping used for region lookup.
             runtime_factory: Optional deterministic factory used by tests.
             retry_policy: Bounded same-region retry policy applied outside botocore.
+            capabilities: Catalog sampling support for this model, when known.
         """
         self._model = model
         self._configured_region = region
         self._environment = environment
         self._runtime_factory = runtime_factory
         self._retry_policy = retry_policy
+        self._capabilities = capabilities
         self._client: BedrockRuntime | None = None
         self._lock = threading.Lock()
 
@@ -184,7 +193,7 @@ class BedrockClient:
             The typed non-streaming model response with observed request economics.
         """
         started_at = time.monotonic()
-        payload = converse_request(self._model.model_id, request)
+        payload = converse_request(self._model.model_id, request, self._capabilities)
         response = self._call_with_retry(lambda: self._runtime().converse(payload))
         return converse_response(
             response,

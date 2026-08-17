@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 from wmo.common.models import (
     Embedding,
+    ModelCapabilities,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
@@ -130,6 +131,7 @@ class AzureClient:
         transport: JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         """Create a client bound to one endpoint, key, API version, and deployment.
 
@@ -141,6 +143,7 @@ class AzureClient:
             transport: Optional deterministic transport used by tests.
             retry_policy: Bounded same-endpoint retry policy.
             timeout_seconds: Timeout for every transport attempt.
+            capabilities: Catalog sampling support for this model, when known.
 
         Raises:
             ValueError: The key, endpoint, API version, or timeout is missing or invalid.
@@ -160,6 +163,7 @@ class AzureClient:
         self._transport = transport or HttpxJsonTransport()
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
+        self._capabilities = capabilities
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one non-streaming request through Azure Chat Completions.
@@ -180,7 +184,7 @@ class AzureClient:
                 route="chat/completions",
             ),
             headers=self._headers(),
-            payload=openai_compatible_request(self._model.model_id, request),
+            payload=openai_compatible_request(self._model.model_id, request, self._capabilities),
             timeout_seconds=self._timeout_seconds,
             retry_policy=self._retry_policy,
         )

@@ -4,19 +4,21 @@ from __future__ import annotations
 
 import json
 import time
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypedDict, runtime_checkable
 
 from pydantic import TypeAdapter
 
 from wmo.common.core.artifacts import ContractModel, JsonObject
 from wmo.common.models import (
     AssistantAction,
+    ModelCapabilities,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
     ToolCall,
     Usage,
 )
+from wmo.runtime.models.providers.sampling import include_sampling_field
 
 if TYPE_CHECKING:
     import tinker
@@ -77,6 +79,7 @@ class TinkerSdkSampler:
         model: ModelSnapshot,
         api_key: str,
         base_url: str | None,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         """Bind one catalog identity and credential to a future sampling session.
 
@@ -84,12 +87,14 @@ class TinkerSdkSampler:
             model: Resolved Tinker handle or base-model identity from the local catalog.
             api_key: Credential read from the configured environment variable.
             base_url: Optional explicit Tinker endpoint for the local connection.
+            capabilities: Catalog sampling support for this model, when known.
         """
         if not api_key:
             raise ValueError("Tinker sampling requires a non-empty API key")
         self._model = model
         self._api_key = api_key
         self._base_url = base_url
+        self._capabilities = capabilities
         self._sdk_sampler: tinker.SamplingClient | None = None
         self._renderer: CookbookRenderer | None = None
 
@@ -119,8 +124,7 @@ class TinkerSdkSampler:
             prompt=prompt,
             num_samples=1,
             sampling_params=tinker.SamplingParams(
-                max_tokens=request.maximum_output_tokens,
-                temperature=request.temperature if request.temperature is not None else 1.0,
+                **tinker_sampling_params(request, self._capabilities),
                 stop=renderer.get_stop_sequences(),
             ),
         ).result()
@@ -211,11 +215,47 @@ class TinkerSamplingClient:
         )
 
 
+class TinkerSamplingWire(TypedDict, total=False):
+    """SDK sampling fields derived from the typed request and catalog support."""
+
+    max_tokens: int | None
+    temperature: float
+
+
+def tinker_sampling_params(
+    request: ModelRequest,
+    capabilities: ModelCapabilities | None,
+) -> TinkerSamplingWire:
+    """Return Tinker sampling kwargs that honor catalog-declared field support.
+
+    Args:
+        request: Typed WMO request.
+        capabilities: Catalog sampling support for this model, when known.
+
+    Returns:
+        Fields to pass into ``tinker.SamplingParams``. Temperature is omitted when the
+        catalog declares it unsupported. When the request omits temperature and the
+        catalog has not forbidden it, Tinker still receives its historical default of
+        ``1.0``.
+    """
+    params: TinkerSamplingWire = {"max_tokens": request.maximum_output_tokens}
+    if include_sampling_field(request, capabilities, "temperature"):
+        temperature = request.temperature
+        if temperature is not None:
+            params["temperature"] = temperature
+    elif request.temperature is None and (
+        capabilities is None or capabilities.sampling.temperature is not False
+    ):
+        params["temperature"] = 1.0
+    return params
+
+
 def create_tinker_sampler(
     *,
     model: ModelSnapshot,
     api_key: str,
     base_url: str | None,
+    capabilities: ModelCapabilities | None = None,
 ) -> TinkerSampler:
     """Construct WMO's default lazy sampler for one cataloged Tinker record.
 
@@ -223,6 +263,7 @@ def create_tinker_sampler(
         model: Resolved handle or base-model identity from the local catalog.
         api_key: Credential already read from the record's configured environment variable.
         base_url: Optional Tinker API base URL.
+        capabilities: Catalog sampling support for this model, when known.
 
     Returns:
         A sampling-only adapter that opens its session on the first completion.
@@ -231,7 +272,12 @@ def create_tinker_sampler(
         TinkerOptionalDependencyError: The optional SDK or cookbook is not installed.
     """
     _require_tinker_dependencies()
-    return TinkerSdkSampler(model=model, api_key=api_key, base_url=base_url)
+    return TinkerSdkSampler(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        capabilities=capabilities,
+    )
 
 
 def _require_tinker_dependencies() -> None:

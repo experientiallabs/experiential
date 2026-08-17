@@ -13,7 +13,9 @@ zero means the provider documents no separate charge for that cache operation.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from wmo.common.models.model import SamplingSupport
 
 _SNAPSHOT_SUFFIX_PATTERN = re.compile(r"(?:[-@]\d{8}|-latest)$")
 _GEMINI_PREFIX = "models/"
@@ -27,6 +29,7 @@ class KnownModel:
     supports_embeddings: bool = False
     supports_tools: bool = False
     supports_structured_output: bool = False
+    sampling: SamplingSupport = field(default_factory=SamplingSupport)
     context_window_tokens: int | None = None
     maximum_output_tokens: int | None = None
     input_cost_per_million_tokens_usd: float | None = None
@@ -43,6 +46,7 @@ def _chat(
     cache_write_usd: float | None = None,
     context_window_tokens: int | None = None,
     maximum_output_tokens: int | None = None,
+    sampling: SamplingSupport | None = None,
 ) -> KnownModel:
     """Describe one documented chat model that supports tools and structured output.
 
@@ -53,6 +57,8 @@ def _chat(
         cache_write_usd: Documented cache-write price, when the provider publishes one.
         context_window_tokens: Documented context window, when the provider publishes one.
         maximum_output_tokens: Documented output ceiling, when the provider publishes one.
+        sampling: Declared sampling-field support. Chat models default to accepting
+            temperature unless the provider contract says otherwise.
 
     Returns:
         The verified metadata record for the model.
@@ -61,6 +67,7 @@ def _chat(
         supports_completions=True,
         supports_tools=True,
         supports_structured_output=True,
+        sampling=sampling if sampling is not None else SamplingSupport(temperature=True),
         context_window_tokens=context_window_tokens,
         maximum_output_tokens=maximum_output_tokens,
         input_cost_per_million_tokens_usd=input_usd,
@@ -88,6 +95,8 @@ def _embedding(*, input_usd: float, context_window_tokens: int | None = None) ->
     )
 
 
+_GPT_56_SAMPLING = SamplingSupport(temperature=False)
+
 _OPENAI_MODELS: dict[str, KnownModel] = {
     "gpt-5.6-sol": _chat(
         input_usd=5.0,
@@ -96,6 +105,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=30.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
+        sampling=_GPT_56_SAMPLING,
     ),
     "gpt-5.6-terra": _chat(
         input_usd=2.5,
@@ -104,6 +114,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=15.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
+        sampling=_GPT_56_SAMPLING,
     ),
     "gpt-5.6-luna": _chat(
         input_usd=1.0,
@@ -112,6 +123,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=6.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
+        sampling=_GPT_56_SAMPLING,
     ),
     "gpt-5.5": _chat(input_usd=5.0, cached_input_usd=0.5, output_usd=30.0),
     "gpt-5.5-pro": _chat(input_usd=30.0, output_usd=180.0),

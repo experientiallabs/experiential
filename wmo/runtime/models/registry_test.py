@@ -288,7 +288,9 @@ def test_tinker_resolution_uses_runtime_owned_default_construction(
         model: ModelSnapshot,
         api_key: str,
         base_url: str | None,
+        capabilities: ModelCapabilities | None = None,
     ) -> TinkerSampler:
+        del capabilities
         constructed.append((model.model_id, api_key))
         assert base_url is None
         return _FakeTinkerSampler()
@@ -321,8 +323,9 @@ def test_tinker_resolution_reports_a_missing_optional_dependency(
         model: ModelSnapshot,
         api_key: str,
         base_url: str | None,
+        capabilities: ModelCapabilities | None = None,
     ) -> TinkerSampler:
-        del model, api_key, base_url
+        del model, api_key, base_url, capabilities
         raise TinkerOptionalDependencyError("install with uv sync --extra sft")
 
     monkeypatch.setattr("wmo.runtime.models.registry.create_tinker_sampler", missing_tinker)
