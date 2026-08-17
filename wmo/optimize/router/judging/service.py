@@ -27,6 +27,7 @@ from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_
 from wmo.common.models import (
     ModelCatalog,
     ModelSnapshot,
+    PricingSource,
 )
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from wmo.common.tasks import TaskCase, load_task_set
@@ -61,6 +62,7 @@ from wmo.optimize.router.judging.contracts import (
     judge_feedback_schema,
 )
 from wmo.optimize.router.judging.labels import calibration_sample_digest, save_label_draft
+from wmo.optimize.router.judging.pricing import resolve_manual_judge_prices
 from wmo.optimize.router.judging.protocol import TemplateJudgeClient, positional_bias_count
 from wmo.optimize.router.judging.selection import (
     pairwise_references,
@@ -415,18 +417,20 @@ def manual_judge_calibration_is_complete(store: ProjectStore) -> bool:
 def estimate_manual_judge_budget(
     plan: ManualJudgeCalibrationPlan,
     *,
-    input_usd_per_million_tokens: float,
-    output_usd_per_million_tokens: float,
+    catalog: ModelCatalog | None = None,
+    input_usd_per_million_tokens: float | None = None,
+    output_usd_per_million_tokens: float | None = None,
     maximum_input_tokens_per_call: int,
     maximum_cost_usd: float,
     retry_policy: RetryPolicy | None = None,
 ) -> JudgeCalibrationBudget:
-    """Reserve worst-case scalar judging spend before credentials or provider calls.
+    """Reserve worst-case judging spend before credentials or provider calls.
 
     Args:
         plan: Frozen real-trace calibration plan.
-        input_usd_per_million_tokens: Explicit judge input-token price.
-        output_usd_per_million_tokens: Explicit judge output-token price.
+        catalog: Local catalog used when advanced overrides are omitted.
+        input_usd_per_million_tokens: Optional advanced input-price override.
+        output_usd_per_million_tokens: Optional advanced output-price override.
         maximum_input_tokens_per_call: Conservative request-token ceiling.
         maximum_cost_usd: Operator's total calibration spend ceiling.
         retry_policy: Runtime retry bound used by provider clients.
@@ -435,18 +439,33 @@ def estimate_manual_judge_budget(
         Finite conservative admission budget for one call per labeled rollout.
 
     Raises:
+        ManualJudgeError: Catalog, identity, or pricing provenance cannot admit the run.
         ValueError: Prices, bounds, or total ceiling cannot admit the complete run.
     """
+    if catalog is None:
+        if input_usd_per_million_tokens is None or output_usd_per_million_tokens is None:
+            raise ManualJudgeError(
+                "judge calibration requires the project model catalog to resolve prices"
+            )
+        input_price = input_usd_per_million_tokens
+        output_price = output_usd_per_million_tokens
+        source = PricingSource.CONFIGURED
+    else:
+        input_price, output_price, source = resolve_manual_judge_prices(
+            catalog,
+            judge_alias=plan.setup.judge_alias,
+            expected_model=plan.setup.judge_model,
+            input_usd_per_million_tokens=input_usd_per_million_tokens,
+            output_usd_per_million_tokens=output_usd_per_million_tokens,
+        )
     resolved_retry = retry_policy or RetryPolicy()
     calls_per_trace = 2 if plan.setup.prompt_template.response_shape == "pairwise" else 1
     call_count = len(plan.traces) * calls_per_trace
-    per_attempt = (
-        maximum_input_tokens_per_call * input_usd_per_million_tokens
-        + 4_096 * output_usd_per_million_tokens
-    ) / 1_000_000
+    per_attempt = (maximum_input_tokens_per_call * input_price + 4_096 * output_price) / 1_000_000
     return JudgeCalibrationBudget(
-        input_usd_per_million_tokens=input_usd_per_million_tokens,
-        output_usd_per_million_tokens=output_usd_per_million_tokens,
+        input_usd_per_million_tokens=input_price,
+        output_usd_per_million_tokens=output_price,
+        pricing_source=source,
         maximum_input_tokens_per_call=maximum_input_tokens_per_call,
         maximum_attempts_per_call=resolved_retry.maximum_attempts,
         call_count=call_count,

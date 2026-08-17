@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Sequence
 from typing import Literal
 
@@ -12,29 +11,27 @@ from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     Embedding,
-    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
-    NumericMeasurement,
-    OperationEconomics,
     ToolCall,
     ToolChoice,
     Usage,
 )
-from wmo.runtime.models.providers.errors import ProviderResponseError
-from wmo.runtime.models.providers.openai_compatible import (
-    DEFAULT_RETRY_POLICY,
-    DEFAULT_TIMEOUT_SECONDS,
-    normalize_embedding_vector,
+from wmo.runtime.models.providers.base import (
+    DEFAULT_MAXIMUM_OUTPUT_TOKENS,
+    ProviderHttpClient,
 )
-from wmo.runtime.models.providers.request import post_json
-from wmo.runtime.models.providers.retry import RetryPolicy
-from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
+from wmo.runtime.models.providers.errors import (
+    ProviderResponseError,
+    require_array,
+    require_integer,
+    require_object,
+)
+from wmo.runtime.models.providers.openai_compatible import normalize_embedding_vector
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_MAXIMUM_OUTPUT_TOKENS = 4096
 
 
 def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
@@ -108,15 +105,16 @@ def gemini_generate_response(
     Raises:
         ProviderResponseError: The response omits a usable candidate or has malformed content.
     """
-    candidates = _array(payload.get("candidates"), "candidates")
+    candidates = require_array(payload.get("candidates"), "Gemini candidates")
     if not candidates:
         raise ProviderResponseError("Gemini response has no candidates")
-    candidate = _object(candidates[0], "candidates[0]")
-    content = _object(candidate.get("content"), "candidates[0].content")
+    candidate = require_object(candidates[0], "Gemini candidates[0]")
+    content = require_object(candidate.get("content"), "Gemini candidates[0].content")
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
-    for index, part_value in enumerate(_array(content.get("parts"), "candidates[0].content.parts")):
-        part = _object(part_value, f"candidates[0].content.parts[{index}]")
+    parts = require_array(content.get("parts"), "Gemini candidates[0].content.parts")
+    for index, part_value in enumerate(parts):
+        part = require_object(part_value, f"Gemini candidates[0].content.parts[{index}]")
         text = part.get("text")
         function_call = part.get("functionCall")
         if isinstance(text, str):
@@ -130,74 +128,35 @@ def gemini_generate_response(
         output = AssistantAction(content=output_text, tool_calls=tuple(tool_calls))
     except ValueError as exc:
         raise ProviderResponseError("Gemini response has no text or tool call") from exc
-    model_version = payload.get("modelVersion")
-    model = (
-        configured_model.model_copy(update={"model_id": model_version})
-        if isinstance(model_version, str) and model_version
-        else configured_model
-    )
-    return ModelResponse(
+    return ModelResponse.completed(
         output=output,
-        model=model,
-        economics=OperationEconomics(
-            usage=_gemini_usage(payload),
-            latency_seconds=NumericMeasurement(value=latency_seconds, provenance="observed"),
-        ),
-        finish_reason=(
-            ModelFinishReason.LENGTH
-            if candidate.get("finishReason") == "MAX_TOKENS"
-            else ModelFinishReason.COMPLETED
-        ),
+        configured_model=configured_model,
+        served_model_id=payload.get("modelVersion"),
+        usage=_gemini_usage(payload),
+        latency_seconds=latency_seconds,
+        hit_length_limit=candidate.get("finishReason") == "MAX_TOKENS",
     )
 
 
-class GeminiClient:
+class GeminiClient(ProviderHttpClient):
     """Calls one explicit Gemini model through its native REST protocol."""
 
-    def __init__(
-        self,
-        *,
-        model: ModelSnapshot,
-        api_key: str,
-        transport: JsonHttpTransport | None = None,
-        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
-        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-        base_url: str = GEMINI_BASE_URL,
-    ) -> None:
-        """Create a Gemini client with an API key sent only to Gemini's endpoint."""
-        if not api_key:
-            raise ValueError("Gemini clients require a non-empty API key")
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
-        self._model = model
-        self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
-        self._transport = transport or HttpxJsonTransport()
-        self._retry_policy = retry_policy
-        self._timeout_seconds = timeout_seconds
+    def _headers(self) -> dict[str, str]:
+        """Build native Gemini headers using the goog API key scheme."""
+        return {"x-goog-api-key": self._api_key, "content-type": "application/json"}
 
-    def complete(self, request: ModelRequest) -> ModelResponse:
-        """Complete one native Gemini generateContent request.
+    def _completion_path(self) -> str:
+        """Return the model-scoped native generateContent route."""
+        return f"models/{_path_model_id(self._model.model_id)}:generateContent"
 
-        Args:
-            request: Visible messages, tool schemas, and sampling controls to send.
+    def _build_request(self, request: ModelRequest) -> JsonObject:
+        """Convert one typed request into a native generateContent payload."""
+        return gemini_generate_request(self._model.model_id, request)
 
-        Returns:
-            The typed non-streaming model response with observed request economics.
-        """
-        started_at = time.monotonic()
-        response = post_json(
-            self._transport,
-            f"{self._base_url}/models/{_path_model_id(self._model.model_id)}:generateContent",
-            headers=self._headers(),
-            payload=gemini_generate_request(self._model.model_id, request),
-            timeout_seconds=self._timeout_seconds,
-            retry_policy=self._retry_policy,
-        )
+    def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
+        """Convert one completed generateContent payload into the shared response contract."""
         return gemini_generate_response(
-            response,
-            configured_model=self._model,
-            latency_seconds=time.monotonic() - started_at,
+            payload, configured_model=self._model, latency_seconds=latency_seconds
         )
 
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
@@ -215,19 +174,15 @@ class GeminiClient:
         if not texts:
             return ()
         model_name = f"models/{_path_model_id(self._model.model_id)}"
-        response = post_json(
-            self._transport,
-            f"{self._base_url}/models/{_path_model_id(self._model.model_id)}:batchEmbedContents",
-            headers=self._headers(),
-            payload={
+        response = self._post(
+            f"models/{_path_model_id(self._model.model_id)}:batchEmbedContents",
+            {
                 "requests": [
                     {"model": model_name, "content": {"parts": [{"text": text}]}} for text in texts
                 ]
             },
-            timeout_seconds=self._timeout_seconds,
-            retry_policy=self._retry_policy,
         )
-        values = _array(response.get("embeddings"), "embeddings")
+        values = require_array(response.get("embeddings"), "Gemini embeddings")
         if len(values) != len(texts):
             raise ProviderResponseError(
                 f"Gemini embedding count {len(values)} does not match request count {len(texts)}"
@@ -235,14 +190,14 @@ class GeminiClient:
         return tuple(
             Embedding(
                 values=normalize_embedding_vector(
-                    _array(_object(value, f"embeddings[{index}]").get("values"), "values")
+                    require_array(
+                        require_object(value, f"Gemini embeddings[{index}]").get("values"),
+                        "Gemini values",
+                    )
                 )
             )
             for index, value in enumerate(values)
         )
-
-    def _headers(self) -> dict[str, str]:
-        return {"x-goog-api-key": self._api_key, "content-type": "application/json"}
 
 
 def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonObject:
@@ -299,7 +254,7 @@ def _gemini_tool_choice(
 
 def _gemini_tool_call(value: JsonValue, index: int) -> ToolCall:
     """Map one native Gemini function call with a deterministic local call ID fallback."""
-    call = _object(value, f"functionCall[{index}]")
+    call = require_object(value, f"Gemini functionCall[{index}]")
     name = call.get("name")
     arguments = call.get("args", {})
     if not isinstance(name, str) or not name:
@@ -319,12 +274,14 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
     raw = payload.get("usageMetadata")
     if raw is None:
         return None
-    usage = _object(raw, "usageMetadata")
+    usage = require_object(raw, "Gemini usageMetadata")
     return Usage(
-        input_tokens=_integer(usage.get("promptTokenCount"), "promptTokenCount"),
-        output_tokens=_integer(usage.get("candidatesTokenCount"), "candidatesTokenCount"),
-        cached_input_tokens=_integer(
-            usage.get("cachedContentTokenCount"), "cachedContentTokenCount"
+        input_tokens=require_integer(usage.get("promptTokenCount"), "Gemini promptTokenCount"),
+        output_tokens=require_integer(
+            usage.get("candidatesTokenCount"), "Gemini candidatesTokenCount"
+        ),
+        cached_input_tokens=require_integer(
+            usage.get("cachedContentTokenCount"), "Gemini cachedContentTokenCount"
         ),
     )
 
@@ -332,26 +289,3 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
 def _path_model_id(model_id: str) -> str:
     """Remove the optional wire prefix before placing a model in a Gemini path."""
     return model_id.removeprefix("models/")
-
-
-def _array(value: JsonValue | None, label: str) -> list[JsonValue]:
-    """Return a native array or raise a focused conversion error."""
-    if not isinstance(value, list):
-        raise ProviderResponseError(f"Gemini {label} must be an array")
-    return value
-
-
-def _object(value: JsonValue | None, label: str) -> JsonObject:
-    """Return a native object or raise a focused conversion error."""
-    if not isinstance(value, dict):
-        raise ProviderResponseError(f"Gemini {label} must be an object")
-    return value
-
-
-def _integer(value: JsonValue | None, label: str) -> int:
-    """Read an optional non-negative native usage integer."""
-    if value is None:
-        return 0
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ProviderResponseError(f"Gemini {label} must be a non-negative integer")
-    return value

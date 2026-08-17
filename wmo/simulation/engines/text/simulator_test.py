@@ -21,6 +21,7 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
+from wmo.common.evaluations.build_test import _snapshot, _store
 from wmo.common.models import (
     AssistantAction,
     CompletionCostReservation,
@@ -40,7 +41,7 @@ from wmo.common.models import (
     Usage,
     completion_cost_reservation,
 )
-from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
+from wmo.common.project import ArtifactStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact, SimulationCellBinding, SimulationMode, StopReason
 from wmo.common.tasks import TaskCase, TaskSet, ToolSchema
 from wmo.runtime.agents import AgentEpisode, AgentRuntime
@@ -243,16 +244,6 @@ class _ToolAttemptAgent:
         raise AssertionError("text-only environment must reject the attempted tool call")
 
 
-def _snapshot(alias: str) -> ModelSnapshot:
-    return ModelSnapshot(
-        provider="test",
-        model_id=alias,
-        revision="fixture",
-        capabilities_sha256="a" * 64,
-        connection_sha256="b" * 64,
-    )
-
-
 def _response(
     content: str,
     *,
@@ -313,10 +304,6 @@ def _cell(cell_id: str, task_id: str) -> EvaluationCell:
         purpose="fit",
         execution="simulate",
     )
-
-
-def _store(tmp_path: Path) -> ArtifactStore:
-    return ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
 
 
 def _persist_plan(store: ArtifactStore, plan: EvaluationPlan) -> ArtifactInput:

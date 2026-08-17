@@ -244,6 +244,24 @@ def _run_checked(
     return result
 
 
+def _tty_answer_bytes(answer: str) -> bytes:
+    """Encode one scripted terminal answer.
+
+    Keyboard sequences that start with an escape, or a lone carriage return, are written
+    exactly so a raw-mode picker can read them. Line-oriented prompts still receive a
+    trailing newline.
+
+    Args:
+        answer: Scripted key sequence or line-oriented prompt answer.
+
+    Returns:
+        Bytes written to the child pseudo-terminal.
+    """
+    if answer.startswith("\x1b") or answer == "\r":
+        return answer.encode()
+    return (answer + "\n").encode()
+
+
 def _run_tty_child(
     command: list[str],
     *,
@@ -308,7 +326,7 @@ def _run_tty_child(
                 prompt, answer = pending[0]
                 search_from = prompt_position + len(prompt)
                 try:
-                    os.write(master, (answer + "\n").encode())
+                    os.write(master, _tty_answer_bytes(answer))
                 except OSError as error:
                     if error.errno != errno.EIO:
                         raise
@@ -459,6 +477,21 @@ def _installed_release_driver() -> None:
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             """Suppress nondeterministic HTTP server logs."""
             del format, args
+
+        def do_GET(self) -> None:
+            """Publish the model IDs this loopback account may call."""
+            state.append(self.path, {})
+            body = json.dumps(
+                {
+                    "object": "list",
+                    "data": [{"id": "core-model"}, {"id": "candidate-b-model"}],
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self) -> None:
             """Serve deterministic embeddings and chat completions on loopback only.
@@ -839,60 +872,36 @@ def _installed_release_driver() -> None:
             completion_marker=completion_marker,
         )
 
-    def model_answers(
-        alias: str,
-        model: str,
-        *,
-        embeddings: bool,
-        add_another: bool,
-    ) -> list[tuple[str, str]]:
-        """Return ordered interactive answers for one explicit model declaration.
-
-        Args:
-            alias: Stable local model alias.
-            model: Provider model identifier.
-            embeddings: Whether the alias supports embeddings.
-            add_another: Whether setup should collect another model afterward.
-
-        Returns:
-            Ordered prompt and answer pairs.
-        """
-        answers = [
-            ("Connection", "loopback"),
-            ("Model alias", alias),
-            ("Provider model ID", model),
-            ("Supports tools?", "y"),
-            ("Supports embeddings?", "y" if embeddings else "n"),
-            ("Supports structured output?", "y"),
-            ("Supports chat completions?", "y"),
-            ("Record context window tokens?", "y"),
-            ("Context window tokens", "128000"),
-            ("Record maximum output tokens?", "y"),
-            ("Maximum output tokens", "16000"),
-            ("Input cost per million tokens in USD", "0"),
-            ("Output cost per million tokens in USD", "0"),
-            ("Cached input cost per million tokens in USD", "0"),
-            ("Cache write cost per million tokens in USD", "0"),
-            ("Add another available model?", "y" if add_another else "n"),
-        ]
-        return answers
-
+    down = "\x1b[B"
+    enter = "\r"
     setup_answers = [
-        ("Add a OpenAI connection?", "n"),
-        ("Add a OpenRouter connection?", "n"),
-        ("Add a Anthropic connection?", "n"),
-        ("Add a Gemini connection?", "n"),
-        ("Add a Azure connection?", "n"),
-        ("Add a Bedrock connection?", "n"),
-        ("Add a OpenAI-compatible connection?", "y"),
-        ("Connection name", "loopback"),
-        ("API key environment variable", "P17_PROVIDER_KEY"),
-        ("Base URL", provider_url),
-        ("Add another OpenAI-compatible connection?", "n"),
-        *model_answers("core", "core-model", embeddings=True, add_another=False),
-        ("World model alias", "core"),
-        ("Use 'core' as the judge?", "y"),
-        ("Embedder alias", "core"),
+        (
+            "Select the providers you want to use",
+            (down * 4) + enter + (down * 3) + enter + down + enter + down + enter,
+        ),
+        ("base URL", provider_url),
+        ("credential environment variable", "P17_PROVIDER_KEY"),
+        ("Continue without this provider", "2"),
+        ("Select the models to configure", "1"),
+        ("cancels.", ""),
+        ("Connection for the declared model", "1"),
+        ("Provider model ID", "core-model"),
+        ("Supports chat completions?", "y"),
+        ("Supports embeddings?", "y"),
+        ("Supports tools?", "y"),
+        ("Supports structured output?", "y"),
+        ("Record context window tokens?", "y"),
+        ("Context window tokens", "128000"),
+        ("Record maximum output tokens?", "y"),
+        ("Maximum output tokens", "16000"),
+        ("Input cost per million tokens in USD", "0"),
+        ("Output cost per million tokens in USD", "0"),
+        ("Cached input cost per million tokens in USD", "0"),
+        ("Cache write cost per million tokens in USD", "0"),
+        ("cancels.", ""),
+        ("World model", "1"),
+        ("Judge model", "1"),
+        ("Embedder model", "1"),
         ("Save this configuration?", "y"),
     ]
     try:
@@ -968,10 +977,6 @@ def _installed_release_driver() -> None:
             calibration_arguments.extend(["--label", f"{preview.trace_id}:task-success=5"])
         calibration_arguments.extend(
             [
-                "--input-usd-per-million",
-                "0",
-                "--output-usd-per-million",
-                "0",
                 "--maximum-cost-usd",
                 "0.000001",
                 "--yes",
@@ -1013,7 +1018,7 @@ def _installed_release_driver() -> None:
             optimize_arguments,
             [
                 ("Candidate alias", "candidate-b"),
-                ("Provider connection", "loopback"),
+                ("Provider connection", "openai-compatible"),
                 ("Provider model ID", "candidate-b-model"),
                 ("Supports tools?", "y"),
                 ("Context window tokens", "128000"),
@@ -1022,8 +1027,8 @@ def _installed_release_driver() -> None:
                 ("Output USD per million tokens", "0"),
                 ("Cached input USD per million tokens", "0"),
                 ("Cache write USD per million tokens", "0"),
-                ("Candidate aliases (comma separated)", "core,candidate-b"),
-                ("Incumbent alias", "core"),
+                ("Candidate aliases (comma separated)", "core-model,candidate-b"),
+                ("Incumbent alias", "core-model"),
                 ("Save these router candidates?", "y"),
             ],
         )
@@ -1186,8 +1191,8 @@ def _installed_release_driver() -> None:
         )
         assert len(completed) == len(prior_completed) + 3
         assert len({event.interaction_id for event in completed}) == len(completed)
-        assert accepted[1].lineage_id == accepted[2].lineage_id
-        assert accepted[1].selected_alias == accepted[2].selected_alias
+        assert accepted[1].identity.lineage_id == accepted[2].identity.lineage_id
+        assert accepted[1].acceptance.selected_alias == accepted[2].acceptance.selected_alias
         current_project = support_store.load_project()
         assert current_project.build is not None
         assert current_project.models is not None
@@ -1258,7 +1263,9 @@ def _installed_release_driver() -> None:
         }
         assert refresh.dataset.dataset.dataset_id != completed_build.trace_dataset.artifact_id
         response_acceptances = tuple(
-            event for event in accepted if event.lineage_id == accepted[1].lineage_id
+            event
+            for event in accepted
+            if event.identity.lineage_id == accepted[1].identity.lineage_id
         )
         assert len(response_acceptances) == 2
         observed_response = response_acceptances[0]
@@ -1554,16 +1561,11 @@ def test_built_archives_match_current_package_contract() -> None:
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
     """W16 customer and comparison workflows resolve without test-only API owners."""
-    import wmo
     from wmo.common.judging import HumanScoreReview, JudgeCalibrationService, RubricReview
     from wmo.runtime.environments import LocalProcessEnvironmentRuntime
     from wmo.simulation import compare_text_and_sandbox
     from wmo.simulation.engines import SandboxSimulator
 
-    assert callable(wmo.compose_router)
-    assert callable(wmo.load_project_router)
-    assert callable(wmo.load_router)
-    assert callable(wmo.create_project_router_app)
     assert callable(HumanScoreReview.open)
     assert callable(JudgeCalibrationService)
     assert callable(RubricReview.open)

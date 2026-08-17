@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -10,26 +9,18 @@ import pytest
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
-    ArtifactInput,
     FailureAttribution,
     FailureCode,
     SourceIdentity,
     StructuredFailure,
-    stable_id,
 )
 from wmo.common.models import (
     AssistantAction,
     ModelFinishReason,
     ModelMessage,
-    ModelRequest,
-    ModelResponse,
-    ModelSnapshot,
-    OperationEconomics,
     ToolCall,
-    Usage,
 )
 from wmo.common.project import ProjectConfig, ProjectStore
-from wmo.common.routing import RouterFeatureExtractor, RoutingDecision
 from wmo.optimize.model.sft import (
     AssistantActionEvent,
     RuntimeInteractionExampleSource,
@@ -42,11 +33,10 @@ from wmo.optimize.model.sft import (
     load_verified_sft_dataset,
     write_sft_dataset,
 )
-from wmo.runtime.router import RuntimeAcceptedEvent, RuntimeInteractionJournal
-from wmo.runtime.router.journal import RuntimeAcceptance, _interaction_identity
+from wmo.runtime.router import RuntimeInteractionJournal
 from wmo.runtime.router.snapshot import seal_runtime_trace_snapshot
+from wmo.simulation.retrieval.refresh_test import _accept, _complete, _request
 
-_DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 14, tzinfo=UTC)
 
 
@@ -62,149 +52,6 @@ def _store(tmp_path: Path) -> ProjectStore:
     store = ProjectStore(tmp_path / ".wmo", "support-agent")
     store.initialize(ProjectConfig(project_id="support-agent"))
     return store
-
-
-def _model() -> ModelSnapshot:
-    """Return the fixed routed model identity used by journal fixtures."""
-    return ModelSnapshot(
-        provider="openai",
-        model_id="gpt-test",
-        capabilities_sha256=_DIGEST,
-        connection_sha256="b" * 64,
-    )
-
-
-def _request(*messages: ModelMessage) -> ModelRequest:
-    """Build one exact routed request from visible messages.
-
-    Args:
-        messages: Complete request history.
-
-    Returns:
-        Canonical routed request.
-    """
-    return ModelRequest(messages=messages)
-
-
-def _decision(lineage_id: str, request: ModelRequest) -> RoutingDecision:
-    """Build deterministic route pins for one request.
-
-    Args:
-        lineage_id: Hashed conversation identity from the journal.
-        request: Exact request being routed.
-
-    Returns:
-        Content-addressed single-candidate routing decision.
-    """
-    feature = RouterFeatureExtractor().from_request(request)
-    material = {
-        "policy_id": "router-policy-a",
-        "policy_sha256": _DIGEST,
-        "request_sha256": hashlib.sha256(
-            feature.encode("utf-8"), usedforsecurity=False
-        ).hexdigest(),
-        "episode_id_sha256": hashlib.sha256(
-            lineage_id.encode("utf-8"), usedforsecurity=False
-        ).hexdigest(),
-        "selected_alias": "candidate-a",
-        "baseline_alias": "candidate-a",
-        "neighbor_count": 2,
-        "paired_count": 2,
-        "best_similarity": 1.0,
-        "estimated_quality_difference": None,
-        "uncertainty": None,
-        "fallback_reason": None,
-    }
-    return RoutingDecision(
-        decision_id=stable_id("routing-decision", material),
-        **material,
-    )
-
-
-def _accept(
-    journal: RuntimeInteractionJournal,
-    *,
-    key: str,
-    conversation: str,
-    request: ModelRequest,
-    now: datetime,
-) -> RuntimeAcceptedEvent:
-    """Accept one routed interaction into the durable journal.
-
-    Args:
-        journal: Project journal receiving the acceptance.
-        key: Stable idempotency key.
-        conversation: Caller conversation identity.
-        request: Exact visible model request.
-        now: Acceptance timestamp.
-
-    Returns:
-        Durable accepted event ready for a terminal result.
-    """
-    identity = _interaction_identity(journal.project_id, key, request, conversation)
-    decision = _decision(identity.lineage_id, request)
-    claim = journal.claim(
-        identity,
-        RuntimeAcceptance(
-            decision=decision,
-            selected_alias=decision.selected_alias,
-            selected_model=_model(),
-            policy_input=ArtifactInput(
-                artifact_id=decision.policy_id,
-                sha256=decision.policy_sha256,
-            ),
-        ),
-        now=now,
-        stale_after=timedelta(minutes=5),
-    )
-    assert claim.accepted is not None
-    return claim.accepted
-
-
-def _complete(
-    journal: RuntimeInteractionJournal,
-    *,
-    key: str,
-    conversation: str,
-    request: ModelRequest,
-    output: AssistantAction,
-    now: datetime,
-    finish_reason: ModelFinishReason = ModelFinishReason.COMPLETED,
-) -> RuntimeAcceptedEvent:
-    """Accept and complete one routed interaction.
-
-    Args:
-        journal: Project journal receiving both events.
-        key: Stable idempotency key.
-        conversation: Caller conversation identity.
-        request: Exact visible model request.
-        output: Complete assistant target, including tool calls.
-        now: Acceptance timestamp.
-        finish_reason: Provider-reported terminal reason preserved in source provenance.
-
-    Returns:
-        Accepted event named by the completion.
-    """
-    accepted = _accept(
-        journal,
-        key=key,
-        conversation=conversation,
-        request=request,
-        now=now,
-    )
-    journal.record_completed(
-        accepted,
-        ModelResponse(
-            output=output,
-            model=_model(),
-            economics=OperationEconomics(
-                usage=Usage(input_tokens=8, output_tokens=3, cached_input_tokens=0)
-            ),
-            finish_reason=finish_reason,
-        ),
-        completed_at=now + timedelta(seconds=1),
-    )
-    return accepted
 
 
 def _snapshot(

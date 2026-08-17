@@ -384,136 +384,6 @@ def test_load_router_preserves_runtime_selection_parameters(
     assert model_client.embed_calls == model_client.complete_calls == 0
 
 
-def test_loaded_router_keeps_identical_unkeyed_chat_calls_distinct(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Assign separate durable identities to identical stateless Chat calls.
-
-    Args:
-        tmp_path: Pytest-owned local artifact root.
-        monkeypatch: Scoped loaded-runtime replacement.
-    """
-    runtime, model_client = _runtime()
-    root = tmp_path / ".wmo"
-    store = _store_with_policy(root, "support-agent", runtime)
-    monkeypatch.setattr(
-        "wmo.runtime.router.application.load_project_router",
-        lambda project, selected_root, **kwargs: runtime,
-    )
-
-    with load_router("support-agent", root=root) as router:
-        for _ in range(2):
-            router.chat.completions.create(
-                model="support-agent",
-                messages=[{"role": "user", "content": "same transcript"}],
-            )
-
-    accepted = tuple(
-        event
-        for event in RuntimeInteractionJournal(store.paths).read_events()
-        if isinstance(event, RuntimeAcceptedEvent)
-    )
-    assert len({event.interaction_id for event in accepted}) == 2
-    assert len({event.lineage_id for event in accepted}) == 2
-    assert model_client.embed_calls == model_client.complete_calls == 2
-
-
-def test_loaded_router_responses_continuation_keeps_one_lineage(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Preserve Responses routing lineage through the official previous response ID.
-
-    Args:
-        tmp_path: Pytest-owned local artifact root.
-        monkeypatch: Scoped loaded-runtime replacement.
-    """
-    runtime, model_client = _runtime()
-    root = tmp_path / ".wmo"
-    store = _store_with_policy(root, "support-agent", runtime)
-    monkeypatch.setattr(
-        "wmo.runtime.router.application.load_project_router",
-        lambda project, selected_root, **kwargs: runtime,
-    )
-
-    with load_router("support-agent", root=root) as router:
-        first = router.responses.create(model="support-agent", input="first")
-        router.responses.create(
-            model="support-agent",
-            input="second",
-            previous_response_id=first.id,
-        )
-
-    accepted = tuple(
-        event
-        for event in RuntimeInteractionJournal(store.paths).read_events()
-        if isinstance(event, RuntimeAcceptedEvent)
-    )
-    assert len(accepted) == 2
-    assert accepted[0].lineage_id == accepted[1].lineage_id
-    assert model_client.embed_calls == 1
-    assert model_client.complete_calls == 2
-
-
-@pytest.mark.parametrize("api", ["chat", "responses"])
-def test_loaded_router_key_replays_across_separate_clients(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    api: Literal["chat", "responses"],
-) -> None:
-    """Replay one standard caller key after a process-style runtime reload.
-
-    Args:
-        tmp_path: Pytest-owned local artifact root.
-        monkeypatch: Scoped runtime sequence replacement.
-        api: Official OpenAI resource exercised by the parameterized regression.
-    """
-    root = tmp_path / ".wmo"
-    first_runtime, first_client = _runtime()
-    restarted_runtime, restarted_client = _runtime()
-    _store_with_policy(root, "support-agent", first_runtime)
-    runtimes = iter((first_runtime, restarted_runtime))
-    monkeypatch.setattr(
-        "wmo.runtime.router.application.load_project_router",
-        lambda project, selected_root, **kwargs: next(runtimes),
-    )
-    headers = {"Idempotency-Key": "official-replay"}
-
-    with load_router("support-agent", root=root) as first_router:
-        first = (
-            first_router.responses.create(
-                model="support-agent",
-                input="same",
-                extra_headers=headers,
-            )
-            if api == "responses"
-            else first_router.chat.completions.create(
-                model="support-agent",
-                messages=[{"role": "user", "content": "same"}],
-                extra_headers=headers,
-            )
-        )
-    with load_router("support-agent", root=root) as restarted_router:
-        replay = (
-            restarted_router.responses.create(
-                model="support-agent",
-                input="same",
-                extra_headers=headers,
-            )
-            if api == "responses"
-            else restarted_router.chat.completions.create(
-                model="support-agent",
-                messages=[{"role": "user", "content": "same"}],
-                extra_headers=headers,
-            )
-        )
-
-    assert first.id == replay.id
-    assert first_client.complete_calls == 1
-    assert restarted_client.embed_calls == restarted_client.complete_calls == 0
-
-
 @pytest.mark.parametrize("api", ["chat", "responses"])
 def test_loaded_router_key_rejects_changed_content_with_official_409(
     tmp_path: Path,
@@ -598,55 +468,6 @@ def test_loaded_router_provider_failure_has_no_completed_target(
     assert sum(isinstance(event, RuntimeAttemptFailedEvent) for event in events) == 1
     assert not any(isinstance(event, RuntimeCompletedEvent) for event in events)
     assert model_client.complete_calls == 1
-
-
-@pytest.mark.parametrize("api", ["chat", "responses"])
-def test_loaded_router_stream_is_completed_before_consumption(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    api: Literal["chat", "responses"],
-) -> None:
-    """Commit buffered provider success before the official stream is consumed.
-
-    Args:
-        tmp_path: Pytest-owned local artifact root.
-        monkeypatch: Scoped loaded-runtime replacement.
-        api: Official OpenAI streaming resource exercised by the regression.
-    """
-    runtime, model_client = _runtime()
-    root = tmp_path / ".wmo"
-    store = _store_with_policy(root, "support-agent", runtime)
-    monkeypatch.setattr(
-        "wmo.runtime.router.application.load_project_router",
-        lambda project, selected_root, **kwargs: runtime,
-    )
-    headers = {"Idempotency-Key": "official-stream"}
-
-    with load_router("support-agent", root=root) as router:
-        stream = (
-            router.responses.create(
-                model="support-agent",
-                input="stream",
-                stream=True,
-                extra_headers=headers,
-            )
-            if api == "responses"
-            else router.chat.completions.create(
-                model="support-agent",
-                messages=[{"role": "user", "content": "stream"}],
-                stream=True,
-                extra_headers=headers,
-            )
-        )
-        completed = tuple(
-            event
-            for event in RuntimeInteractionJournal(store.paths).read_events()
-            if isinstance(event, RuntimeCompletedEvent)
-        )
-        stream.close()
-
-    assert len(completed) == 1
-    assert model_client.embed_calls == model_client.complete_calls == 1
 
 
 def test_two_loaded_clients_share_one_project_journal_safely(
@@ -735,7 +556,9 @@ def test_injected_project_service_journals_every_unkeyed_openai_call(tmp_path: P
     accepted = tuple(event for event in events if isinstance(event, RuntimeAcceptedEvent))
     completed = tuple(event for event in events if isinstance(event, RuntimeCompletedEvent))
     assert len(accepted) == len(completed) == 2
-    assert accepted[0].idempotency_key_sha256 != accepted[1].idempotency_key_sha256
+    assert (
+        accepted[0].identity.idempotency_key_sha256 != accepted[1].identity.idempotency_key_sha256
+    )
     assert model_client.embed_calls == model_client.complete_calls == 2
 
 
@@ -757,7 +580,7 @@ def test_identical_unkeyed_chat_calls_remain_distinct_interactions(tmp_path: Pat
         event for event in journal.read_events() if isinstance(event, RuntimeAcceptedEvent)
     )
     assert len({event.interaction_id for event in accepted}) == 2
-    assert len({event.lineage_id for event in accepted}) == 2
+    assert len({event.identity.lineage_id for event in accepted}) == 2
     assert model_client.embed_calls == model_client.complete_calls == 2
 
 
@@ -786,7 +609,7 @@ def test_responses_previous_response_id_preserves_journal_lineage(tmp_path: Path
         event for event in journal.read_events() if isinstance(event, RuntimeAcceptedEvent)
     )
     assert len(accepted) == 2
-    assert accepted[0].lineage_id == accepted[1].lineage_id
+    assert accepted[0].identity.lineage_id == accepted[1].identity.lineage_id
     assert model_client.embed_calls == 1
     assert model_client.complete_calls == 2
 

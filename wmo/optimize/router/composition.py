@@ -80,6 +80,7 @@ from wmo.optimize.router.fit.workflow import (
 from wmo.optimize.router.judgment_budget import (
     JudgmentBudgetError,
     find_verified_judgment,
+    find_verified_judgments,
     persist_dispatch_reservation,
     read_dispatch_reservation,
 )
@@ -144,17 +145,6 @@ class RouterEvaluationSetup(ContractModel):
     seed: int
     maximum_steps: int = Field(gt=0)
     maximum_concurrency: int = Field(gt=0)
-
-
-class TraceSource(Protocol):
-    """Loads one explicit local source into canonical normalized traces."""
-
-    def load(self) -> TraceNormalizationResult:
-        """Return canonical normalized traces after one explicit source read.
-
-        Returns:
-            Canonical normalized traces and any rejected-source issues.
-        """
 
 
 class ReviewSupplier(Protocol):
@@ -268,7 +258,7 @@ class RouterCompositionResult:
 
 def compose_router(
     project: ProjectStore,
-    trace_source: TraceSource | TraceNormalizationResult,
+    trace_source: TraceNormalizationResult,
     *,
     services: RouterWorkflowServices,
     budget: RouterCompositionBudget,
@@ -280,7 +270,7 @@ def compose_router(
 
     Args:
         project: Initialized local project store.
-        trace_source: Explicit normalized input or a loader that performs the source read.
+        trace_source: Canonical normalized traces used to build task evidence.
         services: Review, simulation, judging, and runtime dependencies. None are auto-resolved.
         budget: Finite simulation spend and judgment-call ceilings.
         created_at: Timezone-aware artifact completion time.
@@ -296,12 +286,9 @@ def compose_router(
     started = time.monotonic()
     _preflight(project, services, budget, code_revision)
     completed_build = completed_project_build(project)
-    normalized = (
-        trace_source if isinstance(trace_source, TraceNormalizationResult) else trace_source.load()
-    )
     built = reconstruct_completed_project_build(
         project,
-        normalized,
+        trace_source,
         created_at=created_at,
     )
     _phase(phase_hook, "review")
@@ -798,8 +785,8 @@ def _complete_cell_evidence(
         (item.task_id, item.candidate_alias, item.repeat): item.rollout_artifact_id
         for item in setup.observed_cells
     }
-    evidence = []
-    consumed = 0
+    bound_cells = []
+    protocols_by_rollout: dict[str, EvaluationProtocol] = {}
     for cell in cells:
         rollout_id = (
             cell.observed_rollout_id
@@ -818,14 +805,25 @@ def _complete_cell_evidence(
         protocol = (
             setup.production_protocol if cell.execution == "observed" else setup.simulation_protocol
         )
+        existing_protocol = protocols_by_rollout.setdefault(rollout_id, protocol)
+        if existing_protocol != protocol:
+            raise RouterCompositionError("one rollout is bound to conflicting evaluation protocols")
+        bound_cells.append((cell, rollout_id, protocol))
+    try:
+        judgments_by_rollout = find_verified_judgments(
+            project,
+            protocols_by_rollout=protocols_by_rollout,
+            rubric_id=review.rubric_id,
+            calibration_id=review.calibration_id,
+        )
+    except JudgmentBudgetError as exc:
+        raise RouterCompositionError(str(exc)) from exc
+
+    evidence = []
+    consumed = 0
+    for cell, rollout_id, protocol in bound_cells:
         try:
-            judgment = find_verified_judgment(
-                project,
-                rollout_id,
-                review.rubric_id,
-                review.calibration_id,
-                protocol,
-            )
+            judgment = judgments_by_rollout.get(rollout_id)
             receipt = read_dispatch_reservation(
                 project,
                 plan_input,
@@ -835,6 +833,16 @@ def _complete_cell_evidence(
                 review.calibration_id,
                 protocol,
             )
+            if judgment is None and receipt is not None:
+                judgment = find_verified_judgment(
+                    project,
+                    rollout_id,
+                    review.rubric_id,
+                    review.calibration_id,
+                    protocol,
+                )
+                if judgment is not None:
+                    judgments_by_rollout[rollout_id] = judgment
         except JudgmentBudgetError as exc:
             raise RouterCompositionError(str(exc)) from exc
         if judgment is not None or receipt is not None:
@@ -868,6 +876,7 @@ def _complete_cell_evidence(
                 calibration_artifact_id=review.calibration_id,
             )
             _persist_judgment(project, judgment)
+            judgments_by_rollout[rollout_id] = judgment
         rollout, _input = read_rollout(project.artifacts, rollout_id)
         evidence.append(
             EvaluationCellEvidence(

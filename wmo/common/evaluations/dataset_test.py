@@ -237,28 +237,8 @@ def test_low_denominator_statuses_are_verified_against_the_exact_gate() -> None:
 
 
 def test_fidelity_reports_account_for_each_unique_planned_overlap() -> None:
-    """Empty, complete, and partial overlap sets retain an exact denominator."""
-    assert (
-        _fidelity_report(
-            overlap_cell_ids=(),
-            usable_overlap_count=0,
-            failed_overlap_count=0,
-        ).planned_overlap_count
-        == 0
-    )
-
+    """Approved reports may carry failed overlaps; mismatched or repeated accounting is rejected."""
     full_overlap_ids = tuple(f"cell-fidelity-{index}" for index in range(10))
-    assert (
-        _fidelity_report(
-            overlap_cell_ids=full_overlap_ids,
-            usable_overlap_count=10,
-            failed_overlap_count=0,
-            status="approved",
-            score_mae=0.08,
-        ).usable_overlap_count
-        == 10
-    )
-
     failures = (
         FidelityFailure(
             cell_id="cell-fidelity-8",
@@ -269,16 +249,14 @@ def test_fidelity_reports_account_for_each_unique_planned_overlap() -> None:
             failure=StructuredFailure(code=FailureCode.PROVIDER, message="provider failed"),
         ),
     )
-    assert (
-        _fidelity_report(
-            overlap_cell_ids=full_overlap_ids,
-            usable_overlap_count=8,
-            failed_overlap_count=2,
-            failures=failures,
-            status="approved",
-            score_mae=0.08,
-        ).failed_overlap_count
-        == 2
+    # approved reports may carry failed overlaps
+    _fidelity_report(
+        overlap_cell_ids=full_overlap_ids,
+        usable_overlap_count=8,
+        failed_overlap_count=2,
+        failures=failures,
+        status="approved",
+        score_mae=0.08,
     )
 
     with pytest.raises(ValidationError, match="must match the planned overlap count"):

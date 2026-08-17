@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import field_validator, model_validator
+from pydantic import AwareDatetime, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -47,15 +46,7 @@ class LatestSFTModelOptimization(ContractModel):
     dataset: ArtifactInput
     runtime_snapshot: ArtifactInput
     model_alias_prefix: ArtifactId
-    updated_at: datetime
-
-    @field_validator("updated_at")
-    @classmethod
-    def _require_timezone(cls, value: datetime) -> datetime:
-        """Require an explicit timezone for the coordination update."""
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("latest model-optimization update time must include a timezone")
-        return value
+    updated_at: AwareDatetime
 
     @model_validator(mode="after")
     def _require_distinct_artifacts(self) -> LatestSFTModelOptimization:

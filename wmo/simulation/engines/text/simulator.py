@@ -32,6 +32,7 @@ from wmo.common.rollouts import (
 )
 from wmo.runtime.agents import AgentRuntime
 from wmo.runtime.models import ResolvedModel
+from wmo.simulation.engines.clock import timestamp, utc_now
 from wmo.simulation.engines.text.artifact_set import persist_artifact_set
 from wmo.simulation.engines.text.bindings import (
     SimulationResolution,
@@ -77,8 +78,6 @@ from wmo.simulation.engines.text.rollout_support import (
     known_total_spend,
     normalize_text_tool_failure,
     orchestration_economics,
-    timestamp,
-    utc_now,
 )
 from wmo.simulation.orchestration import require_implemented_mode
 from wmo.simulation.retrieval import TraceRAGRetriever
@@ -944,7 +943,8 @@ class WorldModelSimulator:
 
     def _load_optional_rollout(self, rollout_id: ArtifactId) -> RolloutArtifact | None:
         """Load an existing rollout while distinguishing absence from immutable corruption."""
-        if rollout_id not in self._store.list_ids():
+        destination = self._store.project_directory / "artifacts" / rollout_id
+        if not destination.exists():
             return None
         return self._load_rollout(rollout_id)
 

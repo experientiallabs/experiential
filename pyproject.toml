@@ -32,6 +32,7 @@ sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
 postgres = ["psycopg[binary]>=3.1"]
 dev = [
     "pytest>=8.0",
+    "pytest-xdist>=3.8",
     "ruff>=0.5",
     "ty>=0.0.1a1",
     "world-model-optimizer[sft]",

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Literal
@@ -13,6 +12,9 @@ from wmo.common.core.artifacts import (
     FailureCode,
     StructuredFailure,
     canonical_json_bytes,
+    canonical_jsonl_bytes,
+    envelope_matches_manifest,
+    sha256_bytes,
     stable_id,
 )
 from wmo.common.evaluations.dataset import (
@@ -141,7 +143,7 @@ def build_evaluation_dataset(
         )
         for cell in selected_cells
     )
-    rows_payload = _jsonl_bytes(rows)
+    rows_payload = canonical_jsonl_bytes(rows)
     used_task_ids = {row.task_id for row in rows}
     fit_task_ids = tuple(
         task.task_id
@@ -162,7 +164,7 @@ def build_evaluation_dataset(
             "version": "evaluation-dataset-v1",
             "inputs": [item.model_dump(mode="json") for item in inputs],
             "plan": plan_input.model_dump(mode="json"),
-            "rows_sha256": hashlib.sha256(rows_payload).hexdigest(),
+            "rows_sha256": sha256_bytes(rows_payload),
             "protocols": [item.model_dump(mode="json") for item in ordered_protocols],
             "fidelity_reports": [
                 reports[report_id].model_dump(mode="json") for report_id in report_ids
@@ -184,7 +186,7 @@ def build_evaluation_dataset(
         protocols=ordered_protocols,
         fidelity_report_ids=report_ids,
         rows_path="rows.jsonl",
-        rows_sha256=hashlib.sha256(rows_payload).hexdigest(),
+        rows_sha256=sha256_bytes(rows_payload),
     )
     dataset = EvaluationDataset(manifest=manifest, rows=rows)
     destination = store.project_directory / "artifacts" / evaluation_id
@@ -227,24 +229,12 @@ def load_evaluation_dataset(store: ArtifactStore, evaluation_id: ArtifactId) -> 
         manifest = EvaluationDatasetManifest.model_validate_json(
             store.read_bytes(evaluation_id, "evaluation.json")
         )
-        if (
-            manifest.schema_version,
-            manifest.created_at,
-            manifest.inputs,
-            manifest.code_revision,
-            manifest.source,
-        ) != (
-            stored.manifest.schema_version,
-            stored.manifest.created_at,
-            stored.manifest.inputs,
-            stored.manifest.code_revision,
-            stored.manifest.source,
-        ):
+        if not envelope_matches_manifest(manifest, stored.manifest):
             raise EvaluationEvidenceError(
                 "evaluation data envelope differs from its artifact manifest"
             )
         rows_payload = store.read_bytes(evaluation_id, manifest.rows_path)
-        if hashlib.sha256(rows_payload).hexdigest() != manifest.rows_sha256:
+        if sha256_bytes(rows_payload) != manifest.rows_sha256:
             raise EvaluationEvidenceError("evaluation rows digest does not match its manifest")
         rows = tuple(
             EvaluationRow.model_validate_json(line)
@@ -619,9 +609,3 @@ def _not_run_row(cell: EvaluationCell, evidence: EvaluationCellEvidence) -> Eval
 def _internal_rollout_failure(message: str) -> StructuredFailure:
     """Create a structured validation failure for an invalid failed rollout."""
     return StructuredFailure(code=FailureCode.INTERNAL, message=message)
-
-
-def _jsonl_bytes(rows: Sequence[EvaluationRow]) -> bytes:
-    """Serialize ordered evaluation rows as deterministic newline-terminated JSONL."""
-    payload = b"\n".join(canonical_json_bytes(row) for row in rows)
-    return payload + b"\n" if payload else b""

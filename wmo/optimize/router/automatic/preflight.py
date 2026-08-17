@@ -74,6 +74,23 @@ class ObservedRouterTrace:
 
 
 @dataclass(frozen=True)
+class AutomaticRouterOptions:
+    """Tasteful bounded controls for one automatic router optimization."""
+
+    maximum_provider_cost_usd: float = 25.0
+    maximum_judgments: int = 100
+    preferred_fidelity_overlaps: int = 10
+    maximum_model_calls: int = 8
+    maximum_router_feature_tokens: int = 8_192
+    maximum_retrieval_query_tokens: int = 32_768
+    router_embedding_maximum_attempts: int = 3
+    completion_maximum_attempts: int = 3
+    simulation_maximum_output_tokens: int = 16_000
+    maximum_concurrency: int = 1
+    seed: int = 0
+
+
+@dataclass(frozen=True)
 class AutomaticRouterPreflight:
     """Verified read-only inputs ready for post-consent artifact and provider work."""
 
@@ -124,15 +141,7 @@ def preflight_automatic_router(
     selection: RouterCandidateSelection,
     *,
     catalog_override: ModelCatalog | None = None,
-    maximum_model_calls: int,
-    preferred_fidelity_overlaps: int,
-    maximum_router_feature_tokens: int,
-    maximum_retrieval_query_tokens: int,
-    router_embedding_maximum_attempts: int,
-    completion_maximum_attempts: int,
-    simulation_maximum_output_tokens: int,
-    maximum_judgments: int,
-    maximum_simulation_cost_usd: float,
+    options: AutomaticRouterOptions,
 ) -> AutomaticRouterPreflight:
     """Verify every local prerequisite and report all failures before credentials or writes.
 
@@ -140,15 +149,7 @@ def preflight_automatic_router(
         project: Existing project whose completed build will be optimized.
         selection: Explicit candidates and incumbent collected for this optimize run.
         catalog_override: Confirmed prospective catalog before its atomic post-consent write.
-        maximum_model_calls: Bounded built-in agent request ceiling.
-        preferred_fidelity_overlaps: Positive maximum real-overlap target for fidelity evidence.
-        maximum_router_feature_tokens: Conservative input-token ceiling per router feature.
-        maximum_retrieval_query_tokens: Conservative input-token ceiling per RAG query.
-        router_embedding_maximum_attempts: Retry ceiling reserved per feature embedding.
-        completion_maximum_attempts: Active provider request-attempt ceiling.
-        simulation_maximum_output_tokens: Candidate and world-model output ceiling per turn.
-        maximum_judgments: Maximum number of post-rollout judge calls.
-        maximum_simulation_cost_usd: One shared ceiling for embeddings and simulation providers.
+        options: Bounded provider, evidence, retry, and concurrency controls.
 
     Returns:
         Fully verified local inputs and conservative router-feature reservation.
@@ -156,19 +157,11 @@ def preflight_automatic_router(
     Raises:
         AutomaticRouterPreflightError: One or more prerequisites are missing or inconsistent.
     """
-    scalar_errors = _validate_positive_options(
-        maximum_model_calls=maximum_model_calls,
-        preferred_fidelity_overlaps=preferred_fidelity_overlaps,
-        maximum_router_feature_tokens=maximum_router_feature_tokens,
-        maximum_retrieval_query_tokens=maximum_retrieval_query_tokens,
-        router_embedding_maximum_attempts=router_embedding_maximum_attempts,
-        completion_maximum_attempts=completion_maximum_attempts,
-        simulation_maximum_output_tokens=simulation_maximum_output_tokens,
-        maximum_judgments=maximum_judgments,
-    )
-    problems = list(scalar_errors)
-    if maximum_simulation_cost_usd <= 0 or not math.isfinite(maximum_simulation_cost_usd):
-        problems.append("maximum_simulation_cost_usd must be positive and finite")
+    problems = list(_validate_positive_options(options))
+    if options.maximum_provider_cost_usd <= 0 or not math.isfinite(
+        options.maximum_provider_cost_usd
+    ):
+        problems.append("maximum_provider_cost_usd must be positive and finite")
     config = _capture(problems, "project", project.load_project)
     catalog = catalog_override or _capture(
         problems, "model catalog", lambda: load_model_catalog(project.model_catalog_path)
@@ -215,7 +208,7 @@ def preflight_automatic_router(
         traces,
         identity_evidence,
         candidates,
-        preferred_fidelity_overlaps,
+        options.preferred_fidelity_overlaps,
     )
     fidelity_overlap_count = len(observed)
     if not observed:
@@ -226,7 +219,7 @@ def preflight_automatic_router(
     try:
         agent_identity = agent_factory_sha256(
             config.agent,
-            maximum_model_calls=maximum_model_calls,
+            maximum_model_calls=options.maximum_model_calls,
         )
     except ValueError as exc:
         problems.append(f"agent runtime: {exc}")
@@ -237,16 +230,16 @@ def preflight_automatic_router(
         embedder_alias,
         embedder,
         tasks,
-        maximum_router_feature_tokens,
-        router_embedding_maximum_attempts,
+        options.maximum_router_feature_tokens,
+        options.router_embedding_maximum_attempts,
     )
     query_reservation = retrieval_embedding_reservation(
         problems,
         catalog,
         embedder_alias,
         embedder,
-        maximum_retrieval_query_tokens,
-        router_embedding_maximum_attempts,
+        options.maximum_retrieval_query_tokens,
+        options.router_embedding_maximum_attempts,
     )
     candidate_requests, world_request = simulation_completion_reservations(
         problems,
@@ -254,8 +247,8 @@ def preflight_automatic_router(
         candidates=candidates,
         world_alias=world_alias,
         world=world,
-        maximum_attempts=completion_maximum_attempts,
-        maximum_output_tokens=simulation_maximum_output_tokens,
+        maximum_attempts=options.completion_maximum_attempts,
+        maximum_output_tokens=options.simulation_maximum_output_tokens,
     )
     judge_request = judge_completion_reservation(
         problems,
@@ -264,7 +257,7 @@ def preflight_automatic_router(
         judge=judge,
         audit=audit,
     )
-    judge_provider_call_count = maximum_judgments * (
+    judge_provider_call_count = options.maximum_judgments * (
         2 if setup is not None and setup.prompt_template.response_shape == "pairwise" else 1
     )
     judge_reservation_cost_usd = (
@@ -274,7 +267,7 @@ def preflight_automatic_router(
     )
     remaining_cost_usd = remaining_simulation_budget(
         problems,
-        maximum_provider_cost_usd=maximum_simulation_cost_usd,
+        maximum_provider_cost_usd=options.maximum_provider_cost_usd,
         router_reservation=reservation,
         judge_reservation_cost_usd=judge_reservation_cost_usd,
     )
@@ -326,7 +319,7 @@ def preflight_automatic_router(
         trace_identity_evidence=identity_evidence,
         observed_traces=observed,
         fidelity_overlap_count=fidelity_overlap_count,
-        preferred_fidelity_overlaps=preferred_fidelity_overlaps,
+        preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
         router_embedding_reservation=reservation,
         retrieval_embedding_reservation=query_reservation,
         candidate_completion_reservations=candidate_requests,
@@ -346,16 +339,31 @@ def preflight_automatic_router(
     )
 
 
-def _validate_positive_options(**values: int) -> tuple[str, ...]:
+_BOUNDED_OPTION_FIELDS = (
+    "maximum_model_calls",
+    "preferred_fidelity_overlaps",
+    "maximum_router_feature_tokens",
+    "maximum_retrieval_query_tokens",
+    "router_embedding_maximum_attempts",
+    "completion_maximum_attempts",
+    "simulation_maximum_output_tokens",
+    "maximum_judgments",
+    "maximum_concurrency",
+)
+
+
+def _validate_positive_options(options: AutomaticRouterOptions) -> tuple[str, ...]:
     """List nonpositive bounded controls before reading project state.
 
     Args:
-        **values: Named bounded workflow controls.
+        options: Bounded workflow controls to validate.
 
     Returns:
         Actionable option problems.
     """
-    return tuple(f"{name} must be positive" for name, value in values.items() if value <= 0)
+    return tuple(
+        f"{name} must be positive" for name in _BOUNDED_OPTION_FIELDS if getattr(options, name) <= 0
+    )
 
 
 def _capture[T](problems: list[str], label: str, operation: Callable[[], T]) -> T | None:

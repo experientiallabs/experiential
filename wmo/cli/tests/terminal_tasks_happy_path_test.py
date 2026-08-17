@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
@@ -170,7 +171,14 @@ def _write_catalog(root: Path) -> None:
                     model="world-id",
                     capabilities=ModelCapabilities(maximum_output_tokens=16_000),
                 ),
-                "judge": ModelRecord(connection="fixture", model=_JUDGE_MODEL_ID),
+                "judge": ModelRecord(
+                    connection="fixture",
+                    model=_JUDGE_MODEL_ID,
+                    capabilities=ModelCapabilities(
+                        input_cost_per_million_tokens_usd=0,
+                        output_cost_per_million_tokens_usd=0,
+                    ),
+                ),
                 "embed": ModelRecord(
                     connection="fixture",
                     model="embed-id",
@@ -188,7 +196,7 @@ def _write_catalog(root: Path) -> None:
 def _calibrate_arguments(
     root: Path, labels: Sequence[str], sample_size: int = _SAMPLE_SIZE
 ) -> list[str]:
-    """Return one non-interactive calibrate invocation with explicit zero prices."""
+    """Return one non-interactive calibrate invocation that uses catalog prices."""
     return [
         "config",
         "judge",
@@ -198,10 +206,6 @@ def _calibrate_arguments(
         str(root),
         "--sample-size",
         str(sample_size),
-        "--input-usd-per-million",
-        "0",
-        "--output-usd-per-million",
-        "0",
         "--yes",
         "--approve",
         "--non-interactive",
@@ -259,27 +263,103 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
         for argument in ("--label", f"{trace.trace_id}:task-success=4")
     ]
 
+    before_preflight = store.read_review()
+    without_consent = [
+        argument for argument in _calibrate_arguments(root, ()) if argument != "--yes"
+    ]
+    refused = runner.invoke(app, without_consent)
+    assert refused.exit_code == 2
+    assert "Spend preflight: manual judge calibration" in refused.output
+    assert "Judge name: judge" in refused.output
+    assert "Exact model: openai/judge-id" in refused.output
+    assert "Judge calls authorized: 10" in refused.output
+    assert "Maximum estimated cost: $0.0000" in refused.output
+    assert "Hard spend ceiling: $10.0000" in refused.output
+    assert "missing labels" not in refused.output
+    assert store.read_review() == before_preflight
+
     _RuntimeCatalog.judge_fail_after = 0
     interrupted = runner.invoke(app, _calibrate_arguments(root, labels))
     assert interrupted.exit_code != 0
+    assert "ZERO-TO-FIVE CALIBRATION" in interrupted.output
+    assert "User / task:" in interrupted.output
+    assert "Tool call:" in interrupted.output
+    assert "Tool arguments:" in interrupted.output
+    assert "Tool result:" in interrupted.output
+    assert "Tool output:" in interrupted.output
+    assert "Final outcome:" in interrupted.output
+    assert "0: The agent did not address the task." in interrupted.output
+    assert "5: The agent fully and correctly addressed the task." in interrupted.output
     drafted = _drafted_labels(store)
     assert len(drafted) == _SAMPLE_SIZE
     assert {item["score"] for item in drafted} == {4}
 
     _RuntimeCatalog.judge_fail_after = None
     _RuntimeCatalog.judge_clients = []
-    resumed = runner.invoke(app, _calibrate_arguments(root, ()))
-    assert resumed.exit_code == 0, resumed.output
+    resumed = runner.invoke(
+        app,
+        [argument for argument in _calibrate_arguments(root, ()) if argument != "--approve"],
+    )
+    assert resumed.exit_code == 2
     assert "Resuming 10 saved human labels" in resumed.output
-    assert "Approved judge calibration" in resumed.output
+    resumed_text = unstyle(resumed.output)
+    assert "--approve" in resumed_text
     assert sum(client.calls for client in _RuntimeCatalog.judge_clients) == _SAMPLE_SIZE
+    assert _review_completion(store) == (True, False)
 
     _RuntimeCatalog.judge_fail_after = 0
-    replay = runner.invoke(app, _calibrate_arguments(root, ()))
+    _RuntimeCatalog.judge_clients = []
+    unapproved_replay = runner.invoke(
+        app,
+        [
+            argument
+            for argument in _calibrate_arguments(root, ())
+            if argument not in {"--yes", "--approve"}
+        ],
+    )
+    assert unapproved_replay.exit_code == 2
+    assert "already complete" in unapproved_replay.output
+    replay_text = unstyle(unapproved_replay.output)
+    assert "--approve" in replay_text
+    assert "Spend preflight" not in unapproved_replay.output
+    assert "Resuming" not in unapproved_replay.output
+    assert _RuntimeCatalog.judge_clients == []
+    assert _review_completion(store) == (True, False)
+
+    approved = runner.invoke(
+        app,
+        [argument for argument in _calibrate_arguments(root, ()) if argument != "--yes"],
+    )
+    assert approved.exit_code == 0, approved.output
+    assert "Approved judge calibration" in approved.output
+    assert "Spend preflight" not in approved.output
+    assert _RuntimeCatalog.judge_clients == []
+    assert _review_completion(store) == (True, True)
+
+    replay = runner.invoke(
+        app,
+        [
+            *[
+                argument
+                for argument in _calibrate_arguments(root, ())
+                if argument not in {"--yes", "--approve"}
+            ],
+            "--page",
+        ],
+    )
     assert replay.exit_code == 0, replay.output
     assert "Approved judge calibration" in replay.output
+    assert "Spend preflight" not in replay.output
+    assert _RuntimeCatalog.judge_clients == []
 
-    resampled = runner.invoke(app, _calibrate_arguments(root, (), sample_size=_SAMPLE_SIZE - 2))
+    resampled = runner.invoke(
+        app,
+        [
+            argument
+            for argument in _calibrate_arguments(root, (), sample_size=_SAMPLE_SIZE - 2)
+            if argument not in {"--yes", "--approve"}
+        ],
+    )
     assert resampled.exit_code == 0, resampled.output
     assert "already complete" in resampled.output
     assert "Approved judge calibration" in resampled.output
@@ -323,3 +403,21 @@ def _drafted_labels(store: ProjectStore) -> tuple[dict[str, object], ...]:
         assert isinstance(entry, dict)
         labels.append(entry)
     return tuple(labels)
+
+
+def _review_completion(store: ProjectStore) -> tuple[bool, bool]:
+    """Return whether judge audit and explicit approval pointers are present.
+
+    Args:
+        store: Project whose mutable review pointers are inspected.
+
+    Returns:
+        Audit-present and approved-calibration-present flags.
+    """
+    review = store.read_review()
+    assert isinstance(review, dict)
+    manual_judge = review["manual_judge"]
+    assert isinstance(manual_judge, dict)
+    return manual_judge.get("audit") is not None, manual_judge.get(
+        "approved_calibration"
+    ) is not None

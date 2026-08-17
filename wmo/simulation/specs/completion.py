@@ -12,6 +12,7 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
     ContractModel,
+    envelope_matches_manifest,
     stable_id,
 )
 from wmo.common.models import CompletionCostReservation
@@ -202,19 +203,7 @@ def load_simulation_completion_contract(
         )
         if value.completion_contract_id != artifact_id:
             raise ValueError("completion contract identity differs from its artifact")
-        if (
-            value.schema_version,
-            value.created_at,
-            value.inputs,
-            value.code_revision,
-            value.source,
-        ) != (
-            stored.manifest.schema_version,
-            stored.manifest.created_at,
-            stored.manifest.inputs,
-            stored.manifest.code_revision,
-            stored.manifest.source,
-        ):
+        if not envelope_matches_manifest(value, stored.manifest):
             raise ValueError("completion contract differs from its manifest")
         expected_id = stable_id(
             "simulation-completion",

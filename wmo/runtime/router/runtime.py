@@ -9,7 +9,14 @@ from collections.abc import Callable
 
 import numpy as np
 
-from wmo.common.core.artifacts import ArtifactId, ContractModel, Sha256, sha256_json, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactId,
+    ContractModel,
+    Sha256,
+    envelope_matches_manifest,
+    sha256_json,
+    stable_id,
+)
 from wmo.common.models import IdempotentModelClient, ModelAlias, ModelRequest, ModelResponse
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore
 from wmo.common.routing import KnnRouterPolicy, RouterFeatureExtractor, RoutingDecision
@@ -139,19 +146,7 @@ class RouterRuntime:
             policy = KnnRouterPolicy.model_validate_json(store.read_bytes(policy_id, "policy.json"))
             if policy.policy_id != policy_id:
                 raise ValueError("router policy ID differs from its artifact")
-            if (
-                policy.schema_version,
-                policy.created_at,
-                policy.inputs,
-                policy.code_revision,
-                policy.source,
-            ) != (
-                stored.manifest.schema_version,
-                stored.manifest.created_at,
-                stored.manifest.inputs,
-                stored.manifest.code_revision,
-                stored.manifest.source,
-            ):
+            if not envelope_matches_manifest(policy, stored.manifest):
                 raise ValueError("router policy payload differs from its artifact manifest")
             manifest, bank = load_knn_bank(
                 store, policy.bank_artifact_id, expected_sha256=policy.bank_sha256

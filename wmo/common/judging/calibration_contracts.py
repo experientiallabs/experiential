@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -51,16 +50,8 @@ class InsufficientCalibrationRiskAcceptance(ArtifactEnvelope):
     eligible_label_count: int = Field(ge=1)
     eligible_rollout_count: int = Field(ge=1, lt=10)
     recommended_label_count: Literal[10] = 10
-    accepted_at: datetime
+    accepted_at: AwareDatetime
     risk_accepted: Literal[True] = True
-
-    @field_validator("accepted_at")
-    @classmethod
-    def _require_timezone(cls, value: datetime) -> datetime:
-        """Require an auditable timezone-aware human acceptance timestamp."""
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("risk acceptance timestamps must include a timezone")
-        return value
 
     @model_validator(mode="after")
     def _require_report_bound_acceptance(self) -> InsufficientCalibrationRiskAcceptance:

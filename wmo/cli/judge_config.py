@@ -5,19 +5,27 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import typer
+from pydantic import JsonValue
 from rich.console import Console
+from rich.markup import escape
 from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.common.config import resolve_command_budget_usd
 from wmo.common.judging import Rubric, RubricDimension
 from wmo.common.judging.provenance import read_artifact_json
-from wmo.common.models import load_model_catalog
+from wmo.common.models import ModelSnapshot, load_model_catalog
 from wmo.common.project import ProjectStore
 from wmo.common.release_revision import installed_release_revision
+from wmo.common.traces import Trace, TraceSpan
+from wmo.optimize.router.judging.artifacts import read_audit, require_review_state
 from wmo.optimize.router.judging.contracts import (
+    JudgeCalibrationBudget,
     JudgePromptTemplate,
     JudgeTracePreview,
     ManualJudgeCalibrationResult,
@@ -31,6 +39,7 @@ from wmo.optimize.router.judging.labels import (
 )
 from wmo.optimize.router.judging.service import (
     DEFAULT_JUDGE_TEMPLATE,
+    ManualJudgeCalibrationPlan,
     ManualJudgeError,
     ManualJudgeSetupPlan,
     calibrate_manual_judge,
@@ -45,7 +54,6 @@ from wmo.runtime.models.registry import RuntimeModelCatalog
 
 judge_app = typer.Typer(help="Set up and manually calibrate a project judge.", no_args_is_help=True)
 _console = Console()
-_ROOT_OPTION = typer.Option(Path(".wmo"), "--root", help="Local .wmo project root.")
 _RUBRIC_FILE_OPTION = typer.Option(
     None, "--rubric-file", help="JSON array of complete zero-to-five rubric dimensions."
 )
@@ -70,7 +78,7 @@ _LABEL_OPTION = typer.Option(
 )
 def judge_setup(
     project: str = typer.Argument(..., metavar="PROJECT", help="Configured local project ID."),
-    root: Path = _ROOT_OPTION,
+    root: Path = ROOT_OPTION,
     judge_alias: str | None = typer.Option(
         None, "--judge-alias", help="Configured completion alias; defaults to roles.judge."
     ),
@@ -97,7 +105,7 @@ def judge_setup(
     Raises:
         typer.BadParameter: Local files, build evidence, or confirmation are invalid.
     """
-    try:
+    with usage_error(OSError, ValueError, ManualJudgeError):
         revision = installed_release_revision()
         store = ProjectStore(root, project)
         dimensions = _load_rubric_dimensions(rubric_file)
@@ -122,8 +130,6 @@ def judge_setup(
             _console.print("Judge setup was not saved.")
             return
         setup = commit_manual_judge_setup(store, plan, confirmed=True)
-    except (OSError, ValueError, ManualJudgeError) as exc:
-        raise typer.BadParameter(str(exc)) from None
     _console.print(f"Saved judge setup {setup.setup_id} for {project}.")
 
 
@@ -133,13 +139,30 @@ def judge_setup(
 )
 def judge_calibrate(
     project: str = typer.Argument(..., metavar="PROJECT", help="Configured local project ID."),
-    root: Path = _ROOT_OPTION,
+    root: Path = ROOT_OPTION,
     sample_size: int = typer.Option(10, "--sample-size", min=1),
     label: list[str] | None = _LABEL_OPTION,
-    input_price: float = typer.Option(..., "--input-usd-per-million", min=0),
-    output_price: float = typer.Option(..., "--output-usd-per-million", min=0),
+    input_price: float | None = typer.Option(
+        None,
+        "--input-usd-per-million",
+        min=0,
+        rich_help_panel="Advanced",
+        help="Advanced override for judge input price when catalog pricing is unavailable.",
+    ),
+    output_price: float | None = typer.Option(
+        None,
+        "--output-usd-per-million",
+        min=0,
+        rich_help_panel="Advanced",
+        help="Advanced override for judge output price when catalog pricing is unavailable.",
+    ),
     maximum_input_tokens: int = typer.Option(32_768, "--maximum-input-tokens", min=1),
-    maximum_cost_usd: float = typer.Option(10.0, "--maximum-cost-usd", min=0.000001),
+    maximum_cost_usd: float | None = typer.Option(
+        None,
+        "--maximum-cost-usd",
+        min=0.000001,
+        help="Calibration spend ceiling. Defaults to the shared command-budget setting, then $10.",
+    ),
     yes: bool = typer.Option(False, "--yes", help="Consent to the displayed judge spend."),
     approve: bool = typer.Option(
         False, "--approve", help="Approve the report after it is displayed."
@@ -150,6 +173,17 @@ def judge_calibrate(
         help="Accept valid grouped evidence from fewer than ten rollouts.",
     ),
     non_interactive: bool = typer.Option(False, "--non-interactive"),
+    transcript_character_limit: int = typer.Option(
+        1_200,
+        "--transcript-character-limit",
+        min=200,
+        help="Maximum characters shown for each transcript field before a truthful marker.",
+    ),
+    page: bool = typer.Option(
+        False,
+        "--page",
+        help="Page full transcripts in an interactive terminal instead of truncating them.",
+    ),
 ) -> None:
     """Collect frozen labels, run consented judge calls, and separately approve evidence.
 
@@ -158,35 +192,49 @@ def judge_calibrate(
         root: Local project root containing ``models.toml``.
         sample_size: Maximum number of distinct fit lineages to calibrate.
         label: Repeatable explicit human score inputs.
-        input_price: Explicit judge input price per million tokens.
-        output_price: Explicit judge output price per million tokens.
+        input_price: Optional advanced input-price override.
+        output_price: Optional advanced output-price override.
         maximum_input_tokens: Conservative input bound for every call attempt.
-        maximum_cost_usd: Total calibration spend ceiling.
+        maximum_cost_usd: Optional spend ceiling; otherwise the shared command-budget setting.
         yes: Explicit spend consent only.
         approve: Separate approval of the displayed completed report.
         accept_insufficient_labels: Explicit risk acceptance below ten labeled rollouts.
         non_interactive: Refuse prompts and list missing explicit inputs.
+        transcript_character_limit: Maximum displayed characters per transcript field.
+        page: Page untruncated transcripts through the interactive terminal.
 
     Raises:
         typer.BadParameter: Evidence, labels, budget, consent, or approval is invalid.
     """
-    try:
+    with usage_error(OSError, ValueError, ManualJudgeError):
         revision = installed_release_revision()
         store = ProjectStore(root, project)
         now = datetime.now(UTC)
         plan = prepare_manual_judge_calibration(store, sample_size=sample_size)
         rubric = _load_setup_rubric(store, plan.setup)
-        _render_calibration_previews(plan.previews)
         sample_sha256 = calibration_sample_digest(plan.setup, calibration_sample(plan))
         drafted = read_label_draft(store, plan.setup, sample_sha256)
         completed = manual_judge_calibration_is_complete(store)
         if completed:
+            state = require_review_state(store)
+            assert state.audit is not None
+            budget = read_audit(store, state.audit).budget
             _console.print(
                 "Judge calibration is already complete; replaying its immutable evidence "
                 "without collecting labels."
             )
-        elif drafted:
-            _console.print(f"Resuming {len(drafted)} saved human labels for this trace sample.")
+        else:
+            catalog = load_model_catalog(store.model_catalog_path)
+            budget = estimate_manual_judge_budget(
+                plan,
+                catalog=catalog,
+                input_usd_per_million_tokens=input_price,
+                output_usd_per_million_tokens=output_price,
+                maximum_input_tokens_per_call=maximum_input_tokens,
+                maximum_cost_usd=resolve_command_budget_usd(root, maximum_cost_usd),
+            )
+        if page and not completed and not can_prompt(_console):
+            raise ValueError("--page requires an interactive terminal; omit it for wrapped output")
 
         def persist(collected: tuple[ManualJudgeLabel, ...]) -> None:
             """Save human labels to durable review state before any judge provider work.
@@ -196,10 +244,33 @@ def judge_calibrate(
             """
             save_label_draft(store, plan.setup, sample_sha256, collected, now)
 
-        labels = (
-            drafted
-            if completed
-            else _collect_labels(
+    if not completed:
+        _render_spend_preflight(plan, budget)
+        spend = (
+            f"at most ${_format_usd(budget.estimated_cost_usd)} across "
+            f"{budget.call_count} judge calls "
+            f"with up to {budget.maximum_attempts_per_call} attempts each, inside the "
+            f"${_format_usd(budget.maximum_cost_usd)} ceiling"
+        )
+        if not require_spend_consent(
+            _console,
+            yes=yes,
+            spend=spend,
+            command="wmo config judge calibrate",
+            question="Run this named judge calibration within the displayed ceiling?",
+        ):
+            _console.print("Judge calibration was not started. No labels or provider calls ran.")
+            return
+        if drafted:
+            _console.print(f"Resuming {len(drafted)} saved human labels for this trace sample.")
+        _render_calibration_review(
+            plan,
+            rubric,
+            character_limit=None if page else transcript_character_limit,
+            page=page,
+        )
+        with usage_error(OSError, ValueError, ManualJudgeError):
+            labels = _collect_labels(
                 plan.setup,
                 rubric,
                 tuple(label or ()),
@@ -208,29 +279,9 @@ def judge_calibrate(
                 persist,
                 non_interactive=non_interactive,
             )
-        )
-        budget = estimate_manual_judge_budget(
-            plan,
-            input_usd_per_million_tokens=input_price,
-            output_usd_per_million_tokens=output_price,
-            maximum_input_tokens_per_call=maximum_input_tokens,
-            maximum_cost_usd=maximum_cost_usd,
-        )
-    except (OSError, ValueError, ManualJudgeError) as exc:
-        raise typer.BadParameter(str(exc)) from None
-    spend = (
-        f"at most ${budget.estimated_cost_usd:.4f} across {budget.call_count} judge calls "
-        f"with up to {budget.maximum_attempts_per_call} attempts each"
-    )
-    if not require_spend_consent(
-        _console,
-        yes=yes,
-        spend=spend,
-        command="wmo config judge calibrate",
-    ):
-        _console.print("Judge calibration was not started.")
-        return
-    try:
+    else:
+        labels = drafted
+    with usage_error(OSError, ValueError, ManualJudgeError):
         runtime = RuntimeModelCatalog(load_model_catalog(store.model_catalog_path))
         result = calibrate_manual_judge(
             store,
@@ -245,10 +296,14 @@ def judge_calibrate(
             code_revision=revision,
         )
         _render_report(result)
-        should_approve = approve or _confirm(
-            "Approve this immutable judge calibration?",
-            non_interactive=non_interactive,
-            required_flag="--approve",
+        should_approve = (
+            result.approved_calibration is not None
+            or approve
+            or _confirm(
+                "Approve this immutable judge calibration?",
+                non_interactive=non_interactive,
+                required_flag="--approve",
+            )
         )
         if should_approve and result.approved_calibration is None:
             result = calibrate_manual_judge(
@@ -263,8 +318,6 @@ def judge_calibrate(
                 created_at=now,
                 code_revision=revision,
             )
-    except (OSError, ValueError, ManualJudgeError) as exc:
-        raise typer.BadParameter(str(exc)) from None
     if result.approved_calibration is None:
         _console.print("Calibration evidence saved but not approved.")
     else:
@@ -306,52 +359,348 @@ def _load_prompt_template(path: Path | None) -> JudgePromptTemplate:
 
 
 def _render_setup(plan: ManualJudgeSetupPlan) -> None:
-    """Display every setup identity and a concise real-trace preview.
+    """Display the judge, plain-language rubric, and representative tasks.
 
     Args:
         plan: Read-only setup plan awaiting confirmation.
     """
-    _console.print(f"Judge alias: {plan.judge_alias}")
-    _console.print(f"Judge model: {plan.judge_model.provider}/{plan.judge_model.model_id}")
-    _console.print(
-        f"Prompt: {plan.prompt_template.prompt.prompt_id} ({plan.prompt_template.prompt.sha256})"
+    _console.print("\n[bold]Judge setup[/bold]")
+    _console.print(f"Judge name: {plan.judge_alias}", markup=False)
+    _console.print(f"Exact model: {_model_name(plan.judge_model)}", markup=False)
+    mode = (
+        "A/B pairwise comparison"
+        if plan.prompt_template.response_shape == "pairwise"
+        else "Zero-to-five scoring"
     )
-    _console.print(f"Response shape: {plan.prompt_template.response_shape}")
-    _console.print(f"Variable mapping: {json.dumps(plan.prompt_template.variable_mapping)}")
-    _console.print(
-        "Structured response schema: "
-        + json.dumps(plan.prompt_template.response_schema, sort_keys=True)
-    )
-    _console.print(
-        "Score projection: "
-        + json.dumps(plan.prompt_template.score_projection.model_dump(mode="json"), sort_keys=True)
-    )
-    _console.print("Rubric:")
-    for dimension in plan.dimensions:
-        _console.print(f"  {dimension.dimension_id}: {dimension.name}")
-    _console.print("Real trace preview:")
-    for preview in plan.previews:
-        _console.print(
-            f"  {preview.trace_id} [{preview.outcome}] {preview.task} "
-            f"({len(preview.span_names)} spans)"
-        )
+    _console.print(f"Calibration mode: {mode}", markup=False)
+    _render_rubric(plan.dimensions)
+    _console.print("\n[bold]Representative tasks[/bold]")
+    for index, preview in enumerate(plan.previews, start=1):
+        _console.print(f"{index}. {preview.task}", markup=False)
+        _console.print(f"   Recorded outcome: {preview.outcome}", markup=False)
 
 
-def _render_calibration_previews(previews: tuple[JudgeTracePreview, ...]) -> None:
-    """Display the frozen real-trace sample before requesting human labels.
+def _render_spend_preflight(
+    plan: ManualJudgeCalibrationPlan,
+    budget: JudgeCalibrationBudget,
+) -> None:
+    """Display the exact judge identity and conservative spend admission.
 
     Args:
-        previews: Ordered real trace previews selected for calibration.
+        plan: Frozen calibration plan naming the exact judge model.
+        budget: Conservative complete-call reservation already checked against its ceiling.
     """
-    _console.print("Calibration traces:")
-    for preview in previews:
-        comparison = (
-            f" vs {preview.reference_trace_id}" if preview.reference_trace_id is not None else ""
+    _console.print("\n[bold]Spend preflight: manual judge calibration[/bold]")
+    _console.print(f"Judge name: {plan.setup.judge_alias}", markup=False)
+    _console.print(f"Exact model: {_model_name(plan.setup.judge_model)}", markup=False)
+    _console.print(f"Pricing: {budget.pricing_source.value}", markup=False)
+    _console.print(f"Judge calls authorized: {budget.call_count}", markup=False)
+    _console.print(
+        f"Tokens: up to {budget.maximum_input_tokens_per_call} input and "
+        f"{budget.maximum_output_tokens_per_call} output per attempt",
+        markup=False,
+    )
+    _console.print(
+        f"Maximum estimated cost: ${_format_usd(budget.estimated_cost_usd)}", markup=False
+    )
+    _console.print(f"Hard spend ceiling: ${_format_usd(budget.maximum_cost_usd)}", markup=False)
+    _console.print(f"Maximum attempts per call: {budget.maximum_attempts_per_call}", markup=False)
+
+
+def _format_usd(value: float) -> str:
+    """Format an admitted dollar bound without rounding a positive value to zero.
+
+    Args:
+        value: Finite nonnegative estimated cost or positive hard ceiling.
+
+    Returns:
+        Fixed-point decimal text preserving the float's round-trip value and at least four
+        fractional digits.
+    """
+    whole, separator, fraction = format(Decimal(str(value)), "f").partition(".")
+    significant_fraction = fraction.rstrip("0") if separator else ""
+    return f"{whole}.{significant_fraction.ljust(4, '0')}"
+
+
+def _render_calibration_review(
+    plan: ManualJudgeCalibrationPlan,
+    rubric: Rubric,
+    *,
+    character_limit: int | None,
+    page: bool,
+) -> None:
+    """Render readable scalar or A/B transcripts after spend consent.
+
+    Args:
+        plan: Frozen traces and optional same-task references in display order.
+        rubric: Finalized plain-language zero-to-five rubric.
+        character_limit: Per-field limit, or ``None`` for full transcript text.
+        page: Whether to send the full review through Rich's terminal pager.
+    """
+
+    def render() -> None:
+        """Write the complete review into the active console or pager buffer."""
+        pairwise = plan.setup.prompt_template.response_shape == "pairwise"
+        heading = "PAIRWISE A/B CALIBRATION" if pairwise else "ZERO-TO-FIVE CALIBRATION"
+        _console.print(f"\n[bold]{heading}[/bold]")
+        _render_rubric(rubric.dimensions)
+        for index, (trace, reference) in enumerate(
+            zip(plan.traces, plan.reference_traces, strict=True), start=1
+        ):
+            if pairwise:
+                _console.print(f"\n[bold]Pair {index}, candidate A[/bold]")
+                _render_trace(trace, character_limit=character_limit)
+                if reference is None:
+                    raise ValueError("pairwise calibration preview is missing candidate B")
+                _console.print(f"\n[bold]Pair {index}, candidate B[/bold]")
+                _render_trace(reference, character_limit=character_limit)
+            else:
+                _console.print(f"\n[bold]Trace {index}[/bold]")
+                _render_trace(trace, character_limit=character_limit)
+
+    if page:
+        with _console.pager(styles=True):
+            render()
+    else:
+        render()
+
+
+def _render_rubric(dimensions: tuple[RubricDimension, ...]) -> None:
+    """Render complete plain-language rubric dimensions and zero-to-five anchors.
+
+    Args:
+        dimensions: Finalized rubric dimensions in scoring order.
+    """
+    _console.print("\n[bold]Rubric[/bold]")
+    for dimension in dimensions:
+        _console.print(dimension.name, style="bold", markup=False)
+        _console.print(dimension.description, markup=False)
+        for anchor in dimension.anchors:
+            _console.print(f"  {anchor.score}: {anchor.description}", markup=False)
+
+
+def _render_trace(trace: Trace, *, character_limit: int | None) -> None:
+    """Render one normalized trace as a role-separated readable transcript.
+
+    Args:
+        trace: Verified immutable normalized production trace.
+        character_limit: Maximum characters per field, or ``None`` for the full value.
+    """
+    _render_field("User / task", trace.task, character_limit=character_limit)
+    if trace.initial_context:
+        _render_field(
+            "Initial context",
+            _jsonish_text(trace.initial_context),
+            character_limit=character_limit,
         )
-        _console.print(
-            f"  {preview.trace_id}{comparison} [{preview.outcome}] {preview.task} "
-            f"spans={', '.join(preview.span_names)}"
+    for span in trace.spans:
+        _render_span(span, character_limit=character_limit)
+    outcome = trace.outcome
+    if outcome is None:
+        _render_field("Final outcome", "Not recorded", character_limit=character_limit)
+        return
+    outcome_text = outcome.status
+    if outcome.outcome_name is not None:
+        outcome_text += f" ({outcome.outcome_name})"
+    _render_field("Final outcome", outcome_text, character_limit=character_limit)
+    if outcome.failure is not None:
+        _render_field(
+            "Final failure",
+            f"{outcome.failure.code.value}: {outcome.failure.message} "
+            f"(retryable={str(outcome.failure.retryable).lower()})",
+            character_limit=character_limit,
         )
+
+
+def _render_span(span: TraceSpan, *, character_limit: int | None) -> None:
+    """Render recognized assistant, tool-call, tool-result, and failure evidence.
+
+    Args:
+        span: One normalized chronological trace span.
+        character_limit: Maximum characters per field, or ``None`` for the full value.
+    """
+    attributes = span.attributes
+    operation = attributes.get("gen_ai.operation.name")
+    tool_name = attributes.get("gen_ai.tool.name")
+    arguments = attributes.get("gen_ai.tool.call.arguments")
+    result = attributes.get("gen_ai.tool.message")
+    if result is None:
+        result = attributes.get("gen_ai.tool.output")
+    completion = _assistant_completion(attributes)
+    user_input = _user_input(attributes)
+    if user_input is not None:
+        _render_field("User message", user_input, character_limit=character_limit)
+    if span.model is not None:
+        _render_field("Assistant / model", _model_name(span.model), character_limit=character_limit)
+    if completion:
+        _render_field("Assistant output", completion, character_limit=character_limit)
+    if operation != "execute_tool" and isinstance(tool_name, str):
+        _render_field("Tool call", tool_name, character_limit=character_limit)
+        if arguments is not None:
+            _render_field(
+                "Tool arguments", _jsonish_text(arguments), character_limit=character_limit
+            )
+    if operation == "execute_tool":
+        _render_field(
+            "Tool result",
+            tool_name if isinstance(tool_name, str) else span.name,
+            character_limit=character_limit,
+        )
+        if result is not None:
+            _render_field("Tool output", _jsonish_text(result), character_limit=character_limit)
+    if span.failure is not None:
+        _render_field(
+            "Span failure",
+            f"{span.failure.code.value}: {span.failure.message}",
+            character_limit=character_limit,
+        )
+
+
+def _assistant_completion(attributes: dict[str, JsonValue]) -> str | None:
+    """Extract readable assistant content from supported normalized attributes.
+
+    Args:
+        attributes: Canonical normalized span attributes.
+
+    Returns:
+        Assistant content when captured, otherwise ``None``.
+    """
+    for key in ("gen_ai.completion", "gen_ai.response.text"):
+        value = attributes.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return _last_role_message(
+        _decoded_json_value(attributes.get("gen_ai.output.messages")),
+        frozenset({"assistant", "model"}),
+    )
+
+
+def _user_input(attributes: dict[str, JsonValue]) -> str | None:
+    """Extract the latest readable user message from one normalized span.
+
+    Args:
+        attributes: Canonical normalized span attributes.
+
+    Returns:
+        Latest user content when captured, otherwise the legacy prompt field.
+    """
+    text = _last_role_message(
+        _decoded_json_value(attributes.get("gen_ai.input.messages")),
+        frozenset({"user", "human"}),
+    )
+    if text is not None:
+        return text
+    prompt = attributes.get("gen_ai.prompt")
+    return prompt.strip() if isinstance(prompt, str) and prompt.strip() else None
+
+
+def _last_role_message(value: JsonValue, roles: frozenset[str]) -> str | None:
+    """Return the latest visible message for one set of transcript roles.
+
+    Args:
+        value: Decoded normalized message collection.
+        roles: Accepted lowercase role names.
+
+    Returns:
+        Latest nonempty message content, or ``None`` when absent.
+    """
+    if not isinstance(value, list):
+        return None
+    for item in reversed(value):
+        if not isinstance(item, dict) or item.get("role") not in roles:
+            continue
+        text = _message_text(item.get("content"))
+        if text is not None:
+            return text
+    return None
+
+
+def _decoded_json_value(value: JsonValue | None) -> JsonValue:
+    """Decode JSON-encoded semantic attributes without guessing malformed text.
+
+    Args:
+        value: Native or JSON-encoded normalized attribute value.
+
+    Returns:
+        Decoded JSON value, or the original value when it is not encoded JSON.
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _message_text(value: JsonValue | None) -> str | None:
+    """Read plain text from one normalized message content value.
+
+    Args:
+        value: String or structured content parts.
+
+    Returns:
+        Joined text content, or ``None`` when no text was captured.
+    """
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if not isinstance(value, list):
+        return None
+    texts = tuple(
+        item["text"].strip()
+        for item in value
+        if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip()
+    )
+    return "\n".join(texts) if texts else None
+
+
+def _jsonish_text(value: JsonValue) -> str:
+    """Format native or JSON-encoded transcript evidence for a human.
+
+    Args:
+        value: Captured transcript value.
+
+    Returns:
+        Stable indented JSON when possible, otherwise its original text.
+    """
+    decoded = value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return json.dumps(decoded, indent=2, sort_keys=True, ensure_ascii=False)
+
+
+def _render_field(label: str, value: str, *, character_limit: int | None) -> None:
+    """Render one safely wrapped transcript field with truthful truncation.
+
+    Args:
+        label: Human role or evidence label.
+        value: Captured field text.
+        character_limit: Maximum characters, or ``None`` for the full value.
+    """
+    shown = value
+    if character_limit is not None and len(value) > character_limit:
+        omitted = len(value) - character_limit
+        shown = (
+            value[:character_limit]
+            + f"\n... [truncated {omitted} characters; use --page for the full transcript]"
+        )
+    _console.print(f"{label}:", style="bold", markup=False)
+    _console.print(shown, markup=False, overflow="fold")
+
+
+def _model_name(model: ModelSnapshot) -> str:
+    """Return the plain provider and model identity without internal hashes.
+
+    Args:
+        model: Model snapshot with provider, model, and optional revision fields.
+
+    Returns:
+        Human-readable exact provider and model identity.
+    """
+    suffix = f" (revision {model.revision})" if model.revision is not None else ""
+    return f"{model.provider}/{model.model_id}{suffix}"
 
 
 def _collect_labels(
@@ -413,21 +762,45 @@ def _collect_labels(
         raise ValueError(
             "missing labels: " + ", ".join(":".join(part or "-" for part in key) for key in missing)
         )
+    dimensions = {dimension.dimension_id: dimension for dimension in rubric.dimensions}
+    preview_positions = {
+        (preview.trace_id, preview.reference_trace_id): index
+        for index, preview in enumerate(previews, start=1)
+    }
     for key in missing:
         trace_id, reference_id, dimension_id = key
+        dimension = dimensions[dimension_id]
+        _render_score_prompt(dimension)
+        position = preview_positions[(trace_id, reference_id)]
         if pairwise:
-            value: int | str = Prompt.ask(
-                f"Winner for {trace_id} vs {reference_id} on {dimension_id}",
-                choices=["winner_a", "winner_b", "tie"],
+            choice = Prompt.ask(
+                "Pair "
+                f"{position}: choose candidate A, candidate B, or tie for "
+                f"{escape(dimension.name)}",
+                choices=["A", "B", "tie"],
             )
+            value: int | str = {"A": "winner_a", "B": "winner_b", "tie": "tie"}[choice]
         else:
-            score = IntPrompt.ask(f"Score {trace_id} on {dimension_id} (0-5)")
+            score = IntPrompt.ask(f"Trace {position}: score {escape(dimension.name)} from 0 to 5")
             if score not in range(6):
                 raise ValueError("judge labels must be integers from zero through five")
             value = score
         parsed[key] = _label(key, value, pairwise=pairwise)
         persist(tuple(parsed[item] for item in expected if item in parsed))
     return tuple(parsed[key] for key in expected)
+
+
+def _render_score_prompt(dimension: RubricDimension) -> None:
+    """Keep one score question adjacent to its complete plain-language anchors.
+
+    Args:
+        dimension: Rubric dimension the next prompt asks the operator to score.
+    """
+    _console.print()
+    _console.print(f"Score prompt: {dimension.name}", style="bold", markup=False)
+    _console.print(dimension.description, markup=False)
+    for anchor in dimension.anchors:
+        _console.print(f"  {anchor.score}: {anchor.description}", markup=False)
 
 
 def _label(

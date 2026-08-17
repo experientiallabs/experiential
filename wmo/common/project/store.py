@@ -23,6 +23,8 @@ from wmo.common.core.artifacts import (
     assert_secret_free,
     assert_text_secret_free,
     canonical_json_bytes,
+    canonical_jsonl_bytes,
+    envelope_matches_manifest,
     validate_artifact_file_path,
 )
 from wmo.common.core.files import fsync_directory_best_effort, write_bytes_atomic
@@ -235,23 +237,184 @@ class ArtifactStore:
         for relative_path, records in files.items():
             if Path(relative_path).suffix != ".jsonl":
                 raise ArtifactStoreError("write_jsonl requires .jsonl data-file paths")
-            serialized_records = []
             for record in records:
                 try:
                     assert_secret_free(record)
                 except SecretBoundaryError as exc:
                     raise ArtifactStoreError(str(exc)) from exc
-                serialized_records.append(canonical_json_bytes(record))
-            payload = b"\n".join(serialized_records)
-            if payload:
-                payload += b"\n"
-            serialized_files[relative_path] = payload
+            serialized_files[relative_path] = canonical_jsonl_bytes(records)
         return self.write(
             artifact_id=artifact_id,
             artifact_type=artifact_type,
             envelope=envelope,
             files=serialized_files,
         )
+
+    def write_or_verify_exact(
+        self,
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        envelope: ArtifactEnvelope,
+        files: Mapping[str, bytes],
+    ) -> ArtifactManifest:
+        """Write a deterministic artifact or verify an existing exact replay.
+
+        Args:
+            artifact_id: Stable content-derived artifact identity.
+            artifact_type: Expected immutable artifact type.
+            envelope: Exact expected artifact provenance envelope.
+            files: Exact expected serialized payloads.
+
+        Returns:
+            Newly written or byte-for-byte verified artifact manifest.
+
+        Raises:
+            ValueError: An existing artifact has different manifest fields or payload bytes.
+            ArtifactStoreError: The existing artifact is corrupt or the write fails.
+        """
+        if not self._paths.artifact_directory(
+            validate_local_id(artifact_id, label="artifact ID")
+        ).exists():
+            # The existence probe only skips write() work that is doomed to AlreadyExists on a
+            # replay; losing the creation race still lands in the verify branch below.
+            try:
+                return self.write(
+                    artifact_id=artifact_id,
+                    artifact_type=artifact_type,
+                    envelope=envelope,
+                    files=files,
+                )
+            except ArtifactAlreadyExistsError:
+                pass
+        manifest = self.read(artifact_id).manifest
+        if manifest.artifact_type != artifact_type or not envelope_matches_manifest(
+            envelope, manifest
+        ):
+            raise ValueError(f"existing artifact {artifact_id} manifest differs from exact replay")
+        self._verify_replay_files(artifact_id, manifest, files)
+        return manifest
+
+    def write_or_replay[EnvelopeT: ArtifactEnvelope](
+        self,
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        envelope: EnvelopeT,
+        envelope_path: str,
+        envelope_type: type[EnvelopeT],
+        files: Mapping[str, bytes],
+    ) -> tuple[EnvelopeT, ArtifactManifest]:
+        """Write a deterministic artifact or adopt its exact existing replay.
+
+        An existing artifact matches when it repeats the expected type, file set, and payload
+        bytes, and its persisted canonical envelope equals the expected envelope after adopting
+        the original materialization time.
+
+        Args:
+            artifact_id: Stable content-derived artifact identity.
+            artifact_type: Expected immutable artifact type.
+            envelope: Exact expected artifact provenance envelope.
+            envelope_path: Data-file path holding the canonical serialized envelope.
+            envelope_type: Concrete envelope model used to parse the stored payload.
+            files: Exact expected serialized payloads, including the envelope file.
+
+        Returns:
+            The newly written or existing verified envelope and its artifact manifest.
+
+        Raises:
+            ValueError: An existing artifact differs from the expected exact replay.
+            ArtifactStoreError: The existing artifact is corrupt or the write fails.
+        """
+        if not self._paths.artifact_directory(
+            validate_local_id(artifact_id, label="artifact ID")
+        ).exists():
+            # The existence probe only skips write() work that is doomed to AlreadyExists on a
+            # replay; losing the creation race still lands in the verify branch below.
+            try:
+                manifest = self.write(
+                    artifact_id=artifact_id,
+                    artifact_type=artifact_type,
+                    envelope=envelope,
+                    files=files,
+                )
+            except ArtifactAlreadyExistsError:
+                pass
+            else:
+                return envelope, manifest
+        stored = self.read(artifact_id)
+        manifest = stored.manifest
+        if manifest.artifact_type != artifact_type:
+            raise ValueError(f"existing artifact {artifact_id} manifest differs from exact replay")
+        stored_envelope = self._stored_file_bytes(stored, envelope_path)
+        try:
+            existing = envelope_type.model_validate_json(stored_envelope)
+        except (ValidationError, ValueError) as exc:
+            raise ValueError(f"existing artifact {artifact_id} has an invalid envelope") from exc
+        adopted = envelope.model_copy(update={"created_at": existing.created_at})
+        if stored_envelope != canonical_json_bytes(adopted):
+            raise ValueError(f"existing artifact {artifact_id} envelope differs from exact replay")
+        if not envelope_matches_manifest(existing, manifest):
+            raise ValueError(f"existing artifact {artifact_id} manifest differs from exact replay")
+        self._verify_replay_files(artifact_id, manifest, files, skip=envelope_path)
+        return existing, manifest
+
+    def _verify_replay_files(
+        self,
+        artifact_id: str,
+        manifest: ArtifactManifest,
+        files: Mapping[str, bytes],
+        *,
+        skip: str | None = None,
+    ) -> None:
+        """Require an existing artifact to repeat the expected file set and payload bytes.
+
+        The caller has already fully verified the artifact with `read`, which proves every stored
+        payload matches its manifest digest, so digesting the EXPECTED payloads against the same
+        manifest entries proves byte equality without re-reading any stored file.
+
+        Args:
+            artifact_id: Existing verified artifact identity.
+            manifest: Parsed manifest of the existing artifact, already verified by `read`.
+            files: Exact expected serialized payloads.
+            skip: Optional path whose bytes the caller compares separately.
+
+        Raises:
+            ValueError: The stored file set or any payload differs from the expected replay.
+        """
+        if tuple(sorted(files)) != tuple(item.path for item in manifest.files):
+            raise ValueError(f"existing artifact {artifact_id} file set differs from exact replay")
+        entries = {item.path: item for item in manifest.files}
+        for relative_path, expected_payload in files.items():
+            if relative_path == skip:
+                continue
+            if file_digest(relative_path, expected_payload) != entries[relative_path]:
+                raise ValueError(
+                    f"existing artifact {artifact_id} payload differs from exact replay"
+                )
+
+    @staticmethod
+    def _stored_file_bytes(stored: StoredArtifact, relative_path: str) -> bytes:
+        """Read one data file from an artifact the caller already fully verified with `read`.
+
+        Args:
+            stored: Verified artifact returned by `read`.
+            relative_path: Safe artifact-relative data-file path.
+
+        Returns:
+            Complete verified file bytes.
+
+        Raises:
+            ArtifactCorruptionError: The artifact does not own the file or its bytes changed.
+            ValueError: The relative path is not a safe artifact file path.
+        """
+        validated_path = validate_artifact_file_path(relative_path).as_posix()
+        entry = next((item for item in stored.manifest.files if item.path == validated_path), None)
+        if entry is None:
+            raise ArtifactCorruptionError(
+                f"artifact {stored.manifest.artifact_id} does not own data file {validated_path}"
+            )
+        return _read_verified_artifact_file(stored.directory, stored.manifest.artifact_id, entry)
 
     def read(self, artifact_id: str) -> StoredArtifact:
         """Read and fully verify one completed immutable artifact.

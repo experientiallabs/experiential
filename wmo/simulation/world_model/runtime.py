@@ -6,7 +6,12 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from wmo.common.core.artifacts import ArtifactInput, JsonObject, stable_id
+from wmo.common.core.artifacts import (
+    ArtifactInput,
+    JsonObject,
+    envelope_matches_manifest,
+    stable_id,
+)
 from wmo.common.models import (
     AssistantAction,
     ModelClient,
@@ -335,21 +340,7 @@ def _load_verified_artifact(
     artifact = GroundedWorldModelArtifact.model_validate_json(
         store.read_bytes(artifact_id, WORLD_MODEL_ARTIFACT_PATH)
     )
-    manifest_identity = (
-        stored.manifest.schema_version,
-        stored.manifest.created_at,
-        stored.manifest.inputs,
-        stored.manifest.code_revision,
-        stored.manifest.source,
-    )
-    envelope_identity = (
-        artifact.schema_version,
-        artifact.created_at,
-        artifact.inputs,
-        artifact.code_revision,
-        artifact.source,
-    )
-    if manifest_identity != envelope_identity:
+    if not envelope_matches_manifest(artifact, stored.manifest):
         raise ValueError("grounded world-model envelope differs from its artifact manifest")
     if artifact.world_model_id != artifact_id:
         raise ValueError("grounded world-model artifact ID differs from its directory")

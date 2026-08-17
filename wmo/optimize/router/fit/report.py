@@ -35,7 +35,6 @@ from wmo.common.routing import KnnRouterPolicy, RouterFeatureExtractor, RoutingD
 from wmo.common.routing.bank import KnnBankManifest, KnnEvidenceBank
 from wmo.common.routing.decision import policy_content_sha256, select_from_bank
 from wmo.common.tasks import TaskCase
-from wmo.optimize.router.fit.persistence import write_or_verify_exact
 
 EvidenceStratum = Literal["world_model", "sandbox", "production", "mixed", "missing"]
 
@@ -351,8 +350,7 @@ def build_held_out_report(
         run_spend=run_spend,
         coverage=coverage,
     )
-    write_or_verify_exact(
-        store,
+    store.write_or_verify_exact(
         artifact_id=report.report_id,
         artifact_type="router-report",
         envelope=report,

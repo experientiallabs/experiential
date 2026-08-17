@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -10,7 +9,8 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
     ContractModel,
-    canonical_json_bytes,
+    canonical_jsonl_bytes,
+    sha256_bytes,
     sha256_json,
 )
 from wmo.common.core.locks import file_write_lock
@@ -608,7 +608,7 @@ def _reuse_or_require_append(
             "runtime journal is shorter than the latest selected immutable prefix"
         )
     selected_prefix = events[: snapshot.last_ordinal]
-    if _events_sha256(selected_prefix) != snapshot.prefix_sha256:
+    if sha256_bytes(canonical_jsonl_bytes(selected_prefix)) != snapshot.prefix_sha256:
         raise AutomaticSFTPreparationError(
             "runtime journal changed inside the latest selected immutable prefix"
         )
@@ -795,18 +795,3 @@ def _materialize_appended_prefix(
         created=True,
         accepted=False,
     )
-
-
-def _events_sha256(events: tuple[RuntimeJournalEvent, ...]) -> str:
-    """Return the canonical newline-framed digest for a validated journal prefix.
-
-    Args:
-        events: Ordered validated journal events in the selected prefix.
-
-    Returns:
-        SHA-256 digest matching the runtime snapshot prefix contract.
-    """
-    payload = b"\n".join(canonical_json_bytes(event) for event in events)
-    if payload:
-        payload += b"\n"
-    return hashlib.sha256(payload).hexdigest()

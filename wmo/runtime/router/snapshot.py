@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
-from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import (
-    BaseModel,
     Field,
     TypeAdapter,
     ValidationError,
@@ -25,11 +22,13 @@ from wmo.common.core.artifacts import (
     Sha256,
     SourceIdentity,
     canonical_json_bytes,
+    canonical_jsonl_bytes,
+    envelope_matches_manifest,
+    sha256_bytes,
     stable_id,
     validate_artifact_file_path,
 )
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
     ArtifactManifest,
     ArtifactStore,
@@ -43,7 +42,8 @@ from wmo.runtime.router.journal import (
     RuntimeInteractionJournal,
     RuntimeJournalError,
     RuntimeJournalEvent,
-    _validate_events,
+    acceptance_pins,
+    validate_events,
 )
 
 _SNAPSHOT_ARTIFACT_TYPE = "runtime-trace-snapshot"
@@ -150,8 +150,8 @@ class RuntimeTraceInteraction(ContractModel):
         attempt_ordinals = tuple(event.attempt_ordinal for event in accepted)
         if attempt_ordinals != tuple(range(1, len(accepted) + 1)):
             raise ValueError("runtime interaction attempt ordinals must be contiguous")
-        original_pins = _accepted_pins(accepted[0])
-        if any(_accepted_pins(event) != original_pins for event in accepted[1:]):
+        original_pins = acceptance_pins(accepted[0])
+        if any(acceptance_pins(event) != original_pins for event in accepted[1:]):
             raise ValueError("runtime interaction retry pins differ from the original acceptance")
         completed_attempts = tuple(
             attempt
@@ -298,9 +298,9 @@ def seal_runtime_trace_snapshot(
     _require_same_project(journal, store)
     all_events = journal.read_events()
     events = _select_prefix(all_events, last_ordinal)
-    prefix_sha256 = _sha256(_jsonl_bytes(events))
+    prefix_sha256 = sha256_bytes(canonical_jsonl_bytes(events))
     interactions = _build_interactions(events)
-    interactions_payload = _jsonl_bytes(interactions)
+    interactions_payload = canonical_jsonl_bytes(interactions)
     source = SourceIdentity(
         kind="production",
         source_id=f"{journal.project_id}/runtime/interactions",
@@ -320,7 +320,7 @@ def seal_runtime_trace_snapshot(
         for attempt in interaction.attempts
         for event in attempt.terminal_events
     )
-    interactions_sha256 = _sha256(interactions_payload)
+    interactions_sha256 = sha256_bytes(interactions_payload)
     snapshot_id = stable_id(
         "runtime-trace-snapshot",
         {
@@ -403,7 +403,7 @@ def load_runtime_trace_snapshot(
             f"runtime trace snapshot envelope ID differs from artifact {snapshot_id}"
         )
     payload = store.read_bytes(snapshot_id, snapshot.interactions_path)
-    if _sha256(payload) != snapshot.interactions_sha256:
+    if sha256_bytes(payload) != snapshot.interactions_sha256:
         raise ArtifactCorruptionError(
             f"runtime trace snapshot {snapshot_id} interaction digest differs from envelope"
         )
@@ -418,7 +418,7 @@ def load_runtime_trace_snapshot(
         raise ArtifactCorruptionError(
             f"runtime trace snapshot {snapshot_id} event boundary differs from envelope"
         )
-    if _sha256(_jsonl_bytes(events)) != snapshot.prefix_sha256:
+    if sha256_bytes(canonical_jsonl_bytes(events)) != snapshot.prefix_sha256:
         raise ArtifactCorruptionError(
             f"runtime trace snapshot {snapshot_id} journal prefix differs from envelope"
         )
@@ -438,7 +438,8 @@ def load_runtime_trace_snapshot(
         raise ArtifactCorruptionError(
             f"runtime trace snapshot {snapshot_id} failed attempt count differs from envelope"
         )
-    _require_envelope_matches_manifest(snapshot, stored.manifest)
+    if not envelope_matches_manifest(snapshot, stored.manifest):
+        raise ArtifactCorruptionError("artifact envelope differs from its manifest")
     return LoadedRuntimeTraceSnapshot(
         snapshot=snapshot,
         manifest=stored.manifest,
@@ -471,7 +472,7 @@ def _select_prefix(
             f"last_ordinal must be between 1 and {len(events)} inclusive"
         )
     prefix = events[:last_ordinal]
-    _validate_events(prefix)
+    validate_events(prefix)
     return prefix
 
 
@@ -606,6 +607,8 @@ def _derive_traces(
             continue
         completed_attempt = interaction.attempts[interaction.completed_attempt_ordinal - 1]
         accepted = completed_attempt.accepted
+        identity = accepted.identity
+        acceptance = accepted.acceptance
         completed = next(
             event
             for event in completed_attempt.terminal_events
@@ -613,22 +616,22 @@ def _derive_traces(
         )
         request_context = _JSON_OBJECT_ADAPTER.validate_python(
             {
-                "model_request": accepted.request.model_dump(mode="json"),
-                "routing_decision": accepted.decision.model_dump(mode="json"),
+                "model_request": identity.request.model_dump(mode="json"),
+                "routing_decision": acceptance.decision.model_dump(mode="json"),
             }
         )
         attributes = _JSON_OBJECT_ADAPTER.validate_python(
             {
                 "runtime.interaction_id": interaction.interaction_id,
-                "runtime.lineage_id": accepted.lineage_id,
-                "runtime.request_sha256": accepted.request_sha256,
+                "runtime.lineage_id": identity.lineage_id,
+                "runtime.request_sha256": identity.request_sha256,
                 "runtime.response_sha256": completed.response_sha256,
                 "runtime.attempt_ordinal": completed.attempt_ordinal,
-                "runtime.selected_alias": accepted.selected_alias,
-                "runtime.selected_model": accepted.selected_model.model_dump(mode="json"),
+                "runtime.selected_alias": acceptance.selected_alias,
+                "runtime.selected_model": acceptance.selected_model.model_dump(mode="json"),
                 "runtime.response_model": completed.response.model.model_dump(mode="json"),
-                "runtime.policy_id": accepted.policy_input.artifact_id,
-                "runtime.policy_sha256": accepted.policy_input.sha256,
+                "runtime.policy_id": acceptance.policy_input.artifact_id,
+                "runtime.policy_sha256": acceptance.policy_input.sha256,
                 "runtime.finish_reason": completed.response.finish_reason,
                 "runtime.response_output": completed.response.output.model_dump(mode="json"),
                 "runtime.economics": completed.response.economics.model_dump(mode="json"),
@@ -637,10 +640,10 @@ def _derive_traces(
         traces.append(
             Trace(
                 trace_id=interaction.interaction_id,
-                conversation_id=accepted.lineage_id,
+                conversation_id=identity.lineage_id,
                 task=routed_task_text(accepted),
                 initial_context=request_context,
-                tools=accepted.request.tools,
+                tools=identity.request.tools,
                 spans=(
                     TraceSpan(
                         span_id=completed.event_id,
@@ -672,10 +675,10 @@ def routed_task_text(accepted: RuntimeAcceptedEvent) -> str:
     Returns:
         Last visible user text, first available message text, or a stable fallback task.
     """
-    for message in reversed(accepted.request.messages):
+    for message in reversed(accepted.identity.request.messages):
         if message.role == "user" and message.content:
             return message.content
-    for message in accepted.request.messages:
+    for message in accepted.identity.request.messages:
         if message.content:
             return message.content
     return "Complete the routed model request."
@@ -687,40 +690,44 @@ def _persist_snapshot(
     interactions: tuple[RuntimeTraceInteraction, ...],
     interactions_payload: bytes,
 ) -> LoadedRuntimeTraceSnapshot:
-    """Write a new prefix snapshot or return its exact existing materialization.
+    """Write a new prefix snapshot or adopt its exact existing materialization.
+
+    `write_or_replay` proves the stored artifact holds exactly `interactions_payload` and this
+    envelope (modulo the adopted materialization time), so the caller's already-validated
+    interactions ARE the stored records and nothing needs to be reloaded or re-parsed.
 
     Args:
         store: Project artifact store receiving the snapshot.
         snapshot: Validated immutable snapshot envelope.
-        interactions: Canonical logical interactions bound by the envelope.
+        interactions: Validated interaction records serialized into `interactions_payload`.
         interactions_payload: Canonical serialized interaction records.
 
     Returns:
-        Fully reloaded and verified snapshot materialization.
+        The persisted or byte-verified existing snapshot materialization.
 
     Raises:
         RuntimeTraceSnapshotError: An existing snapshot differs from exact replay.
         ArtifactStoreError: A new artifact cannot be persisted safely.
     """
     try:
-        store.write(
+        envelope, manifest = store.write_or_replay(
             artifact_id=snapshot.snapshot_id,
             artifact_type=_SNAPSHOT_ARTIFACT_TYPE,
             envelope=snapshot,
+            envelope_path=_SNAPSHOT_PATH,
+            envelope_type=RuntimeTraceSnapshot,
             files={
                 _INTERACTIONS_PATH: interactions_payload,
                 _SNAPSHOT_PATH: canonical_json_bytes(snapshot),
             },
         )
-    except ArtifactAlreadyExistsError:
-        loaded = load_runtime_trace_snapshot(store, snapshot.snapshot_id)
-        replay = snapshot.model_copy(update={"created_at": loaded.snapshot.created_at})
-        if loaded.snapshot != replay or loaded.interactions != interactions:
-            raise RuntimeTraceSnapshotError(
-                "existing runtime trace snapshot differs from the journal prefix replay"
-            ) from None
-        return loaded
-    return load_runtime_trace_snapshot(store, snapshot.snapshot_id)
+    except ValueError as exc:
+        raise RuntimeTraceSnapshotError(
+            f"existing runtime trace snapshot differs from the journal prefix replay: {exc}"
+        ) from exc
+    return LoadedRuntimeTraceSnapshot(
+        snapshot=envelope, manifest=manifest, interactions=interactions
+    )
 
 
 def _persist_dataset(
@@ -742,8 +749,8 @@ def _persist_dataset(
         RuntimeTraceSnapshotError: Existing dataset material differs from exact replay.
         ArtifactStoreError: A new dataset cannot be persisted safely.
     """
-    traces_payload = _jsonl_bytes(traces)
-    traces_sha256 = _sha256(traces_payload)
+    traces_payload = canonical_jsonl_bytes(traces)
+    traces_sha256 = sha256_bytes(traces_payload)
     snapshot_input = artifact_input(loaded_snapshot.manifest)
     source = SourceIdentity(
         kind="production",
@@ -780,69 +787,21 @@ def _persist_dataset(
         trace_ids=trace_ids,
     )
     try:
-        manifest = store.write(
+        return store.write_or_replay(
             artifact_id=dataset.dataset_id,
             artifact_type=_TRACE_DATASET_ARTIFACT_TYPE,
             envelope=dataset,
+            envelope_path=_TRACE_DATASET_PATH,
+            envelope_type=TraceDataset,
             files={
                 _TRACE_DATASET_PATH: canonical_json_bytes(dataset),
                 _TRACES_PATH: traces_payload,
             },
         )
-    except ArtifactAlreadyExistsError:
-        return _load_exact_dataset_replay(store, dataset, traces_payload)
-    return dataset, manifest
-
-
-def _load_exact_dataset_replay(
-    store: ArtifactStore,
-    expected: TraceDataset,
-    traces_payload: bytes,
-) -> tuple[TraceDataset, ArtifactManifest]:
-    """Load an existing byte-identical dataset derived from the same snapshot.
-
-    Args:
-        store: Project artifact store containing the expected dataset.
-        expected: Exact dataset envelope derived from the current snapshot.
-        traces_payload: Exact canonical trace bytes derived from the current snapshot.
-
-    Returns:
-        Verified existing dataset and artifact manifest.
-
-    Raises:
-        RuntimeTraceSnapshotError: Type, envelope, trace bytes, or provenance differs from replay.
-    """
-    stored = store.read(expected.dataset_id)
-    if stored.manifest.artifact_type != _TRACE_DATASET_ARTIFACT_TYPE:
+    except ValueError as exc:
         raise RuntimeTraceSnapshotError(
-            f"existing artifact {expected.dataset_id} is not a trace dataset"
-        )
-    try:
-        existing = TraceDataset.model_validate_json(
-            store.read_bytes(expected.dataset_id, _TRACE_DATASET_PATH)
-        )
-    except (ValidationError, ValueError) as exc:
-        raise RuntimeTraceSnapshotError(
-            f"existing trace dataset {expected.dataset_id} has an invalid envelope"
+            f"existing runtime trace dataset differs from the snapshot replay: {exc}"
         ) from exc
-    expected_existing_id = stable_id(
-        "trace-dataset",
-        existing.model_dump(mode="json", exclude={"created_at", "dataset_id"}),
-    )
-    if existing.dataset_id != expected_existing_id:
-        raise RuntimeTraceSnapshotError(
-            "existing runtime trace dataset ID differs from its canonical content"
-        )
-    if existing != expected:
-        raise RuntimeTraceSnapshotError(
-            "existing runtime trace dataset differs from the snapshot replay"
-        )
-    if store.read_bytes(expected.dataset_id, _TRACES_PATH) != traces_payload:
-        raise RuntimeTraceSnapshotError(
-            "existing runtime trace dataset records differ from the snapshot replay"
-        )
-    _require_envelope_matches_manifest(existing, stored.manifest)
-    return existing, stored.manifest
 
 
 def _parse_canonical_interactions(
@@ -871,7 +830,7 @@ def _parse_canonical_interactions(
             raise RuntimeJournalError(
                 f"snapshot interaction JSONL has invalid line {index}"
             ) from exc
-    canonical = _jsonl_bytes(interactions)
+    canonical = canonical_jsonl_bytes(interactions)
     if canonical != payload:
         raise RuntimeJournalError("snapshot interaction JSONL is not canonical")
     return tuple(interactions)
@@ -897,7 +856,7 @@ def _events_from_interactions(
             events.append(attempt.accepted)
             events.extend(attempt.terminal_events)
     events.sort(key=lambda event: event.ordinal)
-    _validate_events(events)
+    validate_events(events)
     expected_interaction_ids = tuple(
         dict.fromkeys(
             event.interaction_id for event in events if isinstance(event, RuntimeAcceptedEvent)
@@ -909,14 +868,6 @@ def _events_from_interactions(
             "snapshot interaction rows differ from first-acceptance journal order"
         )
     return tuple(events)
-
-
-def _accepted_pins(event: RuntimeAcceptedEvent) -> JsonObject:
-    """Return the immutable interaction fields that every retry must preserve."""
-    material = event.model_dump(mode="json")
-    for field in ("event_id", "ordinal", "attempt_ordinal", "attempt_started_at"):
-        del material[field]
-    return _JSON_OBJECT_ADAPTER.validate_python(material)
 
 
 def _require_same_project(journal: RuntimeInteractionJournal, store: ArtifactStore) -> None:
@@ -936,42 +887,3 @@ def _require_same_project(journal: RuntimeInteractionJournal, store: ArtifactSto
         raise RuntimeTraceSnapshotError(
             "runtime journal and artifact store must belong to the same project"
         )
-
-
-def _require_envelope_matches_manifest(
-    envelope: ArtifactEnvelope, manifest: ArtifactManifest
-) -> None:
-    """Require shared provenance fields to match the immutable artifact manifest.
-
-    Args:
-        envelope: Domain artifact envelope loaded from a data file.
-        manifest: Store-level manifest that digests that file.
-
-    Raises:
-        ArtifactCorruptionError: Shared schema or provenance fields differ.
-    """
-    if (
-        manifest.schema_version,
-        manifest.created_at,
-        manifest.inputs,
-        manifest.code_revision,
-        manifest.source,
-    ) != (
-        envelope.schema_version,
-        envelope.created_at,
-        envelope.inputs,
-        envelope.code_revision,
-        envelope.source,
-    ):
-        raise ArtifactCorruptionError("artifact envelope differs from its manifest")
-
-
-def _jsonl_bytes(records: Sequence[BaseModel]) -> bytes:
-    """Serialize ordered contract records as deterministic newline-terminated JSONL."""
-    payload = b"\n".join(canonical_json_bytes(record) for record in records)
-    return payload + b"\n" if payload else b""
-
-
-def _sha256(payload: bytes) -> str:
-    """Return a content digest for immutable runtime evidence."""
-    return hashlib.sha256(payload, usedforsecurity=False).hexdigest()

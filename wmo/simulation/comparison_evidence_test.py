@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import sys
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
@@ -15,10 +14,9 @@ import pytest
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
-    canonical_json_bytes,
     sha256_json,
 )
-from wmo.common.evaluations import EvaluationCell, EvaluationPlan
+from wmo.common.evaluations import EvaluationPlan
 from wmo.common.models import (
     EmbeddingCostReservation,
     ModelCapabilities,
@@ -26,7 +24,6 @@ from wmo.common.models import (
     ModelMessage,
     ModelRequest,
     ModelSnapshot,
-    RoutedCandidateSnapshot,
     ToolCall,
 )
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
@@ -38,7 +35,7 @@ from wmo.common.rollouts import (
     StopReason,
     WorldModelSimulatorSnapshot,
 )
-from wmo.common.tasks import TaskCase, TaskSet
+from wmo.common.tasks import TaskCase
 from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
 from wmo.runtime.agents import AgentEpisode
 from wmo.runtime.environments import (
@@ -56,7 +53,7 @@ from wmo.simulation import (
     persist_comparison,
     persist_comparison_spec,
 )
-from wmo.simulation.comparison_test import _inputs
+from wmo.simulation.comparison_test import _inputs, _persist_plan, _persist_tasks, _task
 from wmo.simulation.engines import CandidateBinding, SandboxSimulator
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
@@ -66,10 +63,10 @@ from wmo.simulation.engines.text.simulator_test import (
     _grounded_world_model_input,
     _response,
     _ScriptedClient,
+    _snapshot,
 )
 from wmo.simulation.retrieval import TraceRAGRetriever
 
-_PLAN_AT = datetime(2026, 8, 12, 10, tzinfo=UTC)
 _LOCK_AT = datetime(2026, 8, 12, 11, tzinfo=UTC)
 _EVIDENCE_AT = datetime(2026, 8, 12, 12, tzinfo=UTC)
 _COMPARISON_AT = datetime(2026, 8, 12, 13, tzinfo=UTC)
@@ -175,12 +172,12 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
         [
             _response(
                 '{"message":"done","terminal":true}',
-                snapshot=_world_snapshot(),
+                snapshot=_snapshot("world-model-a"),
                 cost=0.0,
             ),
             _response(
                 '{"message":"done","terminal":true}',
-                snapshot=_world_snapshot(),
+                snapshot=_snapshot("world-model-a"),
                 cost=0.0,
             ),
         ]
@@ -199,7 +196,9 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
         candidate_models={
             "candidate-a": _resolved("candidate-a", candidate_snapshot, candidate_text)
         },
-        world_models={"world-model-a": _resolved("world-model-a", _world_snapshot(), world)},
+        world_models={
+            "world-model-a": _resolved("world-model-a", _snapshot("world-model-a"), world)
+        },
         grounded_world_models={
             "world-model-a": _grounded_world_model(
                 world,
@@ -507,7 +506,7 @@ def _spec(
                 grounded_world_model_input=grounded_input,
                 prompt_version="text-world-model-v1",
                 query_embedding=EmbeddingCostReservation(
-                    model=_world_snapshot().model_copy(update={"model_id": "embedder-a"}),
+                    model=_snapshot("world-model-a").model_copy(update={"model_id": "embedder-a"}),
                     input_usd_per_million_tokens=0.0,
                     maximum_attempts=2,
                     maximum_input_tokens=10_000,
@@ -528,87 +527,6 @@ def _spec(
         seed=16,
         maximum_steps=2,
         maximum_cost_usd=10.0 if mode is SimulationMode.WORLD_MODEL else None,
-    )
-
-
-def _persist_tasks(
-    store: ArtifactStore,
-    tasks: tuple[TaskCase, ...],
-    revision: str,
-) -> tuple[TaskSet, ArtifactInput]:
-    """Persist exact release-bound tasks for both comparison modes."""
-    payload = b"\n".join(canonical_json_bytes(task) for task in tasks) + b"\n"
-    task_set = TaskSet(
-        schema_version=1,
-        created_at=_PLAN_AT,
-        code_revision=revision,
-        task_set_id="task-set-1",
-        task_ids=tuple(task.task_id for task in tasks),
-        tasks_path="tasks.jsonl",
-        tasks_sha256=hashlib.sha256(payload).hexdigest(),
-    )
-    manifest = store.write(
-        artifact_id=task_set.task_set_id,
-        artifact_type="task-set",
-        envelope=task_set,
-        files={"task-set.json": canonical_json_bytes(task_set), "tasks.jsonl": payload},
-    )
-    return task_set, artifact_input(manifest)
-
-
-def _persist_plan(
-    store: ArtifactStore,
-    tasks: tuple[TaskCase, ...],
-    task_input: ArtifactInput,
-    label: str,
-    revision: str,
-) -> tuple[EvaluationPlan, ArtifactInput]:
-    """Persist one release-bound mode-specific plan over the same tasks."""
-    cells = tuple(
-        EvaluationCell(
-            cell_id=f"{label}-cell-{suffix}",
-            task_id=task.task_id,
-            candidate_alias="candidate-a",
-            repeat=0,
-            purpose="held_out",
-            execution="simulate",
-        )
-        for task, suffix in zip(tasks, ("a", "b"), strict=True)
-    )
-    plan = EvaluationPlan(
-        schema_version=2,
-        created_at=_PLAN_AT,
-        inputs=(task_input,),
-        code_revision=revision,
-        plan_id=f"{label}-plan-1",
-        task_set_id="task-set-1",
-        candidate_snapshots=(
-            RoutedCandidateSnapshot(alias="candidate-a", model=_candidate_snapshot()),
-        ),
-        pricing_snapshot_id="pricing-1",
-        pricing_snapshot_sha256="d" * 64,
-        fidelity_thresholds_id="fidelity-thresholds-1",
-        fidelity_thresholds_sha256="f" * 64,
-        fidelity_protocol_sha256="e" * 64,
-        cells=cells,
-    )
-    manifest = store.write_json(
-        artifact_id=plan.plan_id,
-        artifact_type="evaluation-plan",
-        envelope=plan,
-        files={"evaluation-plan.json": plan},
-    )
-    return plan, artifact_input(manifest)
-
-
-def _candidate_snapshot() -> ModelSnapshot:
-    """Return the one frozen candidate used by both comparison modes."""
-    return ModelSnapshot(
-        provider="test",
-        model_id="candidate-a",
-        revision="fixture",
-        capabilities_sha256="c" * 64,
-        connection_sha256="d" * 64,
     )
 
 
@@ -637,29 +555,6 @@ def _rollouts(
             artifact_input(store.read(rollout_id).manifest),
         )
         for rollout_id in artifact_set.artifact_ids
-    )
-
-
-def _task(task_id: str) -> TaskCase:
-    """Return one held-out task shared across text and executable modes."""
-    return TaskCase(
-        task_id=task_id,
-        lineage_group_id=f"lineage-{task_id}",
-        partition="held_out",
-        instruction=f"Complete {task_id} with the customer runtime.",
-        workload_weight=0.5,
-        source_trace_ids=(f"trace-{task_id}",),
-    )
-
-
-def _world_snapshot() -> ModelSnapshot:
-    """Return the frozen fake world-model identity."""
-    return ModelSnapshot(
-        provider="test",
-        model_id="world-model-a",
-        revision="fixture",
-        capabilities_sha256="a" * 64,
-        connection_sha256="b" * 64,
     )
 
 

@@ -9,12 +9,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime
+from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 JsonObject = dict[str, JsonValue]
 
@@ -140,17 +140,10 @@ class ArtifactEnvelope(ContractModel):
     """
 
     schema_version: int = Field(ge=1)
-    created_at: datetime
+    created_at: AwareDatetime
     inputs: tuple[ArtifactInput, ...] = ()
     code_revision: str = Field(min_length=1, max_length=256)
     source: SourceIdentity | None = None
-
-    @field_validator("created_at")
-    @classmethod
-    def _require_timezone(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("created_at must include a timezone")
-        return value
 
     @field_validator("inputs")
     @classmethod
@@ -163,6 +156,31 @@ class ArtifactEnvelope(ContractModel):
         if input_ids != tuple(sorted(input_ids)):
             raise ValueError("artifact inputs must be sorted by artifact_id")
         return value
+
+
+def envelope_matches_manifest(envelope: ArtifactEnvelope, manifest: ArtifactEnvelope) -> bool:
+    """Report whether two artifact envelopes share identical provenance identity.
+
+    Args:
+        envelope: Domain artifact envelope loaded from a data file.
+        manifest: Store-level manifest (or second envelope) to compare against.
+
+    Returns:
+        True when schema_version, created_at, inputs, code_revision, and source all match.
+    """
+    return (
+        envelope.schema_version,
+        envelope.created_at,
+        envelope.inputs,
+        envelope.code_revision,
+        envelope.source,
+    ) == (
+        manifest.schema_version,
+        manifest.created_at,
+        manifest.inputs,
+        manifest.code_revision,
+        manifest.source,
+    )
 
 
 def sorted_unique_inputs(
@@ -216,10 +234,35 @@ def canonical_json_bytes(value: BaseModel | JsonValue) -> bytes:
     ).encode("utf-8")
 
 
+def canonical_jsonl_bytes(records: Sequence[BaseModel | JsonValue]) -> bytes:
+    """Serialize ordered records as deterministic newline-terminated JSONL.
+
+    Args:
+        records: Ordered structured records to serialize, one per line.
+
+    Returns:
+        Canonical UTF-8 JSONL with a trailing newline, or empty bytes for no records.
+    """
+    payload = b"\n".join(canonical_json_bytes(record) for record in records)
+    return payload + b"\n" if payload else b""
+
+
+def sha256_bytes(payload: bytes) -> str:
+    """Return the SHA-256 hex digest of an immutable artifact payload.
+
+    Args:
+        payload: Exact persisted bytes whose content-addressed identity is needed.
+
+    Returns:
+        The lowercase hexadecimal SHA-256 digest of the payload.
+    """
+    # Content-addressed artifact identity, not password or credential storage.
+    return hashlib.sha256(payload, usedforsecurity=False).hexdigest()
+
+
 def sha256_json(value: BaseModel | JsonValue) -> str:
     """Return the SHA-256 digest of `value`'s deterministic JSON serialization."""
-    # Content-addressed artifact identity, not password or credential storage.
-    return hashlib.sha256(canonical_json_bytes(value), usedforsecurity=False).hexdigest()
+    return sha256_bytes(canonical_json_bytes(value))
 
 
 def stable_id(prefix: str, value: BaseModel | JsonValue) -> str:
