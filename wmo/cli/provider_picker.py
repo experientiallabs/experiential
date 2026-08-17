@@ -21,10 +21,8 @@ from wmo.cli.picker import (
     PickerKey,
     PickerOption,
     PickerResult,
-    select_many,
-    select_many_list,
-    select_one,
-    uses_keyboard_list,
+    choose_many,
+    choose_one,
 )
 from wmo.common.models import (
     ModelCapabilities,
@@ -303,7 +301,7 @@ def _select_provider_rows(
     preselected: Sequence[str],
     read_key: Callable[[], PickerKey] | None,
 ) -> PickerResult:
-    """Show the provider list as a keyboard screen on a TTY, otherwise as typed rows.
+    """Show the provider multi-select screen for this console.
 
     Args:
         console: Terminal used for the screen.
@@ -314,20 +312,12 @@ def _select_provider_rows(
     Returns:
         The chosen rows, or the requested back or cancel navigation.
     """
-    title = "Select the providers you want to use"
-    if read_key is not None or uses_keyboard_list(console):
-        return select_many_list(
-            console,
-            title=title,
-            options=options,
-            preselected=preselected,
-            read_key=read_key,
-        )
-    return select_many(
+    return choose_many(
         console,
-        title=title,
+        title="Select the providers you want to use",
         options=options,
         preselected=preselected,
+        read_key=read_key,
     )
 
 
@@ -645,7 +635,7 @@ def _recover(title: str, *, console: Console) -> str:
     Raises:
         SetupCancelled: The user cancelled setup.
     """
-    result = select_one(
+    result = choose_one(
         console,
         title=title,
         options=[

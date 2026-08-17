@@ -2,28 +2,15 @@
 
 from __future__ import annotations
 
-import time
-from collections.abc import Mapping, Sequence
-from typing import Literal
+from collections.abc import Mapping
 from urllib.parse import urlsplit
 
-from wmo.common.models import (
-    Embedding,
-    ModelRequest,
-    ModelResponse,
-    ModelSnapshot,
-)
+from wmo.common.core.artifacts import JsonObject
+from wmo.common.models import ModelSnapshot
 from wmo.runtime.models.credentials import ModelCredentialError
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
-from wmo.runtime.models.providers.openai_compatible import (
-    openai_compatible_request,
-    openai_compatible_response,
-    openai_embedding_request,
-    openai_embedding_response,
-)
-from wmo.runtime.models.providers.request import post_json
-from wmo.runtime.models.providers.retry import RetryPolicy
-from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
+from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+from wmo.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
 AZURE_OPENAI_API_KEY_ENV = "AZURE_OPENAI_API_KEY"
 AZURE_OPENAI_ENDPOINT_ENV = "AZURE_OPENAI_ENDPOINT"
@@ -88,36 +75,29 @@ def bind_azure_api_key(
     return api_key
 
 
-def azure_request_url(
-    endpoint: str,
-    *,
-    deployment: str,
-    api_version: str,
-    route: Literal["chat/completions", "embeddings"],
-) -> str:
-    """Build one Azure Chat Completions or embeddings URL for the configured API surface.
+def _azure_base_url(endpoint: str, *, deployment: str, api_version: str) -> str:
+    """Build the Azure request root for the configured API surface.
 
-    ``v1`` uses the Foundry and Azure OpenAI ``/openai/v1`` routes and places the deployment in
-    the JSON body. A dated API version uses the classic deployment-in-path route.
+    ``v1`` uses the Foundry and Azure OpenAI ``/openai/v1`` root and places the deployment in
+    the JSON body. A dated API version uses the classic deployment-in-path root.
 
     Args:
-        endpoint: Normalized Azure resource endpoint.
+        endpoint: Normalized Azure resource endpoint, with or without the ``/openai/v1`` root.
         deployment: Exact deployment identifier sent for this alias.
         api_version: ``v1`` or a dated Azure OpenAI API version.
-        route: Chat Completions or embeddings path suffix.
 
     Returns:
-        Absolute request URL. The URL never includes a credential.
+        Absolute request root. The root never includes a credential or query string.
     """
     root = endpoint.rstrip("/")
     if api_version == _V1_API_VERSION:
         if root.lower().endswith(_V1_ROOT_SUFFIX):
-            return f"{root}/{route}"
-        return f"{root}{_V1_ROOT_SUFFIX}/{route}"
-    return f"{root}/openai/deployments/{deployment}/{route}?api-version={api_version}"
+            return root
+        return f"{root}{_V1_ROOT_SUFFIX}"
+    return f"{root}/openai/deployments/{deployment}"
 
 
-class AzureClient:
+class AzureClient(OpenAICompatibleClient):
     """Calls one explicit Azure connection without streaming, failover, or guessed deployments."""
 
     def __init__(
@@ -145,76 +125,19 @@ class AzureClient:
         Raises:
             ValueError: The key, endpoint, API version, or timeout is missing or invalid.
         """
-        if not api_key:
-            raise ValueError("Azure clients require a non-empty API key")
         if not endpoint:
             raise ValueError("Azure clients require an explicit resource endpoint")
         if not api_version:
             raise ValueError("Azure clients require an explicit api_version")
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
-        self._model = model
-        self._endpoint = endpoint
-        self._api_key = api_key
+        super().__init__(
+            model=model,
+            api_key=api_key,
+            base_url=_azure_base_url(endpoint, deployment=model.model_id, api_version=api_version),
+            transport=transport,
+            retry_policy=retry_policy,
+            timeout_seconds=timeout_seconds,
+        )
         self._api_version = api_version
-        self._transport = transport or HttpxJsonTransport()
-        self._retry_policy = retry_policy
-        self._timeout_seconds = timeout_seconds
-
-    def complete(self, request: ModelRequest) -> ModelResponse:
-        """Complete one non-streaming request through Azure Chat Completions.
-
-        Args:
-            request: Visible messages, tool schemas, and sampling controls to send.
-
-        Returns:
-            The typed non-streaming model response with observed request economics.
-        """
-        started_at = time.monotonic()
-        response = post_json(
-            self._transport,
-            azure_request_url(
-                self._endpoint,
-                deployment=self._model.model_id,
-                api_version=self._api_version,
-                route="chat/completions",
-            ),
-            headers=self._headers(),
-            payload=openai_compatible_request(self._model.model_id, request),
-            timeout_seconds=self._timeout_seconds,
-            retry_policy=self._retry_policy,
-        )
-        return openai_compatible_response(
-            response,
-            configured_model=self._model,
-            latency_seconds=time.monotonic() - started_at,
-        )
-
-    def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
-        """Embed ordered text through the configured Azure deployment.
-
-        Args:
-            texts: Ordered visible text values to embed.
-
-        Returns:
-            Unit-normalized embeddings in the input order, or an empty tuple for no texts.
-        """
-        if not texts:
-            return ()
-        response = post_json(
-            self._transport,
-            azure_request_url(
-                self._endpoint,
-                deployment=self._model.model_id,
-                api_version=self._api_version,
-                route="embeddings",
-            ),
-            headers=self._headers(),
-            payload=openai_embedding_request(self._model.model_id, texts),
-            timeout_seconds=self._timeout_seconds,
-            retry_policy=self._retry_policy,
-        )
-        return openai_embedding_response(response, expected_count=len(texts))
 
     def _headers(self) -> dict[str, str]:
         """Return Azure ``api-key`` authentication headers without a Bearer token."""
@@ -222,6 +145,20 @@ class AzureClient:
             "api-key": self._api_key,
             "Content-Type": "application/json",
         }
+
+    def _post(self, path: str, payload: JsonObject) -> JsonObject:
+        """Post below the Azure root, appending the dated API version when one is configured.
+
+        Args:
+            path: Provider route below the configured base URL.
+            payload: JSON request body.
+
+        Returns:
+            The decoded JSON response body.
+        """
+        if self._api_version != _V1_API_VERSION:
+            path = f"{path}?api-version={self._api_version}"
+        return super()._post(path, payload)
 
 
 def _canonical_azure_endpoint(value: str) -> tuple[str, str, int | None, str]:

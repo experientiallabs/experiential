@@ -67,6 +67,7 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
     Sha256,
+    canonical_json_bytes,
     sha256_json,
     stable_id,
 )
@@ -82,7 +83,6 @@ from wmo.common.models import (
     write_model_catalog,
 )
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
     ProjectStore,
     ProjectStoreError,
@@ -318,21 +318,14 @@ def write_sft_model_optimization_config(
             to another immutable config.
     """
     try:
-        config_manifest = store.artifacts.write_json(
+        config, config_manifest = store.artifacts.write_or_replay(
             artifact_id=config.config_id,
             artifact_type=_CONFIG_ARTIFACT_TYPE,
             envelope=config,
-            files={"config.json": config},
+            envelope_path="config.json",
+            envelope_type=SFTModelOptimizationConfig,
+            files={"config.json": canonical_json_bytes(config)},
         )
-    except ArtifactAlreadyExistsError:
-        existing, stored = _load_sft_model_optimization_config_artifact(store, config.config_id)
-        replay = config.model_copy(update={"created_at": existing.created_at})
-        if existing != replay:
-            raise SFTModelOptimizationError(
-                "existing SFT model optimization config does not match its content-addressed ID"
-            ) from None
-        config = existing
-        config_manifest = stored.manifest
     except (ArtifactCorruptionError, ValueError) as exc:
         raise SFTModelOptimizationError(
             f"cannot persist SFT model optimization config {config.config_id}: {exc}"

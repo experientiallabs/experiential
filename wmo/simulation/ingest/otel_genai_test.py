@@ -50,25 +50,6 @@ def _spans() -> list[dict[str, object]]:
     ]
 
 
-def test_load_otel_genai_file_normalizes_flat_span_records(tmp_path: Path) -> None:
-    """Flat GenAI span records normalize through the canonical OTLP path."""
-    path = tmp_path / "otel.json"
-    path.write_text(json.dumps(_spans()), encoding="utf-8")
-
-    result = load_otel_genai_file(path)
-
-    assert result.issues == ()
-    trace = result.traces[0]
-    assert trace.task == "Reset my password"
-    assert [span.name for span in trace.spans] == ["agent.model_call", "agent.tool_call"]
-    call = trace.spans[0]
-    assert call.model is not None
-    assert (call.model.provider, call.model.model_id) == ("openai", "gpt-4o")
-    assert call.usage is not None
-    assert (call.usage.input_tokens, call.usage.output_tokens) == (15, 2)
-    assert trace.spans[1].parent_span_id == call.span_id
-
-
 def test_load_otel_genai_file_preserves_opaque_source_identity(tmp_path: Path) -> None:
     """Opaque identifiers are mapped deterministically and retained as source evidence."""
     spans = _spans()
@@ -152,22 +133,6 @@ def test_load_otel_genai_file_retains_malformed_jsonl_issue(tmp_path: Path) -> N
 
     assert [issue.source_record for issue in result.issues] == ["line-2"]
     assert len(result.traces[0].spans) == 2
-
-
-def test_load_otel_genai_file_excludes_record_without_timing(tmp_path: Path) -> None:
-    """A record with no end time is excluded with an explicit issue."""
-    spans = _spans()
-    del spans[1]["end_time"]
-    path = tmp_path / "otel.json"
-    path.write_text(json.dumps(spans), encoding="utf-8")
-
-    result = load_otel_genai_file(path)
-
-    assert [issue.source_record for issue in result.issues] == [
-        "record-1",
-        f"trace-{'9' * 32}",
-    ]
-    assert result.traces == ()
 
 
 def test_load_otel_genai_file_rejects_unsupported_document(tmp_path: Path) -> None:

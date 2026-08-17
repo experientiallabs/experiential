@@ -171,6 +171,7 @@ class RolloutArtifact(SimulationArtifact):
     final_output: AssistantAction | None = None
     stop_reason: StopReason
     failure: StructuredFailure | None = None
+    secret_redaction_count: int = Field(default=0, ge=0)
     candidate_economics: OperationEconomics
     world_model_economics: OperationEconomics | None = None
     retrieval_economics: OperationEconomics | None = None

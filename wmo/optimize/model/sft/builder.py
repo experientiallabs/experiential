@@ -308,6 +308,7 @@ def write_sft_dataset(store: ProjectStore, artifact: SFTDatasetArtifact) -> SFTD
                 "examples.jsonl": files["examples.jsonl"],
             },
         )
+    # Intentional semantic-subset replay: equality is a digest subset over the two stored files.
     except ArtifactAlreadyExistsError:
         existing = load_sft_dataset(store, artifact.dataset.dataset_id, require_accepted=False)
         if (

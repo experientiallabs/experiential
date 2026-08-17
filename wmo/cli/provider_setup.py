@@ -133,7 +133,6 @@ def run_provider_setup(
         existing_connections=_existing_connections(existing),
         existing_connection_providers=_existing_connection_providers(existing),
         existing_catalog_models={} if existing is None else existing.models,
-        existing_models=_existing_models(existing),
         retainable_roles=_retained_setup_roles(existing),
         role_inputs=_role_inputs(options, existing=existing),
         explicit_providers=explicit_providers,
@@ -152,7 +151,6 @@ def _interactive_setup(
     existing_connections: tuple[ProviderConnection, ...],
     existing_connection_providers: Mapping[str, str],
     existing_catalog_models: Mapping[str, ModelRecord],
-    existing_models: tuple[ProviderModelSelection, ...],
     retainable_roles: Mapping[str, frozenset[SetupRole]],
     role_inputs: SetupRoleInputs,
     explicit_providers: tuple[str, ...],
@@ -167,7 +165,6 @@ def _interactive_setup(
         existing_connections: Secret-free connections already configured in the catalog.
         existing_connection_providers: Exact provider kind for every persisted connection.
         existing_catalog_models: Exact record for every persisted model alias.
-        existing_models: Model aliases already configured in the catalog.
         retainable_roles: Exact prior roles each incomplete alias may retain.
         role_inputs: Role values supplied by flags or already persisted.
         explicit_providers: Validated ``--provider`` values that skip the opening list once.
@@ -233,19 +230,15 @@ def _interactive_setup(
                 if mode == "recommended":
                     result = _recommended_result(
                         session,
-                        existing_connections=existing_connections,
                         known_existing_connections=tuple(sorted(existing_connection_providers)),
                         known_existing_aliases=tuple(sorted(existing_catalog_models)),
-                        existing_models=existing_models,
                         console=console,
                     )
                     return result
             result = _collect_models_and_roles(
                 session,
-                existing_connections=existing_connections,
                 known_existing_connections=tuple(sorted(existing_connection_providers)),
                 known_existing_aliases=tuple(sorted(existing_catalog_models)),
-                existing_models=existing_models,
                 role_inputs=role_inputs,
                 console=console,
             )
@@ -259,20 +252,16 @@ def _interactive_setup(
 def _recommended_result(
     session: SetupSession,
     *,
-    existing_connections: tuple[ProviderConnection, ...],
     known_existing_connections: tuple[str, ...],
     known_existing_aliases: tuple[str, ...],
-    existing_models: tuple[ProviderModelSelection, ...],
     console: Console,
 ) -> ProviderSetupResult:
     """Assign every wizard role from verified discovered model availability.
 
     Args:
         session: Provider endpoints and verified available models.
-        existing_connections: Secret-free connections already configured.
         known_existing_connections: Every persisted connection name.
         known_existing_aliases: Every persisted model alias.
-        existing_models: Existing configurable model selections.
         console: Terminal receiving the deterministic summary.
 
     Returns:
@@ -331,8 +320,6 @@ def _recommended_result(
             incumbent=selection.incumbent,
         ),
         endpoints=session.endpoints,
-        existing_connections=existing_connections,
-        existing_models=existing_models,
         known_existing_connections=known_existing_connections,
         known_existing_aliases=known_existing_aliases,
     )
@@ -450,10 +437,8 @@ def _recommended_router_selection_from_models(
 def _collect_models_and_roles(
     session: SetupSession,
     *,
-    existing_connections: tuple[ProviderConnection, ...],
     known_existing_connections: tuple[str, ...],
     known_existing_aliases: tuple[str, ...],
-    existing_models: tuple[ProviderModelSelection, ...],
     role_inputs: SetupRoleInputs,
     console: Console,
 ) -> ProviderSetupResult | None:
@@ -461,10 +446,8 @@ def _collect_models_and_roles(
 
     Args:
         session: Answers already collected in this setup session.
-        existing_connections: Connections already configured in the catalog.
         known_existing_connections: Every connection name in the persisted catalog.
         known_existing_aliases: Every model alias in the persisted catalog.
-        existing_models: Model aliases already configured in the catalog.
         role_inputs: Role values supplied by flags or already persisted.
         console: Terminal used for every screen.
 
@@ -487,8 +470,6 @@ def _collect_models_and_roles(
             chosen,
             roles=roles,
             endpoints=session.endpoints,
-            existing_connections=existing_connections,
-            existing_models=existing_models,
             known_existing_connections=known_existing_connections,
             known_existing_aliases=known_existing_aliases,
         )
@@ -647,33 +628,6 @@ def _existing_connections(existing: ModelCatalog | None) -> tuple[ProviderConnec
         if connection.provider in SETUP_PROVIDERS
         and (connection.provider == "bedrock" or connection.api_key_env is not None)
     )
-
-
-def _existing_models(existing: ModelCatalog | None) -> tuple[ProviderModelSelection, ...]:
-    """Convert setup-compatible existing model aliases into input records.
-
-    Args:
-        existing: Existing catalog, or ``None`` on first setup.
-
-    Returns:
-        Compatible explicit model selections in deterministic order.
-    """
-    if existing is None:
-        return ()
-    supported_connections = {item.name for item in _existing_connections(existing)}
-    records = []
-    for alias, model in sorted(existing.models.items()):
-        if model.connection not in supported_connections:
-            continue
-        records.append(
-            ProviderModelSelection(
-                alias=alias,
-                connection=model.connection,
-                model=model.model,
-                capabilities=model.capabilities or ModelCapabilities(),
-            )
-        )
-    return tuple(records)
 
 
 def _existing_model_aliases(existing: ModelCatalog | None) -> tuple[str, ...]:

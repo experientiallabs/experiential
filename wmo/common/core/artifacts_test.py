@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.common.core.artifacts import (
+    SECRET_REDACTION_PLACEHOLDER,
     ArtifactEnvelope,
     ArtifactInput,
     FailureAttribution,
@@ -16,9 +17,12 @@ from wmo.common.core.artifacts import (
     SourceIdentity,
     StructuredFailure,
     assert_secret_free,
+    assert_text_secret_free,
     canonical_json_bytes,
     canonical_jsonl_bytes,
     envelope_matches_manifest,
+    redact_secret_json,
+    redact_secret_text,
     sha256_bytes,
     sha256_json,
     sorted_unique_inputs,
@@ -161,6 +165,67 @@ def test_artifact_file_paths_reject_nonportable_components() -> None:
     for path in ("../outside.json", "nested\\outside.json", "C:/outside.json"):
         with pytest.raises(ValueError, match="relative POSIX"):
             validate_artifact_file_path(path)
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+        "AKIAABCDEFGHIJKLMNOP",
+        "xoxb-1234567890-abcdefghij",
+        "Bearer abcdefghijklmnop",
+        "OPENAI_API_KEY",
+    ],
+)
+def test_redact_secret_text_replaces_every_secret_pattern(secret: str) -> None:
+    """Each secret-like value pattern and credential environment name is replaced once.
+
+    Args:
+        secret: One representative match for a rejected secret pattern.
+    """
+    redacted, count = redact_secret_text(f"model output includes {secret} inline")
+
+    assert count == 1
+    assert secret not in redacted
+    assert redacted == f"model output includes {SECRET_REDACTION_PLACEHOLDER} inline"
+    assert_secret_free({"content": redacted})
+
+
+def test_redaction_placeholder_passes_every_secret_boundary() -> None:
+    """The fixed placeholder itself never trips the immutable-artifact secret boundary."""
+    assert_secret_free({"content": SECRET_REDACTION_PLACEHOLDER})
+    assert_text_secret_free(SECRET_REDACTION_PLACEHOLDER)
+    assert redact_secret_text(SECRET_REDACTION_PLACEHOLDER) == (SECRET_REDACTION_PLACEHOLDER, 0)
+
+
+def test_redact_secret_json_counts_nested_replacements() -> None:
+    """Nested JSON content is redacted structurally with an aggregate replacement count."""
+    payload = {
+        "response": {
+            "output": [
+                {"content": "export OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456"},
+                {"content": "no secrets here"},
+            ]
+        },
+        "steps": 3,
+    }
+
+    redacted, count = redact_secret_json(payload)
+
+    assert count == 2
+    assert redacted == {
+        "response": {
+            "output": [
+                {
+                    "content": "export "
+                    f"{SECRET_REDACTION_PLACEHOLDER}={SECRET_REDACTION_PLACEHOLDER}"
+                },
+                {"content": "no secrets here"},
+            ]
+        },
+        "steps": 3,
+    }
+    assert_secret_free(redacted)
 
 
 def test_structured_failures_preserve_runtime_attribution() -> None:

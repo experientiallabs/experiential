@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -23,9 +24,21 @@ from wmo.common.models import (
 )
 from wmo.optimize.router.judging.service import (
     ManualJudgeSetupPlan,
+    calibrate_manual_judge,
     default_judge_dimensions,
+    estimate_manual_judge_budget,
+    prepare_manual_judge_calibration,
 )
-from wmo.optimize.router.judging.service_test import _built_store, _catalog, _setup
+from wmo.optimize.router.judging.service_test import (
+    _built_store,
+    _catalog,
+    _JudgeClient,
+    _labels,
+    _RuntimeCatalog,
+    _setup,
+)
+from wmo.runtime.models import ResolvedModel
+from wmo.runtime.models.registry import RuntimeModelCatalog
 
 
 @pytest.mark.parametrize(
@@ -108,6 +121,132 @@ def _priced_catalog() -> ModelCatalog:
             }
         }
     )
+
+
+def test_interactive_judge_setup_accepts_enter_as_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blank response accepts the displayed judge setup and persists it."""
+    store = _built_store(tmp_path)
+    _write_catalog(store.paths.root, _catalog())
+    monkeypatch.setenv("WMO_RELEASE_REVISION", "a" * 40)
+    monkeypatch.setattr(judge_config_module, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(
+        judge_config_module,
+        "maybe_edit_setup_plan",
+        lambda plan, *, console: plan,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["config", "judge", "setup", "support", "--root", str(store.paths.root)],
+        input="\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Save this judge setup and finalize its rubric? [y/n] (y):" in result.output
+    assert "Saved judge setup" in result.output
+    review = store.read_review()
+    assert isinstance(review, dict)
+    assert "manual_judge" in review
+
+
+def test_interactive_judge_setup_preserves_explicit_n_decline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit ``n`` still declines the displayed judge setup."""
+    store = _built_store(tmp_path)
+    _write_catalog(store.paths.root, _catalog())
+    monkeypatch.setenv("WMO_RELEASE_REVISION", "a" * 40)
+    monkeypatch.setattr(judge_config_module, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(
+        judge_config_module,
+        "maybe_edit_setup_plan",
+        lambda plan, *, console: plan,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["config", "judge", "setup", "support", "--root", str(store.paths.root)],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Save this judge setup and finalize its rubric? [y/n] (y):" in result.output
+    assert "Judge setup was not saved." in result.output
+    review = store.read_review()
+    assert isinstance(review, dict)
+    assert "manual_judge" not in review
+
+
+def test_interactive_completed_calibration_accepts_enter_as_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blank response approves completed calibration evidence without new calls."""
+    store = _built_store(tmp_path)
+    _setup(store)
+    _write_catalog(store.paths.root, _catalog())
+    plan = prepare_manual_judge_calibration(store, sample_size=3)
+    labels = _labels(store)
+    client = _JudgeClient(plan.setup.judge_model)
+    runtime = _RuntimeCatalog(
+        ResolvedModel(
+            alias="judge-main",
+            snapshot=plan.setup.judge_model,
+            capabilities=ModelCapabilities(),
+            client=client,
+            embedding_client=None,
+        )
+    )
+    budget = estimate_manual_judge_budget(
+        plan,
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=2.0,
+        maximum_input_tokens_per_call=4_096,
+        maximum_cost_usd=1.0,
+    )
+    reviewed = calibrate_manual_judge(
+        store,
+        cast(RuntimeModelCatalog, runtime),
+        plan,
+        labels,
+        budget,
+        spend_consented=True,
+        approve=False,
+        accept_insufficient_labels=True,
+        created_at=datetime.now(UTC),
+        code_revision="test-revision",
+    )
+    assert reviewed.approved_calibration is None
+    assert len(client.requests) == 3
+
+    monkeypatch.setenv("WMO_RELEASE_REVISION", "a" * 40)
+    monkeypatch.setattr(judge_config_module, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(
+        judge_config_module,
+        "RuntimeModelCatalog",
+        lambda _catalog: runtime,
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "judge",
+            "calibrate",
+            "support",
+            "--root",
+            str(store.paths.root),
+            "--sample-size",
+            "3",
+            "--accept-insufficient-labels",
+        ],
+        input="\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Approve this immutable judge calibration? [y/n] (y):" in result.output
+    assert "Approved judge calibration" in result.output
+    assert len(client.requests) == 3
 
 
 def test_calibrate_prints_catalog_pricing_breakdown_before_labels(tmp_path: Path) -> None:

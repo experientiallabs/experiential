@@ -1,9 +1,11 @@
 """Selection prompts shared by interactive CLI setup screens.
 
-Provider setup uses a keyboard multi-select on a real terminal: Up and Down move focus, Enter
-selects or deselects the focused row, and a final Complete row submits. Other screens still read
-whole lines so a long list can filter, collapse, and accept back or cancel words. The same
-line-based path remains available for scripted non-terminal sessions.
+Every provider, model, role, and candidate screen is keyboard driven on a real terminal: Up and
+Down move focus inside one region redrawn in place by ``wmo.cli.picker_view``, Space or Enter
+toggles a row on a multi-select screen whose Complete row submits, and Enter confirms the focused
+row on a single-select screen. A console without a terminal cannot be driven by raw keys, so the
+same screens fall back to the line-based path, which reads whole lines and accepts numbers, ranges,
+filter text, and back or cancel words.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ from functools import partial
 from rich.console import Console
 from rich.markup import escape
 
+from wmo.cli.picker_view import PickerMode, PickerRow, picker_view
+
 _BACK_WORDS = frozenset({"b", "back"})
 _CANCEL_WORDS = frozenset({"q", "quit", "cancel"})
 _ALL_WORDS = frozenset({"a", "all"})
@@ -29,7 +33,6 @@ _NONE_WORDS = frozenset({"none", "clear"})
 _MORE_WORDS = frozenset({"more", "m"})
 _COLLAPSED_LIMIT = 12
 _COMPLETE_LABEL = "Complete"
-_NARROW_WIDTH = 72
 
 
 class PickerAction(StrEnum):
@@ -40,11 +43,12 @@ class PickerAction(StrEnum):
 
 
 class PickerKey(StrEnum):
-    """One decoded key from a keyboard multi-select list."""
+    """One decoded key from a keyboard-driven picker screen."""
 
     UP = "up"
     DOWN = "down"
     ENTER = "enter"
+    SPACE = "space"
     BACK = "back"
     CANCEL = "cancel"
     IGNORE = "ignore"
@@ -284,6 +288,8 @@ def interpret_key_bytes(data: bytes) -> PickerKey:
     """
     if data in {b"\r", b"\n"}:
         return PickerKey.ENTER
+    if data == b" ":
+        return PickerKey.SPACE
     if data in {b"b", b"B"}:
         return PickerKey.BACK
     if data in {b"q", b"Q", b"\x03"}:
@@ -347,16 +353,6 @@ def _terminal_key_reader(
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def read_terminal_key() -> PickerKey:
-    """Read one key from the controlling terminal in raw mode.
-
-    Returns:
-        The decoded picker action for the next key press.
-    """
-    with _terminal_key_reader(None) as reader:
-        return reader()
-
-
 def select_many_list(
     console: Console,
     *,
@@ -368,8 +364,8 @@ def select_many_list(
 ) -> PickerResult:
     """Choose several rows from a keyboard-driven list with a Complete action.
 
-    Up and Down move focus. Enter selects or deselects the focused option. Enter on the
-    Complete row submits the current selection and does nothing on any other row.
+    Up and Down move focus. Space or Enter selects or deselects the focused option. Either key on
+    the Complete row submits the current selection.
 
     Args:
         console: Terminal used for the list.
@@ -391,32 +387,32 @@ def select_many_list(
     selected = [value for value in preselected if value in values]
     focus = 0
     complete_index = len(options)
-    with _terminal_key_reader(read_key) as reader:
-        console.print(f"[bold]{title}[/bold]")
+    status = ""
+    with (
+        _terminal_key_reader(read_key) as reader,
+        picker_view(console, title=title, mode=PickerMode.MULTIPLE) as view,
+    ):
         while True:
-            _render_list(
-                console,
-                options,
-                selected=selected,
+            view.show(
+                _multi_rows(options, selected=selected),
                 focus=focus,
+                status=status,
             )
             key = reader()
+            status = ""
             if key is PickerKey.BACK:
                 return PickerResult(action=PickerAction.BACK)
             if key is PickerKey.CANCEL:
                 return PickerResult(action=PickerAction.CANCEL)
-            if key is PickerKey.UP:
-                focus = (focus - 1) % (complete_index + 1)
+            if key in (PickerKey.UP, PickerKey.DOWN):
+                focus = _moved(focus, key=key, count=complete_index + 1)
                 continue
-            if key is PickerKey.DOWN:
-                focus = (focus + 1) % (complete_index + 1)
-                continue
-            if key is not PickerKey.ENTER:
+            if key not in (PickerKey.ENTER, PickerKey.SPACE):
                 continue
             if focus == complete_index:
                 if len(selected) >= minimum:
                     return PickerResult(values=tuple(selected))
-                console.print(f"[yellow]Select at least {minimum}.[/yellow]")
+                status = f"Select at least {minimum}."
                 continue
             value = options[focus].value
             if value in selected:
@@ -425,33 +421,164 @@ def select_many_list(
                 selected.append(value)
 
 
-def _render_list(
+def select_one_list(
     console: Console,
+    *,
+    title: str,
+    options: Sequence[PickerOption],
+    default: str | None = None,
+    read_key: Callable[[], PickerKey] | None = None,
+) -> PickerResult:
+    """Choose exactly one row from a keyboard-driven list.
+
+    Up and Down move focus, and Enter confirms the focused row immediately. A prior answer starts
+    focused so the same key confirms it again.
+
+    Args:
+        console: Terminal used for the list.
+        title: Screen heading describing what is being chosen.
+        options: Every selectable row, in presentation order.
+        default: Value focused first when it is still available.
+        read_key: Optional key source used by tests instead of the controlling terminal.
+
+    Returns:
+        The chosen value, or the requested back or cancel navigation.
+
+    Raises:
+        ValueError: The screen has no rows to choose from.
+    """
+    if not options:
+        raise ValueError(f"{title} has no available choices")
+    focus = next(
+        (index for index, option in enumerate(options) if option.value == default),
+        0,
+    )
+    rows = tuple(PickerRow(label=option.label, detail=option.detail) for option in options)
+    with (
+        _terminal_key_reader(read_key) as reader,
+        picker_view(console, title=title, mode=PickerMode.SINGLE) as view,
+    ):
+        while True:
+            view.show(rows, focus=focus)
+            key = reader()
+            if key is PickerKey.BACK:
+                return PickerResult(action=PickerAction.BACK)
+            if key is PickerKey.CANCEL:
+                return PickerResult(action=PickerAction.CANCEL)
+            if key in (PickerKey.UP, PickerKey.DOWN):
+                focus = _moved(focus, key=key, count=len(options))
+                continue
+            if key in (PickerKey.ENTER, PickerKey.SPACE):
+                return PickerResult(values=(options[focus].value,))
+
+
+def choose_many(
+    console: Console,
+    *,
+    title: str,
+    options: Sequence[PickerOption],
+    preselected: Sequence[str] = (),
+    minimum: int = 1,
+    read_key: Callable[[], PickerKey] | None = None,
+) -> PickerResult:
+    """Collect several values from the keyboard list, or from typed lines without a terminal.
+
+    Args:
+        console: Terminal used for the screen.
+        title: Screen heading describing what is being chosen.
+        options: Every selectable row, in presentation order.
+        preselected: Values already chosen, kept when the screen is shown again.
+        minimum: Smallest accepted number of selected values.
+        read_key: Optional key source used by tests instead of the controlling terminal.
+
+    Returns:
+        The chosen values, or the requested back or cancel navigation.
+    """
+    if read_key is not None or uses_keyboard_list(console):
+        return select_many_list(
+            console,
+            title=title,
+            options=options,
+            preselected=preselected,
+            minimum=minimum,
+            read_key=read_key,
+        )
+    return select_many(
+        console,
+        title=title,
+        options=options,
+        preselected=preselected,
+        minimum=minimum,
+    )
+
+
+def choose_one(
+    console: Console,
+    *,
+    title: str,
+    options: Sequence[PickerOption],
+    default: str | None = None,
+    read_key: Callable[[], PickerKey] | None = None,
+) -> PickerResult:
+    """Collect one value from the keyboard list, or from typed lines without a terminal.
+
+    Args:
+        console: Terminal used for the screen.
+        title: Screen heading describing what is being chosen.
+        options: Every selectable row, in presentation order.
+        default: Value focused first, or accepted by an empty line on the line-based path.
+        read_key: Optional key source used by tests instead of the controlling terminal.
+
+    Returns:
+        The chosen value, or the requested back or cancel navigation.
+    """
+    if read_key is not None or uses_keyboard_list(console):
+        return select_one_list(
+            console,
+            title=title,
+            options=options,
+            default=default,
+            read_key=read_key,
+        )
+    return select_one(console, title=title, options=options, default=default)
+
+
+def _multi_rows(
     options: Sequence[PickerOption],
     *,
     selected: Sequence[str],
-    focus: int,
-) -> None:
-    """Print the option rows, selection marks, focus marker, and Complete action."""
+) -> tuple[PickerRow, ...]:
+    """Build the rendered rows of a multi-select screen, ending with the Complete action.
+
+    Args:
+        options: Every selectable row, in presentation order.
+        selected: Values currently selected.
+
+    Returns:
+        One row per option, plus the Complete row that submits the screen.
+    """
     chosen = frozenset(selected)
-    width = console.width or 80
-    narrow = width < _NARROW_WIDTH
-    for index, option in enumerate(options):
-        pointer = ">" if index == focus else " "
-        mark = "[x]" if option.value in chosen else "[ ]"
-        console.print(f"  {pointer} {escape(mark)} {escape(option.label)}")
-        if option.detail:
-            console.print(f"      [dim]{escape(option.detail)}[/dim]")
-    pointer = ">" if focus == len(options) else " "
-    console.print(f"  {pointer} {_COMPLETE_LABEL}")
-    if narrow:
-        console.print("[dim]Up/Down moves focus. Enter selects or deselects.[/dim]")
-        console.print("[dim]Activate Complete to submit. b goes back, q cancels.[/dim]")
-        return
-    console.print(
-        "[dim]Up/Down moves focus, Enter selects or deselects, Complete submits, "
-        "b goes back, q cancels.[/dim]"
-    )
+    rows = [
+        PickerRow(label=option.label, detail=option.detail, marked=option.value in chosen)
+        for option in options
+    ]
+    rows.append(PickerRow(label=_COMPLETE_LABEL, action=True))
+    return tuple(rows)
+
+
+def _moved(focus: int, *, key: PickerKey, count: int) -> int:
+    """Return the focus index after one Up or Down key, wrapping at both ends.
+
+    Args:
+        focus: Current focus index.
+        key: Decoded Up or Down key.
+        count: Number of focusable rows.
+
+    Returns:
+        The next focus index.
+    """
+    step = -1 if key is PickerKey.UP else 1
+    return (focus + step) % count
 
 
 def _stdin_is_tty() -> bool:

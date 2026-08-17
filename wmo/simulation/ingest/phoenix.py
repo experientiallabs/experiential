@@ -23,18 +23,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 
 from pydantic import JsonValue
 
-from wmo.common.core.artifacts import JsonObject, SourceIdentity
-from wmo.simulation.ingest.otlp import (
-    GENAI_SEMANTIC_CONVENTION_VERSION,
-    OtlpTraceFormatError,
-    TraceNormalizationIssue,
-    TraceNormalizationResult,
-    decode_otlp_attributes,
-)
+from wmo.common.core.artifacts import JsonObject
+from wmo.simulation.ingest.otlp import decode_otlp_attributes
 from wmo.simulation.ingest.vendor_observations import (
     VendorObservation,
     VendorTokenUsage,
@@ -44,15 +37,16 @@ from wmo.simulation.ingest.vendor_observations import (
 )
 from wmo.simulation.ingest.vendor_records import (
     VendorTraceFormatError,
+    dotted_lookup,
     first_user_text,
     flatten_records,
     json_text,
     message_text,
-    read_vendor_export,
     required_text,
     source_timestamp,
 )
-from wmo.simulation.ingest.vendor_trace import approved_extensions, build_vendor_traces
+from wmo.simulation.ingest.vendor_source import VendorSource
+from wmo.simulation.ingest.vendor_trace import approved_extensions
 
 VENDOR = "phoenix"
 
@@ -105,79 +99,23 @@ class _PhoenixSpan:
     error: str | None
 
 
-def load_phoenix_file(
-    path: Path,
-    *,
-    semantic_convention_version: str = GENAI_SEMANTIC_CONVENTION_VERSION,
-    source_id: str | None = None,
-) -> TraceNormalizationResult:
-    """Read a Phoenix or OpenInference span export into canonical trace evidence.
+def _record_observations(record: _PhoenixRecord, ordinal: int) -> tuple[VendorObservation, ...]:
+    """Convert one Phoenix record through its declared shape into observations.
 
     Args:
-        path: OTLP envelope, native span array, flat span rows, or JSONL export.
-        semantic_convention_version: Pinned GenAI semantic-convention version for the traces.
-        source_id: Optional durable source label. The local path is used when omitted.
+        record: Undecoded Phoenix span record marked with its declared export shape.
+        ordinal: Source order position for the emitted observation.
 
     Returns:
-        Canonical traces and every retained parse or validation exclusion.
+        Declared observation, or nothing for orchestration-only span kinds.
 
     Raises:
-        VendorTraceFormatError: The export cannot be read or decoded.
+        VendorTraceFormatError: The record lacks identity, timing, or tool evidence.
+        OtlpTraceFormatError: An OTLP record declares malformed attributes.
     """
-    export = read_vendor_export(path, vendor=VENDOR, source_id=source_id)
-    return normalize_phoenix_payloads(
-        export.payloads,
-        source=export.source,
-        semantic_convention_version=semantic_convention_version,
-        initial_issues=export.issues,
-    )
-
-
-def normalize_phoenix_payloads(
-    payloads: Sequence[JsonValue],
-    *,
-    source: SourceIdentity,
-    semantic_convention_version: str = GENAI_SEMANTIC_CONVENTION_VERSION,
-    initial_issues: Sequence[TraceNormalizationIssue] = (),
-) -> TraceNormalizationResult:
-    """Normalize decoded Phoenix or OpenInference documents into canonical traces.
-
-    Args:
-        payloads: Decoded Phoenix documents in source order.
-        source: Immutable identity of the source bytes or transport result.
-        semantic_convention_version: Pinned GenAI semantic-convention version for the traces.
-        initial_issues: Parse exclusions collected before span mapping.
-
-    Returns:
-        Canonical traces and every retained validation exclusion.
-    """
-    issues = list(initial_issues)
-    observations: list[VendorObservation] = []
-    ordinal = 0
-    for index, payload in enumerate(payloads, start=1):
-        try:
-            records = _payload_records(payload)
-        except (VendorTraceFormatError, OtlpTraceFormatError) as exc:
-            issues.append(TraceNormalizationIssue(f"record-{index}", str(exc)))
-            continue
-        for record in records:
-            try:
-                span = _otlp_span(record.raw) if record.otlp else _native_span(record.raw)
-                converted = _span_observation(span, ordinal)
-            except (VendorTraceFormatError, OtlpTraceFormatError) as exc:
-                issues.append(TraceNormalizationIssue(f"record-{index}", str(exc)))
-                continue
-            if converted is None:
-                continue
-            observations.append(converted)
-            ordinal += 1
-    return build_vendor_traces(
-        observations,
-        vendor=VENDOR,
-        source=source,
-        semantic_convention_version=semantic_convention_version,
-        initial_issues=issues,
-    )
+    span = _otlp_span(record.raw) if record.otlp else _native_span(record.raw)
+    converted = _span_observation(span, ordinal)
+    return () if converted is None else (converted,)
 
 
 def _payload_records(payload: JsonValue) -> tuple[_PhoenixRecord, ...]:
@@ -328,21 +266,23 @@ def _native_span(record: JsonObject) -> _PhoenixSpan:
         VendorTraceFormatError: Identity or timing is absent.
     """
     attributes = _record_attributes(record)
-    parent = _lookup(record, ("parent_id", "parentId", "parent_span_id", "parentSpanId"))
+    parent = dotted_lookup(record, ("parent_id", "parentId", "parent_span_id", "parentSpanId"))
     return _PhoenixSpan(
         trace_id=required_text(
-            _lookup(record, ("context.trace_id", "trace_id", "traceId")), "Phoenix trace_id"
+            dotted_lookup(record, ("context.trace_id", "trace_id", "traceId")), "Phoenix trace_id"
         ),
         span_id=required_text(
-            _lookup(record, ("context.span_id", "span_id", "spanId")), "Phoenix span_id"
+            dotted_lookup(record, ("context.span_id", "span_id", "spanId")), "Phoenix span_id"
         ),
         parent_id=parent if isinstance(parent, str) and parent.strip() else None,
-        name=required_text(_lookup(record, ("name", "span_name")), "Phoenix span name"),
+        name=required_text(dotted_lookup(record, ("name", "span_name")), "Phoenix span name"),
         attributes=attributes,
         started_at=source_timestamp(
-            _lookup(record, ("start_time", "startTime")), "Phoenix start_time"
+            dotted_lookup(record, ("start_time", "startTime")), "Phoenix start_time"
         ),
-        ended_at=source_timestamp(_lookup(record, ("end_time", "endTime")), "Phoenix end_time"),
+        ended_at=source_timestamp(
+            dotted_lookup(record, ("end_time", "endTime")), "Phoenix end_time"
+        ),
         error=_native_error(record),
     )
 
@@ -356,10 +296,10 @@ def _native_error(record: JsonObject) -> str | None:
     Returns:
         Declared error message when the record declares an error status, otherwise ``None``.
     """
-    code = _lookup(record, ("status_code", "statusCode", "status.code"))
+    code = dotted_lookup(record, ("status_code", "statusCode", "status.code"))
     if not isinstance(code, str) or code.casefold() != "error":
         return None
-    message = _lookup(record, ("status_message", "statusMessage", "status.message"))
+    message = dotted_lookup(record, ("status_message", "statusMessage", "status.message"))
     return message if isinstance(message, str) and message.strip() else "span reported an error"
 
 
@@ -401,30 +341,6 @@ def _flatten_into(node: JsonObject, prefix: str, target: JsonObject) -> None:
             _flatten_into(value, f"{path}.", target)
         else:
             target[path] = value
-
-
-def _lookup(record: JsonObject, paths: Sequence[str]) -> JsonValue | None:
-    """Read the first declared value among dotted record paths.
-
-    Args:
-        record: Native Phoenix span object or flat dotted span row.
-        paths: Dotted candidate paths in preference order.
-
-    Returns:
-        First declared value, or ``None`` when the record declares none.
-    """
-    for path in paths:
-        if path in record:
-            return record[path]
-        node: JsonValue | None = record
-        for part in path.split("."):
-            if not isinstance(node, dict) or part not in node:
-                node = None
-                break
-            node = node[part]
-        if node is not None:
-            return node
-    return None
 
 
 def _span_observation(span: _PhoenixSpan, ordinal: int) -> VendorObservation | None:
@@ -649,3 +565,10 @@ def _text(attributes: JsonObject, keys: Sequence[str]) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+PHOENIX_SOURCE: VendorSource[_PhoenixRecord] = VendorSource(
+    vendor=VENDOR,
+    records=_payload_records,
+    convert=_record_observations,
+)

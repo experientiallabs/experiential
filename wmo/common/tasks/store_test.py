@@ -10,7 +10,7 @@ import pytest
 from wmo.common.core.artifacts import SourceIdentity
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore, ProjectPaths
 from wmo.common.tasks import TaskCase, TaskSet, ToolSchema
-from wmo.common.tasks.store import load_task_set, resolve_task_set
+from wmo.common.tasks.store import load_task_set
 from wmo.common.traces import Trace, TraceSource, TraceSpan
 from wmo.simulation.mining.descriptors import HashingDescriptorEmbedder
 from wmo.simulation.mining.service import MiningSpec, mine_tasks, persist_task_set
@@ -90,27 +90,3 @@ def test_load_task_set_rejects_a_typed_envelope_with_wrong_task_ids(tmp_path) ->
 
     with pytest.raises(ArtifactCorruptionError, match="data file digest mismatch"):
         load_task_set(store, task_set.task_set_id)
-
-
-def test_resolve_task_set_uses_the_only_immutable_task_set(tmp_path) -> None:  # noqa: ANN001
-    """A caller cannot accidentally pick an unspecified task set from a project."""
-    store, task_set = _task_set_store(tmp_path)
-
-    assert resolve_task_set(store).task_set == task_set
-
-
-def test_resolve_task_set_rejects_an_absent_or_ambiguous_default(tmp_path) -> None:  # noqa: ANN001
-    """Unnamed consumers get deterministic directions instead of an arbitrary artifact."""
-    empty = ArtifactStore(ProjectPaths(root=tmp_path / "empty", project_id="support"))
-
-    with pytest.raises(ArtifactCorruptionError, match="no immutable task set"):
-        resolve_task_set(empty)
-
-    store, _ = _task_set_store(tmp_path / "multiple")
-    _task_set_store(tmp_path / "multiple", task_set_id="task-set-second")
-
-    with pytest.raises(
-        ArtifactCorruptionError,
-        match="multiple task sets; pass --task-set with one of: task-set-fixture, task-set-second",
-    ):
-        resolve_task_set(store)

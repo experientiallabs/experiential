@@ -47,7 +47,7 @@ from wmo.runtime.models import (
     RuntimeModelCatalog,
 )
 from wmo.runtime.models.preflight import preflight_capabilities
-from wmo.runtime.models.providers.retry import RetryPolicy
+from wmo.runtime.models.providers.transport import RetryPolicy
 from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source
@@ -73,9 +73,8 @@ _TRACE_FILE_OPTION = typer.Option(
     "-t",
     metavar="PATH",
     help=(
-        "Local trace export in the declared --source format, or the JSON source declaration "
-        "of a postgres table. Omit it only when bare `wmo build PROJECT` should launch the "
-        "interactive wizard."
+        "Local trace export in the declared --source format. Omit it only when bare "
+        "`wmo build PROJECT` should launch the interactive wizard."
     ),
 )
 _PROVIDER_OPTION = typer.Option(
@@ -156,7 +155,7 @@ def build(
         project: Safe local project identifier below ``<root>/projects``.
         legacy_trace_file: Active positional trace-path compatibility for packaged examples.
         trace_file: Explicit local canonical trace export, or ``None`` for the interactive wizard.
-        source: Declared local-export format, or ``postgres`` for a table declaration.
+        source: Declared local-export format.
         root: Local ``.wmo`` artifact root.
         world_model: Optional configured alias override for this project.
         judge: Optional configured alias override for this project.

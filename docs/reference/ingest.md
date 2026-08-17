@@ -14,7 +14,6 @@ loader. Each source is declared, never guessed:
 | `mastra` | Mastra spans, or a `spans` envelope. |
 | `phoenix` | Phoenix and OpenInference spans, native nested, flat dotted, or OTLP JSON. |
 | `chat-json` | OpenAI-style chat conversations, one object, an array, or bare message arrays. |
-| `postgres` | A JSON declaration of one Postgres table holding rows in one of the formats above. |
 
 Every file source accepts JSON or JSONL. A malformed JSONL line is never skipped silently: it is
 retained as an explicit normalization issue. Every normalized trace keeps the immutable source
@@ -36,37 +35,6 @@ result = load_trace_source("langfuse", Path("export.jsonl"))
 ```
 
 The source table is explicit, so an undeclared name fails closed rather than being detected.
-
-## Postgres tables
-
-`--source postgres` takes a local JSON declaration instead of an export, so a checked-in
-declaration never holds a credential:
-
-```json
-{
-  "table": "public.agent_traces",
-  "payload_format": "chat-json",
-  "payload_column": "payload",
-  "trace_id_column": "trace_id",
-  "order_column": "created_at",
-  "row_shape": "document",
-  "since": "2026-05-01T00:00:00Z"
-}
-```
-
-The connection string comes from the declaration's optional `dsn` or from `WMO_POSTGRES_DSN`. The
-table and column names accept only plain identifiers, and dynamic names reach SQL only as quoted
-identifiers. `row_shape` is `document` when one row holds one whole trace payload, or `message`
-when one row holds one chat message; message rows require `chat-json`, a `trace_id_column`, and an
-`order_column`, and a row with no declared trace identity becomes an explicit issue instead of a
-guessed conversation. Turn order is never invented: the database ranks the message rows of each
-conversation on the declared order column, and a conversation holding rows the database ranks alike
-or a row with no order value is retained as an explicit issue rather than assembled in an arbitrary
-order. Document rows tied on the order column are broken by trace identity and payload
-text, so equal timestamps cannot reorder a corpus between builds. `since` requires `order_column`.
-The driver is optional: install it with
-`uv sync --extra postgres` or `world-model-optimizer[postgres]`. A Python caller may inject its own
-row reader through `load_postgres_source(config, reader=...)` and keep its existing pool.
 
 ## Stored evidence
 

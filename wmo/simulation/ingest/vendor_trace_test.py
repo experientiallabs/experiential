@@ -140,10 +140,45 @@ def test_build_vendor_traces_maps_declared_failures_to_the_trace_outcome() -> No
     assert "upstream 500" in outcome.failure.message
 
 
-def test_approved_extensions_copies_only_approved_keys() -> None:
-    """Vendor metadata reaches canonical spans only through approved WMO extensions."""
-    extensions = approved_extensions(
-        {"wmo.conversation.id": "thread-1", "vendor.internal": "drop me"}
+def test_build_vendor_traces_strict_pairing_rejects_unpaired_calls_and_results() -> None:
+    """Strict pairing excludes traces whose declared calls or explicit results never pair."""
+    unpaired_call = build_vendor_traces(
+        [_MODEL_OBSERVATION], vendor="langfuse", source=_SOURCE, strict_tool_pairing=True
+    )
+    mismatched_result = build_vendor_traces(
+        [_MODEL_OBSERVATION, replace(_TOOL_OBSERVATION, tool_call_id="call-9")],
+        vendor="langfuse",
+        source=_SOURCE,
+        strict_tool_pairing=True,
     )
 
-    assert extensions == {"wmo.conversation.id": "thread-1"}
+    assert unpaired_call.traces == ()
+    assert "unmatched generated langfuse tool calls: get_weather:call-1" in (
+        unpaired_call.issues[0].message
+    )
+    assert mismatched_result.traces == ()
+    assert "unmatched explicit langfuse tool result: get_weather:call-9" in (
+        mismatched_result.issues[0].message
+    )
+
+
+def test_approved_extensions_copies_only_approved_keys() -> None:
+    """Vendor metadata reaches canonical spans only through approved WMO extensions.
+
+    ``wmo.outcome.escalated`` and ``wmo.trace.metadata`` are deliberately approved for every
+    vendor source sharing this collector.
+    """
+    extensions = approved_extensions(
+        {
+            "wmo.conversation.id": "thread-1",
+            "wmo.outcome.escalated": True,
+            "wmo.trace.metadata": {"team": "support"},
+            "vendor.internal": "drop me",
+        }
+    )
+
+    assert extensions == {
+        "wmo.conversation.id": "thread-1",
+        "wmo.outcome.escalated": True,
+        "wmo.trace.metadata": {"team": "support"},
+    }

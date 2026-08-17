@@ -13,6 +13,7 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
+    canonical_json_bytes,
     stable_id,
 )
 from wmo.common.judging.calibration import CalibrationError
@@ -35,7 +36,7 @@ from wmo.common.models import (
     OperationEconomics,
     ToolCall,
 )
-from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
+from wmo.common.project import ArtifactCorruptionError, ProjectStore
 from wmo.common.rollouts import RolloutArtifact
 
 
@@ -347,29 +348,19 @@ class LMJudge:
             calibration_artifact_id=calibration_artifact_id,
         )
         try:
-            store.artifacts.write_json(
+            stored, _ = store.artifacts.write_or_replay(
                 artifact_id=judgment.judgment_id,
                 artifact_type="judgment",
                 envelope=judgment,
-                files={"judgment.json": judgment},
+                envelope_path="judgment.json",
+                envelope_type=Judgment,
+                files={"judgment.json": canonical_json_bytes(judgment)},
             )
-        except ArtifactAlreadyExistsError:
-            try:
-                stored, _stored_input = read_artifact_json(
-                    store,
-                    artifact_id=judgment.judgment_id,
-                    expected_artifact_type="judgment",
-                    relative_path="judgment.json",
-                    model_type=Judgment,
-                )
-            except JudgingProvenanceError as exc:
-                raise JudgmentError("existing judgment artifact cannot be resumed safely") from exc
-            if not _same_judgment_identity(stored, judgment):
-                raise JudgmentError(
-                    "existing judgment artifact conflicts with this judgment"
-                ) from None
-            return stored
-        return judgment
+        except ArtifactCorruptionError as exc:
+            raise JudgmentError("existing judgment artifact cannot be resumed safely") from exc
+        except ValueError as exc:
+            raise JudgmentError("existing judgment artifact conflicts with this judgment") from exc
+        return stored
 
 
 def _load_authoritative_judging_inputs(
@@ -544,23 +535,3 @@ def _render_judgment_request(rollout: RolloutArtifact, rubric: Rubric) -> str:
 def _utc_now() -> datetime:
     """Return the default timezone-aware timestamp for immutable judgments."""
     return datetime.now(UTC)
-
-
-def _same_judgment_identity(left: Judgment, right: Judgment) -> bool:
-    """Compare persisted judgment content while permitting a safe retry at a later time."""
-    return (
-        left.schema_version == right.schema_version
-        and left.judgment_id == right.judgment_id
-        and left.rollout_id == right.rollout_id
-        and left.rubric_id == right.rubric_id
-        and left.calibration_id == right.calibration_id
-        and left.judge_model == right.judge_model
-        and left.judge_prompt_id == right.judge_prompt_id
-        and left.judge_prompt_sha256 == right.judge_prompt_sha256
-        and left.dimensions == right.dimensions
-        and left.overall_score == right.overall_score
-        and left.judge_economics == right.judge_economics
-        and left.inputs == right.inputs
-        and left.code_revision == right.code_revision
-        and left.source == right.source
-    )

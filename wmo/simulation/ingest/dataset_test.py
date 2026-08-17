@@ -150,6 +150,10 @@ def test_persist_trace_dataset_writes_trace_and_issue_evidence(tmp_path: Path) -
         "invalid_trace_count": 1,
         "issues": [{"message": "invalid JSONL record", "source_record": "line-4"}],
     }
+    loaded = load_trace_dataset(store, dataset.dataset_id)
+    evidence = read_trace_model_identity_evidence(store, loaded)
+    assert evidence is not None
+    assert evidence.records == ()
 
 
 def test_direct_model_spans_persist_explicit_unspecified_provenance(tmp_path: Path) -> None:

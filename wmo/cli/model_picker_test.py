@@ -21,13 +21,11 @@ from wmo.cli.provider_picker import (
     SetupSession,
 )
 from wmo.common.models import (
-    ConnectionConfig,
     DiscoveredModel,
     ModelCapabilities,
     ModelRecord,
     PricingSource,
     ProviderConnection,
-    ProviderModelSelection,
     SetupRole,
     resolve_discovered_model,
 )
@@ -198,8 +196,8 @@ def test_the_setup_written_from_confirmed_answers_carries_verified_metadata() ->
         chosen,
         roles=roles,
         endpoints=(_endpoint(),),
-        existing_connections=(),
-        existing_models=(),
+        known_existing_connections=(),
+        known_existing_aliases=(),
     )
 
     setup = result.setup
@@ -226,10 +224,6 @@ def test_already_configured_models_are_not_written_again() -> None:
         pricing_source=PricingSource.CONFIGURED,
         configured=True,
     )
-    existing_models = (
-        ProviderModelSelection(alias="luna", connection="openai", model="gpt-5.6-luna"),
-    )
-
     result = build_result(
         (configured, _EMBEDDER),
         roles=assign_roles(
@@ -239,8 +233,8 @@ def test_already_configured_models_are_not_written_again() -> None:
         )
         or pytest.fail("roles were not assigned"),
         endpoints=(_endpoint(),),
-        existing_connections=(_OPENAI,),
-        existing_models=existing_models,
+        known_existing_connections=("openai",),
+        known_existing_aliases=("luna",),
     )
 
     assert [model.alias for model in result.setup.models] == ["embedder"]
@@ -371,8 +365,8 @@ def test_summary_states_providers_models_roles_prices_and_credential_behavior() 
         chosen,
         roles=roles,
         endpoints=(_endpoint(),),
-        existing_connections=(),
-        existing_models=(),
+        known_existing_connections=(),
+        known_existing_aliases=(),
     )
     render_summary(result, chosen=chosen, endpoints=(_endpoint(),), console=console)
 
@@ -400,8 +394,8 @@ def test_summary_names_the_aws_credential_chain_for_bedrock() -> None:
         chosen,
         roles=roles,
         endpoints=(_endpoint(), _endpoint(bedrock)),
-        existing_connections=(),
-        existing_models=(),
+        known_existing_connections=(),
+        known_existing_aliases=(),
     )
     render_summary(
         result,
@@ -428,8 +422,8 @@ def test_summary_names_confirmed_router_candidates() -> None:
         chosen,
         roles=roles,
         endpoints=(_endpoint(),),
-        existing_connections=(),
-        existing_models=(),
+        known_existing_connections=(),
+        known_existing_aliases=(),
     )
     render_summary(result, chosen=chosen, endpoints=(_endpoint(),), console=console)
 
@@ -450,12 +444,11 @@ def test_a_connection_only_used_by_unselected_models_is_not_written() -> None:
         chosen,
         roles=roles,
         endpoints=(_endpoint(), _endpoint(other)),
-        existing_connections=(),
-        existing_models=(),
+        known_existing_connections=(),
+        known_existing_aliases=(),
     )
 
     assert [connection.name for connection in result.setup.connections] == ["openai"]
-    assert ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY").provider
 
 
 def test_duplicate_provider_model_names_receive_distinct_aliases() -> None:

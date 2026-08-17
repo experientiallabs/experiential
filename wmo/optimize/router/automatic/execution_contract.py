@@ -14,11 +14,12 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     Sha256,
+    canonical_json_bytes,
     envelope_matches_manifest,
     stable_id,
 )
 from wmo.common.models import CompletionCostReservation, ModelSnapshot
-from wmo.common.project import ArtifactAlreadyExistsError, ArtifactStore, artifact_input
+from wmo.common.project import ArtifactStore, artifact_input
 from wmo.common.routing import (
     ReservedFrozenEmbeddingSet,
     RouterEmbeddingReservation,
@@ -311,19 +312,17 @@ def persist_router_execution_contract(
         remaining_simulation_cost_usd=remaining,
     )
     try:
-        store.write_json(
+        stored, _ = store.write_or_replay(
             artifact_id=contract_id,
             artifact_type="router-execution-contract",
             envelope=contract,
-            files={"execution-contract.json": contract},
+            envelope_path="execution-contract.json",
+            envelope_type=RouterExecutionContract,
+            files={"execution-contract.json": canonical_json_bytes(contract)},
         )
-    except ArtifactAlreadyExistsError:
-        existing = load_router_execution_contract(store, contract_id)
-        replay = contract.model_copy(update={"created_at": existing.created_at})
-        if existing != replay:
-            raise ValueError("existing router execution contract differs from replay") from None
-        return existing
-    return contract
+    except ValueError as exc:
+        raise ValueError("existing router execution contract differs from replay") from exc
+    return stored
 
 
 def load_router_execution_contract(

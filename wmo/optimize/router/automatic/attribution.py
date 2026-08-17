@@ -20,7 +20,6 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
     ArtifactStore,
     artifact_input,
@@ -286,22 +285,17 @@ def persist_router_observed_attribution_set(
         records=resolved_records,
     )
     _verify_attribution_inputs(store, value)
-    destination = store.project_directory / "artifacts" / attribution_id
-    if destination.exists():
-        existing, input_value = load_router_observed_attribution_set(store, attribution_id)
-        replay = value.model_copy(update={"created_at": existing.created_at})
-        if existing != replay:
-            raise ValueError("existing router attribution differs from exact replay")
-        return existing, input_value
     try:
-        store.write_json(
+        store.write_or_replay(
             artifact_id=attribution_id,
             artifact_type="router-observed-attribution",
             envelope=value,
-            files={"attribution.json": value},
+            envelope_path="attribution.json",
+            envelope_type=RouterObservedAttributionSet,
+            files={"attribution.json": canonical_json_bytes(value)},
         )
-    except ArtifactAlreadyExistsError:
-        return load_router_observed_attribution_set(store, attribution_id)
+    except ValueError as exc:
+        raise ValueError("existing router attribution differs from exact replay") from exc
     return load_router_observed_attribution_set(store, attribution_id)
 
 

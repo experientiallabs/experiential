@@ -12,12 +12,12 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
     ContractModel,
+    canonical_json_bytes,
     envelope_matches_manifest,
     stable_id,
 )
 from wmo.common.models import CompletionCostReservation
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
     ArtifactStore,
     ArtifactStoreError,
     artifact_input,
@@ -165,18 +165,17 @@ def persist_simulation_completion_contract(
         maximum_attempts=maximum_attempts,
     )
     try:
-        manifest = store.write_json(
+        stored, manifest = store.write_or_replay(
             artifact_id=contract_id,
             artifact_type="simulation-completion-contract",
             envelope=value,
-            files={"completion-contract.json": value},
+            envelope_path="completion-contract.json",
+            envelope_type=SimulationCompletionContract,
+            files={"completion-contract.json": canonical_json_bytes(value)},
         )
-    except ArtifactAlreadyExistsError:
-        existing, input_record = load_simulation_completion_contract(store, contract_id)
-        if existing != value.model_copy(update={"created_at": existing.created_at}):
-            raise ValueError("existing completion contract differs from replay") from None
-        return existing, input_record
-    return value, artifact_input(manifest)
+    except ValueError as exc:
+        raise ValueError("existing completion contract differs from replay") from exc
+    return stored, artifact_input(manifest)
 
 
 def load_simulation_completion_contract(

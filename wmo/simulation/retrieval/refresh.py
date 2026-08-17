@@ -329,6 +329,8 @@ def refresh_runtime_trace_rag(
                 envelope=refresh,
                 files={_REFRESH_PATH: canonical_json_bytes(refresh)},
             )
+        # Intentional semantic-subset replay: _load_exact_refresh deep-verifies expected
+        # bindings, which write_or_replay's byte-equality check cannot express.
         except ArtifactAlreadyExistsError:
             return _load_exact_refresh(
                 store,

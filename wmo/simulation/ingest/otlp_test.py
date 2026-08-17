@@ -542,3 +542,28 @@ def test_otlp_routing_tags_ignore_late_request_tags() -> None:
 
     assert result.issues == ()
     assert routing_descriptor(result.traces[0]).tags == ("domain:travel",)
+
+
+def test_otlp_ignores_a_non_text_conversation_id() -> None:
+    """A non-text conversation id is skipped and the trace still normalizes without one."""
+    payload = _payload()
+    _replace_attribute(payload, span_index=0, key="wmo.conversation.id", value=42)
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.issues == ()
+    assert len(result.traces) == 1
+    assert result.traces[0].conversation_id is None
+
+
+def test_otlp_blank_conversation_id_falls_back_to_the_genai_key() -> None:
+    """A blank wmo.conversation.id falls through to a declared gen_ai.conversation.id."""
+    payload = _payload()
+    _replace_attribute(payload, span_index=0, key="wmo.conversation.id", value="  ")
+    attributes = cast(list[dict[str, object]], _span(payload, 0)["attributes"])
+    attributes.append(_attribute("gen_ai.conversation.id", "conversation-genai"))
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.issues == ()
+    assert result.traces[0].conversation_id == "conversation-genai"

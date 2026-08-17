@@ -13,6 +13,7 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     Sha256,
+    canonical_json_bytes,
     envelope_matches_manifest,
     stable_id,
 )
@@ -22,7 +23,7 @@ from wmo.common.models import (
     router_candidate_capabilities_sha256,
 )
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
+    ArtifactCorruptionError,
     ArtifactStore,
     ArtifactStoreError,
     artifact_input,
@@ -101,20 +102,21 @@ def persist_router_runtime_capability_contract(
         candidates=candidates,
     )
     try:
-        store.write_json(
+        stored, _ = store.write_or_replay(
             artifact_id=contract_id,
             artifact_type="router-runtime-capabilities",
             envelope=contract,
-            files={"capabilities.json": contract},
+            envelope_path="capabilities.json",
+            envelope_type=RouterRuntimeCapabilityContract,
+            files={"capabilities.json": canonical_json_bytes(contract)},
         )
-    except ArtifactAlreadyExistsError:
-        existing = load_router_runtime_capability_contract(store, contract_id)
-        if existing != contract.model_copy(update={"created_at": existing.created_at}):
-            raise RouterRuntimeCapabilityError(
-                "existing router capability contract differs from replay"
-            ) from None
-        return existing
-    return contract
+    except ArtifactCorruptionError as exc:
+        raise RouterRuntimeCapabilityError(str(exc)) from exc
+    except ValueError as exc:
+        raise RouterRuntimeCapabilityError(
+            "existing router capability contract differs from replay"
+        ) from exc
+    return stored
 
 
 def load_router_runtime_capability_contract(

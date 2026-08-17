@@ -11,7 +11,7 @@ from typing import Concatenate, Protocol
 
 from pydantic import JsonValue
 
-from wmo.common.core.artifacts import ArtifactInput, JsonObject, stable_id
+from wmo.common.core.artifacts import ArtifactInput, JsonObject, canonical_json_bytes, stable_id
 from wmo.common.core.locks import FileLockTimeout
 from wmo.common.judging import (
     CalibrationReport,
@@ -21,7 +21,7 @@ from wmo.common.judging import (
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.models import AssistantAction, ModelSnapshot, OperationEconomics, Usage
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
+    ArtifactCorruptionError,
     ArtifactStoreError,
     ProjectStore,
     ProjectStoreError,
@@ -608,28 +608,20 @@ def write_production_rollout(
         candidate_economics=OperationEconomics(usage=_combined_usage(trace)),
     )
     try:
-        manifest = store.artifacts.write_json(
+        _stored, manifest = store.artifacts.write_or_replay(
             artifact_id=artifact_id,
             artifact_type="rollout",
             envelope=rollout,
-            files={"rollout.json": rollout},
+            envelope_path="rollout.json",
+            envelope_type=RolloutArtifact,
+            files={"rollout.json": canonical_json_bytes(rollout)},
         )
-    except ArtifactAlreadyExistsError:
-        try:
-            existing, existing_input = read_artifact_json(
-                store,
-                artifact_id=artifact_id,
-                expected_artifact_type="rollout",
-                relative_path="rollout.json",
-                model_type=RolloutArtifact,
-            )
-        except JudgingProvenanceError as exc:
-            raise ManualJudgeError("existing production rollout cannot be resumed safely") from exc
-        if not _same_rollout_identity(existing, rollout):
-            raise ManualJudgeError(
-                "existing production rollout conflicts with the selected trace"
-            ) from None
-        return existing_input
+    except ArtifactCorruptionError as exc:
+        raise ManualJudgeError("existing production rollout cannot be resumed safely") from exc
+    except ValueError as exc:
+        raise ManualJudgeError(
+            "existing production rollout conflicts with the selected trace"
+        ) from exc
     return artifact_input(manifest)
 
 
@@ -648,19 +640,6 @@ def _attributed_candidate(candidate: ModelSnapshot | None) -> ModelSnapshot:
     if candidate is None:
         raise ManualJudgeError("attributed production rollouts require a candidate snapshot")
     return candidate
-
-
-def _same_rollout_identity(left: RolloutArtifact, right: RolloutArtifact) -> bool:
-    """Compare immutable rollout content while excluding materialization time.
-
-    Args:
-        left: Persisted rollout from an earlier attempt.
-        right: Freshly materialized rollout for the same real trace.
-
-    Returns:
-        Whether all semantically immutable fields match.
-    """
-    return left.model_copy(update={"created_at": right.created_at}) == right
 
 
 def _rollout_span(span: TraceSpan) -> RolloutSpan:
@@ -813,34 +792,19 @@ def write_audit(
         positional_bias_flips=(positional_bias[1] if positional_bias is not None else None),
     )
     try:
-        store.artifacts.write_json(
+        stored, _ = store.artifacts.write_or_replay(
             artifact_id=audit_id,
             artifact_type="manual-judge-calibration-audit",
             envelope=audit,
-            files={"audit.json": audit},
+            envelope_path="audit.json",
+            envelope_type=ManualJudgeCalibrationAudit,
+            files={"audit.json": canonical_json_bytes(audit)},
         )
-    except ArtifactAlreadyExistsError:
-        existing = read_audit(store, artifact_input(store.artifacts.read(audit_id).manifest))
-        if not _same_audit_identity(existing, audit):
-            raise ManualJudgeError("existing judge calibration audit conflicts") from None
-        return existing
-    return audit
-
-
-def _same_audit_identity(
-    existing: ManualJudgeCalibrationAudit,
-    replay: ManualJudgeCalibrationAudit,
-) -> bool:
-    """Compare an existing audit with a retry while ignoring materialization time only.
-
-    Args:
-        existing: Manifest-verified immutable audit written by an earlier attempt.
-        replay: Audit reconstructed from the current verified calibration evidence.
-
-    Returns:
-        Whether every semantic field and input matches after preserving the original timestamp.
-    """
-    return existing == replay.model_copy(update={"created_at": existing.created_at})
+    except ArtifactCorruptionError as exc:
+        raise ManualJudgeError("existing judge calibration audit cannot be resumed safely") from exc
+    except ValueError as exc:
+        raise ManualJudgeError("existing judge calibration audit conflicts") from exc
+    return stored
 
 
 def read_audit(store: ProjectStore, expected: ArtifactInput) -> ManualJudgeCalibrationAudit:

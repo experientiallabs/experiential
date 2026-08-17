@@ -1,15 +1,8 @@
-"""Selection prompt tests for line-based screens and the keyboard multi-select list."""
+"""Selection prompt tests for the keyboard screens on a real terminal and the typed fallback."""
 
 from __future__ import annotations
 
-import errno
 import io
-import os
-import pty
-import select
-import subprocess
-import sys
-import time
 from collections.abc import Callable
 
 import pytest
@@ -23,7 +16,14 @@ from wmo.cli.picker import (
     select_many,
     select_many_list,
     select_one,
+    select_one_list,
 )
+from wmo.conftest import TerminalRun
+
+_DOWN = "\x1b[B"
+_UP = "\x1b[A"
+_ENTER = "\r"
+_SPACE = " "
 
 
 class ScriptedConsole(Console):
@@ -243,62 +243,58 @@ def _keys(*actions: PickerKey) -> Callable[[], PickerKey]:
     return lambda: next(iterator)
 
 
-def _run_keyboard_picker_pty(*, ready_marker: str) -> str:
-    """Drive a real terminal picker with one immediate batched key sequence.
+def _picker_script(body: str) -> str:
+    """Wrap one picker call in a child program that reports what it chose.
 
     Args:
-        ready_marker: Output proving how far the child rendered before input is sent.
+        body: Statements that assign ``result`` from a picker screen.
 
     Returns:
-        Complete decoded terminal output from the child process.
+        Source for a child interpreter attached to a pseudo-terminal.
     """
-    script = """
-from rich.console import Console
-from wmo.cli.picker import PickerOption, select_many_list
-
-result = select_many_list(
-    Console(force_terminal=True),
-    title="Providers",
-    options=(PickerOption("a", "A"), PickerOption("b", "B")),
-)
-print("RESULT:" + ",".join(result.values), flush=True)
-"""
-    master, slave = pty.openpty()
-    process = subprocess.Popen(
-        [sys.executable, "-c", script],
-        stdin=slave,
-        stdout=slave,
-        stderr=slave,
-        close_fds=True,
+    return (
+        "from rich.console import Console\n"
+        "from wmo.cli.picker import PickerOption, choose_many, choose_one\n"
+        "console = Console()\n"
+        f"{body}\n"
+        'print("RESULT:" + ",".join(result.values) + "|" + str(result.action), flush=True)\n'
     )
-    os.close(slave)
-    output = bytearray()
-    sent = False
-    deadline = time.monotonic() + 5
-    try:
-        while time.monotonic() < deadline:
-            readable, _, _ = select.select([master], [], [], 0.05)
-            if readable:
-                try:
-                    output.extend(os.read(master, 65_536))
-                except OSError as error:
-                    if error.errno != errno.EIO:
-                        raise
-                    break
-            if not sent and ready_marker.encode() in output:
-                os.write(master, b"\x1b[B\r\x1b[B\r")
-                sent = True
-            if process.poll() is not None:
-                break
-        if process.poll() is None:
-            process.terminate()
-            process.wait(timeout=2)
-    finally:
-        os.close(master)
-    transcript = output.decode(errors="replace")
-    assert sent, f"picker never rendered {ready_marker!r}:\n{transcript}"
-    assert process.returncode == 0, f"picker exited {process.returncode}:\n{transcript}"
-    return transcript
+
+
+def _model_options(count: int) -> str:
+    """Return source building model rows that keep provider, role, and pricing metadata.
+
+    Args:
+        count: Number of model rows the child screen offers.
+
+    Returns:
+        A Python expression evaluating to the option tuple.
+    """
+    return (
+        "tuple(\n"
+        "    PickerOption(\n"
+        '        value=f"model-{index}",\n'
+        '        label=f"model-{index} (openai/gpt-{index})",\n'
+        '        detail=f"roles: judge, world_model; pricing: api",\n'
+        "    )\n"
+        f"    for index in range(1, {count + 1})\n"
+        ")"
+    )
+
+
+def _assert_single_region(run: TerminalRun, *, title: str, rows: tuple[str, ...]) -> None:
+    """Assert the visible screen kept one copy of the heading and of every named row.
+
+    Args:
+        run: Completed pseudo-terminal session.
+        title: Screen heading that must appear exactly once.
+        rows: Row labels that must each appear exactly once.
+    """
+    text = run.screen_text()
+    assert text.count(title) == 1, text
+    for row in rows:
+        assert text.count(row) == 1, text
+    assert "^[[" not in run.transcript, run.transcript
 
 
 @pytest.mark.parametrize(
@@ -329,16 +325,273 @@ def test_interpret_key_bytes_maps_terminal_events(raw: bytes, expected: PickerKe
 
 
 @pytest.mark.parametrize("ready_marker", ["Providers", "q cancels."])
-def test_keyboard_list_accepts_batched_keys_from_a_real_terminal(ready_marker: str) -> None:
-    """Terminal readiness and unbuffered reads preserve an immediate arrow-key batch.
+def test_provider_multi_select_redraws_one_region_for_repeated_and_batched_keys(
+    ready_marker: str,
+    python_terminal_child: Callable[..., TerminalRun],
+) -> None:
+    """Repeated and batched arrow keys move focus inside a single redrawn region.
 
     Args:
-        ready_marker: Early or fully rendered output that triggers the key batch.
+        ready_marker: Early or fully rendered output that triggers the first key batch.
+        python_terminal_child: Runner for one inline script under a pseudo-terminal.
     """
-    transcript = _run_keyboard_picker_pty(ready_marker=ready_marker)
+    script = _picker_script(
+        "result = choose_many(\n"
+        "    console,\n"
+        '    title="Providers",\n'
+        f"    options={_model_options(6)},\n"
+        ")"
+    )
 
-    assert "RESULT:b" in transcript
-    assert "^[[B" not in transcript
+    run = python_terminal_child(
+        script,
+        steps=[
+            (ready_marker, _DOWN + _DOWN + _SPACE),
+            (None, _DOWN + _DOWN + _UP + _SPACE),
+            (None, _DOWN + _DOWN + _DOWN + _ENTER),
+        ],
+    )
+
+    assert "RESULT:model-3,model-4|None" in run.transcript
+    _assert_single_region(
+        run,
+        title="Providers",
+        rows=("model-1 (openai/gpt-1)", "model-6 (openai/gpt-6)"),
+    )
+    assert "[x] model-3 (openai/gpt-3)" in run.screen_text()
+    assert [line for line in run.screen if line.strip() == "> Complete"]
+
+
+def test_model_single_select_confirms_the_focused_row_with_enter(
+    python_terminal_child: Callable[..., TerminalRun],
+) -> None:
+    """Enter immediately confirms the focused model and keeps its metadata visible.
+
+    Args:
+        python_terminal_child: Runner for one inline script under a pseudo-terminal.
+    """
+    script = _picker_script(
+        "result = choose_one(\n"
+        "    console,\n"
+        '    title="World model for the build",\n'
+        f"    options={_model_options(4)},\n"
+        ')\nassert result.values, "single select returned nothing"'
+    )
+
+    run = python_terminal_child(
+        script,
+        steps=[("World model for the build", _DOWN), (None, _DOWN + _ENTER)],
+    )
+
+    assert "RESULT:model-3|None" in run.transcript
+    _assert_single_region(
+        run,
+        title="World model for the build",
+        rows=("model-1 (openai/gpt-1)", "model-4 (openai/gpt-4)"),
+    )
+    assert "roles: judge, world_model; pricing: api" in run.screen_text()
+    assert "[ ]" not in run.screen_text()
+
+
+def test_candidate_multi_select_accepts_an_empty_optional_selection(
+    python_terminal_child: Callable[..., TerminalRun],
+) -> None:
+    """An optional candidate screen submits nothing from Complete without typed commands.
+
+    Args:
+        python_terminal_child: Runner for one inline script under a pseudo-terminal.
+    """
+    script = _picker_script(
+        "result = choose_many(\n"
+        "    console,\n"
+        '    title="Router candidates",\n'
+        f"    options={_model_options(3)},\n"
+        "    minimum=0,\n"
+        ")"
+    )
+
+    run = python_terminal_child(
+        script,
+        steps=[
+            ("Router candidates", _SPACE),
+            (None, _SPACE),
+            (None, _DOWN + _DOWN + _DOWN + _ENTER),
+        ],
+    )
+
+    assert "RESULT:|None" in run.transcript
+    _assert_single_region(run, title="Router candidates", rows=("model-2 (openai/gpt-2)",))
+    assert "[x]" not in run.screen_text()
+
+
+def test_a_long_model_list_scrolls_inside_the_terminal(
+    python_terminal_child: Callable[..., TerminalRun],
+) -> None:
+    """A list taller than the terminal scrolls instead of growing the region.
+
+    Args:
+        python_terminal_child: Runner for one inline script under a pseudo-terminal.
+    """
+    script = _picker_script(
+        "result = choose_one(\n"
+        "    console,\n"
+        '    title="Judge model",\n'
+        f"    options={_model_options(40)},\n"
+        ")"
+    )
+
+    run = python_terminal_child(
+        script,
+        steps=[("Judge model", _DOWN * 12), (None, _ENTER)],
+        size=(16, 100),
+    )
+
+    assert "RESULT:model-13|None" in run.transcript
+    text = run.screen_text()
+    assert text.count("Judge model") == 1
+    assert "more above" in text
+    assert "more below" in text
+    assert "model-40" not in text
+    assert len(run.screen) <= 16, run.screen
+
+
+def test_a_narrow_terminal_keeps_the_hint_and_metadata_readable(
+    python_terminal_child: Callable[..., TerminalRun],
+) -> None:
+    """A narrow terminal splits the hint and still redraws one region.
+
+    Args:
+        python_terminal_child: Runner for one inline script under a pseudo-terminal.
+    """
+    script = _picker_script(
+        "result = choose_many(\n"
+        "    console,\n"
+        '    title="Providers",\n'
+        f"    options={_model_options(3)},\n"
+        ")"
+    )
+
+    run = python_terminal_child(
+        script,
+        steps=[("Providers", _SPACE), (None, _DOWN + _DOWN + _DOWN + _ENTER)],
+        size=(24, 44),
+    )
+
+    assert "RESULT:model-1|None" in run.transcript
+    text = run.screen_text()
+    assert text.count("Providers") == 1
+    assert "Activate Complete to submit." in text
+    assert "roles: judge, world_model; pricing:" in text
+
+
+def test_cancelling_a_screen_restores_the_terminal(
+    python_terminal_child: Callable[..., TerminalRun],
+) -> None:
+    """Cancelling leaves canonical input, a visible cursor, and one region behind.
+
+    Args:
+        python_terminal_child: Runner for one inline script under a pseudo-terminal.
+    """
+    script = _picker_script(
+        "result = choose_many(\n"
+        "    console,\n"
+        '    title="Providers",\n'
+        f"    options={_model_options(3)},\n"
+        ")\n"
+        "import sys, termios\n"
+        'print("CANON:" + str(bool(termios.tcgetattr(sys.stdin.fileno())[3] & termios.ICANON)))'
+    )
+
+    run = python_terminal_child(script, steps=[("Providers", _DOWN + "q")])
+
+    assert "RESULT:|cancel" in run.transcript
+    assert "CANON:True" in run.transcript
+    assert "\x1b[?25h" in run.transcript
+    assert run.transcript.count("\x1b[?25l") == 1
+
+
+def test_an_exception_during_a_screen_restores_the_terminal(
+    python_terminal_child: Callable[..., TerminalRun],
+) -> None:
+    """A failure raised while a screen waits for keys still releases the region.
+
+    Args:
+        python_terminal_child: Runner for one inline script under a pseudo-terminal.
+    """
+    script = (
+        "import signal, sys, termios\n"
+        "from rich.console import Console\n"
+        "from wmo.cli.picker import PickerOption, choose_many\n"
+        "def fail(signum, frame):\n"
+        '    """Interrupt the blocked key read with a failure.\n\n'
+        "    Args:\n"
+        "        signum: Signal number delivered by the timer.\n"
+        "        frame: Interrupted stack frame.\n\n"
+        "    Raises:\n"
+        "        RuntimeError: Always, standing in for a failing screen.\n"
+        '    """\n'
+        '    raise RuntimeError("screen failed")\n'
+        "signal.signal(signal.SIGALRM, fail)\n"
+        "signal.setitimer(signal.ITIMER_REAL, 0.75)\n"
+        "try:\n"
+        "    choose_many(\n"
+        "        Console(),\n"
+        '        title="Providers",\n'
+        '        options=(PickerOption("a", "provider-a"), PickerOption("b", "provider-b")),\n'
+        "    )\n"
+        "except RuntimeError as error:\n"
+        '    print("FAILED:" + str(error))\n'
+        'print("CANON:" + str(bool(termios.tcgetattr(sys.stdin.fileno())[3] & termios.ICANON)))\n'
+    )
+
+    run = python_terminal_child(script, steps=[])
+
+    assert "FAILED:screen failed" in run.transcript
+    assert "CANON:True" in run.transcript
+    assert "\x1b[?25h" in run.transcript
+    assert run.screen_text().count("Providers") == 1
+
+
+def test_keyboard_single_select_starts_on_a_prior_answer() -> None:
+    """A prior answer is focused first so one Enter keeps it."""
+    console = _console("")
+
+    result = select_one_list(
+        console,
+        title="Judge",
+        options=_options(3),
+        default="model-3",
+        read_key=_keys(PickerKey.ENTER),
+    )
+
+    assert result.values == ("model-3",)
+    assert "> model-3" in console.output
+
+
+def test_keyboard_single_select_navigates_and_can_leave_the_screen() -> None:
+    """Up and Down wrap around the rows, and b or q leave without a value."""
+    console = _console("")
+
+    result = select_one_list(
+        console,
+        title="Judge",
+        options=_options(3),
+        read_key=_keys(PickerKey.UP, PickerKey.DOWN, PickerKey.DOWN, PickerKey.ENTER),
+    )
+    assert result.values == ("model-2",)
+
+    assert (
+        select_one_list(
+            console, title="Judge", options=_options(2), read_key=_keys(PickerKey.BACK)
+        ).action
+        is PickerAction.BACK
+    )
+    assert (
+        select_one_list(
+            console, title="Judge", options=_options(2), read_key=_keys(PickerKey.CANCEL)
+        ).action
+        is PickerAction.CANCEL
+    )
 
 
 def test_keyboard_list_moves_focus_toggles_selection_and_submits_from_complete() -> None:

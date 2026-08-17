@@ -114,19 +114,27 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
     ),
-    "gpt-5.5": _chat(input_usd=5.0, cached_input_usd=0.5, output_usd=30.0),
-    "gpt-5.5-pro": _chat(input_usd=30.0, output_usd=180.0),
-    "gpt-5.4": _chat(input_usd=2.5, cached_input_usd=0.25, output_usd=15.0),
-    "gpt-5.4-mini": _chat(input_usd=0.75, cached_input_usd=0.075, output_usd=4.5),
-    "gpt-5.4-nano": _chat(input_usd=0.2, cached_input_usd=0.02, output_usd=1.25),
-    "gpt-5.4-pro": _chat(input_usd=30.0, output_usd=180.0),
-    "gpt-5.2": _chat(input_usd=1.75, cached_input_usd=0.175, output_usd=14.0),
-    "gpt-5.2-pro": _chat(input_usd=21.0, output_usd=168.0),
-    "gpt-5.1": _chat(input_usd=1.25, cached_input_usd=0.125, output_usd=10.0),
-    "gpt-5": _chat(input_usd=1.25, cached_input_usd=0.125, output_usd=10.0),
-    "gpt-5-mini": _chat(input_usd=0.25, cached_input_usd=0.025, output_usd=2.0),
-    "gpt-5-nano": _chat(input_usd=0.05, cached_input_usd=0.005, output_usd=0.4),
-    "gpt-5-pro": _chat(input_usd=15.0, output_usd=120.0),
+    "gpt-5.5": _chat(input_usd=5.0, cached_input_usd=0.5, cache_write_usd=0.0, output_usd=30.0),
+    "gpt-5.5-pro": _chat(input_usd=30.0, cache_write_usd=0.0, output_usd=180.0),
+    "gpt-5.4": _chat(input_usd=2.5, cached_input_usd=0.25, cache_write_usd=0.0, output_usd=15.0),
+    "gpt-5.4-mini": _chat(
+        input_usd=0.75, cached_input_usd=0.075, cache_write_usd=0.0, output_usd=4.5
+    ),
+    "gpt-5.4-nano": _chat(
+        input_usd=0.2, cached_input_usd=0.02, cache_write_usd=0.0, output_usd=1.25
+    ),
+    "gpt-5.4-pro": _chat(input_usd=30.0, cache_write_usd=0.0, output_usd=180.0),
+    "gpt-5.2": _chat(input_usd=1.75, cached_input_usd=0.175, cache_write_usd=0.0, output_usd=14.0),
+    "gpt-5.2-pro": _chat(input_usd=21.0, cache_write_usd=0.0, output_usd=168.0),
+    "gpt-5.1": _chat(input_usd=1.25, cached_input_usd=0.125, cache_write_usd=0.0, output_usd=10.0),
+    "gpt-5": _chat(input_usd=1.25, cached_input_usd=0.125, cache_write_usd=0.0, output_usd=10.0),
+    "gpt-5-mini": _chat(
+        input_usd=0.25, cached_input_usd=0.025, cache_write_usd=0.0, output_usd=2.0
+    ),
+    "gpt-5-nano": _chat(
+        input_usd=0.05, cached_input_usd=0.005, cache_write_usd=0.0, output_usd=0.4
+    ),
+    "gpt-5-pro": _chat(input_usd=15.0, cache_write_usd=0.0, output_usd=120.0),
     "text-embedding-3-small": _embedding(input_usd=0.02, context_window_tokens=8_192),
     "text-embedding-3-large": _embedding(input_usd=0.13, context_window_tokens=8_192),
     "text-embedding-ada-002": _embedding(input_usd=0.1, context_window_tokens=8_192),

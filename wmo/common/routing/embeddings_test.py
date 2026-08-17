@@ -142,7 +142,7 @@ def test_router_embedding_write_crash_blocks_unknown_spend_redispatch(
         feature_count=1,
     )
     client = _EmbeddingClient()
-    original_write = project.artifacts.write_json
+    original_write = project.artifacts.write_or_replay
 
     def fail_after_provider(**_kwargs: object) -> object:
         """Model a crash after provider success but before artifact publication.
@@ -155,7 +155,7 @@ def test_router_embedding_write_crash_blocks_unknown_spend_redispatch(
         """
         raise OSError("injected embedding artifact publication crash")
 
-    monkeypatch.setattr(project.artifacts, "write_json", fail_after_provider)
+    monkeypatch.setattr(project.artifacts, "write_or_replay", fail_after_provider)
     with pytest.raises(OSError, match="publication crash"):
         persist_router_embeddings(
             project.artifacts,
@@ -170,7 +170,7 @@ def test_router_embedding_write_crash_blocks_unknown_spend_redispatch(
             created_at=datetime(2026, 8, 12, tzinfo=UTC),
             code_revision="test",
         )
-    monkeypatch.setattr(project.artifacts, "write_json", original_write)
+    monkeypatch.setattr(project.artifacts, "write_or_replay", original_write)
 
     with pytest.raises(ValueError, match="reconcile provider spend"):
         persist_router_embeddings(
