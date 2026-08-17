@@ -255,7 +255,7 @@ def preflight_automatic_router(
             world_alias=world_alias,
             world=world,
             maximum_attempts=options.completion_maximum_attempts,
-            maximum_input_tokens=estimated_input_tokens,
+            estimated_input_tokens=estimated_input_tokens,
             maximum_output_tokens=options.simulation_maximum_output_tokens,
         )
     judge_request = judge_completion_reservation(

@@ -39,7 +39,11 @@ class _Client:
 
 
 def test_reserved_judge_prices_openai_usage_without_observed_cost() -> None:
-    """Reconcile a native OpenAI response under the frozen retry and cache rates."""
+    """Reconcile a native OpenAI response under the frozen retry and cache rates.
+
+    The retry allowance charges the observed request input at the highest input rate plus the
+    full reserved output budget, not the hard admission ceiling.
+    """
     model = ModelSnapshot(
         provider="openai",
         model_id="judge-model",
@@ -112,4 +116,4 @@ def test_reserved_judge_prices_openai_usage_without_observed_cost() -> None:
 
     assert result.economics.cost_usd is not None
     assert result.economics.cost_usd.provenance == "estimated"
-    assert result.economics.cost_usd.value == 0.0042025
+    assert result.economics.cost_usd.value == 0.0024025

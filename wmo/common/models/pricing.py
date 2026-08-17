@@ -74,7 +74,14 @@ class EmbeddingCostReservation(ContractModel):
 
 
 class CompletionCostReservation(ContractModel):
-    """Conservative retry-bound ceiling for one completion provider request."""
+    """Conservative retry-bound ceiling for one completion provider request.
+
+    ``maximum_input_tokens`` is the hard per-request admission ceiling, sized from the model's
+    real context capacity. ``estimated_input_tokens`` is the realistic per-call planning size
+    used only to price ``estimated_maximum_call_cost_usd``; an actual request may exceed the
+    estimate as long as it fits the hard ceiling and the caller's remaining spend budget.
+    An absent estimate prices the reservation from the hard ceiling itself.
+    """
 
     model: ModelSnapshot
     input_usd_per_million_tokens: float = Field(ge=0)
@@ -84,6 +91,7 @@ class CompletionCostReservation(ContractModel):
     maximum_attempts: int = Field(gt=0)
     maximum_input_tokens: int = Field(gt=0)
     maximum_output_tokens: int = Field(gt=0)
+    estimated_input_tokens: int | None = Field(default=None, gt=0)
     estimated_maximum_call_cost_usd: float = Field(ge=0)
 
     @field_validator(
@@ -128,11 +136,41 @@ class CompletionCostReservation(ContractModel):
         """
         return max(input_price, cached_input_price, cache_write_price)
 
-    def expected_maximum_call_cost_usd(self) -> float:
-        """Calculate the complete retry-bound cost ceiling for one request.
+    def planning_input_tokens(self) -> int:
+        """Return the input size used to price this reservation.
 
         Returns:
-            Conservative maximum cost in USD.
+            The realistic per-call estimate, or the hard ceiling without one.
+        """
+        if self.estimated_input_tokens is not None:
+            return self.estimated_input_tokens
+        return self.maximum_input_tokens
+
+    def expected_maximum_call_cost_usd(self) -> float:
+        """Calculate the retry-bound planning cost for one realistic request.
+
+        Returns:
+            Conservative planning cost in USD priced from the realistic input estimate.
+        """
+        input_price = self._input_price_ceiling(
+            self.input_usd_per_million_tokens,
+            self.cached_input_usd_per_million_tokens,
+            self.cache_write_usd_per_million_tokens,
+        )
+        return (
+            self.maximum_attempts
+            * (
+                self.planning_input_tokens() * input_price
+                + self.maximum_output_tokens * self.output_usd_per_million_tokens
+            )
+            / 1_000_000
+        )
+
+    def absolute_maximum_call_cost_usd(self) -> float:
+        """Calculate the retry-bound cost of one request at the hard admission ceiling.
+
+        Returns:
+            Absolute maximum cost in USD for one admitted request.
         """
         input_price = self._input_price_ceiling(
             self.input_usd_per_million_tokens,
@@ -150,14 +188,20 @@ class CompletionCostReservation(ContractModel):
 
     @model_validator(mode="after")
     def _require_complete_ceiling(self) -> CompletionCostReservation:
-        """Require the persisted total to equal its retry-bound request ceiling.
+        """Require the persisted total to equal its retry-bound planning cost.
 
         Returns:
             The unchanged validated reservation.
 
         Raises:
-            ValueError: The total omits a price, token ceiling, or retry factor.
+            ValueError: The estimate exceeds the hard ceiling or the total omits a price,
+                token estimate, or retry factor.
         """
+        if (
+            self.estimated_input_tokens is not None
+            and self.estimated_input_tokens > self.maximum_input_tokens
+        ):
+            raise ValueError("completion input estimate exceeds its hard admission ceiling")
         if not math.isclose(
             self.estimated_maximum_call_cost_usd,
             self.expected_maximum_call_cost_usd(),
@@ -178,6 +222,7 @@ def completion_cost_reservation(
     maximum_attempts: int,
     maximum_input_tokens: int,
     maximum_output_tokens: int,
+    estimated_input_tokens: int | None = None,
 ) -> CompletionCostReservation:
     """Create one exact conservative completion-call reservation.
 
@@ -188,21 +233,26 @@ def completion_cost_reservation(
         cached_input_usd_per_million_tokens: Cached-read input price.
         cache_write_usd_per_million_tokens: Total cache-write input rate.
         maximum_attempts: Runtime request-attempt ceiling.
-        maximum_input_tokens: Full serialized request-input ceiling.
+        maximum_input_tokens: Hard per-request input admission ceiling.
         maximum_output_tokens: Provider output ceiling.
+        estimated_input_tokens: Realistic per-call input size used only for cost planning,
+            or ``None`` to plan at the hard ceiling.
 
     Returns:
-        Validated retry-bound maximum call cost.
+        Validated retry-bound planning call cost.
     """
     input_price = CompletionCostReservation._input_price_ceiling(
         input_usd_per_million_tokens,
         cached_input_usd_per_million_tokens,
         cache_write_usd_per_million_tokens,
     )
+    planning_input_tokens = (
+        estimated_input_tokens if estimated_input_tokens is not None else maximum_input_tokens
+    )
     estimated = (
         maximum_attempts
         * (
-            maximum_input_tokens * input_price
+            planning_input_tokens * input_price
             + maximum_output_tokens * output_usd_per_million_tokens
         )
         / 1_000_000
@@ -216,6 +266,7 @@ def completion_cost_reservation(
         maximum_attempts=maximum_attempts,
         maximum_input_tokens=maximum_input_tokens,
         maximum_output_tokens=maximum_output_tokens,
+        estimated_input_tokens=estimated_input_tokens,
         estimated_maximum_call_cost_usd=estimated,
     )
 
@@ -263,10 +314,12 @@ def reconcile_completion_economics(
 
     A successful response exposes usage for its completed attempt but provider adapters do not
     expose whether earlier retry attempts were billed. The derived charge therefore prices the
-    successful usage exactly under the frozen mutually exclusive rates and reserves the full
-    per-attempt ceiling for every possible earlier attempt. A provider cost measurement has no
-    retry-coverage marker, so it is treated as successful-attempt evidence and never as proof that
-    earlier attempts were free.
+    successful usage exactly under the frozen mutually exclusive rates and reserves, for every
+    possible earlier attempt, the observed request input at the highest input rate plus the full
+    reserved output budget. Earlier attempts of the same call sent the same request, so the
+    observed input size bounds them without charging the context-sized admission ceiling. A
+    provider cost measurement has no retry-coverage marker, so it is treated as successful-attempt
+    evidence and never as proof that earlier attempts were free.
 
     Args:
         reservation: Frozen model prices, token bounds, and retry ceiling.
@@ -324,7 +377,7 @@ def reconcile_completion_economics(
         successful_input_cost + usage.output_tokens * reservation.output_usd_per_million_tokens
     ) / 1_000_000
     maximum_attempt_cost = (
-        reservation.maximum_input_tokens
+        usage.input_tokens
         * CompletionCostReservation._input_price_ceiling(
             reservation.input_usd_per_million_tokens,
             reservation.cached_input_usd_per_million_tokens,
@@ -339,7 +392,7 @@ def reconcile_completion_economics(
         retry_inclusive_cost,
         measured.value if measured is not None else 0.0,
     )
-    if derived_cost > reservation.estimated_maximum_call_cost_usd:
+    if derived_cost > reservation.absolute_maximum_call_cost_usd():
         raise ValueError("derived completion spend exceeds its request reservation")
     if (
         measured is not None

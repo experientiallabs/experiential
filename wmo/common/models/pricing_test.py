@@ -16,6 +16,7 @@ from wmo.common.models import (
     OperationEconomics,
     Usage,
     completion_cost_reservation,
+    completion_request_cost_usd,
     persist_pricing_snapshot,
     reconcile_completion_economics,
 )
@@ -78,6 +79,62 @@ def test_completion_reservation_covers_cache_write_output_and_retries() -> None:
     assert reservation.estimated_maximum_call_cost_usd == pytest.approx(0.012)
 
 
+def test_completion_reservation_prices_from_the_realistic_input_estimate() -> None:
+    """An explicit estimate prices planning cost while the hard ceiling bounds admission."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000_000,
+        maximum_output_tokens=500,
+        estimated_input_tokens=1_000,
+    )
+
+    assert reservation.planning_input_tokens() == 1_000
+    assert reservation.estimated_maximum_call_cost_usd == pytest.approx(0.012)
+    assert reservation.absolute_maximum_call_cost_usd() == pytest.approx(6.006)
+
+
+def test_completion_reservation_rejects_estimate_above_the_hard_ceiling() -> None:
+    """A planning estimate can never exceed the per-request admission ceiling."""
+    with pytest.raises(ValidationError, match="exceeds its hard admission ceiling"):
+        completion_cost_reservation(
+            model=_model(),
+            input_usd_per_million_tokens=1,
+            output_usd_per_million_tokens=4,
+            cached_input_usd_per_million_tokens=0.5,
+            cache_write_usd_per_million_tokens=2,
+            maximum_attempts=3,
+            maximum_input_tokens=1_000,
+            maximum_output_tokens=500,
+            estimated_input_tokens=2_000,
+        )
+
+
+def test_request_larger_than_the_estimate_is_admitted_up_to_the_hard_ceiling() -> None:
+    """An actual request above the realistic estimate is priced, not rejected."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=1,
+        maximum_input_tokens=1_000_000,
+        maximum_output_tokens=500,
+        estimated_input_tokens=1_000,
+    )
+
+    cost = completion_request_cost_usd(reservation, input_tokens=50_000, output_tokens=500)
+
+    assert cost == pytest.approx(0.102)
+    with pytest.raises(ValueError, match="reserved input-token ceiling"):
+        completion_request_cost_usd(reservation, input_tokens=1_000_001, output_tokens=500)
+
+
 def test_completion_reservation_rejects_tampered_total() -> None:
     """A persisted reservation cannot omit a price, bound, or retry factor."""
     reservation = completion_cost_reservation(
@@ -101,7 +158,7 @@ def test_completion_reservation_rejects_tampered_total() -> None:
 
 
 def test_missing_provider_cost_uses_cached_usage_and_prior_retry_ceiling() -> None:
-    """Derive successful usage while conservatively charging every possible failed retry."""
+    """Charge each possible failed retry at the observed request size, not the hard ceiling."""
     reservation = completion_cost_reservation(
         model=_model(),
         input_usd_per_million_tokens=1,
@@ -119,7 +176,7 @@ def test_missing_provider_cost_uses_cached_usage_and_prior_retry_ceiling() -> No
     )
 
     assert economics.cost_usd is not None
-    assert economics.cost_usd.value == pytest.approx(0.0082025)
+    assert economics.cost_usd.value == pytest.approx(0.0046025)
     assert economics.cost_usd.provenance == "estimated"
 
 
@@ -162,7 +219,7 @@ def test_observed_success_cost_does_not_hide_possible_failed_retries() -> None:
     )
 
     assert economics.cost_usd is not None
-    assert economics.cost_usd.value == pytest.approx(0.0082025)
+    assert economics.cost_usd.value == pytest.approx(0.0046025)
     assert economics.cost_usd.provenance == "estimated"
 
 

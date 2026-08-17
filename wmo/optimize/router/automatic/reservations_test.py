@@ -166,8 +166,8 @@ def test_simulation_input_estimate_sums_explicit_deterministic_components() -> N
         )
 
 
-def test_completion_reservation_uses_trace_estimate_not_full_context() -> None:
-    """The persisted input ceiling equals the trace estimate instead of the context window."""
+def test_completion_reservation_prices_from_trace_estimate_and_admits_to_context() -> None:
+    """The trace estimate prices the reservation while context capacity bounds admission."""
     traces = tuple(_trace(f"t-{index}", "x" * 2_000) for index in range(5))
     estimate = simulation_input_token_estimate(
         traces,
@@ -185,14 +185,20 @@ def test_completion_reservation_uses_trace_estimate_not_full_context() -> None:
         model=_snapshot("world"),
         label="world model",
         maximum_attempts=3,
-        maximum_input_tokens=estimate,
+        estimated_input_tokens=estimate,
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
 
     assert problems == []
     assert reservation is not None
-    assert reservation.maximum_input_tokens == estimate
-    assert reservation.maximum_input_tokens < _LARGE_CONTEXT_TOKENS // 10
+    assert reservation.estimated_input_tokens == estimate
+    assert reservation.maximum_input_tokens == _LARGE_CONTEXT_TOKENS - _OUTPUT_TOKENS
+    assert reservation.planning_input_tokens() == estimate
+    assert reservation.planning_input_tokens() < _LARGE_CONTEXT_TOKENS // 10
+    assert (
+        reservation.estimated_maximum_call_cost_usd
+        < reservation.absolute_maximum_call_cost_usd() / 5
+    )
 
 
 def test_completion_reservation_rejects_estimates_above_the_context_window() -> None:
@@ -206,7 +212,7 @@ def test_completion_reservation_rejects_estimates_above_the_context_window() -> 
         model=_snapshot("world"),
         label="world model",
         maximum_attempts=3,
-        maximum_input_tokens=_LARGE_CONTEXT_TOKENS,
+        estimated_input_tokens=_LARGE_CONTEXT_TOKENS,
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
 
@@ -217,11 +223,11 @@ def test_completion_reservation_rejects_estimates_above_the_context_window() -> 
     ]
 
 
-def _completion_contract(maximum_input_tokens: int) -> SimulationCompletionContract:
+def _completion_contract(estimated_input_tokens: int) -> SimulationCompletionContract:
     """Build one immutable completion contract for the fixture world and candidate.
 
     Args:
-        maximum_input_tokens: Per-call input reservation for both models.
+        estimated_input_tokens: Realistic per-call input planning size for both models.
 
     Returns:
         Frozen candidate and world reservations under retry ceiling three.
@@ -234,7 +240,7 @@ def _completion_contract(maximum_input_tokens: int) -> SimulationCompletionContr
         model=_snapshot("world"),
         label="world model",
         maximum_attempts=3,
-        maximum_input_tokens=maximum_input_tokens,
+        estimated_input_tokens=estimated_input_tokens,
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
     candidate = completion_reservation_from_catalog(
@@ -244,7 +250,7 @@ def _completion_contract(maximum_input_tokens: int) -> SimulationCompletionContr
         model=_snapshot("candidate"),
         label="candidate",
         maximum_attempts=3,
-        maximum_input_tokens=maximum_input_tokens,
+        estimated_input_tokens=estimated_input_tokens,
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
     candidate_b = completion_reservation_from_catalog(
@@ -254,7 +260,7 @@ def _completion_contract(maximum_input_tokens: int) -> SimulationCompletionContr
         model=_snapshot("candidate-b"),
         label="candidate",
         maximum_attempts=3,
-        maximum_input_tokens=maximum_input_tokens,
+        estimated_input_tokens=estimated_input_tokens,
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
     assert problems == []

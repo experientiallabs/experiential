@@ -198,21 +198,15 @@ class RecordingCandidateClient:
         """Return only assistant-visible candidate and simulated-user transcript turns."""
         return self._visible_transcript
 
-    def terminal_limit_error(self) -> TextSimulationError | None:
-        """Return a no-call maximum-step failure when a nonterminal world turn exhausted v1.
+    @property
+    def turn_limit_reached(self) -> bool:
+        """Return whether a nonterminal scenario exhausted the pinned candidate turn ceiling.
 
         Returns:
-            A structured terminal error after the final permitted nonterminal world transition,
-            or ``None`` when another candidate turn remains or the world model ended the scenario.
+            True after the final permitted nonterminal world transition, False when another
+            candidate turn remains or the world model ended the scenario.
         """
-        if self._terminal or len(self._candidate_responses) < self._maximum_steps:
-            return None
-        return _text_failure(
-            StopReason.MAXIMUM_STEPS,
-            FailureCode.BUDGET,
-            f"text simulation reached its maximum of {self._maximum_steps} candidate turns",
-            phase="candidate_turn_limit",
-        )
+        return not self._terminal and len(self._candidate_responses) >= self._maximum_steps
 
     @property
     def recorded(self) -> RecordedTextCalls:

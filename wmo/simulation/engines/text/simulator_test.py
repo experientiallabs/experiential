@@ -1490,6 +1490,55 @@ def test_text_simulation_continues_after_agent_completion_until_world_terminal(
     assert candidate_client.requests[1].messages[-1].content == "Please continue."
 
 
+def test_text_simulation_turn_exhaustion_is_a_judgeable_outcome_without_failure(
+    tmp_path: Path,
+) -> None:
+    """Exhausting the pinned candidate turn ceiling records evidence instead of a failure.
+
+    Args:
+        tmp_path: Isolated project root for immutable simulator artifacts.
+    """
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient(
+        [
+            _response("first answer", snapshot=_snapshot("candidate-a")),
+            _response("second answer", snapshot=_snapshot("candidate-a")),
+        ]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Please continue.","terminal":false}',
+                snapshot=_snapshot("world-model-a"),
+            ),
+            _response(
+                '{"message":"Still not done.","terminal":false}',
+                snapshot=_snapshot("world-model-a"),
+            ),
+        ]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+    )
+
+    artifact_set = simulator.run(_spec(plan_input, task_set_input, ("cell-a",)))
+    rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
+
+    assert rollout.stop_reason == StopReason.MAXIMUM_STEPS
+    assert rollout.failure is None
+    assert len(candidate_client.requests) == 2
+    assert len(world_client.requests) == 2
+
+
 def test_text_simulation_cross_runner_claim_prevents_duplicate_paid_calls(tmp_path: Path) -> None:
     """Two concurrent same-spec runners share one durable paid-cell claim and rollout."""
     cell = _cell("cell-a", "task-a")
