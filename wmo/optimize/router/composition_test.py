@@ -799,9 +799,10 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     def exact_cap_spend(
         phase_project: ProjectStore,
         artifact_set: SimulationArtifactSet,
+        phase_setup: RouterEvaluationSetup,
     ) -> float:
         """Return spend that exactly exhausts the admitted phase budget."""
-        del phase_project, artifact_set
+        del phase_project, artifact_set, phase_setup
         return 1.0
 
     monkeypatch.setattr(workflow_module, "_verified_simulation_spend", exact_cap_spend)

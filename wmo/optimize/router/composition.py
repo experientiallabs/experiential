@@ -49,7 +49,12 @@ from wmo.common.project import (
     ProjectStore,
     artifact_input,
 )
-from wmo.common.rollouts import SimulationArtifactSet
+from wmo.common.rollouts import (
+    RolloutArtifact,
+    SimulationArtifactSet,
+    retryable_dispatch_failure,
+    unknown_spend_failure,
+)
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import KnnBankManifest
 from wmo.optimize.router.activation import load_project_router
@@ -81,6 +86,13 @@ from wmo.optimize.router.judgment_budget import (
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime
 from wmo.simulation.build import ProjectBuild
+from wmo.simulation.engines.text.bindings import rollout_id_for_binding
+from wmo.simulation.engines.text.errors import SimulationConfigurationError
+from wmo.simulation.engines.text.grounding import (
+    load_completion_contract,
+    unknown_dispatch_worst_case_usd,
+)
+from wmo.simulation.engines.text.rollout_support import rollout_spend
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
@@ -297,7 +309,7 @@ def compose_router(
         progress=progress,
         progress_detail="fit",
     )
-    fit_spend = _verified_simulation_spend(project, fit_set)
+    fit_spend = _verified_simulation_spend(project, fit_set, setup)
     if fit_spend > budget.maximum_simulation_cost_usd:
         raise RouterCompositionError("verified fit simulation spend exceeds the total budget")
     remaining_cost_usd = max(0.0, budget.maximum_simulation_cost_usd - fit_spend)
@@ -365,7 +377,7 @@ def compose_router(
         progress=progress,
         progress_detail="held-out",
     )
-    held_out_spend = _verified_simulation_spend(project, held_set)
+    held_out_spend = _verified_simulation_spend(project, held_set, setup)
     if math.fsum((fit_spend, held_out_spend)) > budget.maximum_simulation_cost_usd:
         raise RouterCompositionError("verified composed simulation spend exceeds the total budget")
     held_evidence, _held_dispatched = _complete_cell_evidence(
@@ -490,6 +502,8 @@ def _run_or_load_simulation(
             raise RouterCompositionError(
                 "completed simulation artifact set differs from phase spec"
             )
+        if any(retryable_dispatch_failure(rollout.failure) for rollout in rollouts):
+            continue
         matches.append(artifact_set)
     if len(matches) > 1:
         raise RouterCompositionError("multiple completed artifact sets name one simulation phase")
@@ -509,6 +523,7 @@ def _run_or_load_simulation(
 def _verified_simulation_spend(
     project: ProjectStore,
     expected: SimulationArtifactSet,
+    setup: RouterEvaluationSetup,
 ) -> float:
     """Recompute one phase's spend from verified immutable rollouts.
 
@@ -535,11 +550,62 @@ def _verified_simulation_spend(
     )
     if hashlib.sha256(index_payload).hexdigest() != artifact_set.artifacts_sha256:
         raise RouterCompositionError("simulation spend index digest has drifted")
-    values = tuple(
-        observed_rollout_spend(read_rollout(project.artifacts, rollout_id)[0])
-        for rollout_id in artifact_set.artifact_ids
-    )
+    values: list[float] = []
+    for rollout_id in artifact_set.artifact_ids:
+        rollout = read_rollout(project.artifacts, rollout_id)[0]
+        values.append(observed_rollout_spend(rollout))
+        values.extend(_superseded_attempt_spend(project, rollout, setup))
     return math.fsum(values)
+
+
+def _superseded_attempt_spend(
+    project: ProjectStore,
+    rollout: RolloutArtifact,
+    setup: RouterEvaluationSetup,
+) -> tuple[float, ...]:
+    """Return conservative charges for every superseded retry attempt behind one rollout.
+
+    Args:
+        project: Project store containing the immutable prior-attempt artifacts.
+        rollout: Final rollout selected for its cell, possibly after retries.
+        setup: Reviewed evaluation setup naming the completion reservation contract.
+
+    Returns:
+        One worst-case charge per superseded attempt, so retried dispatches with unknown
+        spend still count against the phase ceiling.
+
+    Raises:
+        RouterCompositionError: A superseded attempt cannot be reconciled conservatively.
+    """
+    if rollout.retry_attempt == 0:
+        return ()
+    binding = rollout.simulation_binding
+    if binding is None:
+        raise RouterCompositionError("retried simulation rollout lacks its cell binding")
+    try:
+        contract = load_completion_contract(project.artifacts, setup.simulation_completion_input)
+    except SimulationConfigurationError as exc:
+        raise RouterCompositionError(str(exc)) from exc
+    charges = []
+    for attempt in range(rollout.retry_attempt):
+        prior, _input = read_rollout(
+            project.artifacts, rollout_id_for_binding(binding, attempt=attempt)
+        )
+        spend = rollout_spend(
+            prior,
+            unknown_dispatch_fallback_usd=lambda item: unknown_dispatch_worst_case_usd(
+                contract,
+                item.simulation_binding.candidate_alias
+                if item.simulation_binding is not None
+                else None,
+            ),
+        )
+        if spend is None:
+            raise RouterCompositionError(
+                "superseded simulation attempt spend cannot be reconciled conservatively"
+            )
+        charges.append(spend)
+    return tuple(charges)
 
 
 def _fit_and_lock_once(
@@ -675,6 +741,10 @@ def _complete_cell_evidence(
     bound_cells = []
     protocols_by_rollout: dict[str, EvaluationProtocol] = {}
     for cell in cells:
+        if cell.execution != "observed":
+            simulated = rollouts_by_cell.get(cell.cell_id)
+            if simulated is not None and unknown_spend_failure(simulated.failure):
+                continue
         rollout_id = (
             cell.observed_rollout_id
             if cell.execution == "observed"
