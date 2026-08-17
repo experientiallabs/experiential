@@ -1,7 +1,7 @@
 """Live end-to-end walk of every locked CLI path against real OpenAI providers.
 
-The ordinary gate excludes this module by name (``-k "not live"``); the nightly integration
-workflow runs it with real credentials. It configures an OpenAI catalog around gpt-5.6-luna at
+The ordinary gate excludes this module by name (``-k "not live"``); run it locally with real
+credentials when needed. It configures an OpenAI catalog around gpt-5.6-luna at
 pinned maximum reasoning effort, builds immutable evidence from the pinned public terminal-tasks
 export, calibrates the judge with real provider calls, optimizes a router over an attributed copy
 of the export, serves the frozen policy over the OpenAI-compatible loopback surface, and proves
