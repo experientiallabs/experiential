@@ -825,7 +825,7 @@ def test_build_replacement_serializes_human_score_writer_and_removes_stale_state
                 rollout_id="rollout-a",
                 lineage_id="lineage-a",
                 dimension_id="task-success",
-                score=3,
+                score=1,
                 submission_id="submission-a",
                 created_at=_TIME,
             )

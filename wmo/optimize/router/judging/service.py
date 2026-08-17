@@ -81,6 +81,15 @@ _PROMPT_TEXT = (
 DEFAULT_JUDGE_PROMPT = PromptDefinition.from_text("wmo-judge-evidence-json-v2", _PROMPT_TEXT)
 
 
+def default_judge_dimensions() -> tuple[RubricDimension, ...]:
+    """Return the editable default task-success axis for first setup.
+
+    Returns:
+        One 0-1 axis whose meaning is completion of the original user prompt.
+    """
+    return (default_task_success_axis(),)
+
+
 def default_judge_template(
     dimensions: tuple[RubricDimension, ...] | None = None,
 ) -> JudgePromptTemplate:
@@ -149,15 +158,6 @@ class ManualJudgeCalibrationPlan:
     traces: tuple[Trace, ...]
     reference_traces: tuple[Trace | None, ...]
     previews: tuple[JudgeTracePreview, ...]
-
-
-def default_judge_dimensions() -> tuple[RubricDimension, ...]:
-    """Return the editable default task-success axis for first setup.
-
-    Returns:
-        One 0-1 axis whose meaning is completion of the original user prompt.
-    """
-    return (default_task_success_axis(),)
 
 
 def prepare_manual_judge_setup(

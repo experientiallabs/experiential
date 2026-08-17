@@ -12,7 +12,7 @@ from wmo.common.judging import (
 
 def test_default_axis_table_shows_range_meaning_and_score_anchors() -> None:
     """The 0-1 default axis prints ID, range, product meaning, and both scores."""
-    table = render_rubric_table((default_task_success_axis(),), width=80)
+    table = render_rubric_table((default_task_success_axis(),), width=120)
 
     assert table.startswith("Rubric")
     assert "1. task-success  Task success" in table

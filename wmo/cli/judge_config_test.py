@@ -88,7 +88,7 @@ def test_setup_contract_renders_rubric_table_instead_of_schema_or_traces() -> No
         dimensions=(default_task_success_axis(),),
     )
 
-    rendered = render_setup_contract(cast(ManualJudgeSetupPlan, plan), width=72)
+    rendered = render_setup_contract(cast(ManualJudgeSetupPlan, plan), width=120)
 
     assert "Judge alias: judge-main" in rendered
     assert "1. task-success  Task success" in rendered
