@@ -18,6 +18,8 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import cast
 
+from click import unstyle
+
 if os.environ.get("WMO_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
 
@@ -904,8 +906,9 @@ def _installed_release_driver() -> None:
             ["build", "support-agent", "--traces", str(traces), "--root", str(root)],
             setup_answers,
         )
-        assert "Model setup is required" in build_output
-        assert "Candidate aliases" not in build_output
+        plain_build_output = unstyle(build_output)
+        assert "Model setup is required" in plain_build_output
+        assert "Candidate aliases" not in plain_build_output
         support_store = ProjectStore(root, "support-agent")
         support_project = support_store.load_project()
         assert support_project.build is not None
@@ -926,8 +929,8 @@ def _installed_release_driver() -> None:
             "embedding    at most $0.000000",
             "ceiling      $5.000000",
         ):
-            assert expected in build_output, build_output
-        assert "Proceed?" not in build_output
+            assert expected in plain_build_output, build_output
+        assert "Proceed?" not in plain_build_output
         provider_after_build = state.snapshot()
         selected_build = support_project.build
         replay_output = run_cli(
