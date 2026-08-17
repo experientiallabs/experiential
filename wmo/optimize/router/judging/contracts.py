@@ -20,7 +20,7 @@ from wmo.common.judging import (
     CalibrationReport,
     PromptDefinition,
 )
-from wmo.common.models import ModelSnapshot, OperationEconomics
+from wmo.common.models import ModelSnapshot, OperationEconomics, PricingSource
 
 
 class ManualJudgeError(ValueError):
@@ -199,10 +199,15 @@ class ManualJudgeSetupArtifact(ArtifactEnvelope):
 
 
 class JudgeCalibrationBudget(ContractModel):
-    """Conservative finite reservation for counterbalanced judge calls."""
+    """Conservative finite reservation for counterbalanced judge calls.
+
+    New estimates always record an exact pricing source. A stored budget written before
+    provenance existed loads as ``unknown`` instead of inventing catalog or configured prices.
+    """
 
     input_usd_per_million_tokens: float = Field(ge=0)
     output_usd_per_million_tokens: float = Field(ge=0)
+    pricing_source: PricingSource = PricingSource.UNKNOWN
     maximum_input_tokens_per_call: int = Field(gt=0)
     maximum_output_tokens_per_call: Literal[4096] = 4096
     maximum_attempts_per_call: int = Field(gt=0)

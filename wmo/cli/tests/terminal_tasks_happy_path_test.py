@@ -165,7 +165,14 @@ def _write_catalog(root: Path) -> None:
                     model="world-id",
                     capabilities=ModelCapabilities(maximum_output_tokens=16_000),
                 ),
-                "judge": ModelRecord(connection="fixture", model=_JUDGE_MODEL_ID),
+                "judge": ModelRecord(
+                    connection="fixture",
+                    model=_JUDGE_MODEL_ID,
+                    capabilities=ModelCapabilities(
+                        input_cost_per_million_tokens_usd=0,
+                        output_cost_per_million_tokens_usd=0,
+                    ),
+                ),
                 "embed": ModelRecord(
                     connection="fixture",
                     model="embed-id",
@@ -183,7 +190,7 @@ def _write_catalog(root: Path) -> None:
 def _calibrate_arguments(
     root: Path, labels: Sequence[str], sample_size: int = _SAMPLE_SIZE
 ) -> list[str]:
-    """Return one non-interactive calibrate invocation with explicit zero prices."""
+    """Return one non-interactive calibrate invocation that uses catalog prices."""
     return [
         "config",
         "judge",
@@ -193,10 +200,6 @@ def _calibrate_arguments(
         str(root),
         "--sample-size",
         str(sample_size),
-        "--input-usd-per-million",
-        "0",
-        "--output-usd-per-million",
-        "0",
         "--yes",
         "--approve",
         "--non-interactive",
