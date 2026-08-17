@@ -256,7 +256,9 @@ def compose_router(
         trace_source: Canonical normalized traces used to build task evidence.
         services: Review, simulation, judging, and runtime dependencies. None are auto-resolved.
         budget: Finite simulation spend and judgment-call ceilings.
-        created_at: Timezone-aware artifact completion time.
+        created_at: Timezone-aware artifact completion time. Artifacts derived from the
+            frozen evaluation plan reuse the plan's replayed creation time so resumed
+            runs reproduce completed specs, locks, and reports exactly.
         code_revision: Exact code revision for every new artifact.
         phase_hook: Optional local observer used to audit phase ordering.
 
@@ -307,6 +309,7 @@ def compose_router(
     )
     plan_input = artifact_input(project.artifacts.read(plan.plan_id).manifest)
     task_input = built.review.task_set
+    artifact_time = plan.created_at
     _phase(phase_hook, "fit_started")
     fit_cells = tuple(cell for cell in plan.cells if cell.purpose == "fit")
     spec = build_router_simulation_spec(
@@ -315,7 +318,6 @@ def compose_router(
         task_input,
         setup,
         budget.maximum_simulation_cost_usd,
-        created_at,
         code_revision,
         fit_cells,
         phase="fit",
@@ -353,14 +355,14 @@ def compose_router(
         pricing_snapshot_id=setup.pricing_snapshot_id,
         guard=setup.guard,
         judgment_status=setup.judgment_status,
-        created_at=created_at,
+        created_at=artifact_time,
         code_revision=code_revision,
     )
     fit, policy_lock = _fit_and_lock_once(
         project,
         plan_input,
         fit_config,
-        created_at,
+        artifact_time,
         code_revision,
     )
     _phase(phase_hook, "policy_locked")
@@ -373,7 +375,6 @@ def compose_router(
         task_input,
         setup,
         remaining_cost_usd,
-        created_at,
         code_revision,
         held_cells,
         phase="heldout",
@@ -403,7 +404,7 @@ def compose_router(
                 cell_evidence=held_evidence,
             ),
             embedding_set_id=setup.embedding_set_id,
-            created_at=created_at,
+            created_at=artifact_time,
             code_revision=code_revision,
         ),
     )

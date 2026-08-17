@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -704,7 +704,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
             normalized,
             services=services,
             budget=budget,
-            created_at=_TIME,
+            created_at=_TIME + timedelta(days=1),
             code_revision="test-revision",
             phase_hook=crash_after_lock,
         )
@@ -714,7 +714,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         normalized,
         services=services,
         budget=budget,
-        created_at=_TIME,
+        created_at=_TIME + timedelta(days=2),
         code_revision="test-revision",
         phase_hook=crash_after_lock,
     )
@@ -729,11 +729,13 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         normalized,
         services=services,
         budget=budget,
-        created_at=_TIME,
+        created_at=_TIME + timedelta(days=3),
         code_revision="test-revision",
     )
 
     assert second.optimization == first.optimization
+    assert first.simulation_spec.created_at == first.plan.created_at
+    assert second.simulation_spec == first.simulation_spec
     assert completed_build.fit_rag in first.simulation_spec.inputs
     assert completed_build.fit_rag in first.held_out_simulation_spec.inputs
     assert first.held_out_simulation_spec.maximum_cost_usd == pytest.approx(

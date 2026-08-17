@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 
 from wmo.common.core.artifacts import ArtifactInput, stable_id
@@ -20,7 +19,6 @@ def build_router_simulation_spec(
     task_input: ArtifactInput,
     setup: RouterEvaluationSetup,
     maximum_cost_usd: float,
-    created_at: datetime,
     code_revision: str,
     cells: tuple[EvaluationCell, ...],
     *,
@@ -28,13 +26,15 @@ def build_router_simulation_spec(
 ) -> SimulationSpec:
     """Create one phase-scoped simulation spec over the exact fit-only RAG.
 
+    The spec timestamp is the frozen plan's creation time, never the current invocation
+    time, so a resumed run reproduces the exact spec digest stamped on completed rollouts.
+
     Args:
         plan: Frozen evaluation plan containing the selected cells.
         plan_input: Exact persisted evaluation-plan pointer.
         task_input: Exact persisted task-set pointer.
         setup: Reviewed candidates, protocols, retrieval pointer, and world-model settings.
         maximum_cost_usd: Finite provider-spend ceiling for this phase.
-        created_at: Immutable specification timestamp.
         code_revision: Exact source revision bound to generated artifacts.
         cells: Phase-specific plan cells eligible for simulation.
         phase: Fit or held-out phase label used in stable identity.
@@ -70,7 +70,7 @@ def build_router_simulation_spec(
         spec_inputs.append(setup.simulation_completion_input)
     return SimulationSpec(
         schema_version=1,
-        created_at=created_at,
+        created_at=plan.created_at,
         inputs=tuple(sorted(spec_inputs, key=lambda item: item.artifact_id)),
         code_revision=code_revision,
         simulation_id=stable_id("simulation", binding),

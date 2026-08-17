@@ -18,7 +18,7 @@ from pathlib import Path
 import typer
 from pydantic import ValidationError
 from rich.console import Console
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Confirm
 
 from wmo.cli.model_picker import (
     RoleAssignment,
@@ -168,7 +168,8 @@ def _interactive_setup(
         retainable_roles: Exact prior roles each incomplete alias may retain.
         role_inputs: Role values supplied by flags or already persisted.
         explicit_providers: Validated ``--provider`` values that skip the opening list once.
-        offer_recommended_defaults: Whether to offer one verified default assignment.
+        offer_recommended_defaults: Whether verified discovery proposes one default
+            assignment first, with manual model selection as the fallback.
         console: Terminal used for every screen.
         lister: Provider listing seam, injected by tests so no live request is made.
         environment: Process environment consulted and updated for pasted credentials.
@@ -217,20 +218,22 @@ def _interactive_setup(
                 session.endpoints, discovered = prepared
             session.available = (*configured, *discovered)
             if offer_recommended_defaults:
-                mode = Prompt.ask(
-                    "Setup mode",
-                    choices=["recommended", "custom"],
-                    default="recommended",
-                    console=console,
-                )
-                if mode == "recommended":
-                    result = _recommended_result(
+                try:
+                    recommended = _recommended_result(
                         session,
                         known_existing_connections=tuple(sorted(existing_connection_providers)),
                         known_existing_aliases=tuple(sorted(existing_catalog_models)),
                         console=console,
                     )
-                    return result
+                except ValueError as exc:
+                    console.print(f"[yellow]note[/yellow] {exc}")
+                else:
+                    if Confirm.ask(
+                        "Use these recommended models?",
+                        default=True,
+                        console=console,
+                    ):
+                        return recommended
             result = _collect_models_and_roles(
                 session,
                 known_existing_connections=tuple(sorted(existing_connection_providers)),
@@ -293,7 +296,7 @@ def _recommended_result(
     if not world or not judges or not embedders:
         raise ValueError(
             "recommended defaults need verified world, judge, embedder, and two distinct priced "
-            "router models; choose custom setup to fill the missing roles"
+            "router models; continue with manual model selection to fill the missing roles"
         )
     selection = _recommended_router_selection_from_models(
         recommendations,

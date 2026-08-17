@@ -9,13 +9,27 @@ selects a completed project build.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
-from rich.prompt import Prompt
 
+from wmo.cli.build_wizard_screens import (
+    WizardBuildPlan,
+)
+from wmo.cli.build_wizard_screens import (
+    render_completed_replay as _render_completed_replay,
+)
+from wmo.cli.build_wizard_screens import (
+    render_plan as _render_plan,
+)
+from wmo.cli.build_wizard_screens import (
+    select_trace as _select_trace,
+)
+from wmo.cli.build_wizard_screens import (
+    select_workflow as _select_workflow,
+)
 from wmo.cli.consent import require_spend_consent
 from wmo.common.models import (
     ModelCatalog,
@@ -28,12 +42,11 @@ from wmo.common.models import (
 from wmo.common.project import (
     ProjectBudgetConfiguration,
     ProjectConfig,
-    ProjectModelConfiguration,
     ProjectRetrievalConfiguration,
     ProjectStore,
 )
 from wmo.common.release_revision import installed_release_revision
-from wmo.common.tasks import TaskCase, load_task_set
+from wmo.common.tasks import load_task_set
 from wmo.common.traces import load_trace_dataset
 from wmo.optimize.router.automatic.attribution import resolve_router_observed_attributions
 from wmo.optimize.router.automatic.preflight import preflight_automatic_router
@@ -59,27 +72,8 @@ from wmo.optimize.router.judging.service import (
     prepare_manual_judge_setup,
 )
 from wmo.runtime.models import RuntimeModelCatalog
-from wmo.simulation.build import ProjectBuild, build_project
+from wmo.simulation.build import build_project
 from wmo.simulation.ingest.dataset import read_trace_model_identity_evidence
-from wmo.simulation.ingest.sources import CANONICAL_TRACE_SOURCES
-
-
-@dataclass(frozen=True)
-class WizardBuildPlan:
-    """Provider-free grounded-build plan shown before the one spend authorization."""
-
-    trace_path: Path | None
-    source: str
-    catalog: ModelCatalog
-    selected: ProjectModelConfiguration
-    tasks: tuple[TaskCase, ...]
-    completed: ProjectBuild | None
-    accepted_traces: int
-    invalid_traces: int
-    fit_tasks: int
-    held_out_tasks: int
-    build_estimate_usd: float
-    build_reused: bool
 
 
 def run_build_wizard(
@@ -127,6 +121,7 @@ def run_build_wizard(
     if replay is not None:
         _render_completed_replay(project, replay, console=console)
         return
+    selection = _select_workflow(console=console)
     existing = _completed_build_plan(
         root,
         project,
@@ -135,6 +130,11 @@ def run_build_wizard(
         embedder=embedder,
     )
     if existing is None:
+        if not selection.build:
+            raise ValueError(
+                "the build step was not selected and no completed grounded build exists; "
+                "include the build step to create one"
+            )
         chosen_source, trace_path = _select_trace(source, console=console)
         plan = _prepare_new_build(
             project,
@@ -148,45 +148,45 @@ def run_build_wizard(
             maximum_build_cost_usd=maximum_build_cost_usd,
             code_revision=code_revision,
             providers=providers,
+            setup_providers=selection.providers,
             console=console,
         )
     else:
         plan = existing
         console.print("[dim]resume[/dim] Verified completed grounded build")
-    catalog = _ensure_router_defaults(root, plan.catalog, console=console)
-    candidate_plan = _candidate_plan(root, catalog)
-    cost_plan = _wizard_cost_plan(
-        root,
-        project,
-        plan,
-        catalog,
-        candidate_plan.selection,
-    )
-    router_ceiling = cost_plan.required_provider_cost_usd
-    options = replace(
-        AutomaticRouterOptions(),
-        maximum_provider_cost_usd=router_ceiling,
-        maximum_judgments=cost_plan.maximum_judgments,
-    )
-    if (
-        maximum_router_cost_usd is not None
-        and maximum_router_cost_usd < cost_plan.required_provider_cost_usd
-    ):
-        _render_plan(
+    cost_plan: AutomaticRouterCostPlan | None = None
+    router_ceiling = 0.0
+    catalog = plan.catalog
+    if selection.router:
+        catalog = _ensure_router_defaults(root, plan.catalog, console=console)
+        candidate_plan = _candidate_plan(root, catalog)
+        cost_plan = _wizard_cost_plan(
+            root,
             project,
             plan,
-            catalog=catalog,
-            cost_plan=cost_plan,
-            maximum_build_cost_usd=maximum_build_cost_usd,
-            router_ceiling=router_ceiling,
-            supplied_router_cap=maximum_router_cost_usd,
-            console=console,
+            catalog,
+            candidate_plan.selection,
         )
-        raise ValueError(
-            f"router cap ${maximum_router_cost_usd:.6f} is below the exact required "
-            f"${cost_plan.required_provider_cost_usd:.6f}; increase "
-            "--max-router-cost-usd or omit it"
-        )
+        router_ceiling = cost_plan.required_provider_cost_usd
+        if (
+            maximum_router_cost_usd is not None
+            and maximum_router_cost_usd < cost_plan.required_provider_cost_usd
+        ):
+            _render_plan(
+                project,
+                plan,
+                catalog=catalog,
+                cost_plan=cost_plan,
+                maximum_build_cost_usd=maximum_build_cost_usd,
+                router_ceiling=router_ceiling,
+                supplied_router_cap=maximum_router_cost_usd,
+                console=console,
+            )
+            raise ValueError(
+                f"router cap ${maximum_router_cost_usd:.6f} is below the exact required "
+                f"${cost_plan.required_provider_cost_usd:.6f}; increase "
+                "--max-router-cost-usd or omit it"
+            )
     if not plan.build_reused and plan.build_estimate_usd > maximum_build_cost_usd:
         raise ValueError(
             f"grounded build requires ${plan.build_estimate_usd:.6f}, above the configured "
@@ -204,23 +204,29 @@ def run_build_wizard(
     )
     build_ceiling = 0.0 if plan.build_reused else maximum_build_cost_usd
     total_ceiling = math.fsum((build_ceiling, router_ceiling))
+    if cost_plan is not None:
+        assumptions = (
+            "serving and fit-only RAG embeddings",
+            f"{cost_plan.simulated_episode_count} closed-loop candidate episodes",
+            f"{cost_plan.maximum_judgments} configured judge decisions",
+        )
+    else:
+        assumptions = ("serving and fit-only RAG embeddings",)
     if total_ceiling > 0 and not require_spend_consent(
         console,
         root=root,
         yes=False,
         estimated_cost_usd=total_ceiling,
         command=f"wmo build {project}",
-        assumptions=(
-            "serving and fit-only RAG embeddings",
-            f"{cost_plan.simulated_episode_count} closed-loop candidate episodes",
-            f"{cost_plan.maximum_judgments} configured judge decisions",
-        ),
+        assumptions=assumptions,
     ):
         console.print("Wizard stopped before paid build or router work.")
         return
 
+    run_judge = selection.router or selection.judge_rubric or selection.judge_calibration
+    total_stages = 1 + (1 if run_judge else 0) + (2 if selection.router else 0)
     if not plan.build_reused:
-        console.print("[bold]1/4 Simulation and RAG indexes[/bold]")
+        console.print(f"[bold]1/{total_stages} Simulation and RAG indexes[/bold]")
         from wmo.cli.build_cmd import _complete_grounded_build, _validated_role_snapshots
 
         assert plan.completed is not None
@@ -242,22 +248,51 @@ def run_build_wizard(
             provider_spend_authorized=True,
         )
     else:
-        console.print("[bold]1/4 Simulation and RAG indexes[/bold] [green]reused[/green]")
+        console.print(
+            f"[bold]1/{total_stages} Simulation and RAG indexes[/bold] [green]reused[/green]"
+        )
 
     store = ProjectStore(root, project)
-    console.print("[bold]2/4 Judge syllabus[/bold]")
-    _ensure_judge_calibration(
-        store,
-        catalog,
-        created_at=datetime.now(UTC),
-        code_revision=code_revision,
-    )
-    console.print(
-        "  Human calibration is optional. This build keeps provisional judgment provenance "
-        "until examples are approved."
+    if run_judge:
+        console.print(f"[bold]2/{total_stages} Judge syllabus[/bold]")
+        _ensure_judge_calibration(
+            store,
+            catalog,
+            created_at=datetime.now(UTC),
+            code_revision=code_revision,
+            edit_rubric=selection.judge_rubric,
+            console=console,
+        )
+        if selection.judge_calibration:
+            cost_plan, router_ceiling = _run_selected_judge_calibration(
+                root,
+                project,
+                plan,
+                cost_plan=cost_plan,
+                router_ceiling=router_ceiling,
+                router_selected=selection.router,
+                console=console,
+            )
+            if selection.router and cost_plan is None:
+                console.print("Wizard stopped before router optimization.")
+                return
+        else:
+            console.print(
+                "  Human calibration is optional. This build keeps provisional judgment "
+                "provenance until examples are approved."
+            )
+    if not selection.router:
+        console.print("[green]Done[/green] Router optimization was not selected.")
+        console.print(f"  next  rerun wmo build {project} and include router optimization")
+        return
+    assert cost_plan is not None
+    options = replace(
+        AutomaticRouterOptions(),
+        maximum_provider_cost_usd=router_ceiling,
+        maximum_judgments=cost_plan.maximum_judgments,
     )
 
-    console.print("[bold]3/4 Router plan[/bold]")
+    console.print(f"[bold]3/{total_stages} Router plan[/bold]")
     catalog = load_model_catalog(root / "models.toml")
     candidate_plan = _candidate_plan(root, catalog)
     preflight = preflight_automatic_router(
@@ -274,7 +309,7 @@ def run_build_wizard(
         f"  {len(preflight.candidates)} candidates, {len(preflight.observed_traces)} "
         f"reusable historical cells, ${options.maximum_provider_cost_usd:.4f} ceiling"
     )
-    console.print("[bold]4/4 Router optimization[/bold]")
+    console.print(f"[bold]4/{total_stages} Router optimization[/bold]")
     result = optimize_project_router(
         store,
         candidate_plan,
@@ -308,6 +343,8 @@ def _ensure_judge_calibration(
     *,
     created_at: datetime,
     code_revision: str,
+    edit_rubric: bool = False,
+    console: Console | None = None,
 ) -> None:
     """Create the judge syllabus and bootstrap only absent calibration state.
 
@@ -316,6 +353,9 @@ def _ensure_judge_calibration(
         catalog: Static catalog containing the selected judge identity.
         created_at: Time for any newly materialized setup or calibration evidence.
         code_revision: Exact producer revision for any new immutable evidence.
+        edit_rubric: Whether a fresh syllabus opens the interactive rubric editor
+            instead of committing the task-success default silently.
+        console: Interactive terminal, required when ``edit_rubric`` is set.
 
     Raises:
         ValueError: A completed audit awaits explicit human approval without a selected
@@ -337,6 +377,13 @@ def _ensure_judge_calibration(
             created_at=created_at,
             code_revision=code_revision,
         )
+        if edit_rubric:
+            assert console is not None
+            from wmo.cli.judge_rubric import maybe_edit_setup_plan
+            from wmo.common.judging import render_rubric_table
+
+            console.print(render_rubric_table(setup_plan.dimensions, width=console.width))
+            setup_plan = maybe_edit_setup_plan(setup_plan, console=console)
         commit_manual_judge_setup(store, setup_plan, confirmed=True)
     calibration_plan = prepare_manual_judge_calibration(store)
     bootstrap_provisional_judge(
@@ -346,6 +393,83 @@ def _ensure_judge_calibration(
         created_at=created_at,
         code_revision=code_revision,
     )
+
+
+def _run_selected_judge_calibration(
+    root: Path,
+    project: str,
+    plan: WizardBuildPlan,
+    *,
+    cost_plan: AutomaticRouterCostPlan | None,
+    router_ceiling: float,
+    router_selected: bool,
+    console: Console,
+) -> tuple[AutomaticRouterCostPlan | None, float]:
+    """Run the interactive human judge calibration step inside the wizard.
+
+    Calibration is its own separately consented paid command. When the router step is
+    also selected, the router reservation is recomputed afterward because an approved
+    audit replaces provisional judgment pricing; a grown ceiling needs fresh consent.
+
+    Args:
+        root: Local WMO root.
+        project: Local project identifier.
+        plan: Verified deterministic build plan.
+        cost_plan: Router reservation consented before calibration, when router runs.
+        router_ceiling: Router provider ceiling consented before calibration.
+        router_selected: Whether router optimization runs after calibration.
+        console: Interactive terminal.
+
+    Returns:
+        The current router cost plan and ceiling, or ``(None, 0.0)`` when a grown
+        post-calibration ceiling was refused or the router step is not selected.
+    """
+    store = ProjectStore(root, project)
+    state = read_review_state(store)
+    if state is not None and state.approved_calibration is not None:
+        console.print("[dim]calibration[/dim] Approved human calibration already exists")
+        return cost_plan, router_ceiling
+    from wmo.cli.judge_config import judge_calibrate
+
+    judge_calibrate(
+        project=project,
+        root=root,
+        sample_size=5,
+        label=None,
+        judgment=None,
+        input_price=None,
+        output_price=None,
+        maximum_input_tokens=32_768,
+        maximum_cost_usd=None,
+        yes=False,
+        approve=False,
+        accept_insufficient_labels=False,
+        non_interactive=False,
+        transcript_character_limit=1_200,
+        page=False,
+    )
+    if not router_selected:
+        return None, 0.0
+    catalog = load_model_catalog(root / "models.toml")
+    candidate_plan = _candidate_plan(root, catalog)
+    recomputed = _wizard_cost_plan(root, project, plan, catalog, candidate_plan.selection)
+    if recomputed == cost_plan:
+        return cost_plan, router_ceiling
+    required = recomputed.required_provider_cost_usd
+    if required > router_ceiling and not require_spend_consent(
+        console,
+        root=root,
+        yes=False,
+        estimated_cost_usd=required,
+        command=f"wmo build {project}",
+        assumptions=(
+            "router reservation recomputed after approved human judge calibration",
+            f"{recomputed.simulated_episode_count} closed-loop candidate episodes",
+            f"{recomputed.maximum_judgments} configured judge decisions",
+        ),
+    ):
+        return None, 0.0
+    return recomputed, max(router_ceiling, required)
 
 
 def _completed_replay(
@@ -428,91 +552,6 @@ def _require_replay_role_overrides(
         )
 
 
-def _render_completed_replay(
-    project: str,
-    replay: AutomaticRouterReplay,
-    *,
-    console: Console,
-) -> None:
-    """Render one verified completed chain without opening planning or consent.
-
-    Args:
-        project: Local project identifier.
-        replay: Exact completed router and report identities.
-        console: Terminal receiving the replay summary.
-    """
-    console.print("[green]Complete[/green] Reused every verified project artifact.")
-    console.print(f"  router  {replay.policy_id}")
-    console.print(f"  report  {replay.report_id}")
-    console.print(f"  next    wmo run {project}")
-    if replay.judgment_status == "provisional":
-        console.print(f"  optional wmo config judge calibrate {project}")
-        console.print(f"  after approval wmo build {project}")
-
-
-def _select_trace(initial_source: str, *, console: Console) -> tuple[str, Path]:
-    """Select and validate one supported trace source and local declaration path.
-
-    Args:
-        initial_source: CLI-provided initial source choice.
-        console: Interactive terminal.
-
-    Returns:
-        Canonical source name and validated local path.
-    """
-    source = initial_source.strip().casefold()
-    if source not in CANONICAL_TRACE_SOURCES:
-        source = Prompt.ask(
-            "Trace source",
-            choices=list(CANONICAL_TRACE_SOURCES),
-            default="otlp",
-            console=console,
-        )
-    candidates = _trace_candidates(Path.cwd(), source)
-    if len(candidates) == 1:
-        path = candidates[0]
-        console.print(f"[dim]traces[/dim] Using {path}")
-        return source, path
-    if len(candidates) > 1:
-        console.print("Discovered trace files:")
-        for index, candidate in enumerate(candidates, start=1):
-            console.print(f"  {index}. {candidate}")
-        choice = Prompt.ask(
-            "Trace file",
-            choices=[str(index) for index in range(1, len(candidates) + 1)],
-            default="1",
-            console=console,
-        )
-        selected_path = str(candidates[int(choice or "1") - 1])
-    else:
-        selected_path = Prompt.ask("Trace path", console=console)
-    if selected_path is None:
-        raise ValueError("trace path is required")
-    path = Path(selected_path).expanduser()
-    from wmo.cli.build_cmd import _resolve_trace_file
-
-    return source, _resolve_trace_file(path)
-
-
-def _trace_candidates(directory: Path, source: str) -> tuple[Path, ...]:
-    """Return deterministic local trace candidates for one source.
-
-    Args:
-        directory: Current working directory to inspect without recursion.
-        source: Selected canonical trace source.
-
-    Returns:
-        Existing candidate files in deterministic preference order.
-    """
-    preferred = (
-        (directory / "traces.otel.jsonl", directory / "traces.jsonl")
-        if source == "otlp"
-        else (directory / f"traces.{source}.jsonl", directory / "traces.jsonl")
-    )
-    discovered = tuple(sorted(directory.glob("*.jsonl")))
-    return tuple(dict.fromkeys(path for path in (*preferred, *discovered) if path.is_file()))
-
-
 def _prepare_new_build(
     project: str,
     *,
@@ -526,6 +565,7 @@ def _prepare_new_build(
     maximum_build_cost_usd: float,
     code_revision: str,
     providers: tuple[str, ...],
+    setup_providers: bool = True,
     console: Console,
 ) -> WizardBuildPlan:
     """Materialize deterministic build evidence and return a credential-free plan.
@@ -542,10 +582,15 @@ def _prepare_new_build(
         maximum_build_cost_usd: Strict embedding ceiling.
         code_revision: Installed producer revision.
         providers: Repeatable provider names that skip the opening provider list.
+        setup_providers: Whether the providers workflow step may run interactive setup.
         console: Interactive terminal.
 
     Returns:
         Complete provider-free plan with deterministic persisted evidence.
+
+    Raises:
+        ValueError: Traces are invalid, or required roles are missing while the
+            providers step was not selected.
     """
     from wmo.cli.build_cmd import (
         _embedding_cost_ceiling,
@@ -565,6 +610,11 @@ def _prepare_new_build(
     catalog_path = root / "models.toml"
     existing_catalog = load_model_catalog(catalog_path) if catalog_path.exists() else None
     if _missing_build_configuration(existing_catalog):
+        if not setup_providers:
+            raise ValueError(
+                "the providers step was not selected but models.toml is missing required "
+                "roles; include the providers step or run wmo config providers first"
+            )
         catalog = run_provider_setup(
             root,
             ProviderSetupOptions(providers=providers),
@@ -576,6 +626,11 @@ def _prepare_new_build(
     else:
         assert existing_catalog is not None
         catalog = existing_catalog
+        if setup_providers:
+            console.print(
+                "[dim]providers[/dim] Existing catalog already covers every role; "
+                "run wmo config providers to change it"
+            )
     selected = _selected_roles(
         catalog,
         world_model=world_model,
@@ -834,71 +889,4 @@ def _candidate_plan(root: Path, catalog: ModelCatalog) -> RouterCandidateSetupPl
         candidate_models=(),
         prospective_catalog=catalog,
         expected_catalog_sha256=catalog_state_sha256(root / "models.toml"),
-    )
-
-
-def _render_plan(
-    project: str,
-    plan: WizardBuildPlan,
-    *,
-    catalog: ModelCatalog,
-    cost_plan: AutomaticRouterCostPlan,
-    maximum_build_cost_usd: float,
-    router_ceiling: float,
-    supplied_router_cap: float | None,
-    console: Console,
-) -> None:
-    """Render one concise full wizard plan before the named spend authorization.
-
-    Args:
-        project: Local project identifier.
-        plan: Provider-free grounded-build plan.
-        catalog: Catalog containing selected router defaults.
-        cost_plan: Exact complete automatic-router provider reservation.
-        maximum_build_cost_usd: Strict grounded-build ceiling.
-        router_ceiling: Effective automatic-router ceiling.
-        supplied_router_cap: Optional user cap checked against the exact required ceiling.
-        console: Terminal receiving the plan.
-    """
-    build_ceiling = 0.0 if plan.build_reused else maximum_build_cost_usd
-    console.print("[bold]Project plan[/bold]")
-    console.print(f"  [dim]project[/dim]      {project}")
-    console.print(
-        f"  [dim]traces[/dim]       {plan.accepted_traces} accepted, {plan.invalid_traces} "
-        f"invalid; {plan.fit_tasks} fit, {plan.held_out_tasks} held out"
-    )
-    console.print(
-        f"  [dim]models[/dim]       world={plan.selected.world_model}, "
-        f"judge={plan.selected.judge}, embedder={plan.selected.embedder}"
-    )
-    console.print(
-        f"  [dim]router[/dim]       {', '.join(catalog.roles.candidates)}; "
-        f"incumbent={catalog.roles.incumbent}"
-    )
-    console.print("  [dim]RAG[/dim]          serving and fit indexes")
-    console.print("  [dim]syllabus[/dim]     task-success rubric and evaluation instructions")
-    console.print(
-        "  [dim]calibration[/dim]  provisional; optional human approval creates a successor"
-    )
-    console.print(
-        f"  [dim]build spend[/dim]  estimate ${plan.build_estimate_usd:.6f}; "
-        f"ceiling ${build_ceiling:.4f}"
-    )
-    console.print(f"  [dim]embeddings[/dim]   ${cost_plan.router_embedding_cost_usd:.6f}")
-    console.print(
-        f"  [dim]judgments[/dim]    ${cost_plan.judgment_cost_usd:.6f} "
-        f"({cost_plan.maximum_judgments} judge decisions)"
-    )
-    console.print(
-        f"  [dim]simulation[/dim]   ${cost_plan.simulation_cost_usd:.6f} "
-        f"({cost_plan.simulated_episode_count} episodes)"
-    )
-    console.print(
-        f"  [dim]router spend[/dim] required ${cost_plan.required_provider_cost_usd:.6f}; "
-        f"ceiling ${router_ceiling:.6f}"
-    )
-    if supplied_router_cap is not None:
-        console.print(f"  [dim]supplied cap[/dim] ${supplied_router_cap:.6f}")
-    console.print(
-        f"  [dim]total[/dim]        ceiling ${math.fsum((build_ceiling, router_ceiling)):.4f}"
     )

@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 
 import wmo.cli.build_cmd as build_command
 import wmo.cli.build_wizard as wizard
+import wmo.cli.build_wizard_screens as screens
 from wmo.cli.app import app
 from wmo.cli.build_cmd_test import _otlp_export
 from wmo.cli.provider_setup_test import _FakeLister
@@ -289,13 +290,13 @@ def _task_cases(count: int) -> tuple[TaskCase, ...]:
 
 
 def _default_trace_corpus(tmp_path: Path) -> Path:
-    """Write a multi-lineage corpus under the wizard's default single-file name.
+    """Write a multi-lineage corpus under a likely local trace-export file name.
 
     Args:
         tmp_path: Isolated current directory receiving the trace corpus.
 
     Returns:
-        The one auto-discovered OTLP JSONL path.
+        The one local OTLP JSONL path named at the explicit trace prompt.
     """
     generated = _otlp_export(tmp_path, count=12)
     default = tmp_path / "traces.otel.jsonl"
@@ -327,7 +328,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root), "--provider", "openai"],
-        input="\ny\n",
+        input="\ntraces.otel.jsonl\n\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "WMO_RELEASE_REVISION": _REVISION},
     )
 
@@ -335,7 +336,10 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     printed = unstyle(result.output)
     assert lister.requests == ["openai"]
     assert "Select the providers you want to use" not in printed
-    assert printed.count("Setup mode") == 1
+    assert printed.count("Every step this wizard can run") == 1
+    assert printed.index("judge rubric") < printed.index("Trace path")
+    assert printed.count("Trace path (otlp export)") == 1
+    assert printed.count("Use these recommended models?") == 1
     assert printed.count("Authorize wmo build support") == 1
     assert "Judge syllabus" in printed
     assert "Human calibration is optional" in printed
@@ -419,7 +423,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     successor = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="y\n",
+        input="\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "WMO_RELEASE_REVISION": _REVISION},
     )
     assert successor.exit_code == 0, successor.output
@@ -497,7 +501,7 @@ def test_fresh_wizard_refusal_after_discovery_makes_no_paid_calls_or_selected_bu
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="1\n\n\nn\n",
+        input="\ntraces.otel.jsonl\n1\n\n\nn\n",
         env={"OPENAI_API_KEY": "openai-secret", "WMO_RELEASE_REVISION": _REVISION},
     )
 
@@ -539,7 +543,7 @@ def test_explicit_router_cap_below_required_fails_before_consent_or_paid_calls(
             "--max-router-cost-usd",
             "0.01",
         ],
-        input="1\n\n\n",
+        input="\ntraces.otel.jsonl\n1\n\n\n",
         env={"OPENAI_API_KEY": "openai-secret", "WMO_RELEASE_REVISION": _REVISION},
     )
 
@@ -580,7 +584,7 @@ def test_explicit_router_cap_above_required_consents_only_to_exact_plan(
             "--max-router-cost-usd",
             "5000",
         ],
-        input="1\n\n\ny\n",
+        input="\ntraces.otel.jsonl\n1\n\n\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "WMO_RELEASE_REVISION": _REVISION},
     )
 
@@ -667,7 +671,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
     guided = _RUNNER.invoke(
         app,
         ["build", "guided", "--root", str(root)],
-        input="y\n",
+        input=f"\n{traces}\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "WMO_RELEASE_REVISION": _REVISION},
     )
     assert guided.exit_code == 0, guided.output
@@ -761,7 +765,7 @@ def test_interrupted_wizard_resumes_durable_stages_without_duplicate_build_calls
     first = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="1\n\n\ny\n",
+        input="\ntraces.otel.jsonl\n1\n\n\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "WMO_RELEASE_REVISION": _REVISION},
     )
     assert first.exit_code == 1
@@ -775,7 +779,7 @@ def test_interrupted_wizard_resumes_durable_stages_without_duplicate_build_calls
     resumed = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="y\n",
+        input="\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "WMO_RELEASE_REVISION": _REVISION},
     )
 
@@ -829,7 +833,7 @@ def test_approved_calibration_resume_builds_human_calibrated_successor(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(store.paths.root)],
-        input="y\n",
+        input="\ny\n",
         env={"FIXTURE_API_KEY": "fixture-secret", "WMO_RELEASE_REVISION": _REVISION},
     )
 
@@ -874,49 +878,6 @@ def test_bare_build_dispatches_wizard_without_required_trace_option(
     help_text = unstyle(help_result.output)
     assert "interactive" in help_text
     assert "wizard" in help_text
-
-
-def test_trace_discovery_defaults_single_and_lists_multiple(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """One local trace is the default while several receive an explicit numbered picker.
-
-    Args:
-        tmp_path: Isolated current directory with candidate trace files.
-        monkeypatch: Pytest patch fixture supplying deterministic prompt answers.
-    """
-    first = tmp_path / "traces.otel.jsonl"
-    first.write_text("{}\n")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(
-        wizard.Prompt,
-        "ask",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("one discovered trace must not prompt")
-        ),
-    )
-    output = StringIO()
-    selected_source, selected_path = wizard._select_trace(
-        "otlp", console=Console(file=output, force_terminal=False)
-    )
-    assert (selected_source, selected_path) == ("otlp", first)
-    assert "traces Using" in unstyle(output.getvalue())
-    assert first.name in _compact_terminal_text(output.getvalue())
-
-    second = tmp_path / "other.jsonl"
-    second.write_text("{}\n")
-    answers = iter(("2",))
-    output = StringIO()
-    monkeypatch.setattr(wizard.Prompt, "ask", lambda *_args, **_kwargs: next(answers))
-    _source, selected_path = wizard._select_trace(
-        "otlp", console=Console(file=output, force_terminal=False)
-    )
-    assert selected_path in {first, second}
-    assert "Discovered trace files" in unstyle(output.getvalue())
-    compact_output = _compact_terminal_text(output.getvalue())
-    assert first.name in compact_output
-    assert second.name in compact_output
 
 
 def test_invalid_traces_fail_before_provider_discovery(
@@ -1074,6 +1035,11 @@ def test_refused_named_consent_stops_before_paid_provider_stages(
     authorizations: list[tuple[str, float]] = []
     provider_stages: list[str] = []
     monkeypatch.setattr(wizard, "_completed_replay", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        screens.Prompt,
+        "ask",
+        lambda *_args, **kwargs: cast(str, kwargs.get("default", "")),
+    )
     monkeypatch.setattr(wizard, "_completed_build_plan", lambda *_args, **_kwargs: _plan(catalog))
     monkeypatch.setattr(wizard, "_ensure_router_defaults", lambda *_args, **_kwargs: catalog)
     monkeypatch.setattr(
@@ -1148,7 +1114,7 @@ def test_completed_replay_skips_every_prompt_and_provider_stage(
         raise AssertionError("completed replay entered an incomplete stage")
 
     catalog = _catalog()
-    monkeypatch.setattr(wizard.Prompt, "ask", unexpected)
+    monkeypatch.setattr(screens.Prompt, "ask", unexpected)
     monkeypatch.setattr(wizard, "_completed_build_plan", lambda *_args, **_kwargs: _plan(catalog))
     monkeypatch.setattr(wizard, "_ensure_router_defaults", lambda *_args, **_kwargs: catalog)
     monkeypatch.setattr(

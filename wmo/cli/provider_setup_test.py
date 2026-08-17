@@ -468,7 +468,7 @@ def test_wizard_recommended_setup_needs_only_provider_and_one_default_choice(
     assert catalog.roles.candidates == ("gpt-5-6-luna", "gpt-5-6-terra")
     assert catalog.roles.incumbent == "gpt-5-6-luna"
     transcript = unstyle(console.output)
-    assert transcript.count("Setup mode") == 1
+    assert transcript.count("Use these recommended models?") == 1
     assert "Select the models to configure" not in transcript
     assert "Save this configuration?" not in transcript
     persisted = (root / "models.toml").read_text(encoding="utf-8")
