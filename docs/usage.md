@@ -30,4 +30,5 @@ Build stops at review readiness. `wmo optimize router` creates the bounded fit a
 evaluation chain after candidate and manual judge setup. It never invokes world-model fidelity
 testing. Applications that need a world-model quality measurement can call the separate
 `build_fidelity_evaluation_plan` and `build_fidelity_report` APIs; those results never enter router
-fitting or activation. See the [router contracts](reference/router_optimization_config.md).
+fitting or activation. Fidelity reports contain measurements only, never an approval or denial.
+See the [router contracts](reference/router_optimization_config.md).

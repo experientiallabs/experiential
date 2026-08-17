@@ -56,7 +56,8 @@ uv run pytest -q
   project. It freezes one shared provider ceiling before calls, simulates and judges missing
   fit evidence, locks the fit policy before held-out execution, and exactly replays completed work.
   World-model fidelity testing is a separately invoked common-evaluation mode with no authority
-  over router fitting or runtime activation.
+  over router fitting or runtime activation. Its reports contain measurements only and never carry
+  an approval, denial, gate, threshold, or decision.
 - `wmo run PROJECT --root ROOT --port PORT [--ghost]` loads one frozen policy and exposes OpenAI Chat
   Completions, Responses, and Models routes on loopback. Public request and response types come
   from the official OpenAI SDK. Chat retries use the standard `Idempotency-Key`; Responses

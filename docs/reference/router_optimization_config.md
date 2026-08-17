@@ -1,7 +1,7 @@
 # Router optimization contracts
 
 Router optimization consumes one combined plan containing only fit and held-out cells. Fidelity
-cells, fidelity reports, and approval artifacts are not router inputs. The supported sequence is:
+cells and fidelity reports are not router inputs. The supported sequence is:
 
 1. Complete fit evidence.
 2. Fit and lock the bank and policy.
@@ -17,12 +17,10 @@ already completed evidence can use `fit_router`, `report_router`, or `optimize_r
 
 ## Router-only plan
 
-Create the plan with `build_evaluation_plan`. Its public signature has no fidelity threshold,
-protocol, report, or approval argument. The resulting `EvaluationPlan` has:
+Create the plan with `build_evaluation_plan`. Its public signature has no fidelity measurement
+protocol or report argument. The resulting `EvaluationPlan` has:
 
 - fit and held-out cells only;
-- `fidelity_thresholds_id=None`;
-- `fidelity_thresholds_sha256=None`;
 - `fidelity_protocol_sha256=None`.
 
 The router fitter rejects any plan containing a fidelity cell. This keeps world-model quality
@@ -74,9 +72,9 @@ performs both calls in that order for a complete `RouterOptimizationConfig`.
 ## Separate world-model fidelity measurement
 
 Fidelity testing is an explicit common-evaluation workflow. Call
-`build_fidelity_evaluation_plan` with frozen thresholds, observed comparison cells, and the exact
-world-model protocol digest. Execute its fidelity cells, then call `build_fidelity_report` to
-measure agreement.
+`build_fidelity_evaluation_plan` with observed comparison cells, a positive `overlap_count`, and
+the exact world-model protocol digest. Execute its fidelity cells, then call
+`build_fidelity_report` to measure agreement.
 
 ```python
 from wmo.common.evaluations import (
@@ -85,6 +83,7 @@ from wmo.common.evaluations import (
 )
 ```
 
-The resulting plan and report remain world-model quality artifacts. They are not accepted by
-`EvaluationInputs`, are not loaded by the router fitter or runtime, and cannot authorize, block,
-or alter policy fitting.
+The resulting report contains overlap counts, pair failures, pair scores, and score MAE. It has no
+gate, threshold, report-level decision status, or approval timestamp. Fidelity artifacts are not
+accepted by `EvaluationInputs`, are not loaded by the router fitter or runtime, and cannot alter
+policy fitting.

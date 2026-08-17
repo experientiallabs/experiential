@@ -12,23 +12,15 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     Sha256,
-    sha256_json,
     stable_id,
 )
 from wmo.common.evaluations.evidence import (
     EvaluationEvidenceError,
     read_evaluation_plan,
-    read_fidelity_gate,
-    read_fidelity_thresholds,
     read_rollout,
     sorted_evaluation_inputs,
 )
-from wmo.common.evaluations.plan import (
-    EvaluationCell,
-    EvaluationPlan,
-    FidelityGate,
-    FidelityThresholds,
-)
+from wmo.common.evaluations.plan import EvaluationCell, EvaluationPlan
 from wmo.common.models import RoutedCandidateSnapshot, load_pricing_snapshot
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact
@@ -50,76 +42,6 @@ class ObservedProductionCell(ContractModel):
         if value < 0:
             raise ValueError("observed production repeat must be nonnegative")
         return value
-
-
-def default_fidelity_thresholds(
-    *,
-    created_at: datetime,
-    code_revision: str,
-    planned_overlaps: int = 10,
-    minimum_usable_overlaps: int = 8,
-) -> FidelityThresholds:
-    """Create a frozen world-model fidelity gate for an exact real-evidence denominator.
-
-    Args:
-        created_at: Time the immutable threshold record is created.
-        code_revision: Exact WMO revision creating the gate.
-        planned_overlaps: Positive exact number of real fit overlaps frozen into the plan.
-        minimum_usable_overlaps: Positive numerical gate no larger than the denominator.
-
-    Returns:
-        Exact-denominator 0.10-MAE fidelity thresholds.
-    """
-    version = (
-        "world-model-fidelity-v1"
-        if planned_overlaps == 10 and minimum_usable_overlaps == 8
-        else "world-model-fidelity-v2"
-    )
-    thresholds_id = stable_id(
-        "fidelity-thresholds",
-        {
-            "version": version,
-            "planned_overlaps": planned_overlaps,
-            "minimum_usable_overlaps": minimum_usable_overlaps,
-            "maximum_score_mae": 0.10,
-        },
-    )
-    return FidelityThresholds(
-        schema_version=1,
-        created_at=created_at,
-        inputs=(),
-        code_revision=code_revision,
-        fidelity_thresholds_id=thresholds_id,
-        planned_overlaps=planned_overlaps,
-        minimum_usable_overlaps=minimum_usable_overlaps,
-    )
-
-
-def persist_fidelity_thresholds(store: ArtifactStore, thresholds: FidelityThresholds) -> None:
-    """Persist one immutable fidelity gate in the common project store.
-
-    Args:
-        store: Project-local immutable artifact store.
-        thresholds: Frozen fidelity thresholds to persist.
-
-    Raises:
-        EvaluationEvidenceError: An existing artifact differs from deterministic replay.
-    """
-    destination = store.project_directory / "artifacts" / thresholds.fidelity_thresholds_id
-    if destination.exists():
-        existing, _input = read_fidelity_thresholds(store, thresholds.fidelity_thresholds_id)
-        replay = thresholds.model_copy(update={"created_at": existing.created_at})
-        if existing != replay:
-            raise EvaluationEvidenceError(
-                "existing fidelity thresholds differ from deterministic replay"
-            )
-        return
-    store.write_json(
-        artifact_id=thresholds.fidelity_thresholds_id,
-        artifact_type="fidelity-thresholds",
-        envelope=thresholds,
-        files={"thresholds.json": thresholds},
-    )
 
 
 def build_evaluation_plan(
@@ -156,8 +78,8 @@ def build_evaluation_plan(
         candidate_snapshots=candidate_snapshots,
         pricing_snapshot_id=pricing_snapshot_id,
         observed_cells=observed_cells,
-        fidelity_thresholds_id=None,
         fidelity_protocol_sha256=None,
+        fidelity_overlap_count=None,
         additional_inputs=additional_inputs,
         repeats=repeats,
         created_at=created_at,
@@ -172,8 +94,8 @@ def build_fidelity_evaluation_plan(
     candidate_snapshots: Sequence[RoutedCandidateSnapshot],
     pricing_snapshot_id: ArtifactId,
     observed_cells: Sequence[ObservedProductionCell],
-    fidelity_thresholds_id: ArtifactId,
     fidelity_protocol_sha256: Sha256,
+    overlap_count: int = 10,
     additional_inputs: Sequence[ArtifactInput] = (),
     repeats: Sequence[int] = (0,),
     created_at: datetime,
@@ -182,13 +104,13 @@ def build_fidelity_evaluation_plan(
     """Build a separately invoked world-model fidelity measurement plan.
 
     Args:
-        store: Project-local immutable artifact store containing tasks, thresholds, and rollouts.
+        store: Project-local immutable artifact store containing tasks and rollouts.
         task_set_id: Frozen representative task-set artifact.
         candidate_snapshots: Exact aliases and model identities to evaluate.
         pricing_snapshot_id: Exact candidate-pricing artifact bound to the plan.
         observed_cells: Production rollout assignments used as fidelity comparisons.
-        fidelity_thresholds_id: Precommitted world-model fidelity thresholds artifact.
         fidelity_protocol_sha256: Exact world-model measurement protocol digest.
+        overlap_count: Positive number of distinct observed lineages to measure.
         additional_inputs: Optional manifest-bound measurement contracts.
         repeats: Nonnegative repeat indexes planned for every task and candidate.
         created_at: Time the plan is completed.
@@ -203,8 +125,8 @@ def build_fidelity_evaluation_plan(
         candidate_snapshots=candidate_snapshots,
         pricing_snapshot_id=pricing_snapshot_id,
         observed_cells=observed_cells,
-        fidelity_thresholds_id=fidelity_thresholds_id,
         fidelity_protocol_sha256=fidelity_protocol_sha256,
+        fidelity_overlap_count=overlap_count,
         additional_inputs=additional_inputs,
         repeats=repeats,
         created_at=created_at,
@@ -219,8 +141,8 @@ def _build_evaluation_plan(
     candidate_snapshots: Sequence[RoutedCandidateSnapshot],
     pricing_snapshot_id: ArtifactId,
     observed_cells: Sequence[ObservedProductionCell],
-    fidelity_thresholds_id: ArtifactId | None,
     fidelity_protocol_sha256: Sha256 | None,
+    fidelity_overlap_count: int | None,
     additional_inputs: Sequence[ArtifactInput],
     repeats: Sequence[int],
     created_at: datetime,
@@ -238,8 +160,8 @@ def _build_evaluation_plan(
         candidate_snapshots: Exact aliases and model identities to evaluate.
         pricing_snapshot_id: Exact candidate-pricing artifact bound to the plan.
         observed_cells: Production rollout assignments that already fill matrix cells.
-        fidelity_thresholds_id: Optional precommitted world-model fidelity thresholds artifact.
         fidelity_protocol_sha256: Optional world-model measurement protocol digest.
+        fidelity_overlap_count: Optional positive number of observed lineages to measure.
         additional_inputs: Optional manifest-bound workflow contracts to freeze into the plan.
         repeats: Nonnegative repeat indexes planned for every task and candidate.
         created_at: Time the plan is completed.
@@ -254,14 +176,12 @@ def _build_evaluation_plan(
     loaded_tasks = load_task_set(store, task_set_id)
     task_manifest = store.read(task_set_id).manifest
     task_input = artifact_input(task_manifest)
-    if (fidelity_thresholds_id is None) != (fidelity_protocol_sha256 is None):
+    if (fidelity_overlap_count is None) != (fidelity_protocol_sha256 is None):
         raise EvaluationEvidenceError(
-            "fidelity planning requires both thresholds and protocol identity"
+            "fidelity planning requires both overlap count and protocol identity"
         )
-    thresholds = None
-    thresholds_input = None
-    if fidelity_thresholds_id is not None:
-        thresholds, thresholds_input = read_fidelity_thresholds(store, fidelity_thresholds_id)
+    if fidelity_overlap_count is not None and fidelity_overlap_count <= 0:
+        raise EvaluationEvidenceError("fidelity overlap count must be positive")
     candidates = tuple(sorted(candidate_snapshots, key=lambda item: item.alias))
     _require_unique_candidates(candidates)
     for item in additional_inputs:
@@ -327,21 +247,19 @@ def _build_evaluation_plan(
     )
     fidelity_cells = (
         ()
-        if thresholds is None
+        if fidelity_overlap_count is None
         else _fidelity_cells(
             main_cells,
             tasks_by_id,
             task_set_input=task_input,
-            planned_overlaps=thresholds.planned_overlaps,
+            planned_overlaps=fidelity_overlap_count,
         )
     )
     cells = (*main_cells, *fidelity_cells)
-    fidelity_inputs = () if thresholds_input is None else (thresholds_input,)
     plan_inputs = sorted_evaluation_inputs(
         (
             task_input,
             pricing_input,
-            *fidelity_inputs,
             *observed_inputs,
             *additional_inputs,
         )
@@ -349,21 +267,19 @@ def _build_evaluation_plan(
     plan_id = stable_id(
         "evaluation-plan",
         {
-            "version": "sparse-evaluation-plan-v3",
-            "mode": "fidelity" if thresholds is not None else "router",
+            "version": "sparse-evaluation-plan-v4",
+            "mode": "fidelity" if fidelity_overlap_count is not None else "router",
             "inputs": [item.model_dump(mode="json") for item in plan_inputs],
             "task_set": task_input.model_dump(mode="json"),
             "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
             "pricing_snapshot": pricing_input.model_dump(mode="json"),
-            "fidelity_thresholds": (
-                None if thresholds_input is None else thresholds_input.model_dump(mode="json")
-            ),
+            "fidelity_overlap_count": fidelity_overlap_count,
             "fidelity_protocol_sha256": fidelity_protocol_sha256,
             "cells": [cell.model_dump(mode="json") for cell in cells],
         },
     )
     plan = EvaluationPlan(
-        schema_version=3,
+        schema_version=4,
         created_at=created_at,
         inputs=plan_inputs,
         code_revision=code_revision,
@@ -372,8 +288,6 @@ def _build_evaluation_plan(
         candidate_snapshots=candidates,
         pricing_snapshot_id=pricing_snapshot_id,
         pricing_snapshot_sha256=pricing_sha256,
-        fidelity_thresholds_id=(None if thresholds is None else thresholds.fidelity_thresholds_id),
-        fidelity_thresholds_sha256=(None if thresholds_input is None else thresholds_input.sha256),
         fidelity_protocol_sha256=fidelity_protocol_sha256,
         cells=cells,
     )
@@ -393,59 +307,7 @@ def _build_evaluation_plan(
             envelope=plan,
             files={"evaluation-plan.json": plan, "plan.json": plan},
         )
-    if thresholds is None or thresholds_input is None or fidelity_protocol_sha256 is None:
-        return plan
-    plan_input = artifact_input(store.read(plan.plan_id).manifest)
-    overlap_ids = tuple(cell.cell_id for cell in fidelity_cells)
-    scope_sha256 = sha256_json(
-        {
-            "task_set_id": plan.task_set_id,
-            "candidates": [item.model_dump(mode="json") for item in plan.candidate_snapshots],
-            "overlap_cell_ids": overlap_ids,
-        }
-    )
-    gate_id = plan_bound_fidelity_gate_id(plan_input.sha256, fidelity_protocol_sha256)
-    gate = FidelityGate(
-        schema_version=1,
-        created_at=created_at,
-        inputs=sorted_evaluation_inputs((plan_input, thresholds_input)),
-        code_revision=code_revision,
-        fidelity_gate_id=gate_id,
-        fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
-        fidelity_thresholds_sha256=thresholds_input.sha256,
-        evaluation_plan_id=plan.plan_id,
-        evaluation_plan_sha256=plan_input.sha256,
-        protocol_sha256=fidelity_protocol_sha256,
-        task_model_scope_sha256=scope_sha256,
-        overlap_cell_ids=overlap_ids,
-        planned_overlaps=thresholds.planned_overlaps,
-        minimum_usable_overlaps=thresholds.minimum_usable_overlaps,
-        maximum_score_mae=thresholds.maximum_score_mae,
-    )
-    gate_destination = store.project_directory / "artifacts" / gate_id
-    if gate_destination.exists():
-        existing_gate, _input = read_fidelity_gate(store, gate_id)
-        replay_gate = gate.model_copy(update={"created_at": existing_gate.created_at})
-        if existing_gate != replay_gate:
-            raise EvaluationEvidenceError(
-                "existing fidelity gate differs from deterministic replay"
-            )
-    else:
-        store.write_json(
-            artifact_id=gate_id,
-            artifact_type="fidelity-gate",
-            envelope=gate,
-            files={"gate.json": gate},
-        )
     return plan
-
-
-def plan_bound_fidelity_gate_id(plan_sha256: Sha256, protocol_sha256: Sha256) -> ArtifactId:
-    """Return the non-replayable gate ID for one exact plan and protocol."""
-    return stable_id(
-        "fidelity-gate",
-        {"evaluation_plan_sha256": plan_sha256, "protocol_sha256": protocol_sha256},
-    )
 
 
 def _require_unique_candidates(candidates: tuple[RoutedCandidateSnapshot, ...]) -> None:

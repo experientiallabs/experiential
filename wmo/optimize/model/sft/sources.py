@@ -19,7 +19,6 @@ from wmo.common.core.artifacts import (
     sorted_unique_inputs,
     stable_id,
 )
-from wmo.common.evaluations import FidelityReport
 from wmo.common.judging import (
     CalibrationError,
     JudgeCalibration,
@@ -216,16 +215,6 @@ def resolve_teacher_source(store: ProjectStore, source: TeacherSFTSource) -> Pre
     if judgment.judgment_id != judgment_input.artifact_id:
         raise SFTSourceVerificationError("teacher judgment has the wrong identity")
     calibration, calibration_input = _verify_calibration(store, evidence)
-    fidelity, fidelity_input = _read_json(
-        store,
-        artifact_id=evidence.fidelity_report.artifact_id,
-        artifact_type="fidelity-report",
-        relative_path="fidelity-report.json",
-        model_type=FidelityReport,
-        expected_input=evidence.fidelity_report,
-    )
-    if fidelity.fidelity_report_id != fidelity_input.artifact_id:
-        raise SFTSourceVerificationError("teacher fidelity report has the wrong identity")
     transcript = _load_transcript(
         store,
         evidence_id=evidence_input.artifact_id,
@@ -245,8 +234,6 @@ def resolve_teacher_source(store: ProjectStore, source: TeacherSFTSource) -> Pre
         judgment_input=judgment_input,
         calibration=calibration,
         calibration_input=calibration_input,
-        fidelity=fidelity,
-        fidelity_input=fidelity_input,
     )
     return PreparedSFTSource(
         kind="teacher_rollout",
@@ -269,7 +256,6 @@ def resolve_teacher_source(store: ProjectStore, source: TeacherSFTSource) -> Pre
                 rule_input,
                 judgment_input,
                 calibration_input,
-                fidelity_input,
                 evidence_input,
                 rubric_input,
                 *calibration.inputs,
@@ -416,8 +402,6 @@ def _verify_teacher_decision(
     judgment_input: ArtifactInput,
     calibration: JudgeCalibration,
     calibration_input: ArtifactInput,
-    fidelity: FidelityReport,
-    fidelity_input: ArtifactInput,
 ) -> tuple[float, ArtifactInput]:
     """Verify all teacher gates and recompute the usable score from persisted judgment maps."""
     if rule.required_calibration != calibration_input:
@@ -440,10 +424,6 @@ def _verify_teacher_decision(
         raise SFTSourceVerificationError(
             "teacher rollout requires a recursively verified human-calibrated judge"
         )
-    if fidelity.status != "approved" or fidelity.approved_at is None:
-        raise SFTSourceVerificationError("teacher rollout requires an approved fidelity report")
-    if rollout_input not in fidelity.inputs:
-        raise SFTSourceVerificationError("teacher fidelity report does not bind the stored rollout")
     if judgment.rollout_id != rollout.rollout_id:
         raise SFTSourceVerificationError("teacher judgment does not belong to the stored rollout")
     if judgment.calibration_id != calibration.calibration_id:
@@ -486,7 +466,6 @@ def _verify_teacher_decision(
                 task_set_input,
                 judgment_input,
                 calibration_input,
-                fidelity_input,
                 rule_input,
             ),
             key=lambda item: item.artifact_id,

@@ -15,7 +15,7 @@ from wmo.common.core.artifacts import (
     sorted_unique_inputs,
 )
 from wmo.common.evaluations.dataset import EvaluationProtocol, FidelityReport
-from wmo.common.evaluations.plan import EvaluationPlan, FidelityGate, FidelityThresholds
+from wmo.common.evaluations.plan import EvaluationPlan
 from wmo.common.judging import JudgeCalibration, Judgment
 from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.project import ArtifactStore
@@ -58,7 +58,7 @@ def evaluation_protocol_digest(protocol: EvaluationProtocol) -> str:
     """Return the canonical digest used to bind a fidelity report to its protocol.
 
     Args:
-        protocol: Evaluation protocol whose optional report reference must not hash itself.
+        protocol: Complete evaluation protocol used for fidelity measurement.
 
     Returns:
         SHA-256 digest of the complete protocol.
@@ -93,57 +93,6 @@ def read_evaluation_plan(
     return value, input_record
 
 
-def read_fidelity_gate(
-    store: ArtifactStore, artifact_id: ArtifactId
-) -> tuple[FidelityGate, ArtifactInput]:
-    """Load a verified fidelity gate and its manifest-derived input.
-
-    Args:
-        store: Project-local immutable artifact store.
-        artifact_id: Fidelity-gate artifact identity.
-
-    Returns:
-        Parsed gate plus the exact digest of its generic artifact manifest.
-
-    Raises:
-        EvaluationEvidenceError: The artifact is unavailable, wrong-typed, or invalid.
-    """
-    value, input_record = read_artifact_json(
-        store,
-        artifact_id=artifact_id,
-        expected_artifact_type="fidelity-gate",
-        relative_path="gate.json",
-        model_type=FidelityGate,
-        error=EvaluationEvidenceError,
-    )
-    _require_identity(value.fidelity_gate_id, artifact_id, "fidelity gate")
-    return value, input_record
-
-
-def read_fidelity_thresholds(
-    store: ArtifactStore, artifact_id: ArtifactId
-) -> tuple[FidelityThresholds, ArtifactInput]:
-    """Load verified reusable fidelity thresholds without approval authority.
-
-    Args:
-        store: Project-local immutable artifact store.
-        artifact_id: Fidelity-threshold artifact identity.
-
-    Returns:
-        Parsed thresholds and their exact manifest-derived input.
-    """
-    value, input_record = read_artifact_json(
-        store,
-        artifact_id=artifact_id,
-        expected_artifact_type="fidelity-thresholds",
-        relative_path="thresholds.json",
-        model_type=FidelityThresholds,
-        error=EvaluationEvidenceError,
-    )
-    _require_identity(value.fidelity_thresholds_id, artifact_id, "fidelity thresholds")
-    return value, input_record
-
-
 def read_fidelity_report(
     store: ArtifactStore, artifact_id: ArtifactId
 ) -> tuple[FidelityReport, ArtifactInput]:
@@ -168,37 +117,15 @@ def read_fidelity_report(
         error=EvaluationEvidenceError,
     )
     _require_identity(value.fidelity_report_id, artifact_id, "fidelity report")
-    gate, gate_input = read_fidelity_gate(store, value.gate_id)
-    if (
-        gate_input.sha256 != value.gate_sha256
-        or gate_input not in value.inputs
-        or gate.planned_overlaps != value.planned_overlap_count
-    ):
-        raise EvaluationEvidenceError("fidelity report differs from its exact frozen gate")
-    verify_fidelity_report_gate(value, gate)
+    plan, plan_input = read_evaluation_plan(store, value.evaluation_plan_id)
+    if value.evaluation_plan_sha256 != plan_input.sha256 or plan_input not in value.inputs:
+        raise EvaluationEvidenceError("fidelity report differs from its exact evaluation plan")
+    if value.protocol_sha256 != plan.fidelity_protocol_sha256:
+        raise EvaluationEvidenceError("fidelity report protocol differs from its evaluation plan")
+    overlap_cell_ids = tuple(cell.cell_id for cell in plan.cells if cell.purpose == "fidelity")
+    if not overlap_cell_ids or value.overlap_cell_ids != overlap_cell_ids:
+        raise EvaluationEvidenceError("fidelity report overlap scope differs from its plan")
     return value, input_record
-
-
-def verify_fidelity_report_gate(report: FidelityReport, gate: FidelityGate) -> None:
-    """Verify report status and measurements against its recursively loaded gate.
-
-    Args:
-        report: Structurally valid fidelity report.
-        gate: Exact immutable gate named by the report.
-
-    Raises:
-        EvaluationEvidenceError: Status, denominator, usable count, or MAE violates the gate.
-    """
-    if gate.planned_overlaps != report.planned_overlap_count:
-        raise EvaluationEvidenceError("fidelity report denominator differs from its frozen gate")
-    insufficient = report.usable_overlap_count < gate.minimum_usable_overlaps
-    excessive_mae = report.score_mae is None or report.score_mae > gate.maximum_score_mae
-    if report.status == "approved" and (insufficient or excessive_mae):
-        raise EvaluationEvidenceError("approved fidelity report does not satisfy its frozen gate")
-    if report.status == "insufficient" and not insufficient:
-        raise EvaluationEvidenceError("fidelity report meets the gate's usable evidence minimum")
-    if report.status == "rejected" and (insufficient or not excessive_mae):
-        raise EvaluationEvidenceError("rejected fidelity report does not exceed its frozen MAE")
 
 
 def read_rollout(

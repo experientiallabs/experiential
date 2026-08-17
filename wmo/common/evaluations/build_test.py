@@ -24,8 +24,6 @@ from wmo.common.evaluations import (
     build_evaluation_dataset,
     build_evaluation_plan,
     build_fidelity_evaluation_plan,
-    default_fidelity_thresholds,
-    persist_fidelity_thresholds,
 )
 from wmo.common.evaluations.evidence import (
     EvaluationCellEvidence,
@@ -99,6 +97,11 @@ def test_plan_observed_precedence_and_separate_fit_only_fidelity(tmp_path: Path)
         {cell.cell_id for cell in observed_a}
     )
     assert store.read(plan.plan_id).manifest.artifact_type == "evaluation-plan"
+    artifact_types = {
+        store.read(artifact_id).manifest.artifact_type for artifact_id in store.list_ids()
+    }
+    assert "fidelity-gate" not in artifact_types
+    assert "fidelity-thresholds" not in artifact_types
 
     router_plan = build_evaluation_plan(
         store,
@@ -119,8 +122,6 @@ def test_plan_observed_precedence_and_separate_fit_only_fidelity(tmp_path: Path)
     )
 
     assert all(cell.purpose != "fidelity" for cell in router_plan.cells)
-    assert router_plan.fidelity_thresholds_id is None
-    assert router_plan.fidelity_thresholds_sha256 is None
     assert router_plan.fidelity_protocol_sha256 is None
 
 
@@ -176,7 +177,6 @@ def test_plan_rejects_pricing_candidate_scope_before_write(tmp_path: Path) -> No
         files={"pricing.json": reversed_pricing},
     )
     artifact_ids_before = store.list_ids()
-    assert plan.fidelity_thresholds_id is not None
     assert plan.fidelity_protocol_sha256 is not None
 
     for pricing_snapshot_id in (pricing.pricing_snapshot_id, reversed_pricing.pricing_snapshot_id):
@@ -195,8 +195,8 @@ def test_plan_rejects_pricing_candidate_scope_before_write(tmp_path: Path) -> No
                     )
                     for task_id, rollout_id in observed.items()
                 ),
-                fidelity_thresholds_id=plan.fidelity_thresholds_id,
                 fidelity_protocol_sha256=plan.fidelity_protocol_sha256,
+                overlap_count=10,
                 created_at=_TIME,
                 code_revision="test-revision",
             )
@@ -204,7 +204,7 @@ def test_plan_rejects_pricing_candidate_scope_before_write(tmp_path: Path) -> No
 
 
 def test_fidelity_failure_keeps_all_ten_denominator_cells(tmp_path: Path) -> None:
-    """Ten failed overlaps produce an insufficient report and cannot be approved."""
+    """Ten failed overlaps remain explicit measurements in the report denominator."""
     store, plan, observed = _planned_fixture(tmp_path)
     protocol = _world_protocol()
     evidence = []
@@ -240,15 +240,14 @@ def test_fidelity_failure_keeps_all_ten_denominator_cells(tmp_path: Path) -> Non
         code_revision="test-revision",
     )
 
-    assert report.status == "insufficient"
     assert report.planned_overlap_count == 10
     assert report.usable_overlap_count == 0
     assert report.failed_overlap_count == 10
     assert len(report.failures) == 10
 
 
-def test_fidelity_gate_rejects_protocol_replay(tmp_path: Path) -> None:
-    """A gate frozen for one protocol cannot approve another protocol on the same plan."""
+def test_fidelity_report_rejects_protocol_replay(tmp_path: Path) -> None:
+    """A measurement plan cannot be reported under another world-model protocol."""
     store, plan, _observed = _planned_fixture(tmp_path)
     replayed = _world_protocol().model_copy(update={"simulator_prompt_id": "changed-prompt"})
 
@@ -445,8 +444,6 @@ def _planned_fixture(
         _task("task-held-out", partition="held_out"),
     )
     _persist_task_set(store, "task-set-plan", tasks)
-    gate = default_fidelity_thresholds(created_at=_TIME, code_revision="test-revision")
-    persist_fidelity_thresholds(store, gate)
     candidates = (_candidate("candidate-a"), _candidate("candidate-b"))
     _persist_pricing(store, candidates)
     observed = {}
@@ -478,8 +475,8 @@ def _planned_fixture(
         candidate_snapshots=candidates,
         pricing_snapshot_id="pricing-a",
         observed_cells=observed_cells,
-        fidelity_thresholds_id=gate.fidelity_thresholds_id,
         fidelity_protocol_sha256=evaluation_protocol_digest(_world_protocol()),
+        overlap_count=10,
         created_at=_TIME,
         code_revision="test-revision",
     )
@@ -588,7 +585,7 @@ def _materialization_fixture(
         ),
     )
     plan = EvaluationPlan(
-        schema_version=2,
+        schema_version=4,
         created_at=_TIME,
         inputs=tuple(sorted((pricing_input, task_input), key=lambda item: item.artifact_id)),
         code_revision="test-revision",
@@ -597,8 +594,6 @@ def _materialization_fixture(
         candidate_snapshots=(baseline, cheap),
         pricing_snapshot_id="pricing-a",
         pricing_snapshot_sha256=pricing_input.sha256,
-        fidelity_thresholds_id="fidelity-thresholds-a",
-        fidelity_thresholds_sha256=_DIGEST,
         fidelity_protocol_sha256=_DIGEST,
         cells=cells,
     )

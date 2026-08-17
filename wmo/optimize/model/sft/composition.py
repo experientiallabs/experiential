@@ -37,8 +37,8 @@ Examples:
         )
 
     Teacher simulation remains an explicit earlier application step. Its already-persisted
-    ``accepted_teacher_source`` must reference accepted rollout, judgment, calibration, score-rule,
-    and fidelity artifacts before W12 will accept it::
+    ``accepted_teacher_source`` must reference accepted rollout, judgment, calibration, and
+    score-rule artifacts before W12 will accept it::
 
         teacher_dataset = build_sft_dataset(
             store=store,
