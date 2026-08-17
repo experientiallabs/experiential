@@ -271,9 +271,13 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
 
     before_preflight = store.read_review()
     set_maximum_command_cost_usd(0.5, root)
-    over_budget = _calibrate_arguments(root, ())
-    over_budget[over_budget.index("--input-usd-per-million") + 1] = "1"
-    over_budget[over_budget.index("--output-usd-per-million") + 1] = "1"
+    over_budget = [
+        *_calibrate_arguments(root, ()),
+        "--input-usd-per-million",
+        "1",
+        "--output-usd-per-million",
+        "1",
+    ]
     _RuntimeCatalog.judge_clients = []
     refused = runner.invoke(app, over_budget)
     assert refused.exit_code == 2

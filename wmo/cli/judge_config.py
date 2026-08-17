@@ -245,10 +245,7 @@ def judge_calibrate(
                 maximum_input_tokens_per_call=maximum_input_tokens,
                 maximum_cost_usd=sys.float_info.max,
             )
-            if (
-                maximum_cost_usd is not None
-                and budget.estimated_cost_usd > maximum_cost_usd
-            ):
+            if maximum_cost_usd is not None and budget.estimated_cost_usd > maximum_cost_usd:
                 raise ValueError(
                     "judge calibration estimate exceeds --maximum-cost-usd; raise the ceiling "
                     "or reduce the labeled sample"

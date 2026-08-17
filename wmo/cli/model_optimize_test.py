@@ -1279,7 +1279,7 @@ def test_command_budget_rejects_sft_before_credentials_even_with_yes(
         raise AssertionError("Tinker construction must follow command budget authorization")
 
     monkeypatch.setattr(command, "_compose_tinker_backend", forbidden_backend)
-    monkeypatch.setattr(command, "_current_revision", lambda: "command-budget-test")
+    monkeypatch.setattr(command, "installed_release_revision", lambda: "command-budget-test")
 
     result = CliRunner().invoke(
         app,
