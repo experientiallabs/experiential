@@ -12,6 +12,7 @@ from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     Embedding,
+    ModelCapabilities,
     ModelFinishReason,
     ModelMessage,
     ModelRequest,
@@ -31,18 +32,24 @@ from wmo.runtime.models.providers.openai_compatible import (
 )
 from wmo.runtime.models.providers.request import post_json
 from wmo.runtime.models.providers.retry import RetryPolicy
+from wmo.runtime.models.providers.sampling import include_temperature
 from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MAXIMUM_OUTPUT_TOKENS = 4096
 
 
-def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
+def gemini_generate_request(
+    model_id: str,
+    request: ModelRequest,
+    capabilities: ModelCapabilities | None = None,
+) -> JsonObject:
     """Convert a WMO request into Gemini's native generateContent payload.
 
     Args:
         model_id: Gemini model identifier selected by the catalog.
         request: Typed visible messages, tools, and sampling parameters.
+        capabilities: Catalog sampling capabilities for this model, when known.
 
     Returns:
         A non-streaming native payload for the generateContent endpoint.
@@ -79,7 +86,7 @@ def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
     if request.tool_choice is not None:
         payload["toolConfig"] = {"functionCallingConfig": _gemini_tool_choice(request.tool_choice)}
     generation: JsonObject = {}
-    if request.temperature is not None:
+    if include_temperature(request, capabilities):
         generation["temperature"] = request.temperature
     if request.maximum_output_tokens is not None:
         generation["maxOutputTokens"] = request.maximum_output_tokens
@@ -163,6 +170,7 @@ class GeminiClient:
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         base_url: str = GEMINI_BASE_URL,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         """Create a Gemini client with an API key sent only to Gemini's endpoint."""
         if not api_key:
@@ -175,6 +183,7 @@ class GeminiClient:
         self._transport = transport or HttpxJsonTransport()
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
+        self._capabilities = capabilities
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one native Gemini generateContent request.
@@ -190,9 +199,11 @@ class GeminiClient:
             self._transport,
             f"{self._base_url}/models/{_path_model_id(self._model.model_id)}:generateContent",
             headers=self._headers(),
-            payload=gemini_generate_request(self._model.model_id, request),
+            payload=gemini_generate_request(self._model.model_id, request, self._capabilities),
             timeout_seconds=self._timeout_seconds,
             retry_policy=self._retry_policy,
+            provider="gemini",
+            endpoint_class="generate_content",
         )
         return gemini_generate_response(
             response,
@@ -226,6 +237,8 @@ class GeminiClient:
             },
             timeout_seconds=self._timeout_seconds,
             retry_policy=self._retry_policy,
+            provider="gemini",
+            endpoint_class="embed_content",
         )
         values = _array(response.get("embeddings"), "embeddings")
         if len(values) != len(texts):

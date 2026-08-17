@@ -877,17 +877,7 @@ def _structured_completion_failure(exception: Exception) -> StructuredFailure:
     retryable = isinstance(exception, TimeoutError)
     code = FailureCode.TIMEOUT if retryable else FailureCode.PROVIDER
     if isinstance(exception, ProviderTransportError):
-        retryable = (
-            exception.status_code is None
-            or exception.status_code
-            in {
-                408,
-                409,
-                425,
-                429,
-            }
-            or (exception.status_code is not None and exception.status_code >= 500)
-        )
+        retryable = exception.retryable
         code = FailureCode.PROVIDER
     return StructuredFailure(
         code=code,

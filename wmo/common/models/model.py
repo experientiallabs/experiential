@@ -196,6 +196,7 @@ class ModelCapabilities(ContractModel):
     supports_embeddings: bool = False
     supports_structured_output: bool = False
     supports_completions: bool | None = None
+    supports_temperature: bool | None = None
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
@@ -244,6 +245,7 @@ class ModelCapabilities(ContractModel):
             "cache_write_cost_per_million_tokens_usd",
         }
         excluded.add("supports_completions")
+        excluded.add("supports_temperature")
         return sha256_json(self.model_dump(mode="json", exclude=excluded))
 
 

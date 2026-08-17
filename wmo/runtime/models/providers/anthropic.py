@@ -10,6 +10,7 @@ from pydantic import JsonValue
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
+    ModelCapabilities,
     ModelFinishReason,
     ModelMessage,
     ModelRequest,
@@ -28,6 +29,7 @@ from wmo.runtime.models.providers.openai_compatible import (
 )
 from wmo.runtime.models.providers.request import post_json
 from wmo.runtime.models.providers.retry import RetryPolicy
+from wmo.runtime.models.providers.sampling import include_temperature
 from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
@@ -35,12 +37,17 @@ ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAXIMUM_OUTPUT_TOKENS = 4096
 
 
-def anthropic_messages_request(model_id: str, request: ModelRequest) -> JsonObject:
+def anthropic_messages_request(
+    model_id: str,
+    request: ModelRequest,
+    capabilities: ModelCapabilities | None = None,
+) -> JsonObject:
     """Convert one WMO request into native Anthropic Messages JSON.
 
     Args:
         model_id: Anthropic model identifier.
         request: Typed WMO request.
+        capabilities: Catalog sampling capabilities for this model, when known.
 
     Returns:
         Native Messages payload preserving tool-use and tool-result blocks.
@@ -76,7 +83,7 @@ def anthropic_messages_request(model_id: str, request: ModelRequest) -> JsonObje
         ]
     if request.tool_choice is not None:
         payload["tool_choice"] = _anthropic_tool_choice(request.tool_choice)
-    if request.temperature is not None:
+    if include_temperature(request, capabilities):
         payload["temperature"] = request.temperature
     return payload
 
@@ -154,6 +161,7 @@ class AnthropicClient:
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         base_url: str = ANTHROPIC_BASE_URL,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         """Build one explicit Anthropic Messages connection."""
         if not api_key:
@@ -166,6 +174,7 @@ class AnthropicClient:
         self._transport = transport or HttpxJsonTransport()
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
+        self._capabilities = capabilities
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one native Messages request without OpenAI conversion.
@@ -185,9 +194,11 @@ class AnthropicClient:
                 "anthropic-version": ANTHROPIC_VERSION,
                 "content-type": "application/json",
             },
-            payload=anthropic_messages_request(self._model.model_id, request),
+            payload=anthropic_messages_request(self._model.model_id, request, self._capabilities),
             timeout_seconds=self._timeout_seconds,
             retry_policy=self._retry_policy,
+            provider="anthropic",
+            endpoint_class="messages",
         )
         return anthropic_messages_response(
             response,

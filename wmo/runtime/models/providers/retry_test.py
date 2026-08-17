@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import pytest
 
+from wmo.runtime.models.providers.errors import ProviderError
 from wmo.runtime.models.providers.retry import RetryPolicy, classify_retry, run_with_retry
-from wmo.runtime.models.providers.transport import ProviderTransportError
 
 
 @pytest.mark.parametrize(
     ("exception", "retryable"),
     [
-        (ProviderTransportError("unavailable", status_code=503), True),
-        (ProviderTransportError("bad request", status_code=400), False),
-        (ProviderTransportError("network"), True),
+        (ProviderError("unavailable", status_code=503), True),
+        (ProviderError("bad request", status_code=400), False),
+        (ProviderError("network"), True),
+        (
+            ProviderError(
+                "unsupported",
+                status_code=400,
+                error_code="unsupported_parameter",
+                rejected_parameter="temperature",
+            ),
+            False,
+        ),
         (TimeoutError("slow"), True),
         (ValueError("invalid request"), False),
     ],
@@ -32,7 +41,7 @@ def test_retry_runs_a_bounded_same_operation() -> None:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise ProviderTransportError("busy", status_code=429)
+            raise ProviderError("busy", status_code=429)
         return "ok"
 
     assert (

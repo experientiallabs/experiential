@@ -418,6 +418,7 @@ def _existing_models(existing: ModelCatalog | None) -> tuple[ProviderModelSelect
                     capabilities.supports_structured_output if capabilities else False
                 ),
                 supports_completions=(capabilities.supports_completions if capabilities else None),
+                supports_temperature=(capabilities.supports_temperature if capabilities else None),
                 context_window_tokens=capabilities.context_window_tokens if capabilities else None,
                 maximum_output_tokens=(
                     capabilities.maximum_output_tokens if capabilities else None

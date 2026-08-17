@@ -105,6 +105,7 @@ def test_router_candidate_role_requires_prices_and_both_token_limits() -> None:
     """Router candidates need complete price and limit evidence before they are offered."""
     resolved = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.6-luna"))
 
+    assert resolved.capabilities.supports_temperature is False
     assert served_roles(resolved.capabilities) == (
         SetupRole.WORLD_MODEL,
         SetupRole.JUDGE,

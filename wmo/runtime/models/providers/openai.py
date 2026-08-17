@@ -12,6 +12,7 @@ from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     Embedding,
+    ModelCapabilities,
     ModelFinishReason,
     ModelMessage,
     ModelRequest,
@@ -31,17 +32,23 @@ from wmo.runtime.models.providers.openai_compatible import (
 )
 from wmo.runtime.models.providers.request import post_json
 from wmo.runtime.models.providers.retry import RetryPolicy
+from wmo.runtime.models.providers.sampling import include_temperature
 from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
-def openai_responses_request(model_id: str, request: ModelRequest) -> JsonObject:
+def openai_responses_request(
+    model_id: str,
+    request: ModelRequest,
+    capabilities: ModelCapabilities | None = None,
+) -> JsonObject:
     """Convert one WMO request into OpenAI's native Responses API shape.
 
     Args:
         model_id: OpenAI model identifier.
         request: Typed WMO request.
+        capabilities: Catalog sampling capabilities for this model, when known.
 
     Returns:
         Non-streaming Responses API JSON with provider-side storage disabled.
@@ -82,7 +89,7 @@ def openai_responses_request(model_id: str, request: ModelRequest) -> JsonObject
             if not isinstance(request.tool_choice, str)
             else request.tool_choice
         )
-    if request.temperature is not None:
+    if include_temperature(request, capabilities):
         payload["temperature"] = request.temperature
     if request.maximum_output_tokens is not None:
         payload["max_output_tokens"] = request.maximum_output_tokens
@@ -171,6 +178,7 @@ class OpenAIClient:
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         base_url: str = OPENAI_BASE_URL,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         """Create a direct OpenAI client with one explicitly resolved credential."""
         if not api_key:
@@ -183,6 +191,7 @@ class OpenAIClient:
         self._transport = transport or HttpxJsonTransport()
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
+        self._capabilities = capabilities
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one request through the native non-streaming Responses endpoint.
@@ -198,9 +207,11 @@ class OpenAIClient:
             self._transport,
             f"{self._base_url}/responses",
             headers=self._headers(),
-            payload=openai_responses_request(self._model.model_id, request),
+            payload=openai_responses_request(self._model.model_id, request, self._capabilities),
             timeout_seconds=self._timeout_seconds,
             retry_policy=self._retry_policy,
+            provider="openai",
+            endpoint_class="responses",
         )
         return openai_responses_response(
             response,
@@ -226,6 +237,8 @@ class OpenAIClient:
             payload=openai_embedding_request(self._model.model_id, texts),
             timeout_seconds=self._timeout_seconds,
             retry_policy=self._retry_policy,
+            provider="openai",
+            endpoint_class="embeddings",
         )
         return openai_embedding_response(response, expected_count=len(texts))
 

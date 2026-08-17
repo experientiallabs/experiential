@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from wmo.common.models import Embedding, ModelRequest, ModelResponse, ModelSnapshot
+from wmo.common.models import (
+    Embedding,
+    ModelCapabilities,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+)
 from wmo.runtime.models.providers.openai_compatible import (
     DEFAULT_RETRY_POLICY,
     DEFAULT_TIMEOUT_SECONDS,
@@ -30,6 +36,7 @@ class OpenRouterClient:
         transport: JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         """Build one explicit OpenRouter connection."""
         self._client = OpenAICompatibleClient(
@@ -43,6 +50,8 @@ class OpenRouterClient:
                 "HTTP-Referer": OPENROUTER_REFERER,
                 "X-Title": OPENROUTER_TITLE,
             },
+            provider="openrouter",
+            capabilities=capabilities,
         )
 
     def complete(self, request: ModelRequest) -> ModelResponse:

@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.prompt import Confirm
 
 from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.provider_failures import exit_provider_failure
 from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.evaluations import EvaluationCellEvidence, EvaluationPlan
 from wmo.common.models import ProviderModelSelection, load_model_catalog
@@ -31,6 +32,7 @@ from wmo.optimize.router.composition import (
     RouterCompositionBudget,
 )
 from wmo.runtime.models import RuntimeModelCatalog
+from wmo.runtime.models.providers.errors import ProviderError
 
 _console = Console()
 _ROOT_OPTION = typer.Option(Path(".wmo"), "--root", help="Local .wmo project root.")
@@ -203,6 +205,16 @@ def router(
             fidelity_approval=approval,
             created_at=now,
             code_revision=producer_revision,
+        )
+    except ProviderError as exc:
+        exit_provider_failure(
+            _console,
+            exc,
+            saved_progress=(
+                "completed router artifacts were kept and will be replayed",
+                "the failed provider attempt was not recorded as completed evidence",
+            ),
+            retry_command=f"wmo optimize router {project} --root {root} --yes",
         )
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from None

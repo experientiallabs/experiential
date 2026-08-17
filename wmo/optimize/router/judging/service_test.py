@@ -68,6 +68,7 @@ from wmo.optimize.router.judging.service import (
     prepare_manual_judge_calibration,
     prepare_manual_judge_setup,
 )
+from wmo.runtime.models.providers.errors import ProviderError
 from wmo.runtime.models.registry import ResolvedModel, RuntimeModelCatalog
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
@@ -158,6 +159,7 @@ class _StructuredJudgeClient:
         shape: _FeedbackShape,
         *,
         fail_after: int | None = None,
+        failure: Exception | None = None,
     ) -> None:
         """Bind the response shape and optional deterministic interruption boundary.
 
@@ -165,10 +167,12 @@ class _StructuredJudgeClient:
             model: Exact configured judge snapshot.
             shape: Scalar, boolean, categorical, or pairwise response shape.
             fail_after: Raise before this zero-based provider dispatch when set.
+            failure: Exact exception raised at that boundary. Defaults to RuntimeError.
         """
         self.model = model
         self.shape = shape
         self.fail_after = fail_after
+        self.failure = failure or RuntimeError("simulated provider interruption")
         self.requests: list[ModelRequest] = []
 
     def complete(self, request: ModelRequest) -> ModelResponse:
@@ -181,10 +185,10 @@ class _StructuredJudgeClient:
             Deterministic structured response for the configured shape.
 
         Raises:
-            RuntimeError: The configured interruption boundary is reached.
+            Exception: The configured interruption boundary is reached.
         """
         if self.fail_after is not None and len(self.requests) >= self.fail_after:
-            raise RuntimeError("simulated provider interruption")
+            raise self.failure
         self.requests.append(request)
         content = request.messages[1].content or ""
         span_ids = re.findall(r'"span_id":\s*"([^"]+)"', content)
@@ -1328,6 +1332,108 @@ def test_provider_failure_keeps_completed_human_labels_for_replay(tmp_path: Path
 
     digest = calibration_sample_digest(setup, calibration_sample(plan))
     assert read_label_draft(store, setup, digest) == labels
+
+
+def test_provider_error_does_not_record_failed_probe_and_replays_completed_work(
+    tmp_path: Path,
+) -> None:
+    """A typed provider rejection keeps labels and completed probes, never the failed call.
+
+    Args:
+        tmp_path: Isolated project root for immutable calibration evidence.
+    """
+    store = _built_store(tmp_path)
+    setup = _setup(store)
+    plan = prepare_manual_judge_calibration(store, sample_size=3)
+    labels = _labels(store)
+    failure = ProviderError(
+        "Unsupported parameter: 'temperature' is not supported with this model.",
+        provider="openai",
+        endpoint_class="responses",
+        status_code=400,
+        error_code="unsupported_parameter",
+        error_type="invalid_request_error",
+        rejected_parameter="temperature",
+    )
+    first_client = _StructuredJudgeClient(
+        plan.setup.judge_model,
+        "scalar",
+        fail_after=1,
+        failure=failure,
+    )
+    first_runtime = _RuntimeCatalog(
+        ResolvedModel(
+            alias="judge-main",
+            snapshot=plan.setup.judge_model,
+            capabilities=ModelCapabilities(),
+            client=first_client,
+            embedding_client=None,
+        )
+    )
+    budget = estimate_manual_judge_budget(
+        plan,
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=2.0,
+        maximum_input_tokens_per_call=4_096,
+        maximum_cost_usd=1.0,
+    )
+    with pytest.raises(ProviderError, match="temperature") as raised:
+        calibrate_manual_judge(
+            store,
+            cast(RuntimeModelCatalog, first_runtime),
+            plan,
+            labels,
+            budget,
+            spend_consented=True,
+            approve=False,
+            accept_insufficient_labels=True,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+
+    digest = calibration_sample_digest(setup, calibration_sample(plan))
+    assert read_label_draft(store, setup, digest) == labels
+    assert len(first_client.requests) == 1
+    assert _probe_count(store) == 1
+    assert raised.value.retryable is False
+    assert "sk-" not in str(raised.value)
+
+    retry_client = _StructuredJudgeClient(plan.setup.judge_model, "scalar")
+    retry_runtime = _RuntimeCatalog(
+        ResolvedModel(
+            alias="judge-main",
+            snapshot=plan.setup.judge_model,
+            capabilities=ModelCapabilities(),
+            client=retry_client,
+            embedding_client=None,
+        )
+    )
+    result = calibrate_manual_judge(
+        store,
+        cast(RuntimeModelCatalog, retry_runtime),
+        plan,
+        labels,
+        budget,
+        spend_consented=True,
+        approve=False,
+        accept_insufficient_labels=True,
+        created_at=_TIME + timedelta(minutes=10),
+        code_revision="test-revision",
+    )
+
+    assert result.provider_calls_made == 2
+    assert len(retry_client.requests) == 2
+    assert _probe_count(store) == 3
+    assert len(result.audit.judgments) == 3
+
+
+def _probe_count(store: ProjectStore) -> int:
+    """Count persisted judge probes after a calibration attempt."""
+    return sum(
+        1
+        for artifact_id in store.artifacts.list_ids()
+        if store.artifacts.read(artifact_id).manifest.artifact_type == "manual-judge-probe"
+    )
 
 
 def test_retry_reuses_audit_when_review_pointer_write_was_interrupted(

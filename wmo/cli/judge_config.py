@@ -12,6 +12,10 @@ from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.provider_failures import (
+    exit_provider_failure,
+    judge_calibration_retry_command,
+)
 from wmo.common.judging import Rubric, RubricDimension
 from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import load_model_catalog
@@ -41,6 +45,7 @@ from wmo.optimize.router.judging.service import (
     prepare_manual_judge_calibration,
     prepare_manual_judge_setup,
 )
+from wmo.runtime.models.providers.errors import ProviderError
 from wmo.runtime.models.registry import RuntimeModelCatalog
 
 judge_app = typer.Typer(help="Set up and manually calibrate a project judge.", no_args_is_help=True)
@@ -150,6 +155,9 @@ def judge_calibrate(
         help="Accept valid grouped evidence from fewer than ten rollouts.",
     ),
     non_interactive: bool = typer.Option(False, "--non-interactive"),
+    debug: bool = typer.Option(
+        False, "--debug", help="Print sanitized stack frames after a provider failure."
+    ),
 ) -> None:
     """Collect frozen labels, run consented judge calls, and separately approve evidence.
 
@@ -166,6 +174,7 @@ def judge_calibrate(
         approve: Separate approval of the displayed completed report.
         accept_insufficient_labels: Explicit risk acceptance below ten labeled rollouts.
         non_interactive: Refuse prompts and list missing explicit inputs.
+        debug: Whether to print sanitized stack frames after a provider failure.
 
     Raises:
         typer.BadParameter: Evidence, labels, budget, consent, or approval is invalid.
@@ -263,6 +272,28 @@ def judge_calibrate(
                 created_at=now,
                 code_revision=revision,
             )
+    except ProviderError as exc:
+        drafted_count = len(read_label_draft(store, plan.setup, sample_sha256))
+        exit_provider_failure(
+            _console,
+            exc,
+            saved_progress=(
+                f"{drafted_count} human labels saved for this trace sample",
+                "completed judge probes were kept and will be replayed",
+                "the failed provider attempt was not recorded as completed evidence",
+            ),
+            retry_command=judge_calibration_retry_command(
+                project,
+                root=str(root),
+                sample_size=sample_size,
+                input_price=input_price,
+                output_price=output_price,
+                maximum_input_tokens=maximum_input_tokens,
+                maximum_cost_usd=maximum_cost_usd,
+                accept_insufficient_labels=accept_insufficient_labels,
+            ),
+            debug=debug,
+        )
     except (OSError, ValueError, ManualJudgeError) as exc:
         raise typer.BadParameter(str(exc)) from None
     if result.approved_calibration is None:

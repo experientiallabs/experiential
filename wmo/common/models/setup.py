@@ -103,6 +103,7 @@ class ProviderModelSelection(ContractModel):
     supports_embeddings: bool = False
     supports_structured_output: bool = False
     supports_completions: bool | None = None
+    supports_temperature: bool | None = None
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
@@ -157,6 +158,7 @@ class ProviderModelSelection(ContractModel):
             supports_embeddings=self.supports_embeddings,
             supports_structured_output=self.supports_structured_output,
             supports_completions=self.supports_completions,
+            supports_temperature=self.supports_temperature,
             context_window_tokens=self.context_window_tokens,
             maximum_output_tokens=self.maximum_output_tokens,
             input_cost_per_million_tokens_usd=self.input_cost_per_million_tokens_usd,

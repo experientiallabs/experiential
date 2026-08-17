@@ -11,9 +11,20 @@ from typing import Protocol, cast
 from pydantic import JsonValue
 
 from wmo.common.core.artifacts import JsonObject
-from wmo.common.models import Embedding, ModelRequest, ModelResponse, ModelSnapshot
+from wmo.common.models import (
+    Embedding,
+    ModelCapabilities,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+)
 from wmo.runtime.models.providers.bedrock_converse import converse_request, converse_response
-from wmo.runtime.models.providers.errors import ProviderResponseError
+from wmo.runtime.models.providers.errors import (
+    ProviderError,
+    ProviderResponseError,
+    parse_provider_envelope,
+    provider_error_from_transport,
+)
 from wmo.runtime.models.providers.openai_compatible import (
     DEFAULT_RETRY_POLICY,
     normalize_embedding_vector,
@@ -158,6 +169,7 @@ class BedrockClient:
         environment: Mapping[str, str],
         runtime_factory: BedrockRuntimeFactory | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         """Create a lazy Bedrock client that does not import boto or open a session.
 
@@ -167,12 +179,14 @@ class BedrockClient:
             environment: Process or injected environment mapping used for region lookup.
             runtime_factory: Optional deterministic factory used by tests.
             retry_policy: Bounded same-region retry policy applied outside botocore.
+            capabilities: Catalog sampling capabilities for this model, when known.
         """
         self._model = model
         self._configured_region = region
         self._environment = environment
         self._runtime_factory = runtime_factory
         self._retry_policy = retry_policy
+        self._capabilities = capabilities
         self._client: BedrockRuntime | None = None
         self._lock = threading.Lock()
 
@@ -186,7 +200,7 @@ class BedrockClient:
             The typed non-streaming model response with observed request economics.
         """
         started_at = time.monotonic()
-        payload = converse_request(self._model.model_id, request)
+        payload = converse_request(self._model.model_id, request, self._capabilities)
         response = self._call_with_retry(lambda: self._runtime().converse(payload))
         return converse_response(
             response,
@@ -323,7 +337,7 @@ def _import_botocore_config() -> type[object]:
     return Config
 
 
-def _as_transport_error(exc: Exception) -> ProviderTransportError:
+def _as_transport_error(exc: Exception) -> ProviderError:
     """Convert a boto failure into a secret-free retry classification boundary."""
     name = type(exc).__name__
     if name in {
@@ -332,24 +346,35 @@ def _as_transport_error(exc: Exception) -> ProviderTransportError:
         "EndpointConnectionError",
         "TimeoutError",
     }:
-        return ProviderTransportError("Bedrock request timed out")
+        return provider_error_from_transport(
+            "Bedrock request timed out",
+            provider="bedrock",
+            endpoint_class="converse",
+        )
     response = getattr(exc, "response", None)
     if isinstance(response, dict):
-        error = response.get("Error")
+        parsed = parse_provider_envelope(cast("JsonObject", response))
         metadata = response.get("ResponseMetadata")
-        code = error.get("Code") if isinstance(error, dict) else None
         status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
         status_code = status if isinstance(status, int) else None
-        if isinstance(code, str) and code in _RETRYABLE_BOTO_CODES:
-            return ProviderTransportError(
-                f"Bedrock returned {code}", status_code=status_code or 503
-            )
-        if isinstance(code, str):
-            return ProviderTransportError(
-                f"Bedrock request failed ({code})", status_code=status_code
-            )
-        return ProviderTransportError("Bedrock request failed", status_code=status_code)
-    return ProviderTransportError("Bedrock request failed")
+        retryable = parsed.error_code in _RETRYABLE_BOTO_CODES if parsed.error_code else None
+        return ProviderError(
+            parsed.message or "Bedrock request failed",
+            provider="bedrock",
+            endpoint_class="converse",
+            status_code=status_code or (503 if retryable else None),
+            error_code=parsed.error_code,
+            error_type=parsed.error_type,
+            rejected_parameter=parsed.rejected_parameter,
+            request_id=parsed.request_id,
+            retryable=retryable,
+        )
+    return provider_error_from_transport(
+        "Bedrock request failed",
+        provider="bedrock",
+        endpoint_class="converse",
+        retryable=True,
+    )
 
 
 def _read_invoke_body(payload: Mapping[str, object]) -> JsonObject:

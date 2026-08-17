@@ -14,6 +14,7 @@ from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     Embedding,
+    ModelCapabilities,
     ModelFinishReason,
     ModelMessage,
     ModelRequest,
@@ -27,6 +28,7 @@ from wmo.common.models import (
 from wmo.runtime.models.providers.errors import ProviderResponseError
 from wmo.runtime.models.providers.request import post_json
 from wmo.runtime.models.providers.retry import RetryPolicy
+from wmo.runtime.models.providers.sampling import include_temperature
 from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -37,12 +39,17 @@ class OpenAICompatibleResponseError(ProviderResponseError):
     """An OpenAI-compatible endpoint returned a response outside the typed contract."""
 
 
-def openai_compatible_request(model_id: str, request: ModelRequest) -> JsonObject:
+def openai_compatible_request(
+    model_id: str,
+    request: ModelRequest,
+    capabilities: ModelCapabilities | None = None,
+) -> JsonObject:
     """Convert a WMO request into one non-streaming Chat Completions payload.
 
     Args:
         model_id: Provider model identifier to place on the wire.
         request: Typed WMO request.
+        capabilities: Catalog sampling capabilities for this model, when known.
 
     Returns:
         A JSON object for ``/chat/completions``.
@@ -76,7 +83,7 @@ def openai_compatible_request(model_id: str, request: ModelRequest) -> JsonObjec
             if not isinstance(request.tool_choice, str)
             else request.tool_choice
         )
-    if request.temperature is not None:
+    if include_temperature(request, capabilities):
         payload["temperature"] = request.temperature
     if request.maximum_output_tokens is not None:
         payload["max_tokens"] = request.maximum_output_tokens
@@ -185,6 +192,8 @@ class OpenAICompatibleClient:
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         extra_headers: Mapping[str, str] | None = None,
+        provider: str = "openai-compatible",
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         """Create a client with a single explicit endpoint and credential.
 
@@ -196,6 +205,8 @@ class OpenAICompatibleClient:
             retry_policy: Bounded same-endpoint retry policy.
             timeout_seconds: Timeout for every transport attempt.
             extra_headers: Provider-specific non-secret headers.
+            provider: Catalog provider kind used for sanitized diagnostics.
+            capabilities: Catalog sampling capabilities for this model, when known.
         """
         if not api_key:
             raise ValueError("OpenAI-compatible clients require a non-empty API key")
@@ -208,6 +219,8 @@ class OpenAICompatibleClient:
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
         self._extra_headers = dict(extra_headers or {})
+        self._provider = provider
+        self._capabilities = capabilities
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one non-streaming request through Chat Completions.
@@ -223,9 +236,11 @@ class OpenAICompatibleClient:
             self._transport,
             f"{self._base_url}/chat/completions",
             headers=self._headers(),
-            payload=openai_compatible_request(self._model.model_id, request),
+            payload=openai_compatible_request(self._model.model_id, request, self._capabilities),
             timeout_seconds=self._timeout_seconds,
             retry_policy=self._retry_policy,
+            provider=self._provider,
+            endpoint_class="chat_completions",
         )
         return openai_compatible_response(
             response,
@@ -251,6 +266,8 @@ class OpenAICompatibleClient:
             payload=openai_embedding_request(self._model.model_id, texts),
             timeout_seconds=self._timeout_seconds,
             retry_policy=self._retry_policy,
+            provider=self._provider,
+            endpoint_class="embeddings",
         )
         return openai_embedding_response(response, expected_count=len(texts))
 

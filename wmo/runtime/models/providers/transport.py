@@ -8,6 +8,20 @@ from dataclasses import dataclass
 import httpx
 
 from wmo.common.core.artifacts import JsonObject
+from wmo.runtime.models.providers.errors import (
+    ProviderError,
+    ProviderTransportError,
+    provider_error_from_transport,
+    sanitize_provider_text,
+)
+
+_REQUEST_ID_HEADERS = (
+    "x-request-id",
+    "request-id",
+    "x-amzn-requestid",
+    "x-ms-request-id",
+    "x-amz-request-id",
+)
 
 
 @dataclass(frozen=True)
@@ -16,14 +30,7 @@ class JsonHttpResponse:
 
     status_code: int
     body: JsonObject
-
-
-class ProviderTransportError(RuntimeError):
-    """A non-success HTTP or transport result that contains no secret-bearing payload."""
-
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
+    request_id: str | None = None
 
 
 class JsonHttpTransport:
@@ -44,10 +51,10 @@ class JsonHttpTransport:
             timeout_seconds: Bounded per-attempt wall-clock timeout.
 
         Returns:
-            The HTTP status and decoded object response.
+            The HTTP status, decoded object response, and optional request identity.
 
         Raises:
-            ProviderTransportError: The request failed or the endpoint returned non-object JSON.
+            ProviderError: The request failed or the endpoint returned non-object JSON.
         """
         raise NotImplementedError
 
@@ -68,10 +75,10 @@ class JsonHttpTransport:
             timeout_seconds: Bounded per-attempt wall-clock timeout.
 
         Returns:
-            The HTTP status and decoded object response.
+            The HTTP status, decoded object response, and optional request identity.
 
         Raises:
-            ProviderTransportError: The request failed or the endpoint returned non-object JSON.
+            ProviderError: The request failed or the endpoint returned non-object JSON.
         """
         raise NotImplementedError
 
@@ -97,17 +104,17 @@ class HttpxJsonTransport(JsonHttpTransport):
             timeout_seconds: Per-attempt request timeout.
 
         Returns:
-            The HTTP status and decoded JSON response object.
+            The HTTP status, decoded JSON response object, and optional request identity.
 
         Raises:
-            ProviderTransportError: The request fails or the response is not a JSON object.
+            ProviderError: The request fails or the response is not a JSON object.
         """
         try:
             response = self._client.get(url, headers=dict(headers), timeout=timeout_seconds)
         except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
+            raise provider_error_from_transport("provider request timed out") from exc
         except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
+            raise provider_error_from_transport("provider transport request failed") from exc
         return _decoded_response(response)
 
     def post(
@@ -127,10 +134,10 @@ class HttpxJsonTransport(JsonHttpTransport):
             timeout_seconds: Per-attempt request timeout.
 
         Returns:
-            The HTTP status and decoded JSON response object.
+            The HTTP status, decoded JSON response object, and optional request identity.
 
         Raises:
-            ProviderTransportError: The request fails or the response is not a JSON object.
+            ProviderError: The request fails or the response is not a JSON object.
         """
         try:
             response = self._client.post(
@@ -140,10 +147,27 @@ class HttpxJsonTransport(JsonHttpTransport):
                 timeout=timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
+            raise provider_error_from_transport("provider request timed out") from exc
         except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
+            raise provider_error_from_transport("provider transport request failed") from exc
         return _decoded_response(response)
+
+
+def request_id_from_headers(headers: Mapping[str, str]) -> str | None:
+    """Extract one allowlisted request identity and discard every other header.
+
+    Args:
+        headers: Provider response headers. The mapping is not retained.
+
+    Returns:
+        A sanitized request identity, or ``None`` when no allowlisted header is present.
+    """
+    lowered = {name.lower(): value for name, value in headers.items()}
+    for name in _REQUEST_ID_HEADERS:
+        value = lowered.get(name)
+        if isinstance(value, str) and value.strip():
+            return sanitize_provider_text(value.strip())
+    return None
 
 
 def _decoded_response(response: httpx.Response) -> JsonHttpResponse:
@@ -153,21 +177,34 @@ def _decoded_response(response: httpx.Response) -> JsonHttpResponse:
         response: Completed provider HTTP response.
 
     Returns:
-        The status code paired with the decoded JSON object body.
+        The status code paired with the decoded JSON object body and request identity.
 
     Raises:
-        ProviderTransportError: The body is not decodable JSON or is not a JSON object.
+        ProviderError: The body is not decodable JSON or is not a JSON object.
     """
+    request_id = request_id_from_headers(response.headers)
     try:
         body = response.json()
     except ValueError as exc:
-        raise ProviderTransportError(
+        raise provider_error_from_transport(
             f"provider returned non-JSON HTTP {response.status_code}",
             status_code=response.status_code,
+            retryable=False,
         ) from exc
     if not isinstance(body, dict):
-        raise ProviderTransportError(
+        raise provider_error_from_transport(
             f"provider returned non-object JSON HTTP {response.status_code}",
             status_code=response.status_code,
+            retryable=False,
         )
-    return JsonHttpResponse(status_code=response.status_code, body=body)
+    return JsonHttpResponse(status_code=response.status_code, body=body, request_id=request_id)
+
+
+__all__ = [
+    "HttpxJsonTransport",
+    "JsonHttpResponse",
+    "JsonHttpTransport",
+    "ProviderError",
+    "ProviderTransportError",
+    "request_id_from_headers",
+]

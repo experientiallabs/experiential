@@ -124,6 +124,8 @@ class HttpProviderModelLister:
                 headers=headers,
                 timeout_seconds=self._timeout_seconds,
                 retry_policy=self._retry_policy,
+                provider=endpoint.provider,
+                endpoint_class="models",
             )
         except ProviderTransportError as exc:
             raise ProviderListingError(_listing_message(endpoint.provider, exc)) from exc
@@ -329,6 +331,11 @@ def _listing_message(provider: str, exc: ProviderTransportError) -> str:
     """Describe one listing failure without revealing credentials or response content."""
     if exc.status_code in _CREDENTIAL_STATUS_CODES:
         return f"{provider} rejected the configured credential"
+    if exc.rejected_parameter is not None:
+        return (
+            f"{provider} model listing failed with HTTP {exc.status_code} "
+            f"({exc.rejected_parameter})"
+        )
     if exc.status_code is not None:
         return f"{provider} model listing failed with HTTP {exc.status_code}"
     return f"{provider} model listing failed: {exc}"

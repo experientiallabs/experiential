@@ -27,6 +27,7 @@ class KnownModel:
     supports_embeddings: bool = False
     supports_tools: bool = False
     supports_structured_output: bool = False
+    supports_temperature: bool | None = None
     context_window_tokens: int | None = None
     maximum_output_tokens: int | None = None
     input_cost_per_million_tokens_usd: float | None = None
@@ -43,6 +44,7 @@ def _chat(
     cache_write_usd: float | None = None,
     context_window_tokens: int | None = None,
     maximum_output_tokens: int | None = None,
+    supports_temperature: bool | None = True,
 ) -> KnownModel:
     """Describe one documented chat model that supports tools and structured output.
 
@@ -53,6 +55,7 @@ def _chat(
         cache_write_usd: Documented cache-write price, when the provider publishes one.
         context_window_tokens: Documented context window, when the provider publishes one.
         maximum_output_tokens: Documented output ceiling, when the provider publishes one.
+        supports_temperature: Whether the model accepts a temperature sampling parameter.
 
     Returns:
         The verified metadata record for the model.
@@ -61,6 +64,7 @@ def _chat(
         supports_completions=True,
         supports_tools=True,
         supports_structured_output=True,
+        supports_temperature=supports_temperature,
         context_window_tokens=context_window_tokens,
         maximum_output_tokens=maximum_output_tokens,
         input_cost_per_million_tokens_usd=input_usd,
@@ -96,6 +100,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=30.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
+        supports_temperature=False,
     ),
     "gpt-5.6-terra": _chat(
         input_usd=2.5,
@@ -104,6 +109,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=15.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
+        supports_temperature=False,
     ),
     "gpt-5.6-luna": _chat(
         input_usd=1.0,
@@ -112,6 +118,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=6.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
+        supports_temperature=False,
     ),
     "gpt-5.5": _chat(input_usd=5.0, cached_input_usd=0.5, output_usd=30.0),
     "gpt-5.5-pro": _chat(input_usd=30.0, output_usd=180.0),

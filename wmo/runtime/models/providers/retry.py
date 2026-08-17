@@ -6,9 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from wmo.runtime.models.providers.transport import ProviderTransportError
-
-_RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+from wmo.runtime.models.providers.errors import ProviderError
 
 
 @dataclass(frozen=True)
@@ -45,12 +43,8 @@ def classify_retry(exception: Exception) -> RetryClassification:
     Returns:
         A stable retry decision and concise reason.
     """
-    if isinstance(exception, ProviderTransportError):
-        if exception.status_code is None:
-            return RetryClassification(retryable=True, reason="transport")
-        if exception.status_code in _RETRYABLE_STATUS_CODES:
-            return RetryClassification(retryable=True, reason=f"http_{exception.status_code}")
-        return RetryClassification(retryable=False, reason=f"http_{exception.status_code}")
+    if isinstance(exception, ProviderError):
+        return RetryClassification(retryable=exception.retryable, reason=exception.retry_reason)
     if isinstance(exception, TimeoutError):
         return RetryClassification(retryable=True, reason="timeout")
     if isinstance(exception, OSError):

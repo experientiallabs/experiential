@@ -175,6 +175,7 @@ class RuntimeModelCatalog:
                 region=connection.region,
                 environment=self._environment,
                 runtime_factory=self._bedrock_runtime_factory,
+                capabilities=capabilities,
             )
             return ResolvedModel(
                 alias,
@@ -190,6 +191,7 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 base_url=connection.base_url or OPENAI_BASE_URL,
                 transport=self._transport_factory(),
+                capabilities=capabilities,
             )
             return ResolvedModel(
                 alias,
@@ -204,6 +206,7 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 base_url=connection.base_url or OPENROUTER_BASE_URL,
                 transport=self._transport_factory(),
+                capabilities=capabilities,
             )
             return ResolvedModel(
                 alias,
@@ -222,6 +225,7 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 base_url=connection.base_url,
                 transport=self._transport_factory(),
+                capabilities=capabilities,
             )
             return ResolvedModel(
                 alias,
@@ -236,6 +240,7 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 base_url=connection.base_url or ANTHROPIC_BASE_URL,
                 transport=self._transport_factory(),
+                capabilities=capabilities,
             )
             return ResolvedModel(alias, snapshot, capabilities, client, None)
         if provider == "gemini":
@@ -244,6 +249,7 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 base_url=connection.base_url or GEMINI_BASE_URL,
                 transport=self._transport_factory(),
+                capabilities=capabilities,
             )
             return ResolvedModel(
                 alias,
@@ -271,6 +277,7 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 api_version=connection.api_version,
                 transport=self._transport_factory(),
+                capabilities=capabilities,
             )
             return ResolvedModel(
                 alias,

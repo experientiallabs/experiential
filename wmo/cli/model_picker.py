@@ -422,6 +422,7 @@ def model_selection(item: AvailableModel) -> ProviderModelSelection:
         supports_embeddings=capabilities.supports_embeddings,
         supports_structured_output=capabilities.supports_structured_output,
         supports_completions=capabilities.supports_completions,
+        supports_temperature=capabilities.supports_temperature,
         context_window_tokens=capabilities.context_window_tokens,
         maximum_output_tokens=capabilities.maximum_output_tokens,
         input_cost_per_million_tokens_usd=capabilities.input_cost_per_million_tokens_usd,

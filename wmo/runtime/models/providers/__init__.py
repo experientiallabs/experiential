@@ -3,6 +3,7 @@
 from wmo.runtime.models.providers.anthropic import AnthropicClient
 from wmo.runtime.models.providers.azure import AzureClient
 from wmo.runtime.models.providers.bedrock import BedrockClient
+from wmo.runtime.models.providers.errors import ProviderError, ProviderTransportError
 from wmo.runtime.models.providers.gemini import GeminiClient
 from wmo.runtime.models.providers.listing import (
     HttpProviderModelLister,
@@ -32,7 +33,9 @@ __all__ = [
     "OpenAIClient",
     "OpenAICompatibleClient",
     "OpenRouterClient",
+    "ProviderError",
     "ProviderEndpoint",
+    "ProviderTransportError",
     "ProviderListingError",
     "ProviderModelLister",
     "TinkerOptionalDependencyError",
