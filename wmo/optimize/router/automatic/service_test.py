@@ -957,6 +957,7 @@ def test_automatic_router_rejects_substituted_manual_judge_audit_before_calls(
         report_input=audit.report,
         budget=substituted_budget,
         judgments=audit.judgments,
+        trace_reviews=audit.trace_reviews,
         positional_bias=(
             (audit.positional_bias_comparisons, audit.positional_bias_flips)
             if audit.positional_bias_comparisons is not None

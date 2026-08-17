@@ -60,6 +60,7 @@ from wmo.optimize.router.judging.contracts import (
     judge_feedback_schema,
 )
 from wmo.optimize.router.judging.labels import calibration_sample_digest, read_label_draft
+from wmo.optimize.router.judging.review import read_trace_reviews
 from wmo.optimize.router.judging.service import (
     ManualJudgeError,
     calibrate_manual_judge,
@@ -1272,6 +1273,14 @@ def test_pairwise_calibration_uses_same_task_and_counterbalances_order(tmp_path:
     assert len(result.audit.judgments[0].probes) == 2
     assert result.audit.positional_bias_comparisons == 1
     assert result.audit.positional_bias_flips == 1
+    sample_sha256 = calibration_sample_digest(plan.setup, calibration_sample(plan))
+    review = read_trace_reviews(store, plan.setup, sample_sha256)[0]
+    proposal = review.axes[0].judge_proposal
+    accepted = review.axes[0].final_accepted_label
+    assert proposal.cited_trace_evidence == ()
+    assert proposal.cited_reference_trace_evidence == ()
+    assert accepted.cited_trace_evidence == proposal.cited_trace_evidence
+    assert accepted.cited_reference_trace_evidence == proposal.cited_reference_trace_evidence
     first = client.requests[0].messages[1].content or ""
     second = client.requests[1].messages[1].content or ""
     target_rollout = plan.previews[0].rollout_id

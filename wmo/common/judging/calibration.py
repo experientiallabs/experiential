@@ -276,7 +276,7 @@ class JudgeCalibrationService:
             store: Project store containing the exact completed reviewed report artifact.
             report: Report whose persisted evidence is being approved.
             approved_at: Time the customer accepted the visible OOF evidence.
-            accept_insufficient_labels: Explicit risk acceptance below ten rollouts when
+            accept_insufficient_labels: Explicit risk acceptance below five rollouts when
                 per-dimension OOF evidence is valid.
 
         Returns:
@@ -726,7 +726,7 @@ def _report_status(
         tuple(dimension.dimension_id for dimension in rubric.dimensions), metrics, predictions
     ):
         return "insufficient"
-    if len({item.human_score.rollout_id for item in data}) < 10:
+    if len({item.human_score.rollout_id for item in data}) < 5:
         return "insufficient"
     return "ready_for_approval"
 

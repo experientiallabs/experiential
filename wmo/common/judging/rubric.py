@@ -320,7 +320,7 @@ class JudgeCalibration(ArtifactEnvelope):
     out_of_fold_report_sha256: Sha256
     score_maps: tuple[DimensionScoreMap, ...]
     label_count: int = Field(default=0, ge=0)
-    recommended_label_count: Literal[10] = 10
+    recommended_label_count: Literal[5, 10] = 5
     status: Literal["provisional", "insufficient", "human_calibrated"] = "provisional"
     approved_at: AwareDatetime | None = None
     risk_acceptance: ArtifactInput | None = None

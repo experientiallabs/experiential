@@ -34,6 +34,8 @@ from wmo.optimize.router.judging.contracts import (
     ManualJudgeError,
 )
 
+PairwiseCitationEvidence = tuple[tuple[ArtifactId, tuple[str, ...], tuple[str, ...]], ...]
+
 
 class _ScoredDimension(ContractModel):
     """Shared identity and optional rationale for one structured dimension."""
@@ -150,6 +152,7 @@ class TemplateJudgeClient:
         self._code_revision = code_revision
         self._probes: list[ArtifactInput] = []
         self._provider_calls_made = 0
+        self._pairwise_citation_evidence: PairwiseCitationEvidence = ()
 
     @property
     def probes(self) -> tuple[ArtifactInput, ...]:
@@ -160,6 +163,11 @@ class TemplateJudgeClient:
     def provider_calls_made(self) -> int:
         """Return provider dispatches made instead of replayed by this adapter."""
         return self._provider_calls_made
+
+    @property
+    def pairwise_citation_evidence(self) -> PairwiseCitationEvidence:
+        """Return target and reference citations retained from both pairwise orders."""
+        return self._pairwise_citation_evidence
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Execute the finalized schema and normalize its explicit projection.
@@ -372,11 +380,13 @@ class TemplateJudgeClient:
             )
         mapping = self._template.score_projection.pairwise_scores
         normalized: list[JsonObject] = []
+        citations: list[tuple[ArtifactId, tuple[str, ...], tuple[str, ...]]] = []
         for dimension in self._rubric.dimensions:
             left = first_by_id[dimension.dimension_id]
             right = second_by_id[dimension.dimension_id]
             right_target = _reverse_winner(right.winner)
             score = (mapping[left.winner] + mapping[right_target] + 1) // 2
+            citations.append((dimension.dimension_id, (), ()))
             normalized.append(
                 {
                     "dimension_id": dimension.dimension_id,
@@ -384,6 +394,7 @@ class TemplateJudgeClient:
                     "rationale": _combine_rationales(left.rationale, right.rationale),
                 }
             )
+        self._pairwise_citation_evidence = tuple(citations)
         return ModelResponse(
             output=AssistantAction(content=json.dumps({"dimensions": normalized})),
             model=forward.model,
@@ -419,6 +430,47 @@ def positional_bias_count(
         item.winner != _reverse_winner(second_by_id[item.dimension_id].winner) for item in first
     )
     return len(first), disagreements
+
+
+def pairwise_citation_evidence_from_probes(
+    store: ProjectStore,
+    probes: tuple[ArtifactInput, ...],
+    rollout: RolloutArtifact,
+    reference: RolloutArtifact,
+) -> PairwiseCitationEvidence:
+    """Recover pairwise dimension IDs from immutable counterbalanced probes.
+
+    Judge output no longer carries span citations, so each recovered row keeps
+    empty target and reference citation tuples.
+
+    Args:
+        store: Project-local immutable artifact store.
+        probes: Exact forward and reverse probe pointers.
+        rollout: Target rollout shown as candidate A in the forward probe.
+        reference: Reference rollout shown as candidate B in the forward probe.
+
+    Returns:
+        Rubric dimension IDs with empty target and reference citation tuples.
+
+    Raises:
+        ManualJudgeError: Probe order, dimensions, or rollout identity is malformed.
+    """
+    loaded = tuple(_read_probe(store, item) for item in probes)
+    if len(loaded) != 2 or loaded[0].order != "forward" or loaded[1].order != "reverse":
+        raise ManualJudgeError("pairwise citations require forward and reverse probes")
+    first = _PairwiseResponse.model_validate(loaded[0].response).dimensions
+    second = _PairwiseResponse.model_validate(loaded[1].response).dimensions
+    first_by_id = {item.dimension_id: item for item in first}
+    second_by_id = {item.dimension_id: item for item in second}
+    if (
+        len(first_by_id) != len(first)
+        or len(second_by_id) != len(second)
+        or set(first_by_id) != set(second_by_id)
+    ):
+        raise ManualJudgeError("pairwise probes evaluated different rubric dimensions")
+    if rollout.rollout_id == reference.rollout_id:
+        raise ManualJudgeError("pairwise citations require distinct rollouts")
+    return tuple((dimension_id, (), ()) for dimension_id in first_by_id)
 
 
 def _read_probe_if_present(store: ProjectStore, probe_id: str) -> JudgeProtocolProbeArtifact | None:

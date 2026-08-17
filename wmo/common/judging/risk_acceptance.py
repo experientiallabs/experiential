@@ -65,8 +65,8 @@ def require_calibration_risk_acceptance(
     if report.status == "insufficient" and calibration.status == "human_calibrated":
         if report.eligible_rollout_count >= report.recommended_label_count:
             raise RiskAcceptanceError(
-                "insufficient human calibration risk acceptance is limited to fewer than ten "
-                "eligible rollouts"
+                "insufficient human calibration risk acceptance is limited to fewer than "
+                f"{report.recommended_label_count} eligible rollouts"
             )
         if calibration.risk_acceptance is None:
             raise RiskAcceptanceError(
@@ -167,7 +167,10 @@ def _acceptance_from_report(
     if report.status != "insufficient":
         raise RiskAcceptanceError("risk acceptance requires an insufficient calibration report")
     if report.eligible_rollout_count >= report.recommended_label_count:
-        raise RiskAcceptanceError("risk acceptance requires fewer than ten eligible rollouts")
+        raise RiskAcceptanceError(
+            "risk acceptance requires fewer than "
+            f"{report.recommended_label_count} eligible rollouts"
+        )
     if report_input.artifact_id != report.report_id:
         raise RiskAcceptanceError("risk acceptance report manifest has the wrong artifact identity")
     acceptance_id = stable_id(
@@ -190,6 +193,7 @@ def _acceptance_from_report(
         report=report_input,
         eligible_label_count=report.eligible_label_count,
         eligible_rollout_count=report.eligible_rollout_count,
+        recommended_label_count=report.recommended_label_count,
         accepted_at=accepted_at,
     )
 
