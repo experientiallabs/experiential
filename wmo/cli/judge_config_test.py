@@ -160,7 +160,7 @@ def test_calibrate_renders_provider_error_without_traceback(
             "--yes",
         ],
     )
-    printed = unstyle(result.output)
+    printed = " ".join(unstyle(result.output).split())
 
     assert result.exit_code == 1
     assert "Provider call failed" in printed
@@ -170,6 +170,8 @@ def test_calibrate_renders_provider_error_without_traceback(
     assert "1 human labels saved" in printed
     assert "the failed provider attempt was not recorded" in printed
     assert f"wmo config judge calibrate support --root {root}" in printed
+    assert "--yes" in printed
     assert "Traceback" not in printed
     assert secret not in printed
-    assert result.exception is None or result.exception.__class__.__name__ == "Exit"
+    assert "Authorization" not in printed
+    assert isinstance(result.exception, SystemExit)

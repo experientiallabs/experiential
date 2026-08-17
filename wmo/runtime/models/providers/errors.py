@@ -42,8 +42,11 @@ _NONRETRYABLE_ERROR_MARKERS = frozenset(
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _PARAMETER_TOKEN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,63}$")
 _SECRET_TOKEN = re.compile(
-    r"(?i)(?:sk-[A-Za-z0-9_-]{8,}|bearer\s+[A-Za-z0-9._~+/=-]{8,}|api[_-]?key\s*[:=]\s*\S+"
-    r"|aws[_-]?secret[_-]?access[_-]?key\s*[:=]\s*\S+)"
+    r"(?i)(?:authorization\s*:\s*)?(?:sk-[A-Za-z0-9_-]{8,}|bearer\s+[A-Za-z0-9._~+/=-]{8,}"
+    r"|api[_-]?key\s*[:=]\s*\S+|aws[_-]?secret[_-]?access[_-]?key\s*[:=]\s*\S+)"
+)
+_REQUEST_CONTENT = re.compile(
+    r"(?i)(?:\b(?:prompt|tools|messages|input|body)\s*[:=]|\brequest\s*=)\s*.+"
 )
 _MAXIMUM_SAFE_MESSAGE = 240
 
@@ -309,6 +312,7 @@ def sanitize_provider_text(value: str | None) -> str | None:
     if not text:
         return None
     text = _SECRET_TOKEN.sub("[redacted]", text)
+    text = _REQUEST_CONTENT.sub("[redacted]", text)
     if len(text) > _MAXIMUM_SAFE_MESSAGE:
         text = text[: _MAXIMUM_SAFE_MESSAGE - 3] + "..."
     return text
