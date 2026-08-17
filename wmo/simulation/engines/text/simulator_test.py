@@ -1517,6 +1517,9 @@ def test_retrieval_dispatch_failure_persists_a_zero_incremental_reservation(
 def test_prior_attempt_reservation_charges_the_ceiling_before_retry(tmp_path: Path) -> None:
     """A superseded unknown-spend attempt keeps its worst-case charge on retry admission.
 
+    The retry is blocked as a budget outcome once that charged reservation alone reaches the
+    configured ceiling, without dispatching a second provider call.
+
     Args:
         tmp_path: Isolated project root for durable reservation evidence.
     """
@@ -1540,13 +1543,12 @@ def test_prior_attempt_reservation_charges_the_ceiling_before_retry(tmp_path: Pa
         completion_contract_input=completion_input,
     )
     call_reservation = _completion_reservation("candidate-a").estimated_maximum_call_cost_usd
-    episode_reservation = 2 * (2 * call_reservation + 0.000001)
     spec = _spec(
         plan_input,
         task_set_input,
         ("cell-a",),
         completion_contract_input=completion_input,
-        maximum_cost_usd=episode_reservation + 0.4 * call_reservation,
+        maximum_cost_usd=0.4 * call_reservation,
     )
 
     first_set = simulator.run(spec)
