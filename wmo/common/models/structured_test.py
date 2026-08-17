@@ -42,6 +42,18 @@ def test_several_fenced_blocks_stay_invalid() -> None:
     assert structured_json_text(content) == content
 
 
+def test_text_after_the_closing_fence_stays_invalid() -> None:
+    """A fenced block followed by prose is preserved so strict parsing still fails."""
+    content = '```json\n{"a": 1}\n```\nLet me know if you need anything else.'
+    assert structured_json_text(content) == content
+
+
+def test_non_json_fence_label_stays_invalid() -> None:
+    """A fence labeled with another language is preserved so strict parsing still fails."""
+    content = '```python\n{"a": 1}\n```'
+    assert structured_json_text(content) == content
+
+
 def test_single_line_fence_is_unwrapped() -> None:
     """A fence without an inner newline yields the JSON body."""
     assert structured_json_text('```{"a": 1}```') == '{"a": 1}'
