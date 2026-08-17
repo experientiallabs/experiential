@@ -46,7 +46,7 @@ class ManualJudgeLabel(ContractModel):
         Raises:
             ValueError: Scalar and pairwise fields are mixed or incomplete.
         """
-        scalar = self.score is not None and self.winner is None and self.reference_trace_id is None
+        scalar = self.score is not None and self.winner is None
         pairwise = (
             self.score is None and self.winner is not None and self.reference_trace_id is not None
         )
@@ -211,7 +211,7 @@ class JudgeCalibrationBudget(ContractModel):
     maximum_input_tokens_per_call: int = Field(gt=0)
     maximum_output_tokens_per_call: Literal[4096] = 4096
     maximum_attempts_per_call: int = Field(gt=0)
-    call_count: int = Field(gt=0)
+    call_count: int = Field(ge=0)
     estimated_cost_usd: float = Field(ge=0)
     maximum_cost_usd: float = Field(gt=0)
 
@@ -223,7 +223,17 @@ class JudgeCalibrationBudget(ContractModel):
     )
     @classmethod
     def _require_finite(cls, value: float) -> float:
-        """Reject non-finite price and budget values."""
+        """Reject non-finite price and budget values.
+
+        Args:
+            value: Parsed pricing or budget value.
+
+        Returns:
+            The finite value unchanged.
+
+        Raises:
+            ValueError: The value is NaN or infinite.
+        """
         if not math.isfinite(value):
             raise ValueError("judge calibration economics must be finite")
         return value
@@ -253,6 +263,357 @@ class JudgeRunEvidence(ContractModel):
     reference_rollout: ArtifactInput | None = None
     judgment: ArtifactInput
     probes: tuple[ArtifactInput, ...] = ()
+
+
+class JudgeAxisProposal(ContractModel):
+    """One configured-judge proposal retained before a human decision."""
+
+    dimension_id: ArtifactId
+    proposed_score: int = Field(ge=0, le=10)
+    proposed_judgment: str = Field(min_length=1)
+    cited_trace_evidence: tuple[str, ...]
+    cited_reference_trace_evidence: tuple[str, ...] = ()
+
+    @field_validator("cited_trace_evidence")
+    @classmethod
+    def _require_unique_evidence(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Require at least one unique cited trace span for the proposal.
+
+        Args:
+            value: Configured-judge cited span identities.
+
+        Returns:
+            The ordered citations unchanged.
+
+        Raises:
+            ValueError: Citations are absent, empty, or repeated.
+        """
+        if not value:
+            raise ValueError("judge proposals require cited trace evidence")
+        if any(not item for item in value) or len(set(value)) != len(value):
+            raise ValueError("judge proposal evidence IDs must be nonempty and unique")
+        return value
+
+    @field_validator("cited_reference_trace_evidence")
+    @classmethod
+    def _require_unique_reference_evidence(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Validate optional citations from the pairwise reference trace.
+
+        Args:
+            value: Configured-judge cited reference span identities.
+
+        Returns:
+            The ordered optional citations unchanged.
+
+        Raises:
+            ValueError: A citation is empty or repeated.
+        """
+        if any(not item for item in value) or len(set(value)) != len(value):
+            raise ValueError("judge reference evidence IDs must be nonempty and unique")
+        return value
+
+
+class HumanJudgeCorrection(ContractModel):
+    """A human-authored replacement for one judge score and judgment."""
+
+    corrected_score: int = Field(ge=0, le=10)
+    corrected_judgment: str | None = Field(default=None, min_length=1)
+
+
+class FinalAcceptedJudgeLabel(ContractModel):
+    """The label authorized by a human after reviewing a judge proposal."""
+
+    score: int = Field(ge=0, le=10)
+    judgment: str = Field(min_length=1)
+    cited_trace_evidence: tuple[str, ...]
+    cited_reference_trace_evidence: tuple[str, ...] = ()
+    score_source: Literal["configured_judge", "human_correction"]
+    judgment_source: Literal["configured_judge", "human_correction"]
+
+    @field_validator("cited_trace_evidence")
+    @classmethod
+    def _require_unique_evidence(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Require the accepted label to retain concrete trace evidence.
+
+        Args:
+            value: Trace span identities retained with the accepted label.
+
+        Returns:
+            The ordered citations unchanged.
+
+        Raises:
+            ValueError: Citations are absent, empty, or repeated.
+        """
+        if not value:
+            raise ValueError("accepted judge labels require cited trace evidence")
+        if any(not item for item in value) or len(set(value)) != len(value):
+            raise ValueError("accepted label evidence IDs must be nonempty and unique")
+        return value
+
+    @field_validator("cited_reference_trace_evidence")
+    @classmethod
+    def _require_unique_reference_evidence(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Validate optional accepted citations from the pairwise reference trace.
+
+        Args:
+            value: Accepted reference span identities.
+
+        Returns:
+            The ordered optional citations unchanged.
+
+        Raises:
+            ValueError: A citation is empty or repeated.
+        """
+        if any(not item for item in value) or len(set(value)) != len(value):
+            raise ValueError("accepted reference evidence IDs must be nonempty and unique")
+        return value
+
+
+class ManualJudgeAxisDecision(ContractModel):
+    """One explicit accept or correction decision returned by a human reviewer."""
+
+    dimension_id: ArtifactId
+    accepted: bool
+    correction: HumanJudgeCorrection | None = None
+
+    @model_validator(mode="after")
+    def _require_exact_decision_shape(self) -> ManualJudgeAxisDecision:
+        """Require acceptance without a correction or rejection with one correction.
+
+        Returns:
+            The validated human decision.
+
+        Raises:
+            ValueError: Acceptance and correction fields contradict each other.
+        """
+        if self.accepted == (self.correction is not None):
+            raise ValueError("axis decisions must either accept or supply one human correction")
+        return self
+
+
+class ManualJudgeAxisReview(ContractModel):
+    """Separate judge, human, and accepted fields for one rubric axis."""
+
+    dimension_id: ArtifactId
+    judge_proposal: JudgeAxisProposal
+    human_correction: HumanJudgeCorrection | None = None
+    final_accepted_label: FinalAcceptedJudgeLabel
+
+    @model_validator(mode="after")
+    def _require_authorship_preserving_result(self) -> ManualJudgeAxisReview:
+        """Bind the final label to either explicit acceptance or a human correction.
+
+        Returns:
+            The validated axis review.
+
+        Raises:
+            ValueError: The final fields misstate their proposal or correction source.
+        """
+        if self.judge_proposal.dimension_id != self.dimension_id:
+            raise ValueError("judge proposal dimension differs from its reviewed axis")
+        final = self.final_accepted_label
+        proposal = self.judge_proposal
+        if self.human_correction is None:
+            expected = FinalAcceptedJudgeLabel(
+                score=proposal.proposed_score,
+                judgment=proposal.proposed_judgment,
+                cited_trace_evidence=proposal.cited_trace_evidence,
+                cited_reference_trace_evidence=proposal.cited_reference_trace_evidence,
+                score_source="configured_judge",
+                judgment_source="configured_judge",
+            )
+        else:
+            corrected_judgment = self.human_correction.corrected_judgment
+            expected = FinalAcceptedJudgeLabel(
+                score=self.human_correction.corrected_score,
+                judgment=corrected_judgment or proposal.proposed_judgment,
+                cited_trace_evidence=proposal.cited_trace_evidence,
+                cited_reference_trace_evidence=proposal.cited_reference_trace_evidence,
+                score_source="human_correction",
+                judgment_source=(
+                    "human_correction" if corrected_judgment is not None else "configured_judge"
+                ),
+            )
+        if final != expected:
+            raise ValueError("final accepted label does not match its human review decision")
+        return self
+
+
+class ManualJudgeReviewPricing(ContractModel):
+    """Per-trace pricing and observed economics retained with a review."""
+
+    input_usd_per_million_tokens: float = Field(ge=0)
+    output_usd_per_million_tokens: float = Field(ge=0)
+    pricing_source: PricingSource = PricingSource.UNKNOWN
+    maximum_input_tokens_per_call: int = Field(gt=0)
+    maximum_output_tokens_per_call: Literal[4096] = 4096
+    maximum_attempts_per_call: int = Field(gt=0)
+    authorized_call_count: Literal[1, 2]
+    maximum_reserved_cost_usd: float = Field(ge=0)
+    observed_economics: OperationEconomics
+
+    @field_validator(
+        "input_usd_per_million_tokens",
+        "output_usd_per_million_tokens",
+        "maximum_reserved_cost_usd",
+    )
+    @classmethod
+    def _require_finite_pricing(cls, value: float) -> float:
+        """Reject non-finite review prices and reservations.
+
+        Args:
+            value: Parsed price or reserved cost.
+
+        Returns:
+            The finite value unchanged.
+
+        Raises:
+            ValueError: The value is NaN or infinite.
+        """
+        if not math.isfinite(value):
+            raise ValueError("judge review pricing must be finite")
+        return value
+
+    @model_validator(mode="after")
+    def _require_exact_reservation(self) -> ManualJudgeReviewPricing:
+        """Require the trace reservation to match its price and retry bounds.
+
+        Returns:
+            The validated review pricing contract.
+
+        Raises:
+            ValueError: The reserved cost differs from the bounded inputs.
+        """
+        per_attempt = (
+            self.maximum_input_tokens_per_call * self.input_usd_per_million_tokens
+            + self.maximum_output_tokens_per_call * self.output_usd_per_million_tokens
+        ) / 1_000_000
+        expected = per_attempt * self.maximum_attempts_per_call * self.authorized_call_count
+        if not math.isclose(
+            self.maximum_reserved_cost_usd,
+            expected,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("judge review reservation differs from its bounded pricing inputs")
+        return self
+
+
+class ManualJudgeReviewProvenance(ContractModel):
+    """Explicit authorship and source provenance for one completed trace review."""
+
+    proposal_author: Literal["configured_judge"] = "configured_judge"
+    decision_author: Literal["human"] = "human"
+    final_label_authority: Literal["human_acceptance"] = "human_acceptance"
+    historical_source: Literal["recorded_model", "provider_free_production_trace"]
+
+
+class ManualJudgeTraceReviewArtifact(ArtifactEnvelope):
+    """One immutable judge-first trace review completed by a human."""
+
+    review_id: ArtifactId
+    setup: ArtifactInput
+    sample_sha256: Sha256
+    trace_id: str = Field(min_length=1, max_length=512)
+    reference_trace_id: str | None = Field(default=None, min_length=1, max_length=512)
+    lineage_id: ArtifactId
+    trace_evidence: ArtifactInput
+    reference_trace_evidence: ArtifactInput | None = None
+    rubric_revision: ArtifactInput
+    provisional_calibration: ArtifactInput
+    original_judge_response: tuple[ArtifactInput, ...]
+    normalized_judgment: ArtifactInput
+    judge_model: ModelSnapshot
+    pricing: ManualJudgeReviewPricing
+    axes: tuple[ManualJudgeAxisReview, ...]
+    provenance: ManualJudgeReviewProvenance
+    reviewed_at: datetime
+
+    @field_validator("original_judge_response")
+    @classmethod
+    def _require_raw_responses(cls, value: tuple[ArtifactInput, ...]) -> tuple[ArtifactInput, ...]:
+        """Require one scalar response or two counterbalanced pairwise responses.
+
+        Args:
+            value: Original immutable provider-response pointers.
+
+        Returns:
+            The ordered response pointers unchanged.
+
+        Raises:
+            ValueError: The response count is unsupported or a pointer repeats.
+        """
+        if len(value) not in {1, 2}:
+            raise ValueError("trace reviews require one or two original judge responses")
+        if len({item.artifact_id for item in value}) != len(value):
+            raise ValueError("trace review judge responses must be unique")
+        return value
+
+    @field_validator("axes")
+    @classmethod
+    def _require_unique_axes(
+        cls, value: tuple[ManualJudgeAxisReview, ...]
+    ) -> tuple[ManualJudgeAxisReview, ...]:
+        """Require one completed review for every retained rubric axis.
+
+        Args:
+            value: Completed per-axis reviews.
+
+        Returns:
+            The ordered axis reviews unchanged.
+
+        Raises:
+            ValueError: No axis is present or an axis repeats.
+        """
+        if not value:
+            raise ValueError("trace reviews require at least one reviewed rubric axis")
+        dimensions = tuple(item.dimension_id for item in value)
+        if len(set(dimensions)) != len(dimensions):
+            raise ValueError("trace reviews must not repeat a rubric axis")
+        return value
+
+    @model_validator(mode="after")
+    def _require_complete_review_provenance(self) -> ManualJudgeTraceReviewArtifact:
+        """Bind the review to every immutable source and its exact decision time.
+
+        Returns:
+            The validated immutable trace review.
+
+        Raises:
+            ValueError: Timing, comparison evidence, or the input graph is inconsistent.
+        """
+        if self.created_at != self.reviewed_at:
+            raise ValueError("trace review created_at must equal reviewed_at")
+        if (self.reference_trace_id is None) != (self.reference_trace_evidence is None):
+            raise ValueError("reference trace identity and evidence must be present together")
+        reference_citations = tuple(
+            axis.judge_proposal.cited_reference_trace_evidence for axis in self.axes
+        )
+        if self.reference_trace_evidence is None and any(reference_citations):
+            raise ValueError("scalar trace reviews cannot cite reference trace evidence")
+        if self.reference_trace_evidence is not None and any(
+            not citations for citations in reference_citations
+        ):
+            raise ValueError("pairwise trace reviews must cite reference trace evidence")
+        expected = tuple(
+            sorted(
+                (
+                    self.setup,
+                    self.trace_evidence,
+                    *((self.reference_trace_evidence,) if self.reference_trace_evidence else ()),
+                    self.rubric_revision,
+                    self.provisional_calibration,
+                    *self.original_judge_response,
+                    self.normalized_judgment,
+                ),
+                key=lambda item: item.artifact_id,
+            )
+        )
+        if len({item.artifact_id for item in expected}) != len(expected):
+            raise ValueError("trace review inputs must have unique artifact IDs")
+        if self.inputs != expected:
+            raise ValueError("trace review must hash its complete canonical input graph")
+        return self
 
 
 class JudgeProtocolProbeArtifact(ArtifactEnvelope):
@@ -431,6 +792,7 @@ class ManualJudgeCalibrationAudit(ArtifactEnvelope):
     report: ArtifactInput
     budget: JudgeCalibrationBudget
     judgments: tuple[JudgeRunEvidence, ...]
+    trace_reviews: tuple[ArtifactInput, ...] = ()
     positional_bias_comparisons: int | None = Field(default=None, ge=1)
     positional_bias_flips: int | None = Field(default=None, ge=0)
 
@@ -460,6 +822,7 @@ class ManualJudgeCalibrationAudit(ArtifactEnvelope):
                     ),
                     *(item.judgment for item in self.judgments),
                     *(probe for item in self.judgments for probe in item.probes),
+                    *self.trace_reviews,
                 ),
                 key=lambda item: item.artifact_id,
             )
@@ -468,6 +831,12 @@ class ManualJudgeCalibrationAudit(ArtifactEnvelope):
             raise ValueError("manual judge audit must hash its complete canonical input graph")
         if not self.judgments:
             raise ValueError("manual judge audit requires at least one judge probe")
+        if self.schema_version >= 2 and len(self.trace_reviews) != len(self.judgments):
+            raise ValueError("manual judge audit requires one human review per judgment")
+        if self.schema_version == 1 and self.trace_reviews:
+            raise ValueError("version-one manual judge audits cannot name trace reviews")
+        if len({item.artifact_id for item in self.trace_reviews}) != len(self.trace_reviews):
+            raise ValueError("manual judge audit trace reviews must be unique")
         if (self.positional_bias_comparisons is None) != (self.positional_bias_flips is None):
             raise ValueError("positional-bias counts must be both present or both absent")
         if (
@@ -499,7 +868,17 @@ class ManualJudgeLabelDraft(ContractModel):
     def _require_unique_label_keys(
         cls, value: tuple[ManualJudgeLabel, ...]
     ) -> tuple[ManualJudgeLabel, ...]:
-        """Reject two drafted scores for one trace, reference, and dimension key."""
+        """Reject two drafted scores for one trace, reference, and dimension key.
+
+        Args:
+            value: Drafted explicit score inputs.
+
+        Returns:
+            The ordered unique labels unchanged.
+
+        Raises:
+            ValueError: More than one label claims the same review key.
+        """
         keys = tuple(
             (label.trace_id, label.reference_trace_id, label.dimension_id) for label in value
         )
@@ -513,6 +892,7 @@ class ManualJudgeReviewState(ContractModel):
 
     setup: ArtifactInput
     label_drafts: tuple[ManualJudgeLabelDraft, ...] = ()
+    trace_reviews: tuple[ArtifactInput, ...] = ()
     audit: ArtifactInput | None = None
     approved_calibration: ArtifactInput | None = None
 
@@ -535,6 +915,26 @@ class ManualJudgeReviewState(ContractModel):
         keys = tuple((draft.setup_id, draft.sample_sha256) for draft in value)
         if len(set(keys)) != len(keys):
             raise ValueError("review state must not hold two drafts for one calibration sample")
+        return value
+
+    @field_validator("trace_reviews")
+    @classmethod
+    def _require_unique_trace_review_pointers(
+        cls, value: tuple[ArtifactInput, ...]
+    ) -> tuple[ArtifactInput, ...]:
+        """Reject duplicate immutable review pointers in resumable state.
+
+        Args:
+            value: Completed trace review pointers.
+
+        Returns:
+            The ordered unique pointers unchanged.
+
+        Raises:
+            ValueError: A trace review pointer repeats.
+        """
+        if len({item.artifact_id for item in value}) != len(value):
+            raise ValueError("review state must not repeat a trace review pointer")
         return value
 
 

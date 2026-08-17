@@ -1,10 +1,10 @@
 """End-to-end regression over the pinned public terminal-tasks trace export.
 
 The published quickstart hands `wmo build` one unmodified Hugging Face OTLP export whose
-environment-capture spans carry no provider or model identity, then sets up a judge, labels real
+environment-capture spans carry no provider or model identity, then sets up a judge, reviews real
 traces, calibrates, and approves. This module walks that whole path with deterministic local
-model clients and proves the source stays provider free, that completed human labels survive a
-provider failure, and that replay and approval never ask for a label again.
+model clients and proves the source stays provider free, that completed trace reviews survive a
+provider failure, and that replay and approval make no provider calls or review prompts.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ from wmo.common.models import (
 from wmo.common.project import ProjectStore
 from wmo.common.rollouts import RolloutArtifact
 from wmo.common.traces import load_trace_dataset
+from wmo.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
 from wmo.optimize.router.judging.service import prepare_manual_judge_calibration
 from wmo.runtime.models import ResolvedModel
 from wmo.runtime.models.registry import RuntimeModelCatalog
@@ -52,7 +53,7 @@ TRACES_URL = (
 TRACES_SHA256 = "21c62cba7e3372cbf03df051dc2408699fbf8ea3561ba661b599e4949f0e5d42"
 _JUDGE_MODEL_ID = "judge-id"
 _PROJECT = "terminal-tasks"
-_SAMPLE_SIZE = 10
+_SAMPLE_SIZE = 5
 
 
 class _EmbeddingClient:
@@ -200,23 +201,35 @@ def _write_catalog(root: Path) -> None:
 
 
 def _calibrate_arguments(
-    root: Path, labels: Sequence[str], sample_size: int = _SAMPLE_SIZE
+    root: Path,
+    labels: Sequence[str],
+    sample_size: int | None = None,
 ) -> list[str]:
-    """Return one non-interactive calibrate invocation that uses catalog prices."""
-    return [
+    """Return one noninteractive calibrate invocation using catalog prices.
+
+    Args:
+        root: Local test project root.
+        labels: Repeatable explicit label arguments.
+        sample_size: Optional override; ``None`` exercises the installed default of five.
+
+    Returns:
+        Complete nested CLI argument list.
+    """
+    arguments = [
         "config",
         "judge",
         "calibrate",
         _PROJECT,
         "--root",
         str(root),
-        "--sample-size",
-        str(sample_size),
         "--yes",
         "--approve",
         "--non-interactive",
         *labels,
     ]
+    if sample_size is not None:
+        arguments[6:6] = ["--sample-size", str(sample_size)]
+    return arguments
 
 
 def _rollout_payloads(store: ProjectStore) -> tuple[tuple[RolloutArtifact, str], ...]:
@@ -260,7 +273,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     assert setup.exit_code == 0, setup.output
 
     store = ProjectStore(root, _PROJECT)
-    plan = prepare_manual_judge_calibration(store, sample_size=_SAMPLE_SIZE)
+    plan = prepare_manual_judge_calibration(store)
     assert len(plan.traces) == _SAMPLE_SIZE
     assert all(span.model is None for trace in plan.traces for span in trace.spans)
     labels = [
@@ -284,43 +297,50 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     refused_text = " ".join(unstyle(refused.output).replace("│", " ").split())
     assert "Cost preflight" in refused_text
     assert "command: wmo config judge calibrate terminal-tasks" in refused_text
-    assert "estimated cost: $1.10592" in refused_text
+    assert "estimated cost: $0.55296" in refused_text
     assert "configured budget: $0.50 per command" in refused_text
     assert "judge judge: openai/judge-id" in refused_text
-    assert "10 judge calls with up to 3 attempts each" in refused_text
+    assert "5 remaining judge calls with up to 3 attempts each" in refused_text
     assert "--yes cannot override" in refused_text
     assert "missing labels" not in refused_text
     assert _RuntimeCatalog.judge_clients == []
     assert store.read_review() == before_preflight
     set_maximum_command_cost_usd(25.0, root)
 
-    _RuntimeCatalog.judge_fail_after = 0
+    _RuntimeCatalog.judge_fail_after = 1
     interrupted = runner.invoke(app, _calibrate_arguments(root, labels))
     assert interrupted.exit_code != 0
-    assert "INTEGER 0-1 CALIBRATION" in interrupted.output
-    assert "User / task:" in interrupted.output
+    assert "Trace 1 of 5" in interrupted.output
+    assert "Original user request:" in interrupted.output
     assert "Tool call:" in interrupted.output
     assert "Tool arguments:" in interrupted.output
     assert "Tool result:" in interrupted.output
-    assert "Tool output:" in interrupted.output
     assert "Final outcome:" in interrupted.output
+    assert "Configured judge proposals" in interrupted.output
+    assert "Proposed score: 1" in interrupted.output
+    assert "Proposed judgment:" in interrupted.output
+    assert "Cited trace evidence:" in interrupted.output
     assert "0: The agent did not complete the requested task." in interrupted.output
     assert "1: The agent successfully completed the requested task." in interrupted.output
-    drafted = _drafted_labels(store)
-    assert len(drafted) == _SAMPLE_SIZE
-    assert {item["score"] for item in drafted} == {1}
+    assert len(_trace_reviews(store)) == 1
 
     _RuntimeCatalog.judge_fail_after = None
     _RuntimeCatalog.judge_clients = []
     resumed = runner.invoke(
         app,
-        [argument for argument in _calibrate_arguments(root, ()) if argument != "--approve"],
+        [argument for argument in _calibrate_arguments(root, labels) if argument != "--approve"],
     )
     assert resumed.exit_code == 2
-    assert "Resuming 10 saved human labels" in resumed.output
-    resumed_text = unstyle(resumed.output)
+    resumed_text = " ".join(unstyle(resumed.output).replace("│", " ").split())
+    assert "review progress: 1/5 distinct trace lineages complete" in resumed_text
+    assert "Trace 1 of 5" not in resumed.output
+    assert "Trace 2 of 5" in resumed.output
     assert "--approve" in resumed_text
-    assert sum(client.calls for client in _RuntimeCatalog.judge_clients) == _SAMPLE_SIZE
+    assert sum(client.calls for client in _RuntimeCatalog.judge_clients) == _SAMPLE_SIZE - 1
+    drafted = _drafted_labels(store)
+    assert len(drafted) == _SAMPLE_SIZE
+    assert {item["score"] for item in drafted} == {1}
+    assert len(_trace_reviews(store)) == _SAMPLE_SIZE
     assert _review_completion(store) == (True, False)
 
     _RuntimeCatalog.judge_fail_after = 0
@@ -337,7 +357,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     assert "already complete" in unapproved_replay.output
     replay_text = unstyle(unapproved_replay.output)
     assert "--approve" in replay_text
-    assert "Spend preflight" not in unapproved_replay.output
+    assert "Cost preflight" not in unapproved_replay.output
     assert "Resuming" not in unapproved_replay.output
     assert _RuntimeCatalog.judge_clients == []
     assert _review_completion(store) == (True, False)
@@ -348,7 +368,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     )
     assert approved.exit_code == 0, approved.output
     assert "Approved judge calibration" in approved.output
-    assert "Spend preflight" not in approved.output
+    assert "Cost preflight" not in approved.output
     assert _RuntimeCatalog.judge_clients == []
     assert _review_completion(store) == (True, True)
 
@@ -364,11 +384,10 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
         ],
     )
     assert replay.exit_code == 0, replay.output
-    assert "estimated cost: $0.00" in replay.output
-    assert "authorization: automatic" in replay.output
+    assert "Cost preflight" not in replay.output
+    assert "authorization:" not in replay.output
     assert "Proceed?" not in replay.output
     assert "Approved judge calibration" in replay.output
-    assert "Spend preflight" not in replay.output
     assert _RuntimeCatalog.judge_clients == []
 
     resampled = runner.invoke(
@@ -395,6 +414,19 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
         assert provenance.checked_span_count == len(rollout.spans)
         assert all(span.model is None for span in rollout.spans)
         assert _JUDGE_MODEL_ID not in text
+
+    reviews = _trace_reviews(store)
+    assert len(reviews) == _SAMPLE_SIZE
+    for review in reviews:
+        assert review.provenance.historical_source == "provider_free_production_trace"
+        assert review.provenance.proposal_author == "configured_judge"
+        assert review.provenance.decision_author == "human"
+        assert review.original_judge_response
+        assert review.judge_model.model_id == _JUDGE_MODEL_ID
+        assert review.rubric_revision == plan.setup.rubric
+        assert review.axes[0].human_correction is None
+        assert review.axes[0].final_accepted_label.score_source == "configured_judge"
+        assert review.axes[0].final_accepted_label.judgment_source == "configured_judge"
 
     dataset = load_trace_dataset(store.artifacts, plan.setup.trace_dataset.artifact_id)
     assert len(dataset.traces) >= 100
@@ -440,3 +472,31 @@ def _review_completion(store: ProjectStore) -> tuple[bool, bool]:
     return manual_judge.get("audit") is not None, manual_judge.get(
         "approved_calibration"
     ) is not None
+
+
+def _trace_reviews(store: ProjectStore) -> tuple[ManualJudgeTraceReviewArtifact, ...]:
+    """Return completed immutable trace review artifacts from mutable pointer state.
+
+    Args:
+        store: Project whose completed trace review pointers are inspected.
+
+    Returns:
+        Parsed trace review artifacts in incremental completion order.
+    """
+    review = store.read_review()
+    assert isinstance(review, dict)
+    manual_judge = review["manual_judge"]
+    assert isinstance(manual_judge, dict)
+    pointers = manual_judge["trace_reviews"]
+    assert isinstance(pointers, list)
+    artifacts: list[ManualJudgeTraceReviewArtifact] = []
+    for pointer in pointers:
+        assert isinstance(pointer, dict)
+        artifact_id = pointer["artifact_id"]
+        assert isinstance(artifact_id, str)
+        artifacts.append(
+            ManualJudgeTraceReviewArtifact.model_validate_json(
+                store.artifacts.read_bytes(artifact_id, "review.json")
+            )
+        )
+    return tuple(artifacts)

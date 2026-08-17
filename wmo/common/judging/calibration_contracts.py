@@ -43,19 +43,21 @@ class JudgeScoreObservation(ContractModel):
 
 
 class InsufficientCalibrationRiskAcceptance(ArtifactEnvelope):
-    """Explicit human acceptance of the risk from fewer than ten eligible rollouts."""
+    """Explicit human acceptance of the risk from fewer than five eligible rollouts."""
 
     acceptance_id: ArtifactId
     report: ArtifactInput
     eligible_label_count: int = Field(ge=1)
     eligible_rollout_count: int = Field(ge=1, lt=10)
-    recommended_label_count: Literal[10] = 10
+    recommended_label_count: Literal[5, 10] = 5
     accepted_at: AwareDatetime
     risk_accepted: Literal[True] = True
 
     @model_validator(mode="after")
     def _require_report_bound_acceptance(self) -> InsufficientCalibrationRiskAcceptance:
         """Require this durable decision to hash exactly its accepted report."""
+        if self.eligible_rollout_count >= self.recommended_label_count:
+            raise ValueError("risk acceptance requires fewer than the recommended rollout count")
         if self.created_at != self.accepted_at:
             raise ValueError("risk acceptance created_at must equal accepted_at")
         if self.inputs != (self.report,):
@@ -84,7 +86,7 @@ class CalibrationReport(ArtifactEnvelope):
     excluded_held_out_rollout_count: int = Field(ge=0)
     excluded_held_out_lineage_ids: tuple[ArtifactId, ...]
     excluded_held_out_lineage_count: int = Field(ge=0)
-    recommended_label_count: Literal[10] = 10
+    recommended_label_count: Literal[5, 10] = 5
     status: Literal["provisional", "insufficient", "ready_for_approval"]
     score_maps: tuple[DimensionScoreMap, ...]
     dimension_metrics: tuple[DimensionCalibrationMetrics, ...]

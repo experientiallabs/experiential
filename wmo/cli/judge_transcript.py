@@ -32,26 +32,35 @@ def render_trace(console: Console, trace: Trace, *, character_limit: int | None)
         trace: Verified immutable normalized production trace.
         character_limit: Maximum characters per field, or ``None`` for the full value.
     """
-    _render_field(console, "User / task", trace.task, character_limit=character_limit)
+    render_field(console, "Original user request", trace.task, character_limit=character_limit)
     if trace.initial_context:
-        _render_field(
+        render_field(
             console,
             "Initial context",
-            _jsonish_text(trace.initial_context),
+            jsonish_text(trace.initial_context),
             character_limit=character_limit,
         )
-    for span in trace.spans:
-        _render_span(console, span, character_limit=character_limit)
+    completion_positions = tuple(
+        index for index, span in enumerate(trace.spans) if assistant_completion(span.attributes)
+    )
+    final_completion = completion_positions[-1] if completion_positions else None
+    for index, span in enumerate(trace.spans):
+        _render_span(
+            console,
+            span,
+            final_response=index == final_completion,
+            character_limit=character_limit,
+        )
     outcome = trace.outcome
     if outcome is None:
-        _render_field(console, "Final outcome", "Not recorded", character_limit=character_limit)
+        render_field(console, "Final outcome", "Not recorded", character_limit=character_limit)
         return
     outcome_text = outcome.status
     if outcome.outcome_name is not None:
         outcome_text += f" ({outcome.outcome_name})"
-    _render_field(console, "Final outcome", outcome_text, character_limit=character_limit)
+    render_field(console, "Final outcome", outcome_text, character_limit=character_limit)
     if outcome.failure is not None:
-        _render_field(
+        render_field(
             console,
             "Final failure",
             f"{outcome.failure.code.value}: {outcome.failure.message} "
@@ -60,12 +69,19 @@ def render_trace(console: Console, trace: Trace, *, character_limit: int | None)
         )
 
 
-def _render_span(console: Console, span: TraceSpan, *, character_limit: int | None) -> None:
+def _render_span(
+    console: Console,
+    span: TraceSpan,
+    *,
+    final_response: bool,
+    character_limit: int | None,
+) -> None:
     """Render recognized assistant, tool-call, tool-result, and failure evidence.
 
     Args:
         console: Destination for the rendered fields.
         span: One normalized chronological trace span.
+        final_response: Whether this span holds the last captured assistant response.
         character_limit: Maximum characters per field, or ``None`` for the full value.
     """
     attributes = span.attributes
@@ -75,44 +91,42 @@ def _render_span(console: Console, span: TraceSpan, *, character_limit: int | No
     result = attributes.get("gen_ai.tool.message")
     if result is None:
         result = attributes.get("gen_ai.tool.output")
-    completion = _assistant_completion(attributes)
-    user_input = _user_input(attributes)
-    if user_input is not None:
-        _render_field(console, "User message", user_input, character_limit=character_limit)
+    completion = assistant_completion(attributes)
+    user_message = user_input(attributes)
+    console.print(f"\nEvidence span {span.span_id} ({span.name})", style="dim", markup=False)
+    if user_message is not None:
+        render_field(console, "User message", user_message, character_limit=character_limit)
     if span.model is not None:
-        _render_field(
+        render_field(
             console,
-            "Assistant / model",
+            "Assistant model",
             model_display_name(span.model),
             character_limit=character_limit,
         )
     if completion:
-        _render_field(console, "Assistant output", completion, character_limit=character_limit)
+        render_field(
+            console,
+            "Final response" if final_response else "Assistant message",
+            completion,
+            character_limit=character_limit,
+        )
     if operation != "execute_tool" and isinstance(tool_name, str):
-        _render_field(console, "Tool call", tool_name, character_limit=character_limit)
+        render_field(console, "Tool call", tool_name, character_limit=character_limit)
         if arguments is not None:
-            _render_field(
+            render_field(
                 console,
                 "Tool arguments",
-                _jsonish_text(arguments),
+                jsonish_text(arguments),
                 character_limit=character_limit,
             )
     if operation == "execute_tool":
-        _render_field(
-            console,
-            "Tool result",
-            tool_name if isinstance(tool_name, str) else span.name,
-            character_limit=character_limit,
-        )
+        result_name = tool_name if isinstance(tool_name, str) else span.name
+        result_text = result_name
         if result is not None:
-            _render_field(
-                console,
-                "Tool output",
-                _jsonish_text(result),
-                character_limit=character_limit,
-            )
+            result_text += "\n" + jsonish_text(result)
+        render_field(console, "Tool result", result_text, character_limit=character_limit)
     if span.failure is not None:
-        _render_field(
+        render_field(
             console,
             "Span failure",
             f"{span.failure.code.value}: {span.failure.message}",
@@ -120,7 +134,7 @@ def _render_span(console: Console, span: TraceSpan, *, character_limit: int | No
         )
 
 
-def _assistant_completion(attributes: dict[str, JsonValue]) -> str | None:
+def assistant_completion(attributes: dict[str, JsonValue]) -> str | None:
     """Extract readable assistant content from supported normalized attributes.
 
     Args:
@@ -139,7 +153,7 @@ def _assistant_completion(attributes: dict[str, JsonValue]) -> str | None:
     )
 
 
-def _user_input(attributes: dict[str, JsonValue]) -> str | None:
+def user_input(attributes: dict[str, JsonValue]) -> str | None:
     """Extract the latest readable user message from one normalized span.
 
     Args:
@@ -217,7 +231,7 @@ def _message_text(value: JsonValue | None) -> str | None:
     return "\n".join(texts) if texts else None
 
 
-def _jsonish_text(value: JsonValue) -> str:
+def jsonish_text(value: JsonValue) -> str:
     """Format native or JSON-encoded transcript evidence for a human.
 
     Args:
@@ -235,7 +249,40 @@ def _jsonish_text(value: JsonValue) -> str:
     return json.dumps(decoded, indent=2, sort_keys=True, ensure_ascii=False)
 
 
-def _render_field(console: Console, label: str, value: str, *, character_limit: int | None) -> None:
+def span_evidence_text(span: TraceSpan) -> str:
+    """Return role- and tool-labeled visible content from one cited span.
+
+    Args:
+        span: Judge-cited normalized trace span.
+
+    Returns:
+        Captured evidence text without inferred facts.
+    """
+    attributes = span.attributes
+    pieces: list[str] = []
+    user_message = user_input(attributes)
+    completion = assistant_completion(attributes)
+    if user_message is not None:
+        pieces.append("User message: " + user_message)
+    if completion is not None:
+        pieces.append("Assistant message: " + completion)
+    tool_name = attributes.get("gen_ai.tool.name")
+    if isinstance(tool_name, str):
+        pieces.append("Tool: " + tool_name)
+    arguments = attributes.get("gen_ai.tool.call.arguments")
+    if arguments is not None:
+        pieces.append("Tool arguments: " + jsonish_text(arguments))
+    result = attributes.get("gen_ai.tool.message")
+    if result is None:
+        result = attributes.get("gen_ai.tool.output")
+    if result is not None:
+        pieces.append("Tool result: " + jsonish_text(result))
+    if span.failure is not None:
+        pieces.append(f"Failure: {span.failure.code.value}: {span.failure.message}")
+    return "\n".join(pieces) if pieces else f"Captured span {span.name}"
+
+
+def render_field(console: Console, label: str, value: str, *, character_limit: int | None) -> None:
     """Render one safely wrapped transcript field with truthful truncation.
 
     Args:

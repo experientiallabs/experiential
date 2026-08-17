@@ -58,6 +58,7 @@ def calibration_from_report(
         out_of_fold_report_sha256=report_input.sha256,
         score_maps=report.score_maps,
         label_count=report.eligible_label_count,
+        recommended_label_count=report.recommended_label_count,
         status=status,
         approved_at=approved_at,
         risk_acceptance=risk_acceptance,

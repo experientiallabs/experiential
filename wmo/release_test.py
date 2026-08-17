@@ -60,6 +60,8 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "wmo/optimize/router/evaluation/setup.py",
         "wmo/optimize/router/fit/workflow.py",
         "wmo/optimize/router/judging/service.py",
+        "wmo/optimize/router/judging/review.py",
+        "wmo/cli/judge_review.py",
         "wmo/optimize/router/judgment_budget.py",
     }
 )
@@ -73,6 +75,8 @@ REQUIRED_SDIST_MEMBERS = frozenset(
         "wmo/optimize/router/evaluation/setup.py",
         "wmo/optimize/router/fit/workflow.py",
         "wmo/optimize/router/judging/service.py",
+        "wmo/optimize/router/judging/review.py",
+        "wmo/cli/judge_review.py",
         "wmo/optimize/router/judgment_budget.py",
     }
 )
@@ -413,6 +417,7 @@ def _installed_release_driver() -> None:
         prepare_runtime_sft_model_optimization,
     )
     from wmo.optimize.model.sft.selection import load_latest_sft_model_optimization
+    from wmo.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
     from wmo.optimize.router.judging.service import prepare_manual_judge_calibration
     from wmo.runtime.models import CapabilityRequirement, RuntimeModelCatalog
     from wmo.runtime.router import (
@@ -961,7 +966,8 @@ def _installed_release_driver() -> None:
         )
         assert "Saved judge setup" in setup_result.stdout
         assert sum(state.counts().values()) == setup_call_count
-        calibration_plan = prepare_manual_judge_calibration(support_store, sample_size=10)
+        calibration_plan = prepare_manual_judge_calibration(support_store)
+        assert len(calibration_plan.previews) == 5
         assert len(calibration_plan.previews) >= 2
         calibration_arguments = [
             "config",
@@ -970,8 +976,6 @@ def _installed_release_driver() -> None:
             "support-agent",
             "--root",
             str(root),
-            "--sample-size",
-            "10",
         ]
         for preview in calibration_plan.previews:
             calibration_arguments.extend(["--label", f"{preview.trace_id}:task-success=1"])
@@ -981,18 +985,39 @@ def _installed_release_driver() -> None:
                 "0.000001",
                 "--yes",
                 "--approve",
-                "--accept-insufficient-labels",
                 "--non-interactive",
             ]
         )
         calibration_result = run_cli(*calibration_arguments)
         assert "Approved judge calibration" in calibration_result.stdout
+        assert "Trace 1 of 5" in calibration_result.stdout
+        assert "Original user request:" in calibration_result.stdout
+        assert "Configured judge proposals" in calibration_result.stdout
+        assert "Description: The agent successfully completed" in calibration_result.stdout
+        assert "Numeric range: 0 to 1" in calibration_result.stdout
+        assert "Proposed score: 1" in calibration_result.stdout
+        assert "Proposed judgment:" in calibration_result.stdout
+        assert "Cited trace evidence:" in calibration_result.stdout
         assert sum(state.counts().values()) - setup_call_count == len(calibration_plan.previews)
         review = support_store.read_review()
         assert isinstance(review, dict)
         manual_judge = review.get("manual_judge")
         assert isinstance(manual_judge, dict)
         assert manual_judge.get("approved_calibration") is not None
+        trace_review_pointers = manual_judge.get("trace_reviews")
+        assert isinstance(trace_review_pointers, list)
+        assert len(trace_review_pointers) == 5
+        for pointer in trace_review_pointers:
+            assert isinstance(pointer, dict)
+            review_id = pointer.get("artifact_id")
+            assert isinstance(review_id, str)
+            trace_review = ManualJudgeTraceReviewArtifact.model_validate_json(
+                support_store.artifacts.read_bytes(review_id, "review.json")
+            )
+            assert trace_review.provenance.proposal_author == "configured_judge"
+            assert trace_review.provenance.decision_author == "human"
+            assert trace_review.axes[0].human_correction is None
+            assert trace_review.axes[0].final_accepted_label.score_source == "configured_judge"
         optimize_arguments = [
             "optimize",
             "router",
