@@ -235,12 +235,17 @@ def require_model_identity_evidence_matches_traces(
                 error_type=ValueError,
             ),
         )
+        inferred_connection_digest = (
+            None
+            if CONNECTION_DIGEST_ATTRIBUTE in span.attributes
+            else ConnectionConfig(provider=item.model.provider).identity_sha256()
+        )
         _require_component_provenance(
             span.attributes,
             CONNECTION_DIGEST_ATTRIBUTE,
             item.connection,
             item.model.connection_sha256,
-            ConnectionConfig(provider=item.model.provider).identity_sha256(),
+            inferred_connection_digest,
         )
 
 
@@ -249,7 +254,7 @@ def _require_component_provenance(
     key: str,
     provenance: IdentityComponentProvenance,
     recorded_digest: Sha256,
-    inferred_digest: Sha256,
+    inferred_digest: Sha256 | None,
 ) -> None:
     """Verify one declared or inferred digest against canonical span attributes.
 
@@ -258,7 +263,8 @@ def _require_component_provenance(
         key: WMO digest extension key.
         provenance: Persisted declared, inferred, or unspecified classification.
         recorded_digest: Digest retained in the span's model snapshot.
-        inferred_digest: Deterministic normalizer fallback digest.
+        inferred_digest: Deterministic normalizer fallback digest, or ``None`` when the
+            component was declared directly on the span.
 
     Raises:
         ValueError: Declared or inferred provenance disagrees with the canonical span.
@@ -267,5 +273,7 @@ def _require_component_provenance(
     if provenance == "declared":
         if attribute != recorded_digest:
             raise ValueError(f"declared {key} is absent or differs from its model snapshot")
-    elif provenance == "inferred" and (attribute is not None or recorded_digest != inferred_digest):
+    elif provenance == "inferred" and (
+        attribute is not None or inferred_digest is None or recorded_digest != inferred_digest
+    ):
         raise ValueError(f"inferred {key} differs from the canonical telemetry fallback")

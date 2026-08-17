@@ -166,11 +166,7 @@ def _interactive_setup(
     session = SetupSession(selected=tuple(model.alias for model in configured))
     skip_opening_list = bool(explicit_providers)
     if explicit_providers:
-        (
-            session.providers,
-            session.advanced_credentials,
-            session.advanced_models,
-        ) = explicit_provider_selection(explicit_providers)
+        session.providers, session.advanced_models = explicit_provider_selection(explicit_providers)
     try:
         while True:
             if skip_opening_list:
@@ -184,7 +180,7 @@ def _interactive_setup(
                 )
                 if selection is None:
                     return None
-                session.providers, session.advanced_credentials, session.advanced_models = selection
+                session.providers, session.advanced_models = selection
             discovered: tuple[AvailableModel, ...] = ()
             session.endpoints = ()
             if session.providers:
