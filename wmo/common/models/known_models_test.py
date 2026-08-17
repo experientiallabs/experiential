@@ -51,6 +51,23 @@ def test_documented_chat_model_carries_verified_capabilities_and_prices() -> Non
     assert known.output_cost_per_million_tokens_usd == 15.0
     assert known.cached_input_cost_per_million_tokens_usd == 0.25
     assert known.cache_write_cost_per_million_tokens_usd == 3.125
+    assert not known.supports_temperature
+    assert known.reasoning_effort == "xhigh"
+
+
+def test_reasoning_models_pin_sampling_and_small_models_carry_token_limits() -> None:
+    """OpenAI reasoning models reject explicit temperature and small tiers state both limits."""
+    mini = known_model_metadata("openai", "gpt-5.4-mini")
+    embedding = known_model_metadata("openai", "text-embedding-3-large")
+
+    assert mini is not None
+    assert not mini.supports_temperature
+    assert mini.reasoning_effort is None
+    assert mini.context_window_tokens == 400_000
+    assert mini.maximum_output_tokens == 64_000
+    assert embedding is not None
+    assert embedding.supports_temperature
+    assert embedding.reasoning_effort is None
 
 
 def test_documented_embedding_model_serves_embeddings_only() -> None:

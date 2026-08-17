@@ -28,6 +28,8 @@ class KnownModel:
     supports_embeddings: bool = False
     supports_tools: bool = False
     supports_structured_output: bool = False
+    supports_temperature: bool = True
+    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
     context_window_tokens: int | None = None
     maximum_output_tokens: int | None = None
     input_cost_per_million_tokens_usd: float | None = None
@@ -44,6 +46,8 @@ def _chat(
     cache_write_usd: float | None = None,
     context_window_tokens: int | None = None,
     maximum_output_tokens: int | None = None,
+    supports_temperature: bool = True,
+    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None,
 ) -> KnownModel:
     """Describe one documented chat model that supports tools and structured output.
 
@@ -54,6 +58,10 @@ def _chat(
         cache_write_usd: Documented cache-write price, when the provider publishes one.
         context_window_tokens: Documented context window, when the provider publishes one.
         maximum_output_tokens: Documented output ceiling, when the provider publishes one.
+        supports_temperature: Whether the model accepts an explicit sampling temperature;
+            reasoning models pin their sampling and reject the parameter.
+        reasoning_effort: Documented reasoning-effort level to pin, when the provider
+            publishes one for the model.
 
     Returns:
         The verified metadata record for the model.
@@ -62,6 +70,8 @@ def _chat(
         supports_completions=True,
         supports_tools=True,
         supports_structured_output=True,
+        supports_temperature=supports_temperature,
+        reasoning_effort=reasoning_effort,
         context_window_tokens=context_window_tokens,
         maximum_output_tokens=maximum_output_tokens,
         input_cost_per_million_tokens_usd=input_usd,
@@ -97,6 +107,8 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=30.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
+        supports_temperature=False,
+        reasoning_effort="xhigh",
     ),
     "gpt-5.6-terra": _chat(
         input_usd=2.5,
@@ -105,6 +117,8 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=15.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
+        supports_temperature=False,
+        reasoning_effort="xhigh",
     ),
     "gpt-5.6-luna": _chat(
         input_usd=1.0,
@@ -113,28 +127,88 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=6.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
+        supports_temperature=False,
+        reasoning_effort="xhigh",
     ),
-    "gpt-5.5": _chat(input_usd=5.0, cached_input_usd=0.5, cache_write_usd=0.0, output_usd=30.0),
-    "gpt-5.5-pro": _chat(input_usd=30.0, cache_write_usd=0.0, output_usd=180.0),
-    "gpt-5.4": _chat(input_usd=2.5, cached_input_usd=0.25, cache_write_usd=0.0, output_usd=15.0),
+    "gpt-5.5": _chat(
+        input_usd=5.0,
+        cached_input_usd=0.5,
+        cache_write_usd=0.0,
+        output_usd=30.0,
+        supports_temperature=False,
+    ),
+    "gpt-5.5-pro": _chat(
+        input_usd=30.0, cache_write_usd=0.0, output_usd=180.0, supports_temperature=False
+    ),
+    "gpt-5.4": _chat(
+        input_usd=2.5,
+        cached_input_usd=0.25,
+        cache_write_usd=0.0,
+        output_usd=15.0,
+        supports_temperature=False,
+    ),
     "gpt-5.4-mini": _chat(
-        input_usd=0.75, cached_input_usd=0.075, cache_write_usd=0.0, output_usd=4.5
+        input_usd=0.75,
+        cached_input_usd=0.075,
+        cache_write_usd=0.0,
+        output_usd=4.5,
+        context_window_tokens=400_000,
+        maximum_output_tokens=64_000,
+        supports_temperature=False,
     ),
     "gpt-5.4-nano": _chat(
-        input_usd=0.2, cached_input_usd=0.02, cache_write_usd=0.0, output_usd=1.25
+        input_usd=0.2,
+        cached_input_usd=0.02,
+        cache_write_usd=0.0,
+        output_usd=1.25,
+        context_window_tokens=400_000,
+        maximum_output_tokens=64_000,
+        supports_temperature=False,
     ),
-    "gpt-5.4-pro": _chat(input_usd=30.0, cache_write_usd=0.0, output_usd=180.0),
-    "gpt-5.2": _chat(input_usd=1.75, cached_input_usd=0.175, cache_write_usd=0.0, output_usd=14.0),
-    "gpt-5.2-pro": _chat(input_usd=21.0, cache_write_usd=0.0, output_usd=168.0),
-    "gpt-5.1": _chat(input_usd=1.25, cached_input_usd=0.125, cache_write_usd=0.0, output_usd=10.0),
-    "gpt-5": _chat(input_usd=1.25, cached_input_usd=0.125, cache_write_usd=0.0, output_usd=10.0),
+    "gpt-5.4-pro": _chat(
+        input_usd=30.0, cache_write_usd=0.0, output_usd=180.0, supports_temperature=False
+    ),
+    "gpt-5.2": _chat(
+        input_usd=1.75,
+        cached_input_usd=0.175,
+        cache_write_usd=0.0,
+        output_usd=14.0,
+        supports_temperature=False,
+    ),
+    "gpt-5.2-pro": _chat(
+        input_usd=21.0, cache_write_usd=0.0, output_usd=168.0, supports_temperature=False
+    ),
+    "gpt-5.1": _chat(
+        input_usd=1.25,
+        cached_input_usd=0.125,
+        cache_write_usd=0.0,
+        output_usd=10.0,
+        supports_temperature=False,
+    ),
+    "gpt-5": _chat(
+        input_usd=1.25,
+        cached_input_usd=0.125,
+        cache_write_usd=0.0,
+        output_usd=10.0,
+        supports_temperature=False,
+    ),
     "gpt-5-mini": _chat(
-        input_usd=0.25, cached_input_usd=0.025, cache_write_usd=0.0, output_usd=2.0
+        input_usd=0.25,
+        cached_input_usd=0.025,
+        cache_write_usd=0.0,
+        output_usd=2.0,
+        supports_temperature=False,
     ),
     "gpt-5-nano": _chat(
-        input_usd=0.05, cached_input_usd=0.005, cache_write_usd=0.0, output_usd=0.4
+        input_usd=0.05,
+        cached_input_usd=0.005,
+        cache_write_usd=0.0,
+        output_usd=0.4,
+        supports_temperature=False,
     ),
-    "gpt-5-pro": _chat(input_usd=15.0, cache_write_usd=0.0, output_usd=120.0),
+    "gpt-5-pro": _chat(
+        input_usd=15.0, cache_write_usd=0.0, output_usd=120.0, supports_temperature=False
+    ),
     "text-embedding-3-small": _embedding(input_usd=0.02, context_window_tokens=8_192),
     "text-embedding-3-large": _embedding(input_usd=0.13, context_window_tokens=8_192),
     "text-embedding-ada-002": _embedding(input_usd=0.1, context_window_tokens=8_192),

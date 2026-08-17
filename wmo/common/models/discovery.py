@@ -160,6 +160,8 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
             discovered.supports_completions,
             known.supports_completions if known else None,
         ),
+        supports_temperature=known.supports_temperature if known else True,
+        reasoning_effort=known.reasoning_effort if known else None,
         context_window_tokens=discovered.context_window_tokens
         or (known.context_window_tokens if known else None),
         maximum_output_tokens=discovered.maximum_output_tokens

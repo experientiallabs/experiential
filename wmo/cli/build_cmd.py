@@ -48,7 +48,7 @@ from wmo.runtime.models import (
     RuntimeModelCatalog,
 )
 from wmo.runtime.models.preflight import preflight_capabilities
-from wmo.runtime.models.providers.transport import RetryPolicy
+from wmo.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
 from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source
@@ -200,6 +200,13 @@ def build(
             )
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
+        except ProviderTransportError as exc:
+            _console.print(f"[red]error[/red] a provider request failed: {exc}")
+            _console.print(
+                "Completed paid work is saved. Run the wizard again to resume; finished "
+                "steps replay exactly without new spend."
+            )
+            raise typer.Exit(code=1) from exc
         return
     started = time.monotonic()
     with usage_error(
