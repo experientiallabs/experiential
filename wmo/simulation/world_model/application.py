@@ -23,7 +23,7 @@ from wmo.common.models import AssistantAction, ModelMessage, load_model_catalog
 from wmo.common.project import ProjectStore, ProjectStoreError
 from wmo.common.tasks import TaskCase
 from wmo.runtime.models import CapabilityRequirement, RuntimeModelCatalog
-from wmo.runtime.models.providers.retry import RetryPolicy
+from wmo.runtime.models.providers.transport import RetryPolicy
 from wmo.simulation.retrieval import RAGEmbedderBinding
 from wmo.simulation.world_model.runtime import (
     GroundedWorldModel,

@@ -353,16 +353,6 @@ def _terminal_key_reader(
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def read_terminal_key() -> PickerKey:
-    """Read one key from the controlling terminal in raw mode.
-
-    Returns:
-        The decoded picker action for the next key press.
-    """
-    with _terminal_key_reader(None) as reader:
-        return reader()
-
-
 def select_many_list(
     console: Console,
     *,

@@ -21,27 +21,16 @@ from wmo.common.models import (
     ModelSnapshot,
 )
 from wmo.runtime.models.providers.base import ProviderHttpClient
-from wmo.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
+from wmo.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    JsonHttpTransport,
+    ScriptedJsonTransport,
+)
 
 
-class _RecordingTransport(JsonHttpTransport):
-    """Returns one frozen response while retaining the wire call for assertions."""
-
-    def __init__(self) -> None:
-        self.requests: list[tuple[str, Mapping[str, str], JsonObject]] = []
-
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Record one fake call and return a fixed success body."""
-        del timeout_seconds
-        self.requests.append((url, headers, payload))
-        return JsonHttpResponse(status_code=200, body={"answer": "ok"})
+def _ok_transport() -> ScriptedJsonTransport:
+    """Build a transport scripted with the single success body these tests expect."""
+    return ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={"answer": "ok"})])
 
 
 class _EchoClient(ProviderHttpClient):
@@ -110,7 +99,7 @@ def test_rejects_a_nonpositive_timeout() -> None:
 
 def test_complete_posts_bearer_headers_and_class_defaults_to_the_completion_route() -> None:
     """The template owns the URL join, the auth headers, and the `default_headers` merge."""
-    transport = _RecordingTransport()
+    transport = _ok_transport()
     client = _client(transport)
 
     response = client.complete(ModelRequest(messages=(ModelMessage(role="user", content="hi"),)))
@@ -126,7 +115,7 @@ def test_complete_posts_bearer_headers_and_class_defaults_to_the_completion_rout
 
 def test_complete_reports_an_observed_nonnegative_latency() -> None:
     """`_parse_response` must receive the latency the template measured around the post."""
-    client = _client(_RecordingTransport())
+    client = _client(_ok_transport())
 
     response = client.complete(ModelRequest(messages=(ModelMessage(role="user", content="hi"),)))
 

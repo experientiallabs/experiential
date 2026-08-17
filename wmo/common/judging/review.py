@@ -519,6 +519,8 @@ class RubricReview:
                 envelope=rubric,
                 files={"rubric.json": rubric},
             )
+        # Intentional semantic-subset replay: a finalize retry adopts the stored approved_at,
+        # which write_or_replay's created_at-only adoption cannot express.
         except ArtifactAlreadyExistsError:
             try:
                 stored = Rubric.model_validate_json(

@@ -116,7 +116,9 @@ def openai_compatible_response(
     content_value = message.get("content")
     content = content_value if isinstance(content_value, str) else None
     tool_call_values = _array_or_empty(message)
-    tool_calls = tuple(_tool_call(value, index) for index, value in enumerate(tool_call_values))
+    tool_calls = tuple(
+        parse_openai_wire_tool_call(value, index) for index, value in enumerate(tool_call_values)
+    )
     try:
         output = AssistantAction(content=content, tool_calls=tool_calls)
     except ValueError as exc:
@@ -242,9 +244,21 @@ def _openai_message(message: ModelMessage) -> JsonObject:
     return payload
 
 
-def _tool_call(value: JsonValue, index: int) -> ToolCall:
-    """Parse one OpenAI-compatible tool call without accepting malformed JSON arguments."""
-    item = require_object(value, f"tool_calls[{index}]")
+def parse_openai_wire_tool_call(value: object, index: int) -> ToolCall:
+    """Parse one OpenAI-wire tool call without accepting malformed JSON arguments.
+
+    Args:
+        value: One decoded ``tool_calls`` array element.
+        index: Zero-based array position used in error messages.
+
+    Returns:
+        The typed tool call with its arguments decoded as a JSON object.
+
+    Raises:
+        ProviderResponseError: The call lacks identity fields or its arguments do not decode
+            to a JSON object.
+    """
+    item = require_object(cast("JsonValue", value), f"tool_calls[{index}]")
     call_id = require_string(item.get("id"), f"tool_calls[{index}].id")
     function = require_object(item.get("function"), f"tool_calls[{index}].function")
     name = require_string(function.get("name"), f"tool_calls[{index}].function.name")

@@ -6,9 +6,7 @@ import json
 import time
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from pydantic import TypeAdapter
-
-from wmo.common.core.artifacts import ContractModel, JsonObject
+from wmo.common.core.artifacts import ContractModel
 from wmo.common.models import (
     AssistantAction,
     ModelRequest,
@@ -17,6 +15,8 @@ from wmo.common.models import (
     ToolCall,
     Usage,
 )
+from wmo.runtime.models.providers.errors import ProviderResponseError
+from wmo.runtime.models.providers.openai_compatible import parse_openai_wire_tool_call
 
 if TYPE_CHECKING:
     import tinker
@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     from tinker_cookbook.renderers import ToolSpec as CookbookToolSpec
 
 
-_JSON_OBJECT = TypeAdapter(JsonObject)
 _OPTIONAL_DEPENDENCY_GUIDANCE = (
     "install the Tinker sampling dependencies with `uv sync --extra sft` or "
     "`pip install 'world-model-optimizer[sft]'`"
@@ -320,25 +319,8 @@ def _assistant_action(value: dict[str, object]) -> AssistantAction:
 
 
 def _tool_call(value: object, index: int) -> ToolCall:
-    """Validate one renderer tool call's identity and JSON-object arguments."""
-    if not isinstance(value, dict):
-        raise TinkerSamplingError(f"Tinker tool call {index} is not an object")
-    call_id = value.get("id")
-    function = value.get("function")
-    if not isinstance(call_id, str) or not call_id:
-        raise TinkerSamplingError(f"Tinker tool call {index} has no call id")
-    if not isinstance(function, dict):
-        raise TinkerSamplingError(f"Tinker tool call {index} has no function object")
-    name = function.get("name")
-    raw_arguments = function.get("arguments")
-    if not isinstance(name, str) or not name:
-        raise TinkerSamplingError(f"Tinker tool call {index} has no function name")
-    if not isinstance(raw_arguments, str):
-        raise TinkerSamplingError(f"Tinker tool call {index} arguments must be JSON text")
+    """Validate one renderer tool call through the shared OpenAI-wire parser."""
     try:
-        arguments = _JSON_OBJECT.validate_json(raw_arguments)
-    except ValueError as exc:
-        raise TinkerSamplingError(
-            f"Tinker tool call {index} arguments are not a JSON object"
-        ) from exc
-    return ToolCall(call_id=call_id, name=name, arguments=arguments)
+        return parse_openai_wire_tool_call(value, index)
+    except ProviderResponseError as exc:
+        raise TinkerSamplingError(f"Tinker tool call {index} is invalid: {exc}") from exc

@@ -136,6 +136,7 @@ def judge_setup(
             plan = maybe_edit_setup_plan(plan, console=_console)
         confirmed = approve or _confirm(
             "Save this judge setup and finalize its rubric?",
+            default=True,
             non_interactive=non_interactive,
             required_flag="--approve",
         )
@@ -363,6 +364,7 @@ def judge_calibrate(
             or approve
             or _confirm(
                 "Approve this immutable judge calibration?",
+                default=True,
                 non_interactive=non_interactive,
                 required_flag="--approve",
             )
@@ -530,11 +532,18 @@ def _metric(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.3f}"
 
 
-def _confirm(question: str, *, non_interactive: bool, required_flag: str) -> bool:
+def _confirm(
+    question: str,
+    *,
+    default: bool = False,
+    non_interactive: bool,
+    required_flag: str,
+) -> bool:
     """Ask one non-spend confirmation or require its explicit flag.
 
     Args:
         question: Human-readable confirmation prompt.
+        default: Answer selected by a blank response.
         non_interactive: Whether terminal prompting is forbidden.
         required_flag: Explicit flag required without a prompt.
 
@@ -546,4 +555,4 @@ def _confirm(question: str, *, non_interactive: bool, required_flag: str) -> boo
     """
     if non_interactive or not can_prompt(_console):
         raise ValueError(f"noninteractive judge review requires {required_flag}")
-    return Confirm.ask(question, default=False)
+    return Confirm.ask(question, default=default)

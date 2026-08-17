@@ -1,13 +1,16 @@
-"""Contract tests for shared OpenAI-compatible conversion and client behavior."""
+"""Contract tests for shared OpenAI-compatible conversion and client behavior.
+
+This module owns the fixtures shared by the provider suites: `_snapshot` and `_request`
+are imported by `azure_test` and `native_test` so every adapter exercises one transcript.
+"""
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from typing import Literal
 
 import pytest
 
-from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     ModelMessage,
@@ -22,46 +25,47 @@ from wmo.runtime.models.providers.openai_compatible import (
     OpenAICompatibleResponseError,
     openai_compatible_request,
 )
-from wmo.runtime.models.providers.retry import RetryPolicy
-from wmo.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
+from wmo.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    RetryPolicy,
+    ScriptedJsonTransport,
+)
 
 
-class _ScriptedTransport(JsonHttpTransport):
-    """Returns frozen responses while retaining every request for assertions."""
+def _snapshot(provider: str = "openai-compatible", model_id: str = "fake-model") -> ModelSnapshot:
+    """Build an immutable identity fixture for one adapter.
 
-    def __init__(self, responses: list[JsonHttpResponse]) -> None:
-        self._responses = list(responses)
-        self.requests: list[tuple[str, Mapping[str, str], JsonObject]] = []
+    Args:
+        provider: Catalog provider name under test.
+        model_id: Exact configured model or deployment identity.
 
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        del timeout_seconds
-        self.requests.append((url, headers, payload))
-        if not self._responses:
-            raise AssertionError("test made an unexpected provider request")
-        return self._responses.pop(0)
-
-
-def _snapshot() -> ModelSnapshot:
+    Returns:
+        A frozen snapshot with fixture digests.
+    """
     return ModelSnapshot(
-        provider="openai-compatible",
-        model_id="fake-model",
-        revision="fake-revision",
+        provider=provider,
+        model_id=model_id,
+        revision="fixture-revision",
         capabilities_sha256="a" * 64,
         connection_sha256="a" * 64,
     )
 
 
-def _request() -> ModelRequest:
+def _request(
+    *,
+    tool_choice: ToolChoice | Literal["auto", "none", "required"] | None = None,
+) -> ModelRequest:
+    """Build a visible transcript containing an earlier tool call and result.
+
+    Args:
+        tool_choice: Optional tool-choice constraint forwarded to the request.
+
+    Returns:
+        A typed request with system, user, assistant tool-call, and tool-result turns.
+    """
     return ModelRequest(
         messages=(
-            ModelMessage(role="system", content="You are careful."),
+            ModelMessage(role="system", content="You are precise."),
             ModelMessage(role="user", content="Create a ticket."),
             ModelMessage(
                 role="assistant",
@@ -70,7 +74,7 @@ def _request() -> ModelRequest:
                         ToolCall(
                             call_id="call-old",
                             name="create_ticket",
-                            arguments={"priority": "high"},
+                            arguments={"priority": "normal"},
                         ),
                     )
                 ),
@@ -84,18 +88,20 @@ def _request() -> ModelRequest:
                 input_schema={"type": "object"},
             ),
         ),
-        tool_choice=ToolChoice(name="create_ticket"),
-        temperature=0.4,
-        maximum_output_tokens=256,
+        tool_choice=tool_choice,
+        temperature=0.2,
+        maximum_output_tokens=128,
     )
 
 
 def test_openai_compatible_request_keeps_history_tools_and_non_streaming_cap() -> None:
     """Shared conversion keeps every tool turn and emits no streaming request."""
-    payload = openai_compatible_request("fake-model", _request())
+    payload = openai_compatible_request(
+        "fake-model", _request(tool_choice=ToolChoice(name="create_ticket"))
+    )
 
     assert payload["stream"] is False
-    assert payload["max_tokens"] == 256
+    assert payload["max_tokens"] == 128
     assert payload["tool_choice"] == {
         "type": "function",
         "function": {"name": "create_ticket"},
@@ -116,14 +122,14 @@ def test_openai_compatible_request_keeps_history_tools_and_non_streaming_cap() -
         {
             "id": "call-old",
             "type": "function",
-            "function": {"name": "create_ticket", "arguments": '{"priority": "high"}'},
+            "function": {"name": "create_ticket", "arguments": '{"priority": "normal"}'},
         }
     ]
 
 
 def test_openai_compatible_client_converts_tool_usage_and_resolved_identity() -> None:
     """One frozen tool response produces typed output, normalized usage, and actual model ID."""
-    transport = _ScriptedTransport(
+    transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -178,7 +184,7 @@ def test_openai_compatible_client_converts_tool_usage_and_resolved_identity() ->
 
 def test_openai_compatible_client_retries_only_the_same_endpoint() -> None:
     """A retryable status retries the frozen request without a failover model path."""
-    transport = _ScriptedTransport(
+    transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(status_code=503, body={"error": {"message": "busy"}}),
             JsonHttpResponse(
@@ -208,9 +214,26 @@ def test_openai_compatible_client_retries_only_the_same_endpoint() -> None:
     assert idempotency_keys[0] == idempotency_keys[1]
 
 
+def test_response_without_choices_fails_closed_without_exposing_the_key() -> None:
+    """A response with no choices raises a typed error that never includes the credential."""
+    secret = "fake-secret-key-value"
+    transport = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={"choices": []})])
+    client = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://example.test/v1",
+        api_key=secret,
+        transport=transport,
+    )
+
+    with pytest.raises(OpenAICompatibleResponseError, match="no choices") as captured:
+        client.complete(_request())
+    assert secret not in str(captured.value)
+    assert secret not in repr(captured.value)
+
+
 def test_openai_compatible_embedding_response_is_ordered_and_normalized() -> None:
     """Embedding conversion restores provider indexes and returns unit-length vectors."""
-    transport = _ScriptedTransport(
+    transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -242,7 +265,7 @@ def test_openai_compatible_embedding_response_is_ordered_and_normalized() -> Non
 
 def test_openai_compatible_conversion_rejects_malformed_tool_arguments() -> None:
     """A provider cannot turn malformed tool JSON into an invented empty argument object."""
-    transport = _ScriptedTransport(
+    transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,

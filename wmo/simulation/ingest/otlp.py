@@ -20,8 +20,7 @@ from pydantic import JsonValue
 from wmo.common.core.artifacts import FailureCode, JsonObject, SourceIdentity, StructuredFailure
 from wmo.common.core.text import normalize_durable_text
 from wmo.common.models import ModelSnapshot, Usage
-from wmo.common.tasks import ToolSchema
-from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from wmo.common.traces import Trace, TraceSource, TraceSpan
 from wmo.simulation.ingest.environment_capture import canonicalize_environment_capture_payloads
 from wmo.simulation.ingest.json_strict import DuplicateJsonKeyError, reject_duplicate_json_keys
 from wmo.simulation.ingest.model_identity import (
@@ -29,6 +28,17 @@ from wmo.simulation.ingest.model_identity import (
     normalized_capabilities_sha256,
     normalized_connection_sha256,
     normalized_model_identity_evidence,
+)
+from wmo.simulation.ingest.trace_extensions import (
+    CONVERSATION_ID_KEYS,
+    REQUEST_CONTEXT_KEY,
+    REQUEST_TOOLS_KEY,
+    collect_outcome,
+    collect_tools,
+    consistent_json_object,
+    consistent_text,
+    json_value,
+    required_text,
 )
 
 GENAI_SEMANTIC_CONVENTION_VERSION = "1.37.0"
@@ -39,13 +49,6 @@ _MODEL_OPERATIONS = frozenset(
     {"chat", "text_completion", "generate_content", "invoke_agent", "embeddings"}
 )
 _TOOL_OPERATION = "execute_tool"
-_OUTCOME_STATUS_KEY = "wmo.outcome.status"
-_OUTCOME_NAME_KEY = "wmo.outcome.name"
-_OUTCOME_FAILURE_CODE_KEY = "wmo.outcome.failure.code"
-_OUTCOME_FAILURE_MESSAGE_KEY = "wmo.outcome.failure.message"
-_OUTCOME_FAILURE_RETRYABLE_KEY = "wmo.outcome.failure.retryable"
-_REQUEST_CONTEXT_KEY = "wmo.request.context"
-_CONVERSATION_KEYS = ("wmo.conversation.id", "gen_ai.conversation.id")
 
 
 class OtlpTraceFormatError(ValueError):
@@ -376,10 +379,23 @@ def _normalize_trace_group(
     if initial_request is None:
         raise OtlpTraceFormatError("trace has no initial user prompt in GenAI attributes")
     task, initial_attributes = initial_request
-    initial_context = _consistent_json_object((initial_attributes,), _REQUEST_CONTEXT_KEY)
-    conversation_id = _consistent_text(all_attributes, _CONVERSATION_KEYS)
-    tools = _collect_tools((initial_attributes,))
-    outcome = _collect_outcome(all_attributes)
+    initial_context = consistent_json_object(
+        (initial_attributes,), REQUEST_CONTEXT_KEY, error_type=OtlpTraceFormatError
+    )
+    conversation_id = consistent_text(
+        # Lenient: foreign exporters populate identity attributes with non-text values, so an
+        # invalid conversation id is ignored instead of excluding the trace.
+        all_attributes,
+        CONVERSATION_ID_KEYS,
+        error_type=OtlpTraceFormatError,
+        lenient=True,
+    )
+    tools = collect_tools(
+        (initial_attributes,),
+        keys=("gen_ai.tool.definitions", REQUEST_TOOLS_KEY),
+        error_type=OtlpTraceFormatError,
+    )
+    outcome = collect_outcome(all_attributes, failures=(), error_type=OtlpTraceFormatError)
     return Trace(
         trace_id=trace_id,
         conversation_id=conversation_id,
@@ -645,7 +661,7 @@ def _initial_request(
 
 def _task_from_attributes(attributes: JsonObject) -> str | None:
     """Extract one user-visible request from standard GenAI message attributes."""
-    messages = _json_value(attributes.get("gen_ai.input.messages"))
+    messages = json_value(attributes.get("gen_ai.input.messages"))
     if isinstance(messages, list):
         for message in messages:
             if not isinstance(message, dict):
@@ -680,171 +696,6 @@ def _message_content(value: JsonValue) -> str | None:
     return None
 
 
-def _consistent_json_object(attributes_by_span: Iterable[JsonObject], key: str) -> JsonObject:
-    """Return one repeated JSON-object attribute or reject conflicting copies."""
-    values: list[JsonObject] = []
-    for attributes in attributes_by_span:
-        value = _json_value(attributes.get(key))
-        if value is None:
-            continue
-        if not isinstance(value, dict):
-            raise OtlpTraceFormatError(f"{key} must be a JSON object")
-        values.append(value)
-    if not values:
-        return {}
-    if any(value != values[0] for value in values[1:]):
-        raise OtlpTraceFormatError(f"{key} differs across spans in one trace")
-    return values[0]
-
-
-def _consistent_text(attributes_by_span: Iterable[JsonObject], keys: tuple[str, ...]) -> str | None:
-    """Return one repeated text attribute across a trace or reject inconsistent values."""
-    values: list[str] = []
-    for attributes in attributes_by_span:
-        value = _first_text(attributes, keys)
-        if value is not None:
-            values.append(value)
-    if not values:
-        return None
-    if any(value != values[0] for value in values[1:]):
-        raise OtlpTraceFormatError(f"{keys[0]} differs across spans in one trace")
-    return values[0]
-
-
-def _collect_tools(attributes_by_span: Iterable[JsonObject]) -> tuple[ToolSchema, ...]:
-    """Collect stable tool definitions from explicitly supplied request evidence."""
-    by_name: dict[str, ToolSchema] = {}
-    for attributes in attributes_by_span:
-        raw_tools = _json_value(attributes.get("gen_ai.tool.definitions"))
-        if raw_tools is None:
-            raw_tools = _json_value(attributes.get("wmo.request.tools"))
-        if raw_tools is None:
-            continue
-        if not isinstance(raw_tools, list):
-            raise OtlpTraceFormatError("GenAI tool definitions must be a JSON array")
-        for raw_tool in raw_tools:
-            tool = _tool_schema(raw_tool)
-            if tool.name in by_name and by_name[tool.name] != tool:
-                raise OtlpTraceFormatError(f"tool {tool.name!r} has conflicting definitions")
-            by_name[tool.name] = tool
-    return tuple(by_name[name] for name in sorted(by_name))
-
-
-def _tool_schema(raw_tool: JsonValue) -> ToolSchema:
-    """Convert one OpenAI or GenAI tool definition to the canonical visible tool contract."""
-    if not isinstance(raw_tool, dict):
-        raise OtlpTraceFormatError("tool definitions must contain objects")
-    candidate = raw_tool.get("function") if raw_tool.get("type") == "function" else raw_tool
-    if not isinstance(candidate, dict):
-        raise OtlpTraceFormatError("function tool definitions must contain a function object")
-    name = candidate.get("name")
-    if not isinstance(name, str) or not name.strip():
-        raise OtlpTraceFormatError("tool definitions need non-empty names")
-    description = candidate.get("description")
-    if not isinstance(description, str) or not description.strip():
-        description = "No description captured."
-    schema = candidate.get("input_schema", candidate.get("parameters", candidate.get("schema")))
-    if not isinstance(schema, dict):
-        raise OtlpTraceFormatError(f"tool {name!r} needs an object input schema")
-    return ToolSchema(
-        name=normalize_durable_text(name.strip()),
-        description=normalize_durable_text(description.strip()),
-        input_schema=schema,
-    )
-
-
-def _collect_outcome(attributes_by_span: Iterable[JsonObject]) -> TraceOutcome | None:
-    """Map documented WMO outcome extension attributes to canonical terminal evidence."""
-    attributes = tuple(attributes_by_span)
-    status = _consistent_extension_text(attributes, _OUTCOME_STATUS_KEY)
-    outcome_name = _consistent_extension_text(attributes, _OUTCOME_NAME_KEY)
-    failure_code = _consistent_extension_text(attributes, _OUTCOME_FAILURE_CODE_KEY)
-    failure_message = _consistent_extension_text(attributes, _OUTCOME_FAILURE_MESSAGE_KEY)
-    retryable = _consistent_extension_bool(attributes, _OUTCOME_FAILURE_RETRYABLE_KEY)
-    if status is None:
-        if any(
-            value is not None for value in (outcome_name, failure_code, failure_message, retryable)
-        ):
-            raise OtlpTraceFormatError("wmo outcome details require wmo.outcome.status")
-        return None
-    if status not in {"success", "failure", "abandoned", "unknown"}:
-        raise OtlpTraceFormatError(
-            "wmo.outcome.status must be success, failure, abandoned, or unknown"
-        )
-    if status == "success":
-        if failure_code is not None or failure_message is not None or retryable is not None:
-            raise OtlpTraceFormatError("wmo outcome failure details require failure status")
-        return TraceOutcome(status="success", outcome_name=outcome_name)
-    if status == "abandoned":
-        if failure_code is not None or failure_message is not None or retryable is not None:
-            raise OtlpTraceFormatError("wmo outcome failure details require failure status")
-        return TraceOutcome(status="abandoned", outcome_name=outcome_name)
-    if status == "unknown":
-        if failure_code is not None or failure_message is not None or retryable is not None:
-            raise OtlpTraceFormatError("wmo outcome failure details require failure status")
-        return TraceOutcome(status="unknown", outcome_name=outcome_name)
-    if failure_code is None or failure_message is None:
-        raise OtlpTraceFormatError(
-            "failure outcomes need wmo.outcome.failure.code and wmo.outcome.failure.message"
-        )
-    try:
-        code = FailureCode(failure_code)
-    except ValueError as exc:
-        valid_codes = ", ".join(item.value for item in FailureCode)
-        raise OtlpTraceFormatError(
-            f"wmo.outcome.failure.code must be one of: {valid_codes}"
-        ) from exc
-    return TraceOutcome(
-        status="failure",
-        outcome_name=outcome_name,
-        failure=StructuredFailure(code=code, message=failure_message, retryable=retryable or False),
-    )
-
-
-def _consistent_extension_text(attributes: Sequence[JsonObject], key: str) -> str | None:
-    """Return a repeated WMO extension text value or reject ambiguity."""
-    values: list[str] = []
-    for item in attributes:
-        raw = item.get(key)
-        if raw is None:
-            continue
-        if not isinstance(raw, str) or not raw.strip():
-            raise OtlpTraceFormatError(f"{key} must be non-empty text")
-        values.append(normalize_durable_text(raw.strip()))
-    if not values:
-        return None
-    if any(value != values[0] for value in values[1:]):
-        raise OtlpTraceFormatError(f"{key} differs across spans in one trace")
-    return values[0]
-
-
-def _consistent_extension_bool(attributes: Sequence[JsonObject], key: str) -> bool | None:
-    """Return a repeated WMO extension boolean or reject ambiguity."""
-    values: list[bool] = []
-    for item in attributes:
-        raw = item.get(key)
-        if raw is None:
-            continue
-        if not isinstance(raw, bool):
-            raise OtlpTraceFormatError(f"{key} must be boolean")
-        values.append(raw)
-    if not values:
-        return None
-    if any(value != values[0] for value in values[1:]):
-        raise OtlpTraceFormatError(f"{key} differs across spans in one trace")
-    return values[0]
-
-
-def _json_value(value: JsonValue | None) -> JsonValue | None:
-    """Decode a JSON-encoded string extension while leaving native JSON unchanged."""
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return value
-
-
 def _first_text(attributes: JsonObject, keys: tuple[str, ...]) -> str | None:
     """Return the first non-empty text attribute from an ordered key list."""
     for key in keys:
@@ -856,9 +707,7 @@ def _first_text(attributes: JsonObject, keys: tuple[str, ...]) -> str | None:
 
 def _required_text(value: JsonValue | None, label: str) -> str:
     """Require a durable non-empty string field."""
-    if not isinstance(value, str) or not value.strip():
-        raise OtlpTraceFormatError(f"{label} must be non-empty text")
-    return normalize_durable_text(value.strip())
+    return required_text(value, label, error_type=OtlpTraceFormatError)
 
 
 def _validate_w3c_id(value: str, *, kind: str) -> str:

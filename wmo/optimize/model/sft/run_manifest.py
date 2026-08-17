@@ -156,6 +156,7 @@ def initialize_automatic_sft_acceptance(
             envelope=acceptance,
             files={AUTOMATIC_ACCEPTANCE_FILE: acceptance},
         )
+    # Intentional semantic-subset replay: _validate_automatic_acceptance compares semantically.
     except ArtifactAlreadyExistsError:
         existing, existing_input = load_automatic_sft_acceptance(store, acceptance.acceptance_id)
         _validate_automatic_acceptance(

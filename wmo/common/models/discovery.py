@@ -50,7 +50,6 @@ class DiscoveredModel(ContractModel):
 
     provider: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=512)
-    display_name: str | None = Field(default=None, max_length=512)
     supports_completions: bool | None = None
     supports_embeddings: bool | None = None
     supports_tools: bool | None = None
@@ -68,28 +67,8 @@ class ResolvedDiscoveredModel(ContractModel):
 
     provider: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=512)
-    display_name: str | None = Field(default=None, max_length=512)
     capabilities: ModelCapabilities
     pricing_source: PricingSource
-
-    def serves(self, role: SetupRole) -> bool:
-        """Report whether verified metadata proves this model can serve one build role.
-
-        Args:
-            role: Build role the model would be assigned.
-
-        Returns:
-            ``True`` only when every value the role needs is verified.
-        """
-        return serves_role(self.capabilities, role)
-
-    def roles(self) -> tuple[SetupRole, ...]:
-        """List every build role this model can serve.
-
-        Returns:
-            Declaration-ordered roles the merged metadata proves.
-        """
-        return served_roles(self.capabilities)
 
 
 def serves_role(capabilities: ModelCapabilities, role: SetupRole) -> bool:
@@ -193,7 +172,6 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
     return ResolvedDiscoveredModel(
         provider=discovered.provider,
         model=discovered.model,
-        display_name=discovered.display_name,
         capabilities=capabilities,
         pricing_source=_pricing_source(discovered, known=known, input_cost=input_cost),
     )

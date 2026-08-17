@@ -53,8 +53,6 @@ from wmo.optimize.model.sft.contracts import (
 from wmo.optimize.model.sft.rendering import (
     CanonicalSFTTurn,
     context_target_fingerprint,
-    parse_rendered_turn,
-    render_context_target,
 )
 from wmo.optimize.model.sft.runtime_source import (
     PreparedRuntimeSFTSnapshot,
@@ -134,11 +132,9 @@ __all__ = [
     "load_sft_dataset",
     "load_sft_model_optimization_config",
     "load_verified_sft_dataset",
-    "parse_rendered_turn",
     "prepare_runtime_sft_model_optimization",
     "require_completed_runtime_interactions",
     "preflight_sft_model_optimization",
-    "render_context_target",
     "resolve_runtime_source",
     "run_sft_model_optimization",
     "sft_model_optimization_output_dir",

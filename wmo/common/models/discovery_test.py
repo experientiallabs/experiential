@@ -10,6 +10,7 @@ from wmo.common.models.discovery import (
     derive_model_alias,
     resolve_discovered_model,
     served_roles,
+    serves_role,
 )
 
 
@@ -60,7 +61,7 @@ def test_unknown_model_keeps_every_capability_and_price_unknown() -> None:
     assert capabilities.context_window_tokens is None
     assert capabilities.input_cost_per_million_tokens_usd is None
     assert resolved.pricing_source is PricingSource.UNKNOWN
-    assert resolved.roles() == ()
+    assert served_roles(resolved.capabilities) == ()
 
 
 def test_cache_prices_are_never_inferred_from_the_base_input_price() -> None:
@@ -81,9 +82,9 @@ def test_cache_prices_are_never_inferred_from_the_base_input_price() -> None:
     capabilities = resolved.capabilities
     assert capabilities.cached_input_cost_per_million_tokens_usd is None
     assert capabilities.cache_write_cost_per_million_tokens_usd is None
-    assert not resolved.serves(SetupRole.ROUTER_CANDIDATE)
-    assert resolved.serves(SetupRole.WORLD_MODEL)
-    assert resolved.serves(SetupRole.JUDGE)
+    assert not serves_role(resolved.capabilities, SetupRole.ROUTER_CANDIDATE)
+    assert serves_role(resolved.capabilities, SetupRole.WORLD_MODEL)
+    assert serves_role(resolved.capabilities, SetupRole.JUDGE)
 
 
 def test_provider_denial_overrides_maintained_capability() -> None:
@@ -97,8 +98,8 @@ def test_provider_denial_overrides_maintained_capability() -> None:
     )
 
     assert not resolved.capabilities.supports_structured_output
-    assert not resolved.serves(SetupRole.JUDGE)
-    assert resolved.serves(SetupRole.WORLD_MODEL)
+    assert not serves_role(resolved.capabilities, SetupRole.JUDGE)
+    assert serves_role(resolved.capabilities, SetupRole.WORLD_MODEL)
 
 
 def test_router_candidate_role_requires_prices_and_both_token_limits() -> None:
@@ -121,8 +122,8 @@ def test_embedder_role_requires_priced_embedding_support() -> None:
         DiscoveredModel(provider="gemini", model="experimental-embedding", supports_embeddings=True)
     )
 
-    assert priced.roles() == (SetupRole.EMBEDDER,)
-    assert unpriced.roles() == ()
+    assert served_roles(priced.capabilities) == (SetupRole.EMBEDDER,)
+    assert served_roles(unpriced.capabilities) == ()
 
 
 def test_connection_names_and_aliases_are_readable_and_collision_safe() -> None:

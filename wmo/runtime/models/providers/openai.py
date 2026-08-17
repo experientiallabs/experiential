@@ -25,18 +25,30 @@ from wmo.common.models import (
     ToolCall,
     Usage,
 )
+from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
 from wmo.runtime.models.providers.errors import ProviderResponseError
 from wmo.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
+from wmo.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
-def openai_responses_request(model_id: str, request: ModelRequest) -> JsonObject:
+def openai_responses_request(
+    model_id: str,
+    request: ModelRequest,
+    *,
+    supports_temperature: bool = True,
+    reasoning_effort: str | None = None,
+) -> JsonObject:
     """Convert one WMO request into OpenAI's native Responses API shape.
 
     Args:
         model_id: OpenAI model identifier.
         request: Typed WMO request.
+        supports_temperature: Catalog declaration that the model accepts an explicit sampling
+            temperature. Reasoning models pin their sampling and reject the parameter, so a
+            ``False`` declaration omits any requested temperature from the wire payload.
+        reasoning_effort: Optional catalog-pinned reasoning-effort level sent verbatim.
 
     Returns:
         Non-streaming Responses API JSON with provider-side storage disabled.
@@ -77,8 +89,10 @@ def openai_responses_request(model_id: str, request: ModelRequest) -> JsonObject
             if not isinstance(request.tool_choice, str)
             else request.tool_choice
         )
-    if request.temperature is not None:
+    if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
+    if reasoning_effort is not None:
+        payload["reasoning"] = {"effort": reasoning_effort}
     if request.maximum_output_tokens is not None:
         payload["max_output_tokens"] = request.maximum_output_tokens
     return payload
@@ -155,13 +169,54 @@ def openai_responses_response(
 class OpenAIClient(OpenAIEmbeddingMixin):
     """Calls direct OpenAI through its native Responses and embeddings endpoints."""
 
+    def __init__(
+        self,
+        *,
+        model: ModelSnapshot,
+        api_key: str,
+        base_url: str = OPENAI_BASE_URL,
+        transport: JsonHttpTransport | None = None,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        supports_temperature: bool = True,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        """Create a direct OpenAI client with one explicitly resolved credential.
+
+        Args:
+            model: Resolved catalog identity for every request.
+            api_key: Non-empty provider credential.
+            base_url: Provider endpoint root.
+            transport: Optional injected JSON transport for deterministic tests.
+            retry_policy: Bounded retry behavior for transient transport failures.
+            timeout_seconds: Positive per-request timeout.
+            supports_temperature: Catalog declaration that the model accepts an explicit
+                sampling temperature; ``False`` omits requested temperatures from payloads.
+            reasoning_effort: Optional catalog-pinned reasoning-effort level.
+        """
+        super().__init__(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            transport=transport,
+            retry_policy=retry_policy,
+            timeout_seconds=timeout_seconds,
+        )
+        self._supports_temperature = supports_temperature
+        self._reasoning_effort = reasoning_effort
+
     def _completion_path(self) -> str:
         """Return the native non-streaming Responses route."""
         return "responses"
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a native Responses payload."""
-        return openai_responses_request(self._model.model_id, request)
+        return openai_responses_request(
+            self._model.model_id,
+            request,
+            supports_temperature=self._supports_temperature,
+            reasoning_effort=self._reasoning_effort,
+        )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one completed Responses payload into the shared response contract."""

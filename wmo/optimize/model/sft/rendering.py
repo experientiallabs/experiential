@@ -10,7 +10,6 @@ from pydantic import Field
 from wmo.common.core.artifacts import (
     ContractModel,
     Sha256,
-    canonical_json_bytes,
     canonical_jsonl_bytes,
     sha256_bytes,
     sha256_json,
@@ -44,32 +43,6 @@ class CanonicalSFTTurn(ContractModel):
     task: str
     history: tuple[CanonicalSFTContextEvent, ...]
     target: AssistantAction
-
-
-def render_context_target(
-    *, task: str, history: tuple[SFTContextEvent, ...], target: AssistantAction
-) -> str:
-    """Render one complete context and target as deterministic JSON.
-
-    Source-only approval metadata is intentionally absent from the rendering. The target retains
-    the whole `AssistantAction`, including text and all ordered tool calls.
-
-    Args:
-        task: Task text supplied with the source trace or rollout.
-        history: Ordered previous messages, assistant actions, and tool results.
-        target: The complete next assistant action to learn.
-
-    Returns:
-        Canonical compact JSON that round-trips through `parse_rendered_turn`.
-    """
-    return canonical_json_bytes(_canonical_turn(task=task, history=history, target=target)).decode(
-        "utf-8"
-    )
-
-
-def parse_rendered_turn(rendered: str) -> CanonicalSFTTurn:
-    """Parse one canonical context-target rendering without losing action or tool-call structure."""
-    return CanonicalSFTTurn.model_validate_json(rendered)
 
 
 def context_target_fingerprint(

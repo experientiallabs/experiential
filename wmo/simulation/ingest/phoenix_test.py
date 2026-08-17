@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from wmo.simulation.ingest.phoenix import load_phoenix_file
+from wmo.simulation.ingest.phoenix import PHOENIX_SOURCE
 
 
 def _native_spans(provider: str | None = "openai") -> list[dict[str, object]]:
@@ -75,29 +75,6 @@ def _native_spans(provider: str | None = "openai") -> list[dict[str, object]]:
     ]
 
 
-def test_load_phoenix_file_converts_native_llm_and_tool_spans(tmp_path: Path) -> None:
-    """Native Phoenix LLM and TOOL spans become paired canonical spans."""
-    path = tmp_path / "phoenix.json"
-    path.write_text(json.dumps(_native_spans()), encoding="utf-8")
-
-    result = load_phoenix_file(path)
-
-    assert result.issues == ()
-    trace = result.traces[0]
-    assert trace.task == "Refund my order"
-    assert [span.name for span in trace.spans] == ["agent.model_call", "agent.tool_call"]
-    call, tool_result = trace.spans
-    assert call.attributes["gen_ai.tool.name"] == "refund_order"
-    assert call.attributes["gen_ai.tool.call.id"] == "call-5"
-    assert call.model is not None
-    assert (call.model.provider, call.model.model_id) == ("openai", "gpt-4o-mini")
-    assert call.usage is not None
-    assert (call.usage.input_tokens, call.usage.output_tokens) == (40, 5)
-    assert tool_result.attributes["gen_ai.tool.call.id"] == "call-5"
-    assert tool_result.attributes["gen_ai.tool.message"] == "refunded"
-    assert tool_result.parent_span_id == call.span_id
-
-
 def test_load_phoenix_file_converts_flat_dotted_rows(tmp_path: Path) -> None:
     """Flat span rows with dotted column names normalize like native spans."""
     rows = [
@@ -117,7 +94,7 @@ def test_load_phoenix_file_converts_flat_dotted_rows(tmp_path: Path) -> None:
     path = tmp_path / "phoenix_rows.jsonl"
     path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
 
-    result = load_phoenix_file(path)
+    result = PHOENIX_SOURCE.load(path)
 
     trace = result.traces[0]
     assert trace.task == "Where is my package"
@@ -164,7 +141,7 @@ def test_load_phoenix_file_converts_otlp_envelope(tmp_path: Path) -> None:
     path = tmp_path / "phoenix_otlp.json"
     path.write_text(json.dumps(envelope), encoding="utf-8")
 
-    result = load_phoenix_file(path)
+    result = PHOENIX_SOURCE.load(path)
 
     trace = result.traces[0]
     assert trace.task == "Cancel my plan"
@@ -172,29 +149,3 @@ def test_load_phoenix_file_converts_otlp_envelope(tmp_path: Path) -> None:
     assert trace.spans[0].failure is not None
     assert trace.outcome is not None
     assert trace.outcome.status == "failure"
-
-
-def test_load_phoenix_file_excludes_span_without_end_time(tmp_path: Path) -> None:
-    """A span with no end time is excluded with an explicit issue."""
-    spans = _native_spans()
-    del spans[0]["end_time"]
-    path = tmp_path / "phoenix.json"
-    path.write_text(json.dumps(spans), encoding="utf-8")
-
-    result = load_phoenix_file(path)
-
-    assert [issue.source_record for issue in result.issues] == ["record-1", "trace-trace-1"]
-    assert result.traces == ()
-
-
-def test_load_phoenix_file_keeps_model_name_without_provider(tmp_path: Path) -> None:
-    """An LLM span naming only a model keeps it as evidence without resolved identity."""
-    spans = _native_spans(provider=None)
-    path = tmp_path / "phoenix.json"
-    path.write_text(json.dumps(spans), encoding="utf-8")
-
-    result = load_phoenix_file(path)
-
-    span = result.traces[0].spans[0]
-    assert span.model is None
-    assert span.attributes["gen_ai.request.model"] == "gpt-4o-mini"

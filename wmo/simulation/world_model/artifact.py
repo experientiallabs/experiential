@@ -17,7 +17,6 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.models import ModelSnapshot
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
     ArtifactManifest,
     ArtifactStore,
     artifact_input,
@@ -180,20 +179,15 @@ def persist_grounded_world_model(
         prompt_sha256=grounded_world_model_prompt_sha256(),
         top_k=top_k,
     )
-    files = {WORLD_MODEL_ARTIFACT_PATH: canonical_json_bytes(artifact)}
     try:
-        manifest = store.write(
+        stored, manifest = store.write_or_replay(
             artifact_id=artifact.world_model_id,
             artifact_type=GROUNDED_WORLD_MODEL_ARTIFACT_TYPE,
             envelope=artifact,
-            files=files,
+            envelope_path=WORLD_MODEL_ARTIFACT_PATH,
+            envelope_type=GroundedWorldModelArtifact,
+            files={WORLD_MODEL_ARTIFACT_PATH: canonical_json_bytes(artifact)},
         )
-    except ArtifactAlreadyExistsError:
-        stored = store.read(artifact.world_model_id)
-        replay = GroundedWorldModelArtifact.model_validate_json(
-            store.read_bytes(artifact.world_model_id, WORLD_MODEL_ARTIFACT_PATH)
-        )
-        if replay.model_copy(update={"created_at": artifact.created_at}) != artifact:
-            raise ValueError("existing grounded world-model artifact differs from replay") from None
-        manifest = stored.manifest
-    return PersistedGroundedWorldModel(artifact=artifact, manifest=manifest)
+    except ValueError as exc:
+        raise ValueError("existing grounded world-model artifact differs from replay") from exc
+    return PersistedGroundedWorldModel(artifact=stored, manifest=manifest)

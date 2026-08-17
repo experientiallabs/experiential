@@ -19,17 +19,9 @@ is retained as ``gen_ai.request.model`` evidence instead of being resolved into 
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from pathlib import Path
-
 from pydantic import JsonValue
 
-from wmo.common.core.artifacts import JsonObject, SourceIdentity
-from wmo.simulation.ingest.otlp import (
-    GENAI_SEMANTIC_CONVENTION_VERSION,
-    TraceNormalizationIssue,
-    TraceNormalizationResult,
-)
+from wmo.common.core.artifacts import JsonObject
 from wmo.simulation.ingest.vendor_observations import (
     VendorModelIdentity,
     VendorObservation,
@@ -41,17 +33,15 @@ from wmo.simulation.ingest.vendor_observations import (
     declared_usage,
 )
 from wmo.simulation.ingest.vendor_records import (
-    VendorTraceFormatError,
     first_text,
     first_user_text,
-    flatten_records,
     json_text,
     json_value,
-    read_vendor_export,
     required_text,
-    source_timestamp,
+    source_interval,
 )
-from wmo.simulation.ingest.vendor_trace import approved_extensions, build_vendor_traces
+from wmo.simulation.ingest.vendor_source import VendorSource, record_flattener
+from wmo.simulation.ingest.vendor_trace import approved_extensions
 
 VENDOR = "langsmith"
 
@@ -62,86 +52,7 @@ _PROVIDER_KEYS = ("ls_provider", "provider")
 _ERROR_KEYS = ("error",)
 
 
-def load_langsmith_file(
-    path: Path,
-    *,
-    semantic_convention_version: str = GENAI_SEMANTIC_CONVENTION_VERSION,
-    source_id: str | None = None,
-) -> TraceNormalizationResult:
-    """Read a LangSmith run export into canonical trace evidence.
-
-    Args:
-        path: LangSmith run array, ``runs`` envelope, or JSONL export.
-        semantic_convention_version: Pinned GenAI semantic-convention version for the traces.
-        source_id: Optional durable source label. The local path is used when omitted.
-
-    Returns:
-        Canonical traces and every retained parse or validation exclusion.
-
-    Raises:
-        VendorTraceFormatError: The export cannot be read or decoded.
-    """
-    export = read_vendor_export(path, vendor=VENDOR, source_id=source_id)
-    return normalize_langsmith_payloads(
-        export.payloads,
-        source=export.source,
-        semantic_convention_version=semantic_convention_version,
-        initial_issues=export.issues,
-    )
-
-
-def normalize_langsmith_payloads(
-    payloads: Sequence[JsonValue],
-    *,
-    source: SourceIdentity,
-    semantic_convention_version: str = GENAI_SEMANTIC_CONVENTION_VERSION,
-    initial_issues: Sequence[TraceNormalizationIssue] = (),
-) -> TraceNormalizationResult:
-    """Normalize decoded LangSmith run payloads into canonical traces.
-
-    Args:
-        payloads: Decoded LangSmith documents in source order.
-        source: Immutable identity of the source bytes or transport result.
-        semantic_convention_version: Pinned GenAI semantic-convention version for the traces.
-        initial_issues: Parse exclusions collected before run mapping.
-
-    Returns:
-        Canonical traces and every retained validation exclusion.
-    """
-    issues = list(initial_issues)
-    observations: list[VendorObservation] = []
-    ordinal = 0
-    for index, payload in enumerate(payloads, start=1):
-        try:
-            runs = flatten_records(
-                payload,
-                vendor=VENDOR,
-                wrapper_keys=("runs", "data", "results", "items"),
-                record_keys=("run_type", "runType"),
-            )
-        except VendorTraceFormatError as exc:
-            issues.append(TraceNormalizationIssue(f"record-{index}", str(exc)))
-            continue
-        for run in runs:
-            try:
-                converted = _run_observation(run, ordinal)
-            except VendorTraceFormatError as exc:
-                issues.append(TraceNormalizationIssue(f"record-{index}", str(exc)))
-                continue
-            if converted is None:
-                continue
-            observations.append(converted)
-            ordinal += 1
-    return build_vendor_traces(
-        observations,
-        vendor=VENDOR,
-        source=source,
-        semantic_convention_version=semantic_convention_version,
-        initial_issues=issues,
-    )
-
-
-def _run_observation(run: JsonObject, ordinal: int) -> VendorObservation | None:
+def _run_observation(run: JsonObject, ordinal: int) -> tuple[VendorObservation, ...]:
     """Convert one LangSmith run to a declared model or tool-result observation.
 
     Args:
@@ -149,24 +60,21 @@ def _run_observation(run: JsonObject, ordinal: int) -> VendorObservation | None:
         ordinal: Source order position for the emitted observation.
 
     Returns:
-        Declared observation, or ``None`` for orchestration-only run types.
+        Declared observation, or nothing for orchestration-only run types.
 
     Raises:
         VendorTraceFormatError: The run lacks identity, timing, or tool evidence.
     """
     run_type = (first_text(run, ("run_type", "runType")) or "").casefold()
     if run_type not in _MODEL_RUN_TYPES | _TOOL_RUN_TYPES:
-        return None
+        return ()
     source_span_id = required_text(run.get("id"), "LangSmith run id")
     source_trace_id = first_text(run, ("trace_id", "traceId")) or source_span_id
-    started_at = source_timestamp(
-        run.get("start_time", run.get("startTime")), "LangSmith run start_time"
-    )
-    end_value = run.get("end_time", run.get("endTime"))
-    ended_at = (
-        source_timestamp(end_value, "LangSmith run end_time")
-        if end_value is not None
-        else started_at
+    started_at, ended_at = source_interval(
+        run.get("start_time", run.get("startTime")),
+        run.get("end_time", run.get("endTime")),
+        start_label="LangSmith run start_time",
+        end_label="LangSmith run end_time",
     )
     parent = first_text(run, ("parent_run_id", "parentRunId"))
     failure = declared_error_message(run, keys=_ERROR_KEYS, label="LangSmith run")
@@ -174,41 +82,45 @@ def _run_observation(run: JsonObject, ordinal: int) -> VendorObservation | None:
     outputs = json_value(run.get("outputs"))
     extensions = _extensions(run)
     if run_type in _TOOL_RUN_TYPES:
-        return VendorObservation(
+        return (
+            VendorObservation(
+                source_trace_id=source_trace_id,
+                source_span_id=source_span_id,
+                ordinal=ordinal,
+                started_at=started_at,
+                ended_at=ended_at,
+                kind="tool_result",
+                source_parent_span_id=parent,
+                request_text=first_user_text(inputs),
+                tool_name=required_text(run.get("name"), "LangSmith tool run name"),
+                tool_arguments=json_text(inputs),
+                tool_message=declared_completion_text(outputs),
+                failure_message=failure,
+                extensions=extensions,
+            ),
+        )
+    model, declared_model = _model_identity(run)
+    return (
+        VendorObservation(
             source_trace_id=source_trace_id,
             source_span_id=source_span_id,
             ordinal=ordinal,
             started_at=started_at,
             ended_at=ended_at,
-            kind="tool_result",
+            kind="model",
             source_parent_span_id=parent,
             request_text=first_user_text(inputs),
-            tool_name=required_text(run.get("name"), "LangSmith tool run name"),
-            tool_arguments=json_text(inputs),
-            tool_message=declared_completion_text(outputs),
+            input_messages=_input_messages(inputs),
+            completion_text=declared_completion_text(outputs) or None,
+            tool_calls=declared_tool_calls(outputs),
+            model=model,
+            usage=_usage(run, outputs),
             failure_message=failure,
+            declared_attributes=(
+                {} if declared_model is None else {"gen_ai.request.model": declared_model}
+            ),
             extensions=extensions,
-        )
-    model, declared_model = _model_identity(run)
-    return VendorObservation(
-        source_trace_id=source_trace_id,
-        source_span_id=source_span_id,
-        ordinal=ordinal,
-        started_at=started_at,
-        ended_at=ended_at,
-        kind="model",
-        source_parent_span_id=parent,
-        request_text=first_user_text(inputs),
-        input_messages=_input_messages(inputs),
-        completion_text=declared_completion_text(outputs) or None,
-        tool_calls=declared_tool_calls(outputs),
-        model=model,
-        usage=_usage(run, outputs),
-        failure_message=failure,
-        declared_attributes=(
-            {} if declared_model is None else {"gen_ai.request.model": declared_model}
         ),
-        extensions=extensions,
     )
 
 
@@ -308,3 +220,14 @@ def _extensions(run: JsonObject) -> JsonObject:
     if session_id is not None and "wmo.conversation.id" not in extensions:
         extensions["wmo.conversation.id"] = session_id
     return extensions
+
+
+LANGSMITH_SOURCE: VendorSource[JsonObject] = VendorSource(
+    vendor=VENDOR,
+    records=record_flattener(
+        vendor=VENDOR,
+        wrapper_keys=("runs", "data", "results", "items"),
+        record_keys=("run_type", "runType"),
+    ),
+    convert=_run_observation,
+)

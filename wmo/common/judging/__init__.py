@@ -89,6 +89,7 @@ __all__ = [
     "ProposedRubricDimension",
     "RawDimensionJudgment",
     "RawJudgment",
+    "judge_response_schema",
     "Rubric",
     "RubricProposal",
     "RubricProposalEvidence",
@@ -107,5 +108,4 @@ __all__ = [
     "write_router_lineage_split",
     "write_rubric_proposal_evidence",
     "verify_persisted_calibration",
-    "judge_response_schema",
 ]

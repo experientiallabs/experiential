@@ -21,12 +21,12 @@ from wmo.runtime.models.providers.openai_compatible import (
     OPENROUTER_REFERER,
     OPENROUTER_TITLE,
 )
-from wmo.runtime.models.providers.request import get_json
-from wmo.runtime.models.providers.retry import RetryPolicy
 from wmo.runtime.models.providers.transport import (
     HttpxJsonTransport,
     JsonHttpTransport,
     ProviderTransportError,
+    RetryPolicy,
+    get_json,
 )
 
 LISTING_TIMEOUT_SECONDS = 20.0
@@ -142,26 +142,17 @@ class HttpProviderModelLister:
         ]
 
     def _anthropic_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
-        """List Anthropic models, which publish an identity and a display name."""
+        """List Anthropic models, which publish only model identities."""
         base_url = _base_url(endpoint, default=ANTHROPIC_BASE_URL)
         body = self._read(
             endpoint,
             f"{base_url}/models",
             {"x-api-key": endpoint.api_key, "anthropic-version": ANTHROPIC_VERSION},
         )
-        models = []
-        for entry in _entries(endpoint.provider, body.get("data")):
-            identity = _text(entry.get("id"))
-            if identity is None:
-                continue
-            models.append(
-                DiscoveredModel(
-                    provider=endpoint.provider,
-                    model=identity,
-                    display_name=_text(entry.get("display_name")),
-                )
-            )
-        return models
+        return [
+            DiscoveredModel(provider=endpoint.provider, model=identity)
+            for identity in _identities(endpoint.provider, body.get("data"), "id")
+        ]
 
     def _openrouter_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
         """List OpenRouter models, which publish capabilities, limits, and prices."""
@@ -222,7 +213,6 @@ def _openrouter_model(provider: str, identity: str, entry: JsonObject) -> Discov
     return DiscoveredModel(
         provider=provider,
         model=identity,
-        display_name=_text(entry.get("name")),
         supports_completions=True,
         supports_tools="tools" in supported or "tool_choice" in supported,
         supports_structured_output="structured_outputs" in supported
@@ -249,7 +239,6 @@ def _gemini_model(provider: str, identity: str, entry: JsonObject) -> Discovered
     return DiscoveredModel(
         provider=provider,
         model=identity,
-        display_name=_text(entry.get("displayName")),
         supports_completions="generateContent" in supported,
         supports_embeddings="embedContent" in supported or "batchEmbedContents" in supported,
         context_window_tokens=_positive_int(entry.get("inputTokenLimit")),
