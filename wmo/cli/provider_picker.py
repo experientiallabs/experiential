@@ -10,7 +10,7 @@ screen.
 
 from __future__ import annotations
 
-from collections.abc import Callable, MutableMapping, Sequence
+from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from getpass import getpass
 
@@ -19,7 +19,7 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.cli.picker import (
     PickerAction,
-    PickerKey,
+    PickerKeyReader,
     PickerOption,
     PickerResult,
     choose_many,
@@ -217,7 +217,7 @@ def select_providers(
     console: Console,
     environment: MutableMapping[str, str],
     configured: bool = False,
-    read_key: Callable[[], PickerKey] | None = None,
+    read_key: PickerKeyReader | None = None,
 ) -> tuple[tuple[str, ...], bool] | None:
     """Show the one provider screen that opens setup.
 
@@ -276,7 +276,7 @@ def _select_provider_rows(
     *,
     options: Sequence[PickerOption],
     preselected: Sequence[str],
-    read_key: Callable[[], PickerKey] | None,
+    read_key: PickerKeyReader | None,
 ) -> PickerResult:
     """Show the provider multi-select screen for this console.
 

@@ -176,6 +176,62 @@ def test_a_narrow_terminal_splits_the_keyboard_hint() -> None:
     assert "roles: judge; pricing: api" in output
 
 
+def test_an_open_search_shows_the_query_and_swaps_the_hint() -> None:
+    """An open search draws its query with a caret and explains the search bindings."""
+    console = _terminal()
+
+    with picker_view(console, title="Models", mode=PickerMode.SINGLE) as view:
+        view.show(_rows(2), focus=0, query="gpt", searching=True)
+
+    output = _output(console)
+    assert "Search: gpt_" in output
+    assert "Enter confirms the focused match" in output
+    assert "Enter confirms the focused row" not in output
+
+
+def test_a_retained_filter_is_shown_with_the_normal_hint() -> None:
+    """A closed search keeps its filter visible while the normal keyboard hint returns."""
+    console = _terminal()
+
+    with picker_view(console, title="Models", mode=PickerMode.MULTIPLE) as view:
+        view.show(_rows(2), focus=0, query="gpt")
+
+    output = _output(console)
+    assert "Filter: gpt" in output
+    assert "Search: " not in output
+    assert "/ searches" in output
+
+
+def test_a_searching_narrow_terminal_splits_the_search_hint() -> None:
+    """A narrow terminal keeps the search bindings readable across two lines."""
+    console = _terminal(width=40)
+
+    with picker_view(console, title="Models", mode=PickerMode.MULTIPLE) as view:
+        view.show(_rows(1), focus=0, query="gpt", searching=True)
+
+    output = _output(console)
+    assert "Type to search. Backspace edits." in output
+    assert "Enter keeps the matches, Esc clears." in output
+
+
+def test_a_search_frame_still_fits_a_short_terminal(
+    rendered_screen: Callable[[str], tuple[str, ...]],
+) -> None:
+    """The search line costs one row, and a long match list still fits the terminal.
+
+    Args:
+        rendered_screen: Replay of terminal output into the visible screen.
+    """
+    console = _terminal(height=14)
+
+    with picker_view(console, title="Models", mode=PickerMode.SINGLE) as view:
+        view.show(_rows(40), focus=0, query="model", searching=True)
+
+    screen = rendered_screen(_output(console))
+    assert "Search: model_" in "\n".join(screen)
+    assert len(screen) <= 14, screen
+
+
 def test_a_status_message_appears_with_the_frame_that_explains_it() -> None:
     """A refused submission explains itself inside the same region."""
     console = _terminal()

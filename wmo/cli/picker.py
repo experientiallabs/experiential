@@ -3,9 +3,10 @@
 Every provider, model, role, and candidate screen is keyboard driven on a real terminal: Up and
 Down move focus inside one region redrawn in place by ``wmo.cli.picker_view``, Space or Enter
 toggles a row on a multi-select screen whose Complete row submits, and Enter confirms the focused
-row on a single-select screen. A console without a terminal cannot be driven by raw keys, so the
-same screens fall back to the line-based path, which reads whole lines and accepts numbers, ranges,
-filter text, and back or cancel words.
+row on a single-select screen. Slash opens a search line that narrows long lists as the user
+types: Backspace edits the query, Enter keeps the matches, and Esc clears the search. A console
+without a terminal cannot be driven by raw keys, so the same screens fall back to the line-based
+path, which reads whole lines and accepts numbers, ranges, filter text, and back or cancel words.
 """
 
 from __future__ import annotations
@@ -51,7 +52,27 @@ class PickerKey(StrEnum):
     SPACE = "space"
     BACK = "back"
     CANCEL = "cancel"
+    SEARCH = "search"
+    BACKSPACE = "backspace"
+    ESCAPE = "escape"
+    TEXT = "text"
     IGNORE = "ignore"
+
+
+@dataclass(frozen=True)
+class PickerEvent:
+    """One decoded keyboard event, carrying its character when one was typed.
+
+    Attributes:
+        key: Decoded key for navigation handling.
+        text: The printable character behind the key, kept so search mode can append it.
+    """
+
+    key: PickerKey
+    text: str = ""
+
+
+type PickerKeyReader = Callable[[], PickerKey | PickerEvent]
 
 
 @dataclass(frozen=True)
@@ -277,47 +298,84 @@ def uses_keyboard_list(console: Console) -> bool:
     return console.is_terminal and _stdin_is_tty()
 
 
-def interpret_key_bytes(data: bytes) -> PickerKey:
-    """Map one raw terminal key sequence to a picker action.
+def interpret_key_bytes(data: bytes) -> PickerEvent:
+    """Map one raw terminal key sequence to a picker event.
+
+    Printable characters keep their text so search mode can append them; their navigation
+    meaning outside search mode is resolved by the screen loop.
 
     Args:
         data: Bytes read from the terminal for a single key press.
 
     Returns:
-        The decoded action, or ``IGNORE`` for an unrecognized sequence.
+        The decoded event, or an ``IGNORE`` event for an unrecognized sequence.
     """
     if data in {b"\r", b"\n"}:
-        return PickerKey.ENTER
+        return PickerEvent(PickerKey.ENTER)
     if data == b" ":
-        return PickerKey.SPACE
-    if data in {b"b", b"B"}:
-        return PickerKey.BACK
-    if data in {b"q", b"Q", b"\x03"}:
-        return PickerKey.CANCEL
+        return PickerEvent(PickerKey.SPACE, " ")
+    if data in {b"\x7f", b"\x08"}:
+        return PickerEvent(PickerKey.BACKSPACE)
+    if data == b"\x03":
+        return PickerEvent(PickerKey.CANCEL)
     if data in {b"\x1b", b"\x1b\x1b"}:
-        return PickerKey.CANCEL
+        return PickerEvent(PickerKey.ESCAPE)
     if data in {b"\x1b[A", b"\x1bOA"}:
-        return PickerKey.UP
+        return PickerEvent(PickerKey.UP)
     if data in {b"\x1b[B", b"\x1bOB"}:
-        return PickerKey.DOWN
+        return PickerEvent(PickerKey.DOWN)
+    try:
+        text = data.decode()
+    except UnicodeDecodeError:
+        return PickerEvent(PickerKey.IGNORE)
+    if len(text) == 1 and text.isprintable():
+        return PickerEvent(PickerKey.TEXT, text)
+    return PickerEvent(PickerKey.IGNORE)
+
+
+def _navigation_key(event: PickerEvent) -> PickerKey:
+    """Resolve one event to its meaning outside search mode.
+
+    Args:
+        event: Decoded keyboard event.
+
+    Returns:
+        The navigation key the event stands for, or ``IGNORE`` for unbound text.
+    """
+    if event.key is PickerKey.ESCAPE:
+        return PickerKey.CANCEL
+    if event.key is not PickerKey.TEXT:
+        return event.key
+    lowered = event.text.casefold()
+    if lowered == "b":
+        return PickerKey.BACK
+    if lowered == "q":
+        return PickerKey.CANCEL
+    if event.text == "/":
+        return PickerKey.SEARCH
     return PickerKey.IGNORE
 
 
-def _read_terminal_key_from_fd(fd: int) -> PickerKey:
+def _event(raw: PickerKey | PickerEvent) -> PickerEvent:
+    """Normalize an injected bare key into a full event."""
+    return raw if isinstance(raw, PickerEvent) else PickerEvent(raw)
+
+
+def _read_terminal_key_from_fd(fd: int) -> PickerEvent:
     """Read one key sequence without passing through a buffered text stream.
 
     Args:
         fd: Raw terminal file descriptor already configured for immediate input.
 
     Returns:
-        The decoded picker action for the next key press.
+        The decoded picker event for the next key press.
     """
     first = os.read(fd, 1)
     if first != b"\x1b":
         return interpret_key_bytes(first)
     readable, _, _ = select.select([fd], [], [], 0.05)
     if not readable:
-        return PickerKey.CANCEL
+        return PickerEvent(PickerKey.ESCAPE)
     rest = os.read(fd, 1)
     if rest in {b"[", b"O"}:
         extra_ready, _, _ = select.select([fd], [], [], 0.05)
@@ -328,8 +386,8 @@ def _read_terminal_key_from_fd(fd: int) -> PickerKey:
 
 @contextmanager
 def _terminal_key_reader(
-    read_key: Callable[[], PickerKey] | None,
-) -> Iterator[Callable[[], PickerKey]]:
+    read_key: PickerKeyReader | None,
+) -> Iterator[PickerKeyReader]:
     """Yield a scripted reader or hold the controlling terminal in raw input mode.
 
     Args:
@@ -360,12 +418,13 @@ def select_many_list(
     options: Sequence[PickerOption],
     preselected: Sequence[str] = (),
     minimum: int = 1,
-    read_key: Callable[[], PickerKey] | None = None,
+    read_key: PickerKeyReader | None = None,
 ) -> PickerResult:
     """Choose several rows from a keyboard-driven list with a Complete action.
 
     Up and Down move focus. Space or Enter selects or deselects the focused option. Either key on
-    the Complete row submits the current selection.
+    the Complete row submits the current selection. Slash opens a search line that narrows the
+    rows as the user types; selections on rows hidden by the search are kept.
 
     Args:
         console: Terminal used for the list.
@@ -386,20 +445,39 @@ def select_many_list(
     values = {option.value for option in options}
     selected = [value for value in preselected if value in values]
     focus = 0
-    complete_index = len(options)
     status = ""
+    query = ""
+    searching = False
     with (
         _terminal_key_reader(read_key) as reader,
         picker_view(console, title=title, mode=PickerMode.MULTIPLE) as view,
     ):
         while True:
+            visible = _filtered(options, query)
+            complete_index = len(visible)
+            focus = min(focus, complete_index)
             view.show(
-                _multi_rows(options, selected=selected),
+                _multi_rows(visible, selected=selected),
                 focus=focus,
-                status=status,
+                status=_frame_status(status, query=query, matches=complete_index),
+                query=query,
+                searching=searching,
             )
-            key = reader()
+            event = _event(reader())
             status = ""
+            if searching:
+                edit = _search_edit(event, query=query, count=complete_index + 1, focus=focus)
+                if edit.cancelled:
+                    return PickerResult(action=PickerAction.CANCEL)
+                query, searching, focus = edit.query, edit.searching, edit.focus
+                continue
+            key = _navigation_key(event)
+            if key is PickerKey.SEARCH:
+                searching = True
+                continue
+            if key is PickerKey.BACKSPACE and query:
+                query, searching = query[:-1], True
+                continue
             if key is PickerKey.BACK:
                 return PickerResult(action=PickerAction.BACK)
             if key is PickerKey.CANCEL:
@@ -414,7 +492,7 @@ def select_many_list(
                     return PickerResult(values=tuple(selected))
                 status = f"Select at least {minimum}."
                 continue
-            value = options[focus].value
+            value = visible[focus].value
             if value in selected:
                 selected.remove(value)
             else:
@@ -427,12 +505,13 @@ def select_one_list(
     title: str,
     options: Sequence[PickerOption],
     default: str | None = None,
-    read_key: Callable[[], PickerKey] | None = None,
+    read_key: PickerKeyReader | None = None,
 ) -> PickerResult:
     """Choose exactly one row from a keyboard-driven list.
 
     Up and Down move focus, and Enter confirms the focused row immediately. A prior answer starts
-    focused so the same key confirms it again.
+    focused so the same key confirms it again. Slash opens a search line that narrows the rows as
+    the user types, and Enter while searching confirms the focused match.
 
     Args:
         console: Terminal used for the list.
@@ -453,23 +532,48 @@ def select_one_list(
         (index for index, option in enumerate(options) if option.value == default),
         0,
     )
-    rows = tuple(PickerRow(label=option.label, detail=option.detail) for option in options)
+    query = ""
+    searching = False
     with (
         _terminal_key_reader(read_key) as reader,
         picker_view(console, title=title, mode=PickerMode.SINGLE) as view,
     ):
         while True:
-            view.show(rows, focus=focus)
-            key = reader()
+            visible = _filtered(options, query)
+            focus = min(focus, max(len(visible) - 1, 0))
+            rows = tuple(PickerRow(label=option.label, detail=option.detail) for option in visible)
+            view.show(
+                rows,
+                focus=focus,
+                status=_frame_status("", query=query, matches=len(visible)),
+                query=query,
+                searching=searching,
+            )
+            event = _event(reader())
+            if searching:
+                if event.key is PickerKey.ENTER and visible:
+                    return PickerResult(values=(visible[focus].value,))
+                edit = _search_edit(event, query=query, count=max(len(visible), 1), focus=focus)
+                if edit.cancelled:
+                    return PickerResult(action=PickerAction.CANCEL)
+                query, searching, focus = edit.query, edit.searching, edit.focus
+                continue
+            key = _navigation_key(event)
+            if key is PickerKey.SEARCH:
+                searching = True
+                continue
+            if key is PickerKey.BACKSPACE and query:
+                query, searching = query[:-1], True
+                continue
             if key is PickerKey.BACK:
                 return PickerResult(action=PickerAction.BACK)
             if key is PickerKey.CANCEL:
                 return PickerResult(action=PickerAction.CANCEL)
             if key in (PickerKey.UP, PickerKey.DOWN):
-                focus = _moved(focus, key=key, count=len(options))
+                focus = _moved(focus, key=key, count=max(len(visible), 1))
                 continue
-            if key in (PickerKey.ENTER, PickerKey.SPACE):
-                return PickerResult(values=(options[focus].value,))
+            if key in (PickerKey.ENTER, PickerKey.SPACE) and visible:
+                return PickerResult(values=(visible[focus].value,))
 
 
 def choose_many(
@@ -479,7 +583,7 @@ def choose_many(
     options: Sequence[PickerOption],
     preselected: Sequence[str] = (),
     minimum: int = 1,
-    read_key: Callable[[], PickerKey] | None = None,
+    read_key: PickerKeyReader | None = None,
 ) -> PickerResult:
     """Collect several values from the keyboard list, or from typed lines without a terminal.
 
@@ -518,7 +622,7 @@ def choose_one(
     title: str,
     options: Sequence[PickerOption],
     default: str | None = None,
-    read_key: Callable[[], PickerKey] | None = None,
+    read_key: PickerKeyReader | None = None,
 ) -> PickerResult:
     """Collect one value from the keyboard list, or from typed lines without a terminal.
 
@@ -564,6 +668,75 @@ def _multi_rows(
     ]
     rows.append(PickerRow(label=_COMPLETE_LABEL, action=True))
     return tuple(rows)
+
+
+@dataclass(frozen=True)
+class _SearchEdit:
+    """The search state after one keyboard event handled in search mode.
+
+    Attributes:
+        query: Search text after the event.
+        searching: Whether the search line is still open.
+        focus: Focus index after the event.
+        cancelled: Whether the event cancelled the whole screen.
+    """
+
+    query: str
+    searching: bool
+    focus: int
+    cancelled: bool = False
+
+
+def _search_edit(event: PickerEvent, *, query: str, count: int, focus: int) -> _SearchEdit:
+    """Apply one keyboard event to an open search line.
+
+    Typed characters extend the query and reset focus to the first match, Backspace edits the
+    query and closes an already-empty search, Enter closes the search keeping its matches, Esc
+    clears the search, and Up or Down keep moving focus through the matches.
+
+    Args:
+        event: Decoded keyboard event.
+        query: Current search text.
+        count: Number of focusable rows currently visible.
+        focus: Current focus index.
+
+    Returns:
+        The search state after the event.
+    """
+    if event.key is PickerKey.CANCEL:
+        return _SearchEdit(query=query, searching=True, focus=focus, cancelled=True)
+    if event.key is PickerKey.ESCAPE:
+        return _SearchEdit(query="", searching=False, focus=0)
+    if event.key is PickerKey.ENTER:
+        return _SearchEdit(query=query, searching=False, focus=focus)
+    if event.key is PickerKey.BACKSPACE:
+        if query:
+            return _SearchEdit(query=query[:-1], searching=True, focus=0)
+        return _SearchEdit(query="", searching=False, focus=focus)
+    if event.key in (PickerKey.UP, PickerKey.DOWN):
+        moved = _moved(focus, key=event.key, count=count)
+        return _SearchEdit(query=query, searching=True, focus=moved)
+    if event.text:
+        return _SearchEdit(query=query + event.text, searching=True, focus=0)
+    return _SearchEdit(query=query, searching=True, focus=focus)
+
+
+def _frame_status(status: str, *, query: str, matches: int) -> str:
+    """Return the status line for one frame, explaining a search without matches.
+
+    Args:
+        status: Transient status from the last key, kept when present.
+        query: Current search text.
+        matches: Number of rows the search left visible.
+
+    Returns:
+        The status to show under the rows.
+    """
+    if status:
+        return status
+    if query and matches == 0:
+        return f"No row matches {query!r}."
+    return status
 
 
 def _moved(focus: int, *, key: PickerKey, count: int) -> int:

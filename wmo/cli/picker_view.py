@@ -1,10 +1,12 @@
 """One reactive terminal region shared by every keyboard-driven picker screen.
 
-A keyboard picker owns no output of its own: it hands the current rows, focus, and status to this
-view, which redraws a single region in place through one rich ``Live``. Long lists scroll around
-the focused row so the region never outgrows the terminal, and narrow terminals split the keyboard
-hint onto separate lines. A console that cannot be redrawn in place, such as a pipe or a dumb
-terminal, prints each frame instead, which keeps scripted and piped sessions readable.
+A keyboard picker owns no output of its own: it hands the current rows, focus, status, and search
+state to this view, which redraws a single region in place through one rich ``Live``. An open
+search shows its query under the heading and swaps the keyboard hint for the search bindings.
+Long lists scroll around the focused row so the region never outgrows the terminal, and narrow
+terminals split the keyboard hint onto separate lines. A console that cannot be redrawn in place,
+such as a pipe or a dumb terminal, prints each frame instead, which keeps scripted and piped
+sessions readable.
 """
 
 from __future__ import annotations
@@ -26,16 +28,33 @@ _DETAIL_INDENT = "      "
 
 _MULTI_HINT = (
     "Up/Down moves focus, Space or Enter selects or deselects, Complete submits, "
-    "b goes back, q cancels."
+    "/ searches, b goes back, q cancels."
 )
 _MULTI_NARROW_HINTS = (
     "Up/Down moves focus. Space or Enter selects or deselects.",
-    "Activate Complete to submit. b goes back, q cancels.",
+    "Activate Complete to submit.",
+    "/ searches. b goes back, q cancels.",
 )
-_SINGLE_HINT = "Up/Down moves focus, Enter confirms the focused row, b goes back, q cancels."
+_SINGLE_HINT = (
+    "Up/Down moves focus, Enter confirms the focused row, / searches, b goes back, q cancels."
+)
 _SINGLE_NARROW_HINTS = (
     "Up/Down moves focus. Enter confirms the focused row.",
-    "b goes back, q cancels.",
+    "/ searches. b goes back, q cancels.",
+)
+_MULTI_SEARCH_HINT = (
+    "Type to search. Backspace edits, Enter keeps the matches, Esc clears the search."
+)
+_MULTI_SEARCH_NARROW_HINTS = (
+    "Type to search. Backspace edits.",
+    "Enter keeps the matches, Esc clears.",
+)
+_SINGLE_SEARCH_HINT = (
+    "Type to search. Backspace edits, Enter confirms the focused match, Esc clears the search."
+)
+_SINGLE_SEARCH_NARROW_HINTS = (
+    "Type to search. Backspace edits.",
+    "Enter confirms the focused match, Esc clears.",
 )
 
 
@@ -98,15 +117,25 @@ class PickerView:
         if self._live is not None:
             self._live.stop()
 
-    def show(self, rows: Sequence[PickerRow], *, focus: int, status: str = "") -> None:
+    def show(
+        self,
+        rows: Sequence[PickerRow],
+        *,
+        focus: int,
+        status: str = "",
+        query: str = "",
+        searching: bool = False,
+    ) -> None:
         """Replace the region with the current state of the screen.
 
         Args:
             rows: Every row of the screen, in presentation order.
             focus: Index of the focused row.
             status: Optional message explaining why the last key changed nothing.
+            query: Search text currently narrowing the rows.
+            searching: Whether the search line is open for typing.
         """
-        frame = self._frame(rows, focus=focus, status=status)
+        frame = self._frame(rows, focus=focus, status=status, query=query, searching=searching)
         if self._live is None:
             self._console.print(frame)
             return
@@ -118,6 +147,8 @@ class PickerView:
         *,
         focus: int,
         status: str,
+        query: str,
+        searching: bool,
     ) -> RenderableType:
         """Build the complete renderable for one moment of the screen.
 
@@ -125,15 +156,21 @@ class PickerView:
             rows: Every row of the screen, in presentation order.
             focus: Index of the focused row.
             status: Optional message shown under the rows.
+            query: Search text currently narrowing the rows.
+            searching: Whether the search line is open for typing.
 
         Returns:
             The heading, the visible window of rows, and the keyboard hint as one renderable.
         """
         lines: list[Text] = [Text(self._title, style="bold")]
+        if searching:
+            lines.append(Text(f"Search: {query}_", style="cyan"))
+        elif query:
+            lines.append(Text(f"Filter: {query}", style="dim"))
         first, last = _window(
             count=len(rows),
             focus=focus,
-            capacity=self._capacity(rows),
+            capacity=self._capacity(rows, searching=searching, query=query),
         )
         if first > 0:
             lines.append(Text(f"{_ROW_INDENT}... {first} more above", style="dim"))
@@ -144,7 +181,7 @@ class PickerView:
             lines.append(Text(f"{_ROW_INDENT}... {hidden_below} more below", style="dim"))
         if status:
             lines.append(Text(status, style="yellow"))
-        lines.extend(Text(hint, style="dim") for hint in self._hints())
+        lines.extend(Text(hint, style="dim") for hint in self._hints(searching=searching))
         return Group(*lines)
 
     def _row_lines(self, row: PickerRow, *, focused: bool) -> tuple[Text, ...]:
@@ -164,23 +201,38 @@ class PickerView:
             return (label,)
         return (label, Text(f"{_DETAIL_INDENT}{row.detail}", style="dim"))
 
-    def _capacity(self, rows: Sequence[PickerRow]) -> int:
+    def _capacity(self, rows: Sequence[PickerRow], *, searching: bool, query: str) -> int:
         """Return how many rows fit in the region on this terminal.
 
         Args:
             rows: Every row of the screen, used to detect metadata lines.
+            searching: Whether the search line is open for typing.
+            query: Search text currently narrowing the rows.
 
         Returns:
             The largest row count that keeps the region inside the terminal height.
         """
         height = self._console.size.height
         cost = 2 if any(row.detail for row in rows) else 1
-        reserved = _RESERVED_LINES + len(self._hints())
+        reserved = _RESERVED_LINES + len(self._hints(searching=searching))
+        if searching or query:
+            reserved += 1
         return max(_MINIMUM_VISIBLE_ROWS, (height - reserved) // cost)
 
-    def _hints(self) -> tuple[str, ...]:
-        """Return the keyboard hint lines for this screen and terminal width."""
+    def _hints(self, *, searching: bool = False) -> tuple[str, ...]:
+        """Return the keyboard hint lines for this screen, search state, and terminal width.
+
+        Args:
+            searching: Whether the search line is open for typing.
+
+        Returns:
+            The hint lines to print under the rows.
+        """
         narrow = (self._console.width or 80) < _NARROW_WIDTH
+        if searching:
+            if self._mode is PickerMode.SINGLE:
+                return _SINGLE_SEARCH_NARROW_HINTS if narrow else (_SINGLE_SEARCH_HINT,)
+            return _MULTI_SEARCH_NARROW_HINTS if narrow else (_MULTI_SEARCH_HINT,)
         if self._mode is PickerMode.SINGLE:
             return _SINGLE_NARROW_HINTS if narrow else (_SINGLE_HINT,)
         return _MULTI_NARROW_HINTS if narrow else (_MULTI_HINT,)
