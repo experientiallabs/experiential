@@ -15,14 +15,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - name: Install the project and its dev extras
-        run: uv sync --extra dev
+      - name: Install the project and its test extras
+        run: uv sync --extra test
       - name: ruff check
         run: uv run ruff check .
       - name: ruff format
         run: uv run ruff format --check .
+      # The optional sft extra (tinker/torch) is not installed on CI, so the
+      # modules that import it are type-checked locally via `uv sync --extra dev`.
       - name: ty check
-        run: uv run ty check
+        run: >-
+          uv run ty check
+          --exclude "wmo/optimize/model/sft/tinker.py"
+          --exclude "wmo/optimize/model/sft/tinker_test.py"
+          --exclude "wmo/runtime/models/providers/tinker_sampling.py"
       - name: non-live foundation tests
         run: >-
           uv run pytest -n 4 --dist worksteal -q -k "not live"
@@ -41,8 +47,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - name: Install the project and its dev extras
-        run: uv sync --extra dev
+      - name: Install the project and its test extras
+        run: uv sync --extra test
       - name: non-live optimize tests
         run: >-
           uv run pytest -n 4 --dist worksteal -q -k "not live"
@@ -54,8 +60,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - name: Install the project and its dev extras
-        run: uv sync --extra dev
+      - name: Install the project and its test extras
+        run: uv sync --extra test
       - name: non-live simulation tests
         run: >-
           uv run pytest -n 4 --dist worksteal -q -k "not live"
@@ -67,8 +73,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - name: Install the project and its dev extras
-        run: uv sync --extra dev
+      - name: Install the project and its test extras
+        run: uv sync --extra test
       - name: Installed-wheel no-spend release evidence
         run: >-
           uv run pytest -q
@@ -79,8 +85,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - name: Install the project and its dev extras
-        run: uv sync --extra dev
+      - name: Install the project and its test extras
+        run: uv sync --extra test
       - name: W16 router and bounded local-process evidence
         env:
           WMO_RELEASE_REVISION: ${{ github.sha }}

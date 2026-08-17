@@ -2624,6 +2624,12 @@ sft = [
     { name = "tinker" },
     { name = "tinker-cookbook" },
 ]
+test = [
+    { name = "pytest" },
+    { name = "pytest-xdist" },
+    { name = "ruff" },
+    { name = "ty" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -2637,19 +2643,20 @@ requires-dist = [
     { name = "openai", specifier = ">=3.0,<4" },
     { name = "posthog", specifier = ">=7.0" },
     { name = "pydantic", specifier = ">=2.6" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.8" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },
+    { name = "pytest-xdist", marker = "extra == 'test'", specifier = ">=3.8" },
     { name = "rich", specifier = ">=14.1" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
+    { name = "ruff", marker = "extra == 'test'", specifier = ">=0.5" },
     { name = "tinker", marker = "extra == 'sft'", specifier = ">=0.23,<0.24" },
     { name = "tinker-cookbook", marker = "extra == 'sft'", specifier = ">=0.4.3,<0.5" },
     { name = "tomli-w", specifier = ">=1.0" },
-    { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a1" },
+    { name = "ty", marker = "extra == 'test'", specifier = ">=0.0.1a1" },
     { name = "typer", specifier = ">=0.16" },
     { name = "uvicorn", specifier = ">=0.38" },
     { name = "world-model-optimizer", extras = ["sft"], marker = "extra == 'dev'" },
+    { name = "world-model-optimizer", extras = ["test"], marker = "extra == 'dev'" },
 ]
-provides-extras = ["sft", "dev"]
+provides-extras = ["sft", "test", "dev"]
 
 [[package]]
 name = "xxhash"

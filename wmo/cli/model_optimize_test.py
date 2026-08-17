@@ -1047,7 +1047,7 @@ def test_connection_drift_after_consent_fails_before_credential_or_sdk(
         tmp_path: Pytest-owned project directory.
         monkeypatch: Scoped consent, credential, and SDK constructor replacements.
     """
-    import tinker
+    tinker = pytest.importorskip("tinker")
 
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
     command = importlib.import_module("wmo.cli.model_optimize")
@@ -1356,7 +1356,7 @@ def test_tinker_backend_uses_the_selected_credential_environment(
         tmp_path: Pytest-owned project directory.
         monkeypatch: Scoped environment and SDK constructor replacements.
     """
-    import tinker
+    tinker = pytest.importorskip("tinker")
 
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
     command = importlib.import_module("wmo.cli.model_optimize")

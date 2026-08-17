@@ -28,11 +28,15 @@ dependencies = [
 [project.optional-dependencies]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
 sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
-dev = [
+# Lint, type-check, and test tooling without the heavy sft stack; CI installs this extra.
+test = [
     "pytest>=8.0",
     "pytest-xdist>=3.8",
     "ruff>=0.5",
     "ty>=0.0.1a1",
+]
+dev = [
+    "world-model-optimizer[test]",
     "world-model-optimizer[sft]",
 ]
 
@@ -81,3 +85,11 @@ convention = "google"
 "**/*_test.py" = ["D"]
 [tool.ty.environment]
 python-version = "3.12"
+
+[[tool.ty.overrides]]
+# The Tinker SDK ships in the optional sft extra; this command guards its lazy import at
+# runtime, so an absent module is a supported configuration rather than a type error.
+include = ["wmo/cli/model_optimize.py"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
