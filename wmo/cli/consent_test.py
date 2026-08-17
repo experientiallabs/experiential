@@ -82,6 +82,25 @@ def test_a_terminal_is_asked_and_a_yes_consents(
     assert len(answer.asked) == 1
 
 
+def test_a_caller_can_name_the_spend_question(
+    monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
+) -> None:
+    """A paid workflow can replace the generic prompt with its named operation."""
+    answer = _Answer(True)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, _buffer = _console(terminal=True)
+
+    assert require_spend_consent(
+        console,
+        yes=False,
+        spend="at most $1.00",
+        command="wmo config judge calibrate",
+        question="Run this named judge calibration within the displayed ceiling?",
+    )
+
+    assert answer.asked == ["\nRun this named judge calibration within the displayed ceiling?"]
+
+
 def test_no_terminal_and_no_yes_refuses_naming_the_spend_and_the_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

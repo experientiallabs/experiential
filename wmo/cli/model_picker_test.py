@@ -28,6 +28,7 @@ from wmo.common.models import (
     PricingSource,
     ProviderConnection,
     ProviderModelSelection,
+    SetupRole,
     resolve_discovered_model,
 )
 
@@ -272,6 +273,66 @@ def test_configured_catalog_entries_become_selectable_rows() -> None:
     assert rows[0].provider == "openai"
 
 
+def test_unverified_configured_alias_retains_only_its_exact_prior_role() -> None:
+    """Unknown metadata permits retention but not reassignment to a different role."""
+    record = ModelRecord(connection="tinker", model="tinker://sampling/run")
+    rows = configured_models(
+        {"legacy": record},
+        connection_providers={"tinker": "tinker"},
+        retainable_roles={"legacy": frozenset({SetupRole.WORLD_MODEL})},
+    )
+
+    assert len(rows) == 1
+    assert rows[0].capabilities is None
+    assert rows[0].retainable_roles == frozenset({SetupRole.WORLD_MODEL})
+    assert "retain only: world_model" in rows[0].detail()
+    console = ScriptedConsole("\nlegacy\n1\n\n")
+    roles = assign_roles(
+        (*rows, _CHAT, _EMBEDDER),
+        role_inputs=SetupRoleInputs(
+            world_model="legacy",
+            judge="legacy",
+            embedder="embedder",
+        ),
+        console=console,
+    )
+
+    assert roles is not None
+    assert roles.world_model == "legacy"
+    assert roles.judge == "luna"
+    assert roles.embedder == "embedder"
+    assert "No row matches 'legacy'" in console.output
+
+
+def test_unverified_router_candidates_and_incumbent_can_be_retained() -> None:
+    """Exact prior candidate bindings remain selectable without claiming compatibility."""
+    records = {
+        "legacy-a": ModelRecord(connection="tinker", model="tinker://sampling/a"),
+        "legacy-b": ModelRecord(connection="tinker", model="tinker://sampling/b"),
+    }
+    retained = frozenset({SetupRole.ROUTER_CANDIDATE})
+    rows = configured_models(
+        records,
+        connection_providers={"tinker": "tinker"},
+        retainable_roles={"legacy-a": retained, "legacy-b": retained},
+    )
+    roles = assign_roles(
+        (*rows, _CHAT, _EMBEDDER),
+        role_inputs=SetupRoleInputs(
+            world_model="luna",
+            judge="luna",
+            embedder="embedder",
+            candidates=("legacy-a", "legacy-b"),
+            incumbent="legacy-a",
+        ),
+        console=ScriptedConsole("\n\n\n\n\n"),
+    )
+
+    assert roles is not None
+    assert roles.candidates == ("legacy-a", "legacy-b")
+    assert roles.incumbent == "legacy-a"
+
+
 def test_manual_declaration_stays_behind_the_advanced_row() -> None:
     """A hand-declared model is only reachable from the explicit advanced row."""
     session = _session(_CHAT, advanced_models=True)
@@ -284,6 +345,7 @@ def test_manual_declaration_stays_behind_the_advanced_row() -> None:
     declared = session.manual[0]
     assert declared.alias == "private-model"
     assert declared.pricing_source is PricingSource.CONFIGURED
+    assert declared.capabilities is not None
     assert declared.capabilities.supports_tools
     assert declared.capabilities.input_cost_per_million_tokens_usd == 2.0
 

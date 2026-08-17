@@ -2,13 +2,60 @@
 
 from __future__ import annotations
 
+import io
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from click import unstyle
+from rich.console import Console
+from rich.text import Text
 from typer.testing import CliRunner
 
+from wmo.cli import judge_config as judge_config_module
 from wmo.cli.app import app
+from wmo.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
+from wmo.common.judging import Rubric
+from wmo.common.models import ModelSnapshot
+from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from wmo.optimize.router.judging.contracts import (
+    JudgeCalibrationBudget,
+    JudgeTracePreview,
+    ManualJudgeLabel,
+    ManualJudgeSetupArtifact,
+)
+from wmo.optimize.router.judging.service import (
+    ManualJudgeCalibrationPlan,
+    ManualJudgeSetupPlan,
+    default_judge_dimensions,
+)
+
+
+class _PairwiseAnswer:
+    """Return candidate B while retaining the exact human-facing prompt."""
+
+    prompt = ""
+
+    @classmethod
+    def ask(cls, prompt: str, *, choices: list[str]) -> str:
+        """Record one prompt and require plain A, B, and tie choices."""
+        cls.prompt = prompt
+        assert choices == ["A", "B", "tie"]
+        return "B"
+
+
+class _ScalarAnswer:
+    """Return score four while retaining the exact human-facing prompt."""
+
+    prompt = ""
+
+    @classmethod
+    def ask(cls, prompt: str) -> int:
+        """Record one prompt and return a valid scalar score."""
+        cls.prompt = prompt
+        return 4
 
 
 @pytest.mark.parametrize(
@@ -63,3 +110,309 @@ def test_judge_commands_render_as_nested_config_commands() -> None:
     assert "--approve" in setup_output
     assert "--yes" in calibrate_output
     assert "--approve" in calibrate_output
+
+
+def test_setup_output_is_plain_language_and_hides_execution_internals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default setup shows identity, full anchors, and tasks without prompt machinery."""
+    buffer = io.StringIO()
+    monkeypatch.setattr(
+        judge_config_module,
+        "_console",
+        Console(file=buffer, width=42, color_system=None),
+    )
+    plan = cast(
+        ManualJudgeSetupPlan,
+        SimpleNamespace(
+            judge_alias="review-judge",
+            judge_model=_model(),
+            prompt_template=SimpleNamespace(response_shape="scalar"),
+            dimensions=default_judge_dimensions(),
+            previews=(
+                SimpleNamespace(task="Summarize the customer issue.", outcome="success"),
+                SimpleNamespace(task="Find the failed command.", outcome="failure"),
+            ),
+        ),
+    )
+
+    judge_config_module._render_setup(plan)
+
+    output = buffer.getvalue()
+    assert "Judge name: review-judge" in output
+    assert "Exact model: openai/judge-model" in output
+    assert "Task success" in output
+    assert "0: The agent did not address the task." in output
+    assert "5: The agent fully and correctly" in output
+    assert "Summarize the customer issue." in output
+    assert "Find the failed command." in output
+    assert "Prompt:" not in output
+    assert "Variable mapping" not in output
+    assert "response schema" not in output.lower()
+    assert "Score projection" not in output
+    assert "0000000000000000" not in output
+
+
+def test_spend_preflight_preserves_a_small_positive_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A small admitted estimate and ceiling never display as zero."""
+    buffer = io.StringIO()
+    monkeypatch.setattr(
+        judge_config_module,
+        "_console",
+        Console(file=buffer, width=80, color_system=None),
+    )
+    plan = cast(
+        ManualJudgeCalibrationPlan,
+        SimpleNamespace(setup=SimpleNamespace(judge_alias="judge", judge_model=_model())),
+    )
+    budget = JudgeCalibrationBudget(
+        input_usd_per_million_tokens=0,
+        output_usd_per_million_tokens=0,
+        maximum_input_tokens_per_call=1,
+        maximum_attempts_per_call=1,
+        call_count=1,
+        estimated_cost_usd=0.000049,
+        maximum_cost_usd=0.000049,
+    )
+
+    judge_config_module._render_spend_preflight(plan, budget)
+
+    output = buffer.getvalue()
+    assert "Maximum estimated cost: $0.000049" in output
+    assert "Hard spend ceiling: $0.000049" in output
+    assert "$0.0000\n" not in output
+
+
+def test_pairwise_calibration_renders_roles_and_truthful_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A/B review separates task, assistant, tools, result, and terminal failure."""
+    buffer = io.StringIO()
+    monkeypatch.setattr(
+        judge_config_module,
+        "_console",
+        Console(file=buffer, width=36, color_system=None),
+    )
+    first = _trace("trace-a", completion="A" * 80, failed=True)
+    second = _trace("trace-b", completion="Candidate B finished.", failed=False)
+    plan = cast(
+        ManualJudgeCalibrationPlan,
+        SimpleNamespace(
+            setup=SimpleNamespace(prompt_template=SimpleNamespace(response_shape="pairwise")),
+            traces=(first,),
+            reference_traces=(second,),
+        ),
+    )
+
+    judge_config_module._render_calibration_review(
+        plan,
+        cast(Rubric, SimpleNamespace(dimensions=default_judge_dimensions())),
+        character_limit=40,
+        page=False,
+    )
+
+    output = buffer.getvalue()
+    assert "PAIRWISE A/B CALIBRATION" in output
+    assert "Pair 1, candidate A" in output
+    assert "Pair 1, candidate B" in output
+    assert "User / task:" in output
+    assert "User message:" in output
+    assert "Please resolve customer issue trace-a." in " ".join(output.split())
+    assert "Assistant / model:" in output
+    assert "Assistant output:" in output
+    assert "Tool call:" in output
+    assert "Tool arguments:" in output
+    assert "Tool result:" in output
+    assert "Tool output:" in output
+    assert "Final outcome:" in output
+    assert "Final failure:" in output
+    assert "truncated 40 characters" in output
+    assert "use --page for the full transcript" in " ".join(output.split())
+
+
+def test_pairwise_prompt_keeps_anchors_adjacent_and_uses_plain_a_b_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interactive pairwise scoring says A and B while persisting the typed winner."""
+    buffer = io.StringIO()
+    monkeypatch.setattr(
+        judge_config_module,
+        "_console",
+        Console(file=buffer, width=80, color_system=None),
+    )
+    monkeypatch.setattr(judge_config_module, "Prompt", _PairwiseAnswer)
+    setup = cast(
+        ManualJudgeSetupArtifact,
+        SimpleNamespace(prompt_template=SimpleNamespace(response_shape="pairwise")),
+    )
+    preview = cast(
+        JudgeTracePreview,
+        SimpleNamespace(trace_id="trace-a", reference_trace_id="trace-b"),
+    )
+    rubric = cast(Rubric, SimpleNamespace(dimensions=default_judge_dimensions()))
+    persisted: list[tuple[ManualJudgeLabel, ...]] = []
+
+    def persist(labels: tuple[ManualJudgeLabel, ...]) -> None:
+        """Retain incremental labels exactly as the command would save them."""
+        persisted.append(labels)
+
+    labels = judge_config_module._collect_labels(
+        setup,
+        rubric,
+        (),
+        (preview,),
+        (),
+        persist,
+        non_interactive=False,
+    )
+
+    assert labels[0].winner == "winner_b"
+    assert persisted[-1] == labels
+    assert "choose candidate A, candidate B, or tie" in _PairwiseAnswer.prompt
+    output = buffer.getvalue()
+    assert "Score prompt: Task success" in output
+    assert "0: The agent did not address the task." in output
+    assert "5: The agent fully and correctly addressed the task." in output
+
+
+@pytest.mark.parametrize(
+    ("shape", "name"),
+    [
+        ("pairwise", "[/]"),
+        ("scalar", "[link=https://invalid.example]linked name[/link]"),
+    ],
+)
+def test_score_prompt_escapes_user_authored_rich_markup(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+    name: str,
+) -> None:
+    """Malformed and link-like dimension names remain literal scoring text.
+
+    Args:
+        monkeypatch: Scoped prompt replacement.
+        shape: Prompt response shape under test.
+        name: Valid user-authored dimension name containing Rich markup syntax.
+    """
+    dimension = default_judge_dimensions()[0].model_copy(update={"name": name})
+    setup = cast(
+        ManualJudgeSetupArtifact,
+        SimpleNamespace(prompt_template=SimpleNamespace(response_shape=shape)),
+    )
+    preview = cast(
+        JudgeTracePreview,
+        SimpleNamespace(
+            trace_id="trace-a",
+            reference_trace_id="trace-b" if shape == "pairwise" else None,
+        ),
+    )
+    rubric = cast(Rubric, SimpleNamespace(dimensions=(dimension,)))
+    persisted: list[tuple[ManualJudgeLabel, ...]] = []
+
+    def persist(labels: tuple[ManualJudgeLabel, ...]) -> None:
+        """Retain the escaped-prompt test's incremental label."""
+        persisted.append(labels)
+
+    if shape == "pairwise":
+        monkeypatch.setattr(judge_config_module, "Prompt", _PairwiseAnswer)
+        answer_type = _PairwiseAnswer
+    else:
+        monkeypatch.setattr(judge_config_module, "IntPrompt", _ScalarAnswer)
+        answer_type = _ScalarAnswer
+
+    labels = judge_config_module._collect_labels(
+        setup,
+        rubric,
+        (),
+        (preview,),
+        (),
+        persist,
+        non_interactive=False,
+    )
+
+    assert persisted[-1] == labels
+    assert name in Text.from_markup(answer_type.prompt).plain
+
+
+def _model() -> ModelSnapshot:
+    """Return one exact secret-free judge identity."""
+    return ModelSnapshot(
+        provider="openai",
+        model_id="judge-model",
+        revision=None,
+        capabilities_sha256="0" * 64,
+        connection_sha256="1" * 64,
+    )
+
+
+def _trace(trace_id: str, *, completion: str, failed: bool) -> Trace:
+    """Return one transcript fixture with assistant and paired tool evidence.
+
+    Args:
+        trace_id: Stable fixture trace identity.
+        completion: Captured assistant response.
+        failed: Whether terminal evidence records a failure.
+
+    Returns:
+        Complete normalized trace for CLI rendering.
+    """
+    started = datetime(2026, 8, 16, tzinfo=UTC)
+    spans = (
+        TraceSpan(
+            span_id=f"{trace_id}-assistant",
+            name="agent.model_call",
+            started_at=started,
+            ended_at=started + timedelta(seconds=1),
+            attributes={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.input.messages": (
+                    f'[{{"role":"user","content":"Please resolve customer issue {trace_id}."}}]'
+                ),
+                "gen_ai.output.messages": [
+                    {"role": "assistant", "content": [{"type": "text", "text": completion}]}
+                ],
+            },
+            model=_model(),
+        ),
+        TraceSpan(
+            span_id=f"{trace_id}-tool-call",
+            name="agent.model_call",
+            started_at=started + timedelta(seconds=2),
+            ended_at=started + timedelta(seconds=3),
+            attributes={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.tool.name": "search",
+                "gen_ai.tool.call.arguments": '{"query":"customer issue"}',
+            },
+            model=_model(),
+        ),
+        TraceSpan(
+            span_id=f"{trace_id}-tool-result",
+            name="agent.tool_call",
+            started_at=started + timedelta(seconds=4),
+            ended_at=started + timedelta(seconds=5),
+            attributes={
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": "search",
+                "gen_ai.tool.output": "Found the relevant account record.",
+            },
+        ),
+    )
+    failure = StructuredFailure(code=FailureCode.INTERNAL, message="Customer request failed")
+    return Trace(
+        trace_id=trace_id,
+        task="Resolve the customer's support request.",
+        initial_context={"account_tier": "business"},
+        spans=spans,
+        outcome=(
+            TraceOutcome(status="failure", failure=failure)
+            if failed
+            else TraceOutcome(status="success", outcome_name="resolved")
+        ),
+        source=TraceSource(
+            identity=SourceIdentity(kind="manual", source_id=trace_id, sha256="2" * 64),
+            semantic_convention_version="test-v1",
+        ),
+    )

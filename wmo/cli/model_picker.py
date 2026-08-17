@@ -1,8 +1,9 @@
 """Model selection, role assignment, and confirmation screens for provider setup.
 
 These screens run after every selected provider has been prepared. They present the discovered and
-already-configured models as one searchable list, filter each build role to the models whose
-verified metadata can serve it, and render the single summary shown before setup saves anything.
+already-configured models as one searchable list, filter new build-role assignments to models whose
+verified metadata can serve them, preserve exact prior assignments as retain-only choices, and
+render the single summary shown before setup saves anything.
 """
 
 from __future__ import annotations
@@ -272,7 +273,7 @@ def _assign_one_role(
     Raises:
         SetupCancelled: The user cancelled setup.
     """
-    eligible = tuple(item for item in chosen if serves_role(item.capabilities, role))
+    eligible = tuple(item for item in chosen if _serves_or_retains(item, role))
     if not eligible:
         console.print(
             f"[yellow]No selected model can serve the {role_name} role. "
@@ -315,7 +316,7 @@ def _assign_candidates(
         SetupCancelled: The user cancelled setup.
     """
     eligible = tuple(
-        item for item in chosen if serves_role(item.capabilities, SetupRole.ROUTER_CANDIDATE)
+        item for item in chosen if _serves_or_retains(item, SetupRole.ROUTER_CANDIDATE)
     )
     if len(eligible) < 2:
         console.print(
@@ -413,11 +414,14 @@ def build_result(
 
 def model_selection(item: AvailableModel) -> ProviderModelSelection:
     """Convert one configurable model into its persisted setup selection."""
+    capabilities = item.capabilities
+    if capabilities is None:
+        raise ValueError(f"new model alias {item.alias!r} needs explicit capabilities")
     return ProviderModelSelection(
         alias=item.alias,
         connection=item.connection,
         model=item.model,
-        capabilities=item.capabilities,
+        capabilities=capabilities,
     )
 
 
@@ -425,20 +429,24 @@ def configured_models(
     existing_models: Mapping[str, ModelRecord],
     *,
     connection_providers: Mapping[str, str],
+    retainable_roles: Mapping[str, frozenset[SetupRole]] | None = None,
 ) -> tuple[AvailableModel, ...]:
     """Present already-configured catalog aliases as selectable models.
 
     Args:
         existing_models: Exact model records keyed by every persisted alias.
         connection_providers: Exact provider kind keyed by every persisted connection name.
+        retainable_roles: Exact existing role assignments that incomplete aliases may retain.
 
     Returns:
-        Configurable records for every configured alias with usable metadata.
+        Configurable records for aliases with usable metadata or an exact role to retain.
     """
+    retained = {} if retainable_roles is None else retainable_roles
     records = []
     for alias, model in sorted(existing_models.items()):
         capabilities = model.capabilities
-        if capabilities is None or not served_roles(capabilities):
+        roles = retained.get(alias, frozenset())
+        if (capabilities is None or not served_roles(capabilities)) and not roles:
             continue
         records.append(
             AvailableModel(
@@ -449,9 +457,25 @@ def configured_models(
                 capabilities=capabilities,
                 pricing_source=PricingSource.CONFIGURED,
                 configured=True,
+                retainable_roles=roles,
             )
         )
     return tuple(records)
+
+
+def _serves_or_retains(item: AvailableModel, role: SetupRole) -> bool:
+    """Report whether verified metadata serves a role or the exact prior binding retains it.
+
+    Args:
+        item: Selected model with optional verified capabilities and prior role bindings.
+        role: Role being assigned.
+
+    Returns:
+        ``True`` for verified compatibility or an exact retain-only prior assignment.
+    """
+    return (
+        item.capabilities is not None and serves_role(item.capabilities, role)
+    ) or role in item.retainable_roles
 
 
 def render_summary(
@@ -480,6 +504,19 @@ def render_summary(
         )
     for item in chosen:
         capabilities = item.capabilities
+        if capabilities is None:
+            retained = ", ".join(role.value for role in item.retainable_roles)
+            console.print(
+                f"model {item.alias}: {item.provider}/{item.model}, "
+                f"capabilities=unverified, retain_only={retained or 'none'}, "
+                f"pricing={item.pricing_source.value}"
+            )
+            continue
+        verified = frozenset(served_roles(capabilities))
+        retain_only = ", ".join(
+            role.value for role in SetupRole if role in item.retainable_roles - verified
+        )
+        retained = f", retain_only={retain_only}" if retain_only else ""
         console.print(
             f"model {item.alias}: {item.provider}/{item.model}, "
             f"tools={capabilities.supports_tools}, "
@@ -488,7 +525,7 @@ def render_summary(
             f"completions={capabilities.supports_completions}, "
             f"context={capabilities.context_window_tokens}, "
             f"max_output={capabilities.maximum_output_tokens}, "
-            f"pricing={item.pricing_source.value}"
+            f"pricing={item.pricing_source.value}{retained}"
         )
     setup = result.setup
     console.print(
