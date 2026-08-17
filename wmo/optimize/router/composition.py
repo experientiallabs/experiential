@@ -182,7 +182,12 @@ class RouterPolicyLock(ArtifactEnvelope):
 
 @dataclass(frozen=True)
 class RouterWorkflowServices:
-    """Every service capable of dispatching work in the customer workflow."""
+    """Every service capable of dispatching work in the customer workflow.
+
+    ``plan_observer`` runs once with the frozen evaluation plan before any phase work, so a
+    plan-bound judge observes the plan even when every simulation phase replays from persisted
+    artifacts without constructing a simulator.
+    """
 
     review_supplier: ReviewSupplier
     setup_supplier: EvaluationSetupSupplier
@@ -190,6 +195,7 @@ class RouterWorkflowServices:
     judge: Judge
     runtime_catalog: RuntimeModelCatalog
     evaluation_plan_inputs: tuple[ArtifactInput, ...] = ()
+    plan_observer: Callable[[EvaluationPlan], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -271,6 +277,8 @@ def compose_router(
         code_revision=code_revision,
     )
     plan_input = artifact_input(project.artifacts.read(plan.plan_id).manifest)
+    if services.plan_observer is not None:
+        services.plan_observer(plan)
     phase_created_at = plan.created_at
     task_input = built.review.task_set
     _phase(phase_hook, "fit_started")

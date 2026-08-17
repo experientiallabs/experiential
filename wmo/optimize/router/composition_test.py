@@ -413,6 +413,16 @@ class _Judge:
         self.calls = 0
         self.log: list[tuple[str, bool]] = []
         self.fail_on_call: int | None = None
+        self.bound_plan_ids: list[str] = []
+        self.require_bound = False
+
+    def bind_plan(self, plan: EvaluationPlan) -> None:
+        """Record one observed frozen evaluation plan binding.
+
+        Args:
+            plan: Persisted current composition plan.
+        """
+        self.bound_plan_ids.append(plan.plan_id)
 
     def judge_persisted(
         self,
@@ -423,6 +433,8 @@ class _Judge:
         calibration_artifact_id: str,
     ) -> Judgment:
         """Persist one stable judgment unless the configured call must fail."""
+        if self.require_bound and not self.bound_plan_ids:
+            raise ValueError("automatic judge has not been bound to an evaluation plan")
         self.calls += 1
         if self.calls == self.fail_on_call:
             raise RuntimeError("simulated judgment dispatch interruption")
@@ -1043,6 +1055,9 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
 ) -> None:
     """A crash between dispatch reservation and judgment persistence resumes on rerun.
 
+    The rerun uses a fresh unbound plan-requiring judge, as a new process would, so it also
+    proves the plan observer binds the judge when fit simulation replays without a simulator.
+
     Args:
         tmp_path: Isolated project root for composed router artifacts.
     """
@@ -1053,24 +1068,38 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
     )
     _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
-    judge = _Judge()
-    judge.fail_on_call = 1
-    services = RouterWorkflowServices(
-        review_supplier=_ReviewSupplier(),
-        setup_supplier=_SetupSupplier(),
-        simulator_factory=simulator,
-        judge=judge,
-        runtime_catalog=cast(
-            RuntimeModelCatalog,
-            _Catalog(
-                {
-                    "candidate-a": _snapshot("candidate-a"),
-                    "embedder": _snapshot("embedder"),
-                },
-                _Client(),
-            ),
+    catalog = cast(
+        RuntimeModelCatalog,
+        _Catalog(
+            {
+                "candidate-a": _snapshot("candidate-a"),
+                "embedder": _snapshot("embedder"),
+            },
+            _Client(),
         ),
     )
+
+    def _services(judge: _Judge) -> RouterWorkflowServices:
+        """Return workflow services with the judge bound through the plan observer.
+
+        Args:
+            judge: Plan-requiring judge double for one composition attempt.
+
+        Returns:
+            Workflow services mirroring the automatic service wiring.
+        """
+        return RouterWorkflowServices(
+            review_supplier=_ReviewSupplier(),
+            setup_supplier=_SetupSupplier(),
+            simulator_factory=simulator,
+            judge=judge,
+            runtime_catalog=catalog,
+            plan_observer=judge.bind_plan,
+        )
+
+    first_judge = _Judge()
+    first_judge.require_bound = True
+    first_judge.fail_on_call = 1
     budget = RouterCompositionBudget(
         maximum_simulation_cost_usd=10.0,
         maximum_judgments=100,
@@ -1079,7 +1108,7 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
         compose_router(
             project,
             normalized,
-            services=services,
+            services=_services(first_judge),
             budget=budget,
             created_at=_TIME,
             code_revision="test-revision",
@@ -1103,12 +1132,14 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
     orphaned = _artifact_ids("judgment-dispatch")
     assert len(orphaned) == 1
     assert not _artifact_ids("judgment")
+    assert first_judge.calls == 1
 
-    judge.fail_on_call = None
+    second_judge = _Judge()
+    second_judge.require_bound = True
     result = compose_router(
         project,
         normalized,
-        services=services,
+        services=_services(second_judge),
         budget=budget,
         created_at=datetime(2026, 8, 14, tzinfo=UTC),
         code_revision="test-revision",
@@ -1119,4 +1150,5 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
     assert set(orphaned) <= set(receipts)
     assert len(receipts) == len(scored_cells)
     assert len(_artifact_ids("judgment")) == len(scored_cells)
-    assert judge.calls == len(scored_cells) + 1
+    assert second_judge.calls == len(scored_cells)
+    assert second_judge.bound_plan_ids == [result.plan.plan_id]

@@ -447,12 +447,11 @@ def _workflow_services(
             plan: Exact evaluation plan being executed by composition.
 
         Returns:
-            Grounded simulator with candidate, world-model, judge, and retrieval boundaries.
+            Grounded simulator with candidate, world-model, and retrieval boundaries.
 
         Raises:
             AutomaticRouterError: The verified embedder no longer exposes an embedding client.
         """
-        judge.bind_plan(plan)
         embedder = resolved.embedder
         if embedder.embedding_client is None:
             raise AutomaticRouterError("resolved embedder client disappeared after preflight")
@@ -503,6 +502,7 @@ def _workflow_services(
             artifacts.runtime_capability_input,
             artifacts.execution_contract_input,
         ),
+        plan_observer=judge.bind_plan,
     )
 
 
