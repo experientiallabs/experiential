@@ -10,6 +10,7 @@ import hashlib
 import os
 import shutil
 import stat
+import tempfile
 import unicodedata
 import zipfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -63,6 +64,7 @@ _BUNDLE_MANIFEST_PATH = "bundle.json"
 _PROJECT_CONFIG_PATH = "project.json"
 _MAX_BUNDLE_MEMBERS = 20_000
 _MAX_EXPANDED_BYTES = 1_073_741_824
+_MAX_ARCHIVE_BYTES = 2 * _MAX_EXPANDED_BYTES
 _READ_CHUNK_BYTES = 1024 * 1024
 _SUPPORTED_PROJECT_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
@@ -296,11 +298,14 @@ def restore_project_bundle(
     except ValidationError as exc:
         raise ProjectBundleError("expected bundle digest is not a lowercase SHA-256 value") from exc
     source = Path(bundle_path)
-    with _open_regular_file(source) as handle:
-        actual = _sha256_file(handle)
-        if actual != expected:
-            raise ProjectBundleError("Project bundle content digest does not match expected_sha256")
-        loaded = _load_and_verify_bundle(handle)
+    with _open_regular_file(source) as source_handle:
+        with tempfile.TemporaryFile(mode="w+b") as snapshot:
+            actual = _copy_bundle_snapshot(source_handle, snapshot)
+            if actual != expected:
+                raise ProjectBundleError(
+                    "Project bundle content digest does not match expected_sha256"
+                )
+            loaded = _load_and_verify_bundle(snapshot)
     destination_root = Path(root)
     _require_safe_restore_root(destination_root)
     paths = ProjectPaths(destination_root, loaded.project.project_id)
@@ -866,4 +871,22 @@ def _sha256_file(handle: BinaryIO) -> str:
     while chunk := handle.read(_READ_CHUNK_BYTES):
         digest.update(chunk)
     handle.seek(0)
+    return digest.hexdigest()
+
+
+def _copy_bundle_snapshot(source: BinaryIO, snapshot: BinaryIO) -> str:
+    """Hash one bounded source read into the private snapshot used for restore."""
+    source.seek(0)
+    digest = hashlib.sha256(usedforsecurity=False)
+    size_bytes = 0
+    while chunk := source.read(_READ_CHUNK_BYTES):
+        size_bytes += len(chunk)
+        if size_bytes > _MAX_ARCHIVE_BYTES:
+            raise ProjectBundleError(
+                f"Project bundle archive exceeds the {_MAX_ARCHIVE_BYTES} byte limit"
+            )
+        digest.update(chunk)
+        snapshot.write(chunk)
+    snapshot.flush()
+    snapshot.seek(0)
     return digest.hexdigest()

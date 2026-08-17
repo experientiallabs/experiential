@@ -493,26 +493,65 @@ def test_restore_uses_the_same_descriptor_for_digest_and_archive_loading(
         tmp_path / "replacement.wmo-project",
         producer_revision=_REVISION,
     )
-    hash_file = bundle_module._sha256_file
+    copy_snapshot = bundle_module._copy_bundle_snapshot
     swapped = False
 
-    def hash_then_replace_path(handle: BinaryIO) -> str:
+    def copy_then_replace_path(source: BinaryIO, snapshot: BinaryIO) -> str:
         """Replace the pathname only after its already-open content has been authenticated."""
         nonlocal swapped
-        digest = hash_file(handle)
+        digest = copy_snapshot(source, snapshot)
         if not swapped:
             os.replace(replacement.path, authenticated.path)
             swapped = True
         return digest
 
-    monkeypatch.setattr(bundle_module, "_sha256_file", hash_then_replace_path)
+    monkeypatch.setattr(bundle_module, "_copy_bundle_snapshot", copy_then_replace_path)
     restored = restore_project_bundle(
         authenticated.path,
         root=tmp_path / "restored-root",
         expected_sha256=authenticated.sha256,
     )
 
+    assert swapped
     assert restored.paths.project_id == "portable-project"
+    assert restored.load_project().project_id == "portable-project"
+    assert not (tmp_path / "restored-root" / "projects" / "replacement-project").exists()
+
+
+def test_restore_loads_the_private_snapshot_when_the_source_inode_is_rewritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In-place source mutation after copying cannot change the authenticated Project."""
+    authenticated = export_project_bundle(
+        _project_store(tmp_path / "authenticated"),
+        tmp_path / "authenticated.wmo-project",
+        producer_revision=_REVISION,
+    )
+    replacement = export_project_bundle(
+        _project_store(tmp_path / "replacement", project_id="replacement-project"),
+        tmp_path / "replacement.wmo-project",
+        producer_revision=_REVISION,
+    )
+    replacement_bytes = replacement.path.read_bytes()
+    copy_snapshot = bundle_module._copy_bundle_snapshot
+    rewritten = False
+
+    def copy_then_rewrite_inode(source: BinaryIO, snapshot: BinaryIO) -> str:
+        """Rewrite the open source inode only after its bytes are in the private snapshot."""
+        nonlocal rewritten
+        digest = copy_snapshot(source, snapshot)
+        authenticated.path.write_bytes(replacement_bytes)
+        rewritten = True
+        return digest
+
+    monkeypatch.setattr(bundle_module, "_copy_bundle_snapshot", copy_then_rewrite_inode)
+    restored = restore_project_bundle(
+        authenticated.path,
+        root=tmp_path / "restored-root",
+        expected_sha256=authenticated.sha256,
+    )
+
+    assert rewritten
     assert restored.load_project().project_id == "portable-project"
     assert not (tmp_path / "restored-root" / "projects" / "replacement-project").exists()
 
