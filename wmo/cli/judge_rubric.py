@@ -122,10 +122,12 @@ def _require_projection_in_range(
         values = tuple(projection.pairwise_scores.values())
     else:
         return
-    if any(value < min_score or value > max_score for value in values):
+    if any(value < min_score or value > max_score for value in values) or (
+        values and (min(values) != min_score or max(values) != max_score)
+    ):
         raise ValueError(
-            f"custom {template.response_shape} score projections must stay inside "
-            f"{min_score} through {max_score}"
+            f"custom {template.response_shape} score projections must include "
+            f"{min_score} and {max_score} and stay inside that range"
         )
 
 

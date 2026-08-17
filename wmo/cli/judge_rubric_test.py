@@ -104,11 +104,16 @@ def test_default_template_schema_follows_selected_axis_bounds() -> None:
         response_shape="boolean",
         variable_mapping={"rubric": "RULES_CUSTOM", "rollout": "TRACE_CUSTOM"},
         response_schema=judge_feedback_schema("boolean"),
-        score_projection=JudgeScoreProjection(boolean_scores={"false": 1, "true": 4}),
+        score_projection=JudgeScoreProjection(boolean_scores={"false": 0, "true": 4}),
     )
     with pytest.raises(ValueError, match="boolean score projections"):
         rebind_prompt_template(boolean, (default_task_success_axis(),))
     assert rebind_prompt_template(boolean, (wide,)) is boolean
+    stale = boolean.model_copy(
+        update={"score_projection": JudgeScoreProjection(boolean_scores={"false": 0, "true": 1})}
+    )
+    with pytest.raises(ValueError, match="include 0 and 4"):
+        rebind_prompt_template(stale, (wide,))
 
 
 def test_edit_done_keeps_the_current_axes() -> None:
