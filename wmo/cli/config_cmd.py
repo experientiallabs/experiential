@@ -38,6 +38,15 @@ _MODEL_JSON_OPTION = typer.Option(
     "--model-json",
     help="Repeatable JSON model alias with connection, model ID, and capabilities.",
 )
+_PROVIDER_OPTION = typer.Option(
+    None,
+    "--provider",
+    help=(
+        "Repeatable provider that skips the opening list during interactive setup. "
+        "Supported values: openai, anthropic, gemini, openrouter, openai-compatible, "
+        "azure, bedrock."
+    ),
+)
 
 
 @config_app.command("telemetry", help="View or change project-local usage telemetry settings.")
@@ -71,6 +80,7 @@ def config_telemetry(
 @config_app.command("providers", help="Configure model providers and build-time model roles.")
 def config_providers(
     root: Path = ROOT_OPTION,
+    provider: list[str] | None = _PROVIDER_OPTION,
     connection_json: list[str] | None = _CONNECTION_JSON_OPTION,
     model_json: list[str] | None = _MODEL_JSON_OPTION,
     world_model: str | None = typer.Option(
@@ -94,9 +104,11 @@ def config_providers(
     """Configure provider connections before selecting exact build-time role models.
 
     Credential values are never requested or persisted. Only environment-variable names are
-    written. Router candidates remain untouched until ``wmo optimize router``.
+    written. Repeatable ``--provider`` flags skip the opening list. Router candidates remain
+    untouched until ``wmo optimize router``.
     """
     options = ProviderSetupOptions(
+        providers=tuple(provider or ()),
         connection_json=tuple(connection_json or ()),
         model_json=tuple(model_json or ()),
         world_model=world_model,

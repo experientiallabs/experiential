@@ -1,8 +1,9 @@
 """Provider and model setup shared by configuration and first build.
 
 Interactive setup runs the provider and model picker in ``provider_picker``: providers, missing
-credentials, models, roles, and one confirmation. Automation supplies the same catalog update as
-repeatable JSON. Both paths end in one conflict-checked atomic ``models.toml`` write.
+credentials, models, roles, and one confirmation. Repeatable ``--provider`` flags skip the opening
+list and feed the same session. Automation supplies the same catalog update as repeatable JSON.
+Both paths end in one conflict-checked atomic ``models.toml`` write.
 """
 
 from __future__ import annotations
@@ -33,7 +34,9 @@ from wmo.cli.provider_picker import (
     SetupCancelled,
     SetupRoleInputs,
     SetupSession,
+    explicit_provider_selection,
     prepare_providers,
+    resolve_setup_providers,
     select_providers,
 )
 from wmo.common.models import (
@@ -58,6 +61,7 @@ from wmo.runtime.models.providers import HttpProviderModelLister, ProviderModelL
 class ProviderSetupOptions:
     """Structured automation values or optional role choices for setup."""
 
+    providers: tuple[str, ...] = ()
     connection_json: tuple[str, ...] = ()
     model_json: tuple[str, ...] = ()
     world_model: str | None = None
@@ -94,6 +98,10 @@ def run_provider_setup(
     path = root / "models.toml"
     starting_digest = catalog_state_sha256(path)
     existing = load_model_catalog(path) if path.exists() else None
+    try:
+        explicit_providers = resolve_setup_providers(options.providers)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
     if non_interactive:
         try:
             setup = _noninteractive_setup(options, existing=existing)
@@ -112,6 +120,7 @@ def run_provider_setup(
         existing_models=_existing_models(existing),
         retainable_roles=_retained_setup_roles(existing),
         role_inputs=_role_inputs(options, existing=existing),
+        explicit_providers=explicit_providers,
         console=console,
         lister=lister if lister is not None else HttpProviderModelLister(),
         environment=os.environ,
@@ -129,6 +138,7 @@ def _interactive_setup(
     existing_models: tuple[ProviderModelSelection, ...],
     retainable_roles: Mapping[str, frozenset[SetupRole]],
     role_inputs: SetupRoleInputs,
+    explicit_providers: tuple[str, ...],
     console: Console,
     lister: ProviderModelLister,
     environment: MutableMapping[str, str],
@@ -142,6 +152,7 @@ def _interactive_setup(
         existing_models: Model aliases already configured in the catalog.
         retainable_roles: Exact prior roles each incomplete alias may retain.
         role_inputs: Role values supplied by flags or already persisted.
+        explicit_providers: Validated ``--provider`` values that skip the opening list once.
         console: Terminal used for every screen.
         lister: Provider listing seam, injected by tests so no live request is made.
         environment: Process environment consulted and updated for pasted credentials.
@@ -157,17 +168,27 @@ def _interactive_setup(
         retainable_roles=retainable_roles,
     )
     session = SetupSession(selected=tuple(model.alias for model in configured))
+    skip_opening_list = bool(explicit_providers)
+    if explicit_providers:
+        (
+            session.providers,
+            session.advanced_credentials,
+            session.advanced_models,
+        ) = explicit_provider_selection(explicit_providers)
     try:
         while True:
-            selection = select_providers(
-                session,
-                console=console,
-                environment=environment,
-                configured=bool(configured),
-            )
-            if selection is None:
-                return None
-            session.providers, session.advanced_credentials, session.advanced_models = selection
+            if skip_opening_list:
+                skip_opening_list = False
+            else:
+                selection = select_providers(
+                    session,
+                    console=console,
+                    environment=environment,
+                    configured=bool(configured),
+                )
+                if selection is None:
+                    return None
+                session.providers, session.advanced_credentials, session.advanced_models = selection
             discovered: tuple[AvailableModel, ...] = ()
             session.endpoints = ()
             if session.providers:

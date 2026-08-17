@@ -5,12 +5,15 @@ from __future__ import annotations
 import pytest
 
 from wmo.cli import provider_picker
+from wmo.cli.picker import PickerKey
 from wmo.cli.picker_test import ScriptedConsole
 from wmo.cli.provider_picker import (
     SetupCancelled,
     SetupSession,
     credential_hint,
+    explicit_provider_selection,
     prepare_providers,
+    resolve_setup_providers,
     select_providers,
 )
 from wmo.common.models import DiscoveredModel, PricingSource, ProviderConnection, SetupRole
@@ -139,6 +142,72 @@ def test_provider_screen_refuses_an_advanced_only_selection() -> None:
 def test_cancelling_the_provider_screen_returns_no_selection() -> None:
     """Cancelling the first screen ends setup without preparing any provider."""
     assert select_providers(SetupSession(), console=ScriptedConsole("q\n"), environment={}) is None
+
+
+def test_keyboard_provider_list_selects_without_typed_numbers() -> None:
+    """Up, Down, and Enter toggle providers; Complete is the only submit action."""
+    keys = iter(
+        (
+            PickerKey.ENTER,
+            PickerKey.DOWN,
+            PickerKey.ENTER,
+            *(PickerKey.DOWN for _ in range(8)),
+            PickerKey.ENTER,
+        )
+    )
+    console = ScriptedConsole("")
+
+    selection = select_providers(
+        SetupSession(),
+        console=console,
+        environment={"OPENAI_API_KEY": "secret-key"},
+        read_key=lambda: next(keys),
+    )
+
+    assert selection == (("openai", "anthropic"), False, False)
+    assert "> [x] OpenAI" in console.output
+    assert "Complete" in console.output
+    assert "Numbers or ranges" not in console.output
+
+
+def test_keyboard_provider_list_preserves_current_selection_and_cancel() -> None:
+    """Reentering the keyboard list keeps prior marks, and q still cancels."""
+    console = ScriptedConsole("")
+    session = SetupSession(providers=("openai",), advanced_credentials=True)
+
+    cancelled = select_providers(
+        session,
+        console=console,
+        environment={},
+        read_key=lambda: PickerKey.CANCEL,
+    )
+
+    assert cancelled is None
+    assert "[x] OpenAI" in console.output
+    assert "[x] Advanced: choose credential environment-variable names" in console.output
+
+
+def test_resolve_setup_providers_orders_and_rejects_bad_values() -> None:
+    """Explicit names are canonicalized, ordered, and fail closed on bad input."""
+    assert resolve_setup_providers(("bedrock", " OpenAI ", "anthropic")) == (
+        "openai",
+        "anthropic",
+        "bedrock",
+    )
+    with pytest.raises(ValueError, match="unsupported --provider value 'not-a-provider'"):
+        resolve_setup_providers(("openai", "not-a-provider"))
+    with pytest.raises(ValueError, match="duplicate --provider value 'openai'"):
+        resolve_setup_providers(("openai", "OPENAI"))
+
+
+def test_explicit_azure_and_bedrock_keep_manual_model_declaration() -> None:
+    """Named Azure and Bedrock selections still require hand-declared model IDs."""
+    assert explicit_provider_selection(("azure", "bedrock")) == (
+        ("azure", "bedrock"),
+        False,
+        True,
+    )
+    assert explicit_provider_selection(("openai",)) == (("openai",), False, False)
 
 
 def test_canonical_environment_credential_is_used_without_any_prompt() -> None:
