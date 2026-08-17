@@ -41,7 +41,6 @@ from wmo.common.models import (
     RouterCandidateSelection,
     Usage,
     catalog_state_sha256,
-    configure_router_candidates,
     load_model_catalog,
     write_model_catalog,
 )
@@ -69,8 +68,8 @@ from wmo.optimize.router.automatic.preflight import (
 from wmo.optimize.router.automatic.replay import find_completed_automatic_router_replay
 from wmo.optimize.router.automatic.service import (
     AutomaticRouterError,
-    _persist_candidate_provider_setup,
     optimize_project_router,
+    persist_router_candidate_setup,
 )
 from wmo.optimize.router.composition import RouterCandidateSetupPlan
 from wmo.optimize.router.judging.artifacts import read_audit, write_audit, write_review_state
@@ -474,6 +473,131 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
     )
 
 
+def test_replay_restores_discovered_candidate_records_before_reporting_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified replay restores missing discovered provider records before returning.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+        monkeypatch: Test patching seam for the CLI's already-collected candidate plan.
+    """
+    import wmo.cli.router_app as router_app
+
+    store, catalog, state = _completed_project(tmp_path)
+    _approve_manual_judge(store, catalog, state)
+    connection = ProviderConnection(
+        name="discovered",
+        provider="openai",
+        api_key_env="DISCOVERED_API_KEY",
+    )
+    capabilities = catalog.models["candidate-a"].capabilities
+    assert capabilities is not None
+    model = ProviderModelSelection(
+        alias="candidate-new",
+        connection=connection.name,
+        model="candidate-new",
+        capabilities=capabilities,
+    )
+    prospective = catalog.model_copy(
+        update={
+            "connections": {
+                **catalog.connections,
+                connection.name: connection.catalog_config(),
+            },
+            "models": {**catalog.models, model.alias: model.catalog_record()},
+            "roles": catalog.roles.model_copy(
+                update={
+                    "candidates": ("candidate-a", model.alias),
+                    "incumbent": "candidate-a",
+                }
+            ),
+        }
+    )
+    plan = RouterCandidateSetupPlan(
+        selection=RouterCandidateSelection(
+            candidates=("candidate-a", model.alias), incumbent="candidate-a"
+        ),
+        candidate_models=(model,),
+        prospective_catalog=prospective,
+        expected_catalog_sha256=catalog_state_sha256(store.model_catalog_path),
+        candidate_connections=(connection,),
+    )
+    options = AutomaticRouterOptions(
+        maximum_judgments=20,
+        maximum_model_calls=1,
+        simulation_maximum_output_tokens=8_000,
+    )
+    optimize_project_router(
+        store,
+        plan,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        options=options,
+        provider_spend_consented=True,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision=_REVISION,
+    )
+
+    persisted = load_model_catalog(store.model_catalog_path)
+    damaged = persisted.model_copy(
+        update={
+            "connections": {
+                name: value
+                for name, value in persisted.connections.items()
+                if name != connection.name
+            },
+            "models": {
+                alias: value for alias, value in persisted.models.items() if alias != model.alias
+            },
+            "roles": persisted.roles.model_copy(update={"candidates": (), "incumbent": None}),
+        }
+    )
+    write_model_catalog(store.model_catalog_path, damaged)
+    replay_plan = replace(
+        plan,
+        expected_catalog_sha256=catalog_state_sha256(store.model_catalog_path),
+    )
+    monkeypatch.setattr(
+        router_app,
+        "collect_router_candidate_setup",
+        lambda *_args, **_kwargs: replay_plan,
+    )
+    before_credentials = state.credential_resolutions
+    before_completion = tuple(state.completion_calls)
+    before_embedding = tuple(state.embedding_calls)
+
+    cli = _RUNNER.invoke(
+        app,
+        [
+            "optimize",
+            "router",
+            "support",
+            "--root",
+            str(store.paths.root),
+            "--maximum-judgments",
+            "20",
+            "--maximum-model-calls",
+            "1",
+            "--simulation-maximum-output-tokens",
+            "8000",
+            "--non-interactive",
+        ],
+        env={"WMO_RELEASE_REVISION": _REVISION},
+    )
+
+    assert cli.exit_code == 0, cli.output
+    assert "replay: verified completed optimization" in unstyle(cli.output)
+    restored = load_model_catalog(store.model_catalog_path)
+    assert restored.connections[connection.name] == connection.catalog_config()
+    assert restored.models[model.alias] == model.catalog_record()
+    assert restored.roles.candidates == replay_plan.selection.candidates
+    assert restored.roles.incumbent == replay_plan.selection.incumbent
+    assert state.credential_resolutions == before_credentials
+    assert tuple(state.completion_calls) == before_completion
+    assert tuple(state.embedding_calls) == before_embedding
+
+
 def test_automatic_router_refuses_spend_before_credentials_calls_or_writes(
     tmp_path: Path,
 ) -> None:
@@ -521,10 +645,10 @@ def test_automatic_router_refuses_spend_before_credentials_calls_or_writes(
     assert store.read_review() == before_review
 
 
-def test_discovered_candidate_provider_records_persist_before_role_assignment(
+def test_discovered_candidate_provider_records_and_roles_persist_atomically(
     tmp_path: Path,
 ) -> None:
-    """Persist newly discovered candidate metadata before the atomic router-role write.
+    """Persist newly discovered candidate metadata and router roles in one catalog write.
 
     Args:
         tmp_path: Isolated local WMO root.
@@ -570,17 +694,12 @@ def test_discovered_candidate_provider_records_persist_before_role_assignment(
         candidate_connections=(connection,),
     )
 
-    digest = _persist_candidate_provider_setup(project, plan)
+    configured = persist_router_candidate_setup(project, plan)
     saved = load_model_catalog(path)
     assert saved.connections[connection.name].provider == "openai"
     assert saved.models[model.alias] == model.catalog_record()
-    assert saved.roles.candidates == ()
-
-    configured = configure_router_candidates(
-        path,
-        plan.selection,
-        expected_state_sha256=digest,
-    )
+    assert saved.roles.candidates == plan.selection.candidates
+    assert configured.roles.candidates == plan.selection.candidates
     assert configured.roles.candidates == ("candidate-a", model.alias)
 
 

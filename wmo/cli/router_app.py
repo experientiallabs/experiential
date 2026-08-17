@@ -22,7 +22,10 @@ from wmo.optimize.router.automatic.preflight import (
     preflight_automatic_router,
 )
 from wmo.optimize.router.automatic.replay import find_completed_automatic_router_replay
-from wmo.optimize.router.automatic.service import optimize_project_router
+from wmo.optimize.router.automatic.service import (
+    optimize_project_router,
+    persist_router_candidate_setup,
+)
 from wmo.runtime.models import RuntimeModelCatalog
 
 _console = Console()
@@ -149,6 +152,10 @@ def router(
             ),
             non_interactive=effective_noninteractive,
         )
+        with usage_error(OSError, ValueError):
+            configured_catalog = persist_router_candidate_setup(store, candidate_plan)
+            if configured_catalog != candidate_plan.prospective_catalog:
+                raise ValueError("persisted router candidate catalog differs from confirmation")
         _console.print("replay: verified completed optimization")
         _console.print(f"policy: {replay.policy_id}")
         _console.print(f"report: {replay.report_id}")
