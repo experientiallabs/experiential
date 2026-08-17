@@ -50,6 +50,7 @@ def median_trace_token_estimate(traces: tuple[Trace, ...]) -> int | None:
 def simulation_input_token_estimate(
     traces: tuple[Trace, ...],
     *,
+    retrieved_transition_count: int,
     maximum_retrieval_query_tokens: int,
     maximum_output_tokens: int,
 ) -> int | None:
@@ -57,23 +58,29 @@ def simulation_input_token_estimate(
 
     The estimate sums explicit deterministic components instead of a model's full context
     window: one median-length trace for the visible episode transcript, one median-length trace
-    bounding the retrieved fit-RAG transitions rendered into the prompt, the explicit retrieval
-    query token budget, one full output turn echoed back into the next request, and a fixed
-    prompt-framing allowance.
+    for each of the world model's retrieved fit-RAG transitions rendered into the prompt (one
+    whole trace bounds one transition), the explicit retrieval query token budget, one full
+    output turn echoed back into the next request, and a fixed prompt-framing allowance.
 
     Args:
         traces: Verified traces persisted by the completed build.
+        retrieved_transition_count: Frozen world-model retrieval count rendered per prediction.
         maximum_retrieval_query_tokens: Explicit rendered RAG query token budget.
         maximum_output_tokens: Per-turn completion output ceiling echoed into later prompts.
 
     Returns:
         Deterministic per-call input token reservation, or ``None`` without traces.
+
+    Raises:
+        ValueError: The retrieval count is not positive.
     """
+    if retrieved_transition_count <= 0:
+        raise ValueError("retrieved transition count must be positive")
     median = median_trace_token_estimate(traces)
     if median is None:
         return None
     transcript_tokens = median
-    retrieved_transition_tokens = median
+    retrieved_transition_tokens = median * retrieved_transition_count
     return (
         transcript_tokens
         + retrieved_transition_tokens

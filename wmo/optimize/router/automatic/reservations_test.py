@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from wmo.common.core.artifacts import (
     ArtifactInput,
     SourceIdentity,
@@ -140,19 +142,28 @@ def test_simulation_input_estimate_sums_explicit_deterministic_components() -> N
 
     estimate = simulation_input_token_estimate(
         traces,
+        retrieved_transition_count=5,
         maximum_retrieval_query_tokens=_QUERY_TOKENS,
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
 
-    assert estimate == 2 * median + _QUERY_TOKENS + _OUTPUT_TOKENS + 4_096
+    assert estimate == 6 * median + _QUERY_TOKENS + _OUTPUT_TOKENS + 4_096
     assert (
         simulation_input_token_estimate(
             (),
+            retrieved_transition_count=5,
             maximum_retrieval_query_tokens=_QUERY_TOKENS,
             maximum_output_tokens=_OUTPUT_TOKENS,
         )
         is None
     )
+    with pytest.raises(ValueError, match="retrieved transition count"):
+        simulation_input_token_estimate(
+            traces,
+            retrieved_transition_count=0,
+            maximum_retrieval_query_tokens=_QUERY_TOKENS,
+            maximum_output_tokens=_OUTPUT_TOKENS,
+        )
 
 
 def test_completion_reservation_uses_trace_estimate_not_full_context() -> None:
@@ -160,6 +171,7 @@ def test_completion_reservation_uses_trace_estimate_not_full_context() -> None:
     traces = tuple(_trace(f"t-{index}", "x" * 2_000) for index in range(5))
     estimate = simulation_input_token_estimate(
         traces,
+        retrieved_transition_count=5,
         maximum_retrieval_query_tokens=_QUERY_TOKENS,
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
@@ -287,6 +299,7 @@ def test_large_context_model_admits_episodes_under_a_modest_ceiling() -> None:
     traces = tuple(_trace(f"t-{index}", "x" * 4_000) for index in range(5))
     estimate = simulation_input_token_estimate(
         traces,
+        retrieved_transition_count=5,
         maximum_retrieval_query_tokens=_QUERY_TOKENS,
         maximum_output_tokens=_OUTPUT_TOKENS,
     )

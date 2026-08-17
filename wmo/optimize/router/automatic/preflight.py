@@ -58,6 +58,7 @@ from wmo.simulation.ingest.dataset import (
 )
 from wmo.simulation.ingest.model_identity import TraceModelIdentityEvidenceSet
 from wmo.simulation.specs import CandidateCompletionReservation
+from wmo.simulation.world_model import load_grounded_world_model_artifact
 
 
 class AutomaticRouterPreflightError(ValueError):
@@ -227,16 +228,23 @@ def preflight_automatic_router(
         options.maximum_retrieval_query_tokens,
         options.router_embedding_maximum_attempts,
     )
-    estimated_input_tokens = simulation_input_token_estimate(
-        traces,
-        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-        maximum_output_tokens=options.simulation_maximum_output_tokens,
+    world_model_top_k = _world_model_retrieval_count(problems, project, completed)
+    estimated_input_tokens = (
+        None
+        if world_model_top_k is None
+        else simulation_input_token_estimate(
+            traces,
+            retrieved_transition_count=world_model_top_k,
+            maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+            maximum_output_tokens=options.simulation_maximum_output_tokens,
+        )
     )
-    if estimated_input_tokens is None:
+    if world_model_top_k is not None and estimated_input_tokens is None:
         problems.append(
             "simulation completion reservations: the completed build has no persisted traces "
             "to size the per-call input reservation"
         )
+    if estimated_input_tokens is None:
         candidate_requests: tuple[CandidateCompletionReservation, ...] = ()
         world_request = None
     else:
@@ -414,6 +422,31 @@ def _completed_build_problems(
         except (OSError, ValueError) as exc:
             problems.append(f"completed build {name}: {exc}")
     return tuple(problems)
+
+
+def _world_model_retrieval_count(
+    problems: list[str],
+    project: ProjectStore,
+    completed: ProjectBuildArtifacts | None,
+) -> int | None:
+    """Read the frozen per-prediction retrieval count from the completed grounded world model.
+
+    Args:
+        problems: Mutable aggregate problem list.
+        project: Project-local artifact store.
+        completed: Exact completed-build pointers, if present.
+
+    Returns:
+        Persisted world-model top-k, or ``None`` after recording a problem.
+    """
+    if completed is None:
+        return None
+    try:
+        artifact = load_grounded_world_model_artifact(project.artifacts, completed.world_model)
+    except (OSError, ValueError) as exc:
+        problems.append(f"grounded world model: {exc}")
+        return None
+    return artifact.top_k
 
 
 def _candidate_snapshots(
