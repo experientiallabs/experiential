@@ -28,6 +28,7 @@ from wmo.common.models import (
 )
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.optimize.router.judging.contracts import (
+    JudgeCalibrationBudget,
     JudgeTracePreview,
     ManualJudgeLabel,
     ManualJudgeSetupArtifact,
@@ -285,13 +286,13 @@ def test_calibrate_renders_provider_error_without_traceback(
     monkeypatch.setattr(
         judge_config_module,
         "prepare_manual_judge_calibration",
-        lambda store, sample_size: SimpleNamespace(setup=object(), previews=()),
+        lambda store, sample_size: SimpleNamespace(
+            setup=SimpleNamespace(judge_alias="judge", judge_model=_model()),
+            previews=(),
+        ),
     )
     monkeypatch.setattr(judge_config_module, "_load_setup_rubric", lambda store, setup: object())
     monkeypatch.setattr(judge_config_module, "render_rubric_table", lambda *args, **kwargs: "")
-    monkeypatch.setattr(
-        judge_config_module, "_render_spend_preflight", lambda *args, **kwargs: None
-    )
     monkeypatch.setattr(
         judge_config_module, "_render_calibration_review", lambda *args, **kwargs: None
     )
