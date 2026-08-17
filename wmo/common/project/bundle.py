@@ -296,10 +296,11 @@ def restore_project_bundle(
     except ValidationError as exc:
         raise ProjectBundleError("expected bundle digest is not a lowercase SHA-256 value") from exc
     source = Path(bundle_path)
-    actual = _sha256_path(source)
-    if actual != expected:
-        raise ProjectBundleError("Project bundle content digest does not match expected_sha256")
-    loaded = _load_and_verify_bundle(source)
+    with _open_regular_file(source) as handle:
+        actual = _sha256_file(handle)
+        if actual != expected:
+            raise ProjectBundleError("Project bundle content digest does not match expected_sha256")
+        loaded = _load_and_verify_bundle(handle)
     destination_root = Path(root)
     _require_safe_restore_root(destination_root)
     paths = ProjectPaths(destination_root, loaded.project.project_id)
@@ -393,12 +394,11 @@ def _canonical_zip_info(path: str) -> zipfile.ZipInfo:
     return info
 
 
-def _load_and_verify_bundle(path: Path) -> _LoadedBundle:
-    """Read, bound, and recursively verify every archive member before restore writes."""
+def _load_and_verify_bundle(handle: BinaryIO) -> _LoadedBundle:
+    """Verify every archive member through the descriptor authenticated by the caller."""
     try:
-        with _open_regular_file(path) as handle:
-            with zipfile.ZipFile(handle, mode="r") as archive:
-                payloads = _read_archive_payloads(archive)
+        with zipfile.ZipFile(handle, mode="r") as archive:
+            payloads = _read_archive_payloads(archive)
     except ProjectBundleError:
         raise
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
@@ -855,8 +855,15 @@ def _open_regular_file(path: Path) -> Iterator[BinaryIO]:
 
 def _sha256_path(path: Path) -> str:
     """Hash one regular non-symlink file through a stable descriptor."""
-    digest = hashlib.sha256(usedforsecurity=False)
     with _open_regular_file(Path(path)) as handle:
-        while chunk := handle.read(_READ_CHUNK_BYTES):
-            digest.update(chunk)
+        return _sha256_file(handle)
+
+
+def _sha256_file(handle: BinaryIO) -> str:
+    """Hash and rewind one open file so its authenticated bytes can be consumed next."""
+    handle.seek(0)
+    digest = hashlib.sha256(usedforsecurity=False)
+    while chunk := handle.read(_READ_CHUNK_BYTES):
+        digest.update(chunk)
+    handle.seek(0)
     return digest.hexdigest()

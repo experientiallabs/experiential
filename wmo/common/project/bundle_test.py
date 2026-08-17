@@ -9,6 +9,7 @@ import zipfile
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 
@@ -65,9 +66,14 @@ def _catalog_model(alias: str) -> ProjectCatalogModel:
     )
 
 
-def _project_store(tmp_path: Path, *, with_catalog: bool = False) -> ProjectStore:
+def _project_store(
+    tmp_path: Path,
+    *,
+    with_catalog: bool = False,
+    project_id: str = "portable-project",
+) -> ProjectStore:
     """Create a selected provider-free graph plus one unrelated sibling artifact."""
-    store = ProjectStore(tmp_path / "source-root", "portable-project")
+    store = ProjectStore(tmp_path / "source-root", project_id)
     trace = store.artifacts.write_json(
         artifact_id="trace-selected",
         artifact_type="trace-dataset",
@@ -109,7 +115,7 @@ def _project_store(tmp_path: Path, *, with_catalog: bool = False) -> ProjectStor
     models = None
     if with_catalog:
         catalog = ProjectModelCatalog(
-            project_id="portable-project",
+            project_id=project_id,
             models=(
                 _catalog_model("baseline"),
                 _catalog_model("candidate-a"),
@@ -137,7 +143,7 @@ def _project_store(tmp_path: Path, *, with_catalog: bool = False) -> ProjectStor
     )
     store.initialize(
         ProjectConfig(
-            project_id="portable-project",
+            project_id=project_id,
             trace_preparation=ProjectTracePreparationSettings(source_kind="otlp"),
             provider_free_stage=stage,
             models=models,
@@ -471,6 +477,44 @@ def test_restore_requires_exact_digest_absent_destination_and_hard_bounds(
             expected_sha256=exported.sha256,
         )
     assert not (bounded_root / "projects" / "portable-project").exists()
+
+
+def test_restore_uses_the_same_descriptor_for_digest_and_archive_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replacing the pathname after hashing cannot substitute another valid Project bundle."""
+    authenticated = export_project_bundle(
+        _project_store(tmp_path / "authenticated"),
+        tmp_path / "authenticated.wmo-project",
+        producer_revision=_REVISION,
+    )
+    replacement = export_project_bundle(
+        _project_store(tmp_path / "replacement", project_id="replacement-project"),
+        tmp_path / "replacement.wmo-project",
+        producer_revision=_REVISION,
+    )
+    hash_file = bundle_module._sha256_file
+    swapped = False
+
+    def hash_then_replace_path(handle: BinaryIO) -> str:
+        """Replace the pathname only after its already-open content has been authenticated."""
+        nonlocal swapped
+        digest = hash_file(handle)
+        if not swapped:
+            os.replace(replacement.path, authenticated.path)
+            swapped = True
+        return digest
+
+    monkeypatch.setattr(bundle_module, "_sha256_file", hash_then_replace_path)
+    restored = restore_project_bundle(
+        authenticated.path,
+        root=tmp_path / "restored-root",
+        expected_sha256=authenticated.sha256,
+    )
+
+    assert restored.paths.project_id == "portable-project"
+    assert restored.load_project().project_id == "portable-project"
+    assert not (tmp_path / "restored-root" / "projects" / "replacement-project").exists()
 
 
 def test_bundle_manifest_does_not_duplicate_artifact_provenance() -> None:
