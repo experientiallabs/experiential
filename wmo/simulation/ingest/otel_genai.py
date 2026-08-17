@@ -32,6 +32,7 @@ from wmo.simulation.ingest.otlp import (
 )
 from wmo.simulation.ingest.vendor_records import (
     VendorTraceFormatError,
+    dotted_lookup,
     first_text,
     flatten_records,
     read_vendor_export,
@@ -153,8 +154,8 @@ def _otlp_span(record: JsonObject) -> JsonObject:
     Raises:
         VendorTraceFormatError: Identity, naming, or timing evidence is absent or malformed.
     """
-    source_trace_id = required_text(_lookup(record, _TRACE_ID_KEYS), "OTel GenAI trace_id")
-    source_span_id = required_text(_lookup(record, _SPAN_ID_KEYS), "OTel GenAI span_id")
+    source_trace_id = required_text(dotted_lookup(record, _TRACE_ID_KEYS), "OTel GenAI trace_id")
+    source_span_id = required_text(dotted_lookup(record, _SPAN_ID_KEYS), "OTel GenAI span_id")
     trace_id = vendor_w3c_id(source_trace_id, vendor=VENDOR, kind="trace", namespace="trace")
     span_id = vendor_w3c_id(source_span_id, vendor=VENDOR, kind="span", namespace="span")
     attributes = _attributes(record)
@@ -164,11 +165,13 @@ def _otlp_span(record: JsonObject) -> JsonObject:
         "traceId": trace_id,
         "spanId": span_id,
         "name": required_text(record.get("name"), "OTel GenAI span name"),
-        "startTimeUnixNano": _unix_nano(_lookup(record, _START_KEYS), "OTel GenAI start_time"),
-        "endTimeUnixNano": _unix_nano(_lookup(record, _END_KEYS), "OTel GenAI end_time"),
+        "startTimeUnixNano": _unix_nano(
+            dotted_lookup(record, _START_KEYS), "OTel GenAI start_time"
+        ),
+        "endTimeUnixNano": _unix_nano(dotted_lookup(record, _END_KEYS), "OTel GenAI end_time"),
         "attributes": _any_value_array(attributes),
     }
-    parent = _lookup(record, _PARENT_ID_KEYS)
+    parent = dotted_lookup(record, _PARENT_ID_KEYS)
     if isinstance(parent, str) and parent.strip():
         span["parentSpanId"] = vendor_w3c_id(
             parent.strip(), vendor=VENDOR, kind="span", namespace="span"
@@ -293,27 +296,3 @@ def _any_value(value: JsonValue) -> JsonObject:
             }
         }
     raise VendorTraceFormatError("exported GenAI attribute values cannot be null")
-
-
-def _lookup(record: JsonObject, paths: Sequence[str]) -> JsonValue | None:
-    """Read the first declared value among dotted record paths.
-
-    Args:
-        record: Exported span record.
-        paths: Dotted candidate paths in preference order.
-
-    Returns:
-        First declared value, or ``None`` when the record declares none.
-    """
-    for path in paths:
-        if path in record:
-            return record[path]
-        node: JsonValue | None = record
-        for part in path.split("."):
-            if not isinstance(node, dict) or part not in node:
-                node = None
-                break
-            node = node[part]
-        if node is not None:
-            return node
-    return None

@@ -228,6 +228,7 @@ def test_posthog_and_otlp_equivalent_fixtures_produce_equivalent_visible_evidenc
     assert _visible_evidence(posthog.traces[0]) == _visible_evidence(otlp.traces[0])
     assert posthog.traces[0].trace_id == _TRACE_ID
     assert all(len(span.span_id) == 16 for span in posthog.traces[0].spans)
+    assert all(span.attributes["wmo.source.span.id"] for span in posthog.traces[0].spans)
     assert posthog.traces[0].spans[0].started_at < posthog.traces[0].spans[1].started_at
     assert posthog.traces[0].spans[0].model is not None
     assert (
@@ -317,7 +318,7 @@ def test_posthog_rejects_unmatched_generated_tool_calls() -> None:
 
     assert result.traces == ()
     assert len(result.issues) == 1
-    assert "unmatched generated PostHog tool calls" in result.issues[0].message
+    assert "unmatched generated posthog tool calls" in result.issues[0].message
 
 
 def test_posthog_rejects_unmatched_explicit_tool_results() -> None:
@@ -342,7 +343,7 @@ def test_posthog_rejects_unmatched_explicit_tool_results() -> None:
 
     assert result.traces == ()
     assert len(result.issues) == 1
-    assert "unmatched explicit PostHog tool result: cancel_reservation:call-1" in (
+    assert "unmatched explicit posthog tool result: cancel_reservation:call-1" in (
         result.issues[0].message
     )
 
@@ -642,6 +643,6 @@ def test_authorized_hogql_pull_keeps_uuid_timestamp_ties_fifo_deterministic() ->
     ]
     tool_spans = [span for span in trace.spans if span.name == "agent.tool_call"]
     assert [span.attributes["gen_ai.tool.call.id"] for span in tool_spans] == [
-        "posthog-call-3-0",
-        "posthog-call-3-1",
+        "posthog-call-generation-1-0",
+        "posthog-call-generation-1-1",
     ]

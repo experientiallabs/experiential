@@ -19,7 +19,7 @@ from wmo.common.judging.calibration_metrics import (
     WorstDisagreement,
 )
 from wmo.common.judging.lineage import RouterLineageSplit
-from wmo.common.judging.rubric import DimensionScoreMap, JudgeCalibration
+from wmo.common.judging.rubric import DimensionScoreMap
 from wmo.common.models import ModelSnapshot
 
 
@@ -177,13 +177,3 @@ class CalibrationReport(ArtifactEnvelope):
             for metric in self.dimension_metrics
         ):
             raise ValueError("provisional calibration reports require zero metric denominators")
-
-
-def _same_report_identity(left: CalibrationReport, right: CalibrationReport) -> bool:
-    """Compare report evidence while permitting a safe retry with a later clock time."""
-    return left.model_dump(exclude={"created_at"}) == right.model_dump(exclude={"created_at"})
-
-
-def _same_calibration_identity(left: JudgeCalibration, right: JudgeCalibration) -> bool:
-    """Compare frozen calibration content without retry-time artifact timestamps."""
-    return left.model_dump(exclude={"created_at"}) == right.model_dump(exclude={"created_at"})

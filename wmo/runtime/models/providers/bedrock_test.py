@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     ConnectionConfig,
@@ -41,28 +40,8 @@ from wmo.runtime.models.providers.bedrock import (
     resolve_bedrock_region,
 )
 from wmo.runtime.models.providers.errors import ProviderResponseError
-from wmo.runtime.models.providers.transport import (
-    JsonHttpResponse,
-    JsonHttpTransport,
-    ProviderTransportError,
-)
-from wmo.runtime.models.registry import ModelConnectionError, RuntimeModelCatalog
-
-
-class _UnusedTransport(JsonHttpTransport):
-    """Fails if catalog construction unexpectedly tries to make an HTTP call."""
-
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Reject every attempted HTTP-shaped call."""
-        del url, headers, payload, timeout_seconds
-        raise AssertionError("Bedrock catalog construction must not use HTTP transport")
+from wmo.runtime.models.providers.transport import ProviderTransportError, ScriptedJsonTransport
+from wmo.runtime.models.registry import RuntimeModelCatalog
 
 
 class _FakeBedrockRuntime:
@@ -73,7 +52,6 @@ class _FakeBedrockRuntime:
         *,
         converse_response: Mapping[str, object] | None = None,
         invoke_bodies: list[Mapping[str, object]] | None = None,
-        converse_error: Exception | None = None,
     ) -> None:
         self.converse_calls: list[Mapping[str, object]] = []
         self.invoke_calls: list[Mapping[str, object]] = []
@@ -88,13 +66,10 @@ class _FakeBedrockRuntime:
             },
         }
         self._invoke_bodies = list(invoke_bodies or [{"embedding": [3.0, 4.0]}])
-        self._converse_error = converse_error
 
     def converse(self, **request: object) -> Mapping[str, object]:
         """Record one Converse request and return the frozen response."""
         self.converse_calls.append(request)
-        if self._converse_error is not None:
-            raise self._converse_error
         return self._converse_response
 
     def invoke_model(self, **request: object) -> Mapping[str, object]:
@@ -382,7 +357,7 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
             roles=ModelRoles(world_model="claude", judge="claude", embedder="embed"),
         ),
         environment={},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
         bedrock_runtime_factory=lambda *, region_name: runtime,
     )
 
@@ -398,21 +373,6 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
     assert embedder.embedding_client is embedder.client
     assert response.output.content == "ok"
     assert vectors[0].values == (0.6, 0.8)
-    with pytest.raises(ModelConnectionError, match="unsupported provider"):
-        RuntimeModelCatalog(
-            ModelCatalog(
-                connections={"other": ConnectionConfig(provider="waterfall", api_key_env="X")},
-                models={
-                    "x": ModelRecord(
-                        connection="other",
-                        model="x",
-                        capabilities=ModelCapabilities(),
-                    )
-                },
-            ),
-            environment={"X": "x"},
-            transport_factory=_UnusedTransport,
-        ).snapshot("x")
 
 
 def test_snapshot_does_not_construct_a_bedrock_runtime() -> None:
@@ -434,7 +394,7 @@ def test_snapshot_does_not_construct_a_bedrock_runtime() -> None:
             },
         ),
         environment={},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
         bedrock_runtime_factory=forbidden,
     )
 

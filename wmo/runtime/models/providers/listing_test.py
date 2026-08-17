@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 import pytest
 
 from wmo.common.core.artifacts import JsonObject
@@ -12,65 +10,25 @@ from wmo.runtime.models.providers.listing import (
     ProviderEndpoint,
     ProviderListingError,
 )
-from wmo.runtime.models.providers.retry import RetryPolicy
 from wmo.runtime.models.providers.transport import (
     JsonHttpResponse,
     JsonHttpTransport,
     ProviderTransportError,
+    RetryPolicy,
+    ScriptedJsonTransport,
 )
 
 
-class _RecordedRequest:
-    """One GET the lister issued, kept for header and URL assertions."""
+def _transport(*responses: JsonHttpResponse | Exception) -> ScriptedJsonTransport:
+    """Build a scripted transport from varargs answers.
 
-    def __init__(self, url: str, headers: Mapping[str, str]) -> None:
-        """Record one issued request.
+    Args:
+        responses: Responses or errors served in order, one per expected GET.
 
-        Args:
-            url: Absolute URL the lister read.
-            headers: Headers the lister sent.
-        """
-        self.url = url
-        self.headers = dict(headers)
-
-
-class _FakeTransport(JsonHttpTransport):
-    """Answers listing reads from a scripted queue without touching the network."""
-
-    def __init__(self, *responses: JsonHttpResponse | Exception) -> None:
-        """Create a transport that replays one scripted answer per GET.
-
-        Args:
-            responses: Responses or errors to return in order, the last one repeating.
-        """
-        self._responses = list(responses)
-        self.requests: list[_RecordedRequest] = []
-
-    def get(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Return the next scripted listing answer.
-
-        Args:
-            url: Absolute URL requested by the lister.
-            headers: Headers sent by the lister.
-            timeout_seconds: Bounded per-attempt timeout, recorded but unused.
-
-        Returns:
-            The next scripted response.
-
-        Raises:
-            Exception: The next scripted error.
-        """
-        self.requests.append(_RecordedRequest(url, headers))
-        answer = self._responses[0] if len(self._responses) == 1 else self._responses.pop(0)
-        if isinstance(answer, Exception):
-            raise answer
-        return answer
+    Returns:
+        A deterministic transport recording every request.
+    """
+    return ScriptedJsonTransport(responses)
 
 
 def _ok(body: JsonObject) -> JsonHttpResponse:
@@ -102,7 +60,7 @@ def _lister(transport: JsonHttpTransport) -> HttpProviderModelLister:
 
 def test_openai_listing_reads_identities_and_sends_bearer_credential() -> None:
     """OpenAI publishes only identities, which stay unknown until metadata resolves them."""
-    transport = _FakeTransport(_ok({"data": [{"id": "gpt-5.1"}, {"id": "text-embedding-3-small"}]}))
+    transport = _transport(_ok({"data": [{"id": "gpt-5.1"}, {"id": "text-embedding-3-small"}]}))
 
     models = _lister(transport).list_models(
         ProviderEndpoint(provider="openai", api_key="secret-key")
@@ -117,7 +75,7 @@ def test_openai_listing_reads_identities_and_sends_bearer_credential() -> None:
 
 def test_openai_compatible_listing_uses_the_configured_base_url() -> None:
     """An OpenAI-compatible endpoint is listed against its own explicit base URL."""
-    transport = _FakeTransport(_ok({"data": [{"id": "local-model"}]}))
+    transport = _transport(_ok({"data": [{"id": "local-model"}]}))
 
     models = _lister(transport).list_models(
         ProviderEndpoint(
@@ -133,7 +91,7 @@ def test_openai_compatible_listing_uses_the_configured_base_url() -> None:
 
 def test_anthropic_listing_reads_identities_and_sends_version_header() -> None:
     """Anthropic entries without an identity are skipped and the version header is sent."""
-    transport = _FakeTransport(
+    transport = _transport(
         _ok(
             {
                 "data": [
@@ -156,7 +114,7 @@ def test_anthropic_listing_reads_identities_and_sends_version_header() -> None:
 
 def test_openrouter_listing_reads_capabilities_limits_and_prices() -> None:
     """OpenRouter publishes per-token prices, which become per-million-token prices."""
-    transport = _FakeTransport(
+    transport = _transport(
         _ok(
             {
                 "data": [
@@ -197,7 +155,7 @@ def test_openrouter_listing_reads_capabilities_limits_and_prices() -> None:
 
 def test_gemini_listing_follows_pages_and_drops_the_resource_prefix() -> None:
     """Gemini paginates its model resources and prefixes each identity with ``models/``."""
-    transport = _FakeTransport(
+    transport = _transport(
         _ok(
             {
                 "models": [
@@ -239,9 +197,7 @@ def test_gemini_listing_follows_pages_and_drops_the_resource_prefix() -> None:
 
 def test_listing_rejects_an_invalid_credential_without_retrying() -> None:
     """A rejected credential is a terminal answer, so setup can prompt again immediately."""
-    transport = _FakeTransport(
-        ProviderTransportError("provider returned HTTP 401", status_code=401)
-    )
+    transport = _transport(ProviderTransportError("provider returned HTTP 401", status_code=401))
 
     with pytest.raises(ProviderListingError, match="rejected the configured credential"):
         _lister(transport).list_models(ProviderEndpoint(provider="openai", api_key="bad-key"))
@@ -251,7 +207,8 @@ def test_listing_rejects_an_invalid_credential_without_retrying() -> None:
 
 def test_listing_retries_a_timeout_then_reports_it_without_response_content() -> None:
     """Timeouts are retried once and then reported without leaking any payload."""
-    transport = _FakeTransport(ProviderTransportError("provider request timed out"))
+    timeout = ProviderTransportError("provider request timed out")
+    transport = _transport(timeout, timeout)
 
     with pytest.raises(ProviderListingError, match="model listing failed: provider request"):
         _lister(transport).list_models(ProviderEndpoint(provider="anthropic", api_key="secret-key"))
@@ -261,9 +218,8 @@ def test_listing_retries_a_timeout_then_reports_it_without_response_content() ->
 
 def test_listing_reports_a_server_error_status_without_response_content() -> None:
     """A non-success status is summarized by code only."""
-    transport = _FakeTransport(
-        ProviderTransportError("provider returned HTTP 500", status_code=500)
-    )
+    server_error = ProviderTransportError("provider returned HTTP 500", status_code=500)
+    transport = _transport(server_error, server_error)
 
     with pytest.raises(ProviderListingError, match="failed with HTTP 500"):
         _lister(transport).list_models(ProviderEndpoint(provider="gemini", api_key="secret-key"))
@@ -271,7 +227,7 @@ def test_listing_reports_a_server_error_status_without_response_content() -> Non
 
 def test_listing_accepts_an_empty_model_list() -> None:
     """An account with no available model lists nothing instead of failing."""
-    transport = _FakeTransport(_ok({"data": []}))
+    transport = _transport(_ok({"data": []}))
 
     assert (
         _lister(transport).list_models(ProviderEndpoint(provider="openai", api_key="secret-key"))
@@ -281,7 +237,7 @@ def test_listing_accepts_an_empty_model_list() -> None:
 
 def test_listing_rejects_a_non_array_model_list() -> None:
     """A listing body of the wrong shape is a provider error, not an empty account."""
-    transport = _FakeTransport(_ok({"data": {"id": "gpt-5.1"}}))
+    transport = _transport(_ok({"data": {"id": "gpt-5.1"}}))
 
     with pytest.raises(ProviderListingError, match="unexpected model list shape"):
         _lister(transport).list_models(ProviderEndpoint(provider="openai", api_key="secret-key"))
@@ -289,7 +245,7 @@ def test_listing_rejects_a_non_array_model_list() -> None:
 
 def test_listing_requires_a_resolved_credential() -> None:
     """Listing never runs without a credential, so no anonymous request is attempted."""
-    transport = _FakeTransport(_ok({"data": []}))
+    transport = _transport(_ok({"data": []}))
 
     with pytest.raises(ProviderListingError, match="needs a resolved credential"):
         _lister(transport).list_models(ProviderEndpoint(provider="openai", api_key=""))
@@ -299,7 +255,7 @@ def test_listing_requires_a_resolved_credential() -> None:
 
 def test_listing_rejects_an_unsupported_provider() -> None:
     """A provider without a listing endpoint fails closed instead of guessing one."""
-    transport = _FakeTransport(_ok({"data": []}))
+    transport = _transport(_ok({"data": []}))
 
     with pytest.raises(ProviderListingError, match="cannot list models"):
         _lister(transport).list_models(ProviderEndpoint(provider="tinker", api_key="secret-key"))

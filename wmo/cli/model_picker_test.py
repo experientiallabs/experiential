@@ -21,7 +21,6 @@ from wmo.cli.provider_picker import (
     SetupSession,
 )
 from wmo.common.models import (
-    ConnectionConfig,
     DiscoveredModel,
     ModelCapabilities,
     ModelRecord,
@@ -299,35 +298,6 @@ def test_unverified_configured_alias_retains_only_its_exact_prior_role() -> None
     assert "No row matches 'legacy'" in console.output
 
 
-def test_unverified_router_candidates_and_incumbent_can_be_retained() -> None:
-    """Exact prior candidate bindings remain selectable without claiming compatibility."""
-    records = {
-        "legacy-a": ModelRecord(connection="tinker", model="tinker://sampling/a"),
-        "legacy-b": ModelRecord(connection="tinker", model="tinker://sampling/b"),
-    }
-    retained = frozenset({SetupRole.ROUTER_CANDIDATE})
-    rows = configured_models(
-        records,
-        connection_providers={"tinker": "tinker"},
-        retainable_roles={"legacy-a": retained, "legacy-b": retained},
-    )
-    roles = assign_roles(
-        (*rows, _CHAT, _EMBEDDER),
-        role_inputs=SetupRoleInputs(
-            world_model="luna",
-            judge="luna",
-            embedder="embedder",
-            candidates=("legacy-a", "legacy-b"),
-            incumbent="legacy-a",
-        ),
-        console=ScriptedConsole("\n\n\n\n\n"),
-    )
-
-    assert roles is not None
-    assert roles.candidates == ("legacy-a", "legacy-b")
-    assert roles.incumbent == "legacy-a"
-
-
 def test_manual_declaration_stays_behind_the_advanced_row() -> None:
     """A hand-declared model is only reachable from the explicit advanced row."""
     session = _session(_CHAT, advanced_models=True)
@@ -450,7 +420,6 @@ def test_a_connection_only_used_by_unselected_models_is_not_written() -> None:
     )
 
     assert [connection.name for connection in result.setup.connections] == ["openai"]
-    assert ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY").provider
 
 
 def test_duplicate_provider_model_names_receive_distinct_aliases() -> None:

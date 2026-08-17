@@ -17,18 +17,18 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from wmo.simulation.ingest.braintrust import load_braintrust_file
-from wmo.simulation.ingest.chat_json import load_chat_json_file
-from wmo.simulation.ingest.langfuse import load_langfuse_file
-from wmo.simulation.ingest.langsmith import load_langsmith_file
-from wmo.simulation.ingest.mastra import load_mastra_file
+from wmo.simulation.ingest.braintrust import BRAINTRUST_SOURCE
+from wmo.simulation.ingest.chat_json import CHAT_JSON_SOURCE
+from wmo.simulation.ingest.langfuse import LANGFUSE_SOURCE
+from wmo.simulation.ingest.langsmith import LANGSMITH_SOURCE
+from wmo.simulation.ingest.mastra import MASTRA_SOURCE
 from wmo.simulation.ingest.otel_genai import load_otel_genai_file
 from wmo.simulation.ingest.otlp import (
     OtlpTraceFormatError,
     TraceNormalizationResult,
     load_otlp_file,
 )
-from wmo.simulation.ingest.phoenix import load_phoenix_file
+from wmo.simulation.ingest.phoenix import PHOENIX_SOURCE
 from wmo.simulation.ingest.posthog import PostHogPullError, load_posthog_file
 from wmo.simulation.ingest.vendor_records import VendorTraceFormatError
 
@@ -38,14 +38,14 @@ class TraceSourceError(ValueError):
 
 
 _LOADERS: dict[str, Callable[[Path], TraceNormalizationResult]] = {
-    "braintrust": load_braintrust_file,
-    "chat-json": load_chat_json_file,
-    "langfuse": load_langfuse_file,
-    "langsmith": load_langsmith_file,
-    "mastra": load_mastra_file,
+    "braintrust": BRAINTRUST_SOURCE.load,
+    "chat-json": CHAT_JSON_SOURCE.load,
+    "langfuse": LANGFUSE_SOURCE.load,
+    "langsmith": LANGSMITH_SOURCE.load,
+    "mastra": MASTRA_SOURCE.load,
     "otel-genai": load_otel_genai_file,
     "otlp": load_otlp_file,
-    "phoenix": load_phoenix_file,
+    "phoenix": PHOENIX_SOURCE.load,
     "posthog": load_posthog_file,
 }
 CANONICAL_TRACE_SOURCES: tuple[str, ...] = tuple(sorted(_LOADERS))

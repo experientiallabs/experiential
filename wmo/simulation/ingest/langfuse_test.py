@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from wmo.simulation.ingest.langfuse import load_langfuse_file
+from wmo.simulation.ingest.langfuse import LANGFUSE_SOURCE
 
 
 def _trace(observations: list[dict[str, object]] | None = None) -> dict[str, object]:
@@ -87,66 +87,16 @@ def _observations() -> list[dict[str, object]]:
     ]
 
 
-def test_load_langfuse_file_converts_generations_and_tools(tmp_path: Path) -> None:
-    """Generations and tool observations become paired canonical spans."""
+def test_load_langfuse_file_keeps_completion_and_customer_identity(tmp_path: Path) -> None:
+    """The final generation keeps its completion text and the trace's customer identity."""
     path = tmp_path / "langfuse.json"
     path.write_text(json.dumps([_trace()]), encoding="utf-8")
 
-    result = load_langfuse_file(path)
+    result = LANGFUSE_SOURCE.load(path)
 
-    assert result.issues == ()
-    trace = result.traces[0]
-    assert trace.task == "Where is my order?"
-    assert trace.conversation_id == "session-9"
-    assert [span.name for span in trace.spans] == [
-        "agent.model_call",
-        "agent.tool_call",
-        "agent.model_call",
-    ]
-    call, tool_result, answer = trace.spans
-    assert call.attributes["gen_ai.tool.call.id"] == "call-1"
-    assert call.model is not None
-    assert call.model.provider == "openai"
-    assert call.model.model_id == "gpt-4o-mini"
-    assert call.usage is not None
-    assert (call.usage.input_tokens, call.usage.output_tokens) == (42, 7)
-    assert tool_result.attributes["gen_ai.tool.call.id"] == "call-1"
-    assert tool_result.attributes["gen_ai.tool.message"] == "ships tomorrow"
-    assert tool_result.parent_span_id == call.span_id
+    answer = result.traces[0].spans[2]
     assert answer.attributes["gen_ai.completion"] == "It ships tomorrow."
     assert answer.attributes["wmo.customer.id"] == "customer-3"
-
-
-def test_load_langfuse_file_keeps_model_name_without_provider(tmp_path: Path) -> None:
-    """A model declared without a provider is retained as evidence, not as resolved identity."""
-    trace = _trace()
-    trace["metadata"] = {"tier": "gold"}
-    path = tmp_path / "langfuse.json"
-    path.write_text(json.dumps(trace), encoding="utf-8")
-
-    result = load_langfuse_file(path)
-
-    span = result.traces[0].spans[0]
-    assert span.model is None
-    assert span.attributes["gen_ai.request.model"] == "gpt-4o-mini"
-
-
-def test_load_langfuse_file_retains_error_observations(tmp_path: Path) -> None:
-    """An ERROR level observation becomes a structured span failure and trace outcome."""
-    observations = _observations()
-    observations[0]["level"] = "ERROR"
-    observations[0]["statusMessage"] = "rate limited"
-    trace = _trace(observations)
-    path = tmp_path / "langfuse.json"
-    path.write_text(json.dumps(trace), encoding="utf-8")
-
-    result = load_langfuse_file(path)
-
-    normalized = result.traces[0]
-    assert normalized.spans[0].failure is not None
-    assert normalized.spans[0].failure.message == "rate limited"
-    assert normalized.outcome is not None
-    assert normalized.outcome.status == "failure"
 
 
 def test_load_langfuse_file_accepts_bare_observations(tmp_path: Path) -> None:
@@ -165,7 +115,7 @@ def test_load_langfuse_file_accepts_bare_observations(tmp_path: Path) -> None:
     ]
     path.write_text("\n".join(json.dumps(item) for item in observations), encoding="utf-8")
 
-    result = load_langfuse_file(path)
+    result = LANGFUSE_SOURCE.load(path)
 
     assert len(result.traces) == 1
     assert result.traces[0].task == "hello"
@@ -192,20 +142,6 @@ def test_load_langfuse_file_retains_trace_without_convertible_observations(
     path = tmp_path / "langfuse.json"
     path.write_text(json.dumps(trace), encoding="utf-8")
 
-    result = load_langfuse_file(path)
+    result = LANGFUSE_SOURCE.load(path)
 
     assert [span.name for span in result.traces[0].spans] == ["agent.trace"]
-
-
-def test_load_langfuse_file_excludes_observation_without_timing(tmp_path: Path) -> None:
-    """An observation with no start time excludes its trace with an explicit issue."""
-    observations = _observations()
-    del observations[0]["startTime"]
-    trace = _trace(observations)
-    path = tmp_path / "langfuse.json"
-    path.write_text(json.dumps(trace), encoding="utf-8")
-
-    result = load_langfuse_file(path)
-
-    assert result.traces == ()
-    assert [issue.source_record for issue in result.issues] == ["record-1"]

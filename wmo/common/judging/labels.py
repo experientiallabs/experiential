@@ -13,12 +13,13 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ContractModel,
     JsonObject,
+    canonical_json_bytes,
     stable_id,
 )
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.judging.rubric import Rubric
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
+    ArtifactCorruptionError,
     ProjectStore,
     coordinate_completed_build_selection,
 )
@@ -409,27 +410,21 @@ class HumanScoreReview:
             active_label_ids=tuple(score.label_id for score in history.active_scores()),
         )
         try:
-            self._store.artifacts.write_json(
+            stored, _ = self._store.artifacts.write_or_replay(
                 artifact_id=label_set.label_set_id,
                 artifact_type="human-label-set",
                 envelope=label_set,
-                files={"labels.json": label_set},
+                envelope_path="labels.json",
+                envelope_type=HumanLabelSet,
+                files={"labels.json": canonical_json_bytes(label_set)},
             )
-        except ArtifactAlreadyExistsError:
-            try:
-                stored = HumanLabelSet.model_validate_json(
-                    self._store.artifacts.read_bytes(label_set.label_set_id, "labels.json")
-                )
-            except ValueError as exc:
-                raise ValueError(
-                    "existing human label-set artifact cannot be resumed safely"
-                ) from exc
-            if not _same_label_set_identity(stored, label_set):
-                raise ValueError(
-                    "existing human label-set artifact conflicts with this review"
-                ) from None
-            label_set = stored
-        return label_set
+        except ArtifactCorruptionError as exc:
+            raise ValueError("existing human label-set artifact cannot be resumed safely") from exc
+        except ValueError as exc:
+            raise ValueError(
+                "existing human label-set artifact conflicts with this review"
+            ) from exc
+        return stored
 
     def _mutate(
         self,
@@ -543,17 +538,3 @@ def _score_submissions_from_root(root: JsonObject) -> dict[str, str]:
     ):
         raise ValueError("review.json contains an invalid human score submission map")
     return dict(saved)
-
-
-def _same_label_set_identity(left: HumanLabelSet, right: HumanLabelSet) -> bool:
-    """Compare one frozen label set without retry-time artifact timestamps."""
-    return (
-        left.schema_version == right.schema_version
-        and left.label_set_id == right.label_set_id
-        and left.rubric_id == right.rubric_id
-        and left.history == right.history
-        and left.active_label_ids == right.active_label_ids
-        and left.code_revision == right.code_revision
-        and left.inputs == right.inputs
-        and left.source == right.source
-    )

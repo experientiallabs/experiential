@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from pydantic import field_validator, model_validator
 
-from wmo.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel
-from wmo.common.judging.provenance import (
-    JudgingProvenanceError,
-    read_artifact_json,
-    resolve_artifact,
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactId,
+    ContractModel,
+    canonical_json_bytes,
 )
-from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore
+from wmo.common.judging.provenance import JudgingProvenanceError, resolve_artifact
+from wmo.common.project import ArtifactCorruptionError, ProjectStore
 
 
 class RouterLineageAssignment(ContractModel):
@@ -129,43 +130,20 @@ def write_router_lineage_split(
             "router lineage split inputs are not the verified source task-set manifest"
         )
     try:
-        store.artifacts.write_json(
+        existing, _ = store.artifacts.write_or_replay(
             artifact_id=split.split_id,
             artifact_type="router-lineage-split",
             envelope=split,
-            files={"split.json": split},
+            envelope_path="split.json",
+            envelope_type=RouterLineageSplit,
+            files={"split.json": canonical_json_bytes(split)},
         )
-    except ArtifactAlreadyExistsError:
-        try:
-            existing, _input = read_artifact_json(
-                store,
-                artifact_id=split.split_id,
-                expected_artifact_type="router-lineage-split",
-                relative_path="split.json",
-                model_type=RouterLineageSplit,
-            )
-        except JudgingProvenanceError as exc:
-            raise JudgingProvenanceError(
-                "existing router-lineage split artifact cannot be resumed safely"
-            ) from exc
-        if not _same_split_identity(existing, split):
-            raise JudgingProvenanceError(
-                "existing router-lineage split artifact conflicts with this split"
-            ) from None
-        return existing
-    return split
-
-
-def _same_split_identity(left: RouterLineageSplit, right: RouterLineageSplit) -> bool:
-    """Compare one split while permitting a safe retry with a later clock time."""
-    return (
-        left.schema_version == right.schema_version
-        and left.split_id == right.split_id
-        and left.source_task_set_id == right.source_task_set_id
-        and left.fit_lineage_ids == right.fit_lineage_ids
-        and left.held_out_lineage_ids == right.held_out_lineage_ids
-        and left.assignments == right.assignments
-        and left.code_revision == right.code_revision
-        and left.inputs == right.inputs
-        and left.source == right.source
-    )
+    except ArtifactCorruptionError as exc:
+        raise JudgingProvenanceError(
+            "existing router-lineage split artifact cannot be resumed safely"
+        ) from exc
+    except ValueError as exc:
+        raise JudgingProvenanceError(
+            "existing router-lineage split artifact conflicts with this split"
+        ) from exc
+    return existing

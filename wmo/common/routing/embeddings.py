@@ -23,7 +23,7 @@ from wmo.common.core.artifacts import (
 from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
 from wmo.common.models import Embedding, EmbeddingClient, ModelSnapshot
-from wmo.common.project import ArtifactAlreadyExistsError, ArtifactStore
+from wmo.common.project import ArtifactStore
 from wmo.common.routing.features import RouterFeatureExtractor
 from wmo.common.tasks import TaskCase
 
@@ -430,23 +430,17 @@ def persist_router_embeddings(
         reservation=reservation,
     )
     try:
-        store.write_json(
+        stored, _ = store.write_or_replay(
             artifact_id=embedding_set_id,
             artifact_type="router-embeddings",
             envelope=artifact,
-            files={"embeddings.json": artifact},
+            envelope_path="embeddings.json",
+            envelope_type=ReservedFrozenEmbeddingSet,
+            files={"embeddings.json": canonical_json_bytes(artifact)},
         )
-    except ArtifactAlreadyExistsError:
-        existing = load_frozen_embedding_set(store, embedding_set_id)
-        if not isinstance(existing, ReservedFrozenEmbeddingSet):
-            raise ValueError("existing router embeddings use an incompatible schema") from None
-        replay = artifact.model_copy(update={"created_at": existing.created_at})
-        if existing != replay:
-            raise ValueError(
-                "existing router embeddings differ from deterministic replay"
-            ) from None
-        return existing
-    return artifact
+    except ValueError as exc:
+        raise ValueError("existing router embeddings differ from deterministic replay") from exc
+    return stored
 
 
 def _record_embedding_dispatch_intent(

@@ -10,8 +10,7 @@ from wmo.common.models import ModelSnapshot
 from wmo.runtime.models.credentials import ModelCredentialError
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
 from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleClient
-from wmo.runtime.models.providers.retry import RetryPolicy
-from wmo.runtime.models.providers.transport import JsonHttpTransport
+from wmo.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
 AZURE_OPENAI_API_KEY_ENV = "AZURE_OPENAI_API_KEY"
 AZURE_OPENAI_ENDPOINT_ENV = "AZURE_OPENAI_ENDPOINT"

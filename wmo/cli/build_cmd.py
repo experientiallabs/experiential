@@ -32,7 +32,7 @@ from wmo.common.project import (
 )
 from wmo.common.release_revision import installed_release_revision
 from wmo.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
-from wmo.runtime.models.providers.retry import RetryPolicy
+from wmo.runtime.models.providers.transport import RetryPolicy
 from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source

@@ -24,16 +24,10 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 from pydantic import JsonValue
 
-from wmo.common.core.artifacts import JsonObject, SourceIdentity, canonical_json_bytes
-from wmo.simulation.ingest.otlp import (
-    GENAI_SEMANTIC_CONVENTION_VERSION,
-    TraceNormalizationIssue,
-    TraceNormalizationResult,
-)
+from wmo.common.core.artifacts import JsonObject, canonical_json_bytes
 from wmo.simulation.ingest.vendor_observations import (
     VendorModelIdentity,
     VendorObservation,
@@ -45,11 +39,11 @@ from wmo.simulation.ingest.vendor_records import (
     flatten_records,
     message_role,
     message_text,
-    read_vendor_export,
     required_text,
     source_timestamp,
 )
-from wmo.simulation.ingest.vendor_trace import approved_extensions, build_vendor_traces
+from wmo.simulation.ingest.vendor_source import VendorSource
+from wmo.simulation.ingest.vendor_trace import approved_extensions
 
 VENDOR = "chat-json"
 
@@ -59,78 +53,6 @@ _PROVIDER_KEYS = ("provider", "system")
 _TIMESTAMP_KEYS = ("timestamp", "created_at", "created", "time")
 _USER_ROLES = frozenset({"user", "human"})
 _SYNTHETIC_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
-
-
-def load_chat_json_file(
-    path: Path,
-    *,
-    semantic_convention_version: str = GENAI_SEMANTIC_CONVENTION_VERSION,
-    source_id: str | None = None,
-) -> TraceNormalizationResult:
-    """Read a chat JSON or JSONL conversation export into canonical trace evidence.
-
-    Args:
-        path: Conversation object, conversation array, message array, or JSONL export.
-        semantic_convention_version: Pinned GenAI semantic-convention version for the traces.
-        source_id: Optional durable source label. The local path is used when omitted.
-
-    Returns:
-        Canonical traces and every retained parse or validation exclusion.
-
-    Raises:
-        VendorTraceFormatError: The export cannot be read or decoded.
-    """
-    export = read_vendor_export(path, vendor=VENDOR, source_id=source_id)
-    return normalize_chat_json_payloads(
-        export.payloads,
-        source=export.source,
-        semantic_convention_version=semantic_convention_version,
-        initial_issues=export.issues,
-    )
-
-
-def normalize_chat_json_payloads(
-    payloads: Sequence[JsonValue],
-    *,
-    source: SourceIdentity,
-    semantic_convention_version: str = GENAI_SEMANTIC_CONVENTION_VERSION,
-    initial_issues: Sequence[TraceNormalizationIssue] = (),
-) -> TraceNormalizationResult:
-    """Normalize decoded chat JSON payloads into canonical traces.
-
-    Args:
-        payloads: Decoded conversation documents or message arrays in source order.
-        source: Immutable identity of the source bytes or transport result.
-        semantic_convention_version: Pinned GenAI semantic-convention version for the traces.
-        initial_issues: Parse exclusions collected before conversation mapping.
-
-    Returns:
-        Canonical traces and every retained validation exclusion.
-    """
-    issues = list(initial_issues)
-    observations: list[VendorObservation] = []
-    ordinal = 0
-    for index, payload in enumerate(payloads, start=1):
-        try:
-            conversations = _conversations(payload)
-        except VendorTraceFormatError as exc:
-            issues.append(TraceNormalizationIssue(f"record-{index}", str(exc)))
-            continue
-        for conversation in conversations:
-            try:
-                emitted = _conversation_observations(conversation, ordinal)
-            except VendorTraceFormatError as exc:
-                issues.append(TraceNormalizationIssue(f"record-{index}", str(exc)))
-                continue
-            observations.extend(emitted)
-            ordinal += len(emitted)
-    return build_vendor_traces(
-        observations,
-        vendor=VENDOR,
-        source=source,
-        semantic_convention_version=semantic_convention_version,
-        initial_issues=issues,
-    )
 
 
 def _conversations(payload: JsonValue) -> tuple[JsonObject, ...]:
@@ -387,3 +309,10 @@ def _model_identity(conversation: JsonObject) -> VendorModelIdentity | None:
         model_id=model_id,
         revision=first_text(conversation, ("model_revision", "revision")),
     )
+
+
+CHAT_JSON_SOURCE: VendorSource[JsonObject] = VendorSource(
+    vendor=VENDOR,
+    records=_conversations,
+    convert=_conversation_observations,
+)

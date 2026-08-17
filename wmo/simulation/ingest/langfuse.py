@@ -20,17 +20,9 @@ declares a provider in the trace or observation metadata.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from pathlib import Path
-
 from pydantic import JsonValue
 
-from wmo.common.core.artifacts import JsonObject, SourceIdentity
-from wmo.simulation.ingest.otlp import (
-    GENAI_SEMANTIC_CONVENTION_VERSION,
-    TraceNormalizationIssue,
-    TraceNormalizationResult,
-)
+from wmo.common.core.artifacts import JsonObject
 from wmo.simulation.ingest.vendor_observations import (
     VendorModelIdentity,
     VendorObservation,
@@ -44,14 +36,14 @@ from wmo.simulation.ingest.vendor_records import (
     VendorTraceFormatError,
     first_text,
     first_user_text,
-    flatten_records,
     json_text,
     json_value,
-    read_vendor_export,
     required_text,
+    source_interval,
     source_timestamp,
 )
-from wmo.simulation.ingest.vendor_trace import approved_extensions, build_vendor_traces
+from wmo.simulation.ingest.vendor_source import VendorSource, record_flattener
+from wmo.simulation.ingest.vendor_trace import approved_extensions
 
 VENDOR = "langfuse"
 
@@ -60,83 +52,6 @@ _TOOL_TYPES = frozenset({"TOOL", "RETRIEVER"})
 _MODEL_KEYS = ("model", "modelName")
 _PROVIDER_KEYS = ("provider", "modelProvider", "model_provider")
 _ERROR_KEYS = ("statusMessage", "error")
-
-
-def load_langfuse_file(
-    path: Path,
-    *,
-    semantic_convention_version: str = GENAI_SEMANTIC_CONVENTION_VERSION,
-    source_id: str | None = None,
-) -> TraceNormalizationResult:
-    """Read a Langfuse JSON or JSONL export into canonical trace evidence.
-
-    Args:
-        path: Langfuse trace export, observation export, or JSONL export.
-        semantic_convention_version: Pinned GenAI semantic-convention version for the traces.
-        source_id: Optional durable source label. The local path is used when omitted.
-
-    Returns:
-        Canonical traces and every retained parse or validation exclusion.
-
-    Raises:
-        VendorTraceFormatError: The export cannot be read or decoded.
-    """
-    export = read_vendor_export(path, vendor=VENDOR, source_id=source_id)
-    return normalize_langfuse_payloads(
-        export.payloads,
-        source=export.source,
-        semantic_convention_version=semantic_convention_version,
-        initial_issues=export.issues,
-    )
-
-
-def normalize_langfuse_payloads(
-    payloads: Sequence[JsonValue],
-    *,
-    source: SourceIdentity,
-    semantic_convention_version: str = GENAI_SEMANTIC_CONVENTION_VERSION,
-    initial_issues: Sequence[TraceNormalizationIssue] = (),
-) -> TraceNormalizationResult:
-    """Normalize decoded Langfuse payloads into canonical traces.
-
-    Args:
-        payloads: Decoded Langfuse documents in source order.
-        source: Immutable identity of the source bytes or transport result.
-        semantic_convention_version: Pinned GenAI semantic-convention version for the traces.
-        initial_issues: Parse exclusions collected before record mapping.
-
-    Returns:
-        Canonical traces and every retained validation exclusion.
-    """
-    issues = list(initial_issues)
-    observations: list[VendorObservation] = []
-    ordinal = 0
-    for index, payload in enumerate(payloads, start=1):
-        try:
-            records = flatten_records(
-                payload,
-                vendor=VENDOR,
-                wrapper_keys=("data", "traces", "results", "items"),
-                record_keys=("observations", "traceId", "trace_id"),
-            )
-        except VendorTraceFormatError as exc:
-            issues.append(TraceNormalizationIssue(f"record-{index}", str(exc)))
-            continue
-        for record in records:
-            try:
-                emitted = _record_observations(record, ordinal)
-            except VendorTraceFormatError as exc:
-                issues.append(TraceNormalizationIssue(f"record-{index}", str(exc)))
-                continue
-            observations.extend(emitted)
-            ordinal += len(emitted)
-    return build_vendor_traces(
-        observations,
-        vendor=VENDOR,
-        source=source,
-        semantic_convention_version=semantic_convention_version,
-        initial_issues=issues,
-    )
 
 
 def _record_observations(record: JsonObject, ordinal: int) -> tuple[VendorObservation, ...]:
@@ -287,11 +202,11 @@ def _observation(
     if observation_type not in _MODEL_TYPES | _TOOL_TYPES:
         return None
     source_span_id = required_text(raw.get("id"), "Langfuse observation id")
-    started_at = source_timestamp(raw.get("startTime"), "Langfuse observation startTime")
-    ended_at = (
-        source_timestamp(raw.get("endTime"), "Langfuse observation endTime")
-        if raw.get("endTime") is not None
-        else started_at
+    started_at, ended_at = source_interval(
+        raw.get("startTime"),
+        raw.get("endTime"),
+        start_label="Langfuse observation startTime",
+        end_label="Langfuse observation endTime",
     )
     parent = first_text(raw, ("parentObservationId", "parent_observation_id"))
     failure = _failure_message(raw)
@@ -427,3 +342,14 @@ def _trace_extensions(trace: JsonObject) -> JsonObject:
     if user_id is not None and "wmo.customer.id" not in extensions:
         extensions["wmo.customer.id"] = user_id
     return extensions
+
+
+LANGFUSE_SOURCE: VendorSource[JsonObject] = VendorSource(
+    vendor=VENDOR,
+    records=record_flattener(
+        vendor=VENDOR,
+        wrapper_keys=("data", "traces", "results", "items"),
+        record_keys=("observations", "traceId", "trace_id"),
+    ),
+    convert=_record_observations,
+)

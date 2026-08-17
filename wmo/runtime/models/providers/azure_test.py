@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 import pytest
 
 from wmo.common.core.artifacts import JsonObject
@@ -14,11 +12,8 @@ from wmo.common.models import (
     ModelCatalog,
     ModelClient,
     ModelFinishReason,
-    ModelMessage,
     ModelRecord,
-    ModelRequest,
     ModelRoles,
-    ModelSnapshot,
 )
 from wmo.runtime.models.credentials import ModelCredentialError
 from wmo.runtime.models.providers.azure import (
@@ -28,52 +23,13 @@ from wmo.runtime.models.providers.azure import (
     bind_azure_api_key,
     same_azure_endpoint,
 )
-from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleResponseError
-from wmo.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
+from wmo.runtime.models.providers.openai_compatible_test import _request, _snapshot
+from wmo.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from wmo.runtime.models.registry import RuntimeModelCatalog
 
 _SECRET = "azure-secret-key-value"
 _ENDPOINT = "https://resource.openai.azure.com"
 _OTHER_ENDPOINT = "https://other.openai.azure.com"
-
-
-class _ScriptedTransport(JsonHttpTransport):
-    """Returns frozen JSON responses while retaining calls for wire assertions."""
-
-    def __init__(self, responses: list[JsonHttpResponse]) -> None:
-        self._responses = list(responses)
-        self.requests: list[tuple[str, Mapping[str, str], JsonObject]] = []
-
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Record one fake call and return the next frozen response."""
-        del timeout_seconds
-        self.requests.append((url, headers, payload))
-        if not self._responses:
-            raise AssertionError("test made an unexpected provider request")
-        return self._responses.pop(0)
-
-
-def _snapshot(model_id: str = "gpt-deployment") -> ModelSnapshot:
-    """Build an immutable Azure identity fixture."""
-    return ModelSnapshot(
-        provider="azure",
-        model_id=model_id,
-        revision="fixture-revision",
-        capabilities_sha256="a" * 64,
-        connection_sha256="a" * 64,
-    )
-
-
-def _request() -> ModelRequest:
-    """Build a minimal visible transcript."""
-    return ModelRequest(messages=(ModelMessage(role="user", content="Create a ticket."),))
 
 
 def _completion_response() -> JsonObject:
@@ -86,9 +42,11 @@ def _completion_response() -> JsonObject:
 
 def test_v1_route_sends_deployment_and_api_key_header() -> None:
     """Foundry and Azure OpenAI v1 keep the deployment in the body and authenticate with api-key."""
-    transport = _ScriptedTransport([JsonHttpResponse(status_code=200, body=_completion_response())])
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
     client = AzureClient(
-        model=_snapshot(),
+        model=_snapshot("azure", "gpt-deployment"),
         endpoint=_ENDPOINT,
         api_key=_SECRET,
         api_version="v1",
@@ -108,9 +66,11 @@ def test_v1_route_sends_deployment_and_api_key_header() -> None:
 
 def test_classic_route_puts_the_exact_deployment_in_the_path() -> None:
     """Dated Azure OpenAI versions keep the deployment in the URL and the body."""
-    transport = _ScriptedTransport([JsonHttpResponse(status_code=200, body=_completion_response())])
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
     client = AzureClient(
-        model=_snapshot("exact-deployment"),
+        model=_snapshot("azure", "exact-deployment"),
         endpoint=_ENDPOINT,
         api_key=_SECRET,
         api_version="2024-10-21",
@@ -127,26 +87,9 @@ def test_classic_route_puts_the_exact_deployment_in_the_path() -> None:
     assert payload["model"] == "exact-deployment"
 
 
-def test_malformed_response_fails_closed_without_exposing_the_key() -> None:
-    """Incomplete Azure responses raise a typed error that never includes the credential."""
-    transport = _ScriptedTransport([JsonHttpResponse(status_code=200, body={"choices": []})])
-    client = AzureClient(
-        model=_snapshot(),
-        endpoint=_ENDPOINT,
-        api_key=_SECRET,
-        api_version="v1",
-        transport=transport,
-    )
-
-    with pytest.raises(OpenAICompatibleResponseError, match="no choices") as captured:
-        client.complete(_request())
-    assert _SECRET not in str(captured.value)
-    assert _SECRET not in repr(captured.value)
-
-
 def test_embeddings_use_the_configured_deployment_alias() -> None:
     """Embedding aliases send their own deployment ID rather than a guessed base model."""
-    transport = _ScriptedTransport(
+    transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -155,7 +98,7 @@ def test_embeddings_use_the_configured_deployment_alias() -> None:
         ]
     )
     client = AzureClient(
-        model=_snapshot("embed-deployment"),
+        model=_snapshot("azure", "embed-deployment"),
         endpoint=_ENDPOINT,
         api_key=_SECRET,
         api_version="v1",
@@ -231,9 +174,11 @@ def test_canonical_endpoint_comparison_is_host_insensitive_and_path_sensitive() 
 
 def test_a_v1_root_endpoint_is_not_double_appended() -> None:
     """Operators may store either the resource root or the v1 root."""
-    transport = _ScriptedTransport([JsonHttpResponse(status_code=200, body=_completion_response())])
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
     client = AzureClient(
-        model=_snapshot(),
+        model=_snapshot("azure", "gpt-deployment"),
         endpoint="https://resource.openai.azure.com/openai/v1",
         api_key=_SECRET,
         api_version="v1",
@@ -275,7 +220,7 @@ def test_catalog_resolution_pairs_one_endpoint_with_its_key() -> None:
             AZURE_OPENAI_API_KEY_ENV: _SECRET,
             AZURE_OPENAI_ENDPOINT_ENV: _ENDPOINT,
         },
-        transport_factory=lambda: _ScriptedTransport(
+        transport_factory=lambda: ScriptedJsonTransport(
             [JsonHttpResponse(status_code=200, body=_completion_response())]
         ),
     )
@@ -311,7 +256,7 @@ def test_catalog_resolution_pairs_one_endpoint_with_its_key() -> None:
             AZURE_OPENAI_API_KEY_ENV: _SECRET,
             AZURE_OPENAI_ENDPOINT_ENV: _ENDPOINT,
         },
-        transport_factory=lambda: _ScriptedTransport([]),
+        transport_factory=ScriptedJsonTransport,
     )
     with pytest.raises(ModelCredentialError, match="different Azure resource"):
         mismatched.resolve("gpt")

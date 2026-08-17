@@ -19,18 +19,9 @@ only when the row's metadata declares both a provider and a model.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from datetime import datetime
-from pathlib import Path
 
-from pydantic import JsonValue
-
-from wmo.common.core.artifacts import JsonObject, SourceIdentity
-from wmo.simulation.ingest.otlp import (
-    GENAI_SEMANTIC_CONVENTION_VERSION,
-    TraceNormalizationIssue,
-    TraceNormalizationResult,
-)
+from wmo.common.core.artifacts import JsonObject
 from wmo.simulation.ingest.vendor_observations import (
     VendorModelIdentity,
     VendorObservation,
@@ -42,17 +33,15 @@ from wmo.simulation.ingest.vendor_observations import (
     declared_usage,
 )
 from wmo.simulation.ingest.vendor_records import (
-    VendorTraceFormatError,
     first_text,
     first_user_text,
-    flatten_records,
     json_text,
     json_value,
-    read_vendor_export,
     required_text,
-    source_timestamp,
+    source_interval,
 )
-from wmo.simulation.ingest.vendor_trace import approved_extensions, build_vendor_traces
+from wmo.simulation.ingest.vendor_source import VendorSource, record_flattener
+from wmo.simulation.ingest.vendor_trace import approved_extensions
 
 VENDOR = "braintrust"
 
@@ -63,86 +52,7 @@ _PROVIDER_KEYS = ("provider", "model_provider")
 _ERROR_KEYS = ("error",)
 
 
-def load_braintrust_file(
-    path: Path,
-    *,
-    semantic_convention_version: str = GENAI_SEMANTIC_CONVENTION_VERSION,
-    source_id: str | None = None,
-) -> TraceNormalizationResult:
-    """Read a Braintrust log export into canonical trace evidence.
-
-    Args:
-        path: Braintrust row array, envelope, or JSONL export.
-        semantic_convention_version: Pinned GenAI semantic-convention version for the traces.
-        source_id: Optional durable source label. The local path is used when omitted.
-
-    Returns:
-        Canonical traces and every retained parse or validation exclusion.
-
-    Raises:
-        VendorTraceFormatError: The export cannot be read or decoded.
-    """
-    export = read_vendor_export(path, vendor=VENDOR, source_id=source_id)
-    return normalize_braintrust_payloads(
-        export.payloads,
-        source=export.source,
-        semantic_convention_version=semantic_convention_version,
-        initial_issues=export.issues,
-    )
-
-
-def normalize_braintrust_payloads(
-    payloads: Sequence[JsonValue],
-    *,
-    source: SourceIdentity,
-    semantic_convention_version: str = GENAI_SEMANTIC_CONVENTION_VERSION,
-    initial_issues: Sequence[TraceNormalizationIssue] = (),
-) -> TraceNormalizationResult:
-    """Normalize decoded Braintrust rows into canonical traces.
-
-    Args:
-        payloads: Decoded Braintrust documents in source order.
-        source: Immutable identity of the source bytes or transport result.
-        semantic_convention_version: Pinned GenAI semantic-convention version for the traces.
-        initial_issues: Parse exclusions collected before row mapping.
-
-    Returns:
-        Canonical traces and every retained validation exclusion.
-    """
-    issues = list(initial_issues)
-    observations: list[VendorObservation] = []
-    ordinal = 0
-    for index, payload in enumerate(payloads, start=1):
-        try:
-            rows = flatten_records(
-                payload,
-                vendor=VENDOR,
-                wrapper_keys=("events", "rows", "data", "results", "items"),
-                record_keys=("span_id", "root_span_id", "span_attributes"),
-            )
-        except VendorTraceFormatError as exc:
-            issues.append(TraceNormalizationIssue(f"record-{index}", str(exc)))
-            continue
-        for row in rows:
-            try:
-                converted = _row_observation(row, ordinal)
-            except VendorTraceFormatError as exc:
-                issues.append(TraceNormalizationIssue(f"record-{index}", str(exc)))
-                continue
-            if converted is None:
-                continue
-            observations.append(converted)
-            ordinal += 1
-    return build_vendor_traces(
-        observations,
-        vendor=VENDOR,
-        source=source,
-        semantic_convention_version=semantic_convention_version,
-        initial_issues=issues,
-    )
-
-
-def _row_observation(row: JsonObject, ordinal: int) -> VendorObservation | None:
+def _row_observation(row: JsonObject, ordinal: int) -> tuple[VendorObservation, ...]:
     """Convert one Braintrust row to a declared model or tool-result observation.
 
     Args:
@@ -150,14 +60,14 @@ def _row_observation(row: JsonObject, ordinal: int) -> VendorObservation | None:
         ordinal: Source order position for the emitted observation.
 
     Returns:
-        Declared observation, or ``None`` for orchestration-only span types.
+        Declared observation, or nothing for orchestration-only span types.
 
     Raises:
         VendorTraceFormatError: The row lacks identity, timing, or tool evidence.
     """
     span_type = _span_type(row)
     if span_type not in _MODEL_TYPES | _TOOL_TYPES:
-        return None
+        return ()
     source_span_id = required_text(row.get("span_id", row.get("id")), "Braintrust span_id")
     source_trace_id = first_text(row, ("root_span_id",)) or source_span_id
     started_at, ended_at = _interval(row)
@@ -166,41 +76,45 @@ def _row_observation(row: JsonObject, ordinal: int) -> VendorObservation | None:
     extensions = _extensions(row)
     failure = declared_error_message(row, keys=_ERROR_KEYS, label="Braintrust row")
     if span_type in _TOOL_TYPES:
-        return VendorObservation(
+        return (
+            VendorObservation(
+                source_trace_id=source_trace_id,
+                source_span_id=source_span_id,
+                ordinal=ordinal,
+                started_at=started_at,
+                ended_at=ended_at,
+                kind="tool_result",
+                source_parent_span_id=_parent(row),
+                request_text=first_user_text(inputs),
+                tool_name=_tool_name(row),
+                tool_arguments=json_text(inputs),
+                tool_message=declared_completion_text(outputs),
+                failure_message=failure,
+                extensions=extensions,
+            ),
+        )
+    model, declared_model = _model_identity(row)
+    return (
+        VendorObservation(
             source_trace_id=source_trace_id,
             source_span_id=source_span_id,
             ordinal=ordinal,
             started_at=started_at,
             ended_at=ended_at,
-            kind="tool_result",
+            kind="model",
             source_parent_span_id=_parent(row),
             request_text=first_user_text(inputs),
-            tool_name=_tool_name(row),
-            tool_arguments=json_text(inputs),
-            tool_message=declared_completion_text(outputs),
+            input_messages=inputs if isinstance(inputs, list) else None,
+            completion_text=declared_completion_text(outputs) or None,
+            tool_calls=declared_tool_calls(outputs),
+            model=model,
+            usage=_usage(row),
             failure_message=failure,
+            declared_attributes=(
+                {} if declared_model is None else {"gen_ai.request.model": declared_model}
+            ),
             extensions=extensions,
-        )
-    model, declared_model = _model_identity(row)
-    return VendorObservation(
-        source_trace_id=source_trace_id,
-        source_span_id=source_span_id,
-        ordinal=ordinal,
-        started_at=started_at,
-        ended_at=ended_at,
-        kind="model",
-        source_parent_span_id=_parent(row),
-        request_text=first_user_text(inputs),
-        input_messages=inputs if isinstance(inputs, list) else None,
-        completion_text=declared_completion_text(outputs) or None,
-        tool_calls=declared_tool_calls(outputs),
-        model=model,
-        usage=_usage(row),
-        failure_message=failure,
-        declared_attributes=(
-            {} if declared_model is None else {"gen_ai.request.model": declared_model}
         ),
-        extensions=extensions,
     )
 
 
@@ -270,15 +184,12 @@ def _interval(row: JsonObject) -> tuple[datetime, datetime]:
     """
     metrics = row.get("metrics")
     metrics_object: JsonObject = metrics if isinstance(metrics, dict) else {}
-    start_value = metrics_object.get("start", row.get("created"))
-    started_at = source_timestamp(start_value, "Braintrust metrics start")
-    end_value = metrics_object.get("end")
-    ended_at = (
-        source_timestamp(end_value, "Braintrust metrics end")
-        if end_value is not None
-        else started_at
+    return source_interval(
+        metrics_object.get("start", row.get("created")),
+        metrics_object.get("end"),
+        start_label="Braintrust metrics start",
+        end_label="Braintrust metrics end",
     )
-    return started_at, ended_at
 
 
 def _usage(row: JsonObject) -> VendorTokenUsage | None:
@@ -336,3 +247,14 @@ def _extensions(row: JsonObject) -> JsonObject:
         if "wmo.trace.metadata" not in extensions:
             extensions["wmo.trace.metadata"] = metadata
     return extensions
+
+
+BRAINTRUST_SOURCE: VendorSource[JsonObject] = VendorSource(
+    vendor=VENDOR,
+    records=record_flattener(
+        vendor=VENDOR,
+        wrapper_keys=("events", "rows", "data", "results", "items"),
+        record_keys=("span_id", "root_span_id", "span_attributes"),
+    ),
+    convert=_row_observation,
+)

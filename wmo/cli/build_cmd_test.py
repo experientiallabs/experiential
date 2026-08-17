@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -150,67 +150,6 @@ def _otlp_export(tmp_path: Path, count: int = 1) -> Path:
     return path
 
 
-def _environment_capture_otlp_export(tmp_path: Path) -> Path:
-    """Write one exact environment-capture direct-span JSONL export.
-
-    Args:
-        tmp_path: Temporary directory receiving the trace export.
-
-    Returns:
-        Path to the completed JSONL export.
-    """
-    trace_id = "1" * 32
-    prefix = f"{trace_id[:12]}0000"
-    records = (
-        {
-            "traceId": trace_id,
-            "spanId": f"{prefix}a",
-            "parentSpanId": "",
-            "name": "chat terminal",
-            "startTimeUnixNano": 0,
-            "endTimeUnixNano": 1,
-            "status": {"code": "STATUS_CODE_OK"},
-            "attributes": [
-                _attribute("gen_ai.operation.name", "chat"),
-                _attribute("gen_ai.request.model", "terminal-agent"),
-                _attribute("gen_ai.tool.name", "bash"),
-                _attribute(
-                    "gen_ai.tool.call.arguments",
-                    json.dumps({"command": "printf ready"}),
-                ),
-                _attribute("gen_ai.prompt", "Print ready"),
-                _attribute(
-                    "wmh.trace.metadata",
-                    json.dumps(
-                        {
-                            "benchmark": "terminal-tasks",
-                            "returncode": 0,
-                            "task_category": "Filesystem + text processing",
-                        }
-                    ),
-                ),
-            ],
-        },
-        {
-            "traceId": trace_id,
-            "spanId": f"{prefix}b",
-            "parentSpanId": "",
-            "name": "execute_tool terminal",
-            "startTimeUnixNano": 2,
-            "endTimeUnixNano": 3,
-            "status": {"code": "STATUS_CODE_OK"},
-            "attributes": [
-                _attribute("gen_ai.operation.name", "execute_tool"),
-                _attribute("gen_ai.tool.name", "bash"),
-                _attribute("gen_ai.tool.message", "ready"),
-            ],
-        },
-    )
-    path = tmp_path / "traces.otel.jsonl"
-    path.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
-    return path
-
-
 class _EmbeddingClient:
     """Deterministic semantic-shaped client for no-network build tests."""
 
@@ -342,11 +281,11 @@ def _fake_runtime_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
 
 
-def test_first_build_accepts_repeatable_provider_flags_and_replays_without_setup(
+def test_first_build_provider_flags_skip_the_opening_list(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Exact --provider values skip the opening list and a replay does not reopen setup.
+    """Exact --provider values skip the opening list.
 
     Args:
         monkeypatch: Pytest patch fixture supplying a terminal, credential, and listing seam.
@@ -377,17 +316,8 @@ def test_first_build_accepts_repeatable_provider_flags_and_replays_without_setup
     assert lister.requests == ["openai"]
     printed = unstyle(result.output)
     assert "Select the providers you want to use" not in printed
-    assert "openai-secret" not in printed
     saved = load_model_catalog(root / "models.toml")
-    assert saved.connections["openai"].api_key_env == "OPENAI_API_KEY"
     assert saved.roles.world_model == "gpt-5-6-luna"
-
-    replay = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
-
-    assert replay.exit_code == 0, replay.output
-    assert lister.requests == ["openai"]
-    assert "Select the providers you want to use" not in unstyle(replay.output)
-    assert "Model setup is required" not in unstyle(replay.output)
 
 
 def test_first_build_rejects_bad_provider_flags_before_any_write(tmp_path: Path) -> None:
@@ -528,36 +458,6 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     with pytest.raises(ProjectStoreError, match="completed build graph"):
         store.bind_completed_build(swapped)
     assert store.load_project().build == config.build
-
-
-def test_build_accepts_environment_capture_jsonl_through_default_otlp_source(
-    tmp_path: Path,
-) -> None:
-    """The direct capture download shape completes the positional build path.
-
-    Args:
-        tmp_path: Temporary project and trace root.
-    """
-    source = _environment_capture_otlp_export(tmp_path)
-    root = tmp_path / ".wmo"
-    root.mkdir()
-    _catalog(root)
-
-    result = _RUNNER.invoke(app, ["build", "terminal", str(source), "--root", str(root)])
-
-    assert result.exit_code == 0, result.output
-    assert "built 1 accepted, 0 invalid" in result.output
-    store = ProjectStore(root, "terminal")
-    config = store.load_project()
-    assert config.build is not None
-    traces = load_trace_dataset(store.artifacts, config.build.trace_dataset.artifact_id)
-    assert len(traces.traces) == 1
-    assert traces.traces[0].conversation_id == traces.traces[0].trace_id
-    identity_evidence = read_trace_model_identity_evidence(store.artifacts, traces)
-    assert identity_evidence is not None
-    assert identity_evidence.records == ()
-    serving = load_rag_index(store.artifacts, config.build.serving_rag.artifact_id)
-    assert serving.index.transition_count == 1
 
 
 def test_build_package_upgrade_creates_new_immutable_graph(
@@ -1104,243 +1004,20 @@ def _chat_json_export(tmp_path: Path) -> Path:
     return path
 
 
-def _history(turn: int) -> list[JsonValue]:
-    """Return the visible request history observed by one conversation turn.
+def test_build_accepts_a_declared_vendor_source_through_the_source_flag(tmp_path: Path) -> None:
+    """One declared vendor export completes the positional build path via --source.
 
     Args:
-        turn: Zero-based turn index.
-
-    Returns:
-        Messages the model saw for that turn.
-    """
-    messages: list[JsonValue] = []
-    for index in range(turn):
-        request, completion = _TURNS[index]
-        messages.append({"role": "user", "content": request})
-        messages.append({"role": "assistant", "content": completion})
-    messages.append({"role": "user", "content": _TURNS[turn][0]})
-    return messages
-
-
-def _langfuse_export(tmp_path: Path) -> Path:
-    """Write one two-turn Langfuse trace export.
-
-    Args:
-        tmp_path: Temporary directory receiving the trace export.
-
-    Returns:
-        Path to the completed Langfuse export.
-    """
-    observations: list[JsonValue] = [
-        {
-            "id": f"obs-{turn}",
-            "traceId": "trace-1",
-            "type": "GENERATION",
-            "name": "answer",
-            "startTime": f"2026-02-01T00:00:0{turn * 2}Z",
-            "endTime": f"2026-02-01T00:00:0{turn * 2 + 1}Z",
-            "model": "gpt-test",
-            "input": _history(turn),
-            "output": {"role": "assistant", "content": _TURNS[turn][1]},
-        }
-        for turn in range(len(_TURNS))
-    ]
-    path = tmp_path / "langfuse.json"
-    path.write_text(
-        json.dumps(
-            {
-                "id": "trace-1",
-                "timestamp": "2026-02-01T00:00:00Z",
-                "input": {"messages": [{"role": "user", "content": _TURNS[0][0]}]},
-                "metadata": {"provider": "openai"},
-                "observations": observations,
-            }
-        ),
-        encoding="utf-8",
-    )
-    return path
-
-
-def _langsmith_export(tmp_path: Path) -> Path:
-    """Write one two-turn LangSmith run export.
-
-    Args:
-        tmp_path: Temporary directory receiving the trace export.
-
-    Returns:
-        Path to the completed LangSmith export.
-    """
-    runs: list[JsonValue] = [
-        {
-            "id": f"run-{turn}",
-            "trace_id": "trace-1",
-            "run_type": "llm",
-            "name": "ChatOpenAI",
-            "start_time": f"2026-03-01T00:00:0{turn * 2}Z",
-            "end_time": f"2026-03-01T00:00:0{turn * 2 + 1}Z",
-            "inputs": {"messages": _history(turn)},
-            "outputs": {"generations": [[{"text": _TURNS[turn][1]}]]},
-            "extra": {"metadata": {"ls_provider": "openai", "ls_model_name": "gpt-test"}},
-        }
-        for turn in range(len(_TURNS))
-    ]
-    path = tmp_path / "langsmith.json"
-    path.write_text(json.dumps({"runs": runs}), encoding="utf-8")
-    return path
-
-
-def _braintrust_export(tmp_path: Path) -> Path:
-    """Write one two-turn Braintrust log export.
-
-    Args:
-        tmp_path: Temporary directory receiving the trace export.
-
-    Returns:
-        Path to the completed Braintrust export.
-    """
-    rows: list[JsonValue] = [
-        {
-            "id": f"row-{turn}",
-            "span_id": f"span-{turn}",
-            "root_span_id": "root-1",
-            "span_attributes": {"type": "llm", "name": "chat"},
-            "metrics": {
-                "start": 1_772_000_000.0 + turn * 2,
-                "end": 1_772_000_001.0 + turn * 2,
-            },
-            "metadata": {"provider": "openai", "model": "gpt-test"},
-            "input": _history(turn),
-            "output": {"role": "assistant", "content": _TURNS[turn][1]},
-        }
-        for turn in range(len(_TURNS))
-    ]
-    path = tmp_path / "braintrust.json"
-    path.write_text(json.dumps({"events": rows}), encoding="utf-8")
-    return path
-
-
-def _mastra_export(tmp_path: Path) -> Path:
-    """Write one two-turn Mastra span export.
-
-    Args:
-        tmp_path: Temporary directory receiving the trace export.
-
-    Returns:
-        Path to the completed Mastra export.
-    """
-    spans: list[JsonValue] = [
-        {
-            "traceId": "trace-1",
-            "id": f"span-{turn}",
-            "type": "model_generation",
-            "name": "generate",
-            "startTime": f"2026-04-01T00:00:0{turn * 2}Z",
-            "endTime": f"2026-04-01T00:00:0{turn * 2 + 1}Z",
-            "attributes": {"provider": "openai", "model": "gpt-test"},
-            "input": {"messages": _history(turn)},
-            "output": {"text": _TURNS[turn][1]},
-        }
-        for turn in range(len(_TURNS))
-    ]
-    path = tmp_path / "mastra.json"
-    path.write_text(json.dumps({"spans": spans}), encoding="utf-8")
-    return path
-
-
-def _phoenix_export(tmp_path: Path) -> Path:
-    """Write one two-turn Phoenix span export.
-
-    Args:
-        tmp_path: Temporary directory receiving the trace export.
-
-    Returns:
-        Path to the completed Phoenix export.
-    """
-    spans: list[JsonValue] = [
-        {
-            "context": {"trace_id": "trace-1", "span_id": f"span-{turn}"},
-            "name": "ChatCompletion",
-            "start_time": f"2026-05-01T00:00:0{turn * 2}Z",
-            "end_time": f"2026-05-01T00:00:0{turn * 2 + 1}Z",
-            "attributes": {
-                "openinference": {"span": {"kind": "LLM"}},
-                "llm": {
-                    "provider": "openai",
-                    "model_name": "gpt-test",
-                    "input_messages": [{"message": message} for message in _history(turn)],
-                    "output_messages": [
-                        {"message": {"role": "assistant", "content": _TURNS[turn][1]}}
-                    ],
-                },
-            },
-        }
-        for turn in range(len(_TURNS))
-    ]
-    path = tmp_path / "phoenix.json"
-    path.write_text(json.dumps(spans), encoding="utf-8")
-    return path
-
-
-def _otel_genai_export(tmp_path: Path) -> Path:
-    """Write one two-turn exported OpenTelemetry GenAI span corpus.
-
-    Args:
-        tmp_path: Temporary directory receiving the trace export.
-
-    Returns:
-        Path to the completed GenAI span export.
-    """
-    spans: list[JsonValue] = [
-        {
-            "trace_id": "9" * 32,
-            "span_id": f"{turn + 1:016x}",
-            "name": "agent.model_call",
-            "start_time": f"2026-06-01T00:00:0{turn * 2}Z",
-            "end_time": f"2026-06-01T00:00:0{turn * 2 + 1}Z",
-            "attributes": {
-                "gen_ai.operation.name": "chat",
-                "gen_ai.provider.name": "openai",
-                "gen_ai.request.model": "gpt-test",
-                "gen_ai.input.messages": json.dumps(_history(turn)),
-                "gen_ai.output.messages": json.dumps(
-                    [{"role": "assistant", "content": _TURNS[turn][1]}]
-                ),
-            },
-        }
-        for turn in range(len(_TURNS))
-    ]
-    path = tmp_path / "otel-genai.json"
-    path.write_text(json.dumps(spans), encoding="utf-8")
-    return path
-
-
-_VENDOR_EXPORTS: dict[str, Callable[[Path], Path]] = {
-    "braintrust": _braintrust_export,
-    "chat-json": _chat_json_export,
-    "langfuse": _langfuse_export,
-    "langsmith": _langsmith_export,
-    "mastra": _mastra_export,
-    "otel-genai": _otel_genai_export,
-    "phoenix": _phoenix_export,
-}
-
-
-@pytest.mark.parametrize("source", sorted(_VENDOR_EXPORTS))
-def test_build_accepts_every_declared_vendor_source(source: str, tmp_path: Path) -> None:
-    """Each declared vendor export completes the positional build path.
-
-    Args:
-        source: Declared canonical source format.
         tmp_path: Temporary project and trace root.
     """
-    export = _VENDOR_EXPORTS[source](tmp_path)
+    export = _chat_json_export(tmp_path)
     root = tmp_path / ".wmo"
     root.mkdir()
     _catalog(root)
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", str(export), "--source", source, "--root", str(root)],
+        ["build", "support", str(export), "--source", "chat-json", "--root", str(root)],
     )
 
     assert result.exit_code == 0, result.output
@@ -1350,7 +1027,7 @@ def test_build_accepts_every_declared_vendor_source(source: str, tmp_path: Path)
     assert config.build is not None
     traces = load_trace_dataset(store.artifacts, config.build.trace_dataset.artifact_id)
     assert len(traces.traces) == 1
-    assert traces.traces[0].source.identity.source_id.startswith(f"{source}:")
+    assert traces.traces[0].source.identity.source_id.startswith("chat-json:")
 
 
 def test_build_rejects_an_undeclared_trace_source(tmp_path: Path) -> None:

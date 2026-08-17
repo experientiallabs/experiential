@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from wmo.common.core.artifacts import ArtifactInput, stable_id
+from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes, stable_id
 from wmo.common.judging import (
     HumanLabelSet,
     HumanScoreReview,
@@ -28,7 +28,7 @@ from wmo.common.models import (
     ModelCatalog,
     ModelSnapshot,
 )
-from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
+from wmo.common.project import ArtifactCorruptionError, ProjectStore, artifact_input
 from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, load_trace_dataset
 from wmo.optimize.router.judging.artifacts import (
@@ -69,7 +69,7 @@ from wmo.optimize.router.judging.selection import (
     representative_pairwise_pairs,
     trace_preview,
 )
-from wmo.runtime.models.providers.retry import RetryPolicy
+from wmo.runtime.models.providers.transport import RetryPolicy
 from wmo.runtime.models.registry import RuntimeModelCatalog
 from wmo.simulation.build import BuildReviewReadiness
 
@@ -694,19 +694,18 @@ def _write_setup(store: ProjectStore, setup: ManualJudgeSetupArtifact) -> Artifa
         ManualJudgeError: An existing artifact conflicts or cannot be verified.
     """
     try:
-        manifest = store.artifacts.write_json(
+        _stored, manifest = store.artifacts.write_or_replay(
             artifact_id=setup.setup_id,
             artifact_type="manual-judge-setup",
             envelope=setup,
-            files={"setup.json": setup},
+            envelope_path="setup.json",
+            envelope_type=ManualJudgeSetupArtifact,
+            files={"setup.json": canonical_json_bytes(setup)},
         )
-    except ArtifactAlreadyExistsError:
-        saved, saved_input = _read_setup_with_input(store, setup.setup_id)
-        if saved != setup:
-            raise ManualJudgeError(
-                "existing manual judge setup conflicts with confirmation"
-            ) from None
-        return saved_input
+    except ArtifactCorruptionError as exc:
+        raise ManualJudgeError("existing manual judge setup cannot be resumed safely") from exc
+    except ValueError as exc:
+        raise ManualJudgeError("existing manual judge setup conflicts with confirmation") from exc
     return artifact_input(manifest)
 
 

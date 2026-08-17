@@ -2,24 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Literal
-
 import pytest
 
-from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
     EmbeddingClient,
     ModelClient,
-    ModelMessage,
     ModelRequest,
-    ModelSnapshot,
     ToolCall,
     ToolChoice,
     Usage,
 )
-from wmo.common.tasks import ToolSchema
 from wmo.runtime.models.providers.anthropic import (
     AnthropicClient,
     anthropic_messages_request,
@@ -27,6 +20,7 @@ from wmo.runtime.models.providers.anthropic import (
 from wmo.runtime.models.providers.gemini import GeminiClient
 from wmo.runtime.models.providers.openai import OpenAIClient
 from wmo.runtime.models.providers.openai_compatible import OpenRouterClient
+from wmo.runtime.models.providers.openai_compatible_test import _request, _snapshot
 from wmo.runtime.models.providers.tinker_sampling import (
     TinkerSample,
     TinkerSampler,
@@ -34,30 +28,7 @@ from wmo.runtime.models.providers.tinker_sampling import (
     TinkerSdkSampler,
     create_tinker_sampler,
 )
-from wmo.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
-
-
-class _ScriptedTransport(JsonHttpTransport):
-    """Returns frozen JSON responses while retaining calls for wire assertions."""
-
-    def __init__(self, responses: list[JsonHttpResponse]) -> None:
-        self._responses = list(responses)
-        self.requests: list[tuple[str, Mapping[str, str], JsonObject]] = []
-
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Record one fake call and return the next frozen response."""
-        del timeout_seconds
-        self.requests.append((url, headers, payload))
-        if not self._responses:
-            raise AssertionError("test made an unexpected provider request")
-        return self._responses.pop(0)
+from wmo.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 
 
 class _FakeTinkerSampler:
@@ -76,53 +47,6 @@ class _FakeTinkerSampler:
         )
 
 
-def _snapshot(provider: str, model_id: str) -> ModelSnapshot:
-    """Build an immutable identity fixture for one adapter."""
-    return ModelSnapshot(
-        provider=provider,
-        model_id=model_id,
-        revision="fixture-revision",
-        capabilities_sha256="a" * 64,
-        connection_sha256="a" * 64,
-    )
-
-
-def _request(
-    *,
-    tool_choice: ToolChoice | Literal["auto", "none", "required"] | None = None,
-) -> ModelRequest:
-    """Build a visible transcript containing an earlier tool call and result."""
-    return ModelRequest(
-        messages=(
-            ModelMessage(role="system", content="You are precise."),
-            ModelMessage(role="user", content="Create a ticket."),
-            ModelMessage(
-                role="assistant",
-                assistant_action=AssistantAction(
-                    tool_calls=(
-                        ToolCall(
-                            call_id="call-old",
-                            name="create_ticket",
-                            arguments={"priority": "normal"},
-                        ),
-                    )
-                ),
-            ),
-            ModelMessage(role="tool", content="created", tool_call_id="call-old"),
-        ),
-        tools=(
-            ToolSchema(
-                name="create_ticket",
-                description="Create one support ticket.",
-                input_schema={"type": "object"},
-            ),
-        ),
-        tool_choice=tool_choice,
-        temperature=0.2,
-        maximum_output_tokens=128,
-    )
-
-
 def test_default_tinker_factory_constructs_a_lazy_sdk_sampler_without_sampling() -> None:
     """The runtime-owned factory uses the installed dependency but creates no provider session."""
     pytest.importorskip("tinker")
@@ -139,7 +63,7 @@ def test_default_tinker_factory_constructs_a_lazy_sdk_sampler_without_sampling()
 
 def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity() -> None:
     """Direct OpenAI uses Responses, not the compatible chat-completions shape."""
-    transport = _ScriptedTransport(
+    transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -209,7 +133,7 @@ def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity()
 
 def test_openai_embeddings_use_the_shared_normalized_response_contract() -> None:
     """Direct OpenAI reuses only the common non-streaming embedding conversion."""
-    transport = _ScriptedTransport(
+    transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -237,7 +161,7 @@ def test_openai_embeddings_use_the_shared_normalized_response_contract() -> None
 
 def test_openrouter_uses_one_compatible_endpoint_without_failover() -> None:
     """OpenRouter decorates the shared request without adding a provider chain."""
-    transport = _ScriptedTransport(
+    transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -265,7 +189,7 @@ def test_openrouter_uses_one_compatible_endpoint_without_failover() -> None:
 
 def test_anthropic_uses_native_tool_blocks_and_normalizes_cache_usage() -> None:
     """Anthropic tool and cache fields stay native until the shared response boundary."""
-    transport = _ScriptedTransport(
+    transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -340,7 +264,7 @@ def test_anthropic_tool_none_keeps_history_schemas_and_uses_native_none() -> Non
 
 def test_gemini_uses_native_function_calls_usage_identity_and_embeddings() -> None:
     """Gemini retains its content parts, model version, and batch embedding shape."""
-    transport = _ScriptedTransport(
+    transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,

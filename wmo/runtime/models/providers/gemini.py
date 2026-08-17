@@ -28,6 +28,7 @@ from wmo.runtime.models.providers.errors import (
     require_array,
     require_integer,
     require_object,
+    require_string,
 )
 from wmo.runtime.models.providers.openai_compatible import normalize_embedding_vector
 
@@ -255,10 +256,8 @@ def _gemini_tool_choice(
 def _gemini_tool_call(value: JsonValue, index: int) -> ToolCall:
     """Map one native Gemini function call with a deterministic local call ID fallback."""
     call = require_object(value, f"Gemini functionCall[{index}]")
-    name = call.get("name")
+    name = require_string(call.get("name"), f"Gemini functionCall[{index}].name")
     arguments = call.get("args", {})
-    if not isinstance(name, str) or not name:
-        raise ProviderResponseError(f"Gemini functionCall[{index}].name must be text")
     if not isinstance(arguments, dict):
         raise ProviderResponseError(f"Gemini functionCall[{index}].args must be an object")
     call_id = call.get("id")

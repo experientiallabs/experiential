@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 import pytest
 
-from wmo.common.core.artifacts import JsonObject, sha256_json
+from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     AssistantAction,
     ConnectionConfig,
@@ -26,7 +24,7 @@ from wmo.runtime.models.providers.tinker_sampling import (
     TinkerSample,
     TinkerSampler,
 )
-from wmo.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
+from wmo.runtime.models.providers.transport import ScriptedJsonTransport
 from wmo.runtime.models.registry import ModelConnectionError, RuntimeModelCatalog
 
 _DEFAULT_CAPABILITIES = ModelCapabilities(
@@ -35,22 +33,6 @@ _DEFAULT_CAPABILITIES = ModelCapabilities(
     context_window_tokens=128_000,
     maximum_output_tokens=16_000,
 )
-
-
-class _UnusedTransport(JsonHttpTransport):
-    """Fails if construction unexpectedly tries to contact a provider."""
-
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Reject every attempted network-shaped call from this construction fixture."""
-        del url, headers, payload, timeout_seconds
-        raise AssertionError("catalog construction must not make a provider request")
 
 
 class _FakeTinkerSampler:
@@ -104,7 +86,7 @@ def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
     catalog = RuntimeModelCatalog(
         _catalog(),
         environment={},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
 
     snapshot, capabilities = catalog.snapshot("fixture-model")
@@ -151,17 +133,17 @@ def test_snapshot_connection_digest_is_normalized_and_endpoint_specific() -> Non
             base_url="HTTPS://Models.Example.test:443/v1/",
         ),
         environment={},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
     equivalent = RuntimeModelCatalog(
         _catalog(provider="openai-compatible", base_url="https://models.example.test/v1"),
         environment={},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
     distinct = RuntimeModelCatalog(
         _catalog(provider="openai-compatible", base_url="https://models.example.test/v2"),
         environment={},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
 
     first_snapshot, _ = first.snapshot("fixture-model")
@@ -189,7 +171,7 @@ def test_preflight_rejects_capability_before_reading_missing_credentials() -> No
     catalog = RuntimeModelCatalog(
         _catalog(provider="anthropic", capabilities=ModelCapabilities()),
         environment={},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
 
     with pytest.raises(ModelCapabilityError, match="does not support embeddings"):
@@ -204,7 +186,7 @@ def test_resolution_requires_named_credential_without_exposing_its_value() -> No
     catalog = RuntimeModelCatalog(
         _catalog(),
         environment={},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
 
     with pytest.raises(ModelCredentialError, match="FIXTURE_API_KEY"):
@@ -216,12 +198,12 @@ def test_resolution_rejects_unsupported_connection_and_incomplete_compatible_url
     unsupported = RuntimeModelCatalog(
         _catalog(provider="waterfall"),
         environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
     compatible = RuntimeModelCatalog(
         _catalog(provider="openai-compatible"),
         environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
 
     with pytest.raises(ModelConnectionError, match="unsupported provider"):
@@ -240,7 +222,7 @@ def test_model_capability_snapshot_has_exact_limits_and_fails_closed_when_absent
     catalog = RuntimeModelCatalog(
         _catalog(capabilities=capabilities),
         environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
 
     catalog.preflight(
@@ -265,7 +247,7 @@ def test_model_capability_snapshot_has_exact_limits_and_fails_closed_when_absent
     unknown = RuntimeModelCatalog(
         _catalog(capabilities=None),
         environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
     assert unknown.snapshot("fixture-model")[1] == ModelCapabilities()
     assert unknown.resolve("fixture-model").embedding_client is None
@@ -297,7 +279,7 @@ def test_tinker_resolution_uses_runtime_owned_default_construction(
     catalog = RuntimeModelCatalog(
         _catalog(provider="tinker"),
         environment={"FIXTURE_API_KEY": "fixture-tinker-key"},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
 
     resolved = catalog.resolve("fixture-model")
@@ -329,7 +311,7 @@ def test_tinker_resolution_reports_a_missing_optional_dependency(
     catalog = RuntimeModelCatalog(
         _catalog(provider="tinker"),
         environment={"FIXTURE_API_KEY": "fixture-tinker-key"},
-        transport_factory=_UnusedTransport,
+        transport_factory=ScriptedJsonTransport,
     )
 
     with pytest.raises(ModelConnectionError, match="uv sync --extra sft"):

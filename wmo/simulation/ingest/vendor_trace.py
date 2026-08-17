@@ -22,9 +22,6 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
-
-from pydantic import JsonValue
 
 from wmo.common.core.artifacts import (
     FailureCode,
@@ -34,8 +31,7 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.core.text import normalize_durable_text
 from wmo.common.models import ModelSnapshot, Usage
-from wmo.common.tasks import ToolSchema
-from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from wmo.common.traces import Trace, TraceSource, TraceSpan
 from wmo.simulation.ingest.model_identity import (
     CAPABILITIES_DIGEST_ATTRIBUTE,
     CONNECTION_DIGEST_ATTRIBUTE,
@@ -48,12 +44,25 @@ from wmo.simulation.ingest.otlp import (
     TraceNormalizationIssue,
     TraceNormalizationResult,
 )
+from wmo.simulation.ingest.trace_extensions import (
+    CONVERSATION_ID_KEYS,
+    OUTCOME_FAILURE_CODE_KEY,
+    OUTCOME_FAILURE_MESSAGE_KEY,
+    OUTCOME_FAILURE_RETRYABLE_KEY,
+    OUTCOME_NAME_KEY,
+    OUTCOME_STATUS_KEY,
+    REQUEST_CONTEXT_KEY,
+    REQUEST_TOOLS_KEY,
+    collect_outcome,
+    collect_tools,
+    consistent_json_object,
+    consistent_text,
+)
 from wmo.simulation.ingest.vendor_observations import (
     VendorObservation,
 )
 from wmo.simulation.ingest.vendor_records import (
     VendorTraceFormatError,
-    json_value,
     required_text,
     vendor_w3c_id,
 )
@@ -65,34 +74,21 @@ SOURCE_STARTED_ATTRIBUTE = "wmo.source.span.started_at"
 SOURCE_ENDED_ATTRIBUTE = "wmo.source.span.ended_at"
 SYNTHETIC_TIME_ATTRIBUTE = "wmo.source.time.synthetic"
 
-_OUTCOME_STATUS_KEY = "wmo.outcome.status"
-_NONFAILURE_STATUSES: dict[str, Literal["success", "abandoned", "unknown"]] = {
-    "success": "success",
-    "abandoned": "abandoned",
-    "unknown": "unknown",
-}
-_OUTCOME_NAME_KEY = "wmo.outcome.name"
-_OUTCOME_FAILURE_CODE_KEY = "wmo.outcome.failure.code"
-_OUTCOME_FAILURE_MESSAGE_KEY = "wmo.outcome.failure.message"
-_OUTCOME_FAILURE_RETRYABLE_KEY = "wmo.outcome.failure.retryable"
-_TOOLS_KEY = "wmo.request.tools"
-_CONTEXT_KEY = "wmo.request.context"
-_CONVERSATION_KEYS = ("wmo.conversation.id", "gen_ai.conversation.id")
-
 APPROVED_EXTENSION_KEYS = (
     "wmo.customer.id",
     "wmo.conversation.id",
-    _CONTEXT_KEY,
+    REQUEST_CONTEXT_KEY,
     "wmo.request.tags",
-    _TOOLS_KEY,
+    REQUEST_TOOLS_KEY,
     "wmo.trace.metadata",
     CAPABILITIES_DIGEST_ATTRIBUTE,
     CONNECTION_DIGEST_ATTRIBUTE,
-    _OUTCOME_STATUS_KEY,
-    _OUTCOME_NAME_KEY,
-    _OUTCOME_FAILURE_CODE_KEY,
-    _OUTCOME_FAILURE_MESSAGE_KEY,
-    _OUTCOME_FAILURE_RETRYABLE_KEY,
+    "wmo.outcome.escalated",
+    OUTCOME_STATUS_KEY,
+    OUTCOME_NAME_KEY,
+    OUTCOME_FAILURE_CODE_KEY,
+    OUTCOME_FAILURE_MESSAGE_KEY,
+    OUTCOME_FAILURE_RETRYABLE_KEY,
 )
 
 
@@ -147,6 +143,7 @@ def build_vendor_traces(
     source: SourceIdentity,
     semantic_convention_version: str = GENAI_SEMANTIC_CONVENTION_VERSION,
     initial_issues: Sequence[TraceNormalizationIssue] = (),
+    strict_tool_pairing: bool = False,
 ) -> TraceNormalizationResult:
     """Convert declared vendor observations into canonical traces and explicit exclusions.
 
@@ -156,6 +153,8 @@ def build_vendor_traces(
         source: Immutable identity of the source bytes or transport result.
         semantic_convention_version: Pinned GenAI semantic-convention version for the traces.
         initial_issues: Parse exclusions collected before observation mapping.
+        strict_tool_pairing: Whether an unpaired tool call or explicit tool result excludes
+            its trace instead of keeping the span without an asserted pairing.
 
     Returns:
         Valid canonical traces and every retained validation exclusion.
@@ -179,6 +178,7 @@ def build_vendor_traces(
                     vendor=vendor,
                     source=source,
                     semantic_convention_version=semantic_convention_version,
+                    strict_tool_pairing=strict_tool_pairing,
                 )
             )
         except (VendorTraceFormatError, ValueError) as exc:
@@ -199,6 +199,7 @@ def _build_trace(
     vendor: str,
     source: SourceIdentity,
     semantic_convention_version: str,
+    strict_tool_pairing: bool,
 ) -> Trace:
     """Build one canonical trace from the observations sharing a vendor trace key.
 
@@ -208,12 +209,15 @@ def _build_trace(
         vendor: Vendor label retained on every span.
         source: Immutable source identity.
         semantic_convention_version: Pinned GenAI semantic-convention version.
+        strict_tool_pairing: Whether an unpaired tool call or explicit tool result rejects
+            the trace.
 
     Returns:
         One canonical trace with ordered spans and resolved parents.
 
     Raises:
-        VendorTraceFormatError: The trace has no request text or no convertible observation.
+        VendorTraceFormatError: The trace has no request text, no convertible observation, or
+            an unpaired tool call under strict pairing.
     """
     ordered = sorted(observations, key=lambda item: (item.started_at, item.ordinal))
     task = next(
@@ -242,6 +246,7 @@ def _build_trace(
                     trace_id=trace_id,
                     vendor=vendor,
                     pending=pending,
+                    strict=strict_tool_pairing,
                 ),
             )
         else:
@@ -252,18 +257,31 @@ def _build_trace(
         )
     if not emissions:
         raise VendorTraceFormatError(f"{vendor} trace has no convertible observations")
+    if strict_tool_pairing and any(pending.values()):
+        unmatched_calls = ", ".join(
+            f"{name}:{call.call_id}" for name in sorted(pending) for call in pending[name]
+        )
+        raise VendorTraceFormatError(f"unmatched generated {vendor} tool calls: {unmatched_calls}")
     unmatched = {
         call.call_id for calls in pending.values() for call in calls
     }  # Unpaired calls keep their span without asserting a pairing.
     attributes_by_span = tuple(emission.span.attributes for emission in emissions)
     return Trace(
         trace_id=trace_id,
-        conversation_id=_consistent_text(attributes_by_span, _CONVERSATION_KEYS),
+        conversation_id=consistent_text(
+            attributes_by_span, CONVERSATION_ID_KEYS, error_type=VendorTraceFormatError
+        ),
         task=task,
-        initial_context=_initial_context(attributes_by_span),
-        tools=_collect_tools(attributes_by_span),
+        initial_context=consistent_json_object(
+            attributes_by_span, REQUEST_CONTEXT_KEY, error_type=VendorTraceFormatError
+        ),
+        tools=collect_tools(
+            attributes_by_span, keys=(REQUEST_TOOLS_KEY,), error_type=VendorTraceFormatError
+        ),
         spans=_resolve_spans(emissions, unmatched),
-        outcome=_collect_outcome(attributes_by_span, failures),
+        outcome=collect_outcome(
+            attributes_by_span, failures=failures, error_type=VendorTraceFormatError
+        ),
         source=TraceSource(
             identity=source,
             semantic_convention_version=semantic_convention_version,
@@ -348,6 +366,7 @@ def _tool_result_span(
     trace_id: str,
     vendor: str,
     pending: dict[str, deque[_PendingToolCall]],
+    strict: bool,
 ) -> _SpanEmission:
     """Map one tool-result observation and pair it with an earlier model tool call.
 
@@ -356,12 +375,14 @@ def _tool_result_span(
         trace_id: Canonical trace identity.
         vendor: Vendor label retained on every span.
         pending: Tool-call queues by tool name, consumed on an exact match.
+        strict: Whether an unmatched explicit call identity rejects the trace.
 
     Returns:
         One canonical tool-result span emission.
 
     Raises:
-        VendorTraceFormatError: The observation declares no tool name.
+        VendorTraceFormatError: The observation declares no tool name, or its explicit call
+            identity matches no earlier tool call under strict pairing.
     """
     tool_name = required_text(observation.tool_name, f"{vendor} tool result name")
     attributes = _base_attributes(observation, vendor=vendor)
@@ -370,6 +391,10 @@ def _tool_result_span(
     attributes["gen_ai.tool.call.arguments"] = observation.tool_arguments or ""
     attributes["gen_ai.tool.message"] = observation.tool_message or ""
     matched = _match_pending_call(pending[tool_name], observation.tool_call_id)
+    if strict and matched is None and observation.tool_call_id is not None:
+        raise VendorTraceFormatError(
+            f"unmatched explicit {vendor} tool result: {tool_name}:{observation.tool_call_id}"
+        )
     if matched is not None:
         attributes["gen_ai.tool.call.id"] = matched.call_id
     return _emission(
@@ -641,201 +666,3 @@ def _usage(observation: VendorObservation) -> Usage | None:
         output_tokens=usage.output_tokens,
         cached_input_tokens=usage.cached_input_tokens,
     )
-
-
-def _initial_context(attributes_by_span: Sequence[JsonObject]) -> JsonObject:
-    """Return one consistent declared request context for the trace.
-
-    Args:
-        attributes_by_span: Canonical span attributes in trace order.
-
-    Returns:
-        Declared request context, empty when the export declares none.
-
-    Raises:
-        VendorTraceFormatError: The context is not an object or differs across spans.
-    """
-    values: list[JsonObject] = []
-    for attributes in attributes_by_span:
-        value = json_value(attributes.get(_CONTEXT_KEY))
-        if value is None:
-            continue
-        if not isinstance(value, dict):
-            raise VendorTraceFormatError(f"{_CONTEXT_KEY} must be a JSON object")
-        values.append(value)
-    if not values:
-        return {}
-    if any(value != values[0] for value in values[1:]):
-        raise VendorTraceFormatError(f"{_CONTEXT_KEY} differs across spans in one trace")
-    return values[0]
-
-
-def _consistent_text(attributes_by_span: Sequence[JsonObject], keys: Sequence[str]) -> str | None:
-    """Return one repeated text extension across a trace or reject ambiguity.
-
-    Args:
-        attributes_by_span: Canonical span attributes in trace order.
-        keys: Ordered candidate attribute keys.
-
-    Returns:
-        The single declared value, or ``None`` when no span declares one.
-
-    Raises:
-        VendorTraceFormatError: A declared value is blank or spans disagree.
-    """
-    values: list[str] = []
-    for attributes in attributes_by_span:
-        for key in keys:
-            if key not in attributes:
-                continue
-            values.append(required_text(attributes[key], key))
-            break
-    if not values:
-        return None
-    if any(value != values[0] for value in values[1:]):
-        raise VendorTraceFormatError(f"{keys[0]} differs across spans in one trace")
-    return values[0]
-
-
-def _collect_tools(attributes_by_span: Sequence[JsonObject]) -> tuple[ToolSchema, ...]:
-    """Convert declared request tool definitions to canonical visible tools.
-
-    Args:
-        attributes_by_span: Canonical span attributes in trace order.
-
-    Returns:
-        Deterministically ordered tool schemas declared by the export.
-
-    Raises:
-        VendorTraceFormatError: A definition list, schema, or name is invalid or conflicting.
-    """
-    by_name: dict[str, ToolSchema] = {}
-    for attributes in attributes_by_span:
-        value = json_value(attributes.get(_TOOLS_KEY))
-        if value is None:
-            continue
-        if not isinstance(value, list):
-            raise VendorTraceFormatError(f"{_TOOLS_KEY} must be a JSON array")
-        for raw_tool in value:
-            tool = _tool_schema(raw_tool)
-            if tool.name in by_name and by_name[tool.name] != tool:
-                raise VendorTraceFormatError(f"tool {tool.name!r} has conflicting definitions")
-            by_name[tool.name] = tool
-    return tuple(by_name[name] for name in sorted(by_name))
-
-
-def _tool_schema(raw_tool: JsonValue) -> ToolSchema:
-    """Convert one declared function tool definition to the canonical tool contract.
-
-    Args:
-        raw_tool: One declared tool definition.
-
-    Returns:
-        Canonical visible tool schema.
-
-    Raises:
-        VendorTraceFormatError: The definition is not an object with a name and object schema.
-    """
-    if not isinstance(raw_tool, dict):
-        raise VendorTraceFormatError(f"{_TOOLS_KEY} entries must be objects")
-    candidate = raw_tool.get("function") if raw_tool.get("type") == "function" else raw_tool
-    if not isinstance(candidate, dict):
-        raise VendorTraceFormatError("function tool definitions need a function object")
-    name = required_text(candidate.get("name"), "tool definition name")
-    description = candidate.get("description")
-    schema = candidate.get("input_schema", candidate.get("parameters", candidate.get("schema")))
-    if not isinstance(schema, dict):
-        raise VendorTraceFormatError(f"tool {name!r} needs an object input schema")
-    return ToolSchema(
-        name=name,
-        description=(
-            normalize_durable_text(description.strip())
-            if isinstance(description, str) and description.strip()
-            else "No description captured."
-        ),
-        input_schema=schema,
-    )
-
-
-def _collect_outcome(
-    attributes_by_span: Sequence[JsonObject],
-    failures: Sequence[StructuredFailure],
-) -> TraceOutcome | None:
-    """Map declared WMO outcome extensions or source errors to terminal trace evidence.
-
-    Args:
-        attributes_by_span: Canonical span attributes in trace order.
-        failures: Structured span failures observed in this trace, in order.
-
-    Returns:
-        Canonical trace outcome, or ``None`` when the export declares none.
-
-    Raises:
-        VendorTraceFormatError: Outcome extensions are incomplete or contradictory.
-    """
-    status = _consistent_text(attributes_by_span, (_OUTCOME_STATUS_KEY,))
-    outcome_name = _consistent_text(attributes_by_span, (_OUTCOME_NAME_KEY,))
-    failure_code = _consistent_text(attributes_by_span, (_OUTCOME_FAILURE_CODE_KEY,))
-    failure_message = _consistent_text(attributes_by_span, (_OUTCOME_FAILURE_MESSAGE_KEY,))
-    retryable = _consistent_bool(attributes_by_span, _OUTCOME_FAILURE_RETRYABLE_KEY)
-    if status is None:
-        if failures:
-            return TraceOutcome(status="failure", failure=failures[0])
-        if any(
-            value is not None for value in (outcome_name, failure_code, failure_message, retryable)
-        ):
-            raise VendorTraceFormatError(f"outcome details require {_OUTCOME_STATUS_KEY}")
-        return None
-    nonfailure_status = _NONFAILURE_STATUSES.get(status)
-    if nonfailure_status is not None:
-        if any(value is not None for value in (failure_code, failure_message, retryable)):
-            raise VendorTraceFormatError("outcome failure details require failure status")
-        return TraceOutcome(status=nonfailure_status, outcome_name=outcome_name)
-    if status != "failure":
-        raise VendorTraceFormatError(
-            f"{_OUTCOME_STATUS_KEY} must be success, failure, abandoned, or unknown"
-        )
-    if failure_code is None or failure_message is None:
-        if failures:
-            return TraceOutcome(status="failure", outcome_name=outcome_name, failure=failures[0])
-        raise VendorTraceFormatError("failure outcomes need a failure code and message")
-    try:
-        code = FailureCode(failure_code)
-    except ValueError as exc:
-        valid = ", ".join(item.value for item in FailureCode)
-        raise VendorTraceFormatError(
-            f"{_OUTCOME_FAILURE_CODE_KEY} must be one of: {valid}"
-        ) from exc
-    return TraceOutcome(
-        status="failure",
-        outcome_name=outcome_name,
-        failure=StructuredFailure(code=code, message=failure_message, retryable=retryable or False),
-    )
-
-
-def _consistent_bool(attributes_by_span: Sequence[JsonObject], key: str) -> bool | None:
-    """Return one repeated boolean extension or reject inconsistent span values.
-
-    Args:
-        attributes_by_span: Canonical span attributes in trace order.
-        key: Extension attribute key.
-
-    Returns:
-        The single declared boolean, or ``None`` when no span declares one.
-
-    Raises:
-        VendorTraceFormatError: A declared value is not boolean or spans disagree.
-    """
-    values: list[bool] = []
-    for attributes in attributes_by_span:
-        value = attributes.get(key)
-        if value is None:
-            continue
-        if not isinstance(value, bool):
-            raise VendorTraceFormatError(f"{key} must be boolean")
-        values.append(value)
-    if not values:
-        return None
-    if any(value != values[0] for value in values[1:]):
-        raise VendorTraceFormatError(f"{key} differs across spans in one trace")
-    return values[0]

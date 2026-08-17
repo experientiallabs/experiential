@@ -32,8 +32,11 @@ from wmo.runtime.models.providers.errors import (
     require_string,
 )
 from wmo.runtime.models.providers.openai_compatible import normalize_embedding_vector
-from wmo.runtime.models.providers.retry import RetryPolicy, run_with_retry
-from wmo.runtime.models.providers.transport import ProviderTransportError
+from wmo.runtime.models.providers.transport import (
+    ProviderTransportError,
+    RetryPolicy,
+    run_with_retry,
+)
 
 AWS_REGION_ENV = "AWS_REGION"
 AWS_DEFAULT_REGION_ENV = "AWS_DEFAULT_REGION"
