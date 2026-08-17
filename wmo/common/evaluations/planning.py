@@ -64,8 +64,10 @@ def default_fidelity_thresholds(
     Args:
         created_at: Time the immutable threshold record is created.
         code_revision: Exact WMO revision creating the gate.
-        planned_overlaps: Positive exact number of real fit overlaps frozen into the plan.
-        minimum_usable_overlaps: Positive numerical gate no larger than the denominator.
+        planned_overlaps: Exact number of real fit overlaps frozen into the plan; zero is the
+            explicitly waived-evidence scope.
+        minimum_usable_overlaps: Numerical gate no larger than the denominator; zero only when
+            the denominator is zero.
 
     Returns:
         Exact-denominator 0.10-MAE fidelity thresholds.

@@ -88,6 +88,7 @@ class AutomaticRouterOptions:
     simulation_maximum_output_tokens: int = 16_000
     maximum_concurrency: int = 1
     seed: int = 0
+    waive_fidelity_evidence: bool = False
 
 
 @dataclass(frozen=True)
@@ -129,11 +130,15 @@ class AutomaticRouterPreflight:
     remaining_simulation_cost_usd: float
     agent_factory_sha256: Sha256
     simulation_configuration_sha256: Sha256
+    fidelity_evidence_waived: bool = False
 
     @property
     def low_fidelity_evidence(self) -> bool:
         """Return whether explicit approval must acknowledge a sub-preferred denominator."""
-        return self.fidelity_overlap_count < self.preferred_fidelity_overlaps
+        return (
+            not self.fidelity_evidence_waived
+            and self.fidelity_overlap_count < self.preferred_fidelity_overlaps
+        )
 
 
 def preflight_automatic_router(
@@ -209,12 +214,14 @@ def preflight_automatic_router(
         identity_evidence,
         candidates,
         options.preferred_fidelity_overlaps,
+        waive_fidelity_evidence=options.waive_fidelity_evidence,
     )
     fidelity_overlap_count = len(observed)
-    if not observed:
+    if not observed and not options.waive_fidelity_evidence:
         problems.append(
             "fidelity evidence: no real fit trace matches an exact selected candidate model; "
-            "include the production incumbent or collect a matching trace"
+            "include the production incumbent, collect a matching trace, or explicitly waive "
+            "fidelity evidence with --waive-fidelity"
         )
     try:
         agent_identity = agent_factory_sha256(
@@ -336,6 +343,7 @@ def preflight_automatic_router(
                 "redacted_field_names": list(config.redacted_field_names),
             }
         ),
+        fidelity_evidence_waived=options.waive_fidelity_evidence,
     )
 
 
@@ -768,6 +776,8 @@ def _observed_traces(
     identity_evidence: TraceModelIdentityEvidenceSet | None,
     candidates: tuple[RoutedCandidateSnapshot, ...],
     preferred_overlap_limit: int,
+    *,
+    waive_fidelity_evidence: bool = False,
 ) -> tuple[ObservedRouterTrace, ...]:
     """Resolve real fit lineages through verified declared or unique inferred identity.
 
@@ -778,6 +788,9 @@ def _observed_traces(
         identity_evidence: Verified model-span digest provenance, if the dataset carries it.
         candidates: Exact selected candidate identities.
         preferred_overlap_limit: Maximum fidelity overlaps admitted to evaluation.
+        waive_fidelity_evidence: Whether the operator explicitly waived real overlap evidence.
+            The waiver only applies when no fit trace attributes to a selected candidate;
+            resolvable attribution rejects the waiver so real evidence is never discarded.
 
     Returns:
         One deterministic attributed trace per admitted fit lineage.
@@ -793,7 +806,14 @@ def _observed_traces(
             preferred_overlap_limit=preferred_overlap_limit,
         )
     except RouterAttributionError as exc:
-        problems.append(f"fidelity identity attribution: {exc}")
+        if not waive_fidelity_evidence:
+            problems.append(f"fidelity identity attribution: {exc}")
+        return ()
+    if waive_fidelity_evidence:
+        problems.append(
+            "fidelity waiver: real fit traces attribute to selected candidates; "
+            "run without --waive-fidelity to use the measured overlap evidence"
+        )
         return ()
     tasks_by_id = {task.task_id: task for task in tasks}
     traces_by_id = {trace.trace_id: trace for trace in traces}

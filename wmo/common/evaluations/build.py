@@ -266,14 +266,15 @@ def world_model_protocol_is_eligible(
         reports: Fidelity reports loaded with the evaluation dataset.
 
     Returns:
-        ``True`` only for an approved report bound to the exact protocol digest.
+        ``True`` only for an approved or explicitly waived report bound to the exact
+        protocol digest.
     """
     if protocol.evidence_source != "world_model" or protocol.fidelity_report_id is None:
         return False
     report = reports.get(protocol.fidelity_report_id)
     return bool(
         report is not None
-        and report.status == "approved"
+        and report.status in {"approved", "waived"}
         and report.protocol_sha256 == evaluation_protocol_digest(protocol)
         and (
             evaluation_plan_id is None

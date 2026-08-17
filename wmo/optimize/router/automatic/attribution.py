@@ -40,6 +40,8 @@ from wmo.simulation.ingest.model_identity import (
 
 AttributionMatchKind = Literal["declared_exact", "inferred_unique", "strict_snapshot"]
 
+FidelityEvidenceMode = Literal["required", "waived"]
+
 
 class RouterAttributionError(ValueError):
     """Candidate attribution is absent, ambiguous, conflicting, or internally inconsistent."""
@@ -100,7 +102,8 @@ class RouterObservedAttributionSet(ArtifactEnvelope):
     catalog_sha256: Sha256
     candidates: tuple[RoutedCandidateSnapshot, ...] = Field(min_length=2)
     preferred_overlap_limit: int = Field(gt=0)
-    records: tuple[RouterObservedAttribution, ...] = Field(min_length=1)
+    fidelity_evidence: FidelityEvidenceMode = "required"
+    records: tuple[RouterObservedAttribution, ...] = ()
 
     @field_validator("candidates")
     @classmethod
@@ -134,8 +137,13 @@ class RouterObservedAttributionSet(ArtifactEnvelope):
             The unchanged validated artifact.
 
         Raises:
-            ValueError: Records repeat a task, trace, or leakage lineage or exceed the limit.
+            ValueError: Records repeat a task, trace, or leakage lineage, exceed the limit, or
+                conflict with the explicit fidelity-evidence mode.
         """
+        if self.fidelity_evidence == "waived" and self.records:
+            raise ValueError("waived router attribution must not carry observed records")
+        if self.fidelity_evidence == "required" and not self.records:
+            raise ValueError("required router attribution needs at least one observed record")
         if len(self.records) > self.preferred_overlap_limit:
             raise ValueError("router attribution records exceed the preferred overlap limit")
         for label, values in (
@@ -235,6 +243,7 @@ def persist_router_observed_attribution_set(
     catalog_sha256: Sha256,
     candidates: Sequence[RoutedCandidateSnapshot],
     preferred_overlap_limit: int,
+    fidelity_evidence: FidelityEvidenceMode = "required",
     records: Sequence[RouterObservedAttribution],
     created_at: datetime,
     code_revision: str,
@@ -248,6 +257,8 @@ def persist_router_observed_attribution_set(
         catalog_sha256: Digest of the complete confirmed secret-free model catalog.
         candidates: Selected candidate snapshots.
         preferred_overlap_limit: Positive admission bound used by matching.
+        fidelity_evidence: Explicit operator-selected mode; ``"waived"`` records an auditable
+            empty overlap scope for datasets whose traces carry no model identity.
         records: Exact preflight-resolved real overlaps.
         created_at: Artifact materialization time.
         code_revision: Exact producer revision.
@@ -268,6 +279,7 @@ def persist_router_observed_attribution_set(
         catalog_sha256=catalog_sha256,
         candidates=ordered_candidates,
         preferred_overlap_limit=preferred_overlap_limit,
+        fidelity_evidence=fidelity_evidence,
         records=resolved_records,
         code_revision=code_revision,
     )
@@ -283,6 +295,7 @@ def persist_router_observed_attribution_set(
         catalog_sha256=catalog_sha256,
         candidates=ordered_candidates,
         preferred_overlap_limit=preferred_overlap_limit,
+        fidelity_evidence=fidelity_evidence,
         records=resolved_records,
     )
     _verify_attribution_inputs(store, value)
@@ -355,6 +368,7 @@ def load_router_observed_attribution_set(
             catalog_sha256=value.catalog_sha256,
             candidates=value.candidates,
             preferred_overlap_limit=value.preferred_overlap_limit,
+            fidelity_evidence=value.fidelity_evidence,
             records=value.records,
             code_revision=value.code_revision,
         ),
@@ -556,7 +570,13 @@ def _verify_attribution_inputs(
             preferred_overlap_limit=value.preferred_overlap_limit,
         )
     except RouterAttributionError as exc:
+        if value.fidelity_evidence == "waived":
+            return
         raise ArtifactCorruptionError("router attribution cannot be recomputed") from exc
+    if value.fidelity_evidence == "waived":
+        raise ArtifactCorruptionError(
+            "waived router attribution conflicts with resolvable candidate evidence"
+        )
     if expected != value.records:
         raise ArtifactCorruptionError("router attribution records differ from recursive evidence")
 
@@ -569,10 +589,14 @@ def _attribution_semantic(
     catalog_sha256: Sha256,
     candidates: tuple[RoutedCandidateSnapshot, ...],
     preferred_overlap_limit: int,
+    fidelity_evidence: FidelityEvidenceMode,
     records: tuple[RouterObservedAttribution, ...],
     code_revision: str,
 ) -> dict[str, object]:
     """Return the canonical content identity for one attribution request.
+
+    Required-evidence sets keep their original identity material; the explicit waived mode
+    appends its marker so a waived set can never collide with a required one.
 
     Args:
         inputs: Sorted trace and task manifest inputs.
@@ -581,13 +605,14 @@ def _attribution_semantic(
         catalog_sha256: Complete confirmed catalog digest.
         candidates: Sorted selected candidate snapshots.
         preferred_overlap_limit: Exact admitted-overlap ceiling.
+        fidelity_evidence: Explicit fidelity-evidence mode for this attribution scope.
         records: Exact admitted attribution records.
         code_revision: Exact producer revision.
 
     Returns:
         Canonical semantic identity payload.
     """
-    return {
+    semantic: dict[str, object] = {
         "version": "router-observed-attribution-v1",
         "inputs": [item.model_dump(mode="json") for item in inputs],
         "trace_dataset": trace_dataset.model_dump(mode="json"),
@@ -598,3 +623,6 @@ def _attribution_semantic(
         "records": [item.model_dump(mode="json") for item in records],
         "code_revision": code_revision,
     }
+    if fidelity_evidence == "waived":
+        semantic["fidelity_evidence"] = "waived"
+    return semantic

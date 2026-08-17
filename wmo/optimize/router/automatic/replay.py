@@ -243,6 +243,8 @@ def _attribution_matches(
         and attribution.candidates
         == tuple(sorted(preflight.candidates, key=lambda item: item.alias))
         and attribution.preferred_overlap_limit == preflight.preferred_fidelity_overlaps
+        and attribution.fidelity_evidence
+        == ("waived" if preflight.fidelity_evidence_waived else "required")
         and attribution.records == tuple(item.attribution for item in preflight.observed_traces)
     )
 

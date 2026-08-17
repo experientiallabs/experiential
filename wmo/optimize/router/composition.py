@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Protocol
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -139,12 +139,30 @@ class RouterEvaluationSetup(ContractModel):
     judgment_status: Literal["provisional", "human_calibrated"]
     world_model_settings: WorldModelSettings
     simulation_completion_input: ArtifactInput | None = None
-    fidelity_planned_overlaps: int = Field(default=10, gt=0)
-    fidelity_minimum_usable_overlaps: int = Field(default=8, gt=0)
+    fidelity_planned_overlaps: int = Field(default=10, ge=0)
+    fidelity_minimum_usable_overlaps: int = Field(default=8, ge=0)
     agent_id: str = Field(min_length=1, max_length=256)
     seed: int
     maximum_steps: int = Field(gt=0)
     maximum_concurrency: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _require_consistent_fidelity_scope(self) -> RouterEvaluationSetup:
+        """Bind the waived zero-overlap scope to the absence of observed evidence.
+
+        Returns:
+            The unchanged validated setup.
+
+        Raises:
+            ValueError: The fidelity denominator and observed evidence are inconsistent.
+        """
+        if (self.fidelity_planned_overlaps == 0) != (self.fidelity_minimum_usable_overlaps == 0):
+            raise ValueError(
+                "a zero fidelity denominator requires a zero usable minimum and vice versa"
+            )
+        if self.fidelity_planned_overlaps == 0 and self.observed_cells:
+            raise ValueError("a waived fidelity scope must not carry observed production cells")
+        return self
 
 
 class ReviewSupplier(Protocol):

@@ -129,6 +129,7 @@ def optimize_project_router(
         catalog_sha256=preflight.catalog_sha256,
         candidates=preflight.candidates,
         preferred_overlap_limit=preflight.preferred_fidelity_overlaps,
+        fidelity_evidence="waived" if preflight.fidelity_evidence_waived else "required",
         records=tuple(item.attribution for item in preflight.observed_traces),
         created_at=created_at,
         code_revision=code_revision,

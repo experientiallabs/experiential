@@ -77,7 +77,7 @@ def build_fidelity_report(
         approved_at: Explicit approval time when the frozen gate passes.
 
     Returns:
-        Persisted approved, rejected, or insufficient fidelity evidence.
+        Persisted approved, rejected, insufficient, or waived fidelity evidence.
 
     Raises:
         EvaluationEvidenceError: Plan, protocol, evidence, or approval state is inconsistent.
@@ -202,6 +202,7 @@ def build_fidelity_report(
     usable = len(absolute_errors)
     score_mae = sum(absolute_errors) / usable if usable else None
     status = _fidelity_status(
+        planned_count=gate.planned_overlaps,
         usable_count=usable,
         minimum_usable=gate.minimum_usable_overlaps,
         score_mae=score_mae,
@@ -240,7 +241,7 @@ def build_fidelity_report(
         gate_id=gate.fidelity_gate_id,
         gate_sha256=gate_input.sha256,
         status=status,
-        approved_at=approved_at if status == "approved" else None,
+        approved_at=approved_at if status in {"approved", "waived"} else None,
     )
     verify_fidelity_report_gate(report, gate)
     destination = store.project_directory / "artifacts" / report.fidelity_report_id
@@ -346,13 +347,24 @@ def _require_cell_rollout(
 
 def _fidelity_status(
     *,
+    planned_count: int,
     usable_count: int,
     minimum_usable: int,
     score_mae: float | None,
     maximum_score_mae: float,
     approved_at: datetime | None,
-) -> Literal["approved", "rejected", "insufficient"]:
-    """Apply the frozen numerical gate and explicit approval boundary."""
+) -> Literal["approved", "rejected", "insufficient", "waived"]:
+    """Apply the frozen numerical gate and explicit approval boundary.
+
+    A zero planned denominator is the explicitly waived scope and still requires the caller's
+    acknowledgment timestamp so no waiver can happen silently.
+    """
+    if planned_count == 0:
+        if approved_at is None:
+            raise EvaluationEvidenceError(
+                "waived fidelity evidence requires an explicit acknowledgment timestamp"
+            )
+        return "waived"
     if usable_count < minimum_usable:
         if approved_at is not None:
             raise EvaluationEvidenceError("insufficient fidelity evidence cannot be approved")

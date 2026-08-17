@@ -65,8 +65,8 @@ class RouterExecutionContract(ArtifactEnvelope):
     agent_factory_sha256: Sha256
     simulation_configuration_sha256: Sha256
     preferred_fidelity_overlaps: int = Field(gt=0)
-    fidelity_planned_overlaps: int = Field(gt=0)
-    fidelity_minimum_usable_overlaps: int = Field(gt=0)
+    fidelity_planned_overlaps: int = Field(ge=0)
+    fidelity_minimum_usable_overlaps: int = Field(ge=0)
     world_model_alias: ArtifactId
     world_model: ModelSnapshot
     world_model_request: CompletionCostReservation
@@ -121,6 +121,8 @@ class RouterExecutionContract(ArtifactEnvelope):
             raise ValueError("planned fidelity overlaps exceed the preferred bound")
         if self.fidelity_minimum_usable_overlaps > self.fidelity_planned_overlaps:
             raise ValueError("minimum usable fidelity overlaps exceed the planned denominator")
+        if self.fidelity_planned_overlaps > 0 and self.fidelity_minimum_usable_overlaps == 0:
+            raise ValueError("planned fidelity overlaps require a positive usable minimum")
         if self.world_model_request.model != self.world_model:
             raise ValueError("world-model request reservation differs from its model")
         if self.judge_request.model != self.judge_model:
@@ -199,7 +201,8 @@ def persist_router_execution_contract(
         agent_factory_sha256: Exact effective built-in or custom agent configuration digest.
         simulation_configuration_sha256: Exact agent and data-redaction simulation digest.
         preferred_fidelity_overlaps: Operator-selected upper bound on real overlap cells.
-        fidelity_planned_overlaps: Exact real overlap denominator admitted to the plan.
+        fidelity_planned_overlaps: Exact real overlap denominator admitted to the plan; zero is
+            the explicitly waived-evidence scope.
         fidelity_minimum_usable_overlaps: Exact passing denominator bound for the fidelity gate.
         world_model_alias: Build-frozen world-model alias.
         world_model: Exact world-model identity.

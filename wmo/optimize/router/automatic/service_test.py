@@ -23,6 +23,7 @@ from wmo.cli.build_cmd import _build_grounded_artifacts
 from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.core.artifacts import SourceIdentity, canonical_json_bytes
 from wmo.common.evaluations import EvaluationCellEvidence, EvaluationPlan
+from wmo.common.evaluations.evidence import read_fidelity_report
 from wmo.common.models import (
     AssistantAction,
     ConnectionConfig,
@@ -280,6 +281,40 @@ class _FidelityApproval:
         return FidelityApprovalDecision(
             actor_id="test-operator",
             evidence=f"approved {len(evidence)} exact overlaps",
+            approved_at=_TIME,
+        )
+
+
+@dataclass
+class _WaivedFidelityApproval:
+    """Acknowledge the explicitly waived zero-overlap fidelity scope."""
+
+    calls: int = 0
+
+    def __call__(
+        self,
+        project: ProjectStore,
+        plan: EvaluationPlan,
+        evidence: tuple[EvaluationCellEvidence, ...],
+        budget: RouterCompositionBudget,
+    ) -> FidelityApprovalDecision:
+        """Acknowledge an exactly empty waived overlap scope and record one callback.
+
+        Args:
+            project: Project-local store.
+            plan: Frozen current evaluation plan.
+            evidence: Completed fidelity evidence, empty in the waived scope.
+            budget: Finite composition budget.
+
+        Returns:
+            Explicit immutable waiver acknowledgment evidence.
+        """
+        del project, plan, budget
+        assert evidence == ()
+        self.calls += 1
+        return FidelityApprovalDecision(
+            actor_id="test-operator",
+            evidence="acknowledged the explicitly waived zero-overlap fidelity scope",
             approved_at=_TIME,
         )
 
@@ -616,6 +651,134 @@ def test_provider_model_only_telemetry_composes_with_inferred_unique_attribution
     assert attribution.candidate_alias == "candidate-a"
     assert attribution.match_kind == "inferred_unique"
     assert result.artifacts.attribution_input in result.composition.plan.inputs
+
+
+def test_model_free_traces_fail_closed_by_default_and_compose_with_explicit_waiver(
+    tmp_path: Path,
+) -> None:
+    """Model-free telemetry fails closed by default and composes only via the explicit waiver.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+    """
+    store, catalog, state = _completed_project(tmp_path, model_free=True)
+    _approve_manual_judge(store, catalog, state)
+    plan = collect_router_candidate_setup(
+        store.model_catalog_path,
+        catalog,
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    options = AutomaticRouterOptions(
+        maximum_judgments=20,
+        preferred_fidelity_overlaps=1,
+        maximum_model_calls=1,
+        simulation_maximum_output_tokens=8_000,
+    )
+    before_artifacts = store.artifacts.list_ids()
+
+    with pytest.raises(AutomaticRouterPreflightError, match="has no model span"):
+        optimize_project_router(
+            store,
+            plan,
+            cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+            options=options,
+            provider_spend_consented=True,
+            fidelity_approval=_FidelityApproval(),
+            created_at=_TIME + timedelta(hours=1),
+            code_revision=_REVISION,
+        )
+
+    assert store.artifacts.list_ids() == before_artifacts
+    waived_options = replace(options, waive_fidelity_evidence=True)
+    approval = _WaivedFidelityApproval()
+
+    result = optimize_project_router(
+        store,
+        plan,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        options=waived_options,
+        provider_spend_consented=True,
+        fidelity_approval=approval,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision=_REVISION,
+    )
+
+    assert approval.calls == 1
+    assert result.preflight.fidelity_evidence_waived
+    assert result.preflight.observed_traces == ()
+    assert result.preflight.fidelity_overlap_count == 0
+    assert result.composition.optimization.optimization.policy.policy_id
+    attribution_set = RouterObservedAttributionSet.model_validate_json(
+        store.artifacts.read_bytes(
+            result.artifacts.attribution_input.artifact_id, "attribution.json"
+        )
+    )
+    assert attribution_set.fidelity_evidence == "waived"
+    assert attribution_set.records == ()
+    assert result.artifacts.attribution_input in result.composition.plan.inputs
+    report, _report_input = read_fidelity_report(
+        store.artifacts, result.composition.fidelity_report_id
+    )
+    assert report.status == "waived"
+    assert report.planned_overlap_count == 0
+    assert report.approved_at is not None
+    assert all(cell.execution == "simulate" for cell in result.composition.plan.cells)
+    completed_completion = tuple(state.completion_calls)
+    completed_embedding = tuple(state.embedding_calls)
+    completed_credentials = state.credential_resolutions
+
+    replay = find_completed_automatic_router_replay(
+        store,
+        result.preflight,
+        options=waived_options,
+        code_revision=_REVISION,
+    )
+
+    assert replay is not None
+    assert replay.policy_id == result.composition.optimization.optimization.policy.policy_id
+    assert (
+        find_completed_automatic_router_replay(
+            store,
+            replace(result.preflight, fidelity_evidence_waived=False),
+            options=options,
+            code_revision=_REVISION,
+        )
+        is None
+    )
+    assert tuple(state.completion_calls) == completed_completion
+    assert tuple(state.embedding_calls) == completed_embedding
+    assert state.credential_resolutions == completed_credentials
+
+    cli = _RUNNER.invoke(
+        app,
+        [
+            "optimize",
+            "router",
+            "support",
+            "--root",
+            str(store.paths.root),
+            "--maximum-judgments",
+            "20",
+            "--preferred-fidelity-overlaps",
+            "1",
+            "--maximum-model-calls",
+            "1",
+            "--simulation-maximum-output-tokens",
+            "8000",
+            "--waive-fidelity",
+            "--non-interactive",
+        ],
+        env={"WMO_RELEASE_REVISION": _REVISION},
+    )
+
+    assert cli.exit_code == 0, cli.output
+    assert "replay: verified completed optimization" in unstyle(cli.output)
+    assert tuple(state.completion_calls) == completed_completion
+    assert tuple(state.embedding_calls) == completed_embedding
+    assert state.credential_resolutions == completed_credentials
 
 
 def test_ambiguous_inferred_telemetry_fails_before_stateful_boundaries(tmp_path: Path) -> None:
@@ -1087,6 +1250,7 @@ def _completed_project(
     *,
     agent: AgentConfiguration | None = None,
     inferred_identity: bool = False,
+    model_free: bool = False,
 ) -> tuple[ProjectStore, ModelCatalog, _ProviderState]:
     """Create one exact completed build with candidate-attributed real traces.
 
@@ -1095,6 +1259,8 @@ def _completed_project(
         agent: Optional exact custom agent configuration frozen during build.
         inferred_identity: Whether source model digests use telemetry fallbacks rather than the
             selected catalog snapshot.
+        model_free: Whether every trace span omits model identity entirely, matching exports
+            whose capture profile records no provider or model attribution.
 
     Returns:
         Completed project, catalog, and shared provider counters.
@@ -1136,7 +1302,7 @@ def _completed_project(
         if inferred_identity
         else candidate_model
     )
-    traces = tuple(_trace(index, recorded_model) for index in range(12))
+    traces = tuple(_trace(index, None if model_free else recorded_model) for index in range(12))
     built = build_project(
         TraceNormalizationResult(
             traces=traces,
@@ -1281,12 +1447,12 @@ def _catalog() -> ModelCatalog:
     )
 
 
-def _trace(index: int, model: ModelSnapshot) -> Trace:
+def _trace(index: int, model: ModelSnapshot | None) -> Trace:
     """Return one real two-turn trace attributed to the selected incumbent model.
 
     Args:
         index: Unique trace and lineage index.
-        model: Exact incumbent provider model snapshot.
+        model: Exact incumbent provider model snapshot, or ``None`` for model-free telemetry.
 
     Returns:
         Successful canonical trace with one retrievable real transition.

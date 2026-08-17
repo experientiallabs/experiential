@@ -40,22 +40,27 @@ class FidelityThresholds(ArtifactEnvelope):
     """Reusable numerical thresholds with no authority over any evaluation plan."""
 
     fidelity_thresholds_id: ArtifactId
-    planned_overlaps: int = Field(default=10, gt=0)
-    minimum_usable_overlaps: int = Field(default=8, gt=0)
+    planned_overlaps: int = Field(default=10, ge=0)
+    minimum_usable_overlaps: int = Field(default=8, ge=0)
     maximum_score_mae: float = Field(default=0.10, ge=0)
 
     @model_validator(mode="after")
     def _require_usable_denominator(self) -> FidelityThresholds:
         """Keep the usable requirement within the exact planned denominator.
 
+        A zero planned denominator is the explicit waived-evidence scope and requires a zero
+        usable minimum; a positive denominator requires a positive usable minimum.
+
         Returns:
             Validated reusable thresholds.
 
         Raises:
-            ValueError: The usable minimum exceeds the planned overlaps.
+            ValueError: The usable minimum and planned overlaps are inconsistent.
         """
         if self.minimum_usable_overlaps > self.planned_overlaps:
             raise ValueError("minimum usable fidelity overlaps cannot exceed planned overlaps")
+        if self.planned_overlaps > 0 and self.minimum_usable_overlaps == 0:
+            raise ValueError("planned fidelity overlaps require a positive usable minimum")
         return self
 
 
@@ -70,22 +75,29 @@ class FidelityGate(ArtifactEnvelope):
     protocol_sha256: Sha256
     task_model_scope_sha256: Sha256
     overlap_cell_ids: tuple[ArtifactId, ...]
-    planned_overlaps: int = Field(default=10, gt=0)
-    minimum_usable_overlaps: int = Field(default=8, gt=0)
+    planned_overlaps: int = Field(default=10, ge=0)
+    minimum_usable_overlaps: int = Field(default=8, ge=0)
     maximum_score_mae: float = Field(default=0.10, ge=0)
 
     @model_validator(mode="after")
     def _require_usable_denominator(self) -> FidelityGate:
         """Keep the bound usable requirement within its exact overlap scope.
 
+        A zero planned denominator is the explicit waived-evidence scope and requires a zero
+        usable minimum and no overlap cells; a positive denominator requires a positive minimum.
+
         Returns:
             Validated plan-bound gate.
 
         Raises:
-            ValueError: The usable minimum exceeds the planned overlaps.
+            ValueError: The usable minimum, planned overlaps, or overlap cells are inconsistent.
         """
         if self.minimum_usable_overlaps > self.planned_overlaps:
             raise ValueError("minimum usable fidelity overlaps cannot exceed planned overlaps")
+        if self.planned_overlaps > 0 and self.minimum_usable_overlaps == 0:
+            raise ValueError("planned fidelity overlaps require a positive usable minimum")
+        if self.planned_overlaps == 0 and self.overlap_cell_ids:
+            raise ValueError("a waived fidelity gate must not name overlap cells")
         return self
 
 

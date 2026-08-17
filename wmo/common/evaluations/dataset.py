@@ -168,7 +168,7 @@ class FidelityReport(ArtifactEnvelope):
     pairs: tuple[FidelityPair, ...]
     gate_id: ArtifactId
     gate_sha256: Sha256
-    status: Literal["approved", "rejected", "insufficient"]
+    status: Literal["approved", "rejected", "insufficient", "waived"]
     approved_at: AwareDatetime | None = None
 
     @field_validator("overlap_cell_ids")
@@ -206,10 +206,12 @@ class FidelityReport(ArtifactEnvelope):
             raise ValueError("fidelity failures must name planned overlap cells")
         if len(self.failures) != self.failed_overlap_count:
             raise ValueError("fidelity failure records must match the failed overlap count")
-        if self.status == "approved" and self.approved_at is None:
-            raise ValueError("approved fidelity reports require approved_at")
-        if self.status != "approved" and self.approved_at is not None:
-            raise ValueError("only approved fidelity reports may set approved_at")
+        if self.status == "waived" and self.planned_overlap_count != 0:
+            raise ValueError("waived fidelity reports must plan zero overlaps")
+        if self.status in {"approved", "waived"} and self.approved_at is None:
+            raise ValueError("approved or waived fidelity reports require approved_at")
+        if self.status not in {"approved", "waived"} and self.approved_at is not None:
+            raise ValueError("only approved or waived fidelity reports may set approved_at")
         return self
 
 

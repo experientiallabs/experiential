@@ -191,6 +191,12 @@ def verify_fidelity_report_gate(report: FidelityReport, gate: FidelityGate) -> N
     """
     if gate.planned_overlaps != report.planned_overlap_count:
         raise EvaluationEvidenceError("fidelity report denominator differs from its frozen gate")
+    if (gate.planned_overlaps == 0) != (report.status == "waived"):
+        raise EvaluationEvidenceError(
+            "waived fidelity status and a zero-overlap gate must name each other exactly"
+        )
+    if report.status == "waived":
+        return
     insufficient = report.usable_overlap_count < gate.minimum_usable_overlaps
     excessive_mae = report.score_mae is None or report.score_mae > gate.maximum_score_mae
     if report.status == "approved" and (insufficient or excessive_mae):
