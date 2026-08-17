@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
@@ -12,6 +13,7 @@ from rich.markup import escape
 from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.cli.judge_transcript import render_field, render_trace, span_evidence_text
+from wmo.cli.trace_viewer import view_trace_proposal
 from wmo.common.judging import Rubric, RubricDimension
 from wmo.common.traces import TraceSpan
 from wmo.optimize.router.judging.contracts import (
@@ -173,6 +175,14 @@ def render_trace_proposal(
         console: Rich console used for review output.
     """
     limit = None if page else character_limit
+    if _interactive_viewer_available(console):
+        view_trace_proposal(proposal, console=console)
+        console.print(
+            f"\n[bold]Trace {proposal.position} of {proposal.total}[/bold] reviewed in the "
+            "full-screen viewer.",
+        )
+        _render_axis_proposals(proposal, character_limit=limit, console=console)
+        return
 
     def render_conversation() -> None:
         """Write only the current trace conversation to the active output buffer."""
@@ -193,6 +203,18 @@ def render_trace_proposal(
     else:
         render_conversation()
     _render_axis_proposals(proposal, character_limit=limit, console=console)
+
+
+def _interactive_viewer_available(console: Console) -> bool:
+    """Report whether the full-screen viewer can own the terminal.
+
+    Args:
+        console: Rich console used for review output.
+
+    Returns:
+        True when both the console and stdin are interactive terminals.
+    """
+    return console.is_terminal and sys.stdin.isatty()
 
 
 def _render_axis_proposals(
