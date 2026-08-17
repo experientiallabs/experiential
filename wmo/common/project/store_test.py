@@ -141,7 +141,7 @@ def test_provider_free_stage_binding_is_verified_write_once_and_replayable(
         "message",
     ),
     [
-        ("/tmp/upload.json", "a" * 64, "revision", "revision", True, "worker-local"),
+        ("tmp/upload.json", "a" * 64, "revision", "revision", True, "worker-local"),
         ("platform-source:upload", None, "revision", "revision", True, "byte digest"),
         ("platform-source:upload", "a" * 64, "trace", "task", True, "revision"),
         (

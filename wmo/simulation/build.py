@@ -219,6 +219,7 @@ def _require_durable_source_id(source_id: str) -> str:
         PurePosixPath(source_id).is_absolute()
         or PureWindowsPath(source_id).is_absolute()
         or source_id.casefold().startswith("file:")
+        or (("/" in source_id or "\\" in source_id) and "://" not in source_id)
     ):
         raise ValueError(
             "source_id must be a durable acquisition label, not a worker-local filesystem path"

@@ -608,6 +608,7 @@ class ProjectStore:
             PurePosixPath(source_id).is_absolute()
             or PureWindowsPath(source_id).is_absolute()
             or source_id.casefold().startswith("file:")
+            or (("/" in source_id or "\\" in source_id) and "://" not in source_id)
         ):
             raise ValueError("provider-free trace source must be durable, not a worker-local path")
         if task.code_revision != trace.code_revision:
