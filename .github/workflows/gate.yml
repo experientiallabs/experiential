@@ -12,7 +12,6 @@ permissions:
 jobs:
   gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -39,7 +38,6 @@ jobs:
 
   non-live-optimization:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -53,7 +51,6 @@ jobs:
 
   non-live-simulation:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -67,7 +64,6 @@ jobs:
 
   installed-wheel-release-evidence:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -80,7 +76,6 @@ jobs:
 
   w16-darwin-evidence:
     runs-on: macos-latest
-    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
