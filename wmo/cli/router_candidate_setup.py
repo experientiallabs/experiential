@@ -323,6 +323,7 @@ def _interactive_selection(
         if chosen_incumbent.action is PickerAction.BACK:
             if candidates:
                 raise typer.Abort()
+            preselected = selected
             continue
         with usage_error(ValueError):
             return RouterCandidateSelection(
