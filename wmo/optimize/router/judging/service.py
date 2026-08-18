@@ -20,7 +20,12 @@ from wmo.common.judging import (
     write_router_lineage_split,
 )
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
-from wmo.common.models import ModelCatalog, ModelSnapshot, PricingSource
+from wmo.common.models import (
+    DEFAULT_BULK_REASONING_EFFORT,
+    ModelCatalog,
+    ModelSnapshot,
+    PricingSource,
+)
 from wmo.common.project import ArtifactCorruptionError, ProjectStore, artifact_input
 from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, load_trace_dataset
@@ -561,7 +566,10 @@ def calibrate_manual_judge(
     if rubric_input != setup.rubric:
         raise ManualJudgeError("manual judge rubric manifest differs from setup")
     if len(completed_reviews) < len(plan.traces):
-        resolved = runtime_catalog.preflight(setup.judge_alias)
+        resolved = runtime_catalog.preflight(
+            setup.judge_alias,
+            reasoning_effort=DEFAULT_BULK_REASONING_EFFORT,
+        )
         if resolved.snapshot != setup.judge_model:
             raise ManualJudgeError("configured judge identity changed after setup")
         collection = collect_trace_reviews(

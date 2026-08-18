@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from enum import StrEnum
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import Field, JsonValue, field_validator, model_validator
 
@@ -13,6 +13,19 @@ from wmo.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha
 from wmo.common.tasks import ToolSchema
 
 ModelAlias = ArtifactId
+
+ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
+
+DEFAULT_BULK_REASONING_EFFORT: Final[ReasoningEffort] = "medium"
+"""Reasoning effort used for bulk simulation and judging dispatch by default.
+
+Bulk world-model rollouts and judge calls are high-volume background work whose wall time is
+dominated by reasoning tokens. OpenAI documents ``medium`` as the balanced default effort and
+recommends lowering effort for latency- and throughput-sensitive workloads, so bulk dispatch
+uses ``medium`` unless the caller overrides it. The override is applied only to aliases whose
+catalog capabilities pin a reasoning effort, which is the proof that the provider accepts the
+parameter; user-facing serving keeps the catalog pin untouched.
+"""
 
 
 class ModelSnapshot(ContractModel):
@@ -264,7 +277,7 @@ class ModelCapabilities(ContractModel):
     supports_structured_output: bool = False
     supports_completions: bool | None = None
     supports_temperature: bool = True
-    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
+    reasoning_effort: ReasoningEffort | None = None
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)

@@ -277,12 +277,19 @@ def _resolve_all_models(
         AutomaticRouterError: A model identity or required client shape differs from preflight.
     """
 
-    def resolve(alias: str, requirement: CapabilityRequirement) -> ResolvedModel:
+    def resolve(
+        alias: str,
+        requirement: CapabilityRequirement,
+        *,
+        bulk_dispatch: bool = False,
+    ) -> ResolvedModel:
         """Resolve one role through a fresh provider client.
 
         Args:
             alias: Stable catalog alias.
             requirement: Exact local capability proof required for this role.
+            bulk_dispatch: Whether this role sends high-volume simulation or judging calls
+                that use the configured bulk reasoning effort instead of the catalog pin.
 
         Returns:
             Independently constructed resolved model.
@@ -290,8 +297,9 @@ def _resolve_all_models(
         Raises:
             AutomaticRouterError: Credential or capability resolution fails.
         """
+        effort = options.bulk_reasoning_effort if bulk_dispatch else None
         try:
-            return catalog.preflight(alias, requirement)
+            return catalog.preflight(alias, requirement, reasoning_effort=effort)
         except ValueError as exc:
             raise AutomaticRouterError(f"model alias {alias!r} cannot be resolved: {exc}") from exc
 
@@ -302,6 +310,7 @@ def _resolve_all_models(
                 minimum_context_window_tokens=options.simulation_maximum_output_tokens + 1,
                 minimum_output_tokens=options.simulation_maximum_output_tokens,
             ),
+            bulk_dispatch=True,
         )
         for candidate in preflight.candidates
     }
@@ -311,12 +320,14 @@ def _resolve_all_models(
             minimum_context_window_tokens=options.simulation_maximum_output_tokens + 1,
             minimum_output_tokens=options.simulation_maximum_output_tokens,
         ),
+        bulk_dispatch=True,
     )
     judge = resolve(
         preflight.judge_alias,
         CapabilityRequirement(
             minimum_output_tokens=preflight.judge_completion_reservation.maximum_output_tokens,
         ),
+        bulk_dispatch=True,
     )
     embedder = resolve(
         preflight.embedder_alias,

@@ -129,9 +129,15 @@ class _RuntimeCatalog:
         """
         return self._real.snapshot(alias)
 
-    def preflight(self, alias: str, requirement: object | None = None) -> ResolvedModel:
+    def preflight(
+        self,
+        alias: str,
+        requirement: object | None = None,
+        *,
+        reasoning_effort: str | None = None,
+    ) -> ResolvedModel:
         """Return a deterministic resolved model for one configured alias."""
-        del requirement
+        del requirement, reasoning_effort
         snapshot, capabilities = self._real.snapshot(alias)
         client = _JudgeClient(snapshot, fail_after=type(self).judge_fail_after)
         type(self).judge_clients.append(client)

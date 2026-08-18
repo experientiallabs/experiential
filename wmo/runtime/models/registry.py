@@ -14,6 +14,7 @@ from wmo.common.models import (
     ModelCatalog,
     ModelClient,
     ModelSnapshot,
+    ReasoningEffort,
 )
 from wmo.runtime.models.credentials import read_connection_api_key
 from wmo.runtime.models.preflight import CapabilityRequirement, preflight_capabilities
@@ -162,11 +163,20 @@ class RuntimeModelCatalog:
             capabilities,
         )
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(
+        self,
+        alias: str,
+        *,
+        reasoning_effort: ReasoningEffort | None = None,
+    ) -> ResolvedModel:
         """Build the one approved client shape named by an alias.
 
         Args:
             alias: Stable local catalog alias.
+            reasoning_effort: Optional request-shaping override for high-volume dispatch. It
+                replaces the catalog's pinned effort only when the alias already pins one, so a
+                model whose catalog entry never declares reasoning support never receives the
+                parameter.
 
         Returns:
             Resolved identity, capabilities, completion client, and optional embedding client.
@@ -213,13 +223,16 @@ class RuntimeModelCatalog:
             )
         api_key = read_connection_api_key(connection, environment=self._environment)
         if provider == "openai":
+            effort = capabilities.reasoning_effort
+            if effort is not None and reasoning_effort is not None:
+                effort = reasoning_effort
             openai_client = OpenAIClient(
                 model=snapshot,
                 api_key=api_key,
                 base_url=connection.base_url or OPENAI_BASE_URL,
                 transport=self._transport_factory(),
                 supports_temperature=capabilities.supports_temperature,
-                reasoning_effort=capabilities.reasoning_effort,
+                reasoning_effort=effort,
             )
             return ResolvedModel(
                 alias,
@@ -294,12 +307,16 @@ class RuntimeModelCatalog:
         self,
         alias: str,
         requirement: CapabilityRequirement | None = None,
+        *,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> ResolvedModel:
         """Construct and locally capability-check one alias before a paid provider call.
 
         Args:
             alias: Stable local catalog alias to validate and construct.
             requirement: Optional required protocol features and capacity limits.
+            reasoning_effort: Optional request-shaping override applied only when the alias's
+                catalog capabilities already pin a reasoning effort.
 
         Returns:
             The constructed focused client after its exact snapshot satisfies the requirement.
@@ -310,7 +327,7 @@ class RuntimeModelCatalog:
         """
         _, capabilities = self.snapshot(alias)
         preflight_capabilities(alias, capabilities, requirement or CapabilityRequirement())
-        return self.resolve(alias)
+        return self.resolve(alias, reasoning_effort=reasoning_effort)
 
     def with_catalog(self, catalog: ModelCatalog) -> RuntimeModelCatalog:
         """Return an equivalent resolver over updated local catalog metadata.

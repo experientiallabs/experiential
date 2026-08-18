@@ -144,15 +144,22 @@ class _RuntimeCatalog:
         self.resolved = resolved
         self.preflight_calls = 0
 
-    def preflight(self, alias: str) -> ResolvedModel:
+    def preflight(
+        self,
+        alias: str,
+        *,
+        reasoning_effort: str | None = None,
+    ) -> ResolvedModel:
         """Return the fake judge only for its configured alias.
 
         Args:
             alias: Alias requested by calibration.
+            reasoning_effort: Bulk request-shaping override recorded by the runtime seam.
 
         Returns:
             Injected resolved judge.
         """
+        del reasoning_effort
         self.preflight_calls += 1
         assert alias == self.resolved.alias
         return self.resolved
