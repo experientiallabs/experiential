@@ -19,7 +19,7 @@ from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, model_validator
 
-from wmo.common.core.artifacts import JsonObject
+from wmo.common.core.artifacts import FailureCode, JsonObject
 from wmo.common.models import (
     AssistantAction,
     ModelFinishReason,
@@ -411,7 +411,13 @@ def create_router_endpoint(
             return _error(
                 409, "idempotent request is still in progress", code="request_in_progress"
             )
-        except RouterCompletionFailedError:
+        except RouterCompletionFailedError as exc:
+            if exc.failure.code == FailureCode.UNSUPPORTED:
+                return _error(
+                    501,
+                    "routed model does not support the requested capability",
+                    code="tool_calling_unsupported",
+                )
             return _error(502, "idempotent routed model call failed")
         except RouterEpisodeConflictError:
             return _error(409, "request conflicts with an earlier routed turn")
@@ -479,7 +485,13 @@ def create_router_endpoint(
             return _error(
                 409, "idempotent request is still in progress", code="request_in_progress"
             )
-        except RouterCompletionFailedError:
+        except RouterCompletionFailedError as exc:
+            if exc.failure.code == FailureCode.UNSUPPORTED:
+                return _error(
+                    501,
+                    "routed model does not support the requested capability",
+                    code="tool_calling_unsupported",
+                )
             return _error(502, "idempotent routed model call failed")
         except RouterEpisodeConflictError:
             return _error(409, "response continuation conflicts with an earlier routed turn")

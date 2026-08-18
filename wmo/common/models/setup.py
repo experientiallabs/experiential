@@ -17,7 +17,7 @@ from wmo.common.models.catalog import (
     load_model_catalog,
     write_model_catalog,
 )
-from wmo.common.models.model import ModelCapabilities
+from wmo.common.models.model import BillingSource, ModelCapabilities
 
 SETUP_PROVIDERS = frozenset(
     {"anthropic", "azure", "bedrock", "gemini", "openai", "openai-compatible", "openrouter"}
@@ -99,6 +99,7 @@ class ProviderModelSelection(ContractModel):
     alias: str = Field(min_length=1, max_length=128)
     connection: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=2_048)
+    billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED
     capabilities: ModelCapabilities = Field(default_factory=ModelCapabilities)
 
     @model_validator(mode="after")
@@ -147,6 +148,7 @@ class ProviderModelSelection(ContractModel):
         return ModelRecord(
             connection=self.connection,
             model=self.model,
+            billing_source=self.billing_source,
             capabilities=self.capabilities,
         )
 
@@ -327,7 +329,7 @@ def _merge_provider_setup(
         embedder=setup.embedder,
     )
     catalog = ModelCatalog(
-        schema_version=existing.schema_version if existing is not None else 1,
+        schema_version=existing.schema_version if existing is not None else 2,
         connections=connections,
         models=models,
         roles=ModelRoles.model_validate(role_values),

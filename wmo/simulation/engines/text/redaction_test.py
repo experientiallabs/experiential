@@ -13,6 +13,7 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     EmbeddingCostReservation,
     ModelSnapshot,
     OperationEconomics,
@@ -41,6 +42,7 @@ def _model() -> ModelSnapshot:
         Snapshot bound to fixed capability and connection digests.
     """
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="gpt-5.4",
         capabilities_sha256=_DIGEST,

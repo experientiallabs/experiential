@@ -19,7 +19,7 @@ from pydantic import JsonValue
 
 from wmo.common.core.artifacts import FailureCode, JsonObject, SourceIdentity, StructuredFailure
 from wmo.common.core.text import normalize_durable_text
-from wmo.common.models import ModelSnapshot, Usage
+from wmo.common.models import BillingSource, ModelSnapshot, Usage
 from wmo.common.traces import Trace, TraceSource, TraceSpan
 from wmo.simulation.ingest.environment_capture import canonicalize_environment_capture_payloads
 from wmo.simulation.ingest.json_strict import DuplicateJsonKeyError, reject_duplicate_json_keys
@@ -554,6 +554,7 @@ def _model_snapshot(attributes: JsonObject, operation: str) -> ModelSnapshot | N
         provider=provider,
         model_id=model_id,
         revision=revision,
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         capabilities_sha256=capabilities_sha256,
         connection_sha256=connection_sha256,
     )

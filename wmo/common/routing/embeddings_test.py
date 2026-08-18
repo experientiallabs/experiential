@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from wmo.common.core.artifacts import ArtifactInput
-from wmo.common.models import Embedding, ModelSnapshot
+from wmo.common.models import BillingSource, Embedding, ModelSnapshot
 from wmo.common.project import ProjectConfig, ProjectStore
 from wmo.common.routing.embeddings import (
     FrozenEmbedding,
@@ -32,12 +32,13 @@ def test_frozen_embedding_client_is_exact_and_never_imputes() -> None:
     """Completed vectors resolve by exact feature bytes and missing inputs fail loudly."""
     text = '{"initial_user_intent":"hello"}'
     artifact = FrozenEmbeddingSet(
-        schema_version=1,
+        schema_version=3,
         created_at=datetime(2026, 8, 12, tzinfo=UTC),
         code_revision="test",
         embedding_set_id="embedding-set-a",
         embedder_alias="embedder-a",
         embedder=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="fixture",
             model_id="fixture-embedder",
             capabilities_sha256=_DIGEST,
@@ -76,6 +77,7 @@ def test_router_embedding_reservation_is_persisted_and_replay_dispatches_zero_ca
         source_trace_ids=("trace-a",),
     )
     model = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id="embedder",
         capabilities_sha256=_DIGEST,
@@ -239,8 +241,8 @@ def test_router_embedding_rejects_symlinked_coordination_ancestor_before_dispatc
     assert tuple(sorted(path.name for path in external.iterdir())) == before
 
 
-def test_legacy_frozen_embedding_payload_reserializes_without_v2_fields() -> None:
-    """Loading a v1 embedding set preserves its exact serialized field set."""
+def test_legacy_frozen_embedding_payload_migrates_explicit_billing_source() -> None:
+    """Loading a v1 embedding set supplies only conservative model attribution."""
     payload = {
         "schema_version": 1,
         "created_at": "2026-08-12T00:00:00Z",
@@ -261,7 +263,49 @@ def test_legacy_frozen_embedding_payload_reserializes_without_v2_fields() -> Non
 
     restored = FrozenEmbeddingSet.model_validate(payload)
 
-    assert restored.model_dump(mode="json") == payload
+    assert restored.embedder.billing_source == BillingSource.CUSTOMER_MANAGED
+    assert restored.model_dump(mode="json") == {
+        **payload,
+        "schema_version": 3,
+        "embedder": {
+            **payload["embedder"],
+            "billing_source": "customer_managed",
+        },
+    }
+
+
+def test_legacy_frozen_embedding_rejects_current_billing_source_injection() -> None:
+    """A schema-v1 embedder cannot label a legacy operation as host paid."""
+    payload = {
+        "schema_version": 1,
+        "created_at": "2026-08-12T00:00:00Z",
+        "inputs": [],
+        "code_revision": "legacy",
+        "source": None,
+        "embedding_set_id": "injected-legacy-embeddings",
+        "embedder_alias": "embedder",
+        "embedder": {
+            "provider": "fixture",
+            "model_id": "embedder",
+            "revision": None,
+            "billing_source": "host_managed",
+            "capabilities_sha256": _DIGEST,
+            "connection_sha256": _DIGEST,
+        },
+        "embeddings": [{"text_sha256": _DIGEST, "values": [1.0, 0.0]}],
+    }
+
+    with pytest.raises(ValueError, match="schema-v1 router embedder"):
+        FrozenEmbeddingSet.model_validate(payload)
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0])
+def test_router_embedding_rejects_noninteger_schema_one_lookalikes(
+    schema_version: object,
+) -> None:
+    """Boolean and floating-point values cannot select legacy embedding migration."""
+    with pytest.raises(ValueError, match="schema_version must be an integer"):
+        FrozenEmbeddingSet.model_validate({"schema_version": schema_version})
 
 
 def test_router_embedding_under_reservation_fails_before_dispatch(tmp_path: Path) -> None:
@@ -447,7 +491,7 @@ def test_router_embedding_loader_rejects_manifest_envelope_drift(tmp_path: Path)
     """
     project, _task, model = _project_task_model(tmp_path)
     payload = FrozenEmbeddingSet(
-        schema_version=1,
+        schema_version=3,
         created_at=datetime(2026, 8, 12, tzinfo=UTC),
         inputs=(_artifact_input(),),
         code_revision="payload",
@@ -547,6 +591,7 @@ def _project_task_model(tmp_path: Path) -> tuple[ProjectStore, TaskCase, ModelSn
         source_trace_ids=("trace-a",),
     )
     model = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id="embedder",
         capabilities_sha256=_DIGEST,

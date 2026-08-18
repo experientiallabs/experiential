@@ -761,7 +761,7 @@ def _persist_dataset(
     dataset_id = stable_id(
         "trace-dataset",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "inputs": [snapshot_input.model_dump(mode="json")],
             "code_revision": loaded_snapshot.snapshot.code_revision,
             "source": source.model_dump(mode="json"),
@@ -775,7 +775,7 @@ def _persist_dataset(
         },
     )
     dataset = TraceDataset(
-        schema_version=1,
+        schema_version=2,
         created_at=loaded_snapshot.snapshot.created_at,
         inputs=(snapshot_input,),
         code_revision=loaded_snapshot.snapshot.code_revision,

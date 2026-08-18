@@ -13,6 +13,7 @@ from wmo.common.evaluations.evidence import (
     read_judgment,
     read_rollout,
 )
+from wmo.common.models import BillingSource, ModelSnapshot
 from wmo.common.project import (
     ProjectRouterPolicyArtifacts,
     ProjectRouterReportArtifacts,
@@ -68,6 +69,7 @@ def optimization_entries(
                 },
             ),
             component=ProviderSpendComponent.ROUTER_EMBEDDING,
+            billing_source=preflight.embedder.billing_source,
             status=ProviderSpendStatus.RESERVED,
             operation_count=1,
             amount_usd=reserve_usd(preflight.router_embedding_reservation.estimated_cost_usd),
@@ -99,11 +101,20 @@ def optimization_entries(
                     {"judgment_id": judgment.judgment_id, "component": "judge"},
                 ),
                 component=ProviderSpendComponent.JUDGE,
+                billing_source=judgment.judge_model.billing_source,
                 economics=judgment.judge_economics,
                 evidence=judgment_input,
             )
         )
-    return complete_component_entries(tuple(entries))
+    return complete_component_entries(
+        tuple(entries),
+        provider_spend_source_pairs(
+            candidates=tuple(item.model for item in preflight.candidates),
+            world_model=preflight.world_model,
+            judge=preflight.judge_model,
+            embedder=preflight.embedder,
+        ),
+    )
 
 
 def stage_ledger(
@@ -158,16 +169,62 @@ def incurred_entries(
 
 def complete_component_entries(
     entries: Sequence[ProviderSpendEntry],
+    expected_pairs: Sequence[tuple[ProviderSpendComponent, BillingSource]],
 ) -> tuple[ProviderSpendEntry, ...]:
-    """Add explicit not-incurred records for every absent provider-spend component."""
+    """Add explicit zero-call records for every absent component and billing source."""
     result = list(entries)
-    present = {item.component for item in result}
+    present = {(item.component, item.billing_source) for item in result}
+    expected = set(expected_pairs)
+    if {component for component, _source in expected} != set(ProviderSpendComponent):
+        raise ValueError("provider spend source plan must represent every provider component")
+    if not present.issubset(expected):
+        raise ValueError("provider spend entry names a source outside the frozen source plan")
     result.extend(
-        not_incurred_entry(component)
-        for component in ProviderSpendComponent
-        if component not in present
+        not_incurred_entry(component, billing_source)
+        for component, billing_source in sorted(
+            expected - present,
+            key=lambda item: (item[0].value, item[1].value),
+        )
     )
     return tuple(sorted(result, key=lambda item: item.operation_id))
+
+
+def provider_spend_source_pairs(
+    *,
+    candidates: Sequence[ModelSnapshot],
+    world_model: ModelSnapshot,
+    judge: ModelSnapshot,
+    embedder: ModelSnapshot,
+) -> tuple[tuple[ProviderSpendComponent, BillingSource], ...]:
+    """Return the complete alias-free billing-source plan for hosted provider work.
+
+    Args:
+        candidates: Frozen candidate model snapshots.
+        world_model: Frozen grounded simulator model snapshot.
+        judge: Frozen provisional judge model snapshot.
+        embedder: Frozen retrieval and router embedder snapshot.
+
+    Returns:
+        Canonically sorted component and billing-source pairs, including explicit unused
+        ``other_provider`` sources.
+    """
+    candidate_sources = {item.billing_source for item in candidates}
+    all_sources = candidate_sources | {
+        world_model.billing_source,
+        judge.billing_source,
+        embedder.billing_source,
+    }
+    pairs = {(ProviderSpendComponent.CANDIDATE, source) for source in candidate_sources}
+    pairs.update(
+        {
+            (ProviderSpendComponent.WORLD_MODEL, world_model.billing_source),
+            (ProviderSpendComponent.JUDGE, judge.billing_source),
+            (ProviderSpendComponent.RETRIEVAL_EMBEDDING, embedder.billing_source),
+            (ProviderSpendComponent.ROUTER_EMBEDDING, embedder.billing_source),
+        }
+    )
+    pairs.update((ProviderSpendComponent.OTHER_PROVIDER, source) for source in all_sources)
+    return tuple(sorted(pairs, key=lambda item: (item[0].value, item[1].value)))
 
 
 def _rollout_spend_entries(
@@ -188,7 +245,19 @@ def _rollout_spend_entries(
         ProviderSpendComponent.CANDIDATE: rollout.candidate_economics,
         ProviderSpendComponent.WORLD_MODEL: rollout.world_model_economics,
         ProviderSpendComponent.RETRIEVAL_EMBEDDING: rollout.retrieval_economics,
-        ProviderSpendComponent.OTHER_PROVIDER: rollout.orchestration_economics,
+    }
+    if (
+        rollout.candidate is None
+        or rollout.world_model is None
+        or rollout.simulation_binding is None
+    ):
+        raise ValueError("hosted world-model rollout omits exact model billing identities")
+    billing_sources = {
+        ProviderSpendComponent.CANDIDATE: rollout.candidate.billing_source,
+        ProviderSpendComponent.WORLD_MODEL: rollout.world_model.billing_source,
+        ProviderSpendComponent.RETRIEVAL_EMBEDDING: (
+            rollout.simulation_binding.query_embedding.model.billing_source
+        ),
     }
     result = []
     for component, value in economics.items():
@@ -207,6 +276,7 @@ def _rollout_spend_entries(
                     {"rollout_id": rollout.rollout_id, "component": component.value},
                 ),
                 component=component,
+                billing_source=billing_sources[component],
                 economics=value,
                 operation_count=count,
                 evidence=evidence,

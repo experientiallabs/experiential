@@ -754,6 +754,7 @@ def _resolve_base_model(
             provider=connection.provider,
             model_id=record.model,
             revision=record.revision,
+            billing_source=record.billing_source,
             capabilities_sha256=sha256_json(capabilities),
             connection_sha256=connection.identity_sha256(),
         ),
@@ -873,6 +874,7 @@ def _model_record(
         return ModelRecord(
             connection=config.tinker_connection,
             model=model.sampling_handle,
+            billing_source=config.base_model.billing_source,
             sft_provenance=SFTModelProvenance(
                 source_dataset=config.dataset,
                 optimization_config=config_input,

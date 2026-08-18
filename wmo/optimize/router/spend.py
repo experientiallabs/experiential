@@ -20,7 +20,7 @@ from wmo.common.core.artifacts import (
     stable_id,
 )
 from wmo.common.core.money import USD_ZERO, exact_usd, reserve_usd
-from wmo.common.models import OperationEconomics, Usage
+from wmo.common.models import BillingSource, OperationEconomics, Usage
 from wmo.common.project import ArtifactStore, ProjectStage, artifact_input
 
 _LEDGER_ARTIFACT_TYPE = "provider-spend-ledger"
@@ -52,6 +52,7 @@ class ProviderSpendEntry(ContractModel):
 
     operation_id: ArtifactId
     component: ProviderSpendComponent
+    billing_source: BillingSource
     status: ProviderSpendStatus
     operation_count: int = Field(ge=0)
     amount_usd: Decimal = Field(ge=0)
@@ -137,6 +138,20 @@ class ProviderSpendLedger(ArtifactEnvelope):
         """Bind totals, ceiling, inputs, and recovery posture to the complete entry set."""
         if {item.component for item in self.entries} != set(ProviderSpendComponent):
             raise ValueError("provider spend ledger must represent every provider component")
+        pairs_with_zero = {
+            (item.component, item.billing_source)
+            for item in self.entries
+            if item.status == ProviderSpendStatus.NOT_INCURRED
+        }
+        pairs_with_spend = {
+            (item.component, item.billing_source)
+            for item in self.entries
+            if item.status != ProviderSpendStatus.NOT_INCURRED
+        }
+        if pairs_with_zero & pairs_with_spend:
+            raise ValueError(
+                "not-incurred spend cannot coexist with charged spend for one billing source"
+            )
         expected = sum((item.amount_usd for item in self.entries), start=USD_ZERO)
         if self.total_usd != expected:
             raise ValueError("provider spend total differs from its component entries")
@@ -159,6 +174,7 @@ def spend_entry_from_economics(
     *,
     operation_id: str,
     component: ProviderSpendComponent,
+    billing_source: BillingSource,
     economics: OperationEconomics,
     operation_count: int = 1,
     evidence: ArtifactInput | None = None,
@@ -168,6 +184,7 @@ def spend_entry_from_economics(
     Args:
         operation_id: Alias-free stable operation identity.
         component: Provider-backed component that produced the response.
+        billing_source: Credential owner responsible for the provider operation.
         economics: Reconciled provider operation economics.
         operation_count: Provider dispatches aggregated into the economics record.
         evidence: Optional immutable artifact carrying the operation result.
@@ -191,6 +208,7 @@ def spend_entry_from_economics(
     return ProviderSpendEntry(
         operation_id=operation_id,
         component=component,
+        billing_source=billing_source,
         status=status,
         operation_count=operation_count,
         amount_usd=reserve_usd(cost.value),
@@ -309,18 +327,26 @@ def load_provider_spend_ledger(
     return value
 
 
-def not_incurred_entry(component: ProviderSpendComponent) -> ProviderSpendEntry:
-    """Return the canonical explicit zero-call entry for one component.
+def not_incurred_entry(
+    component: ProviderSpendComponent,
+    billing_source: BillingSource,
+) -> ProviderSpendEntry:
+    """Return the canonical explicit zero-call entry for one component and payer.
 
     Args:
         component: Provider component with no operation in this ledger.
+        billing_source: Credential owner whose component operation was not incurred.
 
     Returns:
         Stable not-incurred entry.
     """
     return ProviderSpendEntry(
-        operation_id=stable_id("provider-spend-operation", {"component": component.value}),
+        operation_id=stable_id(
+            "provider-spend-operation",
+            {"component": component.value, "billing_source": billing_source.value},
+        ),
         component=component,
+        billing_source=billing_source,
         status=ProviderSpendStatus.NOT_INCURRED,
         operation_count=0,
         amount_usd=USD_ZERO,

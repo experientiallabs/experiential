@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from wmo.common.core.artifacts import SourceIdentity, canonical_json_bytes, stable_id
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
 from wmo.common.project.paths import ProjectPaths
 from wmo.common.traces import Trace, TraceDataset, TraceSource, TraceSpan, load_trace_dataset
@@ -64,6 +64,7 @@ def _modeled_trace() -> Trace:
     """Return one direct trace carrying a complete but origin-unspecified model snapshot."""
     trace = _trace(1)
     model = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="gpt-test",
         capabilities_sha256="b" * 64,

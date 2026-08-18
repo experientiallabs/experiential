@@ -10,6 +10,7 @@ import pytest
 
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ConnectionConfig,
     EmbeddingClient,
     ModelCapabilities,
@@ -83,6 +84,7 @@ class _FakeBedrockRuntime:
 def _snapshot(model_id: str = "us.anthropic.claude-sonnet-4-5") -> ModelSnapshot:
     """Build an immutable Bedrock identity fixture."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="bedrock",
         model_id=model_id,
         capabilities_sha256="a" * 64,
@@ -342,6 +344,7 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
             connections={"bedrock": ConnectionConfig(provider="bedrock", region="us-east-1")},
             models={
                 "claude": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="bedrock",
                     model="us.anthropic.claude-sonnet-4-5",
                     capabilities=ModelCapabilities(
@@ -350,6 +353,7 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
                     ),
                 ),
                 "embed": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="bedrock",
                     model="amazon.titan-embed-text-v2:0",
                     capabilities=ModelCapabilities(supports_embeddings=True),
@@ -388,6 +392,7 @@ def test_snapshot_does_not_construct_a_bedrock_runtime() -> None:
             connections={"bedrock": ConnectionConfig(provider="bedrock", region="us-east-1")},
             models={
                 "claude": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="bedrock",
                     model="us.anthropic.claude-sonnet-4-5",
                     capabilities=ModelCapabilities(supports_completions=True),

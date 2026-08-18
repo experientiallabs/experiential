@@ -15,6 +15,7 @@ from wmo.common.core.artifacts import (
     StructuredFailure,
 )
 from wmo.common.models import (
+    BillingSource,
     EmbeddingCostReservation,
     ModelSnapshot,
     NumericMeasurement,
@@ -41,6 +42,7 @@ _TIME = datetime(2026, 8, 11, tzinfo=UTC)
 def _model() -> ModelSnapshot:
     """Return one pinned provider model snapshot fixture."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="gpt-5.4",
         capabilities_sha256=_DIGEST,

@@ -35,6 +35,7 @@ from wmo.common.judging import (
     ScoreAnchor,
 )
 from wmo.common.models import (
+    BillingSource,
     EmbeddingCostReservation,
     ModelCapabilities,
     ModelClient,
@@ -177,6 +178,7 @@ def _snapshot(alias: str) -> ModelSnapshot:
         Deterministic fixture snapshot with the exact capability digest.
     """
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="test",
         model_id=alias,
         revision="fixture",

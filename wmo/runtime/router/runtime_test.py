@@ -22,6 +22,7 @@ from wmo.common.evaluations import (
 )
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     CandidateTokenPrice,
     Embedding,
     ModelCapabilities,
@@ -48,6 +49,10 @@ from wmo.common.routing.features import ROUTER_FEATURE_SCHEMA_SHA256
 from wmo.common.tasks import TaskCase, TaskSet
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime, RouterRuntimeIntegrityError
+from wmo.runtime.router.economics import (
+    RoutedProviderComponent,
+    RoutedSpendDisposition,
+)
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
@@ -142,6 +147,10 @@ def test_request_embedding_failures_always_fall_back_with_evidence(bad: object) 
     assert decision.selected_alias == runtime.policy.baseline_alias
     assert decision.fallback_reason == "embedding_error"
     assert decision.neighbor_count == decision.paired_count == 0
+    operation = runtime.selection_operation(_request(), episode_id="episode-a", decision=decision)
+    assert operation.component == RoutedProviderComponent.ROUTER_EMBEDDING
+    assert operation.disposition == RoutedSpendDisposition.RESERVED_AMBIGUOUS
+    assert operation.operation_count == 1
 
 
 def test_episode_stickiness_uses_caller_identity_and_tools_affect_request_hash() -> None:
@@ -611,7 +620,10 @@ def test_routed_completion_reconciles_alias_free_embedding_and_candidate_economi
         input_cost_per_million_tokens_usd=0.1,
     )
     embedder = snapshots["embedder"].model_copy(
-        update={"capabilities_sha256": embedding_capabilities.identity_sha256()}
+        update={
+            "billing_source": BillingSource.HOST_MANAGED,
+            "capabilities_sha256": embedding_capabilities.identity_sha256(),
+        }
     )
     policy = policy.model_copy(update={"embedder": embedder})
     manifest = manifest.model_copy(update={"embedder": embedder})
@@ -647,21 +659,36 @@ def test_routed_completion_reconciles_alias_free_embedding_and_candidate_economi
     routed = runtime.complete(request, episode_id="episode-a", decision=decision)
 
     economics = routed.economics
-    assert economics.router_embedding.usage is not None
-    assert economics.router_embedding.usage.input_tokens > 0
-    assert economics.router_embedding.cost_usd is not None
-    assert economics.selected_candidate.usage == Usage(
+    embedding_economics = economics.router_embedding.economics
+    candidate_economics = economics.selected_candidate.economics
+    assert economics.router_embedding.billing_source == BillingSource.HOST_MANAGED
+    assert economics.selected_candidate.billing_source == BillingSource.CUSTOMER_MANAGED
+    assert economics.operation_count == 2
+    assert [item.disposition for item in economics.operations] == [
+        RoutedSpendDisposition.LOCALLY_PRICED,
+        RoutedSpendDisposition.LOCALLY_PRICED,
+    ]
+    assert embedding_economics.usage is not None
+    assert embedding_economics.usage.input_tokens > 0
+    assert embedding_economics.cost_usd is not None
+    assert candidate_economics.usage == Usage(
         input_tokens=7,
         output_tokens=3,
         cached_input_tokens=2,
     )
-    assert economics.selected_candidate.cost_usd is not None
-    assert economics.selected_candidate.cost_usd.value == pytest.approx(14.5 / 1_000_000)
+    assert candidate_economics.cost_usd is not None
+    assert candidate_economics.cost_usd.value == pytest.approx(14.5 / 1_000_000)
+    assert tuple(item.billing_source for item in economics.by_billing_source) == (
+        BillingSource.CUSTOMER_MANAGED,
+        BillingSource.HOST_MANAGED,
+    )
     assert economics.total.cost_usd is not None
     assert economics.total.cost_usd.value == pytest.approx(
-        economics.router_embedding.cost_usd.value + economics.selected_candidate.cost_usd.value
+        embedding_economics.cost_usd.value + candidate_economics.cost_usd.value
     )
-    assert decision.selected_alias not in economics.model_dump_json()
+    serialized = economics.model_dump_json()
+    assert decision.selected_alias not in serialized
+    assert "model_id" not in serialized
 
 
 def _request(*, tool_name: str | None = None) -> ModelRequest:
@@ -798,6 +825,7 @@ def _snapshot(alias: str, *, candidate_tools: bool = True) -> ModelSnapshot:
         supports_embeddings=alias == "embedder",
     )
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="test",
         model_id=alias,
         revision="fixture",

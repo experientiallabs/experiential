@@ -20,7 +20,7 @@ from wmo.common.core.artifacts import (
     canonical_json_bytes,
     sha256_bytes,
 )
-from wmo.common.models import ModelCapabilities, ModelSnapshot
+from wmo.common.models import BillingSource, ModelCapabilities, ModelSnapshot
 from wmo.common.project import (
     ProjectConfig,
     ProjectModelConfiguration,
@@ -57,6 +57,7 @@ def _catalog_model(alias: str) -> ProjectCatalogModel:
     return ProjectCatalogModel(
         alias=alias,
         model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="openai",
             model_id=f"model-{alias}",
             capabilities_sha256=capabilities.identity_sha256(),

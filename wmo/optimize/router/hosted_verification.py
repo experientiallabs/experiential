@@ -13,7 +13,7 @@ from wmo.common.core.artifacts import (
     sorted_unique_inputs,
 )
 from wmo.common.evaluations import load_evaluation_dataset
-from wmo.common.evaluations.evidence import read_evaluation_plan
+from wmo.common.evaluations.evidence import read_evaluation_plan, read_judgment, read_rollout
 from wmo.common.judging import verify_persisted_calibration
 from wmo.common.project import (
     ProjectBuildArtifacts,
@@ -26,7 +26,11 @@ from wmo.common.project import (
     artifact_input,
 )
 from wmo.common.project.catalog import load_project_model_catalog
-from wmo.common.routing import KnnRouterPolicy
+from wmo.common.routing import (
+    KnnRouterPolicy,
+    ReservedFrozenEmbeddingSet,
+    load_frozen_embedding_set,
+)
 from wmo.common.routing.bank import KnnBankManifest
 from wmo.common.routing.decision import policy_content_sha256
 from wmo.optimize.router.automatic.execution_contract import (
@@ -34,8 +38,10 @@ from wmo.optimize.router.automatic.execution_contract import (
 )
 from wmo.optimize.router.composition import RouterPolicyLock
 from wmo.optimize.router.fit.report import HeldOutRouterReport
+from wmo.optimize.router.hosted_spend import provider_spend_source_pairs
 from wmo.optimize.router.judging.contracts import ProvisionalJudgeSetupArtifact
 from wmo.optimize.router.spend import (
+    ProviderSpendComponent,
     ProviderSpendLedger,
     ProviderSpendStatus,
 )
@@ -534,6 +540,7 @@ def _verify_stage_ledger(
         or ledger.restart != "completed_stage_bundle"
     ):
         raise ValueError("provider spend ledger differs from its selected hosted stage")
+    _verify_ledger_billing_sources(project, config, ledger)
     prior_pointer = (
         config.router_policy.spend_ledger
         if stage == ProjectStage.COMPLETING_REPORT and config.router_policy is not None
@@ -561,6 +568,101 @@ def _verify_stage_ledger(
         if any(current_entries.get(item.operation_id) != item for item in prior_incurred):
             raise ValueError("provider spend ledger drops or changes prior incurred spend")
     return ledger
+
+
+def _verify_ledger_billing_sources(
+    project: ProjectStore,
+    config: ProjectConfig,
+    ledger: ProviderSpendLedger,
+) -> None:
+    """Bind every alias-free ledger source to exact catalog and operation evidence.
+
+    Args:
+        project: Hosted Project owning the selected ledger.
+        config: Verified Project setup and role selection.
+        ledger: Completed stage ledger being restored.
+
+    Raises:
+        ValueError: A component source is absent, extra, or differs from its exact evidence.
+    """
+    if config.model_catalog is None or config.models is None:
+        raise ValueError("provider spend ledger requires a frozen Project model catalog")
+    catalog = load_project_model_catalog(project.artifacts, config.model_catalog)
+    models = {item.alias: item.model for item in catalog.models}
+    try:
+        expected_pairs = set(
+            provider_spend_source_pairs(
+                candidates=tuple(models[alias] for alias in config.models.candidates),
+                world_model=models[config.models.world_model],
+                judge=models[config.models.judge],
+                embedder=models[config.models.embedder],
+            )
+        )
+    except KeyError as exc:
+        raise ValueError("provider spend ledger role is absent from the Project catalog") from exc
+    actual_pairs = {(item.component, item.billing_source) for item in ledger.entries}
+    if actual_pairs != expected_pairs:
+        raise ValueError("provider spend ledger differs from the frozen billing-source plan")
+    embedder_source = models[config.models.embedder].billing_source
+    build_entries = set()
+    if ledger.stage != ProjectStage.BUILDING_WORLD_MODEL and config.build_spend_ledger is not None:
+        build_entries = set(
+            _read_payload(
+                project,
+                config.build_spend_ledger,
+                relative_path="spend-ledger.json",
+                model_type=ProviderSpendLedger,
+            ).entries
+        )
+    for entry in ledger.entries:
+        if entry.status == ProviderSpendStatus.NOT_INCURRED:
+            continue
+        if entry.evidence is None:
+            if (
+                entry.component != ProviderSpendComponent.RETRIEVAL_EMBEDDING
+                or entry.billing_source != embedder_source
+                or (
+                    ledger.stage != ProjectStage.BUILDING_WORLD_MODEL and entry not in build_entries
+                )
+            ):
+                raise ValueError("provider spend entry omits its source-bearing evidence")
+            continue
+        stored = project.artifacts.read(entry.evidence.artifact_id)
+        if artifact_input(stored.manifest) != entry.evidence:
+            raise ValueError("provider spend evidence manifest digest changed")
+        if stored.manifest.artifact_type == "rollout":
+            rollout, _pointer = read_rollout(project.artifacts, entry.evidence.artifact_id)
+            if rollout.candidate is None or rollout.world_model is None:
+                raise ValueError("provider spend rollout omits its model billing sources")
+            if entry.component == ProviderSpendComponent.CANDIDATE:
+                expected_source = rollout.candidate.billing_source
+            elif entry.component == ProviderSpendComponent.WORLD_MODEL:
+                expected_source = rollout.world_model.billing_source
+            elif entry.component == ProviderSpendComponent.RETRIEVAL_EMBEDDING:
+                if rollout.simulation_binding is None:
+                    raise ValueError("provider spend rollout omits its embedding reservation")
+                expected_source = rollout.simulation_binding.query_embedding.model.billing_source
+            else:
+                raise ValueError("provider spend rollout names an unrelated component")
+        elif stored.manifest.artifact_type == "judgment":
+            judgment, _pointer = read_judgment(project.artifacts, entry.evidence.artifact_id)
+            if entry.component != ProviderSpendComponent.JUDGE:
+                raise ValueError("provider spend judgment names an unrelated component")
+            expected_source = judgment.judge_model.billing_source
+        elif stored.manifest.artifact_type == "router-embeddings":
+            embeddings = load_frozen_embedding_set(
+                project.artifacts,
+                entry.evidence.artifact_id,
+            )
+            if entry.component != ProviderSpendComponent.ROUTER_EMBEDDING or not isinstance(
+                embeddings, ReservedFrozenEmbeddingSet
+            ):
+                raise ValueError("provider spend embeddings omit their exact reservation")
+            expected_source = embeddings.reservation.model.billing_source
+        else:
+            raise ValueError("provider spend entry names unsupported operation evidence")
+        if entry.billing_source != expected_source:
+            raise ValueError("provider spend entry billing source differs from its evidence")
 
 
 def _verify_artifact_pointer(

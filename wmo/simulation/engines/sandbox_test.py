@@ -17,6 +17,7 @@ from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelClient,
     ModelMessage,
     ModelRequest,
@@ -710,6 +711,7 @@ def _task(task_id: str) -> TaskCase:
 def _snapshot() -> ModelSnapshot:
     """Return the pinned candidate identity shared by plan and runtime."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id="candidate-a",
         revision="v1",

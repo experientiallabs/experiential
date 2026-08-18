@@ -15,12 +15,14 @@ from wmo.common.evaluations import (
     build_fidelity_report,
 )
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     DiscoveredModel,
     ModelCapabilities,
     ModelCatalog,
     ModelRecord,
     ModelRoles,
+    ModelSnapshot,
     ResolvedDiscoveredModel,
     resolve_discovered_model,
 )
@@ -58,12 +60,23 @@ from wmo.optimize.router.hosted import (
     restore_hosted_project_bundle,
     run_hosted_router_workflow,
 )
-from wmo.optimize.router.spend import ProviderSpendLedger
+from wmo.optimize.router.spend import ProviderSpendEntry, ProviderSpendLedger
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.application import (
     create_project_router_app,
 )
-from wmo.runtime.router.runtime import RoutedCompletionEconomics, RoutedModelResponse, RouterRuntime
+from wmo.runtime.router.economics import (
+    BillingSourceEconomics,
+    RoutedCompletionEconomics,
+    RoutedProviderComponent,
+    RoutedProviderOperation,
+    RoutedSpendDisposition,
+    RoutedSpendLedger,
+)
+from wmo.runtime.router.runtime import (
+    RoutedModelResponse,
+    RouterRuntime,
+)
 from wmo.simulation.build import (
     build_project,
     load_project_provider_free_stage,
@@ -129,6 +142,7 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.ProjectStage is ProjectStage
     assert wmo.ProjectStageEvent is ProjectStageEvent
     assert wmo.ProjectStore is ProjectStore
+    assert wmo.BillingSource is BillingSource
     assert wmo.ConnectionConfig is ConnectionConfig
     assert wmo.DiscoveredModel is DiscoveredModel
     assert wmo.ModelCapabilities is ModelCapabilities
@@ -140,8 +154,25 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.RuntimeModelCatalog is RuntimeModelCatalog
     assert "ledger" in signature(FileHostedAttemptAuthorityStore.commit_stage).parameters
     assert wmo.ProviderSpendLedger is ProviderSpendLedger
+    assert wmo.ProviderSpendEntry is ProviderSpendEntry
+    assert wmo.BillingSourceEconomics is BillingSourceEconomics
     assert wmo.RoutedCompletionEconomics is RoutedCompletionEconomics
+    assert wmo.RoutedProviderComponent is RoutedProviderComponent
+    assert wmo.RoutedProviderOperation is RoutedProviderOperation
+    assert wmo.RoutedSpendDisposition is RoutedSpendDisposition
+    assert wmo.RoutedSpendLedger is RoutedSpendLedger
     assert wmo.RoutedModelResponse is RoutedModelResponse
+    assert ModelRecord.model_fields["billing_source"].is_required()
+    assert ModelSnapshot.model_fields["billing_source"].is_required()
+    assert ProviderSpendEntry.model_fields["billing_source"].is_required()
+    assert set(RoutedCompletionEconomics.model_fields) == {
+        "operations",
+        "operation_count",
+        "router_embedding",
+        "selected_candidate",
+        "by_billing_source",
+        "total",
+    }
     assert wmo.FidelityReport is FidelityReport
     assert wmo.build_fidelity_evaluation_plan is build_fidelity_evaluation_plan
     assert wmo.build_fidelity_report is build_fidelity_report

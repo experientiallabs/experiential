@@ -7,6 +7,7 @@ import pytest
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -55,6 +56,7 @@ def _catalog(
     api_version: str | None = None,
     region: str | None = None,
     capabilities: ModelCapabilities | None = _DEFAULT_CAPABILITIES,
+    billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED,
 ) -> ModelCatalog:
     """Build a minimum one-alias local catalog for deterministic resolution tests."""
     return ModelCatalog(
@@ -71,6 +73,7 @@ def _catalog(
             "fixture-model": ModelRecord(
                 connection="primary",
                 model="fixture-model",
+                billing_source=billing_source,
                 capabilities=capabilities,
             )
         },
@@ -99,6 +102,32 @@ def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
         maximum_output_tokens=16_000,
     )
     assert snapshot.capabilities_sha256 == capabilities.identity_sha256()
+
+
+def test_snapshots_preserve_per_model_billing_source_on_one_connection() -> None:
+    """Do not infer one credential owner from a connection shared by two model aliases."""
+    catalog = _catalog(billing_source=BillingSource.HOST_MANAGED)
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                "customer-model": catalog.models["fixture-model"].model_copy(
+                    update={
+                        "model": "customer-model",
+                        "billing_source": BillingSource.CUSTOMER_MANAGED,
+                    }
+                ),
+            }
+        }
+    )
+    runtime = RuntimeModelCatalog(catalog, environment={})
+
+    host, _host_capabilities = runtime.snapshot("fixture-model")
+    customer, _customer_capabilities = runtime.snapshot("customer-model")
+
+    assert host.billing_source == BillingSource.HOST_MANAGED
+    assert customer.billing_source == BillingSource.CUSTOMER_MANAGED
+    assert host.connection_sha256 == customer.connection_sha256
 
 
 def test_snapshot_identity_excludes_workflow_metadata_added_to_existing_catalogs() -> None:

@@ -19,6 +19,7 @@ from wmo.common.core.artifacts import (
     sha256_json,
 )
 from wmo.common.models import (
+    BillingSource,
     Embedding,
     EmbeddingCostReservation,
     ModelCapabilities,
@@ -652,6 +653,7 @@ def _constant_binding(
     return RAGEmbedderBinding(
         client=_ConstantEmbedder(),
         snapshot=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="test",
             model_id="constant",
             revision="1",

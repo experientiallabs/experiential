@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from wmo.common.models import ModelCapabilities, ModelSnapshot
+from wmo.common.models import BillingSource, ModelCapabilities, ModelSnapshot
 from wmo.common.project import ProjectStore
 from wmo.common.project.catalog import (
     ProjectCatalogModel,
@@ -32,6 +32,7 @@ def _model(alias: str) -> ProjectCatalogModel:
     return ProjectCatalogModel(
         alias=alias,
         model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="openai",
             model_id=f"model-{alias}",
             capabilities_sha256=capabilities.identity_sha256(),

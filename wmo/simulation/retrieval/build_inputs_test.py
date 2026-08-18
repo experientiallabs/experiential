@@ -347,17 +347,17 @@ def test_binding_loader_rejects_rehashed_unsupported_trace_dataset_schema(
     dataset_id = build.trace_dataset.dataset.dataset_id
     stored = store.read(dataset_id)
     envelope = TraceDataset.model_validate_json(store.read_bytes(dataset_id, "trace-dataset.json"))
-    tampered = envelope.model_copy(update={"schema_version": 2})
+    tampered = envelope.model_copy(update={"schema_version": 3})
     tampered_bytes = canonical_json_bytes(tampered)
     (stored.directory / "trace-dataset.json").write_bytes(tampered_bytes)
     files = tuple(
         file_digest(entry.path, tampered_bytes) if entry.path == "trace-dataset.json" else entry
         for entry in stored.manifest.files
     )
-    tampered_manifest = stored.manifest.model_copy(update={"schema_version": 2, "files": files})
+    tampered_manifest = stored.manifest.model_copy(update={"schema_version": 3, "files": files})
     (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
 
-    with pytest.raises(ArtifactCorruptionError, match="unsupported schema version 2"):
+    with pytest.raises(ArtifactCorruptionError, match="unsupported schema version 3"):
         load_task_set_lineage_bindings(store, build.task_set.task_set_id)
 
 

@@ -299,7 +299,7 @@ def load_task_set_lineage_bindings(
             f"task set {task_set_id} lineage bindings differ from its source dataset input"
         )
     trace_stored = store.read(trace_input.artifact_id)
-    if trace_stored.manifest.schema_version != 1:
+    if trace_stored.manifest.schema_version not in {1, 2}:
         raise ArtifactCorruptionError(
             f"trace dataset {trace_input.artifact_id} uses unsupported schema version "
             f"{trace_stored.manifest.schema_version}"

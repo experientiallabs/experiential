@@ -639,7 +639,7 @@ def _persist_release_embeddings(project: ProjectStore, tasks, revision: str) -> 
     """Persist exact local vectors with release-checkout provenance."""
     extractor = RouterFeatureExtractor()
     embeddings = FrozenEmbeddingSet(
-        schema_version=1,
+        schema_version=3,
         created_at=_TIME,
         code_revision=revision,
         embedding_set_id="embeddings-a",

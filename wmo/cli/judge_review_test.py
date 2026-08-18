@@ -18,7 +18,7 @@ from wmo.cli import judge_review as review_module
 from wmo.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
 from wmo.common.judging import Rubric, RubricDimension
 from wmo.common.judging.judgment import Judgment
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.optimize.router.judging.contracts import (
     JudgeTracePreview,
@@ -626,6 +626,7 @@ def _proposal(
 def _model() -> ModelSnapshot:
     """Return one exact secret-free assistant identity."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="assistant-model",
         revision=None,

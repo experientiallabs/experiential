@@ -87,6 +87,7 @@ class Trace(ContractModel):
 class TraceDataset(ArtifactEnvelope):
     """A frozen normalized trace-dataset manifest with auditable exclusions."""
 
+    schema_version: Literal[1, 2] = 2
     dataset_id: ArtifactId
     semantic_convention_version: str = Field(min_length=1, max_length=128)
     traces_path: str = Field(min_length=1)
@@ -95,6 +96,14 @@ class TraceDataset(ArtifactEnvelope):
     issues_sha256: Sha256 | None = None
     invalid_trace_count: int = Field(default=0, ge=0)
     trace_ids: tuple[str, ...]
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def _require_integer_schema_version(cls, value: object) -> object:
+        """Reject boolean and floating-point lookalikes at the version boundary."""
+        if type(value) is not int:
+            raise ValueError("trace dataset schema_version must be an integer")
+        return value
 
     @field_validator("traces_path")
     @classmethod

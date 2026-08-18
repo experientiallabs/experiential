@@ -20,9 +20,13 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
-from wmo.common.core.money import exact_usd, reserve_usd
+from wmo.common.core.money import USD_ZERO, exact_usd
 from wmo.common.project import ExportedProjectBundle, ProjectStage
-from wmo.optimize.router.spend import ProviderSpendComponent, ProviderSpendLedger
+from wmo.optimize.router.spend import (
+    ProviderSpendEntry,
+    ProviderSpendLedger,
+    ProviderSpendStatus,
+)
 
 _AUTHORITY_FILE = "authority.json"
 _STATE_FILE = "attempt-state.json"
@@ -65,21 +69,41 @@ class HostedAttemptBinding(ContractModel):
 
 
 class HostedProviderHazard(ContractModel):
-    """One paid-operation reservation retained outside every portable Project bundle."""
+    """Source-separated reservations retained outside every portable Project bundle."""
 
     schema_version: Literal[1] = 1
     project_id: ArtifactId
     attempt_id: ArtifactId
     authority_sha256: Sha256
     stage: ProjectStage
-    component: ProviderSpendComponent
-    reserved_usd: Decimal = Field(ge=0)
+    reservations: tuple[ProviderSpendEntry, ...]
 
-    @field_validator("reserved_usd", mode="before")
+    @field_validator("reservations")
     @classmethod
-    def _require_exact_reservation(cls, value: object) -> Decimal:
-        """Round one nonnegative reservation up to numeric(20,6)."""
-        return reserve_usd(value)
+    def _require_source_separated_reservations(
+        cls,
+        value: tuple[ProviderSpendEntry, ...],
+    ) -> tuple[ProviderSpendEntry, ...]:
+        """Require canonical source-specific reservations with no artifact evidence."""
+        operation_ids = tuple(item.operation_id for item in value)
+        pairs = tuple((item.component, item.billing_source) for item in value)
+        if not value:
+            raise ValueError("hosted provider hazard requires at least one reservation")
+        if operation_ids != tuple(sorted(operation_ids)) or len(set(operation_ids)) != len(value):
+            raise ValueError("hosted provider reservations need sorted unique operation IDs")
+        if len(set(pairs)) != len(pairs):
+            raise ValueError("hosted provider reservations need unique component-source pairs")
+        if any(
+            item.status != ProviderSpendStatus.RESERVED or item.evidence is not None
+            for item in value
+        ):
+            raise ValueError("hosted provider hazard accepts only evidence-free reservations")
+        return value
+
+    @property
+    def reserved_usd(self) -> Decimal:
+        """Return the exact total reserved across all billing sources."""
+        return sum((item.amount_usd for item in self.reservations), start=USD_ZERO)
 
 
 class HostedStageCommit(ContractModel):
@@ -689,7 +713,8 @@ def _require_state_for_hazard(
         raise HostedAttemptAuthorityError(
             "provider reservation differs from its Project attempt binding"
         )
-    if hazard.reserved_usd > binding.ceiling_usd:
+    committed_usd = USD_ZERO if state.latest_commit is None else state.latest_commit.spend_total_usd
+    if committed_usd + hazard.reserved_usd > binding.ceiling_usd:
         raise HostedAttemptAuthorityError("provider reservation exceeds its attempt ceiling")
     expected_index = (
         0

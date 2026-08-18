@@ -15,10 +15,10 @@ from wmo.common.core.artifacts import (
     ContractModel,
     Sha256,
     sha256_json,
-    stable_id,
 )
-from wmo.common.core.money import USD_ZERO, nonincreasing_float_usd
+from wmo.common.core.money import nonincreasing_float_usd
 from wmo.common.models import (
+    BillingSource,
     ModelCatalog,
     OperationEconomics,
     RouterCandidateSelection,
@@ -68,6 +68,7 @@ from wmo.optimize.router.hosted_spend import (
     complete_component_entries,
     incurred_entries,
     optimization_entries,
+    provider_spend_source_pairs,
     stage_ledger,
 )
 from wmo.optimize.router.hosted_stages import (
@@ -88,7 +89,6 @@ from wmo.optimize.router.spend import (
     ProviderSpendComponent,
     ProviderSpendEntry,
     ProviderSpendLedger,
-    ProviderSpendStatus,
     load_provider_spend_ledger,
     persist_provider_spend_ledger,
 )
@@ -253,6 +253,7 @@ def run_hosted_router_workflow(
         ) from exc
     _raise_unresolved_hazard(
         project,
+        preflight,
         attempt_authority_store,
         authority,
         created_at,
@@ -313,6 +314,7 @@ def run_hosted_router_workflow(
             created_at,
             code_revision,
             setup,
+            preflight,
             attempt_authority_store,
             authority,
             events,
@@ -346,12 +348,29 @@ def run_hosted_router_workflow(
         expected_catalog_sha256=sha256_json(preflight.catalog.model_dump(mode="json")),
     )
     prior_entries = incurred_entries(build_ledger.entries)
+    source_pairs = _preflight_source_pairs(preflight)
     config = project.load_project()
     starting_stage = (
         ProjectStage.COMPLETING_REPORT
         if config.router_policy is not None
         else ProjectStage.OPTIMIZING_ROUTER
     )
+    policy_ledger: ProviderSpendLedger | None = None
+    if config.router_policy is not None:
+        policy_ledger = load_provider_spend_ledger(
+            project.artifacts,
+            config.router_policy.spend_ledger,
+        )
+        if (
+            policy_ledger.stage != ProjectStage.OPTIMIZING_ROUTER
+            or policy_ledger.attempt_id != attempt_id
+            or policy_ledger.attempt_authority_sha256 != authority.authority_sha256
+            or policy_ledger.ceiling_usd != total_ceiling
+            or policy_ledger.outcome != "completed"
+        ):
+            raise HostedRouterPreflightError(
+                "hosted committed policy ledger differs from the active attempt"
+            )
     if config.router_report is None:
         _emit(events, event_sink, project, attempt_id, created_at, starting_stage, "started")
         attempt_authority_store.begin(
@@ -360,11 +379,13 @@ def run_hosted_router_workflow(
                 attempt_id=attempt_id,
                 authority_sha256=authority.authority_sha256,
                 stage=starting_stage,
-                component=ProviderSpendComponent.OTHER_PROVIDER,
-                reserved_usd=remaining,
+                reservations=(
+                    preflight.report_reservations
+                    if starting_stage == ProjectStage.COMPLETING_REPORT
+                    else preflight.fit_reservations
+                ),
             ),
         )
-    policy_ledger: ProviderSpendLedger | None = None
 
     def policy_checkpoint(
         lock: RouterPolicyLock,
@@ -443,8 +464,7 @@ def run_hosted_router_workflow(
                     attempt_id=attempt_id,
                     authority_sha256=authority.authority_sha256,
                     stage=ProjectStage.COMPLETING_REPORT,
-                    component=ProviderSpendComponent.OTHER_PROVIDER,
-                    reserved_usd=max(USD_ZERO, total_ceiling - ledger.total_usd),
+                    reservations=preflight.report_reservations,
                 )
             )
 
@@ -535,23 +555,8 @@ def run_hosted_router_workflow(
         hazard = _require_unresolved_hazard(attempt_authority_store, authority)
         attempt_authority_store.mark_ambiguous(hazard)
         failed_entries = complete_component_entries(
-            (
-                *baseline,
-                ProviderSpendEntry(
-                    operation_id=stable_id(
-                        "provider-spend-operation",
-                        {
-                            "attempt_id": attempt_id,
-                            "stage": hazard.stage.value,
-                            "ambiguity": "reserved-provider-boundary",
-                        },
-                    ),
-                    component=hazard.component,
-                    status=ProviderSpendStatus.RESERVED,
-                    operation_count=1,
-                    amount_usd=hazard.reserved_usd,
-                ),
-            )
+            (*baseline, *hazard.reservations),
+            source_pairs,
         )
         failed, failed_input = persist_provider_spend_ledger(
             project.artifacts,
@@ -623,8 +628,7 @@ def _ensure_grounded_build(
             attempt_id=attempt_id,
             authority_sha256=authority.authority_sha256,
             stage=ProjectStage.BUILDING_WORLD_MODEL,
-            component=ProviderSpendComponent.RETRIEVAL_EMBEDDING,
-            reserved_usd=preflight.build_cost_usd,
+            reservations=preflight.build_reservations,
         ),
     )
     stage = project.load_project().provider_free_stage
@@ -686,6 +690,7 @@ def _ensure_grounded_build(
             created_at,
             code_revision,
             setup,
+            preflight,
             attempt_authority_store,
             authority,
             events,
@@ -700,16 +705,6 @@ def _ensure_grounded_build(
         fit_rag=artifact_input(fit.manifest),
         world_model=artifact_input(world.manifest),
     )
-    entry = ProviderSpendEntry(
-        operation_id=stable_id(
-            "provider-spend-operation",
-            {"attempt_id": attempt_id, "stage": "grounded-build-embedding"},
-        ),
-        component=ProviderSpendComponent.RETRIEVAL_EMBEDDING,
-        status=ProviderSpendStatus.RESERVED,
-        operation_count=2,
-        amount_usd=preflight.build_cost_usd,
-    )
     ceiling = setup.budgets.maximum_provider_cost_usd
     assert ceiling is not None
     ledger, ledger_input = persist_provider_spend_ledger(
@@ -719,7 +714,10 @@ def _ensure_grounded_build(
         attempt_id=attempt_id,
         attempt_authority_sha256=authority.authority_sha256,
         ceiling_usd=ceiling,
-        entries=complete_component_entries((entry,)),
+        entries=complete_component_entries(
+            preflight.build_reservations,
+            _preflight_source_pairs(preflight),
+        ),
         stage_outputs=(
             build.trace_dataset,
             build.task_set,
@@ -769,6 +767,7 @@ def _raise_failed_build(
     created_at: datetime,
     code_revision: str,
     setup: HostedRouterWorkflowSetup,
+    preflight: HostedPreflight,
     attempt_authority_store: HostedAttemptAuthorityStore,
     authority: HostedAttemptAuthority,
     events: list[ProjectStageEvent],
@@ -782,16 +781,6 @@ def _raise_failed_build(
     attempt_authority_store.mark_ambiguous(hazard)
     ceiling = setup.budgets.maximum_provider_cost_usd
     assert ceiling is not None
-    entry = ProviderSpendEntry(
-        operation_id=stable_id(
-            "provider-spend-operation",
-            {"attempt_id": attempt_id, "stage": hazard.stage.value, "ambiguity": "build"},
-        ),
-        component=hazard.component,
-        status=ProviderSpendStatus.RESERVED,
-        operation_count=1,
-        amount_usd=hazard.reserved_usd,
-    )
     ledger, ledger_input = persist_provider_spend_ledger(
         project.artifacts,
         project_id=project.paths.project_id,
@@ -799,7 +788,10 @@ def _raise_failed_build(
         attempt_id=attempt_id,
         attempt_authority_sha256=authority.authority_sha256,
         ceiling_usd=ceiling,
-        entries=complete_component_entries((entry,)),
+        entries=complete_component_entries(
+            hazard.reservations,
+            _preflight_source_pairs(preflight),
+        ),
         outcome="failed_closed",
         created_at=created_at,
         code_revision=code_revision,
@@ -843,6 +835,7 @@ def _automatic_options(
 
 def _raise_unresolved_hazard(
     project: ProjectStore,
+    preflight: HostedPreflight,
     attempt_store: HostedAttemptAuthorityStore,
     authority: HostedAttemptAuthority,
     created_at: datetime,
@@ -875,20 +868,6 @@ def _raise_unresolved_hazard(
         prior_entries = incurred_entries(
             load_provider_spend_ledger(project.artifacts, config.build_spend_ledger).entries
         )
-    entry = ProviderSpendEntry(
-        operation_id=stable_id(
-            "provider-spend-operation",
-            {
-                "attempt_id": authority.attempt_id,
-                "stage": hazard.stage.value,
-                "ambiguity": "restart",
-            },
-        ),
-        component=hazard.component,
-        status=ProviderSpendStatus.RESERVED,
-        operation_count=1,
-        amount_usd=hazard.reserved_usd,
-    )
     ledger, ledger_input = persist_provider_spend_ledger(
         project.artifacts,
         project_id=project.paths.project_id,
@@ -896,12 +875,27 @@ def _raise_unresolved_hazard(
         attempt_id=authority.attempt_id,
         attempt_authority_sha256=authority.authority_sha256,
         ceiling_usd=ceiling,
-        entries=complete_component_entries((*prior_entries, entry)),
+        entries=complete_component_entries(
+            (*prior_entries, *hazard.reservations),
+            _preflight_source_pairs(preflight),
+        ),
         outcome="failed_closed",
         created_at=created_at,
         code_revision=code_revision,
     )
     raise HostedRouterWorkflowError(ledger=ledger, ledger_input=ledger_input, events=())
+
+
+def _preflight_source_pairs(
+    preflight: HostedPreflight,
+) -> tuple[tuple[ProviderSpendComponent, BillingSource], ...]:
+    """Return the complete component and billing-source plan for one hosted setup."""
+    return provider_spend_source_pairs(
+        candidates=tuple(item.model for item in preflight.candidates),
+        world_model=preflight.world_model.model,
+        judge=preflight.judge.model,
+        embedder=preflight.embedder.model,
+    )
 
 
 def _require_unresolved_hazard(

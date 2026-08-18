@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from wmo.common.core.artifacts import stable_id
 from wmo.common.core.money import USD_ZERO, reserve_usd
 from wmo.common.models import (
+    BillingSource,
     ModelCapabilities,
     ModelCatalog,
     RoutedCandidateSnapshot,
@@ -22,18 +23,24 @@ from wmo.common.project import (
     ProjectCatalogModel,
     ProjectHostedSetup,
     ProjectModelCatalog,
+    ProjectStage,
     ProjectStore,
     load_project_model_catalog,
     persist_project_model_catalog,
 )
 from wmo.common.routing import router_embedding_reservation
-from wmo.common.tasks import load_task_set
+from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, load_trace_dataset
 from wmo.optimize.router.automatic.attribution import resolve_router_observed_attributions
 from wmo.optimize.router.automatic.reservations import (
     retrieval_embedding_reservation,
     simulation_completion_reservations,
     simulation_input_token_estimate,
+)
+from wmo.optimize.router.spend import (
+    ProviderSpendComponent,
+    ProviderSpendEntry,
+    ProviderSpendStatus,
 )
 from wmo.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.models.providers.transport import RetryPolicy
@@ -68,6 +75,9 @@ class HostedPreflight:
     embedder: RoutedCandidateSnapshot
     embedder_capabilities: ModelCapabilities
     build_cost_usd: Decimal
+    build_reservations: tuple[ProviderSpendEntry, ...]
+    fit_reservations: tuple[ProviderSpendEntry, ...]
+    report_reservations: tuple[ProviderSpendEntry, ...]
 
 
 @dataclass(frozen=True)
@@ -198,6 +208,20 @@ def preflight_hosted(
                 )
         except ValueError as exc:
             problems.append(f"grounded build inputs: {exc}")
+    build_reservations: tuple[ProviderSpendEntry, ...] = ()
+    embedder_snapshot = snapshots.get(setup.models.embedder)
+    if embedder_snapshot is not None:
+        build_reservations = (
+            _provider_reservation(
+                stage=ProjectStage.BUILDING_WORLD_MODEL,
+                component=ProviderSpendComponent.RETRIEVAL_EMBEDDING,
+                billing_source=embedder_snapshot.model.billing_source,
+                operation_count=2 * RetryPolicy().maximum_attempts,
+                amount_usd=build_cost,
+            ),
+        )
+    fit_reservations: tuple[ProviderSpendEntry, ...] = ()
+    report_reservations: tuple[ProviderSpendEntry, ...] = ()
     ceiling = setup.budgets.maximum_provider_cost_usd
     if ceiling is not None:
         if build_cost > setup.budgets.maximum_build_cost_usd:
@@ -205,7 +229,7 @@ def preflight_hosted(
         candidates = tuple(
             snapshots[alias] for alias in sorted(setup.models.candidates) if alias in snapshots
         )
-        reserved_after_build = _full_router_reservation(
+        fit_reservations, report_reservations = _router_stage_reservations(
             problems,
             tasks,
             traces,
@@ -219,7 +243,13 @@ def preflight_hosted(
             setup,
             options,
         )
-        required = build_cost + reserved_after_build
+        required = sum(
+            (
+                item.amount_usd
+                for item in (*build_reservations, *fit_reservations, *report_reservations)
+            ),
+            start=USD_ZERO,
+        )
         if required > ceiling:
             problems.append(
                 "provider ceiling cannot cover the full build, router embedding, judge, "
@@ -255,6 +285,9 @@ def preflight_hosted(
         embedder=snapshots[setup.models.embedder],
         embedder_capabilities=capabilities[setup.models.embedder],
         build_cost_usd=build_cost,
+        build_reservations=build_reservations,
+        fit_reservations=fit_reservations,
+        report_reservations=report_reservations,
     )
 
 
@@ -293,9 +326,9 @@ def _completion_capability_problems(
         problems.append(f"completion alias {alias!r} is missing " + ", ".join(missing))
 
 
-def _full_router_reservation(
+def _router_stage_reservations(
     problems: list[str],
-    tasks: Sequence[object],
+    tasks: Sequence[TaskCase],
     traces: tuple[Trace, ...],
     catalog: ModelCatalog,
     candidates: tuple[RoutedCandidateSnapshot, ...],
@@ -306,8 +339,8 @@ def _full_router_reservation(
     judge_capabilities: ModelCapabilities | None,
     setup: HostedRouterWorkflowSetup,
     options: HostedRouterWorkflowOptions,
-) -> Decimal:
-    """Return the full retry-inclusive automatic execution reservation before build dispatch."""
+) -> tuple[tuple[ProviderSpendEntry, ...], tuple[ProviderSpendEntry, ...]]:
+    """Return source-separated fit and held-out reservations before build dispatch."""
     if (
         not tasks
         or not traces
@@ -318,7 +351,7 @@ def _full_router_reservation(
         or judge is None
         or judge_capabilities is None
     ):
-        return USD_ZERO
+        return (), ()
     embed_price = embedder_capabilities.input_cost_per_million_tokens_usd
     prices = (
         judge_capabilities.input_cost_per_million_tokens_usd,
@@ -327,7 +360,7 @@ def _full_router_reservation(
         judge_capabilities.cache_write_cost_per_million_tokens_usd,
     )
     if embed_price is None or any(item is None for item in prices):
-        return USD_ZERO
+        return (), ()
     embedding = router_embedding_reservation(
         model=embedder.model,
         input_usd_per_million_tokens=embed_price,
@@ -355,7 +388,7 @@ def _full_router_reservation(
         maximum_output_tokens=options.simulation_maximum_output_tokens,
     )
     if estimated_input_tokens is None:
-        return USD_ZERO
+        return (), ()
     candidate_requests, world_request = simulation_completion_reservations(
         problems,
         catalog=catalog,
@@ -375,31 +408,126 @@ def _full_router_reservation(
         RetryPolicy().maximum_attempts,
     )
     if len(candidate_requests) != len(candidates) or world_request is None or retrieval is None:
-        return USD_ZERO
+        return (), ()
     retrieval_call = (
         retrieval.maximum_input_tokens
         * retrieval.maximum_attempts
         * retrieval.input_usd_per_million_tokens
         / 1_000_000
     )
-    simulated_cell_turns = len(tasks) * setup.system.maximum_model_calls
-    simulation = math.fsum(
-        simulated_cell_turns
-        * (
-            candidate.request.estimated_maximum_call_cost_usd
-            + world_request.estimated_maximum_call_cost_usd
-            + retrieval_call
-        )
-        for candidate in candidate_requests
-    )
-    return reserve_usd(
-        math.fsum(
-            (
-                embedding.estimated_cost_usd,
-                judgment.estimated_maximum_call_cost_usd * options.maximum_judgments * 2,
-                simulation,
+    partition_counts = {
+        "fit": sum(task.partition == "fit" for task in tasks),
+        "held_out": sum(task.partition == "held_out" for task in tasks),
+    }
+    stage_entries = []
+    for partition, stage in (
+        ("fit", ProjectStage.OPTIMIZING_ROUTER),
+        ("held_out", ProjectStage.COMPLETING_REPORT),
+    ):
+        task_count = partition_counts[partition]
+        entries = []
+        if partition == "fit":
+            entries.append(
+                _provider_reservation(
+                    stage=stage,
+                    component=ProviderSpendComponent.ROUTER_EMBEDDING,
+                    billing_source=embedder.model.billing_source,
+                    operation_count=(
+                        embedding.feature_count * embedding.maximum_attempts_per_feature
+                    ),
+                    amount_usd=embedding.estimated_cost_usd,
+                )
+            )
+        entries.append(
+            _provider_reservation(
+                stage=stage,
+                component=ProviderSpendComponent.JUDGE,
+                billing_source=judge.model.billing_source,
+                operation_count=options.maximum_judgments * judgment.maximum_attempts,
+                amount_usd=(judgment.estimated_maximum_call_cost_usd * options.maximum_judgments),
             )
         )
+        cell_turns = task_count * setup.system.maximum_model_calls
+        candidate_totals: dict[BillingSource, Decimal] = {}
+        candidate_counts: dict[BillingSource, int] = {}
+        for candidate in candidate_requests:
+            source = candidate.request.model.billing_source
+            candidate_totals[source] = candidate_totals.get(source, USD_ZERO) + reserve_usd(
+                cell_turns * candidate.request.estimated_maximum_call_cost_usd
+            )
+            candidate_counts[source] = candidate_counts.get(source, 0) + (
+                cell_turns * candidate.request.maximum_attempts
+            )
+        entries.extend(
+            _provider_reservation(
+                stage=stage,
+                component=ProviderSpendComponent.CANDIDATE,
+                billing_source=source,
+                operation_count=candidate_counts[source],
+                amount_usd=amount,
+            )
+            for source, amount in candidate_totals.items()
+            if candidate_counts[source] > 0
+        )
+        provider_cells = cell_turns * len(candidate_requests)
+        if provider_cells > 0:
+            entries.extend(
+                (
+                    _provider_reservation(
+                        stage=stage,
+                        component=ProviderSpendComponent.WORLD_MODEL,
+                        billing_source=world_model.model.billing_source,
+                        operation_count=provider_cells * world_request.maximum_attempts,
+                        amount_usd=(provider_cells * world_request.estimated_maximum_call_cost_usd),
+                    ),
+                    _provider_reservation(
+                        stage=stage,
+                        component=ProviderSpendComponent.RETRIEVAL_EMBEDDING,
+                        billing_source=embedder.model.billing_source,
+                        operation_count=provider_cells * retrieval.maximum_attempts,
+                        amount_usd=provider_cells * retrieval_call,
+                    ),
+                )
+            )
+        stage_entries.append(tuple(sorted(entries, key=lambda item: item.operation_id)))
+    return stage_entries[0], stage_entries[1]
+
+
+def _provider_reservation(
+    *,
+    stage: ProjectStage,
+    component: ProviderSpendComponent,
+    billing_source: BillingSource,
+    operation_count: int,
+    amount_usd: Decimal | float,
+) -> ProviderSpendEntry:
+    """Build one alias-free source-specific maximum reservation.
+
+    Args:
+        stage: Provider-backed hosted stage protected by the reservation.
+        component: Customer-safe provider component.
+        billing_source: Credential owner responsible for the possible dispatches.
+        operation_count: Maximum operations covered by the reservation.
+        amount_usd: Conservative maximum cost across those operations.
+
+    Returns:
+        Canonical reserved spend entry suitable for a durable external hazard.
+    """
+    return ProviderSpendEntry(
+        operation_id=stable_id(
+            "provider-spend-operation",
+            {
+                "stage": stage.value,
+                "component": component.value,
+                "billing_source": billing_source.value,
+                "kind": "maximum-reservation",
+            },
+        ),
+        component=component,
+        billing_source=billing_source,
+        status=ProviderSpendStatus.RESERVED,
+        operation_count=operation_count,
+        amount_usd=reserve_usd(amount_usd),
     )
 
 

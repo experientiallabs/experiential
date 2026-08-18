@@ -21,6 +21,7 @@ from wmo.cli.provider_picker import (
     SetupSession,
 )
 from wmo.common.models import (
+    BillingSource,
     DiscoveredModel,
     ModelCapabilities,
     ModelRecord,
@@ -244,6 +245,7 @@ def test_already_configured_models_are_not_written_again() -> None:
 def test_configured_catalog_entries_become_selectable_rows() -> None:
     """A configured alias with verified metadata is offered beside discovered models."""
     record = ModelRecord(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         connection="openai",
         model="gpt-5.6-luna",
         capabilities=ModelCapabilities(
@@ -253,7 +255,9 @@ def test_configured_catalog_entries_become_selectable_rows() -> None:
             output_cost_per_million_tokens_usd=6.0,
         ),
     )
-    unusable = ModelRecord(connection="openai", model="unknown-model")
+    unusable = ModelRecord(
+        billing_source=BillingSource.CUSTOMER_MANAGED, connection="openai", model="unknown-model"
+    )
 
     rows = configured_models(
         {"luna": record, "mystery": unusable},
@@ -269,7 +273,11 @@ def test_configured_catalog_entries_become_selectable_rows() -> None:
 
 def test_unverified_configured_alias_retains_only_its_exact_prior_role() -> None:
     """Unknown metadata permits retention but not reassignment to a different role."""
-    record = ModelRecord(connection="tinker", model="tinker://sampling/run")
+    record = ModelRecord(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        connection="tinker",
+        model="tinker://sampling/run",
+    )
     rows = configured_models(
         {"legacy": record},
         connection_providers={"tinker": "tinker"},
@@ -301,8 +309,16 @@ def test_unverified_configured_alias_retains_only_its_exact_prior_role() -> None
 def test_unverified_router_candidates_and_incumbent_can_be_retained() -> None:
     """Exact prior candidate bindings remain selectable without claiming compatibility."""
     records = {
-        "legacy-a": ModelRecord(connection="tinker", model="tinker://sampling/a"),
-        "legacy-b": ModelRecord(connection="tinker", model="tinker://sampling/b"),
+        "legacy-a": ModelRecord(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            connection="tinker",
+            model="tinker://sampling/a",
+        ),
+        "legacy-b": ModelRecord(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            connection="tinker",
+            model="tinker://sampling/b",
+        ),
     }
     retained = frozenset({SetupRole.ROUTER_CANDIDATE})
     rows = configured_models(

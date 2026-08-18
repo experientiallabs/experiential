@@ -8,6 +8,7 @@ import pytest
 
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelCapabilities,
     ModelFinishReason,
     ModelRequest,
@@ -234,6 +235,7 @@ def _response(
     return ModelResponse(
         output=action,
         model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="fixture",
             model_id="candidate",
             capabilities_sha256=capabilities.identity_sha256(),

@@ -21,6 +21,7 @@ from wmo.cli.provider_setup_test import _FakeLister as _SetupLister
 from wmo.common.config.settings import set_maximum_command_cost_usd
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     Embedding,
     ModelCapabilities,
@@ -243,6 +244,7 @@ class _RuntimeCatalog:
             capabilities = ModelCapabilities(maximum_output_tokens=16_000)
             embedding = None
         snapshot = ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="fixture",
             model_id=f"fixture-{alias}",
             capabilities_sha256=sha256_json(capabilities),
@@ -276,12 +278,18 @@ def _catalog(root: Path) -> None:
             },
             models={
                 "world": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="fixture",
                     model="world-id",
                     capabilities=ModelCapabilities(maximum_output_tokens=16_000),
                 ),
-                "judge": ModelRecord(connection="fixture", model="judge-id"),
+                "judge": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="fixture",
+                    model="judge-id",
+                ),
                 "embed": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="fixture",
                     model="embed-id",
                     capabilities=ModelCapabilities(
@@ -1082,12 +1090,18 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
         connections={"fixture": ConnectionConfig(provider="openai", api_key_env="FIXTURE_API_KEY")},
         models={
             "world": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 connection="fixture",
                 model="world-id",
                 capabilities=ModelCapabilities(maximum_output_tokens=16_000),
             ),
-            "judge": ModelRecord(connection="fixture", model="judge-id"),
+            "judge": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="fixture",
+                model="judge-id",
+            ),
             "embed": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 connection="fixture",
                 model="embed-id",
                 capabilities=ModelCapabilities(

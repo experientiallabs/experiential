@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
+from typing import Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
@@ -21,7 +22,7 @@ from wmo.common.core.artifacts import (
     validate_artifact_id,
 )
 from wmo.common.core.files import write_text_atomic
-from wmo.common.models.model import ModelCapabilities, ModelSnapshot
+from wmo.common.models.model import BillingSource, ModelCapabilities, ModelSnapshot
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
@@ -182,6 +183,7 @@ class ModelRecord(ContractModel):
     connection: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=2_048)
     revision: str | None = Field(default=None, max_length=256)
+    billing_source: BillingSource
     capabilities: ModelCapabilities | None = None
     sft_provenance: SFTModelProvenance | None = None
 
@@ -199,6 +201,7 @@ class ModelRecord(ContractModel):
                     "connection": self.connection,
                     "model": self.model,
                     "revision": self.revision,
+                    "billing_source": self.billing_source.value,
                     "capabilities": (
                         self.capabilities.model_dump(mode="json")
                         if self.capabilities is not None
@@ -238,10 +241,18 @@ class ModelRoles(ContractModel):
 class ModelCatalog(ContractModel):
     """The local model aliases, connection metadata, and project role assignments."""
 
-    schema_version: int = Field(default=1, ge=1)
+    schema_version: Literal[2] = 2
     connections: dict[str, ConnectionConfig]
     models: dict[str, ModelRecord]
     roles: ModelRoles = Field(default_factory=ModelRoles)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def _require_integer_schema_version(cls, value: object) -> object:
+        """Reject boolean and floating-point lookalikes at the version boundary."""
+        if type(value) is not int:
+            raise ValueError("model catalog schema_version must be an integer")
+        return value
 
     @field_validator("connections")
     @classmethod
@@ -319,9 +330,55 @@ def load_model_catalog(path: Path) -> ModelCatalog:
     except tomllib.TOMLDecodeError as exc:
         raise ModelCatalogError(f"model catalog is invalid TOML: {path}") from exc
     try:
-        return ModelCatalog.model_validate(raw_catalog)
+        return ModelCatalog.model_validate(_migrate_legacy_model_catalog(raw_catalog))
     except ValueError as exc:
         raise ModelCatalogError(f"model catalog is invalid: {exc}") from exc
+
+
+def _migrate_legacy_model_catalog(raw_catalog: JsonObject) -> JsonObject:
+    """Upgrade only schema-v1 local catalogs with conservative customer-owned billing.
+
+    Args:
+        raw_catalog: Parsed secret-free TOML payload.
+
+    Returns:
+        A schema-v2 payload. Current schema records are returned unchanged so a missing
+        ``billing_source`` remains a validation error.
+    """
+    raw_version = raw_catalog.get("schema_version", 1)
+    if type(raw_version) is not int or raw_version != 1:
+        return raw_catalog
+    payload = cast(JsonObject, dict(raw_catalog))
+    models = raw_catalog.get("models")
+    if isinstance(models, dict):
+        migrated_models: JsonObject = {}
+        for alias, value in models.items():
+            if isinstance(value, dict):
+                record = cast(JsonObject, dict(value))
+                if "billing_source" in record:
+                    raise ValueError(
+                        "schema-v1 model record must not declare current billing_source"
+                    )
+                record["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
+                provenance = record.get("sft_provenance")
+                if isinstance(provenance, dict):
+                    migrated_provenance = cast(JsonObject, dict(provenance))
+                    base_model = provenance.get("base_model")
+                    if isinstance(base_model, dict):
+                        migrated_base = cast(JsonObject, dict(base_model))
+                        if "billing_source" in migrated_base:
+                            raise ValueError(
+                                "schema-v1 SFT base model must not declare current billing_source"
+                            )
+                        migrated_base["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
+                        migrated_provenance["base_model"] = migrated_base
+                    record["sft_provenance"] = migrated_provenance
+                migrated_models[str(alias)] = record
+            else:
+                migrated_models[str(alias)] = value
+        payload["models"] = migrated_models
+    payload["schema_version"] = 2
+    return payload
 
 
 def write_model_catalog(path: Path, catalog: ModelCatalog) -> None:

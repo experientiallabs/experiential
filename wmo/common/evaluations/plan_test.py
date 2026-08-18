@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
-from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot, RoutedCandidateSnapshot
 
 _DIGEST = "a" * 64
 
@@ -17,6 +17,7 @@ def _candidate() -> RoutedCandidateSnapshot:
     return RoutedCandidateSnapshot(
         alias="candidate-economy",
         model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="openai",
             model_id="gpt-5.4-mini",
             capabilities_sha256=_DIGEST,

@@ -24,6 +24,7 @@ from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.core.artifacts import SourceIdentity, canonical_json_bytes
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ConnectionConfig,
     Embedding,
     ModelCapabilities,
@@ -996,6 +997,7 @@ def test_automatic_router_rejects_confirmed_catalog_drift_before_credentials(
             "models": {
                 **catalog.models,
                 "unrelated": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="provider",
                     model="unrelated",
                     capabilities=catalog.models["candidate-a"].capabilities,
@@ -1375,6 +1377,7 @@ def _catalog() -> ModelCatalog:
         models={
             **{
                 alias: ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="provider",
                     model=alias,
                     capabilities=completion,
@@ -1382,6 +1385,7 @@ def _catalog() -> ModelCatalog:
                 for alias in ("candidate-a", "candidate-b", "world", "judge")
             },
             "embedder": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 connection="provider",
                 model="embedder",
                 capabilities=embedding,

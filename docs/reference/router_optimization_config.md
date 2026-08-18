@@ -29,6 +29,21 @@ The hosted setup fixes these values before the first provider dispatch:
 - one positive `numeric(20,6)` provider ceiling represented as exact `Decimal` text, never binary
   floating-point authorization.
 
+Every current `ModelRecord` requires `billing_source`, and the resolved immutable `ModelSnapshot`
+preserves it. The only values are `host_managed` and `customer_managed`; the source belongs to the
+model binding, so two aliases using one provider connection may have different values. Schema-v1
+local catalogs and trace datasets decode through narrow legacy migrations as `customer_managed`,
+while current payloads that omit the field fail validation.
+
+Each `ProviderSpendEntry` carries the source for its exact component operation, including observed,
+locally priced, reserved, ambiguous, and explicit not-incurred evidence. Entries from unlike
+sources remain separate. Online `RoutedCompletionEconomics` likewise preserves every alias-free
+provider operation with its component, billing source, disposition, economics, and
+`operation_count`. Its convenience `router_embedding`, `selected_candidate`,
+`by_billing_source`, and overall totals reconcile exactly with those operations, including prior
+reserved-ambiguous retries and definitely-not-incurred predispatch failures; it does not expose the
+selected catalog alias or model ID.
+
 Applications inject a `HostedAttemptAuthorityStore` that durably binds one random write-once
 authority to the Project, attempt, and exact ceiling. It records every paid-operation reservation
 before dispatch and keeps ambiguous spend closed across worker loss. A completed provider stage is

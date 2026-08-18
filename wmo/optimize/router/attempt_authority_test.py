@@ -7,13 +7,18 @@ from pathlib import Path
 
 import pytest
 
+from wmo.common.models import BillingSource
 from wmo.common.project import ProjectStage
 from wmo.optimize.router.attempt_authority import (
     FileHostedAttemptAuthorityStore,
     HostedAttemptAuthorityError,
     HostedProviderHazard,
 )
-from wmo.optimize.router.spend import ProviderSpendComponent
+from wmo.optimize.router.spend import (
+    ProviderSpendComponent,
+    ProviderSpendEntry,
+    ProviderSpendStatus,
+)
 
 
 def test_attempt_binding_is_write_once_for_project_and_exact_ceiling(tmp_path: Path) -> None:
@@ -64,8 +69,16 @@ def test_attempt_rejects_one_microunit_over_large_exact_ceiling(tmp_path: Path) 
                 attempt_id=authority.attempt_id,
                 authority_sha256=authority.authority_sha256,
                 stage=ProjectStage.BUILDING_WORLD_MODEL,
-                component=ProviderSpendComponent.RETRIEVAL_EMBEDDING,
-                reserved_usd=Decimal("99999999999998.000001"),
+                reservations=(
+                    ProviderSpendEntry(
+                        operation_id="provider-reservation-a",
+                        component=ProviderSpendComponent.RETRIEVAL_EMBEDDING,
+                        billing_source=BillingSource.HOST_MANAGED,
+                        status=ProviderSpendStatus.RESERVED,
+                        operation_count=1,
+                        amount_usd=Decimal("99999999999998.000001"),
+                    ),
+                ),
             )
         )
 

@@ -17,6 +17,7 @@ from wmo.common.config.settings import set_maximum_command_cost_usd
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -106,7 +107,13 @@ def _configured_project(tmp_path: Path, training: TinkerSFTSpec) -> _ConfiguredP
             connections={
                 "tinker": ConnectionConfig(provider="tinker", api_key_env="TINKER_API_KEY")
             },
-            models={"base": ModelRecord(connection="tinker", model="test-base-model")},
+            models={
+                "base": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="tinker",
+                    model="test-base-model",
+                )
+            },
         ),
     )
     config = create_sft_model_optimization_config(
@@ -142,7 +149,13 @@ def _seed_catalog(store: ProjectStore) -> ModelCatalog:
     """
     catalog = ModelCatalog(
         connections={"openai": ConnectionConfig(provider="openai")},
-        models={"judge": ModelRecord(connection="openai", model="judge-model")},
+        models={
+            "judge": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="openai",
+                model="judge-model",
+            )
+        },
     )
     write_model_catalog(store.model_catalog_path, catalog)
     return catalog
@@ -185,7 +198,13 @@ def test_cli_first_run_builds_runtime_w12_and_config_without_bootstrap(
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"openai": ConnectionConfig(provider="openai")},
-            models={"judge": ModelRecord(connection="openai", model="judge-model")},
+            models={
+                "judge": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="openai",
+                    model="judge-model",
+                )
+            },
         ),
     )
     _complete(
@@ -233,7 +252,11 @@ def test_cli_first_run_builds_runtime_w12_and_config_without_bootstrap(
     catalog = load_model_catalog(fixture.store.model_catalog_path)
     assert catalog.connections["tinker-local"].provider == "tinker"
     assert catalog.connections["tinker-local"].api_key_env == "TINKER_API_KEY"
-    assert catalog.models["base"] == ModelRecord(connection="tinker-local", model="test-base-model")
+    assert catalog.models["base"] == ModelRecord(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        connection="tinker-local",
+        model="test-base-model",
+    )
     config = command.load_sft_model_optimization_config(fixture.store, latest.config.artifact_id)
     constructed = []
 
@@ -316,7 +339,13 @@ def test_cli_first_run_noninteractive_reports_all_required_tinker_flags(
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"openai": ConnectionConfig(provider="openai")},
-            models={"judge": ModelRecord(connection="openai", model="judge-model")},
+            models={
+                "judge": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="openai",
+                    model="judge-model",
+                )
+            },
         ),
     )
     _complete(
@@ -382,7 +411,13 @@ def test_first_run_setup_cancellation_writes_no_catalog_or_training_state(
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"openai": ConnectionConfig(provider="openai")},
-            models={"judge": ModelRecord(connection="openai", model="judge-model")},
+            models={
+                "judge": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="openai",
+                    model="judge-model",
+                )
+            },
         ),
     )
     command = importlib.import_module("wmo.cli.model_optimize")
@@ -626,6 +661,7 @@ def test_cli_empty_journal_fails_before_backend_or_consent(
     """
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
     configured.store.paths.runtime_journal.unlink()
+    RuntimeInteractionJournal(configured.store.paths).spend_path.unlink()
     command = importlib.import_module("wmo.cli.model_optimize")
     backend_calls = []
     consent_calls = []
@@ -1135,7 +1171,13 @@ def test_first_run_explicit_zero_training_price_is_preserved(
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"openai": ConnectionConfig(provider="openai")},
-            models={"judge": ModelRecord(connection="openai", model="judge-model")},
+            models={
+                "judge": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="openai",
+                    model="judge-model",
+                )
+            },
         ),
     )
     _complete(
@@ -1194,7 +1236,13 @@ def test_schedule_ceiling_refuses_before_tinker_backend_construction(
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"openai": ConnectionConfig(provider="openai")},
-            models={"judge": ModelRecord(connection="openai", model="judge-model")},
+            models={
+                "judge": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="openai",
+                    model="judge-model",
+                )
+            },
         ),
     )
     _complete(
@@ -1405,7 +1453,11 @@ def test_catalog_setup_preserves_unrelated_concurrent_additions(tmp_path: Path) 
             },
             "models": {
                 **observed.models,
-                "other-model": ModelRecord(connection="other", model="other-model-id"),
+                "other-model": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="other",
+                    model="other-model-id",
+                ),
             },
         }
     )
@@ -1426,7 +1478,11 @@ def test_catalog_setup_preserves_unrelated_concurrent_additions(tmp_path: Path) 
     assert updated.connections["tinker-local"] == ConnectionConfig(
         provider="tinker", api_key_env="TINKER_API_KEY"
     )
-    assert updated.models["base"] == ModelRecord(connection="tinker-local", model="test-base-model")
+    assert updated.models["base"] == ModelRecord(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        connection="tinker-local",
+        model="test-base-model",
+    )
 
 
 @pytest.mark.parametrize("conflict", ["connection", "alias"])
@@ -1448,7 +1504,11 @@ def test_catalog_setup_rejects_concurrent_target_drift(tmp_path: Path, conflict:
         connections["tinker-local"] = ConnectionConfig(
             provider="tinker", api_key_env="TINKER_API_KEY"
         )
-        models["base"] = ModelRecord(connection="tinker-local", model="different-model")
+        models["base"] = ModelRecord(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            connection="tinker-local",
+            model="different-model",
+        )
     write_model_catalog(
         fixture.store.model_catalog_path,
         observed.model_copy(update={"connections": connections, "models": models}),
@@ -1499,6 +1559,7 @@ def test_catalog_setup_preserves_compatible_base_model_metadata(tmp_path: Path) 
     fixture = _persisted_dataset(tmp_path)
     command = importlib.import_module("wmo.cli.model_optimize")
     existing_record = ModelRecord(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         connection="tinker-local",
         model="test-base-model",
         revision="provider-revision-1",

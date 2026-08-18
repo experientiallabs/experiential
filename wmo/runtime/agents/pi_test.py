@@ -15,6 +15,7 @@ import pytest
 from wmo.common.core.artifacts import FailureAttribution, FailureCode
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
@@ -313,6 +314,7 @@ class _Model:
                 ),
             ),
             model=ModelSnapshot(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 provider="fixture",
                 model_id="fixture-model",
                 capabilities_sha256=_DIGEST,

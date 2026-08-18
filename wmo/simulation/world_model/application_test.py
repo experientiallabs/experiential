@@ -14,6 +14,7 @@ from openai.types.chat import ChatCompletionAssistantMessageParam
 from wmo.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     Embedding,
     ModelCapabilities,
     ModelRequest,
@@ -514,6 +515,7 @@ def _snapshot(
     """
     resolved_capabilities = capabilities or ModelCapabilities()
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id=model_id,
         capabilities_sha256=sha256_json(resolved_capabilities),

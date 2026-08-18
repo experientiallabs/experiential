@@ -24,8 +24,15 @@ from wmo.runtime.router.completion import (
     RouterCompletionInProgressError,
     RouterCompletionService,
 )
+from wmo.runtime.router.economics import (
+    BillingSourceEconomics,
+    RoutedCompletionEconomics,
+    RoutedProviderComponent,
+    RoutedProviderOperation,
+    RoutedSpendDisposition,
+    RoutedSpendLedger,
+)
 from wmo.runtime.router.journal import (
-    JournaledRouterRuntime,
     RuntimeAcceptedEvent,
     RuntimeAttemptFailedEvent,
     RuntimeCompletedEvent,
@@ -36,8 +43,8 @@ from wmo.runtime.router.journal import (
     RuntimeJournalError,
     RuntimeJournalEvent,
 )
+from wmo.runtime.router.journal_service import JournaledRouterRuntime
 from wmo.runtime.router.runtime import (
-    RoutedCompletionEconomics,
     RoutedModelResponse,
     RouterEpisodeConflictError,
     RouterModelCapabilityError,
@@ -64,7 +71,12 @@ _SERVER_EXPORT_MODULES = {
 }
 
 __all__ = [
+    "BillingSourceEconomics",
     "RoutedCompletionEconomics",
+    "RoutedProviderComponent",
+    "RoutedProviderOperation",
+    "RoutedSpendDisposition",
+    "RoutedSpendLedger",
     "RoutedModelResponse",
     "JournaledRouterRuntime",
     "JournaledRouterCompletionService",

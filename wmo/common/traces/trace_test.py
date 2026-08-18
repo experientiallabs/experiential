@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 from wmo.common.traces import Trace, TraceDataset, TraceOutcome, TraceSource, TraceSpan
 
 _DIGEST = "a" * 64
@@ -27,6 +27,7 @@ def _trace() -> Trace:
                 started_at=started_at,
                 ended_at=started_at + timedelta(seconds=1),
                 model=ModelSnapshot(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     provider="openai",
                     model_id="gpt-5.4",
                     capabilities_sha256=_DIGEST,

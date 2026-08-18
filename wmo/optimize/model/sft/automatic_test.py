@@ -17,6 +17,7 @@ import wmo.optimize.model.sft.run_manifest as run_manifest_module
 from wmo.common.core.artifacts import canonical_json_bytes, sha256_json
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ConnectionConfig,
     ModelCatalog,
     ModelMessage,
@@ -73,7 +74,13 @@ def _bootstrap(tmp_path: Path) -> _Bootstrap:
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"tinker": ConnectionConfig(provider="tinker")},
-            models={"base": ModelRecord(connection="tinker", model="test-base-model")},
+            models={
+                "base": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="tinker",
+                    model="test-base-model",
+                )
+            },
         ),
     )
     config = create_sft_model_optimization_config(
@@ -124,7 +131,13 @@ def test_first_runtime_prefix_needs_no_bootstrap_dataset_or_config(tmp_path: Pat
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"tinker": ConnectionConfig(provider="tinker")},
-            models={"base": ModelRecord(connection="tinker", model="test-base-model")},
+            models={
+                "base": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="tinker",
+                    model="test-base-model",
+                )
+            },
         ),
     )
     _append_completed(fixture.store, key="first", minute=1)
@@ -163,7 +176,13 @@ def test_automatic_runtime_sft_schedules_every_lineage_and_retains_duplicates(
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"tinker": ConnectionConfig(provider="tinker")},
-            models={"base": ModelRecord(connection="tinker", model="test-base-model")},
+            models={
+                "base": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="tinker",
+                    model="test-base-model",
+                )
+            },
         ),
     )
     journal = RuntimeInteractionJournal(fixture.store.paths)
@@ -817,7 +836,13 @@ def test_crash_after_immutable_graph_reuses_artifacts_before_pointer_commit(
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"tinker": ConnectionConfig(provider="tinker")},
-            models={"base": ModelRecord(connection="tinker", model="test-base-model")},
+            models={
+                "base": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="tinker",
+                    model="test-base-model",
+                )
+            },
         ),
     )
     _append_completed(fixture.store, key="first", minute=1)
@@ -884,8 +909,16 @@ def test_two_first_run_pointer_proposals_allow_only_one_compare_and_swap(
         ModelCatalog(
             connections={"tinker": ConnectionConfig(provider="tinker")},
             models={
-                "base-a": ModelRecord(connection="tinker", model="test-base-model"),
-                "base-b": ModelRecord(connection="tinker", model="test-base-model"),
+                "base-a": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="tinker",
+                    model="test-base-model",
+                ),
+                "base-b": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="tinker",
+                    model="test-base-model",
+                ),
             },
         ),
     )

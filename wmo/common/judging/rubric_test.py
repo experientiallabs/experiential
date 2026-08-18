@@ -19,7 +19,7 @@ from wmo.common.judging import (
     score_bounds,
     scored_axis,
 )
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 
 _DIGEST = "a" * 64
 
@@ -183,6 +183,7 @@ def test_rubric_requires_approval_time_and_calibration_excludes_held_out() -> No
             calibration_id="judge-calibration-v1",
             rubric_id="support-rubric-v1",
             judge_model=ModelSnapshot(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 provider="openai",
                 model_id="gpt-5.4-mini",
                 capabilities_sha256=_DIGEST,

@@ -11,6 +11,7 @@ if TYPE_CHECKING:
         build_fidelity_evaluation_plan as build_fidelity_evaluation_plan,
     )
     from wmo.common.evaluations import build_fidelity_report as build_fidelity_report
+    from wmo.common.models import BillingSource as BillingSource
     from wmo.common.models import ConnectionConfig as ConnectionConfig
     from wmo.common.models import DiscoveredModel as DiscoveredModel
     from wmo.common.models import ModelCapabilities as ModelCapabilities
@@ -99,9 +100,22 @@ if TYPE_CHECKING:
     from wmo.runtime.router.application import (
         create_project_router_app as create_project_router_app,
     )
-    from wmo.runtime.router.runtime import (
+    from wmo.runtime.router.economics import (
+        BillingSourceEconomics as BillingSourceEconomics,
+    )
+    from wmo.runtime.router.economics import (
         RoutedCompletionEconomics as RoutedCompletionEconomics,
     )
+    from wmo.runtime.router.economics import (
+        RoutedProviderComponent as RoutedProviderComponent,
+    )
+    from wmo.runtime.router.economics import (
+        RoutedProviderOperation as RoutedProviderOperation,
+    )
+    from wmo.runtime.router.economics import (
+        RoutedSpendDisposition as RoutedSpendDisposition,
+    )
+    from wmo.runtime.router.economics import RoutedSpendLedger as RoutedSpendLedger
     from wmo.runtime.router.runtime import RoutedModelResponse as RoutedModelResponse
     from wmo.runtime.router.runtime import RouterRuntime as RouterRuntime
     from wmo.simulation.build import BuildReviewReadiness as BuildReviewReadiness
@@ -132,6 +146,7 @@ if TYPE_CHECKING:
     from wmo.simulation.world_model.application import load_world_model as load_world_model
 
 _EXPORT_MODULES = {
+    "BillingSource": "wmo.common.models",
     "ConnectionConfig": "wmo.common.models",
     "DiscoveredModel": "wmo.common.models",
     "ModelCapabilities": "wmo.common.models",
@@ -208,7 +223,12 @@ _EXPORT_MODULES = {
     "ProviderSpendEntry": "wmo.optimize.router.spend",
     "ProviderSpendLedger": "wmo.optimize.router.spend",
     "ProviderSpendStatus": "wmo.optimize.router.spend",
-    "RoutedCompletionEconomics": "wmo.runtime.router.runtime",
+    "BillingSourceEconomics": "wmo.runtime.router.economics",
+    "RoutedCompletionEconomics": "wmo.runtime.router.economics",
+    "RoutedProviderComponent": "wmo.runtime.router.economics",
+    "RoutedProviderOperation": "wmo.runtime.router.economics",
+    "RoutedSpendDisposition": "wmo.runtime.router.economics",
+    "RoutedSpendLedger": "wmo.runtime.router.economics",
     "RoutedModelResponse": "wmo.runtime.router.runtime",
 }
 

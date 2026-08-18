@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -19,7 +18,13 @@ from wmo.common.core.artifacts import (
 from wmo.common.core.money import USD_ZERO
 from wmo.common.evaluations import EvaluationDatasetManifest, fidelity
 from wmo.common.judging import JudgeCalibration
-from wmo.common.models import ModelCatalog, ModelClient, ModelRequest, ModelResponse
+from wmo.common.models import (
+    BillingSource,
+    ModelCatalog,
+    ModelClient,
+    ModelRequest,
+    ModelResponse,
+)
 from wmo.common.project import (
     ExportedProjectBundle,
     ProjectBudgetConfiguration,
@@ -214,8 +219,16 @@ def test_hosted_workflow_runs_from_restored_bundle_and_replays_without_dispatch(
             attempt_id=stale_stage_authority.attempt_id,
             authority_sha256=stale_stage_authority.authority_sha256,
             stage=ProjectStage.BUILDING_WORLD_MODEL,
-            component=ProviderSpendComponent.RETRIEVAL_EMBEDDING,
-            reserved_usd=Decimal("1.000000"),
+            reservations=(
+                ProviderSpendEntry(
+                    operation_id="provider-reservation-a",
+                    component=ProviderSpendComponent.RETRIEVAL_EMBEDDING,
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    status=ProviderSpendStatus.RESERVED,
+                    operation_count=1,
+                    amount_usd=Decimal("1.000000"),
+                ),
+            ),
         )
     )
     with pytest.raises(HostedAttemptAuthorityError, match="verified Project bundle"):
@@ -278,13 +291,147 @@ def test_hosted_workflow_runs_from_restored_bundle_and_replays_without_dispatch(
     assert attempt_store.unresolved(authority) is None
 
 
+def test_hosted_workflow_preserves_mixed_billing_sources_without_private_aliases(
+    tmp_path: Path,
+) -> None:
+    """Keep host and customer spend independently attributable through bundle restore."""
+    catalog = _mixed_billing_catalog()
+    prepared, catalog = _restored_prepared_project(tmp_path, model_catalog=catalog)
+    state = _ProviderState()
+    attempt_store = FileHostedAttemptAuthorityStore(tmp_path / "mixed-source-authority")
+    authority = attempt_store.create()
+
+    result = run_hosted_router_workflow(
+        prepared,
+        _setup(),
+        catalog,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        attempt_store,
+        bundle_directory=tmp_path / "mixed-source-bundles",
+        attempt_id=authority.attempt_id,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision=_REVISION,
+        options=_options(),
+    )
+
+    candidate_sources = {
+        entry.billing_source
+        for entry in result.spend_ledger.entries
+        if entry.component == ProviderSpendComponent.CANDIDATE
+        and entry.status != ProviderSpendStatus.NOT_INCURRED
+    }
+    assert candidate_sources == set(BillingSource)
+    totals_by_source = {
+        source: sum(
+            (
+                entry.amount_usd
+                for entry in result.spend_ledger.entries
+                if entry.billing_source == source
+            ),
+            start=USD_ZERO,
+        )
+        for source in BillingSource
+    }
+    assert all(amount > USD_ZERO for amount in totals_by_source.values())
+    assert sum(totals_by_source.values(), start=USD_ZERO) == result.spend_ledger.total_usd
+    assert {
+        entry.billing_source
+        for entry in result.spend_ledger.entries
+        if entry.component == ProviderSpendComponent.OTHER_PROVIDER
+        and entry.status == ProviderSpendStatus.NOT_INCURRED
+    } == set(BillingSource)
+    serialized = result.spend_ledger.model_dump_json()
+    assert "host_managed" in serialized
+    assert "customer_managed" in serialized
+    assert "candidate-a" not in serialized
+    assert "candidate-b" not in serialized
+    assert "FIXTURE_API_KEY" not in serialized
+
+    final_bundle = result.bundles[-1].bundle
+    restored = restore_project_bundle(
+        final_bundle.path,
+        root=tmp_path / "mixed-source-restored",
+        expected_sha256=final_bundle.sha256,
+    )
+    restored_config = restored.load_project()
+    assert restored_config.router_report is not None
+    assert (
+        load_provider_spend_ledger(restored.artifacts, restored_config.router_report.spend_ledger)
+        == result.spend_ledger
+    )
+
+    current = prepared.load_project()
+    assert current.router_policy is not None
+    assert current.router_report is not None
+    policy_ledger = load_provider_spend_ledger(
+        prepared.artifacts,
+        current.router_policy.spend_ledger,
+    )
+    prior_ids = {entry.operation_id for entry in policy_ledger.entries}
+    report_candidates = {
+        entry.billing_source: entry
+        for entry in result.spend_ledger.entries
+        if entry.component == ProviderSpendComponent.CANDIDATE
+        and entry.operation_id not in prior_ids
+    }
+    assert set(report_candidates) == set(BillingSource)
+    swapped = tuple(
+        ProviderSpendEntry.model_validate(
+            {
+                **entry.model_dump(mode="python"),
+                "billing_source": (
+                    BillingSource.CUSTOMER_MANAGED
+                    if entry.billing_source == BillingSource.HOST_MANAGED
+                    else BillingSource.HOST_MANAGED
+                ),
+            }
+        )
+        if entry in report_candidates.values()
+        else entry
+        for entry in result.spend_ledger.entries
+    )
+    forged_pointer = _replacement_ledger(
+        prepared,
+        source_pointer=current.router_report.spend_ledger,
+        stage=ProjectStage.COMPLETING_REPORT,
+        stage_outputs=(current.router_report.report,),
+        entries=swapped,
+    )
+    write_project_config(
+        prepared.paths.project_toml,
+        ProjectConfig.model_validate(
+            {
+                **current.model_dump(mode="python"),
+                "router_report": ProjectRouterReportArtifacts(
+                    report=current.router_report.report,
+                    spend_ledger=forged_pointer,
+                ),
+            }
+        ),
+    )
+    forged_bundle = export_project_bundle(
+        prepared,
+        tmp_path / "mixed-source-forged.wmo.zip",
+        producer_revision=_REVISION,
+    )
+    with pytest.raises(ProjectBundleError, match="billing source differs"):
+        restore_project_bundle(
+            forged_bundle.path,
+            root=tmp_path / "mixed-source-forged-restored",
+            expected_sha256=forged_bundle.sha256,
+        )
+
+
 @pytest.mark.parametrize("failed_alias", ["judge", "world"])
 def test_hosted_optimization_failure_reserves_remaining_ceiling_and_blocks_local_retry(
     tmp_path: Path,
     failed_alias: str,
 ) -> None:
     """Judge and simulation ambiguity expose safe bundles and never reset unknown spend."""
-    prepared, catalog = _restored_prepared_project(tmp_path)
+    prepared, catalog = _restored_prepared_project(
+        tmp_path,
+        model_catalog=_mixed_billing_catalog(),
+    )
     state = _ProviderState()
     runtime = _FailingRuntimeCatalog(catalog, state, failed_alias=failed_alias)
     attempt_store = FileHostedAttemptAuthorityStore(tmp_path / f"attempt-{failed_alias}-authority")
@@ -310,12 +457,12 @@ def test_hosted_optimization_failure_reserves_remaining_ceiling_and_blocks_local
     assert str(error) == "hosted router workflow failed closed after a provider reservation"
     assert error.__cause__ is None
     assert error.ledger.outcome == "failed_closed"
-    assert math.isclose(
-        error.ledger.total_usd,
-        error.ledger.ceiling_usd,
-        rel_tol=1e-12,
-        abs_tol=1e-12,
-    )
+    hazard = attempt_store.unresolved(authority)
+    assert hazard is not None
+    assert hazard.reservations
+    assert {entry.billing_source for entry in hazard.reservations} == set(BillingSource)
+    assert set(hazard.reservations).issubset(set(error.ledger.entries))
+    assert error.ledger.total_usd < error.ledger.ceiling_usd
     assert [item.stage for item in error.bundles] == [ProjectStage.BUILDING_WORLD_MODEL]
     assert any(entry.status == ProviderSpendStatus.RESERVED for entry in error.ledger.entries)
     credentials_before_retry = state.credential_resolutions
@@ -381,6 +528,78 @@ def test_hosted_optimization_failure_reserves_remaining_ceiling_and_blocks_local
     assert alternate_state.credential_resolutions == 0
     assert alternate_state.embedding_calls == []
     assert alternate_state.completion_calls == []
+
+
+def test_report_hazard_failure_and_new_process_retain_committed_fit_spend(
+    tmp_path: Path,
+) -> None:
+    """Immediate report failure carries the policy ledger through durable restart."""
+    prepared, catalog = _restored_prepared_project(
+        tmp_path,
+        model_catalog=_mixed_billing_catalog(),
+    )
+    state = _ProviderState()
+    authority_directory = tmp_path / "report-hazard-authority"
+    attempt_store = _FailAfterReportHazardAuthorityStore(authority_directory)
+    authority = attempt_store.create()
+
+    with pytest.raises(HostedRouterWorkflowError) as captured:
+        run_hosted_router_workflow(
+            prepared,
+            _setup(),
+            catalog,
+            cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+            attempt_store,
+            bundle_directory=tmp_path / "report-hazard-bundles",
+            attempt_id=authority.attempt_id,
+            created_at=_TIME + timedelta(hours=2, minutes=30),
+            code_revision=_REVISION,
+            options=_options(),
+        )
+
+    config = prepared.load_project()
+    assert config.router_policy is not None
+    policy_ledger = load_provider_spend_ledger(
+        prepared.artifacts,
+        config.router_policy.spend_ledger,
+    )
+    fit_entries = {
+        entry for entry in policy_ledger.entries if entry.status != ProviderSpendStatus.NOT_INCURRED
+    }
+    assert fit_entries
+    assert fit_entries.issubset(set(captured.value.ledger.entries))
+    assert captured.value.ledger.stage == ProjectStage.COMPLETING_REPORT
+    assert [item.stage for item in captured.value.bundles] == [
+        ProjectStage.BUILDING_WORLD_MODEL,
+        ProjectStage.OPTIMIZING_ROUTER,
+    ]
+
+    policy_bundle = captured.value.bundles[-1].bundle
+    restored = restore_project_bundle(
+        policy_bundle.path,
+        root=tmp_path / "report-hazard-restored",
+        expected_sha256=policy_bundle.sha256,
+    )
+    restarted_state = _ProviderState()
+    with pytest.raises(HostedRouterWorkflowError) as restarted:
+        run_hosted_router_workflow(
+            restored,
+            _setup(),
+            catalog,
+            cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, restarted_state)),
+            FileHostedAttemptAuthorityStore(authority_directory),
+            bundle_directory=tmp_path / "report-hazard-restarted-bundles",
+            attempt_id=authority.attempt_id,
+            created_at=_TIME + timedelta(hours=2, minutes=30),
+            code_revision=_REVISION,
+            resume_bundle_sha256=policy_bundle.sha256,
+            options=_options(),
+        )
+
+    assert fit_entries.issubset(set(restarted.value.ledger.entries))
+    assert restarted_state.credential_resolutions == 0
+    assert restarted_state.embedding_calls == []
+    assert restarted_state.completion_calls == []
 
 
 def test_hosted_preflight_rejects_missing_connection_before_project_write_or_dispatch(
@@ -1011,7 +1230,8 @@ def test_bundle_restore_rejects_dropped_or_changed_prior_spend(
     )
     prior_operation_id = build_entry.operation_id
     dropped_entries = complete_component_entries(
-        tuple(item for item in policy_ledger.entries if item.operation_id != prior_operation_id)
+        tuple(item for item in policy_ledger.entries if item.operation_id != prior_operation_id),
+        tuple((item.component, item.billing_source) for item in policy_ledger.entries),
     )
     dropped_pointer = _replacement_ledger(
         prepared,
@@ -1504,6 +1724,16 @@ class _FailingCommitAuthorityStore(FileHostedAttemptAuthorityStore):
         raise HostedAttemptAuthorityError("external stage pointer commit failed")
 
 
+class _FailAfterReportHazardAuthorityStore(FileHostedAttemptAuthorityStore):
+    """Fail immediately after durably opening the held-out report reservation."""
+
+    def begin(self, hazard: HostedProviderHazard) -> None:
+        """Persist the report hazard and then simulate an immediate worker callback failure."""
+        super().begin(hazard)
+        if hazard.stage == ProjectStage.COMPLETING_REPORT:
+            raise RuntimeError("injected report callback failure")
+
+
 class _FailingRuntimeCatalog(_RuntimeCatalog):
     """Retain the deterministic catalog while failing one completion role."""
 
@@ -1542,9 +1772,10 @@ def _restored_prepared_project(
     tmp_path: Path,
     *,
     trace_offset: int = 0,
+    model_catalog: ModelCatalog | None = None,
 ) -> tuple[ProjectStore, ModelCatalog]:
     """Return a PR2-style restored provider-free Project and its transient catalog."""
-    catalog = _catalog()
+    catalog = model_catalog or _catalog()
     root = tmp_path / "prepared-source-root"
     root.mkdir()
     store = ProjectStore(root, "support")
@@ -1670,6 +1901,26 @@ def _catalog_with_alternate_world(catalog: ModelCatalog) -> ModelCatalog:
                 **catalog.models,
                 "world": catalog.models["world"].model_copy(update={"model": "alternate-world"}),
             },
+        }
+    )
+
+
+def _mixed_billing_catalog() -> ModelCatalog:
+    """Return one catalog with source attribution varying across model aliases."""
+    catalog = _catalog()
+    sources = {
+        "candidate-a": BillingSource.HOST_MANAGED,
+        "candidate-b": BillingSource.CUSTOMER_MANAGED,
+        "world": BillingSource.HOST_MANAGED,
+        "judge": BillingSource.CUSTOMER_MANAGED,
+        "embedder": BillingSource.HOST_MANAGED,
+    }
+    return catalog.model_copy(
+        update={
+            "models": {
+                alias: record.model_copy(update={"billing_source": sources[alias]})
+                for alias, record in catalog.models.items()
+            }
         }
     )
 

@@ -15,6 +15,7 @@ import pytest
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -60,6 +61,7 @@ class _EchoClient(ProviderHttpClient):
 def _snapshot() -> ModelSnapshot:
     """Build an immutable identity fixture for the echo client."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="echo",
         model_id="echo-1",
         revision="fixture-revision",

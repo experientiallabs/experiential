@@ -15,6 +15,7 @@ from wmo.cli.picker import PickerAction, PickerOption, PickerResult
 from wmo.cli.provider_setup import RouterCandidatePickerResult
 from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -196,7 +197,11 @@ def test_first_optimize_can_define_candidates_from_existing_connections(tmp_path
     path = tmp_path / "models.toml"
     catalog = ModelCatalog(
         connections={"provider": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")},
-        models={"world": ModelRecord(connection="provider", model="world")},
+        models={
+            "world": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED, connection="provider", model="world"
+            )
+        },
         roles=ModelRoles(world_model="world"),
     )
     write_model_catalog(path, catalog)
@@ -348,12 +353,20 @@ def _catalog() -> ModelCatalog:
         connections={"provider": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")},
         models={
             "candidate-a": ModelRecord(
-                connection="provider", model="candidate-a", capabilities=capabilities
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="provider",
+                model="candidate-a",
+                capabilities=capabilities,
             ),
             "candidate-b": ModelRecord(
-                connection="provider", model="candidate-b", capabilities=capabilities
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="provider",
+                model="candidate-b",
+                capabilities=capabilities,
             ),
-            "world": ModelRecord(connection="provider", model="world"),
+            "world": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED, connection="provider", model="world"
+            ),
         },
     )
 
