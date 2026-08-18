@@ -334,7 +334,7 @@ def test_first_build_provider_flags_skip_the_opening_list(
             "--provider",
             "openai",
         ],
-        input="1,3\n\n\n1\n1\n1\ny\n",
+        input="1,3\n\n1\n1\n1\n\ny\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -399,7 +399,7 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     result = _RUNNER.invoke(
         app,
         ["build", "support", str(source), "--root", str(root)],
-        input="1\n\n1,3\n\n\n1\n1\n1\ny\n",
+        input="1\n\n1,3\n\n1\n1\n1\n\ny\n",
     )
 
     assert result.exit_code == 0, result.output

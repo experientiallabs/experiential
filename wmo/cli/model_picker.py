@@ -236,16 +236,19 @@ def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
 def select_reasoning_efforts(
     chosen: tuple[AvailableModel, ...],
     *,
+    roles: RoleAssignment,
     console: Console,
 ) -> tuple[AvailableModel, ...] | None:
-    """Pin one reasoning effort per new reasoning-capable model entry.
+    """Pin one reasoning effort per new reasoning-capable model holding a completion role.
 
-    Only newly selected models whose verified metadata proves reasoning-effort support show a
-    screen; each defaults to the entry's current pin. Already-configured aliases keep their
-    persisted pin, and models without proven support are never asked and never pinned.
+    Only newly selected models that were just assigned a world-model, judge, or router-candidate
+    role and whose verified metadata proves reasoning-effort support show a screen; each defaults
+    to the entry's current pin. Already-configured aliases keep their persisted pin, and models
+    without proven support are never asked and never pinned.
 
     Args:
         chosen: Models the user selected.
+        roles: Confirmed role assignments naming the models to ask about.
         console: Terminal used for the screens.
 
     Returns:
@@ -254,10 +257,16 @@ def select_reasoning_efforts(
     Raises:
         SetupCancelled: The user cancelled setup.
     """
+    role_aliases = frozenset((roles.world_model, roles.judge, *roles.candidates))
     updated = list(chosen)
     for position, item in enumerate(chosen):
         capabilities = item.capabilities
-        if item.configured or capabilities is None or capabilities.reasoning_effort is None:
+        if (
+            item.alias not in role_aliases
+            or item.configured
+            or capabilities is None
+            or capabilities.reasoning_effort is None
+        ):
             continue
         result = choose_one(
             console,

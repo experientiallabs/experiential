@@ -355,13 +355,13 @@ def _collect_models_and_roles(
             return None
         session.selected = selected
         chosen = tuple(item for item in available_models(session) if item.alias in selected)
-        adjusted = select_reasoning_efforts(chosen, console=console)
-        if adjusted is None:
-            continue
-        chosen = adjusted
         roles = assign_roles(chosen, role_inputs=role_inputs, console=console)
         if roles is None:
             continue
+        adjusted = select_reasoning_efforts(chosen, roles=roles, console=console)
+        if adjusted is None:
+            continue
+        chosen = adjusted
         result = build_result(
             chosen,
             roles=roles,

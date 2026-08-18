@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from wmo.cli.model_picker import (
+    RoleAssignment,
     assign_roles,
     build_result,
     configured_models,
@@ -328,11 +329,16 @@ def test_unverified_router_candidates_and_incumbent_can_be_retained() -> None:
     assert roles.incumbent == "legacy-a"
 
 
-def test_reasoning_effort_screens_pin_each_new_reasoning_model_separately() -> None:
-    """Each new reasoning-capable entry gets its own effort screen defaulting to its pin."""
+def test_reasoning_effort_screens_pin_each_role_assigned_reasoning_model_separately() -> None:
+    """Each role-assigned reasoning-capable entry gets its own effort screen with its pin."""
     console = ScriptedConsole("5\n\n")
+    roles = RoleAssignment(
+        world_model="luna", judge="luna", embedder="embedder", candidates=("luna", "terra")
+    )
 
-    updated = select_reasoning_efforts((_CHAT, _OTHER_CHAT, _EMBEDDER), console=console)
+    updated = select_reasoning_efforts(
+        (_CHAT, _OTHER_CHAT, _EMBEDDER), roles=roles, console=console
+    )
 
     assert updated is not None
     first, second, third = updated
@@ -344,6 +350,20 @@ def test_reasoning_effort_screens_pin_each_new_reasoning_model_separately() -> N
     assert third.capabilities.reasoning_effort is None
     assert "Reasoning effort for luna" in console.output
     assert "Reasoning effort for terra" in console.output
+
+
+def test_reasoning_effort_screens_only_ask_models_holding_a_completion_role() -> None:
+    """A reasoning-capable model without a world-model, judge, or candidate role is not asked."""
+    console = ScriptedConsole("\n")
+    roles = RoleAssignment(world_model="luna", judge="luna", embedder="embedder")
+
+    updated = select_reasoning_efforts(
+        (_CHAT, _OTHER_CHAT, _EMBEDDER), roles=roles, console=console
+    )
+
+    assert updated is not None
+    assert "Reasoning effort for luna" in console.output
+    assert "Reasoning effort for terra" not in console.output
 
 
 def test_reasoning_effort_screens_skip_already_configured_aliases() -> None:
@@ -358,8 +378,9 @@ def test_reasoning_effort_screens_skip_already_configured_aliases() -> None:
         configured=True,
     )
     console = ScriptedConsole("")
+    roles = RoleAssignment(world_model="luna", judge="luna", embedder="embedder")
 
-    updated = select_reasoning_efforts((configured, _EMBEDDER), console=console)
+    updated = select_reasoning_efforts((configured, _EMBEDDER), roles=roles, console=console)
 
     assert updated == (configured, _EMBEDDER)
     assert "Reasoning effort" not in console.output
