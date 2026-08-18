@@ -476,7 +476,8 @@ def test_noninteractive_missing_pairwise_labels_list_typed_winner_values() -> No
         )
 
     message = str(excinfo.value)
-    assert "--label trace-a:trace-b:task-success=winner_a|winner_b|tie" in message
+    assert "--label trace-a:trace-b:task-success=WINNER" in message
+    assert "(WINNER is winner_a, winner_b, or tie)" in message
 
 
 def test_noninteractive_scalar_score_respects_the_saved_axis_range() -> None:
