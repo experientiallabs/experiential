@@ -301,7 +301,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     assert refused.exit_code == 2
     refused_text = " ".join(unstyle(refused.output).replace("│", " ").split())
     assert "Cost preflight wmo config judge calibrate terminal-tasks" in refused_text
-    assert "estimated cost $0.55296" in refused_text
+    assert "estimated cost $0.73728" in refused_text
     assert "of the $0.50 per-command budget" in refused_text
     assert "judge judge: openai/judge-id" in refused_text
     assert "5 remaining judge calls with up to 3 attempts each" in refused_text

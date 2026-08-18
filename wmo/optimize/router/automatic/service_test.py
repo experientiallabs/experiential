@@ -1358,7 +1358,7 @@ def _catalog() -> ModelCatalog:
         supports_tools=False,
         supports_structured_output=True,
         context_window_tokens=128_000,
-        maximum_output_tokens=16_000,
+        maximum_output_tokens=32_000,
         input_cost_per_million_tokens_usd=1.0,
         output_cost_per_million_tokens_usd=2.0,
         cached_input_cost_per_million_tokens_usd=0.5,

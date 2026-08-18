@@ -422,6 +422,7 @@ def _automatic_judge(
         preflight.setup,
         created_at=created_at,
         code_revision=code_revision,
+        maximum_output_tokens=reservation.maximum_output_tokens,
     )
 
 

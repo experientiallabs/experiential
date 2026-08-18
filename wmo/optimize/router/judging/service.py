@@ -19,6 +19,7 @@ from wmo.common.judging import (
     RubricReview,
     write_router_lineage_split,
 )
+from wmo.common.judging.evidence import DEFAULT_JUDGE_OUTPUT_TOKENS
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.models import ModelCatalog, ModelSnapshot, PricingSource
 from wmo.common.project import ArtifactCorruptionError, ProjectStore, artifact_input
@@ -425,12 +426,15 @@ def estimate_manual_judge_budget(
         raise ValueError("completed judge review count is outside the frozen trace sample")
     calls_per_trace = 2 if plan.setup.prompt_template.response_shape == "pairwise" else 1
     call_count = (len(plan.traces) - completed_review_count) * calls_per_trace
-    per_attempt = (maximum_input_tokens_per_call * input_price + 4_096 * output_price) / 1_000_000
+    per_attempt = (
+        maximum_input_tokens_per_call * input_price + DEFAULT_JUDGE_OUTPUT_TOKENS * output_price
+    ) / 1_000_000
     return JudgeCalibrationBudget(
         input_usd_per_million_tokens=input_price,
         output_usd_per_million_tokens=output_price,
         pricing_source=source,
         maximum_input_tokens_per_call=maximum_input_tokens_per_call,
+        maximum_output_tokens_per_call=DEFAULT_JUDGE_OUTPUT_TOKENS,
         maximum_attempts_per_call=resolved_retry.maximum_attempts,
         call_count=call_count,
         estimated_cost_usd=per_attempt * resolved_retry.maximum_attempts * call_count,

@@ -891,7 +891,7 @@ def test_estimate_uses_catalog_prices_and_records_provenance(tmp_path: Path) -> 
     assert budget.output_usd_per_million_tokens == 2.0
     assert budget.pricing_source is PricingSource.CONFIGURED
     assert budget.call_count == 3
-    assert budget.estimated_cost_usd == pytest.approx(0.110592)
+    assert budget.estimated_cost_usd == pytest.approx(0.331776)
 
 
 def test_estimate_fails_when_the_ceiling_cannot_admit_the_sample(tmp_path: Path) -> None:
