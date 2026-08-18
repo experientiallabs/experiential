@@ -76,6 +76,8 @@ class SimulationSpec(ArtifactEnvelope):
         maximum_steps: Strict upper bound on candidate model turns per episode.
         maximum_concurrency: Maximum number of episode workers allowed at once.
         maximum_cost_usd: Optional run-wide provider spend ceiling in US dollars.
+        stop_on_overspend: When true, reconciled spend reaching ``maximum_cost_usd`` blocks
+            the next dispatch; by default the authorized run warns and continues.
     """
 
     simulation_id: ArtifactId
@@ -90,6 +92,7 @@ class SimulationSpec(ArtifactEnvelope):
     maximum_steps: int = Field(ge=1)
     maximum_concurrency: int = Field(default=1, ge=1)
     maximum_cost_usd: float | None = Field(default=None, gt=0)
+    stop_on_overspend: bool = False
 
     @field_validator("maximum_cost_usd")
     @classmethod

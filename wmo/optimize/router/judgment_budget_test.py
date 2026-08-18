@@ -31,10 +31,10 @@ from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.retrieval.retrieval_test import _message_trace as _trace
 
 
-def test_judgment_budget_reservation_blocks_partial_retry_dispatch(
+def test_judgment_budget_resumes_interrupted_dispatch_without_widening_budget(
     tmp_path: Path,
 ) -> None:
-    """Consume a failed paid-call slot and block duplicate retry dispatch.
+    """Resume an interrupted paid dispatch under its reserved slot and stay budget-bound.
 
     Args:
         tmp_path: Isolated project root for durable judgment reservations.
@@ -87,7 +87,7 @@ def test_judgment_budget_reservation_blocks_partial_retry_dispatch(
         == budget.maximum_judgments
     )
 
-    with pytest.raises(RouterCompositionError, match="reserved judgment dispatch"):
+    with pytest.raises(RouterCompositionError, match="judgment dispatch budget exhausted"):
         compose_router(
             project,
             normalized,
@@ -96,7 +96,14 @@ def test_judgment_budget_reservation_blocks_partial_retry_dispatch(
             created_at=_TIME,
             code_revision="test-revision",
         )
-    assert judge.calls == 3
+    assert judge.calls == 4
+    assert (
+        sum(
+            project.artifacts.read(artifact_id).manifest.artifact_type == "judgment-dispatch"
+            for artifact_id in project.artifacts.list_ids()
+        )
+        == budget.maximum_judgments
+    )
 
     first_judgment_id = next(
         artifact_id
@@ -127,4 +134,4 @@ def test_judgment_budget_reservation_blocks_partial_retry_dispatch(
             created_at=_TIME,
             code_revision="test-revision",
         )
-    assert judge.calls == 3
+    assert judge.calls == 4

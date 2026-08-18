@@ -57,6 +57,7 @@ from wmo.optimize.router.automatic.replay import (
 from wmo.optimize.router.automatic.reservations import (
     AutomaticRouterCostPlan,
     plan_automatic_router_cost,
+    simulation_input_token_estimate,
 )
 from wmo.optimize.router.automatic.service import (
     AutomaticRouterOptions,
@@ -74,6 +75,7 @@ from wmo.optimize.router.judging.service import (
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.simulation.build import build_project
 from wmo.simulation.ingest.dataset import read_trace_model_identity_evidence
+from wmo.simulation.world_model import load_grounded_world_model_artifact
 
 
 def run_build_wizard(
@@ -806,6 +808,7 @@ def _wizard_cost_plan(
                 "judge calibration audit awaits explicit approval; rerun "
                 f"`wmo config judge calibrate {project}` and approve it"
             )
+    options = AutomaticRouterOptions()
     return plan_automatic_router_cost(
         plan.tasks,
         catalog,
@@ -822,8 +825,51 @@ def _wizard_cost_plan(
             catalog,
             selection,
         ),
-        options=AutomaticRouterOptions(),
+        estimated_input_tokens=_wizard_simulation_input_estimate(store, plan, options),
+        options=options,
     )
+
+
+def _wizard_simulation_input_estimate(
+    store: ProjectStore,
+    plan: WizardBuildPlan,
+    options: AutomaticRouterOptions,
+) -> int:
+    """Size the realistic per-call simulation input reservation from persisted build traces.
+
+    Args:
+        store: Project-local artifact store.
+        plan: Verified task plan and optional fresh deterministic build.
+        options: Bounded automatic-router controls supplying token budgets.
+
+    Returns:
+        Trace-derived per-call input token planning estimate.
+
+    Raises:
+        ValueError: The build has no persisted traces to size the reservation.
+    """
+    config = store.load_project()
+    if plan.completed is not None:
+        traces = plan.completed.artifacts.trace_dataset.traces
+    elif config.build is not None:
+        traces = load_trace_dataset(store.artifacts, config.build.trace_dataset.artifact_id).traces
+    else:
+        raise ValueError("completed build is unavailable for cost planning")
+    if config.build is not None:
+        top_k = load_grounded_world_model_artifact(store.artifacts, config.build.world_model).top_k
+    else:
+        top_k = config.retrieval.top_k
+    estimate = simulation_input_token_estimate(
+        traces,
+        retrieved_transition_count=top_k,
+        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+        maximum_output_tokens=options.simulation_maximum_output_tokens,
+    )
+    if estimate is None:
+        raise ValueError(
+            "the completed build has no persisted traces to size the per-call input reservation"
+        )
+    return estimate
 
 
 def _wizard_observed_candidate_aliases(

@@ -326,7 +326,7 @@ def test_finite_cost_is_preflighted_reserved_and_never_fabricated(tmp_path: Path
 
 
 def test_unknown_dispatched_cost_fails_closed_and_blocks_later_cells(tmp_path: Path) -> None:
-    """An unpriced dispatch is not zero spend, so a later paid cell is never admitted."""
+    """In stop mode an unpriced dispatch is not zero spend, so no later paid cell runs."""
     store, plan, plan_input, task_input = _persist_fixture(
         tmp_path,
         ("task-a", "task-b"),
@@ -355,6 +355,7 @@ def test_unknown_dispatched_cost_fails_closed_and_blocks_later_cells(tmp_path: P
             task_input,
             ("cell-a", "cell-b"),
             maximum_cost_usd=1.0,
+            stop_on_overspend=True,
         )
     )
     first, second = tuple(_load_rollout(store, item) for item in artifact_set.artifact_ids)
@@ -371,7 +372,7 @@ def test_unknown_dispatched_cost_fails_closed_and_blocks_later_cells(tmp_path: P
 
 
 def test_unknown_environment_cost_fails_closed_and_blocks_later_cells(tmp_path: Path) -> None:
-    """An environment that omits promised cost cannot make a later paid cell look affordable."""
+    """In stop mode an environment that omits promised cost blocks every later paid cell."""
     store, plan, plan_input, task_input = _persist_fixture(
         tmp_path,
         ("task-a", "task-b"),
@@ -398,6 +399,7 @@ def test_unknown_environment_cost_fails_closed_and_blocks_later_cells(tmp_path: 
             task_input,
             ("cell-a", "cell-b"),
             maximum_cost_usd=1.0,
+            stop_on_overspend=True,
         )
     )
     first, second = tuple(_load_rollout(store, item) for item in artifact_set.artifact_ids)
@@ -649,6 +651,7 @@ def _spec(
     maximum_time_seconds: float = 30.0,
     maximum_cost_usd: float | None = None,
     environment_sha256: str = _ENVIRONMENT_DIGEST,
+    stop_on_overspend: bool = False,
 ) -> SimulationSpec:
     """Create one exact shared W8 sandbox specification."""
     return SimulationSpec(
@@ -669,6 +672,7 @@ def _spec(
         seed=7,
         maximum_steps=maximum_steps,
         maximum_cost_usd=maximum_cost_usd,
+        stop_on_overspend=stop_on_overspend,
     )
 
 

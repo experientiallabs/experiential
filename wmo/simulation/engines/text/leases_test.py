@@ -1,5 +1,6 @@
 """Adversarial durability tests for text simulation paid-cell claims."""
 
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -361,7 +362,7 @@ def test_crash_after_rollout_artifact_recovers_completed_and_clears_reservation(
 def test_budget_contender_waits_for_active_claim_before_proven_over_budget_block(
     tmp_path: Path,
 ) -> None:
-    """Only recomputed committed spend after an active claim resolves is a permanent block."""
+    """In stop mode only recomputed committed spend after an active claim is a block."""
     project = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
     completed: set[str] = set()
     spend = [0.0]
@@ -399,12 +400,44 @@ def test_budget_contender_waits_for_active_claim_before_proven_over_budget_block
         maximum_cost_usd=1.0,
         rollout_completed=completed.__contains__,
         observed_spend_usd=lambda: spend[0],
+        stop_on_overspend=True,
     )
 
     assert elapsed[0] > 0
     assert blocked.state == TextCellLeaseState.BUDGET_BLOCKED
     assert blocked.observed_spend_usd == 1.1
     assert tuple((project.project_directory / "simulation-leases").glob("*.json")) == ()
+
+
+def test_default_admission_warns_and_owns_after_spend_reaches_the_ceiling(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """By default an authorized run admits a cell after reconciled spend crosses the ceiling.
+
+    Args:
+        tmp_path: Isolated project root for durable admission leases.
+        caplog: Captured lease-store log records.
+    """
+    project = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
+    store = TextCellLeaseStore(project.project_directory, clock=lambda: _TIME)
+
+    with caplog.at_level(logging.WARNING, logger="wmo.simulation.engines.text.leases"):
+        claim = store.acquire(
+            lease_id="lease-a",
+            resolution_id="resolution-a",
+            simulation_id="simulation-a",
+            rollout_id="rollout-a",
+            binding_sha256=_DIGEST,
+            maximum_cost_usd=1.0,
+            rollout_completed=lambda _rollout_id: False,
+            observed_spend_usd=lambda: 1.5,
+        )
+
+    assert claim.state == TextCellLeaseState.OWNED
+    assert claim.lease is not None
+    assert claim.lease.reserved_cost_usd == 1.0
+    assert any("authorized" in record.message for record in caplog.records)
 
 
 def test_stale_tombstone_rejects_symlink_swap_without_touching_victim(tmp_path: Path) -> None:

@@ -428,6 +428,7 @@ class SandboxSimulator:
                     resolution.cell_bindings,
                     resolution_input,
                 ),
+                stop_on_overspend=spec.stop_on_overspend,
             )
         except TextCellLeaseError as exc:
             raise SandboxResumeError(f"sandbox cell {cell.cell_id!r} cannot be admitted") from exc

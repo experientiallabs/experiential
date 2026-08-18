@@ -31,6 +31,7 @@ from wmo.simulation.world_model.runtime import (
     GroundedWorldModel,
     bind_fit_grounded_world_model,
     load_grounded_world_model,
+    load_grounded_world_model_artifact,
 )
 
 _APPLICATION_EXPORTS = frozenset(
@@ -58,6 +59,7 @@ __all__ = [
     "WorldModelSessionLimits",
     "bind_fit_grounded_world_model",
     "load_grounded_world_model",
+    "load_grounded_world_model_artifact",
     "load_world_model",
     "persist_grounded_world_model",
 ]

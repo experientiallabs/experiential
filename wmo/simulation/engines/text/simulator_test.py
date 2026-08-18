@@ -910,21 +910,31 @@ def test_persisted_fit_rag_grounds_active_simulation_and_replay_has_zero_dispatc
     assert store.read_bytes(persisted.index.rag_id, "rag-index.json") == rag_before
 
 
-def test_query_reservation_exceeding_remaining_budget_blocks_every_dispatch(
+def test_worst_case_query_reservation_never_blocks_an_episode_with_spend_remaining(
     tmp_path: Path,
 ) -> None:
-    """Reject a query reservation that exceeds the remaining cell budget.
+    """Complete an episode whose worst-case query reservation exceeds the cell budget.
 
     Args:
-        tmp_path: Isolated project root used to verify zero provider dispatch.
+        tmp_path: Isolated project root used to verify real dispatch under a modest ceiling.
     """
     cell = _cell("cell-a", "task-a")
     plan = _plan((cell,))
     store = _store(tmp_path)
     plan_input = _persist_plan(store, plan)
     task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
-    candidate_client = _ScriptedClient([])
-    world_client = _ScriptedClient([])
+    candidate_client = _ScriptedClient(
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.01)]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Thanks.","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+                cost=0.01,
+            )
+        ]
+    )
     retriever = _FitRetriever(_fit_rag_input(), input_usd_per_million_tokens=100.0)
     simulator = _simulator(
         store,
@@ -953,29 +963,30 @@ def test_query_reservation_exceeding_remaining_budget_blocks_every_dispatch(
     )
     rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
 
-    assert rollout.stop_reason == StopReason.MAXIMUM_COST
-    assert rollout.failure is not None
-    assert rollout.failure.details["phase"] == "query_embedding_reservation"
-    assert candidate_client.requests == []
-    assert world_client.requests == []
-    assert retriever.estimate_calls == 0
-    assert retriever.queries == []
+    assert rollout.stop_reason == StopReason.COMPLETED
+    assert rollout.failure is None
+    assert len(candidate_client.requests) == 1
+    assert len(world_client.requests) == 1
+    assert retriever.estimate_calls == 1
+    assert len(retriever.queries) == 1
 
 
-def test_full_episode_reservation_blocks_candidate_retrieval_and_world_dispatch(
+def test_expensive_episode_estimate_dispatches_until_actual_spend_reaches_the_ceiling(
     tmp_path: Path,
 ) -> None:
-    """Reserve every possible turn before the first candidate or retrieval call.
+    """Stop mode dispatches under an oversized estimate and stops only on reconciled spend.
 
     Args:
-        tmp_path: Isolated project root used to verify zero provider dispatch.
+        tmp_path: Isolated project root used to verify one real dispatch then a spend stop.
     """
     cell = _cell("cell-a", "task-a")
     plan = _plan((cell,))
     store = _store(tmp_path)
     plan_input = _persist_plan(store, plan)
     task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
-    candidate_client = _ScriptedClient([])
+    candidate_client = _ScriptedClient(
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.12)]
+    )
     world_client = _ScriptedClient([])
     retriever = _FitRetriever(_fit_rag_input())
     _contract, completion_input = persist_simulation_completion_contract(
@@ -1022,16 +1033,16 @@ def test_full_episode_reservation_blocks_candidate_retrieval_and_world_dispatch(
             world_model=settings,
             completion_contract_input=completion_input,
             maximum_cost_usd=0.1,
+            stop_on_overspend=True,
         )
     )
     rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
 
     assert rollout.stop_reason == StopReason.MAXIMUM_COST
     assert rollout.failure is not None
-    assert rollout.failure.details["phase"] == "episode_provider_reservation"
-    assert candidate_client.requests == []
+    assert rollout.failure.details["phase"] == "query_embedding_budget"
+    assert len(candidate_client.requests) == 1
     assert world_client.requests == []
-    assert retriever.estimate_calls == 0
     assert retriever.queries == []
 
 
@@ -1165,7 +1176,7 @@ def test_text_simulation_normalizes_agent_tool_attempts_to_unsupported_cells(
 
 
 def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path: Path) -> None:
-    """A length finish is durable evidence, then later selected cells become budget failures."""
+    """In stop mode a length finish is durable evidence, then later cells are budget failures."""
     cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
     plan = _plan(cells)
     store = _store(tmp_path)
@@ -1191,7 +1202,13 @@ def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path
         candidate_client,
         world_client,
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=0.5)
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a", "cell-b"),
+        maximum_cost_usd=0.5,
+        stop_on_overspend=True,
+    )
 
     artifact_set = simulator.run(spec)
     length_rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
@@ -1208,7 +1225,7 @@ def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path
 def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
     tmp_path: Path,
 ) -> None:
-    """Block retrieval and later paid cells after unknown candidate spend.
+    """Stop mode blocks retrieval and later paid cells after unknown candidate spend.
 
     Args:
         tmp_path: Isolated project root for failure evidence.
@@ -1239,7 +1256,13 @@ def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
         candidate_client,
         world_client,
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a", "cell-b"),
+        maximum_cost_usd=1.0,
+        stop_on_overspend=True,
+    )
 
     artifact_set = simulator.run(spec)
     second_rollout = simulator._load_rollout(artifact_set.artifact_ids[1])
@@ -1507,6 +1530,9 @@ def test_retrieval_dispatch_failure_persists_a_zero_incremental_reservation(
 def test_prior_attempt_reservation_charges_the_ceiling_before_retry(tmp_path: Path) -> None:
     """A superseded unknown-spend attempt keeps its worst-case charge on retry admission.
 
+    In stop mode the retry is blocked as a budget outcome once that charged reservation alone
+    reaches the configured ceiling, without dispatching a second provider call.
+
     Args:
         tmp_path: Isolated project root for durable reservation evidence.
     """
@@ -1530,13 +1556,13 @@ def test_prior_attempt_reservation_charges_the_ceiling_before_retry(tmp_path: Pa
         completion_contract_input=completion_input,
     )
     call_reservation = _completion_reservation("candidate-a").estimated_maximum_call_cost_usd
-    episode_reservation = 2 * (2 * call_reservation + 0.000001)
     spec = _spec(
         plan_input,
         task_set_input,
         ("cell-a",),
         completion_contract_input=completion_input,
-        maximum_cost_usd=episode_reservation + 0.4 * call_reservation,
+        maximum_cost_usd=0.4 * call_reservation,
+        stop_on_overspend=True,
     )
 
     first_set = simulator.run(spec)
@@ -1559,7 +1585,7 @@ def test_prior_attempt_reservation_charges_the_ceiling_before_retry(tmp_path: Pa
 
 
 def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: Path) -> None:
-    """A dispatched timeout has unknown spend, so no second paid cell may be sent."""
+    """In stop mode a dispatched timeout has unknown spend, so no second paid cell is sent."""
     cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
     plan = _plan(cells)
     store = _store(tmp_path)
@@ -1580,7 +1606,13 @@ def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: P
     )
 
     artifact_set = simulator.run(
-        _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=0.01)
+        _spec(
+            plan_input,
+            task_set_input,
+            ("cell-a", "cell-b"),
+            maximum_cost_usd=0.01,
+            stop_on_overspend=True,
+        )
     )
     first = simulator._load_rollout(artifact_set.artifact_ids[0])
     second = simulator._load_rollout(artifact_set.artifact_ids[1])
@@ -1599,7 +1631,7 @@ def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: P
 def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_persists(
     tmp_path: Path,
 ) -> None:
-    """A stale tombstone is a budget barrier while its durable rollout is still pending."""
+    """In stop mode a stale tombstone is a budget barrier while its rollout is still pending."""
     cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
     plan = _plan(cells)
     store = _store(tmp_path)
@@ -1626,7 +1658,13 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
         candidate_client,
         world_client,
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a", "cell-b"),
+        maximum_cost_usd=1.0,
+        stop_on_overspend=True,
+    )
     selected, world_model, grounded_world_model = recovery._validate_spec_and_bindings(spec)
     canonical_spec, spec_input = persist_canonical_specification(store, spec)
     resolution, resolution_input, bindings = recovery._persist_resolution(
@@ -1800,6 +1838,55 @@ def test_text_simulation_continues_after_agent_completion_until_world_terminal(
     assert candidate_client.requests[1].messages[-2].assistant_action is not None
     assert candidate_client.requests[1].messages[-2].assistant_action.content == "first answer"
     assert candidate_client.requests[1].messages[-1].content == "Please continue."
+
+
+def test_text_simulation_turn_exhaustion_is_a_judgeable_outcome_without_failure(
+    tmp_path: Path,
+) -> None:
+    """Exhausting the pinned candidate turn ceiling records evidence instead of a failure.
+
+    Args:
+        tmp_path: Isolated project root for immutable simulator artifacts.
+    """
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient(
+        [
+            _response("first answer", snapshot=_snapshot("candidate-a")),
+            _response("second answer", snapshot=_snapshot("candidate-a")),
+        ]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Please continue.","terminal":false}',
+                snapshot=_snapshot("world-model-a"),
+            ),
+            _response(
+                '{"message":"Still not done.","terminal":false}',
+                snapshot=_snapshot("world-model-a"),
+            ),
+        ]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+    )
+
+    artifact_set = simulator.run(_spec(plan_input, task_set_input, ("cell-a",)))
+    rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
+
+    assert rollout.stop_reason == StopReason.MAXIMUM_STEPS
+    assert rollout.failure is None
+    assert len(candidate_client.requests) == 2
+    assert len(world_client.requests) == 2
 
 
 def test_text_simulation_cross_runner_claim_prevents_duplicate_paid_calls(tmp_path: Path) -> None:

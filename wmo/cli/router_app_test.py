@@ -31,6 +31,7 @@ def test_router_help_requires_only_project_and_never_exposes_config() -> None:
     assert "--config" not in output
     assert "--candidate" in output
     assert "--maximum-provider-co" in output
+    assert "--stop-on-overspend" in output
     assert "--approve-fidelity" not in output
     assert "--preferred-fidelity" not in output
     assert "fidelity" not in output.lower()

@@ -54,9 +54,14 @@ class CandidateExecutionBinding(ContractModel):
 
 
 class RouterExecutionContract(ArtifactEnvelope):
-    """Immutable automatic-router calls and one shared provider-spend allocation."""
+    """Immutable automatic-router calls and one shared provider-spend ceiling.
 
-    schema_version: Literal[3] = 3
+    ``reserved_judgment_cost_usd`` records the judge planning estimate for consent and
+    reporting only: judgments spend from the same shared simulation remainder as reconciled
+    actual cost, so the estimate never carves spend away from simulation upfront.
+    """
+
+    schema_version: Literal[4] = 4
     execution_contract_id: ArtifactId
     cost_plan: AutomaticRouterCostPlan
     cost_plan_sha256: Sha256
@@ -164,8 +169,8 @@ class RouterExecutionContract(ArtifactEnvelope):
                 abs_tol=1e-12,
             ):
                 raise ValueError("candidate request differs from its cost-plan reservation")
-        expected_remaining = self.maximum_provider_cost_usd - math.fsum(
-            (self.reserved_router_embedding_cost_usd, self.reserved_judgment_cost_usd)
+        expected_remaining = (
+            self.maximum_provider_cost_usd - self.reserved_router_embedding_cost_usd
         )
         if not math.isclose(
             self.remaining_simulation_cost_usd,
@@ -236,11 +241,9 @@ def persist_router_execution_contract(
     if canonical_inputs != inputs or len({item.artifact_id for item in inputs}) != len(inputs):
         raise ValueError("router execution inputs must be sorted and unique")
     reserved_judgment = judge_request.estimated_maximum_call_cost_usd * maximum_judge_provider_calls
-    remaining = maximum_provider_cost_usd - math.fsum(
-        (router_embedding_reservation.estimated_cost_usd, reserved_judgment)
-    )
+    remaining = maximum_provider_cost_usd - router_embedding_reservation.estimated_cost_usd
     semantic = {
-        "version": "automatic-router-execution-v3",
+        "version": "automatic-router-execution-v4",
         "inputs": [item.model_dump(mode="json") for item in inputs],
         "router_embedding_input": router_embedding_input.model_dump(mode="json"),
         "simulation_completion_input": simulation_completion_input.model_dump(mode="json"),
@@ -263,7 +266,7 @@ def persist_router_execution_contract(
     }
     contract_id = stable_id("router-execution", semantic)
     contract = RouterExecutionContract(
-        schema_version=3,
+        schema_version=4,
         created_at=created_at,
         inputs=inputs,
         code_revision=code_revision,
@@ -381,7 +384,7 @@ def load_router_execution_contract(
     expected_id = stable_id(
         "router-execution",
         {
-            "version": "automatic-router-execution-v3",
+            "version": "automatic-router-execution-v4",
             "inputs": [item.model_dump(mode="json") for item in value.inputs],
             "router_embedding_input": value.router_embedding_input.model_dump(mode="json"),
             "simulation_completion_input": value.simulation_completion_input.model_dump(

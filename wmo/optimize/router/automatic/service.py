@@ -185,6 +185,7 @@ def optimize_project_router(
         budget=RouterCompositionBudget(
             maximum_simulation_cost_usd=preflight.remaining_simulation_cost_usd,
             maximum_judgments=options.maximum_judgments,
+            stop_on_overspend=options.stop_on_overspend,
         ),
         created_at=created_at,
         code_revision=code_revision,
@@ -531,12 +532,11 @@ def _workflow_services(
             plan: Exact evaluation plan being executed by composition.
 
         Returns:
-            Grounded simulator with candidate, world-model, judge, and retrieval boundaries.
+            Grounded simulator with candidate, world-model, and retrieval boundaries.
 
         Raises:
             AutomaticRouterError: The verified embedder no longer exposes an embedding client.
         """
-        judge.bind_plan(plan)
         embedder = resolved.embedder
         if embedder.embedding_client is None:
             raise AutomaticRouterError("resolved embedder client disappeared after preflight")

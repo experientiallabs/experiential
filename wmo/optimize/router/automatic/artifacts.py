@@ -128,6 +128,7 @@ def materialize_automatic_router_artifacts(
     )
     embedding_input = artifact_input(project.artifacts.read(embeddings.embedding_set_id).manifest)
     completion_inputs = sorted_unique_inputs(
+        preflight.completed_build.trace_dataset,
         preflight.completed_build.task_set,
         preflight.completed_build.fit_rag,
         preflight.completed_build.world_model,

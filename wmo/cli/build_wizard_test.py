@@ -1050,6 +1050,11 @@ def test_refused_named_consent_stops_before_paid_provider_stages(
         "_wizard_observed_candidate_aliases",
         lambda *_args: ("world",) * 5 + ("candidate",) * 5,
     )
+    monkeypatch.setattr(
+        wizard,
+        "_wizard_simulation_input_estimate",
+        lambda *_args, **_kwargs: 32_768,
+    )
 
     def refuse(*_args: object, **kwargs: object) -> bool:
         """Capture the exact named command and ceiling, then refuse authorization."""

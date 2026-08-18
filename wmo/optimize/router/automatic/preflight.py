@@ -48,6 +48,7 @@ from wmo.optimize.router.automatic.reservations import (
     retrieval_embedding_reservation,
     router_feature_reservation,
     simulation_completion_reservations,
+    simulation_input_token_estimate,
 )
 from wmo.optimize.router.judging.artifacts import read_audit
 from wmo.optimize.router.judging.contracts import (
@@ -63,6 +64,7 @@ from wmo.simulation.ingest.dataset import (
 )
 from wmo.simulation.ingest.model_identity import TraceModelIdentityEvidenceSet
 from wmo.simulation.specs import CandidateCompletionReservation
+from wmo.simulation.world_model import load_grounded_world_model_artifact
 
 
 class AutomaticRouterPreflightError(ValueError):
@@ -256,16 +258,36 @@ def preflight_automatic_router(
         options.maximum_retrieval_query_tokens,
         options.router_embedding_maximum_attempts,
     )
-    candidate_requests, world_request = simulation_completion_reservations(
-        problems,
-        catalog=catalog,
-        candidates=candidates,
-        world_alias=world_alias,
-        world=world,
-        maximum_attempts=options.completion_maximum_attempts,
-        maximum_input_tokens=options.simulation_maximum_input_tokens,
-        maximum_output_tokens=options.simulation_maximum_output_tokens,
+    world_model_top_k = _world_model_retrieval_count(problems, project, completed)
+    estimated_input_tokens = (
+        None
+        if world_model_top_k is None
+        else simulation_input_token_estimate(
+            traces,
+            retrieved_transition_count=world_model_top_k,
+            maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+            maximum_output_tokens=options.simulation_maximum_output_tokens,
+        )
     )
+    if world_model_top_k is not None and estimated_input_tokens is None:
+        problems.append(
+            "simulation completion reservations: the completed build has no persisted traces "
+            "to size the per-call input reservation"
+        )
+    if estimated_input_tokens is None:
+        candidate_requests: tuple[CandidateCompletionReservation, ...] = ()
+        world_request = None
+    else:
+        candidate_requests, world_request = simulation_completion_reservations(
+            problems,
+            catalog=catalog,
+            candidates=candidates,
+            world_alias=world_alias,
+            world=world,
+            maximum_attempts=options.completion_maximum_attempts,
+            estimated_input_tokens=estimated_input_tokens,
+            maximum_output_tokens=options.simulation_maximum_output_tokens,
+        )
     judge_request = judge_completion_reservation(
         problems,
         catalog=catalog,
@@ -280,7 +302,7 @@ def preflight_automatic_router(
         provisional_maximum_attempts=options.completion_maximum_attempts,
     )
     cost_plan = None
-    if setup is not None and judge_provenance is not None:
+    if setup is not None and judge_provenance is not None and estimated_input_tokens is not None:
         try:
             cost_plan = plan_automatic_router_cost(
                 tasks,
@@ -297,19 +319,8 @@ def preflight_automatic_router(
                 ),
                 provisional_judge=isinstance(judge_provenance, ProvisionalAutomaticJudge),
                 observed_candidate_aliases=tuple(item.candidate_alias for item in observed),
-                options=AutomaticRouterOptions(
-                    maximum_provider_cost_usd=options.maximum_provider_cost_usd,
-                    maximum_judgments=options.maximum_judgments,
-                    maximum_model_calls=options.maximum_model_calls,
-                    maximum_router_feature_tokens=options.maximum_router_feature_tokens,
-                    maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-                    router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
-                    completion_maximum_attempts=options.completion_maximum_attempts,
-                    simulation_maximum_input_tokens=options.simulation_maximum_input_tokens,
-                    simulation_maximum_output_tokens=options.simulation_maximum_output_tokens,
-                    maximum_concurrency=options.maximum_concurrency,
-                    seed=options.seed,
-                ),
+                estimated_input_tokens=estimated_input_tokens,
+                options=options,
             )
         except ValueError as exc:
             problems.append(str(exc))
@@ -336,7 +347,6 @@ def preflight_automatic_router(
         problems,
         maximum_provider_cost_usd=options.maximum_provider_cost_usd,
         router_reservation=reservation,
-        judge_reservation_cost_usd=judge_reservation_cost_usd,
     )
     if problems:
         raise _preflight_error(problems)
@@ -407,7 +417,6 @@ _BOUNDED_OPTION_FIELDS = (
     "maximum_retrieval_query_tokens",
     "router_embedding_maximum_attempts",
     "completion_maximum_attempts",
-    "simulation_maximum_input_tokens",
     "simulation_maximum_output_tokens",
     "maximum_judgments",
     "maximum_concurrency",
@@ -479,6 +488,31 @@ def _completed_build_problems(
         except (OSError, ValueError) as exc:
             problems.append(f"completed build {name}: {exc}")
     return tuple(problems)
+
+
+def _world_model_retrieval_count(
+    problems: list[str],
+    project: ProjectStore,
+    completed: ProjectBuildArtifacts | None,
+) -> int | None:
+    """Read the frozen per-prediction retrieval count from the completed grounded world model.
+
+    Args:
+        problems: Mutable aggregate problem list.
+        project: Project-local artifact store.
+        completed: Exact completed-build pointers, if present.
+
+    Returns:
+        Persisted world-model top-k, or ``None`` after recording a problem.
+    """
+    if completed is None:
+        return None
+    try:
+        artifact = load_grounded_world_model_artifact(project.artifacts, completed.world_model)
+    except (OSError, ValueError) as exc:
+        problems.append(f"grounded world model: {exc}")
+        return None
+    return artifact.top_k
 
 
 def _candidate_snapshots(

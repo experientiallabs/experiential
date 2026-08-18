@@ -58,7 +58,7 @@ def router(
         help="One ceiling for embeddings, simulation, and judging.",
     ),
     maximum_judgments: int = typer.Option(100, "--maximum-judgments", min=1),
-    maximum_model_calls: int = typer.Option(8, "--maximum-model-calls", min=1),
+    maximum_model_calls: int = typer.Option(50, "--maximum-model-calls", min=1),
     maximum_router_feature_tokens: int = typer.Option(
         8_192, "--maximum-router-feature-tokens", min=1
     ),
@@ -69,6 +69,11 @@ def router(
         2_000, "--simulation-maximum-output-tokens", min=256
     ),
     maximum_concurrency: int = typer.Option(1, "--maximum-concurrency", min=1),
+    stop_on_overspend: bool = typer.Option(
+        False,
+        "--stop-on-overspend",
+        help="Stop before the next paid step once reconciled spend reaches the ceiling.",
+    ),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -91,6 +96,8 @@ def router(
         maximum_retrieval_query_tokens: Input ceiling for each grounded retrieval query.
         simulation_maximum_output_tokens: Candidate and world-model output ceiling per turn.
         maximum_concurrency: Maximum simulation workers.
+        stop_on_overspend: Block the next paid dispatch once reconciled spend reaches the
+            ceiling instead of warning and completing the authorized run.
         yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
         non_interactive: Refuse prompts and require complete repeatable inputs.
 
@@ -108,6 +115,7 @@ def router(
         maximum_retrieval_query_tokens=maximum_retrieval_query_tokens,
         simulation_maximum_output_tokens=simulation_maximum_output_tokens,
         maximum_concurrency=maximum_concurrency,
+        stop_on_overspend=stop_on_overspend,
     )
     effective_noninteractive = non_interactive or not can_prompt(_console)
     with usage_error(OSError, ValueError):
@@ -174,10 +182,10 @@ def router(
                 f"${preflight.router_embedding_reservation.estimated_cost_usd:.4f} router "
                 "embedding reservation"
             ),
-            f"${preflight.judge_reservation_cost_usd:.4f} judge reservation",
+            f"${preflight.judge_reservation_cost_usd:.4f} estimated judge spend",
             (
-                f"${preflight.remaining_simulation_cost_usd:.4f} candidate, retrieval, and "
-                "world-model simulation allocation"
+                f"${preflight.remaining_simulation_cost_usd:.4f} shared simulation and "
+                "judging spend ceiling"
             ),
         ),
         non_interactive=effective_noninteractive,
