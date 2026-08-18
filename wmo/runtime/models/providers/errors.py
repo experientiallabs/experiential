@@ -11,6 +11,15 @@ class ProviderResponseError(ValueError):
     """A provider returned a completed response that violates WMO's typed contract."""
 
 
+class ProviderRetryableResponseError(ProviderResponseError):
+    """A completed response decoded to no usable output and merits one bounded re-dispatch.
+
+    Reasoning models can consume an entire output budget on hidden reasoning and return
+    neither visible text nor a tool call. The response is well formed on the wire, so the
+    request is safe to dispatch again under the client's bounded retry policy.
+    """
+
+
 def require_array(value: JsonValue | None, label: str) -> list[JsonValue]:
     """Return a response JSON array or raise a focused conversion error.
 

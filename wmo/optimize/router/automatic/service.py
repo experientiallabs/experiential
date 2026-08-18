@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,6 +55,10 @@ from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.retrieval import RAGEmbedderBinding, load_fit_rag_retriever
 from wmo.simulation.specs import WorldModelSettings
 from wmo.simulation.world_model import bind_fit_grounded_world_model
+
+logger = logging.getLogger(__name__)
+
+_REASONING_JUDGE_OUTPUT_FLOOR_TOKENS = 8_192
 
 
 class AutomaticRouterError(ValueError):
@@ -391,12 +396,25 @@ def _automatic_judge(
         Judge awaiting the exact evaluation plan from the simulator factory.
     """
     judge = resolved.judge
+    reservation = preflight.judge_completion_reservation
+    if (
+        judge.capabilities.reasoning_effort is not None
+        and reservation.maximum_output_tokens < _REASONING_JUDGE_OUTPUT_FLOOR_TOKENS
+    ):
+        logger.warning(
+            "judge model %s pins reasoning effort %s but its approved calibration output "
+            "budget is only %d tokens; reasoning can consume the whole budget and leave no "
+            "visible text, so affected cells retry and may be excluded from evidence",
+            judge.snapshot.model_id,
+            judge.capabilities.reasoning_effort,
+            reservation.maximum_output_tokens,
+        )
     bounded = ReservedJudgeClient(
         judge.client,
-        reservation=preflight.judge_completion_reservation,
+        reservation=reservation,
         model=judge.snapshot,
         capabilities=judge.capabilities,
-        maximum_attempts=preflight.judge_completion_reservation.maximum_attempts,
+        maximum_attempts=reservation.maximum_attempts,
         maximum_provider_calls=preflight.judge_provider_call_count,
     )
     return AutomaticRouterJudge(

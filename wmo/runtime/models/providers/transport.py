@@ -317,6 +317,7 @@ def run_with_retry[ResultT](
     *,
     policy: RetryPolicy,
     sleep: Callable[[float], None] = time.sleep,
+    classify: Callable[[Exception], RetryClassification] = classify_retry,
 ) -> ResultT:
     """Run one idempotent request operation with bounded same-endpoint retries.
 
@@ -324,6 +325,7 @@ def run_with_retry[ResultT](
         operation: A single idempotent provider request attempt.
         policy: Attempt and delay limits.
         sleep: Delay function, injectable for deterministic tests.
+        classify: Retry classifier applied to each attempt's error.
 
     Returns:
         The operation's first successful result.
@@ -336,7 +338,7 @@ def run_with_retry[ResultT](
         try:
             return operation()
         except Exception as exc:
-            classification = classify_retry(exc)
+            classification = classify(exc)
             if not classification.retryable or attempt == policy.maximum_attempts:
                 raise
             if delay > 0:

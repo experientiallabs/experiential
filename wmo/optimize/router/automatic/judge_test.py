@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from wmo.common.models import (
     ModelCapabilities,
     ModelMessage,
@@ -11,6 +13,7 @@ from wmo.common.models import (
     completion_cost_reservation,
 )
 from wmo.optimize.router.automatic.judge import ReservedJudgeClient
+from wmo.optimize.router.errors import JudgeTranscriptAdmissionError
 from wmo.runtime.models.providers.openai import openai_responses_response
 
 
@@ -117,3 +120,82 @@ def test_reserved_judge_prices_openai_usage_without_observed_cost() -> None:
     assert result.economics.cost_usd is not None
     assert result.economics.cost_usd.provenance == "estimated"
     assert result.economics.cost_usd.value == 0.0024025
+
+
+def test_reserved_judge_rejects_an_over_ceiling_transcript_without_a_provider_call() -> None:
+    """An over-ceiling request raises the typed admission error before any provider dispatch."""
+    model = ModelSnapshot(
+        provider="openai",
+        model_id="judge-model",
+        capabilities_sha256="a" * 64,
+        connection_sha256="b" * 64,
+    )
+    reservation = completion_cost_reservation(
+        model=model,
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=4.0,
+        cached_input_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=2.0,
+        maximum_attempts=2,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+    )
+    client = ReservedJudgeClient(
+        _Client(_unused_response(model)),
+        reservation=reservation,
+        model=model,
+        capabilities=ModelCapabilities(
+            supports_completions=True,
+            context_window_tokens=2_000,
+            maximum_output_tokens=500,
+            input_cost_per_million_tokens_usd=1.0,
+            output_cost_per_million_tokens_usd=4.0,
+            cached_input_cost_per_million_tokens_usd=0.5,
+            cache_write_cost_per_million_tokens_usd=2.0,
+        ),
+        maximum_attempts=2,
+        maximum_provider_calls=1,
+    )
+    oversized = ModelRequest(
+        messages=(ModelMessage(role="user", content="x" * 100_000),),
+        maximum_output_tokens=500,
+    )
+
+    with pytest.raises(JudgeTranscriptAdmissionError):
+        client.complete(oversized)
+
+    assert client.calls == 0
+
+
+def _unused_response(model: ModelSnapshot) -> ModelResponse:
+    """Return one minimal parsed response that the admission test never dispatches.
+
+    Args:
+        model: Configured judge model identity.
+
+    Returns:
+        Production-shaped provider response.
+    """
+    return openai_responses_response(
+        {
+            "id": "resp_unused",
+            "object": "response",
+            "created_at": 1.0,
+            "status": "completed",
+            "model": "judge-model",
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_unused",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "unused", "annotations": []}],
+                }
+            ],
+        },
+        configured_model=model,
+        latency_seconds=0.1,
+    )

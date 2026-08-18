@@ -21,6 +21,7 @@ from wmo.common.models import (
 )
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact
+from wmo.optimize.router.errors import JudgeTranscriptAdmissionError
 from wmo.optimize.router.judging.contracts import ManualJudgeError, ManualJudgeSetupArtifact
 from wmo.optimize.router.judging.protocol import TemplateJudgeClient
 from wmo.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
@@ -81,6 +82,8 @@ class ReservedJudgeClient:
             Provider response with known bounded economics.
 
         Raises:
+            JudgeTranscriptAdmissionError: The counted request input exceeds the frozen
+                reserved input-token ceiling, so the rendered transcript cannot be admitted.
             ValueError: The request exceeds a bound or provider usage and spend cannot be bounded.
         """
         if self._calls >= self._maximum_provider_calls:
@@ -90,7 +93,9 @@ class ReservedJudgeClient:
         if output_tokens is None:
             raise ValueError("judge request must declare a maximum output-token ceiling")
         if input_tokens > self._reservation.maximum_input_tokens:
-            raise ValueError("judge request exceeds its reserved input-token ceiling")
+            raise JudgeTranscriptAdmissionError(
+                "judge request exceeds its reserved input-token ceiling"
+            )
         if output_tokens > self._reservation.maximum_output_tokens:
             raise ValueError("judge request exceeds its reserved output-token ceiling")
         self._calls += 1
