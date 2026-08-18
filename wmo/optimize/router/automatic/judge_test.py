@@ -13,8 +13,13 @@ from wmo.common.models import (
     completion_cost_reservation,
 )
 from wmo.optimize.router.automatic.judge import ReservedJudgeClient
-from wmo.optimize.router.errors import JudgeTranscriptAdmissionError
+from wmo.optimize.router.errors import (
+    JudgeDispatchExhaustedError,
+    JudgeTranscriptAdmissionError,
+)
+from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
 from wmo.runtime.models.providers.openai import openai_responses_response
+from wmo.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
 
 
 class _Client:
@@ -165,6 +170,70 @@ def test_reserved_judge_rejects_an_over_ceiling_transcript_without_a_provider_ca
         client.complete(oversized)
 
     assert client.calls == 0
+
+
+def test_reserved_judge_prices_an_exhausted_empty_output_dispatch_conservatively() -> None:
+    """An exhausted empty-output dispatch surfaces its conservative retry-bound spend."""
+    model = ModelSnapshot(
+        provider="openai",
+        model_id="judge-model",
+        capabilities_sha256="a" * 64,
+        connection_sha256="b" * 64,
+    )
+    reservation = completion_cost_reservation(
+        model=model,
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=4.0,
+        cached_input_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=2.0,
+        maximum_attempts=2,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+    )
+    client = ReservedJudgeClient(
+        _ExhaustedClient(),
+        reservation=reservation,
+        model=model,
+        capabilities=ModelCapabilities(
+            supports_completions=True,
+            context_window_tokens=2_000,
+            maximum_output_tokens=500,
+            input_cost_per_million_tokens_usd=1.0,
+            output_cost_per_million_tokens_usd=4.0,
+            cached_input_cost_per_million_tokens_usd=0.5,
+            cache_write_cost_per_million_tokens_usd=2.0,
+        ),
+        maximum_attempts=2,
+        maximum_provider_calls=1,
+    )
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="Judge this."),),
+        maximum_output_tokens=500,
+    )
+
+    with pytest.raises(JudgeDispatchExhaustedError) as excinfo:
+        client.complete(request)
+
+    counted_input = Utf8UpperBoundTokenCounter().count(request)
+    expected = 2 * (counted_input * 2.0 + 500 * 4.0) / 1_000_000
+    assert excinfo.value.conservative_cost_usd == expected
+    assert client.calls == 1
+
+
+class _ExhaustedClient:
+    """Raise the retryable empty-output error for every dispatched request."""
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Raise the exhausted empty-output signal.
+
+        Args:
+            request: Exact judge request accepted by the wrapper.
+
+        Raises:
+            ProviderRetryableResponseError: Always, modeling exhausted bounded retries.
+        """
+        del request
+        raise ProviderRetryableResponseError("OpenAI Responses output has no text or tool call")
 
 
 def _unused_response(model: ModelSnapshot) -> ModelResponse:

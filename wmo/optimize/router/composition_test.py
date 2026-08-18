@@ -59,7 +59,10 @@ from wmo.optimize.router.composition import (
     RouterWorkflowServices,
     compose_router,
 )
-from wmo.optimize.router.errors import JudgeTranscriptAdmissionError
+from wmo.optimize.router.errors import (
+    JudgeDispatchExhaustedError,
+    JudgeTranscriptAdmissionError,
+)
 from wmo.optimize.router.evaluation.spend import observed_rollout_spend
 from wmo.optimize.router.fit.workflow_test import _persist_embeddings, _persist_pricing
 from wmo.optimize.router.judgment_budget import (
@@ -67,7 +70,6 @@ from wmo.optimize.router.judgment_budget import (
     JudgmentExclusionRecord,
 )
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
-from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
 from wmo.runtime.router.runtime_test import _Client, _request
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.engines.text import simulator as text_simulator_module
@@ -1164,7 +1166,10 @@ def test_per_cell_judge_failures_exclude_cells_durably_and_replay_without_redisp
     judge = _Judge()
     judge.raise_after_lock = [
         JudgeTranscriptAdmissionError("judge request exceeds its reserved input-token ceiling"),
-        ProviderRetryableResponseError("OpenAI Responses output has no text or tool call"),
+        JudgeDispatchExhaustedError(
+            "OpenAI Responses output has no text or tool call",
+            conservative_cost_usd=0.25,
+        ),
     ]
     services = RouterWorkflowServices(
         review_supplier=_ReviewSupplier(),
@@ -1224,6 +1229,9 @@ def test_per_cell_judge_failures_exclude_cells_durably_and_replay_without_redisp
     assert {record.cell_id for record in exclusions} <= {
         cell.cell_id for cell in first.plan.cells if cell.purpose == "held_out"
     }
+    costs_by_reason = {record.reason: record.conservative_cost_usd for record in exclusions}
+    assert costs_by_reason["transcript_exceeds_judge_admission_ceiling"] == 0.0
+    assert costs_by_reason["judge_dispatch_failed"] == 0.25
     scored_cells = tuple(cell for cell in first.plan.cells if cell.purpose in {"fit", "held_out"})
     assert len(_artifact_ids("judgment")) == len(scored_cells) - 2
     assert len(_artifact_ids("judgment-dispatch")) == len(scored_cells)

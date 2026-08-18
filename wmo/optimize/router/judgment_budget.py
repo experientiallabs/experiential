@@ -26,8 +26,11 @@ from wmo.common.judging import Judge, Judgment
 from wmo.common.progress import ProgressHook, report
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact, StopReason, unknown_spend_failure
-from wmo.optimize.router.errors import JudgeTranscriptAdmissionError, RouterCompositionError
-from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
+from wmo.optimize.router.errors import (
+    JudgeDispatchExhaustedError,
+    JudgeTranscriptAdmissionError,
+    RouterCompositionError,
+)
 
 if TYPE_CHECKING:
     from wmo.optimize.router.composition import ApprovedRouterReview, RouterEvaluationSetup
@@ -74,6 +77,7 @@ class JudgmentExclusionRecord(ArtifactEnvelope):
     protocol_sha256: Sha256
     reason: JudgmentExclusionReason
     detail: str
+    conservative_cost_usd: float = 0.0
 
 
 def find_verified_judgment(
@@ -327,6 +331,7 @@ def persist_judgment_exclusion(
     *,
     reason: JudgmentExclusionReason,
     detail: str,
+    conservative_cost_usd: float = 0.0,
 ) -> JudgmentExclusionRecord:
     """Record one plan-cell judgment exclusion immutably so replay stays deterministic.
 
@@ -340,6 +345,7 @@ def persist_judgment_exclusion(
         protocol: Frozen evaluation protocol governing the cell.
         reason: Structured cause of the exclusion.
         detail: Concise operator-facing failure description without secrets.
+        conservative_cost_usd: Retry-bound worst-case billed spend of the excluded dispatch.
 
     Returns:
         The newly persisted exact exclusion record.
@@ -363,6 +369,7 @@ def persist_judgment_exclusion(
         protocol_sha256=protocol_sha256,
         reason=reason,
         detail=detail,
+        conservative_cost_usd=conservative_cost_usd,
     )
     project.artifacts.write_json(
         artifact_id=exclusion_id,
@@ -503,10 +510,13 @@ def complete_cell_evidence(
     past that cell with its rollout excluded from judged evidence.
 
     Judgments draw from the shared provider pool as reconciled actual spend, never a planning
-    estimate. Once accumulated judge spend reaches ``remaining_cost_usd``, ``stop_on_overspend``
-    blocks the next dispatch; by default the authorized run logs one warning and keeps judging.
-    The returned total covers every judgment bound to the evidence so later phases subtract
-    actual, not estimated, judge cost.
+    estimate. An exhausted dispatch may have billed every bounded attempt without returning
+    usable output, so its exclusion charges the conservative retry-bound request cost against
+    the same ledger, on the live run and on every replay. Once accumulated judge spend reaches
+    ``remaining_cost_usd``, ``stop_on_overspend`` blocks the next dispatch; by default the
+    authorized run logs one warning and keeps judging. The returned total covers every judgment
+    and exclusion bound to the evidence so later phases subtract actual, not estimated, judge
+    cost.
 
     Args:
         project: Project containing the immutable evidence and dispatch ledger.
@@ -646,6 +656,7 @@ def complete_cell_evidence(
         if consumed > maximum_judgments:
             raise RouterCompositionError("judgment dispatch budget exhausted")
         if judgment is None and exclusion is not None:
+            judge_spend_usd = math.fsum((judge_spend_usd, exclusion.conservative_cost_usd))
             evidence.append(_unjudged_cell_evidence(cell, protocol, rollout))
             _report_judgments()
             continue
@@ -683,7 +694,12 @@ def complete_cell_evidence(
                     rubric_artifact_id=review.rubric_id,
                     calibration_artifact_id=review.calibration_id,
                 )
-            except (JudgeTranscriptAdmissionError, ProviderRetryableResponseError) as exc:
+            except (JudgeTranscriptAdmissionError, JudgeDispatchExhaustedError) as exc:
+                exhausted_cost_usd = (
+                    exc.conservative_cost_usd
+                    if isinstance(exc, JudgeDispatchExhaustedError)
+                    else 0.0
+                )
                 _record_judgment_exclusion(
                     project,
                     plan_input,
@@ -697,7 +713,9 @@ def complete_cell_evidence(
                         else "judge_dispatch_failed"
                     ),
                     error=exc,
+                    conservative_cost_usd=exhausted_cost_usd,
                 )
+                judge_spend_usd = math.fsum((judge_spend_usd, exhausted_cost_usd))
                 evidence.append(_unjudged_cell_evidence(cell, protocol, rollout))
                 _report_judgments()
                 continue
@@ -727,6 +745,7 @@ def _record_judgment_exclusion(
     *,
     reason: JudgmentExclusionReason,
     error: Exception,
+    conservative_cost_usd: float = 0.0,
 ) -> None:
     """Persist one durable structured judgment exclusion and warn the operator.
 
@@ -739,6 +758,7 @@ def _record_judgment_exclusion(
         protocol: Frozen evaluation protocol governing the cell.
         reason: Structured cause of the exclusion.
         error: Per-cell judge failure that triggered the exclusion.
+        conservative_cost_usd: Retry-bound worst-case billed spend of the excluded dispatch.
 
     Raises:
         RouterCompositionError: The exclusion cannot bind to the approved review pins.
@@ -754,6 +774,7 @@ def _record_judgment_exclusion(
             protocol,
             reason=reason,
             detail=str(error),
+            conservative_cost_usd=conservative_cost_usd,
         )
     except JudgmentBudgetError as exc:
         raise RouterCompositionError(str(exc)) from exc
