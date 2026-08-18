@@ -747,7 +747,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     assert completed_build.fit_rag in first.simulation_spec.inputs
     assert completed_build.fit_rag in first.held_out_simulation_spec.inputs
     assert first.held_out_simulation_spec.maximum_cost_usd == pytest.approx(
-        budget.maximum_simulation_cost_usd - first.fit_simulation_spend_usd
+        budget.maximum_simulation_cost_usd
     )
     assert first.total_simulation_spend_usd == pytest.approx(
         first.fit_simulation_spend_usd + first.held_out_simulation_spend_usd
@@ -825,6 +825,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
             budget=RouterCompositionBudget(
                 maximum_simulation_cost_usd=1.0,
                 maximum_judgments=100,
+                stop_on_overspend=True,
             ),
             created_at=_TIME,
             code_revision="test-revision",
@@ -923,6 +924,7 @@ def test_failed_rollouts_skip_judging_and_rerun_replays_after_partial_failure(
         *,
         completion_contract: SimulationCompletionContract | None,
         remaining_cost_usd: float,
+        stop_on_overspend: bool = True,
     ) -> StructuredFailure | None:
         """Reject the first two held-out episode admissions before any provider dispatch."""
         locked = any(
@@ -942,6 +944,7 @@ def test_failed_rollouts_skip_judging_and_rerun_replays_after_partial_failure(
             settings,
             completion_contract=completion_contract,
             remaining_cost_usd=remaining_cost_usd,
+            stop_on_overspend=stop_on_overspend,
         )
 
     monkeypatch.setattr(text_simulator_module, "episode_reservation_failure", failing_admission)

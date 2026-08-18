@@ -197,18 +197,24 @@ def maximum_query_reservation(
 def query_reservation_failure(
     reservation: EmbeddingCostReservation,
     remaining_cost_usd: float,
+    *,
+    stop_on_overspend: bool = True,
 ) -> StructuredFailure | None:
-    """Reject retrieval dispatch only once reconciled spend exhausts the remainder.
+    """Reject retrieval dispatch only when stop mode finds the remainder exhausted.
 
     The worst-case query reservation is a planning value and never gates dispatch on its own:
-    an episode with real budget remaining always admits its next query.
+    an episode with real budget remaining always admits its next query. By default the
+    authorized run also admits queries after the remainder is exhausted; stop mode returns a
+    structured budget failure instead.
 
     Args:
         reservation: Persisted worst-case query-embedding reservation.
         remaining_cost_usd: Reconciled provider budget available to the cell.
+        stop_on_overspend: When true, an exhausted remainder blocks the next query.
 
     Returns:
-        Structured budget failure when no reconciled spend remains, otherwise ``None``.
+        Structured budget failure when stop mode finds no reconciled spend remaining,
+        otherwise ``None``.
 
     Raises:
         SimulationConfigurationError: The reservation unexpectedly has no estimated cost.
@@ -217,7 +223,7 @@ def query_reservation_failure(
     cost = economics.cost_usd
     if cost is None:  # pragma: no cover - maximum_query_reservation always prices the call
         raise SimulationConfigurationError("query-embedding reservation has unknown cost")
-    if remaining_cost_usd > 0:
+    if remaining_cost_usd > 0 or not stop_on_overspend:
         return None
     return StructuredFailure(
         code=FailureCode.BUDGET,
@@ -318,21 +324,24 @@ def episode_reservation_failure(
     *,
     completion_contract: SimulationCompletionContract | None,
     remaining_cost_usd: float,
+    stop_on_overspend: bool = True,
 ) -> StructuredFailure | None:
-    """Admit an episode whenever reconciled provider spend remains under the ceiling.
+    """Reject an episode only when stop mode finds the reconciled remainder exhausted.
 
     Frozen completion reservations carry planning estimates only, so an episode is never
-    rejected because an estimated full run looks too expensive. Every actual request is still
-    checked against the model's real context capacity and the reconciled spend remainder
-    immediately before dispatch.
+    rejected because an estimated full run looks too expensive. By default the authorized run
+    also admits episodes after the remainder is exhausted; stop mode returns a structured
+    zero-dispatch failure instead. Every actual request is still checked against the model's
+    real context capacity immediately before dispatch.
 
     Args:
         settings: Frozen retrieval and completion reservations.
         completion_contract: Frozen completion reservations, or ``None`` for v1 callers.
         remaining_cost_usd: Reconciled cell budget remaining under the durable lease.
+        stop_on_overspend: When true, an exhausted remainder blocks the next episode.
 
     Returns:
-        Structured zero-dispatch failure when no reconciled spend remains.
+        Structured zero-dispatch failure when stop mode finds no reconciled spend remaining.
 
     Raises:
         SimulationConfigurationError: A configured reservation is missing or unpriced.
@@ -341,8 +350,10 @@ def episode_reservation_failure(
     if query is None:  # pragma: no cover - grounding settings require it
         raise SimulationConfigurationError("query-embedding reservation is missing")
     if completion_contract is None:
-        return query_reservation_failure(query, remaining_cost_usd)
-    if remaining_cost_usd > 0:
+        return query_reservation_failure(
+            query, remaining_cost_usd, stop_on_overspend=stop_on_overspend
+        )
+    if remaining_cost_usd > 0 or not stop_on_overspend:
         return None
     return StructuredFailure(
         code=FailureCode.BUDGET,

@@ -974,7 +974,7 @@ def test_worst_case_query_reservation_never_blocks_an_episode_with_spend_remaini
 def test_expensive_episode_estimate_dispatches_until_actual_spend_reaches_the_ceiling(
     tmp_path: Path,
 ) -> None:
-    """Dispatch under an oversized episode estimate and stop only on reconciled spend.
+    """Stop mode dispatches under an oversized estimate and stops only on reconciled spend.
 
     Args:
         tmp_path: Isolated project root used to verify one real dispatch then a spend stop.
@@ -1033,6 +1033,7 @@ def test_expensive_episode_estimate_dispatches_until_actual_spend_reaches_the_ce
             world_model=settings,
             completion_contract_input=completion_input,
             maximum_cost_usd=0.1,
+            stop_on_overspend=True,
         )
     )
     rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
@@ -1175,7 +1176,7 @@ def test_text_simulation_normalizes_agent_tool_attempts_to_unsupported_cells(
 
 
 def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path: Path) -> None:
-    """A length finish is durable evidence, then later selected cells become budget failures."""
+    """In stop mode a length finish is durable evidence, then later cells are budget failures."""
     cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
     plan = _plan(cells)
     store = _store(tmp_path)
@@ -1201,7 +1202,13 @@ def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path
         candidate_client,
         world_client,
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=0.5)
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a", "cell-b"),
+        maximum_cost_usd=0.5,
+        stop_on_overspend=True,
+    )
 
     artifact_set = simulator.run(spec)
     length_rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
@@ -1218,7 +1225,7 @@ def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path
 def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
     tmp_path: Path,
 ) -> None:
-    """Block retrieval and later paid cells after unknown candidate spend.
+    """Stop mode blocks retrieval and later paid cells after unknown candidate spend.
 
     Args:
         tmp_path: Isolated project root for failure evidence.
@@ -1249,7 +1256,13 @@ def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
         candidate_client,
         world_client,
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a", "cell-b"),
+        maximum_cost_usd=1.0,
+        stop_on_overspend=True,
+    )
 
     artifact_set = simulator.run(spec)
     second_rollout = simulator._load_rollout(artifact_set.artifact_ids[1])
@@ -1517,8 +1530,8 @@ def test_retrieval_dispatch_failure_persists_a_zero_incremental_reservation(
 def test_prior_attempt_reservation_charges_the_ceiling_before_retry(tmp_path: Path) -> None:
     """A superseded unknown-spend attempt keeps its worst-case charge on retry admission.
 
-    The retry is blocked as a budget outcome once that charged reservation alone reaches the
-    configured ceiling, without dispatching a second provider call.
+    In stop mode the retry is blocked as a budget outcome once that charged reservation alone
+    reaches the configured ceiling, without dispatching a second provider call.
 
     Args:
         tmp_path: Isolated project root for durable reservation evidence.
@@ -1549,6 +1562,7 @@ def test_prior_attempt_reservation_charges_the_ceiling_before_retry(tmp_path: Pa
         ("cell-a",),
         completion_contract_input=completion_input,
         maximum_cost_usd=0.4 * call_reservation,
+        stop_on_overspend=True,
     )
 
     first_set = simulator.run(spec)
@@ -1571,7 +1585,7 @@ def test_prior_attempt_reservation_charges_the_ceiling_before_retry(tmp_path: Pa
 
 
 def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: Path) -> None:
-    """A dispatched timeout has unknown spend, so no second paid cell may be sent."""
+    """In stop mode a dispatched timeout has unknown spend, so no second paid cell is sent."""
     cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
     plan = _plan(cells)
     store = _store(tmp_path)
@@ -1592,7 +1606,13 @@ def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: P
     )
 
     artifact_set = simulator.run(
-        _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=0.01)
+        _spec(
+            plan_input,
+            task_set_input,
+            ("cell-a", "cell-b"),
+            maximum_cost_usd=0.01,
+            stop_on_overspend=True,
+        )
     )
     first = simulator._load_rollout(artifact_set.artifact_ids[0])
     second = simulator._load_rollout(artifact_set.artifact_ids[1])
@@ -1611,7 +1631,7 @@ def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: P
 def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_persists(
     tmp_path: Path,
 ) -> None:
-    """A stale tombstone is a budget barrier while its durable rollout is still pending."""
+    """In stop mode a stale tombstone is a budget barrier while its rollout is still pending."""
     cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
     plan = _plan(cells)
     store = _store(tmp_path)
@@ -1638,7 +1658,13 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
         candidate_client,
         world_client,
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a", "cell-b"),
+        maximum_cost_usd=1.0,
+        stop_on_overspend=True,
+    )
     selected, world_model, grounded_world_model = recovery._validate_spec_and_bindings(spec)
     canonical_spec, spec_input = persist_canonical_specification(store, spec)
     resolution, resolution_input, bindings = recovery._persist_resolution(

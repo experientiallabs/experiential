@@ -169,6 +169,7 @@ class TextCellLeaseStore:
         maximum_cost_usd: float | None,
         rollout_completed: Callable[[ArtifactId], bool],
         observed_spend_usd: Callable[[], float | None],
+        stop_on_overspend: bool = False,
         cancelled: Callable[[], bool] | None = None,
     ) -> TextCellLeaseClaim:
         """Atomically reserve one paid cell, or wait for its completed immutable artifact.
@@ -181,8 +182,10 @@ class TextCellLeaseStore:
             binding_sha256: Full cell binding digest, checked against any existing claim.
             maximum_cost_usd: Optional run-wide ceiling shared by the selected cells.
             rollout_completed: Checks a lease's expected immutable rollout by artifact identity.
-            observed_spend_usd: Returns known spend for completed cells or ``None`` when it is
-                unpriced and later paid work must fail closed.
+            observed_spend_usd: Returns known spend for completed cells or ``None`` when a
+                dispatched cell's spend is unpriced.
+            stop_on_overspend: When true, unknown or ceiling-reaching spend blocks admission;
+                by default the authorized run continues with a logged warning.
             cancelled: Optional cooperative cancellation probe checked before and during waits.
 
         Returns:
@@ -211,6 +214,7 @@ class TextCellLeaseStore:
                     maximum_cost_usd=maximum_cost_usd,
                     rollout_completed=rollout_completed,
                     observed_spend_usd=observed_spend_usd,
+                    stop_on_overspend=stop_on_overspend,
                     lock_timeout_seconds=min(self._poll_interval_seconds, remaining),
                 )
             except FileLockTimeout:
@@ -294,6 +298,7 @@ class TextCellLeaseStore:
         maximum_cost_usd: float | None,
         rollout_completed: Callable[[ArtifactId], bool],
         observed_spend_usd: Callable[[], float | None],
+        stop_on_overspend: bool,
         lock_timeout_seconds: float,
     ) -> TextCellLeaseClaim | None:
         """Make one lock-protected admission attempt, returning ``None`` for a live follower."""
@@ -337,6 +342,7 @@ class TextCellLeaseStore:
                 maximum_cost_usd=maximum_cost_usd,
                 observed_spend_usd=spend,
                 active_leases=active_leases,
+                stop_on_overspend=stop_on_overspend,
             )
             if contended:
                 return None
@@ -364,8 +370,18 @@ class TextCellLeaseStore:
         maximum_cost_usd: float | None,
         observed_spend_usd: float | None,
         active_leases: tuple[TextCellLease, ...],
+        stop_on_overspend: bool,
     ) -> tuple[float | None, bool]:
-        """Reserve all available budget, or wait until every live reservation resolves."""
+        """Reserve budget for one paid cell under the selected overspend policy.
+
+        By default the finite budget authorizes the run upfront, so admission never fails on
+        spend: once reconciled spend reaches the authorized amount, or a prior dispatch left
+        spend unknown, the cell is admitted with a logged warning and a conservative
+        whole-budget reservation. In stop mode unknown or ceiling-reaching spend yields no
+        reservation, so the caller blocks the cell instead of dispatching it. Finite-budget
+        cells serialize on live reservations in both modes so spend reconciliation stays
+        exact.
+        """
         if maximum_cost_usd is None:
             return None, False
         for lease in active_leases:
@@ -377,13 +393,32 @@ class TextCellLeaseStore:
                 raise TextCellLeaseError(
                     "finite-budget text simulation has an unreserved active paid-cell claim"
                 )
-        if observed_spend_usd is None:
-            return None, False
+        if stop_on_overspend:
+            if observed_spend_usd is None:
+                return None, False
+            if active_leases:
+                return None, True
+            remaining_ceiling = maximum_cost_usd - observed_spend_usd
+            if remaining_ceiling <= 0:
+                return None, False
+            return remaining_ceiling, False
         if active_leases:
             return None, True
+        if observed_spend_usd is None:
+            logger.warning(
+                "prior simulation spend is unknown; admitting the next paid cell because the "
+                "run is already authorized"
+            )
+            return maximum_cost_usd, False
         remaining_ceiling = maximum_cost_usd - observed_spend_usd
         if remaining_ceiling <= 0:
-            return None, False
+            logger.warning(
+                "reconciled simulation spend $%.4f reached the authorized $%.4f; continuing "
+                "because the run is already authorized",
+                observed_spend_usd,
+                maximum_cost_usd,
+            )
+            return maximum_cost_usd, False
         return remaining_ceiling, False
 
     def _active_leases_for(

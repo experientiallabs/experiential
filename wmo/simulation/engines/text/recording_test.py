@@ -1,5 +1,6 @@
 """Tests for text-only candidate recording and preflight boundaries."""
 
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
@@ -219,6 +220,8 @@ def _recorder(
     candidate_request: CompletionCostReservation | None = None,
     world_request: CompletionCostReservation | None = None,
     active_input_price: float | None = 1.0,
+    maximum_cost_usd: float = 10.0,
+    stop_on_overspend: bool = False,
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -231,6 +234,8 @@ def _recorder(
         candidate_request: Optional secure candidate request reservation.
         world_request: Optional secure world-model request reservation.
         active_input_price: Active catalog input price for secure reservation tests.
+        maximum_cost_usd: Reconciled provider-spend ceiling for the recorded cell.
+        stop_on_overspend: Fail before the next paid dispatch once spend reaches the ceiling.
 
     Returns:
         Recorder configured for one deterministic task.
@@ -283,7 +288,8 @@ def _recorder(
         candidate_request=candidate_request,
         world_model_request=world_request,
         completion_maximum_attempts=1,
-        maximum_cost_usd=10.0,
+        maximum_cost_usd=maximum_cost_usd,
+        stop_on_overspend=stop_on_overspend,
         maximum_steps=2,
         maximum_output_tokens=16_000,
         redacted_field_names=frozenset(),
@@ -613,3 +619,68 @@ def test_recorder_fails_closed_on_rebound_response_identity_but_allows_explicit_
         ).output.content
         == "served"
     )
+
+
+def test_default_recorder_warns_once_and_continues_after_spend_reaches_the_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """By default reconciled spend crossing the ceiling logs one warning and keeps dispatching.
+
+    Args:
+        caplog: Captured recorder log records.
+    """
+    candidate_snapshot = _snapshot("candidate-a")
+    world_snapshot = _snapshot("world-model-a")
+    candidate_client = _ScriptedClient(
+        [
+            _response("first turn", model=candidate_snapshot),
+            _response("second turn", model=candidate_snapshot),
+        ]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response('{"message":"continue","terminal":false}', model=world_snapshot),
+            _response('{"message":"done","terminal":true}', model=world_snapshot),
+        ]
+    )
+    recorder = _recorder(candidate_client, world_client, maximum_cost_usd=0.05)
+
+    with caplog.at_level(logging.WARNING, logger="wmo.simulation.engines.text.recording"):
+        recorder.complete(
+            ModelRequest(messages=(ModelMessage(role="user", content="My delivery is late."),))
+        )
+        response = recorder.complete(
+            ModelRequest(messages=(ModelMessage(role="user", content="Any update?"),))
+        )
+
+    assert response.output.content == "second turn"
+    assert len(candidate_client.requests) == 2
+    warnings = [record for record in caplog.records if "already authorized" in record.message]
+    assert len(warnings) == 1
+
+
+def test_stop_mode_recorder_blocks_the_next_dispatch_after_spend_reaches_the_ceiling() -> None:
+    """Stop mode fails closed before the next paid call once reconciled spend hits the ceiling."""
+    candidate_snapshot = _snapshot("candidate-a")
+    world_snapshot = _snapshot("world-model-a")
+    candidate_client = _ScriptedClient([_response("first turn", model=candidate_snapshot)])
+    world_client = _ScriptedClient(
+        [_response('{"message":"continue","terminal":false}', model=world_snapshot)]
+    )
+    recorder = _recorder(
+        candidate_client,
+        world_client,
+        maximum_cost_usd=0.15,
+        stop_on_overspend=True,
+    )
+
+    recorder.complete(
+        ModelRequest(messages=(ModelMessage(role="user", content="My delivery is late."),))
+    )
+    with pytest.raises(TextSimulationError) as error:
+        recorder.complete(
+            ModelRequest(messages=(ModelMessage(role="user", content="Any update?"),))
+        )
+
+    assert error.value.stop_reason == StopReason.MAXIMUM_COST
+    assert len(candidate_client.requests) == 1

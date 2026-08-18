@@ -68,6 +68,11 @@ def router(
         16_000, "--simulation-maximum-output-tokens", min=8_000
     ),
     maximum_concurrency: int = typer.Option(1, "--maximum-concurrency", min=1),
+    stop_on_overspend: bool = typer.Option(
+        False,
+        "--stop-on-overspend",
+        help="Stop before the next paid step once reconciled spend reaches the ceiling.",
+    ),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -90,6 +95,8 @@ def router(
         maximum_retrieval_query_tokens: Input ceiling for each grounded retrieval query.
         simulation_maximum_output_tokens: Candidate and world-model output ceiling per turn.
         maximum_concurrency: Maximum simulation workers.
+        stop_on_overspend: Block the next paid dispatch once reconciled spend reaches the
+            ceiling instead of warning and completing the authorized run.
         yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
         non_interactive: Refuse prompts and require complete repeatable inputs.
 
@@ -107,6 +114,7 @@ def router(
         maximum_retrieval_query_tokens=maximum_retrieval_query_tokens,
         simulation_maximum_output_tokens=simulation_maximum_output_tokens,
         maximum_concurrency=maximum_concurrency,
+        stop_on_overspend=stop_on_overspend,
     )
     effective_noninteractive = non_interactive or not can_prompt(_console)
     with usage_error(OSError, ValueError):

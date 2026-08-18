@@ -527,6 +527,7 @@ class WorldModelSimulator:
                 maximum_cost_usd=spec.maximum_cost_usd,
                 rollout_completed=lambda item: load_optional_rollout(self._store, item) is not None,
                 observed_spend_usd=lambda: self._known_resolution_spend(bindings, resolution_input),
+                stop_on_overspend=spec.stop_on_overspend,
             )
         except TextCellLeaseError as exc:
             raise SimulationResumeError(
@@ -670,6 +671,7 @@ class WorldModelSimulator:
             settings,
             completion_contract=self._completion_contract,
             remaining_cost_usd=maximum_cell_cost_usd,
+            stop_on_overspend=spec.stop_on_overspend,
         )
         if reservation_failure is not None:
             return self._failure_rollout(
@@ -705,6 +707,7 @@ class WorldModelSimulator:
                 else 1
             ),
             maximum_cost_usd=maximum_cell_cost_usd,
+            stop_on_overspend=spec.stop_on_overspend,
             maximum_steps=spec.maximum_steps,
             maximum_output_tokens=settings.maximum_output_tokens,
             redacted_field_names=self._redacted_field_names,
@@ -840,7 +843,7 @@ class WorldModelSimulator:
         *,
         attempt: int = 0,
     ) -> RolloutArtifact:
-        """Represent a cell rejected by the durable finite-spend admission reservation."""
+        """Represent a cell rejected by stop-on-overspend finite-spend admission."""
         failure = StructuredFailure(
             code=FailureCode.BUDGET,
             message="simulation spend is unknown or its durable reservation exhausted the ceiling",

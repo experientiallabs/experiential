@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import time
 from collections.abc import Callable
@@ -98,16 +99,21 @@ from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
 
+logger = logging.getLogger(__name__)
+
 
 class RouterCompositionBudget(ContractModel):
     """Finite dispatch ceilings required by the composed customer workflow.
 
     ``maximum_simulation_cost_usd`` is one shared provider-spend pool: simulation and judging
-    both draw from it as reconciled actual cost, with no estimate-based carve-outs.
+    both draw from it as reconciled actual cost, with no estimate-based carve-outs. By default it
+    authorizes the whole run, so spend crossing it logs a warning and the run completes;
+    ``stop_on_overspend`` instead blocks the next dispatch once reconciled spend reaches it.
     """
 
     maximum_simulation_cost_usd: float = Field(gt=0)
     maximum_judgments: int = Field(gt=0)
+    stop_on_overspend: bool = False
 
     @field_validator("maximum_simulation_cost_usd")
     @classmethod
@@ -116,6 +122,13 @@ class RouterCompositionBudget(ContractModel):
         if not math.isfinite(value):
             raise ValueError("simulation budget must be finite")
         return value
+
+
+def _spend_ceiling_crossed(stop_on_overspend: bool, error: str, detail: str) -> None:
+    """Fail closed in stop mode or log that the authorized run continues past its ceiling."""
+    if stop_on_overspend:
+        raise RouterCompositionError(error)
+    logger.warning("%s; continuing because the run is already authorized", detail)
 
 
 @dataclass(frozen=True)
@@ -307,6 +320,7 @@ def compose_router(
         code_revision,
         fit_cells,
         phase="fit",
+        stop_on_overspend=budget.stop_on_overspend,
     )
     fit_set = _run_or_load_simulation(
         project,
@@ -318,7 +332,12 @@ def compose_router(
     )
     fit_spend = _verified_simulation_spend(project, fit_set, setup)
     if fit_spend > budget.maximum_simulation_cost_usd:
-        raise RouterCompositionError("verified fit simulation spend exceeds the total budget")
+        _spend_ceiling_crossed(
+            budget.stop_on_overspend,
+            "verified fit simulation spend exceeds the total budget",
+            f"verified fit simulation spend ${fit_spend:.4f} exceeds the authorized "
+            f"${budget.maximum_simulation_cost_usd:.4f}",
+        )
     fit_evidence, fit_consumed, fit_judge_spend = _complete_cell_evidence(
         project,
         plan_input,
@@ -329,6 +348,7 @@ def compose_router(
         services.judge,
         budget.maximum_judgments,
         remaining_cost_usd=budget.maximum_simulation_cost_usd - fit_spend,
+        stop_on_overspend=budget.stop_on_overspend,
         progress=progress,
         progress_detail="fit",
     )
@@ -338,8 +358,11 @@ def compose_router(
     if remaining_cost_usd <= 0 and any(
         cell.purpose == "held_out" and cell.execution == "simulate" for cell in plan.cells
     ):
-        raise RouterCompositionError(
-            "fit simulation and judging consumed the total budget; held-out dispatch is blocked"
+        _spend_ceiling_crossed(
+            budget.stop_on_overspend,
+            "fit simulation and judging consumed the total budget; held-out dispatch is blocked",
+            f"fit simulation and judging consumed the authorized "
+            f"${budget.maximum_simulation_cost_usd:.4f} before held-out dispatch",
         )
     fit_config = RouterFitConfig(
         fit=EvaluationInputs(
@@ -373,11 +396,12 @@ def compose_router(
         plan_input,
         task_input,
         setup,
-        remaining_cost_usd,
+        remaining_cost_usd if budget.stop_on_overspend else budget.maximum_simulation_cost_usd,
         plan.created_at,
         code_revision,
         held_cells,
         phase="heldout",
+        stop_on_overspend=budget.stop_on_overspend,
     )
     held_set = _run_or_load_simulation(
         project,
@@ -389,7 +413,12 @@ def compose_router(
     )
     held_out_spend = _verified_simulation_spend(project, held_set, setup)
     if math.fsum((fit_spend, held_out_spend)) > budget.maximum_simulation_cost_usd:
-        raise RouterCompositionError("verified composed simulation spend exceeds the total budget")
+        _spend_ceiling_crossed(
+            budget.stop_on_overspend,
+            "verified composed simulation spend exceeds the total budget",
+            f"verified composed simulation spend ${math.fsum((fit_spend, held_out_spend)):.4f} "
+            f"exceeds the authorized ${budget.maximum_simulation_cost_usd:.4f}",
+        )
     held_evidence, _held_dispatched, _held_judge_spend = _complete_cell_evidence(
         project,
         plan_input,
@@ -401,6 +430,7 @@ def compose_router(
         budget.maximum_judgments - fit_consumed,
         remaining_cost_usd=budget.maximum_simulation_cost_usd
         - math.fsum((fit_spend, fit_judge_spend, held_out_spend)),
+        stop_on_overspend=budget.stop_on_overspend,
         progress=progress,
         progress_detail="held-out",
     )
@@ -737,6 +767,7 @@ def _complete_cell_evidence(
     maximum_judgments: int,
     *,
     remaining_cost_usd: float,
+    stop_on_overspend: bool,
     progress: ProgressHook | None = None,
     progress_detail: str | None = None,
 ) -> tuple[tuple[EvaluationCellEvidence, ...], int, float]:
@@ -746,10 +777,11 @@ def _complete_cell_evidence(
     judgment is dispatched again under that same consumed reservation, so a judge failure never
     strands the project and never widens the finite judgment budget.
 
-    Judgments draw from the shared provider pool as reconciled actual spend: a new dispatch is
-    admitted while accumulated judge spend stays under ``remaining_cost_usd`` and blocked once
-    real spend reaches it, never on a planning estimate. The returned total covers every
-    judgment bound to the evidence so later phases subtract actual, not estimated, judge cost.
+    Judgments draw from the shared provider pool as reconciled actual spend, never a planning
+    estimate. Once accumulated judge spend reaches ``remaining_cost_usd``, ``stop_on_overspend``
+    blocks the next dispatch; by default the authorized run logs one warning and keeps judging.
+    The returned total covers every judgment bound to the evidence so later phases subtract
+    actual, not estimated, judge cost.
     """
     rollouts_by_cell = {}
     for rollout_id in simulated_rollout_ids:
@@ -809,6 +841,7 @@ def _complete_cell_evidence(
 
     evidence = []
     consumed = 0
+    overspend_warned = False
     judge_spend_usd = math.fsum(
         _known_judgment_spend(judgment) for judgment in judgments_by_rollout.values()
     )
@@ -856,10 +889,15 @@ def _complete_cell_evidence(
             raise RouterCompositionError("judgment dispatch budget exhausted")
         if judgment is None:
             if judge_spend_usd >= remaining_cost_usd:
-                raise RouterCompositionError(
-                    "reconciled provider spend reached the shared ceiling before judgment "
-                    "dispatch; increase --maximum-simulation-cost-usd and rerun to resume"
-                )
+                if stop_on_overspend or not overspend_warned:
+                    _spend_ceiling_crossed(
+                        stop_on_overspend,
+                        "reconciled provider spend reached the shared ceiling before judgment "
+                        "dispatch; increase --maximum-simulation-cost-usd and rerun to resume",
+                        f"reconciled judge spend ${judge_spend_usd:.4f} reached the shared "
+                        f"authorized remainder ${remaining_cost_usd:.4f}",
+                    )
+                    overspend_warned = True
             if receipt is None:
                 if consumed >= maximum_judgments:
                     raise RouterCompositionError("judgment dispatch budget exhausted")

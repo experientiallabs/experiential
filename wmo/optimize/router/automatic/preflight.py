@@ -89,6 +89,7 @@ class AutomaticRouterOptions:
     simulation_maximum_output_tokens: int = 16_000
     maximum_concurrency: int = 1
     seed: int = 0
+    stop_on_overspend: bool = False
 
 
 @dataclass(frozen=True)

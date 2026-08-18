@@ -181,6 +181,7 @@ def optimize_project_router(
         budget=RouterCompositionBudget(
             maximum_simulation_cost_usd=preflight.remaining_simulation_cost_usd,
             maximum_judgments=options.maximum_judgments,
+            stop_on_overspend=options.stop_on_overspend,
         ),
         created_at=created_at,
         code_revision=code_revision,

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
@@ -52,6 +53,8 @@ from wmo.simulation.retrieval import RAGAction, RAGQuery
 
 if TYPE_CHECKING:
     from wmo.simulation.world_model import GroundedWorldModel
+
+logger = logging.getLogger(__name__)
 
 
 class TextSimulationError(RuntimeError):
@@ -123,6 +126,7 @@ class RecordingCandidateClient:
         world_model_request: CompletionCostReservation | None,
         completion_maximum_attempts: int,
         maximum_cost_usd: float,
+        stop_on_overspend: bool,
         maximum_steps: int,
         maximum_output_tokens: int,
         redacted_field_names: frozenset[str],
@@ -141,6 +145,8 @@ class RecordingCandidateClient:
             world_model_request: Frozen world-model request ceiling for finite-cost execution.
             completion_maximum_attempts: Active provider request-attempt ceiling.
             maximum_cost_usd: Spend remaining for candidate, retrieval, and world-model calls.
+            stop_on_overspend: When true, reconciled spend reaching the ceiling blocks the
+                next dispatch; by default the authorized episode warns once and continues.
             maximum_steps: Maximum candidate model turns allowed in this episode.
             maximum_output_tokens: Per-call output budget used without silent truncation.
             redacted_field_names: Project fields redacted before events persist.
@@ -156,6 +162,7 @@ class RecordingCandidateClient:
         self._world_model_request = world_model_request
         self._completion_maximum_attempts = completion_maximum_attempts
         self._maximum_cost_usd = maximum_cost_usd
+        self._stop_on_overspend = stop_on_overspend
         self._maximum_steps = maximum_steps
         self._maximum_output_tokens = maximum_output_tokens
         self._redacted_field_names = redacted_field_names
@@ -173,6 +180,7 @@ class RecordingCandidateClient:
         self._failure: TextSimulationError | None = None
         self._provider_dispatch_unknown_spend = False
         self._unknown_dispatch_reserved_cost_usd: float | None = None
+        self._overspend_warned = False
 
     @property
     def terminal_error(self) -> TextSimulationError | None:
@@ -330,16 +338,13 @@ class RecordingCandidateClient:
                 maximum_attempts=self._completion_maximum_attempts,
                 role="candidate",
             )
-            _require_completion_budget(
+            _require_completion_request_bounds(
                 role="candidate",
                 reservation=self._candidate_request,
                 request=candidate_request,
                 token_counter=self._token_counter,
-                candidate_responses=tuple(self._candidate_responses),
-                world_model_responses=tuple(self._world_model_responses),
-                prior_retrieval=tuple(self._retrieval_economics),
-                maximum_cost_usd=self._maximum_cost_usd,
             )
+        self._check_spend_ceiling(role="candidate")
         candidate_started_at = timestamp(self._clock)
         candidate_response = self._dispatch_provider(
             lambda: self._candidate.client.complete(candidate_request),
@@ -389,12 +394,7 @@ class RecordingCandidateClient:
             rag_query,
             self._query_embedding,
         )
-        _require_query_budget(
-            candidate_responses=tuple(self._candidate_responses),
-            world_model_responses=tuple(self._world_model_responses),
-            prior_retrieval=tuple(self._retrieval_economics),
-            maximum_cost_usd=self._maximum_cost_usd,
-        )
+        self._check_spend_ceiling(role="query embedding")
         self._retrieval_economics.append(query_economics)
         prepared = self._dispatch_provider(
             lambda: self._grounded_world_model.prepare_turn(
@@ -423,16 +423,13 @@ class RecordingCandidateClient:
                 maximum_attempts=self._completion_maximum_attempts,
                 role="world model",
             )
-            _require_completion_budget(
+            _require_completion_request_bounds(
                 role="world model",
                 reservation=self._world_model_request,
                 request=prepared.request,
                 token_counter=self._token_counter,
-                candidate_responses=tuple(self._candidate_responses),
-                world_model_responses=tuple(self._world_model_responses),
-                prior_retrieval=tuple(self._retrieval_economics),
-                maximum_cost_usd=self._maximum_cost_usd,
             )
+        self._check_spend_ceiling(role="world model")
         world_started_at = timestamp(self._clock, not_before=candidate_ended_at)
         dispatched = self._dispatch_provider(
             lambda: self._grounded_world_model.complete_turn(prepared),
@@ -492,6 +489,61 @@ class RecordingCandidateClient:
         self._terminal = transition.terminal
         return candidate_response
 
+    def _check_spend_ceiling(self, *, role: str) -> None:
+        """Apply the episode's overspend policy before one paid dispatch.
+
+        Reconciled actual spend is compared against the cell ceiling: in stop mode unknown
+        prior spend or a reached ceiling fails the episode closed before dispatch, and by
+        default the authorized episode logs one warning and continues.
+
+        Args:
+            role: Candidate, query embedding, or world-model label for safe diagnostics.
+
+        Raises:
+            TextSimulationError: Stop mode found unknown prior spend or a reached ceiling.
+        """
+        phase = f"{role.replace(' ', '_')}_budget"
+        costs = [
+            *(response.economics.cost_usd for response in self._candidate_responses),
+            *(response.economics.cost_usd for response in self._world_model_responses),
+            *(economics.cost_usd for economics in self._retrieval_economics),
+        ]
+        if any(cost is None for cost in costs):
+            if self._stop_on_overspend:
+                raise _text_failure(
+                    StopReason.MAXIMUM_COST,
+                    FailureCode.BUDGET,
+                    f"{role} call is blocked because prior provider spend is unknown",
+                    phase=phase,
+                )
+            if not self._overspend_warned:
+                logger.warning(
+                    "prior provider spend is unknown before the %s call; continuing because "
+                    "the run is already authorized",
+                    role,
+                )
+                self._overspend_warned = True
+            return
+        total = math.fsum(cast(NumericMeasurement, cost).value for cost in costs)
+        if total < self._maximum_cost_usd:
+            return
+        if self._stop_on_overspend:
+            raise _text_failure(
+                StopReason.MAXIMUM_COST,
+                FailureCode.BUDGET,
+                f"reconciled provider spend reached the simulation ceiling before the {role} call",
+                phase=phase,
+            )
+        if not self._overspend_warned:
+            logger.warning(
+                "reconciled provider spend $%.4f reached the simulation ceiling $%.4f before "
+                "the %s call; continuing because the run is already authorized",
+                total,
+                self._maximum_cost_usd,
+                role,
+            )
+            self._overspend_warned = True
+
     def _dispatch_provider[ResultT](
         self,
         operation: Callable[[], ResultT],
@@ -526,79 +578,26 @@ class RecordingCandidateClient:
         self._unknown_dispatch_reserved_cost_usd = None
 
 
-def _require_query_budget(
-    *,
-    candidate_responses: Sequence[ModelResponse],
-    world_model_responses: Sequence[ModelResponse],
-    prior_retrieval: Sequence[OperationEconomics],
-    maximum_cost_usd: float,
-) -> None:
-    """Refuse an embedding call once reconciled prior spend reaches the ceiling.
-
-    A pending query's conservative economics never gate dispatch: only accumulated actual
-    spend does, so a large estimate cannot end an episode that still has real budget.
-
-    Args:
-        candidate_responses: Completed candidate calls in this cell.
-        world_model_responses: Completed world-model calls in this cell.
-        prior_retrieval: Estimated query-embedding costs already dispatched in this cell.
-        maximum_cost_usd: Remaining provider-spend ceiling assigned to this cell.
-
-    Raises:
-        TextSimulationError: Prior spend is unknown or has reached the ceiling.
-    """
-    costs = [
-        *(response.economics.cost_usd for response in candidate_responses),
-        *(response.economics.cost_usd for response in world_model_responses),
-        *(economics.cost_usd for economics in prior_retrieval),
-    ]
-    if any(cost is None for cost in costs):
-        raise _text_failure(
-            StopReason.MAXIMUM_COST,
-            FailureCode.BUDGET,
-            "query embedding is blocked because prior provider spend is unknown",
-            phase="query_embedding_budget",
-        )
-    total = math.fsum(cast(NumericMeasurement, cost).value for cost in costs)
-    if total >= maximum_cost_usd:
-        raise _text_failure(
-            StopReason.MAXIMUM_COST,
-            FailureCode.BUDGET,
-            "reconciled provider spend reached the simulation ceiling before the query",
-            phase="query_embedding_budget",
-        )
-
-
-def _require_completion_budget(
+def _require_completion_request_bounds(
     *,
     role: str,
     reservation: CompletionCostReservation,
     request: ModelRequest,
     token_counter: TokenCounter,
-    candidate_responses: Sequence[ModelResponse],
-    world_model_responses: Sequence[ModelResponse],
-    prior_retrieval: Sequence[OperationEconomics],
-    maximum_cost_usd: float,
 ) -> None:
-    """Refuse one completion on a hard request bound or exhausted reconciled spend.
+    """Refuse one completion whose pending request breaks a hard reservation bound.
 
-    The pending request must fit the model's real context-derived ceilings, and dispatch is
-    blocked once accumulated actual spend reaches the cell ceiling. The priced pending cost is
-    a planning value only and never gates dispatch on its own.
+    The pending request must fit the model's real context-derived ceilings. The priced
+    pending cost is a planning value only and never gates dispatch on its own.
 
     Args:
         role: Candidate or world-model label for safe diagnostics.
         reservation: Exact active retry-bound request reservation.
         request: Complete provider-neutral pending request.
         token_counter: Conservative full serialized request counter.
-        candidate_responses: Completed candidate calls in this cell.
-        world_model_responses: Completed world-model calls in this cell.
-        prior_retrieval: Completed conservative retrieval costs in this cell.
-        maximum_cost_usd: Provider-spend ceiling assigned to the cell.
 
     Raises:
-        TextSimulationError: Prior spend is unknown, a hard request bound fails, or spend
-            reached the ceiling.
+        TextSimulationError: The request lacks an output ceiling or exceeds a hard bound.
     """
     output_tokens = request.maximum_output_tokens
     if output_tokens is None:
@@ -621,26 +620,6 @@ def _require_completion_budget(
             str(exc),
             phase=f"{role.replace(' ', '_')}_budget",
         ) from exc
-    costs = [
-        *(response.economics.cost_usd for response in candidate_responses),
-        *(response.economics.cost_usd for response in world_model_responses),
-        *(economics.cost_usd for economics in prior_retrieval),
-    ]
-    if any(cost is None for cost in costs):
-        raise _text_failure(
-            StopReason.MAXIMUM_COST,
-            FailureCode.BUDGET,
-            f"{role} call is blocked because prior provider spend is unknown",
-            phase=f"{role.replace(' ', '_')}_budget",
-        )
-    total = math.fsum(cast(NumericMeasurement, cost).value for cost in costs)
-    if total >= maximum_cost_usd:
-        raise _text_failure(
-            StopReason.MAXIMUM_COST,
-            FailureCode.BUDGET,
-            f"reconciled provider spend reached the simulation ceiling before the {role} call",
-            phase=f"{role.replace(' ', '_')}_budget",
-        )
 
 
 def _verify_completion_budget_binding(
