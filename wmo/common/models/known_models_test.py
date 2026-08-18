@@ -157,9 +157,29 @@ def test_documented_anthropic_model_prices_both_cache_operations() -> None:
     assert known.maximum_output_tokens == 128_000
 
 
-def test_documented_gemini_flash_lite_carries_complete_candidate_metadata() -> None:
-    """The Gemini flash-lite entry states verified limits and every published price."""
-    known = known_model_metadata("gemini", "models/gemini-3.5-flash-lite")
+@pytest.mark.parametrize(
+    ("model", "input_usd", "output_usd", "cached_input_usd"),
+    [
+        ("gemini-3.6-flash", 1.5, 7.5, 0.15),
+        ("gemini-3.5-flash", 1.5, 9.0, 0.15),
+        ("gemini-3.5-flash-lite", 0.3, 2.5, 0.03),
+    ],
+)
+def test_every_gemini_chat_entry_has_complete_verified_metadata(
+    model: str,
+    input_usd: float,
+    output_usd: float,
+    cached_input_usd: float,
+) -> None:
+    """Every maintained Gemini chat entry has verified limits and every published price.
+
+    Args:
+        model: Canonical Gemini model identifier.
+        input_usd: Documented input price per million tokens.
+        output_usd: Documented output price per million tokens.
+        cached_input_usd: Documented cached-input price per million tokens.
+    """
+    known = known_model_metadata("gemini", f"models/{model}")
 
     assert known is not None
     assert known.supports_completions
@@ -168,10 +188,22 @@ def test_documented_gemini_flash_lite_carries_complete_candidate_metadata() -> N
     assert known.supports_temperature is True
     assert known.context_window_tokens == 1_048_576
     assert known.maximum_output_tokens == 65_536
-    assert known.input_cost_per_million_tokens_usd == 0.3
-    assert known.output_cost_per_million_tokens_usd == 2.5
-    assert known.cached_input_cost_per_million_tokens_usd == 0.03
+    assert known.input_cost_per_million_tokens_usd == input_usd
+    assert known.output_cost_per_million_tokens_usd == output_usd
+    assert known.cached_input_cost_per_million_tokens_usd == cached_input_usd
     assert known.cache_write_cost_per_million_tokens_usd == 0.0
+
+
+def test_documented_gemini_embedding_model_serves_embeddings_only() -> None:
+    """The Gemini embedding entry has its verified input price and token limit."""
+    known = known_model_metadata("gemini", "models/gemini-embedding-001")
+
+    assert known is not None
+    assert known.supports_embeddings
+    assert not known.supports_completions
+    assert known.context_window_tokens == 2_048
+    assert known.input_cost_per_million_tokens_usd == 0.15
+    assert known.output_cost_per_million_tokens_usd is None
 
 
 @pytest.mark.parametrize(
