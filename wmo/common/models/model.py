@@ -16,15 +16,14 @@ ModelAlias = ArtifactId
 
 ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
 
-DEFAULT_BULK_REASONING_EFFORT: Final[ReasoningEffort] = "medium"
-"""Reasoning effort used for bulk simulation and judging dispatch by default.
+DEFAULT_REASONING_EFFORT: Final[ReasoningEffort] = "medium"
+"""Reasoning effort pinned by default for models known to accept the parameter.
 
-Bulk world-model rollouts and judge calls are high-volume background work whose wall time is
-dominated by reasoning tokens. OpenAI documents ``medium`` as the balanced default effort and
-recommends lowering effort for latency- and throughput-sensitive workloads, so bulk dispatch
-uses ``medium`` unless the caller overrides it. The override is applied only to aliases whose
-catalog capabilities pin a reasoning effort, which is the proof that the provider accepts the
-parameter; user-facing serving keeps the catalog pin untouched.
+OpenAI documents ``medium`` as the balanced default effort and recommends lowering effort for
+latency- and throughput-sensitive workloads, so provider setup pins ``medium`` on every
+reasoning-capable model unless the user picks a different effort for that entry. Every request
+through the resolved client, serving and optimization alike, uses the entry's pinned effort;
+models without a pinned effort never receive the parameter.
 """
 
 

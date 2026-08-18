@@ -9,14 +9,12 @@ from dataclasses import dataclass
 from wmo.common.core.artifacts import ArtifactInput, Sha256, sha256_json
 from wmo.common.judging import CalibrationReport, JudgeCalibration, verify_persisted_calibration
 from wmo.common.models import (
-    DEFAULT_BULK_REASONING_EFFORT,
     CandidateTokenPrice,
     CompletionCostReservation,
     EmbeddingCostReservation,
     ModelCapabilities,
     ModelCatalog,
     ModelSnapshot,
-    ReasoningEffort,
     RoutedCandidateSnapshot,
     RouterCandidateSelection,
     load_model_catalog,
@@ -92,7 +90,6 @@ class AutomaticRouterOptions:
     maximum_concurrency: int = 1
     seed: int = 0
     stop_on_overspend: bool = False
-    bulk_reasoning_effort: ReasoningEffort = DEFAULT_BULK_REASONING_EFFORT
 
 
 @dataclass(frozen=True)

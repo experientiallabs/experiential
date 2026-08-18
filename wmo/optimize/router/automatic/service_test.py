@@ -231,24 +231,16 @@ class _RuntimeCatalog:
         embedding = _EmbeddingClient(self._state) if capabilities.supports_embeddings else None
         return ResolvedModel(alias, snapshot, capabilities, completion, embedding)
 
-    def preflight(
-        self,
-        alias: str,
-        _requirement: object | None = None,
-        *,
-        reasoning_effort: str | None = None,
-    ) -> ResolvedModel:
+    def preflight(self, alias: str, _requirement: object | None = None) -> ResolvedModel:
         """Reuse deterministic resolution for locally verified fixture capabilities.
 
         Args:
             alias: Current catalog alias.
             _requirement: Production capability requirement already represented by fixture data.
-            reasoning_effort: Bulk request-shaping override recorded by the runtime seam.
 
         Returns:
             Exact deterministic resolved model.
         """
-        del reasoning_effort
         return self.resolve(alias)
 
     def with_catalog(self, catalog: ModelCatalog) -> _RuntimeCatalog:

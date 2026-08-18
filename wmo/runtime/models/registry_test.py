@@ -24,7 +24,7 @@ from wmo.runtime.models.providers.tinker_sampling import (
     TinkerSample,
     TinkerSampler,
 )
-from wmo.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from wmo.runtime.models.providers.transport import ScriptedJsonTransport
 from wmo.runtime.models.registry import ModelConnectionError, RuntimeModelCatalog
 
 _DEFAULT_CAPABILITIES = ModelCapabilities(
@@ -258,79 +258,6 @@ def test_model_capability_snapshot_has_exact_limits_and_fails_closed_when_absent
             "fixture-model",
             CapabilityRequirement(minimum_context_window_tokens=1),
         )
-
-
-def _scripted_openai_text_response() -> JsonHttpResponse:
-    """Return one minimal completed OpenAI Responses body for wire-shape assertions."""
-    return JsonHttpResponse(
-        status_code=200,
-        body={
-            "id": "resp_fixture",
-            "object": "response",
-            "created_at": 1.0,
-            "status": "completed",
-            "model": "fixture-model",
-            "parallel_tool_calls": True,
-            "tool_choice": "auto",
-            "tools": [],
-            "output": [
-                {
-                    "type": "message",
-                    "id": "msg_fixture",
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [{"type": "output_text", "text": "ok", "annotations": []}],
-                }
-            ],
-        },
-    )
-
-
-def test_resolve_reasoning_override_replaces_only_a_pinned_catalog_effort() -> None:
-    """A bulk override lowers a pinned effort and never reaches unpinned models."""
-    pinned_transport = ScriptedJsonTransport([_scripted_openai_text_response()])
-    pinned = RuntimeModelCatalog(
-        _catalog(
-            capabilities=ModelCapabilities(
-                supports_temperature=False,
-                reasoning_effort="xhigh",
-            )
-        ),
-        environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=lambda: pinned_transport,
-    )
-    request = ModelRequest(messages=(ModelMessage(role="user", content="hello"),))
-
-    pinned.resolve("fixture-model", reasoning_effort="medium").client.complete(request)
-
-    assert pinned_transport.requests[0][2]["reasoning"] == {"effort": "medium"}
-
-    unpinned_transport = ScriptedJsonTransport([_scripted_openai_text_response()])
-    unpinned = RuntimeModelCatalog(
-        _catalog(capabilities=ModelCapabilities()),
-        environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=lambda: unpinned_transport,
-    )
-
-    unpinned.preflight("fixture-model", reasoning_effort="medium").client.complete(request)
-
-    assert "reasoning" not in unpinned_transport.requests[0][2]
-
-    serving_transport = ScriptedJsonTransport([_scripted_openai_text_response()])
-    serving = RuntimeModelCatalog(
-        _catalog(
-            capabilities=ModelCapabilities(
-                supports_temperature=False,
-                reasoning_effort="xhigh",
-            )
-        ),
-        environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=lambda: serving_transport,
-    )
-
-    serving.resolve("fixture-model").client.complete(request)
-
-    assert serving_transport.requests[0][2]["reasoning"] == {"effort": "xhigh"}
 
 
 def test_tinker_resolution_uses_runtime_owned_default_construction(

@@ -11,6 +11,7 @@ from wmo.cli.model_picker import (
     declare_model,
     render_summary,
     select_models,
+    select_reasoning_efforts,
 )
 from wmo.cli.picker_test import ScriptedConsole
 from wmo.cli.provider_picker import (
@@ -327,10 +328,47 @@ def test_unverified_router_candidates_and_incumbent_can_be_retained() -> None:
     assert roles.incumbent == "legacy-a"
 
 
+def test_reasoning_effort_screens_pin_each_new_reasoning_model_separately() -> None:
+    """Each new reasoning-capable entry gets its own effort screen defaulting to its pin."""
+    console = ScriptedConsole("5\n\n")
+
+    updated = select_reasoning_efforts((_CHAT, _OTHER_CHAT, _EMBEDDER), console=console)
+
+    assert updated is not None
+    first, second, third = updated
+    assert first.capabilities is not None
+    assert first.capabilities.reasoning_effort == "xhigh"
+    assert second.capabilities is not None
+    assert second.capabilities.reasoning_effort == "medium"
+    assert third.capabilities is not None
+    assert third.capabilities.reasoning_effort is None
+    assert "Reasoning effort for luna" in console.output
+    assert "Reasoning effort for terra" in console.output
+
+
+def test_reasoning_effort_screens_skip_already_configured_aliases() -> None:
+    """Configured aliases keep their persisted pin without showing an effort screen."""
+    configured = AvailableModel(
+        alias="luna",
+        connection="openai",
+        provider="openai",
+        model="gpt-5.6-luna",
+        capabilities=_CHAT.capabilities,
+        pricing_source=PricingSource.CONFIGURED,
+        configured=True,
+    )
+    console = ScriptedConsole("")
+
+    updated = select_reasoning_efforts((configured, _EMBEDDER), console=console)
+
+    assert updated == (configured, _EMBEDDER)
+    assert "Reasoning effort" not in console.output
+
+
 def test_manual_declaration_stays_behind_the_advanced_row() -> None:
     """A hand-declared model is only reachable from the explicit advanced row."""
     session = _session(_CHAT, advanced_models=True)
-    console = ScriptedConsole("2\n\n1\nprivate-model\ny\nn\ny\ny\nn\nn\n2\n6\n0.5\n0.75\n\n")
+    console = ScriptedConsole("2\n\n1\nprivate-model\ny\nn\ny\ny\nn\nn\n2\n6\n0.5\n0.75\n\n\n")
 
     selected = select_models(session, console=console)
 
@@ -342,6 +380,7 @@ def test_manual_declaration_stays_behind_the_advanced_row() -> None:
     assert declared.capabilities is not None
     assert declared.capabilities.supports_tools
     assert declared.capabilities.input_cost_per_million_tokens_usd == 2.0
+    assert declared.capabilities.reasoning_effort is None
 
 
 def test_manual_declaration_requires_a_prepared_connection() -> None:

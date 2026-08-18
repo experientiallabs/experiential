@@ -27,6 +27,7 @@ from wmo.cli.model_picker import (
     model_selection,
     render_summary,
     select_models,
+    select_reasoning_efforts,
     select_router_candidates,
 )
 from wmo.cli.provider_picker import (
@@ -354,6 +355,10 @@ def _collect_models_and_roles(
             return None
         session.selected = selected
         chosen = tuple(item for item in available_models(session) if item.alias in selected)
+        adjusted = select_reasoning_efforts(chosen, console=console)
+        if adjusted is None:
+            continue
+        chosen = adjusted
         roles = assign_roles(chosen, role_inputs=role_inputs, console=console)
         if roles is None:
             continue

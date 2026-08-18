@@ -11,7 +11,8 @@ render the single summary shown before setup saves anything.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import get_args
 
 from rich.console import Console
 from rich.prompt import Confirm
@@ -35,6 +36,7 @@ from wmo.common.models import (
     PricingSource,
     ProviderModelSelection,
     ProviderSetup,
+    ReasoningEffort,
     RouterCandidateSelection,
     SetupRole,
     derive_model_alias,
@@ -43,6 +45,8 @@ from wmo.common.models import (
 )
 
 _MANUAL_MODEL_ROW = "declare-model-manually"
+_NO_REASONING_EFFORT = "none"
+_REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
 
 
 @dataclass(frozen=True)
@@ -178,6 +182,7 @@ def declare_model(session: SetupSession, *, console: Console) -> AvailableModel 
         )
         if supports_completions
         else None,
+        reasoning_effort=_ask_reasoning_effort(console=console) if supports_completions else None,
     )
     taken = frozenset(item.alias for item in available_models(session))
     return AvailableModel(
@@ -189,6 +194,88 @@ def declare_model(session: SetupSession, *, console: Console) -> AvailableModel 
         pricing_source=PricingSource.CONFIGURED,
         configured=False,
     )
+
+
+def _parse_reasoning_effort(value: str) -> ReasoningEffort | None:
+    """Return the reasoning effort named by a picker value, or ``None`` for no pin."""
+    return next((effort for effort in _REASONING_EFFORTS if effort == value), None)
+
+
+def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
+    """Choose an optional reasoning-effort pin for one manually declared completion model.
+
+    Args:
+        console: Terminal used for the screen.
+
+    Returns:
+        The chosen effort, or ``None`` so the parameter is never sent.
+
+    Raises:
+        SetupCancelled: The user cancelled setup.
+    """
+    result = choose_one(
+        console,
+        title="Reasoning effort (pin only for models accepting the OpenAI reasoning parameter)",
+        options=[
+            PickerOption(
+                value=_NO_REASONING_EFFORT,
+                label="none",
+                detail="never send the reasoning parameter",
+            ),
+            *(PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS),
+        ],
+        default=_NO_REASONING_EFFORT,
+    )
+    if result.action is PickerAction.CANCEL:
+        raise SetupCancelled
+    if result.action is PickerAction.BACK:
+        return None
+    return _parse_reasoning_effort(result.values[0])
+
+
+def select_reasoning_efforts(
+    chosen: tuple[AvailableModel, ...],
+    *,
+    console: Console,
+) -> tuple[AvailableModel, ...] | None:
+    """Pin one reasoning effort per new reasoning-capable model entry.
+
+    Only newly selected models whose verified metadata proves reasoning-effort support show a
+    screen; each defaults to the entry's current pin. Already-configured aliases keep their
+    persisted pin, and models without proven support are never asked and never pinned.
+
+    Args:
+        chosen: Models the user selected.
+        console: Terminal used for the screens.
+
+    Returns:
+        The selection with confirmed pins, or ``None`` when the user asked to go back.
+
+    Raises:
+        SetupCancelled: The user cancelled setup.
+    """
+    updated = list(chosen)
+    for position, item in enumerate(chosen):
+        capabilities = item.capabilities
+        if item.configured or capabilities is None or capabilities.reasoning_effort is None:
+            continue
+        result = choose_one(
+            console,
+            title=f"Reasoning effort for {item.alias}",
+            options=[PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS],
+            default=capabilities.reasoning_effort,
+        )
+        if result.action is PickerAction.CANCEL:
+            raise SetupCancelled
+        if result.action is PickerAction.BACK:
+            return None
+        effort = _parse_reasoning_effort(result.values[0])
+        if effort != capabilities.reasoning_effort:
+            updated[position] = replace(
+                item,
+                capabilities=capabilities.model_copy(update={"reasoning_effort": effort}),
+            )
+    return tuple(updated)
 
 
 def assign_roles(
@@ -621,6 +708,7 @@ def render_summary(
             f"embeddings={capabilities.supports_embeddings}, "
             f"structured_output={capabilities.supports_structured_output}, "
             f"completions={capabilities.supports_completions}, "
+            f"reasoning_effort={capabilities.reasoning_effort or 'none'}, "
             f"context={capabilities.context_window_tokens}, "
             f"max_output={capabilities.maximum_output_tokens}, "
             f"pricing={item.pricing_source.value}{retained}"

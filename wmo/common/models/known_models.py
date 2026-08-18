@@ -28,6 +28,7 @@ class KnownModel:
     supports_tools: bool = False
     supports_structured_output: bool = False
     supports_temperature: bool | None = None
+    supports_reasoning_effort: bool = False
     context_window_tokens: int | None = None
     maximum_output_tokens: int | None = None
     input_cost_per_million_tokens_usd: float | None = None
@@ -46,6 +47,7 @@ def _chat(
     maximum_output_tokens: int | None = None,
     supports_temperature: bool | None = True,
     supports_structured_output: bool = True,
+    supports_reasoning_effort: bool = False,
 ) -> KnownModel:
     """Describe one documented chat model with its verified protocol capabilities.
 
@@ -58,6 +60,8 @@ def _chat(
         maximum_output_tokens: Documented output ceiling, when the provider publishes one.
         supports_temperature: Whether the model accepts an explicit temperature parameter.
         supports_structured_output: Whether the model supports structured outputs.
+        supports_reasoning_effort: Whether the model accepts an explicit reasoning-effort
+            parameter on the OpenAI Responses API.
 
     Returns:
         The verified metadata record for the model.
@@ -67,6 +71,7 @@ def _chat(
         supports_tools=True,
         supports_structured_output=supports_structured_output,
         supports_temperature=supports_temperature,
+        supports_reasoning_effort=supports_reasoning_effort,
         context_window_tokens=context_window_tokens,
         maximum_output_tokens=maximum_output_tokens,
         input_cost_per_million_tokens_usd=input_usd,
@@ -103,6 +108,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5.6-terra": _chat(
         input_usd=2.0,
@@ -112,6 +118,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5.6-luna": _chat(
         input_usd=0.2,
@@ -121,6 +128,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5.5": _chat(
         input_usd=5.0,
@@ -130,6 +138,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5.5-pro": _chat(
         input_usd=30.0,
@@ -138,6 +147,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5.4": _chat(
         input_usd=2.5,
@@ -147,6 +157,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5.4-mini": _chat(
         input_usd=0.75,
@@ -156,6 +167,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5.4-nano": _chat(
         input_usd=0.2,
@@ -165,6 +177,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5.4-pro": _chat(
         input_usd=30.0,
@@ -174,6 +187,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5.2": _chat(
         input_usd=1.75,
@@ -183,6 +197,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5.2-pro": _chat(
         input_usd=21.0,
@@ -192,6 +207,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5.1": _chat(
         input_usd=1.25,
@@ -201,6 +217,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5": _chat(
         input_usd=1.25,
@@ -210,6 +227,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5-mini": _chat(
         input_usd=0.25,
@@ -219,6 +237,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5-nano": _chat(
         input_usd=0.05,
@@ -228,6 +247,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "gpt-5-pro": _chat(
         input_usd=15.0,
@@ -236,6 +256,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=400_000,
         maximum_output_tokens=272_000,
         supports_temperature=False,
+        supports_reasoning_effort=True,
     ),
     "text-embedding-3-small": _embedding(input_usd=0.02, context_window_tokens=8_192),
     "text-embedding-3-large": _embedding(input_usd=0.13, context_window_tokens=8_192),
