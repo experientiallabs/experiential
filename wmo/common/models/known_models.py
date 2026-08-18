@@ -306,7 +306,14 @@ _ANTHROPIC_MODELS: dict[str, KnownModel] = {
 _GEMINI_MODELS: dict[str, KnownModel] = {
     "gemini-3.6-flash": _chat(input_usd=1.5, cached_input_usd=0.15, output_usd=7.5),
     "gemini-3.5-flash": _chat(input_usd=1.5, cached_input_usd=0.15, output_usd=9.0),
-    "gemini-3.5-flash-lite": _chat(input_usd=0.3, cached_input_usd=0.03, output_usd=2.5),
+    "gemini-3.5-flash-lite": _chat(
+        input_usd=0.3,
+        cached_input_usd=0.03,
+        cache_write_usd=0.0,
+        output_usd=2.5,
+        context_window_tokens=1_048_576,
+        maximum_output_tokens=65_536,
+    ),
     "gemini-embedding-001": _embedding(input_usd=0.15),
 }
 

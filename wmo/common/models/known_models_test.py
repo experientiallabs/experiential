@@ -157,6 +157,23 @@ def test_documented_anthropic_model_prices_both_cache_operations() -> None:
     assert known.maximum_output_tokens == 128_000
 
 
+def test_documented_gemini_flash_lite_carries_complete_candidate_metadata() -> None:
+    """The Gemini flash-lite entry states verified limits and every published price."""
+    known = known_model_metadata("gemini", "models/gemini-3.5-flash-lite")
+
+    assert known is not None
+    assert known.supports_completions
+    assert known.supports_tools
+    assert known.supports_structured_output
+    assert known.supports_temperature is True
+    assert known.context_window_tokens == 1_048_576
+    assert known.maximum_output_tokens == 65_536
+    assert known.input_cost_per_million_tokens_usd == 0.3
+    assert known.output_cost_per_million_tokens_usd == 2.5
+    assert known.cached_input_cost_per_million_tokens_usd == 0.03
+    assert known.cache_write_cost_per_million_tokens_usd == 0.0
+
+
 @pytest.mark.parametrize(
     ("provider", "model"),
     [
