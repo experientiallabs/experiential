@@ -88,7 +88,15 @@ def build_manual_judge_reviewer(
     )
     missing = tuple(key for key in expected if key not in explicit.labels)
     if non_interactive and missing:
-        raise ValueError("missing labels: " + ", ".join(_display_key(key) for key in missing))
+        value_hint = (
+            "winner_a|winner_b|tie"
+            if setup.prompt_template.response_shape == "pairwise"
+            else "SCORE"
+        )
+        raise ValueError(
+            "missing labels: supply "
+            + " ".join(f"--label {_display_key(key)}={value_hint}" for key in missing)
+        )
 
     def review(proposal: ManualJudgeTraceProposal) -> tuple[ManualJudgeAxisDecision, ...]:
         """Render one trace and return explicit decisions for all proposed axes.

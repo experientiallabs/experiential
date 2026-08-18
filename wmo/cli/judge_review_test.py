@@ -431,6 +431,54 @@ def test_noninteractive_multi_axis_inputs_accept_and_correct_independently() -> 
     )
 
 
+def test_noninteractive_missing_labels_list_ready_to_paste_expressions() -> None:
+    """The non-interactive error lists one paste-ready --label expression per missing key."""
+    proposal = _proposal(_trace("trace-a", completion="Done.", failed=False), multi_axis=True)
+
+    with pytest.raises(ValueError) as excinfo:
+        review_module.build_manual_judge_reviewer(
+            _setup(),
+            proposal.rubric,
+            _previews(proposal),
+            drafted_labels=(),
+            supplied_labels=(),
+            supplied_judgments=(),
+            non_interactive=True,
+            character_limit=1_200,
+            page=False,
+            console=Console(file=io.StringIO(), width=100, color_system=None),
+        )
+
+    message = str(excinfo.value)
+    assert message.startswith("missing labels: supply ")
+    assert "--label trace-a:task-success=SCORE" in message
+    assert "--label trace-a:policy-compliance=SCORE" in message
+
+
+def test_noninteractive_missing_pairwise_labels_list_typed_winner_values() -> None:
+    """The pairwise non-interactive error shows the typed winner values to paste."""
+    trace = _trace("trace-a", completion="Candidate A finished.", failed=False)
+    reference = _trace("trace-b", completion="Candidate B finished.", failed=False)
+    proposal = _proposal(trace, reference=reference)
+
+    with pytest.raises(ValueError) as excinfo:
+        review_module.build_manual_judge_reviewer(
+            _setup(response_shape="pairwise"),
+            proposal.rubric,
+            _previews(proposal),
+            drafted_labels=(),
+            supplied_labels=(),
+            supplied_judgments=(),
+            non_interactive=True,
+            character_limit=1_200,
+            page=False,
+            console=Console(file=io.StringIO(), width=100, color_system=None),
+        )
+
+    message = str(excinfo.value)
+    assert "--label trace-a:trace-b:task-success=winner_a|winner_b|tie" in message
+
+
 def test_noninteractive_scalar_score_respects_the_saved_axis_range() -> None:
     """Explicit scalar corrections cannot leave the finalized inclusive range."""
     proposal = _proposal(_trace("trace-a", completion="Done.", failed=False))

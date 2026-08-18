@@ -1023,7 +1023,8 @@ def test_calibration_reports_then_approves_and_replays_without_calls(tmp_path: P
     assert reviewed.approved_calibration is None
     assert reviewed.provider_calls_made == 3
     assert len(client.requests) == 3
-    assert reviewed.report.worst_disagreements
+    assert reviewed.report.worst_disagreements == ()
+    assert reviewed.report.out_of_fold_predictions
 
     approved = calibrate_manual_judge(
         store,
