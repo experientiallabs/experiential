@@ -31,7 +31,9 @@ from wmo.common.models import (
     ProviderConnection,
     ProviderSetup,
     ReasoningEffort,
+    ResolvedDiscoveredModel,
     SetupRole,
+    canonical_model_id,
     derive_connection_name,
     derive_model_alias,
     resolve_discovered_model,
@@ -543,7 +545,10 @@ def _discover_models(
                 continue
             return () if recovery == _RECOVERY_SKIP else None
         resolved = tuple(resolve_discovered_model(model) for model in discovered)
-        usable = tuple(model for model in resolved if served_roles(model.capabilities))
+        usable = _canonical_models(
+            tuple(model for model in resolved if served_roles(model.capabilities)),
+            provider=provider,
+        )
         if not usable:
             console.print(f"[yellow]{label} published no model with verified metadata.[/yellow]")
             recovery = _recover(f"{label} has no configurable model", console=console)
@@ -567,6 +572,30 @@ def _discover_models(
                 )
             )
         return tuple(models)
+
+
+def _canonical_models(
+    usable: tuple[ResolvedDiscoveredModel, ...],
+    *,
+    provider: str,
+) -> tuple[ResolvedDiscoveredModel, ...]:
+    """Collapse dated snapshots and pointer aliases onto one row per documented model.
+
+    Args:
+        usable: Discovered models whose metadata can serve at least one role.
+        provider: Selected provider kind.
+
+    Returns:
+        One model per canonical identity, preferring the shortest published ID.
+    """
+    by_identity: dict[str, ResolvedDiscoveredModel] = {}
+    for model in usable:
+        identity = canonical_model_id(provider, model.model)
+        held = by_identity.get(identity)
+        if held is None or len(model.model) < len(held.model):
+            by_identity[identity] = model
+    kept = frozenset(model.model for model in by_identity.values())
+    return tuple(model for model in usable if model.model in kept)
 
 
 def _recover(title: str, *, console: Console) -> str:

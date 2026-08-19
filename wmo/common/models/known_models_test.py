@@ -16,6 +16,8 @@ from wmo.common.models.known_models import (
     [
         ("openai", "GPT-5.6-Sol", "gpt-5.6-sol"),
         ("openai", "gpt-5.1-20260210", "gpt-5.1"),
+        ("openai", "gpt-5.4-2026-03-05", "gpt-5.4"),
+        ("openai", "gpt-4.1-2025-04-14", "gpt-4.1"),
         ("anthropic", "claude-haiku-4-5-20251001", "claude-haiku-4-5"),
         ("anthropic", "claude-sonnet-5-latest", "claude-sonnet-5"),
         ("gemini", "models/gemini-3.5-flash", "gemini-3.5-flash"),

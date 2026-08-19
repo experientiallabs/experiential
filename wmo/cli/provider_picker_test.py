@@ -210,6 +210,34 @@ def test_canonical_environment_credential_is_used_without_any_prompt() -> None:
     assert "OPENAI_API_KEY is set" not in console.output
 
 
+def test_dated_snapshots_and_pointer_aliases_collapse_onto_the_base_model_row() -> None:
+    """One documented model appears once even when the listing publishes its snapshots."""
+    console = ScriptedConsole("")
+    lister = _FakeLister(
+        {
+            "openai": [
+                (
+                    DiscoveredModel(provider="openai", model="gpt-5.6-luna-2026-01-15"),
+                    _LUNA,
+                    DiscoveredModel(provider="openai", model="gpt-5.6-luna-latest"),
+                    _TERRA,
+                )
+            ]
+        }
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("openai",),
+        lister=lister,
+        environment={"OPENAI_API_KEY": "secret-key"},
+    )
+
+    assert prepared is not None
+    _, models = prepared
+    assert [model.model for model in models] == ["gpt-5.6-luna", "gpt-5.6-terra"]
+
+
 def test_missing_credential_is_pasted_masked_and_stays_process_local(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
