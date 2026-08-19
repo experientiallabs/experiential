@@ -56,6 +56,7 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
             "max_completion_tokens": 123,
             "stop": ["END", "STOP"],
             "temperature": 0.2,
+            "top_p": 1,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -87,6 +88,8 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
     assert request.tool_choice.name == "weather"
     assert request.maximum_output_tokens == 123
     assert request.stop == ("END", "STOP")
+    assert request.temperature == 0.2
+    assert request.top_p == 1.0
     assert request.structured_text is not None and request.structured_text.strict
     assert request.include_usage
     assert request.metadata == {"cohort": "test"}
@@ -211,6 +214,45 @@ def test_invalid_tool_arguments_and_conflicting_operation_headers_are_specific()
         )
     assert operation.value.detail.code == "idempotency_conflict"
     assert operation.value.detail.param == "Idempotency-Key"
+
+
+def test_chat_decoder_accepts_opencode_nucleus_and_usage_stream_shape() -> None:
+    """OpenCode Chat Completions send top_p=1 with streamed usage and must decode losslessly."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hello"}],
+            "top_p": 1,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+    )
+
+    assert decoded.request.top_p == 1.0
+    assert decoded.request.stream
+    assert decoded.request.include_usage
+
+
+def test_chat_decoder_rejects_out_of_range_top_p() -> None:
+    """Nucleus sampling stays inside the official [0, 1] interval."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hello"}],
+                "top_p": 1.5,
+            }
+        )
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "top_p"
+
+
+def test_responses_decoder_still_rejects_top_p() -> None:
+    """Responses keeps top_p excluded so Chat support does not widen that surface."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_responses({"model": "coding", "input": "hello", "top_p": 1})
+    assert captured.value.detail.code == "unsupported_parameter"
+    assert captured.value.detail.param == "top_p"
 
 
 def test_empty_responses_input_is_a_public_protocol_error() -> None:

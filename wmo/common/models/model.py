@@ -419,6 +419,7 @@ class ModelRequest(ContractModel):
         tools: Tool schemas available for this turn.
         tool_choice: Optional automatic, disabled, required, or named-tool selection.
         temperature: Optional sampling temperature.
+        top_p: Optional nucleus-sampling probability mass in ``[0, 1]``.
         maximum_output_tokens: Optional upper bound for generated tokens.
     """
 
@@ -426,6 +427,7 @@ class ModelRequest(ContractModel):
     tools: tuple[ToolSchema, ...] = ()
     tool_choice: Literal["auto", "none", "required"] | ToolChoice | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, ge=0, le=1)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")

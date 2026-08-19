@@ -97,6 +97,7 @@ def _request(
         ),
         tool_choice=tool_choice,
         temperature=0.2,
+        top_p=1.0,
         maximum_output_tokens=128,
     )
 
@@ -109,6 +110,8 @@ def test_openai_compatible_request_keeps_history_tools_and_non_streaming_cap() -
 
     assert payload["stream"] is False
     assert payload["max_tokens"] == 128
+    assert payload["temperature"] == 0.2
+    assert payload["top_p"] == 1.0
     assert payload["tool_choice"] == {
         "type": "function",
         "function": {"name": "create_ticket"},
@@ -132,6 +135,17 @@ def test_openai_compatible_request_keeps_history_tools_and_non_streaming_cap() -
             "function": {"name": "create_ticket", "arguments": '{"priority": "normal"}'},
         }
     ]
+
+
+def test_openai_compatible_request_omits_absent_top_p() -> None:
+    """Buffered Chat payloads do not invent a nucleus-sampling value."""
+    payload = openai_compatible_request(
+        "fake-model",
+        ModelRequest(messages=(ModelMessage(role="user", content="hello"),)),
+    )
+
+    assert "top_p" not in payload
+    assert "temperature" not in payload
 
 
 def test_openai_compatible_client_converts_tool_usage_and_resolved_identity() -> None:

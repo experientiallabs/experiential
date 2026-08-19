@@ -63,6 +63,7 @@ def model_request(request: GatewayRequest) -> ModelRequest:
         tools=tools,
         tool_choice=choice,
         temperature=request.temperature,
+        top_p=request.top_p,
         maximum_output_tokens=request.maximum_output_tokens,
     )
 

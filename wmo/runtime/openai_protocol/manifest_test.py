@@ -35,6 +35,8 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert chat["audio"] == CompatibilityDisposition.UNSUPPORTED
     assert chat["n"] == CompatibilityDisposition.UNSUPPORTED
     assert chat["logprobs"] == CompatibilityDisposition.UNSUPPORTED
+    assert chat["top_p"] == CompatibilityDisposition.SUPPORTED
     assert responses["background"] == CompatibilityDisposition.UNSUPPORTED
     assert responses["conversation"] == CompatibilityDisposition.UNSUPPORTED
     assert responses["include"] == CompatibilityDisposition.UNSUPPORTED
+    assert responses["top_p"] == CompatibilityDisposition.UNSUPPORTED

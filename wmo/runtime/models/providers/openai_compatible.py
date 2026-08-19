@@ -88,6 +88,8 @@ def openai_compatible_request(model_id: str, request: ModelRequest) -> JsonObjec
         )
     if request.temperature is not None:
         payload["temperature"] = request.temperature
+    if request.top_p is not None:
+        payload["top_p"] = request.top_p
     if request.maximum_output_tokens is not None:
         payload["max_tokens"] = request.maximum_output_tokens
     return payload

@@ -160,6 +160,7 @@ class _ChatRequest(_WireModel):
     max_completion_tokens: int | None = Field(default=None, gt=0)
     stop: str | tuple[str, ...] | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, ge=0, le=1)
     response_format: _ChatResponseFormat | None = None
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None
@@ -285,6 +286,7 @@ def decode_chat(
             maximum_output_tokens=maximum,
             stop=stop,
             temperature=request.temperature,
+            top_p=request.top_p,
             stream=request.stream,
             include_usage=(
                 request.stream_options is not None and request.stream_options.include_usage

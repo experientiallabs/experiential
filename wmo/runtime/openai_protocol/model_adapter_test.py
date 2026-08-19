@@ -43,6 +43,7 @@ def test_model_request_preserves_messages_tools_and_limits() -> None:
         ),
         tool_choice=GatewayNamedToolChoice(name="lookup"),
         temperature=0.25,
+        top_p=1.0,
         maximum_output_tokens=128,
     )
 
@@ -53,6 +54,8 @@ def test_model_request_preserves_messages_tools_and_limits() -> None:
     assert adapted.messages[1].assistant_action.tool_calls[0].arguments == {"q": 1}
     assert isinstance(adapted.tool_choice, ToolChoice)
     assert adapted.tool_choice.name == "lookup"
+    assert adapted.temperature == 0.25
+    assert adapted.top_p == 1.0
     assert adapted.maximum_output_tokens == 128
 
 

@@ -168,6 +168,8 @@ def openai_compatible_stream_payload(model_id: str, request: GatewayRequest) -> 
         payload["max_tokens"] = request.maximum_output_tokens
     if request.temperature is not None:
         payload["temperature"] = request.temperature
+    if request.top_p is not None:
+        payload["top_p"] = request.top_p
     if request.stop:
         payload["stop"] = list(request.stop)
     return payload

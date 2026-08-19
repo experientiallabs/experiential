@@ -117,6 +117,7 @@ class GatewayRequest(ContractModel):
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     stop: tuple[str, ...] = ()
     temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, ge=0, le=1)
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)

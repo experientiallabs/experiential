@@ -32,6 +32,7 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "max_completion_tokens",
                 "stop",
                 "temperature",
+                "top_p",
                 "stream",
                 "stream_options",
             )
@@ -67,7 +68,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "service_tier",
                 "store",
                 "top_logprobs",
-                "top_p",
                 "user",
                 "verbosity",
                 "web_search_options",
