@@ -214,6 +214,7 @@ class _EvidenceSetupSupplier:
                 project.artifacts,
                 candidate_aliases=("candidate-baseline", "candidate-economy"),
                 snapshot=_snapshot,
+                code_revision=self.revision,
             ),
             agent_id="agent-a",
             seed=16,
@@ -225,8 +226,13 @@ class _EvidenceSetupSupplier:
 class _EvidenceSimulatorFactory:
     """Bind the actual text simulator to deterministic local model-client fakes."""
 
-    def __init__(self) -> None:
-        """Initialize deterministic candidate clients and a call counter."""
+    def __init__(self, revision: str) -> None:
+        """Initialize deterministic candidate clients and a call counter.
+
+        Args:
+            revision: Exact checkout revision bound to persisted reservations.
+        """
+        self.revision = revision
         self.calls = 0
         self.candidates = {
             "candidate-baseline": _ScriptedClient(
@@ -304,6 +310,7 @@ class _EvidenceSimulatorFactory:
                 project.artifacts,
                 candidate_aliases=("candidate-baseline", "candidate-economy"),
                 snapshot=_snapshot,
+                code_revision=self.revision,
             ),
             clock=lambda: _TIME,
             monotonic=lambda: 1.0,
@@ -436,7 +443,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
         issues=(),
     )
     completed_build = _bind_completed_build(project, normalized, revision=revision)
-    simulator = _EvidenceSimulatorFactory()
+    simulator = _EvidenceSimulatorFactory(revision)
     judge = _EvidenceJudge(revision)
     runtime_catalog = _RuntimeCatalog()
     services = RouterWorkflowServices(

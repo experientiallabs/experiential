@@ -507,6 +507,7 @@ def _persist_completion_contract(
     snapshot: Callable[[str], ModelSnapshot] | None = None,
     candidate_maximum_input_tokens: int = 80_000,
     candidate_maximum_output_tokens: int = 16_000,
+    code_revision: str = "test-revision",
 ) -> ArtifactInput:
     """Persist the complete candidate and world reservation fixture.
 
@@ -516,6 +517,7 @@ def _persist_completion_contract(
         snapshot: Exact model-identity factory, or the shared simulator-test snapshot.
         candidate_maximum_input_tokens: Hard candidate input admission ceiling.
         candidate_maximum_output_tokens: Candidate provider output ceiling.
+        code_revision: Exact producer revision bound to the contract artifact.
 
     Returns:
         Exact completion-contract manifest input.
@@ -543,7 +545,7 @@ def _persist_completion_contract(
         ),
         maximum_attempts=1,
         created_at=_TIME,
-        code_revision="test-revision",
+        code_revision=code_revision,
     )
     return contract_input
 
