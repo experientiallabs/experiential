@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-WMO_DIR = Path(__file__).resolve().parent.parent
+WMO_DIR = Path(__file__).resolve().parent.parent.parent
 
 
 def test_forbidden_provider_imports_are_absent() -> None:

@@ -17,7 +17,7 @@ from wmo.common.core.artifacts import sha256_json
 from wmo.common.project import ArtifactStore
 
 _REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-_REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+_REPOSITORY_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def exact_checkout_revision() -> str:

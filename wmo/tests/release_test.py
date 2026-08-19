@@ -238,7 +238,7 @@ def _tracked_sdist_members() -> frozenset[str]:
             "conftest.py",
             "wmo",
         ],
-        cwd=Path(__file__).resolve().parent.parent,
+        cwd=Path(__file__).resolve().parent.parent.parent,
         capture_output=True,
         text=True,
         check=True,
@@ -2892,7 +2892,7 @@ def test_gateway_canary_scanner_covers_every_persistent_and_observable_channel(
 
 def test_package_workflow_installs_the_exact_certified_openai_sdk() -> None:
     """The archive smoke lane constrains the SDK version claimed by certification."""
-    repository = Path(__file__).resolve().parent.parent
+    repository = Path(__file__).resolve().parent.parent.parent
     workflow = (repository / ".github" / "workflows" / "python-package.yml").read_text(
         encoding="utf-8"
     )
@@ -2906,7 +2906,7 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     Args:
         tmp_path: Pytest-owned build, virtual environment, and execution root.
     """
-    repository = Path(__file__).resolve().parent.parent
+    repository = Path(__file__).resolve().parent.parent.parent
     distribution = tmp_path / "dist"
     virtual_environment = tmp_path / "venv"
     execution = tmp_path / "execution"
@@ -3027,7 +3027,7 @@ def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
 
 def test_documentation_index_commands_and_release_scope_are_current() -> None:
     """Every indexed doc exists and release docs name current commands and explicit exclusions."""
-    repository = Path(__file__).resolve().parent.parent
+    repository = Path(__file__).resolve().parent.parent.parent
     docs = repository / "docs"
     index = (docs / "README.md").read_text(encoding="utf-8")
     indexed_paths = re.findall(r"\| `([^`]+\.md)` \|", index)

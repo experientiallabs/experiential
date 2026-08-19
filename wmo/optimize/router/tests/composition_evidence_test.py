@@ -53,7 +53,6 @@ from wmo.optimize.router.composition_test import (
     _snapshot,
 )
 from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
-from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
@@ -64,9 +63,10 @@ from wmo.simulation.engines.text.simulator_test import (
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.retrieval import load_fit_rag_retriever, load_rag_index
-from wmo.simulation.retrieval.retrieval_test import _message_trace as _trace
+from wmo.simulation.retrieval.tests.retrieval_test import _message_trace as _trace
 from wmo.simulation.specs import WorldModelSettings
 from wmo.simulation.world_model import bind_fit_grounded_world_model
+from wmo.tests.release_revision_test import exact_checkout_revision, verify_release_evidence
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 

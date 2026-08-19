@@ -79,7 +79,7 @@ from wmo.simulation.retrieval import (
     load_fit_rag_retriever,
     persist_trace_rag,
 )
-from wmo.simulation.retrieval.retrieval_test import _persist_traces
+from wmo.simulation.retrieval.tests.retrieval_test import _persist_traces
 from wmo.simulation.retrieval.transitions import render_rag_key
 from wmo.simulation.specs import (
     CandidateCompletionReservation,
