@@ -126,8 +126,8 @@ def reconcile_alias_activation(
         refusal_failover: Whether typed precommit refusals may advance.
 
     Returns:
-        ``True`` for the exact active revision, ``False`` for a proven absence or mismatch, and
-        ``None`` when a fresh SQLite read is unavailable.
+        ``True`` for the exact committed revision, ``False`` for a proven absence or mismatch,
+        and ``None`` when a fresh SQLite read is unavailable.
     """
     try:
         with connect() as connection:
