@@ -374,7 +374,8 @@ def maximum_attempt_cost_micro_usd(
         return None
     numerator = input_tokens * sum(rate or 0 for rate in input_rates)
     numerator += output_tokens * sum(rate or 0 for rate in output_rates)
-    return (numerator + 999_999) // 1_000_000
+    maximum = (numerator + 999_999) // 1_000_000
+    return maximum if maximum <= MAXIMUM_MICRO_USD else None
 
 
 def require_attempt_budget(

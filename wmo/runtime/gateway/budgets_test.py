@@ -160,6 +160,19 @@ def test_maximum_attempt_cost_is_integer_conservative_and_unknown_prices_fail_cl
 
     assert known is not None and isinstance(known, int) and known > 32
     assert maximum_attempt_cost_micro_usd(request, _deployment(priced=False)) is None
+    unrepresentable = _deployment().model_copy(
+        update={
+            "gateway": _deployment().gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=10**30,
+                        output_micro_usd_per_million_tokens=10**30,
+                    )
+                }
+            )
+        }
+    )
+    assert maximum_attempt_cost_micro_usd(request, unrepresentable) is None
     assert (
         maximum_attempt_cost_micro_usd(
             request.model_copy(update={"maximum_output_tokens": None}),
