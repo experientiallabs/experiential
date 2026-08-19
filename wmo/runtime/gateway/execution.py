@@ -242,6 +242,7 @@ class GatewayExecutionStream:
                     return self._outward(event)
                 continue
             terminal = _with_latest_usage(event, current.latest_usage)
+            withheld_non_refusal_failure = False
             typed_refusal = (
                 terminal.kind == GatewayEventKind.FAILED
                 and terminal.failure is not None
@@ -264,19 +265,7 @@ class GatewayExecutionStream:
                     usage=terminal.usage,
                 )
             elif current.withheld_refusals:
-                failure = terminal.failure or GatewayFailure(
-                    failure_class=GatewayFailureClass.INTERNAL,
-                    safe_message="provider execution failed",
-                )
-                self._health.failed(self._health_key(current.route_index), failure)
-                await self._finish_current(
-                    terminal=terminal,
-                    failure=failure,
-                    finalize_request=True,
-                )
-                self._settle()
-                self._commit_withheld_refusal(current, terminal)
-                return self._outward(self._pending_outward.popleft())
+                withheld_non_refusal_failure = True
             if terminal.kind != GatewayEventKind.FAILED:
                 self._health.succeeded(self._health_key(current.route_index))
                 await self._finish_current(terminal=terminal, failure=None, finalize_request=True)
@@ -295,7 +284,13 @@ class GatewayExecutionStream:
                     finalize_request=True,
                 )
                 self._settle()
+                if withheld_non_refusal_failure:
+                    self._commit_withheld_refusal(current, terminal)
+                    return self._outward(self._pending_outward.popleft())
                 return self._outward(terminal)
+            if withheld_non_refusal_failure:
+                current.withheld_refusals.clear()
+                current.withheld_refusal_bytes = 0
             await self._finish_current(
                 terminal=terminal,
                 failure=failure,

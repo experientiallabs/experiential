@@ -462,6 +462,69 @@ def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> No
     assert opted_ledger.finished_events[0].usage == GatewayUsage(input_tokens=5, output_tokens=2)
 
 
+def test_buffered_refusal_followed_by_retryable_failure_advances_without_exposure() -> None:
+    """An opted-in uncommitted refusal does not block another safe failure class."""
+
+    async def scenario() -> None:
+        """Fail the refusing primary before commitment and complete on the secondary."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        second = _deployment("route-b", connection_sha256="c" * 64)
+        failure = GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider transport failed",
+            failover_eligible=True,
+        )
+        first_provider = _ScriptedProvider(
+            [
+                _WaterfallStream(
+                    (
+                        GatewayEvent(
+                            kind=GatewayEventKind.REFUSAL_DELTA,
+                            sequence_number=0,
+                            text_delta="private refusal detail",
+                        ),
+                        GatewayEvent(
+                            kind=GatewayEventKind.FAILED,
+                            sequence_number=1,
+                            failure=failure,
+                        ),
+                    )
+                )
+            ]
+        )
+        second_provider = _ScriptedProvider([_completed_stream("safe fallback")])
+        ledger = _WaterfallLedger()
+        executor = _executor(
+            (first, second),
+            {
+                first.source_alias: first_provider,
+                second.source_alias: second_provider,
+            },
+            ledger,
+            maximum_same_deployment_attempts=1,
+        )
+
+        stream = await executor.start(
+            route=_route((first, second), refusal_failover=True),
+            request=_request(),
+        )
+        events = [event async for event in stream]
+
+        assert [event.kind for event in events] == [
+            GatewayEventKind.TEXT_DELTA,
+            GatewayEventKind.COMPLETED,
+        ]
+        assert events[0].text_delta == "safe fallback"
+        assert all(event.text_delta != "private refusal detail" for event in events)
+        assert len(second_provider.idempotency_keys) == 1
+        assert ledger.finished[0][1] == failure
+        assert ledger.finished[0][2] is False
+        assert ledger.finished[1][1] is None
+        assert ledger.finished[1][2] is True
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "refusals",
     [
