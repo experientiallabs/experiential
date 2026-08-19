@@ -49,7 +49,7 @@ Fail before any write if a required variable is missing or empty. Never print a 
 
 Required from the first step:
 
-- `OPENAI_API_KEY`: embeddings, judge, and the second router candidate
+- `OPENAI_API_KEY`: embeddings, judge, and the OpenAI router candidate
 - `EXP_WM_ENDPOINT`: hosted OpenAI-compatible base URL, used exactly as provided. The service
   serves `/chat/completions` at that base, so never append a `/v1` suffix.
 - `EXP_WM_API_KEY`: credential for that endpoint
@@ -69,7 +69,9 @@ Keep these exact. If a pin is unavailable, stop and report which one failed.
 
 - World model, first router candidate, and incumbent: hosted OpenAI-compatible
   `deepseek-v4-flash` as alias `dsflash`
-- Judge and second router candidate: OpenAI `gpt-5.6-luna` as alias `luna`. It rejects an
+- Second hosted router candidate: `deepseek-ai/DeepSeek-V4-Flash-0731` as alias `dsflash0731`,
+  served by the same hosted endpoint, so both hosted model IDs exercise the same connection
+- Judge and third router candidate: OpenAI `gpt-5.6-luna` as alias `luna`. It rejects an
   explicit temperature, so its capabilities pin `supports_temperature` false and
   `reasoning_effort` `xhigh`. Its `maximum_output_tokens` is `32000` because the judge
   preflight requires an output budget of at least `16384` and fails closed below it.
@@ -77,7 +79,7 @@ Keep these exact. If a pin is unavailable, stop and report which one failed.
 - Shared command budget: `$50` via `wmo config budget`
 - Build ceiling: `$5`
 - Judge calibration sample: `10` lineages, labeled non-interactively in two passes (see step 5)
-- Router ceilings: `$50` provider cost, `120` judgments, `10` model calls
+- Router ceilings: `$50` provider cost, `200` judgments, `10` model calls
 - Loopback: `127.0.0.1:8000` with durable journaling (do not pass `--ghost`)
 
 The uniform label of `1` is a path-exercise input on the default 0-1 task-success axis. It is
@@ -86,6 +88,9 @@ corrects the judge proposal is complete on the same pass.
 
 Retry-exhausted simulation cells and oversized or empty judge cells become durable per-cell
 exclusions instead of aborting the run; report them if they appear, they are not a failure.
+Stochastic world-model protocol failures are retryable: resume supersedes them with a fresh
+attempt, and a named incumbent may fit with partial coverage as long as at least one fit task
+is covered, with the uncovered task IDs surfaced in the frozen policy.
 
 ## Timing
 
@@ -159,6 +164,7 @@ bench config-providers uv run wmo config providers \
   --connection-json '{"name":"openai","provider":"openai","api_key_env":"OPENAI_API_KEY"}' \
   --connection-json "$EXPWM_JSON" \
   --model-json '{"alias":"dsflash","connection":"expwm","model":"deepseek-v4-flash","capabilities":{"supports_completions":true,"supports_tools":true,"supports_structured_output":true,"supports_temperature":true,"supports_embeddings":false,"maximum_output_tokens":16000,"context_window_tokens":1048576,"input_cost_per_million_tokens_usd":0,"output_cost_per_million_tokens_usd":0,"cached_input_cost_per_million_tokens_usd":0,"cache_write_cost_per_million_tokens_usd":0}}' \
+  --model-json '{"alias":"dsflash0731","connection":"expwm","model":"deepseek-ai/DeepSeek-V4-Flash-0731","capabilities":{"supports_completions":true,"supports_tools":true,"supports_structured_output":true,"supports_temperature":true,"supports_embeddings":false,"maximum_output_tokens":16000,"context_window_tokens":1048576,"input_cost_per_million_tokens_usd":0,"output_cost_per_million_tokens_usd":0,"cached_input_cost_per_million_tokens_usd":0,"cache_write_cost_per_million_tokens_usd":0}}' \
   --model-json '{"alias":"luna","connection":"openai","model":"gpt-5.6-luna","capabilities":{"supports_completions":true,"supports_temperature":false,"reasoning_effort":"xhigh","supports_tools":true,"supports_structured_output":true,"supports_embeddings":false,"context_window_tokens":1050000,"maximum_output_tokens":32000,"input_cost_per_million_tokens_usd":0.2,"output_cost_per_million_tokens_usd":1.2,"cached_input_cost_per_million_tokens_usd":0.02,"cache_write_cost_per_million_tokens_usd":0.25}}' \
   --model-json '{"alias":"embed","connection":"openai","model":"text-embedding-3-small","capabilities":{"supports_completions":false,"supports_embeddings":true,"input_cost_per_million_tokens_usd":0.02,"context_window_tokens":8192}}' \
   --world-model dsflash \
@@ -166,7 +172,7 @@ bench config-providers uv run wmo config providers \
   --embedder embed
 ```
 
-Confirm with `grep`, not by editing the file: `models.toml` names the three aliases, points
+Confirm with `grep`, not by editing the file: `models.toml` names the four aliases, points
 `world_model` at `dsflash`, and contains no credential values. Zero token prices on the hosted
 world-model alias mean self-hosted spend, not a missing price.
 
@@ -238,27 +244,30 @@ Catalog prices supply the judge cost. Success prints an approved calibration art
 
 ## 6. Optimize the router
 
-Two distinct candidates are required; `dsflash` and `luna` are both already configured, so no
-extra provider setup happens here.
+At least two distinct candidates are required; `dsflash`, `dsflash0731`, and `luna` are all
+already configured, so no extra provider setup happens here. The two hosted candidates share
+one endpoint and exercise both of its served model IDs.
 
 ```bash
 bench optimize uv run wmo optimize router "$PROJECT" \
   --root "$ROOT" \
   --candidate dsflash \
+  --candidate dsflash0731 \
   --candidate luna \
   --incumbent dsflash \
   --maximum-provider-cost-usd 50 \
-  --maximum-judgments 120 \
+  --maximum-judgments 200 \
   --maximum-model-calls 10 \
   --yes \
   --non-interactive
 bench optimize-replay uv run wmo optimize router "$PROJECT" \
   --root "$ROOT" \
   --candidate dsflash \
+  --candidate dsflash0731 \
   --candidate luna \
   --incumbent dsflash \
   --maximum-provider-cost-usd 50 \
-  --maximum-judgments 120 \
+  --maximum-judgments 200 \
   --maximum-model-calls 10 \
   --yes \
   --non-interactive
@@ -269,12 +278,11 @@ Success prints a policy ID and a report ID. The second run must print
 for retry-exhausted or unusable judge cells are durable evidence, not failures; record any that
 appear.
 
-Known blocker: a malformed world-model transition (`TextWorldModelProtocolError`, failure phase
-`world_model_protocol`) is persisted as a permanent failed rollout with no retry. The cell then
-carries no score, and fitting fails closed with `named incumbent dsflash lacks score evidence on
-every fit task` whenever any incumbent cell fails this way. The failure is durable in the work
-root, so rerunning the same root replays it instead of retrying. If this happens, stop and report
-the exact failure counts per candidate; do not delete the root to reroll the dice.
+A malformed world-model transition (`TextWorldModelProtocolError`, failure phase
+`world_model_protocol`) is a stochastic, retryable failure: resume supersedes it with a fresh
+attempt, and once attempts are exhausted the cell becomes durable excluded evidence. A named
+incumbent fits with partial coverage; the frozen policy lists any uncovered fit task IDs.
+Report retry counts and coverage gaps if they appear, they are not a failure.
 
 ## 7. Serve the router and send official traffic
 
