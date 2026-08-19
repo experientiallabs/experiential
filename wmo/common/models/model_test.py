@@ -174,7 +174,7 @@ def test_model_messages_reject_tool_and_assistant_fields_on_the_wrong_roles() ->
 
 
 def test_tool_call_preserves_optional_raw_arguments_without_changing_legacy_payloads() -> None:
-    """Raw provider JSON replays exactly while legacy tool-call bytes stay unchanged."""
+    """Raw provider JSON replays exactly but stays outside semantic artifact payloads."""
     legacy = ToolCall(call_id="call-1", name="lookup", arguments={"a": 1, "b": 2})
     retained = ToolCall(
         call_id="call-1",
@@ -190,6 +190,8 @@ def test_tool_call_preserves_optional_raw_arguments_without_changing_legacy_payl
     }
     assert legacy.arguments_json(sort_keys=True, compact=True) == '{"a":1,"b":2}'
     assert retained.arguments_json() == '{ "b": 2, "a": 1 }'
+    assert retained.arguments_json(sort_keys=True, compact=True) == '{"a":1,"b":2}'
+    assert retained.model_dump(mode="json") == legacy.model_dump(mode="json")
     with pytest.raises(ValidationError, match="must match parsed"):
         ToolCall(
             call_id="call-1",

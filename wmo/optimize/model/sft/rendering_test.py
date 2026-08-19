@@ -40,6 +40,36 @@ def test_source_only_approval_does_not_change_normalized_fingerprint() -> None:
     )
 
 
+def test_raw_tool_argument_formatting_does_not_change_normalized_fingerprint() -> None:
+    """Provider whitespace and key order cannot split equivalent rows across partitions."""
+    compact = AssistantAction(
+        tool_calls=(
+            ToolCall(
+                call_id="lookup-1",
+                name="lookup_order",
+                arguments={"limit": 1, "order_id": "o-17"},
+                raw_arguments='{"limit":1,"order_id":"o-17"}',
+            ),
+        )
+    )
+    provider_order = AssistantAction(
+        tool_calls=(
+            ToolCall(
+                call_id="lookup-1",
+                name="lookup_order",
+                arguments={"limit": 1, "order_id": "o-17"},
+                raw_arguments='{ "order_id": "o-17", "limit": 1 }',
+            ),
+        )
+    )
+
+    assert context_target_fingerprint(task="Look up the order.", history=(), target=compact) == (
+        context_target_fingerprint(task="Look up the order.", history=(), target=provider_order)
+    )
+    assert compact.tool_calls[0].arguments_json() == '{"limit":1,"order_id":"o-17"}'
+    assert provider_order.tool_calls[0].arguments_json() == ('{ "order_id": "o-17", "limit": 1 }')
+
+
 def test_structured_example_round_trips_with_complete_target_and_tool_context() -> None:
     """The frozen SFT example contract preserves production-style structure losslessly."""
     example = SFTExample(

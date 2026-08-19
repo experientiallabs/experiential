@@ -59,7 +59,9 @@ def test_gateway_request_preserves_developer_and_raw_tool_history() -> None:
 
     assert request.messages[0].role == "developer"
     assert request.messages[2].tool_calls[0].arguments_json() == '{ "account": 7 }'
-    assert GatewayRequest.model_validate_json(request.model_dump_json()) == request
+    restored = GatewayRequest.model_validate_json(request.model_dump_json())
+    assert restored.messages[2].tool_calls[0].raw_arguments is None
+    assert restored.model_dump(mode="json") == request.model_dump(mode="json")
 
 
 def test_raw_tool_argument_delta_accepts_non_json_fragments_in_order() -> None:

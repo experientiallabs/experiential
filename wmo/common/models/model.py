@@ -181,8 +181,9 @@ class ToolCall(ContractModel):
 
     ``arguments`` retains the existing parsed-object contract used by environments and
     optimization artifacts. ``raw_arguments`` optionally preserves the exact provider-emitted
-    JSON string for protocol replay. Its absent default is omitted from serialization so existing
-    immutable payload bytes and hashes do not change.
+    JSON string for immediate protocol replay. It is deliberately excluded from model
+    serialization so provider formatting cannot affect immutable artifacts, lineage, or
+    deduplication.
     """
 
     call_id: str = Field(min_length=1, max_length=256)
@@ -191,7 +192,7 @@ class ToolCall(ContractModel):
     raw_arguments: str | None = Field(
         default=None,
         max_length=4_000_000,
-        exclude_if=lambda value: value is None,
+        exclude=True,
     )
 
     @model_validator(mode="after")
@@ -222,9 +223,10 @@ class ToolCall(ContractModel):
             compact: Whether fallback encoding omits insignificant separators.
 
         Returns:
-            Exact retained JSON when present, otherwise encoded parsed arguments.
+            Exact retained JSON when present and no canonicalization was requested. Otherwise,
+            encoded parsed arguments honoring the requested canonicalization options.
         """
-        if self.raw_arguments is not None:
+        if self.raw_arguments is not None and not sort_keys and not compact:
             return self.raw_arguments
         separators = (",", ":") if compact else None
         return json.dumps(self.arguments, sort_keys=sort_keys, separators=separators)
