@@ -1,14 +1,12 @@
-"""Provider-free interactive screens and plan rendering for the build wizard.
+"""Provider-free interactive screens for the build wizard.
 
 Every screen here runs before or without paid provider work: the upfront workflow step
-picker, the mandatory explicit trace-path prompt, the credential-free project plan, and
-the completed-replay summary. The wizard state machine in ``build_wizard`` owns ordering,
-consent, and execution.
+picker, the mandatory explicit trace-path prompt, and the completed-replay summary. The
+wizard state machine in ``build_wizard`` owns ordering, consent, and execution.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,7 +17,6 @@ from wmo.common.models import ModelCatalog
 from wmo.common.project import ProjectModelConfiguration
 from wmo.common.tasks import TaskCase
 from wmo.optimize.router.automatic.replay import AutomaticRouterReplay
-from wmo.optimize.router.automatic.reservations import AutomaticRouterCostPlan
 from wmo.simulation.build import ProjectBuild
 from wmo.simulation.ingest.sources import CANONICAL_TRACE_SOURCES
 
@@ -156,57 +153,3 @@ def render_completed_replay(
     if replay.judgment_status == "provisional":
         console.print(f"  optional wmo config judge calibrate {project}")
         console.print(f"  after approval wmo build {project}")
-
-
-def render_plan(
-    project: str,
-    plan: WizardBuildPlan,
-    *,
-    catalog: ModelCatalog,
-    cost_plan: AutomaticRouterCostPlan | None,
-    router_ceiling: float,
-    supplied_router_cap: float | None,
-    console: Console,
-) -> None:
-    """Render one concise full wizard plan before the named spend authorization.
-
-    Args:
-        project: Local project identifier.
-        plan: Provider-free grounded-build plan.
-        catalog: Catalog containing selected router defaults.
-        cost_plan: Exact automatic-router reservation, or ``None`` when the router
-            optimization step is not selected.
-        router_ceiling: Effective automatic-router ceiling.
-        supplied_router_cap: Optional user cap checked against the exact required ceiling.
-        console: Terminal receiving the plan.
-    """
-    build_estimate = 0.0 if plan.build_reused else plan.build_estimate_usd
-    estimated = math.fsum((build_estimate, router_ceiling))
-    console.print("[bold]Plan[/bold]")
-    console.print(f"  [dim]project[/dim]    {project}")
-    console.print(f"  [dim]traces[/dim]     {plan.accepted_traces} accepted")
-    console.print(f"  [dim]tasks[/dim]      {plan.fit_tasks} fit, {plan.held_out_tasks} held out")
-    console.print(
-        f"  [dim]models[/dim]     world {plan.selected.world_model}, "
-        f"judge {plan.selected.judge}, embedder {plan.selected.embedder}"
-    )
-    if cost_plan is not None:
-        console.print(
-            f"  [dim]router[/dim]     {', '.join(catalog.roles.candidates)} "
-            f"[dim](incumbent {catalog.roles.incumbent})[/dim]"
-        )
-    if supplied_router_cap is not None:
-        console.print(f"  [dim]cap[/dim]        {_usd(supplied_router_cap)}")
-    console.print(f"  [dim]estimated[/dim]  {_usd(estimated)}")
-
-
-def _usd(value: float) -> str:
-    """Format one USD amount with exactly two decimals, rounding up to whole cents.
-
-    Args:
-        value: Nonnegative finite USD amount.
-
-    Returns:
-        Dollar-prefixed amount with exactly two decimal places.
-    """
-    return f"${math.ceil(value * 100) / 100:.2f}"

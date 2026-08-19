@@ -78,7 +78,7 @@ _TRACE_FILE_OPTION = typer.Option(
     metavar="PATH",
     help=(
         "Local trace export in the declared --source format. Omit it only when bare "
-        "`wmo build PROJECT` should launch the interactive wizard."
+        "`wmo build PROJECT` should launch the interactive end-to-end build."
     ),
 )
 _PROVIDER_OPTION = typer.Option(
@@ -130,8 +130,8 @@ def build(
         "--max-router-cost-usd",
         min=0.01,
         help=(
-            "Optional automatic-router ceiling for the wizard; omitted uses the exact "
-            "conservative schedule reservation."
+            "Optional automatic-router ceiling for the interactive build; omitted uses "
+            "the exact conservative schedule reservation."
         ),
     ),
     dry_run: bool = typer.Option(
@@ -183,7 +183,7 @@ def build(
         if dry_run or no_interactive or not can_prompt(_console):
             raise typer.BadParameter(
                 "automation and dry runs require an explicit -t/--traces PATH; bare "
-                "`wmo build PROJECT` is the interactive end-to-end wizard"
+                "`wmo build PROJECT` is the interactive end-to-end build"
             )
         from wmo.cli.build_wizard import run_build_wizard
 
@@ -206,7 +206,7 @@ def build(
         except ProviderTransportError as exc:
             _console.print(f"[red]error[/red] a provider request failed: {exc}")
             _console.print(
-                "Completed paid work is saved. Run the wizard again to resume; finished "
+                "Completed paid work is saved. Run wmo build again to resume; finished "
                 "steps replay exactly without new spend."
             )
             raise typer.Exit(code=1) from exc
@@ -214,7 +214,7 @@ def build(
             _console.print(f"[red]error[/red] {exc}")
             _console.print(
                 "Another process owns in-flight paid work. Completed paid work is saved; "
-                "run the wizard again to resume once that process finishes."
+                "run wmo build again to resume once that process finishes."
             )
             raise typer.Exit(code=1) from exc
         return

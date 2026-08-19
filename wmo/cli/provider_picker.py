@@ -300,6 +300,7 @@ def prepare_providers(
     *,
     existing_connections: tuple[ProviderConnection, ...],
     existing_aliases: tuple[str, ...],
+    configured: tuple[AvailableModel, ...] = (),
     console: Console,
     lister: ProviderModelLister,
     environment: MutableMapping[str, str],
@@ -310,6 +311,8 @@ def prepare_providers(
         session: Answers already collected in this setup session.
         existing_connections: Connections already configured in the catalog.
         existing_aliases: Aliases already configured in the catalog.
+        configured: Catalog models already configured, reused instead of re-aliased when
+            discovery lists the same underlying model again.
         console: Terminal used for prompts and progress.
         lister: Provider listing seam.
         environment: Process environment consulted and updated for pasted credentials.
@@ -324,6 +327,10 @@ def prepare_providers(
     available: list[AvailableModel] = []
     taken_names = {connection.name for connection in existing_connections}
     taken_aliases = set(existing_aliases)
+    configured_identities = frozenset(
+        (item.provider, canonical_model_id(item.provider, item.model)) for item in configured
+    )
+    configured_providers = frozenset(item.provider for item in configured)
     for provider in session.providers:
         label = SETUP_PROVIDER_LABELS[provider]
         endpoint = _resolve_endpoint(
@@ -346,12 +353,14 @@ def prepare_providers(
                 console=console,
                 lister=lister,
                 taken_aliases=frozenset(taken_aliases),
+                configured_identities=configured_identities,
             )
         if discovered is None:
             return None
         if (
             not discovered
             and provider not in _MANUAL_MODEL_PROVIDERS
+            and provider not in configured_providers
             and not session.advanced_models
         ):
             console.print(f"[yellow]Skipping {label}.[/yellow]")
@@ -511,6 +520,7 @@ def _discover_models(
     console: Console,
     lister: ProviderModelLister,
     taken_aliases: frozenset[str],
+    configured_identities: frozenset[tuple[str, str]] = frozenset(),
 ) -> tuple[AvailableModel, ...] | None:
     """List one provider account's models and keep the ones with usable metadata.
 
@@ -520,6 +530,8 @@ def _discover_models(
         console: Terminal used for progress and recovery.
         lister: Provider listing seam.
         taken_aliases: Aliases already used by the catalog or this session.
+        configured_identities: Canonical (provider, model) identities already in the
+            catalog; rediscovered matches reuse the existing row instead of a new alias.
 
     Returns:
         Configurable models, or ``None`` when the user asked to change providers.
@@ -555,9 +567,17 @@ def _discover_models(
             if recovery == _RECOVERY_RETRY:
                 continue
             return () if recovery == _RECOVERY_SKIP else None
-        console.print(f"  [green]\u2713[/green] {label}: {len(usable)} models")
+        fresh = tuple(
+            model
+            for model in usable
+            if (provider, canonical_model_id(provider, model.model)) not in configured_identities
+        )
+        if not fresh:
+            console.print(f"  [green]\u2713[/green] {label}: models already configured")
+            return ()
+        console.print(f"  [green]\u2713[/green] {label}: {len(fresh)} models")
         models = []
-        for model in usable:
+        for model in fresh:
             alias = derive_model_alias(provider, model.model, frozenset(aliases))
             aliases.add(alias)
             models.append(

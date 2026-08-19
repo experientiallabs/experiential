@@ -517,7 +517,11 @@ def test_fresh_wizard_refusal_after_discovery_makes_no_paid_calls_or_selected_bu
     printed = unstyle(result.output)
     assert lister.requests == ["openai"]
     assert printed.count("Authorize wmo build support") == 1
-    assert "Wizard stopped before paid build or router work" in printed
+    assert "Stopped before paid build or router work" in printed
+    assert "wizard" not in printed.casefold()
+    assert "Plan" not in printed
+    assert "inspect" not in printed
+    assert "Existing catalog already covers" not in printed
     assert state.credential_resolutions == 0
     assert state.embedding_calls == []
     assert state.completion_calls == []
@@ -599,7 +603,7 @@ def test_explicit_router_cap_above_required_consents_only_to_exact_plan(
 
     assert result.exit_code == 0, result.output
     printed = unstyle(result.output)
-    assert "cap        $5000.00" in printed
+    assert "$5000.00" not in printed
     assert "$5005.00" not in printed
     assert "Authorize wmo build support" in printed
 
@@ -888,7 +892,7 @@ def test_bare_build_dispatches_wizard_without_required_trace_option(
     assert "-t" in unstyle(help_result.output)
     help_text = unstyle(help_result.output)
     assert "interactive" in help_text
-    assert "wizard" in help_text
+    assert "wizard" not in help_text.casefold()
 
 
 def test_invalid_traces_fail_before_provider_discovery(

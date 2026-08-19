@@ -72,6 +72,7 @@ def _prepare(
     environment: dict[str, str],
     existing_connections: tuple[ProviderConnection, ...] = (),
     existing_aliases: tuple[str, ...] = (),
+    configured: tuple[provider_picker.AvailableModel, ...] = (),
 ) -> (
     tuple[tuple[provider_picker.PreparedEndpoint, ...], tuple[provider_picker.AvailableModel, ...]]
     | None
@@ -85,6 +86,7 @@ def _prepare(
         environment: Mutable process environment consulted for credentials.
         existing_connections: Connections already configured in the catalog.
         existing_aliases: Aliases already configured in the catalog.
+        configured: Catalog models already configured before this session.
 
     Returns:
         The prepared endpoints and configurable models, or ``None`` to reselect providers.
@@ -94,6 +96,7 @@ def _prepare(
         session,
         existing_connections=existing_connections,
         existing_aliases=existing_aliases,
+        configured=configured,
         console=console,
         lister=lister,
         environment=environment,
@@ -236,6 +239,68 @@ def test_dated_snapshots_and_pointer_aliases_collapse_onto_the_base_model_row() 
     assert prepared is not None
     _, models = prepared
     assert [model.model for model in models] == ["gpt-5.6-luna", "gpt-5.6-terra"]
+
+
+def test_rediscovered_configured_models_reuse_their_existing_rows() -> None:
+    """Re-listing a provider never mints a suffixed alias for an already-configured model."""
+    console = ScriptedConsole("")
+    lister = _FakeLister({"openai": [(_LUNA, _TERRA)]})
+    configured = (
+        provider_picker.AvailableModel(
+            alias="gpt-5-6-luna",
+            connection="openai",
+            provider="openai",
+            model="gpt-5.6-luna",
+            capabilities=None,
+            pricing_source=PricingSource.CONFIGURED,
+            configured=True,
+        ),
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("openai",),
+        lister=lister,
+        environment={"OPENAI_API_KEY": "secret-key"},
+        existing_aliases=("gpt-5-6-luna",),
+        configured=configured,
+    )
+
+    assert prepared is not None
+    _, models = prepared
+    assert [model.model for model in models] == ["gpt-5.6-terra"]
+    assert all(not model.alias.endswith("-2") for model in models)
+
+
+def test_provider_whose_models_are_all_configured_is_still_prepared() -> None:
+    """A fully-configured provider prepares its endpoint without new model rows."""
+    console = ScriptedConsole("")
+    lister = _FakeLister({"openai": [(_LUNA,)]})
+    configured = (
+        provider_picker.AvailableModel(
+            alias="gpt-5-6-luna",
+            connection="openai",
+            provider="openai",
+            model="gpt-5.6-luna",
+            capabilities=None,
+            pricing_source=PricingSource.CONFIGURED,
+            configured=True,
+        ),
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("openai",),
+        lister=lister,
+        environment={"OPENAI_API_KEY": "secret-key"},
+        existing_aliases=("gpt-5-6-luna",),
+        configured=configured,
+    )
+
+    assert prepared is not None
+    endpoints, models = prepared
+    assert len(endpoints) == 1
+    assert models == ()
 
 
 def test_missing_credential_is_pasted_masked_and_stays_process_local(

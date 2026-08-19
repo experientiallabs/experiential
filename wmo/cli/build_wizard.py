@@ -23,9 +23,6 @@ from wmo.cli.build_wizard_screens import (
     render_completed_replay as _render_completed_replay,
 )
 from wmo.cli.build_wizard_screens import (
-    render_plan as _render_plan,
-)
-from wmo.cli.build_wizard_screens import (
     select_trace as _select_trace,
 )
 from wmo.cli.build_wizard_screens import (
@@ -180,15 +177,6 @@ def run_build_wizard(
             maximum_router_cost_usd is not None
             and maximum_router_cost_usd < cost_plan.required_provider_cost_usd
         ):
-            _render_plan(
-                project,
-                plan,
-                catalog=catalog,
-                cost_plan=cost_plan,
-                router_ceiling=router_ceiling,
-                supplied_router_cap=maximum_router_cost_usd,
-                console=console,
-            )
             raise ValueError(
                 f"router cap ${maximum_router_cost_usd:.2f} is below the exact required "
                 f"${cost_plan.required_provider_cost_usd:.2f}; increase "
@@ -199,15 +187,6 @@ def run_build_wizard(
             f"grounded build requires ${plan.build_estimate_usd:.2f}, above the configured "
             f"${maximum_build_cost_usd:.2f} ceiling; increase --max-build-cost-usd"
         )
-    _render_plan(
-        project,
-        plan,
-        catalog=catalog,
-        cost_plan=cost_plan,
-        router_ceiling=router_ceiling,
-        supplied_router_cap=maximum_router_cost_usd,
-        console=console,
-    )
     build_estimate = 0.0 if plan.build_reused else plan.build_estimate_usd
     total_estimate = math.fsum((build_estimate, router_ceiling))
     if total_estimate > 0 and not require_spend_consent(
@@ -217,7 +196,7 @@ def run_build_wizard(
         estimated_cost_usd=total_estimate,
         command=f"wmo build {project}",
     ):
-        console.print("Wizard stopped before paid build or router work.")
+        console.print("Stopped before paid build or router work.")
         return
 
     run_judge = selection.router or selection.judge_rubric or selection.judge_calibration
@@ -271,7 +250,7 @@ def run_build_wizard(
                 console=console,
             )
             if selection.router and cost_plan is None:
-                console.print("Wizard stopped before router optimization.")
+                console.print("Stopped before router optimization.")
                 return
 
     if not selection.router:
@@ -296,7 +275,7 @@ def run_build_wizard(
     )
     if preflight.cost_plan != cost_plan:
         raise ValueError(
-            "automatic router cost plan changed after the grounded build; rerun the wizard"
+            "automatic router cost plan changed after the grounded build; rerun wmo build"
         )
     console.print(f"[bold]4/{total_stages} Router optimization[/bold]")
     result = optimize_project_router(
@@ -587,7 +566,6 @@ def _prepare_new_build(
     )
     from wmo.cli.provider_setup import ProviderSetupOptions, run_provider_setup
 
-    console.print("[dim]inspect[/dim] Normalize trace evidence")
     normalized = _load_canonical_traces(trace_path, source)
     if not normalized.traces:
         raise ValueError("selected trace source produced no valid canonical traces")
@@ -610,11 +588,6 @@ def _prepare_new_build(
     else:
         assert existing_catalog is not None
         catalog = existing_catalog
-        if setup_providers:
-            console.print(
-                "[dim]providers[/dim] Existing catalog already covers every role; "
-                "run wmo config providers to change it"
-            )
     selected = _selected_roles(
         catalog,
         world_model=world_model,
