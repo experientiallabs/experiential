@@ -235,6 +235,7 @@ class _EvidenceSimulatorFactory:
                         "Resolved by baseline.",
                         snapshot=_snapshot("candidate-baseline"),
                         cost=0.0,
+                        usage=Usage(input_tokens=0, output_tokens=0),
                     )
                 ]
                 * 100
@@ -245,6 +246,7 @@ class _EvidenceSimulatorFactory:
                         "Resolved by economy.",
                         snapshot=_snapshot("candidate-economy"),
                         cost=0.0,
+                        usage=Usage(input_tokens=0, output_tokens=0),
                     )
                 ]
                 * 100
@@ -256,6 +258,7 @@ class _EvidenceSimulatorFactory:
                     '{"message":"Done.","terminal":true}',
                     snapshot=_snapshot("world-model-a"),
                     cost=0.0,
+                    usage=Usage(input_tokens=0, output_tokens=0),
                 )
             ]
             * 200

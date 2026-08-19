@@ -293,12 +293,25 @@ def _response(
     snapshot: ModelSnapshot,
     cost: float | None = 0.10,
     finish_reason: ModelFinishReason = ModelFinishReason.COMPLETED,
+    usage: Usage | None = None,
 ) -> ModelResponse:
+    """Build one scripted completion with explicit observed economics.
+
+    Args:
+        content: Visible assistant text.
+        snapshot: Exact served model identity.
+        cost: Observed provider spend, or ``None`` when spend is unknown.
+        finish_reason: Provider stop reason recorded on the response.
+        usage: Observed token counts, or the shared 8-input 4-output fixture.
+
+    Returns:
+        Provider-neutral completion used by scripted simulator clients.
+    """
     return ModelResponse(
         output=AssistantAction(content=content),
         model=snapshot,
         economics=OperationEconomics(
-            usage=Usage(input_tokens=8, output_tokens=4),
+            usage=usage or Usage(input_tokens=8, output_tokens=4),
             cost_usd=(
                 NumericMeasurement(value=cost, provenance="observed") if cost is not None else None
             ),
