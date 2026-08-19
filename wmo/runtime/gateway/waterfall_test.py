@@ -412,8 +412,12 @@ def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> No
                             usage=GatewayUsage(input_tokens=5, output_tokens=2),
                         ),
                         GatewayEvent(
-                            kind=GatewayEventKind.COMPLETED,
+                            kind=GatewayEventKind.FAILED,
                             sequence_number=2,
+                            failure=GatewayFailure(
+                                failure_class=GatewayFailureClass.REFUSAL,
+                                safe_message="provider refused the request",
+                            ),
                         ),
                     )
                 )
@@ -453,7 +457,11 @@ def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> No
     ]
     assert all(event.kind is not GatewayEventKind.REFUSAL_DELTA for event in opted_events)
     assert opted_fallbacks == 1
-    assert default_ledger.finished[0][1] is None
+    default_failure = default_ledger.finished[0][1]
+    assert default_failure is not None
+    assert default_failure.failure_class is GatewayFailureClass.REFUSAL
+    assert default_ledger.finished_events[0] is not None
+    assert default_ledger.finished_events[0].kind is GatewayEventKind.FAILED
     opted_failure = opted_ledger.finished[0][1]
     assert opted_failure is not None
     assert opted_failure.failure_class is GatewayFailureClass.REFUSAL

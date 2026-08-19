@@ -85,6 +85,7 @@ class _PhysicalAttempt:
     last_provider_sequence: int = -1
     withheld_refusals: list[GatewayEvent] = field(default_factory=list)
     withheld_refusal_bytes: int = 0
+    visible_refusal: bool = False
     settled: bool = False
 
 
@@ -235,6 +236,8 @@ class GatewayExecutionStream:
                 self._commit_withheld_refusal(current, event)
                 return self._outward(self._pending_outward.popleft())
             if event.kind in _SEMANTIC_EVENTS:
+                if event.kind == GatewayEventKind.REFUSAL_DELTA:
+                    current.visible_refusal = True
                 self._committed = True
                 return self._outward(event)
             if event.kind not in _TERMINAL_EVENTS:
@@ -287,6 +290,14 @@ class GatewayExecutionStream:
                 if withheld_non_refusal_failure:
                     self._commit_withheld_refusal(current, terminal)
                     return self._outward(self._pending_outward.popleft())
+                if typed_refusal and current.visible_refusal:
+                    return self._outward(
+                        GatewayEvent(
+                            kind=GatewayEventKind.COMPLETED,
+                            sequence_number=terminal.sequence_number,
+                            usage=terminal.usage,
+                        )
+                    )
                 return self._outward(terminal)
             if withheld_non_refusal_failure:
                 current.withheld_refusals.clear()
@@ -572,6 +583,7 @@ class GatewayExecutionStream:
             *following: Semantic or terminal events that arrived after the refusal.
         """
         self._committed = True
+        current.visible_refusal = True
         self._pending_outward.extend(current.withheld_refusals)
         self._pending_outward.extend(following)
         current.withheld_refusals.clear()
