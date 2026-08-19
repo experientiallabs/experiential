@@ -54,7 +54,7 @@ class WizardBuildPlan:
     invalid_traces: int
     fit_tasks: int
     held_out_tasks: int
-    build_estimate_usd: float
+    build_estimate_usd: float | None
     build_reused: bool
 
 

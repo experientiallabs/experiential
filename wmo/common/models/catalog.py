@@ -263,8 +263,9 @@ class ModelRecord(ContractModel):
     """A stable local alias, exact capability snapshot, and provider-side model name.
 
     An omitted capability declaration means the catalog cannot prove any optional protocol
-    feature or token limit. Callers may still resolve the alias for an unconstrained completion,
-    but capability preflight fails closed instead of inferring support from a provider name.
+    feature or token limit. Unknown declarations stay permissive: capability preflight blocks
+    only an explicit declaration that rules a requirement out, so an undeclared model remains
+    usable and the provider reports any real protocol gap.
 
     ``served_model_id`` accepts an alternate identifier the provider echoes in responses when it
     differs from the requested ``model``, for example a vLLM endpoint that publishes an alias in

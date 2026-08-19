@@ -857,6 +857,55 @@ def test_noninteractive_build_yes_confirms_an_in_budget_estimate(
     assert ProjectStore(root, "support").load_project().build is not None
 
 
+def test_unpriced_embedder_reports_an_undefined_cost_and_requires_manual_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An embedder without catalog pricing warns and builds only with an explicit --yes.
+
+    Args:
+        tmp_path: Temporary trace, catalog, and settings root.
+        monkeypatch: Cost boundary replacement returning an undefined estimate.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    _catalog(root)
+    set_maximum_command_cost_usd(1.0, root)
+    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: None)
+
+    blocked = _RUNNER.invoke(
+        app,
+        ["build", "support", "--traces", str(source), "--root", str(root), "--no-interactive"],
+    )
+
+    assert blocked.exit_code == 2
+    blocked_output = unstyle(blocked.output)
+    assert "cost of this command is undefined" in blocked_output
+    assert "manual override" in blocked_output
+    assert ProjectStore(root, "support").load_project().build is None
+
+    accepted = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+            "--no-interactive",
+            "--yes",
+        ],
+    )
+
+    assert accepted.exit_code == 0, accepted.output
+    accepted_output = unstyle(accepted.output)
+    assert "cost of this command is undefined" in accepted_output
+    assert "undefined (embedder has no catalog price)" in accepted_output
+    assert ProjectStore(root, "support").load_project().build is not None
+
+
 def test_interactive_build_uses_the_cost_specific_confirmation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

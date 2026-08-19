@@ -330,14 +330,19 @@ class ModelCapabilities(ContractModel):
     The runtime records a digest of this object in every resolved model identity. The fields
     describe protocol support, not a claim that a provider accepts every possible prompt.
 
+    ``supports_tools`` and ``supports_embeddings`` are tri-state: ``True`` and ``False`` are
+    explicit operator declarations, while ``None`` means unknown. Unknown support is permissive
+    at runtime so an undeclared or newly released model stays usable; only an explicit ``False``
+    blocks the corresponding protocol feature before dispatch.
+
     ``supports_temperature`` declares whether the provider accepts an explicit sampling
     temperature for this model; reasoning models that pin their sampling reject the parameter, so
     clients omit it when this is ``False``. ``reasoning_effort`` pins an explicit reasoning-effort
     level on providers whose wire protocol accepts one.
     """
 
-    supports_tools: bool = False
-    supports_embeddings: bool = False
+    supports_tools: bool | None = None
+    supports_embeddings: bool | None = None
     supports_structured_output: bool = False
     supports_completions: bool | None = None
     supports_temperature: bool = True
@@ -380,6 +385,10 @@ class ModelCapabilities(ContractModel):
         declarations in a separate candidate capability digest and freezes prices in the pricing
         snapshot.
 
+        Unknown tool and embedding support hashes exactly like an explicit ``False`` so catalogs
+        written before support was declared keep the identity digest frozen into existing
+        artifacts.
+
         Returns:
             Stable digest of capability fields that identify the provider protocol boundary.
         """
@@ -393,7 +402,10 @@ class ModelCapabilities(ContractModel):
             "cache_write_cost_per_million_tokens_usd",
         }
         excluded.add("supports_completions")
-        return sha256_json(self.model_dump(mode="json", exclude=excluded))
+        payload = self.model_dump(mode="json", exclude=excluded)
+        payload["supports_tools"] = bool(self.supports_tools)
+        payload["supports_embeddings"] = bool(self.supports_embeddings)
+        return sha256_json(payload)
 
 
 class ToolChoice(ContractModel):

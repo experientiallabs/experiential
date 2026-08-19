@@ -321,7 +321,7 @@ def build(
             _console.print("[green]dry run complete[/green] No provider calls or build selection.")
             return
         if built is None:
-            if estimate > maximum_build_cost_usd:
+            if estimate is not None and estimate > maximum_build_cost_usd:
                 raise ValueError(
                     over_ceiling_message(
                         estimate=estimate,
@@ -501,9 +501,8 @@ def _validated_role_snapshots(
         World-model snapshot, embedder snapshot, and embedder capabilities.
 
     Raises:
-        ModelCapabilityError: The embedder cannot prove embedding support.
+        ModelCapabilityError: The embedder explicitly declares no embedding support.
         ModelConnectionError: A selected alias or provider is unsupported.
-        ValueError: The embedder has no explicit input price.
     """
     world_snapshot, _world_capabilities = runtime_catalog.snapshot(selected.world_model)
     runtime_catalog.snapshot(selected.judge)
@@ -513,18 +512,13 @@ def _validated_role_snapshots(
         embedder_capabilities,
         CapabilityRequirement(requires_embeddings=True),
     )
-    if embedder_capabilities.input_cost_per_million_tokens_usd is None:
-        raise ValueError(
-            f"embedder alias {selected.embedder!r} has no input_cost_per_million_tokens_usd; "
-            "record explicit pricing before a provider-backed build"
-        )
     return world_snapshot, embedder_snapshot, embedder_capabilities
 
 
 def _embedding_cost_ceiling(
     completed: ProjectBuild,
     capabilities: ModelCapabilities,
-) -> float:
+) -> float | None:
     """Bound retry-inclusive embedding spend from the exact rendered retrieval inputs.
 
     Args:
@@ -532,17 +526,12 @@ def _embedding_cost_ceiling(
         capabilities: Static embedder capabilities and price metadata.
 
     Returns:
-        Conservative USD ceiling across serving and fit-only index construction.
-
-    Raises:
-        ValueError: The selected embedder omits explicit input pricing.
+        Conservative USD ceiling across serving and fit-only index construction, or ``None``
+        when the embedder has no catalog input price and the spend cannot be estimated.
     """
     price = capabilities.input_cost_per_million_tokens_usd
     if price is None:
-        raise ValueError(
-            "embedder has no input_cost_per_million_tokens_usd; "
-            "record explicit pricing before a provider-backed build"
-        )
+        return None
     bindings = _lineage_bindings(completed)
     traces = completed.artifacts.trace_dataset.traces
     serving = extract_real_transitions(
@@ -677,7 +666,7 @@ def _complete_grounded_build(
     world_snapshot: ModelSnapshot,
     embedder_snapshot: ModelSnapshot,
     top_k: int,
-    estimate: float,
+    estimate: float | None,
     maximum_build_cost_usd: float,
     provider_spend_authorized: bool,
     progress: ProgressHook | None = None,
@@ -692,7 +681,7 @@ def _complete_grounded_build(
         world_snapshot: Exact provider-free world-model identity.
         embedder_snapshot: Exact provider-free embedder identity.
         top_k: Frozen retrieval result count.
-        estimate: Conservative retry-inclusive embedding cost.
+        estimate: Conservative retry-inclusive embedding cost, or ``None`` when undefined.
         maximum_build_cost_usd: Strict grounded-build provider ceiling.
         provider_spend_authorized: Whether new embedding calls are authorized.
         progress: Optional observer of embedding, RAG, and finalization stages.
@@ -718,7 +707,7 @@ def _complete_grounded_build(
     if built is None and not provider_spend_authorized:
         raise ValueError("grounded build provider work requires explicit authorization")
     if built is None:
-        if estimate > maximum_build_cost_usd:
+        if estimate is not None and estimate > maximum_build_cost_usd:
             raise ValueError(
                 f"grounded build requires ${estimate:.6f}, above the configured "
                 f"${maximum_build_cost_usd:.6f} ceiling"
@@ -913,7 +902,7 @@ def _render_preflight(
     world_model_id: str,
     embedder_alias: str,
     embedder_model_id: str,
-    estimate: float,
+    estimate: float | None,
     ceiling: float,
     reused: bool,
 ) -> None:
@@ -928,7 +917,7 @@ def _render_preflight(
         world_model_id: Provider model ID bound to that alias.
         embedder_alias: Selected embedder catalog alias.
         embedder_model_id: Provider embedding model ID bound to that alias.
-        estimate: Conservative maximum embedding cost in USD.
+        estimate: Conservative maximum embedding cost in USD, or ``None`` when undefined.
         ceiling: Configured ``--max-build-cost-usd`` value.
         reused: Whether an exact completed grounded build already exists.
     """
@@ -940,6 +929,10 @@ def _render_preflight(
     if reused:
         _console.print(
             "  [dim]embedding[/dim]    reuse exact completed indexes, $0.000000 new spend"
+        )
+    elif estimate is None:
+        _console.print(
+            "  [dim]embedding[/dim]    [yellow]undefined[/yellow] (embedder has no catalog price)"
         )
     else:
         _console.print(f"  [dim]embedding[/dim]    at most ${estimate:.6f}")

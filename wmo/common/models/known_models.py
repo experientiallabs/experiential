@@ -4,7 +4,8 @@ Provider listing endpoints publish which models an authenticated account may cal
 them publish neither prices nor protocol capabilities. This table carries the values WMO verified
 against each provider's public model and pricing documentation so setup never asks a user to copy
 capability booleans, token limits, or prices by hand. A model absent from this table keeps unknown
-capabilities and unknown prices, which fails closed everywhere those values are required.
+capabilities and unknown prices; runtime preflight stays permissive for unknown values, while
+paid commands report the cost as undefined and require explicit spend confirmation.
 
 Prices are USD per million tokens on each provider's standard synchronous tier. A cache price of
 zero means the provider documents no separate charge for that cache operation.

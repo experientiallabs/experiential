@@ -102,7 +102,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
     assert request.tools == (tool,)
     assert ModelCapabilities(supports_tools=True).model_dump(mode="json") == {
         "supports_tools": True,
-        "supports_embeddings": False,
+        "supports_embeddings": None,
         "supports_structured_output": False,
         "supports_completions": None,
         "supports_temperature": True,
@@ -261,3 +261,19 @@ def test_combine_economics_sums_present_usage_and_complete_measurements() -> Non
     assert combined.cost_usd == NumericMeasurement(value=0.5, provenance="estimated")
     assert combined.latency_seconds is None
     assert combine_economics(()) == OperationEconomics()
+
+
+def test_unknown_support_flags_keep_the_frozen_capability_identity_digest() -> None:
+    """Unknown tool and embedding support hash exactly like an explicit denial.
+
+    Existing frozen router artifacts recorded digests when unsupported meant False, so the
+    permissive unknown default must not shift any persisted capability identity.
+    """
+    assert (
+        ModelCapabilities().identity_sha256()
+        == ModelCapabilities(supports_tools=False, supports_embeddings=False).identity_sha256()
+    )
+    assert (
+        ModelCapabilities(supports_tools=True).identity_sha256()
+        != ModelCapabilities().identity_sha256()
+    )

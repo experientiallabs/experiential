@@ -149,7 +149,7 @@ class RuntimeModelCatalog:
 
         Returns:
             Immutable model identity and the alias-specific capability snapshot. Omitted catalog
-            capabilities become an all-unknown, fail-closed snapshot.
+            capabilities become an all-unknown snapshot that permissive preflight accepts.
 
         Raises:
             ModelConnectionError: The alias is unknown or names an unsupported provider.
@@ -231,7 +231,7 @@ class RuntimeModelCatalog:
                 snapshot,
                 capabilities,
                 client,
-                bedrock_client if capabilities.supports_embeddings else None,
+                bedrock_client if capabilities.supports_embeddings is not False else None,
                 served_model_id=record.served_model_id,
             )
         api_key = read_connection_api_key(connection, environment=self._environment)
@@ -249,7 +249,7 @@ class RuntimeModelCatalog:
                 snapshot,
                 capabilities,
                 openai_client,
-                openai_client if capabilities.supports_embeddings else None,
+                openai_client if capabilities.supports_embeddings is not False else None,
                 served_model_id=record.served_model_id,
             )
         if provider == "azure":
@@ -277,7 +277,7 @@ class RuntimeModelCatalog:
                 snapshot,
                 capabilities,
                 client,
-                client if capabilities.supports_embeddings else None,
+                client if capabilities.supports_embeddings is not False else None,
                 served_model_id=record.served_model_id,
             )
         if provider == "tinker":
@@ -317,7 +317,8 @@ class RuntimeModelCatalog:
         )
         embedding_client = (
             http_client
-            if capabilities.supports_embeddings and isinstance(http_client, EmbeddingClient)
+            if capabilities.supports_embeddings is not False
+            and isinstance(http_client, EmbeddingClient)
             else None
         )
         return ResolvedModel(

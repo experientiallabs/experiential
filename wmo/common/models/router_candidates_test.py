@@ -320,3 +320,17 @@ def test_routing_capability_binding_detects_completion_drift_separately() -> Non
     assert router_candidate_capabilities_sha256(supported) != (
         router_candidate_capabilities_sha256(unsupported)
     )
+
+
+def test_unknown_tool_support_keeps_the_frozen_candidate_capability_digest() -> None:
+    """Unknown tool support hashes exactly like an explicit denial for frozen plans."""
+    unknown = _capabilities(supports_tools=None)
+    denied = _capabilities(supports_tools=False)
+    granted = _capabilities(supports_tools=True)
+
+    assert router_candidate_capabilities_sha256(unknown) == (
+        router_candidate_capabilities_sha256(denied)
+    )
+    assert router_candidate_capabilities_sha256(granted) != (
+        router_candidate_capabilities_sha256(unknown)
+    )

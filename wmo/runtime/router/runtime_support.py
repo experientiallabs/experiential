@@ -293,20 +293,23 @@ def validate_idempotency_key(value: str) -> None:
 
 
 def supports_request(resolved: ResolvedModel, request: ModelRequest) -> bool:
-    """Return whether a resolved model proves every requested capability.
+    """Return whether a resolved model can serve every requested capability.
+
+    Unknown capability declarations are permissive: only an explicit ``False`` tool declaration
+    or an explicitly declared output limit below the request excludes the model.
 
     Args:
         resolved: Frozen runtime model binding.
         request: Provider-neutral request to evaluate.
 
     Returns:
-        Whether the model proves the required tools and output-token capacity.
+        Whether no explicit declaration rules out the required tools or output-token capacity.
     """
-    if requires_tool_protocol(request) and not resolved.capabilities.supports_tools:
+    if requires_tool_protocol(request) and resolved.capabilities.supports_tools is False:
         return False
     requested = request.maximum_output_tokens
     available = resolved.capabilities.maximum_output_tokens
-    return requested is None or (available is not None and requested <= available)
+    return requested is None or available is None or requested <= available
 
 
 def eligible_decision(

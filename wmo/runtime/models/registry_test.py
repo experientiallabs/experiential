@@ -200,12 +200,12 @@ def test_snapshot_connection_digest_is_normalized_and_endpoint_specific() -> Non
 def test_preflight_rejects_capability_before_reading_missing_credentials() -> None:
     """A known unsupported requirement fails locally and cannot trigger a paid request."""
     catalog = RuntimeModelCatalog(
-        _catalog(provider="anthropic", capabilities=ModelCapabilities()),
+        _catalog(provider="anthropic", capabilities=ModelCapabilities(supports_embeddings=False)),
         environment={},
         transport_factory=ScriptedJsonTransport,
     )
 
-    with pytest.raises(ModelCapabilityError, match="does not support embeddings"):
+    with pytest.raises(ModelCapabilityError, match="declares no embedding support"):
         catalog.preflight(
             "fixture-model",
             CapabilityRequirement(requires_embeddings=True),
@@ -273,8 +273,8 @@ def test_resolution_carries_the_cataloged_served_model_identity() -> None:
     assert default.resolve("fixture-model").served_model_id is None
 
 
-def test_model_capability_snapshot_has_exact_limits_and_fails_closed_when_absent() -> None:
-    """Model records, not provider names, prove protocol support and W8 capacity boundaries."""
+def test_model_capability_snapshot_has_exact_limits_and_stays_permissive_when_absent() -> None:
+    """Explicit declarations bound preflight while an undeclared model stays usable."""
     capabilities = ModelCapabilities(
         supports_tools=True,
         context_window_tokens=32_768,
@@ -311,14 +311,20 @@ def test_model_capability_snapshot_has_exact_limits_and_fails_closed_when_absent
         transport_factory=ScriptedJsonTransport,
     )
     assert unknown.snapshot("fixture-model")[1] == ModelCapabilities()
-    assert unknown.resolve("fixture-model").embedding_client is None
-    with pytest.raises(ModelCapabilityError, match="does not support tool calls"):
-        unknown.preflight("fixture-model", CapabilityRequirement(requires_tools=True))
-    with pytest.raises(ModelCapabilityError, match="does not report a context window"):
-        unknown.preflight(
-            "fixture-model",
-            CapabilityRequirement(minimum_context_window_tokens=1),
-        )
+    assert unknown.resolve("fixture-model").embedding_client is not None
+    unknown.preflight("fixture-model", CapabilityRequirement(requires_tools=True))
+    unknown.preflight(
+        "fixture-model",
+        CapabilityRequirement(minimum_context_window_tokens=1),
+    )
+
+    declared_unsupported = RuntimeModelCatalog(
+        _catalog(capabilities=ModelCapabilities(supports_tools=False)),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    with pytest.raises(ModelCapabilityError, match="declares no tool call support"):
+        declared_unsupported.preflight("fixture-model", CapabilityRequirement(requires_tools=True))
 
 
 def test_tinker_resolution_uses_runtime_owned_default_construction(

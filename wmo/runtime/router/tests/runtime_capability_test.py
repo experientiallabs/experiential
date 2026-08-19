@@ -29,18 +29,66 @@ def test_selected_model_must_prove_tool_capability_before_dispatch() -> None:
     assert client.complete_calls == 0
 
 
-def test_selected_model_must_prove_output_capacity_before_dispatch() -> None:
-    """An explicit output limit never reaches a model with unknown capacity."""
+def test_selected_model_output_capacity_blocks_only_an_explicit_smaller_limit() -> None:
+    """Unknown output capacity dispatches while an explicit smaller limit fails closed."""
     runtime, client = _runtime()
     request = ModelRequest(
         messages=(ModelMessage(role="user", content="route me"),),
         maximum_output_tokens=100,
     )
 
-    with pytest.raises(RouterModelCapabilityError, match="output-token capacity"):
-        runtime.complete(request, episode_id="capacity-episode")
+    runtime.complete(request, episode_id="capacity-episode")
 
-    assert client.complete_calls == 0
+    assert client.complete_calls == 1
+
+    policy, manifest, bank, snapshots, bounded_client = _fixture()
+    capabilities = ModelCapabilities(supports_tools=True, maximum_output_tokens=50)
+    snapshots = {
+        alias: (
+            snapshot
+            if alias == policy.embedder_alias
+            else snapshot.model_copy(update={"capabilities_sha256": capabilities.identity_sha256()})
+        )
+        for alias, snapshot in snapshots.items()
+    }
+    policy = policy.model_copy(
+        update={
+            "candidates": tuple(
+                RoutedCandidateSnapshot(alias=item.alias, model=snapshots[item.alias])
+                for item in policy.candidates
+            ),
+        }
+    )
+
+    class _BoundedCatalog(_Catalog):
+        """Catalog whose candidate aliases declare an explicit small output limit."""
+
+        def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+            """Return the frozen model and explicitly bounded candidate capabilities."""
+            if alias == "embedder":
+                return super().snapshot(alias)
+            return snapshots[alias], capabilities
+
+        def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+            """Resolve an alias to the shared test client with bounded capabilities."""
+            del role
+            snapshot, bounded = self.snapshot(alias)
+            return ResolvedModel(alias, snapshot, bounded, self.client, self.client)
+
+    bounded_runtime = RouterRuntime(
+        policy,
+        manifest,
+        bank,
+        cast(RuntimeModelCatalog, _BoundedCatalog(snapshots, bounded_client)),
+        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_sha256="a" * 64,
+        pricing_candidate_aliases=bank.candidate_aliases,
+    )
+
+    with pytest.raises(RouterModelCapabilityError, match="output-token capacity"):
+        bounded_runtime.complete(request, episode_id="bounded-capacity-episode")
+
+    assert bounded_client.complete_calls == 0
 
 
 def test_replayed_tool_history_requires_tool_capability() -> None:
@@ -75,7 +123,7 @@ def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
     """
     policy, manifest, bank, snapshots, client = _fixture()
     capabilities = {
-        "cheap": ModelCapabilities(),
+        "cheap": ModelCapabilities(supports_tools=False),
         "baseline": ModelCapabilities(supports_tools=True),
         "embedder": ModelCapabilities(supports_embeddings=True),
     }

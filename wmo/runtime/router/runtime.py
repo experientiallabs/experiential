@@ -172,7 +172,7 @@ class RouterRuntime:
             raise RouterRuntimeIntegrityError(
                 "runtime model catalog cannot resolve policy pins"
             ) from exc
-        if embedder.embedding_client is None or not embedder.capabilities.supports_embeddings:
+        if embedder.embedding_client is None or embedder.capabilities.supports_embeddings is False:
             raise RouterRuntimeIntegrityError("frozen router embedder lacks embedding capability")
         self._embedder = embedder.embedding_client
         self._embedder_billing_source = embedder.snapshot.billing_source
@@ -699,13 +699,14 @@ class RouterRuntime:
                     request_key, RoutedSpendDisposition.DEFINITELY_NOT_INCURRED
                 )
         resolved = self._resolve(selected.selected_alias)
-        if _requires_tool_protocol(request) and not resolved.capabilities.supports_tools:
+        if _requires_tool_protocol(request) and resolved.capabilities.supports_tools is False:
             raise RouterModelCapabilityError(
                 f"routed model alias {selected.selected_alias!r} does not support tool calls"
             )
-        if request.maximum_output_tokens is not None and (
-            resolved.capabilities.maximum_output_tokens is None
-            or request.maximum_output_tokens > resolved.capabilities.maximum_output_tokens
+        if (
+            request.maximum_output_tokens is not None
+            and resolved.capabilities.maximum_output_tokens is not None
+            and request.maximum_output_tokens > resolved.capabilities.maximum_output_tokens
         ):
             raise RouterModelCapabilityError(
                 f"routed model alias {selected.selected_alias!r} cannot prove the requested "
