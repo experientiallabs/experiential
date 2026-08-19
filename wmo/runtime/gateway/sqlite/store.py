@@ -559,8 +559,10 @@ class SQLiteGatewayStore:
         """
         if deadline_monotonic <= self._clock.monotonic():
             raise GatewayStoreError("request deadline has already expired")
-        organization_id, identity_id, key_id = self._authenticate(raw_key)
-        with self._connect() as connection:
+        with self._transaction() as connection:
+            organization_id, identity_id, key_id = self._authenticate_in_transaction(
+                connection, raw_key
+            )
             row = connection.execute(
                 """
                 SELECT a.alias_id, a.alias_name, a.active_revision_id,
@@ -615,8 +617,8 @@ class SQLiteGatewayStore:
         Returns:
             Granted public alias names in stable order.
         """
-        organization_id, identity_id, _ = self._authenticate(raw_key)
-        with self._connect() as connection:
+        with self._transaction() as connection:
+            organization_id, identity_id, _ = self._authenticate_in_transaction(connection, raw_key)
             rows = connection.execute(
                 """
                 SELECT a.alias_name
@@ -635,27 +637,39 @@ class SQLiteGatewayStore:
         """Rotate future key fingerprints while retaining old key authentication."""
         return self._pepper.rotate()
 
-    def _authenticate(self, raw_key: str) -> tuple[str, str, str]:
-        """Authenticate one key without placing its raw value in SQL or logs."""
+    def _authenticate_in_transaction(
+        self, connection: sqlite3.Connection, raw_key: str
+    ) -> tuple[str, str, str]:
+        """Authenticate one key inside the caller's authority transaction.
+
+        Args:
+            connection: Immediate transaction retained through the authority read.
+            raw_key: Caller key that must never enter SQLite or logs.
+
+        Returns:
+            Organization, identity, and virtual-key IDs for active authority.
+
+        Raises:
+            InvalidVirtualKeyError: The key or its owning authority is inactive.
+        """
         try:
             prefix = key_prefix(raw_key)
         except GatewayAuthError as exc:
             raise InvalidVirtualKeyError("virtual key is invalid") from exc
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT k.organization_id, k.identity_id, k.key_id,
-                       k.fingerprint_version, k.fingerprint_sha256,
-                       k.expires_at, k.revoked_at, i.active AS identity_active,
-                       o.active AS organization_active
-                FROM virtual_keys AS k
-                JOIN identities AS i
-                  ON i.organization_id = k.organization_id AND i.identity_id = k.identity_id
-                JOIN organizations AS o ON o.organization_id = k.organization_id
-                WHERE k.prefix = ?
-                """,
-                (prefix,),
-            ).fetchall()
+        rows = connection.execute(
+            """
+            SELECT k.organization_id, k.identity_id, k.key_id,
+                   k.fingerprint_version, k.fingerprint_sha256,
+                   k.expires_at, k.revoked_at, i.active AS identity_active,
+                   o.active AS organization_active
+            FROM virtual_keys AS k
+            JOIN identities AS i
+              ON i.organization_id = k.organization_id AND i.identity_id = k.identity_id
+            JOIN organizations AS o ON o.organization_id = k.organization_id
+            WHERE k.prefix = ?
+            """,
+            (prefix,),
+        ).fetchall()
         now = self._clock.now()
         selected: sqlite3.Row | None = None
         for row in rows:
@@ -680,14 +694,13 @@ class SQLiteGatewayStore:
         organization_id = str(selected["organization_id"])
         identity_id = str(selected["identity_id"])
         key_id = str(selected["key_id"])
-        with self._transaction() as connection:
-            connection.execute(
-                """
-                UPDATE virtual_keys SET last_used_at = ?
-                WHERE organization_id = ? AND key_id = ?
-                """,
-                (utc_text(now), organization_id, key_id),
-            )
+        connection.execute(
+            """
+            UPDATE virtual_keys SET last_used_at = ?
+            WHERE organization_id = ? AND key_id = ?
+            """,
+            (utc_text(now), organization_id, key_id),
+        )
         return organization_id, identity_id, key_id
 
     @contextmanager

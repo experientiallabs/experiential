@@ -296,35 +296,61 @@ def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | N
         raise GatewaySchemaError("gateway database is corrupt or unreadable") from exc
     backup: Path | None = None
     try:
-        integrity = connection.execute("PRAGMA integrity_check").fetchone()
-        if integrity is None or integrity[0] != "ok":
-            raise GatewaySchemaError("gateway database failed integrity check")
-        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > SCHEMA_VERSION:
-            raise GatewaySchemaError(
-                f"gateway database schema {version} is newer than supported {SCHEMA_VERSION}"
-            )
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
-        if 0 < version < SCHEMA_VERSION:
-            backup = _backup_database(connection, path, version)
         connection.execute("BEGIN EXCLUSIVE")
         try:
+            _supported_schema_version(connection)
+            connection.execute("COMMIT")
+        except GatewaySchemaError:
+            connection.execute("ROLLBACK")
+            raise
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = FULL")
+        connection.execute("BEGIN EXCLUSIVE")
+        try:
+            version = _supported_schema_version(connection)
+            if 0 < version < SCHEMA_VERSION:
+                backup = _backup_database(path, version)
             for next_version in range(version + 1, SCHEMA_VERSION + 1):
                 for statement in _MIGRATIONS[next_version]:
                     connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {next_version}")
+            _require_schema_objects(connection)
             connection.execute("COMMIT")
+        except GatewaySchemaError:
+            connection.execute("ROLLBACK")
+            raise
         except (sqlite3.DatabaseError, OSError) as exc:
             connection.execute("ROLLBACK")
             raise GatewaySchemaError("gateway database migration failed") from exc
-        _require_schema_objects(connection)
     except sqlite3.DatabaseError as exc:
         raise GatewaySchemaError("gateway database is corrupt or unreadable") from exc
     finally:
         connection.close()
     os.chmod(path, 0o600)
     return backup
+
+
+def _supported_schema_version(connection: sqlite3.Connection) -> int:
+    """Read and validate schema state while the caller holds an exclusive transaction.
+
+    Args:
+        connection: Database connection inside an exclusive transaction.
+
+    Returns:
+        Supported current schema version.
+
+    Raises:
+        GatewaySchemaError: Integrity fails or the schema is newer than this code.
+    """
+    integrity = connection.execute("PRAGMA integrity_check").fetchone()
+    if integrity is None or integrity[0] != "ok":
+        raise GatewaySchemaError("gateway database failed integrity check")
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if version > SCHEMA_VERSION:
+        raise GatewaySchemaError(
+            f"gateway database schema {version} is newer than supported {SCHEMA_VERSION}"
+        )
+    return version
 
 
 def _create_private_database_file(path: Path) -> None:
@@ -345,17 +371,30 @@ def _create_private_database_file(path: Path) -> None:
         raise GatewaySchemaError("gateway database must not be group or world accessible")
 
 
-def _backup_database(connection: sqlite3.Connection, path: Path, version: int) -> Path:
-    """Create a consistent mode-0600 SQLite backup before forward migration."""
+def _backup_database(path: Path, version: int) -> Path:
+    """Create a consistent mode-0600 SQLite backup before forward migration.
+
+    The caller retains the exclusive migration transaction while this separate read
+    connection copies the last committed WAL snapshot.
+
+    Args:
+        path: Database protected by the caller's exclusive transaction.
+        version: Last committed schema version represented by the backup.
+
+    Returns:
+        Private path containing the consistent pre-migration snapshot.
+    """
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     backup = path.with_name(f"{path.name}.backup-v{version}-{stamp}")
     descriptor = os.open(backup, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
+    source = sqlite3.connect(path)
     destination = sqlite3.connect(backup)
     try:
-        connection.backup(destination)
+        source.backup(destination)
     finally:
         destination.close()
+        source.close()
     os.chmod(backup, 0o600)
     return backup
 

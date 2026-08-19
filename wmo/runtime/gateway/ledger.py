@@ -322,7 +322,7 @@ class SQLiteAttemptLedger:
                     attempt_id,
                 ),
             )
-            if state in {"completed", "cancelled", "incomplete"}:
+            if state in {"completed", "failed", "cancelled", "incomplete"}:
                 connection.execute(
                     """
                     UPDATE gateway_requests SET terminal_state = ?, terminal_at = ?

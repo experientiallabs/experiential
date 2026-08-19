@@ -262,6 +262,42 @@ def test_cancelled_post_commit_attempt_keeps_observed_billable_usage(tmp_path: P
     assert usage.terminal_counts[0].state == "cancelled"
 
 
+def test_failed_attempt_terminalizes_its_parent_request(tmp_path: Path) -> None:
+    """An ordinary terminal provider failure closes both attempt and request state."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("failed-request"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization), deployment=_deployment(), route_depth=0
+    )
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+        safe_message="provider request failed",
+    )
+
+    ledger.finish_attempt(attempt_id=attempt_id, terminal_event=None, failure=failure)
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        request_state = connection.execute(
+            "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
+            (authorization.request_id,),
+        ).fetchone()[0]
+        attempt_state = connection.execute(
+            "SELECT state FROM gateway_attempts WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert request_state == "failed"
+    assert attempt_state == "failed"
+
+
 def test_idempotency_is_opt_in_and_restart_replay_fails_closed(tmp_path: Path) -> None:
     """A stored keyed request is never redispatched when response content is unavailable."""
     clock = FakeLedgerClock()
