@@ -1,9 +1,9 @@
 ---
-name: test-happy-path
-description: Run the live WMO happy path as an unattended automation. Fits the pinned terminal-tasks trace export through the CLI, calibrates the judge non-interactively, fits a router, verifies exact replay, and serves the frozen policy on loopback. Use when asked to test the happy path, verify cloud setup, or attach this skill to an automation.
+name: test-build
+description: Run the live WMO build-to-serve path as an unattended automation. Fits the pinned terminal-tasks trace export through the CLI, calibrates the judge non-interactively, fits a router, verifies exact replay, and serves the frozen policy on loopback. Use when asked to test the build path, verify cloud setup, or attach this skill to an automation.
 ---
 
-# Test the happy path
+# Test the build path
 
 Execute the current CLI path on one isolated local root. This is a live provider run, not the
 deterministic fixture test. It proves the commands complete, that the fitted router replays
