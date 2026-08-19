@@ -1,13 +1,13 @@
 ---
 name: test-happy-path
-description: Run the live WMO happy path as an unattended Cursor automation. Fits one caller-supplied trace export through the CLI, calibrates the judge, fits a router, serves it, and refreshes retrieval from the new journal. Use when asked to test the happy path, verify cloud setup, or attach this skill to a Cursor automation.
+description: Run the live WMO happy path as an unattended automation. Fits the pinned terminal-tasks trace export through the CLI, calibrates the judge non-interactively, fits a router, verifies exact replay, and serves the frozen policy on loopback. Use when asked to test the happy path, verify cloud setup, or attach this skill to an automation.
 ---
 
 # Test the happy path
 
 Execute the current CLI path on one isolated local root. This is a live provider run, not the
-deterministic fixture test. It proves the commands complete and that new routed traffic can enter
-a new retrieval index. It does not claim router quality.
+deterministic fixture test. It proves the commands complete, that the fitted router replays
+exactly, and that routed loopback traffic journals durably. It does not claim router quality.
 
 Every step is a `wmo` or standard shell command. Do not edit `models.toml`, project files, or
 artifacts by hand. Do not call internal Python APIs. If a step cannot be done through the CLI,
@@ -20,19 +20,25 @@ Time every numbered step and report the table at the end.
 
 ## Fit dataset
 
-This skill fits exactly one caller-supplied trace export. It does not choose a corpus, download a
-named public dataset, or fall back to a fixture.
+This skill fits the pinned public terminal-tasks export by default. A caller may override any
+variable below; when overriding, the caller owns the digest. Record the effective values in the
+final report so the fitted dataset is unambiguous.
 
-The caller must set every variable below before the first write. Fail if any is missing, empty,
-or unusable. Record the values in the final report so the fitted dataset is unambiguous.
+- `WMO_HAPPY_PATH_PROJECT` (default `terminal-tasks`): local project ID passed to every command
+- `WMO_HAPPY_PATH_TRACES` (default `$HOME/wmo-fixtures/terminal-tasks-traces.otel.jsonl`):
+  local trace-export file
+- `WMO_HAPPY_PATH_TRACES_SHA256` (default
+  `21c62cba7e3372cbf03df051dc2408699fbf8ea3561ba661b599e4949f0e5d42`): lowercase hex digest
+- `WMO_HAPPY_PATH_SOURCE` (default `otlp`): trace source format
 
-- `WMO_HAPPY_PATH_PROJECT`: local project ID passed to every `wmo` command
-- `WMO_HAPPY_PATH_TRACES`: existing local trace-export file (OTLP or PostHog)
-- `WMO_HAPPY_PATH_TRACES_SHA256`: lowercase hex digest of that file
-- `WMO_HAPPY_PATH_SOURCE`: `otlp` or `posthog`, matching the file
+When the default file is absent, download the pinned export once with `HF_TOKEN`:
 
-Do not invent a project ID. Do not fetch a replacement file. Do not skip the digest check. If the
-file is absent or the digest does not match, stop.
+```
+https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl
+```
+
+Do not skip the digest check. If the file is absent and cannot be downloaded, or the digest does
+not match, stop.
 
 Optional work root: `WMO_HAPPY_PATH_ROOT` (default `/tmp/wmo-happy-path`). Keep the trace file
 outside that directory. The skill deletes the work root at the start of the run.
@@ -43,13 +49,14 @@ Fail before any write if a required variable is missing or empty. Never print a 
 
 Required from the first step:
 
-- `OPENAI_API_KEY`: embeddings, judge, and the first router candidate
-- `WMO_ENDPOINT_BASE_URL`: hosted OpenAI-compatible origin, including the `/v1` suffix
-- `WMO_ENDPOINT_API_KEY`: credential for that origin
+- `OPENAI_API_KEY`: embeddings, judge, and the second router candidate
+- `EXP_WM_ENDPOINT`: hosted OpenAI-compatible base URL, used exactly as provided. The service
+  serves `/chat/completions` at that base, so never append a `/v1` suffix.
+- `EXP_WM_API_KEY`: credential for that endpoint
 
-Required only when optimize needs a second candidate:
+Required only when the pinned export must be downloaded:
 
-- `ANTHROPIC_API_KEY`: Haiku 4.5, added immediately before `wmo optimize router`
+- `HF_TOKEN`
 
 Present but unused by this skill:
 
@@ -60,24 +67,25 @@ Present but unused by this skill:
 
 Keep these exact. If a pin is unavailable, stop and report which one failed.
 
-- World model: hosted OpenAI-compatible `deepseek-v4-flash` as alias `deepseek-v4-flash`
-- Judge, OpenAI candidate, incumbent: `gpt-5.6-luna` as alias `gpt-5-6-luna`
-- Embedder: `text-embedding-3-small`
-- Second optimize candidate, only because the router CLI requires two: `claude-haiku-4-5`
-  (`claude-haiku-4-5-20251001`)
-- Shared command budget: `$25` via `wmo config budget` (covers the optimize estimate)
+- World model, first router candidate, and incumbent: hosted OpenAI-compatible
+  `deepseek-v4-flash` as alias `dsflash`
+- Judge and second router candidate: OpenAI `gpt-5.6-luna` as alias `luna`. It rejects an
+  explicit temperature, so its capabilities pin `supports_temperature` false and
+  `reasoning_effort` `xhigh`. Its `maximum_output_tokens` is `32000` because the judge
+  preflight requires an output budget of at least `16384` and fails closed below it.
+- Embedder: OpenAI `text-embedding-3-small` as alias `embed`
+- Shared command budget: `$50` via `wmo config budget`
 - Build ceiling: `$5`
-- Judge calibration sample: `10` lineages. The current CLI is judge-first: accept each
-  proposed score (the prompt default) after the configured judge responds.
-- Router ceiling: `$25`
-- Refresh ceiling: `$5`
+- Judge calibration sample: `10` lineages, labeled non-interactively in two passes (see step 5)
+- Router ceilings: `$50` provider cost, `120` judgments, `10` model calls
 - Loopback: `127.0.0.1:8000` with durable journaling (do not pass `--ghost`)
 
 The uniform label of `1` is a path-exercise input on the default 0-1 task-success axis. It is
-not a human quality review.
+not a human quality review. Every label carries a paired `--judgment` rationale so a label that
+corrects the judge proposal is complete on the same pass.
 
-Do not add Anthropic or Haiku during build setup. The second candidate exists only for
-`wmo optimize router`.
+Retry-exhausted simulation cells and oversized or empty judge cells become durable per-cell
+exclusions instead of aborting the run; report them if they appear, they are not a failure.
 
 ## Timing
 
@@ -108,19 +116,20 @@ bench() {
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 test -n "$OPENAI_API_KEY"
-test -n "$WMO_ENDPOINT_BASE_URL"
-test -n "$WMO_ENDPOINT_API_KEY"
-test -n "$WMO_HAPPY_PATH_PROJECT"
-test -n "$WMO_HAPPY_PATH_TRACES"
-test -n "$WMO_HAPPY_PATH_TRACES_SHA256"
-test -n "$WMO_HAPPY_PATH_SOURCE"
-test -f "$WMO_HAPPY_PATH_TRACES"
-case "$WMO_HAPPY_PATH_SOURCE" in
-  otlp|posthog) ;;
-  *) echo "WMO_HAPPY_PATH_SOURCE must be otlp or posthog" >&2; exit 1 ;;
-esac
-printf '%s  %s\n' "$WMO_HAPPY_PATH_TRACES_SHA256" "$WMO_HAPPY_PATH_TRACES" \
-  > /tmp/wmo-happy-path-traces.sha256
+test -n "$EXP_WM_ENDPOINT"
+test -n "$EXP_WM_API_KEY"
+PROJECT="${WMO_HAPPY_PATH_PROJECT:-terminal-tasks}"
+TRACES="${WMO_HAPPY_PATH_TRACES:-$HOME/wmo-fixtures/terminal-tasks-traces.otel.jsonl}"
+TRACES_SHA256="${WMO_HAPPY_PATH_TRACES_SHA256:-21c62cba7e3372cbf03df051dc2408699fbf8ea3561ba661b599e4949f0e5d42}"
+SOURCE="${WMO_HAPPY_PATH_SOURCE:-otlp}"
+if [ ! -f "$TRACES" ]; then
+  test -n "$HF_TOKEN"
+  mkdir -p "$(dirname "$TRACES")"
+  curl -sSL --fail -H "Authorization: Bearer $HF_TOKEN" \
+    -o "$TRACES" \
+    "https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl"
+fi
+printf '%s  %s\n' "$TRACES_SHA256" "$TRACES" > /tmp/wmo-happy-path-traces.sha256
 bench verify-traces sha256sum -c /tmp/wmo-happy-path-traces.sha256
 bench preconditions uv run wmo --help
 ```
@@ -132,51 +141,50 @@ WORK="${WMO_HAPPY_PATH_ROOT:-/tmp/wmo-happy-path}"
 rm -rf "$WORK"
 mkdir -p "$WORK"
 ROOT="$WORK/.wmo"
-test -f "$WMO_HAPPY_PATH_TRACES"
+test -f "$TRACES"
 ```
 
-## 3. Configure build providers
+## 3. Configure providers
 
-Write only secret-free catalog names. Expand the OpenAI-compatible origin from the environment so
-the catalog stores the URL, not a credential. `openai-compatible` requires `base_url` on
-`--connection-json`. Fail if the origin contains a double quote.
+Write only secret-free catalog names. Expand the OpenAI-compatible base URL from the environment
+so the catalog stores the URL, not a credential. `openai-compatible` requires `base_url` on
+`--connection-json`. Fail if the base URL contains a double quote.
 
 ```bash
-case "$WMO_ENDPOINT_BASE_URL" in *\"*) echo "WMO_ENDPOINT_BASE_URL cannot contain double quotes" >&2; exit 1 ;; esac
-HOSTED_WM_JSON="{\"name\":\"hosted-wm\",\"provider\":\"openai-compatible\",\"api_key_env\":\"WMO_ENDPOINT_API_KEY\",\"base_url\":\"$WMO_ENDPOINT_BASE_URL\"}"
+case "$EXP_WM_ENDPOINT" in *\"*) echo "EXP_WM_ENDPOINT cannot contain double quotes" >&2; exit 1 ;; esac
+EXPWM_JSON="{\"name\":\"expwm\",\"provider\":\"openai-compatible\",\"api_key_env\":\"EXP_WM_API_KEY\",\"base_url\":\"$EXP_WM_ENDPOINT\"}"
 bench config-providers uv run wmo config providers \
   --root "$ROOT" \
   --non-interactive \
   --connection-json '{"name":"openai","provider":"openai","api_key_env":"OPENAI_API_KEY"}' \
-  --connection-json "$HOSTED_WM_JSON" \
-  --model-json '{"alias":"deepseek-v4-flash","connection":"hosted-wm","model":"deepseek-v4-flash","capabilities":{"supports_completions":true,"supports_tools":true,"supports_structured_output":false,"supports_embeddings":false,"input_cost_per_million_tokens_usd":0,"output_cost_per_million_tokens_usd":0,"cached_input_cost_per_million_tokens_usd":0,"cache_write_cost_per_million_tokens_usd":0}}' \
-  --model-json '{"alias":"gpt-5-6-luna","connection":"openai","model":"gpt-5.6-luna","capabilities":{"supports_completions":true,"supports_temperature":false,"reasoning_effort":"xhigh","supports_tools":true,"supports_structured_output":true,"supports_embeddings":false,"context_window_tokens":1050000,"maximum_output_tokens":128000,"input_cost_per_million_tokens_usd":1.0,"output_cost_per_million_tokens_usd":6.0,"cached_input_cost_per_million_tokens_usd":0.1,"cache_write_cost_per_million_tokens_usd":1.25}}' \
-  --model-json '{"alias":"text-embedding-3-small","connection":"openai","model":"text-embedding-3-small","capabilities":{"supports_completions":false,"supports_embeddings":true,"input_cost_per_million_tokens_usd":0.02,"context_window_tokens":8192}}' \
-  --world-model deepseek-v4-flash \
-  --judge gpt-5-6-luna \
-  --embedder text-embedding-3-small
+  --connection-json "$EXPWM_JSON" \
+  --model-json '{"alias":"dsflash","connection":"expwm","model":"deepseek-v4-flash","capabilities":{"supports_completions":true,"supports_tools":true,"supports_structured_output":true,"supports_temperature":true,"supports_embeddings":false,"maximum_output_tokens":16000,"context_window_tokens":1048576,"input_cost_per_million_tokens_usd":0,"output_cost_per_million_tokens_usd":0,"cached_input_cost_per_million_tokens_usd":0,"cache_write_cost_per_million_tokens_usd":0}}' \
+  --model-json '{"alias":"luna","connection":"openai","model":"gpt-5.6-luna","capabilities":{"supports_completions":true,"supports_temperature":false,"reasoning_effort":"xhigh","supports_tools":true,"supports_structured_output":true,"supports_embeddings":false,"context_window_tokens":1050000,"maximum_output_tokens":32000,"input_cost_per_million_tokens_usd":0.2,"output_cost_per_million_tokens_usd":1.2,"cached_input_cost_per_million_tokens_usd":0.02,"cache_write_cost_per_million_tokens_usd":0.25}}' \
+  --model-json '{"alias":"embed","connection":"openai","model":"text-embedding-3-small","capabilities":{"supports_completions":false,"supports_embeddings":true,"input_cost_per_million_tokens_usd":0.02,"context_window_tokens":8192}}' \
+  --world-model dsflash \
+  --judge luna \
+  --embedder embed
 ```
 
-Confirm with `grep`, not by editing the file: `models.toml` names the three build aliases, points
-`world_model` at `deepseek-v4-flash`, does not mention Anthropic or Haiku, and contains no
-credential values. Zero token prices on the hosted world-model alias mean self-hosted spend, not a
-missing price.
+Confirm with `grep`, not by editing the file: `models.toml` names the three aliases, points
+`world_model` at `dsflash`, and contains no credential values. Zero token prices on the hosted
+world-model alias mean self-hosted spend, not a missing price.
 
 ```bash
-bench config-budget uv run wmo config budget 25 --root "$ROOT"
+bench config-budget uv run wmo config budget 50 --root "$ROOT"
 ```
 
-The default per-command budget is `$10`. Optimize reports a `$25` conservative estimate, so the
-shared ceiling must be raised before that command or it fails closed.
+The default per-command budget is `$10`. The router step freezes a `$50` provider ceiling, so
+the shared ceiling must be raised before that command or it fails closed.
 
 ## 4. Build
 
 ```bash
-bench build uv run wmo build "$WMO_HAPPY_PATH_PROJECT" "$WMO_HAPPY_PATH_TRACES" \
-  --source "$WMO_HAPPY_PATH_SOURCE" \
+bench build uv run wmo build "$PROJECT" "$TRACES" \
+  --source "$SOURCE" \
   --root "$ROOT" \
   --yes \
-  --no-interactive \
+  --non-interactive \
   --max-build-cost-usd 5
 ```
 
@@ -186,127 +194,133 @@ and world-model IDs from that output. Fail if the command asks for a prompt or e
 ## 5. Judge setup and calibration
 
 ```bash
-bench judge-setup uv run wmo config judge setup "$WMO_HAPPY_PATH_PROJECT" \
+bench judge-setup uv run wmo config judge setup "$PROJECT" \
   --root "$ROOT" \
   --approve \
   --non-interactive
 ```
 
-Calibration is judge-first. The configured judge proposes, then the operator accepts or corrects
-each axis. For this path-exercise, accept every proposal (the prompt default). Do not pass
-`--non-interactive`; that flag requires one `--label` per sample axis and there is no CLI that
-emits those trace IDs. Allocate a TTY if the environment does not have one, and accept the
-defaults. `--yes` authorizes the remaining judge-call estimate. `--approve` approves the report.
+Calibration is judge-first and fully non-interactive in two passes. The first pass pays for the
+judge proposals, then fails closed with a paste-ready `--label TRACE_ID:task-success=SCORE`
+expression for every sampled lineage. That exit is expected; do not treat it as a run failure.
 
 ```bash
-bench judge-calibrate bash -c \
-  'yes "" | script -qefc "uv run wmo config judge calibrate \"$WMO_HAPPY_PATH_PROJECT\" --root \"$ROOT\" --sample-size 10 --yes --approve" /dev/null'
+CAL_LOG="$WORK/calibrate-propose.log"
+bench judge-calibrate-propose bash -c \
+  'uv run wmo config judge calibrate "$0" --root "$1" --sample-size 10 --yes --non-interactive > "$2" 2>&1; test $? -ne 0' \
+  "$PROJECT" "$ROOT" "$CAL_LOG"
+grep -q -- '--label' "$CAL_LOG"
+```
+
+Extract every printed label key and rerun with the uniform score of `1` plus a paired
+`--judgment` rationale, so a label that corrects the judge proposal is complete on the same
+pass. The second pass replays the already-paid proposals, applies the labels, and approves.
+
+```bash
+CAL_ARGS=()
+while IFS= read -r key; do
+  CAL_ARGS+=(--label "${key}=1")
+  CAL_ARGS+=(--judgment "${key}=Uniform path-exercise label pinned to the top score.")
+done < <(grep -oE -- '--label [^ ]+=SCORE' "$CAL_LOG" | awk '{print $2}' | sed 's/=SCORE$//' | sort -u)
+test "${#CAL_ARGS[@]}" -ge 2
+bench judge-calibrate uv run wmo config judge calibrate "$PROJECT" \
+  --root "$ROOT" \
+  --sample-size 10 \
+  --yes \
+  --approve \
+  --non-interactive \
+  "${CAL_ARGS[@]}"
 ```
 
 Catalog prices supply the judge cost. Success prints an approved calibration artifact ID.
 
-## 6. Add the second optimize candidate
+## 6. Optimize the router
 
-Optimize requires two completion candidates. Add Haiku only here.
-
-```bash
-test -n "$ANTHROPIC_API_KEY"
-bench config-haiku uv run wmo config providers \
-  --root "$ROOT" \
-  --non-interactive \
-  --connection-json '{"name":"anthropic","provider":"anthropic","api_key_env":"ANTHROPIC_API_KEY"}' \
-  --model-json '{"alias":"claude-haiku-4-5","connection":"anthropic","model":"claude-haiku-4-5-20251001","capabilities":{"supports_completions":true,"supports_tools":true,"supports_structured_output":true,"supports_embeddings":false,"context_window_tokens":200000,"maximum_output_tokens":64000,"input_cost_per_million_tokens_usd":1.0,"output_cost_per_million_tokens_usd":5.0,"cached_input_cost_per_million_tokens_usd":0.1,"cache_write_cost_per_million_tokens_usd":1.25}}'
-```
-
-## 7. Optimize the router
+Two distinct candidates are required; `dsflash` and `luna` are both already configured, so no
+extra provider setup happens here.
 
 ```bash
-bench optimize uv run wmo optimize router "$WMO_HAPPY_PATH_PROJECT" \
+bench optimize uv run wmo optimize router "$PROJECT" \
   --root "$ROOT" \
-  --candidate gpt-5-6-luna \
-  --candidate claude-haiku-4-5 \
-  --incumbent gpt-5-6-luna \
+  --candidate dsflash \
+  --candidate luna \
+  --incumbent dsflash \
+  --maximum-provider-cost-usd 50 \
+  --maximum-judgments 120 \
+  --maximum-model-calls 10 \
   --yes \
-  --approve-fidelity \
-  --non-interactive \
-  --maximum-provider-cost-usd 25
-bench optimize-replay uv run wmo optimize router "$WMO_HAPPY_PATH_PROJECT" \
+  --non-interactive
+bench optimize-replay uv run wmo optimize router "$PROJECT" \
   --root "$ROOT" \
-  --candidate gpt-5-6-luna \
-  --candidate claude-haiku-4-5 \
-  --incumbent gpt-5-6-luna \
+  --candidate dsflash \
+  --candidate luna \
+  --incumbent dsflash \
+  --maximum-provider-cost-usd 50 \
+  --maximum-judgments 120 \
+  --maximum-model-calls 10 \
   --yes \
-  --approve-fidelity \
-  --non-interactive \
-  --maximum-provider-cost-usd 25
+  --non-interactive
 ```
 
 Success prints a policy ID and a report ID. The second run must print
-`replay: verified completed optimization` and make no new provider calls.
+`replay: verified completed optimization` and make no new provider calls. Per-cell exclusions
+for retry-exhausted or unusable judge cells are durable evidence, not failures; record any that
+appear.
 
-## 8. Serve the router and send official traffic
+## 7. Serve the router and send official traffic
 
 Start durable journaling in the background. Do not pass `--ghost`. Time readiness separately
-from the Chat Completions request.
+from the Chat Completions request. The repeated request with the same `Idempotency-Key` must
+return the journaled completion with the same response ID, which proves durable journaling
+without any new provider call.
 
 ```bash
-uv run wmo run "$WMO_HAPPY_PATH_PROJECT" --root "$ROOT" --port 8000 &
+uv run wmo run "$PROJECT" --root "$ROOT" --port 8000 &
 SERVER_PID=$!
 bench run-ready bash -c 'until curl -sS --fail http://127.0.0.1:8000/v1/models >/dev/null; do sleep 0.2; done'
+SMOKE_KEY="happy-path-$(date +%s)"
 bench chat-smoke curl -sS --fail http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$WMO_HAPPY_PATH_PROJECT\",\"messages\":[{\"role\":\"user\",\"content\":\"Help me\"}]}"
+  -H "Idempotency-Key: $SMOKE_KEY" \
+  -o /tmp/wmo-happy-path-chat-first.json \
+  -d "{\"model\":\"$PROJECT\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word ready.\"}]}"
+bench chat-replay curl -sS --fail http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $SMOKE_KEY" \
+  -o /tmp/wmo-happy-path-chat-replay.json \
+  -d "{\"model\":\"$PROJECT\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word ready.\"}]}"
 kill "$SERVER_PID"
 wait "$SERVER_PID" || true
+grep -o '"id":"[^"]*"' /tmp/wmo-happy-path-chat-first.json | head -1
+grep -o '"id":"[^"]*"' /tmp/wmo-happy-path-chat-replay.json | head -1
 ```
 
-The response must be HTTP 200 JSON with a completion choice. The listen line
-`OpenAI API router at http://127.0.0.1:8000/v1` must appear before the request.
+Both responses must be HTTP 200 JSON with a completion choice, and the two response IDs must be
+identical. The listen line `OpenAI API router at http://127.0.0.1:8000/v1` must appear before
+the first request.
 
-## 9. Closed-loop retrieval refresh
-
-```bash
-bench rag-refresh uv run wmo config rag refresh "$WMO_HAPPY_PATH_PROJECT" \
-  --root "$ROOT" \
-  --yes \
-  --non-interactive \
-  --maximum-cost-usd 5
-bench rag-refresh-replay uv run wmo config rag refresh "$WMO_HAPPY_PATH_PROJECT" \
-  --root "$ROOT" \
-  --yes \
-  --non-interactive \
-  --maximum-cost-usd 5
-```
-
-Pass only when the first refresh prints:
-
-- a refresh ID
-- `completed_targets` of at least 1
-- a combined-trace dataset ID
-- a retrieval index ID different from the build serving and fit RAG IDs
-- `completed build serving RAG ... and fit RAG ... are unchanged` with the IDs from step 4
-
-The second refresh must reprint the same refresh ID and make no new embedding calls.
-
-This writes a new retrieval index beside the frozen build. It does not mutate the completed-build
-world model.
+The locked `wmo config` surface has no retrieval-refresh command, so the durable journal
+produced here is the closed-loop evidence this skill verifies. Ingesting journaled traffic into
+a new retrieval index is out of scope for this skill.
 
 ## Pass or fail
 
-Pass only when every step above succeeded, the caller-supplied digest matched, both optimize runs
-agreed on the same policy ID, the loopback request returned 200, and both refresh runs agreed on
-the same refresh ID.
+Pass only when every step above succeeded, the effective digest matched, both optimize runs
+agreed on the same policy ID, the loopback request returned 200, and the idempotent replay
+returned the same response ID.
 
 In the final report include:
 
 - Fit dataset: project ID, source, trace path, and SHA-256
-- Build, calibration, policy, report, refresh, snapshot, combined-dataset, and new retrieval IDs
-- Observed spend ceilings printed by build, calibrate, optimize, and refresh
-- Whether optimize and refresh replayed on the second run
-- The HTTP status of the loopback smoke
+- Build, calibration, policy, and report IDs
+- Observed spend ceilings printed by build, calibrate, and optimize
+- Whether optimize replayed on the second run
+- The HTTP status of both loopback requests and whether the response IDs matched
+- Any durable per-cell exclusions reported by optimize
 - A timing table with every `bench` row: step name, seconds, exit status
 - Any command that prompted, retried, or used a model other than the pins
 
-If any step fails, stop. Do not substitute a different trace export, loosen a digest, invent a
-project ID, substitute OpenRouter, skip calibration approval, raise a spend ceiling, edit files
-by hand, or run Tinker SFT to force a green result.
+If any step fails (other than the expected first calibration pass), stop. Do not substitute a
+different trace export, loosen a digest, invent a project ID, substitute OpenRouter, skip
+calibration approval, raise a spend ceiling, edit files by hand, or run Tinker SFT to force a
+green result.
