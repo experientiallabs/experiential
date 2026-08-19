@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -54,8 +55,14 @@ from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
 from wmo.runtime.openai_protocol.requests import decode_chat, decode_responses
 from wmo.runtime.openai_protocol.state import (
     BoundedContinuationStore,
+    BoundedReplayStore,
     ContinuationState,
     ProtocolNamespace,
+    ReplayClaimKind,
+    ReplayKey,
+    ReplayLease,
+    ResponseContinuationStore,
+    ResponseReplayStore,
 )
 
 _DIGEST = "a" * 64
@@ -76,8 +83,14 @@ class _Clock:
 class _ControlStore:
     """Authorize one public alias without retaining the presented key."""
 
-    def __init__(self, catalog_sha256: str) -> None:
+    def __init__(
+        self,
+        catalog_sha256: str,
+        request_digest: Callable[[GatewayRequest], str] | None = None,
+    ) -> None:
+        """Initialize authority with an optional request-sensitive digest."""
         self._catalog_sha256 = catalog_sha256
+        self._request_digest = request_digest
         self.raw_keys_seen: list[str] = []
 
     def authorize_request(
@@ -100,7 +113,9 @@ class _ControlStore:
             target=DirectTarget(pool_id="pool-one"),
             surface=request.surface,
             catalog_sha256=self._catalog_sha256,
-            canonical_request_sha256=_DIGEST,
+            canonical_request_sha256=(
+                self._request_digest(request) if self._request_digest is not None else _DIGEST
+            ),
             deadline_monotonic=deadline_monotonic,
         )
 
@@ -207,6 +222,31 @@ class _EventStream:
     async def cancel(self) -> None:
         """Record bounded upstream cancellation."""
         self.cancelled = True
+
+
+class _GatedEventStream(_EventStream):
+    """Hold the first provider event until a concurrent gateway claim is waiting."""
+
+    def __init__(
+        self,
+        events: tuple[GatewayEvent, ...],
+        *,
+        started: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        """Bind deterministic provider-start and release signals."""
+        super().__init__(events)
+        self._started = started
+        self._release = release
+        self._waiting = True
+
+    async def __anext__(self) -> GatewayEvent:
+        """Wait once before yielding the injected provider sequence."""
+        if self._waiting:
+            self._waiting = False
+            self._started.set()
+            await self._release.wait()
+        return await super().__anext__()
 
 
 class _BlockingStream:
@@ -351,6 +391,56 @@ class _FailOnceContinuationStore(BoundedContinuationStore):
         await super().remember(namespace=namespace, response_id=response_id, state=state)
 
 
+class _SharedProtocolState:
+    """One structural test implementation shared by independent gateway workers."""
+
+    def __init__(self) -> None:
+        """Create finite replay and continuation state without subclass coupling."""
+        self._replays = BoundedReplayStore(capacity=8, byte_cap=65_536, ttl_seconds=60)
+        self._continuations = BoundedContinuationStore(
+            capacity=8,
+            byte_cap=65_536,
+            ttl_seconds=60,
+        )
+        self.join_count = 0
+        self.two_joiners = asyncio.Event()
+
+    async def claim(self, key: ReplayKey) -> ReplayLease:
+        """Delegate one atomic ownership claim to shared bounded state."""
+        lease = await self._replays.claim(key)
+        if lease.kind == ReplayClaimKind.JOIN:
+            self.join_count += 1
+            if self.join_count == 2:
+                self.two_joiners.set()
+        return lease
+
+    async def remember(
+        self,
+        *,
+        namespace: ProtocolNamespace,
+        response_id: str,
+        state: ContinuationState,
+    ) -> None:
+        """Retain one continuation for every worker."""
+        await self._continuations.remember(
+            namespace=namespace,
+            response_id=response_id,
+            state=state,
+        )
+
+    async def resolve(
+        self,
+        *,
+        namespace: ProtocolNamespace,
+        previous_response_id: str,
+    ) -> ContinuationState:
+        """Resolve one continuation created by any worker."""
+        return await self._continuations.resolve(
+            namespace=namespace,
+            previous_response_id=previous_response_id,
+        )
+
+
 def _catalog() -> tuple[NormalizedGatewayCatalog, ExactModelDeployment]:
     """Build one launch-safe singleton gateway catalog."""
     deployment = ExactModelDeployment(
@@ -385,11 +475,13 @@ def _service(
     provider: _Provider,
     *,
     terminal_flusher: Callable[[], object] | None = None,
-    continuation_store: BoundedContinuationStore | None = None,
+    replay_store: ResponseReplayStore | None = None,
+    continuation_store: ResponseContinuationStore | None = None,
+    request_digest: Callable[[GatewayRequest], str] | None = None,
 ) -> tuple[GatewayService, _ControlStore, _Ledger, ExecutionSnapshot]:
     """Compose the full launch data plane with deterministic injected dependencies."""
     catalog, deployment = _catalog()
-    control = _ControlStore(catalog.identity_sha256())
+    control = _ControlStore(catalog.identity_sha256(), request_digest)
     ledger = _Ledger()
     routes = CatalogRouteResolver({("revision-one", catalog.identity_sha256()): catalog})
     authorization = control.authorize_request(
@@ -431,6 +523,7 @@ def _service(
         ),
         clock=_Clock(),
         readiness_probe=readiness_probe,
+        replay_store=replay_store,
         continuation_store=continuation_store,
         terminal_flusher=flush,
     )
@@ -883,6 +976,113 @@ def test_http_boundary_authenticates_before_json_decode_and_returns_openai_400()
         assert malformed.status_code == 400
         assert malformed.json()["error"]["code"] == "invalid_json"
         assert control.raw_keys_seen == ["caller-secret"]
+
+    asyncio.run(scenario())
+
+
+def test_shared_protocol_state_joins_replays_and_continues_across_gateway_workers() -> None:
+    """Two apps share ownership and continuation state without sharing provider health."""
+
+    async def scenario() -> None:
+        """Drive concurrent, cancelled, conflicting, replayed, and continued HTTP requests."""
+        provider_started = asyncio.Event()
+        release_provider = asyncio.Event()
+        provider = _Provider(
+            lambda: _GatedEventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TEXT_DELTA,
+                        sequence_number=0,
+                        text_delta="hello",
+                    ),
+                    GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+                ),
+                started=provider_started,
+                release=release_provider,
+            )
+        )
+        shared = _SharedProtocolState()
+        replay_store: ResponseReplayStore = shared
+        continuation_store: ResponseContinuationStore = shared
+
+        def request_digest(request: GatewayRequest) -> str:
+            """Hash canonical test request content for body-conflict detection."""
+            return hashlib.sha256(request.model_dump_json().encode()).hexdigest()
+
+        worker_a, _control_a, _ledger_a, _proof_a = _service(
+            provider,
+            replay_store=replay_store,
+            continuation_store=continuation_store,
+            request_digest=request_digest,
+        )
+        worker_b, _control_b, _ledger_b, _proof_b = _service(
+            provider,
+            replay_store=replay_store,
+            continuation_store=continuation_store,
+            request_digest=request_digest,
+        )
+        transport_a = httpx.ASGITransport(app=create_gateway_app(worker_a))
+        transport_b = httpx.ASGITransport(app=create_gateway_app(worker_b))
+        headers = {
+            "authorization": "Bearer caller-secret",
+            "Idempotency-Key": "shared-operation",
+        }
+        original_body = {"model": "public-model", "input": "first"}
+
+        async with (
+            httpx.AsyncClient(transport=transport_a, base_url="http://worker-a") as client_a,
+            httpx.AsyncClient(transport=transport_b, base_url="http://worker-b") as client_b,
+        ):
+            original = asyncio.create_task(
+                client_a.post("/v1/responses", json=original_body, headers=headers)
+            )
+            await provider_started.wait()
+
+            cancelled_joiner = asyncio.create_task(
+                client_b.post("/v1/responses", json=original_body, headers=headers)
+            )
+            while shared.join_count < 1:
+                await asyncio.sleep(0)
+            cancelled_joiner.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled_joiner
+
+            surviving_joiner = asyncio.create_task(
+                client_b.post("/v1/responses", json=original_body, headers=headers)
+            )
+            await shared.two_joiners.wait()
+            conflict = await client_b.post(
+                "/v1/responses",
+                json={"model": "public-model", "input": "different"},
+                headers=headers,
+            )
+            assert conflict.status_code == 409
+            assert conflict.json()["error"]["code"] == "idempotency_conflict"
+
+            release_provider.set()
+            original_response, joined_response = await asyncio.gather(original, surviving_joiner)
+            replayed_response = await client_b.post(
+                "/v1/responses",
+                json=original_body,
+                headers=headers,
+            )
+            first_id = original_response.json()["id"]
+            continued = await client_b.post(
+                "/v1/responses",
+                json={
+                    "model": "public-model",
+                    "input": "second",
+                    "previous_response_id": first_id,
+                },
+                headers={"authorization": "Bearer caller-secret"},
+            )
+
+        assert original_response.status_code == 200
+        assert joined_response.content == original_response.content
+        assert replayed_response.content == original_response.content
+        assert continued.status_code == 200
+        assert continued.json()["previous_response_id"] == first_id
+        assert len(provider.streams) == 2
 
     asyncio.run(scenario())
 

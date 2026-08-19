@@ -66,6 +66,8 @@ from wmo.runtime.openai_protocol.state import (
     ProtocolNamespace,
     ReplayClaimKind,
     ReplayLease,
+    ResponseContinuationStore,
+    ResponseReplayStore,
     episode_namespace,
     replay_key,
 )
@@ -79,7 +81,7 @@ class GatewayDrainingError(RuntimeError):
 
 
 class GatewayService:
-    """Compose protocol, authority, routing, execution, and bounded process-local state."""
+    """Compose protocol, authority, routing, execution, and injected protocol state."""
 
     def __init__(
         self,
@@ -91,8 +93,8 @@ class GatewayService:
         clock: GatewayClock,
         readiness_probe: Callable[[], Awaitable[ExecutionSnapshot]],
         request_timeout_seconds: float = 120,
-        replay_store: BoundedReplayStore | None = None,
-        continuation_store: BoundedContinuationStore | None = None,
+        replay_store: ResponseReplayStore | None = None,
+        continuation_store: ResponseContinuationStore | None = None,
         wall_clock: Callable[[], float] = time.time,
         terminal_flusher: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
@@ -105,8 +107,8 @@ class GatewayService:
             executor: Async singleton provider executor.
             clock: Shared monotonic and wall clock.
             request_timeout_seconds: One total budget beginning before authorization.
-            replay_store: Optional bounded in-process response replay state.
-            continuation_store: Optional bounded Responses continuation state.
+            replay_store: Optional completed-response ownership and replay state.
+            continuation_store: Optional Responses continuation state.
             wall_clock: Injectable epoch clock for public object timestamps.
             readiness_probe: Credential-free proof that one granted alias can route.
             terminal_flusher: Hook that flushes queued terminal accounting after drain.
@@ -119,8 +121,12 @@ class GatewayService:
         self._executor = executor
         self._clock = clock
         self._request_timeout_seconds = request_timeout_seconds
-        self._replays = replay_store or BoundedReplayStore()
-        self._continuations = continuation_store or BoundedContinuationStore()
+        self._replays: ResponseReplayStore = (
+            replay_store if replay_store is not None else BoundedReplayStore()
+        )
+        self._continuations: ResponseContinuationStore = (
+            continuation_store if continuation_store is not None else BoundedContinuationStore()
+        )
         self._wall_clock = wall_clock
         self._readiness_probe = readiness_probe
         self._terminal_flusher = terminal_flusher or _flush_synchronous_ledger
@@ -603,7 +609,7 @@ class GatewayService:
         events: tuple[GatewayEvent, ...],
         response_id: str | None = None,
     ) -> None:
-        """Retain completed Responses history only in bounded process memory."""
+        """Retain completed Responses history through the injected bounded state contract."""
         terminal = next((event for event in reversed(events) if is_terminal(event)), None)
         if terminal is None or terminal.kind == GatewayEventKind.FAILED:
             return
