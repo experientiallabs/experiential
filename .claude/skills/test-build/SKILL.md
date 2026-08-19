@@ -24,12 +24,12 @@ This skill fits the pinned public terminal-tasks export by default. A caller may
 variable below; when overriding, the caller owns the digest. Record the effective values in the
 final report so the fitted dataset is unambiguous.
 
-- `WMO_HAPPY_PATH_PROJECT` (default `terminal-tasks`): local project ID passed to every command
-- `WMO_HAPPY_PATH_TRACES` (default `$HOME/wmo-fixtures/terminal-tasks-traces.otel.jsonl`):
+- `WMO_TEST_BUILD_PROJECT` (default `terminal-tasks`): local project ID passed to every command
+- `WMO_TEST_BUILD_TRACES` (default `$HOME/wmo-fixtures/terminal-tasks-traces.otel.jsonl`):
   local trace-export file
-- `WMO_HAPPY_PATH_TRACES_SHA256` (default
+- `WMO_TEST_BUILD_TRACES_SHA256` (default
   `21c62cba7e3372cbf03df051dc2408699fbf8ea3561ba661b599e4949f0e5d42`): lowercase hex digest
-- `WMO_HAPPY_PATH_SOURCE` (default `otlp`): trace source format
+- `WMO_TEST_BUILD_SOURCE` (default `otlp`): trace source format
 
 When the default file is absent, download the pinned export once with `HF_TOKEN`:
 
@@ -40,7 +40,7 @@ https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/reso
 Do not skip the digest check. If the file is absent and cannot be downloaded, or the digest does
 not match, stop.
 
-Optional work root: `WMO_HAPPY_PATH_ROOT` (default `/tmp/wmo-happy-path`). Keep the trace file
+Optional work root: `WMO_TEST_BUILD_ROOT` (default `/tmp/wmo-test-build`). Keep the trace file
 outside that directory. The skill deletes the work root at the start of the run.
 
 ## Secrets
@@ -103,8 +103,8 @@ except the long-running `wmo run` process, which is timed as `run-ready` until t
 appears. Do not use Python.
 
 ```bash
-WORK="${WMO_HAPPY_PATH_ROOT:-/tmp/wmo-happy-path}"
-BENCH=/tmp/wmo-happy-path-bench.tsv
+WORK="${WMO_TEST_BUILD_ROOT:-/tmp/wmo-test-build}"
+BENCH=/tmp/wmo-test-build-bench.tsv
 : > "$BENCH"
 bench() {
   local name="$1"
@@ -127,10 +127,10 @@ export PATH="$HOME/.local/bin:$PATH"
 test -n "$OPENAI_API_KEY"
 test -n "$EXP_WM_ENDPOINT"
 test -n "$EXP_WM_API_KEY"
-PROJECT="${WMO_HAPPY_PATH_PROJECT:-terminal-tasks}"
-TRACES="${WMO_HAPPY_PATH_TRACES:-$HOME/wmo-fixtures/terminal-tasks-traces.otel.jsonl}"
-TRACES_SHA256="${WMO_HAPPY_PATH_TRACES_SHA256:-21c62cba7e3372cbf03df051dc2408699fbf8ea3561ba661b599e4949f0e5d42}"
-SOURCE="${WMO_HAPPY_PATH_SOURCE:-otlp}"
+PROJECT="${WMO_TEST_BUILD_PROJECT:-terminal-tasks}"
+TRACES="${WMO_TEST_BUILD_TRACES:-$HOME/wmo-fixtures/terminal-tasks-traces.otel.jsonl}"
+TRACES_SHA256="${WMO_TEST_BUILD_TRACES_SHA256:-21c62cba7e3372cbf03df051dc2408699fbf8ea3561ba661b599e4949f0e5d42}"
+SOURCE="${WMO_TEST_BUILD_SOURCE:-otlp}"
 if [ ! -f "$TRACES" ]; then
   test -n "$HF_TOKEN"
   mkdir -p "$(dirname "$TRACES")"
@@ -138,15 +138,15 @@ if [ ! -f "$TRACES" ]; then
     -o "$TRACES" \
     "https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl"
 fi
-printf '%s  %s\n' "$TRACES_SHA256" "$TRACES" > /tmp/wmo-happy-path-traces.sha256
-bench verify-traces sha256sum -c /tmp/wmo-happy-path-traces.sha256
+printf '%s  %s\n' "$TRACES_SHA256" "$TRACES" > /tmp/wmo-test-build-traces.sha256
+bench verify-traces sha256sum -c /tmp/wmo-test-build-traces.sha256
 bench preconditions uv run wmo --help
 ```
 
 ## 2. Isolated work root
 
 ```bash
-WORK="${WMO_HAPPY_PATH_ROOT:-/tmp/wmo-happy-path}"
+WORK="${WMO_TEST_BUILD_ROOT:-/tmp/wmo-test-build}"
 rm -rf "$WORK"
 mkdir -p "$WORK"
 ROOT="$WORK/.wmo"
@@ -292,35 +292,42 @@ fit task IDs. Report retry counts and coverage gaps if they appear, they are not
 
 ## 7. Serve the router and send official traffic
 
-Start durable journaling in the background. Do not pass `--ghost`. Time readiness separately
-from the Chat Completions request. The repeated request with the same `Idempotency-Key` must
-return the journaled completion with the same response ID, which proves durable journaling
-without any new provider call.
+Start durable journaling in the background. Do not pass `--ghost`. The gateway is
+authenticated: startup prints `Gateway key file: <path>` under `$ROOT/gateway/`, and every
+request must carry that key as a bearer token. Time readiness separately from the Chat
+Completions request. The repeated request with the same `Idempotency-Key` must return the
+journaled completion with the same response ID, which proves durable journaling without any
+new provider call.
 
 ```bash
-uv run wmo run "$PROJECT" --root "$ROOT" --port 8000 &
+SERVE_LOG=/tmp/wmo-test-build-serve.log
+uv run wmo run "$PROJECT" --root "$ROOT" --port 8000 > "$SERVE_LOG" 2>&1 &
 SERVER_PID=$!
-bench run-ready bash -c 'until curl -sS --fail http://127.0.0.1:8000/v1/models >/dev/null; do sleep 0.2; done'
-SMOKE_KEY="happy-path-$(date +%s)"
+bench run-key bash -c "until grep -q 'Gateway key file:' $SERVE_LOG; do sleep 0.2; done"
+GATEWAY_KEY="$(tr -d '\n' < "$(sed -n 's/^Gateway key file: //p' "$SERVE_LOG" | head -1)")"
+bench run-ready bash -c "until curl -sS --fail -H 'Authorization: Bearer $GATEWAY_KEY' http://127.0.0.1:8000/v1/models >/dev/null; do sleep 0.2; done"
+SMOKE_KEY="test-build-$(date +%s)"
 bench chat-smoke curl -sS --fail http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_KEY" \
   -H 'Content-Type: application/json' \
   -H "Idempotency-Key: $SMOKE_KEY" \
-  -o /tmp/wmo-happy-path-chat-first.json \
+  -o /tmp/wmo-test-build-chat-first.json \
   -d "{\"model\":\"$PROJECT\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word ready.\"}]}"
 bench chat-replay curl -sS --fail http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_KEY" \
   -H 'Content-Type: application/json' \
   -H "Idempotency-Key: $SMOKE_KEY" \
-  -o /tmp/wmo-happy-path-chat-replay.json \
+  -o /tmp/wmo-test-build-chat-replay.json \
   -d "{\"model\":\"$PROJECT\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word ready.\"}]}"
 kill "$SERVER_PID"
 wait "$SERVER_PID" || true
-grep -o '"id":"[^"]*"' /tmp/wmo-happy-path-chat-first.json | head -1
-grep -o '"id":"[^"]*"' /tmp/wmo-happy-path-chat-replay.json | head -1
+grep -o '"id":"[^"]*"' /tmp/wmo-test-build-chat-first.json | head -1
+grep -o '"id":"[^"]*"' /tmp/wmo-test-build-chat-replay.json | head -1
 ```
 
 Both responses must be HTTP 200 JSON with a completion choice, and the two response IDs must be
-identical. The listen line `OpenAI API router at http://127.0.0.1:8000/v1` must appear before
-the first request.
+identical. The listen line `Uvicorn running on http://127.0.0.1:8000` must appear in the serve
+log before the first request. The key stays in the local root and never enters the report.
 
 The locked `wmo config` surface has no retrieval-refresh command, so the durable journal
 produced here is the closed-loop evidence this skill verifies. Ingesting journaled traffic into
