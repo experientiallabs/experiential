@@ -252,28 +252,34 @@ class RouterProjectTargetResolver:
         if runtime is None:
             raise GatewayRoutingError("project activation is not loaded")
         deadline = RequestDeadline(deadline_monotonic)
-        await self._acquire(deadline)
+        deadline.attempt_timeout()
         model_request = gateway_model_request(request)
         episode_id = project_episode_identity(episode_namespace)
-        task = asyncio.create_task(
-            asyncio.to_thread(
-                runtime._select_unretained,
-                model_request,
-                episode_id=episode_id,
-            )
-        )
-        task.add_done_callback(self._release_permit)
-        try:
-            async with asyncio.timeout(deadline.attempt_timeout()):
-                prepared = await asyncio.shield(task)
-        except TimeoutError as exc:
-            raise ProviderDeadlineExceeded("router selection deadline exceeded") from exc
-        deadline.attempt_timeout()
-        decision = runtime._retain_prepared_selection(
+        decision = runtime._reuse_sticky_selection(  # noqa: SLF001 - selection-only bridge.
             model_request,
             episode_id=episode_id,
-            prepared=prepared,
         )
+        if decision is None:
+            await self._acquire(deadline)
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    runtime._select_unretained,
+                    model_request,
+                    episode_id=episode_id,
+                )
+            )
+            task.add_done_callback(self._release_permit)
+            try:
+                async with asyncio.timeout(deadline.attempt_timeout()):
+                    prepared = await asyncio.shield(task)
+            except TimeoutError as exc:
+                raise ProviderDeadlineExceeded("router selection deadline exceeded") from exc
+            deadline.attempt_timeout()
+            decision = runtime._retain_prepared_selection(
+                model_request,
+                episode_id=episode_id,
+                prepared=prepared,
+            )
         exact_model_id = self._exact_models_by_alias.get(
             (
                 target.project_ref,

@@ -430,6 +430,46 @@ class RouterRuntime:
             disposition=disposition,
         )
 
+    def _reuse_sticky_selection(
+        self,
+        request: ModelRequest,
+        *,
+        episode_id: str,
+    ) -> RoutingDecision | None:
+        """Reuse one retained episode decision without provider work.
+
+        Args:
+            request: Provider-neutral request visible before execution.
+            episode_id: Stable caller-owned episode identity.
+
+        Returns:
+            One cached or sticky decision, or ``None`` when selection needs an embedding.
+        """
+        if not episode_id.strip() or len(episode_id) > 512:
+            raise ValueError("episode_id must be 1 to 512 non-blank characters")
+        identity_sha256 = hashlib.sha256(episode_id.encode("utf-8")).hexdigest()
+        feature = self._extractor.from_request(request)
+        request_sha256 = hashlib.sha256(feature.encode("utf-8")).hexdigest()
+        request_key = (identity_sha256, request_sha256)
+        with self._episode_lock:
+            self._expire_decisions()
+            existing = self._request_decisions.get(request_key)
+            if existing is not None:
+                self._request_decisions.move_to_end(request_key)
+                return existing
+            episode_decision = self._episode_decisions.get(identity_sha256)
+            if episode_decision is None:
+                return None
+            decision = _sticky_decision(episode_decision, request_sha256)
+            return self._publish_decision(
+                request=request,
+                decision=decision,
+                request_key=request_key,
+                identity=episode_id,
+                embedding_economics=zero_operation_economics(),
+                embedding_disposition=RoutedSpendDisposition.DEFINITELY_NOT_INCURRED,
+            )
+
     def _retain_prepared_selection(
         self,
         request: ModelRequest,

@@ -702,8 +702,24 @@ def test_project_resolver_retains_failed_embedding_evidence_without_reembedding(
             deadline_monotonic=__import__("time").monotonic() + 1,
         )
     )
+    continued = asyncio.run(
+        resolver.select(
+            target=target,
+            request=request.model_copy(
+                update={
+                    "messages": (
+                        *request.messages,
+                        GatewayMessage(role="user", content="next"),
+                    )
+                }
+            ),
+            episode_namespace=namespace,
+            deadline_monotonic=__import__("time").monotonic() + 1,
+        )
+    )
 
     assert selection.selected_alias == "baseline"
+    assert continued.selected_alias == selection.selected_alias
     assert client.embed_calls == 1
     assert len(runtime._request_decisions) == 1  # noqa: SLF001 - accounting regression
     decision = next(iter(runtime._request_decisions.values()))  # noqa: SLF001
