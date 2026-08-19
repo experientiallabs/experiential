@@ -33,28 +33,6 @@ from wmo.runtime.gateway.execution import (
 )
 from wmo.runtime.gateway.interfaces import AttemptLedger, GatewayClock, GatewayControlStore
 from wmo.runtime.gateway.ledger import IdempotencyConflictError, IdempotencyReplayUnavailableError
-from wmo.runtime.gateway.openai.errors import OpenAIProtocolError, public_failure_error
-from wmo.runtime.gateway.openai.headers import (
-    commit_dependent_headers,
-    commit_independent_headers,
-)
-from wmo.runtime.gateway.openai.requests import (
-    DecodedGatewayRequest,
-    decode_chat,
-    decode_responses,
-)
-from wmo.runtime.gateway.openai.state import (
-    BoundedContinuationStore,
-    BoundedReplayStore,
-    CachedResponse,
-    ContinuationState,
-    ProtocolNamespace,
-    ReplayClaimKind,
-    ReplayLease,
-    episode_namespace,
-    replay_key,
-)
-from wmo.runtime.gateway.openai.streaming import stable_public_id
 from wmo.runtime.gateway.response import (
     assistant_message,
     capture_frame,
@@ -70,6 +48,28 @@ from wmo.runtime.gateway.sqlite.store import (
 )
 from wmo.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from wmo.runtime.models.providers.errors import normalized_provider_failure
+from wmo.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
+from wmo.runtime.openai_protocol.headers import (
+    commit_dependent_headers,
+    commit_independent_headers,
+)
+from wmo.runtime.openai_protocol.requests import (
+    DecodedGatewayRequest,
+    decode_chat,
+    decode_responses,
+)
+from wmo.runtime.openai_protocol.state import (
+    BoundedContinuationStore,
+    BoundedReplayStore,
+    CachedResponse,
+    ContinuationState,
+    ProtocolNamespace,
+    ReplayClaimKind,
+    ReplayLease,
+    episode_namespace,
+    replay_key,
+)
+from wmo.runtime.openai_protocol.streaming import stable_public_id
 
 _STREAM_REPLAY_CAPTURE_BYTES = 64 * 1024 * 1024
 

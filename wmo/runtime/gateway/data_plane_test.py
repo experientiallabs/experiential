@@ -41,13 +41,6 @@ from wmo.runtime.gateway.execution import (
     GatewayExecutionStream,
     GatewayExecutor,
 )
-from wmo.runtime.gateway.openai.errors import OpenAIProtocolError
-from wmo.runtime.gateway.openai.requests import decode_chat, decode_responses
-from wmo.runtime.gateway.openai.state import (
-    BoundedContinuationStore,
-    ContinuationState,
-    ProtocolNamespace,
-)
 from wmo.runtime.gateway.routing import (
     CatalogRouteResolver,
     GatewayRoute,
@@ -57,6 +50,13 @@ from wmo.runtime.gateway.routing import (
 from wmo.runtime.gateway.service import GatewayDrainingError, GatewayService, create_gateway_app
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.models.providers import RequestDeadline
+from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
+from wmo.runtime.openai_protocol.requests import decode_chat, decode_responses
+from wmo.runtime.openai_protocol.state import (
+    BoundedContinuationStore,
+    ContinuationState,
+    ProtocolNamespace,
+)
 
 _DIGEST = "a" * 64
 
