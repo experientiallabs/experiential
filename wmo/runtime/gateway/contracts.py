@@ -282,8 +282,10 @@ class AuthorizationSnapshot(ContractModel):
     alias: GatewayAliasName
     alias_revision_id: GatewayAliasRevisionId
     target: GatewayTarget
+    surface: GatewayApiSurface
     catalog_sha256: Sha256
     canonical_request_sha256: Sha256
+    caller_operation_sha256: Sha256 | None = None
     deadline_monotonic: float = Field(gt=0)
 
 

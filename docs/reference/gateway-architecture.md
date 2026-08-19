@@ -71,10 +71,11 @@ contract boundary.
 
 ## Request and attempt boundaries
 
-Authorization freezes key-derived organization and identity, alias revision, target, request hash,
-catalog snapshot, and one monotonic deadline before learned selection. A project target does not yet
-know its exact model, pool, or deployments at that point. Selection and direct-target resolution
-produce a separate route-bound execution snapshot.
+Authorization freezes key-derived organization and identity, alias revision, target, API surface,
+request hash, optional hashed caller-operation identity, catalog snapshot, and one monotonic deadline
+before learned selection. Raw idempotency and client request values are not persisted in the
+snapshot. A project target does not yet know its exact model, pool, or deployments at that point.
+Selection and direct-target resolution produce a separate route-bound execution snapshot.
 
 The attempt ledger records acceptance before selection. It records a provider attempt only
 immediately before that provider dispatch. This separates requests that fail or crash before any

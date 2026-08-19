@@ -126,8 +126,10 @@ def test_project_authorization_precedes_route_bound_execution() -> None:
             activation_ref="activation-1",
             catalog_sha256="a" * 64,
         ),
+        surface=GatewayApiSurface.RESPONSES,
         catalog_sha256="a" * 64,
         canonical_request_sha256="b" * 64,
+        caller_operation_sha256="c" * 64,
         deadline_monotonic=10.0,
     )
 
@@ -139,4 +141,6 @@ def test_project_authorization_precedes_route_bound_execution() -> None:
     )
 
     assert authorization.target.kind == "project"
+    assert authorization.surface is GatewayApiSurface.RESPONSES
+    assert authorization.caller_operation_sha256 == "c" * 64
     assert execution.authorization == authorization
