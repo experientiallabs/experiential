@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from wmo.cli.app import app
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -153,15 +154,34 @@ def _eligible_catalog() -> ModelCatalog:
         connections={"provider": connection},
         models={
             "candidate-a": ModelRecord(
-                connection="provider", model="candidate-a", capabilities=completion
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="provider",
+                model="candidate-a",
+                capabilities=completion,
             ),
             "candidate-b": ModelRecord(
-                connection="provider", model="candidate-b", capabilities=completion
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="provider",
+                model="candidate-b",
+                capabilities=completion,
             ),
-            "world": ModelRecord(connection="provider", model="world", capabilities=completion),
-            "judge": ModelRecord(connection="provider", model="judge", capabilities=completion),
+            "world": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="provider",
+                model="world",
+                capabilities=completion,
+            ),
+            "judge": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="provider",
+                model="judge",
+                capabilities=completion,
+            ),
             "embedder": ModelRecord(
-                connection="provider", model="embedder", capabilities=embedding
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="provider",
+                model="embedder",
+                capabilities=embedding,
             ),
         },
         roles=ModelRoles(

@@ -20,6 +20,7 @@ from wmo.cli.build_cmd_test import _otlp_export
 from wmo.cli.provider_setup_test import _FakeLister
 from wmo.common.config.settings import set_maximum_command_cost_usd
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -234,13 +235,29 @@ def _catalog() -> ModelCatalog:
     return ModelCatalog(
         connections={"provider": ConnectionConfig(provider="openai")},
         models={
-            "world": ModelRecord(connection="provider", model="world", capabilities=completion),
-            "judge": ModelRecord(connection="provider", model="judge", capabilities=completion),
+            "world": ModelRecord(
+                connection="provider",
+                model="world",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=completion,
+            ),
+            "judge": ModelRecord(
+                connection="provider",
+                model="judge",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=completion,
+            ),
             "candidate": ModelRecord(
-                connection="provider", model="candidate", capabilities=completion
+                connection="provider",
+                model="candidate",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=completion,
             ),
             "embedder": ModelRecord(
-                connection="provider", model="embedder", capabilities=embedding
+                connection="provider",
+                model="embedder",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=embedding,
             ),
         },
         roles=ModelRoles(
@@ -966,16 +983,28 @@ def test_existing_catalog_router_defaults_use_ranking_diversity_and_world_incumb
             "anthropic": ConnectionConfig(provider="anthropic"),
         },
         models={
-            "luna": ModelRecord(connection="openai", model="gpt-5.6-luna", capabilities=completion),
+            "luna": ModelRecord(
+                connection="openai",
+                model="gpt-5.6-luna",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=completion,
+            ),
             "terra": ModelRecord(
-                connection="openai", model="gpt-5.6-terra", capabilities=completion
+                connection="openai",
+                model="gpt-5.6-terra",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=completion,
             ),
             "sonnet": ModelRecord(
-                connection="anthropic", model="claude-sonnet-5", capabilities=completion
+                connection="anthropic",
+                model="claude-sonnet-5",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=completion,
             ),
             "embed": ModelRecord(
                 connection="openai",
                 model="text-embedding-3-large",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 capabilities=embedding,
             ),
         },

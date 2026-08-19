@@ -19,7 +19,7 @@ from pydantic import JsonValue
 
 from wmo.common.core.artifacts import FailureCode, JsonObject, SourceIdentity, StructuredFailure
 from wmo.common.core.text import normalize_durable_text
-from wmo.common.models import ModelSnapshot, Usage
+from wmo.common.models import BillingSource, ModelSnapshot, Usage
 from wmo.common.traces import Trace, TraceSource, TraceSpan
 from wmo.simulation.ingest.environment_capture import canonicalize_environment_capture_payloads
 from wmo.simulation.ingest.json_strict import DuplicateJsonKeyError, reject_duplicate_json_keys
@@ -77,14 +77,11 @@ class TraceNormalizationResult:
         issues: Corrupt or incomplete source records that were excluded without repair.
         identity_evidence: Exact model-span provenance from a telemetry-aware normalizer. ``None``
             marks direct or programmatic records whose digest origin is unspecified.
-        include_identity_evidence: Whether persistence materializes the provenance payload. Only
-            exact reconstruction of a verified legacy dataset should disable it.
     """
 
     traces: tuple[Trace, ...]
     issues: tuple[TraceNormalizationIssue, ...]
     identity_evidence: tuple[TraceModelIdentityEvidence, ...] | None = None
-    include_identity_evidence: bool = True
 
     @property
     def invalid_trace_count(self) -> int:
@@ -554,6 +551,7 @@ def _model_snapshot(attributes: JsonObject, operation: str) -> ModelSnapshot | N
         provider=provider,
         model_id=model_id,
         revision=revision,
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         capabilities_sha256=capabilities_sha256,
         connection_sha256=connection_sha256,
     )

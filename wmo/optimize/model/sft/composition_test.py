@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -56,7 +57,13 @@ def _prepared(
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"tinker": ConnectionConfig(provider="tinker")},
-            models={"base": ModelRecord(connection="tinker", model="test-base-model")},
+            models={
+                "base": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="tinker",
+                    model="test-base-model",
+                )
+            },
         ),
     )
     resolved_training = _spec(maximum_cost_usd=1.0) if training is None else training
@@ -427,7 +434,13 @@ def test_unbound_config_id_cannot_train_even_when_its_object_was_just_created(
         fixture.store.model_catalog_path,
         ModelCatalog(
             connections={"tinker": ConnectionConfig(provider="tinker")},
-            models={"base": ModelRecord(connection="tinker", model="test-base-model")},
+            models={
+                "base": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="tinker",
+                    model="test-base-model",
+                )
+            },
         ),
     )
     config = create_sft_model_optimization_config(

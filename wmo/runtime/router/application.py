@@ -28,7 +28,8 @@ from wmo.runtime.router.completion import (
     RouterCompletionService,
 )
 from wmo.runtime.router.endpoint import create_router_endpoint
-from wmo.runtime.router.journal import JournaledRouterRuntime, RuntimeInteractionJournal
+from wmo.runtime.router.journal import RuntimeInteractionJournal
+from wmo.runtime.router.journal_service import JournaledRouterRuntime
 from wmo.runtime.router.runtime import DecisionSink, RoutedModelResponse, RouterRuntime
 
 RouterPolicyVerifier = Callable[[ArtifactStore, KnnRouterPolicy, RuntimeModelCatalog], None]

@@ -20,6 +20,7 @@ from wmo.common.evaluations import (
     EvaluationPlan,
     EvaluationProtocol,
     ObservedProductionCell,
+    load_evaluation_dataset,
 )
 from wmo.common.evaluations.build_test import (
     _persist_calibration,
@@ -35,6 +36,9 @@ from wmo.common.judging import (
     ScoreAnchor,
 )
 from wmo.common.models import (
+    BillingSource,
+    CandidateTokenPrice,
+    CompletionCostReservation,
     EmbeddingCostReservation,
     ModelCapabilities,
     ModelClient,
@@ -42,7 +46,9 @@ from wmo.common.models import (
     ModelResponse,
     ModelSnapshot,
     OperationEconomics,
+    PricingSnapshot,
     RoutedCandidateSnapshot,
+    completion_cost_reservation,
 )
 from wmo.common.project import (
     ProjectBuildArtifacts,
@@ -50,7 +56,7 @@ from wmo.common.project import (
     ProjectStore,
     artifact_input,
 )
-from wmo.common.rollouts import SimulationArtifactSet, unknown_spend_failure
+from wmo.common.rollouts import SimulationArtifactSet, StopReason, unknown_spend_failure
 from wmo.common.routing import KnnGuard
 from wmo.common.tasks import load_task_set
 from wmo.optimize.router import composition as composition_module
@@ -74,10 +80,14 @@ from wmo.optimize.router.judgment_budget import (
     JudgmentExclusionRecord,
 )
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models.providers.transport import ProviderTransportError
 from wmo.runtime.router.runtime_test import _Client, _request
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.engines.text import simulator as text_simulator_module
-from wmo.simulation.engines.text.resume import reexecutable_dispatch_failure
+from wmo.simulation.engines.text.resume import (
+    MAXIMUM_CELL_ATTEMPTS,
+    reexecutable_dispatch_failure,
+)
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
     _OneTurnAgent,
@@ -85,6 +95,7 @@ from wmo.simulation.engines.text.simulator_test import (
     _ScriptedClient,
 )
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
+from wmo.simulation.mining.service import MiningSpec
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.retrieval import (
     load_fit_rag_retriever,
@@ -93,14 +104,29 @@ from wmo.simulation.retrieval import (
 )
 from wmo.simulation.retrieval.retrieval_test import _message_trace as _trace
 from wmo.simulation.specs import (
+    CandidateCompletionReservation,
     SimulationCompletionContract,
     SimulationSpec,
     WorldModelSettings,
+    persist_simulation_completion_contract,
 )
 from wmo.simulation.world_model import bind_fit_grounded_world_model, persist_grounded_world_model
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
+_COMPACT_MINING_SPEC = MiningSpec(fit_task_budget=12, held_out_task_budget=4)
+
+
+def _compact_normalized_traces() -> TraceNormalizationResult:
+    """Return the smallest practical corpus for mixed observed and simulated router cells.
+
+    Returns:
+        Canonical traces with enough fit and held-out lineages to fill the focused mining spec.
+    """
+    return TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(20)),
+        issues=(),
+    )
 
 
 def _bind_completed_build(
@@ -108,6 +134,7 @@ def _bind_completed_build(
     normalized: TraceNormalizationResult,
     *,
     revision: str,
+    mining_spec: MiningSpec | None = None,
 ) -> ProjectBuildArtifacts:
     """Persist and select the exact grounded build consumed by router composition.
 
@@ -115,6 +142,7 @@ def _bind_completed_build(
         project: Initialized test project receiving the immutable build graph.
         normalized: Canonical real traces used for tasks and retrieval.
         revision: Exact source revision bound to every artifact.
+        mining_spec: Optional representative-task budgets for the focused test.
 
     Returns:
         Completed project build pointers selected in ``project.toml``.
@@ -124,6 +152,7 @@ def _bind_completed_build(
         project,
         created_at=_TIME,
         code_revision=revision,
+        mining_spec=mining_spec,
     )
     trace_input = artifact_input(built.artifacts.trace_dataset.manifest)
     task_input = built.review.task_set
@@ -169,7 +198,7 @@ def _capabilities(alias: str) -> ModelCapabilities:
     """Return the exact frozen capabilities used by each focused model."""
     if alias == "embedder":
         return ModelCapabilities(supports_embeddings=True)
-    return ModelCapabilities(context_window_tokens=100_000, maximum_output_tokens=16_000)
+    return ModelCapabilities(context_window_tokens=100_000, maximum_output_tokens=32_000)
 
 
 def _snapshot(alias: str) -> ModelSnapshot:
@@ -182,6 +211,7 @@ def _snapshot(alias: str) -> ModelSnapshot:
         Deterministic fixture snapshot with the exact capability digest.
     """
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="test",
         model_id=alias,
         revision="fixture",
@@ -199,6 +229,45 @@ def _resolved(alias: str, client: ModelClient) -> ResolvedModel:
         capabilities=capabilities,
         client=client,
         embedding_client=None,
+    )
+
+
+def _priced_capabilities() -> ModelCapabilities:
+    """Return completion capabilities carrying the explicit prices reservations verify."""
+    return ModelCapabilities(
+        supports_completions=True,
+        context_window_tokens=100_000,
+        maximum_output_tokens=16_000,
+        input_cost_per_million_tokens_usd=1.0,
+        output_cost_per_million_tokens_usd=1.0,
+        cached_input_cost_per_million_tokens_usd=1.0,
+        cache_write_cost_per_million_tokens_usd=1.0,
+    )
+
+
+def _priced_resolved(alias: str, client: ModelClient) -> ResolvedModel:
+    """Resolve one fake completion client under reservation-verifiable priced capabilities."""
+    return ResolvedModel(
+        alias=alias,
+        snapshot=_snapshot(alias),
+        capabilities=_priced_capabilities(),
+        client=client,
+        embedding_client=None,
+    )
+
+
+def _completion_reservation(alias: str) -> CompletionCostReservation:
+    """Freeze one conservative single-attempt completion reservation for ``alias``."""
+    return completion_cost_reservation(
+        model=_snapshot(alias),
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=1.0,
+        cached_input_usd_per_million_tokens=1.0,
+        cache_write_usd_per_million_tokens=1.0,
+        maximum_attempts=1,
+        maximum_input_tokens=84_000,
+        maximum_output_tokens=16_000,
+        estimated_input_tokens=1_000,
     )
 
 
@@ -391,6 +460,95 @@ class _SetupSupplier:
         )
 
 
+def _persist_two_candidate_pricing(project: ProjectStore) -> None:
+    """Persist one pricing snapshot covering both routed candidate aliases.
+
+    Args:
+        project: Project store receiving the immutable pricing snapshot.
+    """
+    pricing = PricingSnapshot(
+        schema_version=1,
+        created_at=_TIME,
+        code_revision="test-revision",
+        pricing_snapshot_id="pricing-two",
+        candidate_prices=tuple(
+            CandidateTokenPrice(
+                candidate_alias=alias,
+                input_usd_per_million_tokens=1.0,
+                output_usd_per_million_tokens=2.0,
+            )
+            for alias in ("candidate-a", "candidate-b")
+        ),
+    )
+    project.artifacts.write_json(
+        artifact_id=pricing.pricing_snapshot_id,
+        artifact_type="pricing-snapshot",
+        envelope=pricing,
+        files={"pricing.json": pricing},
+    )
+
+
+class _ReservedSetupSupplier(_SetupSupplier):
+    """Add a second routed candidate and a persisted exact completion reservation contract."""
+
+    def __call__(
+        self,
+        project: ProjectStore,
+        build: ProjectBuild,
+        review: RouterReviewProvenance,
+        budget: RouterCompositionBudget,
+    ) -> RouterEvaluationSetup:
+        """Persist the reviewed two-candidate setup and its frozen completion reservations.
+
+        Args:
+            project: Project owning the completed build and evaluation artifacts.
+            build: Deterministic trace and task-set build reused by composition.
+            review: Approved rubric and manual calibration identifiers.
+            budget: Finite composition budget already validated by the workflow.
+
+        Returns:
+            Evaluation setup whose simulation binds a persisted completion contract.
+        """
+        setup = super().__call__(project, build, review, budget)
+        if "pricing-two" not in project.artifacts.list_ids():
+            _persist_two_candidate_pricing(project)
+        _contract, contract_input = persist_simulation_completion_contract(
+            project.artifacts,
+            inputs=(),
+            candidate_requests=(
+                CandidateCompletionReservation(
+                    candidate_alias="candidate-a",
+                    request=_completion_reservation("candidate-a"),
+                ),
+                CandidateCompletionReservation(
+                    candidate_alias="candidate-b",
+                    request=_completion_reservation("candidate-b"),
+                ),
+            ),
+            world_model_alias="world-model-a",
+            world_model_request=_completion_reservation("world-model-a"),
+            maximum_attempts=1,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+        return setup.model_copy(
+            update={
+                "candidates": (
+                    *setup.candidates,
+                    RoutedCandidateSnapshot(alias="candidate-b", model=_snapshot("candidate-b")),
+                ),
+                "pricing_snapshot_id": "pricing-two",
+                "production_protocol": setup.production_protocol.model_copy(
+                    update={"pricing_snapshot_id": "pricing-two"}
+                ),
+                "simulation_protocol": setup.simulation_protocol.model_copy(
+                    update={"pricing_snapshot_id": "pricing-two"}
+                ),
+                "simulation_completion_input": contract_input,
+            }
+        )
+
+
 class _MismatchedSetupSupplier(_SetupSupplier):
     """Return a reviewed setup whose fit pointer is outside the completed build."""
 
@@ -478,6 +636,8 @@ class _Judge:
                     dimension_id="dimension-a",
                     raw_score=4,
                     calibrated_score=4.0,
+                    min_score=0,
+                    max_score=5,
                     rationale="Deterministic workflow score.",
                 ),
             ),
@@ -577,6 +737,115 @@ class _LoggingSimulator:
         return self.simulator.run(spec)
 
 
+class _TargetedTransportFailureClient(_ScriptedClient):
+    """Scripted second candidate whose dispatch for one exact task always fails in transport."""
+
+    def __init__(self, responses: list[ModelResponse], failing_instruction: str) -> None:
+        """Store scripted answers plus the instruction whose dispatch never succeeds.
+
+        Args:
+            responses: Responses served in order for every other task.
+            failing_instruction: Exact task instruction whose dispatch always fails.
+        """
+        super().__init__(responses)
+        self._failing_instruction = failing_instruction
+        self.failures = 0
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Fail the targeted task at the transport level and answer every other task.
+
+        Args:
+            request: Candidate request emitted by the recording boundary.
+
+        Returns:
+            The next scripted response for a non-targeted task.
+
+        Raises:
+            ProviderTransportError: Every dispatch that carries the targeted instruction.
+        """
+        if request.messages[0].content == self._failing_instruction:
+            self.requests.append(request)
+            self.failures += 1
+            raise ProviderTransportError("connection reset by provider")
+        return super().complete(request)
+
+
+class _CapExhaustedSimulatorFactory(_SimulatorFactory):
+    """Simulator factory whose second candidate persistently fails one task's dispatch."""
+
+    def __init__(self, failing_instruction: str) -> None:
+        """Target one task with a persistent second-candidate transport failure.
+
+        Args:
+            failing_instruction: Exact task instruction whose dispatch always fails.
+        """
+        super().__init__()
+        self.candidate = _ScriptedClient(
+            [_response("Resolved.", snapshot=_snapshot("candidate-a"), cost=0.01)] * 200
+        )
+        self.failing = _TargetedTransportFailureClient(
+            [_response("Resolved.", snapshot=_snapshot("candidate-b"), cost=0.01)] * 200,
+            failing_instruction,
+        )
+        self.world = _ScriptedClient(
+            [
+                _response(
+                    '{"message":"Done.","terminal":true}',
+                    snapshot=_snapshot("world-model-a"),
+                    cost=0.01,
+                )
+            ]
+            * 400
+        )
+
+    def __call__(self, project: ProjectStore, plan: EvaluationPlan) -> Simulator:
+        """Bind the grounded text simulator to the project's frozen completion contract.
+
+        Args:
+            project: Project owning the completed immutable build graph.
+            plan: Frozen evaluation plan selected for simulation.
+
+        Returns:
+            Logging adapter around the reservation-bound grounded text simulator.
+        """
+        completed = project.load_project().build
+        assert completed is not None
+        fit_retriever = load_fit_rag_retriever(project.artifacts, completed.fit_rag)
+        world_model = _priced_resolved("world-model-a", cast(ModelClient, self.world))
+        contract_id = next(
+            artifact_id
+            for artifact_id in project.artifacts.list_ids()
+            if project.artifacts.read(artifact_id).manifest.artifact_type
+            == "simulation-completion-contract"
+        )
+        simulator = WorldModelSimulator(
+            store=project.artifacts,
+            evaluation_plan=plan,
+            evaluation_plan_input=artifact_input(project.artifacts.read(plan.plan_id).manifest),
+            task_set_input=artifact_input(project.artifacts.read(plan.task_set_id).manifest),
+            fit_rag_input=completed.fit_rag,
+            fit_retriever=fit_retriever,
+            candidate_models={
+                "candidate-a": _priced_resolved("candidate-a", cast(ModelClient, self.candidate)),
+                "candidate-b": _priced_resolved("candidate-b", cast(ModelClient, self.failing)),
+            },
+            world_models={"world-model-a": world_model},
+            grounded_world_models={
+                "world-model-a": bind_fit_grounded_world_model(
+                    project.artifacts,
+                    completed.world_model,
+                    client=world_model.client,
+                    fit_retriever=fit_retriever,
+                )
+            },
+            agent_factory=_OneTurnAgent,
+            completion_contract_input=artifact_input(project.artifacts.read(contract_id).manifest),
+            clock=lambda: _TIME,
+            monotonic=lambda: 1.0,
+        )
+        return _LoggingSimulator(project, simulator, self.log)
+
+
 def test_composition_rejects_fit_rag_outside_completed_build_before_simulation(
     tmp_path: Path,
 ) -> None:
@@ -587,10 +856,13 @@ def test_composition_rejects_fit_rag_outside_completed_build_before_simulation(
     """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
+    normalized = _compact_normalized_traces()
+    _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_COMPACT_MINING_SPEC,
     )
-    _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     judge = _Judge()
     services = RouterWorkflowServices(
@@ -648,10 +920,13 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
+    normalized = _compact_normalized_traces()
+    completed_build = _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_COMPACT_MINING_SPEC,
     )
-    completed_build = _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     judge = _Judge()
     runtime_client = _Client()
@@ -1132,10 +1407,13 @@ def test_failed_rollouts_skip_judging_and_rerun_replays_after_partial_failure(
     """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
+    normalized = _compact_normalized_traces()
+    _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_COMPACT_MINING_SPEC,
     )
-    _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     judge = _Judge()
     services = RouterWorkflowServices(
@@ -1280,6 +1558,135 @@ def test_failed_rollouts_skip_judging_and_rerun_replays_after_partial_failure(
     ) == dispatched
 
 
+def test_retry_cap_exhausted_cell_binds_failed_evidence_and_replays_without_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A cap-exhausted transport-failed cell covers its plan entry as excluded evidence.
+
+    Each resume below the retry cap re-executes the failing cell and still aborts at exact
+    plan coverage. Once the final permitted generation fails, evidence assembly binds the
+    terminal failed rollout, the fitter sees the cell only as a failed unjudged row, its
+    unknown spend stays conservatively charged, and replay adds no provider dispatches.
+
+    Args:
+        tmp_path: Isolated project root for composed router artifacts.
+    """
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
+    completed = _bind_completed_build(project, normalized, revision="test-revision")
+    tasks = load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
+    failing_task = tuple(task for task in tasks if task.partition == "fit")[10]
+    simulator = _CapExhaustedSimulatorFactory(failing_task.instruction)
+    judge = _Judge()
+    services = RouterWorkflowServices(
+        review_supplier=_ReviewSupplier(),
+        setup_supplier=_ReservedSetupSupplier(),
+        simulator_factory=simulator,
+        judge=judge,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _Catalog(
+                {
+                    "candidate-a": _snapshot("candidate-a"),
+                    "candidate-b": _snapshot("candidate-b"),
+                    "embedder": _snapshot("embedder"),
+                },
+                _Client(),
+            ),
+        ),
+    )
+    budget = RouterCompositionBudget(
+        maximum_simulation_cost_usd=10.0,
+        maximum_judgments=400,
+    )
+
+    for hour in range(MAXIMUM_CELL_ATTEMPTS - 1):
+        with pytest.raises(ValueError, match="cover the plan exactly"):
+            compose_router(
+                project,
+                normalized,
+                services=services,
+                budget=budget,
+                created_at=_TIME + timedelta(hours=hour),
+                code_revision="test-revision",
+            )
+    first = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME + timedelta(hours=MAXIMUM_CELL_ATTEMPTS),
+        code_revision="test-revision",
+    )
+
+    failing_cell_ids = {
+        cell.cell_id
+        for cell in first.plan.cells
+        if cell.task_id == failing_task.task_id
+        and cell.candidate_alias == "candidate-b"
+        and cell.purpose == "fit"
+        and cell.execution == "simulate"
+    }
+    assert failing_cell_ids
+    assert simulator.failing.failures == MAXIMUM_CELL_ATTEMPTS * len(failing_cell_ids)
+    terminal = {
+        rollout.cell_id: rollout
+        for artifact_set in (
+            SimulationArtifactSet.model_validate_json(
+                project.artifacts.read_bytes(artifact_id, "artifact-set.json")
+            )
+            for artifact_id in project.artifacts.list_ids()
+            if project.artifacts.read(artifact_id).manifest.artifact_type
+            == "simulation-artifact-set"
+        )
+        for rollout in (
+            read_rollout(project.artifacts, rollout_id)[0]
+            for rollout_id in artifact_set.artifact_ids
+        )
+        if rollout.cell_id in failing_cell_ids
+        and rollout.retry_attempt == MAXIMUM_CELL_ATTEMPTS - 1
+    }
+    assert set(terminal) == failing_cell_ids
+    for rollout in terminal.values():
+        assert rollout.stop_reason == StopReason.FAILURE
+        assert rollout.failure is not None
+        assert rollout.failure.retryable is True
+        assert rollout.failure.details["provider_dispatch_unknown_spend"] is True
+        assert observed_rollout_spend(rollout) > 0
+    fit_dataset = load_evaluation_dataset(project.artifacts, first.optimization.fit_evaluation_id)
+    failed_rows = tuple(row for row in fit_dataset.rows if row.cell_id in failing_cell_ids)
+    assert len(failed_rows) == len(failing_cell_ids)
+    assert all(row.status == "failed" and row.judgment_id is None for row in failed_rows)
+    assert failing_cell_ids.isdisjoint({cell_id for cell_id, _locked in judge.log})
+
+    dispatched = (
+        len(simulator.log),
+        len(simulator.candidate.requests),
+        len(simulator.failing.requests),
+        len(simulator.world.requests),
+        judge.calls,
+    )
+    second = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME + timedelta(hours=MAXIMUM_CELL_ATTEMPTS + 1),
+        code_revision="test-revision",
+    )
+    assert second.optimization == first.optimization
+    assert (
+        len(simulator.log),
+        len(simulator.candidate.requests),
+        len(simulator.failing.requests),
+        len(simulator.world.requests),
+        judge.calls,
+    ) == dispatched
+
+
 def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
     tmp_path: Path,
 ) -> None:
@@ -1293,10 +1700,13 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
     """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
+    normalized = _compact_normalized_traces()
+    _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_COMPACT_MINING_SPEC,
     )
-    _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     catalog = cast(
         RuntimeModelCatalog,
@@ -1390,10 +1800,13 @@ def test_per_cell_judge_failures_exclude_cells_durably_and_replay_without_redisp
     """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
+    normalized = _compact_normalized_traces()
+    _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_COMPACT_MINING_SPEC,
     )
-    _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     judge = _Judge()
     judge.raise_after_lock = [

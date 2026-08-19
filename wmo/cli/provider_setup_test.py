@@ -18,6 +18,7 @@ from wmo.cli.provider_setup import (
     run_router_candidate_picker,
 )
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     DiscoveredModel,
     ModelCapabilities,
@@ -333,7 +334,13 @@ def test_setup_preserves_router_candidates_and_unrelated_entries(tmp_path: Path)
             connections={
                 "router": ConnectionConfig(provider="openrouter", api_key_env="OPENROUTER_API_KEY")
             },
-            models={"candidate": ModelRecord(connection="router", model="vendor/candidate")},
+            models={
+                "candidate": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="router",
+                    model="vendor/candidate",
+                )
+            },
             roles=ModelRoles(candidates=("candidate",), incumbent="candidate"),
         ),
     )
@@ -614,7 +621,13 @@ def test_router_candidate_picker_discovers_only_eligible_completion_models(
     connection = ConnectionConfig(provider="tinker", api_key_env="TINKER_API_KEY")
     catalog = ModelCatalog(
         connections={"custom": connection},
-        models={"world": ModelRecord(connection="custom", model="world")},
+        models={
+            "world": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="custom",
+                model="world",
+            )
+        },
         roles=ModelRoles(world_model="world"),
     )
 
@@ -773,7 +786,13 @@ def test_rerunning_setup_preserves_unrelated_models_and_router_state(
             connections={
                 "router": ConnectionConfig(provider="openrouter", api_key_env="OPENROUTER_API_KEY")
             },
-            models={"candidate": ModelRecord(connection="router", model="vendor/candidate")},
+            models={
+                "candidate": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="router",
+                    model="vendor/candidate",
+                )
+            },
             roles=ModelRoles(candidates=("candidate",), incumbent="candidate"),
         ),
     )
@@ -807,7 +826,13 @@ def test_setup_preserves_entries_owned_by_providers_it_does_not_configure(
             connections={
                 "tinker": ConnectionConfig(provider="tinker", api_key_env="TINKER_API_KEY")
             },
-            models={"sft-run": ModelRecord(connection="tinker", model="tinker://sampling/run")},
+            models={
+                "sft-run": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="tinker",
+                    model="tinker://sampling/run",
+                )
+            },
         ),
     )
 
@@ -871,9 +896,24 @@ def test_configured_models_are_reassignable_without_any_provider_request(
                 "openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")
             },
             models={
-                "chat": ModelRecord(connection="openai", model="chat-id", capabilities=chat),
-                "backup": ModelRecord(connection="openai", model="backup-id", capabilities=chat),
-                "embed": ModelRecord(connection="openai", model="embed-id", capabilities=embedding),
+                "chat": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="openai",
+                    model="chat-id",
+                    capabilities=chat,
+                ),
+                "backup": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="openai",
+                    model="backup-id",
+                    capabilities=chat,
+                ),
+                "embed": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="openai",
+                    model="embed-id",
+                    capabilities=embedding,
+                ),
             },
             roles=ModelRoles(world_model="chat", judge="chat", embedder="embed"),
         ),
@@ -930,8 +970,14 @@ def test_offline_roles_include_models_on_tinker_without_provider_requests(tmp_pa
                 ),
             },
             models={
-                "chat": ModelRecord(connection="custom", model="chat-id", capabilities=chat),
+                "chat": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="custom",
+                    model="chat-id",
+                    capabilities=chat,
+                ),
                 "embed": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="openai",
                     model="embed-id",
                     capabilities=embedding,
@@ -977,8 +1023,13 @@ def test_offline_roles_retain_assigned_tinker_alias_without_capabilities(tmp_pat
             "openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY"),
         },
         models={
-            "legacy": ModelRecord(connection="tinker", model="tinker://sampling/run"),
+            "legacy": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="tinker",
+                model="tinker://sampling/run",
+            ),
             "embed": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 connection="openai",
                 model="embed-id",
                 capabilities=embedding,
@@ -1033,10 +1084,24 @@ def test_offline_setup_preserves_exact_unverified_router_roles_without_revalidat
             "openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY"),
         },
         models={
-            "legacy-a": ModelRecord(connection="tinker", model="tinker://sampling/a"),
-            "legacy-b": ModelRecord(connection="tinker", model="tinker://sampling/b"),
-            "chat": ModelRecord(connection="openai", model="chat-id", capabilities=chat),
+            "legacy-a": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="tinker",
+                model="tinker://sampling/a",
+            ),
+            "legacy-b": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="tinker",
+                model="tinker://sampling/b",
+            ),
+            "chat": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="openai",
+                model="chat-id",
+                capabilities=chat,
+            ),
             "embed": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 connection="openai",
                 model="embed-id",
                 capabilities=embedding,

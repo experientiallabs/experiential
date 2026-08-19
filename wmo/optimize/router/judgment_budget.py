@@ -25,7 +25,7 @@ from wmo.common.evaluations.evidence import (
 from wmo.common.judging import Judge, Judgment
 from wmo.common.progress import ProgressHook, report
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
-from wmo.common.rollouts import RolloutArtifact, StopReason, unknown_spend_failure
+from wmo.common.rollouts import RolloutArtifact, StopReason
 from wmo.optimize.router.errors import (
     JudgeDispatchExhaustedError,
     JudgeTranscriptAdmissionError,
@@ -505,13 +505,17 @@ def complete_cell_evidence(
 
     A persisted reservation without a completed judgment marks an interrupted dispatch; the
     judgment is dispatched again under that same consumed reservation, so a judge failure never
-    strands the project and never widens the finite judgment budget. An unknown-spend dispatch
-    failure that resume will supersede with a fresh attempt is skipped here; a final one, a
-    non-retryable failure or the last permitted attempt, binds as failed evidence so the plan
-    stays exactly covered instead of stranding its cell forever. A per-cell judge failure
+    strands the project and never widens the finite judgment budget. A per-cell judge failure
     that cannot complete, an over-ceiling transcript or a dispatch whose bounded retries were
     exhausted, becomes one durable structured exclusion so the run and every replay continue
     past that cell with its rollout excluded from judged evidence.
+
+    A simulated cell whose latest rollout is a dispatch failure that resume would still
+    supersede with a fresh attempt stays unbound, so exact plan coverage fails and the caller
+    resumes simulation. A terminally failed cell, one whose retry generations are exhausted or
+    whose failure is not retryable, binds its final failed rollout as unjudged evidence: the
+    cell counts as covered, is excluded from judging and fitting inputs, keeps its conservative
+    charge, and replays deterministically without new dispatches.
 
     Judgments draw from the shared provider pool as reconciled actual spend, never a planning
     estimate. An exhausted dispatch may have billed every bounded attempt without returning
@@ -559,11 +563,7 @@ def complete_cell_evidence(
     for cell in cells:
         if cell.execution != "observed":
             simulated = rollouts_by_cell.get(cell.cell_id)
-            if (
-                simulated is not None
-                and unknown_spend_failure(simulated.failure)
-                and reexecutable_dispatch_failure(simulated)
-            ):
+            if simulated is not None and reexecutable_dispatch_failure(simulated):
                 continue
         rollout_id = (
             cell.observed_rollout_id

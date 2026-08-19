@@ -160,6 +160,7 @@ class RuntimeModelCatalog:
                 provider=connection.provider,
                 model_id=record.model,
                 revision=record.revision,
+                billing_source=record.billing_source,
                 capabilities_sha256=capabilities.identity_sha256(),
                 connection_sha256=connection.identity_sha256(),
             ),

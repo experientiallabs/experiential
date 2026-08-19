@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     Embedding,
     ModelCapabilities,
     ModelFinishReason,
@@ -35,9 +36,21 @@ def test_actions_need_payload_and_measurements_are_finite() -> None:
         NumericMeasurement(value=float("inf"), provenance="observed")
 
 
+def test_current_model_snapshot_requires_explicit_billing_source() -> None:
+    """A newly frozen model identity cannot silently infer the credential owner."""
+    with pytest.raises(ValidationError, match="billing_source"):
+        ModelSnapshot(  # ty: ignore[missing-argument]
+            provider="openai",
+            model_id="fixture",
+            capabilities_sha256=_CAPABILITIES_DIGEST,
+            connection_sha256="b" * 64,
+        )
+
+
 def test_completed_factory_prefers_served_identity_and_maps_the_length_limit() -> None:
     """The shared factory keeps served identity, observed latency, and the finish reason."""
     configured = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="configured-model",
         capabilities_sha256=_CAPABILITIES_DIGEST,
@@ -109,7 +122,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
 
 def test_completion_support_preserves_provider_identity_for_existing_traces() -> None:
     """Completion eligibility is frozen separately without orphaning old trace snapshots."""
-    legacy_payload = {
+    identity_payload = {
         "supports_tools": False,
         "supports_embeddings": False,
         "context_window_tokens": None,
@@ -119,7 +132,7 @@ def test_completion_support_preserves_provider_identity_for_existing_traces() ->
     supported = ModelCapabilities(supports_completions=True)
     unsupported = ModelCapabilities(supports_completions=False)
 
-    assert unknown.identity_sha256() == sha256_json(legacy_payload)
+    assert unknown.identity_sha256() == sha256_json(identity_payload)
     assert supported.identity_sha256() == unsupported.identity_sha256()
     assert supported.identity_sha256() == unknown.identity_sha256()
     pinned_sampling = ModelCapabilities(supports_temperature=False, reasoning_effort="xhigh")
@@ -131,14 +144,15 @@ def test_completion_support_preserves_provider_identity_for_existing_traces() ->
         )
 
 
-def test_legacy_routed_candidate_payload_reserializes_byte_for_byte() -> None:
-    """Automatic capability freezing cannot add fields to the v1 candidate contract."""
+def test_routed_candidate_payload_serializes_explicit_billing_source() -> None:
+    """Automatic capability freezing retains the model billing source byte for byte."""
     payload = {
         "alias": "candidate-a",
         "model": {
             "provider": "openai",
             "model_id": "model-a",
             "revision": None,
+            "billing_source": "host_managed",
             "capabilities_sha256": "a" * 64,
             "connection_sha256": "b" * 64,
         },

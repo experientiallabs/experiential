@@ -29,6 +29,7 @@ from wmo.cli.build_wizard_screens import (
     select_workflow as _select_workflow,
 )
 from wmo.cli.consent import require_spend_consent
+from wmo.common.core.money import exact_usd
 from wmo.common.models import (
     ModelCatalog,
     RoutedCandidateSnapshot,
@@ -605,7 +606,9 @@ def _prepare_new_build(
             trace_source=source,
             models=selected,
             retrieval=ProjectRetrievalConfiguration(top_k=top_k),
-            budgets=ProjectBudgetConfiguration(maximum_build_cost_usd=maximum_build_cost_usd),
+            budgets=ProjectBudgetConfiguration(
+                maximum_build_cost_usd=exact_usd(maximum_build_cost_usd)
+            ),
         ),
     )
     completed = build_project(

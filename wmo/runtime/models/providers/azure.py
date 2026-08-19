@@ -120,7 +120,8 @@ class AzureClient(OpenAICompatibleClient):
             api_version: ``v1`` or a dated Azure OpenAI API version.
             transport: Optional deterministic transport used by tests.
             retry_policy: Bounded same-endpoint retry policy.
-            timeout_seconds: Timeout for every transport attempt.
+            timeout_seconds: Per-attempt timeout floor; completion attempts scale above it
+                with the requested maximum output tokens.
 
         Raises:
             ValueError: The key, endpoint, API version, or timeout is missing or invalid.
@@ -146,19 +147,27 @@ class AzureClient(OpenAICompatibleClient):
             "Content-Type": "application/json",
         }
 
-    def _post(self, path: str, payload: JsonObject) -> JsonObject:
+    def _post(
+        self,
+        path: str,
+        payload: JsonObject,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> JsonObject:
         """Post below the Azure root, appending the dated API version when one is configured.
 
         Args:
             path: Provider route below the configured base URL.
             payload: JSON request body.
+            timeout_seconds: Optional per-attempt timeout override; the configured client
+                timeout applies when omitted.
 
         Returns:
             The decoded JSON response body.
         """
         if self._api_version != _V1_API_VERSION:
             path = f"{path}?api-version={self._api_version}"
-        return super()._post(path, payload)
+        return super()._post(path, payload, timeout_seconds=timeout_seconds)
 
 
 def _canonical_azure_endpoint(value: str) -> tuple[str, str, int | None, str]:

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot, RoutedCandidateSnapshot
 from wmo.common.routing import KnnGuard, KnnRouterPolicy, RouterPolicy, RoutingDecision
 
 _DIGEST = "a" * 64
@@ -17,6 +17,7 @@ def _candidate(alias: str) -> RoutedCandidateSnapshot:
     return RoutedCandidateSnapshot(
         alias=alias,
         model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="openai",
             model_id=f"{alias}-model",
             capabilities_sha256=_DIGEST,
@@ -35,6 +36,7 @@ def _policy() -> KnnRouterPolicy:
         candidates=(_candidate("candidate-economy"), _candidate("candidate-incumbent")),
         embedder_alias="embedder",
         embedder=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="openai",
             model_id="text-embedding-3-small",
             capabilities_sha256=_DIGEST,

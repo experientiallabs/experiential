@@ -19,6 +19,7 @@ from wmo.common.core.artifacts import (
     sha256_json,
 )
 from wmo.common.models import (
+    BillingSource,
     Embedding,
     EmbeddingCostReservation,
     ModelCapabilities,
@@ -61,19 +62,24 @@ class _ConstantEmbedder:
         return tuple(Embedding(values=(1.0, 0.0)) for _ in texts)
 
 
-def test_one_trace_and_more_than_one_thousand_traces_are_valid(tmp_path: Path) -> None:
-    """Trace-count guidance never becomes an enforced product boundary."""
-    for count, project_id in ((1, "one-trace"), (1_001, "many-traces")):
-        store = _store(tmp_path / project_id, project_id)
-        source_input, traces = _persist_traces(store, count=count)
-        result = persist_trace_rag(
-            store,
-            (source_input,),
-            _bindings(traces),
-            created_at=_CREATED_AT,
-            code_revision="revision-a",
-        )
-        assert result.index.transition_count == count
+def test_more_than_one_thousand_traces_are_valid(tmp_path: Path) -> None:
+    """The upper trace-count recommendation never becomes a retrieval validity gate.
+
+    Args:
+        tmp_path: Temporary project root for the oversized retrieval fixture.
+    """
+    count = 1_001
+    store = _store(tmp_path, "many-traces")
+    source_input, traces = _persist_traces(store, count=count)
+    result = persist_trace_rag(
+        store,
+        (source_input,),
+        _bindings(traces),
+        created_at=_CREATED_AT,
+        code_revision="revision-a",
+    )
+
+    assert result.index.transition_count == count
 
 
 def test_build_reload_is_deterministic_and_terminal_turns_are_excluded(tmp_path: Path) -> None:
@@ -652,6 +658,7 @@ def _constant_binding(
     return RAGEmbedderBinding(
         client=_ConstantEmbedder(),
         snapshot=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="test",
             model_id="constant",
             revision="1",

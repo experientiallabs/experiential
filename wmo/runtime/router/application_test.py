@@ -725,6 +725,7 @@ def test_capability_rejection_replays_exactly_after_application_restart(
 
     assert first.status_code == replay.status_code == 501
     assert first.content == replay.content
+    assert b"candidate-a" not in first.content
     assert first_client.complete_calls == restarted_client.complete_calls == 0
     assert restarted_client.embed_calls == 0
     events = journal.read_events()

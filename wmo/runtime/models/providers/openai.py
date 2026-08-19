@@ -196,7 +196,8 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             base_url: Provider endpoint root.
             transport: Optional injected JSON transport for deterministic tests.
             retry_policy: Bounded retry behavior for transient transport failures.
-            timeout_seconds: Positive per-request timeout.
+            timeout_seconds: Positive per-attempt timeout floor; completion attempts scale
+                above it with the requested maximum output tokens.
             supports_temperature: Catalog declaration that the model accepts an explicit
                 sampling temperature; ``False`` omits requested temperatures from payloads.
             reasoning_effort: Optional catalog-pinned reasoning-effort level.

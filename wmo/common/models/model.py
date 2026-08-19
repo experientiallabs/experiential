@@ -27,6 +27,13 @@ models without a pinned effort never receive the parameter.
 """
 
 
+class BillingSource(StrEnum):
+    """Credential owner responsible for one provider-backed model operation."""
+
+    HOST_MANAGED = "host_managed"
+    CUSTOMER_MANAGED = "customer_managed"
+
+
 class ModelSnapshot(ContractModel):
     """Resolved model identity captured at an immutable artifact boundary.
 
@@ -37,6 +44,7 @@ class ModelSnapshot(ContractModel):
     provider: str = Field(min_length=1, max_length=128)
     model_id: str = Field(min_length=1, max_length=512)
     revision: str | None = Field(default=None, max_length=256)
+    billing_source: BillingSource
     capabilities_sha256: Sha256
     connection_sha256: Sha256
 

@@ -17,6 +17,7 @@ from wmo.common.core.artifacts import (
     stable_id,
 )
 from wmo.common.judging import RawJudgment, Rubric
+from wmo.common.judging.evidence import visible_rollout_evidence
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.models import (
     AssistantAction,
@@ -102,6 +103,7 @@ class TemplateJudgeClient:
         created_at: datetime,
         code_revision: str,
         maximum_input_tokens: int | None = None,
+        maximum_output_tokens: int,
     ) -> None:
         """Bind one target, optional same-task reference, and exact finalized contract.
 
@@ -118,9 +120,11 @@ class TemplateJudgeClient:
             created_at: Materialization time for newly completed probes.
             code_revision: Exact producer revision for probe artifacts.
             maximum_input_tokens: Reserved request ceiling that rendered evidence must fit.
+            maximum_output_tokens: Reserved per-call output-token ceiling for dispatches.
 
         Raises:
-            ManualJudgeError: Pairwise feedback lacks a distinct same-task reference.
+            ManualJudgeError: Pairwise feedback lacks a distinct same-task reference, or the
+                output-token ceiling is not positive.
         """
         if template.response_shape == "pairwise":
             if reference is None or reference.task_id != rollout.task_id:
@@ -140,9 +144,12 @@ class TemplateJudgeClient:
         self._setup_input = setup_input
         self._rollout_input = rollout_input
         self._reference_input = reference_input
+        if maximum_output_tokens <= 0:
+            raise ManualJudgeError("judge maximum output tokens must be positive")
         self._created_at = created_at
         self._code_revision = code_revision
         self._maximum_input_tokens = maximum_input_tokens
+        self._maximum_output_tokens = maximum_output_tokens
         self._probes: list[ArtifactInput] = []
         self._provider_calls_made = 0
         self._pairwise_citation_evidence: PairwiseCitationEvidence = ()
@@ -199,7 +206,7 @@ class TemplateJudgeClient:
             order: Audit-visible presentation order.
 
         Returns:
-            Provider response after model dispatch.
+            Provider response after model dispatch or exact probe replay.
         """
         probe_id = stable_id(
             "manual-judge-probe",
@@ -236,6 +243,7 @@ class TemplateJudgeClient:
                 candidate_a,
                 candidate_b,
                 maximum_input_tokens=self._maximum_input_tokens,
+                maximum_output_tokens=self._maximum_output_tokens,
             )
         )
         self._provider_calls_made += 1
@@ -569,6 +577,7 @@ def _bounded_judge_request(
     candidate_b: RolloutArtifact | None,
     *,
     maximum_input_tokens: int | None,
+    maximum_output_tokens: int,
 ) -> ModelRequest:
     """Build one judge request whose rendered evidence fits the reserved input ceiling.
 
@@ -582,6 +591,7 @@ def _bounded_judge_request(
         candidate_a: Single or first candidate rollout.
         candidate_b: Optional second pairwise candidate.
         maximum_input_tokens: Reserved conservative request ceiling, or ``None`` for no bound.
+        maximum_output_tokens: Reserved per-call output-token ceiling for dispatches.
 
     Returns:
         Complete provider-neutral judge request within the reserved ceiling.
@@ -608,19 +618,21 @@ def _bounded_judge_request(
                 ),
             ),
             temperature=0.0,
-            maximum_output_tokens=4_096,
+            maximum_output_tokens=maximum_output_tokens,
         )
         if maximum_input_tokens is None or counter.count(request) <= maximum_input_tokens:
             return request
         remaining = [
             (
-                len(json.dumps(span.payload, ensure_ascii=False, sort_keys=True).encode("utf-8")),
+                len(
+                    json.dumps(span["payload"], ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ),
                 rollout.rollout_id,
-                span.span_id,
+                cast(str, span["span_id"]),
             )
             for rollout in rollouts
-            for span in rollout.spans
-            if (rollout.rollout_id, span.span_id) not in elided and span.payload
+            for span in cast(list[JsonObject], visible_rollout_evidence(rollout)["spans"])
+            if (rollout.rollout_id, span["span_id"]) not in elided and span["payload"]
         ]
         if not remaining:
             raise ManualJudgeError(
@@ -640,6 +652,9 @@ def _render_request(
     elided_spans: frozenset[tuple[str, str]] = frozenset(),
 ) -> str:
     """Render all finalized mapped variables and the exact saved response schema.
+
+    Rollout variables use the shared judge-visible evidence projection, so rendered
+    requests exclude provider request payloads and candidate reasoning content.
 
     Args:
         template: Finalized executable prompt contract.
@@ -675,45 +690,34 @@ def _rollout_payload(
     rollout: RolloutArtifact,
     elided_spans: frozenset[tuple[str, str]] = frozenset(),
 ) -> JsonObject:
-    """Return request-visible evidence from one verified rollout.
+    """Return judge-visible evidence with selected span payloads digest-elided.
 
     Args:
         rollout: Verified immutable production rollout.
         elided_spans: Rollout and span identities whose payloads are digest-elided.
 
     Returns:
-        Deterministic task, output, and span payload.
+        Deterministic judge-visible evidence projection with elided payload stubs.
     """
-    return {
-        "rollout_id": rollout.rollout_id,
-        "task_id": rollout.task_id,
-        "final_output": (
-            rollout.final_output.model_dump(mode="json")
-            if rollout.final_output is not None
-            else None
-        ),
-        "spans": [
-            {
-                "span_id": span.span_id,
-                "kind": span.kind.value,
-                "payload": (
-                    {
-                        "payload_elided": True,
-                        "payload_sha256": sha256_json(span.payload),
-                        "payload_bytes": len(
-                            json.dumps(span.payload, ensure_ascii=False, sort_keys=True).encode(
-                                "utf-8"
-                            )
-                        ),
-                    }
-                    if (rollout.rollout_id, span.span_id) in elided_spans
-                    else span.payload
-                ),
-                "failure": span.failure.model_dump(mode="json") if span.failure else None,
+    evidence = visible_rollout_evidence(rollout)
+    if not elided_spans:
+        return evidence
+    spans = []
+    for span in cast(list[JsonObject], evidence["spans"]):
+        if (rollout.rollout_id, cast(str, span["span_id"])) in elided_spans:
+            payload = cast(JsonObject, span["payload"])
+            span = {
+                **span,
+                "payload": {
+                    "payload_elided": True,
+                    "payload_sha256": sha256_json(payload),
+                    "payload_bytes": len(
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                    ),
+                },
             }
-            for span in rollout.spans
-        ],
-    }
+        spans.append(span)
+    return {**evidence, "spans": spans}
 
 
 def _validate_normalized_dimensions(dimensions: list[JsonObject], rubric: Rubric) -> None:

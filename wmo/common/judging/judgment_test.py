@@ -8,13 +8,14 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.common.judging import DimensionJudgment, Judgment
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 
 _DIGEST = "a" * 64
 
 
 def _judge_model() -> ModelSnapshot:
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="gpt-5.4-mini",
         capabilities_sha256=_DIGEST,
@@ -27,6 +28,8 @@ def _dimension_judgment() -> DimensionJudgment:
         dimension_id="task-success",
         raw_score=4,
         calibrated_score=3.8,
+        min_score=0,
+        max_score=5,
         rationale="The refund request includes the order and reason.",
     )
 
@@ -53,6 +56,8 @@ def test_judgment_rejects_duplicate_dimensions_and_nonfinite_scores() -> None:
             dimension_id="task-success",
             raw_score=4,
             calibrated_score=float("nan"),
+            min_score=0,
+            max_score=5,
             rationale="Invalid score.",
         )
     with pytest.raises(ValidationError, match="equal-weight"):
@@ -78,12 +83,16 @@ def test_dimension_judgment_accepts_missing_null_and_unbounded_rationale() -> No
         dimension_id="task-success",
         raw_score=4,
         calibrated_score=3.8,
+        min_score=0,
+        max_score=5,
     )
     explicit_null = DimensionJudgment.model_validate(
         {
             "dimension_id": "task-success",
             "raw_score": 4,
             "calibrated_score": 3.8,
+            "min_score": 0,
+            "max_score": 5,
             "rationale": None,
         }
     )
@@ -92,6 +101,8 @@ def test_dimension_judgment_accepts_missing_null_and_unbounded_rationale() -> No
         dimension_id="task-success",
         raw_score=4,
         calibrated_score=3.8,
+        min_score=0,
+        max_score=5,
         rationale=long_rationale,
     )
 
@@ -108,6 +119,8 @@ def test_dimension_judgment_rejects_citation_era_fields() -> None:
                 "dimension_id": "task-success",
                 "raw_score": 4,
                 "calibrated_score": 3.8,
+                "min_score": 0,
+                "max_score": 5,
                 "evidence_span_ids": ["span-1"],
                 "feedback": "Retired citation-era field.",
             }

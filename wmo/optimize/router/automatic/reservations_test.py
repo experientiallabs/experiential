@@ -14,6 +14,7 @@ from wmo.common.core.artifacts import (
     sha256_json,
 )
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     EmbeddingCostReservation,
     ModelCapabilities,
@@ -224,14 +225,30 @@ def _catalog() -> ModelCatalog:
     return ModelCatalog(
         connections={"openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")},
         models={
-            "world": ModelRecord(connection="openai", model="world", capabilities=world),
+            "world": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="openai",
+                model="world",
+                capabilities=world,
+            ),
             "candidate": ModelRecord(
-                connection="openai", model="candidate", capabilities=candidate
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="openai",
+                model="candidate",
+                capabilities=candidate,
             ),
             "candidate-b": ModelRecord(
-                connection="openai", model="candidate-b", capabilities=candidate
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="openai",
+                model="candidate-b",
+                capabilities=candidate,
             ),
-            "embedder": ModelRecord(connection="openai", model="embedder", capabilities=embedder),
+            "embedder": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="openai",
+                model="embedder",
+                capabilities=embedder,
+            ),
         },
     )
 

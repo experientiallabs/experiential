@@ -34,6 +34,7 @@ from wmo.common.judging import (
 )
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
@@ -101,6 +102,7 @@ class _Graph:
 
 def _model(model_id: str = "judge-model") -> ModelSnapshot:
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fake",
         model_id=model_id,
         capabilities_sha256=_DIGEST,

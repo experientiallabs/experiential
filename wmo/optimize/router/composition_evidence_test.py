@@ -623,6 +623,8 @@ class _EvidenceReviewSupplier:
                 score_maps=(
                     DimensionScoreMap(
                         dimension_id="dimension-a",
+                        min_score=0,
+                        max_score=5,
                         calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
                     ),
                 ),
@@ -643,7 +645,7 @@ def _persist_release_embeddings(project: ProjectStore, tasks, revision: str) -> 
     """Persist exact local vectors with release-checkout provenance."""
     extractor = RouterFeatureExtractor()
     embeddings = FrozenEmbeddingSet(
-        schema_version=1,
+        schema_version=3,
         created_at=_TIME,
         code_revision=revision,
         embedding_set_id="embeddings-a",

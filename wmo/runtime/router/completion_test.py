@@ -14,12 +14,13 @@ from wmo.runtime.router.completion import (
     RouterCompletionFailedError,
     RouterCompletionInProgressError,
 )
+from wmo.runtime.router.economics import routed_spend_ledger
 from wmo.runtime.router.journal import (
-    JournaledRouterRuntime,
     RuntimeIdempotencyConflictError,
     RuntimeInteractionFailedError,
     RuntimeInteractionInProgressError,
 )
+from wmo.runtime.router.journal_service import JournaledRouterRuntime
 from wmo.runtime.router.runtime import RoutedModelResponse
 from wmo.runtime.router.runtime_test import _request
 
@@ -68,7 +69,10 @@ def _failure() -> StructuredFailure:
     [
         (RuntimeIdempotencyConflictError("conflict"), RouterCompletionConflictError),
         (RuntimeInteractionInProgressError("in progress"), RouterCompletionInProgressError),
-        (RuntimeInteractionFailedError(_failure()), RouterCompletionFailedError),
+        (
+            RuntimeInteractionFailedError(_failure(), routed_spend_ledger(())),
+            RouterCompletionFailedError,
+        ),
     ],
 )
 def test_runtime_failures_translate_by_type(
@@ -89,7 +93,10 @@ def test_runtime_failures_translate_by_type(
 
     assert caught.value.__cause__ is runtime_error
     if isinstance(caught.value, RouterCompletionFailedError):
-        assert caught.value.failure is cast(RuntimeInteractionFailedError, runtime_error).failure
+        source = cast(RuntimeInteractionFailedError, runtime_error)
+        assert caught.value.failure is source.failure
+        assert caught.value.spend is source.spend
+        assert caught.value.retryable is source.failure.retryable
 
 
 def test_adapter_forwards_complete_request_identity() -> None:

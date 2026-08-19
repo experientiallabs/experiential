@@ -16,6 +16,7 @@ from wmo.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    OperationEconomics,
     completion_request_cost_usd,
     reconcile_completion_economics,
     verify_completion_reservation,
@@ -26,7 +27,12 @@ from wmo.optimize.router.errors import (
     JudgeDispatchExhaustedError,
     JudgeTranscriptAdmissionError,
 )
-from wmo.optimize.router.judging.contracts import ManualJudgeError, ManualJudgeSetupArtifact
+from wmo.optimize.router.judging.contracts import (
+    JudgeSetupArtifact,
+    ManualJudgeError,
+    ManualJudgeSetupArtifact,
+    ProvisionalJudgeSetupArtifact,
+)
 from wmo.optimize.router.judging.protocol import TemplateJudgeClient
 from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
 from wmo.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
@@ -70,12 +76,18 @@ class ReservedJudgeClient:
         self._reservation = reservation
         self._maximum_provider_calls = maximum_provider_calls
         self._calls = 0
+        self._economics: list[OperationEconomics] = []
         self._counter = Utf8UpperBoundTokenCounter()
 
     @property
     def calls(self) -> int:
         """Return provider requests made through this reservation boundary."""
         return self._calls
+
+    @property
+    def economics(self) -> tuple[OperationEconomics, ...]:
+        """Return reconciled economics for every completed judge provider request."""
+        return tuple(self._economics)
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Preflight one exact request and reconcile bounded response economics.
@@ -123,6 +135,7 @@ class ReservedJudgeClient:
             self._reservation,
             response.economics,
         )
+        self._economics.append(economics)
         return response.model_copy(update={"economics": economics})
 
 
@@ -132,11 +145,12 @@ class AutomaticRouterJudge:
     def __init__(
         self,
         client: ModelClient,
-        setup: ManualJudgeSetupArtifact,
+        setup: JudgeSetupArtifact,
         *,
         created_at: datetime,
         code_revision: str,
         maximum_input_tokens: int | None = None,
+        maximum_output_tokens: int,
     ) -> None:
         """Bind the finalized manual setup and provider boundary.
 
@@ -146,12 +160,35 @@ class AutomaticRouterJudge:
             created_at: Materialization time for provider probes and judgments.
             code_revision: Exact producer revision.
             maximum_input_tokens: Reserved request ceiling that rendered evidence must fit.
+            maximum_output_tokens: Approved per-call output-token reservation for dispatches.
         """
         self._client = client
         self._setup = setup
         self._created_at = created_at
         self._code_revision = code_revision
         self._maximum_input_tokens = maximum_input_tokens
+        self._maximum_output_tokens = maximum_output_tokens
+        self._plan: EvaluationPlan | None = None
+
+    @property
+    def provider_economics(self) -> tuple[OperationEconomics, ...]:
+        """Return completed provider economics when the reserved client records them."""
+        if isinstance(self._client, ReservedJudgeClient):
+            return self._client.economics
+        return ()
+
+    def bind_plan(self, plan: EvaluationPlan) -> None:
+        """Bind the one frozen evaluation plan whose rollouts may be judged.
+
+        Args:
+            plan: Persisted current composition plan.
+
+        Raises:
+            ValueError: A different plan was already bound.
+        """
+        if self._plan is not None and self._plan != plan:
+            raise ValueError("automatic judge is already bound to a different evaluation plan")
+        self._plan = plan
 
     def judge_persisted(
         self,
@@ -199,12 +236,14 @@ class AutomaticRouterJudge:
             created_at=self._created_at,
             code_revision=self._code_revision,
             maximum_input_tokens=self._maximum_input_tokens,
+            maximum_output_tokens=self._maximum_output_tokens,
         )
         return LMJudge(
             adapter,
             self._setup.prompt_template.prompt,
             code_revision=self._code_revision,
             clock=lambda: self._created_at,
+            maximum_output_tokens=self._maximum_output_tokens,
         ).judge_persisted(
             store,
             rollout_artifact_id=rollout_artifact_id,
@@ -283,7 +322,7 @@ class AutomaticRouterJudge:
         return plan
 
 
-def _setup_input(store: ProjectStore, setup: ManualJudgeSetupArtifact) -> ArtifactInput:
+def _setup_input(store: ProjectStore, setup: JudgeSetupArtifact) -> ArtifactInput:
     """Return the exact finalized setup pointer after identity verification.
 
     Args:
@@ -298,9 +337,12 @@ def _setup_input(store: ProjectStore, setup: ManualJudgeSetupArtifact) -> Artifa
     """
     stored = store.artifacts.read(setup.setup_id)
     value = artifact_input(stored.manifest)
-    if stored.manifest.artifact_type != "manual-judge-setup":
+    provisional = isinstance(setup, ProvisionalJudgeSetupArtifact)
+    expected_type = "provisional-judge-setup" if provisional else "manual-judge-setup"
+    if stored.manifest.artifact_type != expected_type:
         raise ManualJudgeError("finalized judge setup has the wrong artifact type")
-    persisted = ManualJudgeSetupArtifact.model_validate_json(
+    setup_type = ProvisionalJudgeSetupArtifact if provisional else ManualJudgeSetupArtifact
+    persisted = setup_type.model_validate_json(
         store.artifacts.read_bytes(setup.setup_id, "setup.json")
     )
     if persisted != setup:

@@ -15,6 +15,7 @@ from wmo.common.judging.lm_test import _axis_schema
 from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelCapabilities,
     ModelMessage,
     ModelRequest,
@@ -56,6 +57,7 @@ def _response(content: str) -> ModelResponse:
     return ModelResponse(
         output=AssistantAction(content=content),
         model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="bedrock",
             model_id="judge-model",
             capabilities_sha256=sha256_json(ModelCapabilities()),
@@ -134,7 +136,7 @@ def _scalar_request(system_text: str) -> ModelRequest:
             ModelMessage(role="user", content="unused"),
         ),
         temperature=0.0,
-        maximum_output_tokens=4_096,
+        maximum_output_tokens=16_384,
     )
 
 
@@ -249,6 +251,7 @@ def test_null_rationale_probe_persists_and_replays(tmp_path: Path) -> None:
         reference_input=None,
         created_at=_TIME,
         code_revision="test-revision",
+        maximum_output_tokens=16_384,
     ).complete(request)
     replay_client = _NullRationaleClient(setup.judge_model)
     replay = TemplateJudgeClient(
@@ -262,6 +265,7 @@ def test_null_rationale_probe_persists_and_replays(tmp_path: Path) -> None:
         reference_input=None,
         created_at=datetime(2026, 8, 13, 1, tzinfo=UTC),
         code_revision="test-revision",
+        maximum_output_tokens=16_384,
     )
     second = replay.complete(request)
 
@@ -339,6 +343,7 @@ def test_long_transcript_judge_request_is_elided_to_fit_the_reserved_ceiling(
         oversized,
         None,
         maximum_input_tokens=None,
+        maximum_output_tokens=16_384,
     )
     assert counter.count(unbounded) > 32_768
 
@@ -348,6 +353,7 @@ def test_long_transcript_judge_request_is_elided_to_fit_the_reserved_ceiling(
         oversized,
         None,
         maximum_input_tokens=32_768,
+        maximum_output_tokens=16_384,
     )
     replayed = _bounded_judge_request(
         setup.prompt_template,
@@ -355,6 +361,7 @@ def test_long_transcript_judge_request_is_elided_to_fit_the_reserved_ceiling(
         oversized,
         None,
         maximum_input_tokens=32_768,
+        maximum_output_tokens=16_384,
     )
 
     assert counter.count(bounded) <= 32_768
@@ -370,6 +377,7 @@ def test_long_transcript_judge_request_is_elided_to_fit_the_reserved_ceiling(
             oversized,
             None,
             maximum_input_tokens=16,
+            maximum_output_tokens=16_384,
         )
 
 
@@ -430,6 +438,7 @@ def test_template_client_dispatch_respects_the_reserved_input_ceiling(
         created_at=_TIME,
         code_revision="test-revision",
         maximum_input_tokens=32_768,
+        maximum_output_tokens=16_384,
     ).complete(_scalar_request(setup.prompt_template.prompt.text))
 
     assert len(client.requests) == 1

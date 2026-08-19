@@ -9,6 +9,7 @@ from wmo.common.core.artifacts import ArtifactInput, sorted_unique_inputs
 from wmo.common.evaluations import ObservedProductionCell
 from wmo.common.models import (
     CandidateTokenPrice,
+    ModelCatalog,
     PricingSnapshot,
     load_model_catalog,
     persist_pricing_snapshot,
@@ -59,6 +60,7 @@ def materialize_automatic_router_artifacts(
     runtime_catalog: RuntimeModelCatalog,
     *,
     attribution_input: ArtifactInput | None,
+    catalog_override: ModelCatalog | None = None,
     router_embedding_maximum_attempts: int,
     completion_maximum_attempts: int,
     maximum_provider_cost_usd: float,
@@ -72,6 +74,7 @@ def materialize_automatic_router_artifacts(
         preflight: Aggregate read-only prerequisite and reservation result.
         runtime_catalog: Credential-capable resolver over the just-persisted catalog.
         attribution_input: Immutable real-overlap attribution, when history is reusable.
+        catalog_override: Transient hosted catalog that must never be written into Project state.
         router_embedding_maximum_attempts: Active embedding retry ceiling.
         completion_maximum_attempts: Active completion retry ceiling.
         maximum_provider_cost_usd: Exact operator-approved shared provider ceiling.
@@ -84,7 +87,7 @@ def materialize_automatic_router_artifacts(
     Raises:
         ValueError: Catalog state, credentials, model identity, or replay evidence differs.
     """
-    active_catalog = load_model_catalog(project.model_catalog_path)
+    active_catalog = catalog_override or load_model_catalog(project.model_catalog_path)
     if active_catalog != preflight.catalog:
         raise ValueError("persisted model catalog differs from the confirmed router preflight")
     resolved_embedder = runtime_catalog.preflight(
@@ -311,7 +314,7 @@ def _candidate_bindings(
 def _runtime_capability_bindings(
     preflight: AutomaticRouterPreflight,
 ) -> tuple[RuntimeCandidateCapability, ...]:
-    """Build runtime-owned candidate bindings without extending the legacy policy.
+    """Build runtime-owned candidate bindings from the confirmed catalog selection.
 
     Args:
         preflight: Verified catalog and selected candidate identities.

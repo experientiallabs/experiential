@@ -8,7 +8,7 @@ from typing import cast
 
 from wmo.common.core.artifacts import Sha256, sha256_json
 from wmo.common.project import AgentConfiguration
-from wmo.runtime.agents.chat import ChatAgentRuntime
+from wmo.runtime.agents.chat import ChatAgentRuntime, normalize_chat_system_prompt
 from wmo.runtime.agents.interface import AgentRuntime, preflight_agent_runtime
 
 AgentFactory = Callable[[], AgentRuntime]
@@ -22,21 +22,23 @@ def agent_factory_sha256(
     configuration: AgentConfiguration | None,
     *,
     maximum_model_calls: int,
+    system_prompt: str | None = None,
 ) -> Sha256:
     """Bind the effective built-in or custom agent configuration to one digest.
 
     Args:
         configuration: Optional project-owned custom factory reference.
         maximum_model_calls: Request ceiling applied when the built-in chat agent is selected.
+        system_prompt: Optional built-in system instruction applied to every model request.
 
     Returns:
         Stable semantic identity for simulation and replay checks.
 
     Raises:
-        ValueError: The built-in request ceiling is not positive.
+        ValueError: The built-in request ceiling or system prompt is invalid.
     """
-    if maximum_model_calls <= 0:
-        raise ValueError("maximum_model_calls must be positive")
+    if not 1 <= maximum_model_calls <= 64:
+        raise ValueError("maximum_model_calls must be between 1 and 64")
     if configuration is not None and configuration.code_revision is None:
         raise ValueError(
             "custom agent configuration requires an immutable code_revision for exact replay"
@@ -45,6 +47,9 @@ def agent_factory_sha256(
         module_name, separator, attribute_name = configuration.factory.partition(":")
         if not separator or not module_name or not attribute_name:
             raise ValueError("agent factory must use the form 'module:attribute'")
+    normalized_prompt = (
+        None if configuration is not None else normalize_chat_system_prompt(system_prompt)
+    )
     binding = (
         {
             "version": "agent-factory-v1",
@@ -55,6 +60,7 @@ def agent_factory_sha256(
         else {
             "version": "agent-factory-v1",
             "kind": "built-in-chat",
+            "system_prompt": normalized_prompt,
             "maximum_model_calls": maximum_model_calls,
         }
     )
@@ -65,12 +71,14 @@ def resolve_agent_factory(
     configuration: AgentConfiguration | None,
     *,
     maximum_model_calls: int,
+    system_prompt: str | None = None,
 ) -> AgentFactory:
     """Resolve a configured custom factory or the built-in bounded chat agent.
 
     Args:
         configuration: Optional project-owned ``module:attribute`` factory reference.
         maximum_model_calls: Hard request ceiling applied to the built-in agent.
+        system_prompt: Optional built-in instruction prepended to candidate requests.
 
     Returns:
         Fresh-runtime factory suitable for concurrent simulation cells.
@@ -79,7 +87,11 @@ def resolve_agent_factory(
         AgentFactoryError: The custom reference is malformed, unavailable, or not callable.
     """
     if configuration is None:
-        return lambda: ChatAgentRuntime(maximum_model_calls=maximum_model_calls)
+        prompt = normalize_chat_system_prompt(system_prompt)
+        return lambda: ChatAgentRuntime(
+            maximum_model_calls=maximum_model_calls,
+            system_prompt=prompt,
+        )
     module_name, separator, attribute_name = configuration.factory.partition(":")
     if not separator or not module_name or not attribute_name:
         raise AgentFactoryError("agent factory must use the form 'module:attribute'")

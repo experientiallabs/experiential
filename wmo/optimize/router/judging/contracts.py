@@ -20,6 +20,7 @@ from wmo.common.judging import (
     CalibrationReport,
     PromptDefinition,
 )
+from wmo.common.judging.evidence import DEFAULT_JUDGE_OUTPUT_TOKENS
 from wmo.common.judging.lm import PORTABLE_RATIONALE_JSON_SCHEMA
 from wmo.common.models import ModelSnapshot, OperationEconomics, PricingSource
 
@@ -69,10 +70,14 @@ class JudgeScoreProjection(ContractModel):
 
 
 class JudgePromptTemplate(ContractModel):
-    """Versioned prompt, variable mapping, and strict response schema."""
+    """Versioned prompt, variable mapping, and strict response schema.
+
+    Template version 3 renders rollout variables through the shared judge-visible evidence
+    projection, which excludes provider request payloads and candidate reasoning content.
+    """
 
     template_id: Literal["wmo-judge-evidence-json"] = "wmo-judge-evidence-json"
-    template_version: Literal["2"] = "2"
+    template_version: Literal["3"] = "3"
     response_shape: Literal["scalar", "boolean", "categorical", "pairwise"] = "scalar"
     prompt: PromptDefinition
     variable_mapping: JsonObject
@@ -162,8 +167,8 @@ class JudgeTracePreview(ContractModel):
     reference_rollout_id: ArtifactId | None = None
 
 
-class ManualJudgeSetupArtifact(ArtifactEnvelope):
-    """Frozen judge contract approved before any calibration work or model call."""
+class JudgeSetupArtifact(ArtifactEnvelope):
+    """Frozen executable judge contract shared by manual and hosted setup modes."""
 
     setup_id: ArtifactId
     project_id: ArtifactId
@@ -176,7 +181,7 @@ class ManualJudgeSetupArtifact(ArtifactEnvelope):
     previews: tuple[JudgeTracePreview, ...]
 
     @model_validator(mode="after")
-    def _require_complete_inputs(self) -> ManualJudgeSetupArtifact:
+    def _require_complete_inputs(self) -> JudgeSetupArtifact:
         """Require every setup source to appear exactly once in envelope inputs.
 
         Returns:
@@ -191,12 +196,22 @@ class ManualJudgeSetupArtifact(ArtifactEnvelope):
             )
         )
         if len({item.artifact_id for item in expected}) != len(expected):
-            raise ValueError("manual judge setup inputs must have unique artifact IDs")
+            raise ValueError("judge setup inputs must have unique artifact IDs")
         if self.inputs != expected:
-            raise ValueError("manual judge setup must hash its complete canonical input graph")
+            raise ValueError("judge setup must hash its complete canonical input graph")
         if not self.previews:
-            raise ValueError("manual judge setup requires at least one rendered real-trace preview")
+            raise ValueError("judge setup requires at least one rendered real-trace preview")
         return self
+
+
+class ManualJudgeSetupArtifact(JudgeSetupArtifact):
+    """Frozen judge contract approved through the optional local manual setup mode."""
+
+
+class ProvisionalJudgeSetupArtifact(JudgeSetupArtifact):
+    """Machine-only hosted judge contract that carries no human approval semantics."""
+
+    status: Literal["provisional"] = "provisional"
 
 
 class JudgeCalibrationBudget(ContractModel):
@@ -210,7 +225,7 @@ class JudgeCalibrationBudget(ContractModel):
     output_usd_per_million_tokens: float = Field(ge=0)
     pricing_source: PricingSource = PricingSource.UNKNOWN
     maximum_input_tokens_per_call: int = Field(gt=0)
-    maximum_output_tokens_per_call: Literal[4096] = 4096
+    maximum_output_tokens_per_call: Literal[16_384] = DEFAULT_JUDGE_OUTPUT_TOKENS
     maximum_attempts_per_call: int = Field(gt=0)
     call_count: int = Field(ge=0)
     estimated_cost_usd: float = Field(ge=0)
@@ -443,7 +458,7 @@ class ManualJudgeReviewPricing(ContractModel):
     output_usd_per_million_tokens: float = Field(ge=0)
     pricing_source: PricingSource = PricingSource.UNKNOWN
     maximum_input_tokens_per_call: int = Field(gt=0)
-    maximum_output_tokens_per_call: Literal[4096] = 4096
+    maximum_output_tokens_per_call: Literal[16_384] = DEFAULT_JUDGE_OUTPUT_TOKENS
     maximum_attempts_per_call: int = Field(gt=0)
     authorized_call_count: Literal[1, 2]
     maximum_reserved_cost_usd: float = Field(ge=0)
@@ -799,10 +814,10 @@ class ManualJudgeCalibrationAudit(ArtifactEnvelope):
             raise ValueError("manual judge audit must hash its complete canonical input graph")
         if not self.judgments:
             raise ValueError("manual judge audit requires at least one judge probe")
-        if self.schema_version >= 2 and len(self.trace_reviews) != len(self.judgments):
+        if self.schema_version != 2:
+            raise ValueError("manual judge audit requires schema_version=2")
+        if len(self.trace_reviews) != len(self.judgments):
             raise ValueError("manual judge audit requires one human review per judgment")
-        if self.schema_version == 1 and self.trace_reviews:
-            raise ValueError("version-one manual judge audits cannot name trace reviews")
         if len({item.artifact_id for item in self.trace_reviews}) != len(self.trace_reviews):
             raise ValueError("manual judge audit trace reviews must be unique")
         if (self.positional_bias_comparisons is None) != (self.positional_bias_flips is None):

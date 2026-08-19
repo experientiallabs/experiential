@@ -170,6 +170,8 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
                     dimension_id="dimension-a",
                     raw_score=4,
                     calibrated_score=4.0,
+                    min_score=0,
+                    max_score=5,
                     rationale="Deterministic completed evidence.",
                 ),
             ),
@@ -286,7 +288,7 @@ def _persist_embeddings(store, tasks) -> None:  # noqa: ANN001 - focused fixture
     """Persist exact local vectors for every request-visible task feature."""
     extractor = RouterFeatureExtractor()
     embeddings = FrozenEmbeddingSet(
-        schema_version=1,
+        schema_version=3,
         created_at=_TIME,
         code_revision="test-revision",
         embedding_set_id="embeddings-a",

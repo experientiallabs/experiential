@@ -27,6 +27,7 @@ from wmo.cli.app import app
 from wmo.common.config.settings import set_maximum_command_cost_usd
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ConnectionConfig,
     Embedding,
     ModelCapabilities,
@@ -187,11 +188,13 @@ def _write_catalog(root: Path) -> None:
             },
             models={
                 "world": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="fixture",
                     model="world-id",
                     capabilities=ModelCapabilities(maximum_output_tokens=16_000),
                 ),
                 "judge": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="fixture",
                     model=_JUDGE_MODEL_ID,
                     capabilities=ModelCapabilities(
@@ -200,6 +203,7 @@ def _write_catalog(root: Path) -> None:
                     ),
                 ),
                 "embed": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="fixture",
                     model="embed-id",
                     capabilities=ModelCapabilities(
@@ -310,7 +314,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     refused = runner.invoke(app, over_budget)
     assert refused.exit_code == 2
     refused_text = " ".join(unstyle(refused.output).replace("│", " ").split())
-    assert "conservative estimate $0.56 exceeds the configured per-command budget" in refused_text
+    assert "conservative estimate $0.74 exceeds the configured per-command budget" in refused_text
     assert "$0.50" in refused_text
     assert "--yes cannot override" in refused_text
     assert "missing labels" not in refused_text

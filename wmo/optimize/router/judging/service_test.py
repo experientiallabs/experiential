@@ -33,6 +33,7 @@ from wmo.common.judging import (
 from wmo.common.judging.judgment import Judgment
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -218,6 +219,7 @@ class _StructuredJudgeClient:
 def _model() -> ModelSnapshot:
     """Return the exact snapshot produced by the local catalog fixture."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="judge-model",
         capabilities_sha256=_capabilities_digest(),
@@ -246,6 +248,7 @@ def _catalog() -> ModelCatalog:
         },
         models={
             "judge-main": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 connection="openai-main",
                 model="judge-model",
                 capabilities=ModelCapabilities(),
@@ -870,6 +873,7 @@ def test_estimate_uses_catalog_prices_and_records_provenance(tmp_path: Path) -> 
         update={
             "models": {
                 "judge-main": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="openai-main",
                     model="judge-model",
                     capabilities=ModelCapabilities(
@@ -892,7 +896,7 @@ def test_estimate_uses_catalog_prices_and_records_provenance(tmp_path: Path) -> 
     assert budget.output_usd_per_million_tokens == 2.0
     assert budget.pricing_source is PricingSource.CONFIGURED
     assert budget.call_count == 3
-    assert budget.estimated_cost_usd == pytest.approx(0.110592)
+    assert budget.estimated_cost_usd == pytest.approx(0.331776)
 
 
 def test_estimate_fails_when_the_ceiling_cannot_admit_the_sample(tmp_path: Path) -> None:
@@ -1024,7 +1028,8 @@ def test_calibration_reports_then_approves_and_replays_without_calls(tmp_path: P
     assert reviewed.approved_calibration is None
     assert reviewed.provider_calls_made == 3
     assert len(client.requests) == 3
-    assert reviewed.report.worst_disagreements
+    assert reviewed.report.worst_disagreements == ()
+    assert reviewed.report.out_of_fold_predictions
 
     approved = calibrate_manual_judge(
         store,

@@ -58,7 +58,6 @@ from wmo.simulation.engines.text.grounding import (
     load_completion_contract,
     load_simulation_task_set,
     require_grounding_settings,
-    unknown_dispatch_worst_case_usd,
     verify_fit_retriever,
 )
 from wmo.simulation.engines.text.leases import (
@@ -635,15 +634,7 @@ class WorldModelSimulator:
         for cell_id, binding in bindings.items():
             cell = next(item for item in self._plan.cells if item.cell_id == cell_id)
             rollouts.extend(persisted_cell_attempts(self._store, cell, binding, pins))
-        return known_total_spend(
-            rollouts,
-            unknown_dispatch_fallback_usd=lambda rollout: unknown_dispatch_worst_case_usd(
-                self._completion_contract,
-                rollout.simulation_binding.candidate_alias
-                if rollout.simulation_binding is not None
-                else None,
-            ),
-        )
+        return known_total_spend(rollouts)
 
     def _execute_cell(
         self,

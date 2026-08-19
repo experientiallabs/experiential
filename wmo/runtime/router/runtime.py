@@ -13,16 +13,41 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ContractModel,
     Sha256,
+    canonical_json_bytes,
     envelope_matches_manifest,
     sha256_json,
     stable_id,
 )
-from wmo.common.models import IdempotentModelClient, ModelAlias, ModelRequest, ModelResponse
+from wmo.common.models import (
+    BillingSource,
+    CandidateTokenPrice,
+    IdempotentModelClient,
+    ModelAlias,
+    ModelRequest,
+    ModelResponse,
+    NumericMeasurement,
+    OperationEconomics,
+    Usage,
+)
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore
-from wmo.common.routing import KnnRouterPolicy, RouterFeatureExtractor, RoutingDecision
+from wmo.common.routing import (
+    KnnRouterPolicy,
+    RouterFeatureExtractor,
+    RoutingDecision,
+    router_feature_token_upper_bound,
+)
 from wmo.common.routing.bank import KnnBankManifest, KnnEvidenceBank, bank_bytes, load_knn_bank
 from wmo.common.routing.decision import policy_content_sha256, select_from_bank
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.router.economics import (
+    BillingSourceEconomics,
+    RoutedCompletionEconomics,
+    RoutedProviderComponent,
+    RoutedProviderOperation,
+    RoutedSpendDisposition,
+    routed_completion_economics,
+    zero_operation_economics,
+)
 
 
 class RouterRuntimeIntegrityError(ValueError):
@@ -42,6 +67,7 @@ class RoutedModelResponse(ContractModel):
 
     decision: RoutingDecision
     response: ModelResponse
+    economics: RoutedCompletionEconomics
 
 
 DecisionSink = Callable[[RoutingDecision], None]
@@ -60,6 +86,7 @@ class RouterRuntime:
         pricing_snapshot_id: ArtifactId,
         pricing_snapshot_sha256: Sha256,
         pricing_candidate_aliases: tuple[ModelAlias, ...],
+        pricing_candidate_prices: tuple[CandidateTokenPrice, ...] | None = None,
         decision_sink: DecisionSink | None = None,
     ) -> None:
         self.policy = policy
@@ -70,6 +97,10 @@ class RouterRuntime:
         self._decision_sink = decision_sink
         self._episode_decisions: dict[str, RoutingDecision] = {}
         self._request_decisions: dict[tuple[Sha256, Sha256], RoutingDecision] = {}
+        self._request_embedding_economics: dict[tuple[Sha256, Sha256], OperationEconomics] = {}
+        self._request_embedding_dispositions: dict[
+            tuple[Sha256, Sha256], RoutedSpendDisposition
+        ] = {}
         self._episode_lock = threading.Lock()
         self._resolved: dict[str, ResolvedModel] = {}
         self._expected_models = {
@@ -85,6 +116,13 @@ class RouterRuntime:
         self._require_activation_identity(
             pricing_snapshot_id, pricing_snapshot_sha256, pricing_candidate_aliases
         )
+        self._candidate_prices = {
+            item.candidate_alias: item for item in pricing_candidate_prices or ()
+        }
+        if self._candidate_prices and tuple(self._candidate_prices) != pricing_candidate_aliases:
+            raise RouterRuntimeIntegrityError(
+                "runtime candidate prices differ from fit-time candidate order"
+            )
         try:
             for candidate in policy.candidates:
                 self._resolve(candidate.alias)
@@ -96,6 +134,8 @@ class RouterRuntime:
         if embedder.embedding_client is None or not embedder.capabilities.supports_embeddings:
             raise RouterRuntimeIntegrityError("frozen router embedder lacks embedding capability")
         self._embedder = embedder.embedding_client
+        self._embedder_billing_source = embedder.snapshot.billing_source
+        self._embedder_input_price = embedder.capabilities.input_cost_per_million_tokens_usd
 
     @property
     def records_decisions(self) -> bool:
@@ -208,6 +248,7 @@ class RouterRuntime:
             pricing_candidate_aliases=tuple(
                 item.candidate_alias for item in pricing.candidate_prices
             ),
+            pricing_candidate_prices=pricing.candidate_prices,
             decision_sink=decision_sink,
         )
 
@@ -238,9 +279,15 @@ class RouterRuntime:
             if existing is not None:
                 return existing
             episode_decision = self._episode_decisions.get(identity_sha256)
+            embedding_economics = zero_operation_economics()
+            embedding_disposition = RoutedSpendDisposition.DEFINITELY_NOT_INCURRED
             if episode_decision is not None:
                 decision = self._sticky_decision(episode_decision, request_sha256)
             else:
+                embedding_economics = _embedding_economics(
+                    feature,
+                    input_usd_per_million_tokens=self._embedder_input_price,
+                )
                 try:
                     embedded = self._embedder.embed((feature,))
                     if len(embedded) != 1:
@@ -253,8 +300,10 @@ class RouterRuntime:
                     ):
                         raise ValueError("embedder returned an invalid router vector")
                 except Exception:  # noqa: BLE001 - request-time embedding failures fall back
+                    embedding_disposition = RoutedSpendDisposition.RESERVED_AMBIGUOUS
                     decision = self._fallback_decision(request_sha256, identity, "embedding_error")
                 else:
+                    embedding_disposition = RoutedSpendDisposition.LOCALLY_PRICED
                     decision = select_from_bank(
                         self.policy,
                         self.manifest,
@@ -275,9 +324,96 @@ class RouterRuntime:
                     )
                     for stale_key in stale_request_keys:
                         del self._request_decisions[stale_key]
+                        self._request_embedding_economics.pop(stale_key, None)
+                        self._request_embedding_dispositions.pop(stale_key, None)
                 self._episode_decisions[identity_sha256] = decision
             self._request_decisions[request_key] = decision
+            self._request_embedding_economics[request_key] = embedding_economics
+            self._request_embedding_dispositions[request_key] = embedding_disposition
             return decision
+
+    def embedding_reservation(self, request: ModelRequest) -> BillingSourceEconomics:
+        """Return the source-attributed reservation before router embedding dispatch.
+
+        Args:
+            request: Provider-neutral request whose exact router feature will be embedded.
+
+        Returns:
+            Alias-free conservative embedding economics and immutable billing source.
+        """
+        feature = self._extractor.from_request(request)
+        return BillingSourceEconomics(
+            billing_source=self._embedder_billing_source,
+            economics=_embedding_economics(
+                feature,
+                input_usd_per_million_tokens=self._embedder_input_price,
+            ),
+        )
+
+    def selection_operation(
+        self,
+        request: ModelRequest,
+        *,
+        episode_id: str,
+        decision: RoutingDecision,
+    ) -> RoutedProviderOperation:
+        """Return the exact settled embedding disposition for one completed selection.
+
+        Args:
+            request: Provider-neutral request used for selection.
+            episode_id: Journal-derived sticky routing lineage.
+            decision: Exact decision returned by ``select``.
+
+        Returns:
+            Alias-free operation evidence suitable for durable rebinding by the journal.
+
+        Raises:
+            ValueError: The decision was not produced for this request and lineage.
+        """
+        feature = self._extractor.from_request(request)
+        request_sha256 = hashlib.sha256(feature.encode("utf-8")).hexdigest()
+        episode_sha256 = hashlib.sha256(episode_id.encode("utf-8")).hexdigest()
+        request_key = (episode_sha256, request_sha256)
+        with self._episode_lock:
+            if self._request_decisions.get(request_key) != decision:
+                raise ValueError("routing decision does not match the completed selection")
+            economics = self._request_embedding_economics[request_key]
+            disposition = self._request_embedding_dispositions[request_key]
+        return _runtime_provider_operation(
+            decision,
+            operation_ordinal=1,
+            component=RoutedProviderComponent.ROUTER_EMBEDDING,
+            billing_source=self._embedder_billing_source,
+            disposition=disposition,
+            economics=economics,
+        )
+
+    def candidate_reservation(
+        self,
+        request: ModelRequest,
+        *,
+        episode_id: str,
+        decision: RoutingDecision,
+    ) -> BillingSourceEconomics:
+        """Validate a pinned candidate and price its request before provider dispatch.
+
+        Args:
+            request: Provider-neutral request to complete.
+            episode_id: Journal-derived sticky routing lineage.
+            decision: Exact accepted routing decision.
+
+        Returns:
+            Alias-free conservative candidate reservation and immutable billing source.
+        """
+        resolved, _, _ = self._prepare_completion(request, episode_id=episode_id, decision=decision)
+        return BillingSourceEconomics(
+            billing_source=resolved.snapshot.billing_source,
+            economics=_candidate_reservation_economics(
+                request,
+                resolved,
+                self._candidate_prices.get(decision.selected_alias),
+            ),
+        )
 
     def complete(
         self,
@@ -303,6 +439,53 @@ class RouterRuntime:
             ValueError: A supplied decision does not bind this request, episode, or policy.
         """
         selected = decision or self.select(request, episode_id=episode_id)
+        if provider_idempotency_key is not None:
+            _validate_idempotency_key(provider_idempotency_key)
+        resolved, embedding_economics, embedding_disposition = self._prepare_completion(
+            request,
+            episode_id=episode_id,
+            decision=selected,
+        )
+        client = resolved.client
+        if provider_idempotency_key is not None and isinstance(client, IdempotentModelClient):
+            response = client.complete_idempotent(request, idempotency_key=provider_idempotency_key)
+        else:
+            response = client.complete(request)
+        price = self._candidate_prices.get(selected.selected_alias)
+        candidate_economics = _candidate_completion_economics(response.economics, price)
+        operations = (
+            _runtime_provider_operation(
+                selected,
+                operation_ordinal=1,
+                component=RoutedProviderComponent.ROUTER_EMBEDDING,
+                billing_source=self._embedder_billing_source,
+                disposition=embedding_disposition,
+                economics=embedding_economics,
+            ),
+            _runtime_provider_operation(
+                selected,
+                operation_ordinal=2,
+                component=RoutedProviderComponent.SELECTED_CANDIDATE,
+                billing_source=resolved.snapshot.billing_source,
+                disposition=_candidate_success_disposition(response.economics, candidate_economics),
+                economics=candidate_economics,
+            ),
+        )
+        return RoutedModelResponse(
+            decision=selected,
+            response=response,
+            economics=routed_completion_economics(operations),
+        )
+
+    def _prepare_completion(
+        self,
+        request: ModelRequest,
+        *,
+        episode_id: str | None,
+        decision: RoutingDecision,
+    ) -> tuple[ResolvedModel, OperationEconomics, RoutedSpendDisposition]:
+        """Validate request pins and capability before candidate provider dispatch."""
+        selected = decision
         feature = self._extractor.from_request(request)
         request_sha256 = hashlib.sha256(feature.encode("utf-8")).hexdigest()
         expected_episode_sha256 = (
@@ -318,8 +501,6 @@ class RouterRuntime:
             or selected.selected_alias not in {item.alias for item in self.policy.candidates}
         ):
             raise ValueError("routing decision does not match this policy, request, or episode")
-        if provider_idempotency_key is not None:
-            _validate_idempotency_key(provider_idempotency_key)
         self._require_bank_integrity()
         with self._episode_lock:
             request_key = (expected_episode_sha256, request_sha256)
@@ -338,9 +519,19 @@ class RouterRuntime:
                 if episode_decision is None:
                     self._episode_decisions[expected_episode_sha256] = selected
                 self._request_decisions[request_key] = selected
+                self._request_embedding_economics[request_key] = zero_operation_economics()
+                self._request_embedding_dispositions[request_key] = (
+                    RoutedSpendDisposition.DEFINITELY_NOT_INCURRED
+                )
                 cached = selected
             if cached != selected:
                 raise ValueError("routing decision is not the exact cached episode decision")
+            embedding_economics = self._request_embedding_economics.get(
+                request_key, zero_operation_economics()
+            )
+            embedding_disposition = self._request_embedding_dispositions.get(
+                request_key, RoutedSpendDisposition.DEFINITELY_NOT_INCURRED
+            )
         resolved = self._resolve(selected.selected_alias)
         if _requires_tool_protocol(request) and not resolved.capabilities.supports_tools:
             raise RouterModelCapabilityError(
@@ -354,12 +545,7 @@ class RouterRuntime:
                 f"routed model alias {selected.selected_alias!r} cannot prove the requested "
                 "output-token capacity"
             )
-        client = resolved.client
-        if provider_idempotency_key is not None and isinstance(client, IdempotentModelClient):
-            response = client.complete_idempotent(request, idempotency_key=provider_idempotency_key)
-        else:
-            response = client.complete(request)
-        return RoutedModelResponse(decision=selected, response=response)
+        return resolved, embedding_economics, embedding_disposition
 
     def _require_activation_identity(
         self,
@@ -549,6 +735,203 @@ class RouterRuntime:
         if self._decision_sink is not None:
             self._decision_sink(decision)
         return decision
+
+
+def _embedding_economics(
+    feature: str,
+    *,
+    input_usd_per_million_tokens: float | None,
+) -> OperationEconomics:
+    """Estimate one successful online router embedding from its request-visible feature.
+
+    Args:
+        feature: Exact provider input rendered by the router feature extractor.
+        input_usd_per_million_tokens: Active explicit embedding price when declared.
+
+    Returns:
+        Conservative usage and locally priced cost without a model alias.
+    """
+    tokens = router_feature_token_upper_bound(feature)
+    cost = (
+        None
+        if input_usd_per_million_tokens is None
+        else NumericMeasurement(
+            value=tokens * input_usd_per_million_tokens / 1_000_000,
+            provenance="estimated",
+        )
+    )
+    return OperationEconomics(
+        usage=Usage(input_tokens=tokens, output_tokens=0),
+        cost_usd=cost,
+    )
+
+
+def _candidate_reservation_economics(
+    request: ModelRequest,
+    resolved: ResolvedModel,
+    price: CandidateTokenPrice | None,
+) -> OperationEconomics:
+    """Build a conservative candidate reservation before provider dispatch.
+
+    Args:
+        request: Exact provider-neutral request to be dispatched.
+        resolved: Frozen selected model and declared capability bounds.
+        price: Fit-time token prices for the selected private alias, when available.
+
+    Returns:
+        Alias-free maximum usage and cost, or explicitly unknown economics when no output bound
+        can be proven.
+    """
+    maximum_output_tokens = (
+        request.maximum_output_tokens or resolved.capabilities.maximum_output_tokens
+    )
+    if maximum_output_tokens is None:
+        return OperationEconomics()
+    request_bytes = len(canonical_json_bytes(request))
+    framing = 64 * (len(request.messages) + len(request.tools) + 1)
+    maximum_input_tokens = request_bytes + framing
+    usage = Usage(
+        input_tokens=maximum_input_tokens,
+        output_tokens=maximum_output_tokens,
+    )
+    if price is None:
+        return OperationEconomics(usage=usage)
+    input_rate = max(
+        price.input_usd_per_million_tokens,
+        price.cached_input_usd_per_million_tokens or 0.0,
+        price.cache_write_usd_per_million_tokens or 0.0,
+    )
+    cost = (
+        maximum_input_tokens * input_rate
+        + maximum_output_tokens * price.output_usd_per_million_tokens
+    ) / 1_000_000
+    return OperationEconomics(
+        usage=usage,
+        cost_usd=NumericMeasurement(value=cost, provenance="estimated"),
+    )
+
+
+def _candidate_success_disposition(
+    observed: OperationEconomics,
+    reconciled: OperationEconomics,
+) -> RoutedSpendDisposition:
+    """Classify candidate accounting as provider-observed or locally priced."""
+    if reconciled != observed or (
+        reconciled.cost_usd is not None and reconciled.cost_usd.provenance == "estimated"
+    ):
+        return RoutedSpendDisposition.LOCALLY_PRICED
+    return RoutedSpendDisposition.OBSERVED
+
+
+def _runtime_provider_operation(
+    decision: RoutingDecision,
+    *,
+    operation_ordinal: int,
+    component: RoutedProviderComponent,
+    billing_source: BillingSource,
+    disposition: RoutedSpendDisposition,
+    economics: OperationEconomics,
+) -> RoutedProviderOperation:
+    """Build one direct-runtime operation without exposing the selected alias."""
+    operation_id = stable_id(
+        "routed-operation",
+        {
+            "decision_id": decision.decision_id,
+            "operation_ordinal": operation_ordinal,
+            "component": component.value,
+        },
+    )
+    return RoutedProviderOperation(
+        operation_id=operation_id,
+        operation_ordinal=operation_ordinal,
+        component=component,
+        billing_source=billing_source,
+        disposition=disposition,
+        operation_count=(0 if disposition == RoutedSpendDisposition.DEFINITELY_NOT_INCURRED else 1),
+        economics=economics,
+    )
+
+
+def _candidate_completion_economics(
+    economics: OperationEconomics,
+    price: CandidateTokenPrice | None,
+) -> OperationEconomics:
+    """Retain measured candidate cost or locally price its observed token usage.
+
+    Args:
+        economics: Provider response economics.
+        price: Fit-time selected-candidate price, kept private from the result.
+
+    Returns:
+        Reconciled alias-free candidate economics.
+
+    Raises:
+        ValueError: Provider cache counters exceed the reported input total.
+    """
+    usage = economics.usage
+    if economics.cost_usd is not None or usage is None or price is None:
+        return economics
+    cached = usage.cached_input_tokens
+    written = usage.cache_write_input_tokens
+    if cached is not None and cached > usage.input_tokens:
+        raise ValueError("candidate cached input exceeds total input usage")
+    if written is not None and written > usage.input_tokens:
+        raise ValueError("candidate cache-write input exceeds total input usage")
+    if cached is not None and written is not None and cached + written > usage.input_tokens:
+        raise ValueError("candidate cache counters overlap beyond total input usage")
+    input_cost = _candidate_input_cost_usd(price, usage)
+    output_cost = usage.output_tokens * price.output_usd_per_million_tokens / 1_000_000
+    return economics.model_copy(
+        update={
+            "cost_usd": NumericMeasurement(
+                value=input_cost + output_cost,
+                provenance="estimated",
+            )
+        }
+    )
+
+
+def _candidate_input_cost_usd(price: CandidateTokenPrice, usage: Usage) -> float:
+    """Conservatively price mutually exclusive ordinary, cached, and cache-write input.
+
+    Args:
+        price: Frozen candidate price units.
+        usage: Provider-reported input and cache token counts.
+
+    Returns:
+        Locally priced input cost in USD.
+    """
+    base = price.input_usd_per_million_tokens
+    cached_price = price.cached_input_usd_per_million_tokens
+    write_price = price.cache_write_usd_per_million_tokens
+    cached = usage.cached_input_tokens
+    written = usage.cache_write_input_tokens
+    if cached is not None and written is not None:
+        ordinary = usage.input_tokens - cached - written
+        total = (
+            ordinary * base
+            + cached * (cached_price if cached_price is not None else base)
+            + written * (write_price if write_price is not None else base)
+        )
+    elif cached is not None:
+        ordinary_price = max(base, write_price if write_price is not None else base)
+        total = (
+            cached * (cached_price if cached_price is not None else base)
+            + (usage.input_tokens - cached) * ordinary_price
+        )
+    elif written is not None:
+        ordinary_price = max(base, cached_price if cached_price is not None else base)
+        total = (
+            written * (write_price if write_price is not None else base)
+            + (usage.input_tokens - written) * ordinary_price
+        )
+    else:
+        total = usage.input_tokens * max(
+            base,
+            cached_price if cached_price is not None else base,
+            write_price if write_price is not None else base,
+        )
+    return total / 1_000_000
 
 
 def _requires_tool_protocol(request: ModelRequest) -> bool:

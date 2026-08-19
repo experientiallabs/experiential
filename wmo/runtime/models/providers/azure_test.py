@@ -6,6 +6,7 @@ import pytest
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     EmbeddingClient,
     ModelCapabilities,
@@ -205,6 +206,7 @@ def test_catalog_resolution_pairs_one_endpoint_with_its_key() -> None:
             },
             models={
                 "gpt": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="azure",
                     model="gpt-deployment",
                     capabilities=ModelCapabilities(
@@ -246,6 +248,7 @@ def test_catalog_resolution_pairs_one_endpoint_with_its_key() -> None:
             },
             models={
                 "gpt": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="azure",
                     model="gpt-deployment",
                     capabilities=ModelCapabilities(supports_completions=True),

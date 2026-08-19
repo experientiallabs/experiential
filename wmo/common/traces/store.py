@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
+from typing import cast
 
 from pydantic import ValidationError
 
-from wmo.common.core.artifacts import envelope_matches_manifest
+from wmo.common.core.artifacts import JsonObject, envelope_matches_manifest
+from wmo.common.models import BillingSource
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore
 from wmo.common.traces.trace import Trace, TraceDataset
 
@@ -65,7 +68,9 @@ def load_trace_dataset(store: ArtifactStore, dataset_id: str) -> LoadedTraceData
         )
     try:
         traces = tuple(
-            Trace.model_validate_json(line) for line in payload.decode("utf-8").splitlines() if line
+            _decode_trace_record(line, legacy=dataset.schema_version == 1)
+            for line in payload.decode("utf-8").splitlines()
+            if line
         )
     except (UnicodeDecodeError, ValidationError, ValueError) as exc:
         raise ArtifactCorruptionError(
@@ -77,3 +82,53 @@ def load_trace_dataset(store: ArtifactStore, dataset_id: str) -> LoadedTraceData
             f"trace dataset {dataset_id} trace records do not match ordered trace IDs"
         )
     return LoadedTraceDataset(dataset=dataset, traces=traces)
+
+
+def _decode_trace_record(payload: str, *, legacy: bool) -> Trace:
+    """Decode one trace, migrating missing billing only under schema-v1 ownership.
+
+    Args:
+        payload: One canonical JSON trace record.
+        legacy: Whether the verified owning trace-dataset envelope is schema v1.
+
+    Returns:
+        A current typed trace whose model snapshots always name a billing source.
+    """
+    decoded = json.loads(payload)
+    if not isinstance(decoded, dict):
+        raise ValueError("trace record must be a JSON object")
+    record = cast(JsonObject, decoded)
+    if legacy:
+        record = _migrate_legacy_trace_billing_sources(record)
+    return Trace.model_validate(record)
+
+
+def _migrate_legacy_trace_billing_sources(record: JsonObject) -> JsonObject:
+    """Add conservative customer-managed attribution to schema-v1 trace snapshots.
+
+    Args:
+        record: Parsed legacy trace record owned by a verified schema-v1 dataset.
+
+    Returns:
+        Copied trace payload with every legacy model snapshot made explicit.
+    """
+    migrated = cast(JsonObject, dict(record))
+    spans = record.get("spans")
+    if not isinstance(spans, list):
+        return migrated
+    migrated_spans: list[object] = []
+    for value in spans:
+        if not isinstance(value, dict):
+            migrated_spans.append(value)
+            continue
+        span = cast(JsonObject, dict(value))
+        model = span.get("model")
+        if isinstance(model, dict):
+            snapshot = cast(JsonObject, dict(model))
+            if "billing_source" in snapshot:
+                raise ValueError("schema-v1 trace model must not declare current billing_source")
+            snapshot["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
+            span["model"] = snapshot
+        migrated_spans.append(span)
+    migrated["spans"] = migrated_spans
+    return migrated

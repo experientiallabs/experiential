@@ -18,7 +18,7 @@ from wmo.cli import judge_review as review_module
 from wmo.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
 from wmo.common.judging import Rubric, RubricDimension
 from wmo.common.judging.judgment import Judgment
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.optimize.router.judging.contracts import (
     JudgeTracePreview,
@@ -431,6 +431,55 @@ def test_noninteractive_multi_axis_inputs_accept_and_correct_independently() -> 
     )
 
 
+def test_noninteractive_missing_labels_list_ready_to_paste_expressions() -> None:
+    """The non-interactive error lists one paste-ready --label expression per missing key."""
+    proposal = _proposal(_trace("trace-a", completion="Done.", failed=False), multi_axis=True)
+
+    with pytest.raises(ValueError) as excinfo:
+        review_module.build_manual_judge_reviewer(
+            _setup(),
+            proposal.rubric,
+            _previews(proposal),
+            drafted_labels=(),
+            supplied_labels=(),
+            supplied_judgments=(),
+            non_interactive=True,
+            character_limit=1_200,
+            page=False,
+            console=Console(file=io.StringIO(), width=100, color_system=None),
+        )
+
+    message = str(excinfo.value)
+    assert message.startswith("missing labels: supply ")
+    assert "--label trace-a:task-success=SCORE" in message
+    assert "--label trace-a:policy-compliance=SCORE" in message
+
+
+def test_noninteractive_missing_pairwise_labels_list_typed_winner_values() -> None:
+    """The pairwise non-interactive error shows the typed winner values to paste."""
+    trace = _trace("trace-a", completion="Candidate A finished.", failed=False)
+    reference = _trace("trace-b", completion="Candidate B finished.", failed=False)
+    proposal = _proposal(trace, reference=reference)
+
+    with pytest.raises(ValueError) as excinfo:
+        review_module.build_manual_judge_reviewer(
+            _setup(response_shape="pairwise"),
+            proposal.rubric,
+            _previews(proposal),
+            drafted_labels=(),
+            supplied_labels=(),
+            supplied_judgments=(),
+            non_interactive=True,
+            character_limit=1_200,
+            page=False,
+            console=Console(file=io.StringIO(), width=100, color_system=None),
+        )
+
+    message = str(excinfo.value)
+    assert "--label trace-a:trace-b:task-success=WINNER" in message
+    assert "(WINNER is winner_a, winner_b, or tie)" in message
+
+
 def test_noninteractive_scalar_score_respects_the_saved_axis_range() -> None:
     """Explicit scalar corrections cannot leave the finalized inclusive range."""
     proposal = _proposal(_trace("trace-a", completion="Done.", failed=False))
@@ -626,6 +675,7 @@ def _proposal(
 def _model() -> ModelSnapshot:
     """Return one exact secret-free assistant identity."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="assistant-model",
         revision=None,

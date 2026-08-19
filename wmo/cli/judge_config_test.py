@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 from wmo.cli import judge_config as judge_config_module
 from wmo.cli.app import app
 from wmo.common.models import (
+    BillingSource,
     ModelCapabilities,
     ModelCatalog,
     ModelRecord,
@@ -111,6 +112,7 @@ def _priced_catalog() -> ModelCatalog:
             "models": {
                 **catalog.models,
                 "judge-main": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection=record.connection,
                     model=record.model,
                     capabilities=ModelCapabilities(
@@ -255,7 +257,7 @@ def test_calibrate_prints_catalog_pricing_breakdown_before_labels(tmp_path: Path
     _setup(store)
     _write_catalog(store.paths.root, _priced_catalog())
     (store.paths.root / "settings.toml").write_text(
-        "[commands]\nmaximum_cost_usd = 0.5\n",
+        "[commands]\nmaximum_cost_usd = 1.0\n",
         encoding="utf-8",
     )
 
@@ -278,7 +280,7 @@ def test_calibrate_prints_catalog_pricing_breakdown_before_labels(tmp_path: Path
     assert result.exit_code == 2
     assert "requires explicit confirmation" in output
     assert "wmo config judge calibrate support" in output
-    assert "$0.37 of $0.50" in output
+    assert "$0.59 of $1.00" in output
     assert "re-run with --yes" in output
     assert "missing labels" not in output
 
@@ -337,7 +339,7 @@ def test_calibrate_uses_shared_command_budget_when_flag_is_omitted(tmp_path: Pat
     output = " ".join(unstyle(result.output).replace("│", " ").split())
     assert result.exit_code == 2
     assert "exceeds the configured per-command" in output
-    assert "wmo config budget 0.37" in output
+    assert "wmo config budget 0.59" in output
     assert "--yes cannot override" in output
     assert "missing labels" not in output
 
@@ -388,6 +390,7 @@ def test_setup_output_is_plain_language_and_hides_execution_internals(
 def _model() -> ModelSnapshot:
     """Return one exact secret-free judge identity."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="judge-model",
         revision=None,

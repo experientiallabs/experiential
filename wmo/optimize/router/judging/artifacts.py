@@ -39,6 +39,7 @@ from wmo.common.traces import Trace, TraceSpan
 from wmo.optimize.router.judging.contracts import (
     JudgeCalibrationBudget,
     JudgeRunEvidence,
+    JudgeSetupArtifact,
     ManualJudgeCalibrationAudit,
     ManualJudgeCalibrationResult,
     ManualJudgeError,
@@ -504,7 +505,7 @@ def find_provisional_calibration(
 
 def write_production_rollout(
     store: ProjectStore,
-    setup: ManualJudgeSetupArtifact,
+    setup: JudgeSetupArtifact,
     task: TaskCase,
     trace: Trace,
     created_at: datetime,

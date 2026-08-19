@@ -1,9 +1,16 @@
 """Tests for router judgment contracts."""
 
+import pytest
+from pydantic import ValidationError
+
 from wmo.common.judging.lm import PORTABLE_RATIONALE_JSON_SCHEMA
 from wmo.common.judging.lm_test import _axis_schema
-from wmo.common.models import PricingSource
-from wmo.optimize.router.judging.contracts import JudgeCalibrationBudget, judge_feedback_schema
+from wmo.common.models import OperationEconomics, PricingSource
+from wmo.optimize.router.judging.contracts import (
+    JudgeCalibrationBudget,
+    ManualJudgeReviewPricing,
+    judge_feedback_schema,
+)
 
 
 def test_stored_budget_without_pricing_source_stays_unknown() -> None:
@@ -21,6 +28,68 @@ def test_stored_budget_without_pricing_source_stays_unknown() -> None:
     )
 
     assert budget.pricing_source is PricingSource.UNKNOWN
+
+
+def test_new_budget_defaults_to_sixteen_k_output_tokens() -> None:
+    """Budgets built without an explicit output reservation get the current default."""
+    budget = JudgeCalibrationBudget(
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=2.0,
+        maximum_input_tokens_per_call=32_768,
+        maximum_attempts_per_call=3,
+        call_count=1,
+        estimated_cost_usd=0.01,
+        maximum_cost_usd=1.0,
+    )
+
+    assert budget.maximum_output_tokens_per_call == 16_384
+
+
+@pytest.mark.parametrize("output_tokens", [4_096, 8_192])
+def test_non_default_output_budget_is_rejected(output_tokens: int) -> None:
+    """Output reservations other than the single supported value fail closed."""
+    with pytest.raises(ValidationError, match="maximum_output_tokens_per_call"):
+        JudgeCalibrationBudget.model_validate(
+            {
+                "input_usd_per_million_tokens": 1.0,
+                "output_usd_per_million_tokens": 2.0,
+                "maximum_input_tokens_per_call": 4096,
+                "maximum_output_tokens_per_call": output_tokens,
+                "maximum_attempts_per_call": 3,
+                "call_count": 1,
+                "estimated_cost_usd": 0.01,
+                "maximum_cost_usd": 1.0,
+            }
+        )
+
+
+def test_review_pricing_reserves_the_default_and_rejects_other_budgets() -> None:
+    """Review pricing reserves 16384 output tokens and rejects any other reservation."""
+    fresh = ManualJudgeReviewPricing(
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=2.0,
+        maximum_input_tokens_per_call=32_768,
+        maximum_attempts_per_call=3,
+        authorized_call_count=1,
+        maximum_reserved_cost_usd=0.196608,
+        observed_economics=OperationEconomics(),
+    )
+
+    assert fresh.maximum_output_tokens_per_call == 16_384
+
+    with pytest.raises(ValidationError, match="maximum_output_tokens_per_call"):
+        ManualJudgeReviewPricing.model_validate(
+            {
+                "input_usd_per_million_tokens": 1.0,
+                "output_usd_per_million_tokens": 2.0,
+                "maximum_input_tokens_per_call": 4096,
+                "maximum_output_tokens_per_call": 4096,
+                "maximum_attempts_per_call": 3,
+                "authorized_call_count": 1,
+                "maximum_reserved_cost_usd": 0.036864,
+                "observed_economics": OperationEconomics().model_dump(mode="json"),
+            }
+        )
 
 
 def test_scalar_feedback_schema_matches_the_portable_rationale_contract() -> None:

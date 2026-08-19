@@ -8,6 +8,7 @@ import math
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -22,7 +23,7 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
-from wmo.common.models import Embedding, EmbeddingClient, ModelSnapshot
+from wmo.common.models import BillingSource, Embedding, EmbeddingClient, ModelSnapshot
 from wmo.common.project import ArtifactStore
 from wmo.common.routing.features import RouterFeatureExtractor
 from wmo.common.tasks import TaskCase
@@ -108,10 +109,42 @@ class FrozenEmbedding(ContractModel):
 class FrozenEmbeddingSet(ArtifactEnvelope):
     """Completed vectors bound to one exact embedder snapshot and feature texts."""
 
+    schema_version: Literal[1, 2, 3] = 3
     embedding_set_id: ArtifactId
     embedder_alias: ArtifactId
     embedder: ModelSnapshot
     embeddings: tuple[FrozenEmbedding, ...]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_v1_embedder_billing_source(cls, value: object) -> object:
+        """Upgrade only schema-v1 embedding payloads with conservative attribution.
+
+        Args:
+            value: Candidate frozen embedding payload.
+
+        Returns:
+            Copied schema-v1 payload with explicit customer-managed embedder attribution.
+            Current payloads are unchanged and still fail when the field is absent.
+        """
+        if not isinstance(value, dict):
+            return value
+        schema_version = value.get("schema_version")
+        if type(schema_version) is not int:
+            raise ValueError("router embedding schema_version must be an integer")
+        if schema_version != 1:
+            return value
+        embedder = value.get("embedder")
+        if not isinstance(embedder, dict):
+            return value
+        migrated = dict(value)
+        migrated_embedder = dict(embedder)
+        if "billing_source" in migrated_embedder:
+            raise ValueError("schema-v1 router embedder must not declare current billing_source")
+        migrated_embedder["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
+        migrated["embedder"] = migrated_embedder
+        migrated["schema_version"] = 3
+        return migrated
 
     @field_validator("embeddings")
     @classmethod
@@ -222,7 +255,7 @@ def load_frozen_embedding_set(
         if schema_version == 2
         else FrozenEmbeddingSet.model_validate_json(payload)
     )
-    if value.schema_version not in {1, 2}:
+    if value.schema_version not in {1, 2, 3}:
         raise ValueError("router embedding set schema version is unsupported")
     if value.embedding_set_id != artifact_id:
         raise ValueError("router embedding set identity differs from its artifact")

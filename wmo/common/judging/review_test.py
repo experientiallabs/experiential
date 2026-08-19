@@ -17,7 +17,7 @@ from wmo.common.judging import (
     RubricReviewError,
     ScoreAnchor,
 )
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.project.store_test import _store
 
@@ -50,6 +50,7 @@ def _proposal() -> RubricProposal:
         proposal_id="proposal-1",
         source_task_set_id="task-set-1",
         proposer_model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="fake",
             model_id="rubric-proposer",
             capabilities_sha256=_DIGEST,

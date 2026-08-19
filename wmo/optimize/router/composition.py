@@ -262,6 +262,7 @@ def compose_router(
     code_revision: str,
     phase_hook: Callable[[str], None] | None = None,
     progress: ProgressHook | None = None,
+    policy_lock_hook: Callable[[RouterPolicyLock, RouterFitWorkflowResult], None] | None = None,
 ) -> RouterCompositionResult:
     """Build evidence, evaluate, freeze, report, and load one router with explicit services.
 
@@ -276,6 +277,8 @@ def compose_router(
         code_revision: Exact code revision for every new artifact.
         phase_hook: Optional local observer used to audit phase ordering.
         progress: Optional observer of truthful stage names and exact unit counts.
+        policy_lock_hook: Optional durable-stage observer invoked after the immutable fit lock and
+            before any held-out simulation opens.
 
     Returns:
         The complete immutable artifact chain and W11 frozen runtime.
@@ -407,6 +410,8 @@ def compose_router(
         code_revision,
     )
     _phase(phase_hook, "policy_locked")
+    if policy_lock_hook is not None:
+        policy_lock_hook(policy_lock, fit)
 
     held_cells = tuple(cell for cell in plan.cells if cell.purpose == "held_out")
     _phase(phase_hook, "heldout_opened")

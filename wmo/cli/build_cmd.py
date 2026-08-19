@@ -21,6 +21,7 @@ from wmo.cli.provider_setup import (
     run_provider_setup,
 )
 from wmo.cli.theme import WMO_THEME
+from wmo.common.core.money import exact_usd
 from wmo.common.models import (
     ModelCapabilities,
     ModelCatalog,
@@ -271,7 +272,7 @@ def build(
                     models=selected,
                     retrieval=ProjectRetrievalConfiguration(top_k=top_k),
                     budgets=ProjectBudgetConfiguration(
-                        maximum_build_cost_usd=maximum_build_cost_usd
+                        maximum_build_cost_usd=exact_usd(maximum_build_cost_usd)
                     ),
                 ),
             )

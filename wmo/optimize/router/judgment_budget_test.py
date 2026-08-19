@@ -16,9 +16,11 @@ from wmo.optimize.router.composition import (
     compose_router,
 )
 from wmo.optimize.router.composition_test import (
+    _COMPACT_MINING_SPEC,
     _TIME,
     _bind_completed_build,
     _Catalog,
+    _compact_normalized_traces,
     _Judge,
     _ReviewSupplier,
     _SetupSupplier,
@@ -27,8 +29,6 @@ from wmo.optimize.router.composition_test import (
 )
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.runtime_test import _Client
-from wmo.simulation.ingest.otlp import TraceNormalizationResult
-from wmo.simulation.retrieval.retrieval_test import _message_trace as _trace
 
 
 def test_judgment_budget_resumes_interrupted_dispatch_without_widening_budget(
@@ -41,10 +41,13 @@ def test_judgment_budget_resumes_interrupted_dispatch_without_widening_budget(
     """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
+    normalized = _compact_normalized_traces()
+    _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_COMPACT_MINING_SPEC,
     )
-    _bind_completed_build(project, normalized, revision="test-revision")
     judge = _Judge()
     judge.fail_on_call = 3
     runtime_client = _Client()

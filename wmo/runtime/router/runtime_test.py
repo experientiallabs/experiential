@@ -22,6 +22,7 @@ from wmo.common.evaluations import (
 )
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     CandidateTokenPrice,
     Embedding,
     ModelCapabilities,
@@ -48,6 +49,10 @@ from wmo.common.routing.features import ROUTER_FEATURE_SCHEMA_SHA256
 from wmo.common.tasks import TaskCase, TaskSet
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime, RouterRuntimeIntegrityError
+from wmo.runtime.router.economics import (
+    RoutedProviderComponent,
+    RoutedSpendDisposition,
+)
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
@@ -143,6 +148,10 @@ def test_request_embedding_failures_always_fall_back_with_evidence(bad: object) 
     assert decision.selected_alias == runtime.policy.baseline_alias
     assert decision.fallback_reason == "embedding_error"
     assert decision.neighbor_count == decision.paired_count == 0
+    operation = runtime.selection_operation(_request(), episode_id="episode-a", decision=decision)
+    assert operation.component == RoutedProviderComponent.ROUTER_EMBEDDING
+    assert operation.disposition == RoutedSpendDisposition.RESERVED_AMBIGUOUS
+    assert operation.operation_count == 1
 
 
 def test_episode_stickiness_uses_caller_identity_and_tools_affect_request_hash() -> None:
@@ -606,6 +615,85 @@ def test_complete_validates_one_prior_decision_without_selecting_again() -> None
         runtime.complete(_request(tool_name="write"), episode_id="episode-a", decision=decision)
 
 
+def test_routed_completion_reconciles_alias_free_embedding_and_candidate_economics() -> None:
+    """Return typed request economics without placing the selected private alias in that record."""
+    policy, manifest, bank, snapshots, client = _fixture()
+    embedding_capabilities = ModelCapabilities(
+        supports_embeddings=True,
+        input_cost_per_million_tokens_usd=0.1,
+    )
+    embedder = snapshots["embedder"].model_copy(
+        update={
+            "billing_source": BillingSource.HOST_MANAGED,
+            "capabilities_sha256": embedding_capabilities.identity_sha256(),
+        }
+    )
+    policy = policy.model_copy(update={"embedder": embedder})
+    manifest = manifest.model_copy(update={"embedder": embedder})
+
+    class _PricedCatalog(_Catalog):
+        def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
+            if alias == "embedder":
+                return embedder, embedding_capabilities
+            return super().snapshot(alias)
+
+    prices = tuple(
+        CandidateTokenPrice(
+            candidate_alias=alias,
+            input_usd_per_million_tokens=1.0,
+            output_usd_per_million_tokens=2.0,
+            cached_input_usd_per_million_tokens=0.5,
+            cache_write_usd_per_million_tokens=1.5,
+        )
+        for alias in bank.candidate_aliases
+    )
+    runtime = RouterRuntime(
+        policy,
+        manifest,
+        bank,
+        cast(RuntimeModelCatalog, _PricedCatalog(snapshots, client)),
+        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_sha256=_DIGEST,
+        pricing_candidate_aliases=bank.candidate_aliases,
+        pricing_candidate_prices=prices,
+    )
+    request = _request(tool_name="read")
+    decision = runtime.select(request, episode_id="episode-a")
+    routed = runtime.complete(request, episode_id="episode-a", decision=decision)
+
+    economics = routed.economics
+    embedding_economics = economics.router_embedding.economics
+    candidate_economics = economics.selected_candidate.economics
+    assert economics.router_embedding.billing_source == BillingSource.HOST_MANAGED
+    assert economics.selected_candidate.billing_source == BillingSource.CUSTOMER_MANAGED
+    assert economics.operation_count == 2
+    assert [item.disposition for item in economics.operations] == [
+        RoutedSpendDisposition.LOCALLY_PRICED,
+        RoutedSpendDisposition.LOCALLY_PRICED,
+    ]
+    assert embedding_economics.usage is not None
+    assert embedding_economics.usage.input_tokens > 0
+    assert embedding_economics.cost_usd is not None
+    assert candidate_economics.usage == Usage(
+        input_tokens=7,
+        output_tokens=3,
+        cached_input_tokens=2,
+    )
+    assert candidate_economics.cost_usd is not None
+    assert candidate_economics.cost_usd.value == pytest.approx(14.5 / 1_000_000)
+    assert tuple(item.billing_source for item in economics.by_billing_source) == (
+        BillingSource.CUSTOMER_MANAGED,
+        BillingSource.HOST_MANAGED,
+    )
+    assert economics.total.cost_usd is not None
+    assert economics.total.cost_usd.value == pytest.approx(
+        embedding_economics.cost_usd.value + candidate_economics.cost_usd.value
+    )
+    serialized = economics.model_dump_json()
+    assert decision.selected_alias not in serialized
+    assert "model_id" not in serialized
+
+
 def _request(*, tool_name: str | None = None) -> ModelRequest:
     from wmo.common.tasks import ToolSchema
 
@@ -740,6 +828,7 @@ def _snapshot(alias: str, *, candidate_tools: bool = True) -> ModelSnapshot:
         supports_embeddings=alias == "embedder",
     )
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="test",
         model_id=alias,
         revision="fixture",

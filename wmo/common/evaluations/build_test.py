@@ -33,6 +33,7 @@ from wmo.common.evaluations.evidence import (
 from wmo.common.evaluations.fidelity import build_fidelity_report
 from wmo.common.judging import DimensionJudgment, DimensionScoreMap, JudgeCalibration, Judgment
 from wmo.common.models import (
+    BillingSource,
     CandidateTokenPrice,
     ModelSnapshot,
     NumericMeasurement,
@@ -536,6 +537,8 @@ def _materialization_fixture(
                 dimension_id="dimension-a",
                 raw_score=4,
                 calibrated_score=4.0,
+                min_score=0,
+                max_score=5,
                 rationale="The response met the requested behavior.",
             ),
         ),
@@ -658,6 +661,7 @@ def _store(root: Path) -> ArtifactStore:
 def _snapshot(alias: str, *, connection: str = "b" * 64) -> ModelSnapshot:
     """Create one secret-free resolved model snapshot."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="test",
         model_id=alias,
         revision="fixture",
@@ -827,6 +831,8 @@ def _persist_calibration(
         score_maps=(
             DimensionScoreMap(
                 dimension_id="dimension-a",
+                min_score=0,
+                max_score=5,
                 calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
             ),
         ),

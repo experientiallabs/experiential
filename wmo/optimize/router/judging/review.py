@@ -242,12 +242,14 @@ def collect_trace_reviews(
             created_at=created_at,
             code_revision=code_revision,
             maximum_input_tokens=budget.maximum_input_tokens_per_call,
+            maximum_output_tokens=budget.maximum_output_tokens_per_call,
         )
         judge = LMJudge(
             adapter,
             setup.prompt_template.prompt,
             code_revision=code_revision,
             clock=lambda: created_at,
+            maximum_output_tokens=budget.maximum_output_tokens_per_call,
         )
         judgment = judge.judge_and_write(
             store,
@@ -450,6 +452,7 @@ def _build_trace_review(
         output_usd_per_million_tokens=budget.output_usd_per_million_tokens,
         pricing_source=budget.pricing_source,
         maximum_input_tokens_per_call=budget.maximum_input_tokens_per_call,
+        maximum_output_tokens_per_call=budget.maximum_output_tokens_per_call,
         maximum_attempts_per_call=budget.maximum_attempts_per_call,
         authorized_call_count=calls_per_trace,
         maximum_reserved_cost_usd=(

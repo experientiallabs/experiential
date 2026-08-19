@@ -66,7 +66,11 @@ class DimensionCalibrationMetrics(ContractModel):
 
 
 class WorstDisagreement(ContractModel):
-    """One visible high-error prediction for human calibration review."""
+    """One visible nonzero-error prediction for human calibration review.
+
+    The ``exact`` direction is accepted only so previously persisted calibration reports still
+    validate; new reports never contain it because exact agreements are not disagreements.
+    """
 
     prediction: OutOfFoldPrediction
     direction: Literal["optimistic", "pessimistic", "exact"]
@@ -207,26 +211,27 @@ def has_valid_grouped_oof(
 def worst_disagreements(
     predictions: Sequence[OutOfFoldPrediction],
 ) -> tuple[WorstDisagreement, ...]:
-    """Return the ten largest valid OOF disagreements with deterministic tie ordering.
+    """Return the ten largest nonzero OOF disagreements with deterministic tie ordering.
+
+    Predictions whose calibrated score equals the human score are agreements, so they are
+    never reported as disagreements.
 
     Args:
         predictions: Valid held-out calibrated predictions to inspect.
 
     Returns:
-        Largest absolute-error disagreements, labeled by calibration direction.
+        Largest nonzero absolute-error disagreements, labeled by calibration direction.
     """
     disagreements: list[WorstDisagreement] = []
-    for prediction in sorted(predictions, key=lambda item: (-item.absolute_error, item.label_id))[
-        :10
-    ]:
+    ranked = sorted(
+        (item for item in predictions if item.calibrated_score != item.human_score),
+        key=lambda item: (-item.absolute_error, item.label_id),
+    )
+    for prediction in ranked[:10]:
         error = prediction.calibrated_score - prediction.human_score
-        direction: Literal["optimistic", "pessimistic", "exact"]
-        if error > 0:
-            direction = "optimistic"
-        elif error < 0:
-            direction = "pessimistic"
-        else:
-            direction = "exact"
+        direction: Literal["optimistic", "pessimistic"] = (
+            "optimistic" if error > 0 else "pessimistic"
+        )
         disagreements.append(WorstDisagreement(prediction=prediction, direction=direction))
     return tuple(disagreements)
 

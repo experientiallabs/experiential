@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.common.models import (
+    BillingSource,
     CandidateTokenPrice,
     CompletionCostReservation,
     ModelSnapshot,
@@ -282,6 +283,7 @@ def test_observed_cache_write_is_priced_without_double_counting() -> None:
 def _model() -> ModelSnapshot:
     """Return one exact completion model snapshot."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id="model-a",
         capabilities_sha256="a" * 64,

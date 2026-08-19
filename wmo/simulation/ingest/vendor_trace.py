@@ -30,7 +30,7 @@ from wmo.common.core.artifacts import (
     StructuredFailure,
 )
 from wmo.common.core.text import normalize_durable_text
-from wmo.common.models import ModelSnapshot, Usage
+from wmo.common.models import BillingSource, ModelSnapshot, Usage
 from wmo.common.traces import Trace, TraceSource, TraceSpan
 from wmo.simulation.ingest.model_identity import (
     CAPABILITIES_DIGEST_ATTRIBUTE,
@@ -634,6 +634,7 @@ def _model_snapshot(observation: VendorObservation) -> ModelSnapshot | None:
         provider=identity.provider,
         model_id=identity.model_id,
         revision=identity.revision,
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         capabilities_sha256=normalized_capabilities_sha256(
             observation.extensions,
             identity.provider,

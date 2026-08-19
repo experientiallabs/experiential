@@ -13,6 +13,7 @@ import pytest
 
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelMessage,
     ModelRequest,
     ModelSnapshot,
@@ -43,6 +44,7 @@ def _snapshot(provider: str = "openai-compatible", model_id: str = "fake-model")
         A frozen snapshot with fixture digests.
     """
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider=provider,
         model_id=model_id,
         revision="fixture-revision",

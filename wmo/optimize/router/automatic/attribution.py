@@ -150,7 +150,7 @@ class RouterObservedAttributionSet(ArtifactEnvelope):
 def resolve_router_observed_attributions(
     tasks: Sequence[TaskCase],
     traces: Sequence[Trace],
-    evidence: TraceModelIdentityEvidenceSet | None,
+    evidence: TraceModelIdentityEvidenceSet,
     candidates: Sequence[RoutedCandidateSnapshot],
 ) -> tuple[RouterObservedAttribution, ...]:
     """Resolve one real fit trace per leakage lineage without guessing model identity.
@@ -158,7 +158,7 @@ def resolve_router_observed_attributions(
     Args:
         tasks: Exact completed representative tasks.
         traces: Exact completed normalized traces.
-        evidence: Verified per-model-span provenance, or ``None`` when the dataset has none.
+        evidence: Verified per-model-span provenance.
         candidates: Explicit selected candidate snapshots.
     Returns:
         Deterministic exact-match real fit attributions. Unmatched traces are omitted.
@@ -166,11 +166,10 @@ def resolve_router_observed_attributions(
     Raises:
         RouterAttributionError: Candidate scope or model identity evidence is inconsistent.
     """
-    if evidence is not None:
-        try:
-            require_model_identity_evidence_matches_traces(traces, evidence)
-        except ValueError as exc:
-            raise RouterAttributionError(f"model identity evidence is inconsistent: {exc}") from exc
+    try:
+        require_model_identity_evidence_matches_traces(traces, evidence)
+    except ValueError as exc:
+        raise RouterAttributionError(f"model identity evidence is inconsistent: {exc}") from exc
     ordered_candidates = tuple(sorted(candidates, key=lambda item: item.alias))
     if len(ordered_candidates) < 2 or len({item.alias for item in ordered_candidates}) != len(
         ordered_candidates
@@ -179,11 +178,7 @@ def resolve_router_observed_attributions(
     traces_by_id = {trace.trace_id: trace for trace in traces}
     if len(traces_by_id) != len(traces):
         raise RouterAttributionError("candidate attribution traces repeat trace IDs")
-    evidence_by_key = (
-        None
-        if evidence is None
-        else {(item.trace_id, item.span_id): item for item in evidence.records}
-    )
+    evidence_by_key = {(item.trace_id, item.span_id): item for item in evidence.records}
     selected: list[RouterObservedAttribution] = []
     admitted_lineages: set[str] = set()
     for task in tasks:
@@ -337,7 +332,7 @@ def load_router_observed_attribution_set(
 def _resolve_trace(
     task: TaskCase,
     trace: Trace,
-    evidence_by_key: dict[tuple[str, str], TraceModelIdentityEvidence] | None,
+    evidence_by_key: dict[tuple[str, str], TraceModelIdentityEvidence],
     candidates: tuple[RoutedCandidateSnapshot, ...],
 ) -> RouterObservedAttribution:
     """Resolve every model span in one trace to one common selected alias.
@@ -345,7 +340,7 @@ def _resolve_trace(
     Args:
         task: Fit task whose source trace is being admitted.
         trace: Exact real production trace.
-        evidence_by_key: Verified model-span evidence, or ``None`` for strict snapshot matching.
+        evidence_by_key: Verified model-span evidence keyed by trace and span identity.
         candidates: Exact selected candidate snapshots.
 
     Returns:
@@ -360,14 +355,11 @@ def _resolve_trace(
     for span in trace.spans:
         if span.model is None:
             continue
-        if evidence_by_key is None:
-            evidence = None
-        else:
-            evidence = evidence_by_key.get((trace.trace_id, span.span_id))
-            if evidence is None:
-                raise RouterAttributionError(
-                    f"trace {trace.trace_id!r} span {span.span_id!r} has no identity evidence"
-                )
+        evidence = evidence_by_key.get((trace.trace_id, span.span_id))
+        if evidence is None:
+            raise RouterAttributionError(
+                f"trace {trace.trace_id!r} span {span.span_id!r} has no identity evidence"
+            )
         candidate, mode, attributed_span = _resolve_span(
             span.model, span.span_id, evidence, candidates
         )
@@ -404,7 +396,7 @@ def _resolve_trace(
 def _resolve_span(
     model: ModelSnapshot,
     span_id: str,
-    evidence: TraceModelIdentityEvidence | None,
+    evidence: TraceModelIdentityEvidence,
     candidates: tuple[RoutedCandidateSnapshot, ...],
 ) -> tuple[RoutedCandidateSnapshot, AttributionMatchKind, RouterAttributedSpan]:
     """Resolve one recorded model span under its exact provenance classification.
@@ -412,7 +404,7 @@ def _resolve_span(
     Args:
         model: Recorded immutable model snapshot.
         span_id: Contributing source span identity.
-        evidence: Verified component provenance, or ``None`` when the dataset has none.
+        evidence: Verified component provenance.
         candidates: Exact selected candidate snapshots.
 
     Returns:
@@ -421,19 +413,15 @@ def _resolve_span(
     Raises:
         RouterAttributionError: Declared evidence conflicts or zero/multiple candidates remain.
     """
-    capabilities: IdentityComponentProvenance = (
-        "unspecified" if evidence is None else evidence.capabilities
-    )
-    connection: IdentityComponentProvenance = (
-        "unspecified" if evidence is None else evidence.connection
-    )
+    capabilities: IdentityComponentProvenance = evidence.capabilities
+    connection: IdentityComponentProvenance = evidence.connection
     if evidence is not None and evidence.model != model:
         raise RouterAttributionError(f"span {span_id!r} evidence differs from its model snapshot")
     if "unspecified" in {capabilities, connection}:
-        matches = tuple(item for item in candidates if item.model == model)
+        matches = tuple(item for item in candidates if _same_generator_model(item.model, model))
         mode: AttributionMatchKind = "strict_snapshot"
     elif capabilities == connection == "declared":
-        matches = tuple(item for item in candidates if item.model == model)
+        matches = tuple(item for item in candidates if _same_generator_model(item.model, model))
         mode = "declared_exact"
     else:
         matches = tuple(
@@ -467,6 +455,31 @@ def _resolve_span(
         connection=connection,
     )
     return matches[0], mode, attributed
+
+
+def _same_generator_model(left: ModelSnapshot, right: ModelSnapshot) -> bool:
+    """Compare exact generator identity without conflating it with the current payer.
+
+    Args:
+        left: Candidate catalog model resolved for the current hosted Project.
+        right: Historical model identity recorded on an uploaded trace.
+
+    Returns:
+        Whether provider, model, revision, capability, and connection identities all match.
+    """
+    return (
+        left.provider,
+        left.model_id,
+        left.revision,
+        left.capabilities_sha256,
+        left.connection_sha256,
+    ) == (
+        right.provider,
+        right.model_id,
+        right.revision,
+        right.capabilities_sha256,
+        right.connection_sha256,
+    )
 
 
 def _verify_attribution_inputs(

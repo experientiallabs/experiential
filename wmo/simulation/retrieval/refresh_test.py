@@ -21,6 +21,7 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     Embedding,
     EmbeddingCostReservation,
     ModelCapabilities,
@@ -29,6 +30,7 @@ from wmo.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    NumericMeasurement,
     OperationEconomics,
     ToolCall,
     Usage,
@@ -43,6 +45,14 @@ from wmo.common.project import (
 from wmo.common.routing import RouterFeatureExtractor, RoutingDecision
 from wmo.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from wmo.runtime.router import RuntimeAcceptedEvent, RuntimeInteractionJournal
+from wmo.runtime.router.economics import (
+    BillingSourceEconomics,
+    RoutedCompletionEconomics,
+    RoutedProviderComponent,
+    RoutedProviderOperation,
+    RoutedSpendDisposition,
+    routed_completion_economics,
+)
 from wmo.runtime.router.journal import RuntimeAcceptance, _interaction_identity
 from wmo.simulation.build import build_task_set
 from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
@@ -114,6 +124,7 @@ class NonFiniteEmbedder:
 def _model() -> ModelSnapshot:
     """Build the fixed routed-model snapshot used by journal fixtures."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="gpt-test",
         capabilities_sha256=_DIGEST,
@@ -147,6 +158,35 @@ def _response(content: str) -> ModelResponse:
         model=_model(),
         economics=OperationEconomics(
             usage=Usage(input_tokens=8, output_tokens=3, cached_input_tokens=0)
+        ),
+    )
+
+
+def _economics() -> RoutedCompletionEconomics:
+    """Return deterministic billing attribution for one routed test response."""
+    return routed_completion_economics(
+        (
+            _operation(1, RoutedProviderComponent.ROUTER_EMBEDDING),
+            _operation(2, RoutedProviderComponent.SELECTED_CANDIDATE),
+        )
+    )
+
+
+def _operation(
+    ordinal: int,
+    component: RoutedProviderComponent,
+) -> RoutedProviderOperation:
+    """Build deterministic customer-managed operation evidence."""
+    return RoutedProviderOperation(
+        operation_id=f"routed-operation-{ordinal:020x}",
+        operation_ordinal=ordinal,
+        component=component,
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        disposition=RoutedSpendDisposition.LOCALLY_PRICED,
+        operation_count=1,
+        economics=OperationEconomics(
+            usage=Usage(input_tokens=ordinal, output_tokens=0),
+            cost_usd=NumericMeasurement(value=ordinal / 1_000_000, provenance="estimated"),
         ),
     )
 
@@ -223,19 +263,32 @@ def _accept(
     """
     identity = _interaction_identity(journal.project_id, key, request, conversation)
     decision = _decision(identity.lineage_id, request)
-    claim = journal.claim(
+    embedding = BillingSourceEconomics(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        economics=_operation(1, RoutedProviderComponent.ROUTER_EMBEDDING).economics,
+    )
+    reserved = journal.reserve_selection(
+        identity,
+        embedding,
+        now=now,
+        stale_after=timedelta(minutes=5),
+    )
+    assert reserved.reservation is not None
+    claim = journal.record_acceptance(
         identity,
         RuntimeAcceptance(
             decision=decision,
             selected_alias=decision.selected_alias,
             selected_model=_model(),
+            router_embedding_billing_source=BillingSource.CUSTOMER_MANAGED,
             policy_input=ArtifactInput(
                 artifact_id=decision.policy_id,
                 sha256=decision.policy_sha256,
             ),
         ),
-        now=now,
-        stale_after=timedelta(minutes=5),
+        reserved.reservation,
+        _operation(1, RoutedProviderComponent.ROUTER_EMBEDDING),
+        accepted_at=now,
     )
     assert claim.accepted is not None
     return claim.accepted
@@ -273,6 +326,7 @@ def _complete(
         now=now,
     )
     action = output if isinstance(output, AssistantAction) else AssistantAction(content=output)
+    _reserve_candidate(journal, accepted, now=now)
     journal.record_completed(
         accepted,
         ModelResponse(
@@ -283,9 +337,28 @@ def _complete(
             ),
             finish_reason=finish_reason,
         ),
+        candidate_operation=_economics().operations[-1],
         completed_at=now + timedelta(seconds=1),
     )
     return accepted
+
+
+def _reserve_candidate(
+    journal: RuntimeInteractionJournal,
+    accepted: RuntimeAcceptedEvent,
+    *,
+    now: datetime,
+) -> None:
+    """Persist one deterministic candidate reservation before low-level dispatch."""
+    claim = journal.reserve_candidate(
+        accepted,
+        BillingSourceEconomics(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            economics=_operation(2, RoutedProviderComponent.SELECTED_CANDIDATE).economics,
+        ),
+        now=now,
+    )
+    assert claim.status == "dispatch"
 
 
 def _two_turn_journal(
@@ -341,6 +414,7 @@ def _binding(client: CountingEmbedder | NonFiniteEmbedder) -> RAGEmbedderBinding
     return RAGEmbedderBinding(
         client=client,
         snapshot=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="openai",
             model_id="text-embedding-test",
             revision="1",
@@ -667,6 +741,7 @@ def test_retry_attempts_produce_one_completed_transition(tmp_path: Path) -> None
         request=request,
         now=_TIME,
     )
+    _reserve_candidate(journal, first_attempt, now=_TIME)
     journal.record_failure(
         first_attempt,
         StructuredFailure(
@@ -680,14 +755,15 @@ def test_retry_attempts_produce_one_completed_transition(tmp_path: Path) -> None
     identity = _interaction_identity(journal.project_id, "retry", request, "conversation-a")
     retry_claim = journal.claim(
         identity,
-        None,
         now=_TIME + timedelta(seconds=2),
         stale_after=timedelta(minutes=5),
     )
     assert retry_claim.accepted is not None
+    _reserve_candidate(journal, retry_claim.accepted, now=_TIME + timedelta(seconds=2))
     journal.record_completed(
         retry_claim.accepted,
         _response("Recovered"),
+        candidate_operation=_economics().operations[-1],
         completed_at=_TIME + timedelta(seconds=3),
     )
     _complete(
@@ -734,6 +810,7 @@ def test_failed_incomplete_interaction_is_skipped_for_later_real_observation(
         request=_request(ModelMessage(role="user", content="Transient retry")),
         now=_TIME + timedelta(minutes=1),
     )
+    _reserve_candidate(journal, incomplete, now=_TIME + timedelta(minutes=1))
     journal.record_failure(
         incomplete,
         StructuredFailure(
@@ -790,9 +867,11 @@ def test_overlapping_acceptance_is_skipped_for_later_real_observation(tmp_path: 
         request=_request(ModelMessage(role="user", content="Concurrent request")),
         now=_TIME + timedelta(seconds=1),
     )
+    _reserve_candidate(journal, first, now=_TIME)
     journal.record_completed(
         first,
         _response("Observed answer"),
+        candidate_operation=_economics().operations[-1],
         completed_at=_TIME + timedelta(seconds=2),
     )
     _complete(
@@ -1154,6 +1233,7 @@ def test_tool_result_is_paired_only_with_its_exact_call_id(tmp_path: Path) -> No
     action = AssistantAction(
         tool_calls=(ToolCall(call_id="call-1", name="lookup", arguments={"id": "A-1"}),)
     )
+    _reserve_candidate(journal, first, now=_TIME)
     journal.record_completed(
         first,
         ModelResponse(
@@ -1163,6 +1243,7 @@ def test_tool_result_is_paired_only_with_its_exact_call_id(tmp_path: Path) -> No
                 usage=Usage(input_tokens=8, output_tokens=3, cached_input_tokens=0)
             ),
         ),
+        candidate_operation=_economics().operations[-1],
         completed_at=_TIME + timedelta(seconds=1),
     )
     _complete(
