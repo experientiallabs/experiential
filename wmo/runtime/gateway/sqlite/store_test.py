@@ -716,7 +716,7 @@ def test_alias_activation_reconciles_lost_commit_acknowledgement(
             """Delegate SQL and lose the COMMIT acknowledgement."""
             result = self.connection.execute(statement, parameters)
             if statement == "COMMIT":
-                raise sqlite3.OperationalError("injected commit acknowledgement failure")
+                raise KeyboardInterrupt("injected post-COMMIT interrupt")
             return result
 
     @contextmanager
@@ -769,7 +769,7 @@ def test_alias_activation_types_only_unreadable_commit_outcome_as_unknown(
             """Delegate SQL and lose the COMMIT acknowledgement."""
             result = self.connection.execute(statement, parameters)
             if statement == "COMMIT":
-                raise sqlite3.OperationalError("injected commit acknowledgement failure")
+                raise KeyboardInterrupt("injected post-COMMIT interrupt")
             return result
 
     @contextmanager
@@ -778,7 +778,7 @@ def test_alias_activation_types_only_unreadable_commit_outcome_as_unknown(
         nonlocal connect_calls
         connect_calls += 1
         if connect_calls > 1:
-            raise sqlite3.OperationalError("injected reconciliation read failure")
+            raise RuntimeError("injected non-sqlite reconciliation failure")
         with original_connect() as connection:
             yield CommitAfterEffectConnection(connection)
 

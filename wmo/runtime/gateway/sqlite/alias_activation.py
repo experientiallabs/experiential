@@ -72,18 +72,24 @@ def alias_activation_transaction(
             raise
         try:
             connection.execute("COMMIT")
-        except Exception as commit_error:  # noqa: BLE001 - reconcile COMMIT acknowledgement
-            outcome = reconcile_alias_activation(
-                connect=connect,
-                organization_id=organization_id,
-                alias_id=alias_id,
-                alias_name=alias_name,
-                revision_id=revision_id,
-                target=target,
-                snapshot_ref=snapshot_ref,
-                catalog_sha256=catalog_sha256,
-                refusal_failover=refusal_failover,
-            )
+        except BaseException as commit_error:  # noqa: BLE001 - COMMIT may land before interruption
+            try:
+                outcome = reconcile_alias_activation(
+                    connect=connect,
+                    organization_id=organization_id,
+                    alias_id=alias_id,
+                    alias_name=alias_name,
+                    revision_id=revision_id,
+                    target=target,
+                    snapshot_ref=snapshot_ref,
+                    catalog_sha256=catalog_sha256,
+                    refusal_failover=refusal_failover,
+                )
+            except BaseException as reconciliation_error:  # noqa: BLE001 - never undo possible COMMIT
+                raise AliasActivationOutcomeUnknownError(
+                    alias_id=alias_id,
+                    revision_id=revision_id,
+                ) from reconciliation_error
             if outcome is True:
                 return
             if outcome is False:
@@ -137,7 +143,7 @@ def reconcile_alias_activation(
                 """,
                 (organization_id, alias_id, revision_id),
             ).fetchone()
-    except (OSError, sqlite3.Error):
+    except Exception:  # noqa: BLE001 - every ordinary read failure leaves COMMIT ambiguous
         return None
     if row is None:
         return False
