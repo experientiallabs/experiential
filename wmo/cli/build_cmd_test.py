@@ -993,9 +993,9 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     assert recovered_review["unrelated_review_state"] == {"preserve": True}
 
 
-@pytest.mark.parametrize("count", [2, 100, 1_001])
-def test_build_accepts_trace_counts_outside_or_inside_guidance(tmp_path: Path, count: int) -> None:
-    """The 100 to 1,000 range is guidance and never a validity gate.
+@pytest.mark.parametrize("count", [2, 100])
+def test_build_accepts_small_and_recommended_trace_counts(tmp_path: Path, count: int) -> None:
+    """The lower trace-count recommendation remains guidance rather than a validity gate.
 
     Args:
         tmp_path: Temporary project and trace root.
@@ -1019,7 +1019,7 @@ def test_build_accepts_trace_counts_outside_or_inside_guidance(tmp_path: Path, c
         assert fit.index.included_partitions == ("fit",)
         assert serving.index.transition_count == 2
         assert fit.index.transition_count == 1
-    if count < 100 or count > 1_000:
+    if count < 100:
         assert "usual starting range" in result.output
     else:
         assert "usual starting range" not in result.output

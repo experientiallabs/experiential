@@ -223,17 +223,26 @@ def test_over_70_lineage_core_selection_is_input_order_independent() -> None:
     assert result.coverage.distances == reversed_result.coverage.distances
 
 
-def test_exact_70_lineages_keep_the_default_50_20_split_under_extreme_workload_skew() -> None:
-    light = tuple(_trace(index, conversation_id=f"light-{index}") for index in range(69))
-    heavy = tuple(_trace(1_000 + index, conversation_id="heavy-lineage") for index in range(100))
+def test_partition_targets_survive_extreme_workload_skew() -> None:
+    """Lineage workload mass cannot displace requested fit and held-out counts.
 
-    result = mine_tasks((*light, *heavy), embedder=IndexEmbedder())
+    Explicit small budgets exercise the partition invariant; the separate default-path test owns
+    the production 50/20 cardinalities.
+    """
+    light = tuple(_trace(index, conversation_id=f"light-{index}") for index in range(6))
+    heavy = tuple(_trace(1_000 + index, conversation_id="heavy-lineage") for index in range(20))
 
-    assert len(result.analysis.leakage_groups) == 70
-    assert len(result.partition.fit_lineage_group_ids) == 50
-    assert len(result.partition.held_out_lineage_group_ids) == 20
-    assert sum(task.partition == "fit" for task in result.tasks) == 50
-    assert sum(task.partition == "held_out" for task in result.tasks) == 20
+    result = mine_tasks(
+        (*light, *heavy),
+        MiningSpec(fit_task_budget=5, held_out_task_budget=2),
+        embedder=IndexEmbedder(),
+    )
+
+    assert len(result.analysis.leakage_groups) == 7
+    assert len(result.partition.fit_lineage_group_ids) == 5
+    assert len(result.partition.held_out_lineage_group_ids) == 2
+    assert sum(task.partition == "fit" for task in result.tasks) == 5
+    assert sum(task.partition == "held_out" for task in result.tasks) == 2
 
 
 def test_under_70_lineages_are_all_retained_with_deterministic_underfill_evidence() -> None:
@@ -265,18 +274,23 @@ def test_mining_requires_an_explicit_embedding_interface() -> None:
 
 
 def test_small_lineage_sets_keep_every_lineage_even_with_multiple_source_traces() -> None:
+    """Underfilled selection retains all lineages when each has multiple source traces."""
     traces = tuple(
-        _trace(index, conversation_id=f"conversation-{index // 2}") for index in range(100)
+        _trace(index, conversation_id=f"conversation-{index // 2}") for index in range(10)
     )
 
-    result = mine_tasks(traces, embedder=IndexEmbedder())
+    result = mine_tasks(
+        traces,
+        MiningSpec(fit_task_budget=4, held_out_task_budget=2),
+        embedder=IndexEmbedder(),
+    )
 
     selected_lineages = {task.lineage_group_id for task in result.tasks}
     all_lineages = {
         *result.partition.fit_lineage_group_ids,
         *result.partition.held_out_lineage_group_ids,
     }
-    assert len(result.analysis.leakage_groups) == 50
+    assert len(result.analysis.leakage_groups) == 5
     assert selected_lineages == all_lineages
 
 

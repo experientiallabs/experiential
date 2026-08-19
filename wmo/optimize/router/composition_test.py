@@ -89,6 +89,7 @@ from wmo.simulation.engines.text.simulator_test import (
     _ScriptedClient,
 )
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
+from wmo.simulation.mining.service import MiningSpec
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.retrieval import (
     load_fit_rag_retriever,
@@ -107,6 +108,19 @@ from wmo.simulation.world_model import bind_fit_grounded_world_model, persist_gr
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
+_COMPACT_MINING_SPEC = MiningSpec(fit_task_budget=12, held_out_task_budget=4)
+
+
+def _compact_normalized_traces() -> TraceNormalizationResult:
+    """Return the smallest practical corpus for mixed observed and simulated router cells.
+
+    Returns:
+        Canonical traces with enough fit and held-out lineages to fill the focused mining spec.
+    """
+    return TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(20)),
+        issues=(),
+    )
 
 
 def _bind_completed_build(
@@ -114,6 +128,7 @@ def _bind_completed_build(
     normalized: TraceNormalizationResult,
     *,
     revision: str,
+    mining_spec: MiningSpec | None = None,
 ) -> ProjectBuildArtifacts:
     """Persist and select the exact grounded build consumed by router composition.
 
@@ -121,6 +136,7 @@ def _bind_completed_build(
         project: Initialized test project receiving the immutable build graph.
         normalized: Canonical real traces used for tasks and retrieval.
         revision: Exact source revision bound to every artifact.
+        mining_spec: Optional representative-task budgets for the focused test.
 
     Returns:
         Completed project build pointers selected in ``project.toml``.
@@ -130,6 +146,7 @@ def _bind_completed_build(
         project,
         created_at=_TIME,
         code_revision=revision,
+        mining_spec=mining_spec,
     )
     trace_input = artifact_input(built.artifacts.trace_dataset.manifest)
     task_input = built.review.task_set
@@ -836,10 +853,13 @@ def test_composition_rejects_fit_rag_outside_completed_build_before_simulation(
     """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
+    normalized = _compact_normalized_traces()
+    _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_COMPACT_MINING_SPEC,
     )
-    _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     judge = _Judge()
     services = RouterWorkflowServices(
@@ -897,10 +917,13 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
+    normalized = _compact_normalized_traces()
+    completed_build = _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_COMPACT_MINING_SPEC,
     )
-    completed_build = _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     judge = _Judge()
     runtime_client = _Client()
@@ -1155,10 +1178,13 @@ def test_failed_rollouts_skip_judging_and_rerun_replays_after_partial_failure(
     """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
+    normalized = _compact_normalized_traces()
+    _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_COMPACT_MINING_SPEC,
     )
-    _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     judge = _Judge()
     services = RouterWorkflowServices(
@@ -1445,10 +1471,13 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
     """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
+    normalized = _compact_normalized_traces()
+    _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_COMPACT_MINING_SPEC,
     )
-    _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     catalog = cast(
         RuntimeModelCatalog,
@@ -1542,10 +1571,13 @@ def test_per_cell_judge_failures_exclude_cells_durably_and_replay_without_redisp
     """
     project = ProjectStore(tmp_path, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
+    normalized = _compact_normalized_traces()
+    _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_COMPACT_MINING_SPEC,
     )
-    _bind_completed_build(project, normalized, revision="test-revision")
     simulator = _SimulatorFactory()
     judge = _Judge()
     judge.raise_after_lock = [
