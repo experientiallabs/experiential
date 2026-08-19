@@ -7,7 +7,9 @@ The root surface is deliberately small:
 | `wmo build PROJECT TRACES --source SOURCE --root ROOT [--provider NAME ...]` | Normalize 100 through 1000 local traces from one [declared source](reference/ingest.md) and mine representative tasks. First-build setup uses a keyboard provider list, or exact `--provider` flags. | Manifest-bound `TraceDataset`, `TaskSet`, and `proposals_pending` review state. |
 | `wmo optimize router PROJECT --root ROOT [--yes]` | Complete bounded fit simulation and judgment, lock a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `wmo optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
+| `wmo run --root ROOT [--check]` | Validate or start the initialized authenticated multi-alias gateway on loopback. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `wmo run PROJECT --root ROOT [--ghost]` | Load a frozen policy and expose it on development-only loopback. | Local OpenAI-compatible endpoint with durable journaling by default or no saved traffic in ghost mode. |
+| `wmo config gateway ...` | Author provider references, identities, virtual keys, grants, aliases, status, and usage without optimizer roles. | Private SQLite authority, immutable catalog snapshots, and versioned receipts. |
 | `wmo config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. | Local `.wmo/models.toml`. |
 | `wmo config budget [USD] --root ROOT` | Read or set the maximum conservative estimate allowed for one paid command. | Local `.wmo/settings.toml`. |
 | `wmo config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.wmo/settings.toml`. |
@@ -25,6 +27,18 @@ product telemetry, which may send unless disabled. `run` makes no provider call 
 An HTTP completion or direct `RouterRuntime.complete` call is the explicit online model-call
 boundary. The router remains frozen for the process lifetime. `run --ghost` still permits provider
 calls but disables durable interaction, replay, RAG, and SFT state for that process.
+
+No-argument `wmo run` is a separate gateway lifecycle. It binds only `127.0.0.1`, starts with no
+provider call, and requires an explicit provider environment reference, exact model alias, identity,
+grant, and virtual key. `wmo run --non-interactive --json` returns `gateway_not_initialized` plus
+exact next commands on an empty root. `wmo run --check` validates local readiness without binding.
+The gateway writes no prompts, responses, tool arguments, raw keys, or provider secrets to SQLite.
+`GET /usage` and `GET /usage.json` show only per-identity counts, token usage, latency, terminal
+states, and attributed estimated cost. Estimated cost is not provider invoice cost.
+
+One-time virtual-key material appears only in the successful key-issue receipt or a newly created
+mode-`0600` output file. Human key issuance on a non-terminal requires `--json` or `--output`.
+Provider configuration accepts an environment variable name, never a raw credential value.
 
 Build stops at review readiness. `wmo optimize router` creates the bounded fit and held-out
 evaluation chain after candidate and manual judge setup. It never invokes world-model fidelity

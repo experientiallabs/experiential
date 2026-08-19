@@ -26,9 +26,7 @@ add_deferred_typer(
     known_names=("router", "model"),
 )
 app.command("build", help="Build a reusable grounded world model from local trace evidence.")(build)
-app.command("run", help="Run one frozen project router on a development-only loopback endpoint.")(
-    run
-)
+app.command("run", help="Run the local gateway or one legacy project router on loopback.")(run)
 
 
 def _quiet_http_logs() -> None:

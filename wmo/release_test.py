@@ -842,6 +842,29 @@ def _installed_release_driver() -> None:
             digest.update(b"\0")
         return digest.hexdigest()
 
+    gateway_root = execution_root / "gateway-empty"
+    empty_gateway = run_cli(
+        "run",
+        "--root",
+        str(gateway_root),
+        "--non-interactive",
+        "--json",
+        expected=2,
+    )
+    empty_payload = json.loads(empty_gateway.stdout)
+    assert empty_payload["error"]["code"] == "gateway_not_initialized"
+    assert not gateway_root.exists()
+    initialized_gateway = run_cli(
+        "config",
+        "gateway",
+        "init",
+        "--root",
+        str(gateway_root),
+        "--non-interactive",
+        "--json",
+    )
+    assert json.loads(initialized_gateway.stdout)["schema_version"] == 1
+
     def assert_embedded_revision(value: object) -> None:
         """Require every recursively present code revision to match the installed release.
 
@@ -1657,9 +1680,12 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     usage = (docs / "usage.md").read_text(encoding="utf-8")
     assert "wmo optimize router" in usage
     assert "wmo optimize model" in usage
+    assert "wmo config gateway" in usage
+    assert "wmo run --root ROOT" in usage
     assert "wmo optimize route" not in usage.replace("wmo optimize router", "")
 
     scope = (docs / "release-scope.md").read_text(encoding="utf-8")
+    assert "local gateway" in scope
     for exclusion in (
         "No paid E2B or Harbor cloud smoke ran",
         "No real Tinker training ran",

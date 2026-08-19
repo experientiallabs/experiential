@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -124,3 +125,17 @@ def test_run_loads_once_and_can_only_bind_loopback(
     assert "OpenAI API router at http://127.0.0.1:8123/v1" in result.output
     assert ("ghost mode enabled" in result.output) is ghost
     assert "--host" not in CliRunner().invoke(app, ["run", "--help"]).output
+
+
+def test_no_argument_noninteractive_run_returns_stable_empty_state_json(tmp_path: Path) -> None:
+    """Automation receives exact setup commands instead of prompts or runtime seeds."""
+    result = CliRunner().invoke(
+        app,
+        ["run", "--root", str(tmp_path), "--non-interactive", "--json"],
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "gateway_not_initialized"
+    assert payload["error"]["next_commands"][0].startswith("wmo config gateway init")
+    assert not (tmp_path / "gateway").exists()
