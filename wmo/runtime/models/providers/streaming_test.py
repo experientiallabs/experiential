@@ -511,11 +511,13 @@ def test_openai_compatible_stream_emits_refusal_reasoning_usage_and_terminal() -
     assert [event.kind for event in events] == [
         GatewayEventKind.REFUSAL_DELTA,
         GatewayEventKind.USAGE,
-        GatewayEventKind.COMPLETED,
+        GatewayEventKind.FAILED,
     ]
     assert events[1].usage is not None
     assert events[1].usage.cached_input_tokens == 5
     assert events[1].usage.reasoning_tokens == 1
+    assert events[2].failure is not None
+    assert events[2].failure.failure_class is GatewayFailureClass.REFUSAL
 
 
 def test_openai_compatible_stream_preserves_provider_order_tool_arguments() -> None:
@@ -864,7 +866,9 @@ def test_launch_adapters_emit_refusal_as_semantic_commit(provider: str) -> None:
     events, committed = asyncio.run(scenario())
 
     assert events[0].kind is GatewayEventKind.REFUSAL_DELTA
-    assert events[-1].kind is GatewayEventKind.COMPLETED
+    assert events[-1].kind is GatewayEventKind.FAILED
+    assert events[-1].failure is not None
+    assert events[-1].failure.failure_class is GatewayFailureClass.REFUSAL
     assert committed is True
 
 

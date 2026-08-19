@@ -510,6 +510,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
     """Map native Responses lifecycle events to provider-neutral events."""
     factory = _EventFactory()
     tools: dict[int, _ToolAccumulator] = {}
+    refusal_seen = False
     async for frame in sse.events():
         if frame.data == "[DONE]":
             raise ProviderResponseError("OpenAI Responses stream ended before a terminal event")
@@ -521,6 +522,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                 yield factory.create(GatewayEventKind.TEXT_DELTA, text_delta=delta)
         elif event_type == "response.refusal.delta":
             delta = _optional_string(payload.get("delta"), "OpenAI refusal delta")
+            refusal_seen = True
             yield factory.create(GatewayEventKind.REFUSAL_DELTA, text_delta=delta)
         elif event_type == "response.output_item.added":
             item = require_object(payload.get("item"), "OpenAI output item")
@@ -601,7 +603,13 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                 event_type == "response.incomplete" or response.get("status") == "incomplete"
             )
             if not is_incomplete:
-                yield factory.create(GatewayEventKind.COMPLETED)
+                if refusal_seen:
+                    yield factory.create(
+                        GatewayEventKind.FAILED,
+                        failure=_provider_refusal_failure(),
+                    )
+                else:
+                    yield factory.create(GatewayEventKind.COMPLETED)
                 return
             details = require_object(
                 response.get("incomplete_details"), "OpenAI incomplete details"
@@ -612,11 +620,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
             elif reason in {"content_filter", "safety"}:
                 yield factory.create(
                     GatewayEventKind.FAILED,
-                    failure=GatewayFailure(
-                        failure_class=GatewayFailureClass.REFUSAL,
-                        safe_message="provider refused the request",
-                        safe_details={"signal": "content_policy"},
-                    ),
+                    failure=_provider_refusal_failure(),
                 )
             else:
                 yield factory.create(
@@ -748,12 +752,18 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
                     cached_input_tokens=cache_read,
                 ),
             )
-            terminal = (
-                GatewayEventKind.INCOMPLETE
-                if stop_reason == "max_tokens"
-                else GatewayEventKind.COMPLETED
-            )
-            yield factory.create(terminal)
+            if refusal_seen or stop_reason == "refusal":
+                yield factory.create(
+                    GatewayEventKind.FAILED,
+                    failure=_provider_refusal_failure(),
+                )
+            else:
+                terminal = (
+                    GatewayEventKind.INCOMPLETE
+                    if stop_reason == "max_tokens"
+                    else GatewayEventKind.COMPLETED
+                )
+                yield factory.create(terminal)
             return
         elif event_type == "error":
             yield factory.create(
@@ -785,12 +795,18 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
                 yield event
             if usage is not None:
                 yield factory.create(GatewayEventKind.USAGE, usage=usage)
-            terminal = (
-                GatewayEventKind.INCOMPLETE
-                if finish_reason == "length"
-                else GatewayEventKind.COMPLETED
-            )
-            yield factory.create(terminal)
+            if refusal_seen or finish_reason in {"content_filter", "safety"}:
+                yield factory.create(
+                    GatewayEventKind.FAILED,
+                    failure=_provider_refusal_failure(),
+                )
+            else:
+                terminal = (
+                    GatewayEventKind.INCOMPLETE
+                    if finish_reason == "length"
+                    else GatewayEventKind.COMPLETED
+                )
+                yield factory.create(terminal)
             return
         payload = _json_object(frame.data)
         if payload.get("error") is not None:
@@ -881,6 +897,15 @@ async def _finish_open_tools(
                 tool_call_index=index,
                 tool_call=tool.complete(),
             )
+
+
+def _provider_refusal_failure() -> GatewayFailure:
+    """Return the shared sanitized terminal classification for provider refusals."""
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.REFUSAL,
+        safe_message="provider refused the request",
+        safe_details={"signal": "content_policy"},
+    )
 
 
 def _openai_usage(value: JsonValue | None) -> GatewayUsage | None:
