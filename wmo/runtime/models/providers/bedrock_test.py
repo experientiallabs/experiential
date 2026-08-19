@@ -80,6 +80,11 @@ class _FakeBedrockRuntime:
         self.converse_calls.append(request)
         return self._converse_response
 
+    def converse_stream(self, **request: object) -> Mapping[str, object]:
+        """Reject streaming in non-streaming fixtures that did not configure events."""
+        del request
+        raise AssertionError("test made an unexpected ConverseStream request")
+
     def invoke_model(self, **request: object) -> Mapping[str, object]:
         """Record one InvokeModel request and return the next embedding body."""
         self.invoke_calls.append(request)
