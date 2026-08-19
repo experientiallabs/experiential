@@ -418,7 +418,11 @@ class BoundedContinuationStore:
             raise OpenAIProtocolError(
                 status_code=400,
                 code="continuation_unavailable",
-                message="The response is too large for bounded local continuation.",
+                message=(
+                    "The response is too large for bounded local continuation. "
+                    "Resend the full conversation history in this request instead of "
+                    "previous_response_id."
+                ),
                 param="previous_response_id",
             )
         key = (namespace, response_id)
@@ -457,7 +461,10 @@ class BoundedContinuationStore:
                 raise OpenAIProtocolError(
                     status_code=400,
                     code="continuation_unavailable",
-                    message="previous_response_id is unavailable or expired in this namespace.",
+                    message=(
+                        "previous_response_id is unavailable or expired in this namespace. "
+                        "Resend the full conversation history in this request."
+                    ),
                     param="previous_response_id",
                 )
             self._entries.move_to_end(key)

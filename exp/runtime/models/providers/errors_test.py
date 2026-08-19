@@ -90,6 +90,66 @@ def test_refusal_and_capability_failures_keep_only_safe_signals() -> None:
     assert capability.safe_details == {"capability": "strict_tools"}
 
 
+@pytest.mark.parametrize(
+    ("exception", "safe_message"),
+    [
+        (
+            ProviderTransportError("raw auth canary", status_code=401),
+            "provider authentication failed; ask the gateway operator to verify "
+            "the provider connection credential",
+        ),
+        (
+            ProviderTransportError("raw missing canary", status_code=404),
+            "provider deployment was not found; ask the gateway operator to verify "
+            "the deployment model ID in the catalog",
+        ),
+        (
+            ProviderTransportError("raw throttle canary", status_code=429),
+            "provider throttled the request; retry after the delay in the Retry-After header",
+        ),
+        (
+            ProviderTransportError("raw slow canary", status_code=408),
+            "provider request timed out; retry the request",
+        ),
+        (
+            ProviderTransportError("raw server canary", status_code=503),
+            "provider service failed; retry after a short delay",
+        ),
+        (
+            ProviderTransportError("raw reject canary", status_code=422),
+            "provider rejected the request; verify the request fields against "
+            "the model alias capabilities",
+        ),
+        (
+            ProviderTransportError("raw body canary"),
+            "provider transport failed; retry the request",
+        ),
+        (
+            ProviderDeadlineExceeded("raw deadline canary"),
+            "provider request deadline exceeded; retry with a shorter prompt "
+            "or a smaller max_tokens value",
+        ),
+        (
+            ProviderResponseError("raw response canary"),
+            "provider returned a malformed response; retry the request",
+        ),
+        (
+            RuntimeError("raw internal canary"),
+            "provider execution failed; retry the request",
+        ),
+    ],
+)
+def test_safe_messages_state_the_failure_and_the_next_action(
+    exception: BaseException,
+    safe_message: str,
+) -> None:
+    """Every public message says what failed and exactly what to do next."""
+    failure = normalized_provider_failure(exception)
+
+    assert failure.safe_message == safe_message
+    assert "canary" not in failure.model_dump_json()
+
+
 def test_cancellation_has_a_dedicated_nonretryable_failure() -> None:
     """Client disconnect cancellation must not be retried or made failover eligible."""
     failure = normalized_provider_failure(asyncio.CancelledError())

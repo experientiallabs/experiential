@@ -77,24 +77,33 @@ def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
     if isinstance(exception, asyncio.CancelledError):
         return GatewayFailure(
             failure_class=GatewayFailureClass.CANCELLED,
-            safe_message="provider request was cancelled",
+            safe_message=(
+                "provider request was cancelled; resend the request if cancellation "
+                "was not intended"
+            ),
         )
     if isinstance(exception, ProviderDeadlineExceeded):
         return GatewayFailure(
             failure_class=GatewayFailureClass.TIMEOUT,
-            safe_message="provider request deadline exceeded",
+            safe_message=(
+                "provider request deadline exceeded; retry with a shorter prompt "
+                "or a smaller max_tokens value"
+            ),
             failover_eligible=True,
         )
     if isinstance(exception, ProviderRefusalError):
         return GatewayFailure(
             failure_class=GatewayFailureClass.REFUSAL,
-            safe_message="provider refused the request",
+            safe_message="provider refused the request; revise the request content and retry",
             safe_details={"signal": exception.signal.value},
         )
     if isinstance(exception, ProviderCapabilityError):
         return GatewayFailure(
             failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
-            safe_message="provider deployment cannot preserve the requested capability",
+            safe_message=(
+                "provider deployment cannot preserve the requested capability; remove the "
+                "unsupported field or request a different model alias"
+            ),
             safe_details={"capability": exception.capability},
         )
     if isinstance(exception, ProviderTransportError):
@@ -102,12 +111,12 @@ def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
     if isinstance(exception, ProviderResponseError):
         return GatewayFailure(
             failure_class=GatewayFailureClass.MALFORMED_RESPONSE,
-            safe_message="provider returned a malformed response",
+            safe_message="provider returned a malformed response; retry the request",
             failover_eligible=True,
         )
     return GatewayFailure(
         failure_class=GatewayFailureClass.INTERNAL,
-        safe_message="provider execution failed",
+        safe_message="provider execution failed; retry the request",
     )
 
 
@@ -126,28 +135,36 @@ def _transport_failure(status_code: int | None) -> GatewayFailure:
     if status_code in {401, 403}:
         return GatewayFailure(
             failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
-            safe_message="provider authentication failed",
+            safe_message=(
+                "provider authentication failed; ask the gateway operator to verify "
+                "the provider connection credential"
+            ),
             failover_eligible=True,
             safe_details=details,
         )
     if status_code == 404:
         return GatewayFailure(
             failure_class=GatewayFailureClass.PROVIDER_NOT_FOUND,
-            safe_message="provider deployment was not found",
+            safe_message=(
+                "provider deployment was not found; ask the gateway operator to verify "
+                "the deployment model ID in the catalog"
+            ),
             failover_eligible=True,
             safe_details=details,
         )
     if status_code == 429:
         return GatewayFailure(
             failure_class=GatewayFailureClass.THROTTLED,
-            safe_message="provider throttled the request",
+            safe_message=(
+                "provider throttled the request; retry after the delay in the Retry-After header"
+            ),
             failover_eligible=True,
             safe_details=details,
         )
     if status_code == 408:
         return GatewayFailure(
             failure_class=GatewayFailureClass.TIMEOUT,
-            safe_message="provider request timed out",
+            safe_message="provider request timed out; retry the request",
             retryable_same_deployment=True,
             failover_eligible=True,
             safe_details=details,
@@ -155,7 +172,7 @@ def _transport_failure(status_code: int | None) -> GatewayFailure:
     if status_code is not None and status_code >= 500:
         return GatewayFailure(
             failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
-            safe_message="provider service failed",
+            safe_message="provider service failed; retry after a short delay",
             retryable_same_deployment=True,
             failover_eligible=True,
             safe_details=details,
@@ -163,12 +180,15 @@ def _transport_failure(status_code: int | None) -> GatewayFailure:
     if status_code is not None:
         return GatewayFailure(
             failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
-            safe_message="provider rejected the request",
+            safe_message=(
+                "provider rejected the request; verify the request fields against "
+                "the model alias capabilities"
+            ),
             safe_details=details,
         )
     return GatewayFailure(
         failure_class=GatewayFailureClass.TRANSPORT,
-        safe_message="provider transport failed",
+        safe_message="provider transport failed; retry the request",
         retryable_same_deployment=True,
         failover_eligible=True,
     )

@@ -248,7 +248,10 @@ def test_continuation_is_bounded_namespaced_and_restart_unavailable() -> None:
         await store.remember(namespace=_namespace(), response_id="resp_one", state=state)
         assert await store.resolve(namespace=_namespace(), previous_response_id="resp_one") == state
 
-        with pytest.raises(OpenAIProtocolError, match="unavailable or expired"):
+        with pytest.raises(
+            OpenAIProtocolError,
+            match="unavailable or expired.*Resend the full conversation history",
+        ):
             await store.resolve(
                 namespace=_namespace(identity="identity-two"),
                 previous_response_id="resp_one",
