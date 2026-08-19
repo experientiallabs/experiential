@@ -8,7 +8,7 @@ import stat
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class GatewaySchemaError(RuntimeError):
@@ -250,7 +250,15 @@ _MIGRATION_2 = (
     """,
 )
 
-_MIGRATIONS = {1: _MIGRATION_1, 2: _MIGRATION_2}
+_MIGRATION_3 = (
+    """
+    ALTER TABLE gateway_attempts
+    ADD COLUMN billing_source TEXT NOT NULL DEFAULT 'customer_managed'
+    CHECK (billing_source IN ('customer_managed', 'host_managed'))
+    """,
+)
+
+_MIGRATIONS = {1: _MIGRATION_1, 2: _MIGRATION_2, 3: _MIGRATION_3}
 
 
 def connect_database(

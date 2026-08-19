@@ -204,11 +204,11 @@ class SQLiteAttemptLedger:
                 """
                 INSERT INTO gateway_attempts (
                     attempt_id, request_id, organization_id, route_depth, deployment_id,
-                    provider, exact_model_id, pool_id, catalog_sha256,
+                    provider, exact_model_id, pool_id, catalog_sha256, billing_source,
                     pricing_source, pricing_effective_at,
                     input_rate, cached_input_rate, output_rate, reasoning_rate,
                     state, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?)
                 """,
                 (
                     attempt_id,
@@ -220,6 +220,7 @@ class SQLiteAttemptLedger:
                     snapshot.exact_model_id,
                     snapshot.pool_id,
                     snapshot.authorization.catalog_sha256,
+                    deployment.billing_source.value,
                     deployment.gateway.pricing_source,
                     (
                         None
