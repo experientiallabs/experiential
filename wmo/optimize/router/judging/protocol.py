@@ -201,7 +201,12 @@ class TemplateJudgeClient:
             order: Audit-visible presentation order.
 
         Returns:
-            Provider response after model dispatch.
+            Provider response after model dispatch or exact probe replay.
+
+        Raises:
+            ManualJudgeError: A new provider call is needed but the finalized setup was
+                persisted under an earlier template version, so its evidence rendering
+                cannot be reproduced.
         """
         probe_id = stable_id(
             "manual-judge-probe",
@@ -230,6 +235,12 @@ class TemplateJudgeClient:
                 output=AssistantAction(content=json.dumps(saved.response)),
                 model=saved.model,
                 economics=saved.economics,
+            )
+        if self._template.template_version != "3":
+            raise ManualJudgeError(
+                "finalized judge setup uses template version "
+                f"{self._template.template_version}, but new provider calls render the "
+                "version 3 evidence projection; rerun judge setup to adopt it"
             )
         response = self._client.complete(
             ModelRequest(

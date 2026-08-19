@@ -99,7 +99,8 @@ class JudgePromptTemplate(ContractModel):
     Template version 3 renders rollout variables through the shared judge-visible evidence
     projection, which excludes provider request payloads and candidate reasoning content.
     Version 2 identifies setups persisted before that projection existed; they keep loading
-    unchanged, and their completed probes replay without any provider call.
+    unchanged and their completed probes replay without any provider call, but new provider
+    calls are refused so one approved setup never mixes two evidence renderings.
     """
 
     template_id: Literal["wmo-judge-evidence-json"] = "wmo-judge-evidence-json"
