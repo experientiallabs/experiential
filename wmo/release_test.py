@@ -106,7 +106,7 @@ FORBIDDEN_FLAT_ROUTER_MODULES = frozenset(
         "wmo/optimize/router/workflow.py",
     }
 )
-_RELEASE_REVISION = "1" * 40
+_TEST_RELEASE_REVISION = "1" * 40
 
 
 def _normalized_path(member_name: str) -> str:
@@ -436,6 +436,8 @@ def _installed_release_driver() -> None:
         refresh_runtime_trace_rag,
     )
 
+    release_revision = os.environ["WMO_RELEASE_REVISION"]
+    assert re.fullmatch(r"[0-9a-f]{40}", release_revision), release_revision
     execution_root = Path.cwd().resolve()
     source_checkout = Path(os.environ["WMO_SOURCE_CHECKOUT"]).resolve()
     assert execution_root != source_checkout
@@ -661,7 +663,7 @@ def _installed_release_driver() -> None:
     child_environment = os.environ.copy()
     child_environment.update(
         {
-            "WMO_RELEASE_REVISION": _RELEASE_REVISION,
+            "WMO_RELEASE_REVISION": release_revision,
             "WMO_INSTALLED_RELEASE_EVIDENCE": "0",
             "AZURE_OPENAI_API_KEY": "deterministic-loopback-placeholder",
             "NO_PROXY": "127.0.0.1,localhost",
@@ -849,7 +851,7 @@ def _installed_release_driver() -> None:
         if isinstance(value, dict):
             for key, item in value.items():
                 if key == "code_revision":
-                    assert item == _RELEASE_REVISION
+                    assert item == release_revision
                 assert_embedded_revision(item)
         elif isinstance(value, list):
             for item in value:
@@ -1314,7 +1316,7 @@ def _installed_release_driver() -> None:
             embedding_reservation=embedding_reservation,
             maximum_embedding_cost_usd=0,
             created_at=refresh_time,
-            code_revision=_RELEASE_REVISION,
+            code_revision=release_revision,
         )
         provider_after_refresh = state.snapshot()
         assert len(provider_after_refresh) > len(provider_before_refresh)
@@ -1368,7 +1370,7 @@ def _installed_release_driver() -> None:
             embedding_reservation=embedding_reservation,
             maximum_embedding_cost_usd=0,
             created_at=refresh_time,
-            code_revision=_RELEASE_REVISION,
+            code_revision=release_revision,
         )
         assert replayed_refresh.refresh.refresh_id == refresh.refresh.refresh_id
         assert replayed_refresh.retrieval.index.rag_id == refresh.retrieval.index.rag_id
@@ -1448,7 +1450,7 @@ def _installed_release_driver() -> None:
         replayed_preparation = prepare_runtime_sft_model_optimization(
             support_store,
             created_at=dataset.dataset.created_at,
-            code_revision=_RELEASE_REVISION,
+            code_revision=release_revision,
         )
         assert replayed_preparation.created is False
         assert replayed_preparation.dataset.dataset.dataset_id == dataset.dataset.dataset_id
@@ -1467,7 +1469,7 @@ def _installed_release_driver() -> None:
         for project_store in (support_store, one_store):
             for artifact_id in project_store.artifacts.list_ids():
                 manifest = project_store.artifacts.read(artifact_id).manifest
-                assert manifest.code_revision == _RELEASE_REVISION
+                assert manifest.code_revision == release_revision
                 for file in manifest.files:
                     if not (file.path.endswith(".json") or file.path.endswith(".jsonl")):
                         continue
@@ -1566,7 +1568,7 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     driver_environment.update(
         {
             "WMO_INSTALLED_RELEASE_EVIDENCE": "1",
-            "WMO_RELEASE_REVISION": _RELEASE_REVISION,
+            "WMO_RELEASE_REVISION": _TEST_RELEASE_REVISION,
             "WMO_TELEMETRY": "0",
             "PYTHONNOUSERSITE": "1",
             "WMO_SOURCE_CHECKOUT": str(repository),

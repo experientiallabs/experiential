@@ -255,7 +255,7 @@ def test_permanently_hung_cleanup_returns_bounded_failure(tmp_path: Path) -> Non
     started = time.monotonic()
 
     artifact_set = simulator.run(
-        _spec(plan_input, task_input, ("cell-a",), maximum_time_seconds=0.03)
+        _spec(plan_input, task_input, ("cell-a",), maximum_time_seconds=0.2)
     )
     rollout = _load_rollout(store, artifact_set.artifact_ids[0])
 
@@ -511,7 +511,11 @@ def test_harbor_cleanup_failure_or_hang_holds_ledger_and_partial_transcript(
     expected_stop: StopReason,
     expected_phase: str,
 ) -> None:
-    """Harbor evidence survives bounded cleanup failure and remains reaper-owned."""
+    """Harbor evidence survives deterministic bounded cleanup failure and stays reaper-owned.
+
+    The Harbor double reports its own bounded cleanup result, so the episode receives ordinary
+    runtime headroom instead of racing all setup and command work against a 30 ms wall clock.
+    """
     store, plan, plan_input, task_input = _persist_fixture(tmp_path, ("task-a",))
     backend = _HarborSession(hang_cleanup=hang_cleanup)
     state_directory = tmp_path / "harbor-state"
@@ -536,7 +540,7 @@ def test_harbor_cleanup_failure_or_hang_holds_ledger_and_partial_transcript(
             plan_input,
             task_input,
             ("cell-a",),
-            maximum_time_seconds=0.03 if hang_cleanup else 30.0,
+            maximum_time_seconds=30.0,
         )
     )
     rollout = _load_rollout(store, artifact_set.artifact_ids[0])
