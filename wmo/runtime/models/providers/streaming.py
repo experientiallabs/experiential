@@ -43,6 +43,10 @@ from wmo.runtime.models.providers.streaming_requests import (
     openai_compatible_stream_payload,
     openai_responses_stream_payload,
 )
+from wmo.runtime.models.providers.streaming_usage import (
+    openai_compatible_usage as _openai_compatible_usage,
+)
+from wmo.runtime.models.providers.streaming_usage import openai_usage as _openai_usage
 from wmo.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
 
 _MAXIMUM_SSE_EVENT_BYTES = 4_000_000
@@ -906,62 +910,6 @@ def _provider_refusal_failure() -> GatewayFailure:
         safe_message="provider refused the request",
         safe_details={"signal": "content_policy"},
     )
-
-
-def _openai_usage(value: JsonValue | None) -> GatewayUsage | None:
-    """Normalize native Responses usage including cached and reasoning subsets."""
-    if value is None:
-        return None
-    usage = require_object(value, "OpenAI usage")
-    return GatewayUsage(
-        input_tokens=require_integer(usage.get("input_tokens"), "OpenAI input_tokens"),
-        output_tokens=require_integer(usage.get("output_tokens"), "OpenAI output_tokens"),
-        cached_input_tokens=_optional_usage_detail(
-            usage.get("input_tokens_details"),
-            field_name="cached_tokens",
-            label="OpenAI cached_tokens",
-        ),
-        reasoning_tokens=_optional_usage_detail(
-            usage.get("output_tokens_details"),
-            field_name="reasoning_tokens",
-            label="OpenAI reasoning_tokens",
-        ),
-    )
-
-
-def _openai_compatible_usage(value: JsonValue) -> GatewayUsage:
-    """Normalize Chat usage including optional cached and reasoning subsets."""
-    usage = require_object(value, "OpenAI-compatible usage")
-    return GatewayUsage(
-        input_tokens=require_integer(usage.get("prompt_tokens"), "prompt_tokens"),
-        output_tokens=require_integer(usage.get("completion_tokens"), "completion_tokens"),
-        cached_input_tokens=_optional_usage_detail(
-            usage.get("prompt_tokens_details"),
-            field_name="cached_tokens",
-            label="cached_tokens",
-        ),
-        reasoning_tokens=_optional_usage_detail(
-            usage.get("completion_tokens_details"),
-            field_name="reasoning_tokens",
-            label="reasoning_tokens",
-        ),
-    )
-
-
-def _optional_usage_detail(
-    value: JsonValue | None,
-    *,
-    field_name: str,
-    label: str,
-) -> int | None:
-    """Preserve an absent provider token subset as unknown instead of zero."""
-    if value is None:
-        return None
-    details = require_object(value, f"{label} details")
-    raw_count = details.get(field_name)
-    if raw_count is None:
-        return None
-    return require_integer(raw_count, label)
 
 
 def _json_object(raw: str) -> JsonObject:
