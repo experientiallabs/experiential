@@ -2,8 +2,8 @@
 
 WMO optimizes agent workflows from traces through a three-step process:
 
-1. Build a simulation and two RAG indexes from your traces: one for serving and one for router fit.
-2. Evaluate real candidate models in closed loop, then fit a router for each request.
+1. Build a simulation using text world models grounded on your traces.
+2. Fit a router that determines which model every request should be sent to.
 3. Train custom open source models just for your agent.
 
 ![Your traces flow through simulation into routing and training optimization](https://raw.githubusercontent.com/experientiallabs/world-model-optimizer/main/assets/wmo-workflow.png)
@@ -22,7 +22,7 @@ your current agent:
 ```bash
 pip install world-model-optimizer
 
-# Build simulation, both RAG indexes, the syllabus, evaluations, and router
+# Build simulation from your agent traces and optimize a router against it
 wmo build support-agent --traces traces.otel.jsonl
 
 # Run your router as an OpenAI compatible endpoint
