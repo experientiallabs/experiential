@@ -21,7 +21,6 @@ from rich.prompt import Confirm
 
 from wmo.cli.picker import PickerAction, PickerOption, choose_many, choose_one
 from wmo.cli.provider_picker import (
-    CREDENTIAL_NOTE,
     AvailableModel,
     PreparedEndpoint,
     ProviderSetupResult,
@@ -74,6 +73,24 @@ def available_models(session: SetupSession) -> tuple[AvailableModel, ...]:
 def _option(item: AvailableModel) -> PickerOption:
     """Present one configurable model as a selectable picker row."""
     return PickerOption(value=item.alias, label=item.label(), detail=item.detail())
+
+
+def _role_options(items: tuple[AvailableModel, ...]) -> list[PickerOption]:
+    """Present eligible models, naming each provider only when several are in play."""
+    if len({item.provider for item in items}) > 1:
+        return [_option(item) for item in items]
+    return [
+        PickerOption(value=item.alias, label=item.label(), detail=_uniform_detail(item))
+        for item in items
+    ]
+
+
+def _uniform_detail(item: AvailableModel) -> str:
+    """Annotate one model row on a single-provider screen, keeping only retain-only notes."""
+    if item.capabilities is None:
+        roles = ", ".join(sorted(role.value for role in item.retainable_roles))
+        return f"retain only: {roles}" if roles else "unverified"
+    return ""
 
 
 def recommendation_key(
@@ -159,7 +176,7 @@ def select_models(session: SetupSession, *, console: Console) -> tuple[str, ...]
             )
         result = choose_many(
             console,
-            title="Select the models to configure",
+            title="Models to configure",
             options=options,
             preselected=session.selected,
         )
@@ -336,7 +353,7 @@ def _ask_role_reasoning_effort(
         return None
     result = choose_one(
         console,
-        title=f"Reasoning effort for the {role_name} ({alias})",
+        title=f"{role_name.capitalize()} effort ({alias})",
         options=[PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS],
         default=default or item.capabilities.reasoning_effort,
     )
@@ -469,7 +486,7 @@ def _assign_one_role(
     result = choose_one(
         console,
         title=title,
-        options=[_option(item) for item in eligible],
+        options=_role_options(eligible),
         default=default,
     )
     if result.action is PickerAction.CANCEL:
@@ -612,7 +629,7 @@ def _assign_router_candidates(
     result = choose_many(
         console,
         title=("Router candidates (2+)" if required else "Router candidates (optional)"),
-        options=[_candidate_option(item) if required else _option(item) for item in eligible],
+        options=_role_options(eligible),
         preselected=preselected,
         minimum=2 if required else 0,
     )
@@ -647,7 +664,7 @@ def _assign_router_candidates(
         console,
         title="Router incumbent",
         options=(
-            [_candidate_option(item) for item in eligible if item.alias in result.values]
+            _role_options(tuple(item for item in eligible if item.alias in result.values))
             if required
             else [PickerOption(value=alias, label=alias) for alias in result.values]
         ),
@@ -658,18 +675,6 @@ def _assign_router_candidates(
     if incumbent_result.action is PickerAction.BACK:
         return None
     return result.values, incumbent_result.values[0], efforts
-
-
-def _candidate_option(item: AvailableModel) -> PickerOption:
-    """Present one strict router-candidate option with provider identity and capabilities.
-
-    Args:
-        item: Eligible model discovered or retained by provider setup.
-
-    Returns:
-        Picker row carrying the alias, provider/model identity, and role metadata.
-    """
-    return PickerOption(value=item.alias, label=item.label(), detail=item.detail())
 
 
 def build_result(
@@ -788,7 +793,6 @@ def _serves_or_retains(item: AvailableModel, role: SetupRole) -> bool:
 def render_summary(
     result: ProviderSetupResult,
     *,
-    chosen: tuple[AvailableModel, ...],
     endpoints: tuple[PreparedEndpoint, ...],
     console: Console,
 ) -> None:
@@ -796,32 +800,21 @@ def render_summary(
 
     Args:
         result: The setup about to be saved.
-        chosen: Models the user selected.
         endpoints: Prepared provider endpoints.
         console: Terminal receiving the summary.
     """
     console.print("[bold]Configuration[/bold]")
     for endpoint in endpoints:
         connection = endpoint.connection
-        credential = connection.api_key_env or "AWS credential chain"
-        endpoint_text = f", {connection.base_url}" if connection.base_url else ""
-        console.print(
-            f"  [green]\u2713[/green] {connection.provider} "
-            f"[dim]({credential}{endpoint_text})[/dim]"
-        )
+        endpoint_text = f"  [dim]({connection.base_url})[/dim]" if connection.base_url else ""
+        console.print(f"  [green]\u2713[/green] {connection.provider}{endpoint_text}")
     setup = result.setup
-    identity = {item.alias: f"{item.provider}/{item.model}" for item in chosen}
 
     def line(label: str, alias: str | None, effort: ReasoningEffort | None = None) -> None:
-        """Print one aligned role line with the alias and its dim identity and effort."""
+        """Print one aligned role line with the alias and its dim reasoning effort."""
         if alias is None:
             return
-        effort_text = f", effort {effort}" if effort is not None else ""
-        note = (
-            f"  [dim]({identity[alias]}{effort_text})[/dim]"
-            if alias in identity
-            else (f"  [dim]({effort_text.removeprefix(', ')})[/dim]" if effort_text else "")
-        )
+        note = f"  [dim](effort {effort})[/dim]" if effort is not None else ""
         console.print(f"  [dim]{label:<12}[/dim] {alias}{note}")
 
     line("world model", setup.world_model, setup.world_model_reasoning_effort)
@@ -837,4 +830,3 @@ def render_summary(
         console.print(
             f"  [dim]{'router':<12}[/dim] {described} [dim](incumbent {result.incumbent})[/dim]"
         )
-    console.print(f"[dim]{CREDENTIAL_NOTE}[/dim]")

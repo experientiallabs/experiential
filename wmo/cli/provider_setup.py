@@ -291,7 +291,6 @@ def _interactive_setup(
     Returns:
         The confirmed setup, or ``None`` when the user cancelled or declined to save.
     """
-    console.print("[bold]Model setup[/bold]")
     configured = configured_models(
         existing_catalog_models,
         connection_providers=existing_connection_providers,
@@ -435,7 +434,7 @@ def _recommended_result(
         known_existing_connections=known_existing_connections,
         known_existing_aliases=known_existing_aliases,
     )
-    render_summary(result, chosen=chosen, endpoints=session.endpoints, console=console)
+    render_summary(result, endpoints=session.endpoints, console=console)
     return result
 
 
@@ -579,7 +578,7 @@ def _collect_models_and_roles(
             known_existing_connections=known_existing_connections,
             known_existing_aliases=known_existing_aliases,
         )
-        render_summary(result, chosen=chosen, endpoints=session.endpoints, console=console)
+        render_summary(result, endpoints=session.endpoints, console=console)
         if not Confirm.ask("Save this configuration?", default=True, console=console):
             raise SetupCancelled
         return result

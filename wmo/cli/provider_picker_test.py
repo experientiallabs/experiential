@@ -10,7 +10,6 @@ from wmo.cli.picker_test import ScriptedConsole
 from wmo.cli.provider_picker import (
     SetupCancelled,
     SetupSession,
-    credential_hint,
     explicit_provider_selection,
     prepare_providers,
     resolve_setup_providers,
@@ -101,12 +100,17 @@ def _prepare(
     )
 
 
-def test_provider_screen_reports_credential_availability_per_provider() -> None:
-    """The one opening screen states which canonical credentials are already readable."""
-    environment = {"OPENAI_API_KEY": "secret-key"}
+def test_provider_screen_never_names_credential_variables() -> None:
+    """The one opening screen shows plain provider names without credential status."""
+    console = ScriptedConsole("1\n\n")
 
-    assert credential_hint("openai", environment=environment) == "OPENAI_API_KEY set"
-    assert credential_hint("anthropic", environment=environment) == "ANTHROPIC_API_KEY needed"
+    selection = select_providers(
+        SetupSession(), console=console, environment={"OPENAI_API_KEY": "secret-key"}
+    )
+
+    assert selection == (("openai",), False)
+    assert "OPENAI_API_KEY" not in console.output
+    assert "API_KEY" not in console.output
 
 
 def test_provider_screen_selects_several_providers_in_one_session() -> None:
@@ -203,7 +207,7 @@ def test_canonical_environment_credential_is_used_without_any_prompt() -> None:
     assert endpoints[0].connection.api_key_env == "OPENAI_API_KEY"
     assert lister.requests == [ProviderEndpoint(provider="openai", api_key="secret-key")]
     assert [model.alias for model in models] == ["gpt-5-6-luna", "text-embedding-3-small"]
-    assert "OPENAI_API_KEY is set" in console.output
+    assert "OPENAI_API_KEY is set" not in console.output
 
 
 def test_missing_credential_is_pasted_masked_and_stays_process_local(
@@ -392,7 +396,7 @@ def test_models_without_verified_metadata_are_hidden_from_the_normal_path() -> N
     assert prepared is not None
     _, models = prepared
     assert [model.model for model in models] == ["gpt-5.6-luna", "text-embedding-3-small"]
-    assert "1 hidden without verified metadata" in console.output
+    assert "internal-preview-model" not in console.output
 
 
 def test_discovered_metadata_and_roles_come_from_the_maintained_table() -> None:
@@ -562,8 +566,8 @@ def test_azure_and_bedrock_force_explicit_manual_model_declaration() -> None:
     selection = select_providers(SetupSession(), console=console, environment={})
 
     assert selection == (("azure", "bedrock"), True)
-    assert "manual model IDs" in console.output
-    assert "AWS credential chain" in console.output
+    assert "azure" in console.output
+    assert "bedrock" in console.output
 
 
 def test_no_prepared_provider_returns_to_the_provider_screen(

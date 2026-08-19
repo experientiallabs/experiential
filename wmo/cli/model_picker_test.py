@@ -346,10 +346,10 @@ def test_each_completion_role_asks_its_effort_directly_after_its_model_screen() 
     assert roles.candidates == ("luna", "terra")
     assert roles.incumbent == "terra"
     assert roles.candidate_reasoning_efforts == {"luna": "medium", "terra": "medium"}
-    assert "Reasoning effort for the world model (luna)" in console.output
-    assert "Reasoning effort for the judge (luna)" in console.output
-    assert "Reasoning effort for the router candidate (luna)" in console.output
-    assert "Reasoning effort for the router candidate (terra)" in console.output
+    assert "World model effort (luna)" in console.output
+    assert "Judge effort (luna)" in console.output
+    assert "Router candidate effort (luna)" in console.output
+    assert "Router candidate effort (terra)" in console.output
 
 
 def test_unassigned_and_unsupported_models_are_never_asked_for_effort() -> None:
@@ -366,9 +366,9 @@ def test_unassigned_and_unsupported_models_are_never_asked_for_effort() -> None:
     assert roles.world_model_reasoning_effort == "medium"
     assert roles.judge_reasoning_effort == "medium"
     assert roles.candidate_reasoning_efforts == {}
-    assert "Reasoning effort for the world model (luna)" in console.output
+    assert "World model effort (luna)" in console.output
     assert "(terra)" not in console.output.split("Router candidates")[-1]
-    assert "Reasoning effort for the embedder" not in console.output
+    assert "Embedder effort" not in console.output
 
 
 def test_manual_declaration_stays_behind_the_advanced_row() -> None:
@@ -397,8 +397,8 @@ def test_manual_declaration_requires_a_prepared_connection() -> None:
     assert "Prepare a provider connection first." in console.output
 
 
-def test_summary_states_providers_models_roles_prices_and_credential_behavior() -> None:
-    """One summary explains everything about to be written, including credential handling."""
+def test_summary_states_providers_models_and_roles_without_credential_details() -> None:
+    """One summary shows compact provider and role lines and never names credentials."""
     console = ScriptedConsole("")
     chosen = (_CHAT, _EMBEDDER)
     roles = assign_roles(
@@ -413,20 +413,20 @@ def test_summary_states_providers_models_roles_prices_and_credential_behavior() 
         known_existing_connections=(),
         known_existing_aliases=(),
     )
-    render_summary(result, chosen=chosen, endpoints=(_endpoint(),), console=console)
+    render_summary(result, endpoints=(_endpoint(),), console=console)
 
     printed = console.output
     assert "Configuration" in printed
-    assert "openai (OPENAI_API_KEY)" in printed
+    assert "openai" in printed
+    assert "OPENAI_API_KEY" not in printed
     assert "world model" in printed
-    assert "luna  (openai/gpt-5.6-luna, effort medium)" in printed
+    assert "luna  (effort medium)" in printed
     assert "embedder     embedder" in printed
-    assert "WMO stores only the credential environment-variable name" in printed
     assert "secret-key" not in printed
 
 
-def test_summary_names_the_aws_credential_chain_for_bedrock() -> None:
-    """A Bedrock connection has no credential variable, so the summary names its chain."""
+def test_summary_lists_every_prepared_provider_by_name() -> None:
+    """Every prepared connection is shown by provider name, with no credential wording."""
     console = ScriptedConsole("")
     bedrock = ProviderConnection(name="bedrock", provider="bedrock", region="us-east-1")
     chosen = (_CHAT, _EMBEDDER)
@@ -444,12 +444,12 @@ def test_summary_names_the_aws_credential_chain_for_bedrock() -> None:
     )
     render_summary(
         result,
-        chosen=chosen,
         endpoints=(_endpoint(), _endpoint(bedrock)),
         console=console,
     )
 
-    assert "bedrock (AWS credential chain)" in console.output
+    assert "bedrock" in console.output
+    assert "AWS credential chain" not in console.output
 
 
 def test_summary_names_confirmed_router_candidates() -> None:
@@ -470,7 +470,7 @@ def test_summary_names_confirmed_router_candidates() -> None:
         known_existing_connections=(),
         known_existing_aliases=(),
     )
-    render_summary(result, chosen=chosen, endpoints=(_endpoint(),), console=console)
+    render_summary(result, endpoints=(_endpoint(),), console=console)
 
     assert "luna (effort medium), terra (effort medium)" in console.output
     assert "(incumbent luna)" in console.output

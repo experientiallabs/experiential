@@ -21,12 +21,12 @@ from rich.live import Live
 from rich.text import Text
 
 _MINIMUM_VISIBLE_ROWS = 3
-_MAXIMUM_VISIBLE_ROWS = 8
+_MAXIMUM_VISIBLE_ROWS = 5
 _RESERVED_LINES = 6
 _ROW_INDENT = " "
 
-_MULTI_HINT = "up/down + space, Enter on Complete; / search, b back, q cancel"
-_SINGLE_HINT = "up/down + Enter; / search, b back, q cancel"
+_MULTI_HINT = "up/down + space, Enter on Complete"
+_SINGLE_HINT = "up/down + Enter"
 _MULTI_SEARCH_HINT = "type to search; Enter keeps matches, Esc clears"
 _SINGLE_SEARCH_HINT = "type to search; Enter confirms, Esc clears"
 
@@ -63,17 +63,26 @@ class PickerView:
     only state, so provider, model, role, and candidate screens stay visually identical.
     """
 
-    def __init__(self, console: Console, *, title: str, mode: PickerMode) -> None:
+    def __init__(
+        self,
+        console: Console,
+        *,
+        title: str,
+        mode: PickerMode,
+        visible_rows: int | None = None,
+    ) -> None:
         """Prepare the region for one screen without drawing anything yet.
 
         Args:
             console: Interactive terminal, or a stream that can only be appended to.
             title: Heading describing what is being chosen.
             mode: Whether the screen collects several values or exactly one.
+            visible_rows: Optional screen-specific ceiling on rows shown at once.
         """
         self._console = console
         self._title = title
         self._mode = mode
+        self._visible_rows = visible_rows
         self._live = (
             Live(console=console, auto_refresh=False, transient=False)
             if console.is_interactive
@@ -136,7 +145,7 @@ class PickerView:
             The heading, the visible window of rows, and the keyboard hint as one renderable.
         """
         title = Text(self._title, style="bold")
-        title.append(f"  ({self._hint(searching=False)})", style="dim")
+        title.append(f" ({self._hint(searching=False)}):", style="dim")
         lines: list[Text] = [title]
         if searching:
             lines.append(Text(f"Search: {query}_", style="cyan"))
@@ -148,12 +157,12 @@ class PickerView:
             capacity=self._capacity(rows, searching=searching, query=query),
         )
         if first > 0:
-            lines.append(Text(f"{_ROW_INDENT}... {first} more above", style="dim"))
+            lines.append(Text(f"{_ROW_INDENT}  \u2026 {first} more above", style="dim"))
         for index in range(first, last):
             lines.extend(self._row_lines(rows[index], focused=index == focus))
         hidden_below = len(rows) - last
         if hidden_below > 0:
-            lines.append(Text(f"{_ROW_INDENT}... {hidden_below} more below", style="dim"))
+            lines.append(Text(f"{_ROW_INDENT}  \u2026 {hidden_below} more", style="dim"))
         if status:
             lines.append(Text(status, style="yellow"))
         if searching:
@@ -170,13 +179,16 @@ class PickerView:
         Returns:
             One label line carrying the focus pointer, mark, and annotation.
         """
-        mark = "" if self._mode is PickerMode.SINGLE or row.action else _mark(row.marked) + " "
         line = Text(_ROW_INDENT)
         if focused:
             line.append("\u276f", style="bold cyan")
         else:
             line.append(" ")
-        line.append(f" {mark}{row.label}")
+        line.append(" ")
+        if self._mode is PickerMode.MULTIPLE and not row.action:
+            line.append(_mark(row.marked), style="green" if row.marked else "dim")
+            line.append(" ")
+        line.append(row.label)
         if row.detail:
             line.append(f"  ({row.detail})", style="dim")
         return (line,)
@@ -199,7 +211,8 @@ class PickerView:
         if searching or query:
             reserved += 1
         available = max(_MINIMUM_VISIBLE_ROWS, height - reserved)
-        return min(available, _MAXIMUM_VISIBLE_ROWS)
+        ceiling = self._visible_rows if self._visible_rows is not None else _MAXIMUM_VISIBLE_ROWS
+        return min(available, ceiling)
 
     def _hint(self, *, searching: bool) -> str:
         """Return the compact keyboard hint for this screen and search state.
@@ -216,18 +229,25 @@ class PickerView:
 
 
 @contextmanager
-def picker_view(console: Console, *, title: str, mode: PickerMode) -> Iterator[PickerView]:
+def picker_view(
+    console: Console,
+    *,
+    title: str,
+    mode: PickerMode,
+    visible_rows: int | None = None,
+) -> Iterator[PickerView]:
     """Own one redraw region for the duration of a screen.
 
     Args:
         console: Terminal, or non-terminal stream, receiving the screen.
         title: Heading describing what is being chosen.
         mode: Whether the screen collects several values or exactly one.
+        visible_rows: Optional screen-specific ceiling on rows shown at once.
 
     Yields:
         The view the screen redraws after every key press.
     """
-    view = PickerView(console, title=title, mode=mode)
+    view = PickerView(console, title=title, mode=mode, visible_rows=visible_rows)
     view.start()
     try:
         yield view

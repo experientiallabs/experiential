@@ -752,7 +752,7 @@ def test_back_from_the_model_screen_reselects_providers_without_losing_answers(
     assert set(saved.connections) == {"openai", "anthropic"}
     assert set(saved.models) == {"claude-sonnet-5", "gpt-5-6-luna", "text-embedding-3-small"}
     assert saved.roles.embedder == "text-embedding-3-small"
-    assert "reading anthropic models" in unstyle(console.output)
+    assert "verifying anthropic" in unstyle(console.output)
 
 
 def test_rerunning_setup_preserves_unrelated_models_and_router_state(
@@ -954,7 +954,9 @@ def test_offline_roles_include_models_on_tinker_without_provider_requests(tmp_pa
     assert catalog.roles == ModelRoles(world_model="chat", judge="chat", embedder="embed")
     assert set(catalog.connections) == {"custom", "openai"}
     assert set(catalog.models) == {"chat", "embed"}
-    assert "tinker/chat-id" in unstyle(console.output)
+    printed = unstyle(console.output)
+    assert "world model  chat" in printed
+    assert "embedder     embed" in printed
 
 
 def test_offline_roles_retain_assigned_tinker_alias_without_capabilities(tmp_path: Path) -> None:
@@ -999,7 +1001,7 @@ def test_offline_roles_retain_assigned_tinker_alias_without_capabilities(tmp_pat
     assert saved == original
     assert load_model_catalog(root / "models.toml") == original
     printed = unstyle(console.output)
-    assert "tinker/tinker://sampling/run" in printed
+    assert "world model  legacy" in printed
     assert "retain only: judge, world_model" in printed
 
 

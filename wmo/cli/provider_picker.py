@@ -65,10 +65,7 @@ _CONFIGURED_ONLY = "configured-models-only"
 _RECOVERY_RETRY = "retry"
 _RECOVERY_SKIP = "skip"
 _RECOVERY_BACK = "back"
-CREDENTIAL_NOTE = (
-    "WMO stores only the credential environment-variable name. A pasted value stays in this "
-    "process; export it or add it to .env to reuse it later."
-)
+_PROVIDER_VISIBLE_ROWS = 3
 
 
 class SetupCancelled(Exception):
@@ -224,7 +221,7 @@ def select_providers(
     Args:
         session: Answers already collected, used to preselect prior choices.
         console: Terminal used for the screen.
-        environment: Process environment used to annotate credential availability.
+        environment: Process environment consulted later for credential resolution.
         configured: Whether the catalog already holds usable models, which makes provider
             selection optional so roles can be edited offline.
         read_key: Optional keyboard source used by tests instead of the controlling terminal.
@@ -233,12 +230,9 @@ def select_providers(
         Selected providers plus whether manual model declaration is needed, or ``None`` when the
         user cancelled.
     """
+    del environment
     options = [
-        PickerOption(
-            value=provider,
-            label=label,
-            detail=credential_hint(provider, environment=environment),
-        )
+        PickerOption(value=provider, label=label)
         for provider, label in SETUP_PROVIDER_LABELS.items()
     ]
     if configured:
@@ -247,7 +241,7 @@ def select_providers(
             PickerOption(
                 value=_CONFIGURED_ONLY,
                 label="Keep the models already configured",
-                detail="no provider request, roles only",
+                detail="roles only",
             ),
         )
     preselected = list(session.providers)
@@ -295,18 +289,8 @@ def _select_provider_rows(
         options=options,
         preselected=preselected,
         read_key=read_key,
+        visible_rows=_PROVIDER_VISIBLE_ROWS,
     )
-
-
-def credential_hint(provider: str, *, environment: MutableMapping[str, str]) -> str:
-    """Describe whether the canonical credential for one provider is already readable."""
-    if provider == "bedrock":
-        return "AWS credential chain, manual model IDs"
-    name = CANONICAL_CREDENTIAL_ENV[provider]
-    status = f"{name} set" if environment.get(name, "").strip() else f"{name} needed"
-    if provider == "azure":
-        return f"{status}, manual model IDs"
-    return status
 
 
 def prepare_providers(
@@ -502,9 +486,8 @@ def _resolve_credential(
     """
     existing = environment.get(api_key_env, "").strip()
     if existing:
-        console.print(f"  [green]\u2713[/green] {api_key_env} is set")
         return existing
-    console.print(f"{label} has no {api_key_env} value. Paste a key to use it for this run.")
+    console.print(f"[dim]{label} needs {api_key_env}.[/dim]")
     try:
         pasted = getpass(f"{label} API key (hidden, empty line skips this provider): ").strip()
     except (EOFError, KeyboardInterrupt) as exc:
@@ -512,7 +495,10 @@ def _resolve_credential(
     if not pasted:
         return None
     environment[api_key_env] = pasted
-    console.print(f"  [green]\u2713[/green] {api_key_env} kept in this process only")
+    console.print(
+        f"[dim]{api_key_env} kept in this process only; export it or add it to .env to "
+        "reuse it later.[/dim]"
+    )
     return pasted
 
 
@@ -547,7 +533,7 @@ def _discover_models(
     )
     aliases = set(taken_aliases)
     while True:
-        console.print(f"[dim]reading {label} models...[/dim]")
+        console.print(f"[dim]verifying {label}\u2026[/dim]")
         try:
             discovered = lister.list_models(request)
         except ProviderListingError as exc:
@@ -558,15 +544,13 @@ def _discover_models(
             return () if recovery == _RECOVERY_SKIP else None
         resolved = tuple(resolve_discovered_model(model) for model in discovered)
         usable = tuple(model for model in resolved if served_roles(model.capabilities))
-        hidden = len(resolved) - len(usable)
         if not usable:
             console.print(f"[yellow]{label} published no model with verified metadata.[/yellow]")
             recovery = _recover(f"{label} has no configurable model", console=console)
             if recovery == _RECOVERY_RETRY:
                 continue
             return () if recovery == _RECOVERY_SKIP else None
-        hidden_note = f" [dim]({hidden} hidden without verified metadata)[/dim]" if hidden else ""
-        console.print(f"  [green]\u2713[/green] {label}: {len(usable)} models{hidden_note}")
+        console.print(f"  [green]\u2713[/green] {label}: {len(usable)} models")
         models = []
         for model in usable:
             alias = derive_model_alias(provider, model.model, frozenset(aliases))

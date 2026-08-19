@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 from collections.abc import Callable
 
 import pytest
@@ -344,7 +345,7 @@ def test_interpret_key_bytes_maps_terminal_events(raw: bytes, expected: PickerEv
     assert interpret_key_bytes(raw) == expected
 
 
-@pytest.mark.parametrize("ready_marker", ["Providers", "q cancel"])
+@pytest.mark.parametrize("ready_marker", ["Providers", "Enter on Complete"])
 def test_provider_multi_select_redraws_one_region_for_repeated_and_batched_keys(
     ready_marker: str,
     python_terminal_child: Callable[..., TerminalRun],
@@ -376,7 +377,7 @@ def test_provider_multi_select_redraws_one_region_for_repeated_and_batched_keys(
     _assert_single_region(
         run,
         title="Providers",
-        rows=("model-1 (openai/gpt-1)", "model-6 (openai/gpt-6)"),
+        rows=("model-3 (openai/gpt-3)", "model-6 (openai/gpt-6)"),
     )
     assert "[x] model-3 (openai/gpt-3)" in run.screen_text()
     assert [line for line in run.screen if line.strip() == "\u276f Complete"]
@@ -470,7 +471,7 @@ def test_a_long_model_list_scrolls_inside_the_terminal(
     text = run.screen_text()
     assert text.count("Judge model") == 1
     assert "more above" in text
-    assert "more below" in text
+    assert re.search(r"\u2026 \d+ more$", text, flags=re.MULTILINE)
     assert "model-40" not in text
     assert len(run.screen) <= 16, run.screen
 
@@ -501,7 +502,7 @@ def test_a_narrow_terminal_keeps_the_hint_and_metadata_readable(
     text = run.screen_text()
     assert text.count("Providers") == 1
     collapsed = " ".join(text.split())
-    assert "q cancel" in collapsed
+    assert "Enter on Complete" in collapsed
     assert "roles: judge, world_model; pricing: api" in collapsed
 
 
@@ -915,4 +916,4 @@ def test_keyboard_list_keeps_details_readable_on_a_narrow_terminal() -> None:
 
     assert result.values == ("model-1",)
     assert "model-1  (detail 1)" in console.output
-    assert "q cancel" in console.output
+    assert "Enter on Complete" in " ".join(console.output.split())

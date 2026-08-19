@@ -165,10 +165,15 @@ def test_a_long_list_scrolls_around_the_focused_row(
         view.show(rows, focus=20)
 
     last = rendered_screen(_output(console))
+
+    def _below(line: str) -> bool:
+        """Match the dim indicator for rows hidden below the visible window."""
+        return line.strip().startswith("\u2026") and line.strip().endswith("more")
+
     assert "more above" not in "\n".join(first)
-    assert any(line.startswith(" ... ") and "more below" in line for line in first)
+    assert any(_below(line) for line in first)
     assert any("more above" in line for line in last)
-    assert any("more below" in line for line in last)
+    assert any(_below(line) for line in last)
     assert " \u276f model-21" in last
     assert not any(line.strip() == "model-1" for line in last)
     assert len(last) <= 14
@@ -182,7 +187,7 @@ def test_a_narrow_terminal_wraps_the_keyboard_hint() -> None:
         view.show(_rows(1, detail=True), focus=0)
 
     text = _plain(console)
-    assert "q cancel" in text
+    assert "Enter on Complete" in text
     assert "pricing: api" in text
 
 
@@ -208,7 +213,7 @@ def test_a_retained_filter_is_shown_with_the_normal_hint() -> None:
     output = _output(console)
     assert "Filter: gpt" in output
     assert "Search: " not in output
-    assert "/ search" in output
+    assert "up/down" in output
 
 
 def test_a_searching_narrow_terminal_keeps_the_search_hint() -> None:
