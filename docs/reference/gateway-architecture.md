@@ -154,7 +154,8 @@ idempotency, request, or provider values.
 OpenAI `3.0.0` `OpenAI` and `AsyncOpenAI` clients are release-certified for Chat Completions and
 Responses in synchronous and asynchronous, streaming and non-streaming forms. Responses
 continuation and duplicate replay retain content only in bounded, process-local, tenant and
-alias-revision-scoped stores. Replay is opt-in through an idempotency or client request key. Restart
+alias-revision-scoped stores. Replay is opt-in through the standard `Idempotency-Key` header;
+`X-Client-Request-Id` is correlation only and keeps episode affinity and response echo. Restart
 or eviction returns an explicit unavailable error and never reconstructs content from SQLite.
 
 ## Content-free observability and lifecycle

@@ -7,9 +7,6 @@ from typing import TYPE_CHECKING
 
 from wmo.runtime.gateway.contracts import (
     AuthorizationSnapshot,
-    CompatibilityDisposition,
-    CompatibilityField,
-    CompatibilityManifest,
     DirectTarget,
     ExecutionSnapshot,
     GatewayApiSurface,
@@ -115,9 +112,6 @@ __all__ = [
     "AliasRevisionRecord",
     "BillingSourceUsageAttribution",
     "AuthorizationSnapshot",
-    "CompatibilityDisposition",
-    "CompatibilityField",
-    "CompatibilityManifest",
     "CreateIdentityCommand",
     "DirectTarget",
     "DisableAliasCommand",

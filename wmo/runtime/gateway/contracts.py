@@ -110,6 +110,7 @@ class GatewayRequest(ContractModel):
 
     surface: GatewayApiSurface
     messages: tuple[GatewayMessage, ...] = Field(min_length=1)
+    instructions: str | None = None
     tools: tuple[GatewayToolDefinition, ...] = ()
     tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None
     parallel_tool_calls: bool | None = None

@@ -260,7 +260,7 @@ def decode_chat(
     _validate_accepted_fields(payload, CHAT_ACCEPTED_FIELDS)
     _validate_official(_CHAT_OFFICIAL, payload)
     request = _validate_wire(_ChatRequest, payload)
-    operation = _caller_operation(idempotency_key, client_request_id)
+    _validate_caller_headers(idempotency_key, client_request_id)
     maximum = request.max_completion_tokens or request.max_tokens
     stop = (
         ()
@@ -286,8 +286,8 @@ def decode_chat(
                 request.stream_options is not None and request.stream_options.include_usage
             ),
             metadata=request.metadata,
-            idempotency_key=operation if idempotency_key is not None else None,
-            client_request_id=operation if client_request_id is not None else None,
+            idempotency_key=idempotency_key,
+            client_request_id=client_request_id,
         )
     except ValidationError as exc:
         raise _validation_protocol_error(exc) from exc
@@ -316,14 +316,12 @@ def decode_responses(
     _validate_accepted_fields(payload, RESPONSES_ACCEPTED_FIELDS)
     _validate_official(_RESPONSES_OFFICIAL, payload)
     request = _validate_wire(_ResponsesRequest, payload)
-    operation = _caller_operation(idempotency_key, client_request_id)
-    messages = list(_response_input_messages(request.input))
-    if request.instructions is not None:
-        messages.insert(0, GatewayMessage(role="developer", content=request.instructions))
+    _validate_caller_headers(idempotency_key, client_request_id)
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.RESPONSES,
-            messages=tuple(messages),
+            messages=_response_input_messages(request.input),
+            instructions=request.instructions,
             tools=tuple(_response_tool(tool) for tool in request.tools),
             tool_choice=_responses_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
@@ -333,8 +331,8 @@ def decode_responses(
             stream=request.stream,
             previous_response_id=request.previous_response_id,
             metadata=request.metadata,
-            idempotency_key=operation if idempotency_key is not None else None,
-            client_request_id=operation if client_request_id is not None else None,
+            idempotency_key=idempotency_key,
+            client_request_id=client_request_id,
         )
     except ValidationError as exc:
         raise _validation_protocol_error(exc) from exc
@@ -374,8 +372,8 @@ def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     return invalid_field(param)
 
 
-def _caller_operation(idempotency_key: str | None, client_request_id: str | None) -> str | None:
-    """Require two optional caller-operation headers to agree exactly."""
+def _validate_caller_headers(idempotency_key: str | None, client_request_id: str | None) -> None:
+    """Require each optional caller header to carry a display-safe value."""
     for name, value in (
         ("Idempotency-Key", idempotency_key),
         ("X-Client-Request-Id", client_request_id),
@@ -384,18 +382,6 @@ def _caller_operation(idempotency_key: str | None, client_request_id: str | None
             not value or len(value) > 512 or any(ord(char) < 32 for char in value)
         ):
             raise invalid_field(name, f"{name} must be a non-empty display-safe value.")
-    if (
-        idempotency_key is not None
-        and client_request_id is not None
-        and idempotency_key != client_request_id
-    ):
-        raise OpenAIProtocolError(
-            status_code=400,
-            code="idempotency_conflict",
-            message="Idempotency-Key and X-Client-Request-Id must identify the same operation.",
-            param="Idempotency-Key",
-        )
-    return idempotency_key or client_request_id
 
 
 def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessage, ...]:

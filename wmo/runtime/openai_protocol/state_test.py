@@ -103,6 +103,37 @@ def test_unkeyed_requests_do_not_deduplicate_and_episode_keys_are_namespaced() -
     assert first[-1] == other_identity[-1] == other_revision[-1]
 
 
+def test_joiner_result_is_bounded_and_owner_abandonment_maps_to_replay_unavailable() -> None:
+    """A joiner neither waits past its bound nor surfaces owner abandonment as cancellation."""
+
+    async def scenario() -> None:
+        """Time out one stalled join, then abandon the owner under a live join."""
+        store = BoundedReplayStore(capacity=4, byte_cap=1_024, ttl_seconds=60)
+        key = replay_key(
+            namespace=_namespace(),
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            caller_operation="operation-slow",
+            canonical_request_sha256=_REQUEST_DIGEST,
+        )
+        assert key is not None
+        owner = await store.claim(key)
+        join = await store.claim(key)
+        with pytest.raises(OpenAIProtocolError) as timed_out:
+            await join.result(timeout_seconds=0.01)
+        assert timed_out.value.detail.code == "idempotency_replay_unavailable"
+        assert timed_out.value.status_code == 409
+
+        waiter = asyncio.create_task(join.result(timeout_seconds=5.0))
+        await asyncio.sleep(0)
+        await owner.abandon()
+        with pytest.raises(OpenAIProtocolError) as abandoned:
+            await waiter
+        assert abandoned.value.detail.code == "idempotency_replay_unavailable"
+        assert abandoned.value.status_code == 409
+
+    asyncio.run(scenario())
+
+
 def test_replay_capacity_rejects_new_work_without_evicting_inflight_owners() -> None:
     """A full in-flight window fails closed instead of exceeding its count bound."""
 

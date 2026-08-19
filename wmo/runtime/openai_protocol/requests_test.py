@@ -140,14 +140,14 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
 
     request = decoded.request
     assert request.surface == GatewayApiSurface.RESPONSES
+    assert request.instructions == "Use tools."
     assert tuple(message.role for message in request.messages) == (
-        "developer",
         "user",
         "assistant",
         "tool",
     )
     assert request.previous_response_id == "resp_previous"
-    assert request.messages[2].tool_calls[0].raw_arguments == '{"city":"Paris"}'
+    assert request.messages[1].tool_calls[0].raw_arguments == '{"city":"Paris"}'
     assert request.parallel_tool_calls is False
     assert request.maximum_output_tokens == 321
     assert request.structured_text is not None
@@ -184,8 +184,8 @@ def test_unknown_and_excluded_fields_fail_with_exact_param(
     assert captured.value.detail.param == param
 
 
-def test_invalid_tool_arguments_and_conflicting_operation_headers_are_specific() -> None:
-    """Malformed history and mismatched dedup headers identify the exact public field."""
+def test_invalid_tool_arguments_are_specific_and_caller_headers_stay_independent() -> None:
+    """Malformed history names the exact field and distinct caller headers both survive."""
     with pytest.raises(OpenAIProtocolError) as arguments:
         decode_chat(
             {
@@ -206,14 +206,13 @@ def test_invalid_tool_arguments_and_conflicting_operation_headers_are_specific()
         )
     assert arguments.value.detail.param == "messages.0.tool_calls.0.function.arguments"
 
-    with pytest.raises(OpenAIProtocolError) as operation:
-        decode_responses(
-            {"model": "coding", "input": "x"},
-            idempotency_key="one",
-            client_request_id="two",
-        )
-    assert operation.value.detail.code == "idempotency_conflict"
-    assert operation.value.detail.param == "Idempotency-Key"
+    decoded = decode_responses(
+        {"model": "coding", "input": "x"},
+        idempotency_key="one",
+        client_request_id="two",
+    )
+    assert decoded.request.idempotency_key == "one"
+    assert decoded.request.client_request_id == "two"
 
 
 def test_chat_decoder_accepts_opencode_nucleus_and_usage_stream_shape() -> None:

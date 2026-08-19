@@ -24,6 +24,7 @@ from wmo.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayMessage,
     GatewayRequest,
 )
 from wmo.runtime.gateway.execution import (
@@ -278,16 +279,16 @@ class GatewayService:
             authorization=authorization,
             request=decoded.request,
         )
-        caller_operation = decoded.request.idempotency_key or decoded.request.client_request_id
         key = replay_key(
             namespace=namespace,
             surface=decoded.request.surface,
-            caller_operation=caller_operation,
+            caller_operation=decoded.request.idempotency_key,
             canonical_request_sha256=authorization.canonical_request_sha256,
         )
         lease = None if key is None else await self._replays.claim(key)
         if lease is not None and lease.kind != ReplayClaimKind.OWNER:
-            return _cached_response(await lease.result())
+            remaining = max(deadline - self._clock.monotonic(), 0.0)
+            return _cached_response(await lease.result(timeout_seconds=remaining))
         accepted = False
         try:
             self._ledger.accept_request(authorization=authorization)
@@ -368,10 +369,20 @@ class GatewayService:
         request: GatewayRequest,
     ) -> tuple[GatewayRequest, tuple[str, str, str, str]]:
         """Resolve optional Responses history and derive tenant-isolated affinity."""
-        caller_key = request.idempotency_key or request.client_request_id
+        caller_key = request.client_request_id or request.idempotency_key
+        prefix = (
+            ()
+            if request.instructions is None
+            else (GatewayMessage(role="developer", content=request.instructions),)
+        )
         if request.previous_response_id is None:
+            execution = (
+                request
+                if not prefix
+                else request.model_copy(update={"messages": (*prefix, *request.messages)})
+            )
             return (
-                request,
+                execution,
                 episode_namespace(
                     namespace=namespace,
                     caller_episode_key=caller_key,
@@ -385,7 +396,7 @@ class GatewayService:
         return (
             request.model_copy(
                 update={
-                    "messages": (*continuation.messages, *request.messages),
+                    "messages": (*prefix, *continuation.messages, *request.messages),
                 }
             ),
             (
@@ -419,6 +430,7 @@ class GatewayService:
         replay_completed = False
         retainable = True
         terminal = False
+        failed = False
         terminal_frames: list[bytes] = []
         events = BoundedGatewayEvents()
         current_task = asyncio.current_task()
@@ -457,6 +469,8 @@ class GatewayService:
                         yield data
                 if event_is_terminal:
                     terminal = True
+                    if event.kind == GatewayEventKind.FAILED:
+                        failed = True
             if request.surface == GatewayApiSurface.RESPONSES and terminal and retainable:
                 await self._remember_continuation(
                     request=request,
@@ -466,7 +480,7 @@ class GatewayService:
                     events=events.snapshot(),
                 )
             if lease is not None:
-                if replayable and terminal:
+                if replayable and terminal and not failed:
                     await lease.complete(
                         CachedResponse(
                             status_code=200,
@@ -478,7 +492,7 @@ class GatewayService:
                     replay_completed = True
                 else:
                     await lease.abandon()
-                    if terminal:
+                    if terminal and not failed:
                         raise OpenAIProtocolError(
                             status_code=500,
                             code="idempotency_replay_unavailable",
@@ -601,12 +615,13 @@ class GatewayService:
         assistant = assistant_message(events)
         if assistant is None:
             return
+        history = request.messages[1:] if request.instructions is not None else request.messages
         await self._continuations.remember(
             namespace=namespace,
             response_id=response_id or stable_public_id("resp", request_id),
             state=ContinuationState(
                 episode_key=episode[-1],
-                messages=(*request.messages, assistant),
+                messages=(*history, assistant),
             ),
         )
 

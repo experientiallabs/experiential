@@ -578,7 +578,7 @@ class ResponsesSseEncoder:
             "incomplete_details": (
                 {"reason": "max_output_tokens"} if status == "incomplete" else None
             ),
-            "instructions": None,
+            "instructions": self.request.instructions,
             "metadata": self.request.metadata or None,
             "model": self.model,
             "output": output,

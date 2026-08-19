@@ -287,6 +287,7 @@ class _Provider:
         self._factory = factory
         self.streams: list[_EventStream | _BlockingStream] = []
         self.idempotency_keys: list[str] = []
+        self.requests: list[GatewayRequest] = []
 
     async def stream(
         self,
@@ -301,6 +302,7 @@ class _Provider:
         assert deadline.remaining_seconds() > 0
         assert retry_policy is not None and retry_policy.maximum_attempts == 1
         self.idempotency_keys.append(idempotency_key)
+        self.requests.append(request)
         stream = self._factory()
         self.streams.append(stream)
         return stream
@@ -441,7 +443,10 @@ def _catalog() -> tuple[NormalizedGatewayCatalog, ExactModelDeployment]:
         connection_sha256="b" * 64,
         capabilities_sha256="c" * 64,
         gateway=GatewayDeploymentMetadata(
-            capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+            capabilities=GatewayDeploymentCapabilities(
+                supports_streaming=True,
+                supports_developer_messages=True,
+            )
         ),
     )
     return (
@@ -466,6 +471,7 @@ def _service(
     replay_store: ResponseReplayStore | None = None,
     continuation_store: ResponseContinuationStore | None = None,
     request_digest: Callable[[GatewayRequest], str] | None = None,
+    request_timeout_seconds: float = 120,
 ) -> tuple[GatewayService, _ControlStore, _Ledger, ExecutionSnapshot]:
     """Compose the full launch data plane with deterministic injected dependencies."""
     catalog, deployment = _catalog()
@@ -512,6 +518,7 @@ def _service(
         clock=_Clock(),
         readiness_probe=readiness_probe,
         replay_store=replay_store,
+        request_timeout_seconds=request_timeout_seconds,
         continuation_store=continuation_store,
         terminal_flusher=flush,
     )

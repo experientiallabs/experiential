@@ -83,8 +83,12 @@ class ReplayLease(Protocol):
         """Return whether this caller owns, joins, or replays the operation."""
         ...
 
-    async def result(self) -> CachedResponse:
-        """Join in-flight work or return the already completed exact response."""
+    async def result(self, *, timeout_seconds: float | None = None) -> CachedResponse:
+        """Join in-flight work or return the already completed exact response.
+
+        Args:
+            timeout_seconds: Optional bound on waiting for the in-flight owner.
+        """
         ...
 
     async def complete(self, response: CachedResponse) -> None:
@@ -156,9 +160,33 @@ class _BoundedReplayLease:
         self._entry = entry
         self.kind = kind
 
-    async def result(self) -> CachedResponse:
-        """Join in-flight work or return the already completed exact response."""
-        await asyncio.shield(self._entry.published.wait())
+    async def result(self, *, timeout_seconds: float | None = None) -> CachedResponse:
+        """Join in-flight work or return the already completed exact response.
+
+        Args:
+            timeout_seconds: Optional bound on waiting for the in-flight owner.
+
+        Returns:
+            The exact retained response published by the owner.
+
+        Raises:
+            OpenAIProtocolError: The owner abandoned the operation or did not
+                publish its result within the given bound.
+        """
+        try:
+            if timeout_seconds is None:
+                await asyncio.shield(self._entry.published.wait())
+            else:
+                async with asyncio.timeout(timeout_seconds):
+                    await asyncio.shield(self._entry.published.wait())
+        except TimeoutError as exc:
+            raise OpenAIProtocolError(
+                status_code=409,
+                code="idempotency_replay_unavailable",
+                message="The keyed original request did not complete within the request budget.",
+                error_type="api_error",
+                param="Idempotency-Key",
+            ) from exc
         response = self._entry.response
         if response is None:
             raise OpenAIProtocolError(

@@ -23,10 +23,10 @@ from wmo.common.models import (
     GatewayEquivalenceCertification,
     GatewayTokenPrices,
     ModelCapabilities,
+    ModelCatalog,
     ModelRecord,
     PricingSnapshot,
     RoutedCandidateSnapshot,
-    ModelCatalog,
     load_model_catalog,
     write_model_catalog,
 )
