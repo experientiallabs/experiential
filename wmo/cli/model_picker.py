@@ -76,17 +76,15 @@ def _option(item: AvailableModel) -> PickerOption:
 
 
 def _role_options(items: tuple[AvailableModel, ...]) -> list[PickerOption]:
-    """Present eligible models, naming each provider only when several are in play."""
-    if len({item.provider for item in items}) > 1:
-        return [_option(item) for item in items]
+    """Present eligible models by shorthand alias, keeping only retain-only notes."""
     return [
-        PickerOption(value=item.alias, label=item.label(), detail=_uniform_detail(item))
+        PickerOption(value=item.alias, label=item.label(), detail=_role_detail(item))
         for item in items
     ]
 
 
-def _uniform_detail(item: AvailableModel) -> str:
-    """Annotate one model row on a single-provider screen, keeping only retain-only notes."""
+def _role_detail(item: AvailableModel) -> str:
+    """Annotate one role row, keeping only retain-only notes."""
     if item.capabilities is None:
         roles = ", ".join(sorted(role.value for role in item.retainable_roles))
         return f"retain only: {roles}" if roles else "unverified"

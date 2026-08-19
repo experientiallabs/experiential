@@ -190,24 +190,14 @@ def optimize_model(
         assert config.training.maximum_datum_tokens is not None
         assert config.training.training_usd_per_million_tokens is not None
         estimate = preflight.conservative_schedule_cost_usd.value
-        assumptions = (
-            f"{len(preflight.planned_batch_counts)} frozen managed batches",
-            f"up to {config.training.maximum_datum_tokens} tokens per training datum",
-            (f"${config.training.training_usd_per_million_tokens:.6f} per million training tokens"),
-        )
     else:
         estimate = 0.0
-        assumptions = (
-            "verified immutable completed SFT replay",
-            "zero new managed training calls",
-        )
     if not require_spend_consent(
         _console,
         root=root,
         yes=yes,
         estimated_cost_usd=estimate,
         command=f"wmo optimize model {project}",
-        assumptions=assumptions,
         non_interactive=non_interactive,
         previously_confirmed=preparation.accepted and preflight.completed_result is None,
     ):

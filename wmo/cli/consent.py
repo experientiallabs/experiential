@@ -1,11 +1,10 @@
-"""Shared cost preflight and authorization for every paid WMO command."""
+"""Shared cost estimate presentation and authorization for every paid WMO command."""
 
 from __future__ import annotations
 
 import math
 import shlex
 import sys
-from collections.abc import Sequence
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from typing import NoReturn
@@ -48,11 +47,10 @@ def require_spend_consent(
     yes: bool,
     estimated_cost_usd: float,
     command: str,
-    assumptions: Sequence[str],
     non_interactive: bool = False,
     previously_confirmed: bool = False,
 ) -> bool:
-    """Render one cost preflight and enforce the configured authorization policy.
+    """Enforce the configured authorization policy for one conservative cost estimate.
 
     Estimates at or below half of the configured budget run automatically. Higher estimates up
     to the budget require ``--yes``, a prior immutable confirmation, or an explicit terminal
@@ -66,7 +64,6 @@ def require_spend_consent(
         yes: Explicit invocation confirmation for an in-budget estimate.
         estimated_cost_usd: Conservative upper-bound estimate for this invocation.
         command: Complete command identity shown to the operator.
-        assumptions: Major bounded inputs used to derive the estimate.
         non_interactive: Whether this invocation forbids terminal questions.
         previously_confirmed: Whether immutable command state records an earlier confirmation.
 
@@ -79,45 +76,20 @@ def require_spend_consent(
         typer.Exit: No explicit confirmation is available in a noninteractive session.
     """
     estimate = _cost_decimal(estimated_cost_usd, label="estimated command cost")
-    if not assumptions:
-        raise typer.BadParameter("cost preflight requires at least one major cost assumption")
     try:
         configured = resolve_command_budget_usd(root, None)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     budget = _cost_decimal(configured, label="configured command budget")
-    _render_preflight(
-        console,
-        command=command,
-        estimate=estimate,
-        budget=budget,
-        assumptions=assumptions,
-    )
     if estimate > budget:
         if non_interactive or not can_prompt(console):
             raise typer.BadParameter(_over_budget_message(root, estimate, budget))
         return _confirm_over_budget(console, command=command, estimate=estimate, budget=budget)
-    if estimate <= budget / Decimal(2):
-        console.print(
-            "[green]authorization:[/green] automatic (estimate is at most 50% of budget)",
-            highlight=False,
-        )
-        return True
-    if yes:
-        console.print("[green]authorization:[/green] confirmed by --yes", highlight=False)
-        return True
-    if previously_confirmed:
-        console.print(
-            "[green]authorization:[/green] reused immutable prior confirmation",
-            highlight=False,
-        )
+    if estimate <= budget / Decimal(2) or yes or previously_confirmed:
         return True
     if non_interactive or not can_prompt(console):
         _refuse_noninteractive(console, command=command, estimate=estimate, budget=budget)
-    prompt = (
-        f"Authorize {command} to spend up to {_format_usd(estimate)} against the "
-        f"{_format_usd(budget)} per-command budget?"
-    )
+    prompt = f"Authorize {command} to spend up to {_format_usd(estimate)}?"
     try:
         return Confirm.ask(prompt, default=False, console=console)
     except EOFError:
@@ -145,17 +117,15 @@ def _confirm_over_budget(
     Raises:
         typer.Exit: Terminal input ended before an answer.
     """
-    console.print(
-        f"[yellow]warning[/yellow] the conservative estimate {_format_usd(estimate)} exceeds "
-        f"the configured {_format_usd(budget)} per-command budget."
+    prompt = (
+        f"[yellow]warning[/yellow] estimated {_format_usd(estimate)} exceeds the "
+        f"{_format_usd(budget)} budget. Proceed anyway?"
     )
-    prompt = f"Proceed anyway and authorize {command} to spend up to {_format_usd(estimate)}?"
     try:
         confirmed = Confirm.ask(prompt, default=False, console=console)
     except EOFError:
         _refuse_unanswered(console, command=command, estimate=estimate, budget=budget)
     if confirmed:
-        console.print("authorization: over-budget estimate explicitly confirmed")
         return True
     console.print("No spend was authorized.")
     return False
@@ -182,53 +152,17 @@ def _cost_decimal(value: float, *, label: str) -> Decimal:
         raise typer.BadParameter(f"{label} must be finite and nonnegative") from exc
 
 
-def _render_preflight(
-    console: Console,
-    *,
-    command: str,
-    estimate: Decimal,
-    budget: Decimal,
-    assumptions: Sequence[str],
-) -> None:
-    """Print the concise cost contract before making an authorization decision.
-
-    Args:
-        console: Command-owned output console.
-        command: Complete command identity.
-        estimate: Conservative invocation estimate.
-        budget: Configured per-command ceiling.
-        assumptions: Major bounded cost inputs.
-    """
-    console.print(
-        f"[bold]Cost preflight[/bold] [cyan]{escape(command)}[/cyan]"
-        f"  estimated cost [bold yellow]{_format_usd(estimate)}[/bold yellow]"
-        " (conservative maximum)"
-        f" of the [green]{_format_usd(budget)}[/green] per-command budget",
-        highlight=False,
-    )
-    console.print(
-        "[dim]assumptions: " + escape("; ".join(assumptions)) + "[/dim]",
-        highlight=False,
-    )
-
-
 def _format_usd(value: Decimal) -> str:
-    """Format USD compactly while preserving sub-cent boundary evidence.
+    """Format USD with exactly two decimal places, rounding up so coverage never shrinks.
 
     Args:
         value: Nonnegative finite decimal USD value.
 
     Returns:
-        Dollar-prefixed value with at least two and at most six decimal places.
+        Dollar-prefixed value with exactly two decimal places.
     """
-    rounded = value.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
-    rendered = f"{rounded:.6f}".rstrip("0").rstrip(".")
-    whole, separator, fraction = rendered.partition(".")
-    if not separator:
-        fraction = "00"
-    elif len(fraction) < 2:
-        fraction = fraction.ljust(2, "0")
-    return f"${whole}.{fraction}"
+    rounded = value.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+    return f"${rounded:.2f}"
 
 
 def _over_budget_message(root: str | Path, estimate: Decimal, budget: Decimal) -> str:
@@ -242,8 +176,7 @@ def _over_budget_message(root: str | Path, estimate: Decimal, budget: Decimal) -
     Returns:
         Error text naming every safe way to proceed.
     """
-    sufficient = estimate.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
-    amount = _format_usd(sufficient).removeprefix("$")
+    amount = _format_usd(estimate).removeprefix("$")
     command = f"wmo config budget {amount} --root {shlex.quote(str(root))}"
     return (
         f"conservative estimate {_format_usd(estimate)} exceeds the configured per-command "

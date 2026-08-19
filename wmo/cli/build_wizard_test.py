@@ -331,7 +331,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     state = _ProviderState()
     lister = _install_integrated_runtime(monkeypatch, state)
     root = tmp_path / ".wmo"
-    set_maximum_command_cost_usd(12.0, root)
+    set_maximum_command_cost_usd(4.0, root)
 
     result = _RUNNER.invoke(
         app,
@@ -350,7 +350,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     assert printed.count("Use these recommended models?") == 1
     assert printed.count("Authorize wmo build support") == 1
     assert "Judge syllabus" in printed
-    assert "Human calibration is optional" in printed
+    assert "Human calibration is optional" not in printed
     assert "next            wmo run support" in printed
     assert "optional        wmo config judge calibrate support" in printed
     for label in (
@@ -504,7 +504,7 @@ def test_fresh_wizard_refusal_after_discovery_makes_no_paid_calls_or_selected_bu
     state = _ProviderState()
     lister = _install_integrated_runtime(monkeypatch, state)
     root = tmp_path / ".wmo"
-    set_maximum_command_cost_usd(12.0, root)
+    set_maximum_command_cost_usd(4.0, root)
 
     result = _RUNNER.invoke(
         app,
@@ -557,8 +557,9 @@ def test_explicit_router_cap_below_required_fails_before_consent_or_paid_calls(
 
     assert result.exit_code == 2
     printed = unstyle(result.output)
-    assert "router cap $0.010000 is below the exact required" in printed
-    assert "increase --max-router-cost-usd or omit it" in printed
+    flat = " ".join(printed.replace("│", " ").split())
+    assert "router cap $0.01 is below the exact required" in flat
+    assert "increase --max-router-cost-usd or omit it" in flat
     assert "Authorize wmo build support" not in printed
     assert state.credential_resolutions == 0
     assert state.embedding_calls == []
@@ -581,7 +582,7 @@ def test_explicit_router_cap_above_required_consents_only_to_exact_plan(
     state = _ProviderState()
     _install_integrated_runtime(monkeypatch, state)
     root = tmp_path / ".wmo"
-    set_maximum_command_cost_usd(12.0, root)
+    set_maximum_command_cost_usd(4.0, root)
     result = _RUNNER.invoke(
         app,
         [
@@ -598,8 +599,8 @@ def test_explicit_router_cap_above_required_consents_only_to_exact_plan(
 
     assert result.exit_code == 0, result.output
     printed = unstyle(result.output)
-    assert "supplied cap $5000.000000" in printed
-    assert "$5005.0000 total ceiling" not in printed
+    assert "cap        $5000.00" in printed
+    assert "$5005.00" not in printed
     assert "Authorize wmo build support" in printed
 
 
@@ -795,7 +796,6 @@ def test_interrupted_wizard_resumes_durable_stages_without_duplicate_build_calls
     )
 
     assert resumed.exit_code == 0, resumed.output
-    assert "Verified completed grounded build" in unstyle(resumed.output)
     assert all(state.embedding_calls.count(item) == 1 for item in build_embeddings)
 
 

@@ -162,7 +162,6 @@ def run_build_wizard(
         )
     else:
         plan = existing
-        console.print("[dim]resume[/dim] Verified completed grounded build")
     cost_plan: AutomaticRouterCostPlan | None = None
     router_ceiling = 0.0
     catalog = plan.catalog
@@ -186,48 +185,37 @@ def run_build_wizard(
                 plan,
                 catalog=catalog,
                 cost_plan=cost_plan,
-                maximum_build_cost_usd=maximum_build_cost_usd,
                 router_ceiling=router_ceiling,
                 supplied_router_cap=maximum_router_cost_usd,
                 console=console,
             )
             raise ValueError(
-                f"router cap ${maximum_router_cost_usd:.6f} is below the exact required "
-                f"${cost_plan.required_provider_cost_usd:.6f}; increase "
+                f"router cap ${maximum_router_cost_usd:.2f} is below the exact required "
+                f"${cost_plan.required_provider_cost_usd:.2f}; increase "
                 "--max-router-cost-usd or omit it"
             )
     if not plan.build_reused and plan.build_estimate_usd > maximum_build_cost_usd:
         raise ValueError(
-            f"grounded build requires ${plan.build_estimate_usd:.6f}, above the configured "
-            f"${maximum_build_cost_usd:.6f} ceiling; increase --max-build-cost-usd"
+            f"grounded build requires ${plan.build_estimate_usd:.2f}, above the configured "
+            f"${maximum_build_cost_usd:.2f} ceiling; increase --max-build-cost-usd"
         )
     _render_plan(
         project,
         plan,
         catalog=catalog,
         cost_plan=cost_plan,
-        maximum_build_cost_usd=maximum_build_cost_usd,
         router_ceiling=router_ceiling,
         supplied_router_cap=maximum_router_cost_usd,
         console=console,
     )
-    build_ceiling = 0.0 if plan.build_reused else maximum_build_cost_usd
-    total_ceiling = math.fsum((build_ceiling, router_ceiling))
-    if cost_plan is not None:
-        assumptions = (
-            "serving and fit-only RAG embeddings",
-            f"{cost_plan.simulated_episode_count} closed-loop candidate episodes",
-            f"{cost_plan.maximum_judgments} configured judge decisions",
-        )
-    else:
-        assumptions = ("serving and fit-only RAG embeddings",)
-    if total_ceiling > 0 and not require_spend_consent(
+    build_estimate = 0.0 if plan.build_reused else plan.build_estimate_usd
+    total_estimate = math.fsum((build_estimate, router_ceiling))
+    if total_estimate > 0 and not require_spend_consent(
         console,
         root=root,
         yes=False,
-        estimated_cost_usd=total_ceiling,
+        estimated_cost_usd=total_estimate,
         command=f"wmo build {project}",
-        assumptions=assumptions,
     ):
         console.print("Wizard stopped before paid build or router work.")
         return
@@ -285,11 +273,7 @@ def run_build_wizard(
             if selection.router and cost_plan is None:
                 console.print("Wizard stopped before router optimization.")
                 return
-        else:
-            console.print(
-                "  Human calibration is optional. This build keeps provisional judgment "
-                "provenance until examples are approved."
-            )
+
     if not selection.router:
         console.print("[green]Done[/green] Router optimization was not selected.")
         console.print(f"  next  rerun wmo build {project} and include router optimization")
@@ -314,10 +298,6 @@ def run_build_wizard(
         raise ValueError(
             "automatic router cost plan changed after the grounded build; rerun the wizard"
         )
-    console.print(
-        f"  {len(preflight.candidates)} candidates, {len(preflight.observed_traces)} "
-        f"reusable historical cells, ${options.maximum_provider_cost_usd:.4f} ceiling"
-    )
     console.print(f"[bold]4/{total_stages} Router optimization[/bold]")
     result = optimize_project_router(
         store,
@@ -471,11 +451,6 @@ def _run_selected_judge_calibration(
         yes=False,
         estimated_cost_usd=required,
         command=f"wmo build {project}",
-        assumptions=(
-            "router reservation recomputed after approved human judge calibration",
-            f"{recomputed.simulated_episode_count} closed-loop candidate episodes",
-            f"{recomputed.maximum_judgments} configured judge decisions",
-        ),
     ):
         return None, 0.0
     return recomputed, max(router_ceiling, required)

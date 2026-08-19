@@ -75,7 +75,7 @@ def test_workflow_selection_defaults_and_explicit_steps(
     assert "judge rubric" in printed
     assert "judge calibration" in printed
     assert "router optimization" in printed
-    assert "task-success default" in printed
+    assert "edit the judge rubric" in printed
 
     output = StringIO()
     custom = screens.select_workflow(console=Console(file=output, force_terminal=False))

@@ -279,22 +279,9 @@ def judge_calibrate(
             "provider calls and no review prompts."
         )
     elif budget.call_count:
-        assumptions = (
-            f"review progress: {reviewed}/{len(plan.traces)} distinct trace lineages complete",
-            f"judge {plan.setup.judge_alias}: {model_display_name(plan.setup.judge_model)}",
-            f"pricing source: {budget.pricing_source.value}",
-            (
-                f"at most {budget.call_count} remaining judge calls with up to "
-                f"{budget.maximum_attempts_per_call} attempts each"
-            ),
-            (
-                f"{budget.maximum_input_tokens_per_call} input and "
-                f"{budget.maximum_output_tokens_per_call} output tokens per attempt"
-            ),
-            (
-                f"${budget.input_usd_per_million_tokens:.6f} input and "
-                f"${budget.output_usd_per_million_tokens:.6f} output per million tokens"
-            ),
+        _console.print(
+            f"[dim]review progress: {reviewed}/{len(plan.traces)} distinct trace lineages "
+            "complete[/dim]"
         )
         if not require_spend_consent(
             _console,
@@ -302,7 +289,6 @@ def judge_calibrate(
             yes=yes,
             estimated_cost_usd=budget.estimated_cost_usd,
             command=f"wmo config judge calibrate {project}",
-            assumptions=assumptions,
             non_interactive=non_interactive,
             previously_confirmed=False,
         ):

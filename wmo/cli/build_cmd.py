@@ -335,25 +335,12 @@ def build(
                         top_k=top_k,
                     )
                 )
-        assumptions = (
-            (
-                "verified immutable grounded indexes are reused",
-                "zero new provider calls",
-            )
-            if built is not None
-            else (
-                "serving and fit-only RAG embeddings",
-                "UTF-8 bytes conservatively counted as input tokens",
-                f"up to {RetryPolicy().maximum_attempts} embedding attempts",
-            )
-        )
         if not require_spend_consent(
             _console,
             root=root,
             yes=yes,
             estimated_cost_usd=estimate,
             command=f"wmo build {project} {trace_file}",
-            assumptions=assumptions,
             non_interactive=no_interactive,
         ):
             return

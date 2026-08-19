@@ -737,9 +737,9 @@ def test_configured_budget_rejects_build_before_provider_resolution(
     )
 
     assert result.exit_code == 2
-    output = " ".join(unstyle(result.output).split())
-    assert "estimated cost $1.00" in output
-    assert "of the $0.50 per-command budget" in output
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert "conservative estimate $1.00 exceeds the configured per-command budget" in output
+    assert "$0.50" in output
     assert "wmo config budget 1.00" in output
     assert "--yes cannot override" in output
     assert provider_resolutions == []
@@ -828,7 +828,7 @@ def test_noninteractive_build_yes_confirms_an_in_budget_estimate(
     )
 
     assert result.exit_code == 0, result.output
-    assert "authorization: confirmed by --yes" in unstyle(result.output)
+    assert "authorization:" not in unstyle(result.output)
     assert ProjectStore(root, "support").load_project().build is not None
 
 
@@ -860,7 +860,6 @@ def test_interactive_build_uses_the_cost_specific_confirmation(
     output = unstyle(result.output)
     assert "Authorize wmo build support" in output
     assert "$0.75" in output
-    assert "$1.00 per-command budget" in output
     assert "Proceed?" not in output
 
 

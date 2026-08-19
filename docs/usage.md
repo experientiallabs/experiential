@@ -13,10 +13,10 @@ The root surface is deliberately small:
 | `wmo config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.wmo/settings.toml`. |
 
 `build`, judge calibration, `optimize router`, and `optimize model` use the same cost authorization
-policy. Each displays the command, conservative estimate, configured per-command budget, and major
-cost assumptions. An estimate at or below 50% of the budget runs automatically. A higher estimate
+policy. An estimate at or below 50% of the budget runs automatically. A higher estimate
 up to the budget requires a clear terminal confirmation or `--yes`; an estimate above the budget
-fails before credentials or provider clients. Set the deterministic ceiling with
+warns and requires an explicit interactive override that defaults to no, and fails closed before
+credentials or provider clients when no terminal is available. Set the deterministic ceiling with
 `wmo config budget USD --root ROOT`. `--yes` confirms only an in-budget invocation and never raises
 the ceiling. Exact completed replays report a zero-dollar estimate and do not prompt.
 

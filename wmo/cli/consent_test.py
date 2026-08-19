@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import re
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -106,7 +107,6 @@ def _authorize(
         yes=yes,
         estimated_cost_usd=estimate,
         command="wmo optimize model support",
-        assumptions=("full frozen schedule", "one retry per managed batch"),
         non_interactive=non_interactive,
         previously_confirmed=previously_confirmed,
     )
@@ -128,12 +128,7 @@ def test_estimate_at_exactly_half_the_budget_runs_automatically(
 
     assert _authorize(console, root, estimate=10.0)
     assert answer.asked == []
-    rendered = _flat(buffer)
-    assert "Cost preflight wmo optimize model support" in rendered
-    assert "estimated cost $10.00" in rendered
-    assert "of the $20.00 per-command budget" in rendered
-    assert "full frozen schedule; one retry per managed batch" in rendered
-    assert "automatic" in rendered
+    assert _flat(buffer) == ""
 
 
 def test_estimate_just_above_half_requires_a_clear_confirmation(
@@ -152,8 +147,7 @@ def test_estimate_just_above_half_requires_a_clear_confirmation(
     assert len(answer.asked) == 1
     prompt = answer.asked[0]
     assert "wmo optimize model support" in prompt
-    assert "$10.000001" in prompt
-    assert "$20.00 per-command budget" in prompt
+    assert "$10.01" in prompt
     assert answer.defaults == [False]
 
 
@@ -190,10 +184,9 @@ def test_estimate_above_budget_fails_even_with_yes(
     assert answer.asked == []
     message = str(caught.value)
     assert "exceeds the configured per-command budget" in message
-    assert "wmo config budget 20.000001 --root" in message
+    assert "wmo config budget 20.01 --root" in message
     assert "wmo root" in message
     assert "--yes cannot override" in message
-    assert "estimated cost $20.000001" in _flat(buffer)
 
 
 def test_over_budget_interactive_override_defaults_to_no(
@@ -214,11 +207,10 @@ def test_over_budget_interactive_override_defaults_to_no(
     assert answer.defaults == [False]
     prompt = answer.asked[0]
     assert "Proceed anyway" in prompt
+    assert "warning" in prompt
     assert "$35.00" in prompt
-    rendered = _flat(buffer)
-    assert "warning" in rendered
-    assert "exceeds the configured $20.00 per-command budget" in rendered
-    assert "No spend was authorized." in rendered
+    assert "exceeds the $20.00 budget" in prompt
+    assert "No spend was authorized." in _flat(buffer)
 
 
 def test_over_budget_interactive_explicit_yes_authorizes(
@@ -237,7 +229,7 @@ def test_over_budget_interactive_explicit_yes_authorizes(
 
     assert len(answer.asked) == 1
     assert answer.defaults == [False]
-    assert "over-budget estimate explicitly confirmed" in _flat(buffer)
+    assert "No spend was authorized." not in _flat(buffer)
 
 
 def test_over_budget_noninteractive_fails_even_with_yes(
@@ -259,15 +251,11 @@ def test_over_budget_noninteractive_fails_even_with_yes(
     assert "--yes cannot override" in str(caught.value)
 
 
-def test_sub_microdollar_estimates_are_displayed_conservatively(tmp_path: Path) -> None:
-    """Visible estimates never round a positive conservative ceiling down to zero."""
-    root = tmp_path / ".wmo"
-    set_maximum_command_cost_usd(1.0, root)
-    console, buffer = _console(terminal=False)
-
-    assert _authorize(console, root, estimate=0.0000001)
-
-    assert "estimated cost $0.000001" in _flat(buffer)
+def test_sub_cent_estimates_are_displayed_conservatively(tmp_path: Path) -> None:
+    """Visible sub-cent amounts round up to one cent instead of down to zero."""
+    assert consent_module._format_usd(Decimal("0.0000001")) == "$0.01"
+    assert consent_module._format_usd(Decimal("0")) == "$0.00"
+    assert consent_module._format_usd(Decimal("95.321")) == "$95.33"
 
 
 def test_noninteractive_above_half_requires_yes(
@@ -306,7 +294,7 @@ def test_noninteractive_yes_confirms_an_in_budget_estimate(
 
     assert _authorize(console, root, estimate=15.0, yes=True, non_interactive=True)
     assert answer.asked == []
-    assert "confirmed by --yes" in _flat(buffer)
+    assert _flat(buffer) == ""
 
 
 def test_prior_immutable_confirmation_avoids_a_repeat_prompt(
@@ -322,7 +310,7 @@ def test_prior_immutable_confirmation_avoids_a_repeat_prompt(
 
     assert _authorize(console, root, estimate=15.0, previously_confirmed=True)
     assert answer.asked == []
-    assert "immutable prior confirmation" in _flat(buffer)
+    assert _flat(buffer) == ""
 
 
 def test_interactive_decline_returns_false_without_authorizing(

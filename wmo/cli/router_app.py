@@ -156,10 +156,6 @@ def router(
             yes=yes,
             estimated_cost_usd=0.0,
             command=f"wmo optimize router {project}",
-            assumptions=(
-                "verified immutable optimization replay",
-                "zero new provider calls",
-            ),
             non_interactive=effective_noninteractive,
         )
         with usage_error(OSError, ValueError):
@@ -177,17 +173,6 @@ def router(
         yes=yes,
         estimated_cost_usd=options.maximum_provider_cost_usd,
         command=f"wmo optimize router {project}",
-        assumptions=(
-            (
-                f"${preflight.router_embedding_reservation.estimated_cost_usd:.4f} router "
-                "embedding reservation"
-            ),
-            f"${preflight.judge_reservation_cost_usd:.4f} estimated judge spend",
-            (
-                f"${preflight.remaining_simulation_cost_usd:.4f} shared simulation and "
-                "judging spend ceiling"
-            ),
-        ),
         non_interactive=effective_noninteractive,
     ):
         _console.print("Router optimization was not started.")

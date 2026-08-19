@@ -36,11 +36,11 @@ class WizardWorkflowSelection:
 
 
 _WORKFLOW_STEPS: tuple[tuple[str, str, bool], ...] = (
-    ("providers", "connections and model roles", True),
-    ("build", "tasks, RAG indexes, world model", True),
-    ("judge rubric", "custom rubric; off uses the task-success default", False),
-    ("judge calibration", "human-labeled audit", False),
-    ("router optimization", "simulate, judge, fit, freeze", True),
+    ("providers", "connect providers and assign model roles", True),
+    ("build", "ingest traces and build the world model", True),
+    ("judge rubric", "edit the judge rubric; off keeps the task-success default", False),
+    ("judge calibration", "review and approve judge examples by hand", False),
+    ("router optimization", "simulate, judge, and fit the router", True),
 )
 
 
@@ -164,7 +164,6 @@ def render_plan(
     *,
     catalog: ModelCatalog,
     cost_plan: AutomaticRouterCostPlan | None,
-    maximum_build_cost_usd: float,
     router_ceiling: float,
     supplied_router_cap: float | None,
     console: Console,
@@ -177,45 +176,37 @@ def render_plan(
         catalog: Catalog containing selected router defaults.
         cost_plan: Exact automatic-router reservation, or ``None`` when the router
             optimization step is not selected.
-        maximum_build_cost_usd: Strict grounded-build ceiling.
         router_ceiling: Effective automatic-router ceiling.
         supplied_router_cap: Optional user cap checked against the exact required ceiling.
         console: Terminal receiving the plan.
     """
-    build_ceiling = 0.0 if plan.build_reused else maximum_build_cost_usd
+    build_estimate = 0.0 if plan.build_reused else plan.build_estimate_usd
+    estimated = math.fsum((build_estimate, router_ceiling))
     console.print("[bold]Plan[/bold]")
-    console.print(f"  [dim]project[/dim]      {project}")
+    console.print(f"  [dim]project[/dim]    {project}")
+    console.print(f"  [dim]traces[/dim]     {plan.accepted_traces} accepted")
+    console.print(f"  [dim]tasks[/dim]      {plan.fit_tasks} fit, {plan.held_out_tasks} held out")
     console.print(
-        f"  [dim]traces[/dim]       {plan.accepted_traces} accepted, {plan.invalid_traces} "
-        f"invalid; {plan.fit_tasks} fit, {plan.held_out_tasks} held out"
-    )
-    console.print(
-        f"  [dim]models[/dim]       world {plan.selected.world_model}, "
+        f"  [dim]models[/dim]     world {plan.selected.world_model}, "
         f"judge {plan.selected.judge}, embedder {plan.selected.embedder}"
-    )
-    console.print(
-        f"  [dim]build spend[/dim]  estimate ${plan.build_estimate_usd:.6f}; "
-        f"ceiling ${build_ceiling:.4f}"
     )
     if cost_plan is not None:
         console.print(
-            f"  [dim]router[/dim]       {', '.join(catalog.roles.candidates)} "
+            f"  [dim]router[/dim]     {', '.join(catalog.roles.candidates)} "
             f"[dim](incumbent {catalog.roles.incumbent})[/dim]"
         )
-        console.print(
-            f"  [dim]router cost[/dim]  embeddings ${cost_plan.router_embedding_cost_usd:.6f}, "
-            f"judgments ${cost_plan.judgment_cost_usd:.6f} ({cost_plan.maximum_judgments}), "
-            f"simulation ${cost_plan.simulation_cost_usd:.6f} "
-            f"({cost_plan.simulated_episode_count} episodes)"
-        )
-        console.print(
-            f"  [dim]router spend[/dim] required ${cost_plan.required_provider_cost_usd:.6f}; "
-            f"ceiling ${router_ceiling:.6f}"
-        )
-    else:
-        console.print("  [dim]router[/dim]       not selected")
     if supplied_router_cap is not None:
-        console.print(f"  [dim]supplied cap[/dim] ${supplied_router_cap:.6f}")
-    console.print(
-        f"  [dim]total[/dim]        ceiling ${math.fsum((build_ceiling, router_ceiling)):.4f}"
-    )
+        console.print(f"  [dim]cap[/dim]        {_usd(supplied_router_cap)}")
+    console.print(f"  [dim]estimated[/dim]  {_usd(estimated)}")
+
+
+def _usd(value: float) -> str:
+    """Format one USD amount with exactly two decimals, rounding up to whole cents.
+
+    Args:
+        value: Nonnegative finite USD amount.
+
+    Returns:
+        Dollar-prefixed amount with exactly two decimal places.
+    """
+    return f"${math.ceil(value * 100) / 100:.2f}"
