@@ -17,6 +17,7 @@ import wmo.cli.build_wizard as wizard
 import wmo.cli.build_wizard_screens as screens
 from wmo.cli.app import app
 from wmo.cli.build_cmd_test import _otlp_export
+from wmo.cli.gateway.compatibility import ProjectGatewayCompatibility
 from wmo.cli.provider_setup_test import _FakeLister
 from wmo.common.config.settings import set_maximum_command_cost_usd
 from wmo.common.models import (
@@ -410,10 +411,72 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     assert runtime.policy.judgment_status == "provisional"
     provisional_policy_bytes = store.artifacts.read_bytes(policy.policy_id, "policy.json")
     served: list[tuple[str, int]] = []
+
+    def _prepare_compatibility(
+        project_name: str,
+        run_root: Path,
+        *,
+        policy_id: str | None,
+    ) -> ProjectGatewayCompatibility:
+        """Return the frozen project's compatibility authority without provider clients.
+
+        Args:
+            project_name: Requested project identifier.
+            run_root: Requested gateway and artifact root.
+            policy_id: Optional exact policy selection.
+
+        Returns:
+            Compatibility authority consumed by the shared launch path.
+        """
+        del policy_id
+        assert project_name == "support"
+        return ProjectGatewayCompatibility(
+            alias=project_name,
+            alias_revision_id="revision-support",
+            identity_id="project-identity",
+            key_file=run_root / "gateway" / "compatibility-keys" / "project-identity.txt",
+            policy_id=runtime.policy.policy_id,
+            changed=True,
+        )
+
+    async def _preflight() -> None:
+        """Complete the gateway preflight without provider work."""
+
+    def _load_gateway(
+        run_root: Path,
+        *,
+        graceful_timeout_seconds: float,
+        project_loader: object,
+        only_aliases: frozenset[str] | None,
+    ) -> SimpleNamespace:
+        """Return a serving-ready gateway fixture for the mocked launch seam.
+
+        Args:
+            run_root: Gateway and artifact root.
+            graceful_timeout_seconds: Requested shutdown drain bound.
+            project_loader: Injected selection-only project loader.
+            only_aliases: Optional compatibility alias filter.
+
+        Returns:
+            Gateway runtime fixture passed to the normal server.
+        """
+        del run_root, graceful_timeout_seconds, project_loader
+        assert only_aliases == frozenset({"support"})
+        return SimpleNamespace(
+            app=object(),
+            service=SimpleNamespace(preflight=_preflight),
+            reconciled_expired_requests=0,
+            reconciled_unknown_attempts=0,
+        )
+
     with monkeypatch.context() as run_patches:
         run_patches.setattr(
-            "wmo.optimize.router.activation.load_project_router",
-            lambda *_args, **_kwargs: runtime,
+            "wmo.cli.gateway.compatibility.prepare_project_gateway",
+            _prepare_compatibility,
+        )
+        run_patches.setattr(
+            "wmo.runtime.gateway.lifecycle.load_local_gateway",
+            _load_gateway,
         )
         run_patches.setattr(
             "uvicorn.run",

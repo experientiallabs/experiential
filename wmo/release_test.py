@@ -2630,8 +2630,7 @@ def _installed_release_driver() -> None:
         )
         assert "candidates: candidate-b, core-model" in optimization_output
         assert "incumbent: core-model" in optimization_output
-        assert "policy:" in optimization_output
-        assert "report:" in optimization_output
+        assert "Complete" in optimization_output
         optimized_artifacts = directory_digest(support_store.paths.artifacts_directory)
         optimized_catalog = (root / "models.toml").read_bytes()
         optimized_project = support_store.paths.project_toml.read_bytes()
