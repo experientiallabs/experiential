@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -65,6 +67,41 @@ def test_forward_migration_creates_consistent_private_backup(tmp_path: Path) -> 
         )
     finally:
         backup_connection.close()
+
+
+def test_concurrent_initializers_choose_migration_plan_under_exclusive_lock(
+    tmp_path: Path,
+) -> None:
+    """Concurrent initializers re-read schema version after exclusive serialization."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = connect_database(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for statement in _MIGRATION_1:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 1")
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+    barrier = threading.Barrier(2)
+
+    def initialize() -> Path | None:
+        """Start one initializer at the same concurrency boundary."""
+        barrier.wait(timeout=5)
+        return initialize_database(path, busy_timeout_ms=10_000)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (executor.submit(initialize), executor.submit(initialize))
+        results = tuple(future.result(timeout=15) for future in futures)
+
+    assert sum(result is not None for result in results) == 1
+    connection = connect_database(path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    finally:
+        connection.close()
 
 
 def test_newer_and_marker_only_schemas_refuse_without_deleting_state(tmp_path: Path) -> None:

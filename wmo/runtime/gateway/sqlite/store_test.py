@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -127,6 +129,53 @@ def test_key_derived_authority_is_deny_by_default_and_revocation_is_immediate(
     assert store.revoke_virtual_key(organization_id="org-one", key_id="key-one")
     with pytest.raises(InvalidVirtualKeyError, match="invalid"):
         store.granted_aliases(raw_key=raw_key)
+
+
+def test_authorization_serializes_with_concurrent_key_revocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed revocation cannot be followed by stale authority issuance."""
+    store, clock, raw_key = _configured_store(tmp_path)
+    authenticated = threading.Event()
+    release_authorization = threading.Event()
+    original = store._authenticate_in_transaction
+
+    def pause_after_authentication(
+        connection: sqlite3.Connection, candidate_key: str
+    ) -> tuple[str, str, str]:
+        """Pause after the credential read while retaining the authority transaction."""
+        authority = original(connection, candidate_key)
+        authenticated.set()
+        assert release_authorization.wait(timeout=5)
+        return authority
+
+    monkeypatch.setattr(store, "_authenticate_in_transaction", pause_after_authentication)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        authorization = executor.submit(
+            store.authorize_request,
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+        assert authenticated.wait(timeout=5)
+        revocation = executor.submit(
+            store.revoke_virtual_key,
+            organization_id="org-one",
+            key_id="key-one",
+        )
+        assert not revocation.done()
+        release_authorization.set()
+        assert authorization.result(timeout=5).virtual_key_id == "key-one"
+        assert revocation.result(timeout=5)
+
+    with pytest.raises(InvalidVirtualKeyError, match="invalid"):
+        store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
 
 
 def test_expiry_identity_disable_and_pepper_rotation_fail_closed(tmp_path: Path) -> None:
