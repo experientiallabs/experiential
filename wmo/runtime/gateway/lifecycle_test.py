@@ -43,6 +43,14 @@ from wmo.runtime.gateway.lifecycle import (
 from wmo.runtime.gateway.management import GatewayManagement
 from wmo.runtime.gateway.project_activation import ProjectActivation
 from wmo.runtime.models import RuntimeModelCatalog
+from wmo.runtime.openai_protocol.state import (
+    BoundedContinuationStore,
+    BoundedReplayStore,
+    ContinuationState,
+    ProtocolNamespace,
+    ReplayKey,
+    ReplayLease,
+)
 from wmo.runtime.router.runtime import RouterRuntime
 
 
@@ -77,6 +85,54 @@ class _ReadinessProjectRepository:
         assert project_ref == "project-one"
         assert activation_ref == "activation-one"
         return self.activation
+
+
+class _ObjectReplayStore:
+    """Object-backed replay adapter injected through gateway composition."""
+
+    def __init__(self) -> None:
+        """Create one adapter around the bounded local replay implementation."""
+        self._store = BoundedReplayStore()
+        self.claim_calls = 0
+
+    async def claim(self, key: ReplayKey) -> ReplayLease:
+        """Record and delegate one replay ownership claim."""
+        self.claim_calls += 1
+        return await self._store.claim(key)
+
+
+class _ObjectContinuationStore:
+    """Object-backed continuation adapter injected through gateway composition."""
+
+    def __init__(self) -> None:
+        """Create one adapter around the bounded local continuation implementation."""
+        self._store = BoundedContinuationStore()
+
+    async def remember(
+        self,
+        *,
+        namespace: ProtocolNamespace,
+        response_id: str,
+        state: ContinuationState,
+    ) -> None:
+        """Delegate one namespaced continuation publication."""
+        await self._store.remember(
+            namespace=namespace,
+            response_id=response_id,
+            state=state,
+        )
+
+    async def resolve(
+        self,
+        *,
+        namespace: ProtocolNamespace,
+        previous_response_id: str,
+    ) -> ContinuationState:
+        """Delegate one namespaced continuation lookup."""
+        return await self._store.resolve(
+            namespace=namespace,
+            previous_response_id=previous_response_id,
+        )
 
 
 def _repository_for_runtime(
@@ -370,13 +426,15 @@ def test_project_certified_pool_preflight_resolves_all_siblings_and_reloads(
     assert manager.aliases()[0].target_kind == "project"
 
 
-def test_real_project_selection_dispatches_frozen_pool_without_router_completion(
+def test_object_project_activation_uses_factory_and_injected_protocol_state(
     tmp_path: Path,
 ) -> None:
-    """Real lifecycle uses RouterRuntime selection only, then owns provider fallback."""
+    """Object activation uses the shared factory with injectable protocol state."""
     dispatched: list[str] = []
     provider_requests: list[str] = []
     recorded: list[RoutingDecision] = []
+    replay = _ObjectReplayStore()
+    continuations = _ObjectContinuationStore()
 
     class ProjectProviderHandler(BaseHTTPRequestHandler):
         """Serve one precommit failure followed by deterministic Chat SSE."""
@@ -459,15 +517,22 @@ def test_real_project_selection_dispatches_frozen_pool_without_router_completion
                 )
             ),
             decision_sink=recorded.append,
+            replay=replay,
+            continuations=continuations,
         )
         assert provider_requests == []
         assert recorded == []
+        assert runtime.service._replays is replay  # noqa: SLF001 - composition seam evidence
+        assert runtime.service._continuations is continuations  # noqa: SLF001
         with TestClient(runtime.app) as client:
             assert provider_requests == []
             assert recorded == []
             response = client.post(
                 "/v1/chat/completions",
-                headers={"Authorization": f"Bearer {raw_key}"},
+                headers={
+                    "Authorization": f"Bearer {raw_key}",
+                    "Idempotency-Key": "object-project-selection",
+                },
                 json={
                     "model": "coding",
                     "messages": [{"role": "user", "content": "project-prompt-canary"}],
@@ -477,6 +542,7 @@ def test_real_project_selection_dispatches_frozen_pool_without_router_completion
         assert response.json()["choices"][0]["message"]["content"] == ("project-response-canary")
         assert provider_requests[0].endswith("/embeddings")
         assert dispatched == ["cheap-model", "cheap-model", "baseline-model"]
+        assert replay.claim_calls == 1
         assert len(recorded) == 1
         assert recorded[0].selected_alias == "cheap"
         with sqlite3.connect(manager.database_path) as connection:

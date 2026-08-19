@@ -19,7 +19,7 @@ from wmo.runtime.gateway.interfaces import AttemptLedger, GatewayClock, GatewayC
 from wmo.runtime.gateway.routing import CatalogRouteResolver
 from wmo.runtime.gateway.service import GatewayService, create_gateway_app
 from wmo.runtime.gateway.usage import GatewayUsageReport, usage_html
-from wmo.runtime.openai_protocol.state import BoundedContinuationStore, BoundedReplayStore
+from wmo.runtime.openai_protocol.state import ResponseContinuationStore, ResponseReplayStore
 
 GatewayReadinessProbe = Callable[[], Awaitable[ExecutionSnapshot]]
 GatewayUsageSupplier = Callable[[], GatewayUsageReport]
@@ -139,8 +139,8 @@ def create_gateway_runtime(
     clock: GatewayClock,
     readiness: GatewayReadinessProbe,
     usage: GatewayUsageSupplier,
-    replay: BoundedReplayStore | None = None,
-    continuations: BoundedContinuationStore | None = None,
+    replay: ResponseReplayStore | None = None,
+    continuations: ResponseContinuationStore | None = None,
     wall_clock: Callable[[], float] | None = None,
     terminal_flusher: GatewayTerminalFlusher | None = None,
 ) -> GatewayRuntime:

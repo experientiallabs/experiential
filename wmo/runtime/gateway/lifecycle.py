@@ -48,6 +48,7 @@ from wmo.runtime.gateway.sqlite.store import SQLiteGatewayStore, SystemGatewayCl
 from wmo.runtime.gateway.usage import read_usage_report
 from wmo.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from wmo.runtime.models.credentials import ModelCredentialError
+from wmo.runtime.openai_protocol.state import ResponseContinuationStore, ResponseReplayStore
 from wmo.runtime.router.errors import RouterApplicationError
 from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
 
@@ -176,6 +177,8 @@ def load_local_gateway(
     environment: Mapping[str, str] | None = None,
     project_repository: ProjectActivationRepository | None = None,
     decision_sink: DecisionSink | None = None,
+    replay: ResponseReplayStore | None = None,
+    continuations: ResponseContinuationStore | None = None,
     only_aliases: frozenset[str] | None = None,
 ) -> LocalGatewayRuntime:
     """Load all granted active aliases and compose the loopback application.
@@ -186,6 +189,8 @@ def load_local_gateway(
         environment: Optional provider credential mapping used by tests.
         project_repository: Repository for verified immutable project activations.
         decision_sink: Optional aggregate-safe recorder for served project selections.
+        replay: Optional shared Chat and Responses replay state.
+        continuations: Optional shared Responses continuation state.
         only_aliases: Optional exact public aliases to expose from the shared application.
 
     Returns:
@@ -313,6 +318,8 @@ def load_local_gateway(
         clock=SystemGatewayClock(),
         readiness=readiness_probe,
         usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
+        replay=replay,
+        continuations=continuations,
     )
     return LocalGatewayRuntime(
         runtime=runtime,
