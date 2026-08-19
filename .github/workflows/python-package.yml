@@ -65,7 +65,8 @@ jobs:
           import wmo.common.models
           import wmo.runtime.models
           from wmo.runtime.environments import LocalProcessEnvironmentRuntime
-          from wmo.runtime.router import RouterRuntime, create_project_router_app
+          from wmo.runtime.openai_protocol import decode_chat, stream_encoder
+          from wmo.runtime.router import RouterRuntime
           from wmo.simulation import compare_text_and_sandbox
           from wmo.simulation.engines import SandboxSimulator
           from wmo.optimize.router import RouterCompositionResult
@@ -73,10 +74,12 @@ jobs:
 
           assert callable(wmo.compose_router)
           assert callable(wmo.load_project_router)
-          assert callable(wmo.create_project_router_app)
+          assert callable(wmo.load_router)
+          assert callable(decode_chat)
+          assert callable(stream_encoder)
           assert wmo.RouterRuntime is RouterRuntime
           assert wmo.RouterCompositionResult is RouterCompositionResult
-          assert wmo.create_project_router_app is create_project_router_app
+          assert "create_project_router_app" not in wmo.__all__
           assert callable(compare_text_and_sandbox)
           assert SimulationSpec.__module__ == "wmo.simulation.specs.simulation"
           assert SandboxSimulator.__module__ == "wmo.simulation.engines.sandbox"

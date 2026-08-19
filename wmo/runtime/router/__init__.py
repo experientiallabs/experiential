@@ -1,4 +1,4 @@
-"""Frozen online router runtime and loopback HTTP adapter."""
+"""Frozen project-selection runtime for gateway-backed aliases."""
 
 from __future__ import annotations
 
