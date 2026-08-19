@@ -104,6 +104,25 @@ class ProjectActivationRepository(Protocol):
         ...
 
 
+def require_project_activation_authority(
+    activation: ProjectActivation,
+    *,
+    project_ref: str,
+    activation_ref: ArtifactId | None,
+) -> None:
+    """Require repository output to match the exact requested project authority."""
+    if activation.project_ref != project_ref:
+        raise ProjectActivationError(
+            f"project activation repository returned project reference "
+            f"{activation.project_ref!r}, expected {project_ref!r}"
+        )
+    if activation_ref is not None and activation.activation_ref != activation_ref:
+        raise ProjectActivationError(
+            f"project activation repository returned activation reference "
+            f"{activation.activation_ref!r}, expected {activation_ref!r}"
+        )
+
+
 @dataclass(frozen=True)
 class LocalArtifactProjectActivationRepository:
     """Load project activations from WMO's local immutable artifact store."""

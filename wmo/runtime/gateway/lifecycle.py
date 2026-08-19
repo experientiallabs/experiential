@@ -37,7 +37,12 @@ from wmo.runtime.gateway.execution import GatewayExecutor
 from wmo.runtime.gateway.interfaces import ProjectTargetResolver
 from wmo.runtime.gateway.ledger import SQLiteAttemptLedger
 from wmo.runtime.gateway.management import GatewayAliasView, GatewayManagement
-from wmo.runtime.gateway.project_activation import ProjectActivation, ProjectActivationRepository
+from wmo.runtime.gateway.project_activation import (
+    ProjectActivation,
+    ProjectActivationError,
+    ProjectActivationRepository,
+    require_project_activation_authority,
+)
 from wmo.runtime.gateway.routing import (
     CatalogRouteResolver,
     GatewayRoutingError,
@@ -536,13 +541,11 @@ def _require_activation_authority(
     activation_ref: str,
 ) -> None:
     """Require repository output to match the exact authorized project target."""
-    if activation.project_ref != project_ref:
-        raise GatewayLifecycleError(
-            f"project activation repository returned project reference "
-            f"{activation.project_ref!r}, expected {project_ref!r}"
+    try:
+        require_project_activation_authority(
+            activation,
+            project_ref=project_ref,
+            activation_ref=activation_ref,
         )
-    if activation.activation_ref != activation_ref:
-        raise GatewayLifecycleError(
-            f"project activation repository returned activation reference "
-            f"{activation.activation_ref!r}, expected {activation_ref!r}"
-        )
+    except ProjectActivationError as exc:
+        raise GatewayLifecycleError(str(exc)) from exc

@@ -15,7 +15,10 @@ from wmo.common.models import (
 )
 from wmo.runtime.gateway.catalog_authority import snapshot_current_catalog
 from wmo.runtime.gateway.management import GatewayManagement
-from wmo.runtime.gateway.project_activation import ProjectActivationRepository
+from wmo.runtime.gateway.project_activation import (
+    ProjectActivationRepository,
+    require_project_activation_authority,
+)
 from wmo.runtime.models import RuntimeModelCatalog
 
 
@@ -52,10 +55,6 @@ def prepare_project_gateway_alias(
     Returns:
         Exact alias, identity, and policy authority for the shared gateway.
     """
-    manager = GatewayManagement(root)
-    if not manager.initialized:
-        manager.initialize()
-    manager.migrate_legacy_provider_connections()
     catalog_for_activation = runtime_catalog or RuntimeModelCatalog(
         load_model_catalog(root / "models.toml"),
         environment=environment,
@@ -65,6 +64,15 @@ def prepare_project_gateway_alias(
         policy_id,
         runtime_catalog=catalog_for_activation,
     )
+    require_project_activation_authority(
+        activation,
+        project_ref=project,
+        activation_ref=policy_id,
+    )
+    manager = GatewayManagement(root)
+    if not manager.initialized:
+        manager.initialize()
+    manager.migrate_legacy_provider_connections()
     metadata_changed = _migrate_legacy_project_gateway_metadata(
         root,
         aliases=activation.candidate_aliases,
