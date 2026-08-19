@@ -276,7 +276,7 @@ class BedrockProviderStream:
         raise ProviderResponseError("Bedrock content block delta is unsupported")
 
     def _content_stop(self, value: object) -> list[GatewayEvent]:
-        """Complete one open tool call when its provider content block stops."""
+        """Complete one open tool call, backfilling empty-object arguments when none streamed."""
         envelope = _mapping(value, "Bedrock contentBlockStop")
         index = require_integer(
             cast("JsonValue | None", envelope.get("contentBlockIndex")),
@@ -285,12 +285,24 @@ class BedrockProviderStream:
         tool = self._tools.pop(index, None)
         if tool is None:
             return []
-        return [
+        events: list[GatewayEvent] = []
+        if not tool.raw_arguments:
+            tool.raw_arguments = "{}"
+            events.append(
+                self._event(
+                    GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+                    tool_call_index=index,
+                    raw_arguments_delta="{}",
+                )
+            )
+        events.append(
             self._event(
                 GatewayEventKind.TOOL_CALL_COMPLETED,
+                tool_call_index=index,
                 tool_call=tool.complete(),
             )
-        ]
+        )
+        return events
 
     def _terminal_events(self) -> list[GatewayEvent]:
         """Map the retained Bedrock stop reason to one terminal gateway event."""

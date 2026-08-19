@@ -576,12 +576,8 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                             tool_call_index=index,
                             raw_arguments_delta=final_arguments,
                         )
-                tool.completed = True
-                yield factory.create(
-                    GatewayEventKind.TOOL_CALL_COMPLETED,
-                    tool_call_index=index,
-                    tool_call=tool.complete(),
-                )
+                for event in _complete_tool(factory, tool):
+                    yield event
         elif event_type in {"response.completed", "response.incomplete"}:
             response = require_object(payload.get("response"), "OpenAI terminal response")
             async for event in _finish_open_tools(factory, tools):
@@ -715,13 +711,8 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
         elif event_type == "content_block_stop":
             index = require_integer(payload.get("index"), "Anthropic content index")
             if index in tools and not tools[index].completed:
-                tool = tools[index]
-                tool.completed = True
-                yield factory.create(
-                    GatewayEventKind.TOOL_CALL_COMPLETED,
-                    tool_call_index=index,
-                    tool_call=tool.complete(),
-                )
+                for event in _complete_tool(factory, tools[index]):
+                    yield event
         elif event_type == "message_delta":
             delta = require_object(payload.get("delta"), "Anthropic message delta")
             raw_reason = delta.get("stop_reason")
@@ -873,6 +864,37 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
     raise ProviderResponseError("OpenAI-compatible stream ended without [DONE]")
 
 
+def _complete_tool(factory: _EventFactory, tool: _ToolAccumulator) -> list[GatewayEvent]:
+    """Close one open tool call, streaming synthetic empty-object arguments if none arrived.
+
+    Args:
+        factory: Sequence-assigning factory for this provider stream.
+        tool: Accumulated identity and raw argument state to close.
+
+    Returns:
+        An argument backfill delta when no fragments streamed, then the completion event.
+    """
+    events: list[GatewayEvent] = []
+    if not tool.raw_arguments:
+        tool.raw_arguments = "{}"
+        events.append(
+            factory.create(
+                GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+                tool_call_index=tool.index,
+                raw_arguments_delta="{}",
+            )
+        )
+    tool.completed = True
+    events.append(
+        factory.create(
+            GatewayEventKind.TOOL_CALL_COMPLETED,
+            tool_call_index=tool.index,
+            tool_call=tool.complete(),
+        )
+    )
+    return events
+
+
 async def _finish_open_tools(
     factory: _EventFactory,
     tools: Mapping[int, _ToolAccumulator],
@@ -881,12 +903,8 @@ async def _finish_open_tools(
     for index in sorted(tools):
         tool = tools[index]
         if not tool.completed:
-            tool.completed = True
-            yield factory.create(
-                GatewayEventKind.TOOL_CALL_COMPLETED,
-                tool_call_index=index,
-                tool_call=tool.complete(),
-            )
+            for event in _complete_tool(factory, tool):
+                yield event
 
 
 def _provider_refusal_failure() -> GatewayFailure:

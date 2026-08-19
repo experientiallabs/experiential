@@ -539,6 +539,68 @@ def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> No
     assert opted_ledger.finished_events[0].usage == GatewayUsage(input_tokens=5, output_tokens=2)
 
 
+def test_refusal_failover_without_claimable_fallback_delivers_the_withheld_refusal() -> None:
+    """An opted-in refusal on a single-deployment route surfaces its withheld content."""
+
+    async def scenario() -> tuple[list[GatewayEvent], _WaterfallLedger]:
+        """Run one refusal stream whose route offers no later deployment."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        first_provider = _ScriptedProvider(
+            [
+                _WaterfallStream(
+                    (
+                        GatewayEvent(
+                            kind=GatewayEventKind.REFUSAL_DELTA,
+                            sequence_number=0,
+                            text_delta="provider refusal body",
+                        ),
+                        GatewayEvent(
+                            kind=GatewayEventKind.USAGE,
+                            sequence_number=1,
+                            usage=GatewayUsage(input_tokens=5, output_tokens=2),
+                        ),
+                        GatewayEvent(
+                            kind=GatewayEventKind.FAILED,
+                            sequence_number=2,
+                            failure=GatewayFailure(
+                                failure_class=GatewayFailureClass.REFUSAL,
+                                safe_message="provider refused the request",
+                            ),
+                        ),
+                    )
+                )
+            ]
+        )
+        ledger = _WaterfallLedger()
+        executor = _executor(
+            (first,),
+            {first.source_alias: first_provider},
+            ledger,
+            maximum_same_deployment_attempts=1,
+        )
+
+        stream = await executor.start(
+            route=_route((first,), refusal_failover=True),
+            request=_request(),
+        )
+        return [event async for event in stream], ledger
+
+    events, ledger = asyncio.run(scenario())
+
+    assert [event.kind for event in events] == [
+        GatewayEventKind.REFUSAL_DELTA,
+        GatewayEventKind.COMPLETED,
+    ]
+    assert events[0].text_delta == "provider refusal body"
+    assert events[1].usage == GatewayUsage(input_tokens=5, output_tokens=2)
+    assert [event.sequence_number for event in events] == [0, 1]
+    assert ledger.finished[0][1] is not None
+    assert ledger.finished[0][1].failure_class is GatewayFailureClass.REFUSAL
+    assert ledger.finished[0][2] is True
+    assert ledger.finished_events[0] is not None
+    assert ledger.finished_events[0].kind is GatewayEventKind.FAILED
+
+
 def test_buffered_refusal_followed_by_retryable_failure_advances_without_exposure() -> None:
     """An opted-in uncommitted refusal does not block another safe failure class."""
 

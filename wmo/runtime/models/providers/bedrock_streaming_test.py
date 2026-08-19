@@ -170,6 +170,7 @@ def test_bedrock_stream_normalizes_text_tools_usage_and_terminal_state() -> None
             GatewayEventKind.COMPLETED,
         ]
         assert events[2].raw_arguments_delta == '{"city":'
+        assert events[4].tool_call_index == 1
         assert events[4].tool_call is not None
         assert events[4].tool_call.raw_arguments == '{"city":"Zürich"}'
         assert events[5].usage is not None
@@ -177,6 +178,64 @@ def test_bedrock_stream_normalizes_text_tools_usage_and_terminal_state() -> None
         assert events[5].usage.cached_input_tokens == 2
         assert runtime.stream_calls[0]["modelId"] == "exact-model"
         assert upstream.closed
+
+    asyncio.run(scenario())
+
+
+def test_bedrock_empty_args_tool_call_streams_synthetic_object_delta() -> None:
+    """A no-argument tool call streams one empty-object delta before its completion."""
+
+    async def scenario() -> None:
+        """Consume one tool call whose provider stream carries no input fragments."""
+        upstream = _EventStream(
+            (
+                {"messageStart": {"role": "assistant"}},
+                {
+                    "contentBlockStart": {
+                        "contentBlockIndex": 1,
+                        "start": {
+                            "toolUse": {
+                                "toolUseId": "t1",
+                                "name": "noargs",
+                            }
+                        },
+                    }
+                },
+                {"contentBlockStop": {"contentBlockIndex": 1}},
+                {"messageStop": {"stopReason": "tool_use"}},
+                {
+                    "metadata": {
+                        "usage": {
+                            "inputTokens": 2,
+                            "outputTokens": 1,
+                            "cacheReadInputTokens": 0,
+                            "cacheWriteInputTokens": 0,
+                        }
+                    }
+                },
+            )
+        )
+        stream = await _client(_Runtime([upstream])).stream(
+            _request(),
+            deadline=RequestDeadline.after(10),
+            idempotency_key="empty-args-operation",
+            retry_policy=RetryPolicy(1, 0, 0),
+        )
+        events = [event async for event in stream]
+
+        assert [event.kind for event in events] == [
+            GatewayEventKind.TOOL_CALL_STARTED,
+            GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            GatewayEventKind.TOOL_CALL_COMPLETED,
+            GatewayEventKind.USAGE,
+            GatewayEventKind.COMPLETED,
+        ]
+        assert events[1].tool_call_index == 1
+        assert events[1].raw_arguments_delta == "{}"
+        assert events[2].tool_call_index == 1
+        assert events[2].tool_call is not None
+        assert events[2].tool_call.raw_arguments == "{}"
+        assert events[2].tool_call.arguments == {}
 
     asyncio.run(scenario())
 

@@ -177,6 +177,7 @@ def test_gemini_stream_preserves_complete_tool_arguments_and_typed_refusal() -> 
             GatewayEventKind.COMPLETED,
         ]
         assert tool_events[1].raw_arguments_delta == '{"city":"Zürich"}'
+        assert tool_events[2].tool_call_index == 0
         assert tool_events[2].tool_call is not None
         assert tool_events[2].tool_call.raw_arguments == '{"city":"Zürich"}'
         assert refusal_events[-1].kind is GatewayEventKind.FAILED

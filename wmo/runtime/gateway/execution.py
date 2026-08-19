@@ -251,12 +251,7 @@ class GatewayExecutionStream:
                 and terminal.failure is not None
                 and terminal.failure.failure_class == GatewayFailureClass.REFUSAL
             )
-            if current.withheld_refusals and typed_refusal:
-                current.withheld_refusals.clear()
-                current.withheld_refusal_bytes = 0
-            elif current.withheld_refusals and terminal.kind != GatewayEventKind.FAILED:
-                current.withheld_refusals.clear()
-                current.withheld_refusal_bytes = 0
+            if current.withheld_refusals and terminal.kind != GatewayEventKind.FAILED:
                 terminal = GatewayEvent(
                     kind=GatewayEventKind.FAILED,
                     sequence_number=terminal.sequence_number,
@@ -267,7 +262,8 @@ class GatewayExecutionStream:
                     ),
                     usage=terminal.usage,
                 )
-            elif current.withheld_refusals:
+                typed_refusal = True
+            elif current.withheld_refusals and not typed_refusal:
                 withheld_non_refusal_failure = True
             if terminal.kind != GatewayEventKind.FAILED:
                 self._health.succeeded(self._health_key(current.route_index))
@@ -290,6 +286,16 @@ class GatewayExecutionStream:
                 if withheld_non_refusal_failure:
                     self._commit_withheld_refusal(current, terminal)
                     return self._outward(self._pending_outward.popleft())
+                if typed_refusal and current.withheld_refusals:
+                    self._commit_withheld_refusal(
+                        current,
+                        GatewayEvent(
+                            kind=GatewayEventKind.COMPLETED,
+                            sequence_number=terminal.sequence_number,
+                            usage=terminal.usage,
+                        ),
+                    )
+                    return self._outward(self._pending_outward.popleft())
                 if typed_refusal and current.visible_refusal:
                     return self._outward(
                         GatewayEvent(
@@ -299,7 +305,7 @@ class GatewayExecutionStream:
                         )
                     )
                 return self._outward(terminal)
-            if withheld_non_refusal_failure:
+            if current.withheld_refusals:
                 current.withheld_refusals.clear()
                 current.withheld_refusal_bytes = 0
             await self._finish_current(

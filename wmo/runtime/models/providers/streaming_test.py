@@ -676,6 +676,135 @@ def test_openai_compatible_stream_preserves_provider_order_tool_arguments() -> N
     assert events[3].tool_call.arguments_json() == raw_arguments
 
 
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "openai-compatible"])
+def test_launch_adapters_complete_empty_argument_tool_calls(provider: str) -> None:
+    """A tool call with no streamed argument fragments completes with empty-object JSON."""
+    if provider == "openai":
+        frames = b"".join(
+            (
+                _sse(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "call_id": "call-1",
+                            "name": "noargs",
+                            "arguments": "",
+                        },
+                    }
+                ),
+                _sse(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "output_index": 0,
+                        "arguments": "",
+                    }
+                ),
+                _sse(
+                    {
+                        "type": "response.completed",
+                        "response": {"status": "completed", "usage": None},
+                    }
+                ),
+            )
+        )
+    elif provider == "anthropic":
+        frames = b"".join(
+            (
+                _sse(
+                    {
+                        "type": "message_start",
+                        "message": {
+                            "usage": {
+                                "input_tokens": 2,
+                                "cache_read_input_tokens": 0,
+                                "cache_creation_input_tokens": 0,
+                            }
+                        },
+                    }
+                ),
+                _sse(
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": "call-1",
+                            "name": "noargs",
+                            "input": {},
+                        },
+                    }
+                ),
+                _sse({"type": "content_block_stop", "index": 0}),
+                _sse(
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "tool_use"},
+                        "usage": {"output_tokens": 1},
+                    }
+                ),
+                _sse({"type": "message_stop"}),
+            )
+        )
+    else:
+        frames = b"".join(
+            (
+                _sse(
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call-1",
+                                            "function": {"name": "noargs"},
+                                        }
+                                    ]
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ]
+                    }
+                ),
+                b"data: [DONE]\n\n",
+            )
+        )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """Return the selected provider's no-argument tool-call fixture."""
+        del request
+        return httpx.Response(200, stream=_ChunkStream((frames,)))
+
+    async def scenario() -> list[GatewayEvent]:
+        """Consume one empty-argument tool-call stream."""
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = _provider_client(provider, http_client)
+            stream = await client.stream(
+                _request(_provider_surface(provider)),
+                deadline=RequestDeadline.after(1),
+                idempotency_key=f"empty-args-{provider}",
+            )
+            return await _collect(stream)
+
+    events = asyncio.run(scenario())
+
+    assert [event.kind for event in events[:3]] == [
+        GatewayEventKind.TOOL_CALL_STARTED,
+        GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+        GatewayEventKind.TOOL_CALL_COMPLETED,
+    ]
+    assert events[1].tool_call_index == 0
+    assert events[1].raw_arguments_delta == "{}"
+    assert events[2].tool_call_index == 0
+    assert events[2].tool_call is not None
+    assert events[2].tool_call.raw_arguments == "{}"
+    assert events[2].tool_call.arguments == {}
+    assert events[-1].kind is GatewayEventKind.COMPLETED
+
+
 def test_stream_open_retry_reuses_stable_idempotency_before_commit() -> None:
     """Safe same-endpoint opening retries keep one identity before semantic output."""
     calls = 0
