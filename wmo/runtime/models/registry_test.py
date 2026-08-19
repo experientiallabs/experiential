@@ -296,7 +296,7 @@ def test_resolution_carries_the_cataloged_served_model_identity() -> None:
             served_model_id="served-canonical-name",
         ),
         environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=ScriptedJsonTransport,
+        transport_factory=ScriptedAsyncJsonTransport,
     )
 
     resolved = catalog.resolve("fixture-model")
@@ -307,7 +307,7 @@ def test_resolution_carries_the_cataloged_served_model_identity() -> None:
     default = RuntimeModelCatalog(
         _catalog(),
         environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=ScriptedJsonTransport,
+        transport_factory=ScriptedAsyncJsonTransport,
     )
 
     assert default.resolve("fixture-model").served_model_id is None
