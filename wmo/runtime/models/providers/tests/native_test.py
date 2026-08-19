@@ -19,12 +19,17 @@ from wmo.runtime.models.providers.anthropic import (
     anthropic_messages_response,
 )
 from wmo.runtime.models.providers.errors import (
+    ProviderCapabilityError,
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderRetryableResponseError,
 )
 from wmo.runtime.models.providers.gemini import GeminiClient, gemini_generate_response
-from wmo.runtime.models.providers.openai import OpenAIClient, openai_responses_response
+from wmo.runtime.models.providers.openai import (
+    OpenAIClient,
+    openai_responses_request,
+    openai_responses_response,
+)
 from wmo.runtime.models.providers.openai_compatible import OpenRouterClient
 from wmo.runtime.models.providers.openai_compatible_test import _request, _snapshot
 from wmo.runtime.models.providers.tinker_sampling import (
@@ -187,7 +192,38 @@ def test_openai_reasoning_model_declarations_shape_the_wire_payload() -> None:
 
     payload = transport.requests[0][2]
     assert "temperature" not in payload
+    assert "top_p" not in payload
     assert payload["reasoning"] == {"effort": "xhigh"}
+
+
+def test_openai_responses_forwards_top_p_on_sampling_models() -> None:
+    """Direct OpenAI Responses keeps caller nucleus sampling on the native wire."""
+    payload = openai_responses_request(
+        "gpt-5.4",
+        _request(top_p=1.0),
+        supports_temperature=True,
+    )
+
+    assert payload["temperature"] == 0.2
+    assert payload["top_p"] == 1.0
+
+
+def test_openai_reasoning_model_rejects_top_p_before_dispatch() -> None:
+    """Pinned-sampling OpenAI models reject top_p instead of silently ignoring it."""
+    transport = ScriptedJsonTransport([])
+    client = OpenAIClient(
+        model=_snapshot("openai", "gpt-5.6-luna"),
+        api_key="fixture-openai-key",
+        base_url="https://openai.fixture/v1",
+        transport=transport,
+        supports_temperature=False,
+        reasoning_effort="xhigh",
+    )
+
+    with pytest.raises(ProviderCapabilityError, match="top_p") as captured:
+        client.complete(_request(top_p=1.0))
+    assert captured.value.capability == "top_p"
+    assert transport.requests == []
 
 
 def test_openai_embeddings_use_the_shared_normalized_response_contract() -> None:
@@ -297,6 +333,8 @@ def test_anthropic_uses_native_tool_blocks_and_normalizes_cache_usage() -> None:
     assert url == "https://anthropic.fixture/v1/messages"
     assert headers["x-api-key"] == "fixture-anthropic-key"
     assert payload["tool_choice"] == {"type": "any"}
+    assert payload["temperature"] == 0.2
+    assert "top_p" not in payload
     messages = payload["messages"]
     assert isinstance(messages, list)
     assert messages[1]["content"][0] == {
@@ -319,6 +357,14 @@ def test_anthropic_tool_none_keeps_history_schemas_and_uses_native_none() -> Non
         }
     ]
     assert payload["tool_choice"] == {"type": "none"}
+
+
+def test_anthropic_messages_forwards_top_p() -> None:
+    """Native Anthropic Messages keeps caller nucleus sampling on the wire."""
+    payload = anthropic_messages_request("claude-fixture", _request(top_p=1.0))
+
+    assert payload["temperature"] == 0.2
+    assert payload["top_p"] == 1.0
 
 
 def test_gemini_uses_native_function_calls_usage_identity_and_embeddings() -> None:

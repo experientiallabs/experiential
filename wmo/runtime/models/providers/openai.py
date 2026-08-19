@@ -29,6 +29,7 @@ from wmo.runtime.gateway.contracts import GatewayRequest
 from wmo.runtime.models.providers.async_transport import AsyncJsonHttpTransport, RequestDeadline
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
 from wmo.runtime.models.providers.errors import (
+    ProviderCapabilityError,
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
@@ -58,13 +59,15 @@ def openai_responses_request(
         request: Typed WMO request.
         supports_temperature: Catalog declaration that the model accepts an explicit sampling
             temperature. Reasoning models pin their sampling and reject the parameter, so a
-            ``False`` declaration omits any requested temperature from the wire payload.
+            ``False`` declaration omits any requested temperature from the wire payload and
+            rejects an explicit ``top_p`` before dispatch.
         reasoning_effort: Optional catalog-pinned reasoning-effort level sent verbatim.
 
     Returns:
         Non-streaming Responses API JSON with provider-side storage disabled.
 
     Raises:
+        ProviderCapabilityError: The request sets ``top_p`` on a model that pins sampling.
         ValueError: A message cannot be represented without losing tool linkage.
     """
     instructions: list[str] = []
@@ -102,6 +105,10 @@ def openai_responses_request(
         )
     if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
+    if request.top_p is not None:
+        if not supports_temperature:
+            raise ProviderCapabilityError(capability="top_p")
+        payload["top_p"] = request.top_p
     if reasoning_effort is not None:
         payload["reasoning"] = {"effort": reasoning_effort}
     if request.maximum_output_tokens is not None:

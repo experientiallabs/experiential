@@ -83,6 +83,8 @@ def anthropic_messages_request(model_id: str, request: ModelRequest) -> JsonObje
         payload["tool_choice"] = _anthropic_tool_choice(request.tool_choice)
     if request.temperature is not None:
         payload["temperature"] = request.temperature
+    if request.top_p is not None:
+        payload["top_p"] = request.top_p
     return payload
 
 

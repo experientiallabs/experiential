@@ -30,7 +30,8 @@ def openai_responses_stream_payload(
         Native Responses request with storage disabled and streaming enabled.
 
     Raises:
-        ProviderCapabilityError: The request uses unsupported stop sequences.
+        ProviderCapabilityError: The request uses unsupported stop sequences, or sets
+            ``top_p`` on a model that pins sampling.
         ProviderResponseError: An instruction message has no text.
     """
     if request.stop:
@@ -69,6 +70,10 @@ def openai_responses_stream_payload(
         payload["max_output_tokens"] = request.maximum_output_tokens
     if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
+    if request.top_p is not None:
+        if not supports_temperature:
+            raise ProviderCapabilityError(capability="top_p")
+        payload["top_p"] = request.top_p
     if reasoning_effort is not None:
         payload["reasoning"] = {"effort": reasoning_effort}
     return payload
@@ -131,6 +136,8 @@ def anthropic_messages_stream_payload(model_id: str, request: GatewayRequest) ->
             payload["tool_choice"] = {"type": mapping[request.tool_choice]}
     if request.temperature is not None:
         payload["temperature"] = request.temperature
+    if request.top_p is not None:
+        payload["top_p"] = request.top_p
     if request.stop:
         payload["stop_sequences"] = list(request.stop)
     return payload
