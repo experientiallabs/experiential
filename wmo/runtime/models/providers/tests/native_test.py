@@ -207,7 +207,7 @@ def test_openai_responses_forwards_top_p_on_sampling_models() -> None:
 
 def test_openai_reasoning_model_rejects_top_p_before_dispatch() -> None:
     """Pinned-sampling OpenAI models reject top_p instead of silently ignoring it."""
-    transport = ScriptedJsonTransport([])
+    transport = ScriptedAsyncJsonTransport(())
     client = OpenAIClient(
         model=_snapshot("openai", "gpt-5.6-luna"),
         api_key="fixture-openai-key",

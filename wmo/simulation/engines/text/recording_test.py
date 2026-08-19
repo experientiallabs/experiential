@@ -30,8 +30,8 @@ from wmo.common.models import (
 from wmo.common.rollouts import StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.models import ResolvedModel
+from wmo.runtime.models.conftest import ScriptedAsyncJsonTransport
 from wmo.runtime.models.providers.openai import openai_responses_response
-from wmo.runtime.models.providers.transport import ScriptedJsonTransport
 from wmo.runtime.models.registry import RuntimeModelCatalog
 from wmo.simulation.engines.text.recording import (
     RecordingCandidateClient,
@@ -654,7 +654,7 @@ def test_response_identity_accepts_a_catalog_pinned_served_model_id() -> None:
             },
         ),
         environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=ScriptedJsonTransport,
+        transport_factory=ScriptedAsyncJsonTransport,
     )
     resolved = catalog.resolve("candidate-a")
     served = resolved.snapshot.model_copy(update={"model_id": "deepseek-v4-flash"})

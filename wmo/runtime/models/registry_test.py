@@ -269,14 +269,14 @@ def test_resolution_threads_catalog_served_model_pin_to_every_http_provider(
             served_model_id="fixture-model-served",
         ),
         environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=ScriptedJsonTransport,
+        transport_factory=ScriptedAsyncJsonTransport,
     )
     unpinned = RuntimeModelCatalog(
         _catalog(
             provider=provider, base_url=base_url, api_version="v1" if provider == "azure" else None
         ),
         environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=ScriptedJsonTransport,
+        transport_factory=ScriptedAsyncJsonTransport,
     )
 
     assert pinned.resolve("fixture-model").served_model_id == "fixture-model-served"
@@ -361,7 +361,7 @@ def test_model_capability_snapshot_has_exact_limits_and_stays_permissive_when_ab
     declared_unsupported = RuntimeModelCatalog(
         _catalog(capabilities=ModelCapabilities(supports_tools=False)),
         environment={"FIXTURE_API_KEY": "fixture-key"},
-        transport_factory=ScriptedJsonTransport,
+        transport_factory=ScriptedAsyncJsonTransport,
     )
     with pytest.raises(ModelCapabilityError, match="declares no tool call support"):
         declared_unsupported.preflight("fixture-model", CapabilityRequirement(requires_tools=True))
