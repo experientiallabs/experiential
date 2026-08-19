@@ -32,12 +32,15 @@ from wmo.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
+    GatewayTarget,
+    ProjectSelection,
+    ProjectTarget,
 )
 from wmo.runtime.gateway.execution import GatewayExecutionError, GatewayExecutor
 from wmo.runtime.gateway.health import DeploymentHealthRegistry
 from wmo.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
-from wmo.runtime.models.providers import RequestDeadline
+from wmo.runtime.models.providers import ProviderDeadlineExceeded, RequestDeadline
 from wmo.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
 
 _DIGEST = "a" * 64
@@ -80,6 +83,57 @@ def test_direct_certified_pool_preserves_operational_deployment_order() -> None:
 
         assert route.deployments == (first, second)
         assert route.snapshot.deployment_ids == ("route-a", "route-b")
+
+    asyncio.run(scenario())
+
+
+def test_project_selection_expands_once_to_its_certified_ordered_pool() -> None:
+    """One learned selection fixes the exact model before exposing its deployment waterfall."""
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    catalog = NormalizedGatewayCatalog(
+        deployments=(first, second),
+        pools=(
+            ExactModelPool(
+                pool_id="pool-one",
+                exact_model_id="exact-one",
+                deployment_ids=(first.deployment_id, second.deployment_id),
+                equivalence=GatewayEquivalenceCertification(
+                    certification_id="certification-one",
+                    provenance="operator comparison run 2026-08-18",
+                    evidence_sha256=_DIGEST,
+                    certified_at=datetime(2026, 8, 18, tzinfo=UTC),
+                ),
+            ),
+        ),
+    )
+    catalog_sha256 = catalog.identity_sha256()
+    project_resolver = _ProjectResolver(first.source_alias)
+    resolver = CatalogRouteResolver(
+        {("revision-one", catalog_sha256): catalog},
+        project_resolver=project_resolver,
+    )
+    authorization = _authorization(catalog_sha256).model_copy(
+        update={
+            "target": ProjectTarget(
+                project_ref="project-one",
+                activation_ref="activation-one",
+                catalog_sha256=catalog_sha256,
+            )
+        }
+    )
+
+    async def scenario() -> None:
+        """Resolve one project decision into both certified physical deployments."""
+        route = await resolver.resolve(
+            authorization=authorization,
+            request=_request(),
+            episode_namespace=("org", "identity", "revision-one", "episode"),
+        )
+
+        assert route.deployments == (first, second)
+        assert route.snapshot.pool_id == "pool-one"
+        assert project_resolver.calls == 1
 
     asyncio.run(scenario())
 
@@ -165,7 +219,7 @@ def test_same_deployment_retry_reuses_identity_and_records_every_dispatch() -> N
         ]
         assert provider.idempotency_keys[0] == provider.idempotency_keys[1]
         assert provider.retry_attempts == [1, 1]
-        assert ledger.started == [("route-a", 0), ("route-a", 0)]
+        assert ledger.started == [("route-a", 0, 0), ("route-a", 1, 0)]
         assert [entry[2] for entry in ledger.finished] == [False, True]
 
     asyncio.run(scenario())
@@ -198,7 +252,7 @@ def test_precommit_failover_changes_deployment_identity_and_finalizes_once() -> 
         assert stream.deployment == second
         assert stream.route_depth == 1
         assert first_provider.idempotency_keys != second_provider.idempotency_keys
-        assert ledger.started == [("route-a", 0), ("route-b", 1)]
+        assert ledger.started == [("route-a", 0, 0), ("route-b", 1, 1)]
         assert [entry[2] for entry in ledger.finished] == [False, True]
         assert ledger.parent_finishes == []
 
@@ -283,7 +337,7 @@ def test_first_semantic_event_freezes_route_even_when_provider_later_fails() -> 
             GatewayEventKind.FAILED,
         ]
         assert second_provider.idempotency_keys == []
-        assert ledger.started == [("route-a", 0)]
+        assert ledger.started == [("route-a", 0, 0)]
         assert ledger.finished[0][2]
 
     asyncio.run(scenario())
@@ -324,10 +378,12 @@ def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> No
             },
             ledger,
             maximum_same_deployment_attempts=1,
-            refusal_failover=opted_in,
         )
 
-        stream = await executor.start(route=_route((first, second)), request=_request())
+        stream = await executor.start(
+            route=_route((first, second), refusal_failover=opted_in),
+            request=_request(),
+        )
         events = [event async for event in stream]
         return events, len(second_provider.idempotency_keys)
 
@@ -342,6 +398,99 @@ def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> No
     ]
     assert all(event.kind is not GatewayEventKind.REFUSAL_DELTA for event in opted_events)
     assert opted_fallbacks == 1
+
+
+def test_deadline_between_attempts_finalizes_parent_and_releases_claims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired next dispatch releases admission and its claimed health probe."""
+    calls = 0
+
+    def attempt_timeout(
+        _deadline: RequestDeadline,
+        maximum_seconds: float | None = None,
+        *,
+        now_monotonic: float | None = None,
+    ) -> float:
+        """Expire only after admission and the first physical dispatch."""
+        del maximum_seconds, now_monotonic
+        nonlocal calls
+        calls += 1
+        if calls >= 3:
+            raise ProviderDeadlineExceeded("provider request deadline exceeded")
+        return 30
+
+    monkeypatch.setattr(RequestDeadline, "attempt_timeout", attempt_timeout)
+
+    async def scenario() -> None:
+        """Advance after a precommit failure into an already expired deadline."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        second = _deployment("route-b", connection_sha256="c" * 64)
+        failure = GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider transport failed",
+            retryable_same_deployment=True,
+            failover_eligible=True,
+        )
+        first_provider = _ScriptedProvider(
+            [
+                _WaterfallStream(
+                    (
+                        GatewayEvent(
+                            kind=GatewayEventKind.FAILED,
+                            sequence_number=0,
+                            failure=failure,
+                        ),
+                    )
+                )
+            ]
+        )
+        second_provider = _ScriptedProvider([_completed_stream("must not run")])
+        now = [100.0]
+        health = DeploymentHealthRegistry(
+            failure_threshold=1,
+            open_seconds=10,
+            throttle_seconds=5,
+            clock=lambda: now[0],
+        )
+        second_key = (_DIGEST, second.deployment_id, second.connection_sha256)
+        health.failed(
+            second_key,
+            GatewayFailure(
+                failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+                safe_message="provider authentication failed",
+            ),
+        )
+        now[0] += 11
+        ledger = _WaterfallLedger()
+        executor = _executor(
+            (first, second),
+            {
+                first.source_alias: first_provider,
+                second.source_alias: second_provider,
+            },
+            ledger,
+            maximum_same_deployment_attempts=1,
+            health=health,
+        )
+
+        stream = await executor.start(route=_route((first, second)), request=_request())
+        events = [event async for event in stream]
+
+        assert [event.kind for event in events] == [GatewayEventKind.FAILED]
+        assert events[0].failure is not None
+        assert events[0].failure.failure_class is GatewayFailureClass.TIMEOUT
+        assert ledger.started == [("route-a", 0, 0)]
+        assert ledger.finished == [("attempt-1", failure, False)]
+        assert len(ledger.parent_finishes) == 1
+        assert ledger.parent_finishes[0].failure_class is GatewayFailureClass.TIMEOUT
+        assert second_provider.idempotency_keys == []
+        await asyncio.wait_for(executor._permits.acquire(), timeout=0.1)  # noqa: SLF001
+        executor._permits.release()  # noqa: SLF001
+        assert health.claim(second_key)
+        health.release_probe(second_key)
+
+    asyncio.run(scenario())
 
 
 class _WaterfallStream:
@@ -381,6 +530,34 @@ class _WaterfallStream:
     async def cancel(self) -> None:
         """Record bounded cancellation of this provider stream."""
         self.cancelled = True
+
+
+class _ProjectResolver:
+    """Return one fixed learned selection while counting selection calls."""
+
+    def __init__(self, selected_alias: str) -> None:
+        """Bind the selected deployment alias."""
+        self._selected_alias = selected_alias
+        self.calls = 0
+
+    async def select(
+        self,
+        *,
+        target: GatewayTarget,
+        request: GatewayRequest,
+        episode_namespace: tuple[str, str, str, str],
+        deadline_monotonic: float,
+    ) -> ProjectSelection:
+        """Return the fixed exact-model decision without provider work."""
+        del request, episode_namespace, deadline_monotonic
+        if not isinstance(target, ProjectTarget):
+            raise AssertionError("project resolver received a direct target")
+        self.calls += 1
+        return ProjectSelection(
+            exact_model_id="exact-one",
+            selected_alias=self._selected_alias,
+            activation_ref=target.activation_ref,
+        )
 
 
 class _ScriptedProvider:
@@ -449,7 +626,7 @@ class _WaterfallLedger:
 
     def __init__(self) -> None:
         """Initialize empty ordered accounting records."""
-        self.started: list[tuple[str, int]] = []
+        self.started: list[tuple[str, int, int]] = []
         self.finished: list[tuple[str, GatewayFailure | None, bool]] = []
         self.parent_finishes: list[GatewayFailure] = []
 
@@ -462,11 +639,12 @@ class _WaterfallLedger:
         *,
         snapshot: ExecutionSnapshot,
         deployment: ExactModelDeployment,
+        attempt_ordinal: int,
         route_depth: int,
     ) -> str:
         """Record one durable physical dispatch before provider work."""
         assert deployment.deployment_id in snapshot.deployment_ids
-        self.started.append((deployment.deployment_id, route_depth))
+        self.started.append((deployment.deployment_id, attempt_ordinal, route_depth))
         return f"attempt-{len(self.started)}"
 
     def record_route_context(
@@ -524,10 +702,17 @@ def _request() -> GatewayRequest:
     )
 
 
-def _route(deployments: tuple[ExactModelDeployment, ...]) -> GatewayRoute:
+def _route(
+    deployments: tuple[ExactModelDeployment, ...],
+    *,
+    refusal_failover: bool = False,
+) -> GatewayRoute:
     """Build one frozen certified route with a live request deadline."""
     authorization = _authorization(_DIGEST).model_copy(
-        update={"deadline_monotonic": time.monotonic() + 30}
+        update={
+            "deadline_monotonic": time.monotonic() + 30,
+            "refusal_failover": refusal_failover,
+        }
     )
     return GatewayRoute(
         snapshot=ExecutionSnapshot(
@@ -548,7 +733,7 @@ def _executor(
     ledger: _WaterfallLedger,
     *,
     maximum_same_deployment_attempts: int = 2,
-    refusal_failover: bool = False,
+    health: DeploymentHealthRegistry | None = None,
 ) -> GatewayExecutor:
     """Compose one revision-pinned executor for the scripted route."""
     catalog = cast(
@@ -559,9 +744,7 @@ def _executor(
         {("revision-one", _DIGEST): catalog},
         ledger,
         maximum_same_deployment_attempts=maximum_same_deployment_attempts,
-        refusal_failover_revisions=(
-            frozenset({"revision-one"}) if refusal_failover else frozenset()
-        ),
+        health=health,
     )
 
 

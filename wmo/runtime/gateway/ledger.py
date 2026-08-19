@@ -170,6 +170,7 @@ class SQLiteAttemptLedger:
         *,
         snapshot: ExecutionSnapshot,
         deployment: ExactModelDeployment,
+        attempt_ordinal: int,
         route_depth: int,
     ) -> AttemptId:
         """Durably mark a provider dispatch before starting network work.
@@ -177,6 +178,7 @@ class SQLiteAttemptLedger:
         Args:
             snapshot: Route-bound immutable request plan.
             deployment: Exact deployment about to receive the request.
+            attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
 
         Returns:
@@ -205,17 +207,21 @@ class SQLiteAttemptLedger:
             connection.execute(
                 """
                 INSERT INTO gateway_attempts (
-                    attempt_id, request_id, organization_id, route_depth, deployment_id,
-                    provider, exact_model_id, pool_id, catalog_sha256, billing_source,
+                    attempt_id, request_id, organization_id, attempt_ordinal, route_depth,
+                    deployment_id, provider, exact_model_id, pool_id, catalog_sha256,
+                    billing_source,
                     pricing_source, pricing_effective_at,
                     input_rate, cached_input_rate, output_rate, reasoning_rate,
                     state, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?)
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?
+                )
                 """,
                 (
                     attempt_id,
                     snapshot.authorization.request_id,
                     snapshot.authorization.organization_id,
+                    attempt_ordinal,
                     route_depth,
                     deployment.deployment_id,
                     deployment.provider,

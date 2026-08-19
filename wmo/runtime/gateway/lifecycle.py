@@ -231,23 +231,26 @@ def load_local_gateway(
                 policy_id=activation_ref,
                 runtime_catalog=runtime_catalog,
             )
+            proof = _project_readiness(
+                manager,
+                alias,
+                normalized,
+                runtime,
+                runtime_catalog,
+                exact_models=exact_models,
+            )
         except RouterApplicationError as exc:
             if not _caused_by_connection_error(exc):
                 raise
             unavailable_aliases.append(alias.alias_name)
             continue
+        except (ModelConnectionError, ModelCredentialError):
+            unavailable_aliases.append(alias.alias_name)
+            continue
         activations[(project_ref, activation_ref)] = runtime
         normalized_catalogs[key] = normalized
         runtime_catalogs[key] = runtime_catalog
-        readiness.append(
-            _project_readiness(
-                manager,
-                alias,
-                normalized,
-                runtime,
-                exact_models=exact_models,
-            )
-        )
+        readiness.append(proof)
 
     if not readiness:
         unavailable = ", ".join(sorted(unavailable_aliases))
@@ -410,18 +413,17 @@ def _direct_readiness(
     catalog: NormalizedGatewayCatalog,
     runtime_catalog: RuntimeModelCatalog,
 ) -> ExecutionSnapshot:
-    """Validate one direct singleton and return provider-idle readiness proof."""
+    """Validate one ordered direct pool and return provider-idle readiness proof."""
     pool_id = _required(alias.pool_id, "pool ID", alias)
     pools = tuple(pool for pool in catalog.pools if pool.pool_id == pool_id)
-    if len(pools) != 1 or len(pools[0].deployment_ids) != 1:
-        raise GatewayLifecycleError(
-            f"alias {alias.alias_name!r} requires one singleton deployment before PR 8"
-        )
-    deployment_id = pools[0].deployment_ids[0]
-    deployments = tuple(item for item in catalog.deployments if item.deployment_id == deployment_id)
-    if len(deployments) != 1:
-        raise GatewayLifecycleError(f"alias {alias.alias_name!r} deployment is unavailable")
-    runtime_catalog.resolve(deployments[0].source_alias)
+    if len(pools) != 1:
+        raise GatewayLifecycleError(f"alias {alias.alias_name!r} pool is unavailable")
+    deployments_by_id = {item.deployment_id: item for item in catalog.deployments}
+    for deployment_id in pools[0].deployment_ids:
+        deployment = deployments_by_id.get(deployment_id)
+        if deployment is None:
+            raise GatewayLifecycleError(f"alias {alias.alias_name!r} deployment is unavailable")
+        runtime_catalog.resolve(deployment.source_alias)
     authorization = _readiness_authorization(
         manager,
         alias,
@@ -440,10 +442,11 @@ def _project_readiness(
     alias: GatewayAliasView,
     catalog: NormalizedGatewayCatalog,
     runtime: RouterRuntime,
+    runtime_catalog: RuntimeModelCatalog,
     *,
     exact_models: dict[tuple[str, str, str, str], str],
 ) -> ExecutionSnapshot:
-    """Validate project candidate mappings and return provider-idle readiness proof."""
+    """Validate project candidate pools and return provider-idle readiness proof."""
     project_ref = _required(alias.project_ref, "project reference", alias)
     activation_ref = _required(alias.activation_ref, "activation reference", alias)
     catalog_sha256 = _required(alias.catalog_sha256, "catalog digest", alias)
@@ -461,13 +464,21 @@ def _project_readiness(
             item
             for item in catalog.pools
             if item.exact_model_id == deployments[0].exact_model_id
-            and item.deployment_ids == (deployments[0].deployment_id,)
+            and deployments[0].deployment_id in item.deployment_ids
         )
         if len(pools) != 1:
             raise GatewayLifecycleError(
                 f"project alias {alias.alias_name!r} candidate {candidate.alias!r} "
-                "does not name one singleton pool"
+                "does not name one unambiguous certified pool"
             )
+        deployments_by_id = {item.deployment_id: item for item in catalog.deployments}
+        for deployment_id in pools[0].deployment_ids:
+            sibling = deployments_by_id.get(deployment_id)
+            if sibling is None:
+                raise GatewayLifecycleError(
+                    f"project alias {alias.alias_name!r} pool deployment is unavailable"
+                )
+            runtime_catalog.resolve(sibling.source_alias)
         exact_models[(project_ref, activation_ref, catalog_sha256, candidate.alias)] = deployments[
             0
         ].exact_model_id
@@ -522,6 +533,7 @@ def _readiness_authorization(
         canonical_request_sha256=sha256_json(
             {"kind": "gateway-readiness-v1", "alias_revision_id": revision_id}
         ),
+        refusal_failover=alias.refusal_failover,
         deadline_monotonic=time.monotonic() + 30,
     )
 

@@ -448,6 +448,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         snapshot_ref: str,
         catalog_sha256: Sha256,
         provider_connections: tuple[ProviderConnectionBinding, ...] = (),
+        refusal_failover: bool = False,
     ) -> None:
         """Create and atomically activate one immutable alias revision.
 
@@ -460,6 +461,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             snapshot_ref: Registered catalog snapshot reference.
             catalog_sha256: Exact normalized catalog digest.
             provider_connections: Exact active connection revisions used by the snapshot.
+            refusal_failover: Whether typed precommit refusals may advance within the pool.
         """
         if isinstance(target, ProjectTarget) and target.catalog_sha256 != catalog_sha256:
             raise GatewayStoreError("project target catalog digest differs from alias activation")
@@ -515,8 +517,9 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 """
                 INSERT INTO alias_revisions (
                     revision_id, organization_id, alias_id, revision_number, target_kind,
-                    pool_id, project_ref, activation_ref, catalog_sha256, snapshot_ref, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pool_id, project_ref, activation_ref, catalog_sha256, snapshot_ref,
+                    refusal_failover, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     revision_id,
@@ -529,6 +532,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                     activation_ref,
                     catalog_sha256,
                     snapshot_ref,
+                    int(refusal_failover),
                     now,
                 ),
             )
@@ -676,7 +680,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             row = connection.execute(
                 """
                 SELECT a.alias_id, a.alias_name, a.active_revision_id,
-                       r.target_kind, r.pool_id, r.project_ref, r.activation_ref, r.catalog_sha256
+                       r.target_kind, r.pool_id, r.project_ref, r.activation_ref,
+                       r.catalog_sha256, r.refusal_failover
                 FROM identity_alias_grants AS g
                 JOIN identities AS i
                   ON i.organization_id = g.organization_id AND i.identity_id = g.identity_id
@@ -716,6 +721,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             deadline_monotonic=deadline_monotonic,
             surface=request.surface,
             caller_operation_sha256=caller_operation,
+            refusal_failover=bool(row["refusal_failover"]),
         )
 
     def authenticate_key(self, *, raw_key: str) -> None:

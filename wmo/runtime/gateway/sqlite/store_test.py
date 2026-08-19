@@ -77,7 +77,11 @@ def _request(content: str = "content-canary") -> GatewayRequest:
     )
 
 
-def _configured_store(tmp_path: Path) -> tuple[SQLiteGatewayStore, FakeClock, str]:
+def _configured_store(
+    tmp_path: Path,
+    *,
+    refusal_failover: bool = False,
+) -> tuple[SQLiteGatewayStore, FakeClock, str]:
     """Create explicit organization, identity, snapshot, alias, grant, and key state."""
     clock = FakeClock()
     store = SQLiteGatewayStore(tmp_path / "gateway.db", clock=clock)
@@ -98,6 +102,7 @@ def _configured_store(tmp_path: Path) -> tuple[SQLiteGatewayStore, FakeClock, st
         target=DirectTarget(pool_id="pool-coding"),
         snapshot_ref="snapshot-one",
         catalog_sha256=_DIGEST,
+        refusal_failover=refusal_failover,
     )
     store.grant_alias(
         organization_id="org-one", identity_id="identity-one", alias_id="alias-coding"
@@ -106,6 +111,27 @@ def _configured_store(tmp_path: Path) -> tuple[SQLiteGatewayStore, FakeClock, st
         organization_id="org-one", identity_id="identity-one", key_id="key-one"
     )
     return store, clock, issued.raw_key
+
+
+@pytest.mark.parametrize("refusal_failover", [False, True])
+def test_authorization_freezes_revision_scoped_refusal_policy(
+    tmp_path: Path,
+    refusal_failover: bool,
+) -> None:
+    """Authorization carries the immutable active revision refusal policy."""
+    store, clock, raw_key = _configured_store(
+        tmp_path,
+        refusal_failover=refusal_failover,
+    )
+
+    snapshot = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request(),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+
+    assert snapshot.refusal_failover is refusal_failover
 
 
 def test_key_derived_authority_is_deny_by_default_and_revocation_is_immediate(

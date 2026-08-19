@@ -63,6 +63,7 @@ class AttemptLedger(Protocol):
         *,
         snapshot: ExecutionSnapshot,
         deployment: ExactModelDeployment,
+        attempt_ordinal: int,
         route_depth: int,
     ) -> AttemptId:
         """Persist one accepted attempt before provider dispatch."""

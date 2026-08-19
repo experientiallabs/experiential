@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,8 +15,11 @@ import httpx
 import openai
 import pytest
 import uvicorn
+from fastapi.testclient import TestClient
 from openai import AsyncOpenAI, OpenAI
+from typer.testing import CliRunner
 
+from wmo.cli.app import app
 from wmo.common.models import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
@@ -42,6 +46,14 @@ class _LoopbackProvider(BaseHTTPRequestHandler):
         assert payload["stream"] is True
         assert payload["stream_options"] == {"include_usage": True}
         type(self).calls += 1
+        if payload["model"] == "provider-model-primary":
+            body = b'{"error":{"message":"primary unavailable"}}'
+            self.send_response(503)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         frames = b"".join(
             (
                 _provider_frame(
@@ -92,6 +104,7 @@ def test_real_loopback_launch_serves_both_official_sdk_clients_and_revocation(
 ) -> None:
     """Sync and async SDK traffic reaches a real upstream and content-free accounting."""
     assert openai.__version__ == "3.0.0"
+    _LoopbackProvider.calls = 0
     provider_port = _unused_port()
     gateway_port = _unused_port()
     provider = ThreadingHTTPServer(("127.0.0.1", provider_port), _LoopbackProvider)
@@ -157,6 +170,199 @@ def test_real_loopback_launch_serves_both_official_sdk_clients_and_revocation(
     )
     for forbidden in (prompt_canary, "hello world", raw_key, "provider-secret-canary"):
         assert forbidden.encode() not in durable
+
+
+def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Noninteractive authoring launches and attributes a real provider waterfall."""
+    _LoopbackProvider.calls = 0
+    provider_port = _unused_port()
+    provider = ThreadingHTTPServer(("127.0.0.1", provider_port), _LoopbackProvider)
+    provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    provider_thread.start()
+    monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret-canary")
+    runner = CliRunner()
+    base_url = f"http://127.0.0.1:{provider_port}/v1"
+    try:
+        commands = (
+            ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+            [
+                "config",
+                "gateway",
+                "provider",
+                "add",
+                "provider-primary",
+                "--provider",
+                "openai-compatible",
+                "--credential-env",
+                "LOOPBACK_PROVIDER_KEY",
+                "--base-url",
+                base_url,
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+            [
+                "config",
+                "gateway",
+                "provider",
+                "add",
+                "provider-secondary",
+                "--provider",
+                "openai-compatible",
+                "--credential-env",
+                "LOOPBACK_PROVIDER_KEY",
+                "--base-url",
+                base_url,
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        )
+        for command in commands:
+            result = runner.invoke(app, command)
+            assert result.exit_code == 0, result.output
+        catalog_sha256 = ""
+        for deployment_alias, connection_name in (
+            ("primary", "provider-primary"),
+            ("secondary", "provider-secondary"),
+        ):
+            created = runner.invoke(
+                app,
+                [
+                    "config",
+                    "gateway",
+                    "alias",
+                    "create",
+                    deployment_alias,
+                    "--deployment",
+                    f"{connection_name}:provider-model-{deployment_alias}",
+                    "--exact-model",
+                    "model-revision-exact",
+                    "--root",
+                    str(tmp_path),
+                    "--non-interactive",
+                    "--json",
+                ],
+            )
+            assert created.exit_code == 0, created.output
+            catalog_sha256 = json.loads(created.stdout)["data"]["catalog_sha256"]
+        certification = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "pool",
+                "certify",
+                "coding",
+                "--deployment-alias",
+                "primary",
+                "--deployment-alias",
+                "secondary",
+                "--exact-model",
+                "model-revision-exact",
+                "--certification-id",
+                "certification-one",
+                "--provenance",
+                "loopback exact-model comparison",
+                "--evidence-sha256",
+                "a" * 64,
+                "--certified-at",
+                "2026-08-18T00:00:00Z",
+                "--expected-catalog-sha256",
+                catalog_sha256,
+                "--revision",
+                "revision-waterfall-one",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        )
+        assert certification.exit_code == 0, certification.output
+        for command in (
+            [
+                "config",
+                "gateway",
+                "identity",
+                "create",
+                "default",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+            [
+                "config",
+                "gateway",
+                "grant",
+                "add",
+                "default",
+                "coding",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        ):
+            result = runner.invoke(app, command)
+            assert result.exit_code == 0, result.output
+        issued = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "key",
+                "issue",
+                "default",
+                "--key-id",
+                "key-one",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        )
+        assert issued.exit_code == 0, issued.output
+        raw_key = json.loads(issued.stdout)["data"]["raw_key"]
+
+        runtime = load_local_gateway(tmp_path, graceful_timeout_seconds=2)
+        with TestClient(runtime.app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": f"Bearer {raw_key}"},
+                json={
+                    "model": "coding",
+                    "messages": [{"role": "user", "content": "waterfall-canary"}],
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+        assert response.headers["x-gateway-route-depth"] == "1"
+        assert _LoopbackProvider.calls == 3
+        connection = sqlite3.connect(tmp_path / "gateway" / "gateway.db")
+        try:
+            attempts = connection.execute(
+                "SELECT deployment_id, attempt_ordinal, route_depth, state "
+                "FROM gateway_attempts ORDER BY attempt_ordinal"
+            ).fetchall()
+        finally:
+            connection.close()
+        assert attempts == [
+            ("primary", 0, 0, "failed"),
+            ("primary", 1, 0, "failed"),
+            ("secondary", 2, 1, "completed"),
+        ]
+    finally:
+        provider.shutdown()
+        provider.server_close()
+        provider_thread.join(timeout=5)
+    assert not provider_thread.is_alive()
 
 
 async def _exercise_async_sdk(base_url: str, raw_key: str, prompt: str) -> None:

@@ -13,6 +13,8 @@ from wmo.common.models import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
+    GatewayEquivalenceCertification,
+    GatewayPoolRecord,
     GatewayTokenPrices,
     ModelCapabilities,
     ModelCatalog,
@@ -182,6 +184,63 @@ def upsert_singleton_deployment(
         if changed:
             models = {**current.models, deployment_alias: record}
             current = current.model_copy(update={"models": models})
+            write_model_catalog(path, current)
+    normalized = normalize_gateway_catalog(current)
+    snapshot = _write_catalog_snapshot(root, current, normalized)
+    return normalized, snapshot, changed
+
+
+def upsert_certified_pool(
+    root: Path,
+    *,
+    pool_id: str,
+    exact_model_id: str,
+    deployment_aliases: tuple[str, ...],
+    certification: GatewayEquivalenceCertification,
+    expected_catalog_sha256: str,
+    replace: bool,
+) -> tuple[NormalizedGatewayCatalog, Path, bool]:
+    """Author one certified ordered pool against an optimistic catalog digest.
+
+    Args:
+        root: WMO root containing ``models.toml`` and gateway snapshots.
+        pool_id: Stable direct-pool and public-alias identifier.
+        exact_model_id: Exact logical model identity shared by every deployment.
+        deployment_aliases: Ordered existing deployment aliases.
+        certification: Operator evidence binding the declared equivalence.
+        expected_catalog_sha256: Normalized digest observed before this mutation.
+        replace: Whether an existing pool declaration may change.
+
+    Returns:
+        Updated normalized catalog, immutable snapshot path, and change status.
+
+    Raises:
+        GatewayCatalogAuthoringError: The catalog moved or the pool already differs.
+    """
+    validate_artifact_id(pool_id)
+    validate_artifact_id(exact_model_id)
+    path = root / "models.toml"
+    with file_write_lock(path, what="the gateway exact-model pool catalog"):
+        current = load_model_catalog(path)
+        observed_sha256 = normalize_gateway_catalog(current).identity_sha256()
+        if observed_sha256 != expected_catalog_sha256:
+            raise GatewayCatalogAuthoringError(
+                "gateway catalog changed; refresh its digest before certifying the pool"
+            )
+        record = GatewayPoolRecord(
+            exact_model_id=exact_model_id,
+            deployment_aliases=deployment_aliases,
+            equivalence=certification,
+        )
+        existing = current.gateway_pools.get(pool_id)
+        if existing is not None and existing != record and not replace:
+            raise GatewayCatalogAuthoringError(
+                f"gateway pool {pool_id!r} exists; pass --replace to update it"
+            )
+        changed = existing != record
+        if changed:
+            pools = {**current.gateway_pools, pool_id: record}
+            current = current.model_copy(update={"gateway_pools": pools})
             write_model_catalog(path, current)
     normalized = normalize_gateway_catalog(current)
     snapshot = _write_catalog_snapshot(root, current, normalized)

@@ -38,6 +38,7 @@ _REVISION_OPTION = typer.Option(None, "--revision")
 _PRICING_SOURCE_OPTION = typer.Option(None, "--pricing-source")
 _MAXIMUM_OUTPUT_OPTION = typer.Option(None, "--maximum-output-tokens", min=1)
 _PRICE_OPTION = typer.Option(None, min=0)
+_REFUSAL_FAILOVER_OPTION = typer.Option(False, "--refusal-failover")
 
 
 @alias_app.command("list")
@@ -67,13 +68,14 @@ def alias_create(
     output_price: int | None = typer.Option(None, "--output-price", min=0),
     reasoning_price: int | None = typer.Option(None, "--reasoning-price", min=0),
     pricing_source: str | None = _PRICING_SOURCE_OPTION,
+    refusal_failover: bool = _REFUSAL_FAILOVER_OPTION,
     non_interactive: bool = _NON_INTERACTIVE_OPTION,
     json_output: bool = _JSON_OPTION,
 ) -> None:
     """Create one direct singleton or verified frozen-project alias."""
     del non_interactive
     with usage_error(ValueError, FileLockTimeout):
-        changed, revision_id = _activate(
+        changed, revision_id, catalog_sha256 = _activate(
             alias=alias,
             root=root,
             deployment=deployment,
@@ -95,6 +97,7 @@ def alias_create(
                 reasoning_micro_usd_per_million_tokens=reasoning_price,
             ),
             pricing_source=pricing_source,
+            refusal_failover=refusal_failover,
             replace=False,
         )
     emit_receipt(
@@ -103,7 +106,11 @@ def alias_create(
             resource_kind="alias_revision",
             resource_id=revision_id,
             changed=changed,
-            data={"alias": alias},
+            data={
+                "alias": alias,
+                "catalog_sha256": catalog_sha256,
+                "refusal_failover": refusal_failover,
+            },
         ),
         json_output=json_output,
         human=f"alias {alias} active at revision {revision_id}",
@@ -131,13 +138,14 @@ def alias_update(
     output_price: int | None = typer.Option(None, "--output-price", min=0),
     reasoning_price: int | None = typer.Option(None, "--reasoning-price", min=0),
     pricing_source: str | None = _PRICING_SOURCE_OPTION,
+    refusal_failover: bool = _REFUSAL_FAILOVER_OPTION,
     non_interactive: bool = _NON_INTERACTIVE_OPTION,
     json_output: bool = _JSON_OPTION,
 ) -> None:
     """Activate a new immutable revision of one existing alias."""
     del non_interactive
     with usage_error(ValueError, FileLockTimeout):
-        changed, revision_id = _activate(
+        changed, revision_id, catalog_sha256 = _activate(
             alias=alias,
             root=root,
             deployment=deployment,
@@ -159,6 +167,7 @@ def alias_update(
                 reasoning_micro_usd_per_million_tokens=reasoning_price,
             ),
             pricing_source=pricing_source,
+            refusal_failover=refusal_failover,
             replace=True,
         )
     emit_receipt(
@@ -167,7 +176,11 @@ def alias_update(
             resource_kind="alias_revision",
             resource_id=revision_id,
             changed=changed,
-            data={"alias": alias},
+            data={
+                "alias": alias,
+                "catalog_sha256": catalog_sha256,
+                "refusal_failover": refusal_failover,
+            },
         ),
         json_output=json_output,
         human=f"alias {alias} active at revision {revision_id}",
@@ -215,8 +228,9 @@ def _activate(
     maximum_output_tokens: int | None,
     prices: GatewayTokenPrices,
     pricing_source: str | None,
+    refusal_failover: bool,
     replace: bool,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
     """Author and activate one exact direct or project-backed alias revision."""
     if (deployment is None) == (project is None):
         raise ValueError("choose exactly one of --deployment or --project")
@@ -257,6 +271,7 @@ def _activate(
             serving_connections=serving_connections,
         )
         authored = ModelCatalog.model_validate_json(authored_snapshot_path(snapshot).read_bytes())
+        catalog_sha256 = normalized.identity_sha256()
         return (
             manager.activate_direct_alias(
                 alias_id=alias,
@@ -264,10 +279,12 @@ def _activate(
                 revision_id=revision_id,
                 pool_id=alias,
                 snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-                catalog_sha256=normalized.identity_sha256(),
+                catalog_sha256=catalog_sha256,
                 provider_connections=manager.provider_bindings(authored),
+                refusal_failover=refusal_failover,
             ),
             revision_id,
+            catalog_sha256,
         )
     runtime = load_project_router(project or "", root, policy_id=policy)
     catalog, normalized, snapshot = snapshot_current_catalog(
@@ -284,6 +301,7 @@ def _activate(
         raise ValueError(
             f"project policy candidates are absent from the gateway catalog: {', '.join(missing)}"
         )
+    catalog_sha256 = normalized.identity_sha256()
     return (
         manager.activate_project_alias(
             alias_id=alias,
@@ -292,10 +310,12 @@ def _activate(
             project_ref=project or "",
             activation_ref=runtime.policy.policy_id,
             snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-            catalog_sha256=normalized.identity_sha256(),
+            catalog_sha256=catalog_sha256,
             provider_connections=manager.provider_bindings(catalog),
+            refusal_failover=refusal_failover,
         ),
         revision_id,
+        catalog_sha256,
     )
 
 

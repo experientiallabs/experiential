@@ -354,14 +354,15 @@ class GatewayExecutionStream:
     async def _dispatch(self, route_index: int) -> _PhysicalAttempt:
         """Persist and open exactly one physical provider dispatch."""
         binding = self._resolved[route_index]
-        self._deadline.attempt_timeout()
         attempt_id: str | None = None
-        self._attempt_counts[route_index] += 1
-        self._total_attempts += 1
         try:
+            self._deadline.attempt_timeout()
+            self._attempt_counts[route_index] += 1
+            self._total_attempts += 1
             attempt_id = self._ledger.start_attempt(
                 snapshot=self._route.snapshot,
                 deployment=binding.deployment,
+                attempt_ordinal=self._total_attempts - 1,
                 route_depth=route_index,
             )
             self._ledger.record_route_context(
@@ -388,6 +389,8 @@ class GatewayExecutionStream:
         except BaseException as exc:
             if attempt_id is None:
                 self._health.release_probe(binding.health_key)
+                if isinstance(exc, ProviderDeadlineExceeded):
+                    raise GatewayExecutionError(normalized_provider_failure(exc)) from exc
                 if not isinstance(exc, asyncio.CancelledError):
                     self._accounting_failure()
                     raise GatewayExecutionError(normalized_provider_failure(exc)) from exc
@@ -564,7 +567,6 @@ class GatewayExecutor:
         maximum_active_requests: int = 64,
         maximum_total_attempts: int = 8,
         maximum_same_deployment_attempts: int = 2,
-        refusal_failover_revisions: frozenset[str] = frozenset(),
         health: DeploymentHealthRegistry | None = None,
     ) -> None:
         """Bind runtime providers, attempt policy, health, and finite request admission.
@@ -575,7 +577,6 @@ class GatewayExecutor:
             maximum_active_requests: Maximum active logical upstream requests.
             maximum_total_attempts: Hard physical dispatch cap for one logical request.
             maximum_same_deployment_attempts: Initial dispatch plus safe retries per deployment.
-            refusal_failover_revisions: Alias revisions allowed to fail over typed refusals.
             health: Optional shared content-free deployment health registry.
         """
         if maximum_active_requests < 1:
@@ -589,7 +590,6 @@ class GatewayExecutor:
         self._permits = asyncio.Semaphore(maximum_active_requests)
         self._maximum_total_attempts = maximum_total_attempts
         self._maximum_same_deployment_attempts = maximum_same_deployment_attempts
-        self._refusal_failover_revisions = refusal_failover_revisions
         self._health = health or DeploymentHealthRegistry()
         self._accounting_healthy = True
 
@@ -648,9 +648,7 @@ class GatewayExecutor:
             accounting_failure=self.mark_accounting_unhealthy,
             maximum_total_attempts=self._maximum_total_attempts,
             maximum_same_deployment_attempts=self._maximum_same_deployment_attempts,
-            refusal_failover=(
-                route.snapshot.authorization.alias_revision_id in self._refusal_failover_revisions
-            ),
+            refusal_failover=route.snapshot.authorization.refusal_failover,
         )
         try:
             await execution.open()

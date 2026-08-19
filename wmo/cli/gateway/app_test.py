@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 from wmo.cli.app import app
 from wmo.cli.gateway import key_output as gateway_key_output
 from wmo.common.core.artifacts import sha256_json
+from wmo.common.models import load_model_catalog
 from wmo.runtime.gateway.auth import IssuedVirtualKey, issue_key_material
 from wmo.runtime.gateway.management import GatewayManagement
 from wmo.runtime.gateway.sqlite import key_delivery
@@ -139,6 +140,197 @@ def test_noninteractive_management_story_emits_stable_secret_safe_json(
         path.read_bytes() for path in (tmp_path / "gateway").rglob("*") if path.is_file()
     )
     assert raw_key.encode() not in durable
+
+
+def test_noninteractive_pool_certification_activates_ordered_alias_with_receipt(
+    tmp_path: Path,
+) -> None:
+    """An agent can certify and activate a digest-guarded ordered deployment pool."""
+    runner = CliRunner()
+    setup_commands = (
+        ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "provider-main",
+            "--provider",
+            "openai-compatible",
+            "--credential-env",
+            "TEST_PROVIDER_KEY",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    for command in setup_commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+    catalog_sha256 = ""
+    for deployment_alias in ("primary", "secondary"):
+        result = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "alias",
+                "create",
+                deployment_alias,
+                "--deployment",
+                f"provider-main:{deployment_alias}-model",
+                "--exact-model",
+                "model-revision-exact",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        catalog_sha256 = json.loads(result.stdout)["data"]["catalog_sha256"]
+
+    certified = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "pool",
+            "certify",
+            "coding",
+            "--deployment-alias",
+            "primary",
+            "--deployment-alias",
+            "secondary",
+            "--exact-model",
+            "model-revision-exact",
+            "--certification-id",
+            "certification-one",
+            "--provenance",
+            "operator-reviewed deployment manifests",
+            "--evidence-sha256",
+            "a" * 64,
+            "--certified-at",
+            "2026-08-18T00:00:00Z",
+            "--expected-catalog-sha256",
+            catalog_sha256,
+            "--revision",
+            "revision-waterfall-one",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+
+    assert certified.exit_code == 0, certified.output
+    receipt = json.loads(certified.stdout)
+    assert receipt["schema_version"] == 1
+    assert receipt["operation"] == "pool.certify"
+    assert receipt["data"]["deployment_aliases"] == ["primary", "secondary"]
+    assert receipt["data"]["catalog_sha256"] != catalog_sha256
+    assert "TEST_PROVIDER_KEY" not in certified.stdout
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    assert catalog.gateway_pools["coding"].deployment_aliases == ("primary", "secondary")
+    alias = next(
+        item for item in GatewayManagement(tmp_path).aliases() if item.alias_id == "coding"
+    )
+    assert alias.pool_id == "coding"
+    assert alias.revision_id == "revision-waterfall-one"
+
+
+def test_pool_certification_rejects_a_stale_catalog_digest_before_activation(
+    tmp_path: Path,
+) -> None:
+    """Optimistic catalog authority prevents a stale pool activation."""
+    runner = CliRunner()
+    initialized = runner.invoke(
+        app,
+        ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+    )
+    assert initialized.exit_code == 0, initialized.output
+    provider = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "provider-main",
+            "--provider",
+            "openai-compatible",
+            "--credential-env",
+            "TEST_PROVIDER_KEY",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert provider.exit_code == 0, provider.output
+    for deployment_alias in ("primary", "secondary"):
+        created = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "alias",
+                "create",
+                deployment_alias,
+                "--deployment",
+                f"provider-main:{deployment_alias}-model",
+                "--exact-model",
+                "model-revision-exact",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        )
+        assert created.exit_code == 0, created.output
+
+    result = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "pool",
+            "certify",
+            "coding",
+            "--deployment-alias",
+            "primary",
+            "--deployment-alias",
+            "secondary",
+            "--exact-model",
+            "model-revision-exact",
+            "--certification-id",
+            "certification-one",
+            "--provenance",
+            "operator-reviewed deployment manifests",
+            "--evidence-sha256",
+            "a" * 64,
+            "--certified-at",
+            "2026-08-18T00:00:00Z",
+            "--expected-catalog-sha256",
+            "0" * 64,
+            "--revision",
+            "revision-waterfall-one",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "refresh its digest" in result.output
+    assert "coding" not in load_model_catalog(tmp_path / "models.toml").gateway_pools
+    assert all(item.alias_id != "coding" for item in GatewayManagement(tmp_path).aliases())
 
 
 def test_key_output_collision_is_rejected_before_key_issuance(tmp_path: Path) -> None:

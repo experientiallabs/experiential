@@ -14,6 +14,9 @@ import pytest
 from wmo.runtime.gateway.sqlite.migrations import (
     _MIGRATION_1,
     _MIGRATION_2,
+    _MIGRATION_3,
+    _MIGRATION_4,
+    _MIGRATION_5,
     SCHEMA_VERSION,
     GatewaySchemaError,
     connect_database,
@@ -29,6 +32,16 @@ def test_initial_database_is_private_wal_with_foreign_keys(tmp_path: Path) -> No
     connection = connect_database(path, busy_timeout_ms=321)
     try:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        columns = {
+            str(row[1]): row for row in connection.execute("PRAGMA table_info(alias_revisions)")
+        }
+        assert columns["refusal_failover"][4] == "0"
+        attempt_columns = {
+            str(row[1]): row for row in connection.execute("PRAGMA table_info(gateway_attempts)")
+        }
+        assert attempt_columns["attempt_ordinal"][3] == 1
+        assert attempt_columns["billing_source"][3] == 1
+        assert "customer_managed" in str(attempt_columns["billing_source"][4])
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 321
@@ -205,10 +218,15 @@ def test_attempt_billing_migration_is_explicit_and_preserves_v2_backup(tmp_path:
         assert "billing_source" not in backup_columns
         assert backup_connection.execute("PRAGMA user_version").fetchone()[0] == 2
         row = current.execute(
-            "SELECT billing_source FROM gateway_attempts WHERE attempt_id = 'attempt-one'"
+            """
+            SELECT billing_source, attempt_ordinal, route_depth
+            FROM gateway_attempts WHERE attempt_id = 'attempt-one'
+            """
         ).fetchone()
         assert row is not None
         assert row["billing_source"] == "customer_managed"
+        assert row["attempt_ordinal"] == 0
+        assert row["route_depth"] == 0
     finally:
         current.close()
         backup_connection.close()
@@ -266,6 +284,106 @@ def test_provider_authority_migration_preserves_v3_backup(tmp_path: Path) -> Non
     finally:
         current.close()
         backup_connection.close()
+
+
+def test_v6_migration_preserves_billing_and_adds_physical_ordinal(tmp_path: Path) -> None:
+    """A v5 host-managed attempt keeps route identity while gaining an ordinal."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for migration in (
+            _MIGRATION_1,
+            _MIGRATION_2,
+            _MIGRATION_3,
+            _MIGRATION_4,
+            _MIGRATION_5,
+        ):
+            for statement in migration:
+                connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO gateway_requests (
+                request_id, organization_id, identity_id, key_id, alias_id,
+                alias_revision_id, api_surface, canonical_request_sha256,
+                accepted_at, deadline_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "request-one",
+                "org-one",
+                "identity-one",
+                "key-one",
+                "alias-one",
+                "revision-one",
+                "chat_completions",
+                "a" * 64,
+                "2026-08-18T00:00:00+00:00",
+                "2026-08-18T00:01:00+00:00",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO gateway_attempts (
+                attempt_id, request_id, organization_id, route_depth, deployment_id,
+                provider, exact_model_id, pool_id, catalog_sha256, billing_source,
+                state, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "attempt-one",
+                "request-one",
+                "org-one",
+                3,
+                "deployment-one",
+                "openai",
+                "exact-one",
+                "pool-one",
+                "b" * 64,
+                "host_managed",
+                "failed",
+                "2026-08-18T00:00:01+00:00",
+            ),
+        )
+        connection.execute("PRAGMA user_version = 5")
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    backup = initialize_database(path)
+
+    assert backup is not None
+    migrated = sqlite3.connect(path)
+    try:
+        row = migrated.execute(
+            """
+            SELECT attempt_id, attempt_ordinal, route_depth, billing_source
+            FROM gateway_attempts
+            """
+        ).fetchone()
+        assert row == ("attempt-one", 0, 3, "host_managed")
+    finally:
+        migrated.close()
+    prior = sqlite3.connect(backup)
+    try:
+        assert prior.execute("PRAGMA user_version").fetchone()[0] == 5
+        columns = {str(row[1]) for row in prior.execute("PRAGMA table_info(gateway_attempts)")}
+        assert "billing_source" in columns
+        assert "attempt_ordinal" not in columns
+        refusal_columns = {
+            str(row[1]) for row in prior.execute("PRAGMA table_info(alias_revisions)")
+        }
+        assert "refusal_failover" in refusal_columns
+        assert (
+            prior.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'provider_connections'"
+            ).fetchone()
+            is not None
+        )
+    finally:
+        prior.close()
 
 
 def test_concurrent_initializers_choose_migration_plan_under_exclusive_lock(

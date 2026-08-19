@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,10 +14,12 @@ from fastapi.testclient import TestClient
 from wmo.common.models import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
+    GatewayEquivalenceCertification,
     GatewayTokenPrices,
     ModelCapabilities,
 )
 from wmo.runtime.gateway.catalog_authority import (
+    upsert_certified_pool,
     upsert_connection,
     upsert_singleton_deployment,
 )
@@ -24,6 +29,18 @@ from wmo.runtime.gateway.lifecycle import (
     load_local_gateway,
 )
 from wmo.runtime.gateway.management import GatewayManagement
+from wmo.runtime.models import RuntimeModelCatalog
+from wmo.runtime.router.runtime import RouterRuntime
+
+
+class _ReadinessProjectRuntime:
+    """Expose only the frozen candidate aliases required during startup."""
+
+    def __init__(self, *aliases: str) -> None:
+        """Build one minimal policy view from ordered candidate aliases."""
+        self.policy = SimpleNamespace(
+            candidates=tuple(SimpleNamespace(alias=alias) for alias in aliases)
+        )
 
 
 def test_local_gateway_preflights_real_state_and_serves_health_and_usage(
@@ -207,6 +224,70 @@ def test_live_alias_revision_drift_is_removed_from_discovery_and_dispatch(
     assert [item["id"] for item in refreshed.json()["data"]] == ["coding"]
 
 
+def test_project_certified_pool_preflight_resolves_all_siblings_and_reloads(
+    tmp_path: Path,
+) -> None:
+    """Project startup accepts one candidate inside an available certified pool."""
+    manager, raw_key = _configured_project_pool(tmp_path)
+
+    def load_project(
+        project: str,
+        root: Path,
+        *,
+        policy_id: str,
+        runtime_catalog: RuntimeModelCatalog,
+    ) -> RouterRuntime:
+        """Return a selection-only runtime naming the pool's primary deployment."""
+        del root, runtime_catalog
+        assert project == "project-one"
+        assert policy_id == "activation-one"
+        return cast(RouterRuntime, _ReadinessProjectRuntime("primary"))
+
+    for _reload in range(2):
+        runtime = load_local_gateway(
+            tmp_path,
+            graceful_timeout_seconds=1,
+            environment={
+                "PRIMARY_PROVIDER_KEY": "primary-available",
+                "SECONDARY_PROVIDER_KEY": "secondary-available",
+            },
+            project_loader=load_project,
+        )
+        with TestClient(runtime.app) as client:
+            models = client.get(
+                "/v1/models",
+                headers={"Authorization": f"Bearer {raw_key}"},
+            )
+        assert [item["id"] for item in models.json()["data"]] == ["coding"]
+    assert manager.aliases()[0].target_kind == "project"
+
+
+def test_project_certified_pool_is_unavailable_when_any_sibling_cannot_resolve(
+    tmp_path: Path,
+) -> None:
+    """Project startup fails closed before dispatch when a pool sibling lacks credentials."""
+    _manager, _raw_key = _configured_project_pool(tmp_path)
+
+    def load_project(
+        project: str,
+        root: Path,
+        *,
+        policy_id: str,
+        runtime_catalog: RuntimeModelCatalog,
+    ) -> RouterRuntime:
+        """Return the same frozen candidate without touching provider clients."""
+        del project, root, policy_id, runtime_catalog
+        return cast(RouterRuntime, _ReadinessProjectRuntime("primary"))
+
+    with pytest.raises(GatewayLifecycleError, match="no granted active alias is locally available"):
+        load_local_gateway(
+            tmp_path,
+            graceful_timeout_seconds=1,
+            environment={"PRIMARY_PROVIDER_KEY": "primary-available"},
+            project_loader=load_project,
+        )
+
+
 def _configured_gateway(root: Path) -> tuple[GatewayManagement, str]:
     """Create one explicit direct alias, identity, grant, and key in real SQLite."""
     manager = GatewayManagement(root)
@@ -239,6 +320,72 @@ def _configured_gateway(root: Path) -> tuple[GatewayManagement, str]:
         alias_name="coding",
         revision_id="revision-one",
         pool_id="coding",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.create_identity(identity_id="default", display_name="Default")
+    manager.add_grant(identity_id="default", alias_id="coding")
+    issued = manager.issue_key(identity_id="default", key_id="key-one")
+    return manager, issued.raw_key
+
+
+def _configured_project_pool(root: Path) -> tuple[GatewayManagement, str]:
+    """Create one project alias whose candidate belongs to a certified ordered pool."""
+    manager = GatewayManagement(root)
+    manager.initialize()
+    for name, credential_env in (
+        ("primary-provider", "PRIMARY_PROVIDER_KEY"),
+        ("secondary-provider", "SECONDARY_PROVIDER_KEY"),
+    ):
+        upsert_connection(
+            root,
+            name=name,
+            connection=ConnectionConfig(
+                provider="openai-compatible",
+                base_url="http://127.0.0.1:9/v1",
+                api_key_env=credential_env,
+            ),
+            replace=False,
+        )
+    normalized = None
+    for deployment_alias, connection_name in (
+        ("primary", "primary-provider"),
+        ("secondary", "secondary-provider"),
+    ):
+        normalized, _snapshot, _changed = upsert_singleton_deployment(
+            root,
+            deployment_alias=deployment_alias,
+            connection_name=connection_name,
+            provider_model=f"{deployment_alias}-model",
+            exact_model_id="model-revision-exact",
+            revision=None,
+            capabilities=ModelCapabilities(),
+            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            prices=GatewayTokenPrices(),
+            pricing_source=None,
+            replace=False,
+        )
+    assert normalized is not None
+    normalized, snapshot, _changed = upsert_certified_pool(
+        root,
+        pool_id="certified-pool",
+        exact_model_id="model-revision-exact",
+        deployment_aliases=("primary", "secondary"),
+        certification=GatewayEquivalenceCertification(
+            certification_id="certification-one",
+            provenance="operator-reviewed deployment manifests",
+            evidence_sha256="a" * 64,
+            certified_at=datetime(2026, 8, 18, tzinfo=UTC),
+        ),
+        expected_catalog_sha256=normalized.identity_sha256(),
+        replace=False,
+    )
+    manager.activate_project_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-project-one",
+        project_ref="project-one",
+        activation_ref="activation-one",
         snapshot_ref=f"catalog-snapshots/{snapshot.name}",
         catalog_sha256=normalized.identity_sha256(),
     )

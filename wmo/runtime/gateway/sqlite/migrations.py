@@ -8,7 +8,7 @@ import stat
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 
 class GatewaySchemaError(RuntimeError):
@@ -319,11 +319,98 @@ _MIGRATION_4 = (
     """,
 )
 
+_MIGRATION_5 = (
+    """
+    ALTER TABLE alias_revisions
+    ADD COLUMN refusal_failover INTEGER NOT NULL DEFAULT 0 CHECK (refusal_failover IN (0, 1))
+    """,
+)
+
+_MIGRATION_6 = (
+    "ALTER TABLE gateway_attempts RENAME TO gateway_attempts_v5",
+    """
+    CREATE TABLE gateway_attempts (
+        attempt_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        organization_id TEXT NOT NULL,
+        attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 0),
+        route_depth INTEGER NOT NULL CHECK (route_depth >= 0),
+        deployment_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        exact_model_id TEXT NOT NULL,
+        pool_id TEXT NOT NULL,
+        catalog_sha256 TEXT NOT NULL CHECK (length(catalog_sha256) = 64),
+        billing_source TEXT NOT NULL DEFAULT 'customer_managed'
+            CHECK (billing_source IN ('customer_managed', 'host_managed')),
+        pricing_source TEXT,
+        pricing_effective_at TEXT,
+        route_reason TEXT,
+        fallback_reason TEXT,
+        input_rate INTEGER CHECK (input_rate IS NULL OR input_rate >= 0),
+        cached_input_rate INTEGER CHECK (cached_input_rate IS NULL OR cached_input_rate >= 0),
+        output_rate INTEGER CHECK (output_rate IS NULL OR output_rate >= 0),
+        reasoning_rate INTEGER CHECK (reasoning_rate IS NULL OR reasoning_rate >= 0),
+        state TEXT NOT NULL CHECK (state IN (
+            'dispatched', 'completed', 'failed', 'cancelled',
+            'incomplete', 'unknown_after_crash'
+        )),
+        started_at TEXT NOT NULL,
+        terminal_at TEXT,
+        failure_class TEXT,
+        input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
+        cached_input_tokens INTEGER CHECK (
+            cached_input_tokens IS NULL OR cached_input_tokens >= 0
+        ),
+        output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
+        reasoning_tokens INTEGER CHECK (reasoning_tokens IS NULL OR reasoning_tokens >= 0),
+        usage_source TEXT CHECK (
+            usage_source IS NULL OR usage_source IN ('observed', 'estimated', 'unknown')
+        ),
+        estimated_cost_micro_usd INTEGER CHECK (
+            estimated_cost_micro_usd IS NULL OR estimated_cost_micro_usd >= 0
+        ),
+        content_retained INTEGER NOT NULL DEFAULT 0 CHECK (content_retained = 0),
+        UNIQUE (organization_id, attempt_id),
+        UNIQUE (request_id, attempt_ordinal),
+        FOREIGN KEY (organization_id, request_id)
+            REFERENCES gateway_requests (organization_id, request_id)
+    ) STRICT
+    """,
+    """
+    INSERT INTO gateway_attempts (
+        attempt_id, request_id, organization_id, attempt_ordinal, route_depth,
+        deployment_id, provider, exact_model_id, pool_id, catalog_sha256,
+        billing_source, pricing_source, pricing_effective_at, route_reason, fallback_reason,
+        input_rate, cached_input_rate, output_rate, reasoning_rate, state, started_at,
+        terminal_at, failure_class, input_tokens, cached_input_tokens, output_tokens,
+        reasoning_tokens, usage_source, estimated_cost_micro_usd, content_retained
+    )
+    SELECT
+        attempt_id, request_id, organization_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY request_id ORDER BY started_at, attempt_id
+        ) - 1,
+        route_depth, deployment_id, provider, exact_model_id, pool_id, catalog_sha256,
+        billing_source, pricing_source, pricing_effective_at, route_reason, fallback_reason,
+        input_rate, cached_input_rate, output_rate, reasoning_rate, state, started_at,
+        terminal_at, failure_class, input_tokens, cached_input_tokens, output_tokens,
+        reasoning_tokens, usage_source, estimated_cost_micro_usd, content_retained
+    FROM gateway_attempts_v5
+    """,
+    "DROP TABLE gateway_attempts_v5",
+    """
+    CREATE INDEX gateway_attempts_usage
+    ON gateway_attempts (organization_id, terminal_at, state)
+    """,
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
     3: _MIGRATION_3,
     4: _MIGRATION_4,
+    5: _MIGRATION_5,
+    6: _MIGRATION_6,
 }
 
 

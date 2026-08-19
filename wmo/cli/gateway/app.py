@@ -18,6 +18,7 @@ from wmo.cli.gateway.key_output import (
     recover_key_output,
     settle_key_output,
 )
+from wmo.cli.gateway.pool import pool_app
 from wmo.cli.gateway.provider import provider_app
 from wmo.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
 from wmo.cli.options import ROOT_OPTION, usage_error
@@ -37,6 +38,7 @@ gateway_app.add_typer(provider_app, name="provider")
 gateway_app.add_typer(identity_app, name="identity")
 gateway_app.add_typer(key_app, name="key")
 gateway_app.add_typer(alias_app, name="alias")
+gateway_app.add_typer(pool_app, name="pool")
 gateway_app.add_typer(grant_app, name="grant")
 
 _console = Console()

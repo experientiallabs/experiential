@@ -55,6 +55,7 @@ class GatewayAliasView(ContractModel):
     activation_ref: str | None = None
     snapshot_ref: str | None = None
     catalog_sha256: str | None = None
+    refusal_failover: bool = False
 
 
 class GatewayGrantView(ContractModel):
@@ -407,7 +408,7 @@ class GatewayManagement:
             """
             SELECT a.alias_id, a.alias_name, a.active, a.active_revision_id,
                    r.target_kind, r.pool_id, r.project_ref, r.activation_ref,
-                   r.snapshot_ref, r.catalog_sha256
+                   r.snapshot_ref, r.catalog_sha256, r.refusal_failover
             FROM gateway_aliases AS a
             LEFT JOIN alias_revisions AS r
               ON r.organization_id = a.organization_id
@@ -433,6 +434,7 @@ class GatewayManagement:
                 catalog_sha256=(
                     None if row["catalog_sha256"] is None else str(row["catalog_sha256"])
                 ),
+                refusal_failover=bool(row["refusal_failover"]),
             )
             for row in rows
         )
@@ -447,6 +449,7 @@ class GatewayManagement:
         snapshot_ref: str,
         catalog_sha256: str,
         provider_connections: tuple[ProviderConnectionBinding, ...] = (),
+        refusal_failover: bool = False,
     ) -> bool:
         """Activate one singleton direct alias against an immutable catalog snapshot."""
         return self._activate_alias(
@@ -457,6 +460,7 @@ class GatewayManagement:
             snapshot_ref=snapshot_ref,
             catalog_sha256=catalog_sha256,
             provider_connections=provider_connections,
+            refusal_failover=refusal_failover,
         )
 
     def activate_project_alias(
@@ -470,6 +474,7 @@ class GatewayManagement:
         snapshot_ref: str,
         catalog_sha256: str,
         provider_connections: tuple[ProviderConnectionBinding, ...] = (),
+        refusal_failover: bool = False,
     ) -> bool:
         """Activate one verified frozen project as exactly one public alias."""
         return self._activate_alias(
@@ -484,6 +489,7 @@ class GatewayManagement:
             snapshot_ref=snapshot_ref,
             catalog_sha256=catalog_sha256,
             provider_connections=provider_connections,
+            refusal_failover=refusal_failover,
         )
 
     def disable_alias(self, *, alias_id: str) -> bool:
@@ -593,6 +599,7 @@ class GatewayManagement:
         snapshot_ref: str,
         catalog_sha256: str,
         provider_connections: tuple[ProviderConnectionBinding, ...],
+        refusal_failover: bool,
     ) -> bool:
         """Register one snapshot and activate an idempotent immutable alias revision."""
         store = self.require_initialized()
@@ -601,7 +608,8 @@ class GatewayManagement:
             existing = connection.execute(
                 """
                 SELECT a.alias_name, r.target_kind, r.pool_id, r.project_ref,
-                       r.activation_ref, r.snapshot_ref, r.catalog_sha256
+                       r.activation_ref, r.snapshot_ref, r.catalog_sha256,
+                       r.refusal_failover
                 FROM alias_revisions AS r
                 JOIN gateway_aliases AS a
                   ON a.organization_id = r.organization_id AND a.alias_id = r.alias_id
@@ -627,8 +635,9 @@ class GatewayManagement:
                 target.activation_ref if isinstance(target, ProjectTarget) else None,
                 snapshot_ref,
                 catalog_sha256,
+                int(refusal_failover),
             )
-            actual = tuple(existing[index] for index in range(7))
+            actual = tuple(existing[index] for index in range(8))
             if actual != expected:
                 raise GatewayStoreError("alias revision ID was reused with different input")
             return False
@@ -649,6 +658,7 @@ class GatewayManagement:
             snapshot_ref=snapshot_ref,
             catalog_sha256=catalog_sha256,
             provider_connections=provider_connections,
+            refusal_failover=refusal_failover,
         )
         return True
 

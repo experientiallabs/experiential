@@ -133,10 +133,11 @@ class _Ledger:
         *,
         snapshot: ExecutionSnapshot,
         deployment: ExactModelDeployment,
+        attempt_ordinal: int,
         route_depth: int,
     ) -> str:
         """Capture dispatch identity and return a deterministic attempt ID."""
-        del deployment, route_depth
+        del deployment, attempt_ordinal, route_depth
         self.started.append(snapshot)
         return f"attempt-{len(self.started)}"
 
