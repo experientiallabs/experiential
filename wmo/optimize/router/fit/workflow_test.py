@@ -49,7 +49,7 @@ from wmo.optimize.router.fit.workflow import (
     report_router,
 )
 from wmo.runtime.models import RuntimeModelCatalog
-from wmo.runtime.router.runtime_test import _Catalog, _Client, _request, _snapshot
+from wmo.runtime.router.runtime_test import _Catalog, _Client, _request, _select, _snapshot
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
@@ -115,11 +115,11 @@ def test_single_workflow_freezes_before_held_out_and_resumes_exactly(
             ),
         ),
     )
-    sticky = runtime.select(_request(), episode_id="customer-episode")
-    assert runtime.select(_request(), episode_id="customer-episode") == sticky
+    sticky = _select(runtime, _request(), episode_id="customer-episode")
+    assert _select(runtime, _request(), episode_id="customer-episode") == sticky
     assert sticky.selected_alias == "candidate-a"
     client.embedding_values = RuntimeError("local embedding failed")
-    fallback = runtime.select(_request(), episode_id="fallback-episode")
+    fallback = _select(runtime, _request(), episode_id="fallback-episode")
     assert fallback.selected_alias == "candidate-a"
     assert fallback.fallback_reason == "embedding_error"
 

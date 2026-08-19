@@ -22,7 +22,7 @@ from wmo.runtime.router.capability import (
     verify_router_runtime_capabilities,
 )
 from wmo.runtime.router.errors import RouterApplicationError
-from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
+from wmo.runtime.router.runtime import RouterRuntime
 
 
 def load_project_router(
@@ -32,7 +32,6 @@ def load_project_router(
     policy_id: ArtifactId | None = None,
     environment: Mapping[str, str] | None = None,
     runtime_catalog: RuntimeModelCatalog | None = None,
-    decision_sink: DecisionSink | None = None,
 ) -> RouterRuntime:
     """Load a project router with complete automatic artifact verification.
 
@@ -42,7 +41,6 @@ def load_project_router(
         policy_id: Optional exact policy identity when the project contains several.
         environment: Optional credential mapping used during runtime client construction.
         runtime_catalog: Optional explicit runtime catalog for deterministic applications.
-        decision_sink: Optional aggregate-safe routing-decision recorder.
 
     Returns:
         Activated immutable router runtime without issuing a model request.
@@ -56,7 +54,6 @@ def load_project_router(
         policy_id=policy_id,
         environment=environment,
         runtime_catalog=runtime_catalog,
-        decision_sink=decision_sink,
         policy_verifier=verify_automatic_router_policy,
     )
 
@@ -68,7 +65,6 @@ def load_router(
     policy_id: ArtifactId | None = None,
     environment: Mapping[str, str] | None = None,
     runtime_catalog: RuntimeModelCatalog | None = None,
-    decision_sink: DecisionSink | None = None,
     ghost: bool = False,
 ) -> OpenAI:
     """Load a verified project router as an official synchronous OpenAI client.
@@ -79,8 +75,7 @@ def load_router(
         policy_id: Optional exact policy identity when the project contains several.
         environment: Optional credential mapping used during runtime client construction.
         runtime_catalog: Optional explicit runtime catalog for deterministic applications.
-        decision_sink: Optional aggregate-safe routing-decision recorder.
-        ghost: Whether completed traffic must bypass durable journal and replay state.
+        ghost: Compatibility flag that leaves project journals disabled.
 
     Returns:
         Official OpenAI client backed by the verified local router and selected traffic mode.
@@ -94,7 +89,6 @@ def load_router(
         policy_id=policy_id,
         environment=environment,
         runtime_catalog=runtime_catalog,
-        decision_sink=decision_sink,
         policy_verifier=verify_automatic_router_policy,
         ghost=ghost,
     )

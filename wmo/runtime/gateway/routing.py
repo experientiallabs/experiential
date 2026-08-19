@@ -245,7 +245,7 @@ class RouterProjectTargetResolver:
         episode_namespace: tuple[str, str, str, str],
         deadline_monotonic: float,
     ) -> ProjectSelection:
-        """Select one logical model without invoking ``RouterRuntime.complete``.
+        """Select one logical model without dispatching the routed candidate.
 
         Args:
             target: Frozen project activation target.
@@ -263,7 +263,7 @@ class RouterProjectTargetResolver:
         deadline.attempt_timeout()
         model_request = gateway_model_request(request)
         episode_id = project_episode_identity(episode_namespace)
-        decision = runtime._reuse_sticky_selection(  # noqa: SLF001 - selection-only bridge.
+        decision = runtime.reuse_sticky_selection(
             model_request,
             episode_id=episode_id,
         )
@@ -271,7 +271,7 @@ class RouterProjectTargetResolver:
             await self._acquire(deadline)
             task = asyncio.create_task(
                 asyncio.to_thread(
-                    runtime._select_unretained,
+                    runtime.select_unretained,
                     model_request,
                     episode_id=episode_id,
                 )
@@ -283,7 +283,7 @@ class RouterProjectTargetResolver:
             except TimeoutError as exc:
                 raise ProviderDeadlineExceeded("router selection deadline exceeded") from exc
             deadline.attempt_timeout()
-            decision = runtime._retain_prepared_selection(
+            decision = runtime.retain_prepared_selection(
                 model_request,
                 episode_id=episode_id,
                 prepared=prepared,

@@ -53,6 +53,12 @@ from wmo.runtime.router.economics import (
 )
 from wmo.runtime.router.journal import RuntimeAcceptance, _interaction_identity
 from wmo.runtime.router.snapshot import seal_runtime_trace_snapshot
+from wmo.runtime.router.snapshot_test import (
+    _journal_accept,
+    _journal_complete,
+    _journal_fail,
+    _journal_reserve_candidate,
+)
 
 _DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 14, tzinfo=UTC)
@@ -157,18 +163,8 @@ def _accept(
     """
     identity = _interaction_identity(journal.project_id, key, request, conversation)
     decision = _decision(identity.lineage_id, request)
-    embedding = BillingSourceEconomics(
-        billing_source=BillingSource.CUSTOMER_MANAGED,
-        economics=_operation(1, RoutedProviderComponent.ROUTER_EMBEDDING).economics,
-    )
-    reserved = journal.reserve_selection(
-        identity,
-        embedding,
-        now=now,
-        stale_after=timedelta(minutes=5),
-    )
-    assert reserved.reservation is not None
-    claim = journal.record_acceptance(
+    return _journal_accept(
+        journal,
         identity,
         RuntimeAcceptance(
             decision=decision,
@@ -180,12 +176,12 @@ def _accept(
                 sha256=decision.policy_sha256,
             ),
         ),
-        reserved.reservation,
-        _operation(1, RoutedProviderComponent.ROUTER_EMBEDDING),
-        accepted_at=now,
+        embedding=BillingSourceEconomics(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            economics=_operation(1, RoutedProviderComponent.ROUTER_EMBEDDING).economics,
+        ),
+        now=now,
     )
-    assert claim.accepted is not None
-    return claim.accepted
 
 
 def _reserve_candidate(
@@ -195,15 +191,15 @@ def _reserve_candidate(
     now: datetime,
 ) -> None:
     """Persist one deterministic candidate reservation before low-level dispatch."""
-    claim = journal.reserve_candidate(
+    _journal_reserve_candidate(
+        journal,
         accepted,
-        BillingSourceEconomics(
+        candidate=BillingSourceEconomics(
             billing_source=BillingSource.CUSTOMER_MANAGED,
             economics=_operation(2, RoutedProviderComponent.SELECTED_CANDIDATE).economics,
         ),
         now=now,
     )
-    assert claim.status == "dispatch"
 
 
 def _complete(
@@ -239,7 +235,8 @@ def _complete(
     )
     action = output if isinstance(output, AssistantAction) else AssistantAction(content=output)
     _reserve_candidate(journal, accepted, now=now)
-    journal.record_completed(
+    _journal_complete(
+        journal,
         accepted,
         ModelResponse(
             output=action,
@@ -359,7 +356,9 @@ def test_completed_multiplicity_is_retained_without_quality_filter(
         request=_request(ModelMessage(role="user", content="Provider failure")),
         now=_TIME + timedelta(minutes=2),
     )
-    journal.record_failure(
+    _reserve_candidate(journal, failed, now=_TIME + timedelta(minutes=2))
+    _journal_fail(
+        journal,
         failed,
         StructuredFailure(
             code=FailureCode.PROVIDER,

@@ -8,13 +8,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from wmo.runtime.router.errors import RouterApplicationError as RouterApplicationError
 
-from wmo.runtime.router.completion import (
-    JournaledRouterCompletionService,
-    RouterCompletionConflictError,
-    RouterCompletionFailedError,
-    RouterCompletionInProgressError,
-    RouterCompletionService,
-)
 from wmo.runtime.router.economics import (
     BillingSourceEconomics,
     RoutedCompletionEconomics,
@@ -27,18 +20,11 @@ from wmo.runtime.router.journal import (
     RuntimeAcceptedEvent,
     RuntimeAttemptFailedEvent,
     RuntimeCompletedEvent,
-    RuntimeIdempotencyConflictError,
-    RuntimeInteractionFailedError,
-    RuntimeInteractionInProgressError,
     RuntimeInteractionJournal,
     RuntimeJournalError,
     RuntimeJournalEvent,
 )
-from wmo.runtime.router.journal_service import JournaledRouterRuntime
 from wmo.runtime.router.runtime import (
-    RoutedModelResponse,
-    RouterEpisodeConflictError,
-    RouterModelCapabilityError,
     RouterRuntime,
     RouterRuntimeIntegrityError,
 )
@@ -65,24 +51,12 @@ __all__ = [
     "RoutedProviderOperation",
     "RoutedSpendDisposition",
     "RoutedSpendLedger",
-    "RoutedModelResponse",
-    "JournaledRouterRuntime",
-    "JournaledRouterCompletionService",
     "RuntimeAcceptedEvent",
     "RuntimeAttemptFailedEvent",
     "RuntimeCompletedEvent",
-    "RuntimeIdempotencyConflictError",
-    "RuntimeInteractionFailedError",
-    "RuntimeInteractionInProgressError",
     "RuntimeInteractionJournal",
     "RuntimeJournalError",
     "RuntimeJournalEvent",
-    "RouterEpisodeConflictError",
-    "RouterModelCapabilityError",
-    "RouterCompletionService",
-    "RouterCompletionConflictError",
-    "RouterCompletionInProgressError",
-    "RouterCompletionFailedError",
     "RouterRuntime",
     "RouterRuntimeIntegrityError",
     "LoadedRuntimeTraceSnapshot",

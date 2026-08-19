@@ -1,17 +1,15 @@
-"""Durable routed-interaction journal and local idempotency boundary.
+"""Validated read surface and event contracts for routed-interaction journals.
 
-The journal guarantees one local logical interaction and one durable target for each project and
-idempotency key. Provider dispatch can still be at-least-once if the process crashes after the
-provider succeeds but before the completion record reaches disk. Remote exactly-once behavior is
-available only when the selected provider honors the explicitly forwarded idempotency key.
+The journal binds one project's append-only JSONL interaction records and their provider-spend
+sidecar, cross-validates both files on every read, and defines the canonical event models
+consumed by runtime trace snapshots and managed SFT dataset builds.
 """
 
 from __future__ import annotations
 
 import hashlib
-import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, Field, TypeAdapter, ValidationError, model_validator
@@ -19,11 +17,8 @@ from pydantic import AwareDatetime, Field, TypeAdapter, ValidationError, model_v
 from wmo.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
-    FailureAttribution,
-    FailureCode,
     Sha256,
     StructuredFailure,
-    canonical_json_bytes,
     sha256_json,
     stable_id,
 )
@@ -31,68 +26,15 @@ from wmo.common.core.locks import file_write_lock
 from wmo.common.models import BillingSource, ModelRequest, ModelResponse, ModelSnapshot
 from wmo.common.project import ProjectPaths
 from wmo.common.routing import RoutingDecision
-from wmo.runtime.router.economics import (
-    BillingSourceEconomics,
-    RoutedCompletionEconomics,
-    RoutedProviderComponent,
-    RoutedProviderOperation,
-    RoutedSpendDisposition,
-    RoutedSpendLedger,
-    routed_completion_economics,
-    routed_spend_ledger,
-    zero_operation_economics,
-)
-from wmo.runtime.router.journal_io import (
-    RuntimeJournalError,
-)
-from wmo.runtime.router.journal_io import (
-    fsync_directories as _fsync_directories,
-)
-from wmo.runtime.router.journal_io import (
-    prepare_runtime_directory as _prepare_runtime_directory,
-)
-from wmo.runtime.router.journal_io import (
-    truncate_torn_tail as _truncate_torn_tail,
-)
+from wmo.runtime.router.economics import RoutedCompletionEconomics, RoutedSpendLedger
+from wmo.runtime.router.journal_io import RuntimeJournalError
 from wmo.runtime.router.journal_spend import (
     RuntimeSpendCheckpointEvent,
-    direct_not_incurred_operation,
     parse_spend_event,
-    rebind_settlement,
-    reserve_operation,
-    settle_operation,
-    spend_event_content_id,
     validate_spend_events,
-)
-from wmo.runtime.router.journal_spend import (
-    live_reservation as _live_reservation,
-)
-from wmo.runtime.router.journal_spend import (
-    next_operation_ordinal as _next_operation_ordinal,
-)
-from wmo.runtime.router.journal_spend import (
-    settled_operations as _settled_sidecar_operations,
 )
 from wmo.runtime.router.journal_validation import (
     acceptance_pins as acceptance_pins,
-)
-from wmo.runtime.router.journal_validation import (
-    candidate_reservation as _candidate_reservation,
-)
-from wmo.runtime.router.journal_validation import (
-    claim_for_existing_state as _claim_for_existing_state,
-)
-from wmo.runtime.router.journal_validation import (
-    failure_spend as _failure_spend,
-)
-from wmo.runtime.router.journal_validation import (
-    require_identity as _require_identity,
-)
-from wmo.runtime.router.journal_validation import (
-    require_interaction_spend_identity as _require_interaction_spend_identity,
-)
-from wmo.runtime.router.journal_validation import (
-    require_spend_identity as _require_spend_identity,
 )
 from wmo.runtime.router.journal_validation import (
     validate_combined_spend as _validate_combined_spend,
@@ -100,32 +42,6 @@ from wmo.runtime.router.journal_validation import (
 from wmo.runtime.router.journal_validation import (
     validate_events,
 )
-
-
-class RuntimeIdempotencyConflictError(ValueError):
-    """An idempotency key was reused for different request or lineage content."""
-
-
-class RuntimeInteractionInProgressError(RuntimeError):
-    """Another process still owns the live provider attempt for this interaction."""
-
-    retryable = True
-
-
-class RuntimeInteractionFailedError(RuntimeError):
-    """A durable provider attempt ended without a completed response."""
-
-    def __init__(self, failure: StructuredFailure, spend: RoutedSpendLedger) -> None:
-        """Retain safe failure meaning and exact alias-free cumulative spend.
-
-        Args:
-            failure: Durable redacted provider failure.
-            spend: Source-attributed cumulative accounting through the failed attempt.
-        """
-        super().__init__(failure.message)
-        self.failure = failure
-        self.spend = spend
-        self.retryable = failure.retryable
 
 
 class RuntimeInteractionIdentity(ContractModel):
@@ -255,24 +171,6 @@ class _InteractionState:
     terminal: RuntimeAttemptFailedEvent | RuntimeCompletedEvent | None
 
 
-@dataclass(frozen=True)
-class JournalClaim:
-    """Result of one atomic attempt to claim an interaction."""
-
-    status: Literal["needs_selection", "dispatch", "live", "completed", "failed"]
-    accepted: RuntimeAcceptedEvent | None = None
-    completed: RuntimeCompletedEvent | None = None
-    failure: RuntimeAttemptFailedEvent | None = None
-
-
-@dataclass(frozen=True)
-class SpendReservationClaim:
-    """Result of atomically reserving one provider-backed runtime operation."""
-
-    status: Literal["dispatch", "live", "superseded"]
-    reservation: RuntimeSpendCheckpointEvent | None = None
-
-
 class RuntimeInteractionJournal:
     """Strict append-only JSONL state for routed interactions in one project."""
 
@@ -281,12 +179,6 @@ class RuntimeInteractionJournal:
         self.path = paths.runtime_journal
         self.spend_path = self.path.with_name("provider-spend.jsonl")
         self.project_id = paths.project_id
-        self._durability_directories = (
-            paths.runtime_directory,
-            paths.project_directory,
-            paths.projects_directory,
-            paths.root,
-        )
 
     def read_events(self) -> tuple[RuntimeJournalEvent, ...]:
         """Read and fully validate all durable records, ignoring only a torn final line."""
@@ -303,454 +195,6 @@ class RuntimeInteractionJournal:
             spend_events = self._read_spend_unlocked()
             _validate_combined_spend(events, spend_events)
             return spend_events
-
-    def reserve_selection(
-        self,
-        identity: RuntimeInteractionIdentity,
-        reservation: BillingSourceEconomics,
-        *,
-        now: datetime,
-        stale_after: timedelta,
-    ) -> SpendReservationClaim:
-        """Persist an embedding reservation before any request-time provider dispatch.
-
-        Args:
-            identity: Canonical secret-free request and lineage identity.
-            reservation: Alias-free embedding ceiling and billing source.
-            now: Current timezone-aware time.
-            stale_after: Age after which an unclosed reservation becomes ambiguous.
-
-        Returns:
-            A dispatch claim for the new reservation or a live/superseded disposition.
-        """
-        _require_timezone(now)
-        if stale_after.total_seconds() <= 0:
-            raise ValueError("stale_after must be positive")
-        with file_write_lock(self.path, what="the routed-interaction journal"):
-            events = list(self._read_unlocked())
-            spend_events = list(self._read_spend_unlocked())
-            _validate_combined_spend(events, spend_events)
-            _require_interaction_spend_identity(spend_events, identity)
-            state = validate_events(events).get(identity.interaction_id)
-            if state is not None:
-                _require_identity(state.accepted, identity)
-                return SpendReservationClaim("superseded")
-            live = _live_reservation(
-                spend_events,
-                interaction_id=identity.interaction_id,
-                component=RoutedProviderComponent.ROUTER_EMBEDDING,
-            )
-            if live is not None:
-                _require_spend_identity(live, identity)
-                if now - live.recorded_at < stale_after:
-                    return SpendReservationClaim("live", reservation=live)
-                ambiguous = settle_operation(
-                    live,
-                    ordinal=len(spend_events) + 1,
-                    disposition=RoutedSpendDisposition.RESERVED_AMBIGUOUS,
-                    recorded_at=now,
-                )
-                self._append_spend_unlocked(ambiguous)
-                spend_events.append(ambiguous)
-            prior_sources = {
-                event.operation.billing_source
-                for event in spend_events
-                if event.interaction_id == identity.interaction_id
-                and event.operation.component == RoutedProviderComponent.ROUTER_EMBEDDING
-            }
-            if prior_sources and prior_sources != {reservation.billing_source}:
-                raise RuntimeJournalError("router embedding billing source changed across retries")
-            checkpoint = reserve_operation(
-                interaction_id=identity.interaction_id,
-                identity_sha256=sha256_json(identity),
-                ordinal=len(spend_events) + 1,
-                operation_ordinal=_next_operation_ordinal(spend_events, identity.interaction_id),
-                component=RoutedProviderComponent.ROUTER_EMBEDDING,
-                reservation=reservation,
-                recorded_at=now,
-            )
-            self._append_spend_unlocked(checkpoint)
-            return SpendReservationClaim("dispatch", reservation=checkpoint)
-
-    def record_acceptance(
-        self,
-        identity: RuntimeInteractionIdentity,
-        acceptance: RuntimeAcceptance,
-        reservation: RuntimeSpendCheckpointEvent,
-        settlement: RoutedProviderOperation,
-        *,
-        accepted_at: datetime,
-    ) -> JournalClaim:
-        """Atomically settle selection and persist immutable route pins.
-
-        Args:
-            identity: Canonical secret-free request and lineage identity.
-            acceptance: Exact selected policy and model pins.
-            reservation: Durable embedding reservation written before selection.
-            settlement: Runtime-reported embedding outcome.
-            accepted_at: Time selection finished and route pins became durable.
-
-        Returns:
-            A dispatch claim or a concurrently established canonical state.
-        """
-        _require_timezone(accepted_at)
-        with file_write_lock(self.path, what="the routed-interaction journal"):
-            events = list(self._read_unlocked())
-            spend_events = list(self._read_spend_unlocked())
-            _validate_combined_spend(events, spend_events)
-            state = validate_events(events).get(identity.interaction_id)
-            if state is not None:
-                _require_identity(state.accepted, identity)
-                return _claim_for_existing_state(state)
-            _require_spend_identity(reservation, identity)
-            live = _live_reservation(
-                spend_events,
-                interaction_id=identity.interaction_id,
-                component=RoutedProviderComponent.ROUTER_EMBEDDING,
-            )
-            if live != reservation:
-                return JournalClaim("live")
-            settled = rebind_settlement(reservation, settlement)
-            prior = _settled_sidecar_operations(spend_events, identity.interaction_id)
-            operations = tuple((*prior, settled))
-            accepted = _accepted_event(
-                identity,
-                acceptance,
-                spend=routed_spend_ledger(operations),
-                ordinal=len(events) + 1,
-                attempt_ordinal=1,
-                received_at=reservation.recorded_at,
-                attempt_started_at=accepted_at,
-            )
-            self._append_unlocked(accepted)
-            return JournalClaim("dispatch", accepted=accepted)
-
-    def record_selection_failure(
-        self,
-        identity: RuntimeInteractionIdentity,
-        reservation: RuntimeSpendCheckpointEvent,
-        *,
-        failed_at: datetime,
-    ) -> RuntimeSpendCheckpointEvent:
-        """Settle a selection crash or error as reserved-ambiguous spend.
-
-        Args:
-            identity: Canonical request and lineage identity.
-            reservation: Pre-embedding checkpoint written before provider dispatch.
-            failed_at: Time the selection failed without accepted route pins.
-
-        Returns:
-            Durable ambiguous embedding settlement.
-        """
-        _require_timezone(failed_at)
-        with file_write_lock(self.path, what="the routed-interaction journal"):
-            events = list(self._read_unlocked())
-            spend_events = list(self._read_spend_unlocked())
-            _validate_combined_spend(events, spend_events)
-            if validate_events(events).get(identity.interaction_id) is not None:
-                raise RuntimeJournalError("cannot fail selection after route acceptance")
-            _require_spend_identity(reservation, identity)
-            live = _live_reservation(
-                spend_events,
-                interaction_id=identity.interaction_id,
-                component=RoutedProviderComponent.ROUTER_EMBEDDING,
-            )
-            if live != reservation:
-                latest = validate_spend_events(spend_events).get(reservation.operation.operation_id)
-                if latest is None:
-                    raise RuntimeJournalError("selection reservation is absent from spend journal")
-                return latest
-            failed = settle_operation(
-                reservation,
-                ordinal=len(spend_events) + 1,
-                disposition=RoutedSpendDisposition.RESERVED_AMBIGUOUS,
-                recorded_at=failed_at,
-            )
-            self._append_spend_unlocked(failed)
-            return failed
-
-    def reserve_candidate(
-        self,
-        accepted: RuntimeAcceptedEvent,
-        reservation: BillingSourceEconomics,
-        *,
-        now: datetime,
-    ) -> SpendReservationClaim:
-        """Persist selected-candidate reservation before provider dispatch.
-
-        Args:
-            accepted: Exact live accepted attempt.
-            reservation: Candidate ceiling and immutable billing source.
-            now: Current timezone-aware reservation time.
-
-        Returns:
-            Dispatch ownership or a live/superseded disposition.
-        """
-        _require_timezone(now)
-        with file_write_lock(self.path, what="the routed-interaction journal"):
-            events = list(self._read_unlocked())
-            spend_events = list(self._read_spend_unlocked())
-            _validate_combined_spend(events, spend_events)
-            state = validate_events(events).get(accepted.interaction_id)
-            if (
-                state is None
-                or not _same_accepted_event(state.accepted, accepted)
-                or state.terminal is not None
-            ):
-                return SpendReservationClaim("superseded")
-            expected_source = accepted.acceptance.selected_model.billing_source
-            if reservation.billing_source != expected_source:
-                raise RuntimeJournalError("candidate billing source differs from accepted model")
-            live = _candidate_reservation(spend_events, accepted)
-            if live is not None:
-                return SpendReservationClaim("live", reservation=live)
-            checkpoint = reserve_operation(
-                interaction_id=accepted.interaction_id,
-                identity_sha256=sha256_json(accepted.identity),
-                ordinal=len(spend_events) + 1,
-                operation_ordinal=max(
-                    _next_operation_ordinal(spend_events, accepted.interaction_id),
-                    len(accepted.spend.operations) + 1,
-                ),
-                component=RoutedProviderComponent.SELECTED_CANDIDATE,
-                reservation=reservation,
-                recorded_at=now,
-                accepted_attempt_ordinal=accepted.attempt_ordinal,
-            )
-            self._append_spend_unlocked(checkpoint)
-            return SpendReservationClaim("dispatch", reservation=checkpoint)
-
-    def claim(
-        self,
-        identity: RuntimeInteractionIdentity,
-        *,
-        now: datetime,
-        stale_after: timedelta,
-    ) -> JournalClaim:
-        """Atomically inspect, create, or retry one provider attempt.
-
-        Args:
-            identity: Secret-free interaction identity derived from caller input.
-            now: Current timezone-aware time.
-            stale_after: Age after which an unclosed attempt may be retried.
-
-        Returns:
-            A claim telling the caller to select, dispatch, wait, replay, or fail.
-        """
-        _require_timezone(now)
-        if stale_after.total_seconds() <= 0:
-            raise ValueError("stale_after must be positive")
-        with file_write_lock(self.path, what="the routed-interaction journal"):
-            events = list(self._read_unlocked())
-            spend_events = list(self._read_spend_unlocked())
-            _validate_combined_spend(events, spend_events)
-            _require_interaction_spend_identity(spend_events, identity)
-            states = validate_events(events)
-            state = states.get(identity.interaction_id)
-            if state is None:
-                live_selection = _live_reservation(
-                    spend_events,
-                    interaction_id=identity.interaction_id,
-                    component=RoutedProviderComponent.ROUTER_EMBEDDING,
-                )
-                if live_selection is None:
-                    return JournalClaim("needs_selection")
-                _require_spend_identity(live_selection, identity)
-                if now - live_selection.recorded_at < stale_after:
-                    return JournalClaim("live")
-                ambiguous = settle_operation(
-                    live_selection,
-                    ordinal=len(spend_events) + 1,
-                    disposition=RoutedSpendDisposition.RESERVED_AMBIGUOUS,
-                    recorded_at=now,
-                )
-                self._append_spend_unlocked(ambiguous)
-                return JournalClaim("needs_selection")
-            _require_identity(state.accepted, identity)
-            terminal = state.terminal
-            if isinstance(terminal, RuntimeCompletedEvent):
-                return JournalClaim("completed", accepted=state.accepted, completed=terminal)
-            if isinstance(terminal, RuntimeAttemptFailedEvent) and not terminal.retryable:
-                return JournalClaim("failed", accepted=state.accepted, failure=terminal)
-            if terminal is None:
-                candidate_reservation = _candidate_reservation(spend_events, state.accepted)
-                if candidate_reservation is None:
-                    return JournalClaim("dispatch", accepted=state.accepted)
-                if now - candidate_reservation.recorded_at < stale_after:
-                    return JournalClaim("live", accepted=state.accepted)
-                stale_failure = StructuredFailure(
-                    code=FailureCode.TIMEOUT,
-                    message="prior routed model attempt became stale",
-                    retryable=True,
-                    attribution=FailureAttribution.MODEL,
-                )
-                failed = _failed_event(
-                    state.accepted,
-                    stale_failure,
-                    spend=_failure_spend(
-                        state.accepted,
-                        candidate_reservation,
-                        disposition=RoutedSpendDisposition.RESERVED_AMBIGUOUS,
-                    ),
-                    ordinal=len(events) + 1,
-                    failed_at=now,
-                )
-                self._append_unlocked(failed)
-                events.append(failed)
-            accepted = _accepted_event(
-                identity,
-                state.accepted.acceptance,
-                spend=(
-                    terminal.spend
-                    if isinstance(terminal, RuntimeAttemptFailedEvent)
-                    else failed.spend
-                ),
-                ordinal=len(events) + 1,
-                attempt_ordinal=state.accepted.attempt_ordinal + 1,
-                received_at=state.accepted.received_at,
-                attempt_started_at=now,
-            )
-            self._append_unlocked(accepted)
-            return JournalClaim("dispatch", accepted=accepted)
-
-    def record_failure(
-        self,
-        accepted: RuntimeAcceptedEvent,
-        failure: StructuredFailure,
-        *,
-        failed_at: datetime,
-    ) -> RuntimeAttemptFailedEvent | RuntimeCompletedEvent:
-        """Append a live failure or reconcile with a concurrent winning outcome."""
-        _require_timezone(failed_at)
-        with file_write_lock(self.path, what="the routed-interaction journal"):
-            events = list(self._read_unlocked())
-            spend_events = list(self._read_spend_unlocked())
-            _validate_combined_spend(events, spend_events)
-            state = validate_events(events).get(accepted.interaction_id)
-            if state is None or not any(
-                isinstance(event, RuntimeAcceptedEvent) and _same_accepted_event(event, accepted)
-                for event in events
-            ):
-                raise RuntimeJournalError(
-                    "cannot fail an interaction attempt that was not accepted"
-                )
-            if isinstance(state.terminal, RuntimeCompletedEvent):
-                return state.terminal
-            if not _same_accepted_event(state.accepted, accepted):
-                prior = _attempt_failure(events, accepted)
-                if prior is None:
-                    raise RuntimeJournalError("superseded attempt has no durable failure")
-                return prior
-            if state.terminal is not None:
-                if isinstance(state.terminal, RuntimeAttemptFailedEvent):
-                    return state.terminal
-                raise RuntimeJournalError("cannot fail an interaction after completion")
-            reservation = _candidate_reservation(spend_events, accepted)
-            if reservation is None:
-                not_incurred = direct_not_incurred_operation(
-                    interaction_id=accepted.interaction_id,
-                    operation_ordinal=len(accepted.spend.operations) + 1,
-                    component=RoutedProviderComponent.SELECTED_CANDIDATE,
-                    billing=BillingSourceEconomics(
-                        billing_source=accepted.acceptance.selected_model.billing_source,
-                        economics=zero_operation_economics(),
-                    ),
-                )
-                spend = routed_spend_ledger((*accepted.spend.operations, not_incurred))
-            else:
-                spend = _failure_spend(
-                    accepted,
-                    reservation,
-                    disposition=RoutedSpendDisposition.RESERVED_AMBIGUOUS,
-                )
-            event = _failed_event(
-                accepted,
-                failure,
-                spend=spend,
-                ordinal=len(events) + 1,
-                failed_at=failed_at,
-            )
-            self._append_unlocked(event)
-            return event
-
-    def record_completed(
-        self,
-        accepted: RuntimeAcceptedEvent,
-        response: ModelResponse,
-        *,
-        candidate_operation: RoutedProviderOperation,
-        completed_at: datetime,
-    ) -> RuntimeAttemptFailedEvent | RuntimeCompletedEvent:
-        """Commit the first response or observe an earlier permanent failure."""
-        _require_timezone(completed_at)
-        with file_write_lock(self.path, what="the routed-interaction journal"):
-            events = list(self._read_unlocked())
-            spend_events = list(self._read_spend_unlocked())
-            _validate_combined_spend(events, spend_events)
-            state = validate_events(events).get(accepted.interaction_id)
-            if state is None or not any(
-                isinstance(event, RuntimeAcceptedEvent) and _same_accepted_event(event, accepted)
-                for event in events
-            ):
-                raise RuntimeJournalError(
-                    "cannot complete an interaction attempt that was not accepted"
-                )
-            if isinstance(state.terminal, RuntimeCompletedEvent):
-                return state.terminal
-            if (
-                isinstance(state.terminal, RuntimeAttemptFailedEvent)
-                and not state.terminal.retryable
-            ):
-                return state.terminal
-            if not _same_accepted_event(state.accepted, accepted):
-                prior = _attempt_failure(events, accepted)
-                if prior is None or not prior.retryable:
-                    raise RuntimeJournalError(
-                        "superseded attempt lacks a retryable durable failure"
-                    )
-            elif state.terminal is not None:
-                raise RuntimeJournalError("cannot complete a terminal interaction attempt")
-            reservation = _candidate_reservation(spend_events, accepted)
-            if reservation is None:
-                raise RuntimeJournalError("completed candidate attempt has no durable reservation")
-            settled_candidate = rebind_settlement(reservation, candidate_operation)
-            operations = list(state.accepted.spend.operations)
-            existing_index = next(
-                (
-                    index
-                    for index, item in enumerate(operations)
-                    if item.operation_id == settled_candidate.operation_id
-                ),
-                None,
-            )
-            if existing_index is None:
-                operations.append(settled_candidate)
-            else:
-                operations[existing_index] = settled_candidate
-            current_reservation = _candidate_reservation(spend_events, state.accepted)
-            if (
-                current_reservation is not None
-                and current_reservation.operation.operation_id != settled_candidate.operation_id
-            ):
-                operations.append(
-                    settle_operation(
-                        current_reservation,
-                        ordinal=len(spend_events) + 1,
-                        disposition=RoutedSpendDisposition.RESERVED_AMBIGUOUS,
-                        recorded_at=completed_at,
-                    ).operation
-                )
-            operations.sort(key=lambda item: item.operation_ordinal)
-            economics = routed_completion_economics(tuple(operations))
-            event = _completed_event(
-                accepted,
-                response,
-                economics,
-                ordinal=len(events) + 1,
-                completed_at=completed_at,
-            )
-            self._append_unlocked(event)
-            return event
 
     def _read_unlocked(self) -> tuple[RuntimeJournalEvent, ...]:
         try:
@@ -805,47 +249,6 @@ class RuntimeInteractionJournal:
         except ValueError as exc:
             raise RuntimeJournalError(str(exc)) from exc
         return tuple(events)
-
-    def _append_unlocked(self, event: RuntimeJournalEvent) -> None:
-        if event.event_id != _event_content_id(event):
-            raise RuntimeJournalError("runtime event ID differs from its canonical content")
-        _prepare_runtime_directory(self.path)
-        _truncate_torn_tail(self.path)
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            descriptor = os.open(self.path, flags, 0o600)
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "ab", closefd=True) as handle:
-                handle.write(canonical_json_bytes(event) + b"\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            _fsync_directories(self._durability_directories)
-        except OSError as exc:
-            raise RuntimeJournalError(f"cannot append runtime journal {self.path}") from exc
-
-    def _append_spend_unlocked(self, event: RuntimeSpendCheckpointEvent) -> None:
-        """Append and fsync one pre-dispatch spend checkpoint."""
-        if event.event_id != spend_event_content_id(event):
-            raise RuntimeJournalError("runtime spend event ID differs from its canonical content")
-        _prepare_runtime_directory(self.spend_path)
-        _truncate_torn_tail(self.spend_path)
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            descriptor = os.open(self.spend_path, flags, 0o600)
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "ab", closefd=True) as handle:
-                handle.write(canonical_json_bytes(event) + b"\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            _fsync_directories(self._durability_directories)
-        except OSError as exc:
-            raise RuntimeJournalError(
-                f"cannot append runtime spend journal {self.spend_path}"
-            ) from exc
 
 
 def _interaction_identity(
@@ -950,28 +353,3 @@ def _event_content_id(event: RuntimeJournalEvent) -> str:
     material = event.model_dump(mode="json")
     del material["event_id"]
     return stable_id("runtime-event", material)
-
-
-def _attempt_failure(
-    events: list[RuntimeJournalEvent], accepted: RuntimeAcceptedEvent
-) -> RuntimeAttemptFailedEvent | None:
-    """Return the durable failure that closed one accepted attempt, if present."""
-    for event in events:
-        if (
-            isinstance(event, RuntimeAttemptFailedEvent)
-            and event.interaction_id == accepted.interaction_id
-            and event.attempt_ordinal == accepted.attempt_ordinal
-        ):
-            return event
-    return None
-
-
-def _same_accepted_event(first: RuntimeAcceptedEvent, second: RuntimeAcceptedEvent) -> bool:
-    """Compare durable accepted-attempt content without execution-only model fields."""
-    return first.model_dump(mode="json") == second.model_dump(mode="json")
-
-
-def _require_timezone(value: datetime) -> None:
-    """Require an aware timestamp at the journal boundary."""
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("runtime journal timestamps must include a timezone")

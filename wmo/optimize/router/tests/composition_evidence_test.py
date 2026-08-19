@@ -55,6 +55,7 @@ from wmo.optimize.router.composition_test import (
 )
 from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.router.runtime_test import _select
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
     _OneTurnAgent,
@@ -508,11 +509,13 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert len(telemetry_delivered) == 1
     assert len(telemetry_attempts) == 2
 
-    first_selection = result.runtime.select(
+    first_selection = _select(
+        result.runtime,
         ModelRequest(messages=(ModelMessage(role="user", content="Resolve customer case 17"),)),
         episode_id="case-17",
     )
-    second_selection = result.runtime.select(
+    second_selection = _select(
+        result.runtime,
         ModelRequest(
             messages=(
                 ModelMessage(role="user", content="Resolve customer case 17"),

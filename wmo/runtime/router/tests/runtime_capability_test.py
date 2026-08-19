@@ -2,115 +2,16 @@
 
 from typing import cast
 
-import pytest
-
 from wmo.common.models import (
-    AssistantAction,
     ModelCapabilities,
     ModelMessage,
     ModelRequest,
     ModelSnapshot,
     RoutedCandidateSnapshot,
-    ToolCall,
 )
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
-from wmo.runtime.router import RouterModelCapabilityError
 from wmo.runtime.router.runtime import RouterRuntime
-from wmo.runtime.router.runtime_test import _Catalog, _fixture, _request, _runtime
-
-
-def test_selected_model_must_prove_tool_capability_before_dispatch() -> None:
-    """A tool-bearing request never reaches an incapable selected model."""
-    runtime, client = _runtime(candidate_tools=False)
-
-    with pytest.raises(RouterModelCapabilityError, match="does not support tool calls"):
-        runtime.complete(_request(tool_name="read"), episode_id="tool-episode")
-
-    assert client.complete_calls == 0
-
-
-def test_selected_model_output_capacity_blocks_only_an_explicit_smaller_limit() -> None:
-    """Unknown output capacity dispatches while an explicit smaller limit fails closed."""
-    runtime, client = _runtime()
-    request = ModelRequest(
-        messages=(ModelMessage(role="user", content="route me"),),
-        maximum_output_tokens=100,
-    )
-
-    runtime.complete(request, episode_id="capacity-episode")
-
-    assert client.complete_calls == 1
-
-    policy, manifest, bank, snapshots, bounded_client = _fixture()
-    capabilities = ModelCapabilities(supports_tools=True, maximum_output_tokens=50)
-    snapshots = {
-        alias: (
-            snapshot
-            if alias == policy.embedder_alias
-            else snapshot.model_copy(update={"capabilities_sha256": capabilities.identity_sha256()})
-        )
-        for alias, snapshot in snapshots.items()
-    }
-    policy = policy.model_copy(
-        update={
-            "candidates": tuple(
-                RoutedCandidateSnapshot(alias=item.alias, model=snapshots[item.alias])
-                for item in policy.candidates
-            ),
-        }
-    )
-
-    class _BoundedCatalog(_Catalog):
-        """Catalog whose candidate aliases declare an explicit small output limit."""
-
-        def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
-            """Return the frozen model and explicitly bounded candidate capabilities."""
-            if alias == "embedder":
-                return super().snapshot(alias)
-            return snapshots[alias], capabilities
-
-        def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
-            """Resolve an alias to the shared test client with bounded capabilities."""
-            del role
-            snapshot, bounded = self.snapshot(alias)
-            return ResolvedModel(alias, snapshot, bounded, self.client, self.client)
-
-    bounded_runtime = RouterRuntime(
-        policy,
-        manifest,
-        bank,
-        cast(RuntimeModelCatalog, _BoundedCatalog(snapshots, bounded_client)),
-        pricing_snapshot_id="pricing-a",
-        pricing_snapshot_sha256="a" * 64,
-        pricing_candidate_aliases=bank.candidate_aliases,
-    )
-
-    with pytest.raises(RouterModelCapabilityError, match="output-token capacity"):
-        bounded_runtime.complete(request, episode_id="bounded-capacity-episode")
-
-    assert bounded_client.complete_calls == 0
-
-
-def test_replayed_tool_history_requires_tool_capability() -> None:
-    """A tool result cannot bypass eligibility by omitting current tool definitions."""
-    runtime, client = _runtime(candidate_tools=False)
-    request = ModelRequest(
-        messages=(
-            ModelMessage(role="user", content="read it"),
-            ModelMessage(
-                role="assistant",
-                assistant_action=AssistantAction(
-                    tool_calls=(ToolCall(call_id="call-a", name="read", arguments={"path": "a"}),)
-                ),
-            ),
-            ModelMessage(role="tool", content="done", tool_call_id="call-a"),
-        )
-    )
-
-    with pytest.raises(RouterModelCapabilityError, match="does not support tool calls"):
-        runtime.complete(request, episode_id="history-episode")
-
-    assert client.complete_calls == 0
+from wmo.runtime.router.runtime_test import _Catalog, _fixture, _request, _select
 
 
 def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
@@ -118,8 +19,7 @@ def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
 
     An ordinary turn first selects the cheap model, a tool turn falls back to the eligible model,
     and both a later turn and an exact replay of the first request remain on that replacement.
-    A fresh episode then dispatches through complete() with the same capability-fallback
-    evidence and exactly one client call.
+    A fresh episode then selects with the same capability-fallback evidence.
     """
     policy, manifest, bank, snapshots, client = _fixture()
     capabilities = {
@@ -177,13 +77,14 @@ def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
         pricing_candidate_aliases=bank.candidate_aliases,
     )
 
-    first = runtime.select(_request(), episode_id="eligible-sticky")
-    fallback = runtime.select(_request(tool_name="read"), episode_id="eligible-sticky")
-    later = runtime.select(
+    first = _select(runtime, _request(), episode_id="eligible-sticky")
+    fallback = _select(runtime, _request(tool_name="read"), episode_id="eligible-sticky")
+    later = _select(
+        runtime,
         ModelRequest(messages=(ModelMessage(role="user", content="ordinary later turn"),)),
         episode_id="eligible-sticky",
     )
-    replayed_first = runtime.select(_request(), episode_id="eligible-sticky")
+    replayed_first = _select(runtime, _request(), episode_id="eligible-sticky")
 
     assert first.selected_alias == "cheap"
     assert fallback.selected_alias == "baseline"
@@ -191,8 +92,32 @@ def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
     assert later.selected_alias == "baseline"
     assert replayed_first.selected_alias == "baseline"
 
-    result = runtime.complete(_request(tool_name="read"), episode_id="eligible")
+    fresh = _select(runtime, _request(tool_name="read"), episode_id="eligible")
 
-    assert result.decision.selected_alias == "baseline"
-    assert result.decision.fallback_reason == "capability_eligibility"
-    assert client.complete_calls == 1
+    assert fresh.selected_alias == "baseline"
+    assert fresh.fallback_reason == "capability_eligibility"
+    assert client.complete_calls == 0
+
+
+def test_unknown_capability_declarations_stay_selectable() -> None:
+    """Unknown tool support and output capacity never exclude a selected model.
+
+    Only an explicit ``supports_tools=False`` or an explicitly smaller declared
+    output limit rules a candidate out of request-time eligibility.
+    """
+    policy, manifest, bank, snapshots, client = _fixture()
+    runtime = RouterRuntime(
+        policy,
+        manifest,
+        bank,
+        cast(RuntimeModelCatalog, _Catalog(snapshots, client)),
+        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_sha256="a" * 64,
+        pricing_candidate_aliases=bank.candidate_aliases,
+    )
+
+    request = _request(tool_name="read").model_copy(update={"maximum_output_tokens": 100})
+    decision = _select(runtime, request, episode_id="permissive-episode")
+
+    assert decision.selected_alias == "cheap"
+    assert decision.fallback_reason is None

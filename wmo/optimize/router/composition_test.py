@@ -80,7 +80,7 @@ from wmo.optimize.router.judgment_budget import (
 )
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.models.providers.transport import ProviderTransportError
-from wmo.runtime.router.runtime_test import _Client, _request
+from wmo.runtime.router.runtime_test import _Client, _request, _select
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.engines.text import simulator as text_simulator_module
 from wmo.simulation.engines.text.resume import MAXIMUM_CELL_ATTEMPTS
@@ -1245,8 +1245,8 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         observed_rollout_spend(rollout)
     )
 
-    decision = first.runtime.select(_request(), episode_id="customer-episode")
-    assert first.runtime.select(_request(), episode_id="customer-episode") == decision
+    decision = _select(first.runtime, _request(), episode_id="customer-episode")
+    assert _select(first.runtime, _request(), episode_id="customer-episode") == decision
     assert first.plan.cells
 
 

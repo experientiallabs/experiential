@@ -61,9 +61,12 @@ def test_caller_supplied_activation_selects_without_a_local_project_directory(
     assert repository.loads == 1
     assert not (tmp_path / "projects" / "platform-project").exists()
     assert client.embed_calls == 0
-    decision = runtime.select(
-        ModelRequest(messages=(ModelMessage(role="user", content="route this"),)),
+    request = ModelRequest(messages=(ModelMessage(role="user", content="route this"),))
+    prepared = runtime.select_unretained(request, episode_id="episode-one")
+    decision = runtime.retain_prepared_selection(
+        request,
         episode_id="episode-one",
+        prepared=prepared,
     )
     assert decision.selected_alias == "cheap"
     assert client.embed_calls == 1

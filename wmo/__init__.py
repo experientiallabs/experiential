@@ -74,7 +74,6 @@ if TYPE_CHECKING:
         RoutedSpendDisposition as RoutedSpendDisposition,
     )
     from wmo.runtime.router.economics import RoutedSpendLedger as RoutedSpendLedger
-    from wmo.runtime.router.runtime import RoutedModelResponse as RoutedModelResponse
     from wmo.runtime.router.runtime import RouterRuntime as RouterRuntime
     from wmo.simulation.build import BuildReviewReadiness as BuildReviewReadiness
     from wmo.simulation.build import ProjectBuild as ProjectBuild
@@ -163,7 +162,6 @@ _EXPORT_MODULES = {
     "RoutedProviderOperation": "wmo.runtime.router.economics",
     "RoutedSpendDisposition": "wmo.runtime.router.economics",
     "RoutedSpendLedger": "wmo.runtime.router.economics",
-    "RoutedModelResponse": "wmo.runtime.router.runtime",
 }
 
 __all__ = list(_EXPORT_MODULES)

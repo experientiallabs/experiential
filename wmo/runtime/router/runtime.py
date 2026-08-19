@@ -1,27 +1,24 @@
-"""Online selection and invocation from one immutable guarded router policy."""
+"""Online selection from one immutable guarded router policy."""
 
 from __future__ import annotations
 
 import hashlib
 import threading
 import time
-import uuid
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 
 from wmo.common.core.artifacts import (
     ArtifactId,
-    ContractModel,
     Sha256,
 )
 from wmo.common.models import (
     CandidateTokenPrice,
-    IdempotentModelClient,
     ModelAlias,
     ModelRequest,
-    ModelResponse,
     OperationEconomics,
 )
 from wmo.common.project import ArtifactStore
@@ -35,23 +32,8 @@ from wmo.common.routing.decision import policy_content_sha256, select_from_bank
 from wmo.runtime.gateway.project_activation import ProjectActivation, load_project_activation
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.economics import (
-    BillingSourceEconomics,
-    RoutedCompletionEconomics,
-    RoutedProviderComponent,
-    RoutedProviderOperation,
     RoutedSpendDisposition,
-    routed_completion_economics,
     zero_operation_economics,
-)
-from wmo.runtime.router.runtime_selection import PreparedSelection, retained_selection
-from wmo.runtime.router.runtime_support import (
-    candidate_completion_economics as _candidate_completion_economics,
-)
-from wmo.runtime.router.runtime_support import (
-    candidate_reservation_economics as _candidate_reservation_economics,
-)
-from wmo.runtime.router.runtime_support import (
-    candidate_success_disposition as _candidate_success_disposition,
 )
 from wmo.runtime.router.runtime_support import (
     decision_content_id as _decision_content_id,
@@ -62,44 +44,26 @@ from wmo.runtime.router.runtime_support import (
 )
 from wmo.runtime.router.runtime_support import fallback_decision as _fallback_decision
 from wmo.runtime.router.runtime_support import (
-    requires_tool_protocol as _requires_tool_protocol,
-)
-from wmo.runtime.router.runtime_support import (
-    runtime_provider_operation as _runtime_provider_operation,
-)
-from wmo.runtime.router.runtime_support import (
     sealed_bank as _sealed_bank,
 )
 from wmo.runtime.router.runtime_support import sticky_decision as _sticky_decision
-from wmo.runtime.router.runtime_support import (
-    validate_idempotency_key as _validate_idempotency_key,
-)
 
 
 class RouterRuntimeIntegrityError(ValueError):
     """Frozen policy, bank, catalog, pricing, or feature identity cannot be activated."""
 
 
-class RouterEpisodeConflictError(ValueError):
-    """A caller reused an episode identity with different request-visible inputs."""
-
-
-class RouterModelCapabilityError(ValueError):
-    """The selected frozen model cannot preserve the requested OpenAI capability."""
-
-
-class RoutedModelResponse(ContractModel):
-    """One exact routing decision and the response produced by its selected model."""
+@dataclass(frozen=True)
+class PreparedSelection:
+    """One decision and the exact physical evidence incurred while selecting it."""
 
     decision: RoutingDecision
-    response: ModelResponse
-    economics: RoutedCompletionEconomics
+    request_key: tuple[Sha256, Sha256]
+    economics: OperationEconomics
+    disposition: RoutedSpendDisposition
 
 
 DecisionSink = Callable[[RoutingDecision], None]
-
-
-_PreparedSelection = PreparedSelection
 
 
 class RouterRuntime:
@@ -137,7 +101,6 @@ class RouterRuntime:
         ] = {}
         self._episode_expiry: dict[str, float] = {}
         self._request_expiry: dict[tuple[Sha256, Sha256], float] = {}
-        self._selection_inflight: dict[tuple[Sha256, Sha256], threading.Event] = {}
         self._decision_capacity = decision_capacity
         self._decision_ttl_seconds = decision_ttl_seconds
         self._clock = clock
@@ -255,58 +218,13 @@ class RouterRuntime:
             decision_sink=decision_sink,
         )
 
-    def select(
-        self,
-        request: ModelRequest,
-        *,
-        episode_id: str | None = None,
-        retain: bool = True,
-    ) -> RoutingDecision:
-        """Return one sticky guarded decision with conservative request-time fallback.
-
-        Args:
-            request: Provider-neutral request visible before candidate execution.
-            episode_id: Optional caller-owned identity for sticky whole-episode routing.
-            retain: Whether to publish the decision into process-local sticky state.
-
-        Returns:
-            Exact immutable decision selected or cached for the episode.
-
-        Raises:
-            ValueError: The episode identity is malformed.
-            RouterRuntimeIntegrityError: Frozen selection state is invalid.
-        """
-        if episode_id is not None and (not episode_id.strip() or len(episode_id) > 512):
-            raise ValueError("episode_id must be 1 to 512 non-blank characters")
-        identity = episode_id or f"request-{uuid.uuid4().hex}"
-        if not retain:
-            return self._select_unretained(request, episode_id=identity).decision
-        return self._select_retained(request, episode_id=identity).decision
-
-    def _select_retained(
+    def select_unretained(
         self,
         request: ModelRequest,
         *,
         episode_id: str,
-    ) -> _PreparedSelection:
-        """Return one retained decision with detached exact embedding evidence.
-
-        Args:
-            request: Provider-neutral request visible to selection.
-            episode_id: Exact non-empty sticky identity for this selection.
-
-        Returns:
-            Retained decision plus the physical evidence incurred by its selection.
-        """
-        return retained_selection(self, request, episode_id=episode_id)
-
-    def _select_unretained(
-        self,
-        request: ModelRequest,
-        *,
-        episode_id: str,
-    ) -> _PreparedSelection:
-        """Compute a selection bundle without mutating sticky or recorder state.
+    ) -> PreparedSelection:
+        """Compute a selection bundle without mutating process-local sticky state.
 
         Args:
             request: Exact request visible to learned selection.
@@ -337,14 +255,14 @@ class RouterRuntime:
             bank=self.bank,
             resolve=self._resolve,
         )
-        return _PreparedSelection(
+        return PreparedSelection(
             decision=decision,
             request_key=(identity_sha256, request_sha256),
             economics=economics,
             disposition=disposition,
         )
 
-    def _reuse_sticky_selection(
+    def reuse_sticky_selection(
         self,
         request: ModelRequest,
         *,
@@ -384,12 +302,12 @@ class RouterRuntime:
                 embedding_disposition=RoutedSpendDisposition.DEFINITELY_NOT_INCURRED,
             )
 
-    def _retain_prepared_selection(
+    def retain_prepared_selection(
         self,
         request: ModelRequest,
         *,
         episode_id: str,
-        prepared: _PreparedSelection,
+        prepared: PreparedSelection,
     ) -> RoutingDecision:
         """Atomically publish one worker-owned prepared selection bundle.
 
@@ -443,238 +361,6 @@ class RouterRuntime:
                 embedding_economics=prepared.economics,
                 embedding_disposition=prepared.disposition,
             )
-
-    def embedding_reservation(self, request: ModelRequest) -> BillingSourceEconomics:
-        """Return the source-attributed reservation before router embedding dispatch.
-
-        Args:
-            request: Provider-neutral request whose exact router feature will be embedded.
-
-        Returns:
-            Alias-free conservative embedding economics and immutable billing source.
-        """
-        feature = self._extractor.from_request(request)
-        return BillingSourceEconomics(
-            billing_source=self._embedder_billing_source,
-            economics=_embedding_economics(
-                feature,
-                input_usd_per_million_tokens=self._embedder_input_price,
-            ),
-        )
-
-    def selection_operation(
-        self,
-        request: ModelRequest,
-        *,
-        episode_id: str,
-        decision: RoutingDecision,
-    ) -> RoutedProviderOperation:
-        """Return the exact settled embedding disposition for one completed selection.
-
-        Args:
-            request: Provider-neutral request used for selection.
-            episode_id: Journal-derived sticky routing lineage.
-            decision: Exact decision returned by ``select``.
-
-        Returns:
-            Alias-free operation evidence suitable for durable rebinding by the journal.
-
-        Raises:
-            ValueError: The decision was not produced for this request and lineage.
-        """
-        feature = self._extractor.from_request(request)
-        request_sha256 = hashlib.sha256(feature.encode("utf-8")).hexdigest()
-        episode_sha256 = hashlib.sha256(episode_id.encode("utf-8")).hexdigest()
-        request_key = (episode_sha256, request_sha256)
-        with self._episode_lock:
-            if self._request_decisions.get(request_key) != decision:
-                raise ValueError("routing decision does not match the completed selection")
-            economics = self._request_embedding_economics[request_key]
-            disposition = self._request_embedding_dispositions[request_key]
-        return _runtime_provider_operation(
-            decision,
-            operation_ordinal=1,
-            component=RoutedProviderComponent.ROUTER_EMBEDDING,
-            billing_source=self._embedder_billing_source,
-            disposition=disposition,
-            economics=economics,
-        )
-
-    def candidate_reservation(
-        self,
-        request: ModelRequest,
-        *,
-        episode_id: str,
-        decision: RoutingDecision,
-    ) -> BillingSourceEconomics:
-        """Validate a pinned candidate and price its request before provider dispatch.
-
-        Args:
-            request: Provider-neutral request to complete.
-            episode_id: Journal-derived sticky routing lineage.
-            decision: Exact accepted routing decision.
-
-        Returns:
-            Alias-free conservative candidate reservation and immutable billing source.
-        """
-        resolved, _, _ = self._prepare_completion(request, episode_id=episode_id, decision=decision)
-        return BillingSourceEconomics(
-            billing_source=resolved.snapshot.billing_source,
-            economics=_candidate_reservation_economics(
-                request,
-                resolved,
-                self._candidate_prices.get(decision.selected_alias),
-            ),
-        )
-
-    def complete(
-        self,
-        request: ModelRequest,
-        *,
-        episode_id: str | None = None,
-        decision: RoutingDecision | None = None,
-        provider_idempotency_key: str | None = None,
-    ) -> RoutedModelResponse:
-        """Validate one exact cached decision and call its pinned model client.
-
-        Args:
-            request: Provider-neutral request to route and complete.
-            episode_id: Optional caller-owned identity for sticky routing.
-            decision: Optional prior decision to validate and consume without reselection.
-            provider_idempotency_key: Optional validated key forwarded only when the selected
-                client implements the explicit idempotency capability.
-
-        Returns:
-            Exact routing decision beside the selected model response.
-
-        Raises:
-            ValueError: A supplied decision does not bind this request, episode, or policy.
-        """
-        prepared: _PreparedSelection | None = None
-        if decision is None:
-            identity = episode_id or f"request-{uuid.uuid4().hex}"
-            prepared = self._select_retained(request, episode_id=identity)
-            selected = prepared.decision
-        else:
-            selected = decision
-        if provider_idempotency_key is not None:
-            _validate_idempotency_key(provider_idempotency_key)
-        resolved, embedding_economics, embedding_disposition = self._prepare_completion(
-            request,
-            episode_id=episode_id,
-            decision=selected,
-            prepared=prepared,
-        )
-        client = resolved.client
-        if provider_idempotency_key is not None and isinstance(client, IdempotentModelClient):
-            response = client.complete_idempotent(request, idempotency_key=provider_idempotency_key)
-        else:
-            response = client.complete(request)
-        price = self._candidate_prices.get(selected.selected_alias)
-        candidate_economics = _candidate_completion_economics(response.economics, price)
-        operations = (
-            _runtime_provider_operation(
-                selected,
-                operation_ordinal=1,
-                component=RoutedProviderComponent.ROUTER_EMBEDDING,
-                billing_source=self._embedder_billing_source,
-                disposition=embedding_disposition,
-                economics=embedding_economics,
-            ),
-            _runtime_provider_operation(
-                selected,
-                operation_ordinal=2,
-                component=RoutedProviderComponent.SELECTED_CANDIDATE,
-                billing_source=resolved.snapshot.billing_source,
-                disposition=_candidate_success_disposition(response.economics, candidate_economics),
-                economics=candidate_economics,
-            ),
-        )
-        return RoutedModelResponse(
-            decision=selected,
-            response=response,
-            economics=routed_completion_economics(operations),
-        )
-
-    def _prepare_completion(
-        self,
-        request: ModelRequest,
-        *,
-        episode_id: str | None,
-        decision: RoutingDecision,
-        prepared: _PreparedSelection | None = None,
-    ) -> tuple[ResolvedModel, OperationEconomics, RoutedSpendDisposition]:
-        """Validate request pins and capability before candidate provider dispatch."""
-        selected = decision
-        feature = self._extractor.from_request(request)
-        request_sha256 = hashlib.sha256(feature.encode("utf-8")).hexdigest()
-        expected_episode_sha256 = (
-            hashlib.sha256(episode_id.encode("utf-8")).hexdigest()
-            if episode_id is not None
-            else selected.episode_id_sha256
-        )
-        if (
-            selected.policy_id != self.policy.policy_id
-            or selected.policy_sha256 != policy_content_sha256(self.policy)
-            or selected.request_sha256 != request_sha256
-            or selected.episode_id_sha256 != expected_episode_sha256
-            or selected.selected_alias not in {item.alias for item in self.policy.candidates}
-        ):
-            raise ValueError("routing decision does not match this policy, request, or episode")
-        self._require_bank_integrity()
-        request_key = (expected_episode_sha256, request_sha256)
-        if prepared is not None:
-            if prepared.request_key != request_key or prepared.decision != selected:
-                raise ValueError("prepared routing decision does not match this request")
-            embedding_economics = prepared.economics
-            embedding_disposition = prepared.disposition
-        else:
-            with self._episode_lock:
-                self._expire_decisions()
-                cached = self._request_decisions.get(request_key)
-                episode_decision = self._episode_decisions.get(expected_episode_sha256)
-                if cached is None:
-                    if selected.decision_id != _decision_content_id(selected):
-                        raise ValueError(
-                            "routing decision does not match this policy, request, or episode"
-                        )
-                    if (
-                        episode_decision is not None
-                        and episode_decision.selected_alias != selected.selected_alias
-                    ):
-                        raise ValueError("routing decision conflicts with the cached episode model")
-                    if episode_decision is None:
-                        self._insert_episode(expected_episode_sha256, selected)
-                    self._insert_request(
-                        request_key,
-                        selected,
-                        zero_operation_economics(),
-                        RoutedSpendDisposition.DEFINITELY_NOT_INCURRED,
-                    )
-                    cached = selected
-                if cached != selected:
-                    raise ValueError("routing decision is not the exact cached episode decision")
-                embedding_economics = self._request_embedding_economics.get(
-                    request_key, zero_operation_economics()
-                )
-                embedding_disposition = self._request_embedding_dispositions.get(
-                    request_key, RoutedSpendDisposition.DEFINITELY_NOT_INCURRED
-                )
-        resolved = self._resolve(selected.selected_alias)
-        if _requires_tool_protocol(request) and resolved.capabilities.supports_tools is False:
-            raise RouterModelCapabilityError(
-                f"routed model alias {selected.selected_alias!r} does not support tool calls"
-            )
-        if (
-            request.maximum_output_tokens is not None
-            and resolved.capabilities.maximum_output_tokens is not None
-            and request.maximum_output_tokens > resolved.capabilities.maximum_output_tokens
-        ):
-            raise RouterModelCapabilityError(
-                f"routed model alias {selected.selected_alias!r} cannot prove the requested "
-                "output-token capacity"
-            )
-        return resolved, embedding_economics, embedding_disposition
 
     def _require_activation_identity(
         self,
@@ -859,6 +545,12 @@ class RouterRuntime:
         )
         return decision
 
+    def _record(self, decision: RoutingDecision) -> RoutingDecision:
+        """Send one published decision to the optional injected recorder."""
+        if self._decision_sink is not None:
+            self._decision_sink(decision)
+        return decision
+
     def _expiry(self) -> float:
         """Return one deadline for newly retained process-local decisions."""
         return self._clock() + self._decision_ttl_seconds
@@ -919,8 +611,3 @@ class RouterRuntime:
             self._request_expiry.pop(key, None)
             self._request_embedding_economics.pop(key, None)
             self._request_embedding_dispositions.pop(key, None)
-
-    def _record(self, decision: RoutingDecision) -> RoutingDecision:
-        if self._decision_sink is not None:
-            self._decision_sink(decision)
-        return decision

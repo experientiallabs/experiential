@@ -2367,7 +2367,6 @@ def _installed_release_driver() -> None:
     assert state.count_containing("project-secondary-model") == project_secondary_before + 1
     assert learned_client.embed_calls == 0
     assert learned_client.complete_calls == 0
-    assert learned_runtime.records_decisions is False
     assert not (project_root / "projects").exists()
     with sqlite3.connect(project_manager.database_path) as connection:
         project_attempts = connection.execute(

@@ -12,109 +12,18 @@ from wmo.runtime.router.economics import (
     RoutedProviderOperation,
     RoutedSpendDisposition,
     RoutedSpendLedger,
-    routed_spend_ledger,
 )
 from wmo.runtime.router.journal_spend import (
     RuntimeSpendCheckpointEvent,
-    live_reservation,
-    settle_operation,
     validate_spend_events,
-)
-from wmo.runtime.router.journal_spend import (
-    require_identity as require_sidecar_identity,
 )
 
 if TYPE_CHECKING:
     from wmo.runtime.router.journal import (
-        JournalClaim,
         RuntimeAcceptedEvent,
-        RuntimeInteractionIdentity,
         RuntimeJournalEvent,
         _InteractionState,
     )
-
-
-def claim_for_existing_state(state: _InteractionState) -> JournalClaim:
-    """Return the non-mutating claim represented by one validated interaction state."""
-    from wmo.runtime.router.journal import (
-        JournalClaim,
-        RuntimeAttemptFailedEvent,
-        RuntimeCompletedEvent,
-    )
-
-    terminal = state.terminal
-    if isinstance(terminal, RuntimeCompletedEvent):
-        return JournalClaim("completed", accepted=state.accepted, completed=terminal)
-    if isinstance(terminal, RuntimeAttemptFailedEvent) and not terminal.retryable:
-        return JournalClaim("failed", accepted=state.accepted, failure=terminal)
-    if terminal is None:
-        return JournalClaim("live", accepted=state.accepted)
-    return JournalClaim("live", accepted=state.accepted, failure=terminal)
-
-
-def candidate_reservation(
-    spend_events: list[RuntimeSpendCheckpointEvent] | tuple[RuntimeSpendCheckpointEvent, ...],
-    accepted: RuntimeAcceptedEvent,
-) -> RuntimeSpendCheckpointEvent | None:
-    """Return the live reservation for one exact accepted candidate attempt."""
-    from wmo.runtime.router.journal import RuntimeJournalError
-
-    try:
-        return live_reservation(
-            spend_events,
-            interaction_id=accepted.interaction_id,
-            component=RoutedProviderComponent.SELECTED_CANDIDATE,
-            accepted_attempt_ordinal=accepted.attempt_ordinal,
-        )
-    except ValueError as exc:
-        raise RuntimeJournalError(str(exc)) from exc
-
-
-def failure_spend(
-    accepted: RuntimeAcceptedEvent,
-    reservation: RuntimeSpendCheckpointEvent,
-    *,
-    disposition: RoutedSpendDisposition,
-) -> RoutedSpendLedger:
-    """Append one conservative candidate failure disposition to accepted spend."""
-    settlement = settle_operation(
-        reservation,
-        ordinal=reservation.ordinal + 1,
-        disposition=disposition,
-        recorded_at=reservation.recorded_at,
-    ).operation
-    return routed_spend_ledger((*accepted.spend.operations, settlement))
-
-
-def require_spend_identity(
-    event: RuntimeSpendCheckpointEvent,
-    identity: RuntimeInteractionIdentity,
-) -> None:
-    """Reject a live reservation reused for different request or lineage content."""
-    from wmo.runtime.router.journal import RuntimeIdempotencyConflictError
-
-    try:
-        require_sidecar_identity(event, sha256_json(identity))
-    except ValueError as exc:
-        raise RuntimeIdempotencyConflictError(str(exc)) from exc
-
-
-def require_interaction_spend_identity(
-    events: tuple[RuntimeSpendCheckpointEvent, ...] | list[RuntimeSpendCheckpointEvent],
-    identity: RuntimeInteractionIdentity,
-) -> None:
-    """Reject a changed request or lineage against any prior sidecar history.
-
-    Args:
-        events: Validated spend checkpoints for the project journal.
-        identity: Current caller request and lineage identity.
-
-    Raises:
-        RuntimeIdempotencyConflictError: The interaction already names another identity.
-    """
-    for event in events:
-        if event.interaction_id == identity.interaction_id:
-            require_spend_identity(event, identity)
 
 
 def validate_combined_spend(
@@ -367,19 +276,6 @@ def validate_events(
 def acceptance_pins(event: RuntimeAcceptedEvent) -> tuple[object, ...]:
     """Return fields that retries must preserve exactly."""
     return (event.identity, event.acceptance, event.received_at)
-
-
-def require_identity(
-    accepted: RuntimeAcceptedEvent,
-    identity: RuntimeInteractionIdentity,
-) -> None:
-    """Reject reuse of one key with a different request, project, or lineage."""
-    from wmo.runtime.router.journal import RuntimeIdempotencyConflictError
-
-    if accepted.identity.model_dump(mode="json") != identity.model_dump(mode="json"):
-        raise RuntimeIdempotencyConflictError(
-            "idempotency key was already used for different request or conversation content"
-        )
 
 
 def routing_decision_content_id(decision: RoutingDecision) -> str:

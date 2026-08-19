@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from wmo.common.core.artifacts import (
     ArtifactInput,
@@ -16,6 +16,7 @@ from wmo.common.core.artifacts import (
     FailureCode,
     StructuredFailure,
     canonical_json_bytes,
+    sha256_json,
     stable_id,
 )
 from wmo.common.models import (
@@ -44,13 +45,26 @@ from wmo.runtime.router.economics import (
     RoutedProviderOperation,
     RoutedSpendDisposition,
     routed_completion_economics,
+    routed_spend_ledger,
 )
 from wmo.runtime.router.journal import (
     RuntimeAcceptance,
     RuntimeAcceptedEvent,
+    RuntimeAttemptFailedEvent,
+    RuntimeCompletedEvent,
+    RuntimeInteractionIdentity,
     RuntimeInteractionJournal,
     RuntimeJournalError,
+    _accepted_event,
+    _completed_event,
+    _failed_event,
     _interaction_identity,
+    validate_events,
+)
+from wmo.runtime.router.journal_spend import (
+    RuntimeSpendCheckpointEvent,
+    reserve_operation,
+    settle_operation,
 )
 from wmo.runtime.router.snapshot import (
     RuntimeTraceAttempt,
@@ -190,6 +204,241 @@ def _journal_and_store(
     return RuntimeInteractionJournal(paths), ArtifactStore(paths)
 
 
+def _append_event(path: Path, event: BaseModel) -> None:
+    """Append one canonical JSONL record to a journal fixture file."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with path.open("ab") as handle:
+        handle.write(canonical_json_bytes(event) + b"\n")
+
+
+def _journal_accept(
+    journal: RuntimeInteractionJournal,
+    identity: RuntimeInteractionIdentity,
+    acceptance: RuntimeAcceptance,
+    *,
+    embedding: BillingSourceEconomics,
+    now: datetime,
+) -> RuntimeAcceptedEvent:
+    """Append one settled embedding reservation and its first accepted attempt.
+
+    Args:
+        journal: Journal fixture receiving both canonical records.
+        identity: Secret-free request and lineage identity.
+        acceptance: Exact route pins accepted for the interaction.
+        embedding: Source-attributed embedding economics reserved before selection.
+        now: Reservation and acceptance timestamp.
+
+    Returns:
+        Durable accepted event appended to the journal.
+    """
+    events = journal.read_events()
+    spend_events = journal.read_spend_events()
+    reservation = reserve_operation(
+        interaction_id=identity.interaction_id,
+        identity_sha256=sha256_json(identity),
+        ordinal=len(spend_events) + 1,
+        operation_ordinal=1,
+        component=RoutedProviderComponent.ROUTER_EMBEDDING,
+        reservation=embedding,
+        recorded_at=now,
+    )
+    _append_event(journal.spend_path, reservation)
+    settled = settle_operation(
+        reservation,
+        ordinal=len(spend_events) + 2,
+        disposition=RoutedSpendDisposition.LOCALLY_PRICED,
+        recorded_at=now,
+    ).operation
+    accepted = _accepted_event(
+        identity,
+        acceptance,
+        spend=routed_spend_ledger((settled,)),
+        ordinal=len(events) + 1,
+        attempt_ordinal=1,
+        received_at=now,
+        attempt_started_at=now,
+    )
+    _append_event(journal.path, accepted)
+    return accepted
+
+
+def _journal_reserve_candidate(
+    journal: RuntimeInteractionJournal,
+    accepted: RuntimeAcceptedEvent,
+    *,
+    candidate: BillingSourceEconomics,
+    now: datetime,
+) -> RuntimeSpendCheckpointEvent:
+    """Append one live candidate reservation bound to an exact accepted attempt.
+
+    Args:
+        journal: Journal fixture receiving the sidecar checkpoint.
+        accepted: Exact accepted attempt whose dispatch is reserved.
+        candidate: Source-attributed candidate ceiling economics.
+        now: Reservation timestamp.
+
+    Returns:
+        Durable reservation checkpoint appended to the spend sidecar.
+    """
+    spend_events = journal.read_spend_events()
+    prior_ordinal = max(
+        (
+            event.operation.operation_ordinal
+            for event in spend_events
+            if event.interaction_id == accepted.interaction_id
+        ),
+        default=0,
+    )
+    checkpoint = reserve_operation(
+        interaction_id=accepted.interaction_id,
+        identity_sha256=sha256_json(accepted.identity),
+        ordinal=len(spend_events) + 1,
+        operation_ordinal=max(prior_ordinal, len(accepted.spend.operations)) + 1,
+        component=RoutedProviderComponent.SELECTED_CANDIDATE,
+        reservation=candidate,
+        recorded_at=now,
+        accepted_attempt_ordinal=accepted.attempt_ordinal,
+    )
+    _append_event(journal.spend_path, checkpoint)
+    return checkpoint
+
+
+def _candidate_reservation_for(
+    spend_events: tuple[RuntimeSpendCheckpointEvent, ...],
+    accepted: RuntimeAcceptedEvent,
+) -> RuntimeSpendCheckpointEvent:
+    """Return the reserved candidate checkpoint for one exact accepted attempt."""
+    matches = tuple(
+        event
+        for event in spend_events
+        if event.interaction_id == accepted.interaction_id
+        and event.accepted_attempt_ordinal == accepted.attempt_ordinal
+        and event.operation.component == RoutedProviderComponent.SELECTED_CANDIDATE
+        and event.operation.disposition == RoutedSpendDisposition.RESERVED
+    )
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _journal_fail(
+    journal: RuntimeInteractionJournal,
+    accepted: RuntimeAcceptedEvent,
+    failure: StructuredFailure,
+    *,
+    failed_at: datetime,
+) -> RuntimeAttemptFailedEvent:
+    """Append one terminal failure settling the live candidate reservation as ambiguous.
+
+    Args:
+        journal: Journal fixture receiving the terminal record.
+        accepted: Exact accepted attempt that failed.
+        failure: Durable redacted provider failure.
+        failed_at: Failure timestamp.
+
+    Returns:
+        Durable failed-attempt event appended to the journal.
+    """
+    events = journal.read_events()
+    spend_events = journal.read_spend_events()
+    reservation = _candidate_reservation_for(spend_events, accepted)
+    settled = settle_operation(
+        reservation,
+        ordinal=len(spend_events) + 1,
+        disposition=RoutedSpendDisposition.RESERVED_AMBIGUOUS,
+        recorded_at=reservation.recorded_at,
+    ).operation
+    failed = _failed_event(
+        accepted,
+        failure,
+        spend=routed_spend_ledger((*accepted.spend.operations, settled)),
+        ordinal=len(events) + 1,
+        failed_at=failed_at,
+    )
+    _append_event(journal.path, failed)
+    return failed
+
+
+def _journal_retry(
+    journal: RuntimeInteractionJournal,
+    accepted: RuntimeAcceptedEvent,
+    failed: RuntimeAttemptFailedEvent,
+    *,
+    now: datetime,
+) -> RuntimeAcceptedEvent:
+    """Append one retry acceptance carrying the failed attempt's exact spend.
+
+    Args:
+        journal: Journal fixture receiving the retry acceptance.
+        accepted: Prior accepted attempt whose pins the retry preserves.
+        failed: Durable retryable failure that closed the prior attempt.
+        now: Retry acceptance timestamp.
+
+    Returns:
+        Durable retry accepted event appended to the journal.
+    """
+    events = journal.read_events()
+    retry = _accepted_event(
+        accepted.identity,
+        accepted.acceptance,
+        spend=failed.spend,
+        ordinal=len(events) + 1,
+        attempt_ordinal=accepted.attempt_ordinal + 1,
+        received_at=accepted.received_at,
+        attempt_started_at=now,
+    )
+    _append_event(journal.path, retry)
+    return retry
+
+
+def _journal_complete(
+    journal: RuntimeInteractionJournal,
+    accepted: RuntimeAcceptedEvent,
+    response: ModelResponse,
+    *,
+    candidate_operation: RoutedProviderOperation,
+    completed_at: datetime,
+) -> RuntimeCompletedEvent:
+    """Append one completed response settling the attempt's candidate reservation.
+
+    Args:
+        journal: Journal fixture receiving the completion.
+        accepted: Exact accepted attempt that produced the response.
+        response: Canonical provider response.
+        candidate_operation: Settled candidate disposition and economics evidence.
+        completed_at: Completion timestamp.
+
+    Returns:
+        Durable completed event appended to the journal.
+    """
+    events = journal.read_events()
+    spend_events = journal.read_spend_events()
+    reservation = _candidate_reservation_for(spend_events, accepted)
+    settled = settle_operation(
+        reservation,
+        ordinal=len(spend_events) + 1,
+        disposition=candidate_operation.disposition,
+        economics=candidate_operation.economics,
+        recorded_at=completed_at,
+    ).operation
+    latest = validate_events(events)[accepted.interaction_id].accepted
+    operations = [
+        settled if item.operation_id == settled.operation_id else item
+        for item in latest.spend.operations
+    ]
+    if all(item.operation_id != settled.operation_id for item in latest.spend.operations):
+        operations.append(settled)
+    operations.sort(key=lambda item: item.operation_ordinal)
+    completed = _completed_event(
+        accepted,
+        response,
+        routed_completion_economics(tuple(operations)),
+        ordinal=len(events) + 1,
+        completed_at=completed_at,
+    )
+    _append_event(journal.path, completed)
+    return completed
+
+
 def _accept(
     journal: RuntimeInteractionJournal,
     *,
@@ -208,7 +457,7 @@ def _accept(
         now: Acceptance timestamp.
 
     Returns:
-        Durable accepted event produced by the journal claim.
+        Durable accepted event appended with settled embedding accounting.
     """
     routed_request = request or _request()
     identity = _interaction_identity(
@@ -218,18 +467,8 @@ def _accept(
         conversation_id,
     )
     decision = _decision(identity.lineage_id, routed_request)
-    embedding = BillingSourceEconomics(
-        billing_source=BillingSource.CUSTOMER_MANAGED,
-        economics=_operation(1, RoutedProviderComponent.ROUTER_EMBEDDING).economics,
-    )
-    reserved = journal.reserve_selection(
-        identity,
-        embedding,
-        now=now,
-        stale_after=timedelta(minutes=5),
-    )
-    assert reserved.reservation is not None
-    claim = journal.record_acceptance(
+    return _journal_accept(
+        journal,
         identity,
         RuntimeAcceptance(
             decision=decision,
@@ -241,12 +480,12 @@ def _accept(
                 sha256=decision.policy_sha256,
             ),
         ),
-        reserved.reservation,
-        _operation(1, RoutedProviderComponent.ROUTER_EMBEDDING),
-        accepted_at=now,
+        embedding=BillingSourceEconomics(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            economics=_operation(1, RoutedProviderComponent.ROUTER_EMBEDDING).economics,
+        ),
+        now=now,
     )
-    assert claim.accepted is not None
-    return claim.accepted
 
 
 def _complete(
@@ -279,7 +518,8 @@ def _complete(
         now=now,
     )
     _reserve_candidate(journal, accepted, now=now)
-    journal.record_completed(
+    _journal_complete(
+        journal,
         accepted,
         response or _response(),
         candidate_operation=_economics().operations[-1],
@@ -295,15 +535,15 @@ def _reserve_candidate(
     now: datetime,
 ) -> None:
     """Persist one deterministic candidate reservation before low-level completion."""
-    claim = journal.reserve_candidate(
+    _journal_reserve_candidate(
+        journal,
         accepted,
-        BillingSourceEconomics(
+        candidate=BillingSourceEconomics(
             billing_source=BillingSource.CUSTOMER_MANAGED,
             economics=_operation(2, RoutedProviderComponent.SELECTED_CANDIDATE).economics,
         ),
         now=now,
     )
-    assert claim.status == "dispatch"
 
 
 def _artifact_bytes(store: ArtifactStore, artifact_id: str) -> dict[str, bytes]:
@@ -649,7 +889,8 @@ def test_retry_success_is_one_target_and_failures_remain_prefix_provenance(
         conversation_id="customer-thread",
     )
     _reserve_candidate(journal, first, now=_TIME)
-    journal.record_failure(
+    failed = _journal_fail(
+        journal,
         first,
         StructuredFailure(
             code=FailureCode.TIMEOUT,
@@ -659,21 +900,11 @@ def test_retry_success_is_one_target_and_failures_remain_prefix_provenance(
         ),
         failed_at=_TIME + timedelta(seconds=1),
     )
-    identity = _interaction_identity(
-        journal.project_id,
-        "retry-key",
-        request,
-        "customer-thread",
-    )
-    retry = journal.claim(
-        identity,
-        now=_TIME + timedelta(seconds=2),
-        stale_after=timedelta(minutes=5),
-    )
-    assert retry.accepted is not None
-    _reserve_candidate(journal, retry.accepted, now=_TIME + timedelta(seconds=2))
-    journal.record_completed(
-        retry.accepted,
+    retry = _journal_retry(journal, first, failed, now=_TIME + timedelta(seconds=2))
+    _reserve_candidate(journal, retry, now=_TIME + timedelta(seconds=2))
+    _journal_complete(
+        journal,
+        retry,
         _response(content="Use the reset link."),
         candidate_operation=_economics().operations[-1],
         completed_at=_TIME + timedelta(seconds=3),
@@ -685,7 +916,8 @@ def test_retry_success_is_one_target_and_failures_remain_prefix_provenance(
         now=_TIME + timedelta(seconds=4),
     )
     _reserve_candidate(journal, permanent, now=_TIME + timedelta(seconds=4))
-    journal.record_failure(
+    _journal_fail(
+        journal,
         permanent,
         StructuredFailure(
             code=FailureCode.PROVIDER,
@@ -723,7 +955,7 @@ def test_retry_success_is_one_target_and_failures_remain_prefix_provenance(
     assert trace.trace_id == first.interaction_id
     assert trace.conversation_id == first.identity.lineage_id
     assert trace.task == "Reset my password"
-    assert trace.spans[0].started_at == retry.accepted.attempt_started_at
+    assert trace.spans[0].started_at == retry.attempt_started_at
     assert trace.spans[0].attributes["runtime.attempt_ordinal"] == 2
     assert trace.source.identity.source_id == exported.snapshot.snapshot_id
     assert trace.source.identity.sha256 == exported.snapshot.prefix_sha256
@@ -740,7 +972,8 @@ def test_late_original_success_preserves_failure_and_superseded_retry(tmp_path: 
     request = _request("Summarize the account")
     original = _accept(journal, key="late-key", request=request)
     _reserve_candidate(journal, original, now=_TIME)
-    journal.record_failure(
+    failed = _journal_fail(
+        journal,
         original,
         StructuredFailure(
             code=FailureCode.TIMEOUT,
@@ -750,14 +983,9 @@ def test_late_original_success_preserves_failure_and_superseded_retry(tmp_path: 
         ),
         failed_at=_TIME + timedelta(seconds=1),
     )
-    identity = _interaction_identity(journal.project_id, "late-key", request, None)
-    replacement = journal.claim(
-        identity,
-        now=_TIME + timedelta(seconds=2),
-        stale_after=timedelta(minutes=5),
-    )
-    assert replacement.accepted is not None
-    journal.record_completed(
+    _journal_retry(journal, original, failed, now=_TIME + timedelta(seconds=2))
+    _journal_complete(
+        journal,
         original,
         _response(content="Account summary"),
         candidate_operation=_economics().operations[-1],
@@ -949,7 +1177,8 @@ def test_empty_or_failed_only_prefix_has_no_canonical_target_dataset(tmp_path: P
 
     accepted = _accept(journal, key="failed-only")
     _reserve_candidate(journal, accepted, now=_TIME)
-    journal.record_failure(
+    _journal_fail(
+        journal,
         accepted,
         StructuredFailure(
             code=FailureCode.PROVIDER,

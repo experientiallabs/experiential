@@ -54,7 +54,6 @@ from wmo.runtime.router.economics import (
     RoutedSpendLedger,
 )
 from wmo.runtime.router.runtime import (
-    RoutedModelResponse,
     RouterRuntime,
 )
 from wmo.simulation.build import (
@@ -117,7 +116,6 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.RoutedProviderOperation is RoutedProviderOperation
     assert wmo.RoutedSpendDisposition is RoutedSpendDisposition
     assert wmo.RoutedSpendLedger is RoutedSpendLedger
-    assert wmo.RoutedModelResponse is RoutedModelResponse
     assert ModelRecord.model_fields["billing_source"].is_required()
     assert ModelSnapshot.model_fields["billing_source"].is_required()
     assert set(RoutedCompletionEconomics.model_fields) == {

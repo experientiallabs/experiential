@@ -7,10 +7,8 @@ from collections.abc import Callable
 
 import numpy as np
 
-from wmo.common.core.artifacts import canonical_json_bytes, stable_id
+from wmo.common.core.artifacts import stable_id
 from wmo.common.models import (
-    BillingSource,
-    CandidateTokenPrice,
     ModelRequest,
     NumericMeasurement,
     OperationEconomics,
@@ -20,11 +18,6 @@ from wmo.common.routing import KnnRouterPolicy, RoutingDecision, router_feature_
 from wmo.common.routing.bank import KnnEvidenceBank
 from wmo.common.routing.decision import policy_content_sha256
 from wmo.runtime.models import ResolvedModel
-from wmo.runtime.router.economics import (
-    RoutedProviderComponent,
-    RoutedProviderOperation,
-    RoutedSpendDisposition,
-)
 
 
 def embedding_economics(
@@ -54,193 +47,6 @@ def embedding_economics(
         usage=Usage(input_tokens=tokens, output_tokens=0),
         cost_usd=cost,
     )
-
-
-def candidate_reservation_economics(
-    request: ModelRequest,
-    resolved: ResolvedModel,
-    price: CandidateTokenPrice | None,
-) -> OperationEconomics:
-    """Build a conservative candidate reservation before provider dispatch.
-
-    Args:
-        request: Provider-neutral request to reserve.
-        resolved: Frozen selected runtime model.
-        price: Optional frozen candidate token price.
-
-    Returns:
-        Conservative usage and cost reservation for the candidate dispatch.
-    """
-    maximum_output_tokens = (
-        request.maximum_output_tokens or resolved.capabilities.maximum_output_tokens
-    )
-    if maximum_output_tokens is None:
-        return OperationEconomics()
-    request_bytes = len(canonical_json_bytes(request))
-    framing = 64 * (len(request.messages) + len(request.tools) + 1)
-    maximum_input_tokens = request_bytes + framing
-    usage = Usage(
-        input_tokens=maximum_input_tokens,
-        output_tokens=maximum_output_tokens,
-    )
-    if price is None:
-        return OperationEconomics(usage=usage)
-    input_rate = max(
-        price.input_usd_per_million_tokens,
-        price.cached_input_usd_per_million_tokens or 0.0,
-        price.cache_write_usd_per_million_tokens or 0.0,
-    )
-    cost = (
-        maximum_input_tokens * input_rate
-        + maximum_output_tokens * price.output_usd_per_million_tokens
-    ) / 1_000_000
-    return OperationEconomics(
-        usage=usage,
-        cost_usd=NumericMeasurement(value=cost, provenance="estimated"),
-    )
-
-
-def candidate_success_disposition(
-    observed: OperationEconomics,
-    reconciled: OperationEconomics,
-) -> RoutedSpendDisposition:
-    """Classify candidate accounting as provider-observed or locally priced.
-
-    Args:
-        observed: Economics reported by the provider.
-        reconciled: Economics after applying frozen local pricing when needed.
-
-    Returns:
-        The durable disposition describing the source of the final economics.
-    """
-    if reconciled != observed or (
-        reconciled.cost_usd is not None and reconciled.cost_usd.provenance == "estimated"
-    ):
-        return RoutedSpendDisposition.LOCALLY_PRICED
-    return RoutedSpendDisposition.OBSERVED
-
-
-def runtime_provider_operation(
-    decision: RoutingDecision,
-    *,
-    operation_ordinal: int,
-    component: RoutedProviderComponent,
-    billing_source: BillingSource,
-    disposition: RoutedSpendDisposition,
-    economics: OperationEconomics,
-) -> RoutedProviderOperation:
-    """Build one direct-runtime operation without exposing the selected alias.
-
-    Args:
-        decision: Frozen routing decision owning the operation.
-        operation_ordinal: Stable position inside the routed completion.
-        component: Router or selected-candidate operation type.
-        billing_source: Frozen credential-ownership classification.
-        disposition: Durable accounting disposition.
-        economics: Settled usage and cost evidence.
-
-    Returns:
-        Alias-free durable provider-operation evidence.
-    """
-    operation_id = stable_id(
-        "routed-operation",
-        {
-            "decision_id": decision.decision_id,
-            "operation_ordinal": operation_ordinal,
-            "component": component.value,
-        },
-    )
-    return RoutedProviderOperation(
-        operation_id=operation_id,
-        operation_ordinal=operation_ordinal,
-        component=component,
-        billing_source=billing_source,
-        disposition=disposition,
-        operation_count=(0 if disposition == RoutedSpendDisposition.DEFINITELY_NOT_INCURRED else 1),
-        economics=economics,
-    )
-
-
-def candidate_completion_economics(
-    economics: OperationEconomics,
-    price: CandidateTokenPrice | None,
-) -> OperationEconomics:
-    """Retain measured candidate cost or locally price observed token usage.
-
-    Args:
-        economics: Provider-observed candidate economics.
-        price: Optional frozen candidate token price.
-
-    Returns:
-        Original economics when complete, otherwise locally priced token usage.
-
-    Raises:
-        ValueError: Provider cache counters are inconsistent with total input usage.
-    """
-    usage = economics.usage
-    if economics.cost_usd is not None or usage is None or price is None:
-        return economics
-    cached = usage.cached_input_tokens
-    written = usage.cache_write_input_tokens
-    if cached is not None and cached > usage.input_tokens:
-        raise ValueError("candidate cached input exceeds total input usage")
-    if written is not None and written > usage.input_tokens:
-        raise ValueError("candidate cache-write input exceeds total input usage")
-    if cached is not None and written is not None and cached + written > usage.input_tokens:
-        raise ValueError("candidate cache counters overlap beyond total input usage")
-    input_cost = _candidate_input_cost_usd(price, usage)
-    output_cost = usage.output_tokens * price.output_usd_per_million_tokens / 1_000_000
-    return economics.model_copy(
-        update={
-            "cost_usd": NumericMeasurement(
-                value=input_cost + output_cost,
-                provenance="estimated",
-            )
-        }
-    )
-
-
-def _candidate_input_cost_usd(price: CandidateTokenPrice, usage: Usage) -> float:
-    """Conservatively price ordinary, cached, and cache-write input.
-
-    Args:
-        price: Frozen candidate token price.
-        usage: Provider-observed token counters.
-
-    Returns:
-        Input-token cost in US dollars.
-    """
-    base = price.input_usd_per_million_tokens
-    cached_price = price.cached_input_usd_per_million_tokens
-    write_price = price.cache_write_usd_per_million_tokens
-    cached = usage.cached_input_tokens
-    written = usage.cache_write_input_tokens
-    if cached is not None and written is not None:
-        ordinary = usage.input_tokens - cached - written
-        total = (
-            ordinary * base
-            + cached * (cached_price if cached_price is not None else base)
-            + written * (write_price if write_price is not None else base)
-        )
-    elif cached is not None:
-        ordinary_price = max(base, write_price if write_price is not None else base)
-        total = (
-            cached * (cached_price if cached_price is not None else base)
-            + (usage.input_tokens - cached) * ordinary_price
-        )
-    elif written is not None:
-        ordinary_price = max(base, cached_price if cached_price is not None else base)
-        total = (
-            written * (write_price if write_price is not None else base)
-            + (usage.input_tokens - written) * ordinary_price
-        )
-    else:
-        total = usage.input_tokens * max(
-            base,
-            cached_price if cached_price is not None else base,
-            write_price if write_price is not None else base,
-        )
-    return total / 1_000_000
 
 
 def requires_tool_protocol(request: ModelRequest) -> bool:
@@ -275,21 +81,6 @@ def decision_content_id(decision: RoutingDecision) -> str:
     material = decision.model_dump(mode="json")
     del material["decision_id"]
     return stable_id("routing-decision", material)
-
-
-def validate_idempotency_key(value: str) -> None:
-    """Reject keys that cannot safely cross an HTTP provider boundary.
-
-    Args:
-        value: Caller-provided provider idempotency key.
-
-    Raises:
-        ValueError: The key is blank, oversized, padded, or not visible ASCII.
-    """
-    if not value or len(value) > 512 or value.strip() != value:
-        raise ValueError("idempotency key must be 1 to 512 non-blank characters")
-    if any(ord(character) < 33 or ord(character) > 126 for character in value):
-        raise ValueError("idempotency key must contain only visible ASCII characters")
 
 
 def supports_request(resolved: ResolvedModel, request: ModelRequest) -> bool:

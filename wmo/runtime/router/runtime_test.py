@@ -39,7 +39,7 @@ from wmo.common.models import (
     Usage,
 )
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
-from wmo.common.routing import KnnGuard, KnnRouterPolicy
+from wmo.common.routing import KnnGuard, KnnRouterPolicy, RoutingDecision
 from wmo.common.routing.bank import (
     CandidateEvidenceCount,
     KnnBankManifest,
@@ -56,21 +56,24 @@ from wmo.runtime.gateway.contracts import (
 )
 from wmo.runtime.gateway.routing import (
     RouterProjectTargetResolver,
-    gateway_model_request,
-    project_episode_identity,
 )
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from wmo.runtime.router import RouterRuntime, RouterRuntimeIntegrityError
-from wmo.runtime.router.economics import (
-    RoutedProviderComponent,
-    RoutedSpendDisposition,
-)
-from wmo.runtime.router.runtime import _PreparedSelection  # noqa: PLC2701
+from wmo.runtime.router.economics import RoutedSpendDisposition
 from wmo.runtime.router.runtime_support import sticky_decision
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
+
+
+def _select(runtime: RouterRuntime, request: ModelRequest, *, episode_id: str) -> RoutingDecision:
+    """Select and retain one decision through the public gateway selection trio."""
+    decision = runtime.reuse_sticky_selection(request, episode_id=episode_id)
+    if decision is not None:
+        return decision
+    prepared = runtime.select_unretained(request, episode_id=episode_id)
+    return runtime.retain_prepared_selection(request, episode_id=episode_id, prepared=prepared)
 
 
 class _Client:
@@ -158,25 +161,29 @@ def test_request_embedding_failures_always_fall_back_with_evidence(bad: object) 
     runtime, client = _runtime()
     client.embedding_values = cast(tuple[Embedding, ...] | Exception, bad)
 
-    decision = runtime.select(_request(), episode_id="episode-a")
+    prepared = runtime.select_unretained(_request(), episode_id="episode-a")
+    decision = runtime.retain_prepared_selection(
+        _request(),
+        episode_id="episode-a",
+        prepared=prepared,
+    )
 
     assert decision.selected_alias == runtime.policy.baseline_alias
     assert decision.fallback_reason == "embedding_error"
     assert decision.neighbor_count == decision.paired_count == 0
-    operation = runtime.selection_operation(_request(), episode_id="episode-a", decision=decision)
-    assert operation.component == RoutedProviderComponent.ROUTER_EMBEDDING
-    assert operation.disposition == RoutedSpendDisposition.RESERVED_AMBIGUOUS
-    assert operation.operation_count == 1
+    assert prepared.disposition == RoutedSpendDisposition.RESERVED_AMBIGUOUS
+    assert prepared.economics.usage is not None
+    assert prepared.economics.usage.input_tokens > 0
 
 
 def test_episode_stickiness_uses_caller_identity_and_tools_affect_request_hash() -> None:
     """An episode stays on its first alias while separate IDs and tool schemas remain distinct."""
     runtime, client = _runtime()
-    first = runtime.select(_request(tool_name="read"), episode_id="episode-a")
+    first = _select(runtime, _request(tool_name="read"), episode_id="episode-a")
     client.embedding_values = ()
-    next_turn = runtime.select(_request(tool_name="write"), episode_id="episode-a")
-    sticky = runtime.select(_request(tool_name="read"), episode_id="episode-a")
-    separate = runtime.select(_request(tool_name="read"), episode_id="episode-b")
+    next_turn = _select(runtime, _request(tool_name="write"), episode_id="episode-a")
+    sticky = _select(runtime, _request(tool_name="read"), episode_id="episode-a")
+    separate = _select(runtime, _request(tool_name="read"), episode_id="episode-b")
 
     assert first.selected_alias == next_turn.selected_alias == sticky.selected_alias == "cheap"
     assert sticky == first
@@ -230,7 +237,7 @@ def test_artifact_mutation_and_pricing_or_alias_drift_block_activation() -> None
     )
     bank.scores.setflags(write=True)
     bank.scores[0, 0] = 0.0
-    assert runtime.select(_request(), episode_id="episode-a").selected_alias == "cheap"
+    assert _select(runtime, _request(), episode_id="episode-a").selected_alias == "cheap"
     with pytest.raises(ValueError, match="cannot set WRITEABLE flag"):
         runtime.bank.scores.setflags(write=True)
 
@@ -309,7 +316,7 @@ def test_decision_integrity_error_is_not_converted_to_embedding_fallback() -> No
     object.__setattr__(runtime.policy.guard, "uncertainty_multiplier", 0.0)
 
     with pytest.raises(ValueError, match="finite and positive"):
-        runtime.select(_request(), episode_id="episode-a")
+        _select(runtime, _request(), episode_id="episode-a")
     assert client.embed_calls == 1
 
 
@@ -323,7 +330,7 @@ def test_store_backed_load_verifies_artifacts_and_normalizes_failures(tmp_path: 
         catalog,
         pricing_snapshot_id=policy.pricing_snapshot_id,
     )
-    assert runtime.select(_request(), episode_id="episode-a").selected_alias == "cheap"
+    assert _select(runtime, _request(), episode_id="episode-a").selected_alias == "cheap"
     with pytest.raises(RouterRuntimeIntegrityError, match="router policy missing-policy"):
         RouterRuntime.load(
             store,
@@ -498,106 +505,6 @@ def test_embedder_candidate_alias_overlap_requires_the_same_frozen_identity() ->
     assert runtime.policy.embedder == runtime.policy.candidates[0].model
 
 
-def test_decision_sink_failure_never_publishes_an_unrecorded_cache_entry() -> None:
-    """A recorder failure retries selection and recording instead of bypassing evidence."""
-    policy, manifest, bank, snapshots, client = _fixture()
-    attempts = 0
-    recorded = []
-
-    def sink(decision: object) -> None:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise RuntimeError("sink unavailable")
-        recorded.append(decision)
-
-    runtime = RouterRuntime(
-        policy,
-        manifest,
-        bank,
-        cast(RuntimeModelCatalog, _Catalog(snapshots, client)),
-        pricing_snapshot_id=policy.pricing_snapshot_id,
-        pricing_snapshot_sha256=policy.pricing_snapshot_sha256,
-        pricing_candidate_aliases=manifest.candidate_aliases,
-        decision_sink=sink,
-    )
-    with pytest.raises(RuntimeError, match="sink unavailable"):
-        runtime.select(_request(), episode_id="episode-a")
-    decision = runtime.select(_request(), episode_id="episode-a")
-
-    assert attempts == 2
-    assert recorded == [decision]
-    assert client.embed_calls == 2
-
-
-def test_concurrent_first_selection_embeds_and_records_exactly_once() -> None:
-    """Two simultaneous first requests share one deterministic cached episode decision."""
-    policy, manifest, bank, snapshots, client = _fixture()
-    recorded = []
-    runtime = RouterRuntime(
-        policy,
-        manifest,
-        bank,
-        cast(RuntimeModelCatalog, _Catalog(snapshots, client)),
-        pricing_snapshot_id=policy.pricing_snapshot_id,
-        pricing_snapshot_sha256=policy.pricing_snapshot_sha256,
-        pricing_candidate_aliases=manifest.candidate_aliases,
-        decision_sink=recorded.append,
-    )
-    start = threading.Barrier(3)
-    decisions: list[object] = []
-
-    def select() -> None:
-        start.wait()
-        decisions.append(runtime.select(_request(), episode_id="episode-a"))
-
-    threads = (threading.Thread(target=select), threading.Thread(target=select))
-    for thread in threads:
-        thread.start()
-    start.wait()
-    for thread in threads:
-        thread.join()
-
-    assert len(decisions) == 2
-    assert decisions[0] == decisions[1]
-    assert client.embed_calls == 1
-    assert recorded == [decisions[0]]
-
-
-def test_distinct_first_selections_embed_outside_the_shared_cache_lock() -> None:
-    """Independent episodes can embed concurrently without serializing on cache state."""
-    runtime, client = _runtime()
-    entered = threading.Barrier(3)
-    decisions: list[object] = []
-
-    def concurrent_embed(texts: Sequence[str]) -> tuple[Embedding, ...]:
-        """Wait until both embedding calls are concurrently in flight."""
-        del texts
-        client.embed_calls += 1
-        entered.wait(timeout=1)
-        return (Embedding(values=(1.0, 0.0)),)
-
-    client.__dict__["embed"] = concurrent_embed
-
-    def select(episode_id: str) -> None:
-        """Select one independent episode on a worker thread."""
-        decisions.append(runtime.select(_request(), episode_id=episode_id))
-
-    threads = (
-        threading.Thread(target=select, args=("episode-a",)),
-        threading.Thread(target=select, args=("episode-b",)),
-    )
-    for thread in threads:
-        thread.start()
-    entered.wait(timeout=1)
-    for thread in threads:
-        thread.join(timeout=1)
-
-    assert all(not thread.is_alive() for thread in threads)
-    assert len(decisions) == 2
-    assert client.embed_calls == 2
-
-
 def test_decision_cache_ttl_and_capacity_bound_all_process_local_state() -> None:
     """Least-recent decisions evict at capacity and expired episodes reselect."""
     policy, manifest, bank, snapshots, client = _fixture()
@@ -615,14 +522,14 @@ def test_decision_cache_ttl_and_capacity_bound_all_process_local_state() -> None
         clock=lambda: now[0],
     )
 
-    runtime.select(_request(), episode_id="episode-a")
-    runtime.select(_request(), episode_id="episode-b")
+    _select(runtime, _request(), episode_id="episode-a")
+    _select(runtime, _request(), episode_id="episode-b")
     assert len(runtime._episode_decisions) == 1  # noqa: SLF001 - bounded-state regression
     assert len(runtime._request_decisions) == 1  # noqa: SLF001 - bounded-state regression
     assert len(runtime._request_embedding_economics) == 1  # noqa: SLF001
     assert len(runtime._request_embedding_dispositions) == 1  # noqa: SLF001
     now[0] = 16.0
-    runtime.select(_request(), episode_id="episode-b")
+    _select(runtime, _request(), episode_id="episode-b")
 
     assert client.embed_calls == 3
     assert len(runtime._episode_decisions) == 1  # noqa: SLF001 - bounded-state regression
@@ -639,9 +546,9 @@ def test_prepared_selections_keep_physical_evidence_local_until_atomic_retain() 
     """Concurrent-equivalent bundles cannot collide or publish before explicit retain."""
     runtime, client = _runtime()
     request = _request()
-    first = runtime._select_unretained(request, episode_id="episode-a")  # noqa: SLF001
+    first = runtime.select_unretained(request, episode_id="episode-a")
     client.embedding_values = RuntimeError("embed failed")
-    second = runtime._select_unretained(request, episode_id="episode-a")  # noqa: SLF001
+    second = runtime.select_unretained(request, episode_id="episode-a")
 
     assert first is not second
     assert first.disposition == RoutedSpendDisposition.LOCALLY_PRICED
@@ -649,30 +556,26 @@ def test_prepared_selections_keep_physical_evidence_local_until_atomic_retain() 
     assert runtime._episode_decisions == {}  # noqa: SLF001 - publication boundary
     assert runtime._request_decisions == {}  # noqa: SLF001 - publication boundary
 
-    retained = runtime._retain_prepared_selection(  # noqa: SLF001
+    retained = runtime.retain_prepared_selection(
         request,
         episode_id="episode-a",
         prepared=first,
     )
-    first_operation = runtime.selection_operation(
-        request,
-        episode_id="episode-a",
-        decision=retained,
+    first_dispositions = tuple(
+        runtime._request_embedding_dispositions.values()  # noqa: SLF001 - accounting regression
     )
-    reconciled = runtime._retain_prepared_selection(  # noqa: SLF001
+    reconciled = runtime.retain_prepared_selection(
         request,
         episode_id="episode-a",
         prepared=second,
     )
-    second_operation = runtime.selection_operation(
-        request,
-        episode_id="episode-a",
-        decision=reconciled,
+    second_dispositions = tuple(
+        runtime._request_embedding_dispositions.values()  # noqa: SLF001 - accounting regression
     )
 
     assert reconciled == retained
-    assert first_operation.disposition == RoutedSpendDisposition.LOCALLY_PRICED
-    assert second_operation.disposition == RoutedSpendDisposition.RESERVED_AMBIGUOUS
+    assert first_dispositions == (RoutedSpendDisposition.LOCALLY_PRICED,)
+    assert second_dispositions == (RoutedSpendDisposition.RESERVED_AMBIGUOUS,)
     assert client.embed_calls == 2
 
 
@@ -723,21 +626,17 @@ def test_project_resolver_retains_failed_embedding_evidence_without_reembedding(
     assert continued.selected_alias == selection.selected_alias
     assert client.embed_calls == 1
     assert len(runtime._request_decisions) == 1  # noqa: SLF001 - accounting regression
-    decision = next(iter(runtime._request_decisions.values()))  # noqa: SLF001
-    operation = runtime.selection_operation(
-        gateway_model_request(request),
-        episode_id=project_episode_identity(namespace),
-        decision=decision,
-    )
-    assert operation.disposition == RoutedSpendDisposition.RESERVED_AMBIGUOUS
-    assert operation.operation_count == 1
+    request_key = next(iter(runtime._request_decisions))  # noqa: SLF001
+    disposition = runtime._request_embedding_dispositions[request_key]  # noqa: SLF001
+    economics = runtime._request_embedding_economics[request_key]  # noqa: SLF001
+    assert disposition == RoutedSpendDisposition.RESERVED_AMBIGUOUS
+    assert economics.usage is not None
+    assert economics.usage.input_tokens > 0
 
 
 def test_timed_out_project_selection_cannot_publish_late_sticky_state() -> None:
     """A detached blocking embed remains unretained after its request deadline expires."""
     runtime, client = _runtime()
-    recorded: list[object] = []
-    runtime._decision_sink = recorded.append  # noqa: SLF001 - deadline publication regression
     entered = threading.Event()
     release = threading.Event()
     completed = threading.Event()
@@ -786,74 +685,12 @@ def test_timed_out_project_selection_cannot_publish_late_sticky_state() -> None:
 
     assert runtime._episode_decisions == {}  # noqa: SLF001 - deadline isolation regression
     assert runtime._request_decisions == {}  # noqa: SLF001 - deadline isolation regression
-    assert recorded == []
-
-
-def test_cached_selection_and_completion_reuse_sealed_activation_without_rehashing() -> None:
-    """Forged decisions reject while exact retries reuse immutable activation state."""
-    runtime, client = _runtime()
-    request = _request()
-    decision = runtime.select(request, episode_id="episode-a")
-    forged = decision.model_copy(update={"decision_id": "forged-decision"})
-    with pytest.raises(ValueError, match="exact cached"):
-        runtime.complete(request, episode_id="episode-a", decision=forged)
-    assert client.requests == []
-
-    runtime.complete(request, episode_id="episode-a", decision=decision)
-    runtime.complete(request, episode_id="episode-a", decision=decision)
-    assert len(client.requests) == 2
-
-    with pytest.raises(ValueError, match="cannot set WRITEABLE flag"):
-        runtime.bank.scores.setflags(write=True)
-    assert runtime.select(request, episode_id="episode-a") == decision
-
-
-def test_complete_survives_concurrent_repopulation_after_internal_selection_eviction() -> None:
-    """A valid in-flight selection survives conflicting same-episode repopulation."""
-    policy, manifest, bank, snapshots, client = _fixture()
-    runtime = RouterRuntime(
-        policy,
-        manifest,
-        bank,
-        cast(RuntimeModelCatalog, _Catalog(snapshots, client)),
-        pricing_snapshot_id=policy.pricing_snapshot_id,
-        pricing_snapshot_sha256=policy.pricing_snapshot_sha256,
-        pricing_candidate_aliases=manifest.candidate_aliases,
-        decision_capacity=1,
-    )
-    original_select = runtime._select_retained  # noqa: SLF001 - concurrency boundary regression.
-
-    def select_then_repopulate(
-        request: ModelRequest,
-        *,
-        episode_id: str,
-    ) -> _PreparedSelection:
-        """Evict and replace the returned episode before completion validation."""
-        prepared = original_select(request, episode_id=episode_id)
-        original_select(_request(tool_name="evict"), episode_id="other-episode")
-        client.embedding_values = ()
-        replacement = original_select(
-            _request(tool_name="repopulate"),
-            episode_id=episode_id,
-        )
-        client.embedding_values = (Embedding(values=(1.0, 0.0)),)
-        assert prepared.decision.selected_alias == "cheap"
-        assert replacement.decision.selected_alias == "baseline"
-        return prepared
-
-    runtime.__dict__["_select_retained"] = select_then_repopulate
-
-    result = runtime.complete(_request(), episode_id="episode-a")
-
-    assert result.decision.episode_id_sha256 == hashlib.sha256(b"episode-a").hexdigest()
-    assert result.decision.selected_alias == "cheap"
-    assert client.complete_calls == 1
 
 
 def test_sticky_decision_identity_hashes_all_retained_evidence() -> None:
     """Unequal first-turn evidence cannot collide for the same later request and episode."""
     runtime, _client = _runtime()
-    first = runtime.select(_request(tool_name="read"), episode_id="episode-a")
+    first = _select(runtime, _request(tool_name="read"), episode_id="episode-a")
     changed = first.model_copy(
         update={
             "neighbor_count": first.neighbor_count + 1,
@@ -868,110 +705,6 @@ def test_sticky_decision_identity_hashes_all_retained_evidence() -> None:
 
     assert sticky != changed_sticky
     assert sticky.decision_id != changed_sticky.decision_id
-
-
-def test_complete_validates_one_prior_decision_without_selecting_again() -> None:
-    """Python completion validates and reuses the exact cached supplied decision."""
-    policy, manifest, bank, snapshots, client = _fixture()
-    recorded = []
-    runtime = RouterRuntime(
-        policy,
-        manifest,
-        bank,
-        cast(RuntimeModelCatalog, _Catalog(snapshots, client)),
-        pricing_snapshot_id="pricing-a",
-        pricing_snapshot_sha256=_DIGEST,
-        pricing_candidate_aliases=bank.candidate_aliases,
-        decision_sink=recorded.append,
-    )
-    request = _request(tool_name="read")
-    decision = runtime.select(request, episode_id="episode-a")
-    routed = runtime.complete(request, episode_id="episode-a", decision=decision)
-
-    assert routed.decision is decision
-    assert len(recorded) == 1
-    assert client.requests == [request]
-    with pytest.raises(ValueError, match="does not match"):
-        runtime.complete(_request(tool_name="write"), episode_id="episode-a", decision=decision)
-
-
-def test_routed_completion_reconciles_alias_free_embedding_and_candidate_economics() -> None:
-    """Return typed request economics without placing the selected private alias in that record."""
-    policy, manifest, bank, snapshots, client = _fixture()
-    embedding_capabilities = ModelCapabilities(
-        supports_embeddings=True,
-        input_cost_per_million_tokens_usd=0.1,
-    )
-    embedder = snapshots["embedder"].model_copy(
-        update={
-            "billing_source": BillingSource.HOST_MANAGED,
-            "capabilities_sha256": embedding_capabilities.identity_sha256(),
-        }
-    )
-    policy = policy.model_copy(update={"embedder": embedder})
-    manifest = manifest.model_copy(update={"embedder": embedder})
-
-    class _PricedCatalog(_Catalog):
-        def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
-            if alias == "embedder":
-                return embedder, embedding_capabilities
-            return super().snapshot(alias)
-
-    prices = tuple(
-        CandidateTokenPrice(
-            candidate_alias=alias,
-            input_usd_per_million_tokens=1.0,
-            output_usd_per_million_tokens=2.0,
-            cached_input_usd_per_million_tokens=0.5,
-            cache_write_usd_per_million_tokens=1.5,
-        )
-        for alias in bank.candidate_aliases
-    )
-    runtime = RouterRuntime(
-        policy,
-        manifest,
-        bank,
-        cast(RuntimeModelCatalog, _PricedCatalog(snapshots, client)),
-        pricing_snapshot_id="pricing-a",
-        pricing_snapshot_sha256=_DIGEST,
-        pricing_candidate_aliases=bank.candidate_aliases,
-        pricing_candidate_prices=prices,
-    )
-    request = _request(tool_name="read")
-    decision = runtime.select(request, episode_id="episode-a")
-    routed = runtime.complete(request, episode_id="episode-a", decision=decision)
-
-    economics = routed.economics
-    embedding_economics = economics.router_embedding.economics
-    candidate_economics = economics.selected_candidate.economics
-    assert economics.router_embedding.billing_source == BillingSource.HOST_MANAGED
-    assert economics.selected_candidate.billing_source == BillingSource.CUSTOMER_MANAGED
-    assert economics.operation_count == 2
-    assert [item.disposition for item in economics.operations] == [
-        RoutedSpendDisposition.LOCALLY_PRICED,
-        RoutedSpendDisposition.LOCALLY_PRICED,
-    ]
-    assert embedding_economics.usage is not None
-    assert embedding_economics.usage.input_tokens > 0
-    assert embedding_economics.cost_usd is not None
-    assert candidate_economics.usage == Usage(
-        input_tokens=7,
-        output_tokens=3,
-        cached_input_tokens=2,
-    )
-    assert candidate_economics.cost_usd is not None
-    assert candidate_economics.cost_usd.value == pytest.approx(14.5 / 1_000_000)
-    assert tuple(item.billing_source for item in economics.by_billing_source) == (
-        BillingSource.CUSTOMER_MANAGED,
-        BillingSource.HOST_MANAGED,
-    )
-    assert economics.total.cost_usd is not None
-    assert economics.total.cost_usd.value == pytest.approx(
-        embedding_economics.cost_usd.value + candidate_economics.cost_usd.value
-    )
-    serialized = economics.model_dump_json()
-    assert decision.selected_alias not in serialized
-    assert "model_id" not in serialized
 
 
 def _request(*, tool_name: str | None = None) -> ModelRequest:

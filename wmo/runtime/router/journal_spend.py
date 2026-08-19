@@ -157,55 +157,6 @@ def settle_operation(
     )
 
 
-def direct_not_incurred_operation(
-    *,
-    interaction_id: str,
-    operation_ordinal: int,
-    component: RoutedProviderComponent,
-    billing: BillingSourceEconomics,
-) -> RoutedProviderOperation:
-    """Create a zero-count operation when provider dispatch was proven absent."""
-    from wmo.runtime.router.economics import zero_operation_economics
-
-    operation_id = stable_id(
-        "routed-operation",
-        {
-            "interaction_id": interaction_id,
-            "operation_ordinal": operation_ordinal,
-            "component": component.value,
-        },
-    )
-    return RoutedProviderOperation(
-        operation_id=operation_id,
-        operation_ordinal=operation_ordinal,
-        component=component,
-        billing_source=billing.billing_source,
-        disposition=RoutedSpendDisposition.DEFINITELY_NOT_INCURRED,
-        operation_count=0,
-        economics=zero_operation_economics(),
-    )
-
-
-def rebind_settlement(
-    reservation: RuntimeSpendCheckpointEvent,
-    settled: RoutedProviderOperation,
-) -> RoutedProviderOperation:
-    """Bind runtime settlement evidence to its durable pre-dispatch reservation."""
-    if settled.component != reservation.operation.component:
-        raise ValueError("runtime settlement component differs from its reservation")
-    if settled.billing_source != reservation.operation.billing_source:
-        raise ValueError("runtime settlement billing source differs from its reservation")
-    if settled.disposition == RoutedSpendDisposition.RESERVED:
-        raise ValueError("runtime settlement evidence remains reserved")
-    return reservation.operation.model_copy(
-        update={
-            "disposition": settled.disposition,
-            "operation_count": settled.operation_count,
-            "economics": settled.economics,
-        }
-    )
-
-
 def validate_spend_events(
     events: tuple[RuntimeSpendCheckpointEvent, ...] | list[RuntimeSpendCheckpointEvent],
 ) -> dict[str, RuntimeSpendCheckpointEvent]:
@@ -267,65 +218,6 @@ def spend_event_content_id(event: RuntimeSpendCheckpointEvent) -> str:
     material = event.model_dump(mode="json")
     del material["event_id"]
     return stable_id("runtime-spend-event", material)
-
-
-def live_reservation(
-    events: tuple[RuntimeSpendCheckpointEvent, ...] | list[RuntimeSpendCheckpointEvent],
-    *,
-    interaction_id: str,
-    component: RoutedProviderComponent,
-    accepted_attempt_ordinal: int | None = None,
-) -> RuntimeSpendCheckpointEvent | None:
-    """Return the matching unsettled reservation, if one exists."""
-    latest = validate_spend_events(events)
-    matches = tuple(
-        event
-        for event in latest.values()
-        if event.interaction_id == interaction_id
-        and event.operation.component == component
-        and event.accepted_attempt_ordinal == accepted_attempt_ordinal
-        and event.operation.disposition == RoutedSpendDisposition.RESERVED
-    )
-    if len(matches) > 1:
-        raise ValueError("runtime spend scope has multiple live reservations")
-    return matches[0] if matches else None
-
-
-def next_operation_ordinal(
-    events: tuple[RuntimeSpendCheckpointEvent, ...] | list[RuntimeSpendCheckpointEvent],
-    interaction_id: str,
-) -> int:
-    """Return the next interaction-local operation ordinal."""
-    ordinals = {
-        event.operation.operation_ordinal
-        for event in events
-        if event.interaction_id == interaction_id
-    }
-    return max(ordinals, default=0) + 1
-
-
-def settled_operations(
-    events: tuple[RuntimeSpendCheckpointEvent, ...] | list[RuntimeSpendCheckpointEvent],
-    interaction_id: str,
-) -> tuple[RoutedProviderOperation, ...]:
-    """Return settled sidecar operations in interaction order."""
-    latest = validate_spend_events(events)
-    operations = tuple(
-        event.operation
-        for event in latest.values()
-        if event.interaction_id == interaction_id
-        and event.operation.disposition != RoutedSpendDisposition.RESERVED
-    )
-    return tuple(sorted(operations, key=lambda item: item.operation_ordinal))
-
-
-def require_identity(
-    event: RuntimeSpendCheckpointEvent,
-    identity_sha256: Sha256,
-) -> None:
-    """Reject a spend reservation reused for different request or lineage content."""
-    if event.identity_sha256 != identity_sha256:
-        raise ValueError("idempotency key was already used for different request content")
 
 
 def _checkpoint_event(

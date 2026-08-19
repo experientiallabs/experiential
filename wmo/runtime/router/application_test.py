@@ -11,7 +11,7 @@ from openai import OpenAI
 
 from wmo.common.routing import RoutingDecision
 from wmo.runtime.gateway.project_alias import ProjectGatewayAlias
-from wmo.runtime.router.application import RouterApplicationError, load_router
+from wmo.runtime.router.application import load_router
 
 
 def test_load_router_uses_the_normal_gateway_application_and_revokes_its_key(
@@ -106,13 +106,3 @@ def test_load_router_uses_the_normal_gateway_application_and_revokes_its_key(
     assert loaded == [(tmp_path, decision_sink, frozenset({"support"}))]
     assert issued[0][0] == "project-identity"
     assert revoked == [issued[0][1]]
-
-
-def test_ghost_compatibility_rejects_a_persistent_project_decision_sink(tmp_path: Path) -> None:
-    """Ghost compatibility cannot silently persist project-selection decisions."""
-
-    def decision_sink(_decision: object) -> None:
-        """Accept one decision for the rejected option combination."""
-
-    with pytest.raises(RouterApplicationError, match="ghost mode cannot use"):
-        load_router("support", root=tmp_path, ghost=True, decision_sink=decision_sink)

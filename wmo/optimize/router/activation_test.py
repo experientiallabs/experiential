@@ -14,7 +14,7 @@ import wmo.optimize.router.activation as activation
 from wmo.common.core.artifacts import ArtifactId
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.application import RouterPolicyVerifier
-from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
+from wmo.runtime.router.runtime import RouterRuntime
 
 
 def test_public_activation_surfaces_inject_one_optimizer_verifier(
@@ -40,7 +40,6 @@ def test_public_activation_surfaces_inject_one_optimizer_verifier(
         policy_id: ArtifactId | None = None,
         environment: Mapping[str, str] | None = None,
         runtime_catalog: RuntimeModelCatalog | None = None,
-        decision_sink: DecisionSink | None = None,
         policy_verifier: RouterPolicyVerifier | None = None,
     ) -> RouterRuntime:
         """Capture the project-loader verifier while preserving the public call shape."""
@@ -49,7 +48,6 @@ def test_public_activation_surfaces_inject_one_optimizer_verifier(
         assert policy_id is None
         assert environment is None
         assert runtime_catalog is None
-        assert decision_sink is None
         project_verifiers.append(policy_verifier)
         return runtime
 
@@ -60,7 +58,6 @@ def test_public_activation_surfaces_inject_one_optimizer_verifier(
         policy_id: ArtifactId | None = None,
         environment: Mapping[str, str] | None = None,
         runtime_catalog: RuntimeModelCatalog | None = None,
-        decision_sink: DecisionSink | None = None,
         policy_verifier: RouterPolicyVerifier | None = None,
         ghost: bool = False,
     ) -> OpenAI:
@@ -70,7 +67,6 @@ def test_public_activation_surfaces_inject_one_optimizer_verifier(
         assert policy_id is None
         assert environment is None
         assert runtime_catalog is None
-        assert decision_sink is None
         client_verifiers.append(policy_verifier)
         client_ghost_modes.append(ghost)
         return client
