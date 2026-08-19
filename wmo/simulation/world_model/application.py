@@ -362,7 +362,7 @@ def load_world_model(
                 load_model_catalog(store.model_catalog_path),
                 environment=environment,
             )
-        resolved_world = catalog.resolve(config.models.world_model)
+        resolved_world = catalog.resolve(config.models.world_model, role="world_model")
         resolved_embedder = catalog.preflight(
             config.models.embedder,
             CapabilityRequirement(requires_embeddings=True),

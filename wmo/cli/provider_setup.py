@@ -162,6 +162,7 @@ def run_router_candidate_picker(
             available,
             preselected=preselected,
             incumbent=incumbent,
+            effort_defaults=catalog.roles.candidate_reasoning_efforts,
             console=console,
         )
         if selection is None:
@@ -399,11 +400,16 @@ def _commit(
     if (
         result.candidates == catalog.roles.candidates
         and result.incumbent == catalog.roles.incumbent
+        and result.candidate_reasoning_efforts == catalog.roles.candidate_reasoning_efforts
     ):
         return catalog
     return configure_router_candidates(
         path,
-        RouterCandidateSelection(candidates=result.candidates, incumbent=result.incumbent),
+        RouterCandidateSelection(
+            candidates=result.candidates,
+            incumbent=result.incumbent,
+            candidate_reasoning_efforts=result.candidate_reasoning_efforts,
+        ),
         expected_state_sha256=catalog_state_sha256(path),
     )
 
@@ -428,6 +434,15 @@ def _role_inputs(
         embedder=options.embedder or _existing_role(existing, "embedder"),
         candidates=existing.roles.candidates if existing is not None else (),
         incumbent=existing.roles.incumbent if existing is not None else None,
+        world_model_reasoning_effort=(
+            existing.roles.world_model_reasoning_effort if existing is not None else None
+        ),
+        judge_reasoning_effort=(
+            existing.roles.judge_reasoning_effort if existing is not None else None
+        ),
+        candidate_reasoning_efforts=(
+            dict(existing.roles.candidate_reasoning_efforts) if existing is not None else {}
+        ),
     )
 
 

@@ -17,7 +17,7 @@ from pydantic import Field
 
 from wmo.common.core.artifacts import ContractModel
 from wmo.common.models.known_models import KnownModel, canonical_model_id, known_model_metadata
-from wmo.common.models.model import ModelCapabilities
+from wmo.common.models.model import DEFAULT_REASONING_EFFORT, ModelCapabilities
 
 _ALIAS_SEPARATOR_PATTERN = re.compile(r"[^a-z0-9]+")
 _MAXIMUM_ALIAS_LENGTH = 128
@@ -164,6 +164,11 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
             known.supports_temperature
             if known is not None and known.supports_temperature is not None
             else True
+        ),
+        reasoning_effort=(
+            DEFAULT_REASONING_EFFORT
+            if known is not None and known.supports_reasoning_effort
+            else None
         ),
         context_window_tokens=discovered.context_window_tokens
         or (known.context_window_tokens if known else None),
