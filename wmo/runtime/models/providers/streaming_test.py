@@ -290,6 +290,7 @@ def test_openai_responses_stream_preserves_raw_tools_usage_and_commitment() -> N
         GatewayEventKind.COMPLETED,
     ]
     assert events[3].tool_call is not None
+    assert events[3].tool_call_index == 0
     assert events[3].tool_call.arguments_json() == raw_arguments
     assert events[5].usage is not None
     assert events[5].usage.cached_input_tokens == 4
@@ -444,6 +445,7 @@ def test_anthropic_stream_normalizes_cache_usage_and_tool_fragments() -> None:
         GatewayEventKind.COMPLETED,
     ]
     assert events[3].tool_call is not None
+    assert events[3].tool_call_index == 0
     assert events[3].tool_call.arguments_json() == '{"x":1}'
     assert events[4].usage is not None
     assert events[4].usage.input_tokens == 15
@@ -591,6 +593,7 @@ def test_openai_compatible_stream_preserves_provider_order_tool_arguments() -> N
         GatewayEventKind.COMPLETED,
     ]
     assert events[3].tool_call is not None
+    assert events[3].tool_call_index == 0
     assert events[3].tool_call.arguments_json() == raw_arguments
 
 
