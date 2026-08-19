@@ -24,6 +24,8 @@ from wmo.runtime.models.providers.base import (
     ProviderHttpClient,
 )
 from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
     ProviderResponseError,
     require_array,
     require_integer,
@@ -110,6 +112,9 @@ def gemini_generate_response(
     if not candidates:
         raise ProviderResponseError("Gemini response has no candidates")
     candidate = require_object(candidates[0], "Gemini candidates[0]")
+    refusal_signal = _gemini_refusal_signal(candidate.get("finishReason"))
+    if refusal_signal is not None:
+        raise ProviderRefusalError(provider="gemini", signal=refusal_signal)
     content = require_object(candidate.get("content"), "Gemini candidates[0].content")
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
@@ -288,3 +293,21 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
 def _path_model_id(model_id: str) -> str:
     """Remove the optional wire prefix before placing a model in a Gemini path."""
     return model_id.removeprefix("models/")
+
+
+def _gemini_refusal_signal(value: object) -> ProviderRefusalSignal | None:
+    """Map a Gemini finish reason to a content-free refusal category.
+
+    Args:
+        value: Provider-reported candidate finish reason.
+
+    Returns:
+        A normalized refusal signal, or ``None`` for ordinary terminal reasons.
+    """
+    if value in {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"}:
+        return ProviderRefusalSignal.SAFETY
+    if value == "RECITATION":
+        return ProviderRefusalSignal.COPYRIGHT
+    if value == "SPII":
+        return ProviderRefusalSignal.SENSITIVE_INFORMATION
+    return None

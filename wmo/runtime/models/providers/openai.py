@@ -25,8 +25,11 @@ from wmo.common.models import (
     ToolCall,
     Usage,
 )
+from wmo.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
 from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
     ProviderResponseError,
     ProviderRetryableResponseError,
 )
@@ -142,7 +145,10 @@ def openai_responses_response(
                 if isinstance(part, ResponseOutputText):
                     text_parts.append(part.text)
                 elif isinstance(part, ResponseOutputRefusal):
-                    text_parts.append(part.refusal)
+                    raise ProviderRefusalError(
+                        provider="openai",
+                        signal=ProviderRefusalSignal.PROVIDER_REFUSAL,
+                    )
                 else:
                     raise ProviderResponseError(
                         f"OpenAI Responses output[{index}] has unsupported content type "
@@ -182,7 +188,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
         model: ModelSnapshot,
         api_key: str,
         base_url: str = OPENAI_BASE_URL,
-        transport: JsonHttpTransport | None = None,
+        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         supports_temperature: bool = True,

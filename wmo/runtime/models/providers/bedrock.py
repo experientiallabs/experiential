@@ -25,6 +25,8 @@ from wmo.common.models import (
 )
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY
 from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
     ProviderResponseError,
     require_array,
     require_integer,
@@ -32,6 +34,7 @@ from wmo.runtime.models.providers.errors import (
     require_string,
 )
 from wmo.runtime.models.providers.openai_compatible import normalize_embedding_vector
+from wmo.runtime.models.providers.protocol import BoundedSyncModelClientAdapter
 from wmo.runtime.models.providers.transport import (
     ProviderTransportError,
     RetryPolicy,
@@ -281,6 +284,32 @@ class BedrockClient:
                 raise _as_transport_error(exc) from exc
 
         return run_with_retry(send, policy=self._retry_policy)
+
+
+class BoundedBedrockClient(BoundedSyncModelClientAdapter):
+    """Gateway compatibility contract for blocking Bedrock SDK calls.
+
+    The wrapper bounds outstanding worker calls and caller wait time. Cancellation is best effort:
+    an active boto call may finish in its worker, but retains its admission permit until it stops.
+    Native Bedrock streaming remains outside this contract.
+    """
+
+    def __init__(
+        self,
+        client: BedrockClient,
+        *,
+        maximum_outstanding_calls: int = 4,
+    ) -> None:
+        """Bind one Bedrock client behind a finite blocking-worker bound.
+
+        Args:
+            client: Existing synchronous Bedrock client.
+            maximum_outstanding_calls: Running plus detached boto calls allowed at once.
+        """
+        super().__init__(
+            client,
+            maximum_outstanding_calls=maximum_outstanding_calls,
+        )
 
 
 def _boto_session_region() -> str | None:
@@ -576,6 +605,11 @@ def _finish_reason(value: object) -> ModelFinishReason:
         raise ProviderResponseError("Bedrock stopReason must be a non-empty string")
     if value in _LENGTH_STOP_REASONS:
         return ModelFinishReason.LENGTH
+    if value in {"content_filtered", "guardrail_intervened"}:
+        raise ProviderRefusalError(
+            provider="bedrock",
+            signal=ProviderRefusalSignal.GUARDRAIL,
+        )
     if value in _COMPLETED_STOP_REASONS:
         return ModelFinishReason.COMPLETED
     raise ProviderResponseError(f"Bedrock stopReason {value!r} is not supported")

@@ -40,7 +40,11 @@ from wmo.runtime.models.providers.bedrock import (
     create_bedrock_runtime_client,
     resolve_bedrock_region,
 )
-from wmo.runtime.models.providers.errors import ProviderResponseError
+from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
+    ProviderResponseError,
+)
 from wmo.runtime.models.providers.transport import ProviderTransportError, ScriptedJsonTransport
 from wmo.runtime.models.registry import RuntimeModelCatalog
 
@@ -576,7 +580,7 @@ def test_converse_response_maps_length_and_rejects_unsupported_blocks() -> None:
             configured_model=_snapshot(),
             latency_seconds=0.1,
         )
-    with pytest.raises(ProviderResponseError, match="not supported"):
+    with pytest.raises(ProviderRefusalError) as refusal_error:
         converse_response(
             {
                 "output": {"message": {"content": [{"text": "blocked"}]}},
@@ -585,3 +589,5 @@ def test_converse_response_maps_length_and_rejects_unsupported_blocks() -> None:
             configured_model=_snapshot(),
             latency_seconds=0.1,
         )
+    assert refusal_error.value.signal is ProviderRefusalSignal.GUARDRAIL
+    assert "blocked" not in str(refusal_error.value)
