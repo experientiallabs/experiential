@@ -36,11 +36,11 @@ class WizardWorkflowSelection:
 
 
 _WORKFLOW_STEPS: tuple[tuple[str, str, bool], ...] = (
-    ("providers", "provider connections and model roles", True),
-    ("build", "grounded build: tasks, RAG indexes, world model", True),
-    ("judge rubric", "custom rubric; off uses the task-success default prompt", False),
-    ("judge calibration", "human-labeled judge audit; off keeps provisional judgments", False),
-    ("router optimization", "simulate, judge, fit, and freeze the router", True),
+    ("providers", "connections and model roles", True),
+    ("build", "tasks, RAG indexes, world model", True),
+    ("judge rubric", "custom rubric; off uses the task-success default", False),
+    ("judge calibration", "human-labeled audit", False),
+    ("router optimization", "simulate, judge, fit, freeze", True),
 )
 
 
@@ -71,7 +71,7 @@ def select_workflow(*, console: Console) -> WizardWorkflowSelection:
     Returns:
         The explicit set of wizard steps the operator chose to run.
     """
-    console.print("[bold]Workflow[/bold] Every step this wizard can run:")
+    console.print("[bold]Workflow[/bold]")
     for index, (name, summary, default) in enumerate(_WORKFLOW_STEPS, start=1):
         marker = "[green]on[/green] " if default else "[dim]off[/dim]"
         console.print(f"  {index}. {name:<19} {marker} [dim]{summary}[/dim]")
@@ -149,7 +149,7 @@ def render_completed_replay(
         replay: Exact completed router and report identities.
         console: Terminal receiving the replay summary.
     """
-    console.print("[green]Complete[/green] Reused every verified project artifact.")
+    console.print("[green]\u2713[/green] reused every verified project artifact")
     console.print(f"  router  {replay.policy_id}")
     console.print(f"  report  {replay.report_id}")
     console.print(f"  next    wmo run {project}")
@@ -183,20 +183,15 @@ def render_plan(
         console: Terminal receiving the plan.
     """
     build_ceiling = 0.0 if plan.build_reused else maximum_build_cost_usd
-    console.print("[bold]Project plan[/bold]")
+    console.print("[bold]Plan[/bold]")
     console.print(f"  [dim]project[/dim]      {project}")
     console.print(
         f"  [dim]traces[/dim]       {plan.accepted_traces} accepted, {plan.invalid_traces} "
         f"invalid; {plan.fit_tasks} fit, {plan.held_out_tasks} held out"
     )
     console.print(
-        f"  [dim]models[/dim]       world={plan.selected.world_model}, "
-        f"judge={plan.selected.judge}, embedder={plan.selected.embedder}"
-    )
-    console.print("  [dim]RAG[/dim]          serving and fit indexes")
-    console.print("  [dim]syllabus[/dim]     task-success rubric and evaluation instructions")
-    console.print(
-        "  [dim]calibration[/dim]  provisional; optional human approval creates a successor"
+        f"  [dim]models[/dim]       world {plan.selected.world_model}, "
+        f"judge {plan.selected.judge}, embedder {plan.selected.embedder}"
     )
     console.print(
         f"  [dim]build spend[/dim]  estimate ${plan.build_estimate_usd:.6f}; "
@@ -204,16 +199,13 @@ def render_plan(
     )
     if cost_plan is not None:
         console.print(
-            f"  [dim]router[/dim]       {', '.join(catalog.roles.candidates)}; "
-            f"incumbent={catalog.roles.incumbent}"
-        )
-        console.print(f"  [dim]embeddings[/dim]   ${cost_plan.router_embedding_cost_usd:.6f}")
-        console.print(
-            f"  [dim]judgments[/dim]    ${cost_plan.judgment_cost_usd:.6f} "
-            f"({cost_plan.maximum_judgments} judge decisions)"
+            f"  [dim]router[/dim]       {', '.join(catalog.roles.candidates)} "
+            f"[dim](incumbent {catalog.roles.incumbent})[/dim]"
         )
         console.print(
-            f"  [dim]simulation[/dim]   ${cost_plan.simulation_cost_usd:.6f} "
+            f"  [dim]router cost[/dim]  embeddings ${cost_plan.router_embedding_cost_usd:.6f}, "
+            f"judgments ${cost_plan.judgment_cost_usd:.6f} ({cost_plan.maximum_judgments}), "
+            f"simulation ${cost_plan.simulation_cost_usd:.6f} "
             f"({cost_plan.simulated_episode_count} episodes)"
         )
         console.print(
@@ -221,7 +213,7 @@ def render_plan(
             f"ceiling ${router_ceiling:.6f}"
         )
     else:
-        console.print("  [dim]router[/dim]       optimization step not selected")
+        console.print("  [dim]router[/dim]       not selected")
     if supplied_router_cap is not None:
         console.print(f"  [dim]supplied cap[/dim] ${supplied_router_cap:.6f}")
     console.print(

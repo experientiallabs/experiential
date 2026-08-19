@@ -344,7 +344,7 @@ def test_interpret_key_bytes_maps_terminal_events(raw: bytes, expected: PickerEv
     assert interpret_key_bytes(raw) == expected
 
 
-@pytest.mark.parametrize("ready_marker", ["Providers", "q cancels."])
+@pytest.mark.parametrize("ready_marker", ["Providers", "q cancel"])
 def test_provider_multi_select_redraws_one_region_for_repeated_and_batched_keys(
     ready_marker: str,
     python_terminal_child: Callable[..., TerminalRun],
@@ -379,7 +379,7 @@ def test_provider_multi_select_redraws_one_region_for_repeated_and_batched_keys(
         rows=("model-1 (openai/gpt-1)", "model-6 (openai/gpt-6)"),
     )
     assert "[x] model-3 (openai/gpt-3)" in run.screen_text()
-    assert [line for line in run.screen if line.strip() == "> Complete"]
+    assert [line for line in run.screen if line.strip() == "\u276f Complete"]
 
 
 def test_model_single_select_confirms_the_focused_row_with_enter(
@@ -500,8 +500,9 @@ def test_a_narrow_terminal_keeps_the_hint_and_metadata_readable(
     assert "RESULT:model-1|None" in run.transcript
     text = run.screen_text()
     assert text.count("Providers") == 1
-    assert "Activate Complete to submit." in text
-    assert "roles: judge, world_model; pricing:" in text
+    collapsed = " ".join(text.split())
+    assert "q cancel" in collapsed
+    assert "roles: judge, world_model; pricing: api" in collapsed
 
 
 def test_a_single_select_search_narrows_a_huge_catalog_on_a_terminal(
@@ -528,7 +529,7 @@ def test_a_single_select_search_narrows_a_huge_catalog_on_a_terminal(
 
     assert "RESULT:model-39|None" in run.transcript
     assert "Search: gpt-39_" in run.transcript
-    assert "Enter confirms the focused match" in run.transcript
+    assert "Enter confirms, Esc clears" in run.transcript
 
 
 def test_a_search_accepts_multibyte_characters_on_a_terminal(
@@ -671,7 +672,7 @@ def test_keyboard_single_select_starts_on_a_prior_answer() -> None:
     )
 
     assert result.values == ("model-3",)
-    assert "> model-3" in console.output
+    assert "\u276f model-3" in console.output
 
 
 def test_keyboard_single_select_navigates_and_can_leave_the_screen() -> None:
@@ -721,9 +722,9 @@ def test_keyboard_list_moves_focus_toggles_selection_and_submits_from_complete()
 
     assert result.action is None
     assert result.values == ("model-1",)
-    assert "> [x] model-1" in console.output
-    assert "> [ ] model-3" in console.output
-    assert "> Complete" in console.output
+    assert "\u276f [x] model-1" in console.output
+    assert "\u276f [ ] model-3" in console.output
+    assert "\u276f Complete" in console.output
 
 
 def test_keyboard_list_keeps_preselected_rows_and_back_cancel_keys() -> None:
@@ -913,5 +914,5 @@ def test_keyboard_list_keeps_details_readable_on_a_narrow_terminal() -> None:
     )
 
     assert result.values == ("model-1",)
-    assert "      detail 1" in console.output
-    assert "Activate Complete to submit." in console.output
+    assert "model-1  (detail 1)" in console.output
+    assert "q cancel" in console.output

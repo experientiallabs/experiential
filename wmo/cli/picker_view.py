@@ -3,8 +3,8 @@
 A keyboard picker owns no output of its own: it hands the current rows, focus, status, and search
 state to this view, which redraws a single region in place through one rich ``Live``. An open
 search shows its query under the heading and swaps the keyboard hint for the search bindings.
-Long lists scroll around the focused row so the region never outgrows the terminal, and narrow
-terminals split the keyboard hint onto separate lines. A console that cannot be redrawn in place,
+Long lists scroll around the focused row inside a small window so only a few options show at
+once, with dim ``... more`` indicators for the rest. A console that cannot be redrawn in place,
 such as a pipe or a dumb terminal, prints each frame instead, which keeps scripted and piped
 sessions readable.
 """
@@ -20,42 +20,15 @@ from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.text import Text
 
-_NARROW_WIDTH = 72
 _MINIMUM_VISIBLE_ROWS = 3
+_MAXIMUM_VISIBLE_ROWS = 8
 _RESERVED_LINES = 6
-_ROW_INDENT = "  "
-_DETAIL_INDENT = "      "
+_ROW_INDENT = " "
 
-_MULTI_HINT = (
-    "Up/Down moves focus, Space or Enter selects or deselects, Complete submits, "
-    "/ searches, b goes back, q cancels."
-)
-_MULTI_NARROW_HINTS = (
-    "Up/Down moves focus. Space or Enter selects or deselects.",
-    "Activate Complete to submit.",
-    "/ searches. b goes back, q cancels.",
-)
-_SINGLE_HINT = (
-    "Up/Down moves focus, Enter confirms the focused row, / searches, b goes back, q cancels."
-)
-_SINGLE_NARROW_HINTS = (
-    "Up/Down moves focus. Enter confirms the focused row.",
-    "/ searches. b goes back, q cancels.",
-)
-_MULTI_SEARCH_HINT = (
-    "Type to search. Backspace edits, Enter keeps the matches, Esc clears the search."
-)
-_MULTI_SEARCH_NARROW_HINTS = (
-    "Type to search. Backspace edits.",
-    "Enter keeps the matches, Esc clears.",
-)
-_SINGLE_SEARCH_HINT = (
-    "Type to search. Backspace edits, Enter confirms the focused match, Esc clears the search."
-)
-_SINGLE_SEARCH_NARROW_HINTS = (
-    "Type to search. Backspace edits.",
-    "Enter confirms the focused match, Esc clears.",
-)
+_MULTI_HINT = "up/down + space, Enter on Complete; / search, b back, q cancel"
+_SINGLE_HINT = "up/down + Enter; / search, b back, q cancel"
+_MULTI_SEARCH_HINT = "type to search; Enter keeps matches, Esc clears"
+_SINGLE_SEARCH_HINT = "type to search; Enter confirms, Esc clears"
 
 
 class PickerMode(StrEnum):
@@ -71,7 +44,7 @@ class PickerRow:
 
     Attributes:
         label: Row text, already carrying any provider and model identity.
-        detail: Optional metadata line, such as served roles and pricing provenance.
+        detail: Optional short annotation shown dimly after the label.
         marked: Whether a multi-select screen currently holds this row as selected.
         action: Whether the row submits the screen instead of naming a value.
     """
@@ -162,7 +135,9 @@ class PickerView:
         Returns:
             The heading, the visible window of rows, and the keyboard hint as one renderable.
         """
-        lines: list[Text] = [Text(self._title, style="bold")]
+        title = Text(self._title, style="bold")
+        title.append(f"  ({self._hint(searching=False)})", style="dim")
+        lines: list[Text] = [title]
         if searching:
             lines.append(Text(f"Search: {query}_", style="cyan"))
         elif query:
@@ -181,25 +156,30 @@ class PickerView:
             lines.append(Text(f"{_ROW_INDENT}... {hidden_below} more below", style="dim"))
         if status:
             lines.append(Text(status, style="yellow"))
-        lines.extend(Text(hint, style="dim") for hint in self._hints(searching=searching))
+        if searching:
+            lines.append(Text(self._hint(searching=True), style="dim"))
         return Group(*lines)
 
     def _row_lines(self, row: PickerRow, *, focused: bool) -> tuple[Text, ...]:
-        """Render one row as its label line plus any metadata line.
+        """Render one row as a single line with its dim annotation inline.
 
         Args:
             row: Row being rendered.
             focused: Whether the row currently holds focus.
 
         Returns:
-            The label line, followed by the metadata line when the row carries one.
+            One label line carrying the focus pointer, mark, and annotation.
         """
-        pointer = ">" if focused else " "
         mark = "" if self._mode is PickerMode.SINGLE or row.action else _mark(row.marked) + " "
-        label = Text(f"{_ROW_INDENT}{pointer} {mark}{row.label}")
-        if not row.detail:
-            return (label,)
-        return (label, Text(f"{_DETAIL_INDENT}{row.detail}", style="dim"))
+        line = Text(_ROW_INDENT)
+        if focused:
+            line.append("\u276f", style="bold cyan")
+        else:
+            line.append(" ")
+        line.append(f" {mark}{row.label}")
+        if row.detail:
+            line.append(f"  ({row.detail})", style="dim")
+        return (line,)
 
     def _capacity(self, rows: Sequence[PickerRow], *, searching: bool, query: str) -> int:
         """Return how many rows fit in the region on this terminal.
@@ -210,32 +190,29 @@ class PickerView:
             query: Search text currently narrowing the rows.
 
         Returns:
-            The largest row count that keeps the region inside the terminal height.
+            The largest row count that keeps the region inside the terminal height and
+            never exceeds the compact visible-row ceiling.
         """
+        del rows
         height = self._console.size.height
-        cost = 2 if any(row.detail for row in rows) else 1
-        reserved = _RESERVED_LINES + len(self._hints(searching=searching))
+        reserved = _RESERVED_LINES
         if searching or query:
             reserved += 1
-        return max(_MINIMUM_VISIBLE_ROWS, (height - reserved) // cost)
+        available = max(_MINIMUM_VISIBLE_ROWS, height - reserved)
+        return min(available, _MAXIMUM_VISIBLE_ROWS)
 
-    def _hints(self, *, searching: bool = False) -> tuple[str, ...]:
-        """Return the keyboard hint lines for this screen, search state, and terminal width.
+    def _hint(self, *, searching: bool) -> str:
+        """Return the compact keyboard hint for this screen and search state.
 
         Args:
             searching: Whether the search line is open for typing.
 
         Returns:
-            The hint lines to print under the rows.
+            One short hint string.
         """
-        narrow = (self._console.width or 80) < _NARROW_WIDTH
         if searching:
-            if self._mode is PickerMode.SINGLE:
-                return _SINGLE_SEARCH_NARROW_HINTS if narrow else (_SINGLE_SEARCH_HINT,)
-            return _MULTI_SEARCH_NARROW_HINTS if narrow else (_MULTI_SEARCH_HINT,)
-        if self._mode is PickerMode.SINGLE:
-            return _SINGLE_NARROW_HINTS if narrow else (_SINGLE_HINT,)
-        return _MULTI_NARROW_HINTS if narrow else (_MULTI_HINT,)
+            return _SINGLE_SEARCH_HINT if self._mode is PickerMode.SINGLE else _MULTI_SEARCH_HINT
+        return _SINGLE_HINT if self._mode is PickerMode.SINGLE else _MULTI_HINT
 
 
 @contextmanager

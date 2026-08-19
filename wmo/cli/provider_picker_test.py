@@ -16,7 +16,13 @@ from wmo.cli.provider_picker import (
     resolve_setup_providers,
     select_providers,
 )
-from wmo.common.models import DiscoveredModel, PricingSource, ProviderConnection, SetupRole
+from wmo.common.models import (
+    DiscoveredModel,
+    PricingSource,
+    ProviderConnection,
+    SetupRole,
+    serves_role,
+)
 from wmo.runtime.models.providers import ProviderEndpoint, ProviderListingError
 
 _LUNA = DiscoveredModel(provider="openai", model="gpt-5.6-luna")
@@ -99,10 +105,8 @@ def test_provider_screen_reports_credential_availability_per_provider() -> None:
     """The one opening screen states which canonical credentials are already readable."""
     environment = {"OPENAI_API_KEY": "secret-key"}
 
-    assert credential_hint("openai", environment=environment) == "OPENAI_API_KEY is set"
-    assert (
-        credential_hint("anthropic", environment=environment) == "ANTHROPIC_API_KEY needs a value"
-    )
+    assert credential_hint("openai", environment=environment) == "OPENAI_API_KEY set"
+    assert credential_hint("anthropic", environment=environment) == "ANTHROPIC_API_KEY needed"
 
 
 def test_provider_screen_selects_several_providers_in_one_session() -> None:
@@ -142,7 +146,7 @@ def test_keyboard_provider_list_selects_without_typed_numbers() -> None:
     )
 
     assert selection == (("openai", "anthropic"), False)
-    assert "> [x] OpenAI" in console.output
+    assert "\u276f [x] openai" in console.output
     assert "Complete" in console.output
     assert "Numbers or ranges" not in console.output
 
@@ -160,7 +164,7 @@ def test_keyboard_provider_list_preserves_current_selection_and_cancel() -> None
     )
 
     assert cancelled is None
-    assert "[x] OpenAI" in console.output
+    assert "[x] openai" in console.output
 
 
 def test_resolve_setup_providers_orders_and_rejects_bad_values() -> None:
@@ -199,7 +203,7 @@ def test_canonical_environment_credential_is_used_without_any_prompt() -> None:
     assert endpoints[0].connection.api_key_env == "OPENAI_API_KEY"
     assert lister.requests == [ProviderEndpoint(provider="openai", api_key="secret-key")]
     assert [model.alias for model in models] == ["gpt-5-6-luna", "text-embedding-3-small"]
-    assert "credential read from OPENAI_API_KEY" in console.output
+    assert "OPENAI_API_KEY is set" in console.output
 
 
 def test_missing_credential_is_pasted_masked_and_stays_process_local(
@@ -255,7 +259,7 @@ def test_empty_masked_paste_skips_that_provider(monkeypatch: pytest.MonkeyPatch)
     endpoints, models = prepared
     assert [endpoint.connection.provider for endpoint in endpoints] == ["openai"]
     assert [model.provider for model in models] == ["openai"]
-    assert "Skipping Anthropic." in console.output
+    assert "Skipping anthropic." in console.output
     assert "ANTHROPIC_API_KEY" not in {key for key in environment}
 
 
@@ -388,7 +392,7 @@ def test_models_without_verified_metadata_are_hidden_from_the_normal_path() -> N
     assert prepared is not None
     _, models = prepared
     assert [model.model for model in models] == ["gpt-5.6-luna", "text-embedding-3-small"]
-    assert "1 hidden without verified capabilities or prices" in console.output
+    assert "1 hidden without verified metadata" in console.output
 
 
 def test_discovered_metadata_and_roles_come_from_the_maintained_table() -> None:
@@ -410,8 +414,13 @@ def test_discovered_metadata_and_roles_come_from_the_maintained_table() -> None:
     assert chat.capabilities is not None
     assert chat.capabilities.supports_structured_output
     assert chat.capabilities.context_window_tokens == 1_050_000
-    assert SetupRole.EMBEDDER.value in embedder.detail()
-    assert "roles: world_model, judge, router_candidate" in chat.detail()
+    assert embedder.capabilities is not None
+    assert serves_role(embedder.capabilities, SetupRole.EMBEDDER)
+    assert serves_role(chat.capabilities, SetupRole.WORLD_MODEL)
+    assert serves_role(chat.capabilities, SetupRole.JUDGE)
+    assert serves_role(chat.capabilities, SetupRole.ROUTER_CANDIDATE)
+    assert chat.detail() == "openai"
+    assert embedder.detail() == "openai"
 
 
 def test_connection_names_and_aliases_avoid_configured_collisions() -> None:
@@ -518,7 +527,7 @@ def test_azure_prepares_exact_connection_for_manual_deployment_declaration() -> 
         base_url="https://resource.openai.azure.com",
         api_version="v1",
     )
-    assert "deployment-specific" in console.output
+    assert "declare deployment model IDs" in console.output
 
 
 def test_bedrock_prepares_credential_chain_without_listing_or_identity_invention() -> None:
@@ -543,7 +552,7 @@ def test_bedrock_prepares_credential_chain_without_listing_or_identity_invention
         provider="bedrock",
         region="us-east-1",
     )
-    assert "deployment-specific" in console.output
+    assert "declare deployment model IDs" in console.output
 
 
 def test_azure_and_bedrock_force_explicit_manual_model_declaration() -> None:
@@ -553,7 +562,7 @@ def test_azure_and_bedrock_force_explicit_manual_model_declaration() -> None:
     selection = select_providers(SetupSession(), console=console, environment={})
 
     assert selection == (("azure", "bedrock"), True)
-    assert "deployment IDs are declared manually" in console.output
+    assert "manual model IDs" in console.output
     assert "AWS credential chain" in console.output
 
 

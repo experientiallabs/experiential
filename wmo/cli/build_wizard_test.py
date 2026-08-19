@@ -336,7 +336,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     printed = unstyle(result.output)
     assert lister.requests == ["openai"]
     assert "Select the providers you want to use" not in printed
-    assert printed.count("Every step this wizard can run") == 1
+    assert printed.count("Workflow") == 1
     assert printed.index("judge rubric") < printed.index("Trace path")
     assert printed.count("Trace path (otlp export)") == 1
     assert printed.count("Use these recommended models?") == 1
@@ -472,7 +472,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
         env={"OPENAI_API_KEY": "openai-secret", "WMO_RELEASE_REVISION": _REVISION},
     )
     assert replay.exit_code == 0, replay.output
-    assert "Reused every verified project artifact" in unstyle(replay.output)
+    assert "reused every verified project artifact" in unstyle(replay.output)
     assert "next    wmo run support" in unstyle(replay.output)
     assert "wmo config judge calibrate support" not in unstyle(replay.output)
     assert lister.requests == ["openai"]
@@ -1147,7 +1147,7 @@ def test_completed_replay_skips_every_prompt_and_provider_stage(
     )
 
     printed = unstyle(output.getvalue())
-    assert "Reused every verified project artifact" in printed
+    assert "reused every verified project artifact" in printed
     assert "policy-a" in printed
     assert "report-a" in printed
     assert "next    wmo run support" in printed

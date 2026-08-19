@@ -940,15 +940,17 @@ def _render_preflight(
         reused: Whether an exact completed grounded build already exists.
     """
     _console.print("[bold]Build preflight[/bold]")
-    _console.print(f"  traces       {accepted} accepted, {invalid} invalid")
-    _console.print(f"  split        {fit_count} fit, {held_out_count} held out")
-    _console.print(f"  world model  {world_alias} ({world_model_id})")
-    _console.print(f"  embedder     {embedder_alias} ({embedder_model_id})")
+    _console.print(f"  [dim]traces[/dim]       {accepted} accepted, {invalid} invalid")
+    _console.print(f"  [dim]split[/dim]        {fit_count} fit, {held_out_count} held out")
+    _console.print(f"  [dim]world model[/dim]  {world_alias} [dim]({world_model_id})[/dim]")
+    _console.print(f"  [dim]embedder[/dim]     {embedder_alias} [dim]({embedder_model_id})[/dim]")
     if reused:
-        _console.print("  embedding    reuse exact completed indexes, $0.000000 new spend")
+        _console.print(
+            "  [dim]embedding[/dim]    reuse exact completed indexes, $0.000000 new spend"
+        )
     else:
-        _console.print(f"  embedding    at most ${estimate:.6f}")
-    _console.print(f"  ceiling      ${ceiling:.6f}")
+        _console.print(f"  [dim]embedding[/dim]    at most ${estimate:.6f}")
+    _console.print(f"  [dim]ceiling[/dim]      ${ceiling:.6f}")
 
 
 def _render_completed_build(
@@ -969,20 +971,18 @@ def _render_completed_build(
     dataset = completed.artifacts.trace_dataset.dataset
     tasks = completed.artifacts.mining.tasks
     duplicate_count = len(dataset.trace_ids) - len(completed.artifacts.mining.analysis.candidates)
-    _console.print("[bold green]Build complete[/bold green]")
     _console.print(
-        f"[green]built[/green] {len(dataset.trace_ids)} accepted, "
-        f"{dataset.invalid_trace_count} invalid, {duplicate_count} duplicate"
+        f"[green]\u2713[/green] ingested {len(dataset.trace_ids)} traces "
+        f"[dim]({dataset.invalid_trace_count} invalid, {duplicate_count} duplicate)[/dim]"
     )
     if len(dataset.trace_ids) < 100 or len(dataset.trace_ids) > 1_000:
         _console.print("[yellow]guidance[/yellow] 100 to 1,000 traces is the usual starting range")
     _console.print(
-        f"[green]split[/green] {sum(task.partition == 'fit' for task in tasks)} fit, "
-        f"{sum(task.partition == 'held_out' for task in tasks)} held_out"
+        f"[green]\u2713[/green] split {sum(task.partition == 'fit' for task in tasks)} fit / "
+        f"{sum(task.partition == 'held_out' for task in tasks)} held out"
     )
-    _console.print(
-        f"[green]grounded[/green] serving RAG {built.serving_rag.artifact_id}, "
-        f"fit RAG {built.fit_rag.artifact_id}, world model {built.world_model.artifact_id}"
-    )
-    _console.print(f"embedding spend ceiling: ${estimate:.6f}")
+    _console.print(f"[green]\u2713[/green] serving RAG {built.serving_rag.artifact_id}")
+    _console.print(f"[green]\u2713[/green] fit RAG {built.fit_rag.artifact_id}")
+    _console.print(f"[green]\u2713[/green] world model {built.world_model.artifact_id}")
+    _console.print(f"[dim]embedding spend ceiling ${estimate:.6f}[/dim]")
     _console.print(f"next: wmo optimize router {project}")

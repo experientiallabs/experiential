@@ -1,15 +1,15 @@
 """Provider and model setup shared by configuration and first build.
 
 Interactive setup runs the provider and model picker in ``provider_picker``: providers, missing
-credentials, models, roles, and one confirmation. Repeatable ``--provider`` flags skip the opening
-list and feed the same session. Automation supplies the same catalog update as repeatable JSON.
-Both paths end in one conflict-checked atomic ``models.toml`` write.
+credentials, then one concise picker per model role, and one confirmation. Repeatable
+``--provider`` flags skip the opening list and feed the same session. Automation supplies the
+same catalog update as repeatable JSON. Both paths end in one conflict-checked atomic
+``models.toml`` write.
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
@@ -27,12 +27,12 @@ from wmo.cli.model_picker import (
     build_result,
     configured_models,
     model_selection,
+    recommendation_key,
     render_summary,
     select_models,
     select_router_candidates,
 )
 from wmo.cli.provider_picker import (
-    CREDENTIAL_NOTE,
     AvailableModel,
     ProviderSetupResult,
     SetupCancelled,
@@ -58,7 +58,6 @@ from wmo.common.models import (
     load_model_catalog,
     serves_role,
 )
-from wmo.common.models.known_models import recommended_model_rank
 from wmo.common.models.setup import SETUP_PROVIDERS
 from wmo.runtime.models.providers import HttpProviderModelLister, ProviderModelLister
 
@@ -292,7 +291,6 @@ def _interactive_setup(
         The confirmed setup, or ``None`` when the user cancelled or declined to save.
     """
     console.print("[bold]Model setup[/bold]")
-    console.print(f"[dim]{CREDENTIAL_NOTE}[/dim]")
     configured = configured_models(
         existing_catalog_models,
         connection_providers=existing_connection_providers,
@@ -453,24 +451,7 @@ def _recommendation_key(
     Returns:
         Stable sort key preferring maintained provider guidance before a cost fallback.
     """
-    rank = recommended_model_rank(item.provider, item.model, role.value)
-    provider_rank = {"openai": 0, "anthropic": 1, "gemini": 2}.get(item.provider, 3)
-    capabilities = item.capabilities
-    assert capabilities is not None
-    if role is SetupRole.EMBEDDER:
-        cost = capabilities.input_cost_per_million_tokens_usd
-    else:
-        input_cost = capabilities.input_cost_per_million_tokens_usd
-        output_cost = capabilities.output_cost_per_million_tokens_usd
-        cost = None if input_cost is None or output_cost is None else input_cost + output_cost
-    return (
-        0 if rank is not None else 1,
-        provider_rank,
-        rank if rank is not None else 10_000,
-        cost if cost is not None else math.inf,
-        item.provider,
-        item.model,
-    )
+    return recommendation_key(item.provider, item.model, item.capabilities, role)
 
 
 def _recommended_router_selection(catalog: ModelCatalog) -> RouterCandidateSelection:
@@ -555,7 +536,11 @@ def _collect_models_and_roles(
     role_inputs: SetupRoleInputs,
     console: Console,
 ) -> ProviderSetupResult | None:
-    """Run the model, role, and confirmation screens for one prepared provider set.
+    """Run the role-first assignment and confirmation screens for one prepared provider set.
+
+    Discovered models go straight to one picker per role. Providers whose model IDs must be
+    declared by hand first run the model-declaration screen, then the same role pickers. Only
+    the models actually assigned a role are persisted.
 
     Args:
         session: Answers already collected in this setup session.
@@ -571,14 +556,21 @@ def _collect_models_and_roles(
         SetupCancelled: The user cancelled setup or declined to save.
     """
     while True:
-        selected = select_models(session, console=console)
-        if selected is None:
-            return None
-        session.selected = selected
-        chosen = tuple(item for item in available_models(session) if item.alias in selected)
-        roles = assign_roles(chosen, role_inputs=role_inputs, console=console)
+        if session.advanced_models:
+            selected = select_models(session, console=console)
+            if selected is None:
+                return None
+            session.selected = selected
+            pool = tuple(item for item in available_models(session) if item.alias in selected)
+        else:
+            pool = available_models(session)
+        roles = assign_roles(pool, role_inputs=role_inputs, console=console)
         if roles is None:
-            continue
+            if session.advanced_models:
+                continue
+            return None
+        used = {roles.world_model, roles.judge, roles.embedder, *roles.candidates}
+        chosen = tuple(item for item in pool if item.alias in used)
         result = build_result(
             chosen,
             roles=roles,

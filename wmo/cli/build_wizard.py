@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
+from rich.panel import Panel
 
 from wmo.cli.build_wizard_screens import (
     WizardBuildPlan,
@@ -111,7 +112,13 @@ def run_build_wizard(
         ValueError: Existing state or a selected wizard input is invalid.
     """
     code_revision = installed_release_revision()
-    console.print("[bold green]WMO project wizard[/bold green]")
+    console.print(
+        Panel(
+            "Let's create a world model. Press Enter to accept the [dim]default[/dim] in brackets.",
+            title="[bold cyan]wmo build[/bold cyan]",
+            border_style="cyan",
+        )
+    )
     _require_replay_role_overrides(
         root,
         project,

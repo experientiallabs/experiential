@@ -99,8 +99,8 @@ def test_model_screen_spans_providers_and_reports_roles_and_pricing_source() -> 
     selected = select_models(session, console=console)
 
     assert selected == ("luna", "embedder")
-    assert "luna (openai/gpt-5.6-luna)" in console.output
-    assert "pricing: wmo-catalog" in console.output
+    assert "luna openai" in console.output
+    assert "embedder openai" in console.output
 
 
 def test_model_screen_back_navigation_returns_to_provider_selection() -> None:
@@ -151,7 +151,7 @@ def test_a_role_with_no_compatible_model_sends_the_user_back_to_selection() -> N
     roles = assign_roles((_CHAT,), role_inputs=SetupRoleInputs(), console=console)
 
     assert roles is None
-    assert "No selected model can serve the embedder role" in console.output
+    assert "No available model can serve the embedder role" in console.output
 
 
 def test_router_candidates_and_their_incumbent_are_assigned_from_selected_models() -> None:
@@ -371,11 +371,11 @@ def test_summary_states_providers_models_roles_prices_and_credential_behavior() 
     render_summary(result, chosen=chosen, endpoints=(_endpoint(),), console=console)
 
     printed = console.output
-    assert "Configuration summary" in printed
-    assert "provider openai: connection openai, credential OPENAI_API_KEY" in printed
-    assert "model luna: openai/gpt-5.6-luna" in printed
-    assert "pricing=wmo-catalog" in printed
-    assert "roles: world_model=luna, judge=luna, embedder=embedder" in printed
+    assert "Configuration" in printed
+    assert "openai (OPENAI_API_KEY)" in printed
+    assert "world model" in printed
+    assert "luna  (openai/gpt-5.6-luna)" in printed
+    assert "embedder     embedder" in printed
     assert "WMO stores only the credential environment-variable name" in printed
     assert "secret-key" not in printed
 
@@ -404,7 +404,7 @@ def test_summary_names_the_aws_credential_chain_for_bedrock() -> None:
         console=console,
     )
 
-    assert "provider bedrock: connection bedrock, credential AWS credential chain" in console.output
+    assert "bedrock (AWS credential chain)" in console.output
 
 
 def test_summary_names_confirmed_router_candidates() -> None:
@@ -427,7 +427,8 @@ def test_summary_names_confirmed_router_candidates() -> None:
     )
     render_summary(result, chosen=chosen, endpoints=(_endpoint(),), console=console)
 
-    assert "router candidates: luna, terra; incumbent luna" in console.output
+    assert "luna, terra" in console.output
+    assert "(incumbent luna)" in console.output
 
 
 def test_a_connection_only_used_by_unselected_models_is_not_written() -> None:

@@ -914,7 +914,7 @@ def _installed_release_driver() -> None:
     space = " "
     setup_answers = [
         (
-            "Select the providers you want to use",
+            "Providers",
             (down * 5) + enter + (down * 2) + enter,
         ),
         ("Azure OpenAI base URL", azure_endpoint),
@@ -934,10 +934,10 @@ def _installed_release_driver() -> None:
         ("Output cost per million tokens in USD", "0"),
         ("Cached input cost per million tokens in USD", "0"),
         ("Cache write cost per million tokens in USD", "0"),
-        ("/core-model)", (down * 2) + enter),
+        ("core-model", (down * 2) + enter),
         ("World model", enter),
-        ("Judge model", enter),
-        ("Embedder model", enter),
+        ("Judge", enter),
+        ("Embedder", enter),
         ("Save this configuration?", "y"),
     ]
     try:

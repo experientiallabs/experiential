@@ -333,7 +333,7 @@ def test_first_build_provider_flags_skip_the_opening_list(
             "--provider",
             "openai",
         ],
-        input="1,3\n\n1\n1\n1\ny\n",
+        input="1\n1\n1\n\ny\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -409,13 +409,13 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
-        input="1\n\n1,3\n\n1\n1\n1\ny\n",
+        input="1\n\n1\n1\n2\n\ny\n",
     )
 
     assert result.exit_code == 0, result.output
     assert lister.requests == ["openai"]
     printed = unstyle(result.output)
-    assert "Select the providers you want to use" in printed
+    assert "Providers" in printed
     assert "openai-secret" not in printed
     saved = load_model_catalog(root / "models.toml")
     assert saved.connections["openai"].api_key_env == "OPENAI_API_KEY"
@@ -485,7 +485,7 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     monkeypatch.setattr("wmo.cli.build_cmd._build_grounded_artifacts", forbid_rebuild)
     replay = _RUNNER.invoke(app, ["build", "support", "--traces", str(source), "--root", str(root)])
     assert replay.exit_code == 0, replay.output
-    assert "embedding spend ceiling: $0.000000" in replay.output
+    assert "embedding spend ceiling $0.000000" in replay.output
 
     swapped = config.build.model_copy(
         update={
@@ -1364,7 +1364,7 @@ def test_exact_replay_has_zero_calls_and_no_prompt(
     assert replay.exit_code == 0, replay.output
     output = unstyle(replay.output)
     assert "reuse exact completed indexes, $0.000000 new spend" in output
-    assert "embedding spend ceiling: $0.000000" in output
+    assert "embedding spend ceiling $0.000000" in output
     assert "Proceed?" not in output
     assert _RESOLVE_CALLS == []
     assert ProjectStore(root, "support").load_project().build == first_build
@@ -1483,7 +1483,7 @@ def test_build_accepts_a_declared_vendor_source_through_the_source_flag(tmp_path
     )
 
     assert result.exit_code == 0, result.output
-    assert "built 1 accepted, 0 invalid" in result.output
+    assert "ingested 1 traces" in result.output
     store = ProjectStore(root, "support")
     config = store.load_project()
     assert config.build is not None

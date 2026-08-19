@@ -282,13 +282,13 @@ def test_explicit_providers_skip_the_opening_list_and_still_discover_models(
 
     console, catalog = _setup(
         root,
-        "1,3\n\n1\n1\n1\ny\n",
+        "1\n1\n2\n\ny\n",
         monkeypatch=monkeypatch,
         options=options,
     )
 
     assert catalog is not None
-    assert "Select the providers you want to use" not in unstyle(console.output)
+    assert "Providers" not in unstyle(console.output)
     saved = load_model_catalog(root / "models.toml")
     assert set(saved.connections) == {"openai"}
     assert saved.roles.embedder == "text-embedding-3-small"
@@ -650,7 +650,7 @@ def test_interactive_setup_saves_providers_models_and_roles_it_derived(
     """
     root = tmp_path / ".wmo"
 
-    console, catalog = _setup(root, "1\n\n1,2,3\n\n1\n1\n1\n1,2\n\n1\ny\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "1\n\n1\n1\n2\n1,2\n\n1\ny\n", monkeypatch=monkeypatch)
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -688,10 +688,10 @@ def test_interactive_final_rejection_writes_no_catalog(
     """
     root = tmp_path / ".wmo"
 
-    console, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\nn\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "1\n\n1\n1\n1\n\nn\n", monkeypatch=monkeypatch)
 
     assert catalog is None
-    assert "Configuration summary" in console.output
+    assert "Configuration" in console.output
     assert not (root / "models.toml").exists()
 
 
@@ -737,7 +737,7 @@ def test_back_from_the_model_screen_reselects_providers_without_losing_answers(
 
     console, catalog = _setup(
         root,
-        "1\n\nb\n2\n\nall\n\n1\n1\n1\n1,2\n\n1\ny\n",
+        "1\n\nb\n2\n\n1\n1\n1\n1,2\n\n1\ny\n",
         monkeypatch=monkeypatch,
         lister=lister,
     )
@@ -748,7 +748,7 @@ def test_back_from_the_model_screen_reselects_providers_without_losing_answers(
     assert set(saved.connections) == {"openai", "anthropic"}
     assert set(saved.models) == {"claude-sonnet-5", "gpt-5-6-luna", "text-embedding-3-small"}
     assert saved.roles.embedder == "text-embedding-3-small"
-    assert "Reading models available to your Anthropic account" in unstyle(console.output)
+    assert "reading anthropic models" in unstyle(console.output)
 
 
 def test_rerunning_setup_preserves_unrelated_models_and_router_state(
@@ -807,7 +807,7 @@ def test_setup_preserves_entries_owned_by_providers_it_does_not_configure(
         ),
     )
 
-    console, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\ny\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "1\n\n1\n1\n1\n\ny\n", monkeypatch=monkeypatch)
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -875,7 +875,7 @@ def test_configured_models_are_reassignable_without_any_provider_request(
         ),
     )
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    console = ScriptedConsole("1\n\n\n1\n1\n1\n1,2\n\n1\ny\n")
+    console = ScriptedConsole("1\n\n1\n1\n1\n1,2\n\n1\ny\n")
 
     catalog = run_provider_setup(
         root,
@@ -981,7 +981,7 @@ def test_offline_roles_retain_assigned_tinker_alias_without_capabilities(tmp_pat
         roles=ModelRoles(world_model="legacy", judge="legacy", embedder="embed"),
     )
     write_model_catalog(root / "models.toml", original)
-    console = ScriptedConsole("1\n\n\n\n\n\n\ny\n")
+    console = ScriptedConsole("1\n\n\n\n\ny\n")
 
     saved = run_provider_setup(
         root,
@@ -996,8 +996,7 @@ def test_offline_roles_retain_assigned_tinker_alias_without_capabilities(tmp_pat
     assert load_model_catalog(root / "models.toml") == original
     printed = unstyle(console.output)
     assert "tinker/tinker://sampling/run" in printed
-    assert "retain only: world_model, judge" in printed
-    assert "capabilities=unverified" in printed
+    assert "retain only: judge, world_model" in printed
 
 
 def test_offline_setup_preserves_exact_unverified_router_roles_without_revalidation(

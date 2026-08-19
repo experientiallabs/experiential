@@ -1,15 +1,16 @@
-"""Model selection, role assignment, and confirmation screens for provider setup.
+"""Role-first model assignment and confirmation screens for provider setup.
 
-These screens run after every selected provider has been prepared. Every one of them uses the
-shared picker: the model screen and the router-candidate screen are multi-select, and a single build
-role and the router incumbent are single-select. Each row keeps its provider identity, served roles,
-and pricing provenance visible. The screens filter new build-role assignments to models whose
+These screens run after every selected provider has been prepared. Setup asks for each model
+role in turn: world model, judge, embedder, then optional router candidates and their incumbent.
+Every screen uses the shared picker with concise shorthand aliases, sorted so the recommended
+model for each role comes first. The screens filter new build-role assignments to models whose
 verified metadata can serve them, preserve exact prior assignments as retain-only choices, and
-render the single summary shown before setup saves anything.
+render the single compact summary shown before setup saves anything.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -41,6 +42,7 @@ from wmo.common.models import (
     served_roles,
     serves_role,
 )
+from wmo.common.models.known_models import recommended_model_rank
 
 _MANUAL_MODEL_ROW = "declare-model-manually"
 
@@ -64,6 +66,64 @@ def available_models(session: SetupSession) -> tuple[AvailableModel, ...]:
 def _option(item: AvailableModel) -> PickerOption:
     """Present one configurable model as a selectable picker row."""
     return PickerOption(value=item.alias, label=item.label(), detail=item.detail())
+
+
+def recommendation_key(
+    provider: str,
+    model: str,
+    capabilities: ModelCapabilities,
+    role: SetupRole,
+) -> tuple[int, int, int, float, str, str]:
+    """Rank one verified model by maintained guidance, then capability and cost.
+
+    Args:
+        provider: Provider kind publishing the model.
+        model: Exact provider-side model ID.
+        capabilities: Verified capability and price metadata.
+        role: Role being filled.
+
+    Returns:
+        Stable sort key preferring maintained provider guidance before a cost fallback.
+    """
+    rank = recommended_model_rank(provider, model, role.value)
+    provider_rank = {"openai": 0, "anthropic": 1, "gemini": 2}.get(provider, 3)
+    if role is SetupRole.EMBEDDER:
+        cost = capabilities.input_cost_per_million_tokens_usd
+    else:
+        input_cost = capabilities.input_cost_per_million_tokens_usd
+        output_cost = capabilities.output_cost_per_million_tokens_usd
+        cost = None if input_cost is None or output_cost is None else input_cost + output_cost
+    return (
+        0 if rank is not None else 1,
+        provider_rank,
+        rank if rank is not None else 10_000,
+        cost if cost is not None else math.inf,
+        provider,
+        model,
+    )
+
+
+def _role_ordered(
+    items: tuple[AvailableModel, ...],
+    role: SetupRole,
+) -> tuple[AvailableModel, ...]:
+    """Order eligible models so the recommended choice for one role comes first.
+
+    Args:
+        items: Eligible models for the role.
+        role: Role being assigned.
+
+    Returns:
+        Verified models in recommendation order, then retain-only models by alias.
+    """
+
+    def key(item: AvailableModel) -> tuple[int, tuple[int, int, int, float, str, str]]:
+        """Sort verified models by recommendation and retain-only models after them."""
+        if item.capabilities is None:
+            return (1, (0, 0, 0, 0.0, item.provider, item.model))
+        return (0, recommendation_key(item.provider, item.model, item.capabilities, role))
+
+    return tuple(sorted(items, key=key))
 
 
 def select_models(session: SetupSession, *, console: Console) -> tuple[str, ...] | None:
@@ -223,7 +283,7 @@ def assign_roles(
     judge = _assign_one_role(
         chosen,
         role=SetupRole.JUDGE,
-        title="Judge model",
+        title="Judge",
         role_name="judge",
         default=role_inputs.judge,
         console=console,
@@ -233,7 +293,7 @@ def assign_roles(
     embedder = _assign_one_role(
         chosen,
         role=SetupRole.EMBEDDER,
-        title="Embedder model",
+        title="Embedder",
         role_name="embedder",
         default=role_inputs.embedder,
         console=console,
@@ -277,11 +337,14 @@ def _assign_one_role(
     Raises:
         SetupCancelled: The user cancelled setup.
     """
-    eligible = tuple(item for item in chosen if _serves_or_retains(item, role))
+    eligible = _role_ordered(
+        tuple(item for item in chosen if _serves_or_retains(item, role)),
+        role,
+    )
     if not eligible:
         console.print(
-            f"[yellow]No selected model can serve the {role_name} role. "
-            "Select more models.[/yellow]"
+            f"[yellow]No available model can serve the {role_name} role. "
+            "Choose another provider.[/yellow]"
         )
         return None
     result = choose_one(
@@ -384,14 +447,17 @@ def _assign_router_candidates(
         SetupCancelled: The user cancelled interactive setup.
         ValueError: An explicit candidate or incumbent is not eligible.
     """
-    eligible = tuple(
-        item
-        for item in chosen
-        if (
-            item.capabilities is not None
-            and serves_role(item.capabilities, SetupRole.ROUTER_CANDIDATE)
-        )
-        or (not required and SetupRole.ROUTER_CANDIDATE in item.retainable_roles)
+    eligible = _role_ordered(
+        tuple(
+            item
+            for item in chosen
+            if (
+                item.capabilities is not None
+                and serves_role(item.capabilities, SetupRole.ROUTER_CANDIDATE)
+            )
+            or (not required and SetupRole.ROUTER_CANDIDATE in item.retainable_roles)
+        ),
+        SetupRole.ROUTER_CANDIDATE,
     )
     if len(eligible) < 2:
         if required:
@@ -414,11 +480,7 @@ def _assign_router_candidates(
         )
     result = choose_many(
         console,
-        title=(
-            "Router candidates (select at least two)"
-            if required
-            else "Router candidates (optional, Complete with none skips)"
-        ),
+        title=("Router candidates (2+)" if required else "Router candidates (optional)"),
         options=[_candidate_option(item) if required else _option(item) for item in eligible],
         preselected=preselected,
         minimum=2 if required else 0,
@@ -439,7 +501,7 @@ def _assign_router_candidates(
         return result.values, incumbent
     incumbent_result = choose_one(
         console,
-        title="Router incumbent among the candidates",
+        title="Router incumbent",
         options=(
             [_candidate_option(item) for item in eligible if item.alias in result.values]
             if required
@@ -583,7 +645,7 @@ def render_summary(
     endpoints: tuple[PreparedEndpoint, ...],
     console: Console,
 ) -> None:
-    """Show providers, models, roles, capabilities, prices, and credential behavior once.
+    """Show the providers, models, and roles about to be saved, one compact line each.
 
     Args:
         result: The setup about to be saved.
@@ -591,46 +653,31 @@ def render_summary(
         endpoints: Prepared provider endpoints.
         console: Terminal receiving the summary.
     """
-    console.print("[bold]Configuration summary[/bold]")
+    console.print("[bold]Configuration[/bold]")
     for endpoint in endpoints:
         connection = endpoint.connection
-        endpoint_text = f", base_url={connection.base_url}" if connection.base_url else ""
         credential = connection.api_key_env or "AWS credential chain"
+        endpoint_text = f", {connection.base_url}" if connection.base_url else ""
         console.print(
-            f"provider {connection.provider}: connection {connection.name}, "
-            f"credential {credential}{endpoint_text}"
-        )
-    for item in chosen:
-        capabilities = item.capabilities
-        if capabilities is None:
-            retained = ", ".join(role.value for role in item.retainable_roles)
-            console.print(
-                f"model {item.alias}: {item.provider}/{item.model}, "
-                f"capabilities=unverified, retain_only={retained or 'none'}, "
-                f"pricing={item.pricing_source.value}"
-            )
-            continue
-        verified = frozenset(served_roles(capabilities))
-        retain_only = ", ".join(
-            role.value for role in SetupRole if role in item.retainable_roles - verified
-        )
-        retained = f", retain_only={retain_only}" if retain_only else ""
-        console.print(
-            f"model {item.alias}: {item.provider}/{item.model}, "
-            f"tools={capabilities.supports_tools}, "
-            f"embeddings={capabilities.supports_embeddings}, "
-            f"structured_output={capabilities.supports_structured_output}, "
-            f"completions={capabilities.supports_completions}, "
-            f"context={capabilities.context_window_tokens}, "
-            f"max_output={capabilities.maximum_output_tokens}, "
-            f"pricing={item.pricing_source.value}{retained}"
+            f"  [green]\u2713[/green] {connection.provider} "
+            f"[dim]({credential}{endpoint_text})[/dim]"
         )
     setup = result.setup
-    console.print(
-        f"roles: world_model={setup.world_model}, judge={setup.judge}, embedder={setup.embedder}"
-    )
+    identity = {item.alias: f"{item.provider}/{item.model}" for item in chosen}
+
+    def line(label: str, alias: str | None) -> None:
+        """Print one aligned role line with the alias and its dim provider identity."""
+        if alias is None:
+            return
+        note = f"  [dim]({identity[alias]})[/dim]" if alias in identity else ""
+        console.print(f"  [dim]{label:<12}[/dim] {alias}{note}")
+
+    line("world model", setup.world_model)
+    line("judge", setup.judge)
+    line("embedder", setup.embedder)
     if result.candidates:
         console.print(
-            f"router candidates: {', '.join(result.candidates)}; incumbent {result.incumbent}"
+            f"  [dim]{'router':<12}[/dim] {', '.join(result.candidates)} "
+            f"[dim](incumbent {result.incumbent})[/dim]"
         )
-    console.print(f"credentials: {CREDENTIAL_NOTE}")
+    console.print(f"[dim]{CREDENTIAL_NOTE}[/dim]")
