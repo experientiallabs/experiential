@@ -44,6 +44,7 @@ _INCUMBENT_ALIAS = "mini"
 _CALIBRATION_SAMPLE_SIZE = 10
 _CALIBRATION_CEILING_USD = "8"
 _ROUTER_CEILING_USD = "60"
+_COMMAND_BUDGET_USD = "75"
 _ROUTER_JUDGMENTS = "60"
 _SERVER_PORT = 8399
 _MODELS: tuple[dict[str, object], ...] = (
@@ -247,7 +248,12 @@ def _calibrate_judge(runner: CliRunner, root: Path) -> None:
     labels = [
         argument
         for trace in plan.traces
-        for argument in ("--label", f"{trace.trace_id}:task-success={top_score}")
+        for argument in (
+            "--label",
+            f"{trace.trace_id}:task-success={top_score}",
+            "--judgment",
+            f"{trace.trace_id}:task-success=Live calibration label pinned to the top score.",
+        )
     ]
     result = runner.invoke(
         app,
@@ -390,6 +396,8 @@ def test_live_openai_pipeline_covers_every_locked_cli_path(
         app, ["config", "providers", "--root", str(root), "--non-interactive"]
     )
     assert providers.exit_code == 0, providers.output
+    budget = runner.invoke(app, ["config", "budget", _COMMAND_BUDGET_USD, "--root", str(root)])
+    assert budget.exit_code == 0, budget.output
     _walk_telemetry(runner, root)
 
     attributed = tmp_path / "traces.attributed.jsonl"
