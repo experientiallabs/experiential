@@ -20,7 +20,7 @@ from wmo.common.core.files import write_text_atomic
 
 
 def _exclude_absent(value: object) -> bool:
-    """Return whether an optional compatibility field should be omitted from serialization.
+    """Return whether an optional absent field should be omitted from serialization.
 
     Args:
         value: Field value being serialized.

@@ -18,17 +18,6 @@ UNKNOWN_DISPATCH_RESERVED_COST_KEY = "unknown_dispatch_reserved_cost_usd"
 
 _DISPATCH_FAILURE_PHASE = "candidate_or_world_model"
 
-_TRANSPORT_EXCEPTION_TYPES = frozenset(
-    {
-        "ProviderTransportError",
-        "TimeoutError",
-        "ConnectionError",
-        "ConnectionResetError",
-        "OSError",
-    }
-)
-"""Exception types treated as transport-class for evidence persisted without a retry flag."""
-
 
 def unknown_spend_failure(failure: StructuredFailure | None) -> bool:
     """Return whether a persisted failure left its dispatched provider spend unknown.
@@ -57,7 +46,7 @@ def unknown_dispatch_reserved_cost_usd(failure: StructuredFailure | None) -> flo
 
     Returns:
         The nonnegative finite reserved amount persisted with the failure, or ``None`` when
-        the evidence predates reservation persistence or the value is unusable.
+        the value is absent or unusable.
     """
     if failure is None:
         return None
@@ -73,11 +62,9 @@ def unknown_dispatch_reserved_cost_usd(failure: StructuredFailure | None) -> flo
 def retryable_dispatch_failure(failure: StructuredFailure | None) -> bool:
     """Return whether a persisted provider dispatch failure is transport-retryable.
 
-    Only candidate or world-model dispatch failures qualify. Evidence that carries an
-    explicit ``retry_classification`` detail is trusted exactly as classified. Evidence
-    persisted before retry classification existed falls back to the transport-class
-    exception types, so a legacy transient transport failure stays resumable. Budget,
-    validation, and stale-lease failures never qualify.
+    Only candidate or world-model dispatch failures qualify, and only when the
+    persisted failure is marked retryable. Budget, validation, and stale-lease
+    failures never qualify.
 
     Args:
         failure: Structured failure retained by a rollout artifact, or ``None``.
@@ -91,8 +78,4 @@ def retryable_dispatch_failure(failure: StructuredFailure | None) -> bool:
         return False
     if failure.details.get("phase") != _DISPATCH_FAILURE_PHASE:
         return False
-    if failure.retryable:
-        return True
-    if "retry_classification" in failure.details:
-        return False
-    return failure.exception_type in _TRANSPORT_EXCEPTION_TYPES
+    return failure.retryable

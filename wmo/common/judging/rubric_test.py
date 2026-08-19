@@ -104,24 +104,6 @@ def test_rubric_rejects_empty_axes_duplicate_ids_and_invalid_ranges() -> None:
         )
 
 
-def test_legacy_zero_to_five_payload_loads_without_range_fields() -> None:
-    """Pre-range rubric cards keep their 0-5 meaning when min_score and max_score are absent."""
-    axis = RubricDimension.model_validate(
-        {
-            "dimension_id": "task-success",
-            "name": "Task success",
-            "description": "Whether the customer received a correct outcome.",
-            "anchors": [
-                {"score": score, "description": f"Score {score} outcome."} for score in range(6)
-            ],
-        }
-    )
-
-    assert axis.min_score == 0
-    assert axis.max_score == 5
-    assert axis.permitted_scores() == (0, 1, 2, 3, 4, 5)
-
-
 def test_rubric_rejects_axes_that_do_not_share_one_range() -> None:
     """A shared schema cannot describe mixed inclusive ranges in one rubric."""
     with pytest.raises(ValidationError, match="same inclusive score range"):

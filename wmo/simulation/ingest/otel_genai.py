@@ -138,7 +138,6 @@ def normalize_otel_genai_payloads(
         traces=result.traces,
         issues=(*issues, *result.issues),
         identity_evidence=result.identity_evidence,
-        include_identity_evidence=result.include_identity_evidence,
     )
 
 

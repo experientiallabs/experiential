@@ -204,7 +204,7 @@ class WorldModel:
     ) -> WorldModelObservation:
         """Predict and append one user turn from an official OpenAI assistant message.
 
-        The persisted artifact is text-only. Any tool call, legacy function call, audio payload,
+        The persisted artifact is text-only. Any tool call, function call, audio payload,
         non-text content, or non-assistant role is rejected before retrieval or provider dispatch.
 
         Args:

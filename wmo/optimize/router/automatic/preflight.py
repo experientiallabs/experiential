@@ -809,12 +809,12 @@ def _observed_traces(
         problems: Mutable aggregate preflight failures.
         tasks: Verified representative tasks.
         traces: Verified normalized production traces.
-        identity_evidence: Verified model-span digest provenance, if the dataset carries it.
+        identity_evidence: Verified model-span digest provenance, when a completed build exists.
         candidates: Exact selected candidate identities.
     Returns:
         One deterministic exact-match trace per attributable fit lineage.
     """
-    if not tasks or not traces or not candidates:
+    if not tasks or not traces or not candidates or identity_evidence is None:
         return ()
     try:
         attributions = resolve_router_observed_attributions(

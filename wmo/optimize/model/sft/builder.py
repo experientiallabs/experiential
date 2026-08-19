@@ -291,8 +291,6 @@ def write_sft_dataset(store: ProjectStore, artifact: SFTDatasetArtifact) -> SFTD
     Raises:
         SFTBuildError: Existing data conflicts or serialized rows violate dataset invariants.
     """
-    if artifact.build_spec is None:
-        raise SFTBuildError("new SFT datasets must persist their deterministic build spec")
     _validate_artifact_rows(artifact)
     files = {
         "dataset.json": artifact.metadata().model_dump(mode="json", exclude_none=False),
@@ -373,40 +371,22 @@ def load_sft_dataset(
 def load_verified_sft_dataset(
     store: ProjectStore,
     dataset_id: ArtifactId,
-    *,
-    legacy_build_spec: SFTBuildSpec | None = None,
 ) -> SFTDatasetArtifact:
     """Reload and rebuild one accepted dataset from its persisted W12 evidence chain.
 
     Args:
         store: Project-local store owning the dataset and every transitive source artifact.
         dataset_id: Stable ID of the previously persisted W12 dataset.
-        legacy_build_spec: Exact original W12 build settings when loading metadata that predates
-            persisted build specifications.
 
     Returns:
         The canonical dataset only when its stored bytes equal a fresh deterministic rebuild.
 
     Raises:
         SFTBuildError: Any dataset, source, evidence, input, partition, build, or fingerprint
-            invariant cannot be reproduced from the immutable project store. Legacy metadata
-            additionally requires its original build settings before it can be verified.
+            invariant cannot be reproduced from the immutable project store.
     """
     loaded = load_sft_dataset(store, dataset_id)
     build_spec = loaded.build_spec
-    if build_spec is None:
-        if legacy_build_spec is None:
-            raise SFTBuildError(
-                f"frozen SFT dataset {dataset_id} predates persisted build specs; "
-                "provide legacy_build_spec with its original W12 settings"
-            )
-        build_spec = legacy_build_spec
-        loaded = loaded.model_copy(update={"build_spec": build_spec})
-    elif legacy_build_spec is not None:
-        raise SFTBuildError(
-            f"frozen SFT dataset {dataset_id} already persists its build spec; "
-            "legacy_build_spec is only valid for legacy metadata"
-        )
     production_sources = tuple(
         ProductionSFTSource(acceptance_evidence_id=source.acceptance_evidence.artifact_id)
         for source in loaded.sources

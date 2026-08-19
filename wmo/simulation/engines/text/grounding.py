@@ -246,13 +246,13 @@ def completion_reservations(
     """Resolve and verify exact candidate and world request ceilings.
 
     Args:
-        contract: Frozen automatic-simulation reservations, or ``None`` for v1 callers.
+        contract: Frozen automatic-simulation reservations, or ``None`` when unbudgeted.
         candidate_alias: Evaluation cell candidate alias.
         candidate: Active exact candidate model.
         world_model: Active exact world model.
 
     Returns:
-        Candidate and world request reservations, or two ``None`` values for legacy settings.
+        Candidate and world request reservations, or two ``None`` values when unbudgeted.
 
     Raises:
         SimulationConfigurationError: A reservation is absent or differs from active metadata.
@@ -289,36 +289,6 @@ def completion_reservations(
     return selected, world
 
 
-def unknown_dispatch_worst_case_usd(
-    contract: SimulationCompletionContract | None,
-    candidate_alias: str | None,
-) -> float | None:
-    """Return the persisted retry-inclusive worst case for one ambiguous provider dispatch.
-
-    The failed dispatch is one candidate or one world-model call, but persisted evidence does
-    not always record which, so the returned charge conservatively covers both request
-    ceilings from the frozen completion contract.
-
-    Args:
-        contract: Frozen automatic-simulation reservations, or ``None`` for v1 callers.
-        candidate_alias: Candidate alias bound to the failed cell, or ``None`` when unknown.
-
-    Returns:
-        The combined candidate and world-model retry-inclusive maximum, or ``None`` when the
-        contract or the alias reservation is unavailable.
-    """
-    if contract is None or candidate_alias is None:
-        return None
-    candidates = {item.candidate_alias: item.request for item in contract.candidate_requests}
-    candidate = candidates.get(candidate_alias)
-    if candidate is None:
-        return None
-    return (
-        candidate.estimated_maximum_call_cost_usd
-        + contract.world_model_request.estimated_maximum_call_cost_usd
-    )
-
-
 def episode_reservation_failure(
     settings: WorldModelSettings,
     *,
@@ -336,7 +306,7 @@ def episode_reservation_failure(
 
     Args:
         settings: Frozen retrieval and completion reservations.
-        completion_contract: Frozen completion reservations, or ``None`` for v1 callers.
+        completion_contract: Frozen completion reservations, or ``None`` when unbudgeted.
         remaining_cost_usd: Reconciled cell budget remaining under the durable lease.
         stop_on_overspend: When true, an exhausted remainder blocks the next episode.
 

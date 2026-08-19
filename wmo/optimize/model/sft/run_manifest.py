@@ -30,7 +30,7 @@ from wmo.common.project import (
     artifact_input,
 )
 from wmo.optimize.model.sft.builder import SFTBuildError, load_verified_sft_dataset
-from wmo.optimize.model.sft.contracts import SFTBuildSpec, SFTDatasetArtifact
+from wmo.optimize.model.sft.contracts import SFTDatasetArtifact
 from wmo.optimize.model.sft.rendering import partitioned_rows_sha256
 from wmo.optimize.model.sft.training_contracts import (
     TinkerSFTError,
@@ -430,15 +430,12 @@ def load_tinker_sft_run(
 def verified_training_inputs(
     store: ProjectStore,
     dataset_id: ArtifactId,
-    *,
-    legacy_build_spec: SFTBuildSpec | None = None,
 ) -> tuple[SFTDatasetArtifact, ArtifactInput]:
     """Load one recursively verified W12 dataset and its exact manifest input.
 
     Args:
         store: Project store owning the immutable dataset.
         dataset_id: Persisted W12 dataset identity.
-        legacy_build_spec: Explicit settings required only for a legacy dataset.
 
     Returns:
         The verified dataset and exact manifest input used by W13.
@@ -447,11 +444,7 @@ def verified_training_inputs(
         TinkerSFTError: The W12 artifact graph cannot be verified for training.
     """
     try:
-        dataset = load_verified_sft_dataset(
-            store,
-            dataset_id,
-            legacy_build_spec=legacy_build_spec,
-        )
+        dataset = load_verified_sft_dataset(store, dataset_id)
         dataset_input = artifact_input(store.artifacts.read(dataset_id).manifest)
     except (ArtifactCorruptionError, SFTBuildError) as exc:
         raise TinkerSFTError(f"W12 dataset {dataset_id} is not safe for training: {exc}") from exc

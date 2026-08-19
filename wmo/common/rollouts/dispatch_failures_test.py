@@ -98,7 +98,7 @@ def test_retryable_dispatch_failure_requires_provider_dispatch_transport_class()
     """Only transport-class provider dispatch failures qualify for resume re-execution."""
     assert retryable_dispatch_failure(None) is False
     assert retryable_dispatch_failure(_failure(retryable=True)) is True
-    assert retryable_dispatch_failure(_failure()) is True
+    assert retryable_dispatch_failure(_failure()) is False
     assert (
         retryable_dispatch_failure(
             _failure(

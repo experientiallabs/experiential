@@ -185,7 +185,6 @@ def optimize_project_router(
                 if preflight.trace_identity_evidence is None
                 else preflight.trace_identity_evidence.records
             ),
-            include_identity_evidence=preflight.trace_identity_evidence is not None,
         ),
         services=services,
         budget=RouterCompositionBudget(

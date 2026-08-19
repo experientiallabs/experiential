@@ -799,10 +799,10 @@ class ManualJudgeCalibrationAudit(ArtifactEnvelope):
             raise ValueError("manual judge audit must hash its complete canonical input graph")
         if not self.judgments:
             raise ValueError("manual judge audit requires at least one judge probe")
-        if self.schema_version >= 2 and len(self.trace_reviews) != len(self.judgments):
+        if self.schema_version != 2:
+            raise ValueError("manual judge audit requires schema_version=2")
+        if len(self.trace_reviews) != len(self.judgments):
             raise ValueError("manual judge audit requires one human review per judgment")
-        if self.schema_version == 1 and self.trace_reviews:
-            raise ValueError("version-one manual judge audits cannot name trace reviews")
         if len({item.artifact_id for item in self.trace_reviews}) != len(self.trace_reviews):
             raise ValueError("manual judge audit trace reviews must be unique")
         if (self.positional_bias_comparisons is None) != (self.positional_bias_flips is None):
