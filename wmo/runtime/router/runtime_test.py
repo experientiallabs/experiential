@@ -46,7 +46,7 @@ from wmo.common.routing.bank import (
 )
 from wmo.common.routing.features import ROUTER_FEATURE_SCHEMA_SHA256
 from wmo.common.tasks import TaskCase, TaskSet
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime, RouterRuntimeIntegrityError
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
@@ -109,7 +109,8 @@ class _Catalog:
             supports_embeddings=alias == "embedder",
         )
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        del role
         self.resolve_calls.append(alias)
         snapshot, capabilities = self.snapshot(alias)
         return ResolvedModel(
@@ -352,7 +353,8 @@ def test_resolved_catalog_identity_cannot_diverge_from_snapshot_pin(drift_alias:
     policy, manifest, bank, snapshots, client = _fixture()
 
     class _SplitCatalog(_Catalog):
-        def resolve(self, alias: str) -> ResolvedModel:
+        def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+            del role
             resolved = super().resolve(alias)
             if alias == drift_alias:
                 return ResolvedModel(
@@ -382,7 +384,8 @@ def test_catalog_resolution_failure_is_normalized_to_integrity_error() -> None:
     policy, manifest, bank, snapshots, client = _fixture()
 
     class _BrokenCatalog(_Catalog):
-        def resolve(self, alias: str) -> ResolvedModel:
+        def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+            del role
             raise RuntimeError(f"cannot resolve {alias}")
 
     with pytest.raises(RouterRuntimeIntegrityError, match="cannot resolve policy pins"):

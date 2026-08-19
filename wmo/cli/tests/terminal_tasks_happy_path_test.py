@@ -44,7 +44,7 @@ from wmo.common.rollouts import RolloutArtifact
 from wmo.common.traces import load_trace_dataset
 from wmo.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
 from wmo.optimize.router.judging.service import prepare_manual_judge_calibration
-from wmo.runtime.models import ResolvedModel
+from wmo.runtime.models import CatalogRoleName, ResolvedModel
 from wmo.runtime.models.registry import RuntimeModelCatalog
 
 TRACES_URL = (
@@ -129,7 +129,14 @@ class _RuntimeCatalog:
         """
         return self._real.snapshot(alias)
 
-    def preflight(self, alias: str, requirement: object | None = None) -> ResolvedModel:
+    def preflight(
+        self,
+        alias: str,
+        requirement: object | None = None,
+        *,
+        role: CatalogRoleName | None = None,
+    ) -> ResolvedModel:
+        del role
         """Return a deterministic resolved model for one configured alias."""
         del requirement
         snapshot, capabilities = self._real.snapshot(alias)
@@ -138,7 +145,8 @@ class _RuntimeCatalog:
         embedding = self._embedding if alias == "embed" else None
         return ResolvedModel(alias, snapshot, capabilities, client, embedding)
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        del role
         """Resolve one alias with the same deterministic clients as preflight."""
         return self.preflight(alias)
 

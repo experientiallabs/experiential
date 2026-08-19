@@ -4,14 +4,16 @@ These screens run after every selected provider has been prepared. Every one of 
 shared picker: the model screen and the router-candidate screen are multi-select, and a single build
 role and the router incumbent are single-select. Each row keeps its provider identity, served roles,
 and pricing provenance visible. The screens filter new build-role assignments to models whose
-verified metadata can serve them, preserve exact prior assignments as retain-only choices, and
-render the single summary shown before setup saves anything.
+verified metadata can serve them, preserve exact prior assignments as retain-only choices, ask
+for a role-specific reasoning effort directly after each completion role names a reasoning-capable
+model, and render the single summary shown before setup saves anything.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import get_args
 
 from rich.console import Console
 from rich.prompt import Confirm
@@ -35,6 +37,7 @@ from wmo.common.models import (
     PricingSource,
     ProviderModelSelection,
     ProviderSetup,
+    ReasoningEffort,
     RouterCandidateSelection,
     SetupRole,
     derive_model_alias,
@@ -43,17 +46,22 @@ from wmo.common.models import (
 )
 
 _MANUAL_MODEL_ROW = "declare-model-manually"
+_NO_REASONING_EFFORT = "none"
+_REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
 
 
 @dataclass(frozen=True)
 class RoleAssignment:
-    """Confirmed build role assignments from one setup session."""
+    """Confirmed build role assignments and role-specific reasoning efforts from one session."""
 
     world_model: str
     judge: str
     embedder: str
     candidates: tuple[str, ...] = ()
     incumbent: str | None = None
+    world_model_reasoning_effort: ReasoningEffort | None = None
+    judge_reasoning_effort: ReasoningEffort | None = None
+    candidate_reasoning_efforts: dict[str, ReasoningEffort] = field(default_factory=dict)
 
 
 def available_models(session: SetupSession) -> tuple[AvailableModel, ...]:
@@ -178,6 +186,7 @@ def declare_model(session: SetupSession, *, console: Console) -> AvailableModel 
         )
         if supports_completions
         else None,
+        reasoning_effort=_ask_reasoning_effort(console=console) if supports_completions else None,
     )
     taken = frozenset(item.alias for item in available_models(session))
     return AvailableModel(
@@ -189,6 +198,93 @@ def declare_model(session: SetupSession, *, console: Console) -> AvailableModel 
         pricing_source=PricingSource.CONFIGURED,
         configured=False,
     )
+
+
+def _parse_reasoning_effort(value: str) -> ReasoningEffort | None:
+    """Return the reasoning effort named by a picker value, or ``None`` for no pin."""
+    return next((effort for effort in _REASONING_EFFORTS if effort == value), None)
+
+
+def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
+    """Choose an optional reasoning-effort pin for one manually declared completion model.
+
+    Args:
+        console: Terminal used for the screen.
+
+    Returns:
+        The chosen effort, or ``None`` so the parameter is never sent.
+
+    Raises:
+        SetupCancelled: The user cancelled setup.
+    """
+    result = choose_one(
+        console,
+        title="Reasoning effort (pin only for models accepting the OpenAI reasoning parameter)",
+        options=[
+            PickerOption(
+                value=_NO_REASONING_EFFORT,
+                label="none",
+                detail="never send the reasoning parameter",
+            ),
+            *(PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS),
+        ],
+        default=_NO_REASONING_EFFORT,
+    )
+    if result.action is PickerAction.CANCEL:
+        raise SetupCancelled
+    if result.action is PickerAction.BACK:
+        return None
+    return _parse_reasoning_effort(result.values[0])
+
+
+class _RoleEffortBack:
+    """Sentinel marking a back navigation from one role effort screen."""
+
+
+_ROLE_EFFORT_BACK = _RoleEffortBack()
+
+
+def _ask_role_reasoning_effort(
+    chosen: tuple[AvailableModel, ...],
+    *,
+    alias: str,
+    role_name: str,
+    default: ReasoningEffort | None,
+    console: Console,
+) -> ReasoningEffort | None | _RoleEffortBack:
+    """Choose the reasoning effort one completion role uses for its just-selected model.
+
+    The screen appears only when the selected model's verified capabilities carry a reasoning
+    pin; unsupported and unverified models are never asked and keep no role effort.
+
+    Args:
+        chosen: Models the user selected.
+        alias: Model just assigned to the role.
+        role_name: Readable role name shown in the screen title.
+        default: Prior role effort accepted with an empty line.
+        console: Terminal used for the screen.
+
+    Returns:
+        The chosen effort, ``None`` when the model carries no reasoning pin, or the back
+        sentinel when the user asked to go back.
+
+    Raises:
+        SetupCancelled: The user cancelled setup.
+    """
+    item = next((entry for entry in chosen if entry.alias == alias), None)
+    if item is None or item.capabilities is None or item.capabilities.reasoning_effort is None:
+        return None
+    result = choose_one(
+        console,
+        title=f"Reasoning effort for the {role_name} ({alias})",
+        options=[PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS],
+        default=default or item.capabilities.reasoning_effort,
+    )
+    if result.action is PickerAction.CANCEL:
+        raise SetupCancelled
+    if result.action is PickerAction.BACK:
+        return _ROLE_EFFORT_BACK
+    return _parse_reasoning_effort(result.values[0])
 
 
 def assign_roles(
@@ -220,6 +316,17 @@ def assign_roles(
     )
     if world_model is None:
         return None
+    world_effort = _ask_role_reasoning_effort(
+        chosen,
+        alias=world_model,
+        role_name="world model",
+        default=role_inputs.world_model_reasoning_effort
+        if world_model == role_inputs.world_model
+        else None,
+        console=console,
+    )
+    if isinstance(world_effort, _RoleEffortBack):
+        return None
     judge = _assign_one_role(
         chosen,
         role=SetupRole.JUDGE,
@@ -229,6 +336,15 @@ def assign_roles(
         console=console,
     )
     if judge is None:
+        return None
+    judge_effort = _ask_role_reasoning_effort(
+        chosen,
+        alias=judge,
+        role_name="judge",
+        default=role_inputs.judge_reasoning_effort if judge == role_inputs.judge else None,
+        console=console,
+    )
+    if isinstance(judge_effort, _RoleEffortBack):
         return None
     embedder = _assign_one_role(
         chosen,
@@ -249,6 +365,9 @@ def assign_roles(
         embedder=embedder,
         candidates=candidates[0],
         incumbent=candidates[1],
+        world_model_reasoning_effort=world_effort,
+        judge_reasoning_effort=judge_effort,
+        candidate_reasoning_efforts=candidates[2],
     )
 
 
@@ -302,16 +421,17 @@ def _assign_candidates(
     *,
     role_inputs: SetupRoleInputs,
     console: Console,
-) -> tuple[tuple[str, ...], str | None] | None:
-    """Choose optional router candidates and their incumbent from the selected models.
+) -> tuple[tuple[str, ...], str | None, dict[str, ReasoningEffort]] | None:
+    """Choose optional router candidates, their efforts, and the incumbent.
 
     Args:
         chosen: Models the user selected.
-        role_inputs: Prior candidate roles accepted with an empty line.
+        role_inputs: Prior candidate roles and efforts accepted with an empty line.
         console: Terminal used for the screens.
 
     Returns:
-        Candidate aliases with their incumbent, or ``None`` when the selection must change.
+        Candidate aliases, incumbent, and per-candidate reasoning efforts, or ``None`` when
+        the selection must change.
 
     Raises:
         SetupCancelled: The user cancelled setup.
@@ -320,6 +440,7 @@ def _assign_candidates(
         chosen,
         preselected=role_inputs.candidates,
         incumbent=role_inputs.incumbent,
+        effort_defaults=role_inputs.candidate_reasoning_efforts,
         console=console,
         required=False,
     )
@@ -330,14 +451,16 @@ def select_router_candidates(
     *,
     preselected: tuple[str, ...] = (),
     incumbent: str | None = None,
+    effort_defaults: Mapping[str, ReasoningEffort] | None = None,
     console: Console,
 ) -> RouterCandidateSelection | None:
-    """Choose at least two eligible completion models and one incumbent.
+    """Choose at least two eligible completion models, their efforts, and one incumbent.
 
     Args:
         models: Configured and newly discovered models offered by provider setup.
         preselected: Candidate aliases to retain in the multi-select screen.
         incumbent: Explicit incumbent that skips the incumbent screen.
+        effort_defaults: Persisted per-candidate efforts accepted with an empty line.
         console: Terminal used for the screens.
 
     Returns:
@@ -352,12 +475,17 @@ def select_router_candidates(
         models,
         preselected=preselected,
         incumbent=incumbent,
+        effort_defaults={} if effort_defaults is None else effort_defaults,
         console=console,
         required=True,
     )
     if picked is None or picked[1] is None:
         return None
-    return RouterCandidateSelection(candidates=picked[0], incumbent=picked[1])
+    return RouterCandidateSelection(
+        candidates=picked[0],
+        incumbent=picked[1],
+        candidate_reasoning_efforts=picked[2],
+    )
 
 
 def _assign_router_candidates(
@@ -365,20 +493,23 @@ def _assign_router_candidates(
     *,
     preselected: tuple[str, ...],
     incumbent: str | None,
+    effort_defaults: Mapping[str, ReasoningEffort],
     console: Console,
     required: bool,
-) -> tuple[tuple[str, ...], str | None] | None:
+) -> tuple[tuple[str, ...], str | None, dict[str, ReasoningEffort]] | None:
     """Share router-candidate selection between optional setup and required router setup.
 
     Args:
         chosen: Models currently visible to the picker.
         preselected: Candidate aliases to preselect.
         incumbent: Explicit incumbent, or ``None`` to show the incumbent screen.
+        effort_defaults: Persisted per-candidate efforts accepted with an empty line.
         console: Terminal used for the screens.
         required: Whether fewer than two selected candidates is an error instead of a skip.
 
     Returns:
-        Candidate aliases and incumbent, or ``None`` when the caller should go back.
+        Candidate aliases, incumbent, and per-candidate reasoning efforts, or ``None`` when
+        the caller should go back.
 
     Raises:
         SetupCancelled: The user cancelled interactive setup.
@@ -404,7 +535,7 @@ def _assign_router_candidates(
             "[dim]Router candidates need two priced models with explicit token limits. "
             "Skipping that role for now.[/dim]"
         )
-        return (), None
+        return (), None, {}
     eligible_aliases = {item.alias for item in eligible}
     unknown = tuple(alias for alias in preselected if alias not in eligible_aliases)
     if unknown:
@@ -432,11 +563,24 @@ def _assign_router_candidates(
             console.print("[yellow]Router candidates need at least two models.[/yellow]")
             return None
         console.print("[dim]Router candidates need at least two models. Skipping that role.[/dim]")
-        return (), None
+        return (), None, {}
+    efforts: dict[str, ReasoningEffort] = {}
+    for alias in result.values:
+        effort = _ask_role_reasoning_effort(
+            chosen,
+            alias=alias,
+            role_name="router candidate",
+            default=effort_defaults.get(alias),
+            console=console,
+        )
+        if isinstance(effort, _RoleEffortBack):
+            return None
+        if effort is not None:
+            efforts[alias] = effort
     if incumbent is not None:
         if incumbent not in result.values:
             raise ValueError("router incumbent must also be a selected candidate")
-        return result.values, incumbent
+        return result.values, incumbent, efforts
     incumbent_result = choose_one(
         console,
         title="Router incumbent among the candidates",
@@ -451,7 +595,7 @@ def _assign_router_candidates(
         raise SetupCancelled
     if incumbent_result.action is PickerAction.BACK:
         return None
-    return result.values, incumbent_result.values[0]
+    return result.values, incumbent_result.values[0], efforts
 
 
 def _candidate_option(item: AvailableModel) -> PickerOption:
@@ -502,11 +646,14 @@ def build_result(
         world_model=roles.world_model,
         judge=roles.judge,
         embedder=roles.embedder,
+        world_model_reasoning_effort=roles.world_model_reasoning_effort,
+        judge_reasoning_effort=roles.judge_reasoning_effort,
     )
     return ProviderSetupResult(
         setup=setup,
         candidates=roles.candidates,
         incumbent=roles.incumbent,
+        candidate_reasoning_efforts=dict(roles.candidate_reasoning_efforts),
     )
 
 
@@ -621,16 +768,22 @@ def render_summary(
             f"embeddings={capabilities.supports_embeddings}, "
             f"structured_output={capabilities.supports_structured_output}, "
             f"completions={capabilities.supports_completions}, "
+            f"reasoning_effort={capabilities.reasoning_effort or 'none'}, "
             f"context={capabilities.context_window_tokens}, "
             f"max_output={capabilities.maximum_output_tokens}, "
             f"pricing={item.pricing_source.value}{retained}"
         )
     setup = result.setup
+    world_effort = setup.world_model_reasoning_effort or "catalog pin"
+    judge_effort = setup.judge_reasoning_effort or "catalog pin"
     console.print(
-        f"roles: world_model={setup.world_model}, judge={setup.judge}, embedder={setup.embedder}"
+        f"roles: world_model={setup.world_model} (effort {world_effort}), "
+        f"judge={setup.judge} (effort {judge_effort}), embedder={setup.embedder}"
     )
     if result.candidates:
-        console.print(
-            f"router candidates: {', '.join(result.candidates)}; incumbent {result.incumbent}"
+        described = ", ".join(
+            f"{alias} (effort {result.candidate_reasoning_efforts.get(alias, 'catalog pin')})"
+            for alias in result.candidates
         )
+        console.print(f"router candidates: {described}; incumbent {result.incumbent}")
     console.print(f"credentials: {CREDENTIAL_NOTE}")

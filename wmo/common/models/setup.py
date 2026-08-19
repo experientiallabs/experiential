@@ -17,7 +17,7 @@ from wmo.common.models.catalog import (
     load_model_catalog,
     write_model_catalog,
 )
-from wmo.common.models.model import ModelCapabilities
+from wmo.common.models.model import ModelCapabilities, ReasoningEffort
 
 SETUP_PROVIDERS = frozenset(
     {"anthropic", "azure", "bedrock", "gemini", "openai", "openai-compatible", "openrouter"}
@@ -161,6 +161,8 @@ class ProviderSetup(ContractModel):
     world_model: str = Field(min_length=1, max_length=128)
     judge: str = Field(min_length=1, max_length=128)
     embedder: str = Field(min_length=1, max_length=128)
+    world_model_reasoning_effort: ReasoningEffort | None = None
+    judge_reasoning_effort: ReasoningEffort | None = None
 
     @model_validator(mode="after")
     def _require_unique_references_and_role_capabilities(self) -> ProviderSetup:
@@ -325,6 +327,8 @@ def _merge_provider_setup(
         world_model=setup.world_model,
         judge=setup.judge,
         embedder=setup.embedder,
+        world_model_reasoning_effort=setup.world_model_reasoning_effort,
+        judge_reasoning_effort=setup.judge_reasoning_effort,
     )
     catalog = ModelCatalog(
         schema_version=existing.schema_version if existing is not None else 1,

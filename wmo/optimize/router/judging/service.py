@@ -634,7 +634,7 @@ def calibrate_manual_judge(
     if rubric_input != setup.rubric:
         raise ManualJudgeError("manual judge rubric manifest differs from setup")
     if len(completed_reviews) < len(plan.traces):
-        resolved = runtime_catalog.preflight(setup.judge_alias)
+        resolved = runtime_catalog.preflight(setup.judge_alias, role="judge")
         if resolved.snapshot != setup.judge_model:
             raise ManualJudgeError("configured judge identity changed after setup")
         collection = collect_trace_reviews(

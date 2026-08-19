@@ -72,7 +72,7 @@ from wmo.optimize.router.judging.service import (
     prepare_manual_judge_setup,
 )
 from wmo.optimize.router.judging.template_bind import DEFAULT_JUDGE_TEMPLATE
-from wmo.runtime.models.registry import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models.registry import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.mining.service import MiningSpec
@@ -146,7 +146,8 @@ class _RuntimeCatalog:
         self.resolved = resolved
         self.preflight_calls = 0
 
-    def preflight(self, alias: str) -> ResolvedModel:
+    def preflight(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        del role
         """Return the fake judge only for its configured alias.
 
         Args:
