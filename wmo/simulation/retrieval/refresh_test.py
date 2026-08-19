@@ -38,7 +38,6 @@ from wmo.common.models import (
 from wmo.common.project import (
     ArtifactCorruptionError,
     ArtifactStore,
-    ProjectBuildArtifacts,
     ProjectPaths,
     artifact_input,
 )
@@ -57,6 +56,7 @@ from wmo.runtime.router.journal import RuntimeAcceptance, _interaction_identity
 from wmo.simulation.build import build_task_set
 from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
+from wmo.simulation.mining.bindings import load_task_set_lineage_bindings
 from wmo.simulation.mining.service import MiningSpec
 from wmo.simulation.retrieval import (
     PersistedRuntimeRAGRefresh,
@@ -68,7 +68,6 @@ from wmo.simulation.retrieval import (
     RuntimeRAGRefreshError,
     RuntimeTraceStitchingError,
     TraceRAGRetriever,
-    load_completed_build_rag_lineage_bindings,
     load_rag_index,
     load_runtime_rag_refresh,
     refresh_runtime_trace_rag,
@@ -1035,14 +1034,15 @@ def test_real_import_and_runtime_snapshot_build_one_new_union_and_index(tmp_path
     )
     imported = built.trace_dataset
     imported_input = artifact_input(imported.manifest)
-    completed = ProjectBuildArtifacts(
-        trace_dataset=imported_input,
-        task_set=artifact_input(store.read(built.task_set.task_set_id).manifest),
-        serving_rag=ArtifactInput(artifact_id="serving-rag-placeholder", sha256="1" * 64),
-        fit_rag=ArtifactInput(artifact_id="fit-rag-placeholder", sha256="2" * 64),
-        world_model=ArtifactInput(artifact_id="world-model-placeholder", sha256="3" * 64),
+    lineage_payload = load_task_set_lineage_bindings(store, built.task_set.task_set_id)
+    imported_bindings = tuple(
+        RAGLineageBinding(
+            trace_id=item.trace_id,
+            lineage_id=item.lineage_id,
+            partition=item.partition,
+        )
+        for item in lineage_payload.bindings
     )
-    imported_bindings = load_completed_build_rag_lineage_bindings(store, completed)
     binding = _binding(CountingEmbedder())
 
     result = refresh_runtime_trace_rag(

@@ -247,7 +247,6 @@ class RouterCompositionResult:
     plan: EvaluationPlan
     simulation_spec: SimulationSpec
     held_out_simulation_spec: SimulationSpec
-    policy_lock_id: ArtifactId
     fit_simulation_spend_usd: float
     held_out_simulation_spend_usd: float
     total_simulation_spend_usd: float
@@ -504,7 +503,6 @@ def compose_router(
         plan=plan,
         simulation_spec=spec,
         held_out_simulation_spec=held_spec,
-        policy_lock_id=policy_lock.lock_id,
         fit_simulation_spend_usd=fit_spend,
         held_out_simulation_spend_usd=held_out_spend,
         total_simulation_spend_usd=total_spend,

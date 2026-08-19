@@ -43,8 +43,10 @@ from wmo.common.routing import (
 from wmo.optimize.router.activation import load_project_router
 from wmo.optimize.router.fit.workflow import (
     EvaluationInputs,
-    RouterOptimizationConfig,
-    optimize_router,
+    RouterFitConfig,
+    RouterReportConfig,
+    fit_router,
+    report_router,
 )
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.runtime_test import _Catalog, _Client, _request, _snapshot
@@ -62,13 +64,13 @@ def test_single_workflow_freezes_before_held_out_and_resumes_exactly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prove replay reuses one provider-free config and immutable artifact set.
+    """Prove replay reuses one provider-free config pair and immutable artifact set.
 
     Args:
         tmp_path: Isolated project directory for persisted workflow artifacts.
         monkeypatch: Patch fixture used to observe evaluation dataset construction.
     """
-    store, config = _workflow_fixture(tmp_path)
+    store, fit_config, report_config = _workflow_fixture(tmp_path)
     from wmo.optimize.router.fit import workflow as workflow_module
 
     actual_build = workflow_module.build_evaluation_dataset
@@ -86,9 +88,9 @@ def test_single_workflow_freezes_before_held_out_and_resumes_exactly(
         return actual_build(*args, **kwargs)
 
     monkeypatch.setattr(workflow_module, "build_evaluation_dataset", checked_build)
-    first = optimize_router(store.artifacts, config)
+    first = report_router(store.artifacts, fit_router(store.artifacts, fit_config), report_config)
     artifact_ids = store.artifacts.list_ids()
-    replay = optimize_router(store.artifacts, config)
+    replay = report_router(store.artifacts, fit_router(store.artifacts, fit_config), report_config)
 
     assert opened == [("fit",), ("held_out",), ("fit",), ("held_out",)]
     assert replay == first
@@ -122,7 +124,7 @@ def test_single_workflow_freezes_before_held_out_and_resumes_exactly(
     assert fallback.fallback_reason == "embedding_error"
 
 
-def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfig]:
+def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterFitConfig, RouterReportConfig]:
     """Persist a deterministic completed-evidence project with no live client."""
     project = ProjectStore(root, "project-a")
     project.initialize(ProjectConfig(project_id="project-a"))
@@ -224,7 +226,7 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
     )
     _persist_embeddings(store, tasks)
     protocols = (production_protocol,)
-    return project, RouterOptimizationConfig(
+    fit_config = RouterFitConfig(
         fit=EvaluationInputs(
             evaluation_plan_id=plan.plan_id,
             protocols=protocols,
@@ -233,16 +235,6 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
                 for item in main_evidence
                 if next(cell for cell in plan.cells if cell.cell_id == item.cell_id).purpose
                 == "fit"
-            ),
-        ),
-        held_out=EvaluationInputs(
-            evaluation_plan_id=plan.plan_id,
-            protocols=protocols,
-            cell_evidence=tuple(
-                item
-                for item in main_evidence
-                if next(cell for cell in plan.cells if cell.cell_id == item.cell_id).purpose
-                == "held_out"
             ),
         ),
         embedding_set_id="embeddings-a",
@@ -259,6 +251,22 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
         created_at=_TIME,
         code_revision="test-revision",
     )
+    report_config = RouterReportConfig(
+        held_out=EvaluationInputs(
+            evaluation_plan_id=plan.plan_id,
+            protocols=protocols,
+            cell_evidence=tuple(
+                item
+                for item in main_evidence
+                if next(cell for cell in plan.cells if cell.cell_id == item.cell_id).purpose
+                == "held_out"
+            ),
+        ),
+        embedding_set_id="embeddings-a",
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+    return project, fit_config, report_config
 
 
 def _persist_pricing(store) -> None:  # noqa: ANN001 - focused fixture

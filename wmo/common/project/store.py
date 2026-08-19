@@ -29,7 +29,6 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.core.files import fsync_directory_best_effort, write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
-from wmo.common.project.hosted_state import HostedProjectStoreMixin
 from wmo.common.project.manifests import ArtifactFile, ArtifactManifest, artifact_input, file_digest
 from wmo.common.project.paths import ProjectPaths, validate_local_id
 from wmo.common.project.project import (
@@ -503,7 +502,7 @@ class ArtifactStore:
         return tuple(sorted(artifact_ids))
 
 
-class ProjectStore(HostedProjectStoreMixin):
+class ProjectStore:
     """Own project configuration, immutable pointer bindings, review draft, and artifacts."""
 
     def __init__(self, root: Path, project_id: str) -> None:

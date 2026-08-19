@@ -38,10 +38,8 @@ from wmo.optimize.router.automatic.attribution import (
 )
 from wmo.optimize.router.automatic.judge_provenance import (
     AutomaticJudgeProvenance,
-    HostedAutomaticJudgeEvidence,
     HumanCalibratedAutomaticJudge,
     ProvisionalAutomaticJudge,
-    hosted_judge_inputs,
     manual_judge_inputs,
 )
 from wmo.optimize.router.automatic.reservations import (
@@ -175,7 +173,6 @@ def preflight_automatic_router(
     selection: RouterCandidateSelection,
     *,
     catalog_override: ModelCatalog | None = None,
-    hosted_judge: HostedAutomaticJudgeEvidence | None = None,
     options: AutomaticRouterOptions,
 ) -> AutomaticRouterPreflight:
     """Verify every local prerequisite and report all failures before credentials or writes.
@@ -184,7 +181,6 @@ def preflight_automatic_router(
         project: Existing project whose completed build will be optimized.
         selection: Explicit candidates and incumbent collected for this optimize run.
         catalog_override: Confirmed prospective catalog before its atomic post-consent write.
-        hosted_judge: Optional machine-only provisional evidence for the hosted workflow.
         options: Bounded provider, evidence, retry, and concurrency controls.
 
     Returns:
@@ -223,38 +219,13 @@ def preflight_automatic_router(
         _require_completion_economics(problems, catalog, judge_alias, "judge")
     if embedder_alias is not None:
         _require_embedder_economics(problems, catalog, embedder_alias)
-    if hosted_judge is None:
-        setup, setup_input, judge_provenance = manual_judge_inputs(
-            problems,
-            project,
-            completed,
-            judge_alias,
-            judge,
-        )
-    else:
-        (
-            setup,
-            setup_input,
-            hosted_calibration_id,
-            hosted_calibration_input,
-        ) = hosted_judge_inputs(
-            problems,
-            project,
-            completed,
-            judge_alias,
-            judge,
-            hosted_judge,
-            catalog,
-            options,
-        )
-        judge_provenance = (
-            ProvisionalAutomaticJudge(
-                calibration_id=hosted_calibration_id,
-                calibration_input=hosted_calibration_input,
-            )
-            if hosted_calibration_id is not None and hosted_calibration_input is not None
-            else None
-        )
+    setup, setup_input, judge_provenance = manual_judge_inputs(
+        problems,
+        project,
+        completed,
+        judge_alias,
+        judge,
+    )
     tasks, traces, identity_evidence = _build_evidence(problems, project, completed)
     observed = _observed_traces(
         problems,
@@ -319,22 +290,18 @@ def preflight_automatic_router(
             estimated_input_tokens=estimated_input_tokens,
             maximum_output_tokens=options.simulation_maximum_output_tokens,
         )
-    judge_request = (
-        judge_completion_reservation(
-            problems,
-            catalog=catalog,
-            judge_alias=judge_alias,
-            judge=judge,
-            audit=(
-                judge_provenance.audit
-                if isinstance(judge_provenance, HumanCalibratedAutomaticJudge)
-                else None
-            ),
-            provisional=isinstance(judge_provenance, ProvisionalAutomaticJudge),
-            provisional_maximum_attempts=options.completion_maximum_attempts,
-        )
-        if hosted_judge is None
-        else hosted_judge.request_reservation
+    judge_request = judge_completion_reservation(
+        problems,
+        catalog=catalog,
+        judge_alias=judge_alias,
+        judge=judge,
+        audit=(
+            judge_provenance.audit
+            if isinstance(judge_provenance, HumanCalibratedAutomaticJudge)
+            else None
+        ),
+        provisional=isinstance(judge_provenance, ProvisionalAutomaticJudge),
+        provisional_maximum_attempts=options.completion_maximum_attempts,
     )
     cost_plan = None
     if setup is not None and judge_provenance is not None and estimated_input_tokens is not None:

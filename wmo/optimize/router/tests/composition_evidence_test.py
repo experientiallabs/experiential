@@ -467,7 +467,6 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert result.build.review.status == "proposals_pending"
     assert result.review.rubric_id == "rubric-a"
     assert result.review.calibration_id == "calibration-a"
-    assert result.policy_lock_id
     report = result.optimization.optimization.report
     assert len(report.held_out_task_ids) == 20
     assert report.coverage.planned_row_count == 40

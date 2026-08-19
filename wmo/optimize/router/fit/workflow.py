@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel
 from wmo.common.evaluations import (
@@ -40,34 +40,6 @@ class EvaluationInputs(ContractModel):
     rollout_set_ids: tuple[ArtifactId, ...] = ()
     protocols: tuple[EvaluationProtocol, ...]
     cell_evidence: tuple[EvaluationCellEvidence, ...]
-
-
-class RouterOptimizationConfig(ContractModel):
-    """One explicit provider-free fit and post-lock held-out report configuration."""
-
-    fit: EvaluationInputs
-    held_out: EvaluationInputs
-    embedding_set_id: ArtifactId
-    incumbent_alias: ArtifactId | None = None
-    pricing_snapshot_id: ArtifactId
-    guard: KnnGuard
-    judgment_status: Literal["provisional", "human_calibrated"]
-    created_at: datetime
-    code_revision: str = Field(min_length=1, max_length=256)
-
-    @model_validator(mode="after")
-    def _require_one_combined_plan(self) -> RouterOptimizationConfig:
-        """Require fit and held-out inputs to share one evaluation plan.
-
-        Returns:
-            The validated router optimization configuration.
-
-        Raises:
-            ValueError: If fit and held-out inputs name different evaluation plans.
-        """
-        if self.fit.evaluation_plan_id != self.held_out.evaluation_plan_id:
-            raise ValueError("fit and held-out evidence must name one combined evaluation plan")
-        return self
 
 
 class RouterFitConfig(ContractModel):
@@ -113,47 +85,6 @@ class RouterWorkflowResult:
     fit_evaluation_id: ArtifactId
     held_out_evaluation_id: ArtifactId
     optimization: RouterOptimizationResult
-
-
-def optimize_router(
-    store: ArtifactStore,
-    config: RouterOptimizationConfig,
-) -> RouterWorkflowResult:
-    """Fit, freeze, then open held-out evidence and report without provider calls.
-
-    Args:
-        store: Project-local immutable artifact store.
-        config: Single explicit configuration naming already completed evidence.
-
-    Returns:
-        Fit and held-out evaluation IDs with the frozen optimization result.
-
-    Raises:
-        RouterWorkflowError: Evidence, pricing, embedding, or split bindings are invalid.
-    """
-    fit = fit_router(
-        store,
-        RouterFitConfig(
-            fit=config.fit,
-            embedding_set_id=config.embedding_set_id,
-            incumbent_alias=config.incumbent_alias,
-            pricing_snapshot_id=config.pricing_snapshot_id,
-            guard=config.guard,
-            judgment_status=config.judgment_status,
-            created_at=config.created_at,
-            code_revision=config.code_revision,
-        ),
-    )
-    return report_router(
-        store,
-        fit,
-        RouterReportConfig(
-            held_out=config.held_out,
-            embedding_set_id=config.embedding_set_id,
-            created_at=config.created_at,
-            code_revision=config.code_revision,
-        ),
-    )
 
 
 def fit_router(store: ArtifactStore, config: RouterFitConfig) -> RouterFitWorkflowResult:

@@ -31,7 +31,6 @@ from wmo.optimize.router.judging.contracts import (
     JudgeSetupArtifact,
     ManualJudgeError,
     ManualJudgeSetupArtifact,
-    ProvisionalJudgeSetupArtifact,
 )
 from wmo.optimize.router.judging.protocol import TemplateJudgeClient
 from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
@@ -337,12 +336,9 @@ def _setup_input(store: ProjectStore, setup: JudgeSetupArtifact) -> ArtifactInpu
     """
     stored = store.artifacts.read(setup.setup_id)
     value = artifact_input(stored.manifest)
-    provisional = isinstance(setup, ProvisionalJudgeSetupArtifact)
-    expected_type = "provisional-judge-setup" if provisional else "manual-judge-setup"
-    if stored.manifest.artifact_type != expected_type:
+    if stored.manifest.artifact_type != "manual-judge-setup":
         raise ManualJudgeError("finalized judge setup has the wrong artifact type")
-    setup_type = ProvisionalJudgeSetupArtifact if provisional else ManualJudgeSetupArtifact
-    persisted = setup_type.model_validate_json(
+    persisted = ManualJudgeSetupArtifact.model_validate_json(
         store.artifacts.read_bytes(setup.setup_id, "setup.json")
     )
     if persisted != setup:

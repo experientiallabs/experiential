@@ -208,12 +208,6 @@ class ManualJudgeSetupArtifact(JudgeSetupArtifact):
     """Frozen judge contract approved through the optional local manual setup mode."""
 
 
-class ProvisionalJudgeSetupArtifact(JudgeSetupArtifact):
-    """Machine-only hosted judge contract that carries no human approval semantics."""
-
-    status: Literal["provisional"] = "provisional"
-
-
 class JudgeCalibrationBudget(ContractModel):
     """Conservative finite reservation for counterbalanced judge calls.
 

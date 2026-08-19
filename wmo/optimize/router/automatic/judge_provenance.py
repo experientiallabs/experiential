@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Annotated, Literal
 
 from pydantic import Field
@@ -11,19 +10,14 @@ from pydantic import Field
 from wmo.common.core.artifacts import ArtifactInput, ContractModel
 from wmo.common.judging import CalibrationReport, JudgeCalibration, verify_persisted_calibration
 from wmo.common.models import (
-    CompletionCostReservation,
-    ModelCatalog,
     ModelSnapshot,
-    verify_completion_reservation,
 )
 from wmo.common.project import ProjectBuildArtifacts, ProjectStore, artifact_input
-from wmo.optimize.router.automatic.reservations import AutomaticRouterOptions
 from wmo.optimize.router.judging.artifacts import read_audit
 from wmo.optimize.router.judging.contracts import (
     ManualJudgeCalibrationAudit,
     ManualJudgeReviewState,
     ManualJudgeSetupArtifact,
-    ProvisionalJudgeSetupArtifact,
 )
 
 
@@ -49,105 +43,6 @@ AutomaticJudgeProvenance = Annotated[
     ProvisionalAutomaticJudge | HumanCalibratedAutomaticJudge,
     Field(discriminator="judgment_status"),
 ]
-
-
-@dataclass(frozen=True)
-class HostedAutomaticJudgeEvidence:
-    """Prebuilt machine-only judge contract used by the noninteractive hosted path."""
-
-    setup: ProvisionalJudgeSetupArtifact
-    setup_input: ArtifactInput
-    calibration_id: str
-    calibration_input: ArtifactInput
-    request_reservation: CompletionCostReservation
-
-
-def hosted_judge_inputs(
-    problems: list[str],
-    project: ProjectStore,
-    completed: ProjectBuildArtifacts | None,
-    judge_alias: str | None,
-    judge_model: ModelSnapshot | None,
-    evidence: HostedAutomaticJudgeEvidence,
-    catalog: ModelCatalog,
-    options: AutomaticRouterOptions,
-) -> tuple[
-    ProvisionalJudgeSetupArtifact | None,
-    ArtifactInput | None,
-    str | None,
-    ArtifactInput | None,
-]:
-    """Verify machine-only setup, provisional calibration, and request reservation.
-
-    Args:
-        problems: Mutable aggregate preflight problem list.
-        project: Project-local immutable artifact store.
-        completed: Selected completed build, if present.
-        judge_alias: Project-frozen judge alias, if available.
-        judge_model: Static current judge snapshot, if available.
-        evidence: Hosted provisional setup and request reservation.
-        catalog: Active transient model catalog.
-        options: Active retry and request controls.
-
-    Returns:
-        Verified setup, setup pointer, calibration ID, and calibration pointer.
-    """
-    try:
-        setup_stored = project.artifacts.read(evidence.setup_input.artifact_id)
-        if setup_stored.manifest.artifact_type != "provisional-judge-setup":
-            raise ValueError("setup pointer is not machine-only provisional judge evidence")
-        if artifact_input(setup_stored.manifest) != evidence.setup_input:
-            raise ValueError("setup manifest digest changed")
-        persisted = ProvisionalJudgeSetupArtifact.model_validate_json(
-            project.artifacts.read_bytes(evidence.setup_input.artifact_id, "setup.json")
-        )
-        if persisted != evidence.setup or persisted.setup_id != evidence.setup_input.artifact_id:
-            raise ValueError("setup payload differs from its selected artifact")
-        calibration, calibration_input = verify_persisted_calibration(
-            project,
-            evidence.calibration_id,
-        )
-        if calibration_input != evidence.calibration_input:
-            raise ValueError("provisional calibration manifest digest changed")
-        if calibration.status != "provisional" or calibration.label_count != 0:
-            raise ValueError("hosted judge calibration must remain zero-label provisional evidence")
-        if completed is None or (
-            persisted.trace_dataset != completed.trace_dataset
-            or persisted.task_set != completed.task_set
-        ):
-            raise ValueError("provisional judge setup differs from the completed build")
-        if judge_alias is None or persisted.judge_alias != judge_alias:
-            raise ValueError("provisional judge alias differs from the Project role")
-        if judge_model is None or persisted.judge_model != judge_model:
-            raise ValueError("provisional judge model differs from the active snapshot")
-        if (
-            calibration.rubric_id != persisted.rubric.artifact_id
-            or calibration.judge_model != persisted.judge_model
-            or calibration.judge_prompt_id != persisted.prompt_template.prompt.prompt_id
-            or calibration.judge_prompt_sha256 != persisted.prompt_template.prompt.sha256
-        ):
-            raise ValueError("provisional calibration differs from its machine-only setup")
-        configured = project.load_project().hosted_judge
-        if configured is None or (
-            configured.setup != evidence.setup_input
-            or configured.calibration != evidence.calibration_input
-            or configured.status != "provisional"
-        ):
-            raise ValueError("Project does not select this provisional judge evidence")
-        record = catalog.models.get(judge_alias)
-        capabilities = record.capabilities if record is not None else None
-        if capabilities is None:
-            raise ValueError("judge capability declaration is absent")
-        verify_completion_reservation(
-            evidence.request_reservation,
-            model=persisted.judge_model,
-            capabilities=capabilities,
-            maximum_attempts=options.completion_maximum_attempts,
-        )
-        return persisted, evidence.setup_input, calibration.calibration_id, calibration_input
-    except (OSError, ValueError) as exc:
-        problems.append(f"hosted provisional judge: {exc}")
-        return None, None, None, None
 
 
 def manual_judge_inputs(

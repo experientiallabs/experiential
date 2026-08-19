@@ -27,40 +27,18 @@ from wmo.common.models import (
     resolve_discovered_model,
 )
 from wmo.common.project import (
-    ExportedProjectBundle,
     ProjectBudgetConfiguration,
     ProjectModelConfiguration,
     ProjectProviderFreeStage,
     ProjectRetrievalConfiguration,
-    ProjectStage,
-    ProjectStageEvent,
     ProjectStore,
     ProjectSystemConfiguration,
     ProjectTracePreparationSettings,
-    export_project_bundle,
-    restore_project_bundle,
 )
 from wmo.optimize.router.activation import load_project_router, load_router
-from wmo.optimize.router.attempt_authority import (
-    FileHostedAttemptAuthorityStore,
-    HostedAttemptAuthority,
-    HostedAttemptAuthorityStore,
-    HostedAttemptState,
-    HostedProviderHazard,
-    HostedStageCommit,
-    create_hosted_attempt_authority,
-)
 from wmo.optimize.router.automatic import service as automatic_router
 from wmo.optimize.router.composition import compose_router
-from wmo.optimize.router.fit.workflow import fit_router, optimize_router, report_router
-from wmo.optimize.router.hosted import (
-    HostedRouterWorkflowOptions,
-    HostedRouterWorkflowResult,
-    HostedRouterWorkflowSetup,
-    restore_hosted_project_bundle,
-    run_hosted_router_workflow,
-)
-from wmo.optimize.router.spend import ProviderSpendEntry, ProviderSpendLedger
+from wmo.optimize.router.fit.workflow import fit_router, report_router
 from wmo.runtime.gateway.composition import (
     GatewayRuntime,
     GatewayRuntimeConfig,
@@ -106,43 +84,14 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.load_project_provider_free_stage is load_project_provider_free_stage
     assert wmo.ProjectProviderFreeStage is ProjectProviderFreeStage
     assert wmo.ProjectTracePreparationSettings is ProjectTracePreparationSettings
-    assert wmo.export_project_bundle is export_project_bundle
-    assert wmo.restore_project_bundle is restore_project_bundle
-    assert wmo.ExportedProjectBundle is ExportedProjectBundle
-    assert {
-        "export_project_bundle",
-        "restore_project_bundle",
-        "ExportedProjectBundle",
-    }.issubset(wmo.__all__)
-    assert not {
-        "ProjectBundleManifest",
-        "ProjectBundleMember",
-        "ProjectBundleError",
-        "ProjectModelCatalog",
-    }.intersection(wmo.__all__)
-    assert wmo.optimize_router is optimize_router
     assert wmo.fit_router is fit_router
     assert wmo.report_router is report_router
     assert wmo.RouterRuntime is RouterRuntime
     assert wmo.compose_router is compose_router
-    assert wmo.run_hosted_router_workflow is run_hosted_router_workflow
-    assert wmo.HostedRouterWorkflowSetup is HostedRouterWorkflowSetup
-    assert wmo.HostedRouterWorkflowOptions is HostedRouterWorkflowOptions
-    assert wmo.HostedRouterWorkflowResult is HostedRouterWorkflowResult
-    assert wmo.restore_hosted_project_bundle is restore_hosted_project_bundle
-    assert wmo.HostedAttemptAuthority is HostedAttemptAuthority
-    assert wmo.HostedAttemptAuthorityStore is HostedAttemptAuthorityStore
-    assert wmo.HostedAttemptState is HostedAttemptState
-    assert wmo.HostedProviderHazard is HostedProviderHazard
-    assert wmo.HostedStageCommit is HostedStageCommit
-    assert wmo.FileHostedAttemptAuthorityStore is FileHostedAttemptAuthorityStore
-    assert wmo.create_hosted_attempt_authority is create_hosted_attempt_authority
     assert wmo.ProjectBudgetConfiguration is ProjectBudgetConfiguration
     assert wmo.ProjectModelConfiguration is ProjectModelConfiguration
     assert wmo.ProjectRetrievalConfiguration is ProjectRetrievalConfiguration
     assert wmo.ProjectSystemConfiguration is ProjectSystemConfiguration
-    assert wmo.ProjectStage is ProjectStage
-    assert wmo.ProjectStageEvent is ProjectStageEvent
     assert wmo.ProjectStore is ProjectStore
     assert wmo.BillingSource is BillingSource
     assert wmo.ConnectionConfig is ConnectionConfig
@@ -162,9 +111,6 @@ def test_public_api_matches_quickstart() -> None:
         "GatewayRuntimeConfig",
         "create_gateway_runtime",
     }.issubset(wmo.__all__)
-    assert "ledger" in signature(FileHostedAttemptAuthorityStore.commit_stage).parameters
-    assert wmo.ProviderSpendLedger is ProviderSpendLedger
-    assert wmo.ProviderSpendEntry is ProviderSpendEntry
     assert wmo.BillingSourceEconomics is BillingSourceEconomics
     assert wmo.RoutedCompletionEconomics is RoutedCompletionEconomics
     assert wmo.RoutedProviderComponent is RoutedProviderComponent
@@ -174,7 +120,6 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.RoutedModelResponse is RoutedModelResponse
     assert ModelRecord.model_fields["billing_source"].is_required()
     assert ModelSnapshot.model_fields["billing_source"].is_required()
-    assert ProviderSpendEntry.model_fields["billing_source"].is_required()
     assert set(RoutedCompletionEconomics.model_fields) == {
         "operations",
         "operation_count",
