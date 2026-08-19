@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import BillingSource, ModelSnapshot, RoutedCandidateSnapshot
 from wmo.common.routing import KnnGuard, KnnRouterPolicy, RouterPolicy, RoutingDecision
 
@@ -70,6 +71,23 @@ def test_persisted_policy_resolves_through_the_router_policy_union() -> None:
     policy = _policy()
 
     assert TypeAdapter(RouterPolicy).validate_json(policy.model_dump_json()) == policy
+
+
+def test_complete_coverage_policy_serialization_preserves_legacy_content_digests() -> None:
+    """Loading a policy persisted without the uncovered-task field keeps its exact digest."""
+    policy = _policy()
+    legacy_payload = policy.model_dump(mode="json")
+    assert "baseline_uncovered_fit_task_ids" not in legacy_payload
+
+    reloaded = KnnRouterPolicy.model_validate(legacy_payload)
+
+    assert reloaded.baseline_uncovered_fit_task_ids == ()
+    assert sha256_json(reloaded) == sha256_json(legacy_payload)
+
+    partial = policy.model_copy(update={"baseline_uncovered_fit_task_ids": ("task-1",)})
+    partial_payload = partial.model_dump(mode="json")
+    assert partial_payload["baseline_uncovered_fit_task_ids"] == ["task-1"]
+    assert KnnRouterPolicy.model_validate(partial_payload) == partial
 
 
 def test_policy_rejects_unpinned_baseline_and_nonfinite_guard_values() -> None:

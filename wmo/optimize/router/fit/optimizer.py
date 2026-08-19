@@ -841,7 +841,6 @@ def _persist_policy(
         "version": "guarded-knn-policy-v1",
         "inputs": [item.model_dump(mode="json") for item in inputs],
         "baseline_alias": baseline.alias,
-        "baseline_uncovered_fit_task_ids": list(baseline.uncovered_task_ids),
         "candidates": [
             item.model_dump(mode="json") for item in dataset.manifest.candidate_snapshots
         ],
@@ -862,6 +861,8 @@ def _persist_policy(
         "evaluation_protocols_sha256": bank.evaluation_protocols_sha256,
         "judgment_status": spec.judgment_status,
     }
+    if baseline.uncovered_task_ids:
+        material["baseline_uncovered_fit_task_ids"] = list(baseline.uncovered_task_ids)
     policy = KnnRouterPolicy(
         schema_version=1,
         created_at=spec.created_at,
