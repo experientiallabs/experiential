@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from wmo.common.core.artifacts import Sha256, sha256_json
+from wmo.common.models import ConnectionConfig
 from wmo.runtime.gateway.auth import (
     FingerprintPepperFile,
     GatewayAuthError,
@@ -31,6 +32,15 @@ from wmo.runtime.gateway.contracts import (
 )
 from wmo.runtime.gateway.interfaces import GatewayClock
 from wmo.runtime.gateway.sqlite.migrations import connect_database, initialize_database
+from wmo.runtime.gateway.sqlite.provider_authority import (
+    ProviderConnectionAuthority,
+    ProviderConnectionBinding,
+    active_provider_connections,
+    bind_alias_provider_connections,
+    bound_provider_connections,
+    disable_provider_connection,
+    upsert_provider_connection,
+)
 
 
 class GatewayStoreError(ValueError):
@@ -121,6 +131,70 @@ class SQLiteGatewayStore:
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (organization_id, slug, display_name, now, now),
+            )
+
+    def upsert_provider_connection(
+        self,
+        *,
+        organization_id: str,
+        connection_id: str,
+        revision_id: str,
+        config: ConnectionConfig,
+        replace: bool = False,
+    ) -> tuple[bool, ProviderConnectionAuthority]:
+        """Create or explicitly revise one secret-free serving connection."""
+        with self._transaction() as connection:
+            return upsert_provider_connection(
+                connection,
+                organization_id=organization_id,
+                connection_id=connection_id,
+                revision_id=revision_id,
+                config=config,
+                replace=replace,
+                now=utc_text(self._clock.now()),
+            )
+
+    def provider_connections(
+        self,
+        *,
+        organization_id: str,
+    ) -> tuple[ProviderConnectionAuthority, ...]:
+        """Return active provider connections from SQLite authority."""
+        with self._connect() as connection:
+            return active_provider_connections(
+                connection,
+                organization_id=organization_id,
+            )
+
+    def alias_provider_connections(
+        self,
+        *,
+        organization_id: str,
+        alias_id: str,
+        alias_revision_id: str,
+    ) -> tuple[ProviderConnectionAuthority, ...]:
+        """Return exact provider revisions frozen into one alias revision."""
+        with self._connect() as connection:
+            return bound_provider_connections(
+                connection,
+                organization_id=organization_id,
+                alias_id=alias_id,
+                alias_revision_id=alias_revision_id,
+            )
+
+    def disable_provider_connection(
+        self,
+        *,
+        organization_id: str,
+        connection_id: str,
+    ) -> bool:
+        """Disable an unreferenced serving provider connection."""
+        with self._transaction() as connection:
+            return disable_provider_connection(
+                connection,
+                organization_id=organization_id,
+                connection_id=connection_id,
+                now=utc_text(self._clock.now()),
             )
 
     def create_identity(
@@ -347,6 +421,7 @@ class SQLiteGatewayStore:
         target: GatewayTarget,
         snapshot_ref: str,
         catalog_sha256: Sha256,
+        provider_connections: tuple[ProviderConnectionBinding, ...] = (),
     ) -> None:
         """Create and atomically activate one immutable alias revision.
 
@@ -358,6 +433,7 @@ class SQLiteGatewayStore:
             target: Direct pool or frozen project activation target.
             snapshot_ref: Registered catalog snapshot reference.
             catalog_sha256: Exact normalized catalog digest.
+            provider_connections: Exact active connection revisions used by the snapshot.
         """
         if isinstance(target, ProjectTarget) and target.catalog_sha256 != catalog_sha256:
             raise GatewayStoreError("project target catalog digest differs from alias activation")
@@ -429,6 +505,14 @@ class SQLiteGatewayStore:
                     snapshot_ref,
                     now,
                 ),
+            )
+            bind_alias_provider_connections(
+                connection,
+                organization_id=organization_id,
+                alias_id=alias_id,
+                alias_revision_id=revision_id,
+                bindings=provider_connections,
+                now=now,
             )
             connection.execute(
                 """

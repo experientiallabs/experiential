@@ -8,7 +8,7 @@ import stat
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class GatewaySchemaError(RuntimeError):
@@ -258,7 +258,73 @@ _MIGRATION_3 = (
     """,
 )
 
-_MIGRATIONS = {1: _MIGRATION_1, 2: _MIGRATION_2, 3: _MIGRATION_3}
+_MIGRATION_4 = (
+    """
+    CREATE TABLE provider_connections (
+        connection_id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        active_revision_id TEXT,
+        active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (organization_id, connection_id),
+        FOREIGN KEY (organization_id) REFERENCES organizations (organization_id),
+        FOREIGN KEY (organization_id, connection_id, active_revision_id)
+            REFERENCES provider_connection_revisions (
+                organization_id, connection_id, revision_id
+            )
+            DEFERRABLE INITIALLY DEFERRED
+    ) STRICT
+    """,
+    """
+    CREATE TABLE provider_connection_revisions (
+        revision_id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        connection_id TEXT NOT NULL,
+        revision_number INTEGER NOT NULL CHECK (revision_number > 0),
+        provider TEXT NOT NULL,
+        base_url TEXT,
+        api_key_env TEXT,
+        api_version TEXT,
+        region TEXT,
+        connection_sha256 TEXT NOT NULL CHECK (length(connection_sha256) = 64),
+        created_at TEXT NOT NULL,
+        UNIQUE (organization_id, connection_id, revision_number),
+        UNIQUE (organization_id, connection_id, revision_id),
+        FOREIGN KEY (organization_id, connection_id)
+            REFERENCES provider_connections (organization_id, connection_id)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE alias_revision_provider_connections (
+        organization_id TEXT NOT NULL,
+        alias_id TEXT NOT NULL,
+        alias_revision_id TEXT NOT NULL,
+        connection_id TEXT NOT NULL,
+        connection_revision_id TEXT NOT NULL,
+        connection_sha256 TEXT NOT NULL CHECK (length(connection_sha256) = 64),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (
+            organization_id, alias_id, alias_revision_id, connection_id
+        ),
+        FOREIGN KEY (organization_id, alias_id, alias_revision_id)
+            REFERENCES alias_revisions (organization_id, alias_id, revision_id)
+            ON DELETE CASCADE,
+        FOREIGN KEY (
+            organization_id, connection_id, connection_revision_id
+        ) REFERENCES provider_connection_revisions (
+            organization_id, connection_id, revision_id
+        )
+    ) STRICT
+    """,
+)
+
+_MIGRATIONS = {
+    1: _MIGRATION_1,
+    2: _MIGRATION_2,
+    3: _MIGRATION_3,
+    4: _MIGRATION_4,
+}
 
 
 def connect_database(
@@ -419,7 +485,10 @@ def _require_schema_objects(connection: sqlite3.Connection) -> None:
         "identity_alias_grants",
         "operation_receipts",
         "organizations",
+        "provider_connection_revisions",
+        "provider_connections",
         "project_activation_bindings",
+        "alias_revision_provider_connections",
         "virtual_keys",
     }
     rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
