@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.common.models.known_models import canonical_model_id, known_model_metadata
+from wmo.common.models.known_models import (
+    canonical_model_id,
+    known_model_metadata,
+    recommended_model_rank,
+)
 
 
 @pytest.mark.parametrize(
@@ -12,6 +16,8 @@ from wmo.common.models.known_models import canonical_model_id, known_model_metad
     [
         ("openai", "GPT-5.6-Sol", "gpt-5.6-sol"),
         ("openai", "gpt-5.1-20260210", "gpt-5.1"),
+        ("openai", "gpt-5.4-2026-03-05", "gpt-5.4"),
+        ("openai", "gpt-4.1-2025-04-14", "gpt-4.1"),
         ("anthropic", "claude-haiku-4-5-20251001", "claude-haiku-4-5"),
         ("anthropic", "claude-sonnet-5-latest", "claude-sonnet-5"),
         ("gemini", "models/gemini-3.5-flash", "gemini-3.5-flash"),
@@ -48,6 +54,22 @@ def test_documented_chat_model_carries_verified_capabilities_and_prices() -> Non
     assert known.cached_input_cost_per_million_tokens_usd == 0.2
     assert known.cache_write_cost_per_million_tokens_usd == 2.5
     assert known.supports_temperature is False
+    assert known.supports_reasoning_effort
+
+
+def test_reasoning_models_pin_sampling_and_small_models_carry_token_limits() -> None:
+    """OpenAI reasoning models reject explicit temperature and small tiers state both limits."""
+    mini = known_model_metadata("openai", "gpt-5.4-mini")
+    embedding = known_model_metadata("openai", "text-embedding-3-large")
+
+    assert mini is not None
+    assert mini.supports_temperature is False
+    assert mini.supports_reasoning_effort
+    assert mini.context_window_tokens == 400_000
+    assert mini.maximum_output_tokens == 128_000
+    assert embedding is not None
+    assert embedding.supports_temperature is None
+    assert not embedding.supports_reasoning_effort
 
 
 @pytest.mark.parametrize(
@@ -223,3 +245,12 @@ def test_unverified_models_have_no_maintained_metadata(provider: str, model: str
         model: Provider-published model ID absent from the maintained table.
     """
     assert known_model_metadata(provider, model) is None
+
+
+def test_recommendation_ranks_are_explicit_per_provider_and_role() -> None:
+    """Maintained wizard guidance ranks exact models without relying on alias order."""
+    assert recommended_model_rank("openai", "gpt-5.6-luna", "world_model") == 0
+    assert recommended_model_rank("openai", "text-embedding-3-large", "embedder") == 0
+    assert recommended_model_rank("anthropic", "claude-sonnet-5", "judge") == 0
+    assert recommended_model_rank("gemini", "models/gemini-3.6-flash", "router_candidate") == 0
+    assert recommended_model_rank("openai", "gpt-5.4-mini", "world_model") is None

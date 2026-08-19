@@ -31,7 +31,9 @@ from wmo.common.models import (
     ProviderConnection,
     ProviderSetup,
     ReasoningEffort,
+    ResolvedDiscoveredModel,
     SetupRole,
+    canonical_model_id,
     derive_connection_name,
     derive_model_alias,
     resolve_discovered_model,
@@ -44,13 +46,13 @@ from wmo.runtime.models.providers import (
 )
 
 SETUP_PROVIDER_LABELS = {
-    "openai": "OpenAI",
-    "anthropic": "Anthropic",
-    "gemini": "Gemini",
-    "openrouter": "OpenRouter",
-    "openai-compatible": "OpenAI-compatible endpoint",
-    "azure": "Azure OpenAI",
-    "bedrock": "Amazon Bedrock",
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "gemini": "gemini",
+    "openrouter": "openrouter",
+    "openai-compatible": "openai-compatible",
+    "azure": "azure",
+    "bedrock": "bedrock",
 }
 CANONICAL_CREDENTIAL_ENV = {
     "openai": "OPENAI_API_KEY",
@@ -65,10 +67,7 @@ _CONFIGURED_ONLY = "configured-models-only"
 _RECOVERY_RETRY = "retry"
 _RECOVERY_SKIP = "skip"
 _RECOVERY_BACK = "back"
-CREDENTIAL_NOTE = (
-    "WMO stores only the credential environment-variable name. A pasted value stays in this "
-    "process; export it or add it to .env to reuse it later."
-)
+_PROVIDER_VISIBLE_ROWS = 3
 
 
 class SetupCancelled(Exception):
@@ -113,22 +112,17 @@ class AvailableModel:
     retainable_roles: frozenset[SetupRole] = frozenset()
 
     def label(self) -> str:
-        """Describe this model as one picker row."""
-        return f"{self.alias} ({self.provider}/{self.model})"
+        """Describe this model as one picker row by its shorthand alias."""
+        return self.alias
 
     def detail(self) -> str:
-        """Summarize the roles and price provenance behind this model."""
-        verified = (
-            frozenset(served_roles(self.capabilities))
-            if self.capabilities is not None
-            else frozenset()
-        )
-        roles = ", ".join(role.value for role in SetupRole if role in verified)
-        retain_only = ", ".join(
-            role.value for role in SetupRole if role in self.retainable_roles - verified
-        )
-        retained = f"; retain only: {retain_only}" if retain_only else ""
-        return f"roles: {roles or 'unverified'}{retained}; pricing: {self.pricing_source.value}"
+        """Annotate this model with its provider, marking retain-only prior roles."""
+        if self.capabilities is None:
+            roles = ", ".join(sorted(role.value for role in self.retainable_roles))
+            if roles:
+                return f"{self.provider}, retain only: {roles}"
+            return f"{self.provider}, unverified"
+        return self.provider
 
 
 @dataclass(frozen=True)
@@ -229,7 +223,7 @@ def select_providers(
     Args:
         session: Answers already collected, used to preselect prior choices.
         console: Terminal used for the screen.
-        environment: Process environment used to annotate credential availability.
+        environment: Process environment consulted later for credential resolution.
         configured: Whether the catalog already holds usable models, which makes provider
             selection optional so roles can be edited offline.
         read_key: Optional keyboard source used by tests instead of the controlling terminal.
@@ -238,12 +232,9 @@ def select_providers(
         Selected providers plus whether manual model declaration is needed, or ``None`` when the
         user cancelled.
     """
+    del environment
     options = [
-        PickerOption(
-            value=provider,
-            label=label,
-            detail=credential_hint(provider, environment=environment),
-        )
+        PickerOption(value=provider, label=label)
         for provider, label in SETUP_PROVIDER_LABELS.items()
     ]
     if configured:
@@ -252,7 +243,7 @@ def select_providers(
             PickerOption(
                 value=_CONFIGURED_ONLY,
                 label="Keep the models already configured",
-                detail="no provider request, roles only",
+                detail="roles only",
             ),
         )
     preselected = list(session.providers)
@@ -296,22 +287,12 @@ def _select_provider_rows(
     """
     return choose_many(
         console,
-        title="Select the providers you want to use",
+        title="Providers",
         options=options,
         preselected=preselected,
         read_key=read_key,
+        visible_rows=_PROVIDER_VISIBLE_ROWS,
     )
-
-
-def credential_hint(provider: str, *, environment: MutableMapping[str, str]) -> str:
-    """Describe whether the canonical credential for one provider is already readable."""
-    if provider == "bedrock":
-        return "uses the AWS credential chain; model IDs are declared manually"
-    name = CANONICAL_CREDENTIAL_ENV[provider]
-    status = f"{name} is set" if environment.get(name, "").strip() else f"{name} needs a value"
-    if provider == "azure":
-        return f"{status}; deployment IDs are declared manually"
-    return status
 
 
 def prepare_providers(
@@ -319,6 +300,7 @@ def prepare_providers(
     *,
     existing_connections: tuple[ProviderConnection, ...],
     existing_aliases: tuple[str, ...],
+    configured: tuple[AvailableModel, ...] = (),
     console: Console,
     lister: ProviderModelLister,
     environment: MutableMapping[str, str],
@@ -329,6 +311,8 @@ def prepare_providers(
         session: Answers already collected in this setup session.
         existing_connections: Connections already configured in the catalog.
         existing_aliases: Aliases already configured in the catalog.
+        configured: Catalog models already configured, reused instead of re-aliased when
+            discovery lists the same underlying model again.
         console: Terminal used for prompts and progress.
         lister: Provider listing seam.
         environment: Process environment consulted and updated for pasted credentials.
@@ -343,6 +327,10 @@ def prepare_providers(
     available: list[AvailableModel] = []
     taken_names = {connection.name for connection in existing_connections}
     taken_aliases = set(existing_aliases)
+    configured_identities = frozenset(
+        (item.provider, canonical_model_id(item.provider, item.model)) for item in configured
+    )
+    configured_providers = frozenset(item.provider for item in configured)
     for provider in session.providers:
         label = SETUP_PROVIDER_LABELS[provider]
         endpoint = _resolve_endpoint(
@@ -356,10 +344,7 @@ def prepare_providers(
             console.print(f"[yellow]Skipping {label}.[/yellow]")
             continue
         if provider in _MANUAL_MODEL_PROVIDERS:
-            console.print(
-                f"[dim]{label} model IDs are deployment-specific; "
-                "declare them on the model screen.[/dim]"
-            )
+            console.print(f"[dim]{label}: declare deployment model IDs on the model screen[/dim]")
             discovered: tuple[AvailableModel, ...] | None = ()
         else:
             discovered = _discover_models(
@@ -368,12 +353,14 @@ def prepare_providers(
                 console=console,
                 lister=lister,
                 taken_aliases=frozenset(taken_aliases),
+                configured_identities=configured_identities,
             )
         if discovered is None:
             return None
         if (
             not discovered
             and provider not in _MANUAL_MODEL_PROVIDERS
+            and provider not in configured_providers
             and not session.advanced_models
         ):
             console.print(f"[yellow]Skipping {label}.[/yellow]")
@@ -510,9 +497,8 @@ def _resolve_credential(
     """
     existing = environment.get(api_key_env, "").strip()
     if existing:
-        console.print(f"[dim]{label} credential read from {api_key_env}.[/dim]")
         return existing
-    console.print(f"{label} has no {api_key_env} value. Paste a key to use it for this run.")
+    console.print(f"[dim]{label} needs {api_key_env}.[/dim]")
     try:
         pasted = getpass(f"{label} API key (hidden, empty line skips this provider): ").strip()
     except (EOFError, KeyboardInterrupt) as exc:
@@ -520,7 +506,10 @@ def _resolve_credential(
     if not pasted:
         return None
     environment[api_key_env] = pasted
-    console.print(f"[dim]{label} credential kept in this process only.[/dim]")
+    console.print(
+        f"[dim]{api_key_env} kept in this process only; export it or add it to .env to "
+        "reuse it later.[/dim]"
+    )
     return pasted
 
 
@@ -531,6 +520,7 @@ def _discover_models(
     console: Console,
     lister: ProviderModelLister,
     taken_aliases: frozenset[str],
+    configured_identities: frozenset[tuple[str, str]] = frozenset(),
 ) -> tuple[AvailableModel, ...] | None:
     """List one provider account's models and keep the ones with usable metadata.
 
@@ -540,6 +530,8 @@ def _discover_models(
         console: Terminal used for progress and recovery.
         lister: Provider listing seam.
         taken_aliases: Aliases already used by the catalog or this session.
+        configured_identities: Canonical (provider, model) identities already in the
+            catalog; rediscovered matches reuse the existing row instead of a new alias.
 
     Returns:
         Configurable models, or ``None`` when the user asked to change providers.
@@ -555,7 +547,7 @@ def _discover_models(
     )
     aliases = set(taken_aliases)
     while True:
-        console.print(f"Reading models available to your {label} account...")
+        console.print(f"[dim]verifying {label}\u2026[/dim]")
         try:
             discovered = lister.list_models(request)
         except ProviderListingError as exc:
@@ -565,20 +557,27 @@ def _discover_models(
                 continue
             return () if recovery == _RECOVERY_SKIP else None
         resolved = tuple(resolve_discovered_model(model) for model in discovered)
-        usable = tuple(model for model in resolved if served_roles(model.capabilities))
-        hidden = len(resolved) - len(usable)
+        usable = _canonical_models(
+            tuple(model for model in resolved if served_roles(model.capabilities)),
+            provider=provider,
+        )
         if not usable:
             console.print(f"[yellow]{label} published no model with verified metadata.[/yellow]")
             recovery = _recover(f"{label} has no configurable model", console=console)
             if recovery == _RECOVERY_RETRY:
                 continue
             return () if recovery == _RECOVERY_SKIP else None
-        console.print(
-            f"[dim]{label}: {len(usable)} configurable models, "
-            f"{hidden} hidden without verified capabilities or prices.[/dim]"
+        fresh = tuple(
+            model
+            for model in usable
+            if (provider, canonical_model_id(provider, model.model)) not in configured_identities
         )
+        if not fresh:
+            console.print(f"  [green]\u2713[/green] {label}: models already configured")
+            return ()
+        console.print(f"  [green]\u2713[/green] {label}: {len(fresh)} models")
         models = []
-        for model in usable:
+        for model in fresh:
             alias = derive_model_alias(provider, model.model, frozenset(aliases))
             aliases.add(alias)
             models.append(
@@ -593,6 +592,30 @@ def _discover_models(
                 )
             )
         return tuple(models)
+
+
+def _canonical_models(
+    usable: tuple[ResolvedDiscoveredModel, ...],
+    *,
+    provider: str,
+) -> tuple[ResolvedDiscoveredModel, ...]:
+    """Collapse dated snapshots and pointer aliases onto one row per documented model.
+
+    Args:
+        usable: Discovered models whose metadata can serve at least one role.
+        provider: Selected provider kind.
+
+    Returns:
+        One model per canonical identity, preferring the shortest published ID.
+    """
+    by_identity: dict[str, ResolvedDiscoveredModel] = {}
+    for model in usable:
+        identity = canonical_model_id(provider, model.model)
+        held = by_identity.get(identity)
+        if held is None or len(model.model) < len(held.model):
+            by_identity[identity] = model
+    kept = frozenset(model.model for model in by_identity.values())
+    return tuple(model for model in usable if model.model in kept)
 
 
 def _recover(title: str, *, console: Console) -> str:

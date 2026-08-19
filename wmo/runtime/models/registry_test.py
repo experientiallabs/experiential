@@ -56,8 +56,8 @@ def _catalog(
     api_version: str | None = None,
     region: str | None = None,
     capabilities: ModelCapabilities | None = _DEFAULT_CAPABILITIES,
-    billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED,
     served_model_id: str | None = None,
+    billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED,
 ) -> ModelCatalog:
     """Build a minimum one-alias local catalog for deterministic resolution tests."""
     return ModelCatalog(
@@ -281,6 +281,36 @@ def test_resolution_threads_catalog_served_model_pin_to_every_http_provider(
 
     assert pinned.resolve("fixture-model").served_model_id == "fixture-model-served"
     assert unpinned.resolve("fixture-model").served_model_id is None
+
+
+def test_resolution_carries_the_cataloged_served_model_identity() -> None:
+    """An openai-compatible alias exposes its declared served identity for response checks.
+
+    A vLLM endpoint may publish an alias in /models yet echo the canonical served name in every
+    completion; the resolved identity must carry that declared exception.
+    """
+    catalog = RuntimeModelCatalog(
+        _catalog(
+            provider="openai-compatible",
+            base_url="https://models.example.test/v1",
+            served_model_id="served-canonical-name",
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    resolved = catalog.resolve("fixture-model")
+
+    assert resolved.served_model_id == "served-canonical-name"
+    assert resolved.snapshot.model_id == "fixture-model"
+
+    default = RuntimeModelCatalog(
+        _catalog(),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    assert default.resolve("fixture-model").served_model_id is None
 
 
 def test_model_capability_snapshot_has_exact_limits_and_fails_closed_when_absent() -> None:

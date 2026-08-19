@@ -101,6 +101,7 @@ def test_single_workflow_freezes_before_held_out_and_resumes_exactly(
     runtime = load_project_router(
         "project-a",
         tmp_path,
+        policy_id=first.optimization.policy.policy_id,
         runtime_catalog=cast(
             RuntimeModelCatalog,
             _Catalog(

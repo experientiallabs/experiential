@@ -149,6 +149,7 @@ class AutomaticRouterJudge:
         *,
         created_at: datetime,
         code_revision: str,
+        maximum_input_tokens: int | None = None,
         maximum_output_tokens: int,
     ) -> None:
         """Bind the finalized manual setup and provider boundary.
@@ -158,12 +159,14 @@ class AutomaticRouterJudge:
             setup: Finalized manual judge prompt, mapping, schema, and rubric pointer.
             created_at: Materialization time for provider probes and judgments.
             code_revision: Exact producer revision.
+            maximum_input_tokens: Reserved request ceiling that rendered evidence must fit.
             maximum_output_tokens: Approved per-call output-token reservation for dispatches.
         """
         self._client = client
         self._setup = setup
         self._created_at = created_at
         self._code_revision = code_revision
+        self._maximum_input_tokens = maximum_input_tokens
         self._maximum_output_tokens = maximum_output_tokens
         self._plan: EvaluationPlan | None = None
 
@@ -232,6 +235,7 @@ class AutomaticRouterJudge:
             reference_input=reference_input,
             created_at=self._created_at,
             code_revision=self._code_revision,
+            maximum_input_tokens=self._maximum_input_tokens,
             maximum_output_tokens=self._maximum_output_tokens,
         )
         return LMJudge(

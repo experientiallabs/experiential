@@ -16,6 +16,7 @@ from wmo.cli.judge.rubric import maybe_edit_setup_plan
 from wmo.cli.judge.transcript import model_display_name
 from wmo.cli.shared.consent import can_prompt, require_spend_consent
 from wmo.cli.shared.options import ROOT_OPTION, usage_error
+from wmo.cli.shared.theme import WMO_THEME
 from wmo.common.config import resolve_command_budget_usd
 from wmo.common.judging import Rubric, RubricDimension, render_rubric_table, score_bounds
 from wmo.common.judging.provenance import read_artifact_json
@@ -53,7 +54,7 @@ from wmo.optimize.router.judging.service import (
 from wmo.runtime.models.registry import RuntimeModelCatalog
 
 judge_app = typer.Typer(help="Set up and manually calibrate a project judge.", no_args_is_help=True)
-_console = Console()
+_console = Console(theme=WMO_THEME)
 _RUBRIC_FILE_OPTION = typer.Option(
     None, "--rubric-file", help="JSON array of rubric axes with IDs, ranges, and score meanings."
 )
@@ -278,22 +279,9 @@ def judge_calibrate(
             "provider calls and no review prompts."
         )
     elif budget.call_count:
-        assumptions = (
-            f"review progress: {reviewed}/{len(plan.traces)} distinct trace lineages complete",
-            f"judge {plan.setup.judge_alias}: {model_display_name(plan.setup.judge_model)}",
-            f"pricing source: {budget.pricing_source.value}",
-            (
-                f"at most {budget.call_count} remaining judge calls with up to "
-                f"{budget.maximum_attempts_per_call} attempts each"
-            ),
-            (
-                f"{budget.maximum_input_tokens_per_call} input and "
-                f"{budget.maximum_output_tokens_per_call} output tokens per attempt"
-            ),
-            (
-                f"${budget.input_usd_per_million_tokens:.6f} input and "
-                f"${budget.output_usd_per_million_tokens:.6f} output per million tokens"
-            ),
+        _console.print(
+            f"[dim]review progress: {reviewed}/{len(plan.traces)} distinct trace lineages "
+            "complete[/dim]"
         )
         if not require_spend_consent(
             _console,
@@ -301,7 +289,6 @@ def judge_calibrate(
             yes=yes,
             estimated_cost_usd=budget.estimated_cost_usd,
             command=f"wmo config judge calibrate {project}",
-            assumptions=assumptions,
             non_interactive=non_interactive,
             previously_confirmed=False,
         ):

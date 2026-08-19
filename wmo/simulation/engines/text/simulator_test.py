@@ -1815,6 +1815,81 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
     assert world_client.requests == []
 
 
+def test_resume_recovers_a_later_stale_cell_before_admitting_earlier_pending_cells(
+    tmp_path: Path,
+) -> None:
+    """A dead claim on a later cell never deadlocks a resumed run at an earlier cell.
+
+    The stale claim reserves the whole ceiling until its own cell persists recovery
+    evidence, so the resumed run recovers that cell first and then admits the rest.
+    """
+    cells = (_cell("cell-a", "task-a"), _cell("cell-b", "task-b"))
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(
+        store,
+        {"task-a": _task("task-a"), "task-b": _task("task-b")},
+    )
+    candidate_client = _ScriptedClient(
+        [_response("candidate 0", snapshot=_snapshot("candidate-a"))]
+    )
+    world_client = _ScriptedClient(
+        [_response('{"message":"done","terminal":true}', snapshot=_snapshot("world-model-a"))]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+    )
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a", "cell-b"),
+        maximum_cost_usd=1.0,
+    )
+    selected, world_model, grounded_world_model = simulator._validate_spec_and_bindings(spec)
+    canonical_spec, spec_input = persist_canonical_specification(store, spec)
+    resolution, _resolution_input, bindings = simulator._persist_resolution(
+        canonical_spec, spec_input, selected, world_model, grounded_world_model
+    )
+    second_binding = bindings["cell-b"]
+    holder = TextCellLeaseStore(store.project_directory, clock=lambda: _TIME)
+    holder.acquire(
+        lease_id=lease_id_for_binding(resolution, second_binding),
+        resolution_id=resolution.resolution_id,
+        simulation_id=spec.simulation_id,
+        rollout_id=rollout_id_for_binding(second_binding),
+        binding_sha256=binding_digest(second_binding),
+        maximum_cost_usd=1.0,
+        rollout_completed=lambda _rollout_id: False,
+        observed_spend_usd=lambda: 0.0,
+    )
+    elapsed = [0.0]
+    simulator._leases = TextCellLeaseStore(
+        store.project_directory,
+        clock=lambda: _TIME.replace(hour=1),
+        owner_alive=lambda _pid: False,
+        sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+        monotonic=lambda: elapsed[0],
+        wait_timeout_seconds=0.05,
+    )
+
+    artifact_set = simulator.run(spec)
+
+    first = simulator._load_rollout(artifact_set.artifact_ids[0])
+    recovered = simulator._load_rollout(artifact_set.artifact_ids[1])
+    assert first.stop_reason == StopReason.COMPLETED
+    assert recovered.stop_reason == StopReason.MAXIMUM_COST
+    assert recovered.failure is not None
+    assert recovered.failure.details["phase"] == "paid_cell_stale_lease"
+    assert len(candidate_client.requests) == 1
+    assert len(world_client.requests) == 1
+
+
 def test_text_simulation_serializes_finite_cost_admission(tmp_path: Path) -> None:
     """Serialize cells so later admission uses reconciled provider spend.
 

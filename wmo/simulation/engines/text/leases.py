@@ -255,6 +255,29 @@ class TextCellLeaseStore:
                 exc,
             )
 
+    def stale_recovery_pending(self, lease_id: ArtifactId) -> bool:
+        """Return whether a dead prior claim awaits this exact cell's recovery rollout.
+
+        A stale tombstone, or an expired claim whose owner process is gone, keeps a
+        whole-ceiling budget barrier that only this cell's persisted recovery evidence
+        clears, so callers should run such cells before admitting sibling cells.
+
+        Args:
+            lease_id: Stable local filename for the exact resolution and cell binding.
+
+        Returns:
+            True when a stale tombstone or a dead expired claim awaits this cell's recovery.
+        """
+        try:
+            lease = self._read_optional(self._path(lease_id))
+        except TextCellLeaseError:
+            return False
+        if lease is None:
+            return False
+        if lease.status == TextCellLeaseStatus.STALE:
+            return True
+        return self._is_stale(lease, _aware_now(self._clock))
+
     def record_dispatch_intent(self, lease: TextCellLease) -> TextCellLease:
         """Durably record intent before a candidate or environment dispatch can begin.
 

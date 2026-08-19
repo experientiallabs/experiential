@@ -43,6 +43,7 @@ from wmo.optimize.router.composition import (
     ApprovedRouterReview,
     RouterCompositionBudget,
     RouterEvaluationSetup,
+    RouterReviewProvenance,
     RouterWorkflowServices,
 )
 from wmo.optimize.router.composition_test import (
@@ -82,7 +83,7 @@ class _EvidenceSetupSupplier:
         self,
         project: ProjectStore,
         build: wmo.ProjectBuild,
-        review: ApprovedRouterReview,
+        review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
         """Persist reviewed evidence bound to the project's completed fit RAG.
@@ -96,7 +97,7 @@ class _EvidenceSetupSupplier:
         Returns:
             Complete release evaluation setup over the exact completed fit RAG.
         """
-        del review, budget
+        del budget
         completed = project.load_project().build
         assert completed is not None
         fit_index = load_rag_index(project.artifacts, completed.fit_rag.artifact_id).index
@@ -189,7 +190,7 @@ class _EvidenceSetupSupplier:
                 uncertainty_multiplier=0.5,
                 quality_tolerance=0.0,
             ),
-            judgment_status="provisional",
+            judgment_status=review.judgment_status,
             world_model_settings=WorldModelSettings(
                 world_model_alias="world-model-a",
                 grounded_world_model_input=completed.world_model,
@@ -619,7 +620,9 @@ class _EvidenceReviewSupplier:
                         calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
                     ),
                 ),
-                status="provisional",
+                label_count=sum(task.partition == "fit" for task in tasks),
+                status="human_calibrated",
+                approved_at=_TIME,
             )
             project.artifacts.write_json(
                 artifact_id=calibration.calibration_id,

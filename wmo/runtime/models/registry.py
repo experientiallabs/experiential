@@ -293,7 +293,12 @@ class RuntimeModelCatalog:
                 sampler=sampler,
             )
             return ResolvedModel(
-                alias, snapshot, capabilities, client, None, served_model_id=record.served_model_id
+                alias,
+                snapshot,
+                capabilities,
+                client,
+                None,
+                served_model_id=record.served_model_id,
             )
         entry = _HTTP_PROVIDERS.get(provider)
         if entry is None:

@@ -338,13 +338,13 @@ def test_explicit_providers_skip_the_opening_list_and_still_discover_models(
 
     console, catalog = _setup(
         root,
-        "1,3\n\n1\n\n1\n\n1\ny\n",
+        "1\n\n1\n\n2\n\ny\n",
         monkeypatch=monkeypatch,
         options=options,
     )
 
     assert catalog is not None
-    assert "Select the providers you want to use" not in unstyle(console.output)
+    assert "Providers" not in unstyle(console.output)
     saved = load_model_catalog(root / "models.toml")
     assert set(saved.connections) == {"openai"}
     assert saved.roles.embedder == "text-embedding-3-small"
@@ -477,6 +477,7 @@ def _setup(
     monkeypatch: pytest.MonkeyPatch,
     lister: _FakeLister | None = None,
     options: ProviderSetupOptions | None = None,
+    offer_recommended_defaults: bool = False,
 ) -> tuple[ScriptedConsole, ModelCatalog | None]:
     """Run one scripted interactive setup session against injected provider listings.
 
@@ -486,6 +487,7 @@ def _setup(
         monkeypatch: Patch fixture supplying canonical credentials.
         lister: Injected provider listing seam, defaulting to the OpenAI fixture.
         options: Optional role flags or automation values.
+        offer_recommended_defaults: Whether one verified default assignment is offered.
 
     Returns:
         The scripted console and the committed catalog, or ``None`` when setup aborted.
@@ -501,10 +503,132 @@ def _setup(
             replace=False,
             console=console,
             lister=lister or _FakeLister(),
+            offer_recommended_defaults=offer_recommended_defaults,
         )
     except typer.Abort:
         return console, None
     return console, catalog
+
+
+def test_wizard_recommended_setup_needs_only_provider_and_one_default_choice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verified discovery fills every role after the top-level recommended choice.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the secret-free catalog.
+        monkeypatch: Pytest patch fixture supplying an existing canonical credential.
+    """
+    root = tmp_path / ".wmo"
+    console, catalog = _setup(
+        root,
+        "1\n\n\n",
+        monkeypatch=monkeypatch,
+        offer_recommended_defaults=True,
+    )
+
+    assert catalog is not None
+    assert catalog.roles.world_model == "gpt-5-6-luna"
+    assert catalog.roles.judge == "gpt-5-6-luna"
+    assert catalog.roles.embedder == "text-embedding-3-large"
+    assert catalog.roles.candidates == ("gpt-5-6-luna", "gpt-5-6-terra")
+    assert catalog.roles.incumbent == "gpt-5-6-luna"
+    transcript = unstyle(console.output)
+    assert transcript.count("Use these recommended models?") == 1
+    assert "Select the models to configure" not in transcript
+    assert "Save this configuration?" not in transcript
+    persisted = (root / "models.toml").read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY" in persisted
+    assert "openai-secret" not in transcript
+    assert "openai-secret" not in persisted
+
+
+def test_wizard_recommended_setup_prefers_provider_diversity_for_router_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified second provider supplies the alternative without displacing Luna defaults.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the selected multi-provider catalog.
+        monkeypatch: Pytest patch fixture supplying both canonical credentials.
+    """
+    lister = _FakeLister(
+        {
+            "openai": (
+                DiscoveredModel(provider="openai", model="gpt-5.6-luna"),
+                DiscoveredModel(provider="openai", model="gpt-5.6-terra"),
+                DiscoveredModel(provider="openai", model="text-embedding-3-large"),
+            ),
+            "anthropic": (DiscoveredModel(provider="anthropic", model="claude-sonnet-5"),),
+        }
+    )
+
+    console, catalog = _setup(
+        tmp_path / ".wmo",
+        "1,2\n\n\n",
+        monkeypatch=monkeypatch,
+        lister=lister,
+        offer_recommended_defaults=True,
+    )
+
+    assert catalog is not None
+    assert catalog.roles.world_model == "gpt-5-6-luna"
+    assert catalog.roles.judge == "gpt-5-6-luna"
+    assert catalog.roles.embedder == "text-embedding-3-large"
+    assert catalog.roles.candidates == ("gpt-5-6-luna", "claude-sonnet-5")
+    assert catalog.roles.incumbent == "gpt-5-6-luna"
+    summary = unstyle(console.output)
+    assert "gpt-5-6-luna" in summary
+    assert "claude-sonnet-5" in summary
+
+
+def test_wizard_recommended_setup_falls_back_by_verified_capability_and_cost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent ranked IDs use stable capability and price metadata from discovery.
+
+    Args:
+        tmp_path: Temporary WMO root receiving deterministic fallback choices.
+        monkeypatch: Pytest patch fixture supplying the canonical OpenAI credential.
+    """
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
+    lister = _FakeLister(
+        {
+            "anthropic": (
+                DiscoveredModel(
+                    provider="anthropic",
+                    model="claude-sonnet-4-6",
+                    context_window_tokens=200_000,
+                    maximum_output_tokens=32_000,
+                ),
+                DiscoveredModel(
+                    provider="anthropic",
+                    model="claude-opus-4-8",
+                    context_window_tokens=200_000,
+                    maximum_output_tokens=32_000,
+                ),
+            ),
+            "gemini": (DiscoveredModel(provider="gemini", model="gemini-embedding-001"),),
+        }
+    )
+
+    _console, catalog = _setup(
+        tmp_path / ".wmo",
+        "2,3\n\n\n",
+        monkeypatch=monkeypatch,
+        lister=lister,
+        offer_recommended_defaults=True,
+    )
+
+    assert catalog is not None
+    assert catalog.roles.world_model == "claude-sonnet-4-6"
+    assert catalog.roles.judge == "claude-sonnet-4-6"
+    assert catalog.roles.embedder == "gemini-embedding-001"
+    assert catalog.roles.candidates == ("claude-sonnet-4-6", "claude-opus-4-8")
+    assert catalog.roles.incumbent == "claude-sonnet-4-6"
 
 
 class _FakeLister:
@@ -521,6 +645,7 @@ class _FakeLister:
                 DiscoveredModel(provider="openai", model="gpt-5.6-luna"),
                 DiscoveredModel(provider="openai", model="gpt-5.6-terra"),
                 DiscoveredModel(provider="openai", model="text-embedding-3-small"),
+                DiscoveredModel(provider="openai", model="text-embedding-3-large"),
                 DiscoveredModel(provider="openai", model="internal-preview-model"),
             )
         }
@@ -551,9 +676,7 @@ def test_interactive_setup_saves_providers_models_and_roles_it_derived(
     """
     root = tmp_path / ".wmo"
 
-    console, catalog = _setup(
-        root, "1\n\n1,2,3\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n", monkeypatch=monkeypatch
-    )
+    console, catalog = _setup(root, "1\n\n1\n\n1\n\n2\n1,2\n\n\n\n1\ny\n", monkeypatch=monkeypatch)
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -595,10 +718,10 @@ def test_interactive_final_rejection_writes_no_catalog(
     """
     root = tmp_path / ".wmo"
 
-    console, catalog = _setup(root, "1\n\n1,3\n\n1\n\n1\n\n1\nn\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "1\n\n1\n\n1\n\n1\n\nn\n", monkeypatch=monkeypatch)
 
     assert catalog is None
-    assert "Configuration summary" in console.output
+    assert "Configuration" in console.output
     assert not (root / "models.toml").exists()
 
 
@@ -644,7 +767,7 @@ def test_back_from_the_model_screen_reselects_providers_without_losing_answers(
 
     console, catalog = _setup(
         root,
-        "1\n\nb\n2\n\nall\n\n1\n\n1\n\n1\n1,2\n\n\n1\ny\n",
+        "1\n\nb\n2\n\n1\n\n1\n\n1\n1,2\n\n\n1\ny\n",
         monkeypatch=monkeypatch,
         lister=lister,
     )
@@ -655,7 +778,7 @@ def test_back_from_the_model_screen_reselects_providers_without_losing_answers(
     assert set(saved.connections) == {"openai", "anthropic"}
     assert set(saved.models) == {"claude-sonnet-5", "gpt-5-6-luna", "text-embedding-3-small"}
     assert saved.roles.embedder == "text-embedding-3-small"
-    assert "Reading models available to your Anthropic account" in unstyle(console.output)
+    assert "verifying anthropic" in unstyle(console.output)
 
 
 def test_rerunning_setup_preserves_unrelated_models_and_router_state(
@@ -726,7 +849,7 @@ def test_setup_preserves_entries_owned_by_providers_it_does_not_configure(
         ),
     )
 
-    console, catalog = _setup(root, "1\n\n1,3\n\n1\n\n1\n\n1\ny\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "1\n\n1\n\n1\n\n1\n\ny\n", monkeypatch=monkeypatch)
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -809,7 +932,7 @@ def test_configured_models_are_reassignable_without_any_provider_request(
         ),
     )
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    console = ScriptedConsole("1\n\n\n1\n1\n1\n1,2\n\n1\ny\n")
+    console = ScriptedConsole("1\n\n1\n1\n1\n1,2\n\n1\ny\n")
 
     catalog = run_provider_setup(
         root,
@@ -890,7 +1013,9 @@ def test_offline_roles_include_models_on_tinker_without_provider_requests(tmp_pa
     assert catalog.roles == ModelRoles(world_model="chat", judge="chat", embedder="embed")
     assert set(catalog.connections) == {"custom", "openai"}
     assert set(catalog.models) == {"chat", "embed"}
-    assert "tinker/chat-id" in unstyle(console.output)
+    printed = unstyle(console.output)
+    assert "world model  chat" in printed
+    assert "embedder     embed" in printed
 
 
 def test_offline_roles_retain_assigned_tinker_alias_without_capabilities(tmp_path: Path) -> None:
@@ -926,7 +1051,7 @@ def test_offline_roles_retain_assigned_tinker_alias_without_capabilities(tmp_pat
         roles=ModelRoles(world_model="legacy", judge="legacy", embedder="embed"),
     )
     write_model_catalog(root / "models.toml", original)
-    console = ScriptedConsole("1\n\n\n\n\n\n\ny\n")
+    console = ScriptedConsole("1\n\n\n\n\ny\n")
 
     saved = run_provider_setup(
         root,
@@ -940,9 +1065,8 @@ def test_offline_roles_retain_assigned_tinker_alias_without_capabilities(tmp_pat
     assert saved == original
     assert load_model_catalog(root / "models.toml") == original
     printed = unstyle(console.output)
-    assert "tinker/tinker://sampling/run" in printed
-    assert "retain only: world_model, judge" in printed
-    assert "capabilities=unverified" in printed
+    assert "world model  legacy" in printed
+    assert "retain only: judge, world_model" in printed
 
 
 def test_offline_setup_preserves_exact_unverified_router_roles_without_revalidation(

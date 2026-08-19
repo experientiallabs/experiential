@@ -266,16 +266,15 @@ class ModelRecord(ContractModel):
     feature or token limit. Callers may still resolve the alias for an unconstrained completion,
     but capability preflight fails closed instead of inferring support from a provider name.
 
-    ``served_model_id`` is the provider-reported response identity when it differs from the
-    requested model ID, for example when an endpoint normalizes every response to one configured
-    served-model name. Identity validation accepts a response naming either the requested model
-    or this pinned served identity.
+    ``served_model_id`` accepts an alternate identifier the provider echoes in responses when it
+    differs from the requested ``model``, for example a vLLM endpoint that publishes an alias in
+    ``/models`` but reports its canonical served name in every completion.
     """
 
     connection: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=2_048)
-    served_model_id: str | None = Field(default=None, min_length=1, max_length=2_048)
     revision: str | None = Field(default=None, max_length=256)
+    served_model_id: str | None = Field(default=None, min_length=1, max_length=2_048)
     billing_source: BillingSource
     capabilities: ModelCapabilities | None = None
     gateway: GatewayDeploymentMetadata | None = None
@@ -294,8 +293,8 @@ class ModelRecord(ContractModel):
                 {
                     "connection": self.connection,
                     "model": self.model,
-                    "served_model_id": self.served_model_id,
                     "revision": self.revision,
+                    "served_model_id": self.served_model_id,
                     "billing_source": self.billing_source.value,
                     "capabilities": (
                         self.capabilities.model_dump(mode="json")

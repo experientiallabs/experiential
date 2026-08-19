@@ -51,10 +51,11 @@ uv run pytest -q
 - `wmo/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
   current engines, orchestration, artifact construction, and comparisons. New modules for those
   responsibilities go inside `wmo/simulation/`, never at the flat `wmo/` root.
-- `wmo build TRACE_FILE --source otlp|posthog --project PROJECT --root ROOT` is the only CLI path
+- `wmo build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` is the only CLI path
   from local traces to immutable task evidence. It accepts 100 through 1000 normalized traces,
-  writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, and makes no
-  model, provider, or judge calls. Route each corpus through an explicit canonical source loader.
+  writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, builds both
+  RAG indexes under a strict embedding-cost ceiling, and binds the grounded world model without a
+  completion or judge call. Route each corpus through an explicit canonical source loader.
 - New trace sources belong in `wmo/simulation/ingest/`, normalize into the `Trace` and `TraceSpan`
   contracts in `wmo/common/traces/`, support file ingestion, and register from
   `wmo/simulation/ingest/__init__.py`.
@@ -65,9 +66,10 @@ uv run pytest -q
   opens only after fit evidence, policy locking, and remaining-budget checks pass. Router fitting
   never runs or consumes world-model fidelity evaluation.
 - `wmo optimize router PROJECT --root ROOT` discovers the completed build, fit-only RAG, grounded
-  world model, approved manual judge calibration, and confirmed router candidates from the
-  project. It freezes one shared provider ceiling before calls, simulates and judges missing
-  fit evidence, locks the fit policy before held-out execution, and exactly replays completed work.
+  world model, judge syllabus and provenance, and confirmed router candidates from the project.
+  Human calibration is recommended but optional. The command freezes one shared provider ceiling
+  before calls, simulates and judges missing fit evidence, locks the fit policy before held-out
+  execution, and exactly replays completed work.
   World-model fidelity testing is a separately invoked common-evaluation mode with no authority
   over router fitting or runtime activation. Its reports contain measurements only and never carry
   an approval, denial, gate, threshold, or decision.

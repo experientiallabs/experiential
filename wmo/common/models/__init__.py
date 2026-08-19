@@ -40,7 +40,11 @@ from wmo.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
     normalize_gateway_catalog,
 )
-from wmo.common.models.known_models import KnownModel, known_model_metadata
+from wmo.common.models.known_models import (
+    KnownModel,
+    canonical_model_id,
+    known_model_metadata,
+)
 from wmo.common.models.model import (
     DEFAULT_REASONING_EFFORT,
     AssistantAction,
@@ -150,6 +154,7 @@ __all__ = [
     "ToolCall",
     "ToolChoice",
     "Usage",
+    "canonical_model_id",
     "catalog_state_sha256",
     "combine_economics",
     "completion_candidate_aliases",

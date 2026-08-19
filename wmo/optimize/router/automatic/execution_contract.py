@@ -25,6 +25,7 @@ from wmo.common.routing import (
     RouterEmbeddingReservation,
     load_frozen_embedding_set,
 )
+from wmo.optimize.router.automatic.reservations import AutomaticRouterCostPlan
 from wmo.runtime.router.capability import load_router_runtime_capability_contract
 from wmo.simulation.specs import load_simulation_completion_contract
 
@@ -62,6 +63,8 @@ class RouterExecutionContract(ArtifactEnvelope):
 
     schema_version: Literal[4] = 4
     execution_contract_id: ArtifactId
+    cost_plan: AutomaticRouterCostPlan
+    cost_plan_sha256: Sha256
     router_embedding_input: ArtifactInput
     simulation_completion_input: ArtifactInput
     runtime_capability_input: ArtifactInput
@@ -120,6 +123,11 @@ class RouterExecutionContract(ArtifactEnvelope):
             raise ValueError("router execution contract needs at least two unique candidates")
         if self.incumbent_alias not in aliases:
             raise ValueError("router execution incumbent must be one of the selected candidates")
+        if self.cost_plan_sha256 != self.cost_plan.cost_plan_sha256:
+            raise ValueError("automatic cost-plan digest differs from its exact schedule")
+        planned_aliases = tuple(item.candidate_alias for item in self.cost_plan.candidate_episodes)
+        if set(planned_aliases) != set(aliases):
+            raise ValueError("automatic cost plan differs from the execution candidates")
         if self.world_model_request.model != self.world_model:
             raise ValueError("world-model request reservation differs from its model")
         if self.judge_request.model != self.judge_model:
@@ -145,6 +153,22 @@ class RouterExecutionContract(ArtifactEnvelope):
             abs_tol=1e-12,
         ):
             raise ValueError("judgment allocation differs from its full call reservation")
+        if self.maximum_judge_provider_calls != self.cost_plan.maximum_judge_provider_calls:
+            raise ValueError("execution judge calls differ from the automatic cost plan")
+        if self.maximum_provider_cost_usd < self.cost_plan.required_provider_cost_usd:
+            raise ValueError("provider ceiling is below the complete automatic cost plan")
+        planned_by_alias = {
+            item.candidate_alias: item for item in self.cost_plan.candidate_episodes
+        }
+        for candidate in self.candidates:
+            planned = planned_by_alias[candidate.candidate_alias]
+            if not math.isclose(
+                candidate.request.estimated_maximum_call_cost_usd,
+                planned.candidate_cost_per_step_usd,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise ValueError("candidate request differs from its cost-plan reservation")
         expected_remaining = (
             self.maximum_provider_cost_usd - self.reserved_router_embedding_cost_usd
         )
@@ -166,6 +190,7 @@ def persist_router_execution_contract(
     simulation_completion_input: ArtifactInput,
     runtime_capability_input: ArtifactInput,
     router_embedding_reservation: RouterEmbeddingReservation,
+    cost_plan: AutomaticRouterCostPlan,
     candidates: tuple[CandidateExecutionBinding, ...],
     incumbent_alias: ArtifactId,
     agent_factory_sha256: Sha256,
@@ -190,6 +215,7 @@ def persist_router_execution_contract(
         simulation_completion_input: Exact simulation completion reservation manifest.
         runtime_capability_input: Exact candidate routing-capability manifest.
         router_embedding_reservation: Pre-dispatch embedding ceiling.
+        cost_plan: Pure full-schedule reservation approved before provider work.
         candidates: Selected candidate capability and request bindings.
         incumbent_alias: Exact quality baseline selected for fitting and fallback.
         agent_factory_sha256: Exact effective built-in or custom agent configuration digest.
@@ -223,6 +249,8 @@ def persist_router_execution_contract(
         "simulation_completion_input": simulation_completion_input.model_dump(mode="json"),
         "runtime_capability_input": runtime_capability_input.model_dump(mode="json"),
         "router_embedding_reservation": router_embedding_reservation.model_dump(mode="json"),
+        "cost_plan": cost_plan.model_dump(mode="json"),
+        "cost_plan_sha256": cost_plan.cost_plan_sha256,
         "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
         "incumbent_alias": incumbent_alias,
         "agent_factory_sha256": agent_factory_sha256,
@@ -243,6 +271,8 @@ def persist_router_execution_contract(
         inputs=inputs,
         code_revision=code_revision,
         execution_contract_id=contract_id,
+        cost_plan=cost_plan,
+        cost_plan_sha256=cost_plan.cost_plan_sha256,
         router_embedding_input=router_embedding_input,
         simulation_completion_input=simulation_completion_input,
         runtime_capability_input=runtime_capability_input,
@@ -364,6 +394,8 @@ def load_router_execution_contract(
             "router_embedding_reservation": value.router_embedding_reservation.model_dump(
                 mode="json"
             ),
+            "cost_plan": value.cost_plan.model_dump(mode="json"),
+            "cost_plan_sha256": value.cost_plan_sha256,
             "candidates": [candidate.model_dump(mode="json") for candidate in value.candidates],
             "incumbent_alias": value.incumbent_alias,
             "agent_factory_sha256": value.agent_factory_sha256,

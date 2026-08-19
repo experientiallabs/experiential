@@ -8,7 +8,6 @@ from wmo.cli.providers import provider_picker
 from wmo.cli.providers.provider_picker import (
     SetupCancelled,
     SetupSession,
-    credential_hint,
     explicit_provider_selection,
     prepare_providers,
     resolve_setup_providers,
@@ -16,7 +15,13 @@ from wmo.cli.providers.provider_picker import (
 )
 from wmo.cli.shared.picker import PickerKey
 from wmo.cli.shared.picker_test import ScriptedConsole
-from wmo.common.models import DiscoveredModel, PricingSource, ProviderConnection, SetupRole
+from wmo.common.models import (
+    DiscoveredModel,
+    PricingSource,
+    ProviderConnection,
+    SetupRole,
+    serves_role,
+)
 from wmo.runtime.models.providers import ProviderEndpoint, ProviderListingError
 
 _LUNA = DiscoveredModel(provider="openai", model="gpt-5.6-luna")
@@ -67,6 +72,7 @@ def _prepare(
     environment: dict[str, str],
     existing_connections: tuple[ProviderConnection, ...] = (),
     existing_aliases: tuple[str, ...] = (),
+    configured: tuple[provider_picker.AvailableModel, ...] = (),
 ) -> (
     tuple[tuple[provider_picker.PreparedEndpoint, ...], tuple[provider_picker.AvailableModel, ...]]
     | None
@@ -80,6 +86,7 @@ def _prepare(
         environment: Mutable process environment consulted for credentials.
         existing_connections: Connections already configured in the catalog.
         existing_aliases: Aliases already configured in the catalog.
+        configured: Catalog models already configured before this session.
 
     Returns:
         The prepared endpoints and configurable models, or ``None`` to reselect providers.
@@ -89,20 +96,24 @@ def _prepare(
         session,
         existing_connections=existing_connections,
         existing_aliases=existing_aliases,
+        configured=configured,
         console=console,
         lister=lister,
         environment=environment,
     )
 
 
-def test_provider_screen_reports_credential_availability_per_provider() -> None:
-    """The one opening screen states which canonical credentials are already readable."""
-    environment = {"OPENAI_API_KEY": "secret-key"}
+def test_provider_screen_never_names_credential_variables() -> None:
+    """The one opening screen shows plain provider names without credential status."""
+    console = ScriptedConsole("1\n\n")
 
-    assert credential_hint("openai", environment=environment) == "OPENAI_API_KEY is set"
-    assert (
-        credential_hint("anthropic", environment=environment) == "ANTHROPIC_API_KEY needs a value"
+    selection = select_providers(
+        SetupSession(), console=console, environment={"OPENAI_API_KEY": "secret-key"}
     )
+
+    assert selection == (("openai",), False)
+    assert "OPENAI_API_KEY" not in console.output
+    assert "API_KEY" not in console.output
 
 
 def test_provider_screen_selects_several_providers_in_one_session() -> None:
@@ -142,7 +153,7 @@ def test_keyboard_provider_list_selects_without_typed_numbers() -> None:
     )
 
     assert selection == (("openai", "anthropic"), False)
-    assert "> [x] OpenAI" in console.output
+    assert "\u276f [x] openai" in console.output
     assert "Complete" in console.output
     assert "Numbers or ranges" not in console.output
 
@@ -160,7 +171,7 @@ def test_keyboard_provider_list_preserves_current_selection_and_cancel() -> None
     )
 
     assert cancelled is None
-    assert "[x] OpenAI" in console.output
+    assert "[x] openai" in console.output
 
 
 def test_resolve_setup_providers_orders_and_rejects_bad_values() -> None:
@@ -199,7 +210,97 @@ def test_canonical_environment_credential_is_used_without_any_prompt() -> None:
     assert endpoints[0].connection.api_key_env == "OPENAI_API_KEY"
     assert lister.requests == [ProviderEndpoint(provider="openai", api_key="secret-key")]
     assert [model.alias for model in models] == ["gpt-5-6-luna", "text-embedding-3-small"]
-    assert "credential read from OPENAI_API_KEY" in console.output
+    assert "OPENAI_API_KEY is set" not in console.output
+
+
+def test_dated_snapshots_and_pointer_aliases_collapse_onto_the_base_model_row() -> None:
+    """One documented model appears once even when the listing publishes its snapshots."""
+    console = ScriptedConsole("")
+    lister = _FakeLister(
+        {
+            "openai": [
+                (
+                    DiscoveredModel(provider="openai", model="gpt-5.6-luna-2026-01-15"),
+                    _LUNA,
+                    DiscoveredModel(provider="openai", model="gpt-5.6-luna-latest"),
+                    _TERRA,
+                )
+            ]
+        }
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("openai",),
+        lister=lister,
+        environment={"OPENAI_API_KEY": "secret-key"},
+    )
+
+    assert prepared is not None
+    _, models = prepared
+    assert [model.model for model in models] == ["gpt-5.6-luna", "gpt-5.6-terra"]
+
+
+def test_rediscovered_configured_models_reuse_their_existing_rows() -> None:
+    """Re-listing a provider never mints a suffixed alias for an already-configured model."""
+    console = ScriptedConsole("")
+    lister = _FakeLister({"openai": [(_LUNA, _TERRA)]})
+    configured = (
+        provider_picker.AvailableModel(
+            alias="gpt-5-6-luna",
+            connection="openai",
+            provider="openai",
+            model="gpt-5.6-luna",
+            capabilities=None,
+            pricing_source=PricingSource.CONFIGURED,
+            configured=True,
+        ),
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("openai",),
+        lister=lister,
+        environment={"OPENAI_API_KEY": "secret-key"},
+        existing_aliases=("gpt-5-6-luna",),
+        configured=configured,
+    )
+
+    assert prepared is not None
+    _, models = prepared
+    assert [model.model for model in models] == ["gpt-5.6-terra"]
+    assert all(not model.alias.endswith("-2") for model in models)
+
+
+def test_provider_whose_models_are_all_configured_is_still_prepared() -> None:
+    """A fully-configured provider prepares its endpoint without new model rows."""
+    console = ScriptedConsole("")
+    lister = _FakeLister({"openai": [(_LUNA,)]})
+    configured = (
+        provider_picker.AvailableModel(
+            alias="gpt-5-6-luna",
+            connection="openai",
+            provider="openai",
+            model="gpt-5.6-luna",
+            capabilities=None,
+            pricing_source=PricingSource.CONFIGURED,
+            configured=True,
+        ),
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("openai",),
+        lister=lister,
+        environment={"OPENAI_API_KEY": "secret-key"},
+        existing_aliases=("gpt-5-6-luna",),
+        configured=configured,
+    )
+
+    assert prepared is not None
+    endpoints, models = prepared
+    assert len(endpoints) == 1
+    assert models == ()
 
 
 def test_missing_credential_is_pasted_masked_and_stays_process_local(
@@ -255,7 +356,7 @@ def test_empty_masked_paste_skips_that_provider(monkeypatch: pytest.MonkeyPatch)
     endpoints, models = prepared
     assert [endpoint.connection.provider for endpoint in endpoints] == ["openai"]
     assert [model.provider for model in models] == ["openai"]
-    assert "Skipping Anthropic." in console.output
+    assert "Skipping anthropic." in console.output
     assert "ANTHROPIC_API_KEY" not in {key for key in environment}
 
 
@@ -388,7 +489,7 @@ def test_models_without_verified_metadata_are_hidden_from_the_normal_path() -> N
     assert prepared is not None
     _, models = prepared
     assert [model.model for model in models] == ["gpt-5.6-luna", "text-embedding-3-small"]
-    assert "1 hidden without verified capabilities or prices" in console.output
+    assert "internal-preview-model" not in console.output
 
 
 def test_discovered_metadata_and_roles_come_from_the_maintained_table() -> None:
@@ -410,8 +511,13 @@ def test_discovered_metadata_and_roles_come_from_the_maintained_table() -> None:
     assert chat.capabilities is not None
     assert chat.capabilities.supports_structured_output
     assert chat.capabilities.context_window_tokens == 1_050_000
-    assert SetupRole.EMBEDDER.value in embedder.detail()
-    assert "roles: world_model, judge, router_candidate" in chat.detail()
+    assert embedder.capabilities is not None
+    assert serves_role(embedder.capabilities, SetupRole.EMBEDDER)
+    assert serves_role(chat.capabilities, SetupRole.WORLD_MODEL)
+    assert serves_role(chat.capabilities, SetupRole.JUDGE)
+    assert serves_role(chat.capabilities, SetupRole.ROUTER_CANDIDATE)
+    assert chat.detail() == "openai"
+    assert embedder.detail() == "openai"
 
 
 def test_connection_names_and_aliases_avoid_configured_collisions() -> None:
@@ -518,7 +624,7 @@ def test_azure_prepares_exact_connection_for_manual_deployment_declaration() -> 
         base_url="https://resource.openai.azure.com",
         api_version="v1",
     )
-    assert "deployment-specific" in console.output
+    assert "declare deployment model IDs" in console.output
 
 
 def test_bedrock_prepares_credential_chain_without_listing_or_identity_invention() -> None:
@@ -543,7 +649,7 @@ def test_bedrock_prepares_credential_chain_without_listing_or_identity_invention
         provider="bedrock",
         region="us-east-1",
     )
-    assert "deployment-specific" in console.output
+    assert "declare deployment model IDs" in console.output
 
 
 def test_azure_and_bedrock_force_explicit_manual_model_declaration() -> None:
@@ -553,8 +659,8 @@ def test_azure_and_bedrock_force_explicit_manual_model_declaration() -> None:
     selection = select_providers(SetupSession(), console=console, environment={})
 
     assert selection == (("azure", "bedrock"), True)
-    assert "deployment IDs are declared manually" in console.output
-    assert "AWS credential chain" in console.output
+    assert "azure" in console.output
+    assert "bedrock" in console.output
 
 
 def test_no_prepared_provider_returns_to_the_provider_screen(

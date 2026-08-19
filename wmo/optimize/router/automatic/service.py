@@ -27,13 +27,15 @@ from wmo.optimize.router.automatic.artifacts import (
 from wmo.optimize.router.automatic.attribution import persist_router_observed_attribution_set
 from wmo.optimize.router.automatic.judge import AutomaticRouterJudge, ReservedJudgeClient
 from wmo.optimize.router.automatic.preflight import (
-    AutomaticRouterOptions,
     AutomaticRouterPreflight,
     HostedAutomaticJudgeEvidence,
+    HumanCalibratedAutomaticJudge,
     preflight_automatic_router,
 )
+from wmo.optimize.router.automatic.reservations import AutomaticRouterOptions
 from wmo.optimize.router.composition import (
     ApprovedRouterReview,
+    ProvisionalRouterReview,
     RouterCandidateSetupPlan,
     RouterCompositionBudget,
     RouterCompositionResult,
@@ -173,16 +175,18 @@ def optimize_project_router(
             raise AutomaticRouterError(
                 "persisted router candidate catalog differs from confirmation"
             )
-    _attribution, attribution_input = persist_router_observed_attribution_set(
-        project.artifacts,
-        trace_dataset=preflight.completed_build.trace_dataset,
-        task_set=preflight.completed_build.task_set,
-        catalog_sha256=preflight.catalog_sha256,
-        candidates=preflight.candidates,
-        records=tuple(item.attribution for item in preflight.observed_traces),
-        created_at=created_at,
-        code_revision=code_revision,
-    )
+    attribution_input = None
+    if preflight.observed_traces:
+        _attribution, attribution_input = persist_router_observed_attribution_set(
+            project.artifacts,
+            trace_dataset=preflight.completed_build.trace_dataset,
+            task_set=preflight.completed_build.task_set,
+            catalog_sha256=preflight.catalog_sha256,
+            candidates=preflight.candidates,
+            records=tuple(item.attribution for item in preflight.observed_traces),
+            created_at=created_at,
+            code_revision=code_revision,
+        )
     artifacts = materialize_automatic_router_artifacts(
         project,
         preflight,
@@ -491,6 +495,7 @@ def _automatic_judge(
         preflight.setup,
         created_at=created_at,
         code_revision=code_revision,
+        maximum_input_tokens=preflight.judge_completion_reservation.maximum_input_tokens,
         maximum_output_tokens=reservation.maximum_output_tokens,
     )
 
@@ -528,8 +533,8 @@ def _workflow_services(
         project: ProjectStore,
         build: ProjectBuild,
         budget: RouterCompositionBudget,
-    ) -> ApprovedRouterReview:
-        """Supply the manually approved review identities to composition.
+    ) -> ApprovedRouterReview | ProvisionalRouterReview:
+        """Supply exact typed judge provenance to composition.
 
         Args:
             project: Project already verified by automatic preflight.
@@ -537,18 +542,28 @@ def _workflow_services(
             budget: Shared composition budget already admitted before provider access.
 
         Returns:
-            Approved rubric and calibration identities frozen by manual review.
+            Rubric and calibration identities with their exact eligibility status.
         """
         del project, build, budget
+        if preflight.judgment_status == "provisional":
+            return ProvisionalRouterReview(
+                rubric_id=preflight.setup.rubric.artifact_id,
+                calibration_id=preflight.calibration_id,
+                calibration_input=preflight.calibration_input,
+            )
+        if not isinstance(preflight.judge_provenance, HumanCalibratedAutomaticJudge):
+            raise AutomaticRouterError("human calibration provenance changed after preflight")
         return ApprovedRouterReview(
             rubric_id=preflight.setup.rubric.artifact_id,
-            calibration_id=preflight.approved_calibration_id,
+            calibration_id=preflight.calibration_id,
+            calibration_input=preflight.calibration_input,
+            audit_input=preflight.judge_provenance.audit_input,
         )
 
     def setup_supplier(
         project: ProjectStore,
         build: ProjectBuild,
-        review: ApprovedRouterReview,
+        review: ApprovedRouterReview | ProvisionalRouterReview,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
         """Build the evaluation setup from preflighted immutable inputs.
@@ -657,7 +672,7 @@ def _workflow_services(
         judge=judge,
         runtime_catalog=runtime_catalog,
         evaluation_plan_inputs=(
-            artifacts.attribution_input,
+            *((artifacts.attribution_input,) if artifacts.attribution_input is not None else ()),
             artifacts.runtime_capability_input,
             artifacts.execution_contract_input,
         ),
@@ -683,7 +698,7 @@ def _protocols(
     shared = {
         "agent_id": preflight.project_config.project_id,
         "rubric_id": preflight.setup.rubric.artifact_id,
-        "judge_calibration_id": preflight.approved_calibration_id,
+        "judge_calibration_id": preflight.calibration_id,
         "pricing_snapshot_id": artifacts.pricing.pricing_snapshot_id,
     }
     production_id = stable_id(
@@ -706,7 +721,7 @@ def _protocols(
             agent_id=preflight.project_config.project_id,
             simulator_id="production-import-v1",
             rubric_id=preflight.setup.rubric.artifact_id,
-            judge_calibration_id=preflight.approved_calibration_id,
+            judge_calibration_id=preflight.calibration_id,
             pricing_snapshot_id=artifacts.pricing.pricing_snapshot_id,
         ),
         EvaluationProtocol(
@@ -717,7 +732,7 @@ def _protocols(
             world_model=preflight.world_model,
             simulator_prompt_id=WORLD_MODEL_TEXT_PROMPT_ID,
             rubric_id=preflight.setup.rubric.artifact_id,
-            judge_calibration_id=preflight.approved_calibration_id,
+            judge_calibration_id=preflight.calibration_id,
             pricing_snapshot_id=artifacts.pricing.pricing_snapshot_id,
         ),
     )

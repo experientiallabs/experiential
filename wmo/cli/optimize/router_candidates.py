@@ -108,6 +108,7 @@ def run_router_candidate_picker(
                 session,
                 existing_connections=existing_connections,
                 existing_aliases=existing_aliases,
+                configured=configured,
                 console=console,
                 lister=provider_lister,
                 environment=provider_environment,

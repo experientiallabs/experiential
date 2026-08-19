@@ -456,6 +456,7 @@ def select_many_list(
     preselected: Sequence[str] = (),
     minimum: int = 1,
     read_key: PickerKeyReader | None = None,
+    visible_rows: int | None = None,
 ) -> PickerResult:
     """Choose several rows from a keyboard-driven list with a Complete action.
 
@@ -470,6 +471,7 @@ def select_many_list(
         preselected: Values already chosen, kept when the screen is shown again.
         minimum: Smallest accepted number of selected values.
         read_key: Optional key source used by tests instead of the controlling terminal.
+        visible_rows: Optional screen-specific ceiling on rows shown at once.
 
     Returns:
         The chosen values, or the requested back or cancel navigation.
@@ -487,7 +489,9 @@ def select_many_list(
     searching = False
     with (
         _terminal_key_reader(read_key) as reader,
-        picker_view(console, title=title, mode=PickerMode.MULTIPLE) as view,
+        picker_view(
+            console, title=title, mode=PickerMode.MULTIPLE, visible_rows=visible_rows
+        ) as view,
     ):
         while True:
             visible = _filtered(options, query)
@@ -543,6 +547,7 @@ def select_one_list(
     options: Sequence[PickerOption],
     default: str | None = None,
     read_key: PickerKeyReader | None = None,
+    visible_rows: int | None = None,
 ) -> PickerResult:
     """Choose exactly one row from a keyboard-driven list.
 
@@ -556,6 +561,7 @@ def select_one_list(
         options: Every selectable row, in presentation order.
         default: Value focused first when it is still available.
         read_key: Optional key source used by tests instead of the controlling terminal.
+        visible_rows: Optional screen-specific ceiling on rows shown at once.
 
     Returns:
         The chosen value, or the requested back or cancel navigation.
@@ -573,7 +579,9 @@ def select_one_list(
     searching = False
     with (
         _terminal_key_reader(read_key) as reader,
-        picker_view(console, title=title, mode=PickerMode.SINGLE) as view,
+        picker_view(
+            console, title=title, mode=PickerMode.SINGLE, visible_rows=visible_rows
+        ) as view,
     ):
         while True:
             visible = _filtered(options, query)
@@ -621,6 +629,7 @@ def choose_many(
     preselected: Sequence[str] = (),
     minimum: int = 1,
     read_key: PickerKeyReader | None = None,
+    visible_rows: int | None = None,
 ) -> PickerResult:
     """Collect several values from the keyboard list, or from typed lines without a terminal.
 
@@ -631,6 +640,7 @@ def choose_many(
         preselected: Values already chosen, kept when the screen is shown again.
         minimum: Smallest accepted number of selected values.
         read_key: Optional key source used by tests instead of the controlling terminal.
+        visible_rows: Optional screen-specific ceiling on rows shown at once.
 
     Returns:
         The chosen values, or the requested back or cancel navigation.
@@ -643,6 +653,7 @@ def choose_many(
             preselected=preselected,
             minimum=minimum,
             read_key=read_key,
+            visible_rows=visible_rows,
         )
     return select_many(
         console,
@@ -660,6 +671,7 @@ def choose_one(
     options: Sequence[PickerOption],
     default: str | None = None,
     read_key: PickerKeyReader | None = None,
+    visible_rows: int | None = None,
 ) -> PickerResult:
     """Collect one value from the keyboard list, or from typed lines without a terminal.
 
@@ -669,6 +681,7 @@ def choose_one(
         options: Every selectable row, in presentation order.
         default: Value focused first, or accepted by an empty line on the line-based path.
         read_key: Optional key source used by tests instead of the controlling terminal.
+        visible_rows: Optional screen-specific ceiling on rows shown at once.
 
     Returns:
         The chosen value, or the requested back or cancel navigation.
@@ -680,6 +693,7 @@ def choose_one(
             options=options,
             default=default,
             read_key=read_key,
+            visible_rows=visible_rows,
         )
     return select_one(console, title=title, options=options, default=default)
 

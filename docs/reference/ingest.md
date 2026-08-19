@@ -1,6 +1,6 @@
 # Local trace input
 
-`wmo build PROJECT TRACES --source SOURCE` reads one explicit local corpus through one canonical
+`wmo build PROJECT --traces PATH --source SOURCE` reads one explicit local corpus through one canonical
 loader. Each source is declared, never guessed:
 
 | `--source` | Local input |
@@ -44,12 +44,17 @@ normalized traces after validation and source deduplication. The limit applies t
 not to the smaller representative task count that semantic deduplication and mining produce.
 
 No generic vendor-adapter registry and no format detection are part of the command. Build does not
-pull a remote source, resolve a provider, propose a rubric, run a judge, or call an embedding API.
-Representative task selection uses the deterministic local hashing embedder unless a Python caller
-supplies another explicit descriptor embedder.
+pull a remote source, propose a rubric, run a judge, or call the selected world model. Representative
+task selection uses the deterministic local hashing embedder unless a Python caller supplies another
+explicit descriptor embedder.
 
-Build makes zero model, provider, or judge paid calls. The CLI preserves anonymous aggregate
-PostHog product telemetry, which may send after successful persistence unless the user runs
+After local trace and split construction, build shows the selected world model and embedder, the
+conservative embedding-cost ceiling, and the configured maximum. An estimate over that maximum
+fails before credentials or provider construction. An estimate within the maximum runs without a
+confirmation prompt, builds the serving and fit-only RAG indexes, and binds the grounded world model.
+`--dry-run` shows the same preflight with no provider call and no completed-build selection. Exact
+replay verifies and reuses completed indexes with no provider call. Anonymous aggregate PostHog
+product telemetry may send after successful persistence unless the user runs
 `wmo config telemetry disable`. Telemetry does not include prompts, traces, paths, model names, or
 customer content.
 

@@ -84,6 +84,50 @@ def test_noninteractive_failure_adds_no_extra_lines() -> None:
     assert buffer.getvalue() == "  . grounded model\n"
 
 
+def test_interactive_countable_stage_renders_a_bar_and_rate_based_eta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A countable stage shows a progress bar and an ETA once a rate is observable."""
+    clock = iter([0.0, 10.0, 10.0])
+    monkeypatch.setattr("wmo.cli.shared.progress.monotonic", lambda: next(clock))
+    console, buffer = _plain_console(interactive=True)
+    with progress_display(console) as observe:
+        observe(ProgressEvent(stage="judgments", completed=0, total=4))
+        observe(ProgressEvent(stage="judgments", completed=2, total=4))
+    output = buffer.getvalue()
+    assert "\u2501" in output
+    assert "2/4" in output
+    assert "eta 10s" in output
+
+
+def test_interactive_first_countable_update_has_no_eta() -> None:
+    """No ETA is invented before any progress rate is observable."""
+    console, buffer = _plain_console(interactive=True)
+    with progress_display(console) as observe:
+        observe(ProgressEvent(stage="judgments", completed=0, total=4))
+    assert "eta" not in buffer.getvalue()
+
+
+def test_single_line_display_prints_no_permanent_finished_rows() -> None:
+    """A single-line section keeps one in-place line across every stage change."""
+    console, buffer = _plain_console(interactive=True)
+    with progress_display(console, single_line=True) as observe:
+        observe(ProgressEvent(stage="preflight"))
+        observe(ProgressEvent(stage="judgments", completed=1, total=2))
+        observe(ProgressEvent(stage="artifact publication"))
+    assert "[x]" not in buffer.getvalue()
+
+
+def test_single_line_failure_still_marks_the_active_stage_unfinished() -> None:
+    """A raising single-line section leaves its interrupted stage visible."""
+    console, buffer = _plain_console(interactive=True)
+    with pytest.raises(RuntimeError, match="boom"):
+        with progress_display(console, single_line=True) as observe:
+            observe(ProgressEvent(stage="fitting"))
+            raise RuntimeError("boom")
+    assert "[ ] fitting" in buffer.getvalue()
+
+
 def test_qualified_attaches_a_detail_and_preserves_counts() -> None:
     """The wrapper forwards events with the owning command's qualifier attached."""
     seen: list[ProgressEvent] = []

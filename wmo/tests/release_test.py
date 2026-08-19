@@ -18,6 +18,8 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import cast
 
+from click import unstyle
+
 if os.environ.get("WMO_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
 
@@ -2400,12 +2402,12 @@ def _installed_release_driver() -> None:
     space = " "
     setup_answers = [
         (
-            "Select the providers you want to use",
+            "Providers",
             (down * 5) + enter + (down * 2) + enter,
         ),
-        ("Azure OpenAI base URL", azure_endpoint),
+        ("azure base URL", azure_endpoint),
         ("Azure OpenAI API version", ""),
-        ("Select the models to configure", space + down + enter),
+        ("Models to configure", space + down + enter),
         ("Connection for the declared model", enter),
         ("Provider model ID", "core-model"),
         ("Supports chat completions?", "y"),
@@ -2421,20 +2423,21 @@ def _installed_release_driver() -> None:
         ("Cached input cost per million tokens in USD", "0"),
         ("Cache write cost per million tokens in USD", "0"),
         ("Reasoning effort", enter),
-        ("/core-model)", (down * 2) + enter),
+        ("core-model", (down * 2) + enter),
         ("World model", enter),
-        ("Judge model", enter),
-        ("Embedder model", enter),
+        ("Judge", enter),
+        ("Embedder", enter),
         ("Save this configuration?", "y"),
     ]
     try:
         assert not root.exists()
         build_output = run_tty(
-            ["build", "support-agent", str(traces), "--root", str(root)],
+            ["build", "support-agent", "--traces", str(traces), "--root", str(root)],
             setup_answers,
         )
-        assert "Model setup is required" in build_output
-        assert "Candidate aliases" not in build_output
+        plain_build_output = unstyle(build_output)
+        assert "Model setup is required" in plain_build_output
+        assert "Candidate aliases" not in plain_build_output
         assert "Complete" in build_output
         support_store = ProjectStore(root, "support-agent")
         support_project = support_store.load_project()
@@ -2447,6 +2450,49 @@ def _installed_release_driver() -> None:
         build_counts = state.counts()
         assert build_counts[provider_embeddings_path] > 0
         assert build_counts[provider_chat_path] == 0
+        for expected in (
+            "Build preflight",
+            "traces",
+            "split",
+            "world model  core-model (core-model)",
+            "embedder     core-model (core-model)",
+            "embedding    at most $0.000000",
+            "ceiling      $5.000000",
+        ):
+            assert expected in plain_build_output, build_output
+        assert "Proceed?" not in plain_build_output
+        provider_after_build = state.snapshot()
+        selected_build = support_project.build
+        replay_output = run_cli(
+            "build",
+            "support-agent",
+            "--traces",
+            str(traces),
+            "--root",
+            str(root),
+            "--no-interactive",
+        )
+        assert "reuse exact completed indexes, $0.000000 new spend" in replay_output.stdout
+        assert "Proceed?" not in replay_output.stdout
+        assert state.snapshot() == provider_after_build
+        assert support_store.load_project().build == selected_build
+        dry_run_output = run_cli(
+            "build",
+            "dry-run-agent",
+            "--traces",
+            str(traces),
+            "--root",
+            str(root),
+            "--dry-run",
+            "--no-interactive",
+        )
+        assert "Build preflight" in dry_run_output.stdout
+        assert "dry run complete" in dry_run_output.stdout
+        assert "Proceed?" not in dry_run_output.stdout
+        assert state.snapshot() == provider_after_build
+        dry_run_store = ProjectStore(root, "dry-run-agent")
+        assert dry_run_store.load_project().build is None
+        assert dry_run_store.read_review() is None
         world_model = wmo.load_world_model(
             "support-agent",
             root=root,
@@ -2584,8 +2630,7 @@ def _installed_release_driver() -> None:
         )
         assert "candidates: candidate-b, core-model" in optimization_output
         assert "incumbent: core-model" in optimization_output
-        assert "policy:" in optimization_output
-        assert "report:" in optimization_output
+        assert "Complete" in optimization_output
         optimized_artifacts = directory_digest(support_store.paths.artifacts_directory)
         optimized_catalog = (root / "models.toml").read_bytes()
         optimized_project = support_store.paths.project_toml.read_bytes()
@@ -2779,6 +2824,7 @@ def _installed_release_driver() -> None:
         one_result = run_cli(
             "build",
             "one-trace",
+            "--traces",
             str(one_trace),
             "--root",
             str(root),

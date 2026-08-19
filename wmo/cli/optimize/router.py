@@ -13,6 +13,7 @@ from wmo.cli.optimize.router_candidates import collect_router_candidates
 from wmo.cli.shared.consent import can_prompt, require_spend_consent
 from wmo.cli.shared.options import ROOT_OPTION, usage_error
 from wmo.cli.shared.progress import progress_display
+from wmo.cli.shared.theme import WMO_THEME
 from wmo.common.models import ProviderModelSelection, load_model_catalog
 from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.project import ProjectStore
@@ -29,7 +30,7 @@ from wmo.optimize.router.automatic.service import (
 )
 from wmo.runtime.models import RuntimeModelCatalog
 
-_console = Console()
+_console = Console(theme=WMO_THEME)
 _CANDIDATE_OPTION = typer.Option(
     None,
     "--candidate",
@@ -65,7 +66,7 @@ def router(
         32_768, "--maximum-retrieval-query-tokens", min=1
     ),
     simulation_maximum_output_tokens: int = typer.Option(
-        16_000, "--simulation-maximum-output-tokens", min=8_000
+        2_000, "--simulation-maximum-output-tokens", min=256
     ),
     maximum_concurrency: int = typer.Option(1, "--maximum-concurrency", min=1),
     stop_on_overspend: bool = typer.Option(
@@ -155,10 +156,6 @@ def router(
             yes=yes,
             estimated_cost_usd=0.0,
             command=f"wmo optimize router {project}",
-            assumptions=(
-                "verified immutable optimization replay",
-                "zero new provider calls",
-            ),
             non_interactive=effective_noninteractive,
         )
         with usage_error(OSError, ValueError):
@@ -176,22 +173,14 @@ def router(
         yes=yes,
         estimated_cost_usd=options.maximum_provider_cost_usd,
         command=f"wmo optimize router {project}",
-        assumptions=(
-            (
-                f"${preflight.router_embedding_reservation.estimated_cost_usd:.4f} router "
-                "embedding reservation"
-            ),
-            f"${preflight.judge_reservation_cost_usd:.4f} estimated judge spend",
-            (
-                f"${preflight.remaining_simulation_cost_usd:.4f} shared simulation and "
-                "judging spend ceiling"
-            ),
-        ),
         non_interactive=effective_noninteractive,
     ):
         _console.print("Router optimization was not started.")
         return
-    with usage_error(OSError, ValueError), progress_display(_console) as progress:
+    with (
+        usage_error(OSError, ValueError),
+        progress_display(_console, single_line=True) as progress,
+    ):
         result = optimize_project_router(
             store,
             candidate_plan,
@@ -212,8 +201,7 @@ def router(
         },
         root=root,
     )
-    _console.print(f"policy: {result.composition.optimization.optimization.policy.policy_id}")
-    _console.print(f"report: {result.composition.optimization.optimization.report.report_id}")
+    _console.print("[green]Complete[/green]")
 
 
 def _render_preflight(

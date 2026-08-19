@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 from collections.abc import Callable
 
 import pytest
@@ -45,6 +46,21 @@ def _output(console: Console) -> str:
     return console.file.getvalue()
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _plain(console: Console) -> str:
+    """Return the console transcript with ANSI sequences removed and wraps rejoined.
+
+    Args:
+        console: Console created by ``_terminal``.
+
+    Returns:
+        The visible text as one whitespace-collapsed string.
+    """
+    return " ".join(_ANSI.sub("", _output(console)).split())
+
+
 def _rows(count: int, *, detail: bool = False) -> tuple[PickerRow, ...]:
     """Build numbered rows for a screen.
 
@@ -84,7 +100,7 @@ def test_repeated_frames_redraw_one_region_on_a_terminal(
     assert text.count("Select the providers") == 1
     assert text.count("model-1") == 1
     assert text.count("model-3") == 1
-    assert "  > [ ] model-3" in screen
+    assert " \u276f [ ] model-3" in screen
     assert _output(console).endswith("\x1b[?25h")
 
 
@@ -111,31 +127,25 @@ def test_multi_select_marks_selection_and_names_the_submit_row() -> None:
     with picker_view(console, title="Providers", mode=PickerMode.MULTIPLE) as view:
         view.show(rows, focus=2)
 
-    output = _output(console)
-    assert "[x] openai" in output
-    assert "[ ] anthropic" in output
-    assert "> Complete" in output
-    assert "Space or Enter selects or deselects" in output
+    text = _plain(console)
+    assert "[x] openai" in text
+    assert "[ ] anthropic" in text
+    assert "\u276f Complete" in text
+    assert "Enter on Complete" in text
 
 
 def test_single_select_shows_metadata_without_selection_marks() -> None:
-    """A single-select frame keeps provider, role, and pricing metadata but drops marks."""
+    """A single-select frame keeps its dim annotation inline but drops selection marks."""
     console = _terminal()
-    rows = (
-        PickerRow(
-            label="sonnet (anthropic/claude-sonnet-4)",
-            detail="roles: judge, world_model; pricing: api",
-        ),
-    )
+    rows = (PickerRow(label="sonnet", detail="anthropic"),)
 
     with picker_view(console, title="World model", mode=PickerMode.SINGLE) as view:
         view.show(rows, focus=0)
 
-    output = _output(console)
-    assert "> sonnet (anthropic/claude-sonnet-4)" in output
-    assert "roles: judge, world_model; pricing: api" in output
-    assert "[ ]" not in output
-    assert "Enter confirms the focused row" in output
+    text = _plain(console)
+    assert "\u276f sonnet (anthropic)" in text
+    assert "[ ]" not in text
+    assert "up/down + Enter" in text
 
 
 def test_a_long_list_scrolls_around_the_focused_row(
@@ -155,25 +165,30 @@ def test_a_long_list_scrolls_around_the_focused_row(
         view.show(rows, focus=20)
 
     last = rendered_screen(_output(console))
-    assert "  ... 1 more above" not in "\n".join(first)
-    assert any(line.startswith("  ... ") and "more below" in line for line in first)
+
+    def _below(line: str) -> bool:
+        """Match the dim indicator for rows hidden below the visible window."""
+        return line.strip().startswith("\u2026") and line.strip().endswith("more")
+
+    assert "more above" not in "\n".join(first)
+    assert any(_below(line) for line in first)
     assert any("more above" in line for line in last)
-    assert any("more below" in line for line in last)
-    assert "  > model-21" in last
+    assert any(_below(line) for line in last)
+    assert " \u276f model-21" in last
     assert not any(line.strip() == "model-1" for line in last)
     assert len(last) <= 14
 
 
-def test_a_narrow_terminal_splits_the_keyboard_hint() -> None:
-    """A narrow terminal keeps the hint readable by using two shorter lines."""
+def test_a_narrow_terminal_wraps_the_keyboard_hint() -> None:
+    """A narrow terminal wraps the inline hint and annotation without losing either."""
     console = _terminal(width=40)
 
     with picker_view(console, title="Providers", mode=PickerMode.MULTIPLE) as view:
         view.show(_rows(1, detail=True), focus=0)
 
-    output = _output(console)
-    assert "Activate Complete to submit." in output
-    assert "roles: judge; pricing: api" in output
+    text = _plain(console)
+    assert "Enter on Complete" in text
+    assert "pricing: api" in text
 
 
 def test_an_open_search_shows_the_query_and_swaps_the_hint() -> None:
@@ -185,8 +200,7 @@ def test_an_open_search_shows_the_query_and_swaps_the_hint() -> None:
 
     output = _output(console)
     assert "Search: gpt_" in output
-    assert "Enter confirms the focused match" in output
-    assert "Enter confirms the focused row" not in output
+    assert "Enter confirms, Esc clears" in output
 
 
 def test_a_retained_filter_is_shown_with_the_normal_hint() -> None:
@@ -199,19 +213,19 @@ def test_a_retained_filter_is_shown_with_the_normal_hint() -> None:
     output = _output(console)
     assert "Filter: gpt" in output
     assert "Search: " not in output
-    assert "/ searches" in output
+    assert "up/down" in output
 
 
-def test_a_searching_narrow_terminal_splits_the_search_hint() -> None:
-    """A narrow terminal keeps the search bindings readable across two lines."""
+def test_a_searching_narrow_terminal_keeps_the_search_hint() -> None:
+    """A narrow terminal still shows the search bindings while a search is open."""
     console = _terminal(width=40)
 
     with picker_view(console, title="Models", mode=PickerMode.MULTIPLE) as view:
         view.show(_rows(1), focus=0, query="gpt", searching=True)
 
-    output = _output(console)
-    assert "Type to search. Backspace edits." in output
-    assert "Enter keeps the matches, Esc clears." in output
+    text = _plain(console)
+    assert "Search: gpt_" in text
+    assert "Esc clears" in text
 
 
 def test_a_search_frame_still_fits_a_short_terminal(
