@@ -367,3 +367,59 @@ def test_responses_instructions_are_per_turn_and_echoed_without_inheritance() ->
         assert all(message.role != "developer" for message in third_messages)
 
     asyncio.run(scenario())
+
+
+def test_client_disconnect_still_records_a_cancelled_terminal() -> None:
+    """Repeated caller cancellation never loses the durable cancelled terminal write.
+
+    ASGI servers redeliver cancellation at every await point while tearing down a
+    disconnected response task, so the settlement path must complete its ledger
+    write and upstream cancellation in a detached task.
+    """
+
+    async def scenario() -> None:
+        """Cancel a parked streaming consumer until it dies, then check accounting."""
+        provider = _Provider(_BlockingStream)
+        service, _control, ledger, _proof = _service(provider)
+        response = await service.complete(
+            raw_key="caller-secret",
+            decoded=decode_chat(
+                {
+                    "model": "public-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                }
+            ),
+        )
+        assert isinstance(response, StreamingResponse)
+        iterator = cast(AsyncIterator[bytes], response.body_iterator)
+
+        async def consume() -> None:
+            """Read frames until the caller is torn down."""
+            async for _frame in iterator:
+                pass
+
+        consumer = asyncio.create_task(consume())
+        stream = None
+        while stream is None:
+            await asyncio.sleep(0)
+            stream = provider.streams[0] if provider.streams else None
+        assert isinstance(stream, _BlockingStream)
+        await stream.entered.wait()
+        assert not ledger.finished
+        while not consumer.done():
+            consumer.cancel()
+            await asyncio.sleep(0)
+        assert consumer.cancelled()
+        for _ in range(200):
+            if ledger.finished and stream.cancelled:
+                break
+            await asyncio.sleep(0.005)
+        assert stream.cancelled
+        terminal, failure = ledger.finished[-1]
+        assert failure is not None
+        assert failure.failure_class is GatewayFailureClass.CANCELLED
+        assert terminal is not None
+        assert terminal.kind is GatewayEventKind.FAILED
+
+    asyncio.run(scenario())

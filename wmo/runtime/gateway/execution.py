@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -56,6 +56,24 @@ _TERMINAL_EVENTS = {
 }
 _MAX_WITHHELD_REFUSAL_BYTES = 65_536
 _MAX_WITHHELD_REFUSAL_EVENTS = 256
+_DETACHED_SETTLEMENTS: set[asyncio.Task[None]] = set()
+
+
+async def settle_despite_cancellation(settlement: Coroutine[object, object, None]) -> None:
+    """Run one terminal settlement that completes even when the caller is cancelled.
+
+    A caller torn down by client disconnect observes ``CancelledError`` at every
+    await point, so the durable terminal ledger write runs in a detached task and
+    is only awaited through a shield. Cancellation still propagates to the caller,
+    while the settlement always runs to completion in the background.
+
+    Args:
+        settlement: Settlement coroutine performing the durable write.
+    """
+    task = asyncio.ensure_future(settlement)
+    _DETACHED_SETTLEMENTS.add(task)
+    task.add_done_callback(_DETACHED_SETTLEMENTS.discard)
+    await asyncio.shield(task)
 
 
 class GatewayExecutionError(RuntimeError):
@@ -366,6 +384,14 @@ class GatewayExecutionStream:
         if current is None:
             self._settle()
             return
+        await settle_despite_cancellation(self._abort_settlement(current, failure))
+
+    async def _abort_settlement(
+        self,
+        current: _PhysicalAttempt,
+        failure: GatewayFailure,
+    ) -> None:
+        """Durably terminalize and cancel upstream work for one aborted attempt."""
         accounting_error: BaseException | None = None
         owns_cancel = False
         async with self._settlement_lock:
@@ -510,6 +536,17 @@ class GatewayExecutionStream:
         finalize_request: bool,
     ) -> None:
         """Settle one provider opening failure before another physical dispatch."""
+        await settle_despite_cancellation(
+            self._open_failure_settlement(dispatch_failure, finalize_request=finalize_request)
+        )
+
+    async def _open_failure_settlement(
+        self,
+        dispatch_failure: _DispatchFailure,
+        *,
+        finalize_request: bool,
+    ) -> None:
+        """Durably record one opening failure regardless of caller cancellation."""
         try:
             await asyncio.to_thread(
                 self._ledger.finish_attempt,
@@ -536,6 +573,24 @@ class GatewayExecutionStream:
     ) -> None:
         """Durably settle the active attempt once under the shared settlement lock."""
         current = self._require_current()
+        await settle_despite_cancellation(
+            self._current_settlement(
+                current,
+                terminal=terminal,
+                failure=failure,
+                finalize_request=finalize_request,
+            )
+        )
+
+    async def _current_settlement(
+        self,
+        current: _PhysicalAttempt,
+        *,
+        terminal: GatewayEvent,
+        failure: GatewayFailure | None,
+        finalize_request: bool,
+    ) -> None:
+        """Write one attempt terminal exactly once regardless of caller cancellation."""
         async with self._settlement_lock:
             if current.settled:
                 return
@@ -550,8 +605,6 @@ class GatewayExecutionStream:
                 current.settled = True
                 if finalize_request:
                     self._parent_finalized = True
-            except asyncio.CancelledError:
-                raise
             except BaseException:
                 self._accounting_failure()
                 raise
@@ -650,6 +703,10 @@ class GatewayExecutionStream:
         """Terminalize a parent whose next attempt could not be durably started."""
         if self._parent_finalized:
             return
+        await settle_despite_cancellation(self._parent_settlement(failure))
+
+    async def _parent_settlement(self, failure: GatewayFailure) -> None:
+        """Durably finalize the logical request regardless of caller cancellation."""
         try:
             await asyncio.to_thread(
                 self._ledger.finish_request,

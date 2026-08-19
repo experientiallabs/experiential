@@ -31,6 +31,7 @@ from wmo.runtime.gateway.execution import (
     GatewayExecutionError,
     GatewayExecutionStream,
     GatewayExecutor,
+    settle_despite_cancellation,
 )
 from wmo.runtime.gateway.interfaces import AttemptLedger, GatewayClock, GatewayControlStore
 from wmo.runtime.gateway.ledger import IdempotencyConflictError, IdempotencyReplayUnavailableError
@@ -910,13 +911,34 @@ async def _finish_request_quietly(
 ) -> None:
     """Attempt durable pre-dispatch finalization without masking the primary failure."""
     try:
+        await settle_despite_cancellation(
+            _request_finalization(
+                ledger,
+                authorization=authorization,
+                failure=failure,
+                accounting_failure=accounting_failure,
+            )
+        )
+    except asyncio.CancelledError:
+        return
+    except BaseException:  # noqa: BLE001 - primary request failure remains authoritative
+        return
+
+
+async def _request_finalization(
+    ledger: AttemptLedger,
+    *,
+    authorization: AuthorizationSnapshot,
+    failure: GatewayFailure,
+    accounting_failure: Callable[[], None],
+) -> None:
+    """Write one pre-dispatch request terminal regardless of caller cancellation."""
+    try:
         await asyncio.to_thread(
             ledger.finish_request,
             authorization=authorization,
             failure=failure,
         )
-    except asyncio.CancelledError:
-        return
     except BaseException:  # noqa: BLE001 - primary request failure remains authoritative
         accounting_failure()
-        return
+        raise
