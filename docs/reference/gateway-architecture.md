@@ -17,11 +17,11 @@ perform no provider request. Only an authorized model request may cross the prov
 
 ## Authority and management
 
-`wmo config gateway` owns explicit local setup. Its provider, identity, key, grant, alias, and pool
-commands produce versioned receipts suitable for interactive or non-interactive callers. There are
-no runtime seeds. A usable installation requires an organization, active identity, active virtual
-key, explicit identity-to-alias grant, active alias revision, immutable catalog snapshot, and a
-resolvable provider credential reference.
+`wmo config gateway` owns explicit local setup. Its provider, identity, key, grant, alias, pool, and
+monthly budget commands produce versioned receipts suitable for interactive or non-interactive
+callers. There are no runtime seeds. A usable installation requires an organization, active
+identity, active virtual key, explicit identity-to-alias grant, active alias revision, immutable
+catalog snapshot, and a resolvable provider credential reference.
 
 Private serving authority lives in `ROOT/gateway/gateway.db`, including identities, keys, grants,
 provider connections and revisions, aliases and revisions, attempts, and usage. SQLite uses WAL
@@ -74,6 +74,22 @@ it. Opted-in refusal deltas are withheld only in a bounded in-memory buffer: a r
 result can advance to the next certified deployment, while mixed semantic output or buffer overflow
 commits and flushes the original route. Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
+
+Before each physical dispatch, the same immediate SQLite transaction reserves the request's
+conservative maximum integer micro-USD cost and inserts its attempt row. Applicable hard limits can
+cover the local team, one identity, one alias pool, and each provider deployment within that pool.
+An exhausted deployment allocation removes only that route from the current certified waterfall.
+If no route can fit the shared team, identity, or total pool allocation, the neutral protocol
+returns HTTP 429 with OpenAI `insufficient_quota` semantics before provider work. Any required
+unknown price makes that route ineligible while a hard limit applies.
+
+Settlement replaces the reservation with observed integer micro-USD usage. A dispatched failure,
+cancellation, or crash without trustworthy usage retains its conservative reservation because it
+may be billable. Retries and fallbacks therefore consume one allocation entry per physical attempt,
+while keyed replay creates no new reservation. A period is the immutable UTC bucket beginning at
+`YYYY-MM-01T00:00:00+00:00`; rollover selects a new bucket and never clears or rewrites an earlier
+month. Management and remaining-allocation reports are CLI surfaces only. There is no budgets
+dashboard.
 
 Each physical attempt records its own provider, model, usage, latency, terminal state, estimated
 cost attribution, and frozen credential-ownership billing source. Later catalog activation and

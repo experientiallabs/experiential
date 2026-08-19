@@ -11,7 +11,8 @@ on the exact release checkout.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses, bounded in-memory continuation and replay,
-  content-free SQLite accounting, and loopback-only health and usage views.
+  content-free SQLite accounting, monthly integer micro-USD enforcement, and loopback-only health
+  and usage views.
 - Both no-argument gateway launch and the retained `wmo run PROJECT [--ghost]` compatibility form
   are installed-wheel surfaces. Gateway startup is provider-idle and requires explicit authority.
 - The installed-wheel gateway lane uses real SQLite, a real subprocess listener, a real loopback
@@ -21,6 +22,11 @@ on the exact release checkout.
   attempts, provider-authentication fallback, refusal policy, post-commit no-switch, restart and
   replay behavior, revocation, cancellation, WAL mode, and mixed `host_managed`/
   `customer_managed` cost attribution that remains frozen across restart and catalog replacement.
+- Real-SQLite monthly budget evidence covers atomic concurrent reservations, provider-only route
+  exhaustion, shared identity quota errors, billable failure and crash retention, retry and
+  fallback accounting, keyed replay without duplicate spend, explicit schema migration, and UTC
+  month rollover without a reset job. The real loopback waterfall is configured through the
+  interactive-capable CLI and returns OpenAI `insufficient_quota` after shared exhaustion.
 - Deterministic source-level certification additionally covers selection-only project routing,
   authentication-circuit open/skip/recovery, concurrent multi-identity key revocation and alias
   revision activation, and atomic rollback of a failed legacy SQLite migration.
@@ -58,6 +64,9 @@ The machine-readable dated matrix is
 labeled as provider-byte incremental tool-argument streaming.
 
 ## Explicitly excluded
+
+- There is no budgets dashboard. Monthly allocation management and remaining-allocation reporting
+  are explicit interactive or non-interactive CLI operations.
 
 - No paid E2B or Harbor cloud smoke ran. The repository verifies the optional `bounded-close-v1`
   Harbor lifecycle and ledger with injected fakes, but makes no cloud cleanup, provider-quality, or

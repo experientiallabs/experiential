@@ -18,6 +18,7 @@ from wmo.runtime.gateway.sqlite.migrations import (
     _MIGRATION_3,
     _MIGRATION_4,
     _MIGRATION_5,
+    _MIGRATION_6,
     SCHEMA_VERSION,
     GatewaySchemaError,
     connect_database,
@@ -43,6 +44,15 @@ def test_initial_database_is_private_wal_with_foreign_keys(tmp_path: Path) -> No
         assert attempt_columns["attempt_ordinal"][3] == 1
         assert attempt_columns["billing_source"][3] == 1
         assert "customer_managed" in str(attempt_columns["billing_source"][4])
+        assert "budget_period_start" in attempt_columns
+        assert "budget_reserved_micro_usd" in attempt_columns
+        assert "budget_settled_micro_usd" in attempt_columns
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'gateway_monthly_budgets'"
+            ).fetchone()
+            is not None
+        )
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 321
@@ -383,6 +393,97 @@ def test_v6_migration_preserves_billing_and_adds_physical_ordinal(tmp_path: Path
             ).fetchone()
             is not None
         )
+    finally:
+        prior.close()
+
+
+def test_v7_migration_assigns_immutable_period_and_preserves_prior_cost(tmp_path: Path) -> None:
+    """A v6 attempt enters its original UTC month without a destructive reset."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for migration in (
+            _MIGRATION_1,
+            _MIGRATION_2,
+            _MIGRATION_3,
+            _MIGRATION_4,
+            _MIGRATION_5,
+            _MIGRATION_6,
+        ):
+            for statement in migration:
+                connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO gateway_requests (
+                request_id, organization_id, identity_id, key_id, alias_id,
+                alias_revision_id, api_surface, canonical_request_sha256,
+                accepted_at, deadline_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "request-one",
+                "org-one",
+                "identity-one",
+                "key-one",
+                "alias-one",
+                "revision-one",
+                "chat_completions",
+                "a" * 64,
+                "2026-08-31T23:59:00+00:00",
+                "2026-09-01T00:01:00+00:00",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO gateway_attempts (
+                attempt_id, request_id, organization_id, attempt_ordinal, route_depth,
+                deployment_id, provider, exact_model_id, pool_id, catalog_sha256,
+                billing_source, state, started_at, estimated_cost_micro_usd
+            ) VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, 'completed', ?, ?)
+            """,
+            (
+                "attempt-one",
+                "request-one",
+                "org-one",
+                "deployment-one",
+                "openai",
+                "exact-one",
+                "pool-one",
+                "b" * 64,
+                "host_managed",
+                "2026-08-31T23:59:30+00:00",
+                17,
+            ),
+        )
+        connection.execute("PRAGMA user_version = 6")
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    backup = initialize_database(path)
+
+    assert backup is not None
+    current = sqlite3.connect(path)
+    try:
+        row = current.execute(
+            """
+            SELECT budget_period_start, budget_reserved_micro_usd,
+                   budget_settled_micro_usd
+            FROM gateway_attempts WHERE attempt_id = 'attempt-one'
+            """
+        ).fetchone()
+        assert row == ("2026-08-01T00:00:00+00:00", None, 17)
+        assert current.execute("PRAGMA user_version").fetchone() == (7,)
+    finally:
+        current.close()
+    prior = sqlite3.connect(backup)
+    try:
+        columns = {str(row[1]) for row in prior.execute("PRAGMA table_info(gateway_attempts)")}
+        assert "budget_period_start" not in columns
+        assert prior.execute("PRAGMA user_version").fetchone() == (6,)
     finally:
         prior.close()
 

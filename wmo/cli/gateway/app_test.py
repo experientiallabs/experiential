@@ -37,6 +37,7 @@ from wmo.runtime.gateway.sqlite.store import OperationOutcomeUnknownError, SQLit
 EXPECTED_GATEWAY_COMMANDS = {"init", "status", "usage"}
 EXPECTED_GATEWAY_GROUPS = {
     "alias": {"create", "disable", "list", "update"},
+    "budget": {"list", "remaining", "set"},
     "grant": {"add", "list", "remove"},
     "identity": {"create", "disable", "list", "update"},
     "key": {"issue", "list", "revoke"},

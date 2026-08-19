@@ -10,6 +10,11 @@ from typing import cast
 
 from wmo.common.core.artifacts import stable_id
 from wmo.common.models.gateway_catalog import ExactModelDeployment
+from wmo.runtime.gateway.budgets import (
+    BudgetReservationRejected,
+    BudgetScopeKind,
+    maximum_attempt_cost_micro_usd,
+)
 from wmo.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -405,6 +410,23 @@ class GatewayExecutionStream:
                 return None
             except asyncio.CancelledError:
                 raise
+            except _BudgetRouteSkipped as exc:
+                if exc.scope_kind is not BudgetScopeKind.DEPLOYMENT:
+                    failure = _budget_quota_failure()
+                    if finalize_on_exhaustion:
+                        await self._finish_parent(failure)
+                    return failure
+                next_candidate = self._next_budget_candidate(current_candidate)
+                if next_candidate is None:
+                    failure = (
+                        _budget_quota_failure()
+                        if current_candidate == len(self._resolved) - 1
+                        else _all_routes_unavailable()
+                    )
+                    if finalize_on_exhaustion:
+                        await self._finish_parent(failure)
+                    return failure
+                current_candidate = next_candidate
             except _DispatchFailure as exc:
                 failure = exc.failure
                 self._health.failed(self._health_key(current_candidate), failure)
@@ -424,14 +446,18 @@ class GatewayExecutionStream:
         attempt_id: str | None = None
         try:
             self._deadline.attempt_timeout()
-            self._attempt_counts[route_index] += 1
-            self._total_attempts += 1
             attempt_id = self._ledger.start_attempt(
                 snapshot=self._route.snapshot,
                 deployment=binding.deployment,
-                attempt_ordinal=self._total_attempts - 1,
+                attempt_ordinal=self._total_attempts,
                 route_depth=route_index,
+                maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(
+                    self._request,
+                    binding.deployment,
+                ),
             )
+            self._attempt_counts[route_index] += 1
+            self._total_attempts += 1
             self._ledger.record_route_context(
                 attempt_id=attempt_id,
                 route_reason=self._route.route_reason,
@@ -453,6 +479,9 @@ class GatewayExecutionStream:
                 raise asyncio.CancelledError
             current.stream = stream
             current.iterator = stream.__aiter__()
+        except BudgetReservationRejected as exc:
+            self._health.release_probe(binding.health_key)
+            raise _BudgetRouteSkipped(exc.scope_kind) from exc
         except BaseException as exc:
             if attempt_id is None:
                 self._health.release_probe(binding.health_key)
@@ -552,6 +581,13 @@ class GatewayExecutionStream:
                 return route_index
         return None
 
+    def _next_budget_candidate(self, current: int) -> int | None:
+        """Advance past a route whose hard monthly allocation cannot admit this call."""
+        for route_index in range(current + 1, len(self._resolved)):
+            if self._health.claim(self._health_key(route_index)):
+                return route_index
+        return None
+
     def _require_current_index_for_failure(self) -> int:
         """Return the last dispatched route index, including failed opening attempts."""
         if self._current is not None and not self._current.settled:
@@ -639,6 +675,15 @@ class _DispatchFailure(Exception):
         self.attempt_id = attempt_id
         self.failure = failure
         self.cancelled = cancelled
+
+
+class _BudgetRouteSkipped(Exception):
+    """A physical route could not reserve beneath its applicable monthly limits."""
+
+    def __init__(self, scope_kind: BudgetScopeKind) -> None:
+        """Retain only the content-free scope classification for fallback policy."""
+        self.scope_kind = scope_kind
+        super().__init__(scope_kind.value)
 
 
 class GatewayExecutor:
@@ -831,4 +876,12 @@ def _all_routes_unavailable() -> GatewayFailure:
     return GatewayFailure(
         failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
         safe_message="all exact-model deployments are unavailable",
+    )
+
+
+def _budget_quota_failure() -> GatewayFailure:
+    """Return the sanitized quota failure after no route can reserve its maximum cost."""
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.QUOTA_EXCEEDED,
+        safe_message="monthly gateway allocation is exhausted",
     )

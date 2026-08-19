@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 
 from wmo.cli.gateway.alias import alias_app
+from wmo.cli.gateway.budget import budget_app
 from wmo.cli.gateway.key_output import (
     KeyOutputOutcomeUnknownError,
     KeyOutputRecoveryError,
@@ -35,6 +36,7 @@ identity_app = typer.Typer(help="Manage gateway caller identities.", no_args_is_
 key_app = typer.Typer(help="Issue and revoke virtual API keys.", no_args_is_help=True)
 grant_app = typer.Typer(help="Manage deny-by-default identity grants.", no_args_is_help=True)
 gateway_app.add_typer(provider_app, name="provider")
+gateway_app.add_typer(budget_app, name="budget")
 gateway_app.add_typer(identity_app, name="identity")
 gateway_app.add_typer(key_app, name="key")
 gateway_app.add_typer(alias_app, name="alias")

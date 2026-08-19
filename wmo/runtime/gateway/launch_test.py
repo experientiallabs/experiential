@@ -8,6 +8,7 @@ import socket
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -185,6 +186,8 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
     monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret-canary")
     runner = CliRunner()
     base_url = f"http://127.0.0.1:{provider_port}/v1"
+    budget_period = datetime.now(UTC).strftime("%Y-%m")
+    gateway_client: TestClient | None = None
     try:
         commands = (
             ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
@@ -243,6 +246,12 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
                     f"{connection_name}:provider-model-{deployment_alias}",
                     "--exact-model",
                     "model-revision-exact",
+                    "--maximum-output-tokens",
+                    "16",
+                    "--input-price",
+                    "1000000",
+                    "--output-price",
+                    "2000000",
                     "--root",
                     str(tmp_path),
                     "--non-interactive",
@@ -329,36 +338,218 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
         )
         assert issued.exit_code == 0, issued.output
         raw_key = json.loads(issued.stdout)["data"]["raw_key"]
+        for budget_arguments in (
+            ["--scope", "team"],
+            ["--scope", "identity", "--identity", "default"],
+            ["--scope", "pool", "--alias", "coding", "--pool", "coding"],
+            [
+                "--scope",
+                "deployment",
+                "--alias",
+                "coding",
+                "--pool",
+                "coding",
+                "--deployment",
+                "primary",
+            ],
+            [
+                "--scope",
+                "deployment",
+                "--alias",
+                "coding",
+                "--pool",
+                "coding",
+                "--deployment",
+                "secondary",
+            ],
+        ):
+            configured = runner.invoke(
+                app,
+                [
+                    "config",
+                    "gateway",
+                    "budget",
+                    "set",
+                    "--period",
+                    budget_period,
+                    *budget_arguments,
+                    "--limit-micro-usd",
+                    "1000000",
+                    "--root",
+                    str(tmp_path),
+                    "--non-interactive",
+                    "--json",
+                ],
+            )
+            assert configured.exit_code == 0, configured.output
 
         runtime = load_local_gateway(tmp_path, graceful_timeout_seconds=2)
-        with TestClient(runtime.app) as client:
-            response = client.post(
-                "/v1/chat/completions",
-                headers={"Authorization": f"Bearer {raw_key}"},
-                json={
-                    "model": "coding",
-                    "messages": [{"role": "user", "content": "waterfall-canary"}],
-                },
-            )
+        gateway_client = TestClient(runtime.app)
+        gateway_client.__enter__()
+        first_response = gateway_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": "waterfall-canary"}],
+            },
+        )
 
-        assert response.status_code == 200, response.text
-        assert response.json()["choices"][0]["message"]["content"] == "hello world"
-        assert response.headers["x-gateway-route-depth"] == "1"
+        assert first_response.status_code == 200, first_response.text
+        assert first_response.json()["choices"][0]["message"]["content"] == "hello world"
+        assert first_response.headers["x-gateway-route-depth"] == "1"
         assert _LoopbackProvider.calls == 3
+        remaining_result = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "budget",
+                "remaining",
+                "--period",
+                budget_period,
+                "--root",
+                str(tmp_path),
+                "--json",
+            ],
+        )
+        assert remaining_result.exit_code == 0, remaining_result.output
+        budget_rows = json.loads(remaining_result.stdout)["items"]
+        primary_budget = next(
+            row for row in budget_rows if row["budget"]["scope"].get("deployment_id") == "primary"
+        )
+        assert primary_budget["charged_micro_usd"] > 0
+        exhausted_primary = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "budget",
+                "set",
+                "--period",
+                budget_period,
+                "--scope",
+                "deployment",
+                "--alias",
+                "coding",
+                "--pool",
+                "coding",
+                "--deployment",
+                "primary",
+                "--limit-micro-usd",
+                str(primary_budget["charged_micro_usd"]),
+                "--replace",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        )
+        assert exhausted_primary.exit_code == 0, exhausted_primary.output
+        second_response = gateway_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": "budget-fallback-canary"}],
+            },
+        )
+        assert second_response.status_code == 200, second_response.text
+        assert second_response.headers["x-gateway-route-depth"] == "1"
+        assert _LoopbackProvider.calls == 4
+
+        replay_headers = {
+            "Authorization": f"Bearer {raw_key}",
+            "Idempotency-Key": "budget-replay-one",
+        }
+        replay_payload = {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "budget-replay-canary"}],
+        }
+        original = gateway_client.post(
+            "/v1/chat/completions",
+            headers=replay_headers,
+            json=replay_payload,
+        )
+        replay = gateway_client.post(
+            "/v1/chat/completions",
+            headers=replay_headers,
+            json=replay_payload,
+        )
+        assert original.status_code == 200, original.text
+        assert replay.status_code == 200, replay.text
+        assert replay.json() == original.json()
+        assert _LoopbackProvider.calls == 5
+
+        refreshed = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "budget",
+                "remaining",
+                "--period",
+                budget_period,
+                "--root",
+                str(tmp_path),
+                "--json",
+            ],
+        )
+        identity_budget = next(
+            row
+            for row in json.loads(refreshed.stdout)["items"]
+            if row["budget"]["scope"]["kind"] == "identity"
+        )
+        exhausted_identity = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "budget",
+                "set",
+                "--period",
+                budget_period,
+                "--scope",
+                "identity",
+                "--identity",
+                "default",
+                "--limit-micro-usd",
+                str(identity_budget["charged_micro_usd"]),
+                "--replace",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        )
+        assert exhausted_identity.exit_code == 0, exhausted_identity.output
+        quota_response = gateway_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={"model": "coding", "input": "quota-canary"},
+        )
+        assert quota_response.status_code == 429
+        assert quota_response.json()["error"]["code"] == "insufficient_quota"
+        assert quota_response.json()["error"]["type"] == "insufficient_quota"
+        assert _LoopbackProvider.calls == 5
         connection = sqlite3.connect(tmp_path / "gateway" / "gateway.db")
         try:
             attempts = connection.execute(
-                "SELECT deployment_id, attempt_ordinal, route_depth, state "
-                "FROM gateway_attempts ORDER BY attempt_ordinal"
+                "SELECT deployment_id, route_depth, state FROM gateway_attempts "
+                "ORDER BY started_at, attempt_id"
             ).fetchall()
         finally:
             connection.close()
         assert attempts == [
-            ("primary", 0, 0, "failed"),
-            ("primary", 1, 0, "failed"),
-            ("secondary", 2, 1, "completed"),
+            ("primary", 0, "failed"),
+            ("primary", 0, "failed"),
+            ("secondary", 1, "completed"),
+            ("secondary", 1, "completed"),
+            ("secondary", 1, "completed"),
         ]
     finally:
+        if gateway_client is not None:
+            gateway_client.__exit__(None, None, None)
         provider.shutdown()
         provider.server_close()
         provider_thread.join(timeout=5)

@@ -47,14 +47,16 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
 REQUIRED_WHEEL_MODULES = frozenset(
     {
         "wmo/cli/gateway/app.py",
+        "wmo/cli/gateway/budget.py",
         "wmo/common/judging/calibration.py",
         "wmo/common/judging/labels.py",
         "wmo/common/judging/review.py",
         "wmo/common/models/model.py",
         "wmo/runtime/environments/local.py",
         "wmo/runtime/gateway/lifecycle.py",
+        "wmo/runtime/gateway/budgets.py",
         "wmo/runtime/gateway/ledger.py",
-        "wmo/runtime/gateway/openai/requests.py",
+        "wmo/runtime/openai_protocol/requests.py",
         "wmo/runtime/gateway/provider_certification.py",
         "wmo/runtime/gateway/service.py",
         "wmo/runtime/gateway/usage.py",

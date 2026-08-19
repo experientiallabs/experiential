@@ -14,7 +14,13 @@ class OpenAIErrorDetail(ContractModel):
     """One public OpenAI error without provider or credential details."""
 
     message: str = Field(min_length=1, max_length=2_048)
-    type: Literal["invalid_request_error", "authentication_error", "permission_error", "api_error"]
+    type: Literal[
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "insufficient_quota",
+        "api_error",
+    ]
     param: str | None = Field(default=None, max_length=512)
     code: str = Field(min_length=1, max_length=128)
 
@@ -35,7 +41,11 @@ class OpenAIProtocolError(ValueError):
         code: str,
         message: str,
         error_type: Literal[
-            "invalid_request_error", "authentication_error", "permission_error", "api_error"
+            "invalid_request_error",
+            "authentication_error",
+            "permission_error",
+            "insufficient_quota",
+            "api_error",
         ] = "invalid_request_error",
         param: str | None = None,
     ) -> None:
@@ -122,7 +132,11 @@ def public_failure_error(
             int,
             str,
             Literal[
-                "invalid_request_error", "authentication_error", "permission_error", "api_error"
+                "invalid_request_error",
+                "authentication_error",
+                "permission_error",
+                "insufficient_quota",
+                "api_error",
             ],
         ],
     ] = {
@@ -134,6 +148,7 @@ def public_failure_error(
         ),
         GatewayFailureClass.AUTHENTICATION: (401, "invalid_key", "authentication_error"),
         GatewayFailureClass.AUTHORIZATION: (403, "model_not_granted", "permission_error"),
+        GatewayFailureClass.QUOTA_EXCEEDED: (429, "insufficient_quota", "insufficient_quota"),
         GatewayFailureClass.THROTTLED: (429, "unavailable_route", "api_error"),
         GatewayFailureClass.TIMEOUT: (504, "deadline_exceeded", "api_error"),
         GatewayFailureClass.CANCELLED: (499, "request_cancelled", "api_error"),

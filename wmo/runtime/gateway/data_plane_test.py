@@ -135,9 +135,10 @@ class _Ledger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
+        maximum_cost_micro_usd: int | None = None,
     ) -> str:
         """Capture dispatch identity and return a deterministic attempt ID."""
-        del deployment, attempt_ordinal, route_depth
+        del deployment, attempt_ordinal, route_depth, maximum_cost_micro_usd
         self.started.append(snapshot)
         return f"attempt-{len(self.started)}"
 

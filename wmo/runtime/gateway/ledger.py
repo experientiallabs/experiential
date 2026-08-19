@@ -12,6 +12,13 @@ from pathlib import Path
 from wmo.common.core.artifacts import ContractModel
 from wmo.common.models.gateway_catalog import BillingSource, ExactModelDeployment
 from wmo.runtime.gateway.auth import utc_text
+from wmo.runtime.gateway.budgets import (
+    MAXIMUM_MICRO_USD,
+    budget_period_start,
+    current_budget_period,
+    require_attempt_budget,
+    settle_attempt_budgets,
+)
 from wmo.runtime.gateway.contracts import (
     AttemptId,
     AuthorizationSnapshot,
@@ -193,6 +200,7 @@ class SQLiteAttemptLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
+        maximum_cost_micro_usd: int | None = None,
     ) -> AttemptId:
         """Durably mark a provider dispatch before starting network work.
 
@@ -201,6 +209,7 @@ class SQLiteAttemptLedger:
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
+            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
 
         Returns:
             Stable new attempt ID.
@@ -209,12 +218,19 @@ class SQLiteAttemptLedger:
             raise GatewayLedgerError("attempt deployment is absent from the execution snapshot")
         if deployment.exact_model_id != snapshot.exact_model_id:
             raise GatewayLedgerError("attempt deployment changes the selected exact model")
+        if maximum_cost_micro_usd is not None and not (
+            0 <= maximum_cost_micro_usd <= MAXIMUM_MICRO_USD
+        ):
+            raise GatewayLedgerError("maximum attempt cost must fit a nonnegative SQLite integer")
         attempt_id = f"attempt-{uuid.uuid4().hex}"
         prices = deployment.gateway.prices
+        now = self._clock.now()
+        period_start = budget_period_start(current_budget_period(now))
         with self._transaction() as connection:
             request = connection.execute(
                 """
-                SELECT organization_id, terminal_state FROM gateway_requests
+                SELECT organization_id, identity_id, alias_id, terminal_state
+                FROM gateway_requests
                 WHERE request_id = ?
                 """,
                 (snapshot.authorization.request_id,),
@@ -233,9 +249,9 @@ class SQLiteAttemptLedger:
                     billing_source,
                     pricing_source, pricing_effective_at,
                     input_rate, cached_input_rate, output_rate, reasoning_rate,
-                    state, started_at
+                    state, started_at, budget_period_start, budget_reserved_micro_usd
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?
                 )
                 """,
                 (
@@ -260,8 +276,21 @@ class SQLiteAttemptLedger:
                     prices.cached_input_micro_usd_per_million_tokens,
                     prices.output_micro_usd_per_million_tokens,
                     prices.reasoning_micro_usd_per_million_tokens,
-                    utc_text(self._clock.now()),
+                    utc_text(now),
+                    period_start,
+                    maximum_cost_micro_usd,
                 ),
+            )
+            require_attempt_budget(
+                connection,
+                organization_id=snapshot.authorization.organization_id,
+                identity_id=str(request["identity_id"]),
+                alias_id=str(request["alias_id"]),
+                pool_id=snapshot.pool_id,
+                deployment_id=deployment.deployment_id,
+                attempt_id=attempt_id,
+                period_start=period_start,
+                maximum_cost_micro_usd=maximum_cost_micro_usd,
             )
         return attempt_id
 
@@ -314,7 +343,7 @@ class SQLiteAttemptLedger:
             row = connection.execute(
                 """
                 SELECT request_id, state, input_rate, cached_input_rate,
-                       output_rate, reasoning_rate
+                       output_rate, reasoning_rate, budget_reserved_micro_usd
                 FROM gateway_attempts WHERE attempt_id = ?
                 """,
                 (attempt_id,),
@@ -333,17 +362,24 @@ class SQLiteAttemptLedger:
                 output_rate=_optional_int(row["output_rate"]),
                 reasoning_rate=_optional_int(row["reasoning_rate"]),
             )
+            budget_settlement = (
+                cost if cost is not None else _optional_int(row["budget_reserved_micro_usd"])
+            )
+            if budget_settlement is not None and budget_settlement > MAXIMUM_MICRO_USD:
+                raise GatewayLedgerError("attempt cost exceeds SQLite integer capacity")
+            terminal_at = utc_text(self._clock.now())
             connection.execute(
                 """
                 UPDATE gateway_attempts
                 SET state = ?, terminal_at = ?, failure_class = ?,
                     input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
-                    reasoning_tokens = ?, usage_source = ?, estimated_cost_micro_usd = ?
+                    reasoning_tokens = ?, usage_source = ?, estimated_cost_micro_usd = ?,
+                    budget_settled_micro_usd = ?
                 WHERE attempt_id = ? AND state = 'dispatched'
                 """,
                 (
                     state,
-                    utc_text(self._clock.now()),
+                    terminal_at,
                     normalized_failure,
                     None if usage is None else usage.input_tokens,
                     None if usage is None else usage.cached_input_tokens,
@@ -351,8 +387,14 @@ class SQLiteAttemptLedger:
                     None if usage is None else usage.reasoning_tokens,
                     "unknown" if usage is None else "observed",
                     cost,
+                    budget_settlement,
                     attempt_id,
                 ),
+            )
+            settle_attempt_budgets(
+                connection,
+                attempt_id=attempt_id,
+                settled_micro_usd=budget_settlement,
             )
             if finalize_request and state in {"completed", "failed", "cancelled", "incomplete"}:
                 connection.execute(
@@ -360,7 +402,7 @@ class SQLiteAttemptLedger:
                     UPDATE gateway_requests SET terminal_state = ?, terminal_at = ?
                     WHERE request_id = ? AND terminal_state IS NULL
                     """,
-                    (state, utc_text(self._clock.now()), str(row["request_id"])),
+                    (state, terminal_at, str(row["request_id"])),
                 )
 
     def finish_request(

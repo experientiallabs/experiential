@@ -241,6 +241,7 @@ class GatewayFailureClass(StrEnum):
     UNSUPPORTED_CAPABILITY = "unsupported_capability"
     AUTHENTICATION = "authentication"
     AUTHORIZATION = "authorization"
+    QUOTA_EXCEEDED = "quota_exceeded"
     THROTTLED = "throttled"
     TRANSPORT = "transport"
     TIMEOUT = "timeout"

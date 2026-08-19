@@ -9,7 +9,7 @@ The root surface is deliberately small:
 | `wmo optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `wmo run --root ROOT [--check]` | Validate or start the initialized authenticated multi-alias gateway on loopback. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `wmo run PROJECT --root ROOT [--ghost]` | Activate a frozen policy as one project-backed alias and launch the normal gateway. | The same authenticated OpenAI endpoint and SQLite accounting as no-argument `wmo run`. |
-| `wmo config gateway ...` | Author provider references, identities, virtual keys, grants, aliases, certified exact-model pools, status, and usage without optimizer roles. | Private SQLite authority, immutable catalog snapshots, and versioned receipts. |
+| `wmo config gateway ...` | Author provider references, identities, virtual keys, grants, aliases, certified exact-model pools, monthly limits, status, and usage without optimizer roles. | Private SQLite authority, immutable catalog snapshots, and versioned receipts. |
 | `wmo config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. | Local `.wmo/models.toml`. |
 | `wmo config budget [USD] --root ROOT` | Read or set the maximum conservative estimate allowed for one paid command. | Local `.wmo/settings.toml`. |
 | `wmo config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.wmo/settings.toml`. |
@@ -69,6 +69,29 @@ value is frozen on each physical attempt before dispatch and remains unchanged a
 replacement and restart. Usage JSON and HTML expose content-free physical-attempt buckets by source;
 they do not partition logical request counts. Legacy schema-v1/v2 attempts migrate explicitly as
 `customer_managed`.
+
+Monthly serving limits are separate from the one-shot `wmo config budget` command ceiling. They use
+integer micro-USD and explicit immutable UTC periods. The local team, an identity, a total alias
+pool, and each provider deployment can have overlapping hard limits:
+
+```console
+wmo config gateway budget set --period 2026-08 --scope identity \
+  --identity TEAM_MEMBER --limit-micro-usd 20000000000 \
+  --root ROOT --non-interactive --json
+wmo config gateway budget set --period 2026-08 --scope deployment \
+  --alias PUBLIC_ALIAS --pool EXACT_POOL --deployment AZURE_DEPLOYMENT \
+  --limit-micro-usd 10000000000 --root ROOT --non-interactive --json
+wmo config gateway budget set --period 2026-08 --scope deployment \
+  --alias PUBLIC_ALIAS --pool EXACT_POOL --deployment BEDROCK_DEPLOYMENT \
+  --limit-micro-usd 10000000000 --root ROOT --non-interactive --json
+wmo config gateway budget remaining --period 2026-08 --root ROOT --json
+```
+
+Omit required values in an interactive terminal to receive prompts. Pass `--non-interactive` to
+fail immediately instead. `--replace` changes a configured limit without deleting the month or its
+spend. Exhausting one deployment continues to the next certified exact-model route. Exhausting all
+applicable shared capacity returns OpenAI `insufficient_quota`. Unknown required pricing fails
+closed under a hard limit. There is no budget reset job and no budgets dashboard.
 
 Official OpenAI SDK clients use the issued virtual key and loopback base URL:
 

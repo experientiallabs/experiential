@@ -65,8 +65,9 @@ class AttemptLedger(Protocol):
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
+        maximum_cost_micro_usd: int | None = None,
     ) -> AttemptId:
-        """Persist one accepted attempt before provider dispatch."""
+        """Atomically reserve cost and persist one attempt before provider dispatch."""
         ...
 
     def finish_attempt(

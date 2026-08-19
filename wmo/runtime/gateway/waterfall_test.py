@@ -21,6 +21,7 @@ from wmo.common.models.gateway_catalog import (
     ExactModelPool,
     NormalizedGatewayCatalog,
 )
+from wmo.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from wmo.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -237,6 +238,74 @@ def test_throttle_window_recovers_without_opening_the_failure_circuit() -> None:
     assert not health.claim(key)
     now[0] += 6
     assert health.claim(key)
+
+
+def test_exhausted_provider_allocation_skips_only_that_certified_route() -> None:
+    """A deployment allocation rejection advances without dispatching or opening health."""
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    first_provider = _ScriptedProvider([_completed_stream("must not dispatch")])
+    second_provider = _ScriptedProvider([_completed_stream("secondary")])
+    ledger = _WaterfallLedger(rejected_deployments={"route-a"})
+    executor = _executor(
+        (first, second),
+        {first.source_alias: first_provider, second.source_alias: second_provider},
+        ledger,
+    )
+
+    async def scenario() -> tuple[str, int]:
+        """Consume the affordable fallback and return its content and depth."""
+        stream = await executor.start(route=_route((first, second)), request=_request())
+        events = [event async for event in stream]
+        return "".join(event.text_delta or "" for event in events), stream.route_depth
+
+    assert asyncio.run(scenario()) == ("secondary", 1)
+    assert first_provider.idempotency_keys == []
+    assert len(second_provider.idempotency_keys) == 1
+    assert ledger.started == [("route-b", 0, 1)]
+
+
+def test_all_budget_ineligible_routes_return_quota_without_dispatch() -> None:
+    """Shared exhaustion owns the parent terminal and surfaces one quota failure."""
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    providers = {
+        first.source_alias: _ScriptedProvider([_completed_stream("first")]),
+        second.source_alias: _ScriptedProvider([_completed_stream("second")]),
+    }
+    ledger = _WaterfallLedger(rejected_deployments={"route-a", "route-b"})
+    executor = _executor((first, second), providers, ledger)
+
+    with pytest.raises(GatewayExecutionError) as error:
+        asyncio.run(executor.start(route=_route((first, second)), request=_request()))
+
+    assert error.value.failure.failure_class is GatewayFailureClass.QUOTA_EXCEEDED
+    assert error.value.request_finalized
+    assert all(provider.idempotency_keys == [] for provider in providers.values())
+    assert len(ledger.parent_finishes) == 1
+    assert ledger.parent_finishes[0].failure_class is GatewayFailureClass.QUOTA_EXCEEDED
+
+
+def test_shared_budget_exhaustion_returns_quota_without_probing_later_routes() -> None:
+    """A team, identity, or pool rejection applies to the whole logical waterfall."""
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    providers = {
+        first.source_alias: _ScriptedProvider([_completed_stream("first")]),
+        second.source_alias: _ScriptedProvider([_completed_stream("second")]),
+    }
+    ledger = _WaterfallLedger(
+        rejected_deployments={"route-a", "route-b"},
+        rejected_scope=BudgetScopeKind.IDENTITY,
+    )
+    executor = _executor((first, second), providers, ledger)
+
+    with pytest.raises(GatewayExecutionError) as error:
+        asyncio.run(executor.start(route=_route((first, second)), request=_request()))
+
+    assert error.value.failure.failure_class is GatewayFailureClass.QUOTA_EXCEEDED
+    assert ledger.budget_checks == ["route-a"]
+    assert all(provider.idempotency_keys == [] for provider in providers.values())
 
 
 def test_same_deployment_retry_reuses_identity_and_records_every_dispatch() -> None:
@@ -904,12 +973,20 @@ class _WaterfallRuntimeCatalog:
 class _WaterfallLedger:
     """Capture physical and parent terminal ownership without request content."""
 
-    def __init__(self) -> None:
-        """Initialize empty ordered accounting records."""
+    def __init__(
+        self,
+        *,
+        rejected_deployments: set[str] | None = None,
+        rejected_scope: BudgetScopeKind = BudgetScopeKind.DEPLOYMENT,
+    ) -> None:
+        """Initialize accounting records and optional predispatch budget rejections."""
         self.started: list[tuple[str, int, int]] = []
         self.finished: list[tuple[str, GatewayFailure | None, bool]] = []
         self.finished_events: list[GatewayEvent | None] = []
         self.parent_finishes: list[GatewayFailure] = []
+        self.rejected_deployments = rejected_deployments or set()
+        self.rejected_scope = rejected_scope
+        self.budget_checks: list[str] = []
 
     def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Accept a parent request when a service-level test requires it."""
@@ -922,9 +999,17 @@ class _WaterfallLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
+        maximum_cost_micro_usd: int | None = None,
     ) -> str:
         """Record one durable physical dispatch before provider work."""
+        del maximum_cost_micro_usd
         assert deployment.deployment_id in snapshot.deployment_ids
+        self.budget_checks.append(deployment.deployment_id)
+        if deployment.deployment_id in self.rejected_deployments:
+            raise BudgetReservationRejected(
+                scope_kind=self.rejected_scope,
+                reason=f"monthly {self.rejected_scope.value} allocation is exhausted",
+            )
         self.started.append((deployment.deployment_id, attempt_ordinal, route_depth))
         return f"attempt-{len(self.started)}"
 
