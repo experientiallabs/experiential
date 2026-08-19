@@ -60,9 +60,16 @@ from wmo.optimize.router.composition import (
     RouterWorkflowServices,
     compose_router,
 )
+from wmo.optimize.router.errors import (
+    JudgeDispatchExhaustedError,
+    JudgeTranscriptAdmissionError,
+)
 from wmo.optimize.router.evaluation.spend import observed_rollout_spend
 from wmo.optimize.router.fit.workflow_test import _persist_embeddings, _persist_pricing
-from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
+from wmo.optimize.router.judgment_budget import (
+    JudgmentDispatchReceipt,
+    JudgmentExclusionRecord,
+)
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.runtime_test import _Client, _request
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
@@ -414,6 +421,7 @@ class _Judge:
         self.calls = 0
         self.log: list[tuple[str, bool]] = []
         self.fail_on_call: int | None = None
+        self.raise_after_lock: list[Exception] = []
 
     def judge_persisted(
         self,
@@ -432,6 +440,8 @@ class _Judge:
             artifact_id.startswith("router-policy-lock-")
             for artifact_id in store.artifacts.list_ids()
         )
+        if locked and self.raise_after_lock:
+            raise self.raise_after_lock.pop(0)
         self.log.append((rollout_value.cell_id or "observed", locked))
         rollout = store.artifacts.read(rollout_artifact_id)
         rubric = store.artifacts.read(rubric_artifact_id)
@@ -1235,3 +1245,109 @@ def test_rerun_completes_a_reserved_judgment_dispatch_left_without_a_judgment(
     assert len(receipts) == len(scored_cells)
     assert len(_artifact_ids("judgment")) == len(scored_cells)
     assert second_judge.calls == len(scored_cells)
+
+
+def test_per_cell_judge_failures_exclude_cells_durably_and_replay_without_redispatch(
+    tmp_path: Path,
+) -> None:
+    """Over-ceiling and exhausted-retry judge failures exclude single cells, never the run.
+
+    Args:
+        tmp_path: Isolated project root for composed router artifacts.
+    """
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
+    _bind_completed_build(project, normalized, revision="test-revision")
+    simulator = _SimulatorFactory()
+    judge = _Judge()
+    judge.raise_after_lock = [
+        JudgeTranscriptAdmissionError("judge request exceeds its reserved input-token ceiling"),
+        JudgeDispatchExhaustedError(
+            "OpenAI Responses output has no text or tool call",
+            conservative_cost_usd=0.25,
+        ),
+    ]
+    services = RouterWorkflowServices(
+        review_supplier=_ReviewSupplier(),
+        setup_supplier=_SetupSupplier(),
+        simulator_factory=simulator,
+        judge=judge,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _Catalog(
+                {
+                    "candidate-a": _snapshot("candidate-a"),
+                    "embedder": _snapshot("embedder"),
+                },
+                _Client(),
+            ),
+        ),
+    )
+    budget = RouterCompositionBudget(
+        maximum_simulation_cost_usd=10.0,
+        maximum_judgments=100,
+    )
+
+    first = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+
+    def _artifact_ids(artifact_type: str) -> tuple[str, ...]:
+        """Return persisted artifact IDs of one exact manifest type.
+
+        Args:
+            artifact_type: Exact immutable manifest artifact type.
+
+        Returns:
+            Matching persisted artifact identifiers.
+        """
+        return tuple(
+            artifact_id
+            for artifact_id in project.artifacts.list_ids()
+            if project.artifacts.read(artifact_id).manifest.artifact_type == artifact_type
+        )
+
+    exclusions = tuple(
+        JudgmentExclusionRecord.model_validate_json(
+            project.artifacts.read_bytes(artifact_id, "exclusion.json")
+        )
+        for artifact_id in _artifact_ids("judgment-exclusion")
+    )
+    assert {record.reason for record in exclusions} == {
+        "transcript_exceeds_judge_admission_ceiling",
+        "judge_dispatch_failed",
+    }
+    assert {record.cell_id for record in exclusions} <= {
+        cell.cell_id for cell in first.plan.cells if cell.purpose == "held_out"
+    }
+    costs_by_reason = {record.reason: record.conservative_cost_usd for record in exclusions}
+    assert costs_by_reason["transcript_exceeds_judge_admission_ceiling"] == 0.0
+    assert costs_by_reason["judge_dispatch_failed"] == 0.25
+    scored_cells = tuple(cell for cell in first.plan.cells if cell.purpose in {"fit", "held_out"})
+    assert len(_artifact_ids("judgment")) == len(scored_cells) - 2
+    assert len(_artifact_ids("judgment-dispatch")) == len(scored_cells)
+    excluded_cells = {record.cell_id for record in exclusions}
+    judged_cells = {cell_id for cell_id, _locked in judge.log}
+    assert excluded_cells.isdisjoint(judged_cells)
+
+    dispatched = judge.calls
+    second = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=datetime(2026, 8, 14, tzinfo=UTC),
+        code_revision="test-revision",
+    )
+
+    assert second.optimization == first.optimization
+    assert judge.calls == dispatched
+    assert len(_artifact_ids("judgment-exclusion")) == len(exclusions)

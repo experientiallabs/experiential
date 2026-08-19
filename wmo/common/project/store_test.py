@@ -8,14 +8,20 @@ from pathlib import Path
 import pytest
 
 import wmo.common.project.store as project_store_module
-from wmo.common.core.artifacts import ArtifactEnvelope, canonical_json_bytes
+from wmo.common.core.artifacts import (
+    ArtifactEnvelope,
+    SourceIdentity,
+    canonical_json_bytes,
+)
 from wmo.common.project import (
     ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
     ArtifactStoreError,
     ProjectConfig,
+    ProjectProviderFreeStage,
     ProjectStore,
     ProjectStoreError,
+    ProjectTracePreparationSettings,
     artifact_input,
 )
 
@@ -29,9 +35,161 @@ def _envelope() -> ArtifactEnvelope:
 
 
 def _store(tmp_path: Path) -> ProjectStore:
+    """Return one initialized ordinary Project store."""
     store = ProjectStore(tmp_path / ".wmo", "support-project")
     store.initialize(ProjectConfig(project_id="support-project"))
     return store
+
+
+def _provider_free_store(tmp_path: Path) -> ProjectStore:
+    """Return one initialized trace-first Project store."""
+    store = ProjectStore(tmp_path / ".wmo", "support-project")
+    store.initialize(
+        ProjectConfig(
+            project_id="support-project",
+            trace_preparation=ProjectTracePreparationSettings(source_kind="chat-json"),
+            retrieval=None,
+            budgets=None,
+        )
+    )
+    return store
+
+
+def _write_provider_free_stage(
+    store: ProjectStore,
+    *,
+    suffix: str,
+    source_id: str = "platform-source:upload",
+    source_sha256: str | None = "a" * 64,
+    trace_revision: str = "producer-revision",
+    task_revision: str = "producer-revision",
+    bind_trace: bool = True,
+) -> ProjectProviderFreeStage:
+    """Write one candidate trace/task graph and return its exact pointer stage.
+
+    Args:
+        store: Project store receiving the immutable fixtures.
+        suffix: Safe suffix distinguishing fixture artifact IDs.
+        source_id: Manifest-owned durable source label.
+        source_sha256: Optional source byte digest.
+        trace_revision: Trace manifest producer revision.
+        task_revision: Task manifest producer revision.
+        bind_trace: Whether the task manifest binds the exact trace input.
+
+    Returns:
+        Minimal exact trace and task pointer graph.
+    """
+    trace_manifest = store.artifacts.write_json(
+        artifact_id=f"trace-stage-{suffix}",
+        artifact_type="trace-dataset",
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            code_revision=trace_revision,
+            source=SourceIdentity(
+                kind="file",
+                source_id=source_id,
+                sha256=source_sha256,
+            ),
+        ),
+        files={"trace-dataset.json": {"dataset_id": f"trace-stage-{suffix}"}},
+    )
+    trace_input = artifact_input(trace_manifest)
+    task_manifest = store.artifacts.write_json(
+        artifact_id=f"task-stage-{suffix}",
+        artifact_type="task-set",
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            inputs=(trace_input,) if bind_trace else (),
+            code_revision=task_revision,
+        ),
+        files={"task-set.json": {"task_set_id": f"task-stage-{suffix}"}},
+    )
+    return ProjectProviderFreeStage(
+        trace_dataset=trace_input,
+        task_set=artifact_input(task_manifest),
+    )
+
+
+def test_provider_free_stage_binding_is_verified_write_once_and_replayable(
+    tmp_path: Path,
+) -> None:
+    """ProjectStore owns exact verification, idempotent replay, and conflicting rejection."""
+    store = _provider_free_store(tmp_path)
+    selected = _write_provider_free_stage(store, suffix="selected")
+
+    first = store.bind_provider_free_stage(selected)
+    replay = store.bind_provider_free_stage(selected)
+
+    assert first.provider_free_stage == selected
+    assert replay == first
+    assert store.load_project().provider_free_stage == selected
+    conflicting = _write_provider_free_stage(store, suffix="conflicting")
+    with pytest.raises(ProjectStoreError, match="different provider-free stage"):
+        store.bind_provider_free_stage(conflicting)
+    assert store.load_project().provider_free_stage == selected
+
+
+@pytest.mark.parametrize(
+    (
+        "source_id",
+        "source_sha256",
+        "trace_revision",
+        "task_revision",
+        "bind_trace",
+        "message",
+    ),
+    [
+        ("tmp/upload.json", "a" * 64, "revision", "revision", True, "worker-local"),
+        ("C:upload.json", "a" * 64, "revision", "revision", True, "worker-local"),
+        ("platform-source:upload", None, "revision", "revision", True, "byte digest"),
+        ("platform-source:upload", "a" * 64, "trace", "task", True, "revision"),
+        (
+            "platform-source:upload",
+            "a" * 64,
+            "revision",
+            "revision",
+            False,
+            "does not bind",
+        ),
+    ],
+)
+def test_provider_free_stage_binding_derives_and_validates_manifest_provenance(
+    source_id: str,
+    source_sha256: str | None,
+    trace_revision: str,
+    task_revision: str,
+    bind_trace: bool,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    """Source, revision, and task lineage are verified from manifests, not stage duplicates.
+
+    Args:
+        source_id: Candidate manifest-owned source label.
+        source_sha256: Candidate manifest-owned source digest.
+        trace_revision: Trace manifest producer revision.
+        task_revision: Task manifest producer revision.
+        bind_trace: Whether the task names the exact trace manifest input.
+        message: Expected verification failure fragment.
+        tmp_path: Isolated Project root.
+    """
+    store = _provider_free_store(tmp_path)
+    stage = _write_provider_free_stage(
+        store,
+        suffix="invalid",
+        source_id=source_id,
+        source_sha256=source_sha256,
+        trace_revision=trace_revision,
+        task_revision=task_revision,
+        bind_trace=bind_trace,
+    )
+
+    with pytest.raises(ProjectStoreError, match=message):
+        store.bind_provider_free_stage(stage)
+
+    assert store.load_project().provider_free_stage is None
 
 
 def test_artifact_round_trip_is_digest_verified_and_immutable(tmp_path: Path) -> None:

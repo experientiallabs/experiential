@@ -14,8 +14,8 @@ not have to know which vendor errors exist.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
 from wmo.simulation.ingest.braintrust import BRAINTRUST_SOURCE
 from wmo.simulation.ingest.chat_json import CHAT_JSON_SOURCE
@@ -37,7 +37,20 @@ class TraceSourceError(ValueError):
     """Raised when a source name is unsupported or its declared corpus cannot be normalized."""
 
 
-_LOADERS: dict[str, Callable[[Path], TraceNormalizationResult]] = {
+class _TraceFileLoader(Protocol):
+    """Canonical file loader that can receive a caller-owned durable source label."""
+
+    def __call__(
+        self,
+        path: Path,
+        *,
+        source_id: str | None = None,
+    ) -> TraceNormalizationResult:
+        """Normalize one local file while preserving the supplied source identity."""
+        ...
+
+
+_LOADERS: dict[str, _TraceFileLoader] = {
     "braintrust": BRAINTRUST_SOURCE.load,
     "chat-json": CHAT_JSON_SOURCE.load,
     "langfuse": LANGFUSE_SOURCE.load,
@@ -51,12 +64,18 @@ _LOADERS: dict[str, Callable[[Path], TraceNormalizationResult]] = {
 CANONICAL_TRACE_SOURCES: tuple[str, ...] = tuple(sorted(_LOADERS))
 
 
-def load_trace_source(source: str, path: Path) -> TraceNormalizationResult:
+def load_trace_source(
+    source: str,
+    path: Path,
+    *,
+    source_id: str | None = None,
+) -> TraceNormalizationResult:
     """Normalize one local corpus through the loader of its declared source.
 
     Args:
         source: Declared source name, matched case-insensitively after trimming.
         path: Local trace export.
+        source_id: Optional durable label that replaces the worker-local path in provenance.
 
     Returns:
         Canonical traces and every retained validation exclusion.
@@ -69,7 +88,7 @@ def load_trace_source(source: str, path: Path) -> TraceNormalizationResult:
         choices = ", ".join(CANONICAL_TRACE_SOURCES)
         raise TraceSourceError(f"unsupported trace source {source!r}; choose one of: {choices}")
     try:
-        return loader(path)
+        return loader(path, source_id=source_id)
     except (
         OtlpTraceFormatError,
         PostHogPullError,

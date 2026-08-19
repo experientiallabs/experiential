@@ -17,6 +17,7 @@ from wmo.runtime.models.providers.anthropic import (
     AnthropicClient,
     anthropic_messages_request,
 )
+from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
 from wmo.runtime.models.providers.gemini import GeminiClient
 from wmo.runtime.models.providers.openai import OpenAIClient
 from wmo.runtime.models.providers.openai_compatible import OpenRouterClient
@@ -28,7 +29,11 @@ from wmo.runtime.models.providers.tinker_sampling import (
     TinkerSdkSampler,
     create_tinker_sampler,
 )
-from wmo.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from wmo.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    RetryPolicy,
+    ScriptedJsonTransport,
+)
 
 
 class _FakeTinkerSampler:
@@ -396,3 +401,89 @@ def test_tinker_sampling_client_requires_only_a_completed_handle_sampler() -> No
     assert sampler.requests == [_request()]
     assert response.model.model_id == "tinker://completed-handle-v2"
     assert response.economics.usage == Usage(input_tokens=8, output_tokens=4)
+
+
+def _reasoning_only_response() -> JsonHttpResponse:
+    """Return one incomplete Responses payload whose output is only hidden reasoning."""
+    return JsonHttpResponse(
+        status_code=200,
+        body={
+            "id": "resp_reasoning_only",
+            "object": "response",
+            "created_at": 1.0,
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "model": "gpt-5.6-luna",
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+            "output": [{"type": "reasoning", "id": "rs_only", "summary": []}],
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 4_096,
+                "total_tokens": 4_116,
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 4_096},
+            },
+        },
+    )
+
+
+def test_openai_reasoning_only_output_is_retried_and_a_later_answer_completes() -> None:
+    """A response with only reasoning output re-dispatches within the bounded retry policy."""
+    transport = ScriptedJsonTransport(
+        [
+            _reasoning_only_response(),
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "id": "resp_visible",
+                    "object": "response",
+                    "created_at": 2.0,
+                    "status": "completed",
+                    "model": "gpt-5.6-luna",
+                    "parallel_tool_calls": True,
+                    "tool_choice": "auto",
+                    "tools": [],
+                    "output": [
+                        {
+                            "type": "message",
+                            "id": "msg_visible",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+    client = OpenAIClient(
+        model=_snapshot("openai", "gpt-5.6-luna"),
+        api_key="fixture-openai-key",
+        base_url="https://openai.fixture/v1",
+        transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0.0),
+    )
+
+    response = client.complete(_request())
+
+    assert response.output.content == "ok"
+    assert len(transport.requests) == 2
+
+
+def test_openai_reasoning_only_output_surfaces_a_retryable_error_after_exhaustion() -> None:
+    """Exhausted empty-output retries raise the typed retryable response error."""
+    transport = ScriptedJsonTransport([_reasoning_only_response(), _reasoning_only_response()])
+    client = OpenAIClient(
+        model=_snapshot("openai", "gpt-5.6-luna"),
+        api_key="fixture-openai-key",
+        base_url="https://openai.fixture/v1",
+        transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0.0),
+    )
+
+    with pytest.raises(ProviderRetryableResponseError, match="no text or tool call"):
+        client.complete(_request())
+
+    assert len(transport.requests) == 2

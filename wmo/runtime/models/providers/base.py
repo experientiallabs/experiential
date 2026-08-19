@@ -9,11 +9,14 @@ from typing import ClassVar
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import ModelRequest, ModelResponse, ModelSnapshot
+from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
 from wmo.runtime.models.providers.transport import (
     HttpxJsonTransport,
     JsonHttpTransport,
+    RetryClassification,
     RetryPolicy,
     post_json,
+    run_with_retry,
 )
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -60,15 +63,29 @@ class ProviderHttpClient(abc.ABC):
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one non-streaming request through the provider's completion route.
 
+        A completed response that decodes to no usable output, such as a reasoning model
+        spending its whole output budget without visible text, is dispatched again under the
+        client's bounded retry policy before the last error surfaces to the caller.
+
         Args:
             request: Visible messages, tool schemas, and sampling controls to send.
 
         Returns:
             The typed non-streaming model response with observed request economics.
         """
-        started_at = time.monotonic()
-        response = self._post(self._completion_path(), self._build_request(request))
-        return self._parse_response(response, latency_seconds=time.monotonic() - started_at)
+        payload = self._build_request(request)
+
+        def attempt() -> ModelResponse:
+            """Post and parse one complete request attempt."""
+            started_at = time.monotonic()
+            response = self._post(self._completion_path(), payload)
+            return self._parse_response(response, latency_seconds=time.monotonic() - started_at)
+
+        return run_with_retry(
+            attempt,
+            policy=self._retry_policy,
+            classify=_classify_empty_output_retry,
+        )
 
     def _headers(self) -> dict[str, str]:
         """Build the authenticated JSON headers sent with every request."""
@@ -100,3 +117,20 @@ class ProviderHttpClient(abc.ABC):
     @abc.abstractmethod
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one decoded provider payload into the shared response contract."""
+
+
+def _classify_empty_output_retry(exception: Exception) -> RetryClassification:
+    """Retry only completed provider responses that decoded to no usable output.
+
+    Transport failures already retry inside each posted attempt, so this outer classifier
+    stays closed to everything except the explicit retryable empty-output signal.
+
+    Args:
+        exception: Error raised by one post-and-parse attempt.
+
+    Returns:
+        A stable retry decision and concise reason.
+    """
+    if isinstance(exception, ProviderRetryableResponseError):
+        return RetryClassification(retryable=True, reason="empty_completed_output")
+    return RetryClassification(retryable=False, reason="non_retryable_response")

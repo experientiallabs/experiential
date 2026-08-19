@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, JsonValue, model_validator
@@ -22,13 +23,19 @@ from wmo.common.project import (
     ArtifactStore,
     ProjectBuildArtifacts,
     ProjectConfig,
+    ProjectProviderFreeStage,
     ProjectStore,
+    ProjectStoreError,
+    ProjectTracePreparationSettings,
     artifact_input,
     coordinate_completed_build_selection,
 )
+from wmo.common.project.project import require_durable_source_id
+from wmo.common.release_revision import installed_release_revision
 from wmo.common.tasks import TaskSet
 from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
+from wmo.simulation.ingest.sources import load_trace_source
 from wmo.simulation.mining.bindings import (
     bindings_for_mining,
     task_set_content_id,
@@ -42,6 +49,8 @@ _BUILD_SCOPED_REVIEW_KEYS = (
     "human_score_history",
     "human_score_submissions",
 )
+_MINIMUM_PROVIDER_FREE_TRACE_COUNT = 100
+_MAXIMUM_PROVIDER_FREE_TRACE_COUNT = 1000
 
 
 @dataclass(frozen=True)
@@ -95,6 +104,140 @@ class ProjectBuild:
 
     artifacts: TaskSetBuild
     review: BuildReviewReadiness
+
+
+def prepare_project_traces(
+    project: str,
+    trace_file: Path,
+    *,
+    root: Path,
+    source_id: str,
+    settings: ProjectTracePreparationSettings,
+) -> ProjectProviderFreeStage:
+    """Prepare and select provider-free Project evidence from one acquired trace file.
+
+    Args:
+        project: Safe local Project identifier below ``root/projects``.
+        trace_file: Worker-local path to the immutable acquired source bytes.
+        root: Local WMO artifact root.
+        source_id: Stable caller-owned source label that remains valid after the worker exits.
+        settings: Declared source kind and deterministic representative-task controls.
+
+    Returns:
+        The exact selected trace and task manifest pointers for the completed provider-free stage.
+
+    Raises:
+        ValueError: The source label, source kind, normalized trace count, or evidence is invalid.
+        ProjectStoreError: Existing Project settings or a selected stage conflict with this request.
+    """
+    durable_source_id = require_durable_source_id(source_id)
+    normalized = load_trace_source(
+        settings.source_kind,
+        Path(trace_file),
+        source_id=durable_source_id,
+    )
+    valid_trace_count = len(normalized.traces)
+    if (
+        not _MINIMUM_PROVIDER_FREE_TRACE_COUNT
+        <= valid_trace_count
+        <= (_MAXIMUM_PROVIDER_FREE_TRACE_COUNT)
+    ):
+        raise ValueError(
+            "provider-free trace preparation requires "
+            f"{_MINIMUM_PROVIDER_FREE_TRACE_COUNT} to {_MAXIMUM_PROVIDER_FREE_TRACE_COUNT} valid "
+            f"normalized traces; got {valid_trace_count} after excluding "
+            f"{len(normalized.issues)} records"
+        )
+    code_revision = installed_release_revision()
+    store = _initialize_provider_free_project(root, project, settings)
+    completed = build_project(
+        normalized,
+        store,
+        created_at=datetime.now(UTC),
+        code_revision=code_revision,
+        mining_spec=MiningSpec(
+            fit_task_budget=settings.fit_task_budget,
+            held_out_task_budget=settings.held_out_task_budget,
+        ),
+        embedder=HashingDescriptorEmbedder(dimensions=settings.descriptor_dimensions),
+    )
+    trace_dataset = artifact_input(completed.artifacts.trace_dataset.manifest)
+    task_set = artifact_input(
+        store.artifacts.read(completed.artifacts.task_set.task_set_id).manifest
+    )
+    stage = ProjectProviderFreeStage(
+        trace_dataset=trace_dataset,
+        task_set=task_set,
+    )
+    store.bind_provider_free_stage(stage)
+    return stage
+
+
+def load_project_provider_free_stage(
+    project: str,
+    *,
+    root: Path,
+) -> ProjectProviderFreeStage:
+    """Load and verify a Project's selected provider-free stage after process restart.
+
+    Args:
+        project: Safe local Project identifier below ``root/projects``.
+        root: Local WMO artifact root.
+
+    Returns:
+        The selected provider-free stage with exact verified manifest pointers.
+
+    Raises:
+        ProjectStoreError: The Project has no selected stage or its pointer graph is invalid.
+    """
+    store = ProjectStore(root, project)
+    stage = store.load_project().provider_free_stage
+    if stage is None:
+        raise ProjectStoreError(
+            "project has no completed provider-free stage; call prepare_project_traces first"
+        )
+    store.bind_provider_free_stage(stage)
+    return stage
+
+
+def _initialize_provider_free_project(
+    root: Path,
+    project: str,
+    settings: ProjectTracePreparationSettings,
+) -> ProjectStore:
+    """Initialize a minimal Project or verify its immutable trace preparation settings.
+
+    Args:
+        root: Local WMO artifact root.
+        project: Safe local Project identifier.
+        settings: Provider-free settings selected before evidence construction.
+
+    Returns:
+        Project store containing the requested provider-free settings.
+
+    Raises:
+        ProjectStoreError: Existing trace preparation settings differ from the request.
+    """
+    store = ProjectStore(root, project)
+    proposed = ProjectConfig(
+        project_id=project,
+        trace_preparation=settings,
+        retrieval=None,
+        budgets=None,
+    )
+    if not store.paths.project_toml.exists():
+        try:
+            store.initialize(proposed)
+        except ProjectStoreError:
+            existing = store.load_project()
+            if existing.trace_preparation != settings:
+                raise
+    existing = store.load_project()
+    if existing.trace_preparation != settings:
+        raise ProjectStoreError(
+            "project already has different provider-free trace preparation settings"
+        )
+    return store
 
 
 def build_task_set(

@@ -24,18 +24,15 @@ from wmo.common.core.artifacts import (
     stable_id,
 )
 from wmo.common.evaluations import (
-    EvaluationCell,
-    EvaluationCellEvidence,
     EvaluationPlan,
     EvaluationProtocol,
     ObservedProductionCell,
     build_evaluation_plan,
 )
 from wmo.common.evaluations.evidence import (
-    read_judgment,
     read_rollout,
 )
-from wmo.common.judging import Judge, Judgment, verify_persisted_calibration
+from wmo.common.judging import Judge, verify_persisted_calibration
 from wmo.common.models import (
     ModelCatalog,
     ProviderConnection,
@@ -46,15 +43,11 @@ from wmo.common.models import (
 from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.progress import ProgressHook, report
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
     ProjectStore,
     artifact_input,
 )
 from wmo.common.rollouts import (
-    RolloutArtifact,
     SimulationArtifactSet,
-    StopReason,
-    unknown_spend_failure,
 )
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import KnnBankManifest
@@ -77,13 +70,7 @@ from wmo.optimize.router.fit.workflow import (
     fit_router,
     report_router,
 )
-from wmo.optimize.router.judgment_budget import (
-    JudgmentBudgetError,
-    find_verified_judgment,
-    find_verified_judgments,
-    persist_dispatch_reservation,
-    read_dispatch_reservation,
-)
+from wmo.optimize.router.judgment_budget import complete_cell_evidence
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime
 from wmo.simulation.build import ProjectBuild
@@ -369,7 +356,7 @@ def compose_router(
             f"verified fit simulation spend ${fit_spend:.4f} exceeds the authorized "
             f"${budget.maximum_simulation_cost_usd:.4f}",
         )
-    fit_evidence, fit_consumed, fit_judge_spend = _complete_cell_evidence(
+    fit_evidence, fit_consumed, fit_judge_spend = complete_cell_evidence(
         project,
         plan_input,
         fit_cells,
@@ -380,6 +367,7 @@ def compose_router(
         budget.maximum_judgments,
         remaining_cost_usd=budget.maximum_simulation_cost_usd - fit_spend,
         stop_on_overspend=budget.stop_on_overspend,
+        spend_ceiling_crossed=_spend_ceiling_crossed,
         progress=progress,
         progress_detail="fit",
     )
@@ -450,7 +438,7 @@ def compose_router(
             f"verified composed simulation spend ${math.fsum((fit_spend, held_out_spend)):.4f} "
             f"exceeds the authorized ${budget.maximum_simulation_cost_usd:.4f}",
         )
-    held_evidence, _held_dispatched, _held_judge_spend = _complete_cell_evidence(
+    held_evidence, _held_dispatched, _held_judge_spend = complete_cell_evidence(
         project,
         plan_input,
         held_cells,
@@ -462,6 +450,7 @@ def compose_router(
         remaining_cost_usd=budget.maximum_simulation_cost_usd
         - math.fsum((fit_spend, fit_judge_spend, held_out_spend)),
         stop_on_overspend=budget.stop_on_overspend,
+        spend_ceiling_crossed=_spend_ceiling_crossed,
         progress=progress,
         progress_detail="held-out",
     )
@@ -710,247 +699,6 @@ def _verify_review(project: ProjectStore, review: RouterReviewProvenance) -> Non
         raise RouterCompositionError(
             "router review differs from its persisted calibration status or rubric"
         )
-
-
-def _complete_cell_evidence(
-    project: ProjectStore,
-    plan_input: ArtifactInput,
-    cells: tuple[EvaluationCell, ...],
-    simulated_rollout_ids: tuple[str, ...],
-    setup: RouterEvaluationSetup,
-    review: RouterReviewProvenance,
-    judge: Judge,
-    maximum_judgments: int,
-    *,
-    remaining_cost_usd: float,
-    stop_on_overspend: bool,
-    progress: ProgressHook | None = None,
-    progress_detail: str | None = None,
-) -> tuple[tuple[EvaluationCellEvidence, ...], int, float]:
-    """Verify evidence and reserve each bounded judgment dispatch durably before calling it.
-
-    A persisted reservation without a completed judgment marks an interrupted dispatch; the
-    judgment is dispatched again under that same consumed reservation, so a judge failure never
-    strands the project and never widens the finite judgment budget.
-
-    Judgments draw from the shared provider pool as reconciled actual spend, never a planning
-    estimate. Once accumulated judge spend reaches ``remaining_cost_usd``, ``stop_on_overspend``
-    blocks the next dispatch; by default the authorized run logs one warning and keeps judging.
-    The returned total covers every judgment bound to the evidence so later phases subtract
-    actual, not estimated, judge cost.
-    """
-    rollouts_by_cell = {}
-    for rollout_id in simulated_rollout_ids:
-        rollout, _input = read_rollout(project.artifacts, rollout_id)
-        if rollout.cell_id is None or rollout.cell_id in rollouts_by_cell:
-            raise RouterCompositionError("simulator output lacks unique evaluation cell bindings")
-        rollouts_by_cell[rollout.cell_id] = rollout
-    observed = {
-        (item.task_id, item.candidate_alias, item.repeat): item.rollout_artifact_id
-        for item in setup.observed_cells
-    }
-    bound_cells = []
-    protocols_by_rollout: dict[str, EvaluationProtocol] = {}
-    rollouts_by_id: dict[str, RolloutArtifact] = {}
-    for cell in cells:
-        if cell.execution != "observed":
-            simulated = rollouts_by_cell.get(cell.cell_id)
-            if simulated is not None and unknown_spend_failure(simulated.failure):
-                continue
-        rollout_id = (
-            cell.observed_rollout_id
-            if cell.execution == "observed"
-            else getattr(rollouts_by_cell.get(cell.cell_id), "rollout_id", None)
-        )
-        if rollout_id is None:
-            raise RouterCompositionError(
-                f"no completed rollout exists for planned cell {cell.cell_id}"
-            )
-        if (
-            cell.execution == "observed"
-            and observed.get((cell.task_id, cell.candidate_alias, cell.repeat)) != rollout_id
-        ):
-            raise RouterCompositionError("observed rollout binding changed after planning")
-        protocol = (
-            setup.production_protocol if cell.execution == "observed" else setup.simulation_protocol
-        )
-        existing_protocol = protocols_by_rollout.setdefault(rollout_id, protocol)
-        if existing_protocol != protocol:
-            raise RouterCompositionError("one rollout is bound to conflicting evaluation protocols")
-        if rollout_id not in rollouts_by_id:
-            rollouts_by_id[rollout_id] = read_rollout(project.artifacts, rollout_id)[0]
-        bound_cells.append((cell, rollout_id, protocol))
-    judgeable_protocols = {
-        rollout_id: protocol
-        for rollout_id, protocol in protocols_by_rollout.items()
-        if not _rollout_failed(rollouts_by_id[rollout_id])
-    }
-    try:
-        judgments_by_rollout = find_verified_judgments(
-            project,
-            protocols_by_rollout=judgeable_protocols,
-            rubric_id=review.rubric_id,
-            calibration_id=review.calibration_id,
-        )
-    except JudgmentBudgetError as exc:
-        raise RouterCompositionError(str(exc)) from exc
-
-    evidence = []
-    consumed = 0
-    overspend_warned = False
-    judge_spend_usd = math.fsum(
-        _known_judgment_spend(judgment) for judgment in judgments_by_rollout.values()
-    )
-    report(progress, "judgments", completed=0, total=len(bound_cells), detail=progress_detail)
-    for cell, rollout_id, protocol in bound_cells:
-        rollout = rollouts_by_id[rollout_id]
-        if _rollout_failed(rollout):
-            evidence.append(
-                EvaluationCellEvidence(
-                    cell_id=cell.cell_id,
-                    protocol_id=protocol.protocol_id,
-                    rollout_artifact_id=rollout_id,
-                    judgment_artifact_id=None,
-                    source_run_id=rollout.source_run_id,
-                )
-            )
-            report(
-                progress,
-                "judgments",
-                completed=len(evidence),
-                total=len(bound_cells),
-                detail=progress_detail,
-            )
-            continue
-        try:
-            judgment = judgments_by_rollout.get(rollout_id)
-            receipt = read_dispatch_reservation(
-                project,
-                plan_input,
-                cell,
-                rollout_id,
-                review.rubric_id,
-                review.calibration_id,
-                protocol,
-            )
-            if judgment is None and receipt is not None:
-                judgment = find_verified_judgment(
-                    project,
-                    rollout_id,
-                    review.rubric_id,
-                    review.calibration_id,
-                    protocol,
-                )
-                if judgment is not None:
-                    judgments_by_rollout[rollout_id] = judgment
-                    judge_spend_usd = math.fsum((judge_spend_usd, _known_judgment_spend(judgment)))
-        except JudgmentBudgetError as exc:
-            raise RouterCompositionError(str(exc)) from exc
-        if judgment is not None or receipt is not None:
-            consumed += 1
-        if consumed > maximum_judgments:
-            raise RouterCompositionError("judgment dispatch budget exhausted")
-        if judgment is None:
-            if judge_spend_usd >= remaining_cost_usd:
-                if stop_on_overspend or not overspend_warned:
-                    _spend_ceiling_crossed(
-                        stop_on_overspend,
-                        "reconciled provider spend reached the shared ceiling before judgment "
-                        "dispatch; increase --maximum-simulation-cost-usd and rerun to resume",
-                        f"reconciled judge spend ${judge_spend_usd:.4f} reached the shared "
-                        f"authorized remainder ${remaining_cost_usd:.4f}",
-                    )
-                    overspend_warned = True
-            if receipt is None:
-                if consumed >= maximum_judgments:
-                    raise RouterCompositionError("judgment dispatch budget exhausted")
-                try:
-                    persist_dispatch_reservation(
-                        project,
-                        plan_input,
-                        cell,
-                        rollout_id,
-                        review.rubric_id,
-                        review.calibration_id,
-                        protocol,
-                    )
-                except JudgmentBudgetError as exc:
-                    raise RouterCompositionError(str(exc)) from exc
-                consumed += 1
-            judgment = judge.judge_persisted(
-                project,
-                rollout_artifact_id=rollout_id,
-                rubric_artifact_id=review.rubric_id,
-                calibration_artifact_id=review.calibration_id,
-            )
-            _persist_judgment(project, judgment)
-            judgments_by_rollout[rollout_id] = judgment
-            judge_spend_usd = math.fsum((judge_spend_usd, _known_judgment_spend(judgment)))
-        evidence.append(
-            EvaluationCellEvidence(
-                cell_id=cell.cell_id,
-                protocol_id=protocol.protocol_id,
-                rollout_artifact_id=rollout_id,
-                judgment_artifact_id=judgment.judgment_id,
-                source_run_id=rollout.source_run_id,
-            )
-        )
-        report(
-            progress,
-            "judgments",
-            completed=len(evidence),
-            total=len(bound_cells),
-            detail=progress_detail,
-        )
-    return tuple(evidence), consumed, judge_spend_usd
-
-
-def _known_judgment_spend(judgment: Judgment) -> float:
-    """Return one judgment's reconciled judge dispatch cost.
-
-    Args:
-        judgment: Persisted or freshly dispatched judgment.
-
-    Returns:
-        Known judge spend in USD, or zero when the judge reported no economics.
-    """
-    economics = judgment.judge_economics
-    if economics is None or economics.cost_usd is None:
-        return 0.0
-    return economics.cost_usd.value
-
-
-def _rollout_failed(rollout: RolloutArtifact) -> bool:
-    """Return whether one persisted rollout terminated as failed evidence.
-
-    Failed rollouts never receive a judgment: the evaluation builder scores them as failed rows
-    directly and rejects any judgment bound to them, so dispatching a judge call against one
-    would waste real spend on an episode that produced no gradable output.
-
-    Args:
-        rollout: Verified persisted rollout evidence.
-
-    Returns:
-        True when the rollout carries a structured failure or a failed stop reason.
-    """
-    return rollout.failure is not None or rollout.stop_reason == StopReason.FAILURE
-
-
-def _persist_judgment(project: ProjectStore, judgment: Judgment) -> None:
-    """Persist or exactly verify one deterministic injected-judge result."""
-    try:
-        project.artifacts.write_json(
-            artifact_id=judgment.judgment_id,
-            artifact_type="judgment",
-            envelope=judgment,
-            files={"judgment.json": judgment},
-        )
-    except ArtifactAlreadyExistsError:
-        existing, _input = read_judgment(project.artifacts, judgment.judgment_id)
-        if existing != judgment:
-            raise RouterCompositionError(
-                "existing judgment differs from injected judge result"
-            ) from None
 
 
 def _phase(hook: Callable[[str], None] | None, phase: str) -> None:

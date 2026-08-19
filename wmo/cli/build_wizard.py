@@ -865,7 +865,10 @@ def _wizard_simulation_input_estimate(
     if config.build is not None:
         top_k = load_grounded_world_model_artifact(store.artifacts, config.build.world_model).top_k
     else:
-        top_k = config.retrieval.top_k
+        retrieval = (
+            config.retrieval if config.retrieval is not None else ProjectRetrievalConfiguration()
+        )
+        top_k = retrieval.top_k
     estimate = simulation_input_token_estimate(
         traces,
         retrieved_transition_count=top_k,
