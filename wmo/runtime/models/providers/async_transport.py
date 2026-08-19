@@ -329,7 +329,17 @@ class _HttpxByteStream:
 
     def __aiter__(self) -> AsyncIterator[bytes]:
         """Yield decoded-transfer bytes directly from HTTPX."""
-        return self._response.aiter_bytes()
+        return self._iter_bytes()
+
+    async def _iter_bytes(self) -> AsyncIterator[bytes]:
+        """Translate read-time HTTPX failures into the sanitized transport taxonomy."""
+        try:
+            async for chunk in self._response.aiter_bytes():
+                yield chunk
+        except httpx.TimeoutException as exc:
+            raise ProviderTransportError("provider response stream timed out") from exc
+        except httpx.TransportError as exc:
+            raise ProviderTransportError("provider response stream failed") from exc
 
     async def aclose(self) -> None:
         """Close the response and transport-owned client idempotently."""
