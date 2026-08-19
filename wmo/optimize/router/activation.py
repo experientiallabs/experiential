@@ -14,9 +14,6 @@ from wmo.common.routing import KnnRouterPolicy
 from wmo.optimize.router.automatic.execution_contract import load_router_execution_contract
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.application import (
-    RouterApplicationError,
-)
-from wmo.runtime.router.application import (
     load_project_router as load_runtime_project_router,
 )
 from wmo.runtime.router.application import load_router as load_runtime_router
@@ -24,6 +21,7 @@ from wmo.runtime.router.capability import (
     load_router_runtime_capability_contract,
     verify_router_runtime_capabilities,
 )
+from wmo.runtime.router.errors import RouterApplicationError
 from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
 
 

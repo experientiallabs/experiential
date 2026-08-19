@@ -125,13 +125,13 @@ assert load_world_model.__module__ == "wmo.simulation.world_model.application"
     )
 
 
-def test_router_server_and_optimizer_activation_imports_resolve_lazily() -> None:
-    """Resolve runtime server adapters separately from optimizer-owned activation."""
+def test_router_selection_and_optimizer_activation_imports_resolve_lazily() -> None:
+    """Expose selection activation without restoring a router HTTP server."""
     _run(
         """
 import wmo.runtime.router as router
 import wmo.optimize.router as optimizer
-assert {"create_router_endpoint", "create_project_router_app"}.issubset(dir(router))
+assert not {"create_router_endpoint", "create_project_router_app"}.intersection(dir(router))
 assert {"load_project_router", "load_router"}.issubset(dir(optimizer))
 try:
     getattr(router, "p17_unknown_router_export")
@@ -141,11 +141,7 @@ else:
     raise AssertionError("unknown router export resolved")
 from wmo.optimize.router import load_router
 from wmo.optimize.router.activation import load_router as nested_load_router
-from wmo.runtime.router import create_router_endpoint
-from wmo.runtime.router.endpoint import create_router_endpoint as nested_endpoint
-assert create_router_endpoint.__module__ == "wmo.runtime.router.endpoint"
 assert load_router.__module__ == "wmo.optimize.router.activation"
-assert create_router_endpoint is nested_endpoint
 assert load_router is nested_load_router
 """
     )

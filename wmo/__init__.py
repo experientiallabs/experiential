@@ -97,9 +97,6 @@ if TYPE_CHECKING:
     from wmo.optimize.router.spend import ProviderSpendLedger as ProviderSpendLedger
     from wmo.optimize.router.spend import ProviderSpendStatus as ProviderSpendStatus
     from wmo.runtime.models import RuntimeModelCatalog as RuntimeModelCatalog
-    from wmo.runtime.router.application import (
-        create_project_router_app as create_project_router_app,
-    )
     from wmo.runtime.router.economics import (
         BillingSourceEconomics as BillingSourceEconomics,
     )
@@ -195,7 +192,6 @@ _EXPORT_MODULES = {
     "optimize_router": "wmo.optimize.router.fit.workflow",
     "report_router": "wmo.optimize.router.fit.workflow",
     "RouterRuntime": "wmo.runtime.router.runtime",
-    "create_project_router_app": "wmo.runtime.router.application",
     "load_project_router": "wmo.optimize.router.activation",
     "load_router": "wmo.optimize.router.activation",
     "ApprovedRouterReview": "wmo.optimize.router.composition",

@@ -42,7 +42,7 @@ from wmo.runtime.gateway.sqlite.store import SQLiteGatewayStore, SystemGatewayCl
 from wmo.runtime.gateway.usage import read_usage_report, usage_html
 from wmo.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from wmo.runtime.models.credentials import ModelCredentialError
-from wmo.runtime.router.application import RouterApplicationError
+from wmo.runtime.router.errors import RouterApplicationError
 from wmo.runtime.router.runtime import RouterRuntime
 
 

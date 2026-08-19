@@ -6,16 +6,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from wmo.runtime.router.application import (
-        RouterApplicationError as RouterApplicationError,
-    )
-    from wmo.runtime.router.application import (
-        create_project_completion_service as create_project_completion_service,
-    )
-    from wmo.runtime.router.application import (
-        create_project_router_app as create_project_router_app,
-    )
-    from wmo.runtime.router.endpoint import create_router_endpoint as create_router_endpoint
+    from wmo.runtime.router.errors import RouterApplicationError as RouterApplicationError
 
 from wmo.runtime.router.completion import (
     JournaledRouterCompletionService,
@@ -64,10 +55,7 @@ from wmo.runtime.router.snapshot import (
 )
 
 _SERVER_EXPORT_MODULES = {
-    "RouterApplicationError": "wmo.runtime.router.application",
-    "create_project_completion_service": "wmo.runtime.router.application",
-    "create_project_router_app": "wmo.runtime.router.application",
-    "create_router_endpoint": "wmo.runtime.router.endpoint",
+    "RouterApplicationError": "wmo.runtime.router.errors",
 }
 
 __all__ = [
@@ -106,10 +94,7 @@ __all__ = [
     "load_runtime_trace_snapshot",
     "routed_task_text",
     "seal_runtime_trace_snapshot",
-    "create_router_endpoint",
     "RouterApplicationError",
-    "create_project_completion_service",
-    "create_project_router_app",
 ]
 
 
