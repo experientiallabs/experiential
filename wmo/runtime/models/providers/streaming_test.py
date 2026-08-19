@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 import httpx
 import pytest
 
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 from wmo.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEvent,
@@ -105,6 +105,7 @@ def _snapshot(provider: str) -> ModelSnapshot:
     return ModelSnapshot(
         provider=provider,
         model_id="exact-model",
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         capabilities_sha256="a" * 64,
         connection_sha256="b" * 64,
     )
