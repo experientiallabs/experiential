@@ -52,12 +52,12 @@ def test_load_router_uses_the_normal_gateway_application_and_revokes_its_key(
         root: Path,
         *,
         policy_id: str | None,
-        project_loader: object,
+        project_repository: object,
         environment: object,
         runtime_catalog: object,
     ) -> ProjectGatewayAlias:
         """Return one already activated project-backed alias."""
-        del environment, project_loader, runtime_catalog
+        del environment, project_repository, runtime_catalog
         prepared.append((project, root, policy_id))
         return ProjectGatewayAlias(
             alias=project,
@@ -72,11 +72,11 @@ def test_load_router_uses_the_normal_gateway_application_and_revokes_its_key(
         *,
         graceful_timeout_seconds: float,
         environment: object,
-        project_loader: object,
+        project_repository: object,
         only_aliases: frozenset[str] | None,
     ) -> object:
         """Return the same gateway application used by the CLI launch path."""
-        del graceful_timeout_seconds, environment, project_loader
+        del graceful_timeout_seconds, environment, project_repository
         loaded.append((root, only_aliases))
         return SimpleNamespace(app=application)
 

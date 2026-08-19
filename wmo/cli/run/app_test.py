@@ -59,7 +59,7 @@ def test_project_form_launches_the_normal_gateway_on_loopback(
         root: Path,
         *,
         graceful_timeout_seconds: float,
-        project_loader: object,
+        project_repository: object,
         only_aliases: frozenset[str] | None,
     ) -> object:
         """Capture the one shared lifecycle composition.
@@ -67,13 +67,13 @@ def test_project_form_launches_the_normal_gateway_on_loopback(
         Args:
             root: Gateway and artifact root.
             graceful_timeout_seconds: Requested shutdown drain bound.
-            project_loader: Injected selection-only project loader.
+            project_repository: Injected immutable project activation repository.
             only_aliases: Optional compatibility alias filter.
 
         Returns:
             Gateway runtime fixture passed to the normal server.
         """
-        del graceful_timeout_seconds, project_loader
+        del graceful_timeout_seconds, project_repository
         loaded.append((root, only_aliases))
         return SimpleNamespace(
             app=application,

@@ -11,8 +11,9 @@ from wmo.cli.gateway.key_output import (
     recover_key_output,
     settle_key_output,
 )
-from wmo.optimize.router.activation import load_project_router
+from wmo.optimize.router.activation import verify_automatic_router_policy
 from wmo.runtime.gateway.management import GatewayManagement
+from wmo.runtime.gateway.project_activation import LocalArtifactProjectActivationRepository
 from wmo.runtime.gateway.project_alias import prepare_project_gateway_alias
 
 
@@ -48,7 +49,10 @@ def prepare_project_gateway(
         project,
         root,
         policy_id=policy_id,
-        project_loader=load_project_router,
+        project_repository=LocalArtifactProjectActivationRepository(
+            root,
+            verifier=verify_automatic_router_policy,
+        ),
     )
     manager = GatewayManagement(root)
     key_file = manager.state_dir / "compatibility-keys" / f"{alias.identity_id}.txt"
