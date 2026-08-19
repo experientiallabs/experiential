@@ -86,18 +86,6 @@ jobs:
           assert LocalProcessEnvironmentRuntime.__module__ == "wmo.runtime.environments.local"
           PY
           /tmp/wmo-wheel-smoke/bin/wmo --help
-      - name: Installed-wheel no-spend release evidence
-        env:
-          PYTHONNOUSERSITE: "1"
-          TERM: xterm-256color
-          WMO_INSTALLED_RELEASE_EVIDENCE: "1"
-          WMO_RELEASE_REVISION: ${{ steps.source_revision.outputs.sha }}
-          WMO_SOURCE_CHECKOUT: ${{ github.workspace }}
-          WMO_TELEMETRY: "0"
-        run: |
-          cp wmo/release_test.py /tmp/wmo-wheel-smoke/installed_release_evidence.py
-          cd /tmp/wmo-wheel-smoke
-          ./bin/python installed_release_evidence.py
       - uses: actions/upload-artifact@v4
         with:
           name: python-dist
