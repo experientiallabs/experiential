@@ -44,11 +44,6 @@ curl -L -o traces.otel.jsonl \
 wmo build terminal-tasks --traces traces.otel.jsonl
 ```
 
-The default build keeps judge provenance truthful and can run before human calibration. To add
-human-approved examples later, run `wmo config judge calibrate PROJECT`, then rerun
-`wmo build PROJECT` to create an immutable human-calibrated successor. Endpoint traffic is saved
-by default and can supply new evidence for later router optimization.
-
 After collecting traces from your router, fine-tune an open source model you own using
 [Tinker](https://tinker.thinkingmachines.ai/).
 
