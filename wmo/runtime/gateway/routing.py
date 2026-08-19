@@ -31,12 +31,18 @@ class GatewayRoutingError(ValueError):
 
 
 class GatewayRoute(ContractModel):
-    """One immutable singleton route ready for provider execution."""
+    """One immutable ordered exact-model route ready for provider execution."""
 
     snapshot: ExecutionSnapshot
     deployment: ExactModelDeployment
+    fallback_deployments: tuple[ExactModelDeployment, ...] = ()
     route_reason: str
     fallback_reason: str | None = None
+
+    @property
+    def deployments(self) -> tuple[ExactModelDeployment, ...]:
+        """Return every certified deployment in deterministic operational order."""
+        return (self.deployment, *self.fallback_deployments)
 
 
 @dataclass(frozen=True)
@@ -118,26 +124,26 @@ class CatalogRouteResolver:
             episode_namespace=episode_namespace,
             deadline_monotonic=authorization.deadline_monotonic,
         )
-        deployments = tuple(
+        selected_deployments = tuple(
             item
             for item in view.catalog.deployments
             if item.source_alias == selection.selected_alias
             and item.exact_model_id == selection.exact_model_id
         )
-        if len(deployments) != 1:
+        if len(selected_deployments) != 1:
             raise GatewayRoutingError(
                 "project selection requires one unambiguous frozen deployment"
             )
-        deployment = deployments[0]
+        deployment = selected_deployments[0]
         pools = tuple(
             item
             for item in view.catalog.pools
             if item.exact_model_id == selection.exact_model_id
-            and item.deployment_ids == (deployment.deployment_id,)
+            and deployment.deployment_id in item.deployment_ids
         )
         if len(pools) != 1:
             raise GatewayRoutingError(
-                "project selection requires one unambiguous singleton exact-model pool"
+                "project selection requires one unambiguous certified exact-model pool"
             )
         pool = pools[0]
         return self._route(
@@ -187,12 +193,13 @@ class CatalogRouteResolver:
         route_reason: str,
         fallback_reason: str | None,
     ) -> GatewayRoute:
-        """Build the launch singleton execution route."""
-        if len(pool.deployment_ids) != 1:
-            raise GatewayRoutingError("multi-deployment pools require the post-launch waterfall")
-        deployment = view.deployments.get(pool.deployment_ids[0])
-        if deployment is None or deployment.exact_model_id != pool.exact_model_id:
-            raise GatewayRoutingError("frozen pool deployment identity is invalid")
+        """Build one ordered execution route from a certified exact-model pool."""
+        deployments: list[ExactModelDeployment] = []
+        for deployment_id in pool.deployment_ids:
+            deployment = view.deployments.get(deployment_id)
+            if deployment is None or deployment.exact_model_id != pool.exact_model_id:
+                raise GatewayRoutingError("frozen pool deployment identity is invalid")
+            deployments.append(deployment)
         return GatewayRoute(
             snapshot=ExecutionSnapshot(
                 authorization=authorization,
@@ -200,7 +207,8 @@ class CatalogRouteResolver:
                 pool_id=pool.pool_id,
                 deployment_ids=pool.deployment_ids,
             ),
-            deployment=deployment,
+            deployment=deployments[0],
+            fallback_deployments=tuple(deployments[1:]),
             route_reason=route_reason,
             fallback_reason=fallback_reason,
         )

@@ -11,6 +11,7 @@ from wmo.runtime.gateway.contracts import GatewayRequest
 from wmo.runtime.gateway.interfaces import ProviderStream
 from wmo.runtime.models.providers.async_transport import RequestDeadline
 from wmo.runtime.models.providers.errors import ProviderCapabilityError
+from wmo.runtime.models.providers.transport import RetryPolicy
 
 
 class AsyncCompletedModelClient(Protocol):
@@ -36,8 +37,9 @@ class AsyncGatewayProvider(Protocol):
         *,
         deadline: RequestDeadline,
         idempotency_key: str,
+        retry_policy: RetryPolicy | None = None,
     ) -> ProviderStream:
-        """Start one cancellable normalized provider stream."""
+        """Start one cancellable stream with an optional caller-owned retry bound."""
         ...
 
 
