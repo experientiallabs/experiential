@@ -587,6 +587,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                 tool.completed = True
                 yield factory.create(
                     GatewayEventKind.TOOL_CALL_COMPLETED,
+                    tool_call_index=index,
                     tool_call=tool.complete(),
                 )
         elif event_type in {"response.completed", "response.incomplete"}:
@@ -724,6 +725,7 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
                 tool.completed = True
                 yield factory.create(
                     GatewayEventKind.TOOL_CALL_COMPLETED,
+                    tool_call_index=index,
                     tool_call=tool.complete(),
                 )
         elif event_type == "message_delta":
@@ -876,6 +878,7 @@ async def _finish_open_tools(
             tool.completed = True
             yield factory.create(
                 GatewayEventKind.TOOL_CALL_COMPLETED,
+                tool_call_index=index,
                 tool_call=tool.complete(),
             )
 
