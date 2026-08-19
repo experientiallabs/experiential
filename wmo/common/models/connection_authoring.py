@@ -77,7 +77,7 @@ def configure_provider_connections(
                 )
             current_connections[selected.name] = proposed
         catalog = ModelCatalog(
-            schema_version=existing.schema_version if existing is not None else 1,
+            schema_version=existing.schema_version if existing is not None else 2,
             connections=current_connections,
             models=models,
             roles=existing.roles if existing is not None else ModelRoles(),

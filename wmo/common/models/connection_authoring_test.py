@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.common.models import (
+    BillingSource,
     ModelCapabilities,
     ModelCatalog,
     ModelRecord,
@@ -55,6 +56,7 @@ def test_role_free_authoring_preserves_models_and_rejects_connection_rebinding(
             "coding": ModelRecord(
                 connection="openai",
                 model="gpt-coding",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 capabilities=ModelCapabilities(supports_completions=True),
             )
         },

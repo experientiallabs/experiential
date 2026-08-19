@@ -35,8 +35,8 @@ from wmo.common.models import (
     NumericMeasurement,
     OperationEconomics,
     RoutedCandidateSnapshot,
-    Usage,
     ToolCall,
+    Usage,
 )
 from wmo.common.project import ProjectPaths
 from wmo.common.routing import RouterFeatureExtractor, RoutingDecision

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from wmo.common.core.artifacts import ArtifactInput, sha256_json
 from wmo.common.models.catalog import (
+    BillingSource,
     ConnectionConfig,
     ModelCatalog,
     ModelRecord,
@@ -32,18 +33,21 @@ def test_singleton_identity_includes_connection_model_revision_and_full_capabili
             "first-low": ModelRecord(
                 connection="first",
                 model="same-name",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 revision="2026-08-01",
                 capabilities=ModelCapabilities(reasoning_effort="low"),
             ),
             "first-high": ModelRecord(
                 connection="first",
                 model="same-name",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 revision="2026-08-01",
                 capabilities=ModelCapabilities(reasoning_effort="high"),
             ),
             "second-low": ModelRecord(
                 connection="second",
                 model="same-name",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 revision="2026-08-01",
                 capabilities=ModelCapabilities(reasoning_effort="low"),
             ),
@@ -68,8 +72,16 @@ def test_identical_alias_records_remain_separate_singleton_pools() -> None:
     catalog = ModelCatalog(
         connections={"openai": ConnectionConfig(provider="openai")},
         models={
-            "coding-a": ModelRecord(connection="openai", model="gpt-coding"),
-            "coding-b": ModelRecord(connection="openai", model="gpt-coding"),
+            "coding-a": ModelRecord(
+                connection="openai",
+                model="gpt-coding",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+            ),
+            "coding-b": ModelRecord(
+                connection="openai",
+                model="gpt-coding",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+            ),
         },
     )
 
@@ -95,6 +107,7 @@ def test_tinker_and_sft_records_are_not_gateway_deployments() -> None:
         base_model=ModelSnapshot(
             provider="tinker",
             model_id="base",
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             capabilities_sha256="f" * 64,
             connection_sha256="0" * 64,
         ),
@@ -107,13 +120,22 @@ def test_tinker_and_sft_records_are_not_gateway_deployments() -> None:
             "tinker": ConnectionConfig(provider="tinker"),
         },
         models={
-            "regular": ModelRecord(connection="openai", model="gpt-coding"),
+            "regular": ModelRecord(
+                connection="openai",
+                model="gpt-coding",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+            ),
             "training": ModelRecord(
                 connection="openai",
                 model=sampling_handle,
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 sft_provenance=provenance,
             ),
-            "tinker-handle": ModelRecord(connection="tinker", model="base"),
+            "tinker-handle": ModelRecord(
+                connection="tinker",
+                model="base",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+            ),
         },
     )
 

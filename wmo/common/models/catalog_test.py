@@ -255,6 +255,7 @@ def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) ->
             "coding": ModelRecord(
                 connection="openai",
                 model="gpt-coding",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 capabilities=capabilities,
                 gateway=GatewayDeploymentMetadata(
                     exact_model_id="coding-exact-v1",
