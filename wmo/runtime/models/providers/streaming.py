@@ -27,7 +27,6 @@ from wmo.runtime.models.providers.async_transport import (
     AsyncStreamingHttpTransport,
     ProviderDeadlineExceeded,
     RequestDeadline,
-    run_with_retry_async,
 )
 from wmo.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -38,6 +37,7 @@ from wmo.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
+from wmo.runtime.models.providers.stream_attempts import StreamAttemptController
 from wmo.runtime.models.providers.streaming_requests import (
     anthropic_messages_stream_payload,
     openai_compatible_stream_payload,
@@ -166,6 +166,7 @@ class _SseDecoder:
         buffer = b""
         event_name: str | None = None
         data_lines: list[str] = []
+        current_event_bytes = 0
         iterator = self._upstream.__aiter__()
         while True:
             try:
@@ -177,16 +178,18 @@ class _SseDecoder:
             except StopAsyncIteration:
                 break
             buffer += chunk
-            if len(buffer) > _MAXIMUM_SSE_EVENT_BYTES:
-                raise ProviderResponseError("provider stream event exceeds the size limit")
             while b"\n" in buffer:
                 raw_line, buffer = buffer.split(b"\n", 1)
+                current_event_bytes += len(raw_line) + 1
+                if current_event_bytes > _MAXIMUM_SSE_EVENT_BYTES:
+                    raise ProviderResponseError("provider stream event exceeds the size limit")
                 line = _decode_sse_line(raw_line)
                 if line == "":
                     if data_lines:
                         yield _SseEvent(event_name, "\n".join(data_lines))
                     event_name = None
                     data_lines = []
+                    current_event_bytes = 0
                     continue
                 if line.startswith(":"):
                     continue
@@ -196,7 +199,12 @@ class _SseDecoder:
                     event_name = value
                 elif field_name == "data":
                     data_lines.append(value)
+            if current_event_bytes + len(buffer) > _MAXIMUM_SSE_EVENT_BYTES:
+                raise ProviderResponseError("provider stream event exceeds the size limit")
         if buffer:
+            current_event_bytes += len(buffer)
+            if current_event_bytes > _MAXIMUM_SSE_EVENT_BYTES:
+                raise ProviderResponseError("provider stream event exceeds the size limit")
             line = _decode_sse_line(buffer)
             if line.startswith("data:"):
                 value = line[5:]
@@ -217,6 +225,8 @@ class NormalizedProviderStream:
         *,
         deadline: RequestDeadline,
         phase_timeout_seconds: float,
+        attempt_controller: StreamAttemptController,
+        decoder: Callable[[_SseDecoder], AsyncIterator[GatewayEvent]],
     ) -> None:
         """Bind normalized events to their active upstream response.
 
@@ -225,11 +235,15 @@ class NormalizedProviderStream:
             events: Provider-specific normalized event iterator.
             deadline: Immutable request-wide deadline.
             phase_timeout_seconds: Maximum wait for one normalized event.
+            attempt_controller: Shared pre-semantic same-endpoint retry state.
+            decoder: Provider-specific event decoder used for a retried response.
         """
         self._upstream = upstream
         self._events = events
         self._deadline = deadline
         self._phase_timeout_seconds = phase_timeout_seconds
+        self._attempt_controller = attempt_controller
+        self._decoder = decoder
         self._committed = False
         self._done = False
         self._last_sequence = -1
@@ -268,6 +282,25 @@ class NormalizedProviderStream:
             self._done = True
             raise
         except BaseException as exc:  # noqa: BLE001 - public failure taxonomy owns conversion.
+            if (
+                isinstance(exc, Exception)
+                and self._last_sequence < 0
+                and self._attempt_controller.can_retry(exc)
+            ):
+                await self._close()
+                try:
+                    upstream = await self._attempt_controller.open(exc)
+                except Exception as retry_exc:  # noqa: BLE001 - normalize final retry failure.
+                    exc = retry_exc
+                else:
+                    self._upstream = upstream
+                    sse = _SseDecoder(
+                        upstream,
+                        deadline=self._deadline,
+                        phase_timeout_seconds=self._phase_timeout_seconds,
+                    )
+                    self._events = self._decoder(sse)
+                    return await self.__anext__()
             event = GatewayEvent(
                 kind=GatewayEventKind.FAILED,
                 sequence_number=self._last_sequence + 1,
@@ -448,29 +481,16 @@ async def _start_stream(
     }
     request_headers["Idempotency-Key"] = idempotency_key
 
-    async def open_attempt(attempt_timeout: float) -> AsyncHttpByteStream:
-        """Open one response and reject its status before reading provider content."""
-        upstream = await transport.stream(
-            url,
-            headers=request_headers,
-            payload=payload,
-            timeout_seconds=attempt_timeout,
-        )
-        if 200 <= upstream.status_code < 300:
-            return upstream
-        status_code = upstream.status_code
-        await upstream.aclose()
-        raise ProviderTransportError(
-            f"provider returned HTTP {status_code}",
-            status_code=status_code,
-        )
-
-    upstream = await run_with_retry_async(
-        open_attempt,
-        policy=retry_policy,
+    attempt_controller = StreamAttemptController(
+        transport,
+        url,
+        headers=request_headers,
+        payload=payload,
         deadline=deadline,
-        attempt_timeout_seconds=timeout_seconds,
+        retry_policy=retry_policy,
+        timeout_seconds=timeout_seconds,
     )
+    upstream = await attempt_controller.open()
     sse = _SseDecoder(
         upstream,
         deadline=deadline,
@@ -481,6 +501,8 @@ async def _start_stream(
         decoder(sse),
         deadline=deadline,
         phase_timeout_seconds=timeout_seconds,
+        attempt_controller=attempt_controller,
+        decoder=decoder,
     )
 
 
@@ -504,6 +526,8 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
             item = require_object(payload.get("item"), "OpenAI output item")
             if item.get("type") == "function_call":
                 index = require_integer(payload.get("output_index"), "OpenAI output_index")
+                if index in tools:
+                    raise ProviderResponseError("OpenAI stream repeated a tool-call start")
                 call_id = require_string(
                     item.get("call_id") or item.get("id"), "OpenAI function call ID"
                 )
@@ -572,12 +596,36 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
             usage = _openai_usage(response.get("usage"))
             if usage is not None:
                 yield factory.create(GatewayEventKind.USAGE, usage=usage)
-            terminal = (
-                GatewayEventKind.INCOMPLETE
-                if event_type == "response.incomplete" or response.get("status") == "incomplete"
-                else GatewayEventKind.COMPLETED
+            is_incomplete = (
+                event_type == "response.incomplete" or response.get("status") == "incomplete"
             )
-            yield factory.create(terminal)
+            if not is_incomplete:
+                yield factory.create(GatewayEventKind.COMPLETED)
+                return
+            details = require_object(
+                response.get("incomplete_details"), "OpenAI incomplete details"
+            )
+            reason = require_string(details.get("reason"), "OpenAI incomplete reason")
+            if reason == "max_output_tokens":
+                yield factory.create(GatewayEventKind.INCOMPLETE)
+            elif reason in {"content_filter", "safety"}:
+                yield factory.create(
+                    GatewayEventKind.FAILED,
+                    failure=GatewayFailure(
+                        failure_class=GatewayFailureClass.REFUSAL,
+                        safe_message="provider refused the request",
+                        safe_details={"signal": "content_policy"},
+                    ),
+                )
+            else:
+                yield factory.create(
+                    GatewayEventKind.FAILED,
+                    failure=GatewayFailure(
+                        failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+                        safe_message="provider ended the stream incompletely",
+                        failover_eligible=True,
+                    ),
+                )
             return
         elif event_type == "response.failed":
             yield factory.create(
@@ -623,6 +671,8 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
             if block_type == "tool_use":
                 call_id = require_string(block.get("id"), "Anthropic tool ID")
                 name = require_string(block.get("name"), "Anthropic tool name")
+                if index in tools:
+                    raise ProviderResponseError("Anthropic stream repeated a tool-call start")
                 tools[index] = _ToolAccumulator(index=index, call_id=call_id, name=name)
                 yield factory.create(
                     GatewayEventKind.TOOL_CALL_STARTED,
@@ -786,6 +836,17 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
                         tool_call_id=call_id,
                         tool_name=name,
                     )
+                else:
+                    repeated_id = item.get("id")
+                    if repeated_id is not None and repeated_id != tool.call_id:
+                        raise ProviderResponseError(
+                            "OpenAI-compatible stream changed a tool-call ID"
+                        )
+                    repeated_name = function.get("name")
+                    if repeated_name is not None and repeated_name != tool.name:
+                        raise ProviderResponseError(
+                            "OpenAI-compatible stream changed a tool-call name"
+                        )
                 fragment = function.get("arguments")
                 if fragment is not None:
                     raw_fragment = _optional_string(fragment, "OpenAI-compatible argument delta")
@@ -824,20 +885,18 @@ def _openai_usage(value: JsonValue | None) -> GatewayUsage | None:
     if value is None:
         return None
     usage = require_object(value, "OpenAI usage")
-    input_details = require_object(
-        usage.get("input_tokens_details") or {}, "OpenAI input token details"
-    )
-    output_details = require_object(
-        usage.get("output_tokens_details") or {}, "OpenAI output token details"
-    )
     return GatewayUsage(
         input_tokens=require_integer(usage.get("input_tokens"), "OpenAI input_tokens"),
         output_tokens=require_integer(usage.get("output_tokens"), "OpenAI output_tokens"),
-        cached_input_tokens=require_integer(
-            input_details.get("cached_tokens"), "OpenAI cached_tokens"
+        cached_input_tokens=_optional_usage_detail(
+            usage.get("input_tokens_details"),
+            field_name="cached_tokens",
+            label="OpenAI cached_tokens",
         ),
-        reasoning_tokens=require_integer(
-            output_details.get("reasoning_tokens"), "OpenAI reasoning_tokens"
+        reasoning_tokens=_optional_usage_detail(
+            usage.get("output_tokens_details"),
+            field_name="reasoning_tokens",
+            label="OpenAI reasoning_tokens",
         ),
     )
 
@@ -845,20 +904,36 @@ def _openai_usage(value: JsonValue | None) -> GatewayUsage | None:
 def _openai_compatible_usage(value: JsonValue) -> GatewayUsage:
     """Normalize Chat usage including optional cached and reasoning subsets."""
     usage = require_object(value, "OpenAI-compatible usage")
-    input_details = require_object(
-        usage.get("prompt_tokens_details") or {}, "OpenAI-compatible prompt details"
-    )
-    output_details = require_object(
-        usage.get("completion_tokens_details") or {}, "OpenAI-compatible completion details"
-    )
     return GatewayUsage(
         input_tokens=require_integer(usage.get("prompt_tokens"), "prompt_tokens"),
         output_tokens=require_integer(usage.get("completion_tokens"), "completion_tokens"),
-        cached_input_tokens=require_integer(input_details.get("cached_tokens"), "cached_tokens"),
-        reasoning_tokens=require_integer(
-            output_details.get("reasoning_tokens"), "reasoning_tokens"
+        cached_input_tokens=_optional_usage_detail(
+            usage.get("prompt_tokens_details"),
+            field_name="cached_tokens",
+            label="cached_tokens",
+        ),
+        reasoning_tokens=_optional_usage_detail(
+            usage.get("completion_tokens_details"),
+            field_name="reasoning_tokens",
+            label="reasoning_tokens",
         ),
     )
+
+
+def _optional_usage_detail(
+    value: JsonValue | None,
+    *,
+    field_name: str,
+    label: str,
+) -> int | None:
+    """Preserve an absent provider token subset as unknown instead of zero."""
+    if value is None:
+        return None
+    details = require_object(value, f"{label} details")
+    raw_count = details.get(field_name)
+    if raw_count is None:
+        return None
+    return require_integer(raw_count, label)
 
 
 def _json_object(raw: str) -> JsonObject:
@@ -914,4 +989,6 @@ async def _next_with_deadline[ValueT](
         async with asyncio.timeout(timeout_seconds):
             return await anext(iterator)
     except TimeoutError as exc:
-        raise ProviderDeadlineExceeded("provider request deadline exceeded") from exc
+        if deadline.remaining_seconds() <= 0:
+            raise ProviderDeadlineExceeded("provider request deadline exceeded") from exc
+        raise ProviderTransportError("provider response stream timed out") from exc
