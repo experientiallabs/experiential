@@ -60,44 +60,51 @@ def alias_activation_transaction(
         Open immediate transaction for the activation body.
 
     Raises:
-        AliasActivationOutcomeUnknownError: COMMIT failed and a fresh read was inconclusive.
-        ValueError: COMMIT was proven not to contain the desired activation.
+        AliasActivationOutcomeUnknownError: COMMIT or teardown failed after dispatch and a fresh
+            read was inconclusive.
+        ValueError: An unacknowledged COMMIT was proven not to contain the desired activation.
     """
-    with connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            yield connection
-        except BaseException:
-            connection.execute("ROLLBACK")
+    commit_started = False
+    commit_acknowledged = False
+    try:
+        with connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            commit_started = True
+            connection.execute("COMMIT")
+            commit_acknowledged = True
+    except BaseException as activation_error:  # noqa: BLE001 - teardown may follow a durable COMMIT
+        if not commit_started:
             raise
         try:
-            connection.execute("COMMIT")
-        except BaseException as commit_error:  # noqa: BLE001 - COMMIT may land before interruption
-            try:
-                outcome = reconcile_alias_activation(
-                    connect=connect,
-                    organization_id=organization_id,
-                    alias_id=alias_id,
-                    alias_name=alias_name,
-                    revision_id=revision_id,
-                    target=target,
-                    snapshot_ref=snapshot_ref,
-                    catalog_sha256=catalog_sha256,
-                    refusal_failover=refusal_failover,
-                )
-            except BaseException as reconciliation_error:  # noqa: BLE001 - never undo possible COMMIT
-                raise AliasActivationOutcomeUnknownError(
-                    alias_id=alias_id,
-                    revision_id=revision_id,
-                ) from reconciliation_error
-            if outcome is True:
-                return
-            if outcome is False:
-                raise ValueError("alias activation did not commit") from commit_error
+            outcome = reconcile_alias_activation(
+                connect=connect,
+                organization_id=organization_id,
+                alias_id=alias_id,
+                alias_name=alias_name,
+                revision_id=revision_id,
+                target=target,
+                snapshot_ref=snapshot_ref,
+                catalog_sha256=catalog_sha256,
+                refusal_failover=refusal_failover,
+            )
+        except BaseException as reconciliation_error:  # noqa: BLE001 - never undo possible COMMIT
             raise AliasActivationOutcomeUnknownError(
                 alias_id=alias_id,
                 revision_id=revision_id,
-            ) from commit_error
+            ) from reconciliation_error
+        if outcome is True:
+            return
+        if outcome is False and not commit_acknowledged:
+            raise ValueError("alias activation did not commit") from activation_error
+        raise AliasActivationOutcomeUnknownError(
+            alias_id=alias_id,
+            revision_id=revision_id,
+        ) from activation_error
 
 
 def reconcile_alias_activation(

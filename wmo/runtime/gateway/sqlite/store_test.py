@@ -784,6 +784,150 @@ def test_alias_activation_reconciles_lost_commit_acknowledgement_after_supersess
     )
 
 
+def test_alias_activation_reconciles_teardown_interruption_after_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A teardown interruption after acknowledged COMMIT preserves exact authority.
+
+    Args:
+        tmp_path: Pytest-owned SQLite database directory.
+        monkeypatch: Scoped connection-context failure injection.
+    """
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.register_catalog_snapshot(
+        organization_id="org-one",
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+    original_connect = store._connect
+    connect_calls = 0
+
+    @contextmanager
+    def teardown_after_commit() -> Iterator[sqlite3.Connection]:
+        """Interrupt only the first connection context after its body returns."""
+        nonlocal connect_calls
+        connect_calls += 1
+        with original_connect() as connection:
+            try:
+                yield connection
+            finally:
+                if connect_calls == 1:
+                    raise KeyboardInterrupt("injected post-COMMIT teardown interruption")
+
+    monkeypatch.setattr(store, "_connect", teardown_after_commit)
+    store.activate_alias_revision(
+        organization_id="org-one",
+        alias_id="alias-one",
+        alias_name="coding",
+        revision_id="revision-one",
+        target=DirectTarget(pool_id="pool-one"),
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+
+    assert connect_calls == 2
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        row = connection.execute(
+            "SELECT active_revision_id FROM gateway_aliases WHERE alias_id = 'alias-one'"
+        ).fetchone()
+    assert row == ("revision-one",)
+
+
+def test_alias_activation_types_unreadable_postcommit_teardown_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable recovery after a post-COMMIT teardown preserves catalog authority.
+
+    Args:
+        tmp_path: Pytest-owned SQLite database directory.
+        monkeypatch: Scoped teardown and fresh-read failure injection.
+    """
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.register_catalog_snapshot(
+        organization_id="org-one",
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+    original_connect = store._connect
+    connect_calls = 0
+
+    @contextmanager
+    def teardown_then_unreadable() -> Iterator[sqlite3.Connection]:
+        """Interrupt teardown once and reject its fresh reconciliation connection."""
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls > 1:
+            raise RuntimeError("injected reconciliation read failure")
+        with original_connect() as connection:
+            try:
+                yield connection
+            finally:
+                raise SystemExit("injected post-COMMIT teardown interruption")
+
+    monkeypatch.setattr(store, "_connect", teardown_then_unreadable)
+    with pytest.raises(AliasActivationOutcomeUnknownError, match="operation_outcome_unknown"):
+        store.activate_alias_revision(
+            organization_id="org-one",
+            alias_id="alias-one",
+            alias_name="coding",
+            revision_id="revision-one",
+            target=DirectTarget(pool_id="pool-one"),
+            snapshot_ref="snapshot-one",
+            catalog_sha256=_DIGEST,
+        )
+
+    assert connect_calls == 2
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        row = connection.execute(
+            "SELECT active_revision_id FROM gateway_aliases WHERE alias_id = 'alias-one'"
+        ).fetchone()
+    assert row == ("revision-one",)
+
+
+def test_alias_activation_keeps_precommit_teardown_failure_definite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A teardown failure before COMMIT remains ordinary and leaves no revision.
+
+    Args:
+        tmp_path: Pytest-owned SQLite database directory.
+        monkeypatch: Scoped precommit teardown failure injection.
+    """
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    original_connect = store._connect
+
+    @contextmanager
+    def precommit_teardown_failure() -> Iterator[sqlite3.Connection]:
+        """Replace one rolled-back body error with an ordinary teardown failure."""
+        with original_connect() as connection:
+            try:
+                yield connection
+            finally:
+                raise RuntimeError("injected precommit teardown failure")
+
+    monkeypatch.setattr(store, "_connect", precommit_teardown_failure)
+    with pytest.raises(RuntimeError, match="injected precommit teardown failure"):
+        store.activate_alias_revision(
+            organization_id="org-one",
+            alias_id="alias-one",
+            alias_name="coding",
+            revision_id="revision-one",
+            target=DirectTarget(pool_id="pool-one"),
+            snapshot_ref="missing-snapshot",
+            catalog_sha256=_DIGEST,
+        )
+
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        count = connection.execute("SELECT COUNT(*) FROM alias_revisions").fetchone()[0]
+    assert count == 0
+
+
 def test_alias_activation_types_only_unreadable_commit_outcome_as_unknown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
