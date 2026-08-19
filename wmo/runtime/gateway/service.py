@@ -308,7 +308,8 @@ class GatewayService:
             )
             stream = await self._executor.start(route=route, request=execution_request)
         except BaseException as exc:
-            if accepted:
+            request_finalized = isinstance(exc, GatewayExecutionError) and exc.request_finalized
+            if accepted and not request_finalized:
                 _finish_request_quietly(
                     self._ledger,
                     authorization=authorization,
@@ -561,9 +562,9 @@ class GatewayService:
         headers.update(
             commit_dependent_headers(
                 exact_model_id=route.snapshot.exact_model_id,
-                provider=route.deployment.provider,
-                deployment_id=route.deployment.deployment_id,
-                route_depth=0,
+                provider=stream.deployment.provider,
+                deployment_id=stream.deployment.deployment_id,
+                route_depth=stream.route_depth,
                 route_reason=route.route_reason,
             )
         )

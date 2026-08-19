@@ -38,7 +38,6 @@ from wmo.runtime.gateway.contracts import (
 )
 from wmo.runtime.gateway.execution import (
     GatewayExecutionError,
-    GatewayExecutionStream,
     GatewayExecutor,
 )
 from wmo.runtime.gateway.routing import (
@@ -50,6 +49,7 @@ from wmo.runtime.gateway.routing import (
 from wmo.runtime.gateway.service import GatewayDrainingError, GatewayService, create_gateway_app
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.models.providers import RequestDeadline
+from wmo.runtime.models.providers.transport import RetryPolicy
 from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
 from wmo.runtime.openai_protocol.requests import decode_chat, decode_responses
 from wmo.runtime.openai_protocol.state import (
@@ -263,10 +263,12 @@ class _Provider:
         *,
         deadline: RequestDeadline,
         idempotency_key: str,
+        retry_policy: RetryPolicy | None = None,
     ) -> _EventStream | _BlockingStream:
         """Open one injected stream under the request-wide deadline."""
         assert request.stream and request.include_usage
         assert deadline.remaining_seconds() > 0
+        assert retry_policy is not None and retry_policy.maximum_attempts == 1
         self.idempotency_keys.append(idempotency_key)
         stream = self._factory()
         self.streams.append(stream)
@@ -472,7 +474,8 @@ def test_direct_request_routes_streams_and_accounts_before_public_completion() -
         assert response.status_code == 200
         assert body["choices"][0]["message"]["content"] == "hello"
         assert body["usage"]["total_tokens"] == 4
-        assert provider.idempotency_keys == ["request-one"]
+        assert len(provider.idempotency_keys) == 1
+        assert provider.idempotency_keys[0] != "request-one"
         assert control.raw_keys_seen == ["caller-secret"]
         assert ledger.routes == [("direct", None)]
         assert ledger.finished[0][0] is not None
@@ -745,16 +748,37 @@ def test_concurrent_abort_and_cancel_have_one_terminal_owner() -> None:
 
     async def scenario() -> None:
         """Race two settlement reasons against one active provider stream."""
+        catalog, _deployment = _catalog()
         ledger = _Ledger()
         upstream = _BlockingStream()
-        releases: list[bool] = []
-        stream = GatewayExecutionStream(
-            upstream,
-            ledger=ledger,
-            attempt_id="attempt-one",
-            release=lambda: releases.append(True),
-            accounting_failure=lambda: None,
+        provider = _Provider(lambda: upstream)
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="race"),),
         )
+        authorization = _ControlStore(catalog.identity_sha256()).authorize_request(
+            raw_key="caller-secret",
+            alias="public-model",
+            request=request,
+            deadline_monotonic=time.monotonic() + 30,
+        )
+        route = await CatalogRouteResolver(
+            {("revision-one", catalog.identity_sha256()): catalog}
+        ).resolve(
+            authorization=authorization,
+            request=request,
+            episode_namespace=("org", "identity", "revision-one", "episode"),
+        )
+        executor = GatewayExecutor(
+            {
+                ("revision-one", catalog.identity_sha256()): cast(
+                    RuntimeModelCatalog, _RuntimeCatalog(provider)
+                )
+            },
+            ledger,
+            maximum_active_requests=1,
+        )
+        stream = await executor.start(route=route, request=request)
         failure = GatewayFailure(
             failure_class=GatewayFailureClass.INTERNAL,
             safe_message="internal stream failure",
@@ -764,7 +788,7 @@ def test_concurrent_abort_and_cancel_have_one_terminal_owner() -> None:
 
         assert upstream.cancelled
         assert len(ledger.finished) == 1
-        assert releases == [True]
+        assert executor._permits._value == 1  # noqa: SLF001 - permit race regression
 
     asyncio.run(scenario())
 

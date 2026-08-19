@@ -1,11 +1,14 @@
-"""Compose one authorized singleton route with provider execution and accounting."""
+"""Execute one frozen exact-model route through bounded physical provider attempts."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass
 from typing import cast
 
+from wmo.common.core.artifacts import stable_id
+from wmo.common.models.gateway_catalog import ExactModelDeployment
 from wmo.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -14,6 +17,7 @@ from wmo.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from wmo.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from wmo.runtime.gateway.interfaces import AttemptLedger, ProviderStream
 from wmo.runtime.gateway.routing import GatewayRoute
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
@@ -25,118 +29,253 @@ from wmo.runtime.models.providers import (
 )
 from wmo.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from wmo.runtime.models.providers.errors import normalized_provider_failure
+from wmo.runtime.models.providers.transport import RetryPolicy
+
+_SINGLE_DISPATCH = RetryPolicy(
+    maximum_attempts=1,
+    initial_delay_seconds=0,
+    maximum_delay_seconds=0,
+)
+_SEMANTIC_EVENTS = {
+    GatewayEventKind.TEXT_DELTA,
+    GatewayEventKind.REFUSAL_DELTA,
+    GatewayEventKind.TOOL_CALL_STARTED,
+    GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+    GatewayEventKind.TOOL_CALL_COMPLETED,
+}
+_TERMINAL_EVENTS = {
+    GatewayEventKind.COMPLETED,
+    GatewayEventKind.INCOMPLETE,
+    GatewayEventKind.FAILED,
+}
 
 
 class GatewayExecutionError(RuntimeError):
     """A route failed before a normalized provider stream could be returned."""
 
-    def __init__(self, failure: GatewayFailure) -> None:
+    def __init__(self, failure: GatewayFailure, *, request_finalized: bool = False) -> None:
         """Retain one sanitized failure for the public protocol boundary."""
         super().__init__(failure.safe_message)
         self.failure = failure
+        self.request_finalized = request_finalized
+
+
+@dataclass(frozen=True)
+class _ResolvedDeployment:
+    """One verified provider binding for a frozen deployment."""
+
+    deployment: ExactModelDeployment
+    provider: AsyncGatewayProvider
+    health_key: DeploymentHealthKey
+    idempotency_key: str
+
+
+@dataclass
+class _PhysicalAttempt:
+    """Mutable stream and usage state for one durably recorded dispatch."""
+
+    route_index: int
+    attempt_id: str
+    stream: ProviderStream | None = None
+    iterator: AsyncIterator[GatewayEvent] | None = None
+    latest_usage: GatewayUsage | None = None
+    last_provider_sequence: int = -1
+    settled: bool = False
 
 
 class GatewayExecutionStream:
-    """Account one normalized provider stream through its single terminal state."""
+    """Expose one logical stream while accounting every precommit physical attempt."""
 
     def __init__(
         self,
-        stream: ProviderStream,
         *,
+        route: GatewayRoute,
+        request: GatewayRequest,
+        deadline: RequestDeadline,
+        resolved: tuple[_ResolvedDeployment, ...],
         ledger: AttemptLedger,
-        attempt_id: str,
+        health: DeploymentHealthRegistry,
         release: Callable[[], None],
         accounting_failure: Callable[[], None],
+        maximum_total_attempts: int,
+        maximum_same_deployment_attempts: int,
+        refusal_failover: bool,
     ) -> None:
-        """Bind provider iteration to durable terminal accounting.
+        """Bind one frozen logical route to its finite physical-attempt policy.
 
         Args:
-            stream: Active normalized provider stream.
-            ledger: Content-free attempt ledger.
-            attempt_id: Durable attempt identity.
-            release: Callback releasing one execution admission permit.
-            accounting_failure: Callback latching terminal accounting failures.
+            route: Ordered certified deployment route.
+            request: Canonical request forced into provider streaming mode.
+            deadline: One request-wide absolute deadline.
+            resolved: Verified runtime providers in route order.
+            ledger: Content-free request and attempt ledger.
+            health: Revision-isolated circuit and throttle registry.
+            release: Callback releasing one logical execution permit.
+            accounting_failure: Callback latching durable accounting failures.
+            maximum_total_attempts: Hard cap across retries and deployments.
+            maximum_same_deployment_attempts: Initial dispatch plus safe retries per deployment.
+            refusal_failover: Whether a typed precommit refusal may advance to another deployment.
         """
-        self._stream = stream
-        self._iterator = stream.__aiter__()
+        self._route = route
+        self._request = request
+        self._deadline = deadline
+        self._resolved = resolved
         self._ledger = ledger
-        self._attempt_id = attempt_id
+        self._health = health
         self._release = release
         self._accounting_failure = accounting_failure
-        self._latest_usage: GatewayUsage | None = None
-        self._last_sequence = -1
+        self._maximum_total_attempts = maximum_total_attempts
+        self._maximum_same_deployment_attempts = maximum_same_deployment_attempts
+        self._refusal_failover = refusal_failover
+        self._attempt_counts = [0 for _ in resolved]
+        self._total_attempts = 0
+        self._current: _PhysicalAttempt | None = None
+        self._committed = False
         self._settled = False
+        self._parent_finalized = False
+        self._next_sequence = 0
         self._settlement_lock = asyncio.Lock()
 
     @property
     def committed(self) -> bool:
-        """Return whether semantic provider output has committed this route."""
-        return self._stream.committed
+        """Return whether outward semantic output has frozen the current deployment."""
+        return self._committed
+
+    @property
+    def deployment(self) -> ExactModelDeployment:
+        """Return the active or terminal physical deployment."""
+        current = self._require_current()
+        return self._resolved[current.route_index].deployment
+
+    @property
+    def route_depth(self) -> int:
+        """Return the zero-based deployment position serving the outward result."""
+        return self._require_current().route_index
+
+    async def open(self) -> None:
+        """Open the first healthy attempt and terminalize final opening exhaustion."""
+        candidate = self._initial_candidate()
+        if candidate is None:
+            raise GatewayExecutionError(_all_routes_unavailable())
+        failure = await self._open_from(candidate, finalize_on_exhaustion=True)
+        if failure is not None:
+            raise GatewayExecutionError(failure, request_finalized=self._parent_finalized)
 
     def __aiter__(self) -> AsyncIterator[GatewayEvent]:
-        """Return this one-pass accounted event iterator."""
+        """Return this one-pass logical event iterator."""
         return self
 
     async def __anext__(self) -> GatewayEvent:
-        """Return the next event after persisting terminal accounting."""
+        """Yield one logical event, advancing routes only before semantic commitment."""
         if self._settled:
             raise StopAsyncIteration
-        try:
-            event = await self._iterator.__anext__()
-        except StopAsyncIteration as exc:
-            async with self._settlement_lock:
+        while True:
+            current = self._require_current()
+            iterator = self._require_iterator(current)
+            try:
+                event = await iterator.__anext__()
+            except StopAsyncIteration:
                 if self._settled:
                     raise
                 failure = GatewayFailure(
                     failure_class=GatewayFailureClass.MALFORMED_RESPONSE,
                     safe_message="provider stream ended without a terminal event",
+                    retryable_same_deployment=True,
+                    failover_eligible=True,
                 )
-                try:
-                    self._ledger.finish_attempt(
-                        attempt_id=self._attempt_id,
-                        terminal_event=None,
-                        failure=failure,
+                event = GatewayEvent(
+                    kind=GatewayEventKind.FAILED,
+                    sequence_number=current.last_provider_sequence + 1,
+                    failure=failure,
+                )
+            except asyncio.CancelledError:
+                await self.abort(
+                    GatewayFailure(
+                        failure_class=GatewayFailureClass.CANCELLED,
+                        safe_message="provider request was cancelled",
                     )
-                except BaseException:
-                    self._accounting_failure()
-                    raise
-                finally:
-                    self._settle()
-                raise GatewayExecutionError(failure) from exc
-        self._last_sequence = event.sequence_number
-        if event.usage is not None:
-            self._latest_usage = event.usage
-        if event.kind in {
-            GatewayEventKind.COMPLETED,
-            GatewayEventKind.INCOMPLETE,
-            GatewayEventKind.FAILED,
-        }:
-            terminal = (
-                event
-                if self._latest_usage is None or event.usage is not None
-                else event.model_copy(update={"usage": self._latest_usage})
+                )
+                raise
+            except BaseException as exc:  # noqa: BLE001 - provider taxonomy owns conversion.
+                failure = normalized_provider_failure(exc)
+                event = GatewayEvent(
+                    kind=GatewayEventKind.FAILED,
+                    sequence_number=current.last_provider_sequence + 1,
+                    failure=failure,
+                )
+            if self._settled:
+                raise StopAsyncIteration
+            current.last_provider_sequence = event.sequence_number
+            if event.usage is not None:
+                current.latest_usage = event.usage
+            if event.kind in _SEMANTIC_EVENTS:
+                self._committed = True
+                return self._outward(event)
+            if event.kind not in _TERMINAL_EVENTS:
+                if self._committed:
+                    return self._outward(event)
+                continue
+            terminal = _with_latest_usage(event, current.latest_usage)
+            if terminal.kind != GatewayEventKind.FAILED:
+                self._health.succeeded(self._health_key(current.route_index))
+                await self._finish_current(terminal=terminal, failure=None, finalize_request=True)
+                self._settle()
+                return self._outward(terminal)
+            failure = terminal.failure or GatewayFailure(
+                failure_class=GatewayFailureClass.INTERNAL,
+                safe_message="provider execution failed",
             )
-            async with self._settlement_lock:
-                if self._settled:
-                    raise StopAsyncIteration
-                try:
-                    self._ledger.finish_attempt(
-                        attempt_id=self._attempt_id,
-                        terminal_event=terminal,
-                        failure=event.failure,
+            self._health.failed(self._health_key(current.route_index), failure)
+            candidate = None if self._committed else self._next_candidate(failure)
+            if candidate is None:
+                await self._finish_current(
+                    terminal=terminal,
+                    failure=failure,
+                    finalize_request=True,
+                )
+                self._settle()
+                return self._outward(terminal)
+            await self._finish_current(
+                terminal=terminal,
+                failure=failure,
+                finalize_request=False,
+            )
+            try:
+                opening_failure = await self._open_from(
+                    candidate,
+                    finalize_on_exhaustion=True,
+                )
+            except asyncio.CancelledError:
+                await self._finish_parent(
+                    GatewayFailure(
+                        failure_class=GatewayFailureClass.CANCELLED,
+                        safe_message="provider request was cancelled",
                     )
-                except BaseException:
-                    self._accounting_failure()
-                    raise
-                finally:
-                    self._settle()
-                return terminal
-        if self._settled:
-            raise StopAsyncIteration
-        return event
+                )
+                self._settle()
+                raise
+            except GatewayExecutionError as exc:
+                await self._finish_parent(exc.failure)
+                self._settle()
+                return self._outward(
+                    GatewayEvent(
+                        kind=GatewayEventKind.FAILED,
+                        sequence_number=0,
+                        failure=exc.failure,
+                    )
+                )
+            if opening_failure is not None:
+                self._settle()
+                return self._outward(
+                    GatewayEvent(
+                        kind=GatewayEventKind.FAILED,
+                        sequence_number=0,
+                        failure=opening_failure,
+                    )
+                )
 
     async def cancel(self) -> None:
-        """Cancel upstream work and durably retain observed usage if available."""
+        """Cancel active upstream work and durably retain observed usage if available."""
         await self.abort(
             GatewayFailure(
                 failure_class=GatewayFailureClass.CANCELLED,
@@ -145,49 +284,277 @@ class GatewayExecutionStream:
         )
 
     async def abort(self, failure: GatewayFailure) -> None:
-        """Cancel upstream work and settle it with the supplied primary failure.
+        """Claim terminal ownership before bounded upstream cancellation.
 
         Args:
-            failure: Sanitized reason the owning gateway stopped this attempt.
+            failure: Sanitized reason the owning gateway stopped this logical request.
         """
+        current = self._current
+        if current is None:
+            self._settle()
+            return
         accounting_error: BaseException | None = None
         owns_cancel = False
         async with self._settlement_lock:
-            if self._settled:
+            if self._settled or current.settled:
                 return
             owns_cancel = True
             terminal = GatewayEvent(
                 kind=GatewayEventKind.FAILED,
-                sequence_number=self._last_sequence + 1,
+                sequence_number=current.last_provider_sequence + 1,
                 failure=failure,
-                usage=self._latest_usage,
+                usage=current.latest_usage,
             )
             try:
                 self._ledger.finish_attempt(
-                    attempt_id=self._attempt_id,
+                    attempt_id=current.attempt_id,
                     terminal_event=terminal,
                     failure=failure,
+                    finalize_request=True,
                 )
-            except Exception as exc:  # noqa: BLE001 - latch any durable ledger failure
+                current.settled = True
+                self._parent_finalized = True
+            except Exception as exc:  # noqa: BLE001 - latch any durable ledger failure.
                 accounting_error = exc
                 self._accounting_failure()
             finally:
                 self._settle()
-        if owns_cancel:
-            await self._stream.cancel()
+        if owns_cancel and current.stream is not None:
+            await current.stream.cancel()
         if accounting_error is not None:
             raise accounting_error
 
+    async def _open_from(
+        self,
+        candidate: int,
+        *,
+        finalize_on_exhaustion: bool,
+    ) -> GatewayFailure | None:
+        """Open the next physical attempt, consuming safe failures within the total cap."""
+        current_candidate: int | None = candidate
+        while current_candidate is not None:
+            try:
+                await self._dispatch(current_candidate)
+                return None
+            except asyncio.CancelledError:
+                raise
+            except _DispatchFailure as exc:
+                failure = exc.failure
+                self._health.failed(self._health_key(current_candidate), failure)
+                next_candidate = self._next_candidate(failure, current_candidate)
+                finalize = finalize_on_exhaustion and next_candidate is None
+                await self._finish_open_failure(exc, finalize_request=finalize)
+                if exc.cancelled:
+                    raise asyncio.CancelledError from exc
+                if next_candidate is None:
+                    return failure
+                current_candidate = next_candidate
+        return _all_routes_unavailable()
+
+    async def _dispatch(self, route_index: int) -> _PhysicalAttempt:
+        """Persist and open exactly one physical provider dispatch."""
+        binding = self._resolved[route_index]
+        self._deadline.attempt_timeout()
+        attempt_id: str | None = None
+        self._attempt_counts[route_index] += 1
+        self._total_attempts += 1
+        try:
+            attempt_id = self._ledger.start_attempt(
+                snapshot=self._route.snapshot,
+                deployment=binding.deployment,
+                route_depth=route_index,
+            )
+            self._ledger.record_route_context(
+                attempt_id=attempt_id,
+                route_reason=self._route.route_reason,
+                fallback_reason=self._route.fallback_reason,
+            )
+            current = _PhysicalAttempt(
+                route_index=route_index,
+                attempt_id=attempt_id,
+            )
+            self._current = current
+            stream = await binding.provider.stream(
+                self._request,
+                deadline=self._deadline,
+                idempotency_key=binding.idempotency_key,
+                retry_policy=_SINGLE_DISPATCH,
+            )
+            if self._settled or current.settled:
+                await stream.cancel()
+                raise asyncio.CancelledError
+            current.stream = stream
+            current.iterator = stream.__aiter__()
+        except BaseException as exc:
+            if attempt_id is None:
+                self._health.release_probe(binding.health_key)
+                if not isinstance(exc, asyncio.CancelledError):
+                    self._accounting_failure()
+                    raise GatewayExecutionError(normalized_provider_failure(exc)) from exc
+                raise
+            failure = normalized_provider_failure(exc)
+            raise _DispatchFailure(
+                attempt_id,
+                failure,
+                cancelled=isinstance(exc, asyncio.CancelledError),
+            ) from exc
+        return current
+
+    async def _finish_open_failure(
+        self,
+        dispatch_failure: _DispatchFailure,
+        *,
+        finalize_request: bool,
+    ) -> None:
+        """Settle one provider opening failure before another physical dispatch."""
+        try:
+            self._ledger.finish_attempt(
+                attempt_id=dispatch_failure.attempt_id,
+                terminal_event=None,
+                failure=dispatch_failure.failure,
+                finalize_request=finalize_request,
+            )
+            current = self._current
+            if current is not None and current.attempt_id == dispatch_failure.attempt_id:
+                current.settled = True
+            if finalize_request:
+                self._parent_finalized = True
+        except Exception:  # noqa: BLE001 - preserve the primary provider failure.
+            self._accounting_failure()
+            raise
+
+    async def _finish_current(
+        self,
+        *,
+        terminal: GatewayEvent,
+        failure: GatewayFailure | None,
+        finalize_request: bool,
+    ) -> None:
+        """Durably settle the active attempt once under the shared settlement lock."""
+        current = self._require_current()
+        async with self._settlement_lock:
+            if current.settled:
+                return
+            try:
+                self._ledger.finish_attempt(
+                    attempt_id=current.attempt_id,
+                    terminal_event=terminal,
+                    failure=failure,
+                    finalize_request=finalize_request,
+                )
+                current.settled = True
+                if finalize_request:
+                    self._parent_finalized = True
+            except BaseException:
+                self._accounting_failure()
+                raise
+
+    def _initial_candidate(self) -> int | None:
+        """Claim the first currently healthy deployment in authored order."""
+        for route_index in range(len(self._resolved)):
+            if self._health.claim(self._health_key(route_index)):
+                return route_index
+        return None
+
+    def _next_candidate(
+        self,
+        failure: GatewayFailure,
+        current: int | None = None,
+    ) -> int | None:
+        """Choose a safe retry or later exact deployment without changing logical model."""
+        if current is None:
+            current = self._require_current_index_for_failure()
+        if self._total_attempts >= self._maximum_total_attempts:
+            return None
+        if (
+            failure.retryable_same_deployment
+            and self._attempt_counts[current] < self._maximum_same_deployment_attempts
+            and self._health.claim(self._health_key(current))
+        ):
+            return current
+        refusal_eligible = (
+            failure.failure_class == GatewayFailureClass.REFUSAL and self._refusal_failover
+        )
+        if not failure.failover_eligible and not refusal_eligible:
+            return None
+        for route_index in range(current + 1, len(self._resolved)):
+            if self._health.claim(self._health_key(route_index)):
+                return route_index
+        return None
+
+    def _require_current_index_for_failure(self) -> int:
+        """Return the last dispatched route index, including failed opening attempts."""
+        if self._current is not None and not self._current.settled:
+            return self._current.route_index
+        for route_index in range(len(self._attempt_counts) - 1, -1, -1):
+            if self._attempt_counts[route_index] > 0:
+                return route_index
+        raise RuntimeError("waterfall failure has no physical attempt")
+
+    def _health_key(self, route_index: int) -> DeploymentHealthKey:
+        """Return the revision-isolated health key for one ordered deployment."""
+        return self._resolved[route_index].health_key
+
+    def _outward(self, event: GatewayEvent) -> GatewayEvent:
+        """Rewrite provider-local sequence numbers into one monotonic public sequence."""
+        outward = event.model_copy(update={"sequence_number": self._next_sequence})
+        self._next_sequence += 1
+        return outward
+
+    def _require_current(self) -> _PhysicalAttempt:
+        """Return the active or terminal attempt after successful stream opening."""
+        if self._current is None:
+            raise RuntimeError("gateway execution stream has no physical attempt")
+        return self._current
+
+    @staticmethod
+    def _require_iterator(current: _PhysicalAttempt) -> AsyncIterator[GatewayEvent]:
+        """Return the opened iterator for one active physical attempt."""
+        if current.iterator is None:
+            raise RuntimeError("gateway physical attempt is not open")
+        return current.iterator
+
+    async def _finish_parent(self, failure: GatewayFailure) -> None:
+        """Terminalize a parent whose next attempt could not be durably started."""
+        if self._parent_finalized:
+            return
+        try:
+            self._ledger.finish_request(
+                authorization=self._route.snapshot.authorization,
+                failure=failure,
+            )
+            self._parent_finalized = True
+        except Exception:
+            self._accounting_failure()
+            raise
+
     def _settle(self) -> None:
-        """Release execution admission exactly once."""
+        """Release logical execution admission exactly once."""
         if self._settled:
             return
         self._settled = True
         self._release()
 
 
+class _DispatchFailure(Exception):
+    """One durably started attempt failed before returning its provider stream."""
+
+    def __init__(
+        self,
+        attempt_id: str,
+        failure: GatewayFailure,
+        *,
+        cancelled: bool,
+    ) -> None:
+        """Retain the attempt and sanitized opening failure."""
+        super().__init__(failure.safe_message)
+        self.attempt_id = attempt_id
+        self.failure = failure
+        self.cancelled = cancelled
+
+
 class GatewayExecutor:
-    """Open provider streams only after preflight, admission, and durable dispatch."""
+    """Open certified provider waterfalls after preflight, admission, and durable dispatch."""
 
     def __init__(
         self,
@@ -195,19 +562,35 @@ class GatewayExecutor:
         ledger: AttemptLedger,
         *,
         maximum_active_requests: int = 64,
+        maximum_total_attempts: int = 8,
+        maximum_same_deployment_attempts: int = 2,
+        refusal_failover_revisions: frozenset[str] = frozenset(),
+        health: DeploymentHealthRegistry | None = None,
     ) -> None:
-        """Bind runtime providers, ledger, and finite request admission.
+        """Bind runtime providers, attempt policy, health, and finite request admission.
 
         Args:
             catalogs: Revision and catalog digests mapped to frozen runtime catalogs.
             ledger: Content-free request and attempt ledger.
-            maximum_active_requests: Maximum active upstream streams.
+            maximum_active_requests: Maximum active logical upstream requests.
+            maximum_total_attempts: Hard physical dispatch cap for one logical request.
+            maximum_same_deployment_attempts: Initial dispatch plus safe retries per deployment.
+            refusal_failover_revisions: Alias revisions allowed to fail over typed refusals.
+            health: Optional shared content-free deployment health registry.
         """
         if maximum_active_requests < 1:
             raise ValueError("maximum_active_requests must be at least one")
+        if maximum_total_attempts < 1:
+            raise ValueError("maximum_total_attempts must be at least one")
+        if maximum_same_deployment_attempts < 1:
+            raise ValueError("maximum_same_deployment_attempts must be at least one")
         self._catalogs = dict(catalogs)
         self._ledger = ledger
         self._permits = asyncio.Semaphore(maximum_active_requests)
+        self._maximum_total_attempts = maximum_total_attempts
+        self._maximum_same_deployment_attempts = maximum_same_deployment_attempts
+        self._refusal_failover_revisions = refusal_failover_revisions
+        self._health = health or DeploymentHealthRegistry()
         self._accounting_healthy = True
 
     def require_healthy(self) -> None:
@@ -230,92 +613,82 @@ class GatewayExecutor:
         route: GatewayRoute,
         request: GatewayRequest,
     ) -> GatewayExecutionStream:
-        """Durably start one singleton provider stream under the request deadline.
+        """Start one certified exact-model waterfall under the request-wide deadline.
 
         Args:
-            route: Frozen exact model and deployment route.
+            route: Frozen ordered exact-model route.
             request: Canonical public request.
 
         Returns:
-            Accounted normalized provider stream.
+            Accounted logical stream frozen on its first semantic event.
 
         Raises:
-            GatewayExecutionError: Preflight, admission, or provider opening fails.
+            GatewayExecutionError: Preflight, admission, resolution, or all openings fail.
         """
         deadline = RequestDeadline(route.snapshot.authorization.deadline_monotonic)
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         try:
-            require_gateway_provider(route.deployment.provider)
-            preflight_gateway_request(
-                provider_request,
-                route.deployment.gateway.capabilities,
-            )
+            for deployment in route.deployments:
+                require_gateway_provider(deployment.provider)
+                preflight_gateway_request(provider_request, deployment.gateway.capabilities)
+            resolved = self._resolve_route(route)
             await self._acquire(deadline)
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):
                 raise
             raise GatewayExecutionError(normalized_provider_failure(exc)) from exc
-        attempt_id: str | None = None
-        try:
-            authorization = route.snapshot.authorization
-            catalog = self._catalogs.get(
-                (authorization.alias_revision_id, authorization.catalog_sha256)
-            )
-            if catalog is None:
-                raise ValueError("runtime catalog is not loaded for the authorized revision")
-            resolved = catalog.resolve(route.deployment.source_alias)
-            _require_deployment_identity(route, resolved)
-            stream_method = getattr(resolved.client, "stream", None)
-            if stream_method is None:
-                raise TypeError("resolved gateway deployment has no async stream capability")
-            attempt_id = self._ledger.start_attempt(
-                snapshot=route.snapshot,
-                deployment=route.deployment,
-                route_depth=0,
-            )
-            self._ledger.record_route_context(
-                attempt_id=attempt_id,
-                route_reason=route.route_reason,
-                fallback_reason=route.fallback_reason,
-            )
-            provider = cast(AsyncGatewayProvider, resolved.client)
-            stream = await provider.stream(
-                provider_request,
-                deadline=deadline,
-                idempotency_key=route.snapshot.authorization.request_id,
-            )
-        except BaseException as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                failure = GatewayFailure(
-                    failure_class=GatewayFailureClass.CANCELLED,
-                    safe_message="provider request was cancelled",
-                )
-            else:
-                failure = normalized_provider_failure(exc)
-            try:
-                if attempt_id is not None:
-                    self._ledger.finish_attempt(
-                        attempt_id=attempt_id,
-                        terminal_event=None,
-                        failure=failure,
-                    )
-            except Exception:  # noqa: BLE001 - preserve the primary provider failure
-                self.mark_accounting_unhealthy()
-            finally:
-                self._permits.release()
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            raise GatewayExecutionError(failure) from exc
-        return GatewayExecutionStream(
-            stream,
+        execution = GatewayExecutionStream(
+            route=route,
+            request=provider_request,
+            deadline=deadline,
+            resolved=resolved,
             ledger=self._ledger,
-            attempt_id=attempt_id,
+            health=self._health,
             release=self._permits.release,
             accounting_failure=self.mark_accounting_unhealthy,
+            maximum_total_attempts=self._maximum_total_attempts,
+            maximum_same_deployment_attempts=self._maximum_same_deployment_attempts,
+            refusal_failover=(
+                route.snapshot.authorization.alias_revision_id in self._refusal_failover_revisions
+            ),
         )
+        try:
+            await execution.open()
+        except BaseException:
+            execution._settle()  # noqa: SLF001 - executor owns admission until open succeeds.
+            raise
+        return execution
+
+    def _resolve_route(self, route: GatewayRoute) -> tuple[_ResolvedDeployment, ...]:
+        """Resolve and identity-check every deployment before the first billable dispatch."""
+        authorization = route.snapshot.authorization
+        catalog = self._catalogs.get(
+            (authorization.alias_revision_id, authorization.catalog_sha256)
+        )
+        if catalog is None:
+            raise ValueError("runtime catalog is not loaded for the authorized revision")
+        resolved: list[_ResolvedDeployment] = []
+        for deployment in route.deployments:
+            runtime_model = catalog.resolve(deployment.source_alias)
+            _require_deployment_identity(deployment, runtime_model)
+            if getattr(runtime_model.client, "stream", None) is None:
+                raise TypeError("resolved gateway deployment has no async stream capability")
+            resolved.append(
+                _ResolvedDeployment(
+                    deployment=deployment,
+                    provider=cast(AsyncGatewayProvider, runtime_model.client),
+                    health_key=(
+                        authorization.catalog_sha256,
+                        deployment.deployment_id,
+                        deployment.connection_sha256,
+                    ),
+                    idempotency_key=_deployment_idempotency_key(route, deployment),
+                )
+            )
+        return tuple(resolved)
 
     async def _acquire(self, deadline: RequestDeadline) -> None:
-        """Wait for execution admission within the one request-wide deadline."""
+        """Wait for logical execution admission within the request-wide deadline."""
         try:
             async with asyncio.timeout(deadline.attempt_timeout()):
                 await self._permits.acquire()
@@ -323,9 +696,11 @@ class GatewayExecutor:
             raise ProviderDeadlineExceeded("gateway execution queue deadline exceeded") from exc
 
 
-def _require_deployment_identity(route: GatewayRoute, resolved: ResolvedModel) -> None:
+def _require_deployment_identity(
+    deployment: ExactModelDeployment,
+    resolved: ResolvedModel,
+) -> None:
     """Fail before accounting or network work when runtime resolution drifts from authority."""
-    deployment = route.deployment
     served_model = resolved.served_model_id or resolved.snapshot.model_id
     if (
         resolved.alias != deployment.source_alias
@@ -338,3 +713,38 @@ def _require_deployment_identity(route: GatewayRoute, resolved: ResolvedModel) -
         )
     ):
         raise ValueError("resolved runtime client differs from the frozen gateway deployment")
+
+
+def _deployment_idempotency_key(
+    route: GatewayRoute,
+    deployment: ExactModelDeployment,
+) -> str:
+    """Derive one stable key reused only by physical retries of this deployment."""
+    authorization = route.snapshot.authorization
+    return stable_id(
+        "gateway-provider-operation",
+        {
+            "request_id": authorization.request_id,
+            "catalog_sha256": authorization.catalog_sha256,
+            "deployment_id": deployment.deployment_id,
+            "connection_sha256": deployment.connection_sha256,
+        },
+    )
+
+
+def _with_latest_usage(
+    event: GatewayEvent,
+    latest_usage: GatewayUsage | None,
+) -> GatewayEvent:
+    """Attach the last observed usage to a terminal event that omitted it."""
+    if latest_usage is None or event.usage is not None:
+        return event
+    return event.model_copy(update={"usage": latest_usage})
+
+
+def _all_routes_unavailable() -> GatewayFailure:
+    """Return the sanitized terminal failure for an exhausted certified pool."""
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+        safe_message="all exact-model deployments are unavailable",
+    )

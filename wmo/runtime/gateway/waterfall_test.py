@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import cast
 
+import pytest
+
+from wmo.common.models import ModelCapabilities, ModelClient, ModelSnapshot
 from wmo.common.models.catalog import (
+    GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayEquivalenceCertification,
 )
@@ -17,14 +24,21 @@ from wmo.common.models.gateway_catalog import (
 from wmo.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
+    ExecutionSnapshot,
     GatewayApiSurface,
+    GatewayEvent,
+    GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
 )
+from wmo.runtime.gateway.execution import GatewayExecutionError, GatewayExecutor
 from wmo.runtime.gateway.health import DeploymentHealthRegistry
-from wmo.runtime.gateway.routing import CatalogRouteResolver
+from wmo.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
+from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models.providers import RequestDeadline
+from wmo.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
 
 _DIGEST = "a" * 64
 
@@ -124,6 +138,433 @@ def test_throttle_window_recovers_without_opening_the_failure_circuit() -> None:
     assert health.claim(key)
 
 
+def test_same_deployment_retry_reuses_identity_and_records_every_dispatch() -> None:
+    """A safe retry keeps one provider key while each physical call gets an attempt."""
+
+    async def scenario() -> None:
+        """Run one opening transport retry followed by success."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        provider = _ScriptedProvider(
+            [
+                ProviderTransportError("connection failed"),
+                _completed_stream("recovered"),
+            ]
+        )
+        ledger = _WaterfallLedger()
+        executor = _executor((first,), {first.source_alias: provider}, ledger)
+
+        stream = await executor.start(
+            route=_route((first,)),
+            request=_request(),
+        )
+        events = [event async for event in stream]
+
+        assert [event.kind for event in events] == [
+            GatewayEventKind.TEXT_DELTA,
+            GatewayEventKind.COMPLETED,
+        ]
+        assert provider.idempotency_keys[0] == provider.idempotency_keys[1]
+        assert provider.retry_attempts == [1, 1]
+        assert ledger.started == [("route-a", 0), ("route-a", 0)]
+        assert [entry[2] for entry in ledger.finished] == [False, True]
+
+    asyncio.run(scenario())
+
+
+def test_precommit_failover_changes_deployment_identity_and_finalizes_once() -> None:
+    """A certified fallback uses a distinct provider key and one final parent owner."""
+
+    async def scenario() -> None:
+        """Fail the first deployment before commitment and complete on the second."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        second = _deployment("route-b", connection_sha256="c" * 64)
+        first_provider = _ScriptedProvider([ProviderTransportError("connection failed")])
+        second_provider = _ScriptedProvider([_completed_stream("fallback")])
+        ledger = _WaterfallLedger()
+        executor = _executor(
+            (first, second),
+            {
+                first.source_alias: first_provider,
+                second.source_alias: second_provider,
+            },
+            ledger,
+            maximum_same_deployment_attempts=1,
+        )
+
+        stream = await executor.start(route=_route((first, second)), request=_request())
+        events = [event async for event in stream]
+
+        assert events[0].text_delta == "fallback"
+        assert stream.deployment == second
+        assert stream.route_depth == 1
+        assert first_provider.idempotency_keys != second_provider.idempotency_keys
+        assert ledger.started == [("route-a", 0), ("route-b", 1)]
+        assert [entry[2] for entry in ledger.finished] == [False, True]
+        assert ledger.parent_finishes == []
+
+    asyncio.run(scenario())
+
+
+def test_all_opening_failures_settle_the_last_attempt_as_parent_owner() -> None:
+    """Exhaustion terminalizes exactly the last physical attempt before surfacing failure."""
+
+    async def scenario() -> None:
+        """Exhaust two unavailable deployments without a second parent terminal write."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        second = _deployment("route-b", connection_sha256="c" * 64)
+        ledger = _WaterfallLedger()
+        executor = _executor(
+            (first, second),
+            {
+                first.source_alias: _ScriptedProvider([ProviderTransportError("first failed")]),
+                second.source_alias: _ScriptedProvider([ProviderTransportError("second failed")]),
+            },
+            ledger,
+            maximum_same_deployment_attempts=1,
+        )
+
+        with pytest.raises(GatewayExecutionError) as raised:
+            await executor.start(route=_route((first, second)), request=_request())
+
+        assert raised.value.request_finalized
+        assert [entry[2] for entry in ledger.finished] == [False, True]
+        assert ledger.parent_finishes == []
+
+    asyncio.run(scenario())
+
+
+def test_first_semantic_event_freezes_route_even_when_provider_later_fails() -> None:
+    """Outward semantic output prevents a later provider failure from advancing routes."""
+
+    async def scenario() -> None:
+        """Emit text then a retryable terminal failure from the first deployment."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        second = _deployment("route-b", connection_sha256="c" * 64)
+        failure = GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider transport failed",
+            retryable_same_deployment=True,
+            failover_eligible=True,
+        )
+        first_provider = _ScriptedProvider(
+            [
+                _WaterfallStream(
+                    (
+                        GatewayEvent(
+                            kind=GatewayEventKind.TEXT_DELTA,
+                            sequence_number=0,
+                            text_delta="committed",
+                        ),
+                        GatewayEvent(
+                            kind=GatewayEventKind.FAILED,
+                            sequence_number=1,
+                            failure=failure,
+                        ),
+                    )
+                )
+            ]
+        )
+        second_provider = _ScriptedProvider([_completed_stream("must not run")])
+        ledger = _WaterfallLedger()
+        executor = _executor(
+            (first, second),
+            {
+                first.source_alias: first_provider,
+                second.source_alias: second_provider,
+            },
+            ledger,
+        )
+
+        stream = await executor.start(route=_route((first, second)), request=_request())
+        events = [event async for event in stream]
+
+        assert [event.kind for event in events] == [
+            GatewayEventKind.TEXT_DELTA,
+            GatewayEventKind.FAILED,
+        ]
+        assert second_provider.idempotency_keys == []
+        assert ledger.started == [("route-a", 0)]
+        assert ledger.finished[0][2]
+
+    asyncio.run(scenario())
+
+
+def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> None:
+    """A typed precommit refusal advances only for an explicitly allowed alias revision."""
+
+    async def scenario(*, opted_in: bool) -> tuple[list[GatewayEvent], int]:
+        """Run one refusal with or without the injected revision policy."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        second = _deployment("route-b", connection_sha256="c" * 64)
+        refusal = GatewayFailure(
+            failure_class=GatewayFailureClass.REFUSAL,
+            safe_message="provider refused the request",
+            safe_details={"signal": "safety"},
+        )
+        first_provider = _ScriptedProvider(
+            [
+                _WaterfallStream(
+                    (
+                        GatewayEvent(
+                            kind=GatewayEventKind.FAILED,
+                            sequence_number=0,
+                            failure=refusal,
+                        ),
+                    )
+                )
+            ]
+        )
+        second_provider = _ScriptedProvider([_completed_stream("allowed fallback")])
+        ledger = _WaterfallLedger()
+        executor = _executor(
+            (first, second),
+            {
+                first.source_alias: first_provider,
+                second.source_alias: second_provider,
+            },
+            ledger,
+            maximum_same_deployment_attempts=1,
+            refusal_failover=opted_in,
+        )
+
+        stream = await executor.start(route=_route((first, second)), request=_request())
+        events = [event async for event in stream]
+        return events, len(second_provider.idempotency_keys)
+
+    default_events, default_fallbacks = asyncio.run(scenario(opted_in=False))
+    opted_events, opted_fallbacks = asyncio.run(scenario(opted_in=True))
+
+    assert [event.kind for event in default_events] == [GatewayEventKind.FAILED]
+    assert default_fallbacks == 0
+    assert [event.kind for event in opted_events] == [
+        GatewayEventKind.TEXT_DELTA,
+        GatewayEventKind.COMPLETED,
+    ]
+    assert all(event.kind is not GatewayEventKind.REFUSAL_DELTA for event in opted_events)
+    assert opted_fallbacks == 1
+
+
+class _WaterfallStream:
+    """Yield one scripted normalized event sequence."""
+
+    def __init__(self, events: tuple[GatewayEvent, ...]) -> None:
+        """Store the provider-local events in delivery order."""
+        self._events = iter(events)
+        self._committed = False
+        self.cancelled = False
+
+    @property
+    def committed(self) -> bool:
+        """Return whether this physical stream emitted semantic output."""
+        return self._committed
+
+    def __aiter__(self) -> AsyncIterator[GatewayEvent]:
+        """Return this one-pass asynchronous iterator."""
+        return self
+
+    async def __anext__(self) -> GatewayEvent:
+        """Yield the next scripted provider event."""
+        try:
+            event = next(self._events)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+        if event.kind in {
+            GatewayEventKind.TEXT_DELTA,
+            GatewayEventKind.REFUSAL_DELTA,
+            GatewayEventKind.TOOL_CALL_STARTED,
+            GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            GatewayEventKind.TOOL_CALL_COMPLETED,
+        }:
+            self._committed = True
+        return event
+
+    async def cancel(self) -> None:
+        """Record bounded cancellation of this provider stream."""
+        self.cancelled = True
+
+
+class _ScriptedProvider:
+    """Open scripted streams or failures while recording dispatch identity."""
+
+    def __init__(self, outcomes: list[_WaterfallStream | BaseException]) -> None:
+        """Retain one outcome per expected physical dispatch."""
+        self._outcomes = outcomes
+        self.idempotency_keys: list[str] = []
+        self.retry_attempts: list[int] = []
+
+    async def stream(
+        self,
+        request: GatewayRequest,
+        *,
+        deadline: RequestDeadline,
+        idempotency_key: str,
+        retry_policy: RetryPolicy | None = None,
+    ) -> _WaterfallStream:
+        """Return or raise the next scripted physical-dispatch result."""
+        assert request.stream and request.include_usage
+        assert deadline.remaining_seconds() > 0
+        assert retry_policy is not None
+        self.idempotency_keys.append(idempotency_key)
+        self.retry_attempts.append(retry_policy.maximum_attempts)
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class _WaterfallRuntimeCatalog:
+    """Resolve each route alias to its injected provider and frozen identity."""
+
+    def __init__(
+        self,
+        deployments: tuple[ExactModelDeployment, ...],
+        providers: dict[str, _ScriptedProvider],
+    ) -> None:
+        """Index deployments and providers by source alias."""
+        self._deployments = {item.source_alias: item for item in deployments}
+        self._providers = providers
+
+    def resolve(self, alias: str, *, role: str | None = None) -> ResolvedModel:
+        """Return one runtime binding matching the frozen deployment exactly."""
+        del role
+        deployment = self._deployments[alias]
+        capabilities = ModelCapabilities()
+        return ResolvedModel(
+            alias=alias,
+            snapshot=ModelSnapshot(
+                provider=deployment.provider,
+                model_id=deployment.provider_model,
+                revision=deployment.revision,
+                capabilities_sha256=capabilities.identity_sha256(),
+                connection_sha256=deployment.connection_sha256,
+            ),
+            capabilities=capabilities,
+            client=cast(ModelClient, self._providers[alias]),
+            embedding_client=None,
+        )
+
+
+class _WaterfallLedger:
+    """Capture physical and parent terminal ownership without request content."""
+
+    def __init__(self) -> None:
+        """Initialize empty ordered accounting records."""
+        self.started: list[tuple[str, int]] = []
+        self.finished: list[tuple[str, GatewayFailure | None, bool]] = []
+        self.parent_finishes: list[GatewayFailure] = []
+
+    def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
+        """Accept a parent request when a service-level test requires it."""
+        del authorization
+
+    def start_attempt(
+        self,
+        *,
+        snapshot: ExecutionSnapshot,
+        deployment: ExactModelDeployment,
+        route_depth: int,
+    ) -> str:
+        """Record one durable physical dispatch before provider work."""
+        assert deployment.deployment_id in snapshot.deployment_ids
+        self.started.append((deployment.deployment_id, route_depth))
+        return f"attempt-{len(self.started)}"
+
+    def record_route_context(
+        self,
+        *,
+        attempt_id: str,
+        route_reason: str | None,
+        fallback_reason: str | None,
+    ) -> None:
+        """Accept display-safe route context for the scripted attempt."""
+        del attempt_id, route_reason, fallback_reason
+
+    def finish_attempt(
+        self,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+    ) -> None:
+        """Record physical settlement and whether it owns parent terminalization."""
+        del terminal_event
+        self.finished.append((attempt_id, failure, finalize_request))
+
+    def finish_request(
+        self,
+        *,
+        authorization: AuthorizationSnapshot,
+        failure: GatewayFailure,
+    ) -> None:
+        """Record terminalization without a new physical attempt."""
+        del authorization
+        self.parent_finishes.append(failure)
+
+
+def _completed_stream(text: str) -> _WaterfallStream:
+    """Build one semantic text event followed by successful terminal completion."""
+    return _WaterfallStream(
+        (
+            GatewayEvent(
+                kind=GatewayEventKind.TEXT_DELTA,
+                sequence_number=0,
+                text_delta=text,
+            ),
+            GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+        )
+    )
+
+
+def _request() -> GatewayRequest:
+    """Build one canonical request for physical execution tests."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hello"),),
+    )
+
+
+def _route(deployments: tuple[ExactModelDeployment, ...]) -> GatewayRoute:
+    """Build one frozen certified route with a live request deadline."""
+    authorization = _authorization(_DIGEST).model_copy(
+        update={"deadline_monotonic": time.monotonic() + 30}
+    )
+    return GatewayRoute(
+        snapshot=ExecutionSnapshot(
+            authorization=authorization,
+            exact_model_id="exact-one",
+            pool_id="pool-one",
+            deployment_ids=tuple(item.deployment_id for item in deployments),
+        ),
+        deployment=deployments[0],
+        fallback_deployments=deployments[1:],
+        route_reason="direct",
+    )
+
+
+def _executor(
+    deployments: tuple[ExactModelDeployment, ...],
+    providers: dict[str, _ScriptedProvider],
+    ledger: _WaterfallLedger,
+    *,
+    maximum_same_deployment_attempts: int = 2,
+    refusal_failover: bool = False,
+) -> GatewayExecutor:
+    """Compose one revision-pinned executor for the scripted route."""
+    catalog = cast(
+        RuntimeModelCatalog,
+        _WaterfallRuntimeCatalog(deployments, providers),
+    )
+    return GatewayExecutor(
+        {("revision-one", _DIGEST): catalog},
+        ledger,
+        maximum_same_deployment_attempts=maximum_same_deployment_attempts,
+        refusal_failover_revisions=(
+            frozenset({"revision-one"}) if refusal_failover else frozenset()
+        ),
+    )
+
+
 def _deployment(deployment_id: str, *, connection_sha256: str) -> ExactModelDeployment:
     """Build one deployment in the shared certified exact-model pool."""
     return ExactModelDeployment(
@@ -135,7 +576,9 @@ def _deployment(deployment_id: str, *, connection_sha256: str) -> ExactModelDepl
         provider_model="provider-model",
         connection_sha256=connection_sha256,
         capabilities_sha256="d" * 64,
-        gateway=GatewayDeploymentMetadata(),
+        gateway=GatewayDeploymentMetadata(
+            capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+        ),
     )
 
 
